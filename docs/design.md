@@ -186,16 +186,16 @@ Overflow reference format (used when CellFlags bit 0 is set):
 
 ```
 Overflow Reference (instead of inline value)
-+----------+----------+-----------+----------+----------+
-| KeyLen   | 0        | Key bytes | OvflPage | TotalLen |
-| uint16   | uint32   |           | uint64   | uint64   |
-+----------+----------+-----------+----------+----------+
++----------+-----------+----------+----------+
+| KeyLen   | Key bytes | OvflPage | TotalLen |
+| uint16   |           | uint64   | uint64   |
++----------+-----------+----------+----------+
 ```
 
-The `ValueLen` field is set to 0 in overflow references — it is not used.
-The actual value size is stored in `TotalLen` (uint64). The reader checks
-`CellFlags.Overflow` to determine whether to read an inline value (using
-`ValueLen`) or follow the overflow pointer (using `OvflPage` + `TotalLen`).
+The overflow cell has a different layout from the inline cell — there is no
+`ValueLen` field. The reader checks `CellFlags.Overflow` to determine which
+format to parse: inline (KeyLen + ValueLen + Key + Value) or overflow
+(KeyLen + Key + OvflPage + TotalLen).
 
 #### Overflow Page
 
@@ -296,11 +296,15 @@ Only one writer at a time, across all processes.
 
 ### Reader Table
 
-- On `BeginRead()`: find an empty slot (TxnID == 0), atomically write the
-  current meta TxnID and PID.
-- On `EndRead()`: atomically set the slot's TxnID to 0.
+- On `BeginRead()`: scan the reader table for a slot with PID == 0. Atomically
+  CAS the PID field from 0 to the caller's PID to claim the slot. If the CAS
+  fails (another process claimed it), try the next slot. Once the slot is
+  claimed, store the current meta TxnID into the slot's TxnID field.
+- On `EndRead()`: set the slot's TxnID to 0, then set PID to 0. This order
+  ensures the writer never sees a stale TxnID in an unclaimed slot.
 - Stale reader detection: if a PID in the reader table is no longer alive
-  (checked via `kill(pid, 0)` or `/proc/<pid>`), the slot can be reclaimed.
+  (checked via `kill(pid, 0)` or `/proc/<pid>`), the slot can be reclaimed
+  by setting both TxnID and PID to 0.
 
 ### Writer's Freelist Reclamation
 
@@ -453,7 +457,7 @@ func (c *Cursor) First() (key, value []byte)
 func (c *Cursor) Last() (key, value []byte)
 func (c *Cursor) Next() (key, value []byte)
 func (c *Cursor) Prev() (key, value []byte)
-func (c *Cursor) Seek(key []byte) (key, value []byte)
+func (c *Cursor) Seek(target []byte) (key, value []byte)
 ```
 
 ## Implementation Modules
@@ -520,14 +524,17 @@ Default: 4096 bytes.
 ### Maximum Key Size
 
 Determined by page size. A branch page must fit at least 2 keys to allow
-splitting. The maximum key size is approximately `(PageSize - 40) / 2`:
+splitting. The fixed overhead is 24 bytes (16-byte page header + 8-byte
+leftmost child pointer). Each key requires 4 bytes (cell directory entry) +
+key bytes + 8 bytes (child pointer). The maximum key size is approximately
+`(PageSize - 48) / 2`:
 
 | Page Size | Max Key Size (approx) |
 |-----------|----------------------|
-| 4KB       | ~1024 bytes          |
-| 8KB       | ~2048 bytes          |
-| 16KB      | ~4096 bytes          |
-| 64KB      | ~16384 bytes         |
+| 4KB       | ~2024 bytes          |
+| 8KB       | ~4024 bytes          |
+| 16KB      | ~8024 bytes          |
+| 64KB      | ~32744 bytes         |
 
 Enforced at `Put()` time. Keys exceeding the limit return an error.
 
