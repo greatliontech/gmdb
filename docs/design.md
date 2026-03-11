@@ -48,7 +48,8 @@ Page Header (16 bytes)
 ```
 
 - **PageID**: The page number (offset = PageID * PageSize).
-- **Type**: One of: Meta, Branch, Leaf, Freelist, Overflow.
+- **Type**: One of: Meta, Branch, Leaf, Overflow. (The freelist uses a regular
+  B+tree with standard Branch and Leaf pages — no special page type needed.)
 - **Count**: Number of items (keys in branch, key/value pairs in leaf).
 - **Overflow**: Number of contiguous overflow pages following this one (0 for
   single-page nodes).
@@ -73,9 +74,12 @@ Meta Page
 | NumKeyspaces     | uint64 - number of keyspaces
 | LastPageID       | uint64 - highest allocated page ID
 | TxnID            | uint64 - transaction ID that wrote this meta
-| Checksum         | uint64 - xxhash of all above fields
+| Checksum         | uint64 - xxhash of all preceding bytes (header through TxnID)
 +------------------+
 ```
+
+Total meta page payload: 16 (header) + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 +
+8 + 8 = 88 bytes. Fits comfortably in any supported page size (min 4KB).
 
 The active meta page is the one with the highest TxnID whose checksum is valid.
 If a crash happens mid-write to the meta page, the checksum will be invalid and
@@ -88,43 +92,50 @@ Branch pages store keys and child page pointers. They do NOT store values.
 
 ```
 Branch Page
-+------------------+
-| Page Header      |
-+------------------+
-| Ptr[0]           | uint64 - page ID of leftmost child
-+------------------+
-| Key[0] | Ptr[1]  | Key bytes + page ID
-| Key[1] | Ptr[2]  | Key bytes + page ID
-| ...              |
-+------------------+
++------------------------+
+| Page Header (16 bytes) |
++------------------------+
+| Ptr[0] (uint64)        |  leftmost child pointer (8 bytes)
++------------------------+
+| Cell Directory         |  Array of (Offset uint16, KeyLen uint16)
+| ...                    |  grows forward, 4 bytes per cell
++------------------------+
+|       free space       |
++------------------------+
+| ...                    |
+| Cell Data 1            |  packed from end of page, grows backward
+| Cell Data 0            |
++------------------------+
 ```
 
-Keys are stored in sorted order. For a branch with N keys, there are N+1 child
-pointers. The search is: if `target < Key[i]`, descend to `Ptr[i]`; if target
->= all keys, descend to `Ptr[N]`.
-
-Key layout within the page:
+Each cell in the data area:
 
 ```
-Cell Directory (at start of data area, grows forward)
-+----------+----------+
-| Offset   | KeyLen   |    per cell: offset into page + key length
-| uint16   | uint16   |
-+----------+----------+
-
-Key Data (packed from end of page, grows backward)
+Branch Cell
 +----------+----------+
 | Key bytes| ChildPtr |
 |          | uint64   |
 +----------+----------+
 ```
 
-This layout allows binary search over the cell directory without parsing
-variable-length keys.
+Keys are stored in sorted order. For a branch with N cells (N keys), there are
+N+1 child pointers: `Ptr[0]` (leftmost, stored after the page header) plus one
+`ChildPtr` per cell.
+
+Search algorithm: binary search the cell directory to find the first cell where
+`target < Key[i]`. If found, descend to the child pointer of cell `i-1` (or
+`Ptr[0]` if `i == 0`). If target >= all keys, descend to the last cell's
+`ChildPtr`.
+
+The cell directory stores `(Offset, KeyLen)` per cell, enabling binary search
+over variable-length keys without parsing the key data area.
 
 #### Leaf Page
 
-Leaf pages store the actual key-value pairs.
+Leaf pages store the actual key-value pairs. Note: the cell directory entry
+format differs from branch pages — leaf cells use `(Offset, CellFlags)` instead
+of `(Offset, KeyLen)`, because leaf cells encode `KeyLen` inside the cell data
+itself and need the flags for overflow/compression/encryption metadata.
 
 ```
 Leaf Page
@@ -146,12 +157,17 @@ Leaf Page
 Each cell in the data area:
 
 ```
-KV Cell
+KV Cell (inline)
 +----------+----------+-----------+-----------+
 | KeyLen   | ValueLen | Key bytes | Val bytes |
 | uint16   | uint32   |           |           |
 +----------+----------+-----------+-----------+
 ```
+
+`ValueLen` is uint32 (max ~4GB for inline values). In practice, inline values
+are limited by leaf page free space — far below 4GB. Values that exceed leaf
+page capacity are stored as overflow pages, referenced via the overflow format
+below which uses uint64 `TotalLen` for unbounded value sizes.
 
 If a value is too large to fit in the leaf page, the CellFlags field in the cell
 directory indicates it's an overflow reference.
@@ -166,7 +182,7 @@ Bits 3-7: Compression algorithm ID (reserved, 0 for now)
 Bits 8-15: Reserved (must be 0)
 ```
 
-Overflow reference format:
+Overflow reference format (used when CellFlags bit 0 is set):
 
 ```
 Overflow Reference (instead of inline value)
@@ -175,6 +191,11 @@ Overflow Reference (instead of inline value)
 | uint16   | uint32   |           | uint64   | uint64   |
 +----------+----------+-----------+----------+----------+
 ```
+
+The `ValueLen` field is set to 0 in overflow references — it is not used.
+The actual value size is stored in `TotalLen` (uint64). The reader checks
+`CellFlags.Overflow` to determine whether to read an inline value (using
+`ValueLen`) or follow the overflow pointer (using `OvflPage` + `TotalLen`).
 
 #### Overflow Page
 
@@ -196,8 +217,7 @@ reclaim.
 
 ### Write Transaction
 
-1. Writer acquires exclusive write lock (flock on data file or mutex in shared
-   memory).
+1. Writer acquires exclusive write lock (flock on lock file).
 2. Writer reads the active meta page to get current roots and TxnID.
 3. For each modification (insert, update, delete):
    - Traverse the B+tree from root to leaf.
@@ -234,8 +254,10 @@ A separate file (`<dbname>.lock`) is mmap'd as shared memory by all processes.
 ```
 Lock File
 +------------------------+
-| Write Lock             | 1 byte (used with flock or futex)
-| Padding                | 7 bytes
+| Header                 |
+| Magic      | uint32    |  identifies file as gmdb lock file
+| Version    | uint16    |  lock file format version
+| MaxReaders | uint16    |  number of reader slots
 +------------------------+
 | Reader Table           |
 | +---------+----------+ |
@@ -246,18 +268,31 @@ Lock File
 | | TxnID   | PID      | | Slot 1
 | | ...                 | |
 | +---------+----------+ |
-| | ...                 | | up to MaxReaders slots (default 126)
+| | ...                 | | up to MaxReaders slots
 | +---------+----------+ |
 +------------------------+
 ```
 
-Total lock file size: 8 + (16 * MaxReaders) = 8 + 2016 = 2024 bytes (fits in
-one page).
+Header size: 8 bytes (aligned). Total lock file size: 8 + (16 * MaxReaders).
+With default MaxReaders=126: 8 + 2016 = 2024 bytes (fits in one page).
+
+The lock file is mmap'd with `MAP_SHARED` by all processes for the reader table.
+The write lock is a separate concern handled via `flock()` (see below).
+
+### Lock File Lifecycle
+
+The lock file is ephemeral. The first process to open the database creates the
+lock file and writes the header (including MaxReaders). Subsequent processes
+read MaxReaders from the header and use it. If the lock file is deleted (e.g.,
+after all processes exit), the next opener recreates it. MaxReaders is NOT
+stored in the data file — it is a runtime coordination property, not a data
+property.
 
 ### Write Lock
 
-The writer acquires an exclusive `flock()` on the data file (or a dedicated lock
-file). Only one writer at a time, across all processes.
+The writer acquires an exclusive `flock()` on the lock file. This is a
+kernel-level advisory lock — no bytes in the file represent the lock state.
+Only one writer at a time, across all processes.
 
 ### Reader Table
 
@@ -316,6 +351,12 @@ Option 1 (over-allocate) is simpler and avoids remapping. The database sets a
 maximum database size at creation time (default 256GB, configurable). This only
 reserves virtual address space, not physical memory.
 
+**Note**: Large virtual address reservations may be affected by Linux
+`vm.overcommit_memory` settings or per-process `RLIMIT_AS` limits. On most
+default configurations this is not an issue — the kernel distinguishes between
+reserved virtual address space and committed memory. Users with restrictive
+settings may need to lower `MaxDBSize`.
+
 ## Keyspaces
 
 The root meta page points to a "keyspace B+tree" — a B+tree whose keys are
@@ -328,6 +369,8 @@ Keyspace Descriptor
 | uint64   | uint16   | uint64   | uint16   |
 +----------+----------+----------+----------+
 ```
+
+Total descriptor size: 8 + 2 + 8 + 2 = 20 bytes.
 
 - **Root**: Page ID of this keyspace's B+tree root.
 - **Depth**: Height of the B+tree (for optimization).
@@ -356,7 +399,8 @@ type Options struct {
     MaxDBSize int64
 
     // MaxReaders is the maximum number of concurrent reader slots.
-    // Default: 126.
+    // Default: 126. Only used when creating a new lock file.
+    // Ignored when the lock file already exists (read from lock file header).
     MaxReaders int
 
     // FileMode for newly created files. Default: 0644.
