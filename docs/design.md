@@ -26,6 +26,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Byte order | Little-endian (fixed) | Portable across architectures |
 | Checksums | Meta pages only | CoW protects data pages; meta checksum detects torn commits |
 | API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime |
+| Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
 | Namespaces | Named keyspaces | Multiple B+trees in one file |
 
 ## File Layout
@@ -876,6 +877,87 @@ acquisition, which is a simple atomic CAS. The context is checked once before
 acquisition but is not stored on the transaction — slot acquisition is
 non-blocking so there is nothing to cancel.
 
+### Write Batching
+
+`DB.Batch()` amortizes write transaction commit costs across multiple
+concurrent callers. Instead of each goroutine acquiring the write lock and
+committing independently (paying fdatasync per transaction), multiple
+callers' closures are collected and executed within a single transaction.
+
+#### Mechanics
+
+The `DB` struct maintains a batch channel and a batch coordinator:
+
+```
+db.batchCh chan batchCall
+
+type batchCall struct {
+    fn     func(tx *Tx) error
+    ctx    context.Context
+    result chan<- error
+}
+```
+
+1. A caller invokes `db.Batch(ctx, fn)`. The closure, context, and a result
+   channel are sent to `db.batchCh`. The caller blocks on the result channel.
+
+2. A coordinator goroutine (started lazily on first `Batch` call) reads from
+   `db.batchCh`. It collects calls until either:
+   - `Options.MaxBatchSize` calls have accumulated (default: 1000), or
+   - `Options.MaxBatchDelay` has elapsed since the first call in the current
+     batch (default: 10ms).
+
+   This delay allows more callers to join the batch, increasing throughput.
+   The tradeoff is added latency — callers wait up to `MaxBatchDelay` for
+   the batch to fill. For latency-sensitive workloads, set `MaxBatchDelay`
+   to 0 (batch fires as soon as the coordinator goroutine runs).
+
+3. The coordinator opens a write transaction via `db.Begin(ctx, true)` (using
+   `context.Background()` — individual caller contexts are checked separately).
+
+4. Each collected closure is executed sequentially within the transaction.
+   Before executing a closure, its `ctx` is checked — if already cancelled,
+   the closure is skipped and the caller receives `ctx.Err()`.
+
+5. If all closures succeed, the transaction is committed. All callers receive
+   `nil` on their result channels.
+
+6. If any closure returns an error, the transaction is **rolled back**. The
+   batch is then split: closures that succeeded are re-batched and retried
+   in a new transaction, and the failing closure is retried individually via
+   `db.Update()`. This ensures that one bad closure does not penalize the
+   others. If the individual retry also fails, that caller receives the error.
+
+7. If `Commit()` itself fails (e.g., I/O error), all callers in the batch
+   receive the commit error.
+
+#### Error Isolation
+
+The rollback-and-retry strategy means that `Batch` provides the same
+semantics as `Update` from each caller's perspective: either their closure's
+effects are committed, or they receive an error. Callers do not need to know
+or care that their work was batched.
+
+The retry cost for a failing closure is bounded: the failing closure is
+retried exactly once individually. If it fails again, the error is returned.
+The successful closures are re-executed in a new batch, which may itself
+collect additional pending callers.
+
+#### When to Use Batch
+
+`Batch` is optimal for workloads with many goroutines performing small,
+independent writes (e.g., incrementing counters, appending log entries,
+updating individual keys). The throughput improvement scales with the
+number of concurrent callers — with N callers, commit cost is amortized
+N-ways.
+
+`Batch` is NOT suitable for:
+- Large transactions that modify many keys (use `Update` directly).
+- Transactions that depend on reading their own writes across callers
+  (closures within a batch see each other's writes, which may cause
+  unexpected interactions).
+- Transactions that need exclusive control over commit timing.
+
 ## Cross-Process Coordination
 
 ### Lock File Layout
@@ -1393,6 +1475,17 @@ type Options struct {
     // through to file extension when reclamation is blocked.
     SlowReader func(info SlowReaderInfo) SlowReaderAction
 
+    // MaxBatchSize is the maximum number of Batch() calls to collect
+    // before executing them in a single transaction. Default: 1000.
+    MaxBatchSize int
+
+    // MaxBatchDelay is the maximum time to wait for additional Batch()
+    // calls before executing the current batch. Lower values reduce
+    // latency; higher values increase throughput by collecting more
+    // callers per transaction. Default: 10ms. Set to 0 to disable
+    // delay (batch fires immediately when the coordinator runs).
+    MaxBatchDelay time.Duration
+
     // FileMode for newly created files. Default: 0644.
     FileMode os.FileMode
 
@@ -1462,6 +1555,25 @@ func (db *DB) View(ctx context.Context, fn func(tx *Tx) error) error
 // blocks until the lock is available or the context is cancelled. Once
 // the transaction callback is entered, the context is not checked.
 func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
+
+// Batch submits a write operation to be batched with other concurrent
+// callers into a single transaction. Multiple goroutines calling Batch
+// concurrently will have their closures executed in one write transaction,
+// amortizing the commit cost (fdatasync) across all of them.
+//
+// The context governs the wait for batch inclusion — if cancelled before
+// the caller's closure executes, Batch returns ctx.Err(). Once the
+// closure begins executing, the context is not checked.
+//
+// If fn returns an error, the entire batch is rolled back and retried:
+// successful closures are re-executed in a new batch, and the failing
+// closure is retried individually via Update. See Write Batching for
+// details.
+//
+// Batch is a throughput optimization for workloads with many concurrent
+// small writes. For exclusive write access or large transactions, use
+// Update or Begin directly.
+func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error
 
 // Begin starts a transaction manually. The context governs lock/slot
 // acquisition:
@@ -1715,7 +1827,7 @@ organized by file:
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
 | `lock.go` | Lock file creation and mmap (shared memory). Writer lock (channel semaphore intra-process + flock cross-process + WriterPID, context-aware). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
 | `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (sort dirty keys + sequential pwrite + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Stats accumulation. |
-| `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Keyspace management. Sync(). Check(). CopyTo(). |
+| `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management. Sync(). Check(). CopyTo(). |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
 
