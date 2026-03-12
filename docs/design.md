@@ -18,12 +18,12 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Isolation | Dual meta pages + CoW | No WAL needed, atomic commit |
 | Crash safety | CoW + atomic meta page swap | File is always consistent |
 | Durability | Three sync modes (Durable, NoMeta, Safe) + unsafe opt-in None | Configurable ACID vs. performance; SyncNone requires explicit `AllowSyncNone` flag |
-| Cross-process | Shared memory lock file (`structs.HostLayout` structs, uint64 PIDs) | C ABI layout guarantee for mmap'd structs; fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness; uint64 PIDs for forward safety |
+| Cross-process | Shared memory lock file (`structs.HostLayout` structs, uint64 PIDs + process start times) | C ABI layout guarantee for mmap'd structs; fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness + start time comparison (PID reuse safe); uint64 PIDs for forward safety |
 | Write lock | Intra-process writer queue (channel) + single flock goroutine (cross-process) | Context-aware blocking; zero goroutine accumulation on cancellation; flock alone doesn't block same-process goroutines |
 | Slow readers | Callback-based notification | Application controls policy; no silent unbounded growth |
 | mmap | pwrite mode (default) or writemap mode | pwrite: write isolation (anonymous slab); writemap: direct mmap writes for performance |
 | Huge pages | `MADV_HUGEPAGE` (opt-in, Linux) | Reduces TLB pressure for large databases; transparent huge pages for file-backed mmap |
-| Dirty page tracking | Hash map (`map[uint64]`) with clock reference bit | O(1) insert/lookup/delete; clock eviction for spill; `slices.Sorted(maps.Keys(...))` at commit for sequential I/O |
+| Dirty page tracking | Hash map (`map[uint64]`) with clock ring (`[]uint64` circular buffer + reference bit) | O(1) insert/lookup/delete; clock ring for spill eviction (O(1) append, tombstones for spilled entries); `slices.Sorted(maps.Keys(...))` at commit for sequential I/O |
 | Dirty page buffers | Anonymous mmap slab (pwrite mode) | GC-invisible; no pool draining on GC cycles; deterministic allocation; `munmap` at transaction close |
 | Page spilling | Clock-based spill to disk mid-transaction (pwrite mode only) | Bounds memory; zero per-access overhead (ref bit vs. O(log n) heap); approximates LRU |
 | Branch keys | Prefix-truncated separators | Shortest distinguishing prefix; maximizes fan-out; shallower trees; full keys in leaves only |
@@ -902,6 +902,8 @@ write mode:
 **pwrite mode:**
 ```
 tx.dirtyPages map[uint64]*dirtyPage
+tx.clockRing  []uint64  // circular buffer of page IDs for clock sweep order
+tx.clockHand  int       // current index into clockRing
 
 type dirtyPage struct {
     data []byte // page content from anonymous mmap slab (len = PageSize * (1 + overflow))
@@ -970,18 +972,24 @@ The same pattern applies to `tx.retiredPages` (the `[]uint64` of page IDs
 to append to the RPL): the slice is reset via `tx.retiredPages = tx.retiredPages[:0]`,
 retaining its backing array for the next transaction.
 
-### Clock Reference Bit (pwrite mode only)
+### Clock Ring and Reference Bit (pwrite mode only)
 
 Each dirty page in pwrite mode carries a `ref` (reference) bit that drives
 the clock-based spill eviction (see Page Spilling). When a dirty page is
 accessed or modified, its `ref` bit is set to `true` — a single field
 write with zero data structure overhead (no heap operations, no map
-lookups). The spill pass uses a clock hand to scan dirty pages and select
-eviction candidates based on the `ref` bit (see Page Spilling for the
-algorithm).
+lookups).
 
-In writemap mode, there is no reference bit because spilling does not
-apply — the OS manages mmap page eviction transparently.
+The transaction also maintains a **clock ring** (`tx.clockRing []uint64`)
+— a circular buffer of page IDs that serves as the sweep order for the
+clock algorithm. When a page is first dirtied, its page ID is appended to
+the ring. The clock hand (`tx.clockHand int`) is an index into this ring.
+Spilled pages are marked as tombstones (`math.MaxUint64`) in the ring
+rather than removed, preserving O(1) operations and stable hand indexing.
+See Page Spilling for the full sweep algorithm.
+
+In writemap mode, there is no reference bit or clock ring because spilling
+does not apply — the OS manages mmap page eviction transparently.
 
 ### Spilled Page Set
 
@@ -1064,28 +1072,40 @@ approximate-LRU scheme with zero per-access overhead on the hot path.
 
 Each dirty page carries a **reference bit** (`ref`). Whenever a dirty page
 is accessed or modified during the transaction, its `ref` bit is set to
-`true`. The transaction maintains a **clock hand** — an index into the
-dirty page set (implemented as the iteration order of the dirty map's keys
-snapshot).
+`true`. The transaction maintains a **clock ring** — a `[]uint64` circular
+buffer of page IDs — alongside the `tx.dirtyPages` map. The clock hand is
+an integer index into this ring.
 
-When spilling is triggered, the clock hand sweeps through dirty pages:
+When a page is dirtied for the first time (added to `tx.dirtyPages`), its
+page ID is appended to the clock ring: O(1). When a page is removed from
+`tx.dirtyPages` (spilled), its ring entry is replaced with a **tombstone**
+(sentinel value `math.MaxUint64`) rather than compacting the ring — this
+preserves O(1) cost and avoids invalidating the clock hand index.
 
-1. If the page's `ref` bit is set, clear it and advance the hand (the page
+When spilling is triggered, the clock hand sweeps through the ring:
+
+1. Skip tombstone entries (spilled pages no longer in the dirty set).
+2. If the page's `ref` bit is set, clear it and advance the hand (the page
    was recently accessed — give it another chance).
-2. If the `ref` bit is already clear, the page is cold — select it for
+3. If the `ref` bit is already clear, the page is cold — select it for
    eviction.
-3. Continue until enough pages are selected for spilling.
+4. Continue until enough pages are selected for spilling.
 
 This approximates LRU without the O(log n) per-access cost of a heap.
 Pages that are actively being modified (e.g., B+tree branch nodes on the
 current insertion path) have their `ref` bits continuously re-set and
 survive clock sweeps. Cold pages (e.g., leaf pages from earlier bulk
 insertions) have their bits cleared on the first sweep and are evicted on
-the second.
+the second. Newly dirtied pages are immediately visible to future sweeps
+— unlike a map-keys snapshot approach, no regeneration step is needed.
 
 The clock hand position persists across spill events within the same
 transaction, so consecutive spills resume where the previous one stopped
-rather than re-scanning already-visited pages.
+rather than re-scanning already-visited pages. Tombstones accumulate
+across spill passes but are bounded by `MaxDirtyPages` (the ring never
+exceeds the total number of pages ever dirtied in the transaction). The
+ring is reset (`tx.clockRing = tx.clockRing[:0]`) at transaction close
+along with the dirty page map.
 
 ### Spill Mechanics
 
@@ -1163,8 +1183,8 @@ ignored when `WriteMap` is true.
    after the commit point — a crash before truncation leaves the file
    larger than necessary but consistent. The next commit will retry.
 9. Writer signals the flock goroutine to release the lock (clears
-   `WriterPID`, releases the flock, makes the goroutine available for
-   the next writer in the queue).
+   `WriterPID` and `WriterStartTime`, releases the flock, makes the
+   goroutine available for the next writer in the queue).
 
 ### Read Transaction
 
@@ -1333,8 +1353,8 @@ When the GC collects a leaked `Tx`:
    leaked transaction's snapshot.
 
 3. **Release the write lock** (if writable): signal the flock goroutine
-   to clear `WriterPID`, release the flock, and serve the next writer
-   in the queue.
+   to clear `WriterPID` and `WriterStartTime`, release the flock, and
+   serve the next writer in the queue.
 
 The cleanup runs on a GC background goroutine — it must not block or
 panic. All operations above are non-blocking (atomic store, syscall
@@ -1423,25 +1443,28 @@ A separate file (`<dbname>.lock`) is mmap'd as shared memory by all processes.
 
 ```
 Lock File
-+---------------------------+
-| Header (24 bytes)         |
-| Magic        | uint64     |  identifies file as gmdb lock file
-| MaxReaders   | uint32     |  number of reader slots (set at creation)
-| Padding      | 4 bytes    |  alignment
-| WriterPID    | uint64     |  PID of current write txn holder (0 = no writer)
-+---------------------------+
-| Reader Table              |
-| +----------+----------+   |
-| | TxnID    | PID      |   | Slot 0
-| | uint64   | uint64   |   |
-| +----------+----------+   |
-| | TxnID    | PID      |   | Slot 1
-| | ...                  |   |
-| +----------+----------+   |
-| | ...                  |   | up to MaxReaders slots
-| +----------+----------+   |
-+---------------------------+
++-------------------------------+
+| Header (32 bytes)             |
+| Magic            | uint64    |  identifies file as gmdb lock file
+| MaxReaders       | uint32    |  number of reader slots (set at creation)
+| Padding          | 4 bytes   |  alignment
+| WriterPID        | uint64    |  PID of current write txn holder (0 = no writer)
+| WriterStartTime  | uint64    |  process start time of writer (for PID reuse detection)
++-------------------------------+
+| Reader Table                  |
+| +---------+---------+-------+ |
+| | TxnID   | PID     | PST   | | Slot 0
+| | uint64  | uint64  | uint64| |
+| +---------+---------+-------+ |
+| | TxnID   | PID     | PST   | | Slot 1
+| | ...                        | |
+| +---------+---------+-------+ |
+| | ...                        | | up to MaxReaders slots
+| +---------+---------+-------+ |
++-------------------------------+
 ```
+
+PST = Process Start Time.
 
 The lock file structures are defined as Go structs with `structs.HostLayout`
 (Go 1.24+), which guarantees the struct uses the host platform's C ABI
@@ -1451,17 +1474,19 @@ on unspecified Go compiler layout behavior:
 
 ```go
 type LockFileHeader struct {
-    _          structs.HostLayout
-    Magic      uint64
-    MaxReaders uint32
-    _          [4]byte // explicit padding for 8-byte alignment
-    WriterPID  uint64
+    _               structs.HostLayout
+    Magic           uint64
+    MaxReaders      uint32
+    _               [4]byte // explicit padding for 8-byte alignment
+    WriterPID       uint64
+    WriterStartTime uint64  // process start time of writer (PID reuse detection)
 }
 
 type ReaderSlot struct {
-    _     structs.HostLayout
-    TxnID uint64
-    PID   uint64
+    _              structs.HostLayout
+    TxnID          uint64
+    PID            uint64
+    ProcessStartTime uint64 // process start time when slot was acquired
 }
 ```
 
@@ -1470,7 +1495,7 @@ the lock file's shared memory structures. Data file page formats remain
 defined as raw byte layouts with explicit encode/decode functions, since
 those must be endian-aware and portable across architectures.
 
-**Header (24 bytes):**
+**Header (32 bytes):**
 - `Magic` (uint64): Identifies the file as a gmdb lock file. Validates that
   the lock file belongs to this database and has not been corrupted.
 - `MaxReaders` (uint32): Number of reader slots. Set at lock file creation
@@ -1481,16 +1506,25 @@ those must be endian-aware and portable across architectures.
   stale writer detection (see Stale Writer Recovery). Stored as uint64 for
   forward safety — Linux `pid_max` can reach 2^22 on 64-bit kernels, and
   uint64 provides consistent alignment with other fields.
+- `WriterStartTime` (uint64): Process start time of the writer, stored
+  alongside `WriterPID` for PID reuse detection. If `WriterPID` is non-zero
+  and the PID is alive, the start time is compared against the PID's current
+  start time — a mismatch means the PID was recycled and the original writer
+  crashed. See Stale Writer Recovery and Process Start Time below.
 
-**Reader Slot (16 bytes):**
+**Reader Slot (24 bytes):**
 - `TxnID` (uint64, atomic): The snapshot transaction ID held by this reader.
   A value of 0 means the slot is free. Non-zero means the slot is active.
 - `PID` (uint64, atomic): Process ID that owns this slot. Used for stale
-  reader detection (`kill(pid, 0)`). Stored as uint64 for alignment
-  consistency with TxnID and forward safety.
+  reader detection. Stored as uint64 for alignment consistency with TxnID
+  and forward safety.
+- `ProcessStartTime` (uint64, atomic): Process start time when the slot was
+  acquired. Used alongside `PID` for PID reuse detection — if the PID is
+  alive but its current start time differs from the stored value, the PID
+  was recycled and the slot is stale. See Process Start Time below.
 
-Total lock file size: 24 + (16 × MaxReaders). With default MaxReaders=4096:
-24 + 65536 = 65560 bytes (~64KB).
+Total lock file size: 32 + (24 × MaxReaders). With default MaxReaders=4096:
+32 + 98304 = 98336 bytes (~96KB).
 
 The lock file is mmap'd with `MAP_SHARED` by all processes for the reader table.
 The write lock is a separate concern handled via `flock()` (see below).
@@ -1498,16 +1532,18 @@ The write lock is a separate concern handled via `flock()` (see below).
 ### Lock File Lifecycle
 
 The lock file is ephemeral. The first process to open the database creates the
-lock file, writes the header (including `Magic`, `MaxReaders`, `WriterPID=0`),
-and initializes all reader slots to zero. Subsequent processes validate `Magic`,
+lock file, writes the header (including `Magic`, `MaxReaders`, `WriterPID=0`,
+`WriterStartTime=0`), and initializes all reader slots to zero. Subsequent processes validate `Magic`,
 read `MaxReaders` from the header, and mmap the file at the corresponding size.
 If the lock file is deleted (e.g., after all processes exit), the next opener
 recreates it. `MaxReaders` is NOT stored in the data file — it is a runtime
 coordination property, not a data property.
 
 On open, if the lock file already exists, the opener checks `WriterPID`. If
-non-zero and the PID is no longer alive (`kill(pid, 0)` returns `ESRCH`), the
-writer crashed while holding the lock — see Stale Writer Recovery.
+non-zero, the opener determines whether the writer is still alive using
+`kill(pid, 0)` and `WriterStartTime` comparison (see Process Start Time).
+If the writer is dead or the PID was recycled, the writer crashed while
+holding the lock — see Stale Writer Recovery.
 
 ### Write Lock
 
@@ -1552,12 +1588,12 @@ The flock goroutine runs a loop:
 5. On flock acquisition, check `req.ctx` again — if cancelled while
    waiting, release the flock immediately and send the cancellation
    error. Loop back to step 1 to serve the next waiter.
-6. If `req.ctx` is still valid, store the caller's PID in the lock file
-   header's `WriterPID` field and send `nil` on `req.result` — the
-   writer now holds the lock.
+6. If `req.ctx` is still valid, store the caller's PID and process start
+   time in the lock file header's `WriterPID` and `WriterStartTime`
+   fields and send `nil` on `req.result` — the writer now holds the lock.
 7. Wait for the writer to signal completion (via a release channel
-   provided alongside the request). On release: clear `WriterPID` to 0,
-   release the flock, loop back to step 1.
+   provided alongside the request). On release: clear `WriterPID` and
+   `WriterStartTime` to 0, release the flock, loop back to step 1.
 
 #### Writer Acquisition Flow
 
@@ -1606,19 +1642,29 @@ mmap. This fd is used exclusively for `flock()`/`funlock()` calls.
 If a process crashes while holding the write lock, `WriterPID` remains non-zero
 and the `flock()` is automatically released by the kernel (flock locks are
 released on fd close / process exit). On `Open()` or when attempting to acquire
-the write lock, if `WriterPID` is non-zero, the process checks whether the PID
-is still alive via `kill(pid, 0)`:
+the write lock, if `WriterPID` is non-zero, the process determines whether the
+writer is still alive using two checks:
 
-- If alive: the writer is still running — proceed with normal `flock()` which
-  will block until the writer finishes.
-- If dead (`ESRCH`): the writer crashed. The flock is already released by the
-  kernel. The new writer acquires the flock, then performs recovery:
+1. `kill(pid, 0)` — if it returns `ESRCH`, the process is dead.
+2. If the PID is alive, compare `WriterStartTime` against the PID's current
+   start time (via `processStartTime(pid)`). If they differ, the PID was
+   recycled — the original writer crashed.
+
+Based on the result:
+
+- If alive and start time matches: the writer is still running — proceed with
+  normal `flock()` which will block until the writer finishes.
+- If dead or PID recycled: the writer crashed. The flock is already released
+  by the kernel. The new writer acquires the flock, then performs recovery:
   1. Read both meta pages and select the valid one (highest TxnID with valid
      checksum). The crashed writer's partial commit is invisible — CoW ensures
      the previous meta page points to a consistent tree.
   2. Scan the reader table for slots with the dead writer's PID and clear them
-     (the crashed process may have also held read transactions).
-  3. Clear `WriterPID` to 0 (it will be set to the new writer's PID shortly).
+     (the crashed process may have also held read transactions). Each slot is
+     also validated via `ProcessStartTime` to avoid clearing slots from a
+     different process that reused the same PID.
+  3. Clear `WriterPID` and `WriterStartTime` to 0 (they will be set to the
+     new writer's values shortly).
 
 No special rollback logic is needed for tree consistency — the CoW model
 guarantees that the previous meta page points to a fully consistent tree.
@@ -1643,7 +1689,7 @@ set — a small, one-time space cost until recovered.
 ### Reader Table
 
 Slot allocation uses a simple scan with atomic CAS — no free stack or other
-auxiliary data structure. The reader table is a flat array of 16-byte slots
+auxiliary data structure. The reader table is a flat array of 24-byte slots
 stored in the lock file's shared mmap. All operations use atomic memory
 operations visible across processes.
 
@@ -1656,7 +1702,8 @@ operations visible across processes.
 3. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID.
    If the CAS fails (another goroutine or process claimed the slot
    concurrently), continue scanning.
-4. Store the caller's PID in the slot's `PID` field.
+4. Store the caller's PID and cached process start time (`db.processStartTime`)
+   in the slot's `PID` and `ProcessStartTime` fields.
 5. Update `db.readerSlotHint` to the acquired slot's index.
 6. If all slots are occupied (full wraparound), return `ErrReadersFull`.
 
@@ -1668,8 +1715,8 @@ and the scan completes in 1–2 iterations. In the worst case (all slots
 before the hint are occupied), the scan wraps around and degrades to
 O(MaxReaders) — no worse than scanning from slot 0.
 
-The CAS on `TxnID` is the serialization point. With 16-byte slots,
-4096 slots = 64KB — fits in L2 cache, sequential scan with hardware
+The CAS on `TxnID` is the serialization point. With 24-byte slots,
+4096 slots = 96KB — fits in L2 cache, sequential scan with hardware
 prefetching.
 
 **Slot release (`Commit`/`Rollback` read transaction):**
@@ -1681,10 +1728,24 @@ The release is a single atomic store. No CAS needed — only the slot owner
 writes to its own slot.
 
 **Stale reader detection:** During the writer's reader table scan (to find
-the minimum active TxnID), if a slot has a non-zero `TxnID` and its `PID`
-is no longer alive (checked via `kill(pid, 0)` returning `ESRCH`), the
-writer clears the slot by storing `TxnID = 0`. This reclaims slots from
-crashed processes.
+the minimum active TxnID), if a slot has a non-zero `TxnID`, the writer
+checks whether the owning process is still alive and is the *same* process
+that acquired the slot:
+
+1. `kill(pid, 0)` — if it returns `ESRCH`, the process is dead. The slot
+   is stale. Clear `TxnID = 0`.
+2. If the PID is alive, compare the slot's `ProcessStartTime` against the
+   PID's current start time (via `processStartTime(pid)`). If they differ,
+   the PID was recycled — a different process now occupies that PID. The
+   slot is stale. Clear `TxnID = 0`.
+3. If both PID and start time match, the original process is still alive
+   and holding the slot legitimately.
+
+This two-step check eliminates the PID reuse vulnerability that affects
+containerized environments where PID namespaces cause rapid PID recycling.
+Without the start time check, a recycled PID would appear alive, permanently
+leaking the reader slot and blocking RPL reclamation. See Process Start Time
+below for platform-specific details.
 
 #### Go Goroutine Model
 
@@ -1706,6 +1767,41 @@ The consequence is that a single Go process running N concurrent read
 transactions consumes N reader slots. Applications must set `MaxReaders`
 high enough to accommodate the expected total across all processes.
 
+#### Process Start Time
+
+To detect PID reuse (where a new process is assigned the same PID as a
+crashed process), both reader slots and the writer header store the
+process's **start time** alongside its PID. The start time is a
+monotonically-increasing value that changes when a PID is recycled,
+providing a unique `(PID, StartTime)` tuple per process lifetime.
+
+At `Open()` time, the process reads its own start time once and caches it
+on the `DB` struct (`db.processStartTime uint64`). This cached value is
+stored in reader slots on `Begin()` and in `WriterStartTime` on write lock
+acquisition.
+
+During stale detection, the writer reads the current start time for a
+given PID via `processStartTime(pid int) (uint64, error)`. If the PID is
+alive but its current start time differs from the stored value, the PID
+was recycled and the slot/writer is stale.
+
+**Platform-specific implementations:**
+
+| Platform | Source | Value | Notes |
+|----------|--------|-------|-------|
+| Linux | `/proc/[pid]/stat` field 22 (`starttime`) | Clock ticks since boot (`uint64`) | Readable without privileges. Monotonic, survives PID reuse. Pure Go: `os.ReadFile` + parse. |
+| macOS | `sysctl` with `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime` | `timeval` packed as `sec*1_000_000 + usec` (`uint64`) | Accessible for same-user processes. Pure Go via `syscall.Sysctl`. |
+| FreeBSD | `sysctl` with `KERN_PROC_PID` → `kinfo_proc.ki_start` | `timeval` packed as `sec*1_000_000 + usec` (`uint64`) | Same interface as macOS. Pure Go via `syscall.Sysctl`. |
+
+All implementations are pure Go (no cgo required). The
+`processStartTime` function is defined per platform via build tags
+(`process_linux.go`, `process_darwin.go`, `process_freebsd.go`).
+
+If `processStartTime` fails (e.g., insufficient permissions to read
+another process's info), the stale check falls back to PID-only liveness
+(`kill(pid, 0)`) — the same behavior as before, which is correct in the
+common case and only vulnerable to PID reuse.
+
 #### Atomic Operations Convention
 
 The codebase uses two distinct atomic access patterns depending on the
@@ -1718,7 +1814,8 @@ memory being accessed:
   enforces that all access goes through the atomic methods. These fields
   are never visible to other processes.
 
-- **Shared-memory fields** (reader table `TxnID` and `PID` in the
+- **Shared-memory fields** (reader table `TxnID`, `PID`, and
+  `ProcessStartTime`; header `WriterPID` and `WriterStartTime` in the
   mmap'd lock file) use the **function-based atomics**
   (`atomic.LoadUint64`, `atomic.StoreUint64`,
   `atomic.CompareAndSwapUint64`) on `unsafe.Pointer`-derived addresses.
@@ -2066,9 +2163,12 @@ write ordering guarantees as the pwrite path.
   When the file needs to shrink (after commit), the truncate SQE is
   appended. On older kernels, `ftruncate()` is used as a fallback.
 
-- **Fallback**: If `io_uring` initialization fails (old kernel, seccomp
-  restrictions, container without `io_uring` support), fall back to the
-  pwrite path silently. Log a warning via the `Logger`.
+- **Fallback**: If `io_uring` initialization fails, fall back to the
+  pwrite path silently. Log a warning via the `Logger`. Specific failure
+  cases: `ENOSYS` (kernel too old, `io_uring_setup` syscall absent),
+  `EPERM` (seccomp profile blocks `io_uring` — common in Docker's default
+  seccomp policy), or `ENOMEM`. The fallback check happens once at
+  `Open()` time, making it completely invisible to callers.
 
 - **writemap mode**: `io_uring` does not apply in writemap mode — dirty
   pages are already in the mmap and commit uses `fdatasync()` or `msync()`
@@ -2879,14 +2979,17 @@ organized by file:
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
 | `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages (per-segment TxnID + PageID arrays), reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
-| `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). Clock-based eviction with reference bit sweep from `tx.dirtyPages` map. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
+| `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). Clock-based eviction via `tx.clockRing` circular buffer with reference bit sweep and tombstones for spilled entries. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` prefaulting (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
 | `iouring_linux.go` | io_uring commit path (Linux 5.6+). Ring initialization with `IORING_REGISTER_FILES` for fixed fd. SQE batch construction (data writes + linked fsync + meta write + linked fsync). `IORING_OP_FTRUNCATE` for geometry changes (Linux 6.9+). CQE completion handling. Registered buffer management with `RLIMIT_MEMLOCK` checking. Fallback detection. |
-| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID, context-aware, zero goroutine accumulation). Stale writer recovery. Reader table: hint-based scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (`slices.Sorted(maps.Keys(...))` + sequential pwrite/pwritev2 + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Dirty page buffer allocation from anonymous mmap slab (pwrite mode). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
+| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime, context-aware, zero goroutine accumulation). Stale writer recovery (PID liveness + start time comparison). Reader table: hint-based scan+CAS slot acquire (stores PID + ProcessStartTime), atomic store release, stale reader detection via PID liveness + start time comparison (PID reuse safe). Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
+| `process_linux.go` | `processStartTime(pid) (uint64, error)`: reads `/proc/[pid]/stat` field 22 (`starttime`, clock ticks since boot). Pure Go, no cgo. |
+| `process_darwin.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
+| `process_freebsd.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.ki_start`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), clock ring (`[]uint64` circular buffer + hand index, pwrite only), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (`slices.Sorted(maps.Keys(...))` + sequential pwrite/pwritev2 + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Dirty page buffer allocation from anonymous mmap slab (pwrite mode). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
 | `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap, lock file, geometry, write mode selection, AllowSyncNone validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Sync(). Check(). CopyTo(). |
 | `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with `Encoder` calls. |
 | `errors.go` | Sentinel error definitions. |
@@ -3085,13 +3188,16 @@ run on storage without integrity guarantees.
 - **Reader isolation**: Readers see an immutable snapshot. Pages they reference
   cannot be reused until all readers on that TxnID have finished.
 - **Stale reader recovery**: If a process crashes without releasing its reader
-  slot, the PID-based detection allows the writer to reclaim the slot.
-- **Stale writer recovery**: If the writer process crashes, `WriterPID` in
-  the lock file header identifies the dead process. The kernel releases the
-  flock automatically. The next writer detects the dead PID, cleans up reader
-  slots from the crashed process, and proceeds — CoW guarantees the tree is
-  consistent. In pwrite mode, no bitmap corruption occurs (dirty pages never
-  reached disk). In writemap mode, some bitmap bits may leak (allocated but
+  slot, the PID liveness check + process start time comparison allows the
+  writer to reclaim the slot — even if the PID has been recycled by a new
+  process (common in containerized environments with PID namespaces).
+- **Stale writer recovery**: If the writer process crashes, `WriterPID` and
+  `WriterStartTime` in the lock file header identify the dead process. The
+  kernel releases the flock automatically. The next writer detects the dead
+  or recycled PID (via start time comparison), cleans up reader slots from
+  the crashed process, and proceeds — CoW guarantees the tree is consistent.
+  In pwrite mode, no bitmap corruption occurs (dirty pages never reached
+  disk). In writemap mode, some bitmap bits may leak (allocated but
   uncommitted pages); recoverable via `Check()` or `CopyTo(compact=true)`.
 - **Silent bitrot detection**: When `PageChecksum` is enabled, every data page
   read is verified against its CRC32C footer. Corruption is detected at read
