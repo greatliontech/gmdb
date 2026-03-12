@@ -1210,7 +1210,7 @@ Lock File
 - Padding (4 bytes): Aligns slot to 16 bytes.
 
 Total lock file size: 16 + (16 × MaxReaders). With default MaxReaders=4096:
-16 + 65536 = 65552 bytes (~64KB, fits in 16 pages at 4KB page size).
+16 + 65536 = 65552 bytes (~64KB).
 
 The lock file is mmap'd with `MAP_SHARED` by all processes for the reader table.
 The write lock is a separate concern handled via `flock()` (see below).
@@ -2320,8 +2320,8 @@ key bytes + 8 bytes (child pointer). The maximum key size is approximately
 | Page Size | Max Key Size (approx) | With PageChecksum |
 |-----------|----------------------|-------------------|
 | 4KB       | ~2024 bytes          | ~2022 bytes       |
-| 8KB       | ~4024 bytes          | ~4022 bytes       |
-| 16KB      | ~8024 bytes          | ~8022 bytes       |
+| 8KB       | ~4072 bytes          | ~4070 bytes       |
+| 16KB      | ~8168 bytes          | ~8166 bytes       |
 | 64KB      | ~32744 bytes         | ~32742 bytes      |
 
 Enforced at `Put()` time. Keys exceeding the limit return an error.
