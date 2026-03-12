@@ -205,9 +205,31 @@ of additional pages. The rest is raw value bytes.
 
 #### Freelist B+tree
 
-Free pages are tracked in a dedicated B+tree (separate from user data). The
-freelist B+tree maps `TxnID -> []PageID` — pages freed by a given transaction
-can only be reused once no reader is still using that transaction's snapshot.
+Free pages are tracked in a dedicated B+tree (separate from user data). Pages
+freed by a given transaction can only be reused once no reader is still using
+that transaction's snapshot.
+
+The freelist B+tree uses a **composite key** encoding with empty values:
+
+```
+Key: TxnID (uint64, big-endian) || PageID (uint64, big-endian)
+Value: (empty — zero bytes)
+```
+
+Each freed page is a separate entry in the B+tree. Both components are stored
+in big-endian byte order so that the standard lexicographic key comparison
+sorts entries first by TxnID, then by PageID within the same transaction.
+
+This design has several advantages:
+- **No special value encoding**: reuses the existing B+tree leaf format as-is.
+  Each entry is just a 16-byte key with no value.
+- **No overflow concern**: a single transaction freeing many pages creates many
+  small entries rather than one large value that could overflow a leaf page.
+- **Efficient range scan for reclamation**: to reclaim all pages freed by
+  transactions older than the oldest active reader, the writer seeks to the
+  beginning of the tree and scans forward until `TxnID >= oldest_reader`.
+- **Simple allocation**: pop entries from the reclaimable range and delete them
+  from the B+tree.
 
 The writer checks the reader table (in shared memory) to find the oldest active
 reader's TxnID. Any freelist entries with TxnID < oldest_reader are safe to
@@ -460,58 +482,24 @@ func (c *Cursor) Prev() (key, value []byte)
 func (c *Cursor) Seek(target []byte) (key, value []byte)
 ```
 
-## Implementation Modules
+## Implementation Layout
 
-The implementation is organized into the following packages/files:
+All code lives in a single `gmdb` package (flat, no sub-packages). This avoids
+circular dependency issues between tightly coupled components (pages, B+tree,
+transactions, mmap) and keeps the public API to one import path. The code is
+organized by file:
 
-### 1. `page` — Page Types and Serialization
-
-- Page header encoding/decoding.
-- Branch page: cell directory, key lookup (binary search), insert/split.
-- Leaf page: cell directory, KV lookup, insert/split, overflow references.
-- Meta page: encode/decode/validate checksum.
-
-### 2. `btree` — On-Disk B+tree Operations
-
-- Search: traverse branch pages to find leaf, binary search within leaf.
-- Insert: search + copy-on-write path from leaf to root, split if needed.
-- Delete: search + copy-on-write, merge/rebalance if needed.
-- Cursor: stateful iterator holding a stack of (pageID, index) pairs.
-- All operations work on page byte slices (from mmap), never Go heap objects.
-
-### 3. `freelist` — Free Page Management
-
-- B+tree mapping TxnID -> page ID ranges.
-- Allocate: find reclaimable pages (TxnID < oldest reader).
-- Free: record pages under current TxnID.
-- Extend: grow file when no free pages available.
-
-### 4. `mmap` — Memory Mapping
-
-- Platform-specific mmap/munmap (linux, darwin).
-- Initial mapping with over-allocated virtual address space.
-- File extension (ftruncate + the mapping covers it automatically).
-
-### 5. `lock` — Cross-Process Coordination
-
-- Lock file creation and mmap (shared memory).
-- Writer lock (flock-based).
-- Reader table: slot acquire/release, stale PID detection.
-- Oldest-reader query for freelist reclamation.
-
-### 6. `tx` — Transaction Management
-
-- Read transaction: snapshot meta, acquire reader slot, provide read-only
-  B+tree access.
-- Write transaction: snapshot meta, acquire write lock, track dirty pages,
-  CoW operations, commit (write pages + fsync + meta swap + fsync), rollback.
-
-### 7. `db` — Top-Level Database
-
-- Open/Close.
-- Environment setup (mmap, lock file).
-- Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers).
-- Keyspace management.
+| File | Responsibility |
+|------|---------------|
+| `page.go` | Page header encoding/decoding. Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references. Meta page: encode/decode/validate checksum. |
+| `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance). Cursor: stateful iterator holding a stack of (pageID, index) pairs. All operations work on page byte slices (from mmap), never Go heap objects. |
+| `freelist.go` | B+tree with composite keys (TxnID \|\| PageID, big-endian, empty values). Allocate: scan reclaimable entries (TxnID < oldest reader), delete from tree. Free: insert entries for each freed page under current TxnID. Extend: grow file when no free pages available. |
+| `mmap.go` | Platform-specific mmap/munmap. Initial mapping with over-allocated virtual address space. File extension (ftruncate + mapping covers it automatically). |
+| `mmap_linux.go` | Linux mmap/munmap syscalls. |
+| `mmap_darwin.go` | macOS mmap/munmap syscalls. |
+| `lock.go` | Lock file creation and mmap (shared memory). Writer lock (flock-based). Reader table: slot acquire/release, stale PID detection. Oldest-reader query for freelist reclamation. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, track dirty pages, CoW operations, commit (write pages + fsync + meta swap + fsync), rollback. |
+| `db.go` | Open/Close. Environment setup (mmap, lock file). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Keyspace management. |
 
 ## Limits
 
