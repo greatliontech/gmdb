@@ -18,27 +18,29 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Isolation | Dual meta pages + CoW | No WAL needed, atomic commit |
 | Crash safety | CoW + atomic meta page swap | File is always consistent |
 | Durability | Three sync modes (Durable, NoMeta, Safe) + unsafe opt-in None | Configurable ACID vs. performance; SyncNone requires explicit `AllowSyncNone` flag |
-| Cross-process | Shared memory lock file (uint64 PIDs) | Fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness; uint64 PIDs for forward safety |
-| Write lock | Channel semaphore (intra-process) + flock (cross-process) | Context-aware blocking; flock alone doesn't block same-process goroutines |
+| Cross-process | Shared memory lock file (`structs.HostLayout` structs, uint64 PIDs) | C ABI layout guarantee for mmap'd structs; fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness; uint64 PIDs for forward safety |
+| Write lock | Intra-process writer queue (channel) + single flock goroutine (cross-process) | Context-aware blocking; zero goroutine accumulation on cancellation; flock alone doesn't block same-process goroutines |
 | Slow readers | Callback-based notification | Application controls policy; no silent unbounded growth |
-| mmap | pwrite mode (default) or writemap mode | pwrite: heap isolation; writemap: direct mmap writes for performance |
+| mmap | pwrite mode (default) or writemap mode | pwrite: write isolation (anonymous slab); writemap: direct mmap writes for performance |
 | Huge pages | `MADV_HUGEPAGE` (opt-in, Linux) | Reduces TLB pressure for large databases; transparent huge pages for file-backed mmap |
-| Dirty page tracking | Hash map (`map[uint64]`) | O(1) insert/lookup/delete; `slices.Sorted(maps.Keys(...))` at commit for sequential I/O |
-| Dirty page buffers | `sync.Pool` for page-sized `[]byte` slices (pwrite mode) | Reduces GC pressure; avoids per-transaction heap churn |
-| Page spilling | LRU-based spill to disk mid-transaction (pwrite mode only) | Bounds memory usage for large write transactions |
+| Dirty page tracking | Hash map (`map[uint64]`) with clock reference bit | O(1) insert/lookup/delete; clock eviction for spill; `slices.Sorted(maps.Keys(...))` at commit for sequential I/O |
+| Dirty page buffers | Anonymous mmap slab (pwrite mode) | GC-invisible; no pool draining on GC cycles; deterministic allocation; `munmap` at transaction close |
+| Page spilling | Clock-based spill to disk mid-transaction (pwrite mode only) | Bounds memory; zero per-access overhead (ref bit vs. O(log n) heap); approximates LRU |
+| Branch keys | Prefix-truncated separators | Shortest distinguishing prefix; maximizes fan-out; shallower trees; full keys in leaves only |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
 | Checksums | Meta: xxhash64 (always); Data: CRC32C footer (optional) | Meta checksum detects torn commits; optional data checksum catches silent bitrot |
 | API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime; `context.Cause(ctx)` preserves cancellation reasons from `WithCancelCause` |
 | Iteration | Cursor (stateful, bidirectional, mutable) + `iter.Seq2` (read-only, composable) | Cursor for mutation and bidirectional movement; `iter.Seq2` for idiomatic `for range` loops |
 | Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
-| Leak detection | `runtime.AddCleanup` on `Tx` | Detects leaked transactions, releases reader slots, logs origin stack trace |
+| Leak detection | `runtime.AddCleanup` on `Tx` and `DB` | Detects leaked transactions (releases reader slots) and leaked DB handles (releases mmap, fds, flock goroutine); logs origin stack trace |
 | Range delete | Subtree retirement via `DeleteRange` | O(pages) not O(entries); bulk-free for DUPSORT nested B+trees |
 | Commit I/O | pwrite/pwritev2 (default) or io_uring (opt-in, Linux) | io_uring batches all commit writes into 1-2 syscalls; pwritev2+RWF_DSYNC for small commits; pwrite is portable fallback |
 | Prefaulting | `MADV_POPULATE_READ` at open (opt-in, Linux 5.14+) | Eliminates first-access page faults; sequential kernel readahead; silent no-op on older kernels |
 | Read txn cooldown | `MADV_COLD` on close (opt-in, Linux 5.4+) | Hints kernel to reclaim page cache after large scans; reduces memory pressure |
 | Typed keyspaces | Generic `TypedKeyspace[K, V]` with `Encoder[T]` interface | Zero-cost type-safe API over byte-oriented Keyspace; append-style `AppendEncode(dst, v) ([]byte, error)` enables buffer reuse and surfaces encode/decode failures; interface enables stateful encoders and buffer pooling |
 | Keyspace names | `unique.Handle[string]` interning | Avoids repeated allocations for frequently opened keyspace names across transactions |
+| Integrity check | `Check() iter.Seq[CheckIssue]` with `CheckFatal` severity | All results (issues + walk failures) are uniform `CheckIssue` values; streaming via `iter.Seq`; `slices.Collect` for batch use; `break` for early abort |
 | Namespaces | Named keyspaces (separate Open/Create API) | Multiple B+trees in one file; clear creation vs. opening semantics |
 
 ## File Layout
@@ -181,6 +183,70 @@ Search algorithm: binary search the cell directory to find the first cell where
 
 The cell directory stores `(Offset, KeyLen)` per cell, enabling binary search
 over variable-length keys without parsing the key data area.
+
+##### Prefix-Truncated Branch Keys
+
+Branch pages store **prefix-truncated separator keys** — the shortest byte
+string that distinguishes the left subtree from the right — rather than
+full keys copied from leaf pages. A branch key need only satisfy the
+invariant:
+
+```
+max_key(left_child) <= separator < min_key(right_child)
+```
+
+For example, if the left child's largest key is `"user:alice:profile"`
+and the right child's smallest key is `"user:bob:settings"`, the
+separator stored in the branch is `"user:b"` (7 bytes) instead of
+the full key (20 bytes). The shortest separator is computed as the
+minimal prefix of the right child's first key that is strictly greater
+than the left child's last key, plus one byte to break the tie if the
+prefix matches exactly.
+
+**Benefits:**
+- **Higher fan-out**: smaller keys → more separators per branch page →
+  wider tree. For workloads with long keys sharing common prefixes
+  (URLs, file paths, composite keys like `tenant:user:resource`), a
+  200-byte key might compress to 10–20 bytes in the branch, increasing
+  fan-out by 10–20x.
+- **Shallower trees**: higher fan-out → fewer levels → fewer page
+  accesses per lookup. A tree that would be depth 4 with full keys
+  might be depth 3 with truncated keys.
+- **Reduced I/O**: less data read per branch page traversal.
+
+**Separator computation:**
+
+At **leaf split** time, when a leaf page overflows and is split into
+two halves:
+1. Let `L` = the last key of the left leaf (the split point).
+2. Let `R` = the first key of the right leaf.
+3. Compute the shortest byte string `S` such that `L <= S < R`.
+   This is the common prefix of `L` and `R`, extended by one byte —
+   the first byte where `R` exceeds `L`, taken from `R`.
+4. Insert `S` (not `R`) into the parent branch page.
+
+At **merge** time, when two siblings are merged:
+1. Remove the separator from the parent branch.
+2. If the merge produces a new sibling boundary, recompute the
+   separator from the new boundary keys using the same algorithm.
+
+At **redistribute** time, when keys are moved between siblings to
+balance fill ratios:
+1. Recompute the separator from the new boundary keys (last key of
+   left sibling, first key of right sibling).
+2. Replace the old separator in the parent branch.
+
+**Leaf pages are unaffected**: leaves store full keys — they are the
+source of truth. Prefix truncation only applies to branch page
+separators. Cursor navigation compares against full keys in leaves
+and truncated separators in branches; the B+tree search algorithm
+handles this naturally since branch comparisons only determine which
+child to descend into.
+
+**Interaction with maximum key size**: the maximum key size limit
+(see Limits) applies to full keys stored in leaf pages. Branch page
+separators are always shorter than or equal to the full keys, so they
+never exceed the limit.
 
 #### Leaf Page
 
@@ -722,24 +788,46 @@ B+tree rebalancing: a merge operation may CoW a node, then free one of the
 two original nodes. The CoW'd copy becomes unnecessary if its contents are
 merged into a sibling.
 
-Loose pages are tracked in a singly-linked list (`tx.loosePages`) using the
-page's own memory to store the link pointer (the page is already in memory
-since it was dirtied). A counter (`tx.looseCount`) tracks the list length.
+Loose pages are tracked in a **hash map** (`tx.loosePages map[uint64]struct{}`).
+This provides O(1) insertion, O(1) membership check, and O(1) deletion.
+The page's buffer in the anonymous mmap slab is returned to the slab's
+free bitmap immediately when a page becomes loose, making it available for
+new dirty page allocations.
+
+A hash map is used instead of a simpler `[]uint64` slice because of the
+**tail page refund** operation at commit time. Tail refund checks whether
+consecutive page IDs at the file tail (`FirstUnallocated - 1`,
+`FirstUnallocated - 2`, ...) are loose, requiring membership lookups by
+page ID. With a slice, each lookup is O(n) where n is the loose page
+count. In the worst case — a large `DeleteRange` triggering cascading
+merges followed by rebalancing — the loose set can approach
+`MaxDirtyPages` (65536 default). If the loose pages are concentrated at
+the file tail (e.g., the transaction extended the file, did work, then
+freed most of it), tail refund performs up to n membership checks against
+n loose pages: O(n²) with a slice vs. O(n) with a map.
+
+| Loose pages (n) | Tail checks (t) | `[]uint64` total ops | `map` total ops |
+|-----------------|------------------|----------------------|-----------------|
+| 100             | 10               | 1,000                | 10              |
+| 1,000           | 100              | 100,000              | 100             |
+| 5,000           | 500              | 2,500,000            | 500             |
+| 65,536          | 65,536           | ~4.3 billion         | 65,536          |
 
 Loose pages are **immediately reusable** within the same transaction without
 any bitmap or RPL interaction:
-- `pageAlloc()` checks `tx.loosePages` first (O(1) pop from the linked list).
+- `pageAlloc()` checks `tx.loosePages` first. For single-page allocations,
+  any entry is popped from the map (O(1) amortized via `range` + `delete`).
 - Loose pages that are reused via `pageAlloc()` never touch the bitmap or RPL
   — they were allocated and freed within the same transaction, so no reader
   can ever reference them.
-- At commit time, any loose pages still in the list (allocated a page ID but
+- At commit time, any loose pages still in the map (allocated a page ID but
   never reused) are added to `tx.retiredPages` for inclusion in the RPL.
 
 #### Page Allocation Priority
 
 `pageAlloc(n)` allocates `n` contiguous pages using this priority:
 
-1. **Loose pages** (n=1 only): pop from `tx.loosePages`. O(1).
+1. **Loose pages** (n=1 only): pop any entry from `tx.loosePages` map. O(1) amortized.
 2. **Allocation bitmap**: scan the bitmap for a free page (n=1) or a
    contiguous run of free pages (n>1), starting from the LIFO hint.
 3. **RPL reclamation**: if the bitmap has no suitable free pages, reclaim
@@ -761,8 +849,8 @@ enables file shrinkage at commit time (see Database Geometry).
 
 The refund process iterates: clearing tail bits may expose new tail pages.
 It runs until no more tail pages are free. Loose pages are checked first
-(by scanning the linked list for tail page IDs), then the bitmap (by
-checking bits from `FirstUnallocated - 1` downward).
+(by O(1) lookup in the `tx.loosePages` map for each tail page ID), then
+the bitmap (by checking bits from `FirstUnallocated - 1` downward).
 
 #### Freeing Pages
 
@@ -816,15 +904,24 @@ write mode:
 tx.dirtyPages map[uint64]*dirtyPage
 
 type dirtyPage struct {
-    data     []byte // page content from sync.Pool (len = PageSize * (1 + overflow))
-    lastUsed uint64 // monotonic counter for LRU spill priority
+    data []byte // page content from anonymous mmap slab (len = PageSize * (1 + overflow))
+    ref  bool   // clock reference bit for spill priority
 }
 ```
 
-Single-page `data` buffers are drawn from a `sync.Pool` keyed by page size,
-reducing GC pressure by reusing allocations across transactions. Multi-page
-buffers (overflow pages) are heap-allocated normally since their sizes vary.
-Buffers are returned to the pool at transaction close (commit or rollback).
+Dirty page buffers are allocated from an **anonymous mmap slab** — a
+contiguous region created at transaction start via
+`mmap(MAP_PRIVATE|MAP_ANONYMOUS)` sized to `MaxDirtyPages * PageSize`.
+The slab is invisible to the Go GC (no scanning, no pool draining on GC
+cycles), providing deterministic allocation performance regardless of GC
+pressure. Page-sized chunks are carved from the slab via a free bitmap;
+multi-page buffers (overflow pages) consume contiguous runs of chunks from
+the same slab. The slab is `munmap`'d at transaction close (commit or
+rollback).
+
+Virtual address space is reserved upfront but physical memory is only
+committed by the kernel on first write to each page (demand paging), so
+the reservation cost is negligible on 64-bit systems.
 
 **writemap mode:**
 ```
@@ -849,15 +946,41 @@ iteration, which requires extracting and sorting the keys — but this is a
 one-time O(n log n) cost amortized against N `pwrite()` syscalls, making it
 negligible.
 
-### LRU Counter (pwrite mode only)
+#### Map Reuse Across Transactions
 
-Each dirty page in pwrite mode carries a `lastUsed` counter — a monotonic
-value incremented on each page access or modification. This counter drives
-the LRU-based spill priority (see Page Spilling). The counter is stored in
-the `dirtyPage` struct alongside the page data, so updating it on access is
-a simple field write with no additional map lookup.
+The dirty page maps (`tx.dirtyPages` and `tx.spilledPages`) and the loose
+page map (`tx.loosePages`) are pooled on the `DB` struct and reused across
+write transactions. On rollback or after commit cleanup, the maps are
+reset via the `clear` builtin rather than discarded:
 
-In writemap mode, there is no `lastUsed` counter because spilling does not
+```go
+clear(tx.dirtyPages)   // O(1): resets to empty, retains allocated buckets
+clear(tx.spilledPages)
+clear(tx.loosePages)
+```
+
+`clear` resets a map to empty without deallocating its internal hash table
+storage. The next transaction inherits pre-allocated buckets sized for the
+previous transaction's workload, avoiding the incremental growth phase
+(repeated allocations and rehashes as the map doubles from its minimum
+size). For write-heavy workloads with consistent transaction sizes, this
+eliminates per-transaction map allocation overhead entirely.
+
+The same pattern applies to `tx.retiredPages` (the `[]uint64` of page IDs
+to append to the RPL): the slice is reset via `tx.retiredPages = tx.retiredPages[:0]`,
+retaining its backing array for the next transaction.
+
+### Clock Reference Bit (pwrite mode only)
+
+Each dirty page in pwrite mode carries a `ref` (reference) bit that drives
+the clock-based spill eviction (see Page Spilling). When a dirty page is
+accessed or modified, its `ref` bit is set to `true` — a single field
+write with zero data structure overhead (no heap operations, no map
+lookups). The spill pass uses a clock hand to scan dirty pages and select
+eviction candidates based on the `ref` bit (see Page Spilling for the
+algorithm).
+
+In writemap mode, there is no reference bit because spilling does not
 apply — the OS manages mmap page eviction transparently.
 
 ### Spilled Page Set
@@ -934,22 +1057,39 @@ Spilling is triggered when the dirty page count exceeds `Options.MaxDirtyPages`
 (default: 65536). The writer selects a subset of dirty pages to write to disk
 via `pwrite()`, removing them from the in-memory dirty set.
 
-### LRU-Based Spill Priority
+### Clock-Based Spill Eviction
 
-Pages are selected for spilling based on a Least Recently Used (LRU) policy.
-Each dirty page carries a `lastUsed` counter that is updated whenever the page
-is accessed or modified during the transaction. When spilling, pages with the
-lowest `lastUsed` values are spilled first — these are the pages least likely
-to be accessed again.
+Pages are selected for spilling using the **clock algorithm** — an
+approximate-LRU scheme with zero per-access overhead on the hot path.
 
-This is significantly better than arbitrary or page-number-ordered spilling.
-Pages that are actively being modified (e.g., B+tree internal nodes on the
-current insertion path) stay in memory, while cold pages (e.g., leaf pages
-from earlier bulk insertions) are spilled.
+Each dirty page carries a **reference bit** (`ref`). Whenever a dirty page
+is accessed or modified during the transaction, its `ref` bit is set to
+`true`. The transaction maintains a **clock hand** — an index into the
+dirty page set (implemented as the iteration order of the dirty map's keys
+snapshot).
+
+When spilling is triggered, the clock hand sweeps through dirty pages:
+
+1. If the page's `ref` bit is set, clear it and advance the hand (the page
+   was recently accessed — give it another chance).
+2. If the `ref` bit is already clear, the page is cold — select it for
+   eviction.
+3. Continue until enough pages are selected for spilling.
+
+This approximates LRU without the O(log n) per-access cost of a heap.
+Pages that are actively being modified (e.g., B+tree branch nodes on the
+current insertion path) have their `ref` bits continuously re-set and
+survive clock sweeps. Cold pages (e.g., leaf pages from earlier bulk
+insertions) have their bits cleared on the first sweep and are evicted on
+the second.
+
+The clock hand position persists across spill events within the same
+transaction, so consecutive spills resume where the previous one stopped
+rather than re-scanning already-visited pages.
 
 ### Spill Mechanics
 
-1. Sort dirty pages by `lastUsed` (ascending — coldest first).
+1. Sweep dirty pages via the clock algorithm to select eviction candidates.
 2. Write the selected pages to their allocated positions via `pwrite()`. Group
    adjacent pages into single write calls where possible.
 3. Remove spilled pages from `tx.dirtyPages` and add their page IDs to
@@ -980,19 +1120,19 @@ ignored when `WriteMap` is true.
 
 ### Write Transaction
 
-1. Writer acquires the intra-process semaphore, then the cross-process
-   `flock(LOCK_EX)` on the lock file, both respecting `ctx` cancellation
-   (see Write Lock). Returns `context.Cause(ctx)` if cancelled while
-   waiting, preserving the original cancellation reason.
+1. Writer submits a request to the flock goroutine's writer queue and waits
+   for the lock grant, respecting `ctx` cancellation (see Write Lock).
+   Returns `context.Cause(ctx)` if cancelled while waiting, preserving the
+   original cancellation reason.
 2. Writer reads the active meta page to get current roots, TxnID, and geometry.
 3. For each modification (insert, update, delete):
    - Traverse the B+tree from root to leaf.
    - Copy each page along the path (CoW — never modify in place).
    - Allocate new pages via `pageAlloc()` (loose pages → bitmap →
      RPL reclamation → slow reader check → file extension).
-   - In **pwrite mode**: modified pages are held as heap-allocated dirty pages
-     (with LRU counters for spill priority). If the dirty page count exceeds
-     `MaxDirtyPages`, spill the coldest dirty pages to disk via `pwrite()`
+   - In **pwrite mode**: modified pages are held in the anonymous mmap slab
+     (with clock reference bits for spill priority). If the dirty page count
+     exceeds `MaxDirtyPages`, spill cold dirty pages to disk via `pwrite()`
      (see Page Spilling).
    - In **writemap mode**: modifications happen directly in the mmap. The
      dirty set tracks page IDs only (no heap copies, no spilling).
@@ -1022,8 +1162,9 @@ ignored when `WriteMap` is true.
    `GeoShrinkPages`, truncate the file via `ftruncate()`. This happens
    after the commit point — a crash before truncation leaves the file
    larger than necessary but consistent. The next commit will retry.
-9. Writer clears `WriterPID`, releases the flock, then releases the
-   intra-process semaphore.
+9. Writer signals the flock goroutine to release the lock (clears
+   `WriterPID`, releases the flock, makes the goroutine available for
+   the next writer in the queue).
 
 ### Read Transaction
 
@@ -1142,7 +1283,7 @@ When `Begin()` creates a `Tx`, a cleanup is registered:
 tx := &Tx{...}
 tx.cleanup = runtime.AddCleanup(tx, func(info txCleanupInfo) {
     // 1. Log warning with the stack trace captured at Begin() time.
-    // 2. Release the reader slot (or write lock + semaphore).
+    // 2. Release the reader slot (or signal flock goroutine to release write lock).
 }, txCleanupInfo{
     slotIndex:  tx.readerSlot,
     writable:   tx.writable,
@@ -1191,9 +1332,9 @@ When the GC collects a leaked `Tx`:
    the reader table. This unblocks RPL reclamation for pages held by the
    leaked transaction's snapshot.
 
-3. **Release the write lock** (if writable): clear `WriterPID`, release
-   the flock, release the intra-process semaphore. This unblocks other
-   writers.
+3. **Release the write lock** (if writable): signal the flock goroutine
+   to clear `WriterPID`, release the flock, and serve the next writer
+   in the queue.
 
 The cleanup runs on a GC background goroutine — it must not block or
 panic. All operations above are non-blocking (atomic store, syscall
@@ -1213,6 +1354,66 @@ flock/funlock, channel send).
 - **Debug, not control flow**: applications should not rely on cleanup
   for normal operation. It exists solely to detect bugs and limit their
   blast radius.
+
+### Database Handle Leak Detection
+
+The same `runtime.AddCleanup` pattern is applied to the `DB` struct
+itself to detect `DB.Close()` leaks. A leaked `DB` holds open file
+descriptors, mmap regions, the flock goroutine, and (in pwrite mode)
+the anonymous mmap slab — all of which are process-scoped resources
+that outlive any individual transaction.
+
+#### Setup
+
+When `Open()` creates a `DB`, a cleanup is registered:
+
+```go
+db := &DB{...}
+db.cleanup = runtime.AddCleanup(db, func(info dbCleanupInfo) {
+    // 1. Log warning with the stack trace captured at Open() time.
+    // 2. Stop the flock goroutine.
+    // 3. munmap the data file and lock file mappings.
+    // 4. Close all file descriptors (data file, lock fd).
+}, dbCleanupInfo{
+    openStack: captureStack(),
+    logger:    opts.Logger,
+    // ... fd and mmap references needed for cleanup ...
+})
+```
+
+`dbCleanupInfo` is a separate struct — not the `DB` itself — to avoid
+preventing GC collection. It contains only the information needed to
+release resources and log a diagnostic.
+
+#### Normal Close
+
+When `Close()` is called, the cleanup is cancelled:
+
+```go
+func (db *DB) Close() error {
+    db.cleanup.Stop()
+    // ... normal close logic ...
+}
+```
+
+#### Cleanup Behavior
+
+When the GC collects a leaked `DB`:
+
+1. **Log a warning** via the `*slog.Logger` captured at `Open()` time.
+   The message includes the stack trace from `Open()` showing where
+   the leaked handle was created.
+
+2. **Stop the flock goroutine** by closing `db.writerCh`. The goroutine
+   exits its loop and releases the flock if currently held.
+
+3. **munmap** the data file mapping and the lock file mapping.
+
+4. **Close file descriptors**: data file fd, lock file fd.
+
+The same limitations apply as for `Tx` leak detection: timing is
+non-deterministic (GC-dependent), the cleanup is a safety net for
+debugging, and applications should not rely on it for normal operation.
 
 ## Cross-Process Coordination
 
@@ -1241,6 +1442,33 @@ Lock File
 | +----------+----------+   |
 +---------------------------+
 ```
+
+The lock file structures are defined as Go structs with `structs.HostLayout`
+(Go 1.24+), which guarantees the struct uses the host platform's C ABI
+layout rules. This allows safely overlaying Go structs on the mmap'd
+shared memory region without manual byte offset arithmetic or reliance
+on unspecified Go compiler layout behavior:
+
+```go
+type LockFileHeader struct {
+    _          structs.HostLayout
+    Magic      uint64
+    MaxReaders uint32
+    _          [4]byte // explicit padding for 8-byte alignment
+    WriterPID  uint64
+}
+
+type ReaderSlot struct {
+    _     structs.HostLayout
+    TxnID uint64
+    PID   uint64
+}
+```
+
+The `HostLayout` marker is a compile-time guarantee — it applies only to
+the lock file's shared memory structures. Data file page formats remain
+defined as raw byte layouts with explicit encode/decode functions, since
+those must be endian-aware and portable across architectures.
 
 **Header (24 bytes):**
 - `Magic` (uint64): Identifies the file as a gmdb lock file. Validates that
@@ -1285,38 +1513,93 @@ writer crashed while holding the lock — see Stale Writer Recovery.
 
 Write serialization uses two layers:
 
-- **Intra-process**: a channel-based semaphore (`chan struct{}` with capacity
-  1) on the `DB` struct. This prevents two goroutines in the same process
-  from attempting concurrent writes. A channel is used instead of
-  `sync.Mutex` because it supports `select` with `ctx.Done()` for
-  context-aware blocking.
-- **Cross-process**: `flock(LOCK_EX)` on the lock file. This prevents writers
-  in different processes.
+- **Intra-process**: a writer queue managed by a single **flock goroutine**
+  on the `DB` struct. Writers submit requests via a channel and receive
+  the lock grant via a per-request response channel. This prevents two
+  goroutines in the same process from attempting concurrent writes while
+  supporting context-aware cancellation with zero goroutine accumulation.
+- **Cross-process**: `flock(LOCK_EX)` on the lock file, acquired and
+  released exclusively by the flock goroutine. This prevents writers in
+  different processes.
 
-A `Begin(ctx, writable=true)` call acquires the write lock in two phases,
-both respecting context cancellation:
+#### Flock Goroutine
 
-1. **Intra-process**: `select` on the semaphore channel and `ctx.Done()`. If
-   the context is cancelled while waiting, return `context.Cause(ctx)` — this
-   preserves the original cancellation reason when `context.WithCancelCause`
-   is used by the caller, falling back to `ctx.Err()` otherwise.
-2. **Cross-process**: attempt `flock(LOCK_EX)` in a separate goroutine. The
-   calling goroutine `select`s on the flock completion channel and
-   `ctx.Done()`. If the context is cancelled while waiting for flock, the
-   flock attempt is abandoned (the background goroutine will complete the
-   flock and immediately release it via `flock(LOCK_UN)`). The returned error
-   is `context.Cause(ctx)` to preserve the cancellation cause.
-3. Store the caller's PID in the lock file header's `WriterPID` field.
+The `DB` struct maintains a single persistent goroutine (started at
+`Open()` time, stopped at `Close()`) that is the sole owner of flock
+acquisition and release. At most one goroutine is ever blocked in the
+`flock()` syscall.
 
-`Commit()` and `Rollback()` clear `WriterPID` to 0, release the flock, then
-release the semaphore. This two-layer approach is necessary because `flock()`
-is per-fd and per-process — a second goroutine calling `flock()` on the same
-fd would succeed immediately (the kernel considers the lock already held by
-this process).
+```
+db.writerCh chan writerRequest
 
-The `DB` struct holds a single dedicated fd for the write lock (`db.lockFd`),
-opened separately from the fd used for the reader table mmap. This fd is used
-exclusively for `flock()`/`funlock()` calls.
+type writerRequest struct {
+    ctx    context.Context
+    result chan<- error  // nil = lock granted; non-nil = cancelled/error
+}
+```
+
+The flock goroutine runs a loop:
+
+1. Read the next `writerRequest` from `db.writerCh`.
+2. Check `req.ctx` — if already cancelled, send `context.Cause(req.ctx)`
+   on `req.result` and loop back to step 1.
+3. If the flock is not currently held (no cross-process contention),
+   acquire `flock(LOCK_EX)` — this blocks in the kernel until granted.
+4. While blocked in `flock`, the goroutine cannot check `req.ctx`.
+   However, since this is the only goroutine that ever calls `flock`,
+   there is no goroutine accumulation. The flock completes when the
+   external writer releases it.
+5. On flock acquisition, check `req.ctx` again — if cancelled while
+   waiting, release the flock immediately and send the cancellation
+   error. Loop back to step 1 to serve the next waiter.
+6. If `req.ctx` is still valid, store the caller's PID in the lock file
+   header's `WriterPID` field and send `nil` on `req.result` — the
+   writer now holds the lock.
+7. Wait for the writer to signal completion (via a release channel
+   provided alongside the request). On release: clear `WriterPID` to 0,
+   release the flock, loop back to step 1.
+
+#### Writer Acquisition Flow
+
+A `Begin(ctx, writable=true)` call:
+
+1. Send a `writerRequest{ctx, result}` to `db.writerCh`.
+2. `select` on `result` and `ctx.Done()`:
+   - If `result` receives `nil`: lock is granted. Proceed with the
+     write transaction.
+   - If `result` receives a non-nil error: lock was not granted (e.g.,
+     the flock goroutine detected a stale writer and recovery failed).
+   - If `ctx.Done()` fires first: the writer gives up. The flock
+     goroutine will detect the cancelled context when it processes the
+     request (step 2 or 5 above) and skip or release accordingly.
+     Return `context.Cause(ctx)`.
+
+`Commit()` and `Rollback()` signal the flock goroutine to release the
+lock via the release channel.
+
+#### Why This Design
+
+The previous approach — spawning a new goroutine per write lock attempt
+to call `flock(LOCK_EX)` — suffered from goroutine accumulation under
+rapid context cancellation. Each cancelled attempt left a goroutine
+blocked in `flock` until it acquired and released, draining one-by-one.
+Under pathological cancellation patterns (e.g., request timeouts in a
+web server), this could accumulate hundreds of goroutines.
+
+The single flock goroutine eliminates this: at most one goroutine is
+ever in the `flock` syscall. Cancelled writers simply dequeue — they
+never touch flock. The goroutine is a fixed-cost resource (one per `DB`
+instance, ~8KB stack) that exists for the lifetime of the database
+handle.
+
+This two-layer approach (intra-process queue + cross-process flock) is
+necessary because `flock()` is per-fd and per-process — a second
+goroutine calling `flock()` on the same fd would succeed immediately
+(the kernel considers the lock already held by this process).
+
+The `DB` struct holds a single dedicated fd for the write lock
+(`db.lockFd`), opened separately from the fd used for the reader table
+mmap. This fd is used exclusively for `flock()`/`funlock()` calls.
 
 #### Stale Writer Recovery
 
@@ -1340,8 +1623,8 @@ is still alive via `kill(pid, 0)`:
 No special rollback logic is needed for tree consistency — the CoW model
 guarantees that the previous meta page points to a fully consistent tree.
 
-In **pwrite mode**, bitmap modifications are held in the dirty page set on
-the heap and only written at commit time. If the writer crashes before
+In **pwrite mode**, bitmap modifications are held in the dirty page set in
+the anonymous mmap slab and only written at commit time. If the writer crashes before
 commit, no bitmap modifications reach disk — the on-disk bitmap is fully
 consistent with the previous meta page. No leaked pages.
 
@@ -1365,17 +1648,29 @@ stored in the lock file's shared mmap. All operations use atomic memory
 operations visible across processes.
 
 **Slot acquire (`Begin` read transaction):**
-1. Scan the reader table for a slot where `TxnID == 0` (free).
-2. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID.
+1. Start scanning from the **slot hint** (`db.readerSlotHint`, an
+   `atomic.Uint32` on the `DB` struct) rather than slot 0. The hint
+   caches the index of the last successfully acquired slot, so the scan
+   begins in a region likely to contain free slots.
+2. Scan forward (with wraparound) for a slot where `TxnID == 0` (free).
+3. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID.
    If the CAS fails (another goroutine or process claimed the slot
    concurrently), continue scanning.
-3. Store the caller's PID in the slot's `PID` field.
-4. If all slots are occupied, return `ErrReadersFull`.
+4. Store the caller's PID in the slot's `PID` field.
+5. Update `db.readerSlotHint` to the acquired slot's index.
+6. If all slots are occupied (full wraparound), return `ErrReadersFull`.
 
-The CAS on `TxnID` is the serialization point. The scan is O(MaxReaders) in
-the worst case, but in practice most slots are concentrated at the low end
-of the array (temporal locality). With 16-byte slots, 4096 slots = 64KB —
-fits in L2 cache, sequential scan with hardware prefetching.
+The hint is process-local (stored on the `DB` struct, not in shared
+memory) and updated with a relaxed atomic store — no cross-process
+coordination. Under steady-state load where a process repeatedly opens
+and closes read transactions, the hint points to a recently-freed slot
+and the scan completes in 1–2 iterations. In the worst case (all slots
+before the hint are occupied), the scan wraps around and degrades to
+O(MaxReaders) — no worse than scanning from slot 0.
+
+The CAS on `TxnID` is the serialization point. With 16-byte slots,
+4096 slots = 64KB — fits in L2 cache, sequential scan with hardware
+prefetching.
 
 **Slot release (`Commit`/`Rollback` read transaction):**
 1. Store `TxnID = 0` (atomic store). This single operation makes the slot
@@ -1410,6 +1705,26 @@ slots may share the same PID (same process), which is correct:
 The consequence is that a single Go process running N concurrent read
 transactions consumes N reader slots. Applications must set `MaxReaders`
 high enough to accommodate the expected total across all processes.
+
+#### Atomic Operations Convention
+
+The codebase uses two distinct atomic access patterns depending on the
+memory being accessed:
+
+- **In-process fields** (`DB`, `Tx` struct fields such as
+  `db.readerSlotHint`, stats counters, the clock hand, etc.) use Go's
+  **typed atomics** (`atomic.Uint64`, `atomic.Uint32`, `atomic.Int64`).
+  Typed atomics prevent accidental non-atomic reads — the compiler
+  enforces that all access goes through the atomic methods. These fields
+  are never visible to other processes.
+
+- **Shared-memory fields** (reader table `TxnID` and `PID` in the
+  mmap'd lock file) use the **function-based atomics**
+  (`atomic.LoadUint64`, `atomic.StoreUint64`,
+  `atomic.CompareAndSwapUint64`) on `unsafe.Pointer`-derived addresses.
+  Typed atomics cannot be used here because the memory is not a Go
+  struct field — it is a raw region in a `MAP_SHARED` mmap visible
+  across processes.
 
 ### Writer's Page Reclamation
 
@@ -1461,15 +1776,16 @@ cache serves the data.
 ### Write Path: pwrite Mode (Default)
 
 The writer does NOT write through the mmap. Instead:
-- Dirty pages are allocated on the Go heap as `[]byte` slices.
-- Modifications happen on these heap copies.
+- Dirty pages are allocated from an anonymous mmap slab (GC-invisible).
+- Modifications happen on these slab-allocated copies.
 - At commit, dirty pages are written to their allocated positions via
   `pwrite()`.
 - `fdatasync()` flushes data, then the meta page is written and synced.
 
-This mode provides **heap isolation**: a stray pointer or buffer overrun in
-user code cannot corrupt the on-disk database because the mmap is read-only.
-Page spilling applies in this mode (see Page Spilling).
+This mode provides **write isolation**: a stray pointer or buffer overrun in
+user code cannot corrupt the on-disk database because the data file mmap is
+read-only. The anonymous slab is separate from both the Go heap and the
+data file mmap. Page spilling applies in this mode (see Page Spilling).
 
 ### Write Path: Writemap Mode
 
@@ -1482,18 +1798,18 @@ The writer modifies pages directly in the mmap:
 - CoW still applies: the writer allocates a new page (from bitmap or file
   extension) and copies the old page's content into the new location **in the
   mmap**.
-- Modifications happen directly on the mmap'd page. No heap copy.
+- Modifications happen directly on the mmap'd page. No slab copy.
 - At commit, `msync()` or `fdatasync()` flushes the dirty range, then the
   meta page is updated and synced.
 
 **Advantages:**
-- No heap allocation for dirty pages — reduces GC pressure significantly.
+- No slab allocation for dirty pages — no anonymous mmap overhead.
 - Single flush operation instead of N `pwrite()` calls + flush.
-- Lower memory usage: no separate heap copies of modified pages.
+- Lower memory usage: no separate copies of modified pages.
 - Better performance for write-heavy workloads.
 
 **Tradeoffs:**
-- **No heap isolation**: a bug (stray pointer, buffer overrun) can corrupt the
+- **No write isolation**: a bug (stray pointer, buffer overrun) can corrupt the
   mmap'd file directly. The database file *is* the mutable working memory.
 - **No page spilling**: since pages are already in the mmap (backed by the OS
   page cache), spilling is unnecessary and does not apply. The OS handles
@@ -1739,8 +2055,9 @@ write ordering guarantees as the pwrite path.
   are pinned in memory and count against `RLIMIT_MEMLOCK`. At
   `MaxDirtyPages=65536` × 4KB = 256MB, this could hit default limits
   (typically 64KB-256KB for unprivileged users). The implementation checks
-  `RLIMIT_MEMLOCK` at initialization and falls back to unregistered
-  buffers if the limit is insufficient.
+  `RLIMIT_MEMLOCK` at initialization via `syscall.Getrlimit`
+  (pure Go, no cgo required) and falls back to unregistered buffers
+  if the limit is insufficient.
 
 - **File geometry via io_uring**: On Linux 6.9+, `IORING_OP_FTRUNCATE` is
   available, allowing file growth and shrinkage to be included in the SQE
@@ -1899,7 +2216,34 @@ var (
 
 // Open a database. Creates the file if it doesn't exist.
 func Open(path string, opts *Options) (*DB, error)
+```
 
+### Path Traversal Safety
+
+`Open()` uses `os.OpenRoot` (Go 1.24+) to confine all file operations
+to the database directory. The path argument is split into a directory
+and base name:
+
+```go
+root, err := os.OpenRoot(filepath.Dir(path))
+defer root.Close()
+dataFile, err := root.Open(filepath.Base(path), ...)
+lockFile, err := root.Open(filepath.Base(path)+".lock", ...)
+```
+
+`os.OpenRoot` returns an `os.Root` handle that rejects symlink traversal
+outside the root directory. This prevents an attacker who controls the
+database path (e.g., in multi-tenant or container environments) from
+redirecting file operations to arbitrary locations via symlinks. Without
+this, a symlink at the database path could cause `Open()` to create or
+overwrite files outside the intended directory.
+
+The `os.Root` handle is used for all file creation and opening during
+`Open()` — both the data file and the lock file. After `Open()` returns,
+the resolved file descriptors are used directly and the `os.Root` is
+closed.
+
+```go
 // SyncMode controls the durability guarantees of committed transactions.
 type SyncMode int
 
@@ -1952,9 +2296,10 @@ type Options struct {
 
     // WriteMap enables writemap mode. The data file is mapped read-write
     // and dirty pages are modified directly in the mmap instead of being
-    // heap-allocated and written via pwrite(). Significantly faster for
-    // write-heavy workloads but offers no protection against stray
-    // pointer bugs corrupting the database. Default: false.
+    // allocated from an anonymous mmap slab and written via pwrite().
+    // Significantly faster for write-heavy workloads but offers no
+    // protection against stray pointer bugs corrupting the database.
+    // Default: false.
     WriteMap bool
 
     // UseIOURing enables the io_uring commit path (Linux 5.6+ only).
@@ -2318,9 +2663,13 @@ type CheckSeverity int
 const (
     CheckWarning CheckSeverity = iota // non-critical (e.g., suboptimal layout)
     CheckError                        // structural integrity violation
+    CheckFatal                        // walk could not continue past this point
 )
 
 // CheckIssue describes a single integrity problem found during a database check.
+// All results — including walk failures — are represented as issues. A
+// CheckFatal issue means the walk stopped at that point and nothing beyond
+// it was checked.
 type CheckIssue struct {
     Severity CheckSeverity
     PageID   uint64 // page where the issue was found (0 if N/A)
@@ -2339,10 +2688,26 @@ type CheckIssue struct {
 //   - Keyspace descriptor consistency (root page validity, counts)
 //   - DUPSORT subpage and nested B+tree integrity
 //
-// The callback fn is invoked for each issue found. If fn returns a non-nil
-// error, the check aborts early and Check returns that error. If all issues
-// are reported without fn returning an error, Check returns nil.
-func (db *DB) Check(fn func(issue CheckIssue) error) error
+// Check returns an iter.Seq[CheckIssue] that yields issues as they are
+// found during the walk. All results — including walk failures (I/O
+// errors, unreadable pages) — are represented as CheckIssue values.
+// Walk failures are reported as CheckFatal severity and are always the
+// last issue yielded.
+//
+// The caller can break early, collect all issues via
+// slices.Collect(db.Check()), or stream issues for immediate display.
+//
+//   // Health check
+//   issues := slices.Collect(db.Check())
+//
+//   // Streaming display
+//   for issue := range db.Check() {
+//       fmt.Println(issue.Severity, issue.PageID, issue.Message)
+//   }
+//
+//   // Testing
+//   require.Empty(t, slices.Collect(db.Check()))
+func (db *DB) Check() iter.Seq[CheckIssue]
 
 // CopyTo creates a hot backup of the database to the given path. The copy
 // is taken from a consistent read transaction snapshot — writers are not
@@ -2511,21 +2876,53 @@ organized by file:
 | File | Responsibility |
 |------|---------------|
 | `page.go` | Page header encoding/decoding (8-byte header: Type, Count, Overflow — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode, segment linking. |
-| `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance with configurable `MergeThreshold`). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
+| `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
-| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages (per-segment TxnID + PageID arrays), reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: singly-linked list of intra-transaction recycled pages. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
-| `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). LRU-based priority selection from `tx.dirtyPages` map. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
+| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages (per-segment TxnID + PageID arrays), reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
+| `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). Clock-based eviction with reference bit sweep from `tx.dirtyPages` map. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` prefaulting (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
 | `iouring_linux.go` | io_uring commit path (Linux 5.6+). Ring initialization with `IORING_REGISTER_FILES` for fixed fd. SQE batch construction (data writes + linked fsync + meta write + linked fsync). `IORING_OP_FTRUNCATE` for geometry changes (Linux 6.9+). CQE completion handling. Registered buffer management with `RLIMIT_MEMLOCK` checking. Fallback detection. |
-| `lock.go` | Lock file creation and mmap (shared memory, uint64 PIDs). Writer lock (channel semaphore intra-process + flock cross-process + WriterPID, context-aware). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (`slices.Sorted(maps.Keys(...))` + sequential pwrite/pwritev2 + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Dirty page buffer pooling via `sync.Pool` (pwrite mode). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
-| `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection, AllowSyncNone validation). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Sync(). Check(). CopyTo(). |
+| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID, context-aware, zero goroutine accumulation). Stale writer recovery. Reader table: hint-based scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (`slices.Sorted(maps.Keys(...))` + sequential pwrite/pwritev2 + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Dirty page buffer allocation from anonymous mmap slab (pwrite mode). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
+| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap, lock file, geometry, write mode selection, AllowSyncNone validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Sync(). Check(). CopyTo(). |
 | `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with `Encoder` calls. |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
+
+### Coding Conventions
+
+**Default values via `cmp.Or`** (Go 1.22+): Options fields with zero-value
+defaults use `cmp.Or` for concise initialization:
+
+```go
+pageSize := cmp.Or(opts.PageSize, 4096)
+maxReaders := cmp.Or(opts.MaxReaders, 4096)
+maxDirtyPages := cmp.Or(opts.MaxDirtyPages, 65536)
+maxBatchSize := cmp.Or(opts.MaxBatchSize, 1000)
+```
+
+`cmp.Or` returns the first non-zero argument. This replaces verbose
+`if field == 0 { field = default }` blocks throughout `Open()` and
+transaction setup, reducing boilerplate and making the defaults
+scannable at a glance.
+
+**Concurrency tests via `testing/synctest`** (Go 1.24+): All
+concurrency-critical code paths use `synctest.Run` for deterministic
+testing. `synctest.Run` controls goroutine scheduling in tests,
+eliminating flaky timing-dependent assertions. Key areas:
+
+- **Batch coordinator**: verifying `MaxBatchDelay` timeout fires at the
+  correct time, batch collection fills to `MaxBatchSize`, and
+  rollback+retry executes the correct closures — without `time.Sleep`
+  or racy channel coordination.
+- **Flock goroutine**: verifying context cancellation while the flock is
+  pending correctly dequeues the writer, and that the flock goroutine
+  releases the lock on behalf of a cancelled waiter.
+- **Reader table**: verifying concurrent slot acquisition via CAS under
+  contention, and stale reader detection clearing the correct slots.
 
 ## Limits
 
@@ -2683,8 +3080,6 @@ run on storage without integrity guarantees.
   commit point. Even if it's torn, the checksum will fail and the DB falls
   back to the other meta page.
 - **Write ordering**: In `SyncDurable` mode, dirty pages are fdatasync'd
-  BEFORE the meta page update, and the meta page is fdatasync'd AFTER writing
-  it. In other sync modes, ordering relies on CoW (see Durability , dirty pages are fdatasync'd
   BEFORE the meta page update, and the meta page is fdatasync'd AFTER writing
   it. In other sync modes, ordering relies on CoW (see Durability Modes).
 - **Reader isolation**: Readers see an immutable snapshot. Pages they reference
