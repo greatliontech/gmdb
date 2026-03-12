@@ -28,6 +28,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime |
 | Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
 | Leak detection | `runtime.AddCleanup` on `Tx` | Detects leaked transactions, releases reader slots, logs origin stack trace |
+| Range delete | Subtree retirement via `DeleteRange` | O(pages) not O(entries); bulk-free for DUPSORT nested B+trees |
 | Namespaces | Named keyspaces | Multiple B+trees in one file |
 
 ## File Layout
@@ -363,6 +364,113 @@ enables:
 
 The fixed value size is stored in the keyspace descriptor (see Keyspaces).
 A `Put()` call with a value of the wrong size returns an error.
+
+### Range Delete
+
+`Keyspace.DeleteRange(start, end)` deletes all keys in the range
+`[start, end)` in a single operation. This is significantly more efficient
+than iterating with a cursor and deleting one key at a time, because it
+can retire entire B+tree subtrees without visiting individual leaf entries.
+
+#### Algorithm
+
+The range delete operates in three phases:
+
+**Phase 1: Find boundary paths.**
+
+Descend the B+tree twice to find:
+- The **left boundary path**: the path from root to the leaf containing
+  `start` (or the first key, if `start` is nil).
+- The **right boundary path**: the path from root to the leaf containing
+  the last key before `end` (or the last key, if `end` is nil).
+
+Each path is a stack of `(pageID, index)` pairs — the same structure used
+by the cursor.
+
+**Phase 2: Identify and retire interior subtrees.**
+
+Walk up from the two boundary paths to find their **lowest common
+ancestor** (LCA) — the deepest branch page that contains both boundaries.
+At each level between the LCA and the leaves:
+
+- **Interior children** — child pointers in branch pages that fall
+  strictly between the left and right boundary indices — are entirely
+  within the delete range. Their entire subtrees are retired without
+  visiting individual leaves.
+- **Boundary children** — the leftmost and rightmost child at each level
+  — are partially within the range and must be descended into.
+
+Retiring a subtree: walk the branch pages of the subtree recursively. For
+each page encountered (branch or leaf), add its page ID to
+`tx.retiredPages`. For leaf pages, accumulate the entry count for the
+return value. For overflow pages referenced by leaf cells, retire the
+entire overflow run. The walk visits every page in the subtree exactly
+once — O(pages in subtree), not O(entries in subtree). Since branch pages
+fan out by hundreds of keys, the number of pages is dramatically smaller
+than the number of entries.
+
+**Phase 3: Clean up boundary leaves and rebalance.**
+
+- In the left boundary leaf: delete entries from `start` (or the cell
+  matching `start`) through the end of the leaf (CoW the leaf first).
+- In the right boundary leaf: delete entries from the beginning through
+  the last key before `end` (CoW the leaf first).
+- If the left and right boundaries are in the same leaf, delete the
+  entries between them.
+- Retire any overflow pages referenced by deleted entries.
+- Walk up from the boundary leaves to the LCA, removing the interior
+  child pointers that were retired in Phase 2 from each branch page
+  (CoW each branch).
+- Rebalance: check fill ratios on the modified branch and leaf pages.
+  Merge or redistribute with siblings as needed, following the normal
+  `MergeThreshold` logic. The rebalance propagates upward, potentially
+  reducing tree depth if the root becomes empty.
+
+#### Complexity
+
+| Operation | Naive (cursor loop) | Range delete |
+|-----------|-------------------|--------------|
+| Delete N keys spanning P pages | O(N × depth) | O(P + depth²) |
+| CoW'd pages | O(N × depth) | O(depth²) — only boundary paths |
+| Retired pages | N leaf cells + splits | P pages (bulk) + boundary cleanup |
+
+For a range covering 1 million keys across 10,000 leaf pages in a tree of
+depth 4: naive deletion does ~4 million CoW operations; range delete walks
+~10,000 pages for retirement + ~16 CoW operations on boundary paths.
+
+#### DUPSORT Bulk Free
+
+When deleting a key in a DUPSORT keyspace whose duplicates are stored in a
+nested B+tree, the nested tree is freed using the same subtree retirement
+mechanism:
+
+1. Read the nested B+tree root page ID and count from the leaf cell.
+2. Walk the nested B+tree's branch pages recursively, retiring every page.
+3. Remove the key's cell from the parent leaf page.
+
+This is O(pages in nested tree), not O(duplicate values). A key with 1
+million duplicates stored across 10,000 pages is freed by visiting ~10,000
+pages — not 1 million individual delete operations.
+
+The same bulk-free applies when `DeleteRange` encounters keys with nested
+B+trees within the range: the nested trees are retired as part of the
+subtree retirement in Phase 2, or individually for keys in boundary leaves
+in Phase 3.
+
+#### Cursor-Based Range Delete
+
+For callers who need finer control (e.g., conditional deletion, progress
+reporting), cursor-based deletion remains available:
+
+```go
+c := ks.Cursor()
+for k, _ := c.SeekGE(start); k != nil && bytes.Compare(k, end) < 0; k, _ = c.Next() {
+    c.Delete()
+}
+```
+
+This uses the naive one-at-a-time path. `DeleteRange` should be preferred
+when deleting a contiguous range unconditionally.
 
 ### Free Space Management
 
@@ -1744,9 +1852,20 @@ func (ks *Keyspace) Get(key []byte) ([]byte, error)
 func (ks *Keyspace) Put(key, value []byte) error
 
 // Delete removes a key and its value. For DUPSORT keyspaces, removes all
-// duplicate values for the key. To delete a single duplicate, use
-// Cursor.SeekDup() + Cursor.Delete().
+// duplicate values for the key (using bulk subtree retirement for nested
+// B+trees). To delete a single duplicate, use Cursor.SeekDup() +
+// Cursor.Delete().
 func (ks *Keyspace) Delete(key []byte) error
+
+// DeleteRange deletes all keys in the range [start, end). Returns the
+// number of deleted key-value pairs (for DUPSORT, each duplicate counts
+// as one). If start is nil, deletes from the first key. If end is nil,
+// deletes through the last key. If both are nil, deletes all keys.
+//
+// DeleteRange retires entire B+tree subtrees that fall within the range
+// without visiting individual leaf entries — O(pages) not O(entries).
+// See Range Delete for the algorithm.
+func (ks *Keyspace) DeleteRange(start, end []byte) (int64, error)
 
 // Cursor for iterating over key-value pairs.
 func (ks *Keyspace) Cursor() *Cursor
@@ -1927,7 +2046,7 @@ organized by file:
 | File | Responsibility |
 |------|---------------|
 | `page.go` | Page header encoding/decoding. Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: encode/decode entry list, segment linking. |
-| `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance with configurable `MergeThreshold`). Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
+| `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance with configurable `MergeThreshold`). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages, reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: singly-linked list of intra-transaction recycled pages. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
 | `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). LRU-based priority selection from `tx.dirtyPages` map. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
