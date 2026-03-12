@@ -29,7 +29,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
 | Checksums | Meta: xxhash64 (always); Data: CRC32C footer (optional) | Meta checksum detects torn commits; optional data checksum catches silent bitrot |
-| API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime |
+| API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime; `context.Cause(ctx)` preserves cancellation reasons from `WithCancelCause` |
 | Iteration | Cursor (stateful, bidirectional, mutable) + `iter.Seq2` (read-only, composable) | Cursor for mutation and bidirectional movement; `iter.Seq2` for idiomatic `for range` loops |
 | Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
 | Leak detection | `runtime.AddCleanup` on `Tx` | Detects leaked transactions, releases reader slots, logs origin stack trace |
@@ -37,7 +37,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Commit I/O | pwrite/pwritev2 (default) or io_uring (opt-in, Linux) | io_uring batches all commit writes into 1-2 syscalls; pwritev2+RWF_DSYNC for small commits; pwrite is portable fallback |
 | Prefaulting | `MADV_POPULATE_READ` at open (opt-in, Linux 5.14+) | Eliminates first-access page faults; sequential kernel readahead; silent no-op on older kernels |
 | Read txn cooldown | `MADV_COLD` on close (opt-in, Linux 5.4+) | Hints kernel to reclaim page cache after large scans; reduces memory pressure |
-| Typed keyspaces | Generic `TypedKeyspace[K, V]` with `Encoder[T]` interface | Zero-cost type-safe API over byte-oriented Keyspace; interface enables stateful encoders and buffer pooling |
+| Typed keyspaces | Generic `TypedKeyspace[K, V]` with `Encoder[T]` interface | Zero-cost type-safe API over byte-oriented Keyspace; append-style `AppendEncode(dst, v) ([]byte, error)` enables buffer reuse and surfaces encode/decode failures; interface enables stateful encoders and buffer pooling |
 | Keyspace names | `unique.Handle[string]` interning | Avoids repeated allocations for frequently opened keyspace names across transactions |
 | Namespaces | Named keyspaces (separate Open/Create API) | Multiple B+trees in one file; clear creation vs. opening semantics |
 
@@ -982,7 +982,8 @@ ignored when `WriteMap` is true.
 
 1. Writer acquires the intra-process semaphore, then the cross-process
    `flock(LOCK_EX)` on the lock file, both respecting `ctx` cancellation
-   (see Write Lock). Returns `ctx.Err()` if cancelled while waiting.
+   (see Write Lock). Returns `context.Cause(ctx)` if cancelled while
+   waiting, preserving the original cancellation reason.
 2. Writer reads the active meta page to get current roots, TxnID, and geometry.
 3. For each modification (insert, update, delete):
    - Traverse the B+tree from root to leaf.
@@ -1026,7 +1027,7 @@ ignored when `WriteMap` is true.
 
 ### Read Transaction
 
-1. Reader checks `ctx` — returns `ctx.Err()` if already cancelled.
+1. Reader checks `ctx` — returns `context.Cause(ctx)` if already cancelled.
 2. Reader acquires a slot in the reader table (shared memory) via scan+CAS
    and records the current TxnID from the active meta page. Returns
    `ErrReadersFull` immediately if no slots are available (no blocking).
@@ -1081,7 +1082,8 @@ type batchCall struct {
 
 4. Each collected closure is executed sequentially within the transaction.
    Before executing a closure, its `ctx` is checked — if already cancelled,
-   the closure is skipped and the caller receives `ctx.Err()`.
+   the closure is skipped and the caller receives `context.Cause(ctx)` to
+   preserve the original cancellation reason.
 
 5. If all closures succeed, the transaction is committed. All callers receive
    `nil` on their result channels.
@@ -1295,12 +1297,15 @@ A `Begin(ctx, writable=true)` call acquires the write lock in two phases,
 both respecting context cancellation:
 
 1. **Intra-process**: `select` on the semaphore channel and `ctx.Done()`. If
-   the context is cancelled while waiting, return `ctx.Err()` immediately.
+   the context is cancelled while waiting, return `context.Cause(ctx)` — this
+   preserves the original cancellation reason when `context.WithCancelCause`
+   is used by the caller, falling back to `ctx.Err()` otherwise.
 2. **Cross-process**: attempt `flock(LOCK_EX)` in a separate goroutine. The
    calling goroutine `select`s on the flock completion channel and
    `ctx.Done()`. If the context is cancelled while waiting for flock, the
    flock attempt is abandoned (the background goroutine will complete the
-   flock and immediately release it via `flock(LOCK_UN)`).
+   flock and immediately release it via `flock(LOCK_UN)`). The returned error
+   is `context.Cause(ctx)` to preserve the cancellation cause.
 3. Store the caller's PID in the lock file header's `WriterPID` field.
 
 `Commit()` and `Rollback()` clear `WriterPID` to 0, release the flock, then
@@ -2097,8 +2102,8 @@ func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
 // amortizing the commit cost (fdatasync) across all of them.
 //
 // The context governs the wait for batch inclusion — if cancelled before
-// the caller's closure executes, Batch returns ctx.Err(). Once the
-// closure begins executing, the context is not checked.
+// the caller's closure executes, Batch returns context.Cause(ctx). Once
+// the closure begins executing, the context is not checked.
 //
 // If fn returns an error, the entire batch is rolled back and retried:
 // successful closures are re-executed in a new batch, and the failing
@@ -2113,7 +2118,8 @@ func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error
 // Begin starts a transaction manually. The context governs lock/slot
 // acquisition:
 //   - For write transactions: blocks on the write lock, respecting
-//     context cancellation. Returns ctx.Err() if cancelled while waiting.
+//     context cancellation. Returns context.Cause(ctx) if cancelled
+//     while waiting.
 //   - For read transactions: returns ErrReadersFull immediately if no
 //     slots are available (no blocking). The context is checked once
 //     before attempting slot acquisition.
@@ -2394,20 +2400,30 @@ key/value serialization automatically via the `Encoder[T]` interface:
 ```go
 // Encoder handles serialization between a Go type and byte slices.
 // Implementations may be stateful (e.g., buffer pooling).
+//
+// AppendEncode appends the encoded form of v to dst and returns the
+// extended buffer. Callers pass dst[:0] from a sync.Pool to reuse
+// allocations on the hot path. Returning an error allows encoders to
+// reject values that cannot be represented (e.g., keys exceeding the
+// maximum size).
+//
+// Decode deserializes src into a value of type T. Returning an error
+// allows encoders to surface malformed or truncated data rather than
+// panicking or silently producing corrupt values.
 type Encoder[T any] interface {
-    Encode(T) []byte
-    Decode([]byte) T
+    AppendEncode(dst []byte, v T) ([]byte, error)
+    Decode(src []byte) (T, error)
 }
 
 // FuncEncoder adapts plain functions into the Encoder interface for
 // simple cases where no state is needed.
 type FuncEncoder[T any] struct {
-    EncodeFunc func(T) []byte
-    DecodeFunc func([]byte) T
+    EncodeFunc func(dst []byte, v T) ([]byte, error)
+    DecodeFunc func(src []byte) (T, error)
 }
 
-func (f FuncEncoder[T]) Encode(v T) []byte  { return f.EncodeFunc(v) }
-func (f FuncEncoder[T]) Decode(b []byte) T  { return f.DecodeFunc(b) }
+func (f FuncEncoder[T]) AppendEncode(dst []byte, v T) ([]byte, error) { return f.EncodeFunc(dst, v) }
+func (f FuncEncoder[T]) Decode(src []byte) (T, error)                 { return f.DecodeFunc(src) }
 
 // TypedKeyspace wraps a Keyspace with type-safe key/value encoding.
 type TypedKeyspace[K, V any] struct {
@@ -2464,9 +2480,14 @@ func (c *TypedCursor[K, V]) Err() error
 
 The typed layer is a **zero-cost abstraction** at the API level — all
 methods delegate to the underlying `Keyspace` and `Cursor` methods with
-`Encoder` calls. No additional allocations beyond the serialization itself.
-Using an interface instead of closures allows stateful encoders (e.g., with
-buffer pooling via `sync.Pool`) and is more idiomatic Go — encoders can be
+`Encoder` calls. The `AppendEncode` signature follows the standard Go
+append pattern (`strconv.AppendInt`, `time.AppendFormat`, etc.), allowing
+callers to pass a reusable `[]byte` buffer (e.g., from `sync.Pool`) to
+eliminate per-call allocations on the hot path. Returning `error` from both
+`AppendEncode` and `Decode` ensures malformed data is surfaced cleanly
+rather than panicking or silently producing corrupt values. Using an
+interface instead of closures allows stateful encoders (e.g., with buffer
+pooling via `sync.Pool`) and is more idiomatic Go — encoders can be
 implemented as method sets on types. The `FuncEncoder` adapter is provided
 for simple stateless cases.
 
