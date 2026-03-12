@@ -20,6 +20,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Write lock | Go mutex (intra-process) + flock (cross-process) | flock alone doesn't block same-process goroutines |
 | Slow readers | Callback-based notification | Application controls policy; no silent unbounded growth |
 | mmap | pwrite mode (default) or writemap mode | pwrite: heap isolation; writemap: direct mmap writes for performance |
+| Dirty page tracking | Hash map (`map[uint64]`) | O(1) insert/lookup/delete; sort once at commit for sequential I/O |
 | Page spilling | LRU-based spill to disk mid-transaction (pwrite mode only) | Bounds memory usage for large write transactions |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
@@ -657,6 +658,104 @@ flip — no further cascading allocations.
 
 Steps 1-4 happen before the dirty page flush and meta page swap.
 
+## Dirty Page Tracking
+
+A write transaction must track which pages have been modified (dirtied via
+CoW) for two purposes: writing them to disk at commit time, and avoiding
+double-CoW when the same page is modified multiple times within a
+transaction.
+
+### Data Structure
+
+The dirty set is a **hash map** keyed by page ID. The value depends on the
+write mode:
+
+**pwrite mode:**
+```
+tx.dirtyPages map[uint64]*dirtyPage
+
+type dirtyPage struct {
+    data     []byte // heap-allocated page content (len = PageSize * (1 + overflow))
+    lastUsed uint64 // monotonic counter for LRU spill priority
+}
+```
+
+**writemap mode:**
+```
+tx.dirtyPages map[uint64]struct{} // page IDs only, content lives in the mmap
+```
+
+### Operations
+
+| Operation | Method | Complexity |
+|-----------|--------|------------|
+| Add dirty page | `tx.dirtyPages[pageID] = &dirtyPage{...}` | O(1) amortized |
+| Check if dirty | `_, ok := tx.dirtyPages[pageID]` | O(1) |
+| Remove (spill) | `delete(tx.dirtyPages, pageID)` | O(1) |
+| Count | `len(tx.dirtyPages)` | O(1) |
+| Commit-time iteration | Sort keys, iterate in page-ID order | O(n log n) once |
+
+The hash map replaces the sorted-array approach used in LMDB/libmdbx, where
+insertions required maintaining sort order (O(n) shift) and lookups required
+binary search (O(log n)). The map provides O(1) for all single-element
+operations. The only operation that costs more is commit-time sequential
+iteration, which requires extracting and sorting the keys — but this is a
+one-time O(n log n) cost amortized against N `pwrite()` syscalls, making it
+negligible.
+
+### LRU Counter (pwrite mode only)
+
+Each dirty page in pwrite mode carries a `lastUsed` counter — a monotonic
+value incremented on each page access or modification. This counter drives
+the LRU-based spill priority (see Page Spilling). The counter is stored in
+the `dirtyPage` struct alongside the page data, so updating it on access is
+a simple field write with no additional map lookup.
+
+In writemap mode, there is no `lastUsed` counter because spilling does not
+apply — the OS manages mmap page eviction transparently.
+
+### Spilled Page Set
+
+Pages that have been spilled to disk mid-transaction are tracked in a
+separate **hash map**:
+
+```
+tx.spilledPages map[uint64]struct{}
+```
+
+When a B+tree traversal reaches a page, the lookup path checks:
+1. `tx.dirtyPages` — if present, use the in-memory dirty copy.
+2. `tx.spilledPages` — if present, the page was written to disk earlier in
+   this transaction. Re-read it from the mmap (the spilled content is at
+   the page's allocated position) and re-dirty it if modification is needed.
+3. Otherwise, read directly from the mmap (immutable page from a previous
+   transaction).
+
+Using a hash map for `spilledPages` provides O(1) membership checks instead
+of binary search on a sorted slice. The set is typically small (only
+populated when `MaxDirtyPages` is exceeded), so the overhead is minimal
+either way, but O(1) is simpler and consistent with the dirty page map.
+
+### Commit-Time Write Ordering
+
+At commit time in pwrite mode, dirty pages are written to disk via
+`pwrite()`. For I/O efficiency, pages are written in ascending page-ID
+order to produce sequential disk writes:
+
+1. Extract keys from `tx.dirtyPages` into a slice.
+2. Sort the slice.
+3. Walk the sorted slice, issuing `pwrite()` for each page. Group
+   adjacent pages (consecutive page IDs) into single write calls where
+   possible (scatter-gather optimization).
+
+Spilled pages are excluded from this write — they are already on disk at
+their final positions.
+
+In writemap mode, no explicit writes are needed — dirty pages are already
+in the mmap. The sorted key extraction is still used for `fdatasync()`
+range hints if the OS supports them, but this is an optimization, not a
+correctness requirement.
+
 ## Page Spilling
 
 When a write transaction dirties more pages than can fit in available memory,
@@ -688,11 +787,11 @@ from earlier bulk insertions) are spilled.
 1. Sort dirty pages by `lastUsed` (ascending — coldest first).
 2. Write the selected pages to their allocated positions via `pwrite()`. Group
    adjacent pages into single write calls where possible.
-3. Remove spilled pages from the dirty set and record their page IDs in
-   `tx.spilledPages` (a sorted slice).
+3. Remove spilled pages from `tx.dirtyPages` and add their page IDs to
+   `tx.spilledPages` (see Dirty Page Tracking).
 4. If a spilled page is later accessed again (e.g., a B+tree traversal reaches
-   it), it is re-read from the mmap and re-dirtied. The `spilledPages` list is
-   checked during page lookup to detect this case.
+   it), it is re-read from the mmap and re-dirtied. The `tx.spilledPages` map
+   is checked during page lookup to detect this case (O(1)).
 
 ### Interaction with Free Space Management
 
@@ -740,8 +839,10 @@ ignored when `WriteMap` is true.
    c. Append all `tx.retiredPages` to the RPL (allocating new segment pages
       from the bitmap if needed — bounded, non-recursive).
    d. Update `NumFreePages`, `RPLHeadPage`, `RPLTailPage`, `RPLEntryCount`.
-5. Flush dirty data pages to stable storage:
-   - **pwrite mode**: write all non-spilled dirty pages via `pwrite()`.
+5. Flush dirty data pages to stable storage (see Dirty Page Tracking for
+   commit-time write ordering):
+   - **pwrite mode**: sort `tx.dirtyPages` keys, write non-spilled dirty
+     pages via `pwrite()` in page-ID order.
    - **writemap mode**: no explicit write needed (pages are already in the mmap).
    - `fdatasync()` if `SyncMode` is `SyncDurable` or `SyncNoMeta`. Skipped for
      `SyncSafe` and `SyncNone`.
@@ -1573,13 +1674,13 @@ organized by file:
 | `page.go` | Page header encoding/decoding. Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate checksum (including geometry fields, bitmap/RPL pointers). RPL segment page: encode/decode entry list, segment linking. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance with configurable `MergeThreshold`). Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages, reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: singly-linked list of intra-transaction recycled pages. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
-| `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). LRU-based priority selection. Spill list tracking for re-dirtying detection. Adjacent page grouping for efficient I/O. |
+| `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). LRU-based priority selection from `tx.dirtyPages` map. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
 | `lock.go` | Lock file creation and mmap (shared memory). Writer lock (Go mutex intra-process + flock cross-process + WriterPID). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, track dirty pages (with LRU counters in pwrite mode, page ID set in writemap mode), CoW operations, spill trigger (pwrite only), commit (RPL append + bitmap update + write/flush + meta swap + sync per SyncMode + geometry shrink), rollback. Stats accumulation. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (sort dirty keys + sequential pwrite + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Stats accumulation. |
 | `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Keyspace management. Sync(). Check(). CopyTo(). |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
