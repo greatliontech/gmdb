@@ -230,10 +230,110 @@ This design has several advantages:
   beginning of the tree and scans forward until `TxnID >= oldest_reader`.
 - **Simple allocation**: pop entries from the reclaimable range and delete them
   from the B+tree.
+- **Bounded self-referential impact**: each insert/delete is a fixed-size
+  operation (16-byte key, no value). A leaf split produces at most 1 extra
+  freed page and requires at most 1 new entry to record — the perturbation
+  is bounded and convergence is fast.
 
 The writer checks the reader table (in shared memory) to find the oldest active
 reader's TxnID. Any freelist entries with TxnID < oldest_reader are safe to
 reclaim.
+
+#### Freelist Runtime Optimizations
+
+Three runtime optimizations reduce freelist B+tree churn and improve allocation
+performance. These are inspired by LMDB's approach, adapted to the composite
+key design.
+
+##### Loose Pages
+
+Pages that are dirtied (copied via CoW) and then freed within the **same write
+transaction** are called "loose pages." This commonly occurs during B+tree
+rebalancing: a merge operation may CoW a node, then free one of the two
+original nodes. The CoW'd copy becomes unnecessary if its contents are merged
+into a sibling.
+
+Loose pages are tracked in a singly-linked list (`tx.loosePages`) using the
+page's own memory to store the link pointer (the page is already in memory
+since it was dirtied). A counter (`tx.looseCount`) tracks the list length.
+
+Loose pages are **immediately reusable** within the same transaction without
+any freelist B+tree interaction:
+- `pageAlloc()` checks `tx.loosePages` first (O(1) pop from the linked list).
+- Loose pages are never written to the freelist B+tree — they were born and
+  died in the same transaction, so no other reader can ever reference them.
+- At commit time, any remaining loose pages are moved to the transaction's
+  pending free list for insertion into the freelist B+tree.
+
+This optimization is critical for the self-referential problem: freelist B+tree
+operations that split/merge nodes produce loose pages that are recycled without
+further B+tree modifications, preventing cascading changes.
+
+##### Batched Reclamation (Reclaimed Page Cache)
+
+Rather than querying the freelist B+tree on every `pageAlloc()` call, the
+writer maintains an in-memory cache of reclaimed pages (`tx.reclaimedPages` —
+a sorted slice of page IDs).
+
+The reclamation flow:
+1. On the first `pageAlloc()` call that finds no loose pages, the writer scans
+   the freelist B+tree from the beginning, collecting all entries where
+   `TxnID < oldestReader` into `tx.reclaimedPages`.
+2. The collected page IDs are sorted in ascending order.
+3. Subsequent `pageAlloc()` calls pop pages from `tx.reclaimedPages` (O(1)).
+4. For multi-page (contiguous) allocations, `tx.reclaimedPages` is scanned for
+   runs of consecutive page IDs.
+5. At commit time, the consumed entries are batch-deleted from the freelist
+   B+tree.
+
+This turns N individual B+tree lookups into one range scan + one batch delete,
+significantly reducing B+tree operations during a write transaction.
+
+##### Oldest Reader Caching
+
+Scanning the reader table to find the minimum active TxnID is O(MaxReaders).
+The writer caches this value (`tx.cachedOldestReader`) and refreshes it
+lazily — only when the reclaimed page cache is exhausted and a new scan is
+needed. Reading a stale (higher) value is conservative: it delays reclamation
+but never causes incorrect behavior.
+
+#### Page Allocation Priority
+
+`pageAlloc(n)` allocates `n` contiguous pages using this priority:
+
+1. **Loose pages** (n=1 only): pop from `tx.loosePages`. O(1).
+2. **Reclaimed page cache**: search `tx.reclaimedPages` for a suitable page
+   (n=1) or a contiguous run (n>1).
+3. **Freelist B+tree scan**: if the cache is empty, scan the freelist B+tree
+   for reclaimable entries (TxnID < oldest reader), populate the cache, and
+   retry step 2.
+4. **File extension**: if no free pages are available, extend the file by
+   advancing `LastPageID` and growing the file via `ftruncate()`.
+
+#### Freeing Pages
+
+When a CoW operation replaces an old page with a new copy:
+- If the old page was **dirtied in this transaction** (i.e., it was itself a
+  CoW copy made earlier in this transaction), it becomes a **loose page** —
+  added to `tx.loosePages`.
+- If the old page was **from a previous transaction** (an immutable page in the
+  mmap), its page ID is added to `tx.pendingFrees` — a list of page IDs to
+  insert into the freelist B+tree at commit time, keyed under the current
+  TxnID.
+
+#### Commit-Time Freelist Update
+
+During commit, the writer:
+1. Moves any remaining loose pages into `tx.pendingFrees`.
+2. Inserts all `tx.pendingFrees` entries into the freelist B+tree as
+   `(currentTxnID || pageID)` keys with empty values.
+3. Deletes all consumed entries from the freelist B+tree (pages that were in
+   `tx.reclaimedPages` and allocated during this transaction).
+4. The insertion/deletion loop may itself dirty or free freelist B+tree pages.
+   Because each operation has bounded space impact (fixed-size entries, no
+   overflow values), the loop converges quickly — typically in 1-2 iterations.
+
+Steps 2-3 happen before the dirty page flush and meta page swap.
 
 ## Copy-on-Write (CoW) Transaction Model
 
@@ -244,10 +344,20 @@ reclaim.
 3. For each modification (insert, update, delete):
    - Traverse the B+tree from root to leaf.
    - Copy each page along the path (don't modify in place).
-   - Allocate new pages from the freelist (or extend the file).
+   - Allocate new pages via `pageAlloc()` (loose pages → reclaimed cache →
+     freelist B+tree scan → file extension).
    - Modified pages are written to their new locations via `pwrite()`.
-4. The old pages along the modified path are added to the freelist under the
-   new TxnID.
+   - Old pages are tracked: pages from previous transactions go to
+     `tx.pendingFrees`; pages dirtied then freed in this transaction become
+     loose pages in `tx.loosePages`.
+4. Commit-time freelist update:
+   a. Move remaining loose pages into `tx.pendingFrees`.
+   b. Insert all `tx.pendingFrees` into the freelist B+tree under the current
+      TxnID.
+   c. Delete consumed entries (pages allocated from the reclaimed cache) from
+      the freelist B+tree.
+   d. Repeat b-c if the freelist B+tree operations produced new pending frees
+      (convergence loop — typically 1-2 iterations).
 5. All dirty pages are written and `fdatasync()`'d.
 6. The inactive meta page is updated with new root pointers, new TxnID, and
    checksum.
@@ -493,7 +603,7 @@ organized by file:
 |------|---------------|
 | `page.go` | Page header encoding/decoding. Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references. Meta page: encode/decode/validate checksum. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance). Cursor: stateful iterator holding a stack of (pageID, index) pairs. All operations work on page byte slices (from mmap), never Go heap objects. |
-| `freelist.go` | B+tree with composite keys (TxnID \|\| PageID, big-endian, empty values). Allocate: scan reclaimable entries (TxnID < oldest reader), delete from tree. Free: insert entries for each freed page under current TxnID. Extend: grow file when no free pages available. |
+| `freelist.go` | Freelist B+tree with composite keys (TxnID \|\| PageID, big-endian, empty values). Page allocation with priority: loose pages → reclaimed cache → B+tree scan → file extension. Batched reclamation: range scan reclaimable entries (TxnID < oldest reader) into in-memory cache, batch delete at commit. Loose page tracking: singly-linked list of intra-transaction recycled pages. Commit-time freelist update: insert pending frees, delete consumed entries, convergence loop. |
 | `mmap.go` | Platform-specific mmap/munmap. Initial mapping with over-allocated virtual address space. File extension (ftruncate + mapping covers it automatically). |
 | `mmap_linux.go` | Linux mmap/munmap syscalls. |
 | `mmap_darwin.go` | macOS mmap/munmap syscalls. |
