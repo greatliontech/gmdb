@@ -11,12 +11,12 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | File layout | Fixed-size pages (4KB–64KB, configurable, immutable after creation) | Matches OS page size, mmap-friendly |
 | Value storage | Inline + overflow pages | Simple single read path, overflow for large values |
 | Duplicate values | DUPSORT with subpage + nested B+tree | Subpage for small sets, nested B+tree for large; DUPFIXED for fixed-size optimization |
-| Free space | Freelist B+tree (composite key, LIFO reclaim) | Fixed-size entries, no overflow in freelist, cache-friendly reclamation |
+| Free space | Allocation bitmap + retired page log (RPL) | O(1) alloc via bitmap, no self-referential allocation, RPL tracks MVCC retirement |
 | File geometry | Dynamic grow/shrink with configurable bounds | Auto-compaction via tail refund, no manual compaction needed |
 | Isolation | Dual meta pages + CoW | No WAL needed, atomic commit |
 | Crash safety | CoW + atomic meta page swap | File is always consistent |
 | Durability | Four sync modes (Durable, NoMeta, Safe, None) | Configurable ACID vs. performance tradeoff |
-| Cross-process | Shared memory lock file | Reader table for tracking oldest active reader |
+| Cross-process | Shared memory lock file | Fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness |
 | Write lock | Go mutex (intra-process) + flock (cross-process) | flock alone doesn't block same-process goroutines |
 | Slow readers | Callback-based notification | Application controls policy; no silent unbounded growth |
 | mmap | pwrite mode (default) or writemap mode | pwrite: heap isolation; writemap: direct mmap writes for performance |
@@ -36,10 +36,17 @@ are powers of 2 from 4KB to 64KB. Default: 4096 bytes (OS page size).
 All multi-byte integers are stored in little-endian byte order.
 
 ```
-+--------+--------+--------+--------+--------+--------+----
-| Meta 0 | Meta 1 | Page 2 | Page 3 | Page 4 | Page 5 | ...
-+--------+--------+--------+--------+--------+--------+----
++--------+--------+------------------+--------+--------+----
+| Meta 0 | Meta 1 | Bitmap Pages ... | Data pages ...       |
+| Page 0 | Page 1 | Page 2 .. N      | Page N+1, N+2, ...   |
++--------+--------+------------------+--------+--------+----
 ```
+
+Bitmap pages occupy a contiguous region starting at page 2. The number of
+bitmap pages is determined by `GeoUpper` at database creation time:
+`BitmapPages = ceil((GeoUpper / PageSize) / (PageSize * 8))`. Data pages
+(B+tree nodes, overflow pages, RPL segment pages) begin immediately after
+the bitmap region. See Allocation Bitmap for details.
 
 ### Page Types
 
@@ -54,9 +61,11 @@ Page Header (16 bytes)
 ```
 
 - **PageID**: The page number (offset = PageID * PageSize).
-- **Type**: One of: Meta, Branch, Leaf, Overflow. (The freelist uses a regular
-  B+tree with standard Branch and Leaf pages — no special page type needed.)
-- **Count**: Number of items (keys in branch, key/value pairs in leaf).
+- **Type**: One of: Meta, Branch, Leaf, Overflow, RPLSegment. Bitmap pages
+  do not carry a page header (see Allocation Bitmap). RPLSegment pages are
+  the retired page log (see Free Space Management).
+- **Count**: Number of items (keys in branch, key/value pairs in leaf, entries
+  in RPL segment).
 - **Overflow**: Number of contiguous overflow pages following this one (0 for
   single-page nodes).
 
@@ -79,8 +88,11 @@ Meta Page
 | GeoGrowPages     | uint64 - growth step in pages
 | GeoShrinkPages   | uint64 - shrink threshold in pages
 | FirstUnallocated | uint64 - first unallocated page ID (high-water mark)
-| FreelistRoot     | uint64 - root page of freelist B+tree
-| NumFreePages     | uint64 - total free pages
+| BitmapPages      | uint32 - number of pages in the allocation bitmap
+| RPLHeadPage      | uint64 - page ID of the newest RPL segment (0 = empty)
+| RPLTailPage      | uint64 - page ID of the oldest RPL segment (0 = empty)
+| RPLEntryCount    | uint64 - total entries across all RPL segments
+| NumFreePages     | uint64 - total free pages (set bits in bitmap)
 | KeyspaceRoot     | uint64 - root page of keyspace B+tree
 | NumKeyspaces     | uint64 - number of keyspaces
 | TxnID            | uint64 - transaction ID that wrote this meta
@@ -88,8 +100,9 @@ Meta Page
 +------------------+
 ```
 
-Total meta page payload: 16 (header) + 4 + 4 + 4 + 4 + 11×8 = 120 bytes.
-Fits comfortably in any supported page size (min 4KB).
+Total meta page payload: 16 (header) + 4×4 (Magic, Version, PageSize, Flags) +
+4 (BitmapPages) + 4 (padding) + 13×8 (uint64 fields including Checksum) =
+144 bytes. Fits comfortably in any supported page size (min 4KB).
 
 The geometry fields (`GeoLower`, `GeoUpper`, `GeoGrowPages`,
 `GeoShrinkPages`) are stored in the meta page so that they persist across
@@ -323,13 +336,13 @@ DupSort Nested B+tree Cell
 The nested B+tree uses the same B+tree implementation as the main keyspace,
 with one difference: its "keys" are the duplicate values, and all "values" are
 empty (zero-length). The nested B+tree's pages are subject to normal CoW,
-freelist management, and page allocation.
+free space management, and page allocation.
 
 ##### Demotion
 
 When deletions reduce a nested B+tree to a single leaf page that would fit as
 a subpage (below the promotion threshold), the B+tree is demoted back to a
-subpage. The leaf page is freed to the freelist, and the entries are packed
+subpage. The leaf page is freed (retired), and the entries are packed
 inline into the parent leaf cell.
 
 ##### DUPFIXED Keyspaces
@@ -344,153 +357,254 @@ enables:
 The fixed value size is stored in the keyspace descriptor (see Keyspaces).
 A `Put()` call with a value of the wrong size returns an error.
 
-#### Freelist B+tree
+### Free Space Management
 
-Free pages are tracked in a dedicated B+tree (separate from user data). Pages
-freed by a given transaction can only be reused once no reader is still using
-that transaction's snapshot.
+Free space is managed by two on-disk structures that separate the two
+concerns: **what is free** (the allocation bitmap) and **when it became free**
+(the retired page log). This separation eliminates the self-referential
+allocation problem found in LMDB/libmdbx's freelist B+tree, where modifying
+the freelist during commit could itself allocate or free pages, requiring
+complex convergence loops.
 
-The freelist B+tree uses a **composite key** encoding with empty values:
+#### Allocation Bitmap
+
+The allocation bitmap is a flat bitfield — one bit per page in the database.
+A set bit means the page is **free and safe to allocate**. A clear bit means
+the page is either in use or retired but not yet reclaimable (still visible
+to an active reader's snapshot).
+
+The bitmap occupies a contiguous region of pages starting at page 2 (after the
+two meta pages). The number of bitmap pages is fixed at database creation time
+based on `GeoUpper`:
 
 ```
-Key: TxnID (uint64, big-endian) || PageID (uint64, big-endian)
-Value: (empty — zero bytes)
+BitmapPages = ceil(GeoUpper / PageSize / BitsPerPage)
+BitsPerPage = PageSize * 8
 ```
 
-Each freed page is a separate entry in the B+tree. Both components are stored
-in big-endian byte order so that the standard lexicographic key comparison
-sorts entries first by TxnID, then by PageID within the same transaction.
+| GeoUpper | PageSize | Total Pages | BitmapPages | Bitmap Size |
+|----------|----------|-------------|-------------|-------------|
+| 1GB      | 4KB      | 262,144     | 8           | 32KB        |
+| 64GB     | 4KB      | 16,777,216  | 512         | 2MB         |
+| 256GB    | 4KB      | 67,108,864  | 2,048       | 8MB         |
+| 1TB      | 4KB      | 268,435,456 | 8,192       | 32MB        |
+| 256GB    | 64KB     | 4,194,304   | 8           | 512KB       |
 
-This design has several advantages:
-- **No special value encoding**: reuses the existing B+tree leaf format as-is.
-  Each entry is just a 16-byte key with no value.
-- **No overflow concern**: a single transaction freeing many pages creates many
-  small entries rather than one large value that could overflow a leaf page.
-- **Efficient range scan for reclamation**: all entries with
-  `TxnID < oldest_reader` are reclaimable. The scan direction is LIFO
-  (newest eligible first — see Freelist Runtime Optimizations).
-- **Simple allocation**: pop entries from the reclaimable range and delete them
-  from the B+tree.
-- **Bounded self-referential impact**: each insert/delete is a fixed-size
-  operation (16-byte key, no value). A leaf split produces at most 1 extra
-  freed page and requires at most 1 new entry to record — the perturbation
-  is bounded and convergence is fast.
+The bitmap pages themselves are never marked as free in the bitmap — their
+bits are permanently clear (reserved). The same applies to meta pages (pages
+0 and 1). Data pages start at page `2 + BitmapPages`.
 
-The writer checks the reader table (in shared memory) to find the oldest active
-reader's TxnID. Any freelist entries with TxnID < oldest_reader are safe to
-reclaim.
+##### Bitmap Storage
 
-#### Freelist Runtime Optimizations
+The bitmap is stored directly in the mmap. In pwrite mode, bitmap
+modifications are written via `pwrite()` as part of the dirty page set. In
+writemap mode, bitmap modifications happen directly in the mmap. Either way,
+bitmap pages participate in the same `fdatasync()` ordering as data pages —
+they are flushed before the meta page swap.
 
-Several runtime optimizations reduce freelist B+tree churn and improve
-allocation performance. These are inspired by LMDB and libmdbx, adapted to
-the composite key design.
+Bitmap pages do not use the standard page header. The entire page is usable
+as bitmap data (PageSize × 8 bits per page). The page type is identified by
+its position in the file (pages 2 through `2 + BitmapPages - 1`), not by a
+header field.
 
-##### Loose Pages
+##### Two-Level Summary
 
-Pages that are dirtied (copied via CoW) and then freed within the **same write
-transaction** are called "loose pages." This commonly occurs during B+tree
-rebalancing: a merge operation may CoW a node, then free one of the two
-original nodes. The CoW'd copy becomes unnecessary if its contents are merged
-into a sibling.
+To accelerate allocation searches over large databases, the bitmap uses a
+two-level structure:
+
+- **Level 0 (detail):** One bit per page in the database, covering page IDs
+  0 through `GeoUpper / PageSize - 1`. Stored across bitmap pages 2
+  through `2 + BitmapPages - 1`. Bits for meta pages (0, 1) and bitmap
+  pages (2 through `2 + BitmapPages - 1`) are permanently clear.
+- **Level 1 (summary):** A separate in-memory array, one bit per uint64
+  word of the detail level. A summary bit is set if the corresponding
+  64-page word in the detail level has **any** set bits (any free pages).
+  Size: `ceil(TotalPages / 64 / 64)` uint64 words. The summary is rebuilt
+  from the detail bitmap when the database is opened and maintained
+  incrementally during transactions.
+
+At 4KB page size with 256GB `GeoUpper` (67M pages): the detail level is
+~1M uint64 words (8MB across 2048 bitmap pages). The summary level is
+~16K uint64 words = 128KB in memory. The summary allows skipping 64-page
+regions with no free space during allocation scans.
+
+For contiguous-run searches (overflow page allocation), the writer scans
+summary words to find regions with free pages, then scans detail words
+within those regions using `math/bits.TrailingZeros64` and
+`math/bits.LeadingZeros64` to find runs. A single uint64 word covers 64
+pages — a run of N < 64 can be found within one word; larger runs span
+word boundaries with a carry-forward scan.
+
+##### Bitmap Operations
+
+**Set bit (free a page):** Load the uint64 word containing the page's bit,
+OR in the bit, write the word back. Update the summary word if the detail
+word transitioned from 0 to non-zero. O(1).
+
+**Clear bit (allocate a page):** Load the uint64 word, AND out the bit,
+write back. Update the summary word if the detail word transitioned from
+non-zero to 0. O(1).
+
+**Find first free (single-page alloc):** Scan summary words starting from
+the LIFO hint (see LIFO Allocation Locality) for a non-zero word. Within
+that summary region, scan detail words for a set bit. Clear it and return.
+O(1) amortized with the LIFO hint; O(TotalPages/64) worst case.
+
+**Find N contiguous free (multi-page alloc):** Scan detail words for runs
+of consecutive set bits. Within a word, `math/bits.TrailingZeros64` on the
+complement finds the length of a run from the LSB. Across word boundaries,
+track the trailing run of one word and the leading run of the next. O(scanned
+words).
+
+**Count free pages:** `math/bits.OnesCount64` (hardware `popcnt`) across
+all detail words. Cached in `NumFreePages` in the meta page and maintained
+incrementally.
+
+#### Retired Page Log (RPL)
+
+The retired page log tracks which pages were freed by which transaction. This
+information is needed for MVCC safety: a page freed by transaction T cannot be
+moved into the allocation bitmap until no active reader holds a snapshot ≤ T.
+
+The RPL is an append-only doubly-linked list of segment pages. Each segment
+page contains a batch of `(TxnID, PageID)` entries:
+
+```
+RPL Segment Page
++---------------------------+
+| Page Header (16 bytes)    |
++---------------------------+
+| NewerSegment | uint64     |  page ID of the next newer segment (0 = this is head)
+| OlderSegment | uint64     |  page ID of the next older segment (0 = this is tail)
+| EntryCount   | uint16     |  number of entries in this segment
+| Padding      | 6 bytes    |
++---------------------------+
+| Entry 0: TxnID (uint64) + PageID (uint64)  |
+| Entry 1: TxnID (uint64) + PageID (uint64)  |
+| ...                                         |
++---------------------------------------------+
+```
+
+Segment capacity at 4KB page size: 16 (page header) + 8 + 8 (link pointers)
++ 2 (EntryCount) + 6 (padding) = 40 bytes overhead. Remaining
+`4096 - 40 = 4056` bytes / 16 bytes per entry = **253 entries per segment
+page**. A transaction freeing 10,000 pages fills ~40 segment pages.
+
+The meta page stores `RPLHeadPage` (newest segment) and `RPLTailPage` (oldest
+segment). Segments are doubly linked: `OlderSegment` links from head toward
+tail; `NewerSegment` links from tail toward head. The doubly-linked structure
+allows efficient operations at both ends: appending new segments at the head
+and reclaiming old segments from the tail.
+
+##### RPL Append (At Commit Time)
+
+When a write transaction commits with retired pages:
+
+1. Allocate one or more new segment pages from the bitmap (or file extension).
+   Each commit always creates **new** segment pages rather than appending to
+   existing segments. This avoids CoW of previous segments — the old head
+   segment is immutable (it belongs to a previous transaction's snapshot).
+2. Fill segment pages with `(currentTxnID, pageID)` entries, sorted by page
+   ID for cache-friendly processing during reclamation. If the retired list
+   exceeds one segment page's capacity (253 entries), allocate additional
+   segment pages and link them via `OlderSegment`/`NewerSegment`.
+3. Link the new head to the previous head: set the new head's
+   `OlderSegment` to the old `RPLHeadPage`, and update the old head's
+   `NewerSegment` to point to the new head. The old head must be CoW'd for
+   this link update — the old head page is added to the dirty set and its
+   original page ID is added to `tx.retiredPages` (this is bounded: at most
+   one extra retired entry per commit for the old head page).
+4. Update `RPLHeadPage` in the meta page to point to the new head. If the
+   RPL was empty, also set `RPLTailPage`.
+
+RPL segment pages are allocated from the bitmap like any other data page.
+Allocating a segment page clears a bit in the bitmap — O(1), no further
+allocation needed. A transaction retiring N pages needs at most
+`ceil(N / 253) + 1` page allocations (segment pages + CoW of old head).
+This is bounded and non-recursive.
+
+##### RPL Reclamation
+
+At the start of a write transaction (or lazily on first `pageAlloc()`), the
+writer reclaims RPL entries whose pages are safe to reuse:
+
+1. Read the oldest active reader's TxnID from the reader table (see
+   Cross-Process Coordination).
+2. Walk the RPL from the **tail** (oldest segments first).
+3. For each entry where `TxnID < oldestReader`:
+   a. Set the corresponding bit in the allocation bitmap.
+   b. Remove the entry from the segment.
+4. When a segment becomes empty, free the segment page itself (set its bit in
+   the bitmap) and advance `RPLTailPage` to the segment's `NewerSegment`.
+5. Update `RPLEntryCount` and `NumFreePages` in the meta page.
+
+Reclamation is performed oldest-first so that the RPL shrinks from the tail.
+Empty segment pages are immediately freed — their bitmap bits are set, making
+them available for allocation in the same transaction.
+
+Modifying a segment page during reclamation (removing entries) requires CoW:
+the old segment page is copied to a new page, and the original page ID is
+added to `tx.retiredPages`. This is bounded — each segment CoW allocates one
+page from the bitmap (which is being populated by the very entries being
+reclaimed) and retires one page. The reclaimed pages always outnumber the
+CoW overhead.
+
+##### Oldest Reader Caching
+
+Scanning the reader table to find the minimum active TxnID is O(MaxReaders).
+The writer caches this value (`tx.cachedOldestReader`) and refreshes it
+lazily — only when the bitmap has no free pages and reclamation might unlock
+more. Reading a stale (higher) value is conservative: it delays reclamation
+but never causes incorrect behavior.
+
+#### LIFO Allocation Locality
+
+The allocation bitmap does not inherently provide LIFO (most-recently-freed
+first) behavior, which is important for cache efficiency and SSD write
+amplification. To achieve LIFO locality without complicating the bitmap:
+
+The writer maintains a **LIFO hint** (`tx.allocHint`) — the page ID of the
+last page reclaimed during the most recent reclamation pass. `pageAlloc()`
+begins its bitmap scan at this hint and wraps around. Reclamation walks the
+RPL from oldest to newest (tail to head). The last entries processed are
+from the newest reclaimable transaction — the most recently freed pages.
+The hint therefore naturally points to recently-freed regions.
+
+For workloads with steady write/free/reuse cycles, this keeps the active
+page set small and concentrated, achieving the same cache locality benefits
+as LMDB's LIFO reclamation.
+
+#### Loose Pages
+
+Pages that are dirtied (copied via CoW) and then freed within the **same
+write transaction** are called "loose pages." This commonly occurs during
+B+tree rebalancing: a merge operation may CoW a node, then free one of the
+two original nodes. The CoW'd copy becomes unnecessary if its contents are
+merged into a sibling.
 
 Loose pages are tracked in a singly-linked list (`tx.loosePages`) using the
 page's own memory to store the link pointer (the page is already in memory
 since it was dirtied). A counter (`tx.looseCount`) tracks the list length.
 
 Loose pages are **immediately reusable** within the same transaction without
-any freelist B+tree interaction:
+any bitmap or RPL interaction:
 - `pageAlloc()` checks `tx.loosePages` first (O(1) pop from the linked list).
-- Loose pages that are reused via `pageAlloc()` never touch the freelist
-  B+tree at all — they were allocated and freed within the same transaction,
-  so no reader can ever reference them.
+- Loose pages that are reused via `pageAlloc()` never touch the bitmap or RPL
+  — they were allocated and freed within the same transaction, so no reader
+  can ever reference them.
 - At commit time, any loose pages still in the list (allocated a page ID but
-  never reused) are moved to `tx.pendingFrees` for insertion into the
-  freelist B+tree. Their page IDs must be tracked so future transactions
-  can reclaim them.
-
-This optimization is critical for the self-referential problem: freelist B+tree
-operations that split/merge nodes produce loose pages that are recycled without
-further B+tree modifications, preventing cascading changes.
-
-##### Batched Reclamation (Reclaimed Page Cache)
-
-Rather than querying the freelist B+tree on every `pageAlloc()` call, the
-writer maintains an in-memory cache of reclaimed pages (`tx.reclaimedPages` —
-a sorted slice of page IDs).
-
-The reclamation flow:
-1. On the first `pageAlloc()` call that finds no loose pages, the writer scans
-   the freelist B+tree collecting all entries where `TxnID < oldestReader`
-   into `tx.reclaimedPages`. The scan direction is LIFO (see below).
-2. The collected page IDs are sorted in ascending order.
-3. Subsequent `pageAlloc()` calls pop pages from `tx.reclaimedPages` (O(1)).
-4. For multi-page (contiguous) allocations, `tx.reclaimedPages` is scanned for
-   runs of consecutive page IDs.
-5. At commit time, any consumed entries not already removed by early GC
-   cleanup are deleted from the freelist B+tree.
-
-This turns N individual B+tree lookups into one range scan + one batch delete,
-significantly reducing B+tree operations during a write transaction.
-
-##### LIFO Reclamation
-
-When scanning the freelist B+tree for reclaimable pages, the writer scans in
-**reverse order** — starting from the newest eligible transaction and working
-backward. The scan begins by seeking to the composite key
-`(oldestReader - 1, MaxUint64)` and iterating with `Prev()`.
-
-LIFO reclamation reuses recently-freed pages first. This has several benefits:
-- **Cache efficiency**: recently freed pages are more likely to still be in the
-  OS page cache. Reusing them avoids disk reads for the new transaction's
-  writes.
-- **Smaller working set**: the set of pages that cycle through
-  write/free/reuse stays small, improving both page cache hit rates and
-  write-back efficiency.
-- **Better for SSD/NVMe**: reduces write amplification by concentrating writes
-  on recently-written pages rather than spreading across the entire file.
-
-##### Early GC Cleanup
-
-During reclamation, when the writer reads a freelist entry into
-`tx.reclaimedPages`, it immediately deletes that entry from the freelist
-B+tree (rather than deferring all deletes to commit time). The B+tree pages
-freed by the deletion become loose pages, which are immediately available for
-allocation. This reduces commit-time work and makes more pages available
-during the transaction.
-
-Early cleanup is performed only when the writer has sufficient "stockpile"
-(loose pages + reclaimed pages) to cover the CoW cost of the deletion itself,
-preventing the deletion from triggering file extension.
-
-##### Oldest Reader Caching
-
-Scanning the reader table to find the minimum active TxnID is O(MaxReaders).
-The writer caches this value (`tx.cachedOldestReader`) and refreshes it
-lazily — only when the reclaimed page cache is exhausted and a new scan is
-needed. Reading a stale (higher) value is conservative: it delays reclamation
-but never causes incorrect behavior.
-
-##### Time-Bounded Reclamation
-
-The freelist B+tree scan in `pageAlloc()` is bounded by both an iteration
-limit and a time limit (`Options.GCTimeLimit`, default 0 = unlimited). If the
-scan exceeds either bound without finding a suitable page (or contiguous run),
-it stops and falls through to file extension. This prevents pathological
-latency spikes on large, fragmented freelists. The limit applies only to
-multi-page (contiguous) allocation searches — single-page allocation from the
-reclaimed cache is always O(1).
+  never reused) are added to `tx.retiredPages` for inclusion in the RPL.
 
 #### Page Allocation Priority
 
 `pageAlloc(n)` allocates `n` contiguous pages using this priority:
 
 1. **Loose pages** (n=1 only): pop from `tx.loosePages`. O(1).
-2. **Reclaimed page cache**: search `tx.reclaimedPages` for a suitable page
-   (n=1) or a contiguous run (n>1).
-3. **Freelist B+tree scan**: if the cache is empty or lacks a contiguous run,
-   scan the freelist B+tree for reclaimable entries (TxnID < oldest reader),
-   populate the cache, and retry step 2. Subject to time/iteration bounds.
+2. **Allocation bitmap**: scan the bitmap for a free page (n=1) or a
+   contiguous run of free pages (n>1), starting from the LIFO hint.
+3. **RPL reclamation**: if the bitmap has no suitable free pages, reclaim
+   entries from the RPL (TxnID < oldest reader) into the bitmap, then retry
+   step 2.
 4. **Slow reader check**: if reclamation is blocked by a long-lived reader,
    invoke the slow reader callback (see Cross-Process Coordination). If the
    reader releases, refresh the oldest reader cache and retry step 3.
@@ -499,17 +613,16 @@ reclaimed cache is always O(1).
 
 ##### Tail Page Refund
 
-After populating or modifying `tx.reclaimedPages` or `tx.loosePages`, the
-writer checks if any pages at the tail of the database file (page IDs equal
-to `FirstUnallocated - 1`, `FirstUnallocated - 2`, etc.) are present in these
-lists. If so, those pages are removed from the lists and `FirstUnallocated` is
-decremented. This reclaims space without going through the freelist and
+After reclamation or at commit time, the writer checks if any pages at the
+tail of the database file (page IDs equal to `FirstUnallocated - 1`,
+`FirstUnallocated - 2`, etc.) are free in the bitmap. If so, those bits are
+cleared and `FirstUnallocated` is decremented. This reclaims file space and
 enables file shrinkage at commit time (see Database Geometry).
 
-The refund process iterates: removing tail pages may expose new tail pages in
-the lists. It runs until no more tail pages are found. Loose pages are checked
-first (by scanning the linked list), then reclaimed pages (by checking the
-sorted slice from the end).
+The refund process iterates: clearing tail bits may expose new tail pages.
+It runs until no more tail pages are free. Loose pages are checked first
+(by scanning the linked list for tail page IDs), then the bitmap (by
+checking bits from `FirstUnallocated - 1` downward).
 
 #### Freeing Pages
 
@@ -517,25 +630,32 @@ When a CoW operation replaces an old page with a new copy:
 - If the old page was **dirtied in this transaction** (i.e., it was itself a
   CoW copy made earlier in this transaction), it becomes a **loose page** —
   added to `tx.loosePages`.
-- If the old page was **from a previous transaction** (an immutable page in the
-  mmap), its page ID is added to `tx.pendingFrees` — a list of page IDs to
-  insert into the freelist B+tree at commit time, keyed under the current
-  TxnID.
+- If the old page was **from a previous transaction** (an immutable page in
+  the mmap), its page ID is added to `tx.retiredPages` — a list of
+  `(currentTxnID, pageID)` pairs to append to the RPL at commit time.
 
-#### Commit-Time Freelist Update
+Note: retired pages are NOT immediately marked free in the bitmap. They enter
+the RPL and are moved to the bitmap only when reclamation determines they are
+safe to reuse (no active reader holds their snapshot).
+
+#### Commit-Time Free Space Update
 
 During commit, the writer:
-1. Moves any remaining loose pages into `tx.pendingFrees`.
-2. Inserts all `tx.pendingFrees` entries into the freelist B+tree as
-   `(currentTxnID || pageID)` keys with empty values.
-3. Deletes any remaining consumed entries from the freelist B+tree that were
-   not already removed by early GC cleanup (pages that were in
-   `tx.reclaimedPages` and allocated during this transaction).
-4. The insertion/deletion loop may itself dirty or free freelist B+tree pages.
-   Because each operation has bounded space impact (fixed-size entries, no
-   overflow values), the loop converges quickly — typically in 1-2 iterations.
+1. Performs tail page refund: check the bitmap for free pages at the end of
+   the file, decrement `FirstUnallocated`.
+2. Moves any remaining loose pages into `tx.retiredPages`.
+3. Appends all `tx.retiredPages` entries to the RPL (allocating new segment
+   pages from the bitmap if the current head segment is full).
+4. Updates `NumFreePages`, `RPLHeadPage`, `RPLTailPage`, and `RPLEntryCount`
+   in the meta page.
 
-Steps 2-3 happen before the dirty page flush and meta page swap.
+Step 3 may allocate RPL segment pages from the bitmap. This is a bounded,
+non-recursive operation: each segment page holds 253 entries, so a transaction
+retiring N pages needs at most `ceil(N / 253) + 1` page allocations (segment
+pages plus CoW of the old RPL head). Each allocation is a single bitmap bit
+flip — no further cascading allocations.
+
+Steps 1-4 happen before the dirty page flush and meta page swap.
 
 ## Page Spilling
 
@@ -574,17 +694,18 @@ from earlier bulk insertions) are spilled.
    it), it is re-read from the mmap and re-dirtied. The `spilledPages` list is
    checked during page lookup to detect this case.
 
-### Interaction with Freelist
+### Interaction with Free Space Management
 
-Spilled pages remain allocated — they are not freed or added to the freelist.
+Spilled pages remain allocated — they are not freed or added to the RPL.
 They are simply written to their final on-disk location early. At commit time,
 spilled pages do not need to be written again (they are already on disk). The
 commit only needs to write the remaining (non-spilled) dirty pages and the
 meta page.
 
-Freelist B+tree pages are never spilled. They are always kept in memory
-because the freelist is modified during commit-time freelist update and
-spilling them would cause unnecessary re-dirtying.
+Bitmap pages and RPL segment pages are never spilled. Bitmap pages are
+modified during commit-time free space update (tail refund, RPL segment
+allocation), and RPL segment pages are written as part of the commit-time
+RPL append. Spilling them would cause unnecessary re-dirtying.
 
 **Note**: Page spilling only applies in pwrite mode. In writemap mode, dirty
 pages live in the mmap (backed by the OS page cache) and the OS handles
@@ -601,8 +722,8 @@ ignored when `WriteMap` is true.
 3. For each modification (insert, update, delete):
    - Traverse the B+tree from root to leaf.
    - Copy each page along the path (CoW — never modify in place).
-   - Allocate new pages via `pageAlloc()` (loose pages → reclaimed cache →
-     freelist B+tree scan → slow reader check → file extension).
+   - Allocate new pages via `pageAlloc()` (loose pages → bitmap →
+     RPL reclamation → slow reader check → file extension).
    - In **pwrite mode**: modified pages are held as heap-allocated dirty pages
      (with LRU counters for spill priority). If the dirty page count exceeds
      `MaxDirtyPages`, spill the coldest dirty pages to disk via `pwrite()`
@@ -610,18 +731,15 @@ ignored when `WriteMap` is true.
    - In **writemap mode**: modifications happen directly in the mmap. The
      dirty set tracks page IDs only (no heap copies, no spilling).
    - Old pages are tracked: pages from previous transactions go to
-     `tx.pendingFrees`; pages dirtied then freed in this transaction become
+     `tx.retiredPages`; pages dirtied then freed in this transaction become
      loose pages in `tx.loosePages`.
-4. Commit-time freelist update:
-   a. Perform tail page refund: remove pages at the end of the file from
-      `tx.loosePages` and `tx.reclaimedPages`, decrement `FirstUnallocated`.
-   b. Move remaining loose pages into `tx.pendingFrees`.
-   c. Insert all `tx.pendingFrees` into the freelist B+tree under the current
-      TxnID.
-   d. Delete any remaining consumed entries (pages allocated from the
-      reclaimed cache) not already removed by early GC cleanup.
-   e. Repeat c-d if the freelist B+tree operations produced new pending frees
-      (convergence loop — typically 1-2 iterations).
+4. Commit-time free space update:
+   a. Perform tail page refund: check the bitmap for free pages at the end of
+      the file, clear those bits, decrement `FirstUnallocated`.
+   b. Move remaining loose pages into `tx.retiredPages`.
+   c. Append all `tx.retiredPages` to the RPL (allocating new segment pages
+      from the bitmap if needed — bounded, non-recursive).
+   d. Update `NumFreePages`, `RPLHeadPage`, `RPLTailPage`, `RPLEntryCount`.
 5. Flush dirty data pages to stable storage:
    - **pwrite mode**: write all non-spilled dirty pages via `pwrite()`.
    - **writemap mode**: no explicit write needed (pages are already in the mmap).
@@ -636,7 +754,7 @@ ignored when `WriteMap` is true.
    `GeoShrinkPages`, truncate the file via `ftruncate()`. This happens
    after the commit point — a crash before truncation leaves the file
    larger than necessary but consistent. The next commit will retry.
-9. Writer releases the flock, then releases the Go mutex.
+9. Writer clears `WriterPID`, releases the flock, then releases the Go mutex.
 
 ### Read Transaction
 
@@ -659,28 +777,44 @@ A separate file (`<dbname>.lock`) is mmap'd as shared memory by all processes.
 
 ```
 Lock File
-+------------------------+
-| Header                 |
-| Magic      | uint32    |  identifies file as gmdb lock file
-| Version    | uint16    |  lock file format version
-| MaxReaders | uint16    |  number of reader slots
-+------------------------+
-| Reader Table           |
-| +---------+----------+ |
-| | TxnID   | PID      | | Slot 0
-| | uint64  | uint32   | |
-| | Padding | 4 bytes  | |
-| +---------+----------+ |
-| | TxnID   | PID      | | Slot 1
-| | ...                 | |
-| +---------+----------+ |
-| | ...                 | | up to MaxReaders slots
-| +---------+----------+ |
-+------------------------+
++---------------------------+
+| Header (16 bytes)         |
+| Magic        | uint64     |  identifies file as gmdb lock file
+| MaxReaders   | uint32     |  number of reader slots (set at creation)
+| WriterPID    | uint32     |  PID of current write txn holder (0 = no writer)
++---------------------------+
+| Reader Table              |
+| +----------+----------+   |
+| | TxnID    | PID      |   | Slot 0
+| | uint64   | uint32   |   |
+| | Padding  | 4 bytes  |   |
+| +----------+----------+   |
+| | TxnID    | PID      |   | Slot 1
+| | ...                  |   |
+| +----------+----------+   |
+| | ...                  |   | up to MaxReaders slots
+| +----------+----------+   |
++---------------------------+
 ```
 
-Header size: 8 bytes (aligned). Total lock file size: 8 + (16 * MaxReaders).
-With default MaxReaders=126: 8 + 2016 = 2024 bytes (fits in one page).
+**Header (16 bytes):**
+- `Magic` (uint64): Identifies the file as a gmdb lock file. Validates that
+  the lock file belongs to this database and has not been corrupted.
+- `MaxReaders` (uint32): Number of reader slots. Set at lock file creation
+  time via `Options.MaxReaders` (default: 4096). Immutable after creation.
+- `WriterPID` (uint32): PID of the process currently holding the write lock.
+  Set when the write lock is acquired, cleared to 0 on release. Used for
+  stale writer detection (see Stale Writer Recovery).
+
+**Reader Slot (16 bytes):**
+- `TxnID` (uint64, atomic): The snapshot transaction ID held by this reader.
+  A value of 0 means the slot is free. Non-zero means the slot is active.
+- `PID` (uint32): Process ID that owns this slot. Used for stale reader
+  detection (`kill(pid, 0)`).
+- Padding (4 bytes): Aligns slot to 16 bytes.
+
+Total lock file size: 16 + (16 × MaxReaders). With default MaxReaders=4096:
+16 + 65536 = 65552 bytes (~64KB, fits in 16 pages at 4KB page size).
 
 The lock file is mmap'd with `MAP_SHARED` by all processes for the reader table.
 The write lock is a separate concern handled via `flock()` (see below).
@@ -688,11 +822,16 @@ The write lock is a separate concern handled via `flock()` (see below).
 ### Lock File Lifecycle
 
 The lock file is ephemeral. The first process to open the database creates the
-lock file and writes the header (including MaxReaders). Subsequent processes
-read MaxReaders from the header and use it. If the lock file is deleted (e.g.,
-after all processes exit), the next opener recreates it. MaxReaders is NOT
-stored in the data file — it is a runtime coordination property, not a data
-property.
+lock file, writes the header (including `Magic`, `MaxReaders`, `WriterPID=0`),
+and initializes all reader slots to zero. Subsequent processes validate `Magic`,
+read `MaxReaders` from the header, and mmap the file at the corresponding size.
+If the lock file is deleted (e.g., after all processes exit), the next opener
+recreates it. `MaxReaders` is NOT stored in the data file — it is a runtime
+coordination property, not a data property.
+
+On open, if the lock file already exists, the opener checks `WriterPID`. If
+non-zero and the PID is no longer alive (`kill(pid, 0)` returns `ESRCH`), the
+writer crashed while holding the lock — see Stale Writer Recovery.
 
 ### Write Lock
 
@@ -704,26 +843,89 @@ Write serialization uses two layers:
   in different processes.
 
 A `Begin(writable=true)` call first acquires the Go mutex, then acquires the
-flock. `Commit()` and `Rollback()` release in reverse order: flock first, then
-mutex. This two-layer approach is necessary because `flock()` is per-fd and
-per-process — a second goroutine calling `flock()` on the same fd would succeed
-immediately (the kernel considers the lock already held by this process).
+flock, then stores the caller's PID in the lock file header's `WriterPID`
+field. `Commit()` and `Rollback()` clear `WriterPID` to 0, release the flock,
+then release the Go mutex. This two-layer approach is necessary because
+`flock()` is per-fd and per-process — a second goroutine calling `flock()` on
+the same fd would succeed immediately (the kernel considers the lock already
+held by this process).
 
 The `DB` struct holds a single dedicated fd for the write lock (`db.lockFd`),
 opened separately from the fd used for the reader table mmap. This fd is used
 exclusively for `flock()`/`funlock()` calls.
 
+#### Stale Writer Recovery
+
+If a process crashes while holding the write lock, `WriterPID` remains non-zero
+and the `flock()` is automatically released by the kernel (flock locks are
+released on fd close / process exit). On `Open()` or when attempting to acquire
+the write lock, if `WriterPID` is non-zero, the process checks whether the PID
+is still alive via `kill(pid, 0)`:
+
+- If alive: the writer is still running — proceed with normal `flock()` which
+  will block until the writer finishes.
+- If dead (`ESRCH`): the writer crashed. The flock is already released by the
+  kernel. The new writer acquires the flock, then performs recovery:
+  1. Read both meta pages and select the valid one (highest TxnID with valid
+     checksum). The crashed writer's partial commit is invisible — CoW ensures
+     the previous meta page points to a consistent tree.
+  2. Scan the reader table for slots with the dead writer's PID and clear them
+     (the crashed process may have also held read transactions).
+  3. Clear `WriterPID` to 0 (it will be set to the new writer's PID shortly).
+
+No special rollback logic is needed for tree consistency — the CoW model
+guarantees that the previous meta page points to a fully consistent tree.
+
+In **pwrite mode**, bitmap modifications are held in the dirty page set on
+the heap and only written at commit time. If the writer crashes before
+commit, no bitmap modifications reach disk — the on-disk bitmap is fully
+consistent with the previous meta page. No leaked pages.
+
+In **writemap mode**, bitmap modifications happen directly in the mmap and
+the OS may flush them to disk at any time. If the writer crashes, some
+bitmap bits may have been cleared (pages allocated) for pages that were
+never committed to any tree. These pages are "leaked" — the bitmap says
+they are in use, but no reachable structure references them. Leaked pages
+are recovered lazily: `Check()` can detect them (pages with cleared bitmap
+bits not reachable from any B+tree, RPL, or meta structure), and a
+recovery write transaction can set their bitmap bits. Alternatively,
+`CopyTo(compact=true)` produces a clean copy with no leaks. In practice,
+leaked pages from a crash are bounded by the crashed transaction's dirty
+set — a small, one-time space cost until recovered.
+
 ### Reader Table
 
-- On `BeginRead()`: scan the reader table for a slot with PID == 0. Atomically
-  CAS the PID field from 0 to the caller's PID to claim the slot. If the CAS
-  fails (another process or goroutine claimed it), try the next slot. Once the
-  slot is claimed, store the current meta TxnID into the slot's TxnID field.
-- On `EndRead()`: set the slot's TxnID to 0, then set PID to 0. This order
-  ensures the writer never sees a stale TxnID in an unclaimed slot.
-- Stale reader detection: if a PID in the reader table is no longer alive
-  (checked via `kill(pid, 0)` or `/proc/<pid>`), the slot can be reclaimed
-  by setting both TxnID and PID to 0.
+Slot allocation uses a simple scan with atomic CAS — no free stack or other
+auxiliary data structure. The reader table is a flat array of 16-byte slots
+stored in the lock file's shared mmap. All operations use atomic memory
+operations visible across processes.
+
+**Slot acquire (`Begin` read transaction):**
+1. Scan the reader table for a slot where `TxnID == 0` (free).
+2. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID.
+   If the CAS fails (another goroutine or process claimed the slot
+   concurrently), continue scanning.
+3. Store the caller's PID in the slot's `PID` field.
+4. If all slots are occupied, return `ErrReadersFull`.
+
+The CAS on `TxnID` is the serialization point. The scan is O(MaxReaders) in
+the worst case, but in practice most slots are concentrated at the low end
+of the array (temporal locality). With 16-byte slots, 4096 slots = 64KB —
+fits in L2 cache, sequential scan with hardware prefetching.
+
+**Slot release (`Commit`/`Rollback` read transaction):**
+1. Store `TxnID = 0` (atomic store). This single operation makes the slot
+   free. The PID field is left as-is — it is only meaningful when `TxnID`
+   is non-zero.
+
+The release is a single atomic store. No CAS needed — only the slot owner
+writes to its own slot.
+
+**Stale reader detection:** During the writer's reader table scan (to find
+the minimum active TxnID), if a slot has a non-zero `TxnID` and its `PID`
+is no longer alive (checked via `kill(pid, 0)` returning `ESRCH`), the
+writer clears the slot by storing `TxnID = 0`. This reclaims slots from
+crashed processes.
 
 #### Go Goroutine Model
 
@@ -732,35 +934,37 @@ reader table design. Each concurrent read transaction — regardless of which
 goroutine or OS thread runs it — claims its own slot via atomic CAS. Multiple
 slots may share the same PID (same process), which is correct:
 
-- **Slot allocation**: the CAS on the PID field serializes slot claims across
+- **Slot allocation**: the CAS on the TxnID field serializes slot claims across
   both goroutines (same process) and external processes.
 - **Stale detection**: `kill(pid, 0)` checks process liveness, not thread
   liveness. If a process crashes, all its slots (potentially many) are stale
   and can be reclaimed. This is the desired behavior.
 - **Oldest reader scan**: the writer finds the minimum TxnID across all
   occupied slots. Multiple slots from the same process with different TxnIDs
-  are handled naturally — the oldest one governs freelist reclamation.
+  are handled naturally — the oldest one governs RPL reclamation.
 
 The consequence is that a single Go process running N concurrent read
 transactions consumes N reader slots. Applications must set `MaxReaders`
 high enough to accommodate the expected total across all processes.
 
-### Writer's Freelist Reclamation
+### Writer's Page Reclamation
 
-Before reclaiming pages, the writer scans the reader table to find the minimum
-active TxnID. Any pages freed by transactions with TxnID < min_active are safe
-to reuse.
+Before reclaiming retired pages, the writer scans the reader table to find the
+minimum active TxnID. Any RPL entries with TxnID < min_active are safe to
+reclaim — their bits are set in the allocation bitmap, making them available
+for allocation.
 
 ### Slow Reader Handling
 
-A single long-lived reader prevents all freelist reclamation for transactions
+A single long-lived reader prevents all RPL reclamation for transactions
 newer than its snapshot, causing unbounded file growth. To address this, the
 application can register a `SlowReader` callback via `Options` (see API
 Surface) that is invoked when a reader is blocking page allocation.
 
 The callback is invoked from `pageAlloc()` when:
-1. The reclaimed page cache is empty.
-2. The freelist B+tree has no more reclaimable entries.
+1. The allocation bitmap has no suitable free pages.
+2. The RPL has no more reclaimable entries (all remaining entries have
+   `TxnID >= oldestReader`).
 3. A reader in the reader table is blocking reclamation.
 
 The callback receives information about the lagging reader and returns an
@@ -811,7 +1015,7 @@ MAP_SHARED | PROT_READ | PROT_WRITE
 ```
 
 The writer modifies pages directly in the mmap:
-- CoW still applies: the writer allocates a new page (from freelist or file
+- CoW still applies: the writer allocates a new page (from bitmap or file
   extension) and copies the old page's content into the new location **in the
   mmap**.
 - Modifications happen directly on the mmap'd page. No heap copy.
@@ -831,7 +1035,7 @@ The writer modifies pages directly in the mmap:
   page cache), spilling is unnecessary and does not apply. The OS handles
   eviction of mmap'd pages to disk transparently.
 - **Dirty page tracking**: the writer still tracks which pages were modified
-  (for the freelist and CoW bookkeeping), but the dirty set stores page IDs
+  (for the free space management and CoW bookkeeping), but the dirty set stores page IDs
   only — not page content.
 
 The full commit path covering both write modes and all sync modes is described
@@ -914,7 +1118,7 @@ file grows and shrinks.
 
 | Parameter | Meta Field | Description | Default |
 |-----------|-----------|-------------|---------|
-| Lower bound | `GeoLower` | Minimum file size in pages. File never shrinks below this. | 2 pages (meta pages only) |
+| Lower bound | `GeoLower` | Minimum file size in pages. File never shrinks below this. | `2 + BitmapPages` (meta + bitmap) |
 | Upper bound | `GeoUpper` | Maximum file size in pages. Determines mmap reservation size. | 256GB / PageSize |
 | Growth step | `GeoGrowPages` | Number of pages to grow by when extending the file. | 65536 pages (256MB at 4KB pages) |
 | Shrink threshold | `GeoShrinkPages` | Shrink the file when `fileSize - FirstUnallocated > threshold`. | 131072 pages (512MB at 4KB pages) |
@@ -1048,7 +1252,7 @@ type Options struct {
     WriteMap bool
 
     // MaxReaders is the maximum number of concurrent reader slots.
-    // Default: 126. Only used when creating a new lock file.
+    // Default: 4096. Only used when creating a new lock file.
     // Ignored when the lock file already exists (read from lock file header).
     MaxReaders int
 
@@ -1064,12 +1268,7 @@ type Options struct {
     // Default: 25 (merge when page is less than 25% full).
     MergeThreshold int
 
-    // GCTimeLimit is the maximum time to spend scanning the freelist
-    // for contiguous page runs during multi-page allocation. Zero means
-    // unlimited. Default: 0.
-    GCTimeLimit time.Duration
-
-    // SlowReader is called when a long-lived reader is blocking freelist
+    // SlowReader is called when a long-lived reader is blocking RPL
     // reclamation during page allocation. If nil, pageAlloc() falls
     // through to file extension when reclamation is blocked.
     SlowReader func(info SlowReaderInfo) SlowReaderAction
@@ -1087,7 +1286,7 @@ type Options struct {
 type Geometry struct {
     // Lower is the minimum database file size in bytes. The file never
     // shrinks below this. Must be a multiple of PageSize.
-    // Default: PageSize * 2 (meta pages only).
+    // Default: (2 + BitmapPages) * PageSize (meta + bitmap pages).
     Lower int64
 
     // Upper is the maximum database file size in bytes. Determines mmap
@@ -1104,7 +1303,7 @@ type Geometry struct {
     ShrinkThreshold int64
 }
 
-// SlowReaderInfo describes a reader that is blocking freelist reclamation.
+// SlowReaderInfo describes a reader that is blocking RPL reclamation.
 type SlowReaderInfo struct {
     PID       int    // process ID of the slow reader
     TxnID     uint64 // transaction ID the reader is holding
@@ -1266,9 +1465,9 @@ func (c *Cursor) CountDup() (int, error)
 
 // DBStats contains environment-level statistics.
 type DBStats struct {
-    // Freelist
-    FreePages    uint64 // total pages in freelist B+tree
-    PendingPages uint64 // pages freed but not yet reclaimable (held by readers)
+    // Free space
+    FreePages    uint64 // total free pages (set bits in allocation bitmap)
+    RetiredPages uint64 // pages in RPL, not yet reclaimable (held by readers)
 
     // Geometry
     FileSize     int64  // current data file size in bytes
@@ -1295,17 +1494,18 @@ const (
 type CheckIssue struct {
     Severity CheckSeverity
     PageID   uint64 // page where the issue was found (0 if N/A)
-    Keyspace string // keyspace name (empty if global/freelist)
+    Keyspace string // keyspace name (empty if global/bitmap/RPL)
     Message  string // human-readable description
 }
 
 // Check performs a full structural integrity walk of the database. It opens
-// a read transaction, walks all B+trees (keyspace trees, freelist tree),
-// and verifies:
+// a read transaction, walks all B+trees (keyspace trees), the allocation
+// bitmap, and the RPL, and verifies:
 //   - Meta page checksum validity
 //   - B+tree structural integrity (page reachability, no cycles, key ordering)
-//   - Freelist consistency (no overlap with data pages)
-//   - Page accounting (all pages accounted for: data + freelist + unallocated)
+//   - Bitmap consistency (no overlap between free and in-use pages)
+//   - RPL consistency (valid segment chain, no duplicate entries)
+//   - Page accounting (all pages accounted for: data + bitmap + RPL + free + unallocated)
 //   - Keyspace descriptor consistency (root page validity, counts)
 //   - DUPSORT subpage and nested B+tree integrity
 //
@@ -1332,7 +1532,7 @@ type TxStats struct {
     // Page management
     DirtyPages     uint64 // pages dirtied (CoW copies)
     LoosePages     uint64 // pages dirtied then freed in this txn
-    ReclaimedPages uint64 // pages reclaimed from freelist
+    ReclaimedPages uint64 // pages reclaimed from RPL into bitmap
     SpilledPages   uint64 // pages spilled to disk mid-transaction
     WrittenPages   uint64 // pages written at commit time
 
@@ -1370,16 +1570,16 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding. Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate checksum (including geometry fields). |
+| `page.go` | Page header encoding/decoding. Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate checksum (including geometry fields, bitmap/RPL pointers). RPL segment page: encode/decode entry list, segment linking. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance with configurable `MergeThreshold`). Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
-| `freelist.go` | Freelist B+tree with composite keys (TxnID \|\| PageID, big-endian, empty values). Page allocation with priority: loose pages → reclaimed cache → B+tree scan (LIFO, time-bounded) → slow reader check → file extension. Batched reclamation with early GC cleanup. Loose page tracking: singly-linked list of intra-transaction recycled pages. Tail page refund for auto-compaction. Commit-time freelist update: insert pending frees, delete consumed entries, convergence loop. |
+| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages, reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: singly-linked list of intra-transaction recycled pages. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
 | `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). LRU-based priority selection. Spill list tracking for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
-| `lock.go` | Lock file creation and mmap (shared memory). Writer lock (Go mutex intra-process + flock cross-process). Reader table: slot acquire/release, stale PID detection. Oldest-reader query for freelist reclamation. Slow reader detection and callback invocation. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, track dirty pages (with LRU counters in pwrite mode, page ID set in writemap mode), CoW operations, spill trigger (pwrite only), commit (freelist update + write/flush + meta swap + sync per SyncMode + geometry shrink), rollback. Stats accumulation. |
+| `lock.go` | Lock file creation and mmap (shared memory). Writer lock (Go mutex intra-process + flock cross-process + WriterPID). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, track dirty pages (with LRU counters in pwrite mode, page ID set in writemap mode), CoW operations, spill trigger (pwrite only), commit (RPL append + bitmap update + write/flush + meta swap + sync per SyncMode + geometry shrink), rollback. Stats accumulation. |
 | `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Keyspace management. Sync(). Check(). CopyTo(). |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
@@ -1454,3 +1654,10 @@ successful write, which modern filesystems (ext4, ZFS, btrfs) already detect.
   cannot be reused until all readers on that TxnID have finished.
 - **Stale reader recovery**: If a process crashes without releasing its reader
   slot, the PID-based detection allows the writer to reclaim the slot.
+- **Stale writer recovery**: If the writer process crashes, `WriterPID` in
+  the lock file header identifies the dead process. The kernel releases the
+  flock automatically. The next writer detects the dead PID, cleans up reader
+  slots from the crashed process, and proceeds — CoW guarantees the tree is
+  consistent. In pwrite mode, no bitmap corruption occurs (dirty pages never
+  reached disk). In writemap mode, some bitmap bits may leak (allocated but
+  uncommitted pages); recoverable via `Check()` or `CopyTo(compact=true)`.
