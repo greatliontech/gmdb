@@ -10,11 +10,14 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Concurrency | Single writer + N readers (MVCC/CoW) | Proven (LMDB), readers never block writer |
 | File layout | Fixed-size pages (4KB–64KB, configurable, immutable after creation) | Matches OS page size, mmap-friendly |
 | Value storage | Inline + overflow pages | Simple single read path, overflow for large values |
-| Free space | Freelist B+tree | LMDB-style, tracks free pages per txn |
+| Free space | Freelist B+tree (composite key, LIFO reclaim) | Fixed-size entries, no overflow in freelist, cache-friendly reclamation |
+| File geometry | Dynamic grow/shrink with configurable bounds | Auto-compaction via tail refund, no manual compaction needed |
 | Isolation | Dual meta pages + CoW | No WAL needed, atomic commit |
 | Crash safety | CoW + atomic meta page swap | File is always consistent |
 | Cross-process | Shared memory lock file | Reader table for tracking oldest active reader |
+| Slow readers | Callback-based notification | Application controls policy; no silent unbounded growth |
 | mmap | MAP_SHARED read + pwrite() for writes | OS handles cache coherency |
+| Page spilling | LRU-based spill to disk mid-transaction | Bounds memory usage for large write transactions |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
 | Checksums | Meta pages only | CoW protects data pages; meta checksum detects torn commits |
@@ -68,18 +71,26 @@ Meta Page
 | Version          | uint32 - format version
 | PageSize         | uint32 - page size in bytes
 | Flags            | uint32 - reserved
+| GeoLower         | uint64 - minimum database size in pages
+| GeoUpper         | uint64 - maximum database size in pages
+| GeoGrowPages     | uint64 - growth step in pages
+| GeoShrinkPages   | uint64 - shrink threshold in pages
+| FirstUnallocated | uint64 - first unallocated page ID (high-water mark)
 | FreelistRoot     | uint64 - root page of freelist B+tree
 | NumFreePages     | uint64 - total free pages
 | KeyspaceRoot     | uint64 - root page of keyspace B+tree
 | NumKeyspaces     | uint64 - number of keyspaces
-| LastPageID       | uint64 - highest allocated page ID
 | TxnID            | uint64 - transaction ID that wrote this meta
 | Checksum         | uint64 - xxhash of all preceding bytes (header through TxnID)
 +------------------+
 ```
 
-Total meta page payload: 16 (header) + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 +
-8 + 8 = 88 bytes. Fits comfortably in any supported page size (min 4KB).
+Total meta page payload: 16 (header) + 4 + 4 + 4 + 4 + 8×10 + 8 = 120
+bytes. Fits comfortably in any supported page size (min 4KB).
+
+The geometry fields (`GeoLower`, `GeoUpper`, `GeoGrowPages`,
+`GeoShrinkPages`) are stored in the meta page so that they persist across
+opens and are available to all processes (see Database Geometry).
 
 The active meta page is the one with the highest TxnID whose checksum is valid.
 If a crash happens mid-write to the meta page, the checksum will be invalid and
@@ -277,8 +288,8 @@ a sorted slice of page IDs).
 
 The reclamation flow:
 1. On the first `pageAlloc()` call that finds no loose pages, the writer scans
-   the freelist B+tree from the beginning, collecting all entries where
-   `TxnID < oldestReader` into `tx.reclaimedPages`.
+   the freelist B+tree collecting all entries where `TxnID < oldestReader`
+   into `tx.reclaimedPages`. The scan direction is LIFO (see below).
 2. The collected page IDs are sorted in ascending order.
 3. Subsequent `pageAlloc()` calls pop pages from `tx.reclaimedPages` (O(1)).
 4. For multi-page (contiguous) allocations, `tx.reclaimedPages` is scanned for
@@ -289,6 +300,36 @@ The reclamation flow:
 This turns N individual B+tree lookups into one range scan + one batch delete,
 significantly reducing B+tree operations during a write transaction.
 
+##### LIFO Reclamation
+
+When scanning the freelist B+tree for reclaimable pages, the writer scans in
+**reverse order** — starting from the newest eligible transaction and working
+backward. The scan begins by seeking to the composite key
+`(oldestReader - 1, MaxUint64)` and iterating with `Prev()`.
+
+LIFO reclamation reuses recently-freed pages first. This has several benefits:
+- **Cache efficiency**: recently freed pages are more likely to still be in the
+  OS page cache. Reusing them avoids disk reads for the new transaction's
+  writes.
+- **Smaller working set**: the set of pages that cycle through
+  write/free/reuse stays small, improving both page cache hit rates and
+  write-back efficiency.
+- **Better for SSD/NVMe**: reduces write amplification by concentrating writes
+  on recently-written pages rather than spreading across the entire file.
+
+##### Early GC Cleanup
+
+During reclamation, when the writer reads a freelist entry into
+`tx.reclaimedPages`, it immediately deletes that entry from the freelist
+B+tree (rather than deferring all deletes to commit time). The B+tree pages
+freed by the deletion become loose pages, which are immediately available for
+allocation. This reduces commit-time work and makes more pages available
+during the transaction.
+
+Early cleanup is performed only when the writer has sufficient "stockpile"
+(loose pages + reclaimed pages) to cover the CoW cost of the deletion itself,
+preventing the deletion from triggering file extension.
+
 ##### Oldest Reader Caching
 
 Scanning the reader table to find the minimum active TxnID is O(MaxReaders).
@@ -297,6 +338,16 @@ lazily — only when the reclaimed page cache is exhausted and a new scan is
 needed. Reading a stale (higher) value is conservative: it delays reclamation
 but never causes incorrect behavior.
 
+##### Time-Bounded Reclamation
+
+The freelist B+tree scan in `pageAlloc()` is bounded by both an iteration
+limit and a time limit (`Options.GCTimeLimit`, default 0 = unlimited). If the
+scan exceeds either bound without finding a suitable page (or contiguous run),
+it stops and falls through to file extension. This prevents pathological
+latency spikes on large, fragmented freelists. The limit applies only to
+multi-page (contiguous) allocation searches — single-page allocation from the
+reclaimed cache is always O(1).
+
 #### Page Allocation Priority
 
 `pageAlloc(n)` allocates `n` contiguous pages using this priority:
@@ -304,11 +355,29 @@ but never causes incorrect behavior.
 1. **Loose pages** (n=1 only): pop from `tx.loosePages`. O(1).
 2. **Reclaimed page cache**: search `tx.reclaimedPages` for a suitable page
    (n=1) or a contiguous run (n>1).
-3. **Freelist B+tree scan**: if the cache is empty, scan the freelist B+tree
-   for reclaimable entries (TxnID < oldest reader), populate the cache, and
-   retry step 2.
-4. **File extension**: if no free pages are available, extend the file by
-   advancing `LastPageID` and growing the file via `ftruncate()`.
+3. **Freelist B+tree scan**: if the cache is empty or lacks a contiguous run,
+   scan the freelist B+tree for reclaimable entries (TxnID < oldest reader),
+   populate the cache, and retry step 2. Subject to time/iteration bounds.
+4. **Slow reader check**: if reclamation is blocked by a long-lived reader,
+   invoke the slow reader callback (see Cross-Process Coordination). If the
+   reader releases, refresh the oldest reader cache and retry step 3.
+5. **File extension**: if no free pages are available, grow the file according
+   to the geometry growth step and advance `FirstUnallocated`.
+
+##### Tail Page Refund
+
+After populating or modifying `tx.reclaimedPages` or `tx.loosePages`, the
+writer checks if any pages at the tail of the database file (page IDs equal
+to `FirstUnallocated - 1`, `FirstUnallocated - 2`, etc.) are present in these
+lists. If so, those pages are removed from the lists and `FirstUnallocated` is
+decremented. This
+reclaims space without going through the freelist, and enables file shrinkage
+at commit time (see Database Geometry).
+
+The refund process iterates: removing tail pages may expose new tail pages in
+the lists. It runs until no more tail pages are found. Loose pages are checked
+first (by scanning the linked list), then reclaimed pages (by checking the
+sorted slice from the end).
 
 #### Freeing Pages
 
@@ -335,34 +404,88 @@ During commit, the writer:
 
 Steps 2-3 happen before the dirty page flush and meta page swap.
 
+## Page Spilling
+
+When a write transaction dirties more pages than can fit in available memory,
+dirty pages must be spilled (written to disk mid-transaction) to make room for
+further modifications. Without spilling, very large write transactions would
+consume unbounded memory.
+
+### Spill Trigger
+
+Spilling is triggered when the dirty page count exceeds `Options.MaxDirtyPages`
+(default: 65536). The writer selects a subset of dirty pages to write to disk
+via `pwrite()`, removing them from the in-memory dirty set.
+
+### LRU-Based Spill Priority
+
+Pages are selected for spilling based on a Least Recently Used (LRU) policy.
+Each dirty page carries a `lastUsed` counter that is updated whenever the page
+is accessed or modified during the transaction. When spilling, pages with the
+lowest `lastUsed` values are spilled first — these are the pages least likely
+to be accessed again.
+
+This is significantly better than arbitrary or page-number-ordered spilling.
+Pages that are actively being modified (e.g., B+tree internal nodes on the
+current insertion path) stay in memory, while cold pages (e.g., leaf pages
+from earlier bulk insertions) are spilled.
+
+### Spill Mechanics
+
+1. Sort dirty pages by `lastUsed` (ascending — coldest first).
+2. Write the selected pages to their allocated positions via `pwrite()`. Group
+   adjacent pages into single write calls where possible.
+3. Remove spilled pages from the dirty set and record their page IDs in
+   `tx.spilledPages` (a sorted slice).
+4. If a spilled page is later accessed again (e.g., a B+tree traversal reaches
+   it), it is re-read from the mmap and re-dirtied. The `spilledPages` list is
+   checked during page lookup to detect this case.
+
+### Interaction with Freelist
+
+Spilled pages remain allocated — they are not freed or added to the freelist.
+They are simply written to their final on-disk location early. At commit time,
+spilled pages do not need to be written again (they are already on disk). The
+commit only needs to write the remaining (non-spilled) dirty pages and the
+meta page.
+
+Freelist B+tree pages are never spilled. They are always kept in memory
+because the freelist is modified during commit-time freelist update and
+spilling them would cause unnecessary re-dirtying.
+
 ## Copy-on-Write (CoW) Transaction Model
 
 ### Write Transaction
 
 1. Writer acquires exclusive write lock (flock on lock file).
-2. Writer reads the active meta page to get current roots and TxnID.
+2. Writer reads the active meta page to get current roots, TxnID, and geometry.
 3. For each modification (insert, update, delete):
    - Traverse the B+tree from root to leaf.
    - Copy each page along the path (don't modify in place).
    - Allocate new pages via `pageAlloc()` (loose pages → reclaimed cache →
-     freelist B+tree scan → file extension).
-   - Modified pages are written to their new locations via `pwrite()`.
+     freelist B+tree scan → slow reader check → file extension).
+   - Modified pages are held in memory as dirty pages (with LRU counters).
    - Old pages are tracked: pages from previous transactions go to
      `tx.pendingFrees`; pages dirtied then freed in this transaction become
      loose pages in `tx.loosePages`.
+   - If the dirty page count exceeds `MaxDirtyPages`, spill the coldest
+     dirty pages to disk via `pwrite()` (LRU-based selection).
 4. Commit-time freelist update:
-   a. Move remaining loose pages into `tx.pendingFrees`.
-   b. Insert all `tx.pendingFrees` into the freelist B+tree under the current
+   a. Perform tail page refund: remove pages at the end of the file from
+      `tx.loosePages` and `tx.reclaimedPages`, decrement `FirstUnallocated`.
+   b. Move remaining loose pages into `tx.pendingFrees`.
+   c. Insert all `tx.pendingFrees` into the freelist B+tree under the current
       TxnID.
-   c. Delete consumed entries (pages allocated from the reclaimed cache) from
+   d. Delete consumed entries (pages allocated from the reclaimed cache) from
       the freelist B+tree.
-   d. Repeat b-c if the freelist B+tree operations produced new pending frees
+   e. Repeat c-d if the freelist B+tree operations produced new pending frees
       (convergence loop — typically 1-2 iterations).
-5. All dirty pages are written and `fdatasync()`'d.
-6. The inactive meta page is updated with new root pointers, new TxnID, and
-   checksum.
-7. The meta page is `fdatasync()`'d. This is the atomic commit point.
-8. Writer releases exclusive lock.
+5. All non-spilled dirty pages are written via `pwrite()` and `fdatasync()`'d.
+6. If `fileSize - FirstUnallocated > GeoShrinkPages`, truncate the file.
+7. The inactive meta page is updated with new root pointers, new TxnID,
+   updated geometry, and checksum.
+8. The meta page is `fdatasync()`'d. This is the atomic commit point.
+9. Writer releases exclusive lock.
 
 ### Read Transaction
 
@@ -444,6 +567,43 @@ Before reclaiming pages, the writer scans the reader table to find the minimum
 active TxnID. Any pages freed by transactions with TxnID < min_active are safe
 to reuse.
 
+### Slow Reader Handling
+
+A single long-lived reader prevents all freelist reclamation for transactions
+newer than its snapshot, causing unbounded file growth. To address this, the
+application can register a callback that is invoked when a reader is blocking
+page allocation:
+
+```go
+type SlowReaderInfo struct {
+    PID        int      // process ID of the slow reader
+    TxnID      uint64   // transaction ID the reader is holding
+    Lag        uint64   // number of transactions behind current
+    HeldPages  uint64   // estimated number of pages held unreclaimable
+}
+
+type SlowReaderAction int
+
+const (
+    SlowReaderWait   SlowReaderAction = iota // retry, reader may release
+    SlowReaderAbort                          // abort allocation with ErrDBFull
+)
+```
+
+The callback is invoked from `pageAlloc()` when:
+1. The reclaimed page cache is empty.
+2. The freelist B+tree has no more reclaimable entries.
+3. A reader in the reader table is blocking reclamation.
+
+The callback receives information about the lagging reader and returns an
+action. `SlowReaderWait` causes `pageAlloc()` to refresh the reader table
+and retry (the reader may have released its slot in the meantime).
+`SlowReaderAbort` causes `pageAlloc()` to return `ErrDBFull`.
+
+The callback is invoked at most once per `pageAlloc()` call to avoid busy
+loops. The application can use the callback to log warnings, send alerts,
+or take corrective action (e.g., killing a stuck process identified by PID).
+
 ## mmap Strategy
 
 ### Read Path
@@ -470,28 +630,60 @@ from the writer's perspective.
 
 ### mmap Resizing
 
-When the writer extends the file (allocates pages beyond the current mmap size),
-readers need to remap. Options:
-
-1. **Over-allocate virtual address space**: mmap a large region (e.g., 1TB of
-   virtual space) upfront but only the file-backed portion is usable. As the
-   file grows, the existing mapping covers the new pages automatically. This
-   works on 64-bit systems. The unmapped region beyond the file size will
-   SIGBUS if accessed, so readers must check `LastPageID` from the meta page.
-
-2. **Remap on transaction start**: Each time a reader begins a transaction, it
-   checks if the file has grown beyond its current mmap. If so, it remaps.
-   This is the bbolt approach.
-
-Option 1 (over-allocate) is simpler and avoids remapping. The database sets a
-maximum database size at creation time (default 256GB, configurable). This only
-reserves virtual address space, not physical memory.
+The mmap region is sized to `GeoUpper` (the maximum database size in pages).
+This over-allocates virtual address space — only the file-backed portion is
+usable, but the mapping does not need to change as the file grows or shrinks.
+The unmapped region beyond the file size will SIGBUS if accessed, so readers
+must check `FirstUnallocated` from the meta page.
 
 **Note**: Large virtual address reservations may be affected by Linux
 `vm.overcommit_memory` settings or per-process `RLIMIT_AS` limits. On most
 default configurations this is not an issue — the kernel distinguishes between
 reserved virtual address space and committed memory. Users with restrictive
-settings may need to lower `MaxDBSize`.
+settings may need to lower `GeoUpper`.
+
+## Database Geometry
+
+The database file size is managed dynamically between configurable lower and
+upper bounds. The geometry is stored in the meta page and controls how the
+file grows and shrinks.
+
+### Geometry Parameters
+
+| Parameter | Meta Field | Description | Default |
+|-----------|-----------|-------------|---------|
+| Lower bound | `GeoLower` | Minimum file size in pages. File never shrinks below this. | 2 pages (meta pages only) |
+| Upper bound | `GeoUpper` | Maximum file size in pages. Determines mmap reservation size. | 256GB / PageSize |
+| Growth step | `GeoGrowPages` | Number of pages to grow by when extending the file. | 65536 pages (256MB at 4KB pages) |
+| Shrink threshold | `GeoShrinkPages` | Shrink the file when `fileSize - FirstUnallocated > threshold`. | 131072 pages (512MB at 4KB pages) |
+
+Geometry is set at database creation time via `Options` and persisted in the
+meta page. It can be modified by calling `DB.SetGeometry()` within a write
+transaction — the new values take effect at the next commit.
+
+### File Growth
+
+When `pageAlloc()` needs to extend the file:
+1. Calculate new size: `alignUp(FirstUnallocated + needed, GeoGrowPages)`.
+2. Clamp to `GeoUpper`. If the new size would exceed `GeoUpper`, return
+   `ErrDBFull`.
+3. Extend the file via `ftruncate()`. The existing mmap (which reserves up to
+   `GeoUpper`) covers the new pages automatically — no remap needed.
+
+### File Shrinkage
+
+At commit time, after the tail page refund (see Freelist Runtime
+Optimizations), if `fileSize - FirstUnallocated > GeoShrinkPages`:
+1. Calculate new size: `alignUp(FirstUnallocated, GeoGrowPages)`.
+2. Clamp to `GeoLower`.
+3. Truncate the file via `ftruncate()`. The mmap reservation remains at
+   `GeoUpper` — the truncated region becomes unmapped (SIGBUS on access),
+   which is safe because `FirstUnallocated` in the meta page prevents any
+   reader from accessing those pages.
+
+File shrinkage is automatic and zero-overhead — it happens as a natural
+consequence of the tail page refund mechanism during commit. No explicit
+compaction is needed for the common case of data deletion.
 
 ## Keyspaces
 
@@ -530,14 +722,30 @@ type Options struct {
     // Ignored when opening an existing database (read from meta page).
     PageSize int
 
-    // MaxDBSize is the maximum virtual address space to reserve.
-    // Default: 256GB. Only affects mmap reservation, not disk usage.
-    MaxDBSize int64
+    // Geometry controls database file size bounds and growth behavior.
+    // Only used when creating a new database. When opening an existing
+    // database, geometry is read from the meta page. Use DB.SetGeometry()
+    // to modify geometry of an existing database within a write transaction.
+    Geometry Geometry
 
     // MaxReaders is the maximum number of concurrent reader slots.
     // Default: 126. Only used when creating a new lock file.
     // Ignored when the lock file already exists (read from lock file header).
     MaxReaders int
+
+    // MaxDirtyPages is the maximum number of dirty pages held in memory
+    // before spilling to disk. Default: 65536.
+    MaxDirtyPages int
+
+    // GCTimeLimit is the maximum time to spend scanning the freelist
+    // for contiguous page runs during multi-page allocation. Zero means
+    // unlimited. Default: 0.
+    GCTimeLimit time.Duration
+
+    // SlowReader is called when a long-lived reader is blocking freelist
+    // reclamation during page allocation. If nil, pageAlloc() falls
+    // through to file extension when reclamation is blocked.
+    SlowReader func(info SlowReaderInfo) SlowReaderAction
 
     // FileMode for newly created files. Default: 0644.
     FileMode os.FileMode
@@ -546,10 +754,50 @@ type Options struct {
     ReadOnly bool
 }
 
+// Geometry controls the database file size bounds and growth/shrink behavior.
+type Geometry struct {
+    // Lower is the minimum database file size. The file never shrinks below
+    // this. Default: PageSize * 2 (meta pages only).
+    Lower int64
+
+    // Upper is the maximum database file size. Determines mmap reservation
+    // size. Default: 256GB.
+    Upper int64
+
+    // GrowStep is the number of bytes to grow by when extending the file.
+    // Must be a multiple of PageSize. Default: 256MB.
+    GrowStep int64
+
+    // ShrinkThreshold is the minimum number of bytes of unused space at
+    // the end of the file before shrinking occurs. Must be a multiple of
+    // PageSize. Default: 512MB.
+    ShrinkThreshold int64
+}
+
+// SlowReaderInfo describes a reader that is blocking freelist reclamation.
+type SlowReaderInfo struct {
+    PID       int    // process ID of the slow reader
+    TxnID     uint64 // transaction ID the reader is holding
+    Lag       uint64 // number of transactions behind current
+    HeldPages uint64 // estimated number of pages held unreclaimable
+}
+
+// SlowReaderAction determines how pageAlloc responds to a slow reader.
+type SlowReaderAction int
+
+const (
+    SlowReaderWait  SlowReaderAction = iota // retry, reader may release
+    SlowReaderAbort                         // abort with ErrDBFull
+)
+
 // DB is a handle to an open database.
 type DB struct { ... }
 
 func (db *DB) Close() error
+
+// SetGeometry updates the database geometry. Must be called within a write
+// transaction. The new geometry takes effect at the next commit.
+func (db *DB) SetGeometry(g Geometry) error
 
 // View executes a read-only transaction.
 func (db *DB) View(fn func(tx *Tx) error) error
@@ -601,15 +849,17 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding. Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references. Meta page: encode/decode/validate checksum. |
+| `page.go` | Page header encoding/decoding. Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references. Meta page: encode/decode/validate checksum (including geometry fields). |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance). Cursor: stateful iterator holding a stack of (pageID, index) pairs. All operations work on page byte slices (from mmap), never Go heap objects. |
-| `freelist.go` | Freelist B+tree with composite keys (TxnID \|\| PageID, big-endian, empty values). Page allocation with priority: loose pages → reclaimed cache → B+tree scan → file extension. Batched reclamation: range scan reclaimable entries (TxnID < oldest reader) into in-memory cache, batch delete at commit. Loose page tracking: singly-linked list of intra-transaction recycled pages. Commit-time freelist update: insert pending frees, delete consumed entries, convergence loop. |
-| `mmap.go` | Platform-specific mmap/munmap. Initial mapping with over-allocated virtual address space. File extension (ftruncate + mapping covers it automatically). |
+| `freelist.go` | Freelist B+tree with composite keys (TxnID \|\| PageID, big-endian, empty values). Page allocation with priority: loose pages → reclaimed cache → B+tree scan (LIFO, time-bounded) → slow reader check → file extension. Batched reclamation with early GC cleanup. Loose page tracking: singly-linked list of intra-transaction recycled pages. Tail page refund for auto-compaction. Commit-time freelist update: insert pending frees, delete consumed entries, convergence loop. |
+| `spill.go` | Dirty page spilling to disk mid-transaction. LRU-based priority selection. Spill list tracking for re-dirtying detection. Adjacent page grouping for efficient I/O. |
+| `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `SetGeometry()` for runtime modification. |
+| `mmap.go` | Platform-specific mmap/munmap. Initial mapping with over-allocated virtual address space (sized to GeoUpper). |
 | `mmap_linux.go` | Linux mmap/munmap syscalls. |
 | `mmap_darwin.go` | macOS mmap/munmap syscalls. |
-| `lock.go` | Lock file creation and mmap (shared memory). Writer lock (flock-based). Reader table: slot acquire/release, stale PID detection. Oldest-reader query for freelist reclamation. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, track dirty pages, CoW operations, commit (write pages + fsync + meta swap + fsync), rollback. |
-| `db.go` | Open/Close. Environment setup (mmap, lock file). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Keyspace management. |
+| `lock.go` | Lock file creation and mmap (shared memory). Writer lock (flock-based). Reader table: slot acquire/release, stale PID detection. Oldest-reader query for freelist reclamation. Slow reader detection and callback invocation. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, track dirty pages (with LRU counters), CoW operations, spill trigger, commit (freelist update + write pages + fsync + geometry shrink + meta swap + fsync), rollback. |
+| `db.go` | Open/Close. Environment setup (mmap, lock file, geometry). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Keyspace management. |
 
 ## Limits
 
@@ -640,7 +890,7 @@ Enforced at `Put()` time. Keys exceeding the limit return an error.
 
 Inline values are limited by available space in the leaf page. Values that
 exceed this are automatically stored as overflow pages. There is no practical
-upper limit on value size (bounded only by disk space and `MaxDBSize`).
+upper limit on value size (bounded only by disk space and `GeoUpper`).
 
 ## Checksums
 
