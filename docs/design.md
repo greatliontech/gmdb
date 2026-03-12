@@ -85,8 +85,8 @@ Meta Page
 +------------------+
 ```
 
-Total meta page payload: 16 (header) + 4 + 4 + 4 + 4 + 8×10 + 8 = 120
-bytes. Fits comfortably in any supported page size (min 4KB).
+Total meta page payload: 16 (header) + 4 + 4 + 4 + 4 + 11×8 = 120 bytes.
+Fits comfortably in any supported page size (min 4KB).
 
 The geometry fields (`GeoLower`, `GeoUpper`, `GeoGrowPages`,
 `GeoShrinkPages`) are stored in the meta page so that they persist across
@@ -236,9 +236,9 @@ This design has several advantages:
   Each entry is just a 16-byte key with no value.
 - **No overflow concern**: a single transaction freeing many pages creates many
   small entries rather than one large value that could overflow a leaf page.
-- **Efficient range scan for reclamation**: to reclaim all pages freed by
-  transactions older than the oldest active reader, the writer seeks to the
-  beginning of the tree and scans forward until `TxnID >= oldest_reader`.
+- **Efficient range scan for reclamation**: all entries with
+  `TxnID < oldest_reader` are reclaimable. The scan direction is LIFO
+  (newest eligible first — see Freelist Runtime Optimizations).
 - **Simple allocation**: pop entries from the reclaimable range and delete them
   from the B+tree.
 - **Bounded self-referential impact**: each insert/delete is a fixed-size
@@ -252,9 +252,9 @@ reclaim.
 
 #### Freelist Runtime Optimizations
 
-Three runtime optimizations reduce freelist B+tree churn and improve allocation
-performance. These are inspired by LMDB's approach, adapted to the composite
-key design.
+Several runtime optimizations reduce freelist B+tree churn and improve
+allocation performance. These are inspired by LMDB and libmdbx, adapted to
+the composite key design.
 
 ##### Loose Pages
 
@@ -370,8 +370,8 @@ After populating or modifying `tx.reclaimedPages` or `tx.loosePages`, the
 writer checks if any pages at the tail of the database file (page IDs equal
 to `FirstUnallocated - 1`, `FirstUnallocated - 2`, etc.) are present in these
 lists. If so, those pages are removed from the lists and `FirstUnallocated` is
-decremented. This
-reclaims space without going through the freelist, and enables file shrinkage
+decremented. This reclaims space without going through the freelist, and
+enables file shrinkage
 at commit time (see Database Geometry).
 
 The refund process iterates: removing tail pages may expose new tail pages in
@@ -396,7 +396,8 @@ During commit, the writer:
 1. Moves any remaining loose pages into `tx.pendingFrees`.
 2. Inserts all `tx.pendingFrees` entries into the freelist B+tree as
    `(currentTxnID || pageID)` keys with empty values.
-3. Deletes all consumed entries from the freelist B+tree (pages that were in
+3. Deletes any remaining consumed entries from the freelist B+tree that were
+   not already removed by early GC cleanup (pages that were in
    `tx.reclaimedPages` and allocated during this transaction).
 4. The insertion/deletion loop may itself dirty or free freelist B+tree pages.
    Because each operation has bounded space impact (fixed-size entries, no
@@ -476,15 +477,18 @@ spilling them would cause unnecessary re-dirtying.
    b. Move remaining loose pages into `tx.pendingFrees`.
    c. Insert all `tx.pendingFrees` into the freelist B+tree under the current
       TxnID.
-   d. Delete consumed entries (pages allocated from the reclaimed cache) from
-      the freelist B+tree.
+   d. Delete any remaining consumed entries (pages allocated from the
+      reclaimed cache) not already removed by early GC cleanup.
    e. Repeat c-d if the freelist B+tree operations produced new pending frees
       (convergence loop — typically 1-2 iterations).
 5. All non-spilled dirty pages are written via `pwrite()` and `fdatasync()`'d.
-6. If `fileSize - FirstUnallocated > GeoShrinkPages`, truncate the file.
-7. The inactive meta page is updated with new root pointers, new TxnID,
-   updated geometry, and checksum.
-8. The meta page is `fdatasync()`'d. This is the atomic commit point.
+6. The inactive meta page is updated with new root pointers, new TxnID,
+   updated `FirstUnallocated`, and checksum.
+7. The meta page is `fdatasync()`'d. This is the atomic commit point.
+8. If `fileSize - FirstUnallocated > GeoShrinkPages`, truncate the file via
+   `ftruncate()`. This happens after the commit point — a crash before
+   truncation leaves the file larger than necessary but consistent. The
+   next commit will retry the truncation.
 9. Writer releases exclusive lock.
 
 ### Read Transaction
@@ -571,24 +575,8 @@ to reuse.
 
 A single long-lived reader prevents all freelist reclamation for transactions
 newer than its snapshot, causing unbounded file growth. To address this, the
-application can register a callback that is invoked when a reader is blocking
-page allocation:
-
-```go
-type SlowReaderInfo struct {
-    PID        int      // process ID of the slow reader
-    TxnID      uint64   // transaction ID the reader is holding
-    Lag        uint64   // number of transactions behind current
-    HeldPages  uint64   // estimated number of pages held unreclaimable
-}
-
-type SlowReaderAction int
-
-const (
-    SlowReaderWait   SlowReaderAction = iota // retry, reader may release
-    SlowReaderAbort                          // abort allocation with ErrDBFull
-)
-```
+application can register a `SlowReader` callback via `Options` (see API
+Surface) that is invoked when a reader is blocking page allocation.
 
 The callback is invoked from `pageAlloc()` when:
 1. The reclaimed page cache is empty.
@@ -755,13 +743,16 @@ type Options struct {
 }
 
 // Geometry controls the database file size bounds and growth/shrink behavior.
+// All sizes are specified in bytes and must be multiples of PageSize. They are
+// converted to pages internally and stored in the meta page as page counts.
 type Geometry struct {
-    // Lower is the minimum database file size. The file never shrinks below
-    // this. Default: PageSize * 2 (meta pages only).
+    // Lower is the minimum database file size in bytes. The file never
+    // shrinks below this. Must be a multiple of PageSize.
+    // Default: PageSize * 2 (meta pages only).
     Lower int64
 
-    // Upper is the maximum database file size. Determines mmap reservation
-    // size. Default: 256GB.
+    // Upper is the maximum database file size in bytes. Determines mmap
+    // reservation size. Must be a multiple of PageSize. Default: 256GB.
     Upper int64
 
     // GrowStep is the number of bytes to grow by when extending the file.
