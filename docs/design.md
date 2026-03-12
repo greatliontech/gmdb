@@ -1459,11 +1459,12 @@ usable, but the mapping does not need to change as the file grows or shrinks.
 The unmapped region beyond the file size will SIGBUS if accessed, so readers
 must check `FirstUnallocated` from the meta page.
 
-**Note**: Large virtual address reservations may be affected by Linux
-`vm.overcommit_memory` settings or per-process `RLIMIT_AS` limits. On most
-default configurations this is not an issue — the kernel distinguishes between
-reserved virtual address space and committed memory. Users with restrictive
-settings may need to lower `GeoUpper`.
+**Note**: `MAP_SHARED` file-backed mappings are not charged against Linux
+`vm.overcommit_memory` accounting — the file is the backing store, not swap.
+However, per-process `RLIMIT_AS` limits do apply to virtual address space
+reservations regardless of mapping type. On most default configurations
+`RLIMIT_AS` is unlimited and this is not an issue. Users with restrictive
+`RLIMIT_AS` settings may need to lower `GeoUpper`.
 
 ### Prefaulting (Linux 5.14+)
 
@@ -2183,23 +2184,26 @@ key/value serialization automatically:
 ```go
 // TypedKeyspace wraps a Keyspace with type-safe key/value encoding.
 type TypedKeyspace[K, V any] struct {
-    name   []byte
-    encKey func(K) []byte
-    decKey func([]byte) K
-    encVal func(V) []byte
-    decVal func([]byte) V
-    flags  KeyspaceFlags
+    name      []byte
+    encKey    func(K) []byte
+    decKey    func([]byte) K
+    encVal    func(V) []byte
+    decVal    func([]byte) V
+    flags     KeyspaceFlags
+    fixedSize uint16 // only meaningful when flags includes KfDupFixed
 }
 
 // NewTypedKeyspace creates a typed keyspace descriptor. The encoder/decoder
 // functions handle serialization between Go types and byte slices. The
 // key encoder MUST produce lexicographically ordered output for the
 // desired key ordering — the underlying B+tree sorts keys as raw bytes.
+// fixedSize is only used when flags includes KfDupFixed — it sets the
+// fixed duplicate value size in bytes. Ignored otherwise.
 func NewTypedKeyspace[K, V any](
     name string,
     encKey func(K) []byte, decKey func([]byte) K,
     encVal func(V) []byte, decVal func([]byte) V,
-    flags KeyspaceFlags,
+    flags KeyspaceFlags, fixedSize uint16,
 ) *TypedKeyspace[K, V]
 
 // Open opens the typed keyspace within a transaction.
