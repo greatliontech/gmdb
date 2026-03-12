@@ -27,6 +27,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Checksums | Meta pages only | CoW protects data pages; meta checksum detects torn commits |
 | API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime |
 | Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
+| Leak detection | `runtime.AddCleanup` on `Tx` | Detects leaked transactions, releases reader slots, logs origin stack trace |
 | Namespaces | Named keyspaces | Multiple B+trees in one file |
 
 ## File Layout
@@ -958,6 +959,96 @@ N-ways.
   unexpected interactions).
 - Transactions that need exclusive control over commit timing.
 
+### Transaction Leak Detection
+
+A transaction that is garbage collected without `Commit()` or `Rollback()`
+is a resource leak: the reader slot (or write lock) is held indefinitely,
+blocking RPL reclamation and potentially causing unbounded file growth.
+This is the most common user error with LMDB/libmdbx-style databases.
+
+gmdb uses `runtime.AddCleanup` (Go 1.24+) to detect and recover from
+leaked transactions automatically.
+
+#### Setup
+
+When `Begin()` creates a `Tx`, a cleanup is registered:
+
+```go
+tx := &Tx{...}
+tx.cleanup = runtime.AddCleanup(tx, func(info txCleanupInfo) {
+    // 1. Log warning with the stack trace captured at Begin() time.
+    // 2. Release the reader slot (or write lock + semaphore).
+}, txCleanupInfo{
+    slotIndex:  tx.readerSlot,
+    writable:   tx.writable,
+    beginStack: captureStack(),
+    db:         tx.db,
+})
+```
+
+`txCleanupInfo` is a separate struct — not the `Tx` itself. This is
+required by `AddCleanup`: the cleanup function must not reference the
+object being cleaned up (no resurrection). The struct contains only the
+information needed to release resources and log a diagnostic.
+
+`captureStack()` calls `runtime.Callers()` at `Begin()` time to record
+the call stack. This is stored in `txCleanupInfo` and included in the
+warning message so the user can identify exactly where the leaked
+transaction was opened.
+
+#### Normal Close
+
+When `Commit()` or `Rollback()` is called, the cleanup is cancelled:
+
+```go
+func (tx *Tx) Commit() error {
+    tx.cleanup.Stop()
+    // ... normal commit logic ...
+}
+```
+
+`runtime.Cleanup.Stop()` prevents the cleanup function from running. In
+the normal (non-leak) case, `AddCleanup` at `Begin()` time and `Stop()`
+at close time are the only overhead — both are cheap operations with no
+allocation.
+
+#### Cleanup Behavior
+
+When the GC collects a leaked `Tx`:
+
+1. **Log a warning** via the `*slog.Logger` on the `DB` struct (see
+   Options). The message includes:
+   - Whether it was a read or write transaction.
+   - The TxnID held by the transaction.
+   - The stack trace from `Begin()` showing where the leak originated.
+
+2. **Release the reader slot** by storing `TxnID = 0` (atomic store) in
+   the reader table. This unblocks RPL reclamation for pages held by the
+   leaked transaction's snapshot.
+
+3. **Release the write lock** (if writable): clear `WriterPID`, release
+   the flock, release the intra-process semaphore. This unblocks other
+   writers.
+
+The cleanup runs on a GC background goroutine — it must not block or
+panic. All operations above are non-blocking (atomic store, syscall
+flock/funlock, channel send).
+
+#### Limitations
+
+- **Timing is non-deterministic**: the cleanup runs when the GC collects
+  the `Tx`, which depends on memory pressure and GC scheduling. A leaked
+  transaction may hold its reader slot for an extended period before the
+  GC runs. This is a safety net, not a substitute for correct resource
+  management.
+- **Cross-process**: the cleanup only runs in the process that created
+  the transaction. If a process exits without closing transactions, the
+  reader slots are reclaimed via PID-based stale detection (see Reader
+  Table), not via cleanup.
+- **Debug, not control flow**: applications should not rely on cleanup
+  for normal operation. It exists solely to detect bugs and limit their
+  blast radius.
+
 ## Cross-Process Coordination
 
 ### Lock File Layout
@@ -1486,6 +1577,11 @@ type Options struct {
     // delay (batch fires immediately when the coordinator runs).
     MaxBatchDelay time.Duration
 
+    // Logger for diagnostic messages (leaked transactions, stale reader
+    // recovery, stale writer recovery). If nil, diagnostics are discarded.
+    // Default: nil.
+    Logger *slog.Logger
+
     // FileMode for newly created files. Default: 0644.
     FileMode os.FileMode
 
@@ -1826,7 +1922,7 @@ organized by file:
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
 | `lock.go` | Lock file creation and mmap (shared memory). Writer lock (channel semaphore intra-process + flock cross-process + WriterPID, context-aware). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (sort dirty keys + sequential pwrite + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Stats accumulation. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (sort dirty keys + sequential pwrite + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
 | `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management. Sync(). Check(). CopyTo(). |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
