@@ -9,30 +9,37 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Data structure | B+tree on fixed-size pages | Only viable option for multi-process mmap |
 | Concurrency | Single writer + N readers (MVCC/CoW) | Proven (LMDB), readers never block writer |
 | File layout | Fixed-size pages (4KB–64KB, configurable, immutable after creation) | Matches OS page size, mmap-friendly |
+| Page header | 8 bytes (Type, Count, Overflow — no PageID) | PageID is redundant (computable from file offset); saves 8 bytes per page for data |
 | Value storage | Inline + overflow pages | Simple single read path, overflow for large values |
 | Duplicate values | DUPSORT with subpage + nested B+tree | Subpage for small sets, nested B+tree for large; DUPFIXED for fixed-size optimization |
 | Free space | Allocation bitmap + retired page log (RPL) | O(1) alloc via bitmap, no self-referential allocation, RPL tracks MVCC retirement |
+| RPL entry format | Per-segment TxnID + array of PageIDs | TxnID stored once per segment (not per entry); doubles segment capacity |
 | File geometry | Dynamic grow/shrink with configurable bounds | Auto-compaction via tail refund, no manual compaction needed |
 | Isolation | Dual meta pages + CoW | No WAL needed, atomic commit |
 | Crash safety | CoW + atomic meta page swap | File is always consistent |
-| Durability | Four sync modes (Durable, NoMeta, Safe, None) | Configurable ACID vs. performance tradeoff |
-| Cross-process | Shared memory lock file | Fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness |
+| Durability | Three sync modes (Durable, NoMeta, Safe) + unsafe opt-in None | Configurable ACID vs. performance; SyncNone requires explicit `AllowSyncNone` flag |
+| Cross-process | Shared memory lock file (uint64 PIDs) | Fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness; uint64 PIDs for forward safety |
 | Write lock | Channel semaphore (intra-process) + flock (cross-process) | Context-aware blocking; flock alone doesn't block same-process goroutines |
 | Slow readers | Callback-based notification | Application controls policy; no silent unbounded growth |
 | mmap | pwrite mode (default) or writemap mode | pwrite: heap isolation; writemap: direct mmap writes for performance |
-| Dirty page tracking | Hash map (`map[uint64]`) | O(1) insert/lookup/delete; sort once at commit for sequential I/O |
+| Huge pages | `MADV_HUGEPAGE` (opt-in, Linux) | Reduces TLB pressure for large databases; transparent huge pages for file-backed mmap |
+| Dirty page tracking | Hash map (`map[uint64]`) | O(1) insert/lookup/delete; `slices.Sorted(maps.Keys(...))` at commit for sequential I/O |
+| Dirty page buffers | `sync.Pool` for page-sized `[]byte` slices (pwrite mode) | Reduces GC pressure; avoids per-transaction heap churn |
 | Page spilling | LRU-based spill to disk mid-transaction (pwrite mode only) | Bounds memory usage for large write transactions |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
 | Checksums | Meta: xxhash64 (always); Data: CRC32C footer (optional) | Meta checksum detects torn commits; optional data checksum catches silent bitrot |
 | API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime |
+| Iteration | Cursor (stateful, bidirectional, mutable) + `iter.Seq2` (read-only, composable) | Cursor for mutation and bidirectional movement; `iter.Seq2` for idiomatic `for range` loops |
 | Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
 | Leak detection | `runtime.AddCleanup` on `Tx` | Detects leaked transactions, releases reader slots, logs origin stack trace |
 | Range delete | Subtree retirement via `DeleteRange` | O(pages) not O(entries); bulk-free for DUPSORT nested B+trees |
-| Commit I/O | pwrite (default) or io_uring (opt-in, Linux) | io_uring batches all commit writes into 1-2 syscalls; pwrite is portable fallback |
+| Commit I/O | pwrite/pwritev2 (default) or io_uring (opt-in, Linux) | io_uring batches all commit writes into 1-2 syscalls; pwritev2+RWF_DSYNC for small commits; pwrite is portable fallback |
 | Prefaulting | `MADV_POPULATE_READ` at open (opt-in, Linux 5.14+) | Eliminates first-access page faults; sequential kernel readahead; silent no-op on older kernels |
-| Typed keyspaces | Generic `TypedKeyspace[K, V]` wrapper | Zero-cost type-safe API over byte-oriented Keyspace; encoder must preserve lexicographic order |
-| Namespaces | Named keyspaces | Multiple B+trees in one file |
+| Read txn cooldown | `MADV_COLD` on close (opt-in, Linux 5.4+) | Hints kernel to reclaim page cache after large scans; reduces memory pressure |
+| Typed keyspaces | Generic `TypedKeyspace[K, V]` with `Encoder[T]` interface | Zero-cost type-safe API over byte-oriented Keyspace; interface enables stateful encoders and buffer pooling |
+| Keyspace names | `unique.Handle[string]` interning | Avoids repeated allocations for frequently opened keyspace names across transactions |
+| Namespaces | Named keyspaces (separate Open/Create API) | Multiple B+trees in one file; clear creation vs. opening semantics |
 
 ## File Layout
 
@@ -60,14 +67,13 @@ the bitmap region. See Allocation Bitmap for details.
 Every page starts with a common header:
 
 ```
-Page Header (16 bytes)
-+----------+----------+----------+----------+
-| PageID   | Type     | Count    | Overflow |
-| uint64   | uint16   | uint16   | uint32   |
-+----------+----------+----------+----------+
+Page Header (8 bytes)
++----------+----------+----------+
+| Type     | Count    | Overflow |
+| uint16   | uint16   | uint32   |
++----------+----------+----------+
 ```
 
-- **PageID**: The page number (offset = PageID * PageSize).
 - **Type**: One of: Meta, Branch, Leaf, Overflow, RPLSegment. Bitmap pages
   do not carry a page header (see Allocation Bitmap). RPLSegment pages are
   the retired page log (see Free Space Management).
@@ -75,6 +81,13 @@ Page Header (16 bytes)
   in RPL segment).
 - **Overflow**: Number of contiguous overflow pages following this one (0 for
   single-page nodes).
+
+The page header does not contain a PageID field. A page's ID is implicit —
+computable from its file offset (`offset / PageSize`). This avoids wasting
+8 bytes per page on redundant information and eliminates any possibility of
+inconsistency between the stored PageID and the actual file position.
+`Check()` verifies page type and structural validity at each offset; no
+stored PageID is needed for integrity checking.
 
 When `Options.PageChecksum` is enabled, every data page (branch, leaf,
 overflow, RPL segment) also carries a 4-byte CRC32C footer in the last 4
@@ -94,12 +107,13 @@ Meta Page
 | Version          | uint32 - format version
 | PageSize         | uint32 - page size in bytes
 | Flags            | uint32 - bit 0: PageChecksum (immutable); bit 1: Steady; bits 2-31: reserved
+| BitmapPages      | uint32 - number of pages in the allocation bitmap
+| Padding          | 4 bytes - alignment
 | GeoLower         | uint64 - minimum database size in pages
 | GeoUpper         | uint64 - maximum database size in pages
 | GeoGrowPages     | uint64 - growth step in pages
 | GeoShrinkPages   | uint64 - shrink threshold in pages
 | FirstUnallocated | uint64 - first unallocated page ID (high-water mark)
-| BitmapPages      | uint32 - number of pages in the allocation bitmap
 | RPLHeadPage      | uint64 - page ID of the newest RPL segment (0 = empty)
 | RPLTailPage      | uint64 - page ID of the oldest RPL segment (0 = empty)
 | RPLEntryCount    | uint64 - total entries across all RPL segments
@@ -111,9 +125,9 @@ Meta Page
 +------------------+
 ```
 
-Total meta page payload: 16 (header) + 4×4 (Magic, Version, PageSize, Flags) +
+Total meta page payload: 8 (header) + 4×4 (Magic, Version, PageSize, Flags) +
 4 (BitmapPages) + 4 (padding) + 13×8 (uint64 fields including Checksum) =
-144 bytes. Fits comfortably in any supported page size (min 4KB).
+136 bytes. Fits comfortably in any supported page size (min 4KB).
 
 The geometry fields (`GeoLower`, `GeoUpper`, `GeoGrowPages`,
 `GeoShrinkPages`) are stored in the meta page so that they persist across
@@ -130,20 +144,20 @@ Branch pages store keys and child page pointers. They do NOT store values.
 
 ```
 Branch Page
-+------------------------+
-| Page Header (16 bytes) |
-+------------------------+
-| Ptr[0] (uint64)        |  leftmost child pointer (8 bytes)
-+------------------------+
-| Cell Directory         |  Array of (Offset uint16, KeyLen uint16)
-| ...                    |  grows forward, 4 bytes per cell
-+------------------------+
-|       free space       |
-+------------------------+
-| ...                    |
-| Cell Data 1            |  packed from end of page, grows backward
-| Cell Data 0            |
-+------------------------+
++-----------------------+
+| Page Header (8 bytes) |
++-----------------------+
+| Ptr[0] (uint64)       |  leftmost child pointer (8 bytes)
++-----------------------+
+| Cell Directory        |  Array of (Offset uint16, KeyLen uint16)
+| ...                   |  grows forward, 4 bytes per cell
++-----------------------+
+|       free space      |
++-----------------------+
+| ...                   |
+| Cell Data 1           |  packed from end of page, grows backward
+| Cell Data 0           |
++-----------------------+
 ```
 
 Each cell in the data area:
@@ -178,19 +192,19 @@ reference, DUPSORT subpage, or nested B+tree reference).
 
 ```
 Leaf Page
-+------------------+
-| Page Header      |
-+------------------+
-| Cell Directory   | Array of (Offset uint16, CellFlags uint16)
-| ...              |
-+------------------+
-|     free space   |
-+------------------+
-| ...              |
-| KV Data N        | packed from end of page
-| KV Data 1        |
-| KV Data 0        |
-+------------------+
++-----------------------+
+| Page Header (8 bytes) |
++-----------------------+
+| Cell Directory        | Array of (Offset uint16, CellFlags uint16)
+| ...                   |
++-----------------------+
+|     free space        |
++-----------------------+
+| ...                   |
+| KV Data N             | packed from end of page
+| KV Data 1             |
+| KV Data 0             |
++-----------------------+
 ```
 
 Each cell in the data area:
@@ -585,29 +599,34 @@ information is needed for MVCC safety: a page freed by transaction T cannot be
 moved into the allocation bitmap until no active reader holds a snapshot ≤ T.
 
 The RPL is an append-only doubly-linked list of segment pages. Each segment
-page contains a batch of `(TxnID, PageID)` entries:
+page stores a single TxnID (the transaction that retired these pages) plus
+an array of PageIDs. Since each commit creates new segment pages (never
+appends to existing segments), all entries in a segment share the same
+TxnID — storing it once per segment instead of per entry doubles capacity:
 
 ```
 RPL Segment Page
-+---------------------------+
-| Page Header (16 bytes)    |
-+---------------------------+
-| NewerSegment | uint64     |  page ID of the next newer segment (0 = this is head)
-| OlderSegment | uint64     |  page ID of the next older segment (0 = this is tail)
-| EntryCount   | uint16     |  number of entries in this segment
-| Padding      | 6 bytes    |
-+---------------------------+
-| Entry 0: TxnID (uint64) + PageID (uint64)  |
-| Entry 1: TxnID (uint64) + PageID (uint64)  |
-| ...                                         |
-+---------------------------------------------+
++--------------------------+
+| Page Header (8 bytes)    |
++--------------------------+
+| TxnID          | uint64  |  transaction that retired these pages
+| NewerSegment   | uint64  |  page ID of the next newer segment (0 = this is head)
+| OlderSegment   | uint64  |  page ID of the next older segment (0 = this is tail)
+| EntryCount     | uint16  |  number of PageID entries in this segment
+| Padding        | 6 bytes |
++--------------------------+
+| PageID 0       | uint64  |
+| PageID 1       | uint64  |
+| ...                      |
++--------------------------+
 ```
 
-Segment capacity at 4KB page size: 16 (page header) + 8 + 8 (link pointers)
-+ 2 (EntryCount) + 6 (padding) = 40 bytes overhead. Remaining
-`4096 - 40 = 4056` bytes / 16 bytes per entry = **253 entries per segment
-page** (253 also with PageChecksum enabled: `4096 - 40 - 4 = 4052` / 16 =
-253). A transaction freeing 10,000 pages fills ~40 segment pages.
+Segment capacity at 4KB page size: 8 (page header) + 8 (TxnID) + 8 + 8
+(link pointers) + 2 (EntryCount) + 6 (padding) = 40 bytes overhead.
+Remaining `4096 - 40 = 4056` bytes / 8 bytes per PageID = **507 entries
+per segment page** (with PageChecksum enabled: `4096 - 40 - 4 = 4052` / 8
+= 506). A transaction freeing 10,000 pages fills ~20 segment pages
+(compared to ~40 with per-entry TxnID).
 
 The meta page stores `RPLHeadPage` (newest segment) and `RPLTailPage` (oldest
 segment). Segments are doubly linked: `OlderSegment` links from head toward
@@ -623,10 +642,11 @@ When a write transaction commits with retired pages:
    Each commit always creates **new** segment pages rather than appending to
    existing segments. This avoids CoW of previous segments — the old head
    segment is immutable (it belongs to a previous transaction's snapshot).
-2. Fill segment pages with `(currentTxnID, pageID)` entries, sorted by page
-   ID for cache-friendly processing during reclamation. If the retired list
-   exceeds one segment page's capacity (253 entries), allocate additional
-   segment pages and link them via `OlderSegment`/`NewerSegment`.
+2. Fill segment pages with the current TxnID in the segment header and
+   PageID entries sorted by page ID for cache-friendly processing during
+   reclamation. If the retired list exceeds one segment page's capacity
+   (507 entries at 4KB page size), allocate additional segment pages and
+   link them via `OlderSegment`/`NewerSegment`.
 3. Link the new head to the previous head: set the new head's
    `OlderSegment` to the old `RPLHeadPage`, and update the old head's
    `NewerSegment` to point to the new head. The old head must be CoW'd for
@@ -639,7 +659,7 @@ When a write transaction commits with retired pages:
 RPL segment pages are allocated from the bitmap like any other data page.
 Allocating a segment page clears a bit in the bitmap — O(1), no further
 allocation needed. A transaction retiring N pages needs at most
-`ceil(N / 253) + 1` page allocations (segment pages + CoW of old head).
+`ceil(N / 507) + 1` page allocations (segment pages + CoW of old head).
 This is bounded and non-recursive.
 
 ##### RPL Reclamation
@@ -650,9 +670,10 @@ writer reclaims RPL entries whose pages are safe to reuse:
 1. Read the oldest active reader's TxnID from the reader table (see
    Cross-Process Coordination).
 2. Walk the RPL from the **tail** (oldest segments first).
-3. For each entry where `TxnID < oldestReader`:
-   a. Set the corresponding bit in the allocation bitmap.
-   b. Remove the entry from the segment.
+3. For each segment where `TxnID < oldestReader`:
+   a. Set the corresponding bits in the allocation bitmap for all PageIDs
+      in the segment.
+   b. Remove the entries from the segment.
 4. When a segment becomes empty, free the segment page itself (set its bit in
    the bitmap) and advance `RPLTailPage` to the segment's `NewerSegment`.
 5. Update `RPLEntryCount` and `NumFreePages` in the meta page.
@@ -750,8 +771,9 @@ When a CoW operation replaces an old page with a new copy:
   CoW copy made earlier in this transaction), it becomes a **loose page** —
   added to `tx.loosePages`.
 - If the old page was **from a previous transaction** (an immutable page in
-  the mmap), its page ID is added to `tx.retiredPages` — a list of
-  `(currentTxnID, pageID)` pairs to append to the RPL at commit time.
+  the mmap), its page ID is added to `tx.retiredPages` — a list of page IDs
+  to append to the RPL at commit time (the TxnID is stored once per RPL
+  segment, not per entry).
 
 Note: retired pages are NOT immediately marked free in the bitmap. They enter
 the RPL and are moved to the bitmap only when reclamation determines they are
@@ -769,8 +791,9 @@ During commit, the writer:
    in the meta page.
 
 Step 3 may allocate RPL segment pages from the bitmap. This is a bounded,
-non-recursive operation: each segment page holds 253 entries, so a transaction
-retiring N pages needs at most `ceil(N / 253) + 1` page allocations (segment
+non-recursive operation: each segment page holds 507 entries (at 4KB page
+size), so a transaction retiring N pages needs at most `ceil(N / 507) + 1`
+page allocations (segment
 pages plus CoW of the old RPL head). Each allocation is a single bitmap bit
 flip — no further cascading allocations.
 
@@ -793,10 +816,15 @@ write mode:
 tx.dirtyPages map[uint64]*dirtyPage
 
 type dirtyPage struct {
-    data     []byte // heap-allocated page content (len = PageSize * (1 + overflow))
+    data     []byte // page content from sync.Pool (len = PageSize * (1 + overflow))
     lastUsed uint64 // monotonic counter for LRU spill priority
 }
 ```
+
+Single-page `data` buffers are drawn from a `sync.Pool` keyed by page size,
+reducing GC pressure by reusing allocations across transactions. Multi-page
+buffers (overflow pages) are heap-allocated normally since their sizes vary.
+Buffers are returned to the pool at transaction close (commit or rollback).
 
 **writemap mode:**
 ```
@@ -811,7 +839,7 @@ tx.dirtyPages map[uint64]struct{} // page IDs only, content lives in the mmap
 | Check if dirty | `_, ok := tx.dirtyPages[pageID]` | O(1) |
 | Remove (spill) | `delete(tx.dirtyPages, pageID)` | O(1) |
 | Count | `len(tx.dirtyPages)` | O(1) |
-| Commit-time iteration | Sort keys, iterate in page-ID order | O(n log n) once |
+| Commit-time iteration | `slices.Sorted(maps.Keys(tx.dirtyPages))` | O(n log n) once |
 
 The hash map replaces the sorted-array approach used in LMDB/libmdbx, where
 insertions required maintaining sort order (O(n) shift) and lookups required
@@ -860,9 +888,8 @@ At commit time in pwrite mode, dirty pages are written to disk via
 `pwrite()`. For I/O efficiency, pages are written in ascending page-ID
 order to produce sequential disk writes:
 
-1. Extract keys from `tx.dirtyPages` into a slice.
-2. Sort the slice.
-3. Walk the sorted slice, issuing `pwrite()` for each page. Group
+1. Extract and sort keys: `keys := slices.Sorted(maps.Keys(tx.dirtyPages))`.
+2. Walk the sorted slice, issuing `pwrite()` for each page. Group
    adjacent pages (consecutive page IDs) into single write calls where
    possible (scatter-gather optimization).
 
@@ -873,6 +900,26 @@ In writemap mode, no explicit writes are needed — dirty pages are already
 in the mmap. The sorted key extraction is still used for `fdatasync()`
 range hints if the OS supports them, but this is an optimization, not a
 correctness requirement.
+
+#### pwritev2 with RWF_DSYNC (Linux 4.7+)
+
+For small commits (fewer than a configurable threshold of dirty pages), the
+pwrite path can use `pwritev2()` with the `RWF_DSYNC` flag instead of
+separate `pwrite()` + `fdatasync()`. `RWF_DSYNC` makes each write
+individually durable without a separate sync syscall, eliminating the
+`fdatasync()` overhead when only a few pages are dirty.
+
+This is beneficial for `SyncDurable` mode with small transactions (1-10
+dirty pages), where the `fdatasync()` latency dominates the commit cost.
+For large commits (hundreds or thousands of dirty pages), the batched
+`fdatasync()` approach is more efficient because it allows the kernel to
+coalesce writes.
+
+The threshold is determined automatically: if `len(tx.dirtyPages)` is small
+enough that the per-write `RWF_DSYNC` overhead is less than a single
+`fdatasync()`, use `pwritev2`; otherwise, fall back to `pwrite` +
+`fdatasync()`. On non-Linux platforms or kernels older than 4.7, the flag
+is unavailable and the standard path is used.
 
 ## Page Spilling
 
@@ -1174,16 +1221,16 @@ A separate file (`<dbname>.lock`) is mmap'd as shared memory by all processes.
 ```
 Lock File
 +---------------------------+
-| Header (16 bytes)         |
+| Header (24 bytes)         |
 | Magic        | uint64     |  identifies file as gmdb lock file
 | MaxReaders   | uint32     |  number of reader slots (set at creation)
-| WriterPID    | uint32     |  PID of current write txn holder (0 = no writer)
+| Padding      | 4 bytes    |  alignment
+| WriterPID    | uint64     |  PID of current write txn holder (0 = no writer)
 +---------------------------+
 | Reader Table              |
 | +----------+----------+   |
 | | TxnID    | PID      |   | Slot 0
-| | uint64   | uint32   |   |
-| | Padding  | 4 bytes  |   |
+| | uint64   | uint64   |   |
 | +----------+----------+   |
 | | TxnID    | PID      |   | Slot 1
 | | ...                  |   |
@@ -1193,24 +1240,27 @@ Lock File
 +---------------------------+
 ```
 
-**Header (16 bytes):**
+**Header (24 bytes):**
 - `Magic` (uint64): Identifies the file as a gmdb lock file. Validates that
   the lock file belongs to this database and has not been corrupted.
 - `MaxReaders` (uint32): Number of reader slots. Set at lock file creation
   time via `Options.MaxReaders` (default: 4096). Immutable after creation.
-- `WriterPID` (uint32): PID of the process currently holding the write lock.
+- Padding (4 bytes): Alignment to 8-byte boundary.
+- `WriterPID` (uint64): PID of the process currently holding the write lock.
   Set when the write lock is acquired, cleared to 0 on release. Used for
-  stale writer detection (see Stale Writer Recovery).
+  stale writer detection (see Stale Writer Recovery). Stored as uint64 for
+  forward safety — Linux `pid_max` can reach 2^22 on 64-bit kernels, and
+  uint64 provides consistent alignment with other fields.
 
 **Reader Slot (16 bytes):**
 - `TxnID` (uint64, atomic): The snapshot transaction ID held by this reader.
   A value of 0 means the slot is free. Non-zero means the slot is active.
-- `PID` (uint32): Process ID that owns this slot. Used for stale reader
-  detection (`kill(pid, 0)`).
-- Padding (4 bytes): Aligns slot to 16 bytes.
+- `PID` (uint64, atomic): Process ID that owns this slot. Used for stale
+  reader detection (`kill(pid, 0)`). Stored as uint64 for alignment
+  consistency with TxnID and forward safety.
 
-Total lock file size: 16 + (16 × MaxReaders). With default MaxReaders=4096:
-16 + 65536 = 65552 bytes (~64KB).
+Total lock file size: 24 + (16 × MaxReaders). With default MaxReaders=4096:
+24 + 65536 = 65560 bytes (~64KB).
 
 The lock file is mmap'd with `MAP_SHARED` by all processes for the reader table.
 The write lock is a separate concern handled via `flock()` (see below).
@@ -1492,20 +1542,65 @@ database's mmap, since the copy reads the entire file sequentially.
 The `Prefault` option defaults to false — most workloads benefit from
 demand paging where only accessed pages enter the page cache.
 
+### Huge Pages (Linux)
+
+When `Options.HugePages` is true, the database calls
+`madvise(MADV_HUGEPAGE)` on the data file mmap after mapping. This enables
+transparent huge page (THP) backing for the file-mapped region, allowing the
+kernel to use 2MB pages instead of 4KB pages where possible.
+
+Benefits:
+- **Reduced TLB pressure**: A 1GB database at 4KB pages requires 262,144
+  TLB entries. With 2MB huge pages, only 512 entries are needed — a 512x
+  reduction. This is significant for random-access workloads (B+tree
+  traversals) where TLB misses dominate latency.
+- **Fewer page faults**: Each fault maps 2MB instead of 4KB, reducing total
+  fault count for sequential access patterns.
+
+THP for file-backed `MAP_SHARED` mappings is mature on Linux 6.x kernels.
+The kernel promotes pages to huge pages opportunistically based on alignment
+and availability — not all pages will be huge-page-backed.
+
+The `HugePages` option defaults to false. On non-Linux platforms the option
+is ignored. On Linux kernels without THP support for file-backed mappings,
+the madvise call has no effect.
+
+### Read Transaction Cooldown (Linux 5.4+)
+
+When `Options.ColdAdvise` is true, closing a read transaction calls
+`madvise(MADV_COLD)` on the mmap region that the transaction accessed.
+This hints the kernel that the pages are no longer actively used and may
+be reclaimed from the page cache under memory pressure.
+
+This is useful for batch processing workloads that perform large sequential
+scans (e.g., exports, analytics queries) and then release the transaction.
+Without `MADV_COLD`, the scanned pages remain in the page cache, potentially
+evicting more useful pages from other workloads.
+
+The implementation tracks the min/max page IDs accessed during the
+transaction (lightweight — just two atomic min/max updates per page read)
+and issues a single `madvise(MADV_COLD, min*PageSize, (max-min+1)*PageSize)`
+on close.
+
+The `ColdAdvise` option defaults to false. On non-Linux platforms or kernels
+older than 5.4, the madvise call is silently ignored.
+
 ## Durability Modes
 
-The database supports four durability modes, configurable via `Options.SyncMode`.
-The mode controls which `fdatasync()` calls are performed during commit. All
-modes preserve **database integrity** (the file is always structurally valid)
-except `SyncNone`. The tradeoff is between commit latency and how much
-data may be lost on a crash.
+The database supports three safe durability modes and one unsafe mode,
+configurable via `Options.SyncMode`. The mode controls which `fdatasync()`
+calls are performed during commit. All safe modes preserve **database
+integrity** (the file is always structurally valid). `SyncNone` is the
+unsafe mode — it risks corruption on crash and requires explicit opt-in
+via `Options.AllowSyncNone = true`. The tradeoff is between commit latency
+and how much data may be lost on a crash.
 
 | Mode | Data Sync | Meta Sync | On Crash | Performance |
 |------|-----------|-----------|----------|-------------|
 | `SyncDurable` (default) | `fdatasync()` | `fdatasync()` | No data loss. Full ACID. | Slowest |
 | `SyncNoMeta` | `fdatasync()` | skip | Last committed transaction may be lost. DB is consistent — falls back to previous meta page. | ~2x faster |
 | `SyncSafe` | skip | skip | Rolls back to the last **steady commit** (the last commit that was explicitly synced via `DB.Sync()` or the last `SyncDurable`/`SyncNoMeta` commit). DB is always consistent — no corruption. | Much faster |
-| `SyncNone` | skip | skip | **Risk of corruption.** No guarantees. For benchmarks and ephemeral data only. | Fastest |
+| `SyncNone` | skip | skip | **Risk of corruption.** No guarantees. Requires `Options.AllowSyncNone = true`. For benchmarks and ephemeral data only. | Fastest |
 
 ### Steady Commits
 
@@ -1514,14 +1609,17 @@ locations (via `pwrite()` in pwrite mode, or directly in the mmap in writemap
 mode) but skips all `fdatasync()` calls. The OS page cache holds the writes,
 which will eventually reach disk, but the order is not guaranteed.
 
-A **steady commit** is a commit where both data and meta pages have been
-confirmed on stable storage. Steady commits occur when:
+A **steady commit** is a commit whose data pages have been confirmed on
+stable storage. (The meta page itself may or may not be synced — what
+matters is that the data it references is durable. If the meta survived a
+crash, recovery can trust it without further validation.) Steady commits
+occur when:
 - `DB.Sync()` is called explicitly (forces `fdatasync()` of the data file).
-- A commit happens in `SyncDurable` or `SyncNoMeta` mode (these sync as part
-  of their normal commit path).
+- A commit happens in `SyncDurable` or `SyncNoMeta` mode (these sync data
+  pages as part of their normal commit path).
 
 Each meta page carries a **steady flag** — a boolean indicating whether the
-commit it represents has been confirmed on stable storage. The steady flag
+data pages it references have been confirmed on stable storage. The steady flag
 is set when `fdatasync()` completes successfully (either from a
 `SyncDurable`/`SyncNoMeta` commit or an explicit `DB.Sync()` call). In
 `SyncSafe` mode, commits write the meta page with the steady flag **clear**.
@@ -1532,23 +1630,24 @@ On recovery after a crash, `Open()` performs the following:
 
 1. Read both meta pages. Discard any with an invalid xxhash64 checksum.
 2. Of the valid meta pages, prefer the one with the higher TxnID.
-3. If the preferred meta page has its steady flag **set**, use it — both
-   data and meta are confirmed on stable storage.
+3. If the preferred meta page has its steady flag **set**, use it — its
+   data pages are confirmed on stable storage.
 4. If the preferred meta page has its steady flag **clear** (a non-steady
    `SyncSafe` commit), validate its tree:
    - **With `PageChecksum` enabled**: read the root page and verify its
      CRC32C. If valid, accept the meta page (the OS flushed data pages
      before the crash). If invalid, fall back to the other meta page.
    - **Without `PageChecksum`**: perform a shallow validation — read the
-     root page and check its page header (type, page ID). If the header
-     is consistent, accept the meta page. If the root page contains
-     zeroes or an invalid header, fall back to the other meta page.
+     root page and check its page header (type, count/overflow). If the
+     header is consistent, accept the meta page. If the root page
+     contains zeroes or an invalid header, fall back to the other meta
+     page.
 5. The fallback meta page is the last steady commit. All transactions
    after that steady commit are lost.
 
 The shallow validation without checksums is not foolproof — a recycled
-page ID could contain a structurally valid header from a previous
-occupant with wrong data. For strongest `SyncSafe` recovery guarantees,
+page could contain a structurally valid header from a previous occupant
+with wrong data. For strongest `SyncSafe` recovery guarantees,
 enable `PageChecksum`. With checksums enabled, recovery can detect any
 partially-flushed data page.
 
@@ -1563,6 +1662,11 @@ the data pages it references. A crash in this state leaves the meta page
 pointing to unwritten or partially written data pages — the database is
 **corrupted**. Use this mode only for ephemeral data or benchmarks where the
 database can be discarded after a crash.
+
+To prevent accidental use, `SyncNone` requires `Options.AllowSyncNone = true`
+to be set explicitly. Setting `SyncMode = SyncNone` without `AllowSyncNone`
+returns an error from `Open()`. This ensures that unsafe mode is always a
+deliberate choice, never an accidental misconfiguration.
 
 The full commit path with mode-dependent behavior is described in the
 Write Transaction section (see Copy-on-Write Transaction Model, steps 5–7).
@@ -1617,10 +1721,28 @@ write ordering guarantees as the pwrite path.
   for the expected dirty page count (`Options.MaxDirtyPages` + overhead).
   If a commit exceeds the ring size, writes are submitted in batches.
 
+- **Fixed file descriptors**: The database fd is registered once at ring
+  initialization time via `io_uring_register(IORING_REGISTER_FILES)`. All
+  subsequent SQEs use the registered fd index instead of the raw fd,
+  avoiding per-I/O fd table lookups in the kernel. This is a measurable
+  win for high-throughput commit patterns.
+
 - **Fixed buffers**: `io_uring` supports pre-registered buffers via
   `io_uring_register(IORING_REGISTER_BUFFERS)` to avoid per-I/O page
   pinning overhead. Dirty page buffers in pwrite mode can be registered
-  at allocation time and deregistered on free.
+  at allocation time and deregistered on free. Note: registered buffers
+  are pinned in memory and count against `RLIMIT_MEMLOCK`. At
+  `MaxDirtyPages=65536` × 4KB = 256MB, this could hit default limits
+  (typically 64KB-256KB for unprivileged users). The implementation checks
+  `RLIMIT_MEMLOCK` at initialization and falls back to unregistered
+  buffers if the limit is insufficient.
+
+- **File geometry via io_uring**: On Linux 6.9+, `IORING_OP_FTRUNCATE` is
+  available, allowing file growth and shrinkage to be included in the SQE
+  chain rather than requiring a separate `ftruncate()` syscall. When the
+  file needs to grow, the truncate SQE is prepended to the write chain.
+  When the file needs to shrink (after commit), the truncate SQE is
+  appended. On older kernels, `ftruncate()` is used as a fallback.
 
 - **Fallback**: If `io_uring` initialization fails (old kernel, seccomp
   restrictions, container without `io_uring` support), fall back to the
@@ -1740,6 +1862,15 @@ Opening a keyspace within a transaction reads the descriptor from the keyspace
 B+tree. Modifications to the keyspace update the descriptor (and its root)
 which propagates up through the keyspace B+tree via CoW.
 
+### Keyspace Name Interning
+
+Keyspace names are interned via `unique.Make[string]` (Go 1.23+). The
+`TypedKeyspace[K, V]` descriptor and internal keyspace lookup caches store
+a `unique.Handle[string]` instead of a raw `string` or `[]byte`. This
+avoids repeated allocations when the same keyspace is opened across many
+transactions (a common pattern). The `unique.Handle` provides O(1) equality
+comparison and is safe for concurrent use.
+
 ## API Surface
 
 ```go
@@ -1778,7 +1909,8 @@ const (
     // commit points.
     SyncSafe
     // SyncNone skips all syncs with no safety net. Risk of corruption on
-    // crash. For benchmarks and ephemeral data only.
+    // crash. For benchmarks and ephemeral data only. Requires
+    // Options.AllowSyncNone = true.
     SyncNone
 )
 
@@ -1806,6 +1938,12 @@ type Options struct {
     // SyncMode controls the durability guarantees of committed
     // transactions. Default: SyncDurable.
     SyncMode SyncMode
+
+    // AllowSyncNone must be set to true when using SyncNone mode.
+    // This explicit opt-in prevents accidental use of the unsafe mode.
+    // Open() returns an error if SyncMode is SyncNone and AllowSyncNone
+    // is false. Default: false.
+    AllowSyncNone bool
 
     // WriteMap enables writemap mode. The data file is mapped read-write
     // and dirty pages are modified directly in the mmap instead of being
@@ -1868,6 +2006,22 @@ type Options struct {
     // the kernel does not support MADV_POPULATE_READ. Default: false.
     Prefault bool
 
+    // HugePages enables transparent huge page support via
+    // madvise(MADV_HUGEPAGE) on the data file mmap (Linux only).
+    // Reduces TLB pressure for large databases by allowing the kernel
+    // to back the mmap with 2MB huge pages where possible. A 1GB
+    // database drops from 262,144 TLB entries (4KB pages) to 512
+    // (2MB huge pages). Ignored on non-Linux platforms. Default: false.
+    HugePages bool
+
+    // ColdAdvise calls madvise(MADV_COLD) on the mmap region accessed
+    // by a read transaction when the transaction closes (Linux 5.4+).
+    // This hints the kernel to reclaim page cache for pages that are
+    // no longer hot, reducing memory pressure after large scans.
+    // Useful for batch readers that scan the entire database. Ignored
+    // on non-Linux platforms or older kernels. Default: false.
+    ColdAdvise bool
+
     // ReadOnly opens the database in read-only mode.
     ReadOnly bool
 }
@@ -1875,24 +2029,26 @@ type Options struct {
 // Geometry controls the database file size bounds and growth/shrink behavior.
 // All sizes are specified in bytes and must be multiples of PageSize. They are
 // converted to pages internally and stored in the meta page as page counts.
+// All fields are uint64 — negative sizes are meaningless for database geometry,
+// and uint64 matches the internal meta page representation.
 type Geometry struct {
     // Lower is the minimum database file size in bytes. The file never
     // shrinks below this. Must be a multiple of PageSize.
     // Default: (2 + BitmapPages) * PageSize (meta + bitmap pages).
-    Lower int64
+    Lower uint64
 
     // Upper is the maximum database file size in bytes. Determines mmap
     // reservation size. Must be a multiple of PageSize. Default: 256GB.
-    Upper int64
+    Upper uint64
 
     // GrowStep is the number of bytes to grow by when extending the file.
     // Must be a multiple of PageSize. Default: 256MB.
-    GrowStep int64
+    GrowStep uint64
 
     // ShrinkThreshold is the minimum number of bytes of unused space at
     // the end of the file before shrinking occurs. Must be a multiple of
     // PageSize. Default: 512MB.
-    ShrinkThreshold int64
+    ShrinkThreshold uint64
 }
 
 // SlowReaderInfo describes a reader that is blocking RPL reclamation.
@@ -1984,17 +2140,27 @@ const (
     KfDupSort KeyspaceFlags = 1 << iota
     // KfDupFixed requires all duplicate values to be the same fixed size
     // (requires KfDupSort). The size is specified via the fixedSize parameter
-    // of OpenKeyspace at keyspace creation time.
+    // of CreateKeyspace at keyspace creation time.
     KfDupFixed
 )
 
-// OpenKeyspace opens a named keyspace within this transaction.
-// If create is true and the keyspace doesn't exist, it is created with
-// the given flags. If the keyspace already exists, flags must match the
-// existing keyspace's flags or be zero (accept existing flags).
-// fixedSize is only used when creating a KfDupFixed keyspace — it sets
-// the fixed duplicate value size in bytes. Ignored otherwise.
-func (tx *Tx) OpenKeyspace(name []byte, create bool, flags KeyspaceFlags, fixedSize uint16) (*Keyspace, error)
+// OpenKeyspace opens an existing named keyspace within this transaction.
+// Returns ErrNotFound if the keyspace does not exist. Flags are read from
+// the stored keyspace descriptor — no flags parameter is needed.
+func (tx *Tx) OpenKeyspace(name []byte) (*Keyspace, error)
+
+// CreateKeyspace creates a new named keyspace within this transaction.
+// Returns ErrKeyExist if the keyspace already exists. Flags are set at
+// creation time and immutable after. fixedSize is only used when flags
+// includes KfDupFixed — it sets the fixed duplicate value size in bytes.
+// Ignored otherwise.
+func (tx *Tx) CreateKeyspace(name []byte, flags KeyspaceFlags, fixedSize uint16) (*Keyspace, error)
+
+// CreateKeyspaceIfNotExists opens a keyspace if it exists, or creates it
+// with the given flags if it does not. If the keyspace already exists,
+// flags must match the existing keyspace's flags or ErrIncompatibleFlags
+// is returned.
+func (tx *Tx) CreateKeyspaceIfNotExists(name []byte, flags KeyspaceFlags, fixedSize uint16) (*Keyspace, error)
 
 // DeleteKeyspace deletes a named keyspace and all its data.
 func (tx *Tx) DeleteKeyspace(name []byte) error
@@ -2015,8 +2181,8 @@ func (ks *Keyspace) Put(key, value []byte) error
 
 // Delete removes a key and its value. For DUPSORT keyspaces, removes all
 // duplicate values for the key (using bulk subtree retirement for nested
-// B+trees). To delete a single duplicate, use Cursor.SeekDup() +
-// Cursor.Delete().
+// B+trees). To delete a single duplicate, use Cursor.Seek(key) +
+// Cursor.SeekDup(value) + Cursor.Delete().
 func (ks *Keyspace) Delete(key []byte) error
 
 // DeleteRange deletes all keys in the range [start, end). Returns the
@@ -2027,7 +2193,7 @@ func (ks *Keyspace) Delete(key []byte) error
 // DeleteRange retires entire B+tree subtrees that fall within the range
 // without visiting individual leaf entries — O(pages) not O(entries).
 // See Range Delete for the algorithm.
-func (ks *Keyspace) DeleteRange(start, end []byte) (int64, error)
+func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error)
 
 // Cursor for iterating over key-value pairs.
 func (ks *Keyspace) Cursor() *Cursor
@@ -2054,12 +2220,6 @@ func (c *Cursor) SeekGE(target []byte) (key, value []byte)
 // Current returns the key-value pair at the current cursor position
 // without moving the cursor.
 func (c *Cursor) Current() (key, value []byte)
-
-// Put inserts or updates a key-value pair at the current cursor position.
-// More efficient than Keyspace.Put() when the cursor is already positioned
-// near the target key (avoids a second tree traversal). If the cursor is
-// not positioned, behaves like Keyspace.Put().
-func (c *Cursor) Put(key, value []byte) error
 
 // Delete deletes the key-value pair at the current cursor position.
 func (c *Cursor) Delete() error
@@ -2101,11 +2261,29 @@ func (c *Cursor) NextKey() (key, value []byte)
 func (c *Cursor) PrevKey() (key, value []byte)
 
 // SeekDup positions the cursor at the first duplicate value >= target
-// for the given key. Returns the value, or nil if not found.
-func (c *Cursor) SeekDup(key, target []byte) (value []byte)
+// for the current key. The cursor must already be positioned on a key
+// (via Seek, SeekGE, First, etc.). Returns the value, or nil if no
+// duplicate value >= target exists for the current key.
+func (c *Cursor) SeekDup(target []byte) (value []byte)
 
 // CountDup returns the number of duplicate values for the current key.
-func (c *Cursor) CountDup() (int, error)
+func (c *Cursor) CountDup() (uint64, error)
+
+// --- Range iterators (read-only, for use with for-range) ---
+
+// All returns an iterator over all key-value pairs in the keyspace.
+// The iterator yields pairs in key order. For DUPSORT keyspaces, each
+// key-value pair (including each duplicate) is yielded separately.
+func (ks *Keyspace) All() iter.Seq2[[]byte, []byte]
+
+// Range returns an iterator over key-value pairs in [start, end).
+// If start is nil, iteration begins at the first key. If end is nil,
+// iteration continues through the last key.
+func (ks *Keyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte]
+
+// Prefix returns an iterator over all key-value pairs whose keys
+// share the given prefix.
+func (ks *Keyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte]
 
 // --- Statistics ---
 
@@ -2116,9 +2294,9 @@ type DBStats struct {
     RetiredPages uint64 // pages in RPL, not yet reclaimable (held by readers)
 
     // Geometry
-    FileSize     int64  // current data file size in bytes
-    GeoLower     int64  // minimum file size in bytes
-    GeoUpper     int64  // maximum file size in bytes
+    FileSize     uint64 // current data file size in bytes
+    GeoLower     uint64 // minimum file size in bytes
+    GeoUpper     uint64 // maximum file size in bytes
     FirstUnalloc uint64 // first unallocated page ID (high-water mark)
 
     // Readers
@@ -2211,35 +2389,55 @@ func (ks *Keyspace) Stats() (KeyspaceStats, error)
 
 A higher-level API layer built on top of the byte-oriented `Keyspace` API.
 `TypedKeyspace[K, V]` provides type-safe access to a keyspace by handling
-key/value serialization automatically:
+key/value serialization automatically via the `Encoder[T]` interface:
 
 ```go
+// Encoder handles serialization between a Go type and byte slices.
+// Implementations may be stateful (e.g., buffer pooling).
+type Encoder[T any] interface {
+    Encode(T) []byte
+    Decode([]byte) T
+}
+
+// FuncEncoder adapts plain functions into the Encoder interface for
+// simple cases where no state is needed.
+type FuncEncoder[T any] struct {
+    EncodeFunc func(T) []byte
+    DecodeFunc func([]byte) T
+}
+
+func (f FuncEncoder[T]) Encode(v T) []byte  { return f.EncodeFunc(v) }
+func (f FuncEncoder[T]) Decode(b []byte) T  { return f.DecodeFunc(b) }
+
 // TypedKeyspace wraps a Keyspace with type-safe key/value encoding.
 type TypedKeyspace[K, V any] struct {
     name      []byte
-    encKey    func(K) []byte
-    decKey    func([]byte) K
-    encVal    func(V) []byte
-    decVal    func([]byte) V
+    keyEnc    Encoder[K]
+    valEnc    Encoder[V]
     flags     KeyspaceFlags
     fixedSize uint16 // only meaningful when flags includes KfDupFixed
 }
 
-// NewTypedKeyspace creates a typed keyspace descriptor. The encoder/decoder
-// functions handle serialization between Go types and byte slices. The
-// key encoder MUST produce lexicographically ordered output for the
-// desired key ordering — the underlying B+tree sorts keys as raw bytes.
+// NewTypedKeyspace creates a typed keyspace descriptor. The key encoder
+// MUST produce lexicographically ordered output for the desired key
+// ordering — the underlying B+tree sorts keys as raw bytes.
 // fixedSize is only used when flags includes KfDupFixed — it sets the
 // fixed duplicate value size in bytes. Ignored otherwise.
 func NewTypedKeyspace[K, V any](
     name string,
-    encKey func(K) []byte, decKey func([]byte) K,
-    encVal func(V) []byte, decVal func([]byte) V,
+    keyEnc Encoder[K],
+    valEnc Encoder[V],
     flags KeyspaceFlags, fixedSize uint16,
 ) *TypedKeyspace[K, V]
 
-// Open opens the typed keyspace within a transaction.
-func (tks *TypedKeyspace[K, V]) Open(tx *Tx, create bool) (*TypedKS[K, V], error)
+// Open opens an existing typed keyspace within a transaction.
+func (tks *TypedKeyspace[K, V]) Open(tx *Tx) (*TypedKS[K, V], error)
+
+// Create creates a new typed keyspace within a transaction.
+func (tks *TypedKeyspace[K, V]) Create(tx *Tx) (*TypedKS[K, V], error)
+
+// CreateIfNotExists opens or creates the typed keyspace.
+func (tks *TypedKeyspace[K, V]) CreateIfNotExists(tx *Tx) (*TypedKS[K, V], error)
 
 // TypedKS is a handle to an opened typed keyspace within a transaction.
 type TypedKS[K, V any] struct { ... }
@@ -2247,8 +2445,11 @@ type TypedKS[K, V any] struct { ... }
 func (t *TypedKS[K, V]) Get(key K) (V, error)
 func (t *TypedKS[K, V]) Put(key K, value V) error
 func (t *TypedKS[K, V]) Delete(key K) error
-func (t *TypedKS[K, V]) DeleteRange(start, end *K) (int64, error)
+func (t *TypedKS[K, V]) DeleteRange(start, end *K) (uint64, error)
 func (t *TypedKS[K, V]) Cursor() *TypedCursor[K, V]
+func (t *TypedKS[K, V]) All() iter.Seq2[K, V]
+func (t *TypedKS[K, V]) Range(start, end *K) iter.Seq2[K, V]
+func (t *TypedKS[K, V]) Prefix(prefix K) iter.Seq2[K, V]
 
 type TypedCursor[K, V any] struct { ... }
 
@@ -2263,8 +2464,11 @@ func (c *TypedCursor[K, V]) Err() error
 
 The typed layer is a **zero-cost abstraction** at the API level — all
 methods delegate to the underlying `Keyspace` and `Cursor` methods with
-encoder/decoder calls. No additional allocations beyond the serialization
-itself.
+`Encoder` calls. No additional allocations beyond the serialization itself.
+Using an interface instead of closures allows stateful encoders (e.g., with
+buffer pooling via `sync.Pool`) and is more idiomatic Go — encoders can be
+implemented as method sets on types. The `FuncEncoder` adapter is provided
+for simple stateless cases.
 
 **Key ordering constraint**: The key encoder must produce byte sequences
 whose lexicographic order matches the desired key order. For `uint64` keys,
@@ -2273,8 +2477,8 @@ representation already sorts lexicographically. The typed API does not
 support custom comparators — the underlying B+tree always uses byte ordering.
 
 The typed API is a convenience layer. Callers who need full control over
-serialization or need to avoid allocation overhead from encoder/decoder
-functions use the byte-oriented `Keyspace` API directly.
+serialization or need to avoid allocation overhead from encoder calls use
+the byte-oriented `Keyspace` API directly.
 
 ## Implementation Layout
 
@@ -2285,19 +2489,20 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding. Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: encode/decode entry list, segment linking. |
+| `page.go` | Page header encoding/decoding (8-byte header: Type, Count, Overflow — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode, segment linking. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance with configurable `MergeThreshold`). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
-| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages, reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: singly-linked list of intra-transaction recycled pages. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
+| `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
+| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages (per-segment TxnID + PageID arrays), reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: singly-linked list of intra-transaction recycled pages. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
 | `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). LRU-based priority selection from `tx.dirtyPages` map. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
-| `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` prefaulting (Linux 5.14+, opt-in via `Options.Prefault`). |
+| `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` prefaulting (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
-| `iouring_linux.go` | io_uring commit path (Linux 5.6+). Ring initialization, SQE batch construction (data writes + linked fsync + meta write + linked fsync), CQE completion handling, registered buffer management, fallback detection. |
-| `lock.go` | Lock file creation and mmap (shared memory). Writer lock (channel semaphore intra-process + flock cross-process + WriterPID, context-aware). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (sort dirty keys + sequential pwrite + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
-| `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management. Sync(). Check(). CopyTo(). |
-| `typed.go` | `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with encoder/decoder functions. |
+| `iouring_linux.go` | io_uring commit path (Linux 5.6+). Ring initialization with `IORING_REGISTER_FILES` for fixed fd. SQE batch construction (data writes + linked fsync + meta write + linked fsync). `IORING_OP_FTRUNCATE` for geometry changes (Linux 6.9+). CQE completion handling. Registered buffer management with `RLIMIT_MEMLOCK` checking. Fallback detection. |
+| `lock.go` | Lock file creation and mmap (shared memory, uint64 PIDs). Writer lock (channel semaphore intra-process + flock cross-process + WriterPID, context-aware). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (`slices.Sorted(maps.Keys(...))` + sequential pwrite/pwritev2 + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Dirty page buffer pooling via `sync.Pool` (pwrite mode). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
+| `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection, AllowSyncNone validation). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Sync(). Check(). CopyTo(). |
+| `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with `Encoder` calls. |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
 
@@ -2312,17 +2517,17 @@ Default: 4096 bytes.
 ### Maximum Key Size
 
 Determined by page size. A branch page must fit at least 2 keys to allow
-splitting. The fixed overhead is 24 bytes (16-byte page header + 8-byte
+splitting. The fixed overhead is 16 bytes (8-byte page header + 8-byte
 leftmost child pointer). Each key requires 4 bytes (cell directory entry) +
 key bytes + 8 bytes (child pointer). The maximum key size is approximately
-`(PageSize - 48) / 2` (or `(PageSize - 52) / 2` with PageChecksum enabled):
+`(PageSize - 40) / 2` (or `(PageSize - 44) / 2` with PageChecksum enabled):
 
 | Page Size | Max Key Size (approx) | With PageChecksum |
 |-----------|----------------------|-------------------|
-| 4KB       | ~2024 bytes          | ~2022 bytes       |
-| 8KB       | ~4072 bytes          | ~4070 bytes       |
-| 16KB      | ~8168 bytes          | ~8166 bytes       |
-| 64KB      | ~32744 bytes         | ~32742 bytes      |
+| 4KB       | ~2028 bytes          | ~2026 bytes       |
+| 8KB       | ~4076 bytes          | ~4074 bytes       |
+| 16KB      | ~8172 bytes          | ~8170 bytes       |
+| 64KB      | ~32748 bytes         | ~32746 bytes      |
 
 Enforced at `Put()` time. Keys exceeding the limit return an error.
 
@@ -2337,7 +2542,7 @@ There is no practical upper limit on value size (bounded only by disk space and
 
 For DUPSORT keyspaces, each duplicate value becomes a key in the nested B+tree
 (or an entry in a subpage). The maximum duplicate value size is therefore the
-same as the maximum key size — approximately `(PageSize - 48) / 2`. Overflow
+same as the maximum key size — approximately `(PageSize - 40) / 2`. Overflow
 pages are not used for duplicate values. A `Put()` call with a duplicate value
 exceeding this limit returns an error.
 
@@ -2367,17 +2572,17 @@ The checksum is stored as a **page footer** — the last 4 bytes of the page:
 
 ```
 Page (with checksum enabled)
-+------------------------+
-| Page Header (16 bytes) |
-+------------------------+
-| Page Content           |
-| (PageSize - 20 bytes)  |
-+------------------------+
-| CRC32C (4 bytes)       |  footer: checksum of bytes 0 through PageSize-5
-+------------------------+
++-----------------------+
+| Page Header (8 bytes) |
++-----------------------+
+| Page Content          |
+| (PageSize - 12 bytes) |
++-----------------------+
+| CRC32C (4 bytes)      |  footer: checksum of bytes 0 through PageSize-5
++-----------------------+
 ```
 
-The footer approach keeps the page header unchanged at 16 bytes. Usable
+The footer approach keeps the page header unchanged at 8 bytes. Usable
 page content shrinks by 4 bytes when checksums are enabled — negligible
 (0.1% at 4KB page size). The checksum covers the entire page from byte 0
 through byte `PageSize - 5` (inclusive), including the page header.
@@ -2457,6 +2662,8 @@ run on storage without integrity guarantees.
   commit point. Even if it's torn, the checksum will fail and the DB falls
   back to the other meta page.
 - **Write ordering**: In `SyncDurable` mode, dirty pages are fdatasync'd
+  BEFORE the meta page update, and the meta page is fdatasync'd AFTER writing
+  it. In other sync modes, ordering relies on CoW (see Durability , dirty pages are fdatasync'd
   BEFORE the meta page update, and the meta page is fdatasync'd AFTER writing
   it. In other sync modes, ordering relies on CoW (see Durability Modes).
 - **Reader isolation**: Readers see an immutable snapshot. Pages they reference
