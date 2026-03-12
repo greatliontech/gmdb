@@ -17,7 +17,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Crash safety | CoW + atomic meta page swap | File is always consistent |
 | Durability | Four sync modes (Durable, NoMeta, Safe, None) | Configurable ACID vs. performance tradeoff |
 | Cross-process | Shared memory lock file | Fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness |
-| Write lock | Go mutex (intra-process) + flock (cross-process) | flock alone doesn't block same-process goroutines |
+| Write lock | Channel semaphore (intra-process) + flock (cross-process) | Context-aware blocking; flock alone doesn't block same-process goroutines |
 | Slow readers | Callback-based notification | Application controls policy; no silent unbounded growth |
 | mmap | pwrite mode (default) or writemap mode | pwrite: heap isolation; writemap: direct mmap writes for performance |
 | Dirty page tracking | Hash map (`map[uint64]`) | O(1) insert/lookup/delete; sort once at commit for sequential I/O |
@@ -25,7 +25,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
 | Checksums | Meta pages only | CoW protects data pages; meta checksum detects torn commits |
-| API | Transaction-based | Explicit read/write txns |
+| API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime |
 | Namespaces | Named keyspaces | Multiple B+trees in one file |
 
 ## File Layout
@@ -815,8 +815,9 @@ ignored when `WriteMap` is true.
 
 ### Write Transaction
 
-1. Writer acquires the intra-process Go mutex, then the cross-process
-   `flock(LOCK_EX)` on the lock file (see Write Lock).
+1. Writer acquires the intra-process semaphore, then the cross-process
+   `flock(LOCK_EX)` on the lock file, both respecting `ctx` cancellation
+   (see Write Lock). Returns `ctx.Err()` if cancelled while waiting.
 2. Writer reads the active meta page to get current roots, TxnID, and geometry.
 3. For each modification (insert, update, delete):
    - Traverse the B+tree from root to leaf.
@@ -855,20 +856,25 @@ ignored when `WriteMap` is true.
    `GeoShrinkPages`, truncate the file via `ftruncate()`. This happens
    after the commit point — a crash before truncation leaves the file
    larger than necessary but consistent. The next commit will retry.
-9. Writer clears `WriterPID`, releases the flock, then releases the Go mutex.
+9. Writer clears `WriterPID`, releases the flock, then releases the
+   intra-process semaphore.
 
 ### Read Transaction
 
-1. Reader acquires a slot in the reader table (shared memory) and records the
-   current TxnID from the active meta page.
-2. Reader traverses the B+tree using page pointers from that meta page. Because
+1. Reader checks `ctx` — returns `ctx.Err()` if already cancelled.
+2. Reader acquires a slot in the reader table (shared memory) via scan+CAS
+   and records the current TxnID from the active meta page. Returns
+   `ErrReadersFull` immediately if no slots are available (no blocking).
+3. Reader traverses the B+tree using page pointers from that meta page. Because
    of CoW, all pages referenced by this TxnID are immutable — the writer will
    never modify them in place.
-3. When done, the reader clears its slot in the reader table.
+4. When done, the reader clears its slot in the reader table.
 
 Readers never need locks on the data file. They never block writers. Writers
 never block readers. The only contention point is the reader table slot
-acquisition, which is a simple atomic CAS.
+acquisition, which is a simple atomic CAS. The context is checked once before
+acquisition but is not stored on the transaction — slot acquisition is
+non-blocking so there is nothing to cancel.
 
 ## Cross-Process Coordination
 
@@ -938,18 +944,31 @@ writer crashed while holding the lock — see Stale Writer Recovery.
 
 Write serialization uses two layers:
 
-- **Intra-process**: a `sync.Mutex` on the `DB` struct. This prevents two
-  goroutines in the same process from attempting concurrent writes.
+- **Intra-process**: a channel-based semaphore (`chan struct{}` with capacity
+  1) on the `DB` struct. This prevents two goroutines in the same process
+  from attempting concurrent writes. A channel is used instead of
+  `sync.Mutex` because it supports `select` with `ctx.Done()` for
+  context-aware blocking.
 - **Cross-process**: `flock(LOCK_EX)` on the lock file. This prevents writers
   in different processes.
 
-A `Begin(writable=true)` call first acquires the Go mutex, then acquires the
-flock, then stores the caller's PID in the lock file header's `WriterPID`
-field. `Commit()` and `Rollback()` clear `WriterPID` to 0, release the flock,
-then release the Go mutex. This two-layer approach is necessary because
-`flock()` is per-fd and per-process — a second goroutine calling `flock()` on
-the same fd would succeed immediately (the kernel considers the lock already
-held by this process).
+A `Begin(ctx, writable=true)` call acquires the write lock in two phases,
+both respecting context cancellation:
+
+1. **Intra-process**: `select` on the semaphore channel and `ctx.Done()`. If
+   the context is cancelled while waiting, return `ctx.Err()` immediately.
+2. **Cross-process**: attempt `flock(LOCK_EX)` in a separate goroutine. The
+   calling goroutine `select`s on the flock completion channel and
+   `ctx.Done()`. If the context is cancelled while waiting for flock, the
+   flock attempt is abandoned (the background goroutine will complete the
+   flock and immediately release it via `flock(LOCK_UN)`).
+3. Store the caller's PID in the lock file header's `WriterPID` field.
+
+`Commit()` and `Rollback()` clear `WriterPID` to 0, release the flock, then
+release the semaphore. This two-layer approach is necessary because `flock()`
+is per-fd and per-process — a second goroutine calling `flock()` on the same
+fd would succeed immediately (the kernel considers the lock already held by
+this process).
 
 The `DB` struct holds a single dedicated fd for the write lock (`db.lockFd`),
 opened separately from the fd used for the reader table mmap. This fd is used
@@ -1432,14 +1451,29 @@ func (db *DB) Close() error
 // retroactively fix the lack of ordering guarantees from prior commits.
 func (db *DB) Sync() error
 
-// View executes a read-only transaction.
-func (db *DB) View(fn func(tx *Tx) error) error
+// View executes a read-only transaction. The context governs slot
+// acquisition only — once the transaction callback is entered, the
+// context is not checked. Use context.Background() when no cancellation
+// is needed.
+func (db *DB) View(ctx context.Context, fn func(tx *Tx) error) error
 
-// Update executes a read-write transaction.
-func (db *DB) Update(fn func(tx *Tx) error) error
+// Update executes a read-write transaction. The context governs write
+// lock acquisition — if the lock is held by another writer, the caller
+// blocks until the lock is available or the context is cancelled. Once
+// the transaction callback is entered, the context is not checked.
+func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
 
-// Begin starts a transaction manually.
-func (db *DB) Begin(writable bool) (*Tx, error)
+// Begin starts a transaction manually. The context governs lock/slot
+// acquisition:
+//   - For write transactions: blocks on the write lock, respecting
+//     context cancellation. Returns ctx.Err() if cancelled while waiting.
+//   - For read transactions: returns ErrReadersFull immediately if no
+//     slots are available (no blocking). The context is checked once
+//     before attempting slot acquisition.
+//
+// Once Begin returns a *Tx, the context is not stored — the caller
+// controls the transaction lifetime via Commit()/Rollback().
+func (db *DB) Begin(ctx context.Context, writable bool) (*Tx, error)
 
 // Tx is a database transaction.
 type Tx struct { ... }
@@ -1679,7 +1713,7 @@ organized by file:
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
-| `lock.go` | Lock file creation and mmap (shared memory). Writer lock (Go mutex intra-process + flock cross-process + WriterPID). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
+| `lock.go` | Lock file creation and mmap (shared memory). Writer lock (channel semaphore intra-process + flock cross-process + WriterPID, context-aware). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
 | `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (sort dirty keys + sequential pwrite + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Stats accumulation. |
 | `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Keyspace management. Sync(). Check(). CopyTo(). |
 | `errors.go` | Sentinel error definitions. |
