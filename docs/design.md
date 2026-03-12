@@ -93,7 +93,7 @@ Meta Page
 | Magic            | uint32 - identifies file as gmdb
 | Version          | uint32 - format version
 | PageSize         | uint32 - page size in bytes
-| Flags            | uint32 - bit 0: PageChecksum; bits 1-31: reserved
+| Flags            | uint32 - bit 0: PageChecksum (immutable); bit 1: Steady; bits 2-31: reserved
 | GeoLower         | uint64 - minimum database size in pages
 | GeoUpper         | uint64 - maximum database size in pages
 | GeoGrowPages     | uint64 - growth step in pages
@@ -1520,17 +1520,40 @@ confirmed on stable storage. Steady commits occur when:
 - A commit happens in `SyncDurable` or `SyncNoMeta` mode (these sync as part
   of their normal commit path).
 
-The meta page tracks whether the last commit is steady via the existing
-checksum and TxnID mechanism. On recovery after a crash:
-- The database reads both meta pages.
-- If a meta page's data pages are not on disk (because the crash happened
-  before the OS flushed them), reading those pages will return stale or zero
-  data — the B+tree will be inconsistent.
-- The database falls back to the other meta page, which points to the last
-  steady commit's tree. All transactions after that steady commit are lost.
+Each meta page carries a **steady flag** — a boolean indicating whether the
+commit it represents has been confirmed on stable storage. The steady flag
+is set when `fdatasync()` completes successfully (either from a
+`SyncDurable`/`SyncNoMeta` commit or an explicit `DB.Sync()` call). In
+`SyncSafe` mode, commits write the meta page with the steady flag **clear**.
+A subsequent `DB.Sync()` re-writes the meta page with the steady flag
+**set** (this is safe — the meta page is small and atomic).
 
-This is safe because CoW never modifies existing pages — the steady commit's
-tree is entirely intact on disk.
+On recovery after a crash, `Open()` performs the following:
+
+1. Read both meta pages. Discard any with an invalid xxhash64 checksum.
+2. Of the valid meta pages, prefer the one with the higher TxnID.
+3. If the preferred meta page has its steady flag **set**, use it — both
+   data and meta are confirmed on stable storage.
+4. If the preferred meta page has its steady flag **clear** (a non-steady
+   `SyncSafe` commit), validate its tree:
+   - **With `PageChecksum` enabled**: read the root page and verify its
+     CRC32C. If valid, accept the meta page (the OS flushed data pages
+     before the crash). If invalid, fall back to the other meta page.
+   - **Without `PageChecksum`**: perform a shallow validation — read the
+     root page and check its page header (type, page ID). If the header
+     is consistent, accept the meta page. If the root page contains
+     zeroes or an invalid header, fall back to the other meta page.
+5. The fallback meta page is the last steady commit. All transactions
+   after that steady commit are lost.
+
+The shallow validation without checksums is not foolproof — a recycled
+page ID could contain a structurally valid header from a previous
+occupant with wrong data. For strongest `SyncSafe` recovery guarantees,
+enable `PageChecksum`. With checksums enabled, recovery can detect any
+partially-flushed data page.
+
+This is safe because CoW never modifies existing pages — the steady
+commit's tree is entirely intact on disk.
 
 ### SyncNone Warning
 
@@ -2041,6 +2064,15 @@ func (c *Cursor) Put(key, value []byte) error
 // Delete deletes the key-value pair at the current cursor position.
 func (c *Cursor) Delete() error
 
+// Err returns the first error encountered during cursor navigation.
+// Navigation methods (First, Last, Next, Prev, Seek, SeekGE) do not
+// return errors directly — they return nil key/value when iteration
+// ends or an error occurs. After a navigation loop, the caller checks
+// Err() to distinguish normal end-of-range (nil) from an error (e.g.,
+// ErrCorrupted from a page checksum failure). This follows the
+// bufio.Scanner / sql.Rows pattern.
+func (c *Cursor) Err() error
+
 // --- DUPSORT operations (only valid on DupSort keyspaces) ---
 
 // FirstDup positions the cursor at the first duplicate value for the
@@ -2226,6 +2258,7 @@ func (c *TypedCursor[K, V]) Next() (K, V, bool)
 func (c *TypedCursor[K, V]) Prev() (K, V, bool)
 func (c *TypedCursor[K, V]) Seek(target K) (K, V, bool)
 func (c *TypedCursor[K, V]) SeekGE(target K) (K, V, bool)
+func (c *TypedCursor[K, V]) Err() error
 ```
 
 The typed layer is a **zero-cost abstraction** at the API level — all
