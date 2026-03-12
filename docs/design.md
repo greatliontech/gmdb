@@ -24,7 +24,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Page spilling | LRU-based spill to disk mid-transaction (pwrite mode only) | Bounds memory usage for large write transactions |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
-| Checksums | Meta pages only | CoW protects data pages; meta checksum detects torn commits |
+| Checksums | Meta: xxhash64 (always); Data: CRC32C footer (optional) | Meta checksum detects torn commits; optional data checksum catches silent bitrot |
 | API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime |
 | Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
 | Leak detection | `runtime.AddCleanup` on `Tx` | Detects leaked transactions, releases reader slots, logs origin stack trace |
@@ -72,6 +72,10 @@ Page Header (16 bytes)
 - **Overflow**: Number of contiguous overflow pages following this one (0 for
   single-page nodes).
 
+When `Options.PageChecksum` is enabled, every data page (branch, leaf,
+overflow, RPL segment) also carries a 4-byte CRC32C footer in the last 4
+bytes of the page. See Checksums for details.
+
 #### Meta Page
 
 Two meta pages exist at page 0 and page 1. They alternate — the writer always
@@ -85,7 +89,7 @@ Meta Page
 | Magic            | uint32 - identifies file as gmdb
 | Version          | uint32 - format version
 | PageSize         | uint32 - page size in bytes
-| Flags            | uint32 - reserved
+| Flags            | uint32 - bit 0: PageChecksum; bits 1-31: reserved
 | GeoLower         | uint64 - minimum database size in pages
 | GeoUpper         | uint64 - maximum database size in pages
 | GeoGrowPages     | uint64 - growth step in pages
@@ -491,7 +495,8 @@ RPL Segment Page
 Segment capacity at 4KB page size: 16 (page header) + 8 + 8 (link pointers)
 + 2 (EntryCount) + 6 (padding) = 40 bytes overhead. Remaining
 `4096 - 40 = 4056` bytes / 16 bytes per entry = **253 entries per segment
-page**. A transaction freeing 10,000 pages fills ~40 segment pages.
+page** (253 also with PageChecksum enabled: `4096 - 40 - 4 = 4052` / 16 =
+253). A transaction freeing 10,000 pages fills ~40 segment pages.
 
 The meta page stores `RPLHeadPage` (newest segment) and `RPLTailPage` (oldest
 segment). Segments are doubly linked: `OlderSegment` links from head toward
@@ -1527,6 +1532,14 @@ type Options struct {
     // Ignored when opening an existing database (read from meta page).
     PageSize int
 
+    // PageChecksum enables CRC32C checksums on data pages (branch, leaf,
+    // overflow, RPL segment). Stored as a flag in the meta page — immutable
+    // after creation. When enabled, every page read is verified and every
+    // page write computes a checksum footer. Default: false.
+    // Only used when creating a new database. Ignored when opening an
+    // existing database (read from meta page Flags).
+    PageChecksum bool
+
     // Geometry controls database file size bounds and growth behavior.
     // Only used when creating a new database. When opening an existing
     // database, geometry is read from the meta page. Use Tx.SetGeometry()
@@ -1913,7 +1926,7 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding. Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate checksum (including geometry fields, bitmap/RPL pointers). RPL segment page: encode/decode entry list, segment linking. |
+| `page.go` | Page header encoding/decoding. Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: encode/decode entry list, segment linking. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance with configurable `MergeThreshold`). Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages, reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: singly-linked list of intra-transaction recycled pages. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
 | `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). LRU-based priority selection from `tx.dirtyPages` map. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
@@ -1941,14 +1954,14 @@ Determined by page size. A branch page must fit at least 2 keys to allow
 splitting. The fixed overhead is 24 bytes (16-byte page header + 8-byte
 leftmost child pointer). Each key requires 4 bytes (cell directory entry) +
 key bytes + 8 bytes (child pointer). The maximum key size is approximately
-`(PageSize - 48) / 2`:
+`(PageSize - 48) / 2` (or `(PageSize - 52) / 2` with PageChecksum enabled):
 
-| Page Size | Max Key Size (approx) |
-|-----------|----------------------|
-| 4KB       | ~2024 bytes          |
-| 8KB       | ~4024 bytes          |
-| 16KB      | ~8024 bytes          |
-| 64KB      | ~32744 bytes         |
+| Page Size | Max Key Size (approx) | With PageChecksum |
+|-----------|----------------------|-------------------|
+| 4KB       | ~2024 bytes          | ~2022 bytes       |
+| 8KB       | ~4024 bytes          | ~4022 bytes       |
+| 16KB      | ~8024 bytes          | ~8022 bytes       |
+| 64KB      | ~32744 bytes         | ~32742 bytes      |
 
 Enforced at `Put()` time. Keys exceeding the limit return an error.
 
@@ -1969,19 +1982,111 @@ exceeding this limit returns an error.
 
 ## Checksums
 
-Only meta pages carry checksums (xxhash64 of all fields). Data pages (branch,
-leaf, overflow) do not have checksums.
+### Meta Page Checksums (Always On)
 
-**Rationale**: The meta page is the atomic commit point — a torn write here
-would silently point to an inconsistent tree. The checksum detects this and
-triggers fallback to the other meta page.
+Both meta pages carry an xxhash64 checksum of all preceding fields. This is
+mandatory and cannot be disabled. The meta page is the atomic commit point —
+a torn write here would silently point to an inconsistent tree. The checksum
+detects this and triggers fallback to the other meta page.
 
-Data pages are protected by CoW: they are written to new locations before the
-meta page is updated (with ordering enforced by `fdatasync()` in `SyncDurable`
-and `SyncNoMeta` modes). A crash during a data page write leaves the meta page
-pointing to the old (consistent) tree. The half-written page is orphaned and
-never referenced. Per-page checksums would only catch silent bitrot after a
-successful write, which modern filesystems (ext4, ZFS, btrfs) already detect.
+### Data Page Checksums (Optional)
+
+Data pages (branch, leaf, overflow, RPL segment) optionally carry a CRC32C
+checksum for defense against silent bitrot, firmware bugs, and storage
+corruption that the filesystem does not detect.
+
+Enabled via `Options.PageChecksum = true` at database creation time. The
+setting is stored as a flag in the meta page's `Flags` field (bit 0) and
+is **immutable after creation** — all pages in a checksummed database have
+checksums, all pages in a non-checksummed database do not.
+
+#### Storage
+
+The checksum is stored as a **page footer** — the last 4 bytes of the page:
+
+```
+Page (with checksum enabled)
++------------------------+
+| Page Header (16 bytes) |
++------------------------+
+| Page Content           |
+| (PageSize - 20 bytes)  |
++------------------------+
+| CRC32C (4 bytes)       |  footer: checksum of bytes 0 through PageSize-5
++------------------------+
+```
+
+The footer approach keeps the page header unchanged at 16 bytes. Usable
+page content shrinks by 4 bytes when checksums are enabled — negligible
+(0.1% at 4KB page size). The checksum covers the entire page from byte 0
+through byte `PageSize - 5` (inclusive), including the page header.
+
+Bitmap pages do not carry checksums (they have no page header or footer).
+Bitmap integrity is guaranteed by the CoW model and meta page checksum.
+
+#### Algorithm: CRC32C
+
+CRC32C (Castagnoli) is used for data page checksums:
+- **Hardware-accelerated** on amd64 (SSE4.2) and arm64 (CRC instructions).
+  Go's `hash/crc32` package uses these automatically.
+- **4 bytes** — minimal space overhead.
+- **~200ns for a 4KB page** with hardware acceleration — comparable to a
+  TLB miss, dominated by memory access rather than computation.
+
+xxhash is faster for large inputs but CRC32C is sufficient for page-sized
+data and has the advantage of hardware acceleration and smaller output.
+
+#### Verification (Read Path)
+
+When checksums are enabled, every page read from the mmap is verified:
+
+1. Compute CRC32C of bytes 0 through `PageSize - 5`.
+2. Compare with the 4-byte footer.
+3. If mismatch, return `ErrCorrupted` with the page ID.
+
+This adds ~200ns per page read. For a point lookup traversing 3-4 B+tree
+levels, the overhead is ~800ns — negligible compared to the tree traversal
+and potential page fault cost. For full-database scans reading millions of
+pages, the overhead is measurable but bounded by memory bandwidth (the
+CRC computation runs at memory speed with hardware acceleration).
+
+Pages in `tx.dirtyPages` (pwrite mode) bypass verification — they are
+in-memory copies that have not been written to disk. Spilled pages that
+are re-read from the mmap are verified on re-read.
+
+#### Computation (Write Path)
+
+When checksums are enabled, the checksum is computed before writing:
+
+- **pwrite mode**: CRC32C is computed on the dirty page buffer before
+  `pwrite()`. The footer bytes are written as part of the page.
+- **writemap mode**: CRC32C is computed on the mmap page content after
+  all modifications are complete, before the commit-time sync. The footer
+  is written directly into the mmap.
+
+#### What Checksums Do and Do Not Catch
+
+**Catches:**
+- Silent bitrot on disk (bit flips in stored data).
+- Firmware bugs in SSD/NVMe controllers that corrupt data at rest.
+- RAID controller or storage stack corruption.
+- Kernel bugs that corrupt the page cache after successful write.
+
+**Does not catch:**
+- Torn writes (already handled by CoW + meta page checksum).
+- In-memory corruption between `pwrite()` and disk (the checksum is
+  computed on the same buffer that is written — if the buffer is corrupt,
+  the checksum matches the corrupt data).
+- Corruption introduced by the application via stray pointers in
+  writemap mode (the checksum is computed on the already-corrupted page).
+
+#### Default
+
+Checksums are **disabled by default**. The rationale: CoW already provides
+crash consistency, and most production deployments use filesystems (ZFS,
+btrfs, ext4 with metadata checksums) or storage controllers that detect
+bitrot. The optional checksum is for users who want defense-in-depth or
+run on storage without integrity guarantees.
 
 ## Integrity and Safety
 
@@ -2004,3 +2109,6 @@ successful write, which modern filesystems (ext4, ZFS, btrfs) already detect.
   consistent. In pwrite mode, no bitmap corruption occurs (dirty pages never
   reached disk). In writemap mode, some bitmap bits may leak (allocated but
   uncommitted pages); recoverable via `Check()` or `CopyTo(compact=true)`.
+- **Silent bitrot detection**: When `PageChecksum` is enabled, every data page
+  read is verified against its CRC32C footer. Corruption is detected at read
+  time with `ErrCorrupted` identifying the affected page.
