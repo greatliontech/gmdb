@@ -29,6 +29,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
 | Leak detection | `runtime.AddCleanup` on `Tx` | Detects leaked transactions, releases reader slots, logs origin stack trace |
 | Range delete | Subtree retirement via `DeleteRange` | O(pages) not O(entries); bulk-free for DUPSORT nested B+trees |
+| Commit I/O | pwrite (default) or io_uring (opt-in, Linux) | io_uring batches all commit writes into 1-2 syscalls; pwrite is portable fallback |
 | Namespaces | Named keyspaces | Multiple B+trees in one file |
 
 ## File Layout
@@ -1514,6 +1515,102 @@ database can be discarded after a crash.
 The full commit path with mode-dependent behavior is described in the
 Write Transaction section (see Copy-on-Write Transaction Model, steps 5–7).
 
+## io_uring Commit Path (Linux, Optional)
+
+The default commit path in pwrite mode issues N `pwrite()` syscalls for dirty
+pages, an `fdatasync()`, one `pwrite()` for the meta page, and a final
+`fdatasync()`. Each syscall is a kernel transition. For transactions with
+thousands of dirty pages, the syscall overhead is significant.
+
+`io_uring` (Linux 5.1+) allows submitting all commit I/O as a single batch
+via one `io_uring_enter()` syscall, with chained completion ordering that
+replaces the multi-syscall sequence.
+
+### Architecture
+
+When `Options.UseIOURing` is true and the kernel supports it, the `DB` struct
+initializes an `io_uring` instance at open time (one ring per `DB`, shared
+across write transactions). The commit path changes as follows:
+
+**Default (pwrite + fdatasync):**
+```
+for each dirty page:       pwrite(fd, page, offset)   // N syscalls
+fdatasync(fd)                                          // 1 syscall
+pwrite(fd, meta, offset)                               // 1 syscall
+fdatasync(fd)                                          // 1 syscall
+                                                       // Total: N + 3
+```
+
+**io_uring:**
+```
+Submit SQE batch:                                      // 1 syscall
+  [WRITE page0] → [WRITE page1] → ... → [WRITE pageN]
+  → [FSYNC linked]
+  → [WRITE meta]
+  → [FSYNC linked]
+Wait for CQE completion                               // 1 syscall (or 0 with IORING_ENTER_GETEVENTS)
+                                                       // Total: 1-2
+```
+
+All dirty page writes are submitted as independent SQEs (they can execute
+in parallel — the kernel reorders for disk locality). The fsync is submitted
+as a **linked SQE** after the data writes, ensuring it waits for all
+preceding writes to complete. The meta page write is linked after the fsync,
+and the final fsync is linked after the meta write. This preserves the same
+write ordering guarantees as the pwrite path.
+
+### Implementation Details
+
+- **Ring sizing**: The ring is created with a submission queue large enough
+  for the expected dirty page count (`Options.MaxDirtyPages` + overhead).
+  If a commit exceeds the ring size, writes are submitted in batches.
+
+- **Fixed buffers**: `io_uring` supports pre-registered buffers via
+  `io_uring_register(IORING_REGISTER_BUFFERS)` to avoid per-I/O page
+  pinning overhead. Dirty page buffers in pwrite mode can be registered
+  at allocation time and deregistered on free.
+
+- **Fallback**: If `io_uring` initialization fails (old kernel, seccomp
+  restrictions, container without `io_uring` support), fall back to the
+  pwrite path silently. Log a warning via the `Logger`.
+
+- **writemap mode**: `io_uring` does not apply in writemap mode — dirty
+  pages are already in the mmap and commit uses `fdatasync()` or `msync()`
+  directly. The io_uring path is pwrite mode only.
+
+- **SyncMode interaction**: In `SyncSafe` and `SyncNone` modes, the fsync
+  SQEs are omitted from the chain. `SyncNoMeta` omits only the final fsync.
+  The write SQEs are still submitted via `io_uring` for batching benefit.
+
+### Expected Benefits
+
+The primary benefit is reduced syscall overhead for write-heavy workloads
+with many dirty pages per commit. For a transaction dirtying 1000 pages:
+
+| Path | Syscalls | Kernel transitions |
+|------|----------|--------------------|
+| pwrite | 1003 | 1003 |
+| io_uring | 1-2 | 1-2 |
+
+Secondary benefits:
+- The kernel can reorder write SQEs for optimal disk scheduling.
+- Linked SQEs express write ordering constraints directly to the kernel
+  rather than serializing in userspace.
+- Potential for zero-copy I/O with registered buffers.
+
+### Limitations
+
+- **Linux only**: `io_uring` is a Linux-specific API. The pwrite path
+  remains the portable default.
+- **Kernel version**: Requires Linux 5.1+ for basic support, 5.6+ for
+  linked SQEs with fsync. Older kernels fall back to pwrite.
+- **Security**: `io_uring` has had kernel security vulnerabilities (several
+  CVEs). Some container runtimes and seccomp profiles disable it. The
+  fallback path ensures gmdb works in restricted environments.
+- **Complexity**: The io_uring code path is an optimization overlay on the
+  existing pwrite path, not a replacement. Both paths must produce
+  identical commit semantics.
+
 ## Database Geometry
 
 The database file size is managed dynamically between configurable lower and
@@ -1664,6 +1761,13 @@ type Options struct {
     // write-heavy workloads but offers no protection against stray
     // pointer bugs corrupting the database. Default: false.
     WriteMap bool
+
+    // UseIOURing enables the io_uring commit path (Linux 5.6+ only).
+    // Submits all commit I/O as a single io_uring batch instead of
+    // individual pwrite() + fdatasync() syscalls. Falls back to pwrite
+    // silently if io_uring is unavailable. Ignored in writemap mode.
+    // Default: false.
+    UseIOURing bool
 
     // MaxReaders is the maximum number of concurrent reader slots.
     // Default: 4096. Only used when creating a new lock file.
@@ -2053,6 +2157,7 @@ organized by file:
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
+| `iouring_linux.go` | io_uring commit path (Linux 5.6+). Ring initialization, SQE batch construction (data writes + linked fsync + meta write + linked fsync), CQE completion handling, registered buffer management, fallback detection. |
 | `lock.go` | Lock file creation and mmap (shared memory). Writer lock (channel semaphore intra-process + flock cross-process + WriterPID, context-aware). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
 | `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (sort dirty keys + sequential pwrite + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
 | `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management. Sync(). Check(). CopyTo(). |
