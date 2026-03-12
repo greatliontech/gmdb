@@ -14,7 +14,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Duplicate values | DUPSORT with subpage + nested B+tree | Subpage for small sets, nested B+tree for large; DUPFIXED for fixed-size optimization |
 | Free space | Allocation bitmap + retired page log (RPL) | O(1) alloc via bitmap, no self-referential allocation, RPL tracks MVCC retirement |
 | RPL entry format | Per-segment TxnID + array of PageIDs | TxnID stored once per segment (not per entry); doubles segment capacity |
-| File geometry | Dynamic grow/shrink with configurable bounds | Auto-compaction via tail refund, no manual compaction needed |
+| File geometry | Dynamic grow/shrink with configurable bounds; GeoUpper immutable after creation | Auto-compaction via tail refund, no manual compaction needed; GeoUpper fixed because bitmap region size depends on it |
 | Isolation | Dual meta pages + CoW | No WAL needed, atomic commit |
 | Crash safety | CoW + atomic meta page swap | File is always consistent |
 | Durability | Three sync modes (Durable, NoMeta, Safe) + unsafe opt-in None | Configurable ACID vs. performance; SyncNone requires explicit `AllowSyncNone` flag |
@@ -2431,13 +2431,27 @@ file grows and shrinks.
 | Parameter | Meta Field | Description | Default |
 |-----------|-----------|-------------|---------|
 | Lower bound | `GeoLower` | Minimum file size in pages. File never shrinks below this. | `2 + BitmapPages` (meta + bitmap) |
-| Upper bound | `GeoUpper` | Maximum file size in pages. Determines mmap reservation size. | 256GB / PageSize |
+| Upper bound | `GeoUpper` | Maximum file size in pages. Determines mmap reservation and bitmap size. **Immutable after creation.** | 256GB / PageSize |
 | Growth step | `GeoGrowPages` | Number of pages to grow by when extending the file. | 65536 pages (256MB at 4KB pages) |
 | Shrink threshold | `GeoShrinkPages` | Shrink the file when `fileSize - FirstUnallocated > threshold`. | 131072 pages (512MB at 4KB pages) |
 
 Geometry is set at database creation time via `Options` and persisted in the
-meta page. It can be modified by calling `Tx.SetGeometry()` on a write
-transaction — the new values take effect when the transaction commits.
+meta page. `GeoLower`, `GeoGrowPages`, and `GeoShrinkPages` can be modified
+by calling `Tx.SetGeometry()` on a write transaction — the new values take
+effect when the transaction commits.
+
+**`GeoUpper` is immutable after creation.** The allocation bitmap occupies a
+fixed region of pages (starting at page 2) whose size is determined by
+`GeoUpper` at creation time (see Allocation Bitmap). Increasing `GeoUpper`
+would require expanding the bitmap region, which would shift all data page
+offsets — every page ID in every B+tree, RPL segment, and keyspace descriptor
+would become invalid. Decreasing `GeoUpper` below the current
+`FirstUnallocated` would orphan allocated pages. Neither operation is
+feasible without a full database rebuild.
+
+To change `GeoUpper`, use `CopyTo(path, compact)` to create a new database
+with different `Options.Geometry.Upper`, then replace the original file.
+`SetGeometry()` returns an error if the caller attempts to change `GeoUpper`.
 
 ### File Growth
 
@@ -2705,7 +2719,10 @@ type Geometry struct {
     Lower uint64
 
     // Upper is the maximum database file size in bytes. Determines mmap
-    // reservation size. Must be a multiple of PageSize. Default: 256GB.
+    // reservation size and allocation bitmap size. Must be a multiple of
+    // PageSize. Immutable after creation — SetGeometry cannot change this;
+    // use CopyTo to create a new database with different Upper.
+    // Default: 256GB.
     Upper uint64
 
     // GrowStep is the number of bytes to grow by when extending the file.
@@ -2801,6 +2818,14 @@ func (tx *Tx) Rollback() error
 
 // SetGeometry updates the database geometry. Only valid on a write
 // transaction. The new geometry takes effect when the transaction commits.
+//
+// GeoUpper (Geometry.Upper) is immutable after creation — the allocation
+// bitmap size is fixed at creation time based on GeoUpper, and changing it
+// would invalidate all page IDs. SetGeometry returns an error if
+// Geometry.Upper differs from the current GeoUpper. To change GeoUpper,
+// use CopyTo to create a new database with different geometry.
+//
+// GeoLower, GrowStep, and ShrinkThreshold may be modified freely.
 func (tx *Tx) SetGeometry(g Geometry) error
 
 // KeyspaceFlags controls keyspace behavior. Set at creation time, immutable after.
@@ -3206,7 +3231,7 @@ organized by file:
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
 | `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |
 | `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). Clock-based eviction via `tx.clockRing` circular buffer with reference bit sweep and tombstones for spilled entries. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
-| `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
+| `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification of `GeoLower`, `GeoGrowPages`, `GeoShrinkPages` (rejects `GeoUpper` changes — bitmap region is fixed at creation). |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` prefaulting (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
