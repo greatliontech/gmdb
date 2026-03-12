@@ -271,10 +271,13 @@ since it was dirtied). A counter (`tx.looseCount`) tracks the list length.
 Loose pages are **immediately reusable** within the same transaction without
 any freelist B+tree interaction:
 - `pageAlloc()` checks `tx.loosePages` first (O(1) pop from the linked list).
-- Loose pages are never written to the freelist B+tree — they were born and
-  died in the same transaction, so no other reader can ever reference them.
-- At commit time, any remaining loose pages are moved to the transaction's
-  pending free list for insertion into the freelist B+tree.
+- Loose pages that are reused via `pageAlloc()` never touch the freelist
+  B+tree at all — they were allocated and freed within the same transaction,
+  so no reader can ever reference them.
+- At commit time, any loose pages still in the list (allocated a page ID but
+  never reused) are moved to `tx.pendingFrees` for insertion into the
+  freelist B+tree. Their page IDs must be tracked so future transactions
+  can reclaim them.
 
 This optimization is critical for the self-referential problem: freelist B+tree
 operations that split/merge nodes produce loose pages that are recycled without
@@ -294,8 +297,8 @@ The reclamation flow:
 3. Subsequent `pageAlloc()` calls pop pages from `tx.reclaimedPages` (O(1)).
 4. For multi-page (contiguous) allocations, `tx.reclaimedPages` is scanned for
    runs of consecutive page IDs.
-5. At commit time, the consumed entries are batch-deleted from the freelist
-   B+tree.
+5. At commit time, any consumed entries not already removed by early GC
+   cleanup are deleted from the freelist B+tree.
 
 This turns N individual B+tree lookups into one range scan + one batch delete,
 significantly reducing B+tree operations during a write transaction.
@@ -370,9 +373,8 @@ After populating or modifying `tx.reclaimedPages` or `tx.loosePages`, the
 writer checks if any pages at the tail of the database file (page IDs equal
 to `FirstUnallocated - 1`, `FirstUnallocated - 2`, etc.) are present in these
 lists. If so, those pages are removed from the lists and `FirstUnallocated` is
-decremented. This reclaims space without going through the freelist, and
-enables file shrinkage
-at commit time (see Database Geometry).
+decremented. This reclaims space without going through the freelist and
+enables file shrinkage at commit time (see Database Geometry).
 
 The refund process iterates: removing tail pages may expose new tail pages in
 the lists. It runs until no more tail pages are found. Loose pages are checked
@@ -485,10 +487,10 @@ spilling them would cause unnecessary re-dirtying.
 6. The inactive meta page is updated with new root pointers, new TxnID,
    updated `FirstUnallocated`, and checksum.
 7. The meta page is `fdatasync()`'d. This is the atomic commit point.
-8. If `fileSize - FirstUnallocated > GeoShrinkPages`, truncate the file via
-   `ftruncate()`. This happens after the commit point — a crash before
-   truncation leaves the file larger than necessary but consistent. The
-   next commit will retry the truncation.
+8. If the OS file size exceeds `FirstUnallocated` by more than
+   `GeoShrinkPages`, truncate the file via `ftruncate()`. This happens
+   after the commit point — a crash before truncation leaves the file
+   larger than necessary but consistent. The next commit will retry.
 9. Writer releases exclusive lock.
 
 ### Read Transaction
@@ -646,8 +648,8 @@ file grows and shrinks.
 | Shrink threshold | `GeoShrinkPages` | Shrink the file when `fileSize - FirstUnallocated > threshold`. | 131072 pages (512MB at 4KB pages) |
 
 Geometry is set at database creation time via `Options` and persisted in the
-meta page. It can be modified by calling `DB.SetGeometry()` within a write
-transaction — the new values take effect at the next commit.
+meta page. It can be modified by calling `Tx.SetGeometry()` on a write
+transaction — the new values take effect when the transaction commits.
 
 ### File Growth
 
@@ -660,8 +662,8 @@ When `pageAlloc()` needs to extend the file:
 
 ### File Shrinkage
 
-At commit time, after the tail page refund (see Freelist Runtime
-Optimizations), if `fileSize - FirstUnallocated > GeoShrinkPages`:
+After the commit point (meta page fsync), if the OS file size exceeds
+`FirstUnallocated` by more than `GeoShrinkPages`:
 1. Calculate new size: `alignUp(FirstUnallocated, GeoGrowPages)`.
 2. Clamp to `GeoLower`.
 3. Truncate the file via `ftruncate()`. The mmap reservation remains at
@@ -712,8 +714,8 @@ type Options struct {
 
     // Geometry controls database file size bounds and growth behavior.
     // Only used when creating a new database. When opening an existing
-    // database, geometry is read from the meta page. Use DB.SetGeometry()
-    // to modify geometry of an existing database within a write transaction.
+    // database, geometry is read from the meta page. Use Tx.SetGeometry()
+    // to modify geometry of an existing database.
     Geometry Geometry
 
     // MaxReaders is the maximum number of concurrent reader slots.
@@ -786,10 +788,6 @@ type DB struct { ... }
 
 func (db *DB) Close() error
 
-// SetGeometry updates the database geometry. Must be called within a write
-// transaction. The new geometry takes effect at the next commit.
-func (db *DB) SetGeometry(g Geometry) error
-
 // View executes a read-only transaction.
 func (db *DB) View(fn func(tx *Tx) error) error
 
@@ -804,6 +802,10 @@ type Tx struct { ... }
 
 func (tx *Tx) Commit() error
 func (tx *Tx) Rollback() error
+
+// SetGeometry updates the database geometry. Only valid on a write
+// transaction. The new geometry takes effect when the transaction commits.
+func (tx *Tx) SetGeometry(g Geometry) error
 
 // OpenKeyspace opens a named keyspace within this transaction.
 // Creates it if it doesn't exist (write txn only).
@@ -844,12 +846,12 @@ organized by file:
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split), delete (CoW, merge/rebalance). Cursor: stateful iterator holding a stack of (pageID, index) pairs. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `freelist.go` | Freelist B+tree with composite keys (TxnID \|\| PageID, big-endian, empty values). Page allocation with priority: loose pages → reclaimed cache → B+tree scan (LIFO, time-bounded) → slow reader check → file extension. Batched reclamation with early GC cleanup. Loose page tracking: singly-linked list of intra-transaction recycled pages. Tail page refund for auto-compaction. Commit-time freelist update: insert pending frees, delete consumed entries, convergence loop. |
 | `spill.go` | Dirty page spilling to disk mid-transaction. LRU-based priority selection. Spill list tracking for re-dirtying detection. Adjacent page grouping for efficient I/O. |
-| `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `SetGeometry()` for runtime modification. |
+| `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
 | `mmap.go` | Platform-specific mmap/munmap. Initial mapping with over-allocated virtual address space (sized to GeoUpper). |
 | `mmap_linux.go` | Linux mmap/munmap syscalls. |
 | `mmap_darwin.go` | macOS mmap/munmap syscalls. |
 | `lock.go` | Lock file creation and mmap (shared memory). Writer lock (flock-based). Reader table: slot acquire/release, stale PID detection. Oldest-reader query for freelist reclamation. Slow reader detection and callback invocation. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, track dirty pages (with LRU counters), CoW operations, spill trigger, commit (freelist update + write pages + fsync + geometry shrink + meta swap + fsync), rollback. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, track dirty pages (with LRU counters), CoW operations, spill trigger, commit (freelist update + write pages + fsync + meta swap + fsync + geometry shrink), rollback. |
 | `db.go` | Open/Close. Environment setup (mmap, lock file, geometry). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Keyspace management. |
 
 ## Limits
