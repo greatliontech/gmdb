@@ -248,60 +248,58 @@ balance fill ratios:
    left sibling, first key of right sibling).
 2. Replace the old separator in the parent branch.
 
-**Leaf pages are unaffected**: leaves store full keys — they are the
-source of truth. Prefix truncation only applies to branch page
-separators. Cursor navigation compares against full keys in leaves
-and truncated separators in branches; the B+tree search algorithm
-handles this naturally since branch comparisons only determine which
-child to descend into.
+**Complementary with leaf prefix compression**: branch pages use
+prefix-truncated separators (compressing keys *across* tree levels —
+the separator is shorter than either boundary key). Leaf pages use
+prefix compression (compressing redundancy *within* a page — each key
+is stored as a delta from its neighbor). The two techniques are
+independent and complementary: branch truncation reduces tree depth,
+leaf compression increases leaf density. Cursor navigation reconstructs
+full keys from the leaf delta encoding and compares against truncated
+separators in branches; the B+tree search algorithm handles this
+naturally since branch comparisons only determine which child to
+descend into.
 
 **Interaction with maximum key size**: the maximum key size limit
-(see Limits) applies to full keys stored in leaf pages. Branch page
-separators are always shorter than or equal to the full keys, so they
-never exceed the limit.
+(see Limits) applies to full keys stored in leaf pages (reconstructed
+from delta encoding). Branch page separators are always shorter than or
+equal to the full keys, so they never exceed the limit.
 
 #### Leaf Page
 
-Leaf pages store the actual key-value pairs. Note: the cell directory entry
-format differs from branch pages — leaf cells use `(Offset, CellFlags)` instead
-of `(Offset, KeyLen)`, because leaf cells encode `KeyLen` inside the cell data
-itself and need the flags to distinguish cell formats (inline value, overflow
-reference, DUPSORT subpage, or nested B+tree reference).
+Leaf pages store the actual key-value pairs using **prefix compression** —
+keys that share common prefixes with their neighbors are stored as deltas
+rather than full keys. This increases leaf density significantly for
+workloads with hierarchical or composite keys (e.g., `tenant:user:resource`
+patterns).
 
 ```
 Leaf Page
 +-----------------------+
 | Page Header (8 bytes) |
 +-----------------------+
-| Cell Directory        | Array of (Offset uint16, CellFlags uint16)
+| RestartInterval uint16|  fixed: 16
+| RestartCount uint16   |  number of restart points
++-----------------------+
+| Restart Table         |  array of (Offset uint16), one per restart point
+| ...                   |  RestartCount × 2 bytes, grows forward
++-----------------------+
+|       free space      |
++-----------------------+
 | ...                   |
-+-----------------------+
-|     free space        |
-+-----------------------+
-| ...                   |
-| KV Data N             | packed from end of page
-| KV Data 1             |
-| KV Data 0             |
+| Entry N               |  packed from end of page, grows backward
+| Entry 1 (delta)       |
+| Entry 0 (restart)     |
 +-----------------------+
 ```
 
-Each cell in the data area:
+Entries at positions 0, 16, 32, ... are **restart points** that store full
+keys. All other entries are **delta entries** that encode the key as a
+difference from the previous entry.
 
-```
-KV Cell (inline)
-+----------+----------+-----------+-----------+
-| KeyLen   | ValueLen | Key bytes | Val bytes |
-| uint16   | uint32   |           |           |
-+----------+----------+-----------+-----------+
-```
-
-`ValueLen` is uint32 (max ~4GB for inline values). In practice, inline values
-are limited by leaf page free space — far below 4GB. Values that exceed leaf
-page capacity are stored as overflow pages, referenced via the overflow format
-below which uses uint64 `TotalLen` for unbounded value sizes.
-
-If a value is too large to fit in the leaf page, the CellFlags field in the cell
-directory indicates it's an overflow reference.
+Each entry carries a `CellFlags` byte in its header to distinguish cell
+formats (inline value, overflow reference, DUPSORT subpage, or nested
+B+tree reference).
 
 CellFlags bit layout:
 
@@ -309,30 +307,159 @@ CellFlags bit layout:
 Bit 0:    Overflow (0 = inline value, 1 = overflow reference)
 Bit 1:    DupData (0 = single value, 1 = duplicate data — subpage or nested B+tree)
 Bit 2:    DupTree (only when Bit 1 is set: 0 = subpage, 1 = nested B+tree)
-Bit 3:    Compressed (reserved, 0 for now)
-Bit 4:    Encrypted (reserved, 0 for now)
-Bits 5-7: Compression algorithm ID (reserved, 0 for now)
-Bits 8-15: Reserved (must be 0)
+Bits 3-7: Reserved (must be 0)
 ```
 
 Note: `Overflow` (bit 0) and `DupData` (bit 1) are mutually exclusive in
 practice — a cell is either a single inline value, an overflow reference, or
 a duplicate data container, never a combination.
 
-Overflow reference format (used when CellFlags bit 0 is set):
+**Restart entry** (full key, at positions 0, 16, 32, ...):
 
 ```
-Overflow Reference (instead of inline value)
-+----------+-----------+----------+----------+
-| KeyLen   | Key bytes | OvflPage | TotalLen |
-| uint16   |           | uint64   | uint64   |
-+----------+-----------+----------+----------+
+Restart Entry (inline)
++-----------+----------+----------+-----------+-----------+
+| CellFlags | KeyLen   | ValueLen | Key bytes | Val bytes |
+| uint8     | uint16   | uint32   |           |           |
++-----------+----------+----------+-----------+-----------+
 ```
 
-The overflow cell has a different layout from the inline cell — there is no
-`ValueLen` field. The reader checks `CellFlags.Overflow` to determine which
-format to parse: inline (KeyLen + ValueLen + Key + Value) or overflow
-(KeyLen + Key + OvflPage + TotalLen).
+**Delta entry** (between restart points):
+
+```
+Delta Entry (inline)
++-----------+-----------+-------------+----------+---------------+-----------+
+| CellFlags | SharedLen | UnsharedLen | ValueLen | UnsharedKey   | Val bytes |
+| uint8     | uint16    | uint16      | uint32   |               |           |
++-----------+-----------+-------------+----------+---------------+-----------+
+```
+
+`SharedLen` is the number of leading bytes shared with the previous entry in
+the same restart group. `UnsharedKey` contains only the bytes after the shared
+prefix. The full key is reconstructed by taking the first `SharedLen` bytes of
+the previous entry's full key and appending `UnsharedKey`.
+
+Delta entries cost 2 extra bytes (`SharedLen`) per entry but save `SharedLen`
+bytes of key data. The net saving per entry is `SharedLen - 2` bytes — positive
+whenever keys share more than a 2-byte prefix. For keys with no shared prefix,
+`SharedLen` is 0 and the overhead is 2 bytes per entry — negligible.
+
+`ValueLen` is uint32 (max ~4GB for inline values). In practice, inline values
+are limited by leaf page free space — far below 4GB. Values that exceed leaf
+page capacity are stored as overflow pages, referenced via the overflow format
+below which uses uint64 `TotalLen` for unbounded value sizes.
+
+**Overflow reference** at a restart point (CellFlags bit 0 set):
+
+```
+Restart Overflow Reference
++-----------+----------+-----------+----------+----------+
+| CellFlags | KeyLen   | Key bytes | OvflPage | TotalLen |
+| uint8     | uint16   |           | uint64   | uint64   |
++-----------+----------+-----------+----------+----------+
+```
+
+**Overflow reference** at a delta position:
+
+```
+Delta Overflow Reference
++-----------+-----------+-------------+---------------+----------+----------+
+| CellFlags | SharedLen | UnsharedLen | UnsharedKey   | OvflPage | TotalLen |
+| uint8     | uint16    | uint16      |               | uint64   | uint64   |
++-----------+-----------+-------------+---------------+----------+----------+
+```
+
+The reader checks `CellFlags.Overflow` to determine which format to parse:
+inline (key + ValueLen + Value) or overflow (key + OvflPage + TotalLen).
+The key portion uses the restart or delta encoding depending on position.
+
+##### Leaf Lookup
+
+Binary search in a prefix-compressed leaf operates in two phases:
+
+1. **Binary search over restart points**: the restart table stores byte
+   offsets to entries at positions 0, 16, 32, .... Each restart entry has
+   a full key, so comparison is direct. This finds the restart group
+   containing the target key. Cost: O(log R) where R = RestartCount.
+
+2. **Linear scan within the restart group**: decode delta entries
+   sequentially from the restart point, reconstructing each full key,
+   until the target is found or passed. Cost: O(K) where K = RestartInterval
+   (16).
+
+Total lookup cost: O(log(n/16) + 16). For a leaf with 30 entries, this is
+~17 comparisons. For a leaf with 200 entries (high-prefix workload), this
+is ~20 comparisons. The linear scan operates on data already in L1 cache
+(the entire leaf page was fetched for the restart point binary search), so
+the per-comparison cost is a memcpy + compare on short suffixes.
+
+##### Leaf Density
+
+The density improvement depends on the ratio of shared prefix length to
+total key length. Example with 200-byte keys sharing a 150-byte common
+prefix and 50-byte values, on a 4KB page:
+
+| Format | Bytes/entry (avg) | Entries/page | Improvement |
+|--------|-------------------|-------------|-------------|
+| Full keys | ~260 | ~15 | baseline |
+| Prefix compressed (K=16) | ~117 | ~33 | 2.2x |
+
+For short keys with minimal sharing (20-byte keys, 2-byte shared prefix),
+the improvement is negligible (~5%). The compression adapts automatically —
+high-prefix workloads benefit; random-key workloads pay only 2 bytes per
+entry overhead.
+
+##### Insert and Delete
+
+Inserting a key between two delta entries within a restart group:
+
+1. Encode the new entry as a delta against its predecessor.
+2. Recompute the successor entry's delta — its `SharedLen` is now relative
+   to the new entry instead of the old predecessor. Only this one entry's
+   encoding changes; entries beyond the successor still delta against their
+   own predecessors, which are unchanged.
+3. If the insertion shifts entry indices, restart point positions change
+   (restarts are at indices 0, K, 2K, ...). The affected restart group
+   must be re-encoded — one entry becomes a restart (full key) and one
+   becomes a delta, or vice versa. This re-encoding is confined to the
+   entries at the old and new restart boundaries.
+
+Deletion is symmetric: remove the entry, recompute one successor's delta,
+adjust restart boundaries if an index shifted.
+
+The restart table (array of offsets) is rebuilt after any insert or delete.
+This is O(RestartCount) — at most ~20 entries for a full leaf page.
+
+##### Leaf Split
+
+When a leaf page overflows, it is split into two halves. Each half is
+re-encoded independently with fresh restart points starting at index 0.
+The boundary keys (last key of the left leaf, first key of the right
+leaf) are full keys reconstructed from the delta encoding. Separator
+computation for the parent branch page is unchanged — it operates on
+full keys.
+
+##### Cursor Key Reconstruction
+
+The cursor maintains a **key reconstruction buffer** (`cursor.keyBuf
+[]byte`) that holds the full key at the current position. On forward
+movement (`Next()`), the buffer is updated incrementally: truncate to
+`SharedLen`, append `UnsharedKey`. This is O(1) amortized.
+
+For reverse movement (`Prev()`), incremental reconstruction is not
+possible — delta entries encode forward, not backward. The cursor
+addresses this by caching all decoded keys for the current restart group
+(**group cache**). When the cursor first enters a restart group (via
+`Seek`, `Next` crossing a group boundary, or `Prev`), all K entries in
+the group are decoded into the cache. Subsequent `Prev()` within the
+group reads from the cache in O(1). Crossing a group boundary triggers
+decoding the previous group.
+
+The group cache is a `[16][]byte` array on the cursor struct. At K=16
+and a maximum key size of ~2KB, the worst-case memory cost is ~32KB per
+cursor — acceptable for a cursor that already holds a page-ID stack for
+tree traversal. In practice, keys are much shorter and the cache is
+small.
 
 #### Overflow Page
 
@@ -371,15 +498,17 @@ B+tree (with empty values).
 
 ##### Subpage Format
 
-A subpage is stored in the leaf cell's value area. The `CellFlags.DupData` bit
-is set and `CellFlags.DupTree` is clear. The subpage layout:
+A subpage is stored in the leaf entry's value area. The `CellFlags.DupData` bit
+is set and `CellFlags.DupTree` is clear. The entry uses the standard
+restart/delta key encoding (see Leaf Page); the subpage replaces the value
+portion. At a restart point:
 
 ```
-DupSort Subpage Cell
-+----------+-----------+-----------+
-| KeyLen   | Key bytes | Subpage   |
-| uint16   |           |           |
-+----------+-----------+-----------+
+DupSort Subpage Entry (restart)
++-----------+----------+-----------+-----------+
+| CellFlags | KeyLen   | Key bytes | Subpage   |
+| uint8     | uint16   |           |           |
++-----------+----------+-----------+-----------+
 
 Subpage (embedded in cell value area):
 +----------+----------+---------+---------+-----+
@@ -412,11 +541,20 @@ Values within the subpage are stored in sorted (lexicographic) order. Lookup
 is binary search. For DUPFIXED subpages, entries are a flat array — binary
 search is O(log N) with direct offset calculation (no scanning).
 
+Subpage entries are **not prefix-compressed**. Subpages store duplicate
+*values* for a single key, which typically do not share prefixes with each
+other (e.g., post IDs in a secondary index, user IDs in a reverse index).
+The subpage is also small by definition — it exists precisely because the
+data fits inline within a leaf cell (below the 50% promotion threshold).
+When a duplicate set grows large enough for prefix compression to matter,
+it is promoted to a nested B+tree whose leaf pages use prefix compression
+like all other leaf pages.
+
 ##### Subpage Promotion Threshold
 
 A subpage is promoted to a nested B+tree when inserting a new duplicate value
 would cause the subpage to exceed **50% of the leaf page's usable space**
-(PageSize minus page header and cell directory overhead). This threshold
+(PageSize minus page header, restart metadata, and restart table overhead). This threshold
 ensures:
 - The leaf page can still hold other keys alongside the promoted cell.
 - Promotion happens before the subpage dominates the leaf page.
@@ -430,15 +568,17 @@ Promotion:
 
 ##### Nested B+tree Reference Cell
 
-When a key's duplicates are stored in a nested B+tree, the leaf cell has
-`CellFlags.DupData` and `CellFlags.DupTree` both set:
+When a key's duplicates are stored in a nested B+tree, the entry has
+`CellFlags.DupData` and `CellFlags.DupTree` both set. The entry uses the
+standard restart/delta key encoding; the nested B+tree reference replaces
+the value portion. At a restart point:
 
 ```
-DupSort Nested B+tree Cell
-+----------+-----------+----------+----------+
-| KeyLen   | Key bytes | Root     | Count    |
-| uint16   |           | uint64   | uint64   |
-+----------+-----------+----------+----------+
+DupSort Nested B+tree Entry (restart)
++-----------+----------+-----------+----------+----------+
+| CellFlags | KeyLen   | Key bytes | Root     | Count    |
+| uint8     | uint16   |           | uint64   | uint64   |
++-----------+----------+-----------+----------+----------+
 ```
 
 - **Root**: Page ID of the nested B+tree's root page.
@@ -451,8 +591,10 @@ across promotion, demotion, split, merge, and delete operations.
 
 The nested B+tree uses the same B+tree implementation as the main keyspace,
 with one difference: its "keys" are the duplicate values, and all "values" are
-empty (zero-length). The nested B+tree's pages are subject to normal CoW,
-free space management, and page allocation.
+empty (zero-length). The nested B+tree's leaf pages use prefix compression
+(same format as all other leaf pages), which benefits duplicate sets with
+shared value prefixes (e.g., timestamp-keyed data). The nested B+tree's pages
+are subject to normal CoW, free space management, and page allocation.
 
 ##### Demotion
 
@@ -2866,6 +3008,9 @@ type CheckIssue struct {
 //   - Leaked pages (bitmap bit clear but page not reachable from any structure —
 //     reported as CheckWarning, not CheckError, since tree integrity is unaffected;
 //     common after writemap crash, recoverable via CopyTo(compact=true))
+//   - Leaf page prefix compression integrity (restart table offsets within page
+//     bounds, restart entries at correct positions, delta chain consistency within
+//     each restart group, reconstructed keys in sorted order)
 //   - Keyspace descriptor consistency (root page validity, counts)
 //   - DUPSORT subpage and nested B+tree integrity
 //
@@ -3056,8 +3201,8 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding (8-byte header: Type, Count, Overflow — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
-| `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
+| `page.go` | Page header encoding/decoding (8-byte header: Type, Count, Overflow — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. DUPSORT subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
+| `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs, key reconstruction buffer (`keyBuf []byte`) for incremental forward decoding, restart group cache (`[16][]byte`) for reverse traversal. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
 | `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |
 | `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). Clock-based eviction via `tx.clockRing` circular buffer with reference bit sweep and tombstones for spilled entries. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
@@ -3133,12 +3278,20 @@ key bytes + 8 bytes (child pointer). The maximum key size is approximately
 
 Enforced at `Put()` time. Keys exceeding the limit return an error.
 
+Note: this limit is determined by branch pages, not leaf pages. Leaf pages
+with prefix compression can store keys up to this size at restart points
+(full keys). Delta entries store only the unshared suffix, so their on-disk
+size is smaller, but the reconstructed full key must still be within the
+branch page limit to allow splitting at any level.
+
 ### Maximum Value Size
 
 For non-DUPSORT keyspaces: inline values are limited by available space in the
 leaf page. Values that exceed this are automatically stored as overflow pages.
 There is no practical upper limit on value size (bounded only by disk space and
-`GeoUpper`).
+`GeoUpper`). Note that leaf prefix compression reduces per-entry key overhead,
+leaving more page space for inline values — a leaf with high prefix sharing
+can fit larger inline values before triggering overflow.
 
 ### Maximum Duplicate Value Size (DUPSORT)
 
