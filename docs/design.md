@@ -30,6 +30,8 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Leak detection | `runtime.AddCleanup` on `Tx` | Detects leaked transactions, releases reader slots, logs origin stack trace |
 | Range delete | Subtree retirement via `DeleteRange` | O(pages) not O(entries); bulk-free for DUPSORT nested B+trees |
 | Commit I/O | pwrite (default) or io_uring (opt-in, Linux) | io_uring batches all commit writes into 1-2 syscalls; pwrite is portable fallback |
+| Prefaulting | `MADV_POPULATE_READ` at open (opt-in, Linux 5.14+) | Eliminates first-access page faults; sequential kernel readahead; silent no-op on older kernels |
+| Typed keyspaces | Generic `TypedKeyspace[K, V]` wrapper | Zero-cost type-safe API over byte-oriented Keyspace; encoder must preserve lexicographic order |
 | Namespaces | Named keyspaces | Multiple B+trees in one file |
 
 ## File Layout
@@ -1463,6 +1465,32 @@ default configurations this is not an issue — the kernel distinguishes between
 reserved virtual address space and committed memory. Users with restrictive
 settings may need to lower `GeoUpper`.
 
+### Prefaulting (Linux 5.14+)
+
+When `Options.Prefault` is true, the database calls
+`madvise(MADV_POPULATE_READ)` on the file-backed portion of the mmap
+(pages 0 through `FirstUnallocated - 1`) at open time. This pre-faults
+all pages into the OS page cache, eliminating page faults on first access.
+
+Benefits:
+- **Predictable latency**: the first read transaction after open does not
+  pay per-page fault costs. Useful for latency-sensitive workloads where
+  cold-start performance matters.
+- **Sequential I/O**: the kernel reads pages sequentially during prefault,
+  which is more efficient than the random-access pattern of demand paging.
+
+`MADV_POPULATE_READ` (Linux 5.14+) is used instead of `MAP_POPULATE`
+because it works on `MAP_SHARED` mappings and returns errors synchronously
+(e.g., if the file is truncated concurrently). If the kernel does not
+support `MADV_POPULATE_READ`, the madvise call fails silently and pages
+are faulted on demand as usual.
+
+Prefaulting is also performed internally during `CopyTo()` on the source
+database's mmap, since the copy reads the entire file sequentially.
+
+The `Prefault` option defaults to false — most workloads benefit from
+demand paging where only accessed pages enter the page cache.
+
 ## Durability Modes
 
 The database supports four durability modes, configurable via `Options.SyncMode`.
@@ -1810,6 +1838,12 @@ type Options struct {
     // FileMode for newly created files. Default: 0644.
     FileMode os.FileMode
 
+    // Prefault pre-faults the mmap into the page cache at open time
+    // via madvise(MADV_POPULATE_READ) (Linux 5.14+). Eliminates page
+    // faults on first access at the cost of slower Open(). Ignored if
+    // the kernel does not support MADV_POPULATE_READ. Default: false.
+    Prefault bool
+
     // ReadOnly opens the database in read-only mode.
     ReadOnly bool
 }
@@ -2140,6 +2174,71 @@ type KeyspaceStats struct {
 func (ks *Keyspace) Stats() (KeyspaceStats, error)
 ```
 
+### Typed Keyspaces (Generics)
+
+A higher-level API layer built on top of the byte-oriented `Keyspace` API.
+`TypedKeyspace[K, V]` provides type-safe access to a keyspace by handling
+key/value serialization automatically:
+
+```go
+// TypedKeyspace wraps a Keyspace with type-safe key/value encoding.
+type TypedKeyspace[K, V any] struct {
+    name   []byte
+    encKey func(K) []byte
+    decKey func([]byte) K
+    encVal func(V) []byte
+    decVal func([]byte) V
+    flags  KeyspaceFlags
+}
+
+// NewTypedKeyspace creates a typed keyspace descriptor. The encoder/decoder
+// functions handle serialization between Go types and byte slices. The
+// key encoder MUST produce lexicographically ordered output for the
+// desired key ordering — the underlying B+tree sorts keys as raw bytes.
+func NewTypedKeyspace[K, V any](
+    name string,
+    encKey func(K) []byte, decKey func([]byte) K,
+    encVal func(V) []byte, decVal func([]byte) V,
+    flags KeyspaceFlags,
+) *TypedKeyspace[K, V]
+
+// Open opens the typed keyspace within a transaction.
+func (tks *TypedKeyspace[K, V]) Open(tx *Tx, create bool) (*TypedKS[K, V], error)
+
+// TypedKS is a handle to an opened typed keyspace within a transaction.
+type TypedKS[K, V any] struct { ... }
+
+func (t *TypedKS[K, V]) Get(key K) (V, error)
+func (t *TypedKS[K, V]) Put(key K, value V) error
+func (t *TypedKS[K, V]) Delete(key K) error
+func (t *TypedKS[K, V]) DeleteRange(start, end *K) (int64, error)
+func (t *TypedKS[K, V]) Cursor() *TypedCursor[K, V]
+
+type TypedCursor[K, V any] struct { ... }
+
+func (c *TypedCursor[K, V]) First() (K, V, bool)
+func (c *TypedCursor[K, V]) Last() (K, V, bool)
+func (c *TypedCursor[K, V]) Next() (K, V, bool)
+func (c *TypedCursor[K, V]) Prev() (K, V, bool)
+func (c *TypedCursor[K, V]) Seek(target K) (K, V, bool)
+func (c *TypedCursor[K, V]) SeekGE(target K) (K, V, bool)
+```
+
+The typed layer is a **zero-cost abstraction** at the API level — all
+methods delegate to the underlying `Keyspace` and `Cursor` methods with
+encoder/decoder calls. No additional allocations beyond the serialization
+itself.
+
+**Key ordering constraint**: The key encoder must produce byte sequences
+whose lexicographic order matches the desired key order. For `uint64` keys,
+this means big-endian encoding. For `string` keys, the natural byte
+representation already sorts lexicographically. The typed API does not
+support custom comparators — the underlying B+tree always uses byte ordering.
+
+The typed API is a convenience layer. Callers who need full control over
+serialization or need to avoid allocation overhead from encoder/decoder
+functions use the byte-oriented `Keyspace` API directly.
+
 ## Implementation Layout
 
 All code lives in a single `gmdb` package (flat, no sub-packages). This avoids
@@ -2155,12 +2254,13 @@ organized by file:
 | `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). LRU-based priority selection from `tx.dirtyPages` map. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
-| `mmap_linux.go` | Linux mmap/munmap/msync syscalls. |
+| `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` prefaulting (Linux 5.14+, opt-in via `Options.Prefault`). |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
 | `iouring_linux.go` | io_uring commit path (Linux 5.6+). Ring initialization, SQE batch construction (data writes + linked fsync + meta write + linked fsync), CQE completion handling, registered buffer management, fallback detection. |
 | `lock.go` | Lock file creation and mmap (shared memory). Writer lock (channel semaphore intra-process + flock cross-process + WriterPID, context-aware). Stale writer recovery. Reader table: scan+CAS slot acquire, atomic store release, stale reader detection via PID liveness. Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
 | `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (sort dirty keys + sequential pwrite + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
 | `db.go` | Open/Close. Environment setup (mmap, lock file, geometry, write mode selection). Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management. Sync(). Check(). CopyTo(). |
+| `typed.go` | `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with encoder/decoder functions. |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
 
