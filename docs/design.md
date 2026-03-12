@@ -176,10 +176,15 @@ Keys are stored in sorted order. For a branch with N cells (N keys), there are
 N+1 child pointers: `Ptr[0]` (leftmost, stored after the page header) plus one
 `ChildPtr` per cell.
 
-Search algorithm: binary search the cell directory to find the first cell where
-`target < Key[i]`. If found, descend to the child pointer of cell `i-1` (or
-`Ptr[0]` if `i == 0`). If target >= all keys, descend to the last cell's
-`ChildPtr`.
+Search algorithm: binary search the cell directory to find the first
+separator `Key[i]` where `target < Key[i]` (i.e., the first separator
+greater than the target). If found, descend to the child to the left of
+that separator — `ChildPtr` of cell `i-1`, or `Ptr[0]` if `i == 0`. If
+no separator is greater than the target (`target >= all keys`), descend
+to the last cell's `ChildPtr` (rightmost child). Note: when
+`target == Key[i]`, the target belongs in the right child (since
+separators are lower bounds of the right child), so the search correctly
+continues past that separator.
 
 The cell directory stores `(Offset, KeyLen)` per cell, enabling binary search
 over variable-length keys without parsing the key data area.
@@ -188,20 +193,24 @@ over variable-length keys without parsing the key data area.
 
 Branch pages store **prefix-truncated separator keys** — the shortest byte
 string that distinguishes the left subtree from the right — rather than
-full keys copied from leaf pages. A branch key need only satisfy the
-invariant:
+full keys copied from leaf pages. A branch separator must satisfy:
 
-```
-max_key(left_child) <= separator < min_key(right_child)
-```
+- Every key in the left child compares **strictly less than** the separator.
+- Every key in the right child compares **greater than or equal to** the separator.
+
+Equivalently: `max(left) < separator <= min(right)`. The separator is a
+lower bound of the right child. This convention matches the descent
+algorithm: find the first separator where `target < sep` and descend to
+that child (so `target == sep` descends right, which is correct since
+the separator is the right child's lower bound).
 
 For example, if the left child's largest key is `"user:alice:profile"`
 and the right child's smallest key is `"user:bob:settings"`, the
 separator stored in the branch is `"user:b"` (7 bytes) instead of
-the full key (20 bytes). The shortest separator is computed as the
-minimal prefix of the right child's first key that is strictly greater
-than the left child's last key, plus one byte to break the tie if the
-prefix matches exactly.
+the full key (20 bytes). The separator is the common prefix of the two
+boundary keys extended by one byte from the right key at the divergence
+point — always a prefix of the right child's first key (see Separator
+computation below).
 
 **Benefits:**
 - **Higher fan-out**: smaller keys → more separators per branch page →
@@ -220,9 +229,12 @@ At **leaf split** time, when a leaf page overflows and is split into
 two halves:
 1. Let `L` = the last key of the left leaf (the split point).
 2. Let `R` = the first key of the right leaf.
-3. Compute the shortest byte string `S` such that `L <= S < R`.
-   This is the common prefix of `L` and `R`, extended by one byte —
-   the first byte where `R` exceeds `L`, taken from `R`.
+3. Compute the shortest byte string `S` such that `L < S <= R`.
+   This is the common prefix of `L` and `R`, extended by one byte
+   from `R` at the first divergence position: `S = R[0 : len(commonPrefix) + 1]`.
+   `S` is always a prefix of `R`, guaranteeing `S <= R`. Since `L`
+   either diverges at a lower byte value or is a proper prefix of `R`,
+   `L < S` holds.
 4. Insert `S` (not `R`) into the parent branch page.
 
 At **merge** time, when two siblings are merged:
@@ -324,9 +336,18 @@ format to parse: inline (KeyLen + ValueLen + Key + Value) or overflow
 
 #### Overflow Page
 
-Overflow pages are contiguous runs of pages that store large values. The first
-page in the run has the standard page header with `Overflow` set to the number
-of additional pages. The rest is raw value bytes.
+Overflow pages are contiguous runs of pages that store large values. The
+first page in the run carries the standard 8-byte page header with
+`Overflow` set to the number of follower pages; the remaining bytes of
+the first page are value data. Follower pages carry no header — they are
+entirely value data. Total value capacity for a run of `1 + N` pages:
+`(PageSize - 8) + N * PageSize` bytes (or subtract 4 from the first page
+and from each follower when `PageChecksum` is enabled).
+
+When `PageChecksum` is enabled, each page in the run carries its own
+independent CRC32C footer. The first page checksums its header + data;
+each follower checksums its data. Per-page checksums allow identifying
+which specific page in the run is corrupted.
 
 #### Duplicate Sorted Values (DUPSORT)
 
@@ -414,15 +435,19 @@ When a key's duplicates are stored in a nested B+tree, the leaf cell has
 
 ```
 DupSort Nested B+tree Cell
-+----------+-----------+----------+----------+----------+
-| KeyLen   | Key bytes | Root     | Count    | Depth    |
-| uint16   |           | uint64   | uint64   | uint16   |
-+----------+-----------+----------+----------+----------+
++----------+-----------+----------+----------+
+| KeyLen   | Key bytes | Root     | Count    |
+| uint16   |           | uint64   | uint64   |
++----------+-----------+----------+----------+
 ```
 
 - **Root**: Page ID of the nested B+tree's root page.
 - **Count**: Number of duplicate values.
-- **Depth**: Height of the nested B+tree (for optimization).
+
+Depth (tree height) is not persisted — it is derived by reading the root
+page on first access (a leaf root means depth 1; a branch root means
+depth > 1, determined by descent). This avoids maintaining an extra field
+across promotion, demotion, split, merge, and delete operations.
 
 The nested B+tree uses the same B+tree implementation as the main keyspace,
 with one difference: its "keys" are the duplicate values, and all "values" are
@@ -435,6 +460,10 @@ When deletions reduce a nested B+tree to a single leaf page that would fit as
 a subpage (below the promotion threshold), the B+tree is demoted back to a
 subpage. The leaf page is freed (retired), and the entries are packed
 inline into the parent leaf cell.
+
+When the last duplicate value for a key is deleted, the key's cell is
+removed from the parent leaf entirely — empty nested trees and empty
+subpages never exist, not even transiently within a write transaction.
 
 ##### DUPFIXED Keyspaces
 
@@ -664,10 +693,10 @@ The retired page log tracks which pages were freed by which transaction. This
 information is needed for MVCC safety: a page freed by transaction T cannot be
 moved into the allocation bitmap until no active reader holds a snapshot ≤ T.
 
-The RPL is an append-only doubly-linked list of segment pages. Each segment
+The RPL is an append-only singly-linked list of segment pages. Each segment
 page stores a single TxnID (the transaction that retired these pages) plus
-an array of PageIDs. Since each commit creates new segment pages (never
-appends to existing segments), all entries in a segment share the same
+an array of PageIDs. Each commit creates new segment pages — existing
+segments are never modified. All entries in a segment share the same
 TxnID — storing it once per segment instead of per entry doubles capacity:
 
 ```
@@ -676,7 +705,6 @@ RPL Segment Page
 | Page Header (8 bytes)    |
 +--------------------------+
 | TxnID          | uint64  |  transaction that retired these pages
-| NewerSegment   | uint64  |  page ID of the next newer segment (0 = this is head)
 | OlderSegment   | uint64  |  page ID of the next older segment (0 = this is tail)
 | EntryCount     | uint16  |  number of PageID entries in this segment
 | Padding        | 6 bytes |
@@ -687,45 +715,44 @@ RPL Segment Page
 +--------------------------+
 ```
 
-Segment capacity at 4KB page size: 8 (page header) + 8 (TxnID) + 8 + 8
-(link pointers) + 2 (EntryCount) + 6 (padding) = 40 bytes overhead.
-Remaining `4096 - 40 = 4056` bytes / 8 bytes per PageID = **507 entries
-per segment page** (with PageChecksum enabled: `4096 - 40 - 4 = 4052` / 8
-= 506). A transaction freeing 10,000 pages fills ~20 segment pages
+Segment capacity at 4KB page size: 8 (page header) + 8 (TxnID) + 8
+(link pointer) + 2 (EntryCount) + 6 (padding) = 32 bytes overhead.
+Remaining `4096 - 32 = 4064` bytes / 8 bytes per PageID = **508 entries
+per segment page** (with PageChecksum enabled: `4096 - 32 - 4 = 4060` / 8
+= 507). A transaction freeing 10,000 pages fills ~20 segment pages
 (compared to ~40 with per-entry TxnID).
 
 The meta page stores `RPLHeadPage` (newest segment) and `RPLTailPage` (oldest
-segment). Segments are doubly linked: `OlderSegment` links from head toward
-tail; `NewerSegment` links from tail toward head. The doubly-linked structure
-allows efficient operations at both ends: appending new segments at the head
-and reclaiming old segments from the tail.
+segment). Segments are singly linked from head toward tail via
+`OlderSegment`. The forward direction (tail toward head) is maintained
+as an in-memory segment list rebuilt at `Open()` time (see RPL Segment
+List below).
 
 ##### RPL Append (At Commit Time)
 
 When a write transaction commits with retired pages:
 
 1. Allocate one or more new segment pages from the bitmap (or file extension).
-   Each commit always creates **new** segment pages rather than appending to
-   existing segments. This avoids CoW of previous segments — the old head
-   segment is immutable (it belongs to a previous transaction's snapshot).
+   Each commit always creates **new** segment pages — existing segments are
+   never modified (they belong to previous transactions' snapshots and may
+   be referenced by active readers).
 2. Fill segment pages with the current TxnID in the segment header and
    PageID entries sorted by page ID for cache-friendly processing during
    reclamation. If the retired list exceeds one segment page's capacity
-   (507 entries at 4KB page size), allocate additional segment pages and
-   link them via `OlderSegment`/`NewerSegment`.
-3. Link the new head to the previous head: set the new head's
-   `OlderSegment` to the old `RPLHeadPage`, and update the old head's
-   `NewerSegment` to point to the new head. The old head must be CoW'd for
-   this link update — the old head page is added to the dirty set and its
-   original page ID is added to `tx.retiredPages` (this is bounded: at most
-   one extra retired entry per commit for the old head page).
+   (508 entries at 4KB page size), allocate additional segment pages and
+   link them via `OlderSegment`.
+3. Set the new head's `OlderSegment` to the old `RPLHeadPage`. No
+   modification of the old head is needed — segments are singly linked
+   (head toward tail only).
 4. Update `RPLHeadPage` in the meta page to point to the new head. If the
    RPL was empty, also set `RPLTailPage`.
+5. Append the new segment page ID(s) to the in-memory segment list
+   (see RPL Segment List).
 
 RPL segment pages are allocated from the bitmap like any other data page.
 Allocating a segment page clears a bit in the bitmap — O(1), no further
 allocation needed. A transaction retiring N pages needs at most
-`ceil(N / 507) + 1` page allocations (segment pages + CoW of old head).
+`ceil(N / 508)` page allocations (segment pages only — no old-head CoW).
 This is bounded and non-recursive.
 
 ##### RPL Reclamation
@@ -735,25 +762,25 @@ writer reclaims RPL entries whose pages are safe to reuse:
 
 1. Read the oldest active reader's TxnID from the reader table (see
    Cross-Process Coordination).
-2. Walk the RPL from the **tail** (oldest segments first).
+2. Walk the in-memory segment list from the **tail** (oldest segments first).
 3. For each segment where `TxnID < oldestReader`:
    a. Set the corresponding bits in the allocation bitmap for all PageIDs
       in the segment.
-   b. Remove the entries from the segment.
-4. When a segment becomes empty, free the segment page itself (set its bit in
-   the bitmap) and advance `RPLTailPage` to the segment's `NewerSegment`.
+4. When a segment is fully reclaimed, free the segment page itself (set its
+   bit in the bitmap), remove it from the in-memory segment list, and
+   advance `RPLTailPage` to the next segment in the list.
 5. Update `RPLEntryCount` and `NumFreePages` in the meta page.
 
 Reclamation is performed oldest-first so that the RPL shrinks from the tail.
 Empty segment pages are immediately freed — their bitmap bits are set, making
 them available for allocation in the same transaction.
 
-Modifying a segment page during reclamation (removing entries) requires CoW:
-the old segment page is copied to a new page, and the original page ID is
-added to `tx.retiredPages`. This is bounded — each segment CoW allocates one
-page from the bitmap (which is being populated by the very entries being
-reclaimed) and retires one page. The reclaimed pages always outnumber the
-CoW overhead.
+Reclamation consumes **whole segments** — a segment is either fully
+reclaimed or left untouched. Since each segment has a single TxnID, this
+is a clean boundary: either all entries in a segment are safe to reclaim
+(TxnID < oldestReader) or none are. This avoids partial segment
+modification and the CoW overhead it would require. Segments are immutable
+on disk from the moment they are written.
 
 ##### Oldest Reader Caching
 
@@ -762,6 +789,28 @@ The writer caches this value (`tx.cachedOldestReader`) and refreshes it
 lazily — only when the bitmap has no free pages and reclamation might unlock
 more. Reading a stale (higher) value is conservative: it delays reclamation
 but never causes incorrect behavior.
+
+##### RPL Segment List
+
+The on-disk RPL is singly linked from head (newest) toward tail (oldest)
+via `OlderSegment`. Reclamation needs to walk in the opposite direction
+(tail to head). To avoid a full chain traversal on every reclamation pass,
+the writer maintains an in-memory **segment list** — a `[]uint64` slice of
+RPL segment page IDs ordered from tail (index 0) to head (last index).
+
+The list is rebuilt at `Open()` time by walking the on-disk chain from
+`RPLHeadPage` via `OlderSegment` links to `RPLTailPage`, then reversing
+the collected page IDs. This is O(RPL segments) — typically tens to low
+hundreds — and happens once.
+
+During normal operation the list is maintained incrementally:
+- **Append** (commit with retired pages): new segment page IDs are
+  appended to the end of the slice.
+- **Reclaim** (tail consumption): consumed segment page IDs are removed
+  from the front of the slice (advance a start index or re-slice).
+
+The list is stored on the `DB` struct and protected by the write lock
+(only the writer modifies it). Readers do not access the RPL segment list.
 
 #### LIFO Allocation Locality
 
@@ -873,17 +922,16 @@ During commit, the writer:
 1. Performs tail page refund: check the bitmap for free pages at the end of
    the file, decrement `FirstUnallocated`.
 2. Moves any remaining loose pages into `tx.retiredPages`.
-3. Appends all `tx.retiredPages` entries to the RPL (allocating new segment
-   pages from the bitmap if the current head segment is full).
+3. Appends all `tx.retiredPages` to the RPL by allocating new segment
+   pages from the bitmap and appending them to the in-memory segment list.
 4. Updates `NumFreePages`, `RPLHeadPage`, `RPLTailPage`, and `RPLEntryCount`
    in the meta page.
 
 Step 3 may allocate RPL segment pages from the bitmap. This is a bounded,
-non-recursive operation: each segment page holds 507 entries (at 4KB page
-size), so a transaction retiring N pages needs at most `ceil(N / 507) + 1`
-page allocations (segment
-pages plus CoW of the old RPL head). Each allocation is a single bitmap bit
-flip — no further cascading allocations.
+non-recursive operation: each segment page holds 508 entries (at 4KB page
+size), so a transaction retiring N pages needs at most `ceil(N / 508)`
+page allocations (segment pages only — no old-head CoW). Each allocation
+is a single bitmap bit flip — no further cascading allocations.
 
 Steps 1-4 happen before the dirty page flush and meta page swap.
 
@@ -1284,6 +1332,26 @@ N-ways.
   (closures within a batch see each other's writes, which may cause
   unexpected interactions).
 - Transactions that need exclusive control over commit timing.
+
+#### Closure Contract
+
+Because of rollback-and-retry, a `Batch` closure **may execute more than
+once** — a successful closure is replayed if another closure in the same
+batch fails and triggers a retry. Closures must therefore be:
+
+- **Side-effect-free outside the transaction**: no logging, metrics
+  emission, channel sends, RPC calls, or mutation of captured state.
+  Database operations within the `*Tx` are safe (they are rolled back
+  and replayed consistently), but external effects are not undone on
+  rollback and will be duplicated on replay.
+- **Idempotent with respect to the transaction**: the closure should
+  produce the same database mutations when re-executed against the same
+  starting state. This is natural for most write patterns (Put, Delete)
+  but can break if the closure reads and branches on values written by
+  a prior closure in the same batch.
+
+Callers who cannot satisfy these constraints should use `Update` instead,
+which executes the closure exactly once.
 
 ### Transaction Leak Detection
 
@@ -1908,6 +1976,13 @@ The writer modifies pages directly in the mmap:
 **Tradeoffs:**
 - **No write isolation**: a bug (stray pointer, buffer overrun) can corrupt the
   mmap'd file directly. The database file *is* the mutable working memory.
+- **Weaker crash space accounting**: tree integrity is fully protected by
+  CoW and dual meta pages (same as pwrite mode). However, the kernel may
+  flush dirty mmap pages in any order before the meta swap, so a crash
+  can leave bitmap bits cleared (pages allocated) for pages that are never
+  committed to any reachable structure. These "leaked" pages waste space
+  but do not affect tree consistency. Recoverable via `Check()` or
+  `CopyTo(compact=true)`. See Stale Writer Recovery for details.
 - **No page spilling**: since pages are already in the mmap (backed by the OS
   page cache), spilling is unnecessary and does not apply. The OS handles
   eviction of mmap'd pages to disk transparently.
@@ -2047,30 +2122,26 @@ A subsequent `DB.Sync()` re-writes the meta page with the steady flag
 On recovery after a crash, `Open()` performs the following:
 
 1. Read both meta pages. Discard any with an invalid xxhash64 checksum.
-2. Of the valid meta pages, prefer the one with the higher TxnID.
-3. If the preferred meta page has its steady flag **set**, use it — its
-   data pages are confirmed on stable storage.
-4. If the preferred meta page has its steady flag **clear** (a non-steady
-   `SyncSafe` commit), validate its tree:
-   - **With `PageChecksum` enabled**: read the root page and verify its
-     CRC32C. If valid, accept the meta page (the OS flushed data pages
-     before the crash). If invalid, fall back to the other meta page.
-   - **Without `PageChecksum`**: perform a shallow validation — read the
-     root page and check its page header (type, count/overflow). If the
-     header is consistent, accept the meta page. If the root page
-     contains zeroes or an invalid header, fall back to the other meta
-     page.
-5. The fallback meta page is the last steady commit. All transactions
-   after that steady commit are lost.
+2. Of the valid meta pages, select the one with the higher TxnID whose
+   steady flag is **set**. This is the last commit whose data pages are
+   confirmed on stable storage.
+3. If neither meta page has the steady flag set (the user never called
+   `DB.Sync()` and never used `SyncDurable`/`SyncNoMeta`), select the
+   meta page with the higher TxnID. In this case, the database has no
+   steady commit to fall back to — data integrity depends on whether
+   the OS flushed pages in the right order, which is not guaranteed.
+4. Non-steady meta pages (steady flag clear) are never preferred over
+   steady ones, regardless of TxnID. A steady meta at TxnID 100 is
+   chosen over a non-steady meta at TxnID 105 — the 5 transactions
+   since the last steady commit are lost.
 
-The shallow validation without checksums is not foolproof — a recycled
-page could contain a structurally valid header from a previous occupant
-with wrong data. For strongest `SyncSafe` recovery guarantees,
-enable `PageChecksum`. With checksums enabled, recovery can detect any
-partially-flushed data page.
-
-This is safe because CoW never modifies existing pages — the steady
-commit's tree is entirely intact on disk.
+Recovery does not attempt to validate a non-steady meta's tree (e.g.,
+by checking the root page checksum). A valid root page does not prove
+that all reachable child pages, bitmap state, and RPL segments are
+durable — the OS may have flushed pages in any order. Accepting a
+partially-durable tree would risk surfacing `ErrCorrupted` on later
+reads when traversals reach unflushed pages. The steady commit's tree
+is guaranteed intact because CoW never modifies existing pages.
 
 ### SyncNone Warning
 
@@ -2257,18 +2328,22 @@ keyspace names (byte strings) and whose values are keyspace descriptors:
 
 ```
 Keyspace Descriptor
-+----------+----------+----------+----------+---------------+
-| Root     | Depth    | Count    | Flags    | DupFixedSize  |
-| uint64   | uint16   | uint64   | uint16   | uint16        |
-+----------+----------+----------+----------+---------------+
++----------+----------+----------+---------------+
+| Root     | Count    | Flags    | DupFixedSize  |
+| uint64   | uint64   | uint16   | uint16        |
++----------+----------+----------+---------------+
 ```
 
-Total descriptor size: 8 + 2 + 8 + 2 + 2 = 22 bytes.
+Total descriptor size: 8 + 8 + 2 + 2 = 20 bytes.
 
 - **Root**: Page ID of this keyspace's B+tree root.
-- **Depth**: Height of the B+tree (for optimization).
 - **Count**: Number of key-value pairs (for DUPSORT keyspaces, this is the
   total number of key-value pairs across all duplicate sets).
+
+Depth (tree height) is not persisted — it is derived by reading the root
+page on first access, consistent with the nested B+tree reference format
+(see DUPSORT). This avoids maintaining a redundant field across split,
+merge, and rebalance operations.
 - **Flags**: Keyspace behavior flags:
   - Bit 0: `DupSort` — multiple sorted values per key.
   - Bit 1: `DupFixed` — all duplicate values have fixed size (requires
@@ -2552,12 +2627,15 @@ func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
 //
 // If fn returns an error, the entire batch is rolled back and retried:
 // successful closures are re-executed in a new batch, and the failing
-// closure is retried individually via Update. See Write Batching for
-// details.
+// closure is retried individually via Update. Because of this, fn may
+// execute more than once — it must be side-effect-free outside the
+// transaction (no logging, metrics, channel sends, RPC, or mutation of
+// captured state) and idempotent with respect to the transaction. See
+// Write Batching for details.
 //
 // Batch is a throughput optimization for workloads with many concurrent
-// small writes. For exclusive write access or large transactions, use
-// Update or Begin directly.
+// small writes. For exclusive write access, large transactions, or
+// closures with external side effects, use Update or Begin directly.
 func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error
 
 // Begin starts a transaction manually. The context governs lock/slot
@@ -2785,6 +2863,9 @@ type CheckIssue struct {
 //   - Bitmap consistency (no overlap between free and in-use pages)
 //   - RPL consistency (valid segment chain, no duplicate entries)
 //   - Page accounting (all pages accounted for: data + bitmap + RPL + free + unallocated)
+//   - Leaked pages (bitmap bit clear but page not reachable from any structure —
+//     reported as CheckWarning, not CheckError, since tree integrity is unaffected;
+//     common after writemap crash, recoverable via CopyTo(compact=true))
 //   - Keyspace descriptor consistency (root page validity, counts)
 //   - DUPSORT subpage and nested B+tree integrity
 //
@@ -2975,10 +3056,10 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding (8-byte header: Type, Count, Overflow — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode, segment linking. |
+| `page.go` | Page header encoding/decoding (8-byte header: Type, Count, Overflow — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: cell directory, KV lookup, insert/split, overflow references, DUPSORT subpage format. Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
-| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only doubly-linked list of segment pages (per-segment TxnID + PageID arrays), reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL, allocate segment pages from bitmap (bounded, non-recursive). |
+| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |
 | `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). Clock-based eviction via `tx.clockRing` circular buffer with reference bit sweep and tombstones for spilled entries. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification. |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
