@@ -931,16 +931,32 @@ This is bounded and non-recursive.
 At the start of a write transaction (or lazily on first `pageAlloc()`), the
 writer reclaims RPL entries whose pages are safe to reuse:
 
-1. Read the oldest active reader's TxnID from the reader table (see
-   Cross-Process Coordination).
+1. Compute the **reclamation bound**: the minimum of the oldest active
+   reader's TxnID (from the reader table) and the last checkpoint's TxnID
+   (from the meta page). In `SyncDurable` and `SyncDataOnly` modes, every
+   commit is a checkpoint, so the checkpoint TxnID equals the current
+   TxnID — no restriction beyond active readers. In `SyncLazy` mode, the
+   checkpoint TxnID may be older than the current TxnID, restricting
+   reclamation to ensure the bitmap on disk is consistent with the
+   checkpoint meta that crash recovery would select.
 2. Walk the in-memory segment list from the **tail** (oldest segments first).
-3. For each segment where `TxnID < oldestReader`:
+3. For each segment where `TxnID < reclaimBound`:
    a. Set the corresponding bits in the allocation bitmap for all PageIDs
       in the segment.
 4. When a segment is fully reclaimed, free the segment page itself (set its
    bit in the bitmap), remove it from the in-memory segment list, and
    advance `RPLTailPage` to the next segment in the list.
 5. Update `RPLEntryCount` and `NumFreePages` in the meta page.
+
+The checkpoint TxnID bound prevents a crash-recovery scenario where the
+on-disk bitmap reflects a newer transaction's reclamation but recovery
+selects an older checkpoint meta. Without this bound, a page retired by
+T100 and reclaimed by T101 could be reallocated for new data by T101.
+If recovery selects T100's checkpoint meta, T100's tree references the
+page expecting its original content, but the page now contains T101's
+data. The checkpoint bound ensures reclamation only processes pages freed
+by transactions older than the last checkpoint — pages that are no longer
+reachable from any recoverable tree state.
 
 Reclamation is performed oldest-first so that the RPL shrinks from the tail.
 Empty segment pages are immediately freed — their bitmap bits are set, making
@@ -949,17 +965,18 @@ them available for allocation in the same transaction.
 Reclamation consumes **whole segments** — a segment is either fully
 reclaimed or left untouched. Since each segment has a single TxnID, this
 is a clean boundary: either all entries in a segment are safe to reclaim
-(TxnID < oldestReader) or none are. This avoids partial segment
+(TxnID < reclaimBound) or none are. This avoids partial segment
 modification and the CoW overhead it would require. Segments are immutable
 on disk from the moment they are written.
 
 ##### Oldest Reader Caching
 
 Scanning the reader table to find the minimum active TxnID is O(MaxReaders).
-The writer caches this value (`tx.cachedOldestReader`) and refreshes it
-lazily — only when the bitmap has no free pages and reclamation might unlock
-more. Reading a stale (higher) value is conservative: it delays reclamation
-but never causes incorrect behavior.
+The writer caches this value (`tx.cachedOldestReader`) and combines it with
+the last checkpoint TxnID to form the reclamation bound. The cache is
+refreshed lazily — only when the bitmap has no free pages and reclamation
+might unlock more. Reading a stale (higher) value is conservative: it
+delays reclamation but never causes incorrect behavior.
 
 ##### RPL Segment List
 
@@ -1041,7 +1058,10 @@ any bitmap or RPL interaction:
   — they were allocated and freed within the same transaction, so no reader
   can ever reference them.
 - At commit time, any loose pages still in the map (allocated a page ID but
-  never reused) are added to `tx.retiredPages` for inclusion in the RPL.
+  never reused) are added to `tx.pendingFrees` — their bitmap bits are set
+  directly, bypassing the RPL. Since loose pages were allocated and freed
+  within the same transaction, no reader can reference them, so MVCC
+  retirement via the RPL is unnecessary.
 
 #### Page Allocation Priority
 
@@ -1092,7 +1112,8 @@ safe to reuse (no active reader holds their snapshot).
 During commit, the writer:
 1. Performs tail page refund: check the bitmap for free pages at the end of
    the file, decrement `HighWaterMark`.
-2. Moves any remaining loose pages into `tx.retiredPages`.
+2. Moves any remaining loose pages into `tx.pendingFrees` (bypasses RPL —
+   no reader can reference same-transaction pages).
 3. Appends all `tx.retiredPages` to the RPL by allocating new segment
    pages from the bitmap and appending them to the in-memory segment list.
 4. Updates `NumFreePages`, `RPLHeadPage`, `RPLTailPage`, and `RPLEntryCount`
@@ -1253,7 +1274,8 @@ global visibility into memory pressure across all processes.
 4. Commit-time free space update:
    a. Perform tail page refund: check the bitmap for free pages at the end of
       the file, clear those bits, decrement `HighWaterMark`.
-   b. Move remaining loose pages into `tx.retiredPages`.
+   b. Move remaining loose pages into `tx.pendingFrees` (bypass RPL — no
+      reader can reference same-transaction pages).
    c. Append all `tx.retiredPages` to the RPL (allocating new segment pages
       from the bitmap if needed — bounded, non-recursive).
    d. Update `NumFreePages`, `RPLHeadPage`, `RPLTailPage`, `RPLEntryCount`.
@@ -1807,13 +1829,24 @@ operations visible across processes.
    caches the index of the last successfully acquired slot, so the scan
    begins in a region likely to contain free slots.
 2. Scan forward (with wraparound) for a slot where `TxnID == 0` (free).
-3. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID.
-   If the CAS fails (another goroutine or process claimed the slot
-   concurrently), continue scanning.
-4. Store the caller's PID and cached process start time (`db.processStartTime`)
-   in the slot's `PID` and `ProcessStartTime` fields.
+3. Store the caller's PID and cached process start time (`db.processStartTime`)
+   in the slot's `PID` and `ProcessStartTime` fields. These are written
+   **before** the TxnID CAS so that the writer never observes an active
+   slot with stale or uninitialized ownership metadata.
+4. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID
+   (release semantics). If the CAS fails (another goroutine or process
+   claimed the slot concurrently), continue scanning.
 5. Update `db.readerSlotHint` to the acquired slot's index.
 6. If all slots are occupied (full wraparound), return `ErrReadersFull`.
+
+The CAS on `TxnID` with release semantics is the **publication barrier**.
+It guarantees that the PID and ProcessStartTime stores (step 3) are visible
+to any thread or process that observes the non-zero TxnID (step 4). The
+writer's stale-reader scan loads TxnID with acquire semantics before reading
+PID/ProcessStartTime, ensuring it always sees the current owner's metadata.
+This eliminates the race where the writer could observe an active TxnID
+with stale PID/start-time from a previous slot occupant and incorrectly
+classify a live reader as stale.
 
 The hint is process-local (stored on the `DB` struct, not in shared
 memory) and updated with a relaxed atomic store — no cross-process
@@ -1962,15 +1995,22 @@ or take corrective action (e.g., killing a stuck process identified by PID).
 
 ## mmap Strategy
 
-The data file is always mapped read-write. All B+tree page modifications
+The data file is mapped read-write by default. All B+tree page modifications
 happen directly in the mmap. Bitmap and meta pages are written via
 `pwrite()` at commit time to ensure ordered writes.
+
+When `Options.ReadOnly` is true, the data file is mapped with `PROT_READ`
+only. Write transactions are rejected with `ErrReadOnly`. The lock file
+remains writable for reader slot acquisition (CAS operations). This allows
+opening databases on read-only media or with read-only filesystem
+permissions, provided the lock file is on writable storage.
 
 ### Read Path
 
 All processes mmap the data file with:
 ```
-MAP_SHARED | PROT_READ | PROT_WRITE
+MAP_SHARED | PROT_READ | PROT_WRITE    (default)
+MAP_SHARED | PROT_READ                 (ReadOnly mode)
 ```
 
 Reads go directly through the mmap. No system calls, no copies. The OS page
@@ -2441,7 +2481,13 @@ type Options struct {
     // on non-Linux platforms or older kernels. Default: false.
     ReclaimOnClose bool
 
-    // ReadOnly opens the database in read-only mode.
+    // ReadOnly opens the database in read-only mode. The data file is
+    // mapped with PROT_READ only (no PROT_WRITE). Write transactions
+    // return ErrReadOnly. The lock file is still writable — reader slot
+    // acquisition requires atomic CAS operations on the shared mmap.
+    // ReadOnly is suitable for deployments where the data file is on
+    // read-only media or has read-only filesystem permissions, provided
+    // the lock file is on writable storage.
     ReadOnly bool
 }
 
@@ -3029,7 +3075,7 @@ organized by file:
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
 | `alloc.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Pending bitmap changes: `tx.pendingAllocs` and `tx.pendingFrees` track deferred bit changes; `pageAlloc()` checks pending sets before scanning the mmap bitmap. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → lagging reader check → file extension. Tail page refund for auto-compaction. Commit-time update: apply pending bitmap changes via pwrite, append retired pages to RPL via new segment pages (bounded, non-recursive). |
 | `fileformat.go` | File format management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetFileFormat()` for runtime modification of `MinSize`, `GrowStep`, `ShrinkThreshold` (rejects `MaxSize` changes — bitmap region is fixed at creation). |
-| `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to MaxSize). Always read-write (`MAP_SHARED \| PROT_READ \| PROT_WRITE`). |
+| `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to MaxSize). Read-write by default (`MAP_SHARED \| PROT_READ \| PROT_WRITE`); read-only when `Options.ReadOnly` is set (`MAP_SHARED \| PROT_READ`). |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` page preloading (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
 | `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime, context-aware, zero goroutine accumulation). Stale writer recovery (PID liveness + start time comparison). Reader table: hint-based scan+CAS slot acquire (stores PID + ProcessStartTime), atomic store release, stale reader detection via PID liveness + start time comparison (PID reuse safe). Oldest-reader query for RPL reclamation. Lagging reader detection and callback invocation. |
