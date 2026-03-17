@@ -9,7 +9,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Data structure | B+tree on fixed-size pages | Only viable option for multi-process mmap |
 | Concurrency | Single writer + N readers (MVCC/CoW) | Proven (LMDB), readers never block writer |
 | File layout | Fixed-size pages (4KB–64KB, configurable, immutable after creation) | Matches OS page size, mmap-friendly |
-| Page header | 8 bytes (Type, Count, Overflow — no PageID) | PageID is redundant (computable from file offset); saves 8 bytes per page for data |
+| Page header | 8 bytes (Type uint8, Flags uint8, Count uint16, Overflow uint32 — no PageID) | PageID is redundant (computable from file offset); Type/Flags split reserves 8 flag bits for future per-page metadata at zero cost |
 | Value storage | Inline + overflow pages | Simple single read path, overflow for large values |
 | Duplicate values | DUPSORT with subpage + nested B+tree | Subpage for small sets, nested B+tree for large; DUPFIXED for fixed-size optimization |
 | Free space | Allocation bitmap + retired page log (RPL) | O(1) alloc via bitmap, no self-referential allocation, RPL tracks MVCC retirement |
@@ -77,19 +77,23 @@ Every page starts with a common header:
 
 ```
 Page Header (8 bytes)
-+----------+----------+----------+
-| Type     | Count    | Overflow |
-| uint16   | uint16   | uint32   |
-+----------+----------+----------+
++----------+----------+----------+----------+
+| Type     | Flags    | Count    | Overflow |
+| uint8    | uint8    | uint16   | uint32   |
++----------+----------+----------+----------+
 ```
 
-- **Type**: One of: Meta, Branch, Leaf, Overflow, RPLSegment. Bitmap pages
-  do not carry a page header (see Allocation Bitmap). RPLSegment pages are
-  the retired page log (see Free Space Management).
-- **Count**: Number of items (keys in branch, key/value pairs in leaf, entries
-  in RPL segment).
-- **Overflow**: Number of contiguous overflow pages following this one (0 for
-  single-page nodes).
+- **Type** (uint8): One of: Branch, Leaf, Overflow, RPLSegment.
+  Meta pages and bitmap pages do not carry the page header — meta pages
+  have their own layout (see Meta Page) and bitmap pages are raw bitfield
+  data (see Allocation Bitmap). RPLSegment pages are the retired page
+  log (see Free Space Management).
+- **Flags** (uint8): Reserved for future per-page flags. Must be zero.
+  Readers must reject pages with unknown flags set.
+- **Count** (uint16): Number of items (keys in branch, key/value pairs in
+  leaf, entries in RPL segment).
+- **Overflow** (uint32): Number of contiguous overflow pages following this
+  one (0 for single-page nodes).
 
 The page header does not contain a PageID field. A page's ID is implicit —
 computable from its file offset (`offset / PageSize`). This avoids wasting
@@ -104,20 +108,22 @@ bytes of the page. See Checksums for details.
 
 #### Meta Page
 
-Two meta pages exist at page 0 and page 1. They alternate — the writer always
-updates the one NOT currently active. Each meta page contains:
+Two meta pages occupy pages 0 and 1. They alternate — the writer always
+updates the one NOT currently active. Meta pages do not carry the standard
+page header — their position is fixed (byte 0 and byte PageSize), so the
+Type field is redundant, and Count/Overflow are meaningless for metadata.
+The meta layout starts directly with Magic:
 
 ```
 Meta Page
 +------------------+
-| Page Header      |
-+------------------+
 | Magic            | uint32 - identifies file as gmdb
 | Version          | uint32 - format version
 | PageSize         | uint32 - page size in bytes
-| Flags            | uint32 - bit 0: PageChecksum (immutable); bit 1: Steady; bits 2-31: reserved
+| Flags            | uint32 - bit 0: PageChecksum (immutable); bit 1: Steady (mutable); bits 2-31: reserved (must be zero)
 | BitmapPages      | uint32 - number of pages in the allocation bitmap
 | Padding          | 4 bytes - alignment
+| UUID             | [16]byte - database identity, generated at creation, immutable
 | GeoLower         | uint64 - minimum database size in pages
 | GeoUpper         | uint64 - maximum database size in pages
 | GeoGrowPages     | uint64 - growth step in pages
@@ -130,13 +136,28 @@ Meta Page
 | KeyspaceRoot     | uint64 - root page of keyspace B+tree
 | NumKeyspaces     | uint64 - number of keyspaces
 | TxnID            | uint64 - transaction ID that wrote this meta
-| Checksum         | uint64 - xxhash of all preceding bytes (header through TxnID)
+| Checksum         | uint64 - xxhash64 of all preceding bytes (Magic through TxnID)
 +------------------+
 ```
 
-Total meta page payload: 8 (header) + 4×4 (Magic, Version, PageSize, Flags) +
-4 (BitmapPages) + 4 (padding) + 13×8 (uint64 fields including Checksum) =
-136 bytes. Fits comfortably in any supported page size (min 4KB).
+Total meta page payload: 4×4 (Magic, Version, PageSize, Flags) +
+4 (BitmapPages) + 4 (padding) + 16 (UUID) + 13×8 (uint64 fields
+including Checksum) = 144 bytes. Fits comfortably in any supported
+page size (min 4KB).
+
+`UUID` is a 128-bit random identifier generated at database creation time
+and copied identically to both meta pages. It uniquely identifies this
+database instance — useful for backup validation ("is this backup from
+the same database?") and lock file association ("does this lock file
+belong to this data file?"). Immutable after creation.
+
+`Flags` policy: `Open()` must reject databases where any unknown flag
+bit is set (bits 2-31 in the current version). This prevents old code
+from silently ignoring features it does not understand, which could
+lead to data corruption. Bit 0 (PageChecksum) is immutable — set at
+creation, never changes. Bit 1 (Steady) is mutable — set/cleared per
+commit depending on whether the commit's data pages have been confirmed
+on stable storage.
 
 The geometry fields (`GeoLower`, `GeoUpper`, `GeoGrowPages`,
 `GeoShrinkPages`) are stored in the meta page so that they persist across
@@ -1661,10 +1682,11 @@ A separate file (`<dbname>.lock`) is mmap'd as shared memory by all processes.
 ```
 Lock File
 +-------------------------------+
-| Header (32 bytes)             |
+| Header (48 bytes)             |
 | Magic            | uint64    |  identifies file as gmdb lock file
 | MaxReaders       | uint32    |  number of reader slots (set at creation)
 | Padding          | 4 bytes   |  alignment
+| UUID             | [16]byte  |  must match data file's UUID
 | WriterPID        | uint64    |  PID of current write txn holder (0 = no writer)
 | WriterStartTime  | uint64    |  process start time of writer (for PID reuse detection)
 +-------------------------------+
@@ -1694,9 +1716,10 @@ type LockFileHeader struct {
     _               structs.HostLayout
     Magic           uint64
     MaxReaders      uint32
-    _               [4]byte // explicit padding for 8-byte alignment
+    _               [4]byte  // explicit padding for 8-byte alignment
+    UUID            [16]byte // must match data file's UUID
     WriterPID       uint64
-    WriterStartTime uint64  // process start time of writer (PID reuse detection)
+    WriterStartTime uint64   // process start time of writer (PID reuse detection)
 }
 
 type ReaderSlot struct {
@@ -1712,12 +1735,18 @@ the lock file's shared memory structures. Data file page formats remain
 defined as raw byte layouts with explicit encode/decode functions, since
 those must be endian-aware and portable across architectures.
 
-**Header (32 bytes):**
+**Header (48 bytes):**
 - `Magic` (uint64): Identifies the file as a gmdb lock file. Validates that
   the lock file belongs to this database and has not been corrupted.
 - `MaxReaders` (uint32): Number of reader slots. Set at lock file creation
   time via `Options.MaxReaders` (default: 4096). Immutable after creation.
 - Padding (4 bytes): Alignment to 8-byte boundary.
+- `UUID` ([16]byte): Database UUID, copied from the data file's meta page
+  at lock file creation time. On `Open()`, the lock file's UUID is compared
+  against the data file's UUID. If they differ, the lock file is stale
+  (belongs to a different database or the data file was replaced) — it is
+  deleted and recreated. This prevents cross-database lock file confusion
+  when files are moved, renamed, or replaced.
 - `WriterPID` (uint64): PID of the process currently holding the write lock.
   Set when the write lock is acquired, cleared to 0 on release. Used for
   stale writer detection (see Stale Writer Recovery). Stored as uint64 for
@@ -1740,8 +1769,8 @@ those must be endian-aware and portable across architectures.
   alive but its current start time differs from the stored value, the PID
   was recycled and the slot is stale. See Process Start Time below.
 
-Total lock file size: 32 + (24 × MaxReaders). With default MaxReaders=4096:
-32 + 98304 = 98336 bytes (~96KB).
+Total lock file size: 48 + (24 × MaxReaders). With default MaxReaders=4096:
+48 + 98304 = 98352 bytes (~96KB).
 
 The lock file is mmap'd with `MAP_SHARED` by all processes for the reader table.
 The write lock is a separate concern handled via `flock()` (see below).
@@ -2490,33 +2519,39 @@ The root meta page points to a "keyspace B+tree" — a B+tree whose keys are
 keyspace names (byte strings) and whose values are keyspace descriptors:
 
 ```
-Keyspace Descriptor
-+----------+----------+----------+---------------+
-| Root     | Count    | Flags    | DupFixedSize  |
-| uint64   | uint64   | uint16   | uint16        |
-+----------+----------+----------+---------------+
+Keyspace Descriptor (32 bytes)
++----------+----------+----------+----------------+----------+----------+
+| Root     | Count    | Kind     | FixedValueSize | NextSeq  | Reserved |
+| uint64   | uint64   | uint8    | uint16         | uint64   | [5]byte  |
++----------+----------+----------+----------------+----------+----------+
 ```
 
-Total descriptor size: 8 + 8 + 2 + 2 = 20 bytes.
+Total descriptor size: 8 + 8 + 1 + 2 + 8 + 5 = 32 bytes.
 
-- **Root**: Page ID of this keyspace's B+tree root.
-- **Count**: Number of key-value pairs (for DUPSORT keyspaces, this is the
-  total number of key-value pairs across all duplicate sets).
+- **Root** (uint64): Page ID of this keyspace's B+tree root. 0 = empty
+  keyspace (no data yet).
+- **Count** (uint64): Number of key-value pairs. For SetKeyspace, this is
+  the total number of key-value pairs across all value sets.
 
 Depth (tree height) is not persisted — it is derived by reading the root
 page on first access, consistent with the nested B+tree reference format
-(see DUPSORT). This avoids maintaining a redundant field across split,
-merge, and rebalance operations.
-- **Flags**: Keyspace behavior flags:
-  - Bit 0: `DupSort` — multiple sorted values per key.
-  - Bit 1: `DupFixed` — all duplicate values have fixed size (requires
-    `DupSort`). `DupFixedSize` stores the value size.
-  - Bits 2-15: Reserved (must be 0).
-- **DupFixedSize**: Fixed duplicate value size in bytes. Only meaningful when
-  `DupFixed` flag is set. Zero otherwise.
-
-Flags are set at keyspace creation time and immutable after. Opening an
-existing keyspace with different flags returns an error.
+(see SetKeyspace nested B+trees). This avoids maintaining a redundant
+field across split, merge, and rebalance operations.
+- **Kind** (uint8): Keyspace type. `0` = Keyspace (key → value),
+  `1` = SetKeyspace (key → sorted set of values). `Open()` rejects
+  unknown Kind values. Set at creation time, immutable after. Opening a
+  keyspace with the wrong type (e.g., `OpenKeyspace` on a SetKeyspace)
+  returns `ErrKeyspaceKindMismatch`.
+- **FixedValueSize** (uint16): Fixed value size in bytes for SetKeyspace.
+  0 = variable-size values. Must be 0 when Kind=0. A `Put()` with a
+  value of the wrong size returns `ErrValueSizeMismatch`. Set at creation
+  time, immutable after.
+- **NextSeq** (uint64): Next sequence number for `NextSequence()`. Starts
+  at 0 (first call returns 1). Updated on each `NextSequence()` call
+  within a write transaction, persisted when the transaction commits.
+  Available on both Keyspace and SetKeyspace.
+- **Reserved** ([5]byte): Must be zero. Reserved for future fields.
+  `Open()` rejects descriptors with non-zero reserved bytes.
 
 Opening a keyspace within a transaction reads the descriptor from the keyspace
 B+tree. Modifications to the keyspace update the descriptor (and its root)
@@ -3233,7 +3268,7 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding (8-byte header: Type, Count, Overflow — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. DUPSORT subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
+| `page.go` | Page header encoding/decoding (8-byte header: Type uint8, Flags uint8, Count uint16, Overflow uint32 — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. DUPSORT subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs, key reconstruction buffer (`keyBuf []byte`) for incremental forward decoding, restart group cache (`[16][]byte`) for reverse traversal. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
 | `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |

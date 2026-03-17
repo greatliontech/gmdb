@@ -290,30 +290,29 @@ func (t *TypedSetKS[K, V]) Prefix(prefix K) iter.Seq2[K, V]
 
 ### Keyspace Descriptor (On-Disk)
 
-The keyspace B+tree stores a descriptor per keyspace. The descriptor
-gains a `Kind` field to distinguish keyspace types:
+The keyspace B+tree stores a descriptor per keyspace. The finalized
+descriptor layout (defined in the main design doc):
 
 ```
-Keyspace Descriptor
-+----------+----------+----------+----------------+
-| Root     | Count    | Kind     | FixedValueSize |
-| uint64   | uint64   | uint8    | uint16         |
-+----------+----------+----------+----------------+
+Keyspace Descriptor (32 bytes)
++----------+----------+----------+----------------+----------+----------+
+| Root     | Count    | Kind     | FixedValueSize | NextSeq  | Reserved |
+| uint64   | uint64   | uint8    | uint16         | uint64   | [5]byte  |
++----------+----------+----------+----------------+----------+----------+
 ```
 
-- **Kind**: `0` = Keyspace, `1` = SetKeyspace.
+- **Kind**: `0` = Keyspace, `1` = SetKeyspace. `Open()` rejects unknown
+  values.
 - **FixedValueSize**: Only meaningful when `Kind == 1` and non-zero.
-  Zero means variable-size values.
+  Zero means variable-size values. Must be 0 when Kind=0.
+- **NextSeq**: Per-keyspace sequence counter for `NextSequence()`.
+  Available on both Keyspace and SetKeyspace.
+- **Reserved**: Must be zero. Reserved for future fields.
 
-`Kind` replaces the `Flags` uint16 field. A single byte is sufficient —
-there are two kinds, not a bitmask of independent flags. This also
-eliminates the `ErrIncompatibleFlags` error — opening a `Keyspace` as a
-`SetKeyspace` (or vice versa) is a type mismatch detected by comparing
-`Kind`, reported as `ErrKeyspaceKindMismatch`.
-
-Total descriptor size: 8 + 8 + 1 + 2 = 19 bytes (was 20 bytes with
-the old `Flags uint16 + DupFixedSize uint16`). Could add 1 byte padding
-to maintain 4-byte alignment: 20 bytes.
+`Kind` replaces the old `Flags` uint16 field. This eliminates the
+`ErrIncompatibleFlags` error — opening a `Keyspace` as a `SetKeyspace`
+(or vice versa) is a type mismatch detected by comparing `Kind`,
+reported as `ErrKeyspaceKindMismatch`.
 
 ### Error Changes
 
@@ -342,16 +341,16 @@ demotion) remain unchanged — only the user-facing terminology changes.
 
 ### Storage: No Changes
 
-The on-disk format is identical. The split is purely at the API level:
+The on-disk page format is identical. The split is purely at the API level:
 
 - `SetKeyspace` uses the same subpage and nested B+tree storage as
   the current DUPSORT implementation.
 - `FixedValueSize` maps to the same flat-array subpage optimization.
 - `CellFlags` bits are renamed (`MultiValue`, `NestedTree`) but the
   bit positions and semantics are unchanged.
-- The keyspace descriptor changes `Flags uint16` to `Kind uint8` +
-  `FixedValueSize uint16`, but the total size and the information
-  content are equivalent.
+- The keyspace descriptor layout is updated (32 bytes with `Kind`,
+  `FixedValueSize`, `NextSeq`, and reserved bytes) but the page format
+  for data pages is unchanged.
 
 ### Delete Semantics
 
