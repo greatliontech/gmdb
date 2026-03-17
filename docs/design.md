@@ -14,10 +14,10 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Duplicate values | DUPSORT with subpage + nested B+tree | Subpage for small sets, nested B+tree for large; DUPFIXED for fixed-size optimization |
 | Free space | Allocation bitmap + retired page log (RPL) | O(1) alloc via bitmap, no self-referential allocation, RPL tracks MVCC retirement |
 | RPL entry format | Per-segment TxnID + array of PageIDs | TxnID stored once per segment (not per entry); doubles segment capacity |
-| File geometry | Dynamic grow/shrink with configurable bounds; GeoUpper immutable after creation | Auto-compaction via tail refund, no manual compaction needed; GeoUpper fixed because bitmap region size depends on it |
+| File format | Dynamic grow/shrink with configurable bounds; MaxSize immutable after creation | Auto-compaction via tail refund, no manual compaction needed; MaxSize fixed because bitmap region size depends on it |
 | Isolation | Dual meta pages + CoW | No WAL needed, atomic commit |
 | Crash safety | CoW + atomic meta page swap | File is always consistent |
-| Durability | Three sync modes (Durable, NoMeta, Safe) + unsafe opt-in None | Configurable ACID vs. performance; SyncNone requires explicit `AllowSyncNone` flag |
+| Durability | Three sync modes (Durable, DataOnly, Lazy) + unsafe opt-in Unsafe | Configurable ACID vs. performance; SyncUnsafe requires explicit `AllowSyncUnsafe` flag |
 | Cross-process | Shared memory lock file (`structs.HostLayout` structs, uint64 PIDs + process start times) | C ABI layout guarantee for mmap'd structs; fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness + start time comparison (PID reuse safe); uint64 PIDs for forward safety |
 | Write lock | Intra-process writer queue (channel) + single flock goroutine (cross-process) | Context-aware blocking; zero goroutine accumulation on cancellation; flock alone doesn't block same-process goroutines |
 | Slow readers | Callback-based notification | Application controls policy; no silent unbounded growth |
@@ -66,8 +66,8 @@ All multi-byte integers are stored in little-endian byte order.
 ```
 
 Bitmap pages occupy a contiguous region starting at page 2. The number of
-bitmap pages is determined by `GeoUpper` at database creation time:
-`BitmapPages = ceil((GeoUpper / PageSize) / (PageSize * 8))`. Data pages
+bitmap pages is determined by `MaxSize` at database creation time:
+`BitmapPages = ceil((MaxSize / PageSize) / (PageSize * 8))`. Data pages
 (B+tree nodes, overflow pages, RPL segment pages) begin immediately after
 the bitmap region. See Allocation Bitmap for details.
 
@@ -120,14 +120,14 @@ Meta Page
 | Magic            | uint32 - identifies file as gmdb
 | Version          | uint32 - format version
 | PageSize         | uint32 - page size in bytes
-| Flags            | uint32 - bit 0: PageChecksum (immutable); bit 1: Steady (mutable); bits 2-31: reserved (must be zero)
+| Flags            | uint32 - bit 0: PageChecksum (immutable); bit 1: Checkpoint (mutable); bits 2-31: reserved (must be zero)
 | BitmapPages      | uint32 - number of pages in the allocation bitmap
 | Padding          | 4 bytes - alignment
 | UUID             | [16]byte - database identity, generated at creation, immutable
-| GeoLower         | uint64 - minimum database size in pages
-| GeoUpper         | uint64 - maximum database size in pages
-| GeoGrowPages     | uint64 - growth step in pages
-| GeoShrinkPages   | uint64 - shrink threshold in pages
+| MinSize          | uint64 - minimum database size in pages
+| MaxSize          | uint64 - maximum database size in pages
+| GrowStep         | uint64 - growth step in pages
+| ShrinkThreshold  | uint64 - shrink threshold in pages
 | FirstUnallocated | uint64 - first unallocated page ID (high-water mark)
 | RPLHeadPage      | uint64 - page ID of the newest RPL segment (0 = empty)
 | RPLTailPage      | uint64 - page ID of the oldest RPL segment (0 = empty)
@@ -155,13 +155,13 @@ belong to this data file?"). Immutable after creation.
 bit is set (bits 2-31 in the current version). This prevents old code
 from silently ignoring features it does not understand, which could
 lead to data corruption. Bit 0 (PageChecksum) is immutable — set at
-creation, never changes. Bit 1 (Steady) is mutable — set/cleared per
+creation, never changes. Bit 1 (Checkpoint) is mutable — set/cleared per
 commit depending on whether the commit's data pages have been confirmed
 on stable storage.
 
-The geometry fields (`GeoLower`, `GeoUpper`, `GeoGrowPages`,
-`GeoShrinkPages`) are stored in the meta page so that they persist across
-opens and are available to all processes (see Database Geometry).
+The file format fields (`MinSize`, `MaxSize`, `GrowStep`,
+`ShrinkThreshold`) are stored in the meta page so that they persist across
+opens and are available to all processes (see File Format).
 
 The active meta page is the one with the highest TxnID whose checksum is valid.
 If a crash happens mid-write to the meta page, the checksum will be invalid and
@@ -772,14 +772,14 @@ to an active reader's snapshot).
 
 The bitmap occupies a contiguous region of pages starting at page 2 (after the
 two meta pages). The number of bitmap pages is fixed at database creation time
-based on `GeoUpper`:
+based on `MaxSize`:
 
 ```
-BitmapPages = ceil(GeoUpper / PageSize / BitsPerPage)
+BitmapPages = ceil(MaxSize / PageSize / BitsPerPage)
 BitsPerPage = PageSize * 8
 ```
 
-| GeoUpper | PageSize | Total Pages | BitmapPages | Bitmap Size |
+| MaxSize | PageSize | Total Pages | BitmapPages | Bitmap Size |
 |----------|----------|-------------|-------------|-------------|
 | 1GB      | 4KB      | 262,144     | 8           | 32KB        |
 | 64GB     | 4KB      | 16,777,216  | 512         | 2MB         |
@@ -810,7 +810,7 @@ To accelerate allocation searches over large databases, the bitmap uses a
 two-level structure:
 
 - **Level 0 (detail):** One bit per page in the database, covering page IDs
-  0 through `GeoUpper / PageSize - 1`. Stored across bitmap pages 2
+  0 through `MaxSize / PageSize - 1`. Stored across bitmap pages 2
   through `2 + BitmapPages - 1`. Bits for meta pages (0, 1) and bitmap
   pages (2 through `2 + BitmapPages - 1`) are permanently clear.
 - **Level 1 (summary):** A separate in-memory array, one bit per uint64
@@ -820,7 +820,7 @@ two-level structure:
   from the detail bitmap when the database is opened and maintained
   incrementally during transactions.
 
-At 4KB page size with 256GB `GeoUpper` (67M pages): the detail level is
+At 4KB page size with 256GB `MaxSize` (67M pages): the detail level is
 ~1M uint64 words (8MB across 2048 bitmap pages). The summary level is
 ~16K uint64 words = 128KB in memory. The summary allows skipping 64-page
 regions with no free space during allocation scans.
@@ -1056,7 +1056,7 @@ any bitmap or RPL interaction:
    invoke the slow reader callback (see Cross-Process Coordination). If the
    reader releases, refresh the oldest reader cache and retry step 3.
 5. **File extension**: if no free pages are available, grow the file according
-   to the geometry growth step and advance `FirstUnallocated`.
+   to the file format growth step and advance `FirstUnallocated`.
 
 ##### Tail Page Refund
 
@@ -1064,7 +1064,7 @@ After reclamation or at commit time, the writer checks if any pages at the
 tail of the database file (page IDs equal to `FirstUnallocated - 1`,
 `FirstUnallocated - 2`, etc.) are free in the bitmap. If so, those bits are
 cleared and `FirstUnallocated` is decremented. This reclaims file space and
-enables file shrinkage at commit time (see Database Geometry).
+enables file shrinkage at commit time (see File Format).
 
 The refund process iterates: clearing tail bits may expose new tail pages.
 It runs until no more tail pages are free. Loose pages are checked first
@@ -1362,7 +1362,7 @@ ignored when `WriteMap` is true.
    for the lock grant, respecting `ctx` cancellation (see Write Lock).
    Returns `context.Cause(ctx)` if cancelled while waiting, preserving the
    original cancellation reason.
-2. Writer reads the active meta page to get current roots, TxnID, and geometry.
+2. Writer reads the active meta page to get current roots, TxnID, and file format.
 3. For each modification (insert, update, delete):
    - Traverse the B+tree from root to leaf.
    - Copy each page along the path (CoW — never modify in place).
@@ -1389,15 +1389,15 @@ ignored when `WriteMap` is true.
    - **pwrite mode**: sort `tx.dirtyPages` keys, write non-spilled dirty
      pages via `pwrite()` in page-ID order.
    - **writemap mode**: no explicit write needed (pages are already in the mmap).
-   - `fdatasync()` if `SyncMode` is `SyncDurable` or `SyncNoMeta`. Skipped for
-     `SyncSafe` and `SyncNone`.
+    - `fdatasync()` if `SyncMode` is `SyncDurable` or `SyncDataOnly`. Skipped for
+      `SyncLazy` and `SyncUnsafe`.
 6. Update the inactive meta page with new root pointers, new TxnID, updated
    `FirstUnallocated`, and checksum. Written via `pwrite()` (pwrite mode) or
    directly in the mmap (writemap mode).
 7. `fdatasync()` the meta page if `SyncMode` is `SyncDurable`. Skipped for all
    other modes. This is the **atomic commit point**.
 8. If the OS file size exceeds `FirstUnallocated` by more than
-   `GeoShrinkPages`, truncate the file via `ftruncate()`. This happens
+   `ShrinkThreshold`, truncate the file via `ftruncate()`. This happens
    after the commit point — a crash before truncation leaves the file
    larger than necessary but consistent. The next commit will retry.
 9. Writer signals the flock goroutine to release the lock (clears
@@ -2174,7 +2174,7 @@ steps 5–7).
 
 ### mmap Resizing
 
-The mmap region is sized to `GeoUpper` (the maximum database size in pages).
+The mmap region is sized to `MaxSize` (the maximum database size in pages).
 This over-allocates virtual address space — only the file-backed portion is
 usable, but the mapping does not need to change as the file grows or shrinks.
 The unmapped region beyond the file size will SIGBUS if accessed, so readers
@@ -2185,7 +2185,7 @@ must check `FirstUnallocated` from the meta page.
 However, per-process `RLIMIT_AS` limits do apply to virtual address space
 reservations regardless of mapping type. On most default configurations
 `RLIMIT_AS` is unlimited and this is not an issue. Users with restrictive
-`RLIMIT_AS` settings may need to lower `GeoUpper`.
+`RLIMIT_AS` settings may need to lower `MaxSize`.
 
 ### Prefaulting (Linux 5.14+)
 
@@ -2261,77 +2261,77 @@ older than 5.4, the madvise call is silently ignored.
 The database supports three safe durability modes and one unsafe mode,
 configurable via `Options.SyncMode`. The mode controls which `fdatasync()`
 calls are performed during commit. All safe modes preserve **database
-integrity** (the file is always structurally valid). `SyncNone` is the
+integrity** (the file is always structurally valid). `SyncUnsafe` is the
 unsafe mode — it risks corruption on crash and requires explicit opt-in
-via `Options.AllowSyncNone = true`. The tradeoff is between commit latency
+via `Options.AllowSyncUnsafe = true`. The tradeoff is between commit latency
 and how much data may be lost on a crash.
 
 | Mode | Data Sync | Meta Sync | On Crash | Performance |
 |------|-----------|-----------|----------|-------------|
 | `SyncDurable` (default) | `fdatasync()` | `fdatasync()` | No data loss. Full ACID. | Slowest |
-| `SyncNoMeta` | `fdatasync()` | skip | Last committed transaction may be lost. DB is consistent — falls back to previous meta page. | ~2x faster |
-| `SyncSafe` | skip | skip | Rolls back to the last **steady commit** (the last commit that was explicitly synced via `DB.Sync()` or the last `SyncDurable`/`SyncNoMeta` commit). DB is always consistent — no corruption. | Much faster |
-| `SyncNone` | skip | skip | **Risk of corruption.** No guarantees. Requires `Options.AllowSyncNone = true`. For benchmarks and ephemeral data only. | Fastest |
+| `SyncDataOnly` | `fdatasync()` | skip | Last committed transaction may be lost. DB is consistent — falls back to previous meta page. | ~2x faster |
+| `SyncLazy` | skip | skip | Rolls back to the last **checkpoint** (the last commit that was explicitly synced via `DB.Checkpoint()` or the last `SyncDurable`/`SyncDataOnly` commit). DB is always consistent — no corruption. | Much faster |
+| `SyncUnsafe` | skip | skip | **Risk of corruption.** No guarantees. Requires `Options.AllowSyncUnsafe = true`. For benchmarks and ephemeral data only. | Fastest |
 
-### Steady Commits
+### Checkpoints
 
-In `SyncSafe` mode, a commit writes data and meta pages to their on-disk
+In `SyncLazy` mode, a commit writes data and meta pages to their on-disk
 locations (via `pwrite()` in pwrite mode, or directly in the mmap in writemap
 mode) but skips all `fdatasync()` calls. The OS page cache holds the writes,
 which will eventually reach disk, but the order is not guaranteed.
 
-A **steady commit** is a commit whose data pages have been confirmed on
+A **checkpoint** is a commit whose data pages have been confirmed on
 stable storage. (The meta page itself may or may not be synced — what
 matters is that the data it references is durable. If the meta survived a
-crash, recovery can trust it without further validation.) Steady commits
+crash, recovery can trust it without further validation.) Checkpoints
 occur when:
-- `DB.Sync()` is called explicitly (forces `fdatasync()` of the data file).
-- A commit happens in `SyncDurable` or `SyncNoMeta` mode (these sync data
+- `DB.Checkpoint()` is called explicitly (forces `fdatasync()` of the data file).
+- A commit happens in `SyncDurable` or `SyncDataOnly` mode (these sync data
   pages as part of their normal commit path).
 
-Each meta page carries a **steady flag** — a boolean indicating whether the
-data pages it references have been confirmed on stable storage. The steady flag
+Each meta page carries a **checkpoint flag** — a boolean indicating whether the
+data pages it references have been confirmed on stable storage. The checkpoint flag
 is set when `fdatasync()` completes successfully (either from a
-`SyncDurable`/`SyncNoMeta` commit or an explicit `DB.Sync()` call). In
-`SyncSafe` mode, commits write the meta page with the steady flag **clear**.
-A subsequent `DB.Sync()` re-writes the meta page with the steady flag
+`SyncDurable`/`SyncDataOnly` commit or an explicit `DB.Checkpoint()` call). In
+`SyncLazy` mode, commits write the meta page with the checkpoint flag **clear**.
+A subsequent `DB.Checkpoint()` re-writes the meta page with the checkpoint flag
 **set** (this is safe — the meta page is small and atomic).
 
 On recovery after a crash, `Open()` performs the following:
 
 1. Read both meta pages. Discard any with an invalid xxhash64 checksum.
 2. Of the valid meta pages, select the one with the higher TxnID whose
-   steady flag is **set**. This is the last commit whose data pages are
+   checkpoint flag is **set**. This is the last commit whose data pages are
    confirmed on stable storage.
-3. If neither meta page has the steady flag set (the user never called
-   `DB.Sync()` and never used `SyncDurable`/`SyncNoMeta`), select the
+3. If neither meta page has the checkpoint flag set (the user never called
+   `DB.Checkpoint()` and never used `SyncDurable`/`SyncDataOnly`), select the
    meta page with the higher TxnID. In this case, the database has no
-   steady commit to fall back to — data integrity depends on whether
+   checkpoint to fall back to — data integrity depends on whether
    the OS flushed pages in the right order, which is not guaranteed.
-4. Non-steady meta pages (steady flag clear) are never preferred over
-   steady ones, regardless of TxnID. A steady meta at TxnID 100 is
-   chosen over a non-steady meta at TxnID 105 — the 5 transactions
-   since the last steady commit are lost.
+4. Non-checkpoint meta pages (checkpoint flag clear) are never preferred over
+   checkpoint ones, regardless of TxnID. A checkpoint meta at TxnID 100 is
+   chosen over a non-checkpoint meta at TxnID 105 — the 5 transactions
+   since the last checkpoint are lost.
 
-Recovery does not attempt to validate a non-steady meta's tree (e.g.,
+Recovery does not attempt to validate a non-checkpoint meta's tree (e.g.,
 by checking the root page checksum). A valid root page does not prove
 that all reachable child pages, bitmap state, and RPL segments are
 durable — the OS may have flushed pages in any order. Accepting a
 partially-durable tree would risk surfacing `ErrCorrupted` on later
-reads when traversals reach unflushed pages. The steady commit's tree
+reads when traversals reach unflushed pages. The checkpoint's tree
 is guaranteed intact because CoW never modifies existing pages.
 
-### SyncNone Warning
+### SyncUnsafe Warning
 
-`SyncNone` provides no crash safety whatsoever. Because `pwrite()` ordering
+`SyncUnsafe` provides no crash safety whatsoever. Because `pwrite()` ordering
 is not guaranteed without `fdatasync()`, the meta page could reach disk before
 the data pages it references. A crash in this state leaves the meta page
 pointing to unwritten or partially written data pages — the database is
 **corrupted**. Use this mode only for ephemeral data or benchmarks where the
 database can be discarded after a crash.
 
-To prevent accidental use, `SyncNone` requires `Options.AllowSyncNone = true`
-to be set explicitly. Setting `SyncMode = SyncNone` without `AllowSyncNone`
+To prevent accidental use, `SyncUnsafe` requires `Options.AllowSyncUnsafe = true`
+to be set explicitly. Setting `SyncMode = SyncUnsafe` without `AllowSyncUnsafe`
 returns an error from `Open()`. This ensures that unsafe mode is always a
 deliberate choice, never an accidental misconfiguration.
 
@@ -2405,7 +2405,7 @@ write ordering guarantees as the pwrite path.
   (pure Go, no cgo required) and falls back to unregistered buffers
   if the limit is insufficient.
 
-- **File geometry via io_uring**: On Linux 6.9+, `IORING_OP_FTRUNCATE` is
+- **File sizing via io_uring**: On Linux 6.9+, `IORING_OP_FTRUNCATE` is
   available, allowing file growth and shrinkage to be included in the SQE
   chain rather than requiring a separate `ftruncate()` syscall. When the
   file needs to grow, the truncate SQE is prepended to the write chain.
@@ -2423,8 +2423,8 @@ write ordering guarantees as the pwrite path.
   pages are already in the mmap and commit uses `fdatasync()` or `msync()`
   directly. The io_uring path is pwrite mode only.
 
-- **SyncMode interaction**: In `SyncSafe` and `SyncNone` modes, the fsync
-  SQEs are omitted from the chain. `SyncNoMeta` omits only the final fsync.
+- **SyncMode interaction**: In `SyncLazy` and `SyncUnsafe` modes, the fsync
+  SQEs are omitted from the chain. `SyncDataOnly` omits only the final fsync.
   The write SQEs are still submitted via `io_uring` for batching benefit.
 
 ### Expected Benefits
@@ -2456,56 +2456,56 @@ Secondary benefits:
   existing pwrite path, not a replacement. Both paths must produce
   identical commit semantics.
 
-## Database Geometry
+## File Format
 
 The database file size is managed dynamically between configurable lower and
-upper bounds. The geometry is stored in the meta page and controls how the
+upper bounds. The file format is stored in the meta page and controls how the
 file grows and shrinks.
 
-### Geometry Parameters
+### File Format Parameters
 
 | Parameter | Meta Field | Description | Default |
 |-----------|-----------|-------------|---------|
-| Lower bound | `GeoLower` | Minimum file size in pages. File never shrinks below this. | `2 + BitmapPages` (meta + bitmap) |
-| Upper bound | `GeoUpper` | Maximum file size in pages. Determines mmap reservation and bitmap size. **Immutable after creation.** | 256GB / PageSize |
-| Growth step | `GeoGrowPages` | Number of pages to grow by when extending the file. | 65536 pages (256MB at 4KB pages) |
-| Shrink threshold | `GeoShrinkPages` | Shrink the file when `fileSize - FirstUnallocated > threshold`. | 131072 pages (512MB at 4KB pages) |
+| Lower bound | `MinSize` | Minimum file size in pages. File never shrinks below this. | `2 + BitmapPages` (meta + bitmap) |
+| Upper bound | `MaxSize` | Maximum file size in pages. Determines mmap reservation and bitmap size. **Immutable after creation.** | 256GB / PageSize |
+| Growth step | `GrowStep` | Number of pages to grow by when extending the file. | 65536 pages (256MB at 4KB pages) |
+| Shrink threshold | `ShrinkThreshold` | Shrink the file when `fileSize - FirstUnallocated > threshold`. | 131072 pages (512MB at 4KB pages) |
 
-Geometry is set at database creation time via `Options` and persisted in the
-meta page. `GeoLower`, `GeoGrowPages`, and `GeoShrinkPages` can be modified
-by calling `Tx.SetGeometry()` on a write transaction — the new values take
+File format is set at database creation time via `Options` and persisted in the
+meta page. `MinSize`, `GrowStep`, and `ShrinkThreshold` can be modified
+by calling `Tx.SetFileFormat()` on a write transaction — the new values take
 effect when the transaction commits.
 
-**`GeoUpper` is immutable after creation.** The allocation bitmap occupies a
+**`MaxSize` is immutable after creation.** The allocation bitmap occupies a
 fixed region of pages (starting at page 2) whose size is determined by
-`GeoUpper` at creation time (see Allocation Bitmap). Increasing `GeoUpper`
+`MaxSize` at creation time (see Allocation Bitmap). Increasing `MaxSize`
 would require expanding the bitmap region, which would shift all data page
 offsets — every page ID in every B+tree, RPL segment, and keyspace descriptor
-would become invalid. Decreasing `GeoUpper` below the current
+would become invalid. Decreasing `MaxSize` below the current
 `FirstUnallocated` would orphan allocated pages. Neither operation is
 feasible without a full database rebuild.
 
-To change `GeoUpper`, use `CopyTo(path, compact)` to create a new database
-with different `Options.Geometry.Upper`, then replace the original file.
-`SetGeometry()` returns an error if the caller attempts to change `GeoUpper`.
+To change `MaxSize`, use `CopyTo(path, compact)` to create a new database
+with different `Options.FileFormat.MaxSize`, then replace the original file.
+`SetFileFormat()` returns an error if the caller attempts to change `MaxSize`.
 
 ### File Growth
 
 When `pageAlloc()` needs to extend the file:
-1. Calculate new size: `alignUp(FirstUnallocated + needed, GeoGrowPages)`.
-2. Clamp to `GeoUpper`. If the new size would exceed `GeoUpper`, return
+1. Calculate new size: `alignUp(FirstUnallocated + needed, GrowStep)`.
+2. Clamp to `MaxSize`. If the new size would exceed `MaxSize`, return
    `ErrDBFull`.
 3. Extend the file via `ftruncate()`. The existing mmap (which reserves up to
-   `GeoUpper`) covers the new pages automatically — no remap needed.
+   `MaxSize`) covers the new pages automatically — no remap needed.
 
 ### File Shrinkage
 
 After the commit point (step 7 of the write transaction), if the OS file size
-exceeds `FirstUnallocated` by more than `GeoShrinkPages`:
-1. Calculate new size: `alignUp(FirstUnallocated, GeoGrowPages)`.
-2. Clamp to `GeoLower`.
+exceeds `FirstUnallocated` by more than `ShrinkThreshold`:
+1. Calculate new size: `alignUp(FirstUnallocated, GrowStep)`.
+2. Clamp to `MinSize`.
 3. Truncate the file via `ftruncate()`. The mmap reservation remains at
-   `GeoUpper` — the truncated region becomes unmapped (SIGBUS on access),
+   `MaxSize` — the truncated region becomes unmapped (SIGBUS on access),
    which is safe because `FirstUnallocated` in the meta page prevents any
    reader from accessing those pages.
 
@@ -2573,7 +2573,7 @@ comparison and is safe for concurrent use.
 var (
     ErrNotFound           = errors.New("gmdb: key not found")
     ErrKeyExist           = errors.New("gmdb: key already exists")
-    ErrDBFull             = errors.New("gmdb: database full (GeoUpper reached)")
+    ErrDBFull             = errors.New("gmdb: database full (MaxSize reached)")
     ErrTxnFull            = errors.New("gmdb: transaction too large")
     ErrReadersFull        = errors.New("gmdb: no reader slots available")
     ErrKeyTooLarge        = errors.New("gmdb: key exceeds maximum size")
@@ -2623,17 +2623,17 @@ type SyncMode int
 const (
     // SyncDurable syncs both data and meta pages. Full ACID. Default.
     SyncDurable SyncMode = iota
-    // SyncNoMeta syncs data pages but not the meta page. Last transaction
+    // SyncDataOnly syncs data pages but not the meta page. Last transaction
     // may be lost on crash, but the database is always consistent.
-    SyncNoMeta
-    // SyncSafe skips all syncs. The database rolls back to the last steady
-    // commit on crash. No corruption risk. Use DB.Sync() to create steady
-    // commit points.
-    SyncSafe
-    // SyncNone skips all syncs with no safety net. Risk of corruption on
+    SyncDataOnly
+    // SyncLazy skips all syncs. The database rolls back to the last checkpoint
+    // on crash. No corruption risk. Use DB.Checkpoint() to create
+    // checkpoints.
+    SyncLazy
+    // SyncUnsafe skips all syncs with no safety net. Risk of corruption on
     // crash. For benchmarks and ephemeral data only. Requires
-    // Options.AllowSyncNone = true.
-    SyncNone
+    // Options.AllowSyncUnsafe = true.
+    SyncUnsafe
 )
 
 // Options for opening a database.
@@ -2651,21 +2651,21 @@ type Options struct {
     // existing database (read from meta page Flags).
     PageChecksum bool
 
-    // Geometry controls database file size bounds and growth behavior.
+    // FileFormat controls database file size bounds and growth behavior.
     // Only used when creating a new database. When opening an existing
-    // database, geometry is read from the meta page. Use Tx.SetGeometry()
-    // to modify geometry of an existing database.
-    Geometry Geometry
+    // database, file format is read from the meta page. Use Tx.SetFileFormat()
+    // to modify file format of an existing database.
+    FileFormat FileFormat
 
     // SyncMode controls the durability guarantees of committed
     // transactions. Default: SyncDurable.
     SyncMode SyncMode
 
-    // AllowSyncNone must be set to true when using SyncNone mode.
+    // AllowSyncUnsafe must be set to true when using SyncUnsafe mode.
     // This explicit opt-in prevents accidental use of the unsafe mode.
-    // Open() returns an error if SyncMode is SyncNone and AllowSyncNone
+    // Open() returns an error if SyncMode is SyncUnsafe and AllowSyncUnsafe
     // is false. Default: false.
-    AllowSyncNone bool
+    AllowSyncUnsafe bool
 
     // WriteMap enables writemap mode. The data file is mapped read-write
     // and dirty pages are modified directly in the mmap instead of being
@@ -2749,12 +2749,12 @@ type Options struct {
     ReadOnly bool
 }
 
-// Geometry controls the database file size bounds and growth/shrink behavior.
+// FileFormat controls the database file size bounds and growth/shrink behavior.
 // All sizes are specified in bytes and must be multiples of PageSize. They are
 // converted to pages internally and stored in the meta page as page counts.
-// All fields are uint64 — negative sizes are meaningless for database geometry,
+// All fields are uint64 — negative sizes are meaningless for file format,
 // and uint64 matches the internal meta page representation.
-type Geometry struct {
+type FileFormat struct {
     // Lower is the minimum database file size in bytes. The file never
     // shrinks below this. Must be a multiple of PageSize.
     // Default: (2 + BitmapPages) * PageSize (meta + bitmap pages).
@@ -2762,7 +2762,7 @@ type Geometry struct {
 
     // Upper is the maximum database file size in bytes. Determines mmap
     // reservation size and allocation bitmap size. Must be a multiple of
-    // PageSize. Immutable after creation — SetGeometry cannot change this;
+    // PageSize. Immutable after creation — SetFileFormat cannot change this;
     // use CopyTo to create a new database with different Upper.
     // Default: 256GB.
     Upper uint64
@@ -2798,12 +2798,12 @@ type DB struct { ... }
 
 func (db *DB) Close() error
 
-// Sync flushes all outstanding writes to stable storage. In SyncSafe mode,
-// this creates a steady commit point — the database will roll back to this
-// point (at most) on crash. In SyncDurable and SyncNoMeta modes, this is a
-// no-op (commits already sync). In SyncNone mode, this syncs but does not
+// Checkpoint flushes all outstanding writes to stable storage. In SyncLazy mode,
+// this creates a checkpoint — the database will roll back to this
+// point (at most) on crash. In SyncDurable and SyncDataOnly modes, this is a
+// no-op (commits already sync). In SyncUnsafe mode, this syncs but does not
 // retroactively fix the lack of ordering guarantees from prior commits.
-func (db *DB) Sync() error
+func (db *DB) Checkpoint() error
 
 // View executes a read-only transaction. The context governs slot
 // acquisition only — once the transaction callback is entered, the
@@ -2858,17 +2858,17 @@ type Tx struct { ... }
 func (tx *Tx) Commit() error
 func (tx *Tx) Rollback() error
 
-// SetGeometry updates the database geometry. Only valid on a write
-// transaction. The new geometry takes effect when the transaction commits.
+// SetFileFormat updates the file format. Only valid on a write
+// transaction. The new file format takes effect when the transaction commits.
 //
-// GeoUpper (Geometry.Upper) is immutable after creation — the allocation
-// bitmap size is fixed at creation time based on GeoUpper, and changing it
-// would invalidate all page IDs. SetGeometry returns an error if
-// Geometry.Upper differs from the current GeoUpper. To change GeoUpper,
-// use CopyTo to create a new database with different geometry.
+// MaxSize (FileFormat.MaxSize) is immutable after creation — the allocation
+// bitmap size is fixed at creation time based on MaxSize, and changing it
+// would invalidate all page IDs. SetFileFormat returns an error if
+// FileFormat.MaxSize differs from the current MaxSize. To change MaxSize,
+// use CopyTo to create a new database with different file format.
 //
-// GeoLower, GrowStep, and ShrinkThreshold may be modified freely.
-func (tx *Tx) SetGeometry(g Geometry) error
+// MinSize, GrowStep, and ShrinkThreshold may be modified freely.
+func (tx *Tx) SetFileFormat(g FileFormat) error
 
 // KeyspaceFlags controls keyspace behavior. Set at creation time, immutable after.
 type KeyspaceFlags uint16
@@ -3031,10 +3031,10 @@ type DBStats struct {
     FreePages    uint64 // total free pages (set bits in allocation bitmap)
     RetiredPages uint64 // pages in RPL, not yet reclaimable (held by readers)
 
-    // Geometry
+    // File format
     FileSize     uint64 // current data file size in bytes
-    GeoLower     uint64 // minimum file size in bytes
-    GeoUpper     uint64 // maximum file size in bytes
+    MinSize     uint64 // minimum file size in bytes
+    MaxSize     uint64 // maximum file size in bytes
     FirstUnalloc uint64 // first unallocated page ID (high-water mark)
 
     // Readers
@@ -3268,22 +3268,22 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding (8-byte header: Type uint8, Flags uint8, Count uint16, Overflow uint32 — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. DUPSORT subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including geometry fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
+| `page.go` | Page header encoding/decoding (8-byte header: Type uint8, Flags uint8, Count uint16, Overflow uint32 — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. DUPSORT subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including file format fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs, key reconstruction buffer (`keyBuf []byte`) for incremental forward decoding, restart group cache (`[16][]byte`) for reverse traversal. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
 | `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |
 | `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). Clock-based eviction via `tx.clockRing` circular buffer with reference bit sweep and tombstones for spilled entries. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
-| `geometry.go` | Database geometry management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetGeometry()` for runtime modification of `GeoLower`, `GeoGrowPages`, `GeoShrinkPages` (rejects `GeoUpper` changes — bitmap region is fixed at creation). |
-| `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to GeoUpper). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
+| `fileformat.go` | File format management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetFileFormat()` for runtime modification of `MinSize`, `GrowStep`, `ShrinkThreshold` (rejects `MaxSize` changes — bitmap region is fixed at creation). |
+| `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to MaxSize). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` prefaulting (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
-| `iouring_linux.go` | io_uring commit path (Linux 5.6+). Ring initialization with `IORING_REGISTER_FILES` for fixed fd. SQE batch construction (data writes + linked fsync + meta write + linked fsync). `IORING_OP_FTRUNCATE` for geometry changes (Linux 6.9+). CQE completion handling. Registered buffer management with `RLIMIT_MEMLOCK` checking. Fallback detection. |
+| `iouring_linux.go` | io_uring commit path (Linux 5.6+). Ring initialization with `IORING_REGISTER_FILES` for fixed fd. SQE batch construction (data writes + linked fsync + meta write + linked fsync). `IORING_OP_FTRUNCATE` for file format changes (Linux 6.9+). CQE completion handling. Registered buffer management with `RLIMIT_MEMLOCK` checking. Fallback detection. |
 | `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime, context-aware, zero goroutine accumulation). Stale writer recovery (PID liveness + start time comparison). Reader table: hint-based scan+CAS slot acquire (stores PID + ProcessStartTime), atomic store release, stale reader detection via PID liveness + start time comparison (PID reuse safe). Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
 | `process_linux.go` | `processStartTime(pid) (uint64, error)`: reads `/proc/[pid]/stat` field 22 (`starttime`, clock ticks since boot). Pure Go, no cgo. |
 | `process_darwin.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
 | `process_freebsd.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.ki_start`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), clock ring (`[]uint64` circular buffer + hand index, pwrite only), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (`slices.Sorted(maps.Keys(...))` + sequential pwrite/pwritev2 + RPL append + bitmap update + meta swap + sync per SyncMode + geometry shrink), rollback. Dirty page buffer allocation from anonymous mmap slab (pwrite mode). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
-| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap, lock file, geometry, write mode selection, AllowSyncNone validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Sync(). Check(). CopyTo(). |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), clock ring (`[]uint64` circular buffer + hand index, pwrite only), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (`slices.Sorted(maps.Keys(...))` + sequential pwrite/pwritev2 + RPL append + bitmap update + meta swap + sync per SyncMode + file format shrink), rollback. Dirty page buffer allocation from anonymous mmap slab (pwrite mode). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
+| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap, lock file, file format, write mode selection, AllowSyncUnsafe validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Checkpoint(). Check(). CopyTo(). |
 | `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with `Encoder` calls. |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
@@ -3356,7 +3356,7 @@ branch page limit to allow splitting at any level.
 For non-DUPSORT keyspaces: inline values are limited by available space in the
 leaf page. Values that exceed this are automatically stored as overflow pages.
 There is no practical upper limit on value size (bounded only by disk space and
-`GeoUpper`). Note that leaf prefix compression reduces per-entry key overhead,
+`MaxSize`). Note that leaf prefix compression reduces per-entry key overhead,
 leaving more page space for inline values — a leaf with high prefix sharing
 can fit larger inline values before triggering overflow.
 
