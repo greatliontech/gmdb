@@ -40,6 +40,8 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Typed keyspaces | Generic `TypedKeyspace[K, V]` with `Encoder[T]` interface | Zero-cost type-safe API over byte-oriented Keyspace; append-style `AppendEncode(dst, v) ([]byte, error)` enables buffer reuse and surfaces encode/decode failures; interface enables stateful encoders and buffer pooling |
 | Keyspace names | `unique.Handle[string]` interning | Avoids repeated allocations for frequently opened keyspace names across transactions |
 | Integrity check | `Check() iter.Seq[CheckIssue]` with `CheckFatal` severity | All results (issues + walk failures) are uniform `CheckIssue` values; streaming via `iter.Seq`; `slices.Collect` for batch use; `break` for early abort |
+| Byte slice ownership | Borrowed references: values valid until tx close, keys valid until next cursor op | Zero-copy from mmap; prefix compression requires key reconstruction buffer (reused per cursor movement); same contract as LMDB/libmdbx/BoltDB |
+| Nil/empty semantics | Nil/empty keys invalid; nil values treated as empty; nil return = not found or end-of-iteration | Catches bugs at API boundary; empty values enable set-of-keys pattern; unambiguous nil semantics |
 | Namespaces | Named keyspaces (separate Open/Create API) | Multiple B+trees in one file; clear creation vs. opening semantics |
 | Block compression | Not supported (explicit decision) | Incompatible with mmap zero-copy read path; would require a decompression buffer pool, cache management, and eviction — fundamentally changing the architecture; key-level prefix compression provides density gains within the mmap model |
 | TTL / Expiry | Not supported (explicit decision) | Adds per-cell overhead or a shadow index for a use case (caches, sessions) that gmdb doesn't target; users can implement TTL with a separate expiry keyspace and periodic cleanup using existing primitives |
@@ -2412,6 +2414,7 @@ var (
     ErrTxTooLarge         = errors.New("gmdb: transaction too large")
     ErrReadersFull        = errors.New("gmdb: no reader slots available")
     ErrKeyTooLarge        = errors.New("gmdb: key exceeds maximum size")
+    ErrKeyEmpty           = errors.New("gmdb: key is nil or empty")
     ErrCorrupted          = errors.New("gmdb: database corrupted")
     ErrVersionMismatch    = errors.New("gmdb: format version mismatch")
     ErrReadOnly           = errors.New("gmdb: write operation on read-only transaction")
@@ -2424,6 +2427,70 @@ var (
 // Open a database. Creates the file if it doesn't exist.
 func Open(path string, opts *Options) (*DB, error)
 ```
+
+### Byte Slice Ownership
+
+All `[]byte` slices returned by gmdb (from `Get`, `Cursor.Next`, `Cursor.Seek`,
+etc.) are **borrowed references** — they point into either the mmap or an
+internal cursor buffer. The caller does not own them.
+
+**Value slices** point directly into the mmap (for inline values) or into
+overflow pages in the mmap. They are valid until the **read transaction
+closes** (`Commit()` or `Rollback()`). No copy, no allocation — true
+zero-copy from the mmap.
+
+**Key slices** may point into the mmap (for keys at restart points in
+prefix-compressed leaves) or into the cursor's key reconstruction buffer
+(`keyBuf`). The reconstruction buffer is reused on each cursor movement.
+Key slices are valid until the **next cursor operation** (`Next()`,
+`Prev()`, `Seek()`, `First()`, `Last()`, etc.) or transaction close,
+whichever comes first.
+
+Callers who need a key or value to outlive these scopes must copy it:
+
+```go
+k, v := c.Next()
+savedKey := bytes.Clone(k)    // key survives next cursor movement
+savedVal := bytes.Clone(v)    // value survives transaction close
+```
+
+`Keyspace.Get()` returns a value slice pointing into the mmap — valid
+until transaction close. No cursor buffer is involved, so the value
+remains stable for the entire transaction.
+
+This contract is the standard for mmap-based B+tree databases (LMDB,
+libmdbx, BoltDB). The zero-copy read path is a core performance
+property of gmdb's architecture.
+
+### Nil and Empty Semantics
+
+**Keys:**
+
+Empty keys (`[]byte{}`) and nil keys (`nil`) are both **invalid**. Any
+operation that takes a key (`Get`, `Put`, `Delete`, `Seek`, etc.) returns
+an error if the key is nil or empty. There is no technical reason a
+zero-length key can't exist in a B+tree, but it is almost always a bug.
+Rejecting it at the API boundary catches errors early.
+
+**Values:**
+
+Empty values (`[]byte{}`) are **valid**. A key can exist with no associated
+data — this is useful for using a keyspace as a set of keys
+(presence/absence). Nil values are treated as empty values: `Put(key, nil)`
+stores the key with a zero-length value, equivalent to `Put(key, []byte{})`.
+
+**Return value conventions:**
+
+| Call | Key exists (empty value) | Key exists (non-empty value) | Key not found | End of iteration |
+|------|--------------------------|------------------------------|---------------|------------------|
+| `Keyspace.Get(k)` | `([]byte{}, nil)` | `(value, nil)` | `(nil, ErrNotFound)` | N/A |
+| `Cursor.Next()` | `(key, []byte{})` | `(key, value)` | N/A | `(nil, nil)` |
+| `Cursor.Err()` | — | — | — | returns non-nil if iteration ended due to error |
+
+Nil return from `Get` always means "not found" (accompanied by
+`ErrNotFound`). Nil return from cursor navigation always means "end of
+iteration" (check `Err()` to distinguish normal end from error). Empty
+`[]byte{}` return from `Get` means "key exists, value is empty."
 
 ### Path Traversal Safety
 
