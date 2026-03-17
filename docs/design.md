@@ -30,7 +30,8 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Checksums | Meta: xxhash64 (always); Data: CRC32C footer (optional) | Meta checksum detects torn commits; optional data checksum catches silent bitrot |
 | API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime; `context.Cause(ctx)` preserves cancellation reasons from `WithCancelCause` |
 | Iteration | Cursor (stateful, bidirectional, mutable) + `iter.Seq2` (read-only, composable) | Cursor for mutation and bidirectional movement; `iter.Seq2` for idiomatic `for range` loops |
-| Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
+| Write batching | Channel-based `Batch()` API with nested transactions | Amortizes commit cost (fdatasync) across concurrent callers; each closure runs in a child transaction — no rollback+retry, closures execute exactly once |
+| Nested transactions | Child transactions with snapshot-and-restore | In-memory only (no disk I/O); CoW to fresh pages means child rollback is just discarding bookkeeping; enables `Batch()` without idempotency requirement |
 | Leak detection | `runtime.AddCleanup` on `Tx` and `DB` | Detects leaked transactions (releases reader slots) and leaked DB handles (releases mmap, fds, flock goroutine); logs origin stack trace |
 | Range delete | Subtree retirement via `DeleteRange` | O(pages) not O(entries); bulk-free for set keyspace nested B+trees |
 | Commit I/O | pwrite (bitmap + meta pages only) + fdatasync | Data pages are already in the mmap; only bitmap and meta need ordered writes; typically 2-5 pwrite calls per commit |
@@ -1353,34 +1354,36 @@ type batchCall struct {
 3. The coordinator opens a write transaction via `db.Begin(ctx, true)` (using
    `context.Background()` — individual caller contexts are checked separately).
 
-4. Each collected closure is executed sequentially within the transaction.
-   Before executing a closure, its `ctx` is checked — if already cancelled,
-   the closure is skipped and the caller receives `context.Cause(ctx)` to
-   preserve the original cancellation reason.
+4. Each collected closure is executed in its own **child transaction**
+   (see Nested Transactions). Before executing a closure, its `ctx` is
+   checked — if already cancelled, the closure is skipped and the caller
+   receives `context.Cause(ctx)` to preserve the original cancellation
+   reason.
 
-5. If all closures succeed, the transaction is committed. All callers receive
-   `nil` on their result channels.
+5. If a closure returns an error, its child transaction is **rolled back**.
+   The parent transaction is unaffected — other closures' child transactions
+   remain intact. The failing caller receives the error.
 
-6. If any closure returns an error, the transaction is **rolled back**. The
-   batch is then split: closures that succeeded are re-batched and retried
-   in a new transaction, and the failing closure is retried individually via
-   `db.Update()`. This ensures that one bad closure does not penalize the
-   others. If the individual retry also fails, that caller receives the error.
+6. If a closure succeeds, its child transaction is **committed** (merged
+   into the parent). The caller will receive `nil` when the parent commits.
 
-7. If `Commit()` itself fails (e.g., I/O error), all callers in the batch
+7. After all closures have run, the parent transaction is committed. All
+   callers whose closures succeeded receive `nil` on their result channels.
+
+8. If `Commit()` itself fails (e.g., I/O error), all callers in the batch
    receive the commit error.
 
 #### Error Isolation
 
-The rollback-and-retry strategy means that `Batch` provides the same
-semantics as `Update` from each caller's perspective: either their closure's
-effects are committed, or they receive an error. Callers do not need to know
-or care that their work was batched.
+Each closure runs in its own child transaction. A failing closure is
+rolled back independently — its modifications are discarded without
+affecting other closures in the batch. Successful closures are committed
+together in the parent transaction. This provides the same semantics as
+`Update` from each caller's perspective: either their closure's effects
+are committed, or they receive an error.
 
-The retry cost for a failing closure is bounded: the failing closure is
-retried exactly once individually. If it fails again, the error is returned.
-The successful closures are re-executed in a new batch, which may itself
-collect additional pending callers.
+No rollback-and-retry is needed. No closure is ever re-executed. Each
+closure runs **exactly once**.
 
 #### When to Use Batch
 
@@ -1399,23 +1402,98 @@ N-ways.
 
 #### Closure Contract
 
-Because of rollback-and-retry, a `Batch` closure **may execute more than
-once** — a successful closure is replayed if another closure in the same
-batch fails and triggers a retry. Closures must therefore be:
+Each `Batch` closure executes **exactly once** within its own child
+transaction. There is no rollback-and-retry — if a closure fails, only
+its child transaction is rolled back. Closures may safely:
 
-- **Side-effect-free outside the transaction**: no logging, metrics
-  emission, channel sends, RPC calls, or mutation of captured state.
-  Database operations within the `*Tx` are safe (they are rolled back
-  and replayed consistently), but external effects are not undone on
-  rollback and will be duplicated on replay.
-- **Idempotent with respect to the transaction**: the closure should
-  produce the same database mutations when re-executed against the same
-  starting state. This is natural for most write patterns (Put, Delete)
-  but can break if the closure reads and branches on values written by
-  a prior closure in the same batch.
+- Perform side effects (logging, metrics, channel sends) — they will
+  not be replayed.
+- Read and branch on values written by prior closures in the same
+  batch (prior closures' child transactions have been committed into
+  the parent, so their writes are visible).
 
-Callers who cannot satisfy these constraints should use `Update` instead,
-which executes the closure exactly once.
+The only constraint: the closure receives a `*Tx` (the child transaction)
+and must perform all database operations through it, not through a
+captured outer `*Tx`.
+
+### Nested Transactions
+
+A write transaction can create child transactions that can be independently
+committed (merged into the parent) or rolled back (discarded) without
+affecting the parent's state. This is an in-memory mechanism — child
+transactions never write to disk. Only the top-level parent commits.
+
+#### Mechanics
+
+```go
+child, err := tx.BeginChild()
+if err != nil { ... }
+
+err = riskyOperation(child)
+if err != nil {
+    child.Rollback()  // undo child's work; parent unchanged
+} else {
+    child.Commit()    // merge into parent
+}
+```
+
+**Child begin** — snapshot the parent's state:
+- Copy `tx.pendingAllocs` (or record its length for truncation)
+- Copy `tx.pendingFrees` (or record its length)
+- Copy `tx.dirtyPages` (the set of dirtied page IDs)
+- Copy `tx.loosePages`
+- Copy `tx.retiredPages` (or record its length)
+- Snapshot keyspace root page IDs and counts
+
+**Child does work:**
+- CoW allocates fresh pages in the mmap, adding to `pendingAllocs` and
+  `dirtyPages`. Old pages go to `retiredPages`. All modifications happen
+  on the same maps as the parent — the child doesn't have its own maps.
+
+**Child commit:**
+- Discard the saved snapshots. The child's modifications remain in the
+  parent's maps. No-op beyond freeing the snapshot memory. The parent
+  continues with the merged state.
+
+**Child rollback:**
+- Restore `pendingAllocs`, `pendingFrees`, `dirtyPages`, `loosePages`,
+  and `retiredPages` from the saved snapshots.
+- Restore keyspace roots to their pre-child state.
+- The child's CoW'd pages in the mmap are abandoned — they hold modified
+  content at freshly allocated positions, but nobody references them.
+  The bitmap on disk still shows them as free (bitmap modifications are
+  deferred), so their content is irrelevant.
+- Done. No buffer copying, no undo of mmap writes. The direct write
+  architecture makes this cheap — CoW always writes to fresh pages, so
+  the parent's pages are untouched.
+
+**Nesting depth:** children can create their own children (arbitrary
+nesting). Each level snapshots the current state. Rollback at any level
+restores to that level's snapshot. Cost is proportional to the number
+of pages modified at each level, not the total database size.
+
+#### Why This Is Simple
+
+In a pwrite/slab architecture, child rollback is hard: the child may
+have modified a page buffer in the slab that the parent also uses.
+Restoring the buffer requires saving its content before modification
+(copy-on-first-write within the child) or maintaining layered buffer
+sets.
+
+With direct write mode, CoW **always** allocates a fresh page in the
+mmap. The old page at the old position is untouched. Rolling back
+means discarding the bookkeeping for the new pages. The mmap has
+modified content at the abandoned positions, but since bitmap changes
+are deferred (pwrite at commit), the on-disk bitmap still shows those
+pages as free. No buffer restoration needed.
+
+#### Interaction with Write Batching
+
+Nested transactions eliminate the rollback-and-retry mechanism in
+`Batch()`. Each closure runs in a child transaction. If a closure
+fails, its child is rolled back — other closures' children are
+unaffected. Closures execute **exactly once** and do not need to be
+idempotent or side-effect-free. See Write Batching for details.
 
 ### Transaction Leak Detection
 
@@ -2568,17 +2646,15 @@ func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
 // the caller's closure executes, Batch returns context.Cause(ctx). Once
 // the closure begins executing, the context is not checked.
 //
-// If fn returns an error, the entire batch is rolled back and retried:
-// successful closures are re-executed in a new batch, and the failing
-// closure is retried individually via Update. Because of this, fn may
-// execute more than once — it must be side-effect-free outside the
-// transaction (no logging, metrics, channel sends, RPC, or mutation of
-// captured state) and idempotent with respect to the transaction. See
-// Write Batching for details.
+// Each closure runs in its own child transaction (see Nested Transactions).
+// If fn returns an error, only its child transaction is rolled back —
+// other closures in the batch are unaffected. fn executes exactly once
+// and may safely perform external side effects (logging, metrics, etc.).
+// See Write Batching for details.
 //
 // Batch is a throughput optimization for workloads with many concurrent
-// small writes. For exclusive write access, large transactions, or
-// closures with external side effects, use Update or Begin directly.
+// small writes. For exclusive write access or large transactions, use
+// Update or Begin directly.
 func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error
 
 // Begin starts a transaction manually. The context governs lock/slot
@@ -2599,6 +2675,14 @@ type Tx struct { ... }
 
 func (tx *Tx) Commit() error
 func (tx *Tx) Rollback() error
+
+// BeginChild creates a child transaction within the current write
+// transaction. The child can be independently committed (merged into
+// the parent) or rolled back (discarded) without affecting the parent.
+// Only valid on a write transaction. Children can be nested arbitrarily.
+// The child receives the same *Tx type — all Keyspace/SetKeyspace
+// operations work identically.
+func (tx *Tx) BeginChild() (*Tx, error)
 
 // SetFileFormat updates the file format. Only valid on a write
 // transaction. The new file format takes effect when the transaction commits.
@@ -3082,8 +3166,8 @@ organized by file:
 | `process_linux.go` | `processStartTime(pid) (uint64, error)`: reads `/proc/[pid]/stat` field 22 (`starttime`, clock ticks since boot). Pure Go, no cgo. |
 | `process_darwin.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
 | `process_freebsd.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.ki_start`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]struct{}`), pending bitmap changes (`tx.pendingAllocs`, `tx.pendingFrees`), CoW operations (allocate fresh page, copy from mmap position A to B, modify B in place), page lookup (`mmap[pageID * pageSize]` — single level), commit (apply pending bitmap changes via pwrite + fdatasync + meta pwrite + fdatasync + RPL append + file format shrink), rollback (discard pending maps). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
-| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap with read-write mapping, lock file, file format, AllowSyncUnsafe validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Checkpoint(). Check(). CopyTo(). |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]struct{}`), pending bitmap changes (`tx.pendingAllocs`, `tx.pendingFrees`), CoW operations (allocate fresh page, copy from mmap position A to B, modify B in place), page lookup (`mmap[pageID * pageSize]` — single level), commit (apply pending bitmap changes via pwrite + fdatasync + meta pwrite + fdatasync + RPL append + file format shrink), rollback (discard pending maps). Nested transactions: `BeginChild()` snapshots pending maps and keyspace roots; child commit discards snapshot (no-op merge); child rollback restores from snapshot. Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
+| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap with read-write mapping, lock file, file format, AllowSyncUnsafe validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, per-closure child transactions. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Checkpoint(). Check(). CopyTo(). |
 | `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with `Encoder` calls. |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
@@ -3111,8 +3195,8 @@ eliminating flaky timing-dependent assertions. Key areas:
 
 - **Batch coordinator**: verifying `MaxBatchDelay` timeout fires at the
   correct time, batch collection fills to `MaxBatchSize`, and
-  rollback+retry executes the correct closures — without `time.Sleep`
-  or racy channel coordination.
+  per-closure child transactions commit/rollback correctly — without
+  `time.Sleep` or racy channel coordination.
 - **Flock goroutine**: verifying context cancellation while the flock is
   pending correctly dequeues the writer, and that the flock goroutine
   releases the lock on behalf of a cancelled waiter.
