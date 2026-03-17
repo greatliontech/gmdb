@@ -43,6 +43,12 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Integrity check | `Check() iter.Seq[CheckIssue]` with `CheckFatal` severity | All results (issues + walk failures) are uniform `CheckIssue` values; streaming via `iter.Seq`; `slices.Collect` for batch use; `break` for early abort |
 | Namespaces | Named keyspaces (separate Open/Create API) | Multiple B+trees in one file; clear creation vs. opening semantics |
 | Block compression | Not supported (explicit decision) | Incompatible with mmap zero-copy read path; would require a decompression buffer pool, cache management, and eviction — fundamentally changing the architecture; key-level prefix compression provides density gains within the mmap model |
+| TTL / Expiry | Not supported (explicit decision) | Adds per-cell overhead or a shadow index for a use case (caches, sessions) that gmdb doesn't target; users can implement TTL with a separate expiry keyspace and periodic cleanup using existing primitives |
+| Named snapshots | Not supported (explicit decision) | Requires preserving historical meta roots and pinning TxnIDs (permanently blocking RPL reclamation); dual meta pages don't preserve old roots past two commits; `CopyTo()` covers the backup use case without ongoing space cost |
+| Merge operators | Not supported (explicit decision) | LSM optimization (defer reads during writes); B+tree read and write paths traverse the same pages — no asymmetry to exploit; `Get` + `Put` does the same work |
+| Sequences | `NextSeq uint64` in keyspace descriptor | Per-keyspace auto-incrementing counter; eliminates the need for a separate SeqKeyspace type — sequential-key workloads use a regular Keyspace with `NextSequence()` + big-endian uint64 keys (prefix compression makes the density gap negligible) |
+| Per-keyspace page sizes | Not supported (explicit decision) | Requires either multi-block nodes in a shared bitmap (adds keyspace context to every page operation, variable slab allocation, non-uniform dirty tracking) or per-keyspace files (breaks cross-keyspace atomic commit); single file with uniform page size is a core design strength |
+| Encryption at rest | Not supported (explicit decision) | Same mmap conflict as compression — encrypted pages can't be read in place, requires decryption buffer pool; LMDB and libmdbx also omit encryption for this reason; filesystem-level encryption (LUKS, FileVault, dm-crypt) covers the primary threat model transparently |
 
 ## File Layout
 
