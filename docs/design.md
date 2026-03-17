@@ -11,7 +11,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | File layout | Fixed-size pages (4KB–64KB, configurable, immutable after creation) | Matches OS page size, mmap-friendly |
 | Page header | 8 bytes (Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID) | PageID is redundant (computable from file offset); Type/Flags split reserves 8 flag bits for future per-page metadata at zero cost |
 | Value storage | Inline + overflow pages | Simple single read path, overflow for large values |
-| Duplicate values | DUPSORT with subpage + nested B+tree | Subpage for small sets, nested B+tree for large; DUPFIXED for fixed-size optimization |
+| Multiple values per key | Set keyspace with subpage + nested B+tree | Subpage for small sets, nested B+tree for large; fixed-size values for fixed-size optimization |
 | Free space | Allocation bitmap + retired page log (RPL) | O(1) alloc via bitmap, no self-referential allocation, RPL tracks MVCC retirement |
 | RPL entry format | Per-segment TxnID + array of PageIDs | TxnID stored once per segment (not per entry); doubles segment capacity |
 | File format | Dynamic grow/shrink with configurable bounds; MaxSize immutable after creation | Auto-compaction via tail refund, no manual compaction needed; MaxSize fixed because bitmap region size depends on it |
@@ -34,7 +34,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Iteration | Cursor (stateful, bidirectional, mutable) + `iter.Seq2` (read-only, composable) | Cursor for mutation and bidirectional movement; `iter.Seq2` for idiomatic `for range` loops |
 | Write batching | Channel-based `Batch()` API | Amortizes commit cost (fdatasync) across concurrent callers; rollback+retry on failure |
 | Leak detection | `runtime.AddCleanup` on `Tx` and `DB` | Detects leaked transactions (releases reader slots) and leaked DB handles (releases mmap, fds, flock goroutine); logs origin stack trace |
-| Range delete | Subtree retirement via `DeleteRange` | O(pages) not O(entries); bulk-free for DUPSORT nested B+trees |
+| Range delete | Subtree retirement via `DeleteRange` | O(pages) not O(entries); bulk-free for set keyspace nested B+trees |
 | Commit I/O | pwrite/pwritev2 (default) or io_uring (opt-in, Linux) | io_uring batches all commit writes into 1-2 syscalls; pwritev2+RWF_DSYNC for small commits; pwrite is portable fallback |
 | Prefaulting | `MADV_POPULATE_READ` at open (opt-in, Linux 5.14+) | Eliminates first-access page faults; sequential kernel readahead; silent no-op on older kernels |
 | Read txn cooldown | `MADV_COLD` on close (opt-in, Linux 5.4+) | Hints kernel to reclaim page cache after large scans; reduces memory pressure |
@@ -326,21 +326,21 @@ keys. All other entries are **delta entries** that encode the key as a
 difference from the previous entry.
 
 Each entry carries a `CellFlags` byte in its header to distinguish cell
-formats (inline value, overflow reference, DUPSORT subpage, or nested
+formats (inline value, overflow reference, set keyspace subpage, or nested
 B+tree reference).
 
 CellFlags bit layout:
 
 ```
 Bit 0:    Overflow (0 = inline value, 1 = overflow reference)
-Bit 1:    DupData (0 = single value, 1 = duplicate data — subpage or nested B+tree)
-Bit 2:    DupTree (only when Bit 1 is set: 0 = subpage, 1 = nested B+tree)
+Bit 1:    MultiValue (0 = single value, 1 = multi-value data — subpage or nested B+tree)
+Bit 2:    NestedTree (only when Bit 1 is set: 0 = subpage, 1 = nested B+tree)
 Bits 3-7: Reserved (must be 0)
 ```
 
-Note: `Overflow` (bit 0) and `DupData` (bit 1) are mutually exclusive in
+Note: `Overflow` (bit 0) and `MultiValue` (bit 1) are mutually exclusive in
 practice — a cell is either a single inline value, an overflow reference, or
-a duplicate data container, never a combination.
+a multi-value data container, never a combination.
 
 **Restart entry** (full key, at positions 0, 16, 32, ...):
 
@@ -504,35 +504,35 @@ independent CRC32C footer. The first page checksums its header + data;
 each follower checksums its data. Per-page checksums allow identifying
 which specific page in the run is corrupted.
 
-#### Duplicate Sorted Values (DUPSORT)
+#### Set Keyspace Storage (Multiple Values Per Key)
 
-Keyspaces opened with the `DupSort` flag allow multiple sorted values per key.
-Each key maps to a sorted set of values (duplicates). This is the primary
+Set keyspaces allow multiple sorted values per key.
+Each key maps to a sorted set of values. This is the primary
 mechanism for secondary indexes (e.g., an index key mapping to a sorted set of
 primary key IDs).
 
 ##### Storage Strategy
 
-DUPSORT uses two storage strategies based on the size of the duplicate set:
+Set keyspaces use two storage strategies based on the size of the value set:
 
-**Subpage (small duplicate sets):** When a key's duplicate values fit within
+**Subpage (small value sets):** When a key's values fit within
 the leaf cell, they are stored inline as a **subpage** — a mini sorted list
 embedded directly in the cell's value area. No extra page allocation is needed.
 
-**Nested B+tree (large duplicate sets):** When duplicates grow too large for a
+**Nested B+tree (large value sets):** When values grow too large for a
 subpage, they are promoted to a full B+tree whose root page ID is stored in
-the leaf cell. Each value in the duplicate set becomes a key in the nested
+the leaf cell. Each value in the set becomes a key in the nested
 B+tree (with empty values).
 
 ##### Subpage Format
 
-A subpage is stored in the leaf entry's value area. The `CellFlags.DupData` bit
-is set and `CellFlags.DupTree` is clear. The entry uses the standard
+A subpage is stored in the leaf entry's value area. The `CellFlags.MultiValue` bit
+is set and `CellFlags.NestedTree` is clear. The entry uses the standard
 restart/delta key encoding (see Leaf Page); the subpage replaces the value
 portion. At a restart point:
 
 ```
-DupSort Subpage Entry (restart)
+SetKeyspace Subpage Entry (restart)
 +-----------+----------+-----------+-----------+
 | CellFlags | KeyLen   | Key bytes | Subpage   |
 | uint8     | uint16   |           |           |
@@ -545,7 +545,7 @@ Subpage (embedded in cell value area):
 +----------+----------+---------+---------+-----+
 ```
 
-For **variable-size values** (standard DUPSORT):
+For **variable-size values** (standard set keyspace):
 ```
 Entry (variable):
 +----------+-----------+
@@ -554,7 +554,7 @@ Entry (variable):
 +----------+-----------+
 ```
 
-For **fixed-size values** (DUPFIXED):
+For **fixed-size values** (set keyspace with fixed-size values):
 ```
 Entry (fixed):
 +-----------+
@@ -566,21 +566,21 @@ Entry (fixed):
 entries (used to quickly compute the subpage's total size for cell allocation).
 
 Values within the subpage are stored in sorted (lexicographic) order. Lookup
-is binary search. For DUPFIXED subpages, entries are a flat array — binary
+is binary search. For fixed-size value subpages, entries are a flat array — binary
 search is O(log N) with direct offset calculation (no scanning).
 
-Subpage entries are **not prefix-compressed**. Subpages store duplicate
+Subpage entries are **not prefix-compressed**. Subpages store
 *values* for a single key, which typically do not share prefixes with each
 other (e.g., post IDs in a secondary index, user IDs in a reverse index).
 The subpage is also small by definition — it exists precisely because the
 data fits inline within a leaf cell (below the 50% promotion threshold).
-When a duplicate set grows large enough for prefix compression to matter,
+When a value set grows large enough for prefix compression to matter,
 it is promoted to a nested B+tree whose leaf pages use prefix compression
 like all other leaf pages.
 
 ##### Subpage Promotion Threshold
 
-A subpage is promoted to a nested B+tree when inserting a new duplicate value
+A subpage is promoted to a nested B+tree when inserting a new value
 would cause the subpage to exceed **50% of the leaf page's usable space**
 (PageSize minus page header, restart metadata, and restart table overhead). This threshold
 ensures:
@@ -590,19 +590,19 @@ ensures:
 Promotion:
 1. Allocate a new leaf page for the nested B+tree.
 2. Copy all subpage entries into the new leaf page as regular key-value cells
-   (where "keys" are the duplicate values and "values" are empty).
+   (where "keys" are the values from the set and "values" are empty).
 3. Replace the subpage cell with a nested B+tree reference cell.
 4. Insert the new value into the nested B+tree.
 
 ##### Nested B+tree Reference Cell
 
-When a key's duplicates are stored in a nested B+tree, the entry has
-`CellFlags.DupData` and `CellFlags.DupTree` both set. The entry uses the
+When a key's values are stored in a nested B+tree, the entry has
+`CellFlags.MultiValue` and `CellFlags.NestedTree` both set. The entry uses the
 standard restart/delta key encoding; the nested B+tree reference replaces
 the value portion. At a restart point:
 
 ```
-DupSort Nested B+tree Entry (restart)
+SetKeyspace Nested B+tree Entry (restart)
 +-----------+----------+-----------+----------+----------+
 | CellFlags | KeyLen   | Key bytes | Root     | Count    |
 | uint8     | uint16   |           | uint64   | uint64   |
@@ -610,7 +610,7 @@ DupSort Nested B+tree Entry (restart)
 ```
 
 - **Root**: Page ID of the nested B+tree's root page.
-- **Count**: Number of duplicate values.
+- **Count**: Number of values in the set.
 
 Depth (tree height) is not persisted — it is derived by reading the root
 page on first access (a leaf root means depth 1; a branch root means
@@ -618,9 +618,9 @@ depth > 1, determined by descent). This avoids maintaining an extra field
 across promotion, demotion, split, merge, and delete operations.
 
 The nested B+tree uses the same B+tree implementation as the main keyspace,
-with one difference: its "keys" are the duplicate values, and all "values" are
+with one difference: its "keys" are the values from the set, and all "values" are
 empty (zero-length). The nested B+tree's leaf pages use prefix compression
-(same format as all other leaf pages), which benefits duplicate sets with
+(same format as all other leaf pages), which benefits value sets with
 shared value prefixes (e.g., timestamp-keyed data). The nested B+tree's pages
 are subject to normal CoW, free space management, and page allocation.
 
@@ -631,13 +631,13 @@ a subpage (below the promotion threshold), the B+tree is demoted back to a
 subpage. The leaf page is freed (retired), and the entries are packed
 inline into the parent leaf cell.
 
-When the last duplicate value for a key is deleted, the key's cell is
+When the last value for a key is deleted, the key's cell is
 removed from the parent leaf entirely — empty nested trees and empty
 subpages never exist, not even transiently within a write transaction.
 
-##### DUPFIXED Keyspaces
+##### Fixed-Size Value Sets
 
-When a DUPSORT keyspace is also opened with the `DupFixed` flag, all duplicate
+When a set keyspace is created with fixed-size values, all
 values must be the same fixed byte size (set at keyspace creation). This
 enables:
 - **No per-value length prefix** in subpages — entries are a flat array.
@@ -720,9 +720,9 @@ For a range covering 1 million keys across 10,000 leaf pages in a tree of
 depth 4: naive deletion does ~4 million CoW operations; range delete walks
 ~10,000 pages for retirement + ~16 CoW operations on boundary paths.
 
-#### DUPSORT Bulk Free
+#### Set Keyspace Bulk Free
 
-When deleting a key in a DUPSORT keyspace whose duplicates are stored in a
+When deleting a key in a set keyspace whose values are stored in a
 nested B+tree, the nested tree is freed using the same subtree retirement
 mechanism:
 
@@ -730,8 +730,8 @@ mechanism:
 2. Walk the nested B+tree's branch pages recursively, retiring every page.
 3. Remove the key's cell from the parent leaf page.
 
-This is O(pages in nested tree), not O(duplicate values). A key with 1
-million duplicates stored across 10,000 pages is freed by visiting ~10,000
+This is O(pages in nested tree), not O(values). A key with 1
+million values stored across 10,000 pages is freed by visiting ~10,000
 pages — not 1 million individual delete operations.
 
 The same bulk-free applies when `DeleteRange` encounters keys with nested
@@ -2536,7 +2536,7 @@ Total descriptor size: 8 + 8 + 1 + 2 + 8 + 5 = 32 bytes.
 
 Depth (tree height) is not persisted — it is derived by reading the root
 page on first access, consistent with the nested B+tree reference format
-(see SetKeyspace nested B+trees). This avoids maintaining a redundant
+(see Set Keyspace Storage). This avoids maintaining a redundant
 field across split, merge, and rebalance operations.
 - **Kind** (uint8): Keyspace type. `0` = Keyspace (key → value),
   `1` = SetKeyspace (key → sorted set of values). `Open()` rejects
@@ -2583,9 +2583,9 @@ var (
     ErrReadOnly           = errors.New("gmdb: write operation on read-only transaction")
     ErrTxClosed           = errors.New("gmdb: transaction already committed or rolled back")
     ErrCursorUnpositioned = errors.New("gmdb: cursor not positioned")
-    ErrIncompatibleFlags  = errors.New("gmdb: keyspace flags do not match existing keyspace")
-    ErrDupSizeFixed       = errors.New("gmdb: value size does not match fixed duplicate size")
-    ErrMultiVal           = errors.New("gmdb: ambiguous operation on key with multiple values")
+    ErrKeyspaceKindMismatch = errors.New("gmdb: keyspace kind does not match existing keyspace")
+    ErrValueSizeMismatch    = errors.New("gmdb: value size does not match fixed value size")
+    ErrAmbiguousKey         = errors.New("gmdb: ambiguous operation on key with multiple values")
 )
 
 // Open a database. Creates the file if it doesn't exist.
@@ -2871,63 +2871,59 @@ func (tx *Tx) Rollback() error
 // MinSize, GrowStep, and ShrinkThreshold may be modified freely.
 func (tx *Tx) SetFileFormat(g FileFormat) error
 
-// KeyspaceFlags controls keyspace behavior. Set at creation time, immutable after.
-type KeyspaceFlags uint16
-
-const (
-    // KfDupSort enables multiple sorted values per key (DUPSORT).
-    KfDupSort KeyspaceFlags = 1 << iota
-    // KfDupFixed requires all duplicate values to be the same fixed size
-    // (requires KfDupSort). The size is specified via the fixedSize parameter
-    // of CreateKeyspace at keyspace creation time.
-    KfDupFixed
-)
-
-// OpenKeyspace opens an existing named keyspace within this transaction.
-// Returns ErrNotFound if the keyspace does not exist. Flags are read from
-// the stored keyspace descriptor — no flags parameter is needed.
+// OpenKeyspace opens an existing named keyspace (single-value) within this
+// transaction. Returns ErrNotFound if the keyspace does not exist. Returns
+// ErrKeyspaceKindMismatch if the keyspace is a SetKeyspace.
 func (tx *Tx) OpenKeyspace(name []byte) (*Keyspace, error)
 
-// CreateKeyspace creates a new named keyspace within this transaction.
-// Returns ErrKeyExists if the keyspace already exists. Flags are set at
-// creation time and immutable after. fixedSize is only used when flags
-// includes KfDupFixed — it sets the fixed duplicate value size in bytes.
-// Ignored otherwise.
-func (tx *Tx) CreateKeyspace(name []byte, flags KeyspaceFlags, fixedSize uint16) (*Keyspace, error)
+// CreateKeyspace creates a new named single-value keyspace within this
+// transaction. Returns ErrKeyExists if the keyspace already exists.
+func (tx *Tx) CreateKeyspace(name []byte) (*Keyspace, error)
 
-// CreateKeyspaceIfNotExists opens a keyspace if it exists, or creates it
-// with the given flags if it does not. If the keyspace already exists,
-// flags must match the existing keyspace's flags or ErrIncompatibleFlags
-// is returned.
-func (tx *Tx) CreateKeyspaceIfNotExists(name []byte, flags KeyspaceFlags, fixedSize uint16) (*Keyspace, error)
+// CreateKeyspaceIfNotExists opens a single-value keyspace if it exists,
+// or creates it if it does not. If the keyspace already exists as a
+// SetKeyspace, returns ErrKeyspaceKindMismatch.
+func (tx *Tx) CreateKeyspaceIfNotExists(name []byte) (*Keyspace, error)
+
+// OpenSetKeyspace opens an existing named set keyspace (multiple sorted
+// values per key) within this transaction. Returns ErrNotFound if the
+// keyspace does not exist. Returns ErrKeyspaceKindMismatch if the
+// keyspace is a single-value Keyspace.
+func (tx *Tx) OpenSetKeyspace(name []byte) (*SetKeyspace, error)
+
+// CreateSetKeyspace creates a new named set keyspace within this
+// transaction. Returns ErrKeyExists if the keyspace already exists.
+// fixedSize sets the fixed value size in bytes for fixed-size value sets;
+// 0 means variable-size values.
+func (tx *Tx) CreateSetKeyspace(name []byte, fixedSize uint16) (*SetKeyspace, error)
+
+// CreateSetKeyspaceIfNotExists opens a set keyspace if it exists, or
+// creates it if it does not. If the keyspace already exists as a
+// single-value Keyspace, returns ErrKeyspaceKindMismatch. If it exists
+// as a SetKeyspace with a different fixedSize, returns
+// ErrKeyspaceKindMismatch.
+func (tx *Tx) CreateSetKeyspaceIfNotExists(name []byte, fixedSize uint16) (*SetKeyspace, error)
 
 // DeleteKeyspace deletes a named keyspace and all its data.
 func (tx *Tx) DeleteKeyspace(name []byte) error
 
-// Keyspace is a handle to a named keyspace within a transaction.
+// Keyspace is a handle to a named single-value keyspace within a transaction.
 type Keyspace struct { ... }
 
-// Get returns the value for the given key. For DUPSORT keyspaces, returns
-// the first (smallest) duplicate value. Returns ErrNotFound if the key
+// Get returns the value for the given key. Returns ErrNotFound if the key
 // does not exist.
 func (ks *Keyspace) Get(key []byte) ([]byte, error)
 
-// Put inserts or updates a key-value pair. For non-DUPSORT keyspaces, an
-// existing value is replaced. For DUPSORT keyspaces, the value is added to
-// the key's sorted duplicate set (no-op if the exact key-value pair already
-// exists).
+// Put inserts or updates a key-value pair. An existing value is replaced.
 func (ks *Keyspace) Put(key, value []byte) error
 
-// Delete removes a key and its value. For DUPSORT keyspaces, removes all
-// duplicate values for the key (using bulk subtree retirement for nested
-// B+trees). To delete a single duplicate, use Cursor.Seek(key) +
-// Cursor.SeekDup(value) + Cursor.Delete().
+// Delete removes a key and its value.
 func (ks *Keyspace) Delete(key []byte) error
 
 // DeleteRange deletes all keys in the range [start, end). Returns the
-// number of deleted key-value pairs (for DUPSORT, each duplicate counts
-// as one). If start is nil, deletes from the first key. If end is nil,
-// deletes through the last key. If both are nil, deletes all keys.
+// number of deleted key-value pairs. If start is nil, deletes from the
+// first key. If end is nil, deletes through the last key. If both are
+// nil, deletes all keys.
 //
 // DeleteRange retires entire B+tree subtrees that fall within the range
 // without visiting individual leaf entries — O(pages) not O(entries).
@@ -2939,21 +2935,17 @@ func (ks *Keyspace) Cursor() *Cursor
 
 type Cursor struct { ... }
 
-// --- Core navigation ---
-
 func (c *Cursor) First() (key, value []byte)
 func (c *Cursor) Last() (key, value []byte)
 func (c *Cursor) Next() (key, value []byte)
 func (c *Cursor) Prev() (key, value []byte)
 
 // Seek positions the cursor at the exact key. Returns the key-value pair,
-// or nil if the key does not exist. For DUPSORT keyspaces, returns the
-// first (smallest) duplicate value for the key.
+// or nil if the key does not exist.
 func (c *Cursor) Seek(target []byte) (key, value []byte)
 
 // SeekGE positions the cursor at the first key >= target.
 // Returns the key-value pair, or nil if no such key exists.
-// For DUPSORT keyspaces, returns the first duplicate value for that key.
 func (c *Cursor) SeekGE(target []byte) (key, value []byte)
 
 // Current returns the key-value pair at the current cursor position
@@ -2972,47 +2964,103 @@ func (c *Cursor) Delete() error
 // bufio.Scanner / sql.Rows pattern.
 func (c *Cursor) Err() error
 
-// --- DUPSORT operations (only valid on DupSort keyspaces) ---
+// SetKeyspace is a handle to a named set keyspace (multiple sorted values
+// per key) within a transaction.
+type SetKeyspace struct { ... }
 
-// FirstDup positions the cursor at the first duplicate value for the
+// Get returns the first (smallest) value for the given key. Returns
+// ErrNotFound if the key does not exist.
+func (ks *SetKeyspace) Get(key []byte) ([]byte, error)
+
+// Put adds a value to the key's sorted value set (no-op if the exact
+// key-value pair already exists).
+func (ks *SetKeyspace) Put(key, value []byte) error
+
+// Delete removes a key and all its values (using bulk subtree retirement
+// for nested B+trees). To delete a single value, use
+// SetCursor.Seek(key) + SetCursor.SeekValue(value) + SetCursor.Delete().
+func (ks *SetKeyspace) Delete(key []byte) error
+
+// DeleteRange deletes all keys in the range [start, end). Returns the
+// number of deleted key-value pairs (each value counts as one). If start
+// is nil, deletes from the first key. If end is nil, deletes through
+// the last key. If both are nil, deletes all keys.
+//
+// DeleteRange retires entire B+tree subtrees that fall within the range
+// without visiting individual leaf entries — O(pages) not O(entries).
+// See Range Delete for the algorithm.
+func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error)
+
+// Cursor for iterating over key-value pairs in a set keyspace.
+func (ks *SetKeyspace) Cursor() *SetCursor
+
+type SetCursor struct { ... }
+
+// --- Core navigation ---
+
+func (c *SetCursor) First() (key, value []byte)
+func (c *SetCursor) Last() (key, value []byte)
+func (c *SetCursor) Next() (key, value []byte)
+func (c *SetCursor) Prev() (key, value []byte)
+
+// Seek positions the cursor at the exact key. Returns the key and the
+// first (smallest) value for the key, or nil if the key does not exist.
+func (c *SetCursor) Seek(target []byte) (key, value []byte)
+
+// SeekGE positions the cursor at the first key >= target.
+// Returns the key and the first value for that key, or nil if no such key exists.
+func (c *SetCursor) SeekGE(target []byte) (key, value []byte)
+
+// Current returns the key-value pair at the current cursor position
+// without moving the cursor.
+func (c *SetCursor) Current() (key, value []byte)
+
+// Delete deletes the key-value pair at the current cursor position.
+func (c *SetCursor) Delete() error
+
+// Err returns the first error encountered during cursor navigation.
+func (c *SetCursor) Err() error
+
+// --- Set cursor operations (value navigation within a key) ---
+
+// FirstValue positions the cursor at the first value for the
 // current key. Returns the value, or nil if the cursor is not positioned.
-func (c *Cursor) FirstDup() (value []byte)
+func (c *SetCursor) FirstValue() (value []byte)
 
-// LastDup positions the cursor at the last duplicate value for the
+// LastValue positions the cursor at the last value for the
 // current key.
-func (c *Cursor) LastDup() (value []byte)
+func (c *SetCursor) LastValue() (value []byte)
 
-// NextDup moves to the next duplicate value for the current key.
-// Returns nil when there are no more duplicates (the cursor does NOT
+// NextValue moves to the next value for the current key.
+// Returns nil when there are no more values (the cursor does NOT
 // advance to the next key).
-func (c *Cursor) NextDup() (key, value []byte)
+func (c *SetCursor) NextValue() (key, value []byte)
 
-// PrevDup moves to the previous duplicate value for the current key.
-// Returns nil when at the first duplicate.
-func (c *Cursor) PrevDup() (key, value []byte)
+// PrevValue moves to the previous value for the current key.
+// Returns nil when at the first value.
+func (c *SetCursor) PrevValue() (key, value []byte)
 
-// NextKey moves to the first duplicate value of the next key, skipping
-// remaining duplicates of the current key.
-func (c *Cursor) NextKey() (key, value []byte)
+// NextKey moves to the first value of the next key, skipping
+// remaining values of the current key.
+func (c *SetCursor) NextKey() (key, value []byte)
 
-// PrevKey moves to the last duplicate value of the previous key,
-// skipping remaining duplicates of the current key.
-func (c *Cursor) PrevKey() (key, value []byte)
+// PrevKey moves to the last value of the previous key,
+// skipping remaining values of the current key.
+func (c *SetCursor) PrevKey() (key, value []byte)
 
-// SeekDup positions the cursor at the first duplicate value >= target
+// SeekValue positions the cursor at the first value >= target
 // for the current key. The cursor must already be positioned on a key
 // (via Seek, SeekGE, First, etc.). Returns the value, or nil if no
-// duplicate value >= target exists for the current key.
-func (c *Cursor) SeekDup(target []byte) (value []byte)
+// value >= target exists for the current key.
+func (c *SetCursor) SeekValue(target []byte) (value []byte)
 
-// CountDup returns the number of duplicate values for the current key.
-func (c *Cursor) CountDup() (uint64, error)
+// CountValues returns the number of values for the current key.
+func (c *SetCursor) CountValues() (uint64, error)
 
 // --- Range iterators (read-only, for use with for-range) ---
 
 // All returns an iterator over all key-value pairs in the keyspace.
-// The iterator yields pairs in key order. For DUPSORT keyspaces, each
-// key-value pair (including each duplicate) is yielded separately.
+// The iterator yields pairs in key order.
 func (ks *Keyspace) All() iter.Seq2[[]byte, []byte]
 
 // Range returns an iterator over key-value pairs in [start, end).
@@ -3080,7 +3128,7 @@ type CheckIssue struct {
 //     bounds, restart entries at correct positions, delta chain consistency within
 //     each restart group, reconstructed keys in sorted order)
 //   - Keyspace descriptor consistency (root page validity, counts)
-//   - DUPSORT subpage and nested B+tree integrity
+//   - Set keyspace subpage and nested B+tree integrity
 //
 // Check returns an iter.Seq[CheckIssue] that yields issues as they are
 // found during the walk. All results — including walk failures (I/O
@@ -3144,7 +3192,7 @@ type KeyspaceStats struct {
     BranchPages   uint64 // number of branch pages
     LeafPages     uint64 // number of leaf pages
     OverflowPages uint64 // number of overflow pages
-    Entries       uint64 // total key-value pairs (including duplicates)
+    Entries       uint64 // total key-value pairs (for set keyspaces, each value counts)
 }
 
 func (ks *Keyspace) Stats() (KeyspaceStats, error)
@@ -3184,25 +3232,20 @@ type FuncEncoder[T any] struct {
 func (f FuncEncoder[T]) AppendEncode(dst []byte, v T) ([]byte, error) { return f.EncodeFunc(dst, v) }
 func (f FuncEncoder[T]) Decode(src []byte) (T, error)                 { return f.DecodeFunc(src) }
 
-// TypedKeyspace wraps a Keyspace with type-safe key/value encoding.
+// TypedKeyspace wraps a single-value Keyspace with type-safe key/value encoding.
 type TypedKeyspace[K, V any] struct {
-    name      []byte
-    keyEnc    Encoder[K]
-    valEnc    Encoder[V]
-    flags     KeyspaceFlags
-    fixedSize uint16 // only meaningful when flags includes KfDupFixed
+    name   []byte
+    keyEnc Encoder[K]
+    valEnc Encoder[V]
 }
 
-// NewTypedKeyspace creates a typed keyspace descriptor. The key encoder
-// MUST produce lexicographically ordered output for the desired key
+// NewTypedKeyspace creates a typed single-value keyspace descriptor. The key
+// encoder MUST produce lexicographically ordered output for the desired key
 // ordering — the underlying B+tree sorts keys as raw bytes.
-// fixedSize is only used when flags includes KfDupFixed — it sets the
-// fixed duplicate value size in bytes. Ignored otherwise.
 func NewTypedKeyspace[K, V any](
     name string,
     keyEnc Encoder[K],
     valEnc Encoder[V],
-    flags KeyspaceFlags, fixedSize uint16,
 ) *TypedKeyspace[K, V]
 
 // Open opens an existing typed keyspace within a transaction.
@@ -3269,8 +3312,8 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding (8-byte header: Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. DUPSORT subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including file format fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
-| `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs, key reconstruction buffer (`keyBuf []byte`) for incremental forward decoding, restart group cache (`[16][]byte`) for reverse traversal. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
+| `page.go` | Page header encoding/decoding (8-byte header: Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. Set keyspace subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including file format fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
+| `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. Set keyspace bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs, key reconstruction buffer (`keyBuf []byte`) for incremental forward decoding, restart group cache (`[16][]byte`) for reverse traversal. Set keyspace: subpage management (inline sorted list), nested B+tree promotion/demotion, set cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
 | `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → lagging reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |
 | `evict.go` | Dirty page eviction to disk mid-transaction (pwrite mode only, no-op in direct write mode). Clock-based eviction via `tx.clockRing` circular buffer with reference bit sweep and tombstones for evicted entries. Evicted pages moved to `tx.evictedPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
@@ -3354,19 +3397,19 @@ branch page limit to allow splitting at any level.
 
 ### Maximum Value Size
 
-For non-DUPSORT keyspaces: inline values are limited by available space in the
+For single-value keyspaces: inline values are limited by available space in the
 leaf page. Values that exceed this are automatically stored as overflow pages.
 There is no practical upper limit on value size (bounded only by disk space and
 `MaxSize`). Note that leaf prefix compression reduces per-entry key overhead,
 leaving more page space for inline values — a leaf with high prefix sharing
 can fit larger inline values before triggering overflow.
 
-### Maximum Duplicate Value Size (DUPSORT)
+### Maximum Value Size (Set Keyspaces)
 
-For DUPSORT keyspaces, each duplicate value becomes a key in the nested B+tree
-(or an entry in a subpage). The maximum duplicate value size is therefore the
+For set keyspaces, each value becomes a key in the nested B+tree
+(or an entry in a subpage). The maximum value size is therefore the
 same as the maximum key size — approximately `(PageSize - 40) / 2`. Overflow
-pages are not used for duplicate values. A `Put()` call with a duplicate value
+pages are not used for set keyspace values. A `Put()` call with a value
 exceeding this limit returns an error.
 
 ## Checksums
