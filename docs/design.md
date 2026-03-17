@@ -2,6 +2,8 @@
 
 A memory-mapped, multi-process, embedded key-value database for Go.
 
+**Minimum Go version: 1.24.** gmdb uses `runtime.AddCleanup` (Go 1.24), `structs.HostLayout` (Go 1.24), `os.OpenRoot` (Go 1.24), `testing/synctest` (Go 1.24), `unique.Make` (Go 1.23), `cmp.Or` (Go 1.22), and `iter.Seq2` (Go 1.23).
+
 ## Design Decisions
 
 | Decision | Choice | Rationale |
@@ -496,7 +498,9 @@ Overflow pages are contiguous runs of pages that store large values. The
 first page in the run carries the standard 8-byte page header with
 `AdditionalPages` set to the number of follower pages; the remaining bytes of
 the first page are value data. Follower pages carry no header — they are
-entirely value data. Total value capacity for a run of `1 + N` pages:
+entirely value data (minus 4 bytes for the CRC32C footer when
+`PageChecksum` is enabled). Total value capacity for a run of `1 + N`
+pages:
 `(PageSize - 8) + N * PageSize` bytes (or subtract 4 from the first page
 and from each follower when `PageChecksum` is enabled).
 
@@ -892,8 +896,8 @@ RPL Segment Page
 Segment capacity at 4KB page size: 8 (page header) + 8 (TxnID) + 8
 (link pointer) + 2 (EntryCount) + 6 (padding) = 32 bytes overhead.
 Remaining `4096 - 32 = 4064` bytes / 8 bytes per PageID = **508 entries
-per segment page** (with PageChecksum enabled: `4096 - 32 - 4 = 4060` / 8
-= 507). A transaction freeing 10,000 pages fills ~20 segment pages
+per segment page** (507 with PageChecksum enabled, due to the 4-byte CRC
+footer reducing available space: `4096 - 32 - 4 = 4060` / 8 = 507). A transaction freeing 10,000 pages fills ~20 segment pages
 (compared to ~40 with per-entry TxnID).
 
 The meta page stores `RPLHeadPage` (newest segment) and `RPLTailPage` (oldest
@@ -1095,6 +1099,16 @@ It runs until no more tail pages are free. Loose pages are checked first
 (by O(1) lookup in the `tx.loosePages` map for each tail page ID), then
 the bitmap (by checking bits from `HighWaterMark - 1` downward).
 
+**Safety with concurrent readers.** Tail refund only decrements
+HighWaterMark for pages that are free in the bitmap. Pages held by an
+active reader's snapshot are not in the bitmap — they remain in the RPL
+until the reclamation bound (oldest reader and checkpoint TxnID) allows
+their reclamation. Therefore, tail refund cannot remove pages that an
+active reader references. The subsequent file shrinkage via `ftruncate()`
+at commit time only truncates pages beyond HighWaterMark, which are
+guaranteed to be unreferenced by any active reader or recoverable tree
+state.
+
 #### Freeing Pages
 
 When a CoW operation replaces an old page with a new copy:
@@ -1127,6 +1141,8 @@ non-recursive operation: each segment page holds 508 entries (at 4KB page
 size), so a transaction retiring N pages needs at most `ceil(N / 508)`
 page allocations (segment pages only — no old-head CoW). Each allocation
 is a single bitmap bit flip — no further cascading allocations.
+
+If the bitmap has no free pages and file extension would exceed MaxSize, RPL segment allocation fails and the commit returns `ErrTxTooLarge`. The transaction must be rolled back. This can happen when the database is near capacity and a large number of pages are retired in a single transaction.
 
 Steps 1-4 happen before the bitmap pwrite and meta page swap.
 
@@ -1239,6 +1255,31 @@ reach disk and the database is fully consistent.
 Typically a commit writes 2-5 bitmap pages (the pages containing the bits
 for allocated and freed pages) plus 1 meta page — a small, bounded number
 of pwrite calls regardless of transaction size.
+
+**Platform note:** On Linux, `fdatasync()` on a file descriptor flushes all
+dirty pages for that file, including pages dirtied via `MAP_SHARED` mmap.
+This is because the kernel's page cache is shared between the pwrite and
+mmap paths. gmdb relies on this behavior for crash safety — the fdatasync
+after bitmap pwrite also flushes the CoW'd data pages that were modified
+directly in the mmap. On platforms where fdatasync does not flush mmap dirty
+pages, an additional `msync(MS_SYNC)` call on the data region would be
+needed before the bitmap pwrite. The current implementation targets Linux;
+portability to other platforms requires verifying this behavior or adding
+msync.
+
+**Bitmap leakage on crash.** A crash between the bitmap pwrite and the meta
+pwrite can leak pages. The bitmap on disk has cleared bits (pages allocated
+for the crashed transaction's CoW) but the meta on disk does not reference
+those pages. These pages appear allocated but are unreferenced — they are
+leaked, not free. The leaked page count is bounded by the number of pages
+the crashed transaction allocated (typically small). `Check()` detects
+leaked pages as `CheckWarning` severity. `CopyTo(compact=true)` recovers
+them. In `SyncLazy` mode, the OS may also flush bitmap pwrite pages from
+uncommitted (post-checkpoint) transactions, causing additional leakage on
+crash. This is an accepted tradeoff of the deferred bitmap approach — the
+alternative (versioned/CoW bitmap) would add significant complexity. The
+B+tree structure is always consistent; only free space accounting may be
+affected.
 
 ## Dirty Page Memory Management
 
@@ -1417,6 +1458,10 @@ its child transaction is rolled back. Closures may safely:
 The only constraint: the closure receives a `*Tx` (the child transaction)
 and must perform all database operations through it, not through a
 captured outer `*Tx`.
+
+#### Coordinator Lifecycle
+
+The batch coordinator goroutine is started lazily on the first `Batch()` call. It is stopped when `DB.Close()` is called: the close method closes `db.batchCh`, which causes the coordinator to drain any pending calls (returning `ErrTxClosed` to each), then exit. In-flight batch transactions are committed or rolled back before the coordinator exits.
 
 ### Nested Transactions
 
@@ -1909,24 +1954,22 @@ operations visible across processes.
    caches the index of the last successfully acquired slot, so the scan
    begins in a region likely to contain free slots.
 2. Scan forward (with wraparound) for a slot where `TxnID == 0` (free).
-3. Store the caller's PID and cached process start time (`db.processStartTime`)
-   in the slot's `PID` and `ProcessStartTime` fields. These are written
-   **before** the TxnID CAS so that the writer never observes an active
-   slot with stale or uninitialized ownership metadata.
-4. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID
-   (release semantics). If the CAS fails (another goroutine or process
-   claimed the slot concurrently), continue scanning.
+3. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID.
+   If the CAS fails (another goroutine or process claimed the slot
+   concurrently), continue scanning.
+4. After successful CAS, store the caller's PID and cached process start
+   time (`db.processStartTime`) in the slot's `PID` and `ProcessStartTime`
+   fields. The CAS establishes ownership — only the CAS winner writes
+   PID and ProcessStartTime.
 5. Update `db.readerSlotHint` to the acquired slot's index.
 6. If all slots are occupied (full wraparound), return `ErrReadersFull`.
 
-The CAS on `TxnID` with release semantics is the **publication barrier**.
-It guarantees that the PID and ProcessStartTime stores (step 3) are visible
-to any thread or process that observes the non-zero TxnID (step 4). The
-writer's stale-reader scan loads TxnID with acquire semantics before reading
-PID/ProcessStartTime, ensuring it always sees the current owner's metadata.
-This eliminates the race where the writer could observe an active TxnID
-with stale PID/start-time from a previous slot occupant and incorrectly
-classify a live reader as stale.
+The CAS on `TxnID` establishes slot ownership. Only the CAS winner writes
+PID and ProcessStartTime — there is no race because the CAS serializes
+access to the slot. The writer's stale-reader scan treats slots with
+non-zero TxnID and zero PID as "being acquired" and skips them (does not
+clear them as stale). This window is brief — the time between a successful
+CAS and the subsequent PID/ProcessStartTime stores.
 
 The hint is process-local (stored on the `DB` struct, not in shared
 memory) and updated with a relaxed atomic store — no cross-process
@@ -1953,6 +1996,10 @@ the minimum active TxnID), if a slot has a non-zero `TxnID`, the writer
 checks whether the owning process is still alive and is the *same* process
 that acquired the slot:
 
+0. If `PID == 0` (but `TxnID != 0`), the slot is being acquired — a reader
+   has won the CAS on TxnID but has not yet stored its PID. The writer
+   skips this slot (does not clear it as stale). This avoids a race where
+   the writer clears a slot between the reader's CAS and its PID store.
 1. `kill(pid, 0)` — if it returns `ESRCH`, the process is dead. The slot
    is stale. Clear `TxnID = 0`.
 2. If the PID is alive, compare the slot's `ProcessStartTime` against the
@@ -2411,7 +2458,7 @@ var (
     ErrNotFound           = errors.New("gmdb: key not found")
     ErrKeyExists          = errors.New("gmdb: key already exists")
     ErrDBFull             = errors.New("gmdb: database full (MaxSize reached)")
-    ErrTxTooLarge         = errors.New("gmdb: transaction too large")
+    ErrTxTooLarge         = errors.New("gmdb: transaction too large") // returned when RPL segment allocation fails at commit (database near full)
     ErrReadersFull        = errors.New("gmdb: no reader slots available")
     ErrKeyTooLarge        = errors.New("gmdb: key exceeds maximum size")
     ErrKeyEmpty           = errors.New("gmdb: key is nil or empty")
@@ -2425,6 +2472,12 @@ var (
 )
 
 // Open a database. Creates the file if it doesn't exist.
+//
+// The data file is created with O_CREATE|O_EXCL to prevent races when
+// multiple processes call Open() simultaneously on a non-existent path.
+// If the exclusive create fails with EEXIST, Open() retries as a normal
+// open (the other process created the file). The lock file uses the
+// same pattern.
 func Open(path string, opts *Options) (*DB, error)
 ```
 
@@ -2491,6 +2544,32 @@ Nil return from `Get` always means "not found" (accompanied by
 `ErrNotFound`). Nil return from cursor navigation always means "end of
 iteration" (check `Err()` to distinguish normal end from error). Empty
 `[]byte{}` return from `Get` means "key exists, value is empty."
+
+### Database Initialization
+
+When `Open()` creates a new database (file does not exist):
+
+1. Create the data file with `O_CREATE|O_EXCL` to prevent races when
+   multiple processes call `Open()` simultaneously. If the exclusive
+   create fails with `EEXIST`, `Open()` retries as a normal open.
+2. Write both meta pages identically:
+   - TxnID = 0
+   - HighWaterMark = 2 + BitmapPages (first data page)
+   - KeyspaceRoot = 0 (empty keyspace B+tree)
+   - NumKeyspaces = 0
+   - RPLHeadPage = 0, RPLTailPage = 0, RPLEntryCount = 0
+   - NumFreePages = 0
+   - Checkpoint flag set on both meta pages
+   - All file format fields from `Options.FileFormat` (or defaults)
+   - UUID generated via `crypto/rand`
+3. Initialize the bitmap region (pages 2 through 2 + BitmapPages - 1):
+   all bits clear (no free pages — all data pages are beyond
+   HighWaterMark and will be allocated via file extension).
+4. Create the lock file with `O_CREATE|O_EXCL`, matching UUID, and
+   empty reader table.
+5. fdatasync the data file.
+
+The first write transaction increments TxnID to 1.
 
 ### Path Traversal Safety
 
@@ -2803,7 +2882,11 @@ func (tx *Tx) CreateSetKeyspace(name []byte, opts *SetKeyspaceOptions) (*SetKeys
 // single-value Keyspace, returns ErrKeyspaceKindMismatch.
 func (tx *Tx) CreateSetKeyspaceIfNotExists(name []byte, opts *SetKeyspaceOptions) (*SetKeyspace, error)
 
-// DeleteKeyspace deletes a named keyspace and all its data.
+// DeleteKeyspace removes a keyspace and all of its data. For set
+// keyspaces, all nested B+trees are retired via bulk subtree
+// retirement. Returns ErrNotFound if the keyspace does not exist.
+// Works for both Keyspace and SetKeyspace types — the Kind field
+// is not checked. Only valid on a write transaction.
 func (tx *Tx) DeleteKeyspace(name []byte) error
 
 // Keyspace is a handle to a named single-value keyspace within a transaction.
@@ -2816,7 +2899,9 @@ func (ks *Keyspace) Get(key []byte) ([]byte, error)
 // Put inserts or updates a key-value pair. An existing value is replaced.
 func (ks *Keyspace) Put(key, value []byte) error
 
-// Delete removes a key and its value.
+// Delete removes the key and its value. If the key does not exist,
+// Delete is a no-op and returns nil — Delete means "ensure this key
+// does not exist."
 func (ks *Keyspace) Delete(key []byte) error
 
 // DeleteRange deletes all keys in the range [start, end). Returns the
@@ -2828,6 +2913,12 @@ func (ks *Keyspace) Delete(key []byte) error
 // without visiting individual leaf entries — O(pages) not O(entries).
 // See Range Delete for the algorithm.
 func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error)
+
+// NextSequence returns the next auto-incrementing sequence number for
+// this keyspace. The counter starts at 0; the first call returns 1.
+// The counter is persisted in the keyspace descriptor and updated when
+// the transaction commits. Only valid on a write transaction.
+func (ks *Keyspace) NextSequence() (uint64, error)
 
 // Cursor for iterating over key-value pairs.
 func (ks *Keyspace) Cursor() *Cursor
@@ -2851,7 +2942,11 @@ func (c *Cursor) SeekGE(target []byte) (key, value []byte)
 // without moving the cursor.
 func (c *Cursor) Current() (key, value []byte)
 
-// Delete deletes the key-value pair at the current cursor position.
+// Delete removes the current key-value pair. After deletion, the
+// cursor is positioned at the next key (the key that followed the
+// deleted key). If the deleted key was the last key, the cursor
+// becomes unpositioned (Next() returns nil). Only valid on a write
+// transaction cursor.
 func (c *Cursor) Delete() error
 
 // Err returns the first error encountered during cursor navigation.
@@ -2877,8 +2972,9 @@ func (ks *SetKeyspace) HasValue(key, value []byte) (bool, error)
 // key-value pair already exists).
 func (ks *SetKeyspace) Put(key, value []byte) error
 
-// Delete removes a key and all its values (using bulk subtree retirement
-// for nested B+trees). To remove a single value from the set, use
+// Delete removes the key and all of its values. If the key does not
+// exist, Delete is a no-op and returns nil. Uses bulk subtree
+// retirement for nested B+trees. To remove a single value, use
 // DeleteValue.
 func (ks *SetKeyspace) Delete(key []byte) error
 
@@ -2900,6 +2996,10 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
 // without visiting individual leaf entries — O(pages) not O(entries).
 // See Range Delete for the algorithm.
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error)
+
+// NextSequence returns the next auto-incrementing sequence number for
+// this keyspace. See Keyspace.NextSequence for details.
+func (ks *SetKeyspace) NextSequence() (uint64, error)
 
 // Cursor for iterating over key-value pairs in a set keyspace.
 func (ks *SetKeyspace) Cursor() *SetCursor
@@ -2925,7 +3025,12 @@ func (c *SetCursor) SeekGE(target []byte) (key, value []byte)
 // without moving the cursor.
 func (c *SetCursor) Current() (key, value []byte)
 
-// Delete deletes the key-value pair at the current cursor position.
+// Delete removes the current value from the current key's set. After
+// deletion, the cursor is positioned at the next value for the
+// current key. If the deleted value was the last value for the key,
+// the cursor advances to the first value of the next key. If there
+// is no next key, the cursor becomes unpositioned. When the last
+// value for a key is deleted, the key itself is removed.
 func (c *SetCursor) Delete() error
 
 // Err returns the first error encountered during cursor navigation.
@@ -2943,12 +3048,13 @@ func (c *SetCursor) LastValue() (value []byte)
 
 // NextValue moves to the next value for the current key.
 // Returns nil when there are no more values (the cursor does NOT
-// advance to the next key).
-func (c *SetCursor) NextValue() (key, value []byte)
+// advance to the next key). The key does not change during value
+// navigation — use Current() to read the key.
+func (c *SetCursor) NextValue() (value []byte)
 
 // PrevValue moves to the previous value for the current key.
 // Returns nil when at the first value.
-func (c *SetCursor) PrevValue() (key, value []byte)
+func (c *SetCursor) PrevValue() (value []byte)
 
 // NextKey moves to the first value of the next key, skipping
 // remaining values of the current key.
@@ -3061,16 +3167,14 @@ type CheckIssue struct {
 //   require.Empty(t, slices.Collect(db.Check()))
 func (db *DB) Check() iter.Seq[CheckIssue]
 
-// CopyTo creates a hot backup of the database to the given path. The copy
-// is taken from a consistent read transaction snapshot — writers are not
-// blocked during the copy.
-//
-// If compact is false, the data file is copied as-is (including free space).
-// This is fast but the copy may be larger than the live data.
-//
-// If compact is true, only live pages are written to the new file in
-// B+tree order, producing a compacted copy with no free space and optimal
-// page layout. This is slower but produces the smallest possible file.
+// CopyTo creates a consistent copy of the database at the given path.
+// The copy is taken from a read transaction snapshot — writers are not
+// blocked. When compact is true, the copy is compacted: free pages are
+// omitted and B+tree pages are written sequentially for optimal read
+// performance. The new database inherits the source's PageSize,
+// BitmapPages, and MaxSize. To create a copy with different FileFormat
+// settings (e.g., a different MaxSize), use CopyTo to create the copy
+// and then re-open it with the desired settings via SetFileFormat().
 func (db *DB) CopyTo(path string, compact bool) error
 
 // TxStats contains per-transaction statistics. Accumulated during the
@@ -3428,7 +3532,10 @@ run on storage without integrity guarantees.
 ## Integrity and Safety
 
 - **No partial writes visible**: CoW ensures all modifications happen on new
-  pages. The old tree is intact until the meta page swap.
+  pages. The old tree is intact until the meta page swap. Bitmap leakage
+  (pages that appear allocated but are unreferenced) is possible on crash
+  between the bitmap pwrite and the meta pwrite, but tree integrity is always
+  preserved. See "Bitmap leakage on crash" in Commit-Time Write Ordering.
 - **Atomic commit**: A single meta page write (< page size, aligned) is the
   commit point. Even if it's torn, the checksum will fail and the DB falls
   back to the other meta page.
@@ -3453,3 +3560,4 @@ run on storage without integrity guarantees.
 - **Silent bitrot detection**: When `PageChecksum` is enabled, every data page
   read is verified against its CRC32C footer. Corruption is detected at read
   time with `ErrCorrupted` identifying the affected page.
+- **Disk full (ENOSPC)**: If `ftruncate()` (file growth) or `pwrite()` (bitmap/meta) fails with ENOSPC, the operation returns an error. A failed `pwrite()` during commit may result in a partially written bitmap page on disk. Since the meta page has not been updated, recovery falls back to the previous meta — the partially written bitmap page is superseded by the next successful commit. File growth failures during the transaction (before commit) cause `pageAlloc()` to return `ErrDBFull`.

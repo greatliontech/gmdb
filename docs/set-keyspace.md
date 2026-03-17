@@ -204,12 +204,12 @@ func (c *SetCursor) LastValue() []byte
 
 // NextValue moves to the next value for the current key. Returns
 // nil when there are no more values (does NOT advance to the next
-// key).
-func (c *SetCursor) NextValue() (key, value []byte)
+// key). The key does not change during value navigation.
+func (c *SetCursor) NextValue() (value []byte)
 
 // PrevValue moves to the previous value for the current key.
 // Returns nil when at the first value.
-func (c *SetCursor) PrevValue() (key, value []byte)
+func (c *SetCursor) PrevValue() (value []byte)
 
 // NextKey moves to the first value of the next key, skipping
 // remaining values of the current key.
