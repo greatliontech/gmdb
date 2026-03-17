@@ -2585,7 +2585,6 @@ var (
     ErrCursorUnpositioned = errors.New("gmdb: cursor not positioned")
     ErrKeyspaceKindMismatch = errors.New("gmdb: keyspace kind does not match existing keyspace")
     ErrValueSizeMismatch    = errors.New("gmdb: value size does not match fixed value size")
-    ErrAmbiguousKey         = errors.New("gmdb: ambiguous operation on key with multiple values")
 )
 
 // Open a database. Creates the file if it doesn't exist.
@@ -2891,18 +2890,25 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name []byte) (*Keyspace, error)
 // keyspace is a single-value Keyspace.
 func (tx *Tx) OpenSetKeyspace(name []byte) (*SetKeyspace, error)
 
+// SetKeyspaceOptions controls set keyspace behavior. All fields are set
+// at creation time and immutable after.
+type SetKeyspaceOptions struct {
+    // FixedValueSize, when non-zero, requires all values in the set to
+    // be exactly this many bytes. Enables storage optimizations: no
+    // per-value length prefix in subpages, direct offset binary search.
+    // A Put() with a value of the wrong size returns ErrValueSizeMismatch.
+    FixedValueSize int
+}
+
 // CreateSetKeyspace creates a new named set keyspace within this
 // transaction. Returns ErrKeyExists if the keyspace already exists.
-// fixedSize sets the fixed value size in bytes for fixed-size value sets;
-// 0 means variable-size values.
-func (tx *Tx) CreateSetKeyspace(name []byte, fixedSize uint16) (*SetKeyspace, error)
+// If opts is nil, default options are used.
+func (tx *Tx) CreateSetKeyspace(name []byte, opts *SetKeyspaceOptions) (*SetKeyspace, error)
 
 // CreateSetKeyspaceIfNotExists opens a set keyspace if it exists, or
 // creates it if it does not. If the keyspace already exists as a
-// single-value Keyspace, returns ErrKeyspaceKindMismatch. If it exists
-// as a SetKeyspace with a different fixedSize, returns
-// ErrKeyspaceKindMismatch.
-func (tx *Tx) CreateSetKeyspaceIfNotExists(name []byte, fixedSize uint16) (*SetKeyspace, error)
+// single-value Keyspace, returns ErrKeyspaceKindMismatch.
+func (tx *Tx) CreateSetKeyspaceIfNotExists(name []byte, opts *SetKeyspaceOptions) (*SetKeyspace, error)
 
 // DeleteKeyspace deletes a named keyspace and all its data.
 func (tx *Tx) DeleteKeyspace(name []byte) error
@@ -2968,18 +2974,29 @@ func (c *Cursor) Err() error
 // per key) within a transaction.
 type SetKeyspace struct { ... }
 
-// Get returns the first (smallest) value for the given key. Returns
-// ErrNotFound if the key does not exist.
-func (ks *SetKeyspace) Get(key []byte) ([]byte, error)
+// Has reports whether the key exists (has at least one value).
+func (ks *SetKeyspace) Has(key []byte) (bool, error)
+
+// HasValue reports whether a specific key-value pair exists.
+func (ks *SetKeyspace) HasValue(key, value []byte) (bool, error)
 
 // Put adds a value to the key's sorted value set (no-op if the exact
 // key-value pair already exists).
 func (ks *SetKeyspace) Put(key, value []byte) error
 
 // Delete removes a key and all its values (using bulk subtree retirement
-// for nested B+trees). To delete a single value, use
-// SetCursor.Seek(key) + SetCursor.SeekValue(value) + SetCursor.Delete().
+// for nested B+trees). To remove a single value from the set, use
+// DeleteValue.
 func (ks *SetKeyspace) Delete(key []byte) error
+
+// DeleteValue removes a single value from the key's sorted set.
+// Returns ErrNotFound if the key or value does not exist. When the last
+// value is removed, the key is also removed — empty sets never exist.
+func (ks *SetKeyspace) DeleteValue(key, value []byte) error
+
+// CountValues returns the number of values for the given key.
+// Returns 0 if the key does not exist.
+func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
 
 // DeleteRange deletes all keys in the range [start, end). Returns the
 // number of deleted key-value pairs (each value counts as one). If start
@@ -3315,7 +3332,7 @@ organized by file:
 | `page.go` | Page header encoding/decoding (8-byte header: Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. Set keyspace subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including file format fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. Set keyspace bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs, key reconstruction buffer (`keyBuf []byte`) for incremental forward decoding, restart group cache (`[16][]byte`) for reverse traversal. Set keyspace: subpage management (inline sorted list), nested B+tree promotion/demotion, set cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
-| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → lagging reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |
+| `alloc.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → lagging reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |
 | `evict.go` | Dirty page eviction to disk mid-transaction (pwrite mode only, no-op in direct write mode). Clock-based eviction via `tx.clockRing` circular buffer with reference bit sweep and tombstones for evicted entries. Evicted pages moved to `tx.evictedPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `fileformat.go` | File format management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetFileFormat()` for runtime modification of `MinSize`, `GrowStep`, `ShrinkThreshold` (rejects `MaxSize` changes — bitmap region is fixed at creation). |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to MaxSize). Supports both read-only (pwrite mode) and read-write (direct write mode) mappings. |

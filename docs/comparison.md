@@ -27,9 +27,9 @@
 |---|---|---|---|
 | Modification strategy | Copy-on-write pages | Copy-on-write pages | In-memory update chains (WT_UPDATE linked lists per key) |
 | Dirty page storage (default) | Anonymous mmap slab (GC-invisible) | malloc'd shadow pages | Heap-allocated WT_UPDATE + WT_INSERT structures |
-| Dirty page storage (writemap) | Direct mmap writes | Direct mmap writes | N/A (always uses buffer pool) |
+| Dirty page storage (direct write) | Direct mmap writes | Direct mmap writes | N/A (always uses buffer pool) |
 | Write-ahead log | No (CoW makes WAL unnecessary) | No (CoW makes WAL unnecessary) | Yes (slot-based consolidated WAL for commit-level durability) |
-| When data reaches disk | At commit (pwrite or writemap + fdatasync) | At commit (pwrite or writemap + fdatasync) | At eviction (dirty pages) or checkpoint (all dirty pages); WAL at commit |
+| When data reaches disk | At commit (pwrite or direct write + fdatasync) | At commit (pwrite or writemap + fdatasync) | At eviction (dirty pages) or checkpoint (all dirty pages); WAL at commit |
 | Commit I/O | pwrite + fdatasync (or io_uring batch) | pwrite/writev + fdatasync (or msync in writemap) | WAL append + fsync; data pages written asynchronously by eviction/checkpoint |
 | Atomic commit point | Meta page write (single page, checksummed) | Meta page write (two-phase txnid_a/txnid_b) | Checkpoint completion (turtle file update) |
 
@@ -41,8 +41,8 @@
 | Lookup | O(1) | O(log n) binary search on sorted portion | O(1) via page pointer |
 | Insert | O(1) amortized | O(1) append (lazy sort) | O(1) prepend to update chain |
 | Commit-time ordering | Sort keys, sequential pwrite | Sort dirty list, sequential pwrite | N/A (eviction writes pages individually; checkpoint reconciles) |
-| Spill/eviction trigger | Dirty count exceeds MaxDirtyPages | Dirty count exceeds dirtyroom | Cache usage exceeds eviction_target percentage |
-| Spill/eviction algorithm | Clock sweep (approximate LRU, O(1) per-access overhead) | LRU via dirtylru counter | Approximate LRU via read_gen (set to future value on access; eviction server increments base) |
+| Eviction trigger | Dirty count exceeds MaxDirtyPages | Dirty count exceeds dirtyroom | Cache usage exceeds eviction_target percentage |
+| Eviction algorithm | Clock sweep (approximate LRU, O(1) per-access overhead) | LRU via dirtylru counter | Approximate LRU via read_gen (set to future value on access; eviction server increments base) |
 
 ## Page Format
 
@@ -72,11 +72,11 @@
 | | gmdb | libmdbx | WiredTiger |
 |---|---|---|---|
 | Full durability | SyncDurable: fdatasync data + fdatasync meta | MDBX_SYNC_DURABLE: fdatasync data + fdatasync meta | transaction_sync enabled + fsync: WAL fsync per commit |
-| Data-only sync | SyncNoMeta: fdatasync data, skip meta sync | MDBX_NOMETASYNC: fdatasync data, skip meta sync | N/A (WAL-based; no equivalent) |
-| Lazy/deferred sync | SyncSafe: no fdatasync; rolls back to last steady commit on crash | MDBX_SAFE_NOSYNC: no fdatasync; rolls back to last steady meta on crash | transaction_sync disabled: rely on periodic checkpoints for durability |
-| No safety | SyncNone: no fdatasync, no steady fallback; requires AllowSyncNone | MDBX_UTTERLY_NOSYNC: no fdatasync, wipes steady metas; risk of corruption | N/A (always has checkpoint mechanism) |
-| Checkpoint concept | "Steady commit": a commit whose data pages have been confirmed on stable storage; created by DB.Sync() | "Steady meta": a meta page whose sign > DATASIGN_WEAK; created by fdatasync | Checkpoint: periodic/on-demand full snapshot of all dirty pages to disk; runs as snapshot isolation txn |
-| Crash recovery | Select meta page with highest TxnID whose checksum is valid and steady flag is set | Select meta page with valid txnid_a==txnid_b and prefer steady meta; check bootid for recency | Recover from last checkpoint + replay WAL from checkpoint LSN forward + rollback_to_stable |
+| Data-only sync | SyncDataOnly: fdatasync data, skip meta sync | MDBX_NOMETASYNC: fdatasync data, skip meta sync | N/A (WAL-based; no equivalent) |
+| Lazy/deferred sync | SyncLazy: no fdatasync; rolls back to last checkpoint on crash | MDBX_SAFE_NOSYNC: no fdatasync; rolls back to last steady meta on crash | transaction_sync disabled: rely on periodic checkpoints for durability |
+| No safety | SyncUnsafe: no fdatasync, no checkpoint fallback; requires AllowSyncUnsafe | MDBX_UTTERLY_NOSYNC: no fdatasync, wipes steady metas; risk of corruption | N/A (always has checkpoint mechanism) |
+| Checkpoint concept | "Checkpoint": a commit whose data pages have been confirmed on stable storage; created by DB.Checkpoint() | "Steady meta": a meta page whose sign > DATASIGN_WEAK; created by fdatasync | Checkpoint: periodic/on-demand full snapshot of all dirty pages to disk; runs as snapshot isolation txn |
+| Crash recovery | Select meta page with highest TxnID whose checksum is valid and checkpoint flag is set | Select meta page with valid txnid_a==txnid_b and prefer steady meta; check bootid for recency | Recover from last checkpoint + replay WAL from checkpoint LSN forward + rollback_to_stable |
 
 ## Meta Pages
 
@@ -85,7 +85,7 @@
 | Count | 2 (pages 0 and 1) | 3 (pages 0, 1, and 2) | N/A (metadata is a separate B+tree file; turtle file tracks metadata checkpoint) |
 | Selection | Highest valid TxnID with valid xxhash64 checksum | Troika system: recent (latest), prefer_steady (last synced), tail (write target) | Last checkpoint in turtle file |
 | Integrity check | xxhash64 checksum of all preceding bytes | Two-phase txnid write (txnid_a at top, txnid_b at bottom; mismatch = torn write) + datasign for steady detection | Block-level CRC32 checksum on every page |
-| Steady/checkpoint marker | Steady flag (bit 1 in Flags) | sign field: DATASIGN_WEAK vs calculated signature | N/A (checkpoint is always fully synced) |
+| Checkpoint marker | Checkpoint flag (bit 1 in Flags) | sign field: DATASIGN_WEAK vs calculated signature | N/A (checkpoint is always fully synced) |
 | Why 2 vs 3 | Sufficient: writer updates the inactive one; crash falls back to the other | Third meta avoids any possibility of corrupting in-use metas; enables steady tracking while non-steady commits advance | N/A |
 
 ## Checksums
@@ -120,7 +120,7 @@ branch separator truncation), which works within the mmap model.
 | Architecture | mmap-based (OS page cache manages everything) | mmap-based (OS page cache manages everything) | Custom buffer pool (application-level cache, heap-allocated) |
 | Cache sizing | Implicit (OS page cache) | Implicit (OS page cache) | Explicit: `cache_size` option (default 100MB; MongoDB uses ~50% of RAM) |
 | Eviction | OS-managed (mmap pages evicted by kernel) | OS-managed (mmap pages evicted by kernel) | Explicit: eviction server thread + worker thread pool; LRU-based with trigger/target thresholds |
-| Dirty page memory | Anonymous mmap slab (pwrite mode) or shared mmap (writemap mode) | malloc'd pages (pwrite mode) or shared mmap (writemap mode) | Heap-allocated WT_UPDATE/WT_INSERT structures (always) |
+| Dirty page memory | Anonymous mmap slab (pwrite mode) or shared mmap (direct write mode) | malloc'd pages (pwrite mode) or shared mmap (writemap mode) | Heap-allocated WT_UPDATE/WT_INSERT structures (always) |
 | mmap usage | Primary I/O mechanism (read path) | Primary I/O mechanism (read path) | Optional read-only optimization for checkpoint data; not primary I/O |
 | GC interaction | None (mmap slab is munmap'd at txn close) | None (malloc'd pages freed at txn close) | GC-unaware (C heap allocator) |
 | Huge pages | MADV_HUGEPAGE opt-in (Linux) | MADV_HUGEPAGE opt-in (Linux) | Not applicable (heap-based cache) |
@@ -160,17 +160,17 @@ branch separator truncation), which works within the mmap model.
 | Stale writer detection | WriterPID + WriterStartTime in lock file header; flock auto-released by kernel on crash | Write mutex with owner-death detection (robust mutexes on Linux) | N/A (lock file prevents concurrent access) |
 | Slow/lagging reader | Callback-based (LaggingReader callback returns wait/abort action) | Callback-based (MDBX_hsr_func returns kill/wait/abort); integrates with transaction parking and ousting | N/A |
 
-## File Geometry / Sizing
+## File Format / Sizing
 
 | | gmdb | libmdbx | WiredTiger |
 |---|---|---|---|
-| Concept name | FileLayout (proposed; currently "Geometry") | Geometry (geo_t in meta page) | N/A (per-table file management) |
-| Min size | Configurable (MinSize / GeoLower) | Configurable (geo.lower) | N/A |
-| Max size | Configurable, immutable after creation (MaxSize / GeoUpper); determines bitmap region size | Configurable (geo.upper); determines mmap limit | N/A (files grow as needed) |
-| Growth step | Configurable (GrowStep / GeoGrowPages) | Configurable (geo.grow_pv, packed exponential) | Implicit (block allocation extends file) |
-| Shrink threshold | Configurable (ShrinkThreshold / GeoShrinkPages) | Configurable (geo.shrink_pv, packed exponential) | Explicit compaction via WT_SESSION::compact |
+| Concept name | FileFormat | Geometry (geo_t in meta page) | N/A (per-table file management) |
+| Min size | Configurable (MinSize) | Configurable (geo.lower) | N/A |
+| Max size | Configurable, immutable after creation (MaxSize); determines bitmap region size | Configurable (geo.upper); determines mmap limit | N/A (files grow as needed) |
+| Growth step | Configurable (GrowStep) | Configurable (geo.grow_pv, packed exponential) | Implicit (block allocation extends file) |
+| Shrink threshold | Configurable (ShrinkThreshold) | Configurable (geo.shrink_pv, packed exponential) | Explicit compaction via WT_SESSION::compact |
 | Auto-shrink | Yes (tail page refund at commit time) | Yes (tail truncation when first_unallocated drops) | No (manual compaction only) |
-| Runtime modification | Tx.SetFileLayout() (all except MaxSize) | mdbx_env_set_geometry() (all params including upper) | N/A |
+| Runtime modification | Tx.SetFileFormat() (all except MaxSize) | mdbx_env_set_geometry() (all params including upper) | N/A |
 
 ## Integrity Checking
 
