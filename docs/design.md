@@ -9,7 +9,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Data structure | B+tree on fixed-size pages | Only viable option for multi-process mmap |
 | Concurrency | Single writer + N readers (MVCC/CoW) | Proven (LMDB), readers never block writer |
 | File layout | Fixed-size pages (4KB–64KB, configurable, immutable after creation) | Matches OS page size, mmap-friendly |
-| Page header | 8 bytes (Type uint8, Flags uint8, Count uint16, Overflow uint32 — no PageID) | PageID is redundant (computable from file offset); Type/Flags split reserves 8 flag bits for future per-page metadata at zero cost |
+| Page header | 8 bytes (Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID) | PageID is redundant (computable from file offset); Type/Flags split reserves 8 flag bits for future per-page metadata at zero cost |
 | Value storage | Inline + overflow pages | Simple single read path, overflow for large values |
 | Duplicate values | DUPSORT with subpage + nested B+tree | Subpage for small sets, nested B+tree for large; DUPFIXED for fixed-size optimization |
 | Free space | Allocation bitmap + retired page log (RPL) | O(1) alloc via bitmap, no self-referential allocation, RPL tracks MVCC retirement |
@@ -20,12 +20,12 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Durability | Three sync modes (Durable, DataOnly, Lazy) + unsafe opt-in Unsafe | Configurable ACID vs. performance; SyncUnsafe requires explicit `AllowSyncUnsafe` flag |
 | Cross-process | Shared memory lock file (`structs.HostLayout` structs, uint64 PIDs + process start times) | C ABI layout guarantee for mmap'd structs; fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness + start time comparison (PID reuse safe); uint64 PIDs for forward safety |
 | Write lock | Intra-process writer queue (channel) + single flock goroutine (cross-process) | Context-aware blocking; zero goroutine accumulation on cancellation; flock alone doesn't block same-process goroutines |
-| Slow readers | Callback-based notification | Application controls policy; no silent unbounded growth |
-| mmap | pwrite mode (default) or writemap mode | pwrite: write isolation (anonymous slab); writemap: direct mmap writes for performance |
+| Lagging readers | Callback-based notification | Application controls policy; no silent unbounded growth |
+| mmap | pwrite mode (default) or direct write mode | pwrite: write isolation (anonymous slab); direct write: direct mmap writes for performance |
 | Huge pages | `MADV_HUGEPAGE` (opt-in, Linux) | Reduces TLB pressure for large databases; transparent huge pages for file-backed mmap |
-| Dirty page tracking | Hash map (`map[uint64]`) with clock ring (`[]uint64` circular buffer + reference bit) | O(1) insert/lookup/delete; clock ring for spill eviction (O(1) append, tombstones for spilled entries); `slices.Sorted(maps.Keys(...))` at commit for sequential I/O |
+| Dirty page tracking | Hash map (`map[uint64]`) with clock ring (`[]uint64` circular buffer + reference bit) | O(1) insert/lookup/delete; clock ring for eviction (O(1) append, tombstones for evicted entries); `slices.Sorted(maps.Keys(...))` at commit for sequential I/O |
 | Dirty page buffers | Anonymous mmap slab (pwrite mode) | GC-invisible; no pool draining on GC cycles; deterministic allocation; `munmap` at transaction close |
-| Page spilling | Clock-based spill to disk mid-transaction (pwrite mode only) | Bounds memory; zero per-access overhead (ref bit vs. O(log n) heap); approximates LRU |
+| Page eviction | Clock-based eviction to disk mid-transaction (pwrite mode only) | Bounds memory; zero per-access overhead (ref bit vs. O(log n) heap); approximates LRU |
 | Branch keys | Prefix-truncated separators | Shortest distinguishing prefix; maximizes fan-out; shallower trees; full keys in leaves only |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
@@ -78,8 +78,8 @@ Every page starts with a common header:
 ```
 Page Header (8 bytes)
 +----------+----------+----------+----------+
-| Type     | Flags    | Count    | Overflow |
-| uint8    | uint8    | uint16   | uint32   |
+| Type     | Flags    | Count    | AdditionalPages |
+| uint8    | uint8    | uint16   | uint32          |
 +----------+----------+----------+----------+
 ```
 
@@ -92,7 +92,7 @@ Page Header (8 bytes)
   Readers must reject pages with unknown flags set.
 - **Count** (uint16): Number of items (keys in branch, key/value pairs in
   leaf, entries in RPL segment).
-- **Overflow** (uint32): Number of contiguous overflow pages following this
+- **AdditionalPages** (uint32): Number of contiguous overflow pages following this
   one (0 for single-page nodes).
 
 The page header does not contain a PageID field. A page's ID is implicit —
@@ -111,7 +111,7 @@ bytes of the page. See Checksums for details.
 Two meta pages occupy pages 0 and 1. They alternate — the writer always
 updates the one NOT currently active. Meta pages do not carry the standard
 page header — their position is fixed (byte 0 and byte PageSize), so the
-Type field is redundant, and Count/Overflow are meaningless for metadata.
+Type field is redundant, and Count/AdditionalPages are meaningless for metadata.
 The meta layout starts directly with Magic:
 
 ```
@@ -128,7 +128,7 @@ Meta Page
 | MaxSize          | uint64 - maximum database size in pages
 | GrowStep         | uint64 - growth step in pages
 | ShrinkThreshold  | uint64 - shrink threshold in pages
-| FirstUnallocated | uint64 - first unallocated page ID (high-water mark)
+| HighWaterMark    | uint64 - first unallocated page ID (high-water mark)
 | RPLHeadPage      | uint64 - page ID of the newest RPL segment (0 = empty)
 | RPLTailPage      | uint64 - page ID of the oldest RPL segment (0 = empty)
 | RPLEntryCount    | uint64 - total entries across all RPL segments
@@ -493,7 +493,7 @@ small.
 
 Overflow pages are contiguous runs of pages that store large values. The
 first page in the run carries the standard 8-byte page header with
-`Overflow` set to the number of follower pages; the remaining bytes of
+`AdditionalPages` set to the number of follower pages; the remaining bytes of
 the first page are value data. Follower pages carry no header — they are
 entirely value data. Total value capacity for a run of `1 + N` pages:
 `(PageSize - 8) + N * PageSize` bytes (or subtract 4 from the first page
@@ -795,7 +795,7 @@ bits are permanently clear (reserved). The same applies to meta pages (pages
 
 The bitmap is stored directly in the mmap. In pwrite mode, bitmap
 modifications are written via `pwrite()` as part of the dirty page set. In
-writemap mode, bitmap modifications happen directly in the mmap. Either way,
+direct write mode, bitmap modifications happen directly in the mmap. Either way,
 bitmap pages participate in the same `fdatasync()` ordering as data pages —
 they are flushed before the meta page swap.
 
@@ -1015,8 +1015,8 @@ new dirty page allocations.
 
 A hash map is used instead of a simpler `[]uint64` slice because of the
 **tail page refund** operation at commit time. Tail refund checks whether
-consecutive page IDs at the file tail (`FirstUnallocated - 1`,
-`FirstUnallocated - 2`, ...) are loose, requiring membership lookups by
+consecutive page IDs at the file tail (`HighWaterMark - 1`,
+`HighWaterMark - 2`, ...) are loose, requiring membership lookups by
 page ID. With a slice, each lookup is O(n) where n is the loose page
 count. In the worst case — a large `DeleteRange` triggering cascading
 merges followed by rebalancing — the loose set can approach
@@ -1052,24 +1052,24 @@ any bitmap or RPL interaction:
 3. **RPL reclamation**: if the bitmap has no suitable free pages, reclaim
    entries from the RPL (TxnID < oldest reader) into the bitmap, then retry
    step 2.
-4. **Slow reader check**: if reclamation is blocked by a long-lived reader,
-   invoke the slow reader callback (see Cross-Process Coordination). If the
+4. **Lagging reader check**: if reclamation is blocked by a long-lived reader,
+   invoke the lagging reader callback (see Cross-Process Coordination). If the
    reader releases, refresh the oldest reader cache and retry step 3.
 5. **File extension**: if no free pages are available, grow the file according
-   to the file format growth step and advance `FirstUnallocated`.
+   to the file format growth step and advance `HighWaterMark`.
 
 ##### Tail Page Refund
 
 After reclamation or at commit time, the writer checks if any pages at the
-tail of the database file (page IDs equal to `FirstUnallocated - 1`,
-`FirstUnallocated - 2`, etc.) are free in the bitmap. If so, those bits are
-cleared and `FirstUnallocated` is decremented. This reclaims file space and
+tail of the database file (page IDs equal to `HighWaterMark - 1`,
+`HighWaterMark - 2`, etc.) are free in the bitmap. If so, those bits are
+cleared and `HighWaterMark` is decremented. This reclaims file space and
 enables file shrinkage at commit time (see File Format).
 
 The refund process iterates: clearing tail bits may expose new tail pages.
 It runs until no more tail pages are free. Loose pages are checked first
 (by O(1) lookup in the `tx.loosePages` map for each tail page ID), then
-the bitmap (by checking bits from `FirstUnallocated - 1` downward).
+the bitmap (by checking bits from `HighWaterMark - 1` downward).
 
 #### Freeing Pages
 
@@ -1090,7 +1090,7 @@ safe to reuse (no active reader holds their snapshot).
 
 During commit, the writer:
 1. Performs tail page refund: check the bitmap for free pages at the end of
-   the file, decrement `FirstUnallocated`.
+   the file, decrement `HighWaterMark`.
 2. Moves any remaining loose pages into `tx.retiredPages`.
 3. Appends all `tx.retiredPages` to the RPL by allocating new segment
    pages from the bitmap and appending them to the in-memory segment list.
@@ -1125,7 +1125,7 @@ tx.clockHand  int       // current index into clockRing
 
 type dirtyPage struct {
     data []byte // page content from anonymous mmap slab (len = PageSize * (1 + overflow))
-    ref  bool   // clock reference bit for spill priority
+    ref  bool   // clock reference bit for eviction priority
 }
 ```
 
@@ -1143,7 +1143,7 @@ Virtual address space is reserved upfront but physical memory is only
 committed by the kernel on first write to each page (demand paging), so
 the reservation cost is negligible on 64-bit systems.
 
-**writemap mode:**
+**direct write mode:**
 ```
 tx.dirtyPages map[uint64]struct{} // page IDs only, content lives in the mmap
 ```
@@ -1154,7 +1154,7 @@ tx.dirtyPages map[uint64]struct{} // page IDs only, content lives in the mmap
 |-----------|--------|------------|
 | Add dirty page | `tx.dirtyPages[pageID] = &dirtyPage{...}` | O(1) amortized |
 | Check if dirty | `_, ok := tx.dirtyPages[pageID]` | O(1) |
-| Remove (spill) | `delete(tx.dirtyPages, pageID)` | O(1) |
+| Remove (evict) | `delete(tx.dirtyPages, pageID)` | O(1) |
 | Count | `len(tx.dirtyPages)` | O(1) |
 | Commit-time iteration | `slices.Sorted(maps.Keys(tx.dirtyPages))` | O(n log n) once |
 
@@ -1168,14 +1168,14 @@ negligible.
 
 #### Map Reuse Across Transactions
 
-The dirty page maps (`tx.dirtyPages` and `tx.spilledPages`) and the loose
+The dirty page maps (`tx.dirtyPages` and `tx.evictedPages`) and the loose
 page map (`tx.loosePages`) are pooled on the `DB` struct and reused across
 write transactions. On rollback or after commit cleanup, the maps are
 reset via the `clear` builtin rather than discarded:
 
 ```go
 clear(tx.dirtyPages)   // O(1): resets to empty, retains allocated buckets
-clear(tx.spilledPages)
+clear(tx.evictedPages)
 clear(tx.loosePages)
 ```
 
@@ -1193,7 +1193,7 @@ retaining its backing array for the next transaction.
 ### Clock Ring and Reference Bit (pwrite mode only)
 
 Each dirty page in pwrite mode carries a `ref` (reference) bit that drives
-the clock-based spill eviction (see Page Spilling). When a dirty page is
+the clock-based eviction (see Page Eviction). When a dirty page is
 accessed or modified, its `ref` bit is set to `true` — a single field
 write with zero data structure overhead (no heap operations, no map
 lookups).
@@ -1202,31 +1202,31 @@ The transaction also maintains a **clock ring** (`tx.clockRing []uint64`)
 — a circular buffer of page IDs that serves as the sweep order for the
 clock algorithm. When a page is first dirtied, its page ID is appended to
 the ring. The clock hand (`tx.clockHand int`) is an index into this ring.
-Spilled pages are marked as tombstones (`math.MaxUint64`) in the ring
+Evicted pages are marked as tombstones (`math.MaxUint64`) in the ring
 rather than removed, preserving O(1) operations and stable hand indexing.
-See Page Spilling for the full sweep algorithm.
+See Page Eviction for the full sweep algorithm.
 
-In writemap mode, there is no reference bit or clock ring because spilling
+In direct write mode, there is no reference bit or clock ring because eviction
 does not apply — the OS manages mmap page eviction transparently.
 
-### Spilled Page Set
+### Evicted Page Set
 
-Pages that have been spilled to disk mid-transaction are tracked in a
+Pages that have been evicted to disk mid-transaction are tracked in a
 separate **hash map**:
 
 ```
-tx.spilledPages map[uint64]struct{}
+tx.evictedPages map[uint64]struct{}
 ```
 
 When a B+tree traversal reaches a page, the lookup path checks:
 1. `tx.dirtyPages` — if present, use the in-memory dirty copy.
-2. `tx.spilledPages` — if present, the page was written to disk earlier in
-   this transaction. Re-read it from the mmap (the spilled content is at
+2. `tx.evictedPages` — if present, the page was written to disk earlier in
+   this transaction. Re-read it from the mmap (the evicted content is at
    the page's allocated position) and re-dirty it if modification is needed.
 3. Otherwise, read directly from the mmap (immutable page from a previous
    transaction).
 
-Using a hash map for `spilledPages` provides O(1) membership checks instead
+Using a hash map for `evictedPages` provides O(1) membership checks instead
 of binary search on a sorted slice. The set is typically small (only
 populated when `MaxDirtyPages` is exceeded), so the overhead is minimal
 either way, but O(1) is simpler and consistent with the dirty page map.
@@ -1242,10 +1242,10 @@ order to produce sequential disk writes:
    adjacent pages (consecutive page IDs) into single write calls where
    possible (scatter-gather optimization).
 
-Spilled pages are excluded from this write — they are already on disk at
+Evicted pages are excluded from this write — they are already on disk at
 their final positions.
 
-In writemap mode, no explicit writes are needed — dirty pages are already
+In direct write mode, no explicit writes are needed — dirty pages are already
 in the mmap. The sorted key extraction is still used for `fdatasync()`
 range hints if the OS supports them, but this is an optimization, not a
 correctness requirement.
@@ -1270,22 +1270,22 @@ enough that the per-write `RWF_DSYNC` overhead is less than a single
 `fdatasync()`. On non-Linux platforms or kernels older than 4.7, the flag
 is unavailable and the standard path is used.
 
-## Page Spilling
+## Page Eviction
 
 When a write transaction dirties more pages than can fit in available memory,
-dirty pages must be spilled (written to disk mid-transaction) to make room for
-further modifications. Without spilling, very large write transactions would
+dirty pages must be evicted (written to disk mid-transaction) to make room for
+further modifications. Without eviction, very large write transactions would
 consume unbounded memory.
 
-### Spill Trigger
+### Eviction Trigger
 
-Spilling is triggered when the dirty page count exceeds `Options.MaxDirtyPages`
+Eviction is triggered when the dirty page count exceeds `Options.MaxDirtyPages`
 (default: 65536). The writer selects a subset of dirty pages to write to disk
 via `pwrite()`, removing them from the in-memory dirty set.
 
-### Clock-Based Spill Eviction
+### Clock-Based Eviction
 
-Pages are selected for spilling using the **clock algorithm** — an
+Pages are selected for eviction using the **clock algorithm** — an
 approximate-LRU scheme with zero per-access overhead on the hot path.
 
 Each dirty page carries a **reference bit** (`ref`). Whenever a dirty page
@@ -1296,18 +1296,18 @@ an integer index into this ring.
 
 When a page is dirtied for the first time (added to `tx.dirtyPages`), its
 page ID is appended to the clock ring: O(1). When a page is removed from
-`tx.dirtyPages` (spilled), its ring entry is replaced with a **tombstone**
+`tx.dirtyPages` (evicted), its ring entry is replaced with a **tombstone**
 (sentinel value `math.MaxUint64`) rather than compacting the ring — this
 preserves O(1) cost and avoids invalidating the clock hand index.
 
-When spilling is triggered, the clock hand sweeps through the ring:
+When eviction is triggered, the clock hand sweeps through the ring:
 
-1. Skip tombstone entries (spilled pages no longer in the dirty set).
+1. Skip tombstone entries (evicted pages no longer in the dirty set).
 2. If the page's `ref` bit is set, clear it and advance the hand (the page
    was recently accessed — give it another chance).
 3. If the `ref` bit is already clear, the page is cold — select it for
    eviction.
-4. Continue until enough pages are selected for spilling.
+4. Continue until enough pages are selected for eviction.
 
 This approximates LRU without the O(log n) per-access cost of a heap.
 Pages that are actively being modified (e.g., B+tree branch nodes on the
@@ -1317,42 +1317,42 @@ insertions) have their bits cleared on the first sweep and are evicted on
 the second. Newly dirtied pages are immediately visible to future sweeps
 — unlike a map-keys snapshot approach, no regeneration step is needed.
 
-The clock hand position persists across spill events within the same
-transaction, so consecutive spills resume where the previous one stopped
+The clock hand position persists across eviction events within the same
+transaction, so consecutive evictions resume where the previous one stopped
 rather than re-scanning already-visited pages. Tombstones accumulate
-across spill passes but are bounded by `MaxDirtyPages` (the ring never
+across eviction passes but are bounded by `MaxDirtyPages` (the ring never
 exceeds the total number of pages ever dirtied in the transaction). The
 ring is reset (`tx.clockRing = tx.clockRing[:0]`) at transaction close
 along with the dirty page map.
 
-### Spill Mechanics
+### Eviction Mechanics
 
 1. Sweep dirty pages via the clock algorithm to select eviction candidates.
 2. Write the selected pages to their allocated positions via `pwrite()`. Group
    adjacent pages into single write calls where possible.
-3. Remove spilled pages from `tx.dirtyPages` and add their page IDs to
-   `tx.spilledPages` (see Dirty Page Tracking).
-4. If a spilled page is later accessed again (e.g., a B+tree traversal reaches
-   it), it is re-read from the mmap and re-dirtied. The `tx.spilledPages` map
+3. Remove evicted pages from `tx.dirtyPages` and add their page IDs to
+   `tx.evictedPages` (see Dirty Page Tracking).
+4. If an evicted page is later accessed again (e.g., a B+tree traversal reaches
+   it), it is re-read from the mmap and re-dirtied. The `tx.evictedPages` map
    is checked during page lookup to detect this case (O(1)).
 
 ### Interaction with Free Space Management
 
-Spilled pages remain allocated — they are not freed or added to the RPL.
+Evicted pages remain allocated — they are not freed or added to the RPL.
 They are simply written to their final on-disk location early. At commit time,
-spilled pages do not need to be written again (they are already on disk). The
-commit only needs to write the remaining (non-spilled) dirty pages and the
+evicted pages do not need to be written again (they are already on disk). The
+commit only needs to write the remaining (non-evicted) dirty pages and the
 meta page.
 
-Bitmap pages and RPL segment pages are never spilled. Bitmap pages are
+Bitmap pages and RPL segment pages are never evicted. Bitmap pages are
 modified during commit-time free space update (tail refund, RPL segment
 allocation), and RPL segment pages are written as part of the commit-time
-RPL append. Spilling them would cause unnecessary re-dirtying.
+RPL append. Evicting them would cause unnecessary re-dirtying.
 
-**Note**: Page spilling only applies in pwrite mode. In writemap mode, dirty
+**Note**: Page eviction only applies in pwrite mode. In direct write mode, dirty
 pages live in the mmap (backed by the OS page cache) and the OS handles
-eviction transparently. The `MaxDirtyPages` option and spilling logic are
-ignored when `WriteMap` is true.
+eviction transparently. The `MaxDirtyPages` option and eviction logic are
+ignored when `DirectWrite` is true.
 
 ## Copy-on-Write (CoW) Transaction Model
 
@@ -1367,36 +1367,37 @@ ignored when `WriteMap` is true.
    - Traverse the B+tree from root to leaf.
    - Copy each page along the path (CoW — never modify in place).
    - Allocate new pages via `pageAlloc()` (loose pages → bitmap →
-     RPL reclamation → slow reader check → file extension).
+      RPL reclamation → lagging reader check → file extension).
+
    - In **pwrite mode**: modified pages are held in the anonymous mmap slab
-     (with clock reference bits for spill priority). If the dirty page count
-     exceeds `MaxDirtyPages`, spill cold dirty pages to disk via `pwrite()`
-     (see Page Spilling).
-   - In **writemap mode**: modifications happen directly in the mmap. The
-     dirty set tracks page IDs only (no heap copies, no spilling).
+     (with clock reference bits for eviction priority). If the dirty page count
+      exceeds `MaxDirtyPages`, evict cold dirty pages to disk via `pwrite()`
+      (see Page Eviction).
+   - In **direct write mode**: modifications happen directly in the mmap. The
+      dirty set tracks page IDs only (no heap copies, no eviction).
    - Old pages are tracked: pages from previous transactions go to
      `tx.retiredPages`; pages dirtied then freed in this transaction become
      loose pages in `tx.loosePages`.
 4. Commit-time free space update:
    a. Perform tail page refund: check the bitmap for free pages at the end of
-      the file, clear those bits, decrement `FirstUnallocated`.
+      the file, clear those bits, decrement `HighWaterMark`.
    b. Move remaining loose pages into `tx.retiredPages`.
    c. Append all `tx.retiredPages` to the RPL (allocating new segment pages
       from the bitmap if needed — bounded, non-recursive).
    d. Update `NumFreePages`, `RPLHeadPage`, `RPLTailPage`, `RPLEntryCount`.
 5. Flush dirty data pages to stable storage (see Dirty Page Tracking for
    commit-time write ordering):
-   - **pwrite mode**: sort `tx.dirtyPages` keys, write non-spilled dirty
+   - **pwrite mode**: sort `tx.dirtyPages` keys, write non-evicted dirty
      pages via `pwrite()` in page-ID order.
-   - **writemap mode**: no explicit write needed (pages are already in the mmap).
+   - **direct write mode**: no explicit write needed (pages are already in the mmap).
     - `fdatasync()` if `SyncMode` is `SyncDurable` or `SyncDataOnly`. Skipped for
       `SyncLazy` and `SyncUnsafe`.
 6. Update the inactive meta page with new root pointers, new TxnID, updated
-   `FirstUnallocated`, and checksum. Written via `pwrite()` (pwrite mode) or
-   directly in the mmap (writemap mode).
+   `HighWaterMark`, and checksum. Written via `pwrite()` (pwrite mode) or
+   directly in the mmap (direct write mode).
 7. `fdatasync()` the meta page if `SyncMode` is `SyncDurable`. Skipped for all
    other modes. This is the **atomic commit point**.
-8. If the OS file size exceeds `FirstUnallocated` by more than
+8. If the OS file size exceeds `HighWaterMark` by more than
    `ShrinkThreshold`, truncate the file via `ftruncate()`. This happens
    after the commit point — a crash before truncation leaves the file
    larger than necessary but consistent. The next commit will retry.
@@ -1920,7 +1921,7 @@ the anonymous mmap slab and only written at commit time. If the writer crashes b
 commit, no bitmap modifications reach disk — the on-disk bitmap is fully
 consistent with the previous meta page. No leaked pages.
 
-In **writemap mode**, bitmap modifications happen directly in the mmap and
+In **direct write mode**, bitmap modifications happen directly in the mmap and
 the OS may flush them to disk at any time. If the writer crashes, some
 bitmap bits may have been cleared (pages allocated) for pages that were
 never committed to any tree. These pages are "leaked" — the bitmap says
@@ -2076,11 +2077,11 @@ minimum active TxnID. Any RPL entries with TxnID < min_active are safe to
 reclaim — their bits are set in the allocation bitmap, making them available
 for allocation.
 
-### Slow Reader Handling
+### Lagging Reader Handling
 
 A single long-lived reader prevents all RPL reclamation for transactions
 newer than its snapshot, causing unbounded file growth. To address this, the
-application can register a `SlowReader` callback via `Options` (see API
+application can register a `LaggingReader` callback via `Options` (see API
 Surface) that is invoked when a reader is blocking page allocation.
 
 The callback is invoked from `pageAlloc()` when:
@@ -2090,9 +2091,9 @@ The callback is invoked from `pageAlloc()` when:
 3. A reader in the reader table is blocking reclamation.
 
 The callback receives information about the lagging reader and returns an
-action. `SlowReaderWait` causes `pageAlloc()` to refresh the reader table
+action. `LaggingReaderWait` causes `pageAlloc()` to refresh the reader table
 and retry (the reader may have released its slot in the meantime).
-`SlowReaderAbort` causes `pageAlloc()` to return `ErrDBFull`.
+`LaggingReaderAbort` causes `pageAlloc()` to return `ErrDBFull`.
 
 The callback is invoked at most once per `pageAlloc()` call to avoid busy
 loops. The application can use the callback to log warnings, send alerts,
@@ -2101,7 +2102,7 @@ or take corrective action (e.g., killing a stuck process identified by PID).
 ## mmap Strategy
 
 The database supports two write modes: **pwrite mode** (default) and
-**writemap mode** (`Options.WriteMap = true`). Both share the same read path
+**direct write mode** (`Options.DirectWrite = true`). Both share the same read path
 and mmap resizing strategy. The mode is chosen at `Open()` time and applies
 to all write transactions for the lifetime of the `DB` handle.
 
@@ -2112,7 +2113,7 @@ All processes mmap the data file with at least:
 MAP_SHARED | PROT_READ
 ```
 
-In writemap mode the mapping adds `PROT_WRITE` (see below).
+In direct write mode the mapping adds `PROT_WRITE` (see below).
 Reads go directly through the mmap. No system calls, no copies. The OS page
 cache serves the data.
 
@@ -2128,11 +2129,11 @@ The writer does NOT write through the mmap. Instead:
 This mode provides **write isolation**: a stray pointer or buffer overrun in
 user code cannot corrupt the on-disk database because the data file mmap is
 read-only. The anonymous slab is separate from both the Go heap and the
-data file mmap. Page spilling applies in this mode (see Page Spilling).
+data file mmap. Page eviction applies in this mode (see Page Eviction).
 
-### Write Path: Writemap Mode
+### Write Path: Direct Write Mode
 
-When `Options.WriteMap` is true, the data file is mapped with:
+When `Options.DirectWrite` is true, the data file is mapped with:
 ```
 MAP_SHARED | PROT_READ | PROT_WRITE
 ```
@@ -2161,8 +2162,8 @@ The writer modifies pages directly in the mmap:
   committed to any reachable structure. These "leaked" pages waste space
   but do not affect tree consistency. Recoverable via `Check()` or
   `CopyTo(compact=true)`. See Stale Writer Recovery for details.
-- **No page spilling**: since pages are already in the mmap (backed by the OS
-  page cache), spilling is unnecessary and does not apply. The OS handles
+- **No page eviction**: since pages are already in the mmap (backed by the OS
+  page cache), eviction is unnecessary and does not apply. The OS handles
   eviction of mmap'd pages to disk transparently.
 - **Dirty page tracking**: the writer still tracks which pages were modified
   (for the free space management and CoW bookkeeping), but the dirty set stores page IDs
@@ -2178,7 +2179,7 @@ The mmap region is sized to `MaxSize` (the maximum database size in pages).
 This over-allocates virtual address space — only the file-backed portion is
 usable, but the mapping does not need to change as the file grows or shrinks.
 The unmapped region beyond the file size will SIGBUS if accessed, so readers
-must check `FirstUnallocated` from the meta page.
+must check `HighWaterMark` from the meta page.
 
 **Note**: `MAP_SHARED` file-backed mappings are not charged against Linux
 `vm.overcommit_memory` accounting — the file is the backing store, not swap.
@@ -2189,9 +2190,9 @@ reservations regardless of mapping type. On most default configurations
 
 ### Prefaulting (Linux 5.14+)
 
-When `Options.Prefault` is true, the database calls
+When `Options.PreloadPages` is true, the database calls
 `madvise(MADV_POPULATE_READ)` on the file-backed portion of the mmap
-(pages 0 through `FirstUnallocated - 1`) at open time. This pre-faults
+(pages 0 through `HighWaterMark - 1`) at open time. This pre-faults
 all pages into the OS page cache, eliminating page faults on first access.
 
 Benefits:
@@ -2210,7 +2211,7 @@ are faulted on demand as usual.
 Prefaulting is also performed internally during `CopyTo()` on the source
 database's mmap, since the copy reads the entire file sequentially.
 
-The `Prefault` option defaults to false — most workloads benefit from
+The `PreloadPages` option defaults to false — most workloads benefit from
 demand paging where only accessed pages enter the page cache.
 
 ### Huge Pages (Linux)
@@ -2238,7 +2239,7 @@ the madvise call has no effect.
 
 ### Read Transaction Cooldown (Linux 5.4+)
 
-When `Options.ColdAdvise` is true, closing a read transaction calls
+When `Options.ReclaimOnClose` is true, closing a read transaction calls
 `madvise(MADV_COLD)` on the mmap region that the transaction accessed.
 This hints the kernel that the pages are no longer actively used and may
 be reclaimed from the page cache under memory pressure.
@@ -2253,7 +2254,7 @@ transaction (lightweight — just two atomic min/max updates per page read)
 and issues a single `madvise(MADV_COLD, min*PageSize, (max-min+1)*PageSize)`
 on close.
 
-The `ColdAdvise` option defaults to false. On non-Linux platforms or kernels
+The `ReclaimOnClose` option defaults to false. On non-Linux platforms or kernels
 older than 5.4, the madvise call is silently ignored.
 
 ## Durability Modes
@@ -2276,7 +2277,7 @@ and how much data may be lost on a crash.
 ### Checkpoints
 
 In `SyncLazy` mode, a commit writes data and meta pages to their on-disk
-locations (via `pwrite()` in pwrite mode, or directly in the mmap in writemap
+locations (via `pwrite()` in pwrite mode, or directly in the mmap in direct write
 mode) but skips all `fdatasync()` calls. The OS page cache holds the writes,
 which will eventually reach disk, but the order is not guaranteed.
 
@@ -2419,7 +2420,7 @@ write ordering guarantees as the pwrite path.
   seccomp policy), or `ENOMEM`. The fallback check happens once at
   `Open()` time, making it completely invisible to callers.
 
-- **writemap mode**: `io_uring` does not apply in writemap mode — dirty
+- **direct write mode**: `io_uring` does not apply in direct write mode — dirty
   pages are already in the mmap and commit uses `fdatasync()` or `msync()`
   directly. The io_uring path is pwrite mode only.
 
@@ -2469,7 +2470,7 @@ file grows and shrinks.
 | Lower bound | `MinSize` | Minimum file size in pages. File never shrinks below this. | `2 + BitmapPages` (meta + bitmap) |
 | Upper bound | `MaxSize` | Maximum file size in pages. Determines mmap reservation and bitmap size. **Immutable after creation.** | 256GB / PageSize |
 | Growth step | `GrowStep` | Number of pages to grow by when extending the file. | 65536 pages (256MB at 4KB pages) |
-| Shrink threshold | `ShrinkThreshold` | Shrink the file when `fileSize - FirstUnallocated > threshold`. | 131072 pages (512MB at 4KB pages) |
+| Shrink threshold | `ShrinkThreshold` | Shrink the file when `fileSize - HighWaterMark > threshold`. | 131072 pages (512MB at 4KB pages) |
 
 File format is set at database creation time via `Options` and persisted in the
 meta page. `MinSize`, `GrowStep`, and `ShrinkThreshold` can be modified
@@ -2482,7 +2483,7 @@ fixed region of pages (starting at page 2) whose size is determined by
 would require expanding the bitmap region, which would shift all data page
 offsets — every page ID in every B+tree, RPL segment, and keyspace descriptor
 would become invalid. Decreasing `MaxSize` below the current
-`FirstUnallocated` would orphan allocated pages. Neither operation is
+`HighWaterMark` would orphan allocated pages. Neither operation is
 feasible without a full database rebuild.
 
 To change `MaxSize`, use `CopyTo(path, compact)` to create a new database
@@ -2492,7 +2493,7 @@ with different `Options.FileFormat.MaxSize`, then replace the original file.
 ### File Growth
 
 When `pageAlloc()` needs to extend the file:
-1. Calculate new size: `alignUp(FirstUnallocated + needed, GrowStep)`.
+1. Calculate new size: `alignUp(HighWaterMark + needed, GrowStep)`.
 2. Clamp to `MaxSize`. If the new size would exceed `MaxSize`, return
    `ErrDBFull`.
 3. Extend the file via `ftruncate()`. The existing mmap (which reserves up to
@@ -2501,12 +2502,12 @@ When `pageAlloc()` needs to extend the file:
 ### File Shrinkage
 
 After the commit point (step 7 of the write transaction), if the OS file size
-exceeds `FirstUnallocated` by more than `ShrinkThreshold`:
-1. Calculate new size: `alignUp(FirstUnallocated, GrowStep)`.
+exceeds `HighWaterMark` by more than `ShrinkThreshold`:
+1. Calculate new size: `alignUp(HighWaterMark, GrowStep)`.
 2. Clamp to `MinSize`.
 3. Truncate the file via `ftruncate()`. The mmap reservation remains at
    `MaxSize` — the truncated region becomes unmapped (SIGBUS on access),
-   which is safe because `FirstUnallocated` in the meta page prevents any
+   which is safe because `HighWaterMark` in the meta page prevents any
    reader from accessing those pages.
 
 File shrinkage is automatic and zero-overhead — it happens as a natural
@@ -2572,15 +2573,15 @@ comparison and is safe for concurrent use.
 // Sentinel errors.
 var (
     ErrNotFound           = errors.New("gmdb: key not found")
-    ErrKeyExist           = errors.New("gmdb: key already exists")
+    ErrKeyExists          = errors.New("gmdb: key already exists")
     ErrDBFull             = errors.New("gmdb: database full (MaxSize reached)")
-    ErrTxnFull            = errors.New("gmdb: transaction too large")
+    ErrTxTooLarge         = errors.New("gmdb: transaction too large")
     ErrReadersFull        = errors.New("gmdb: no reader slots available")
     ErrKeyTooLarge        = errors.New("gmdb: key exceeds maximum size")
     ErrCorrupted          = errors.New("gmdb: database corrupted")
     ErrVersionMismatch    = errors.New("gmdb: format version mismatch")
     ErrReadOnly           = errors.New("gmdb: write operation on read-only transaction")
-    ErrTxnDone            = errors.New("gmdb: transaction already committed or rolled back")
+    ErrTxClosed           = errors.New("gmdb: transaction already committed or rolled back")
     ErrCursorUnpositioned = errors.New("gmdb: cursor not positioned")
     ErrIncompatibleFlags  = errors.New("gmdb: keyspace flags do not match existing keyspace")
     ErrDupSizeFixed       = errors.New("gmdb: value size does not match fixed duplicate size")
@@ -2667,18 +2668,18 @@ type Options struct {
     // is false. Default: false.
     AllowSyncUnsafe bool
 
-    // WriteMap enables writemap mode. The data file is mapped read-write
+    // DirectWrite enables direct write mode. The data file is mapped read-write
     // and dirty pages are modified directly in the mmap instead of being
     // allocated from an anonymous mmap slab and written via pwrite().
     // Significantly faster for write-heavy workloads but offers no
     // protection against stray pointer bugs corrupting the database.
     // Default: false.
-    WriteMap bool
+    DirectWrite bool
 
     // UseIOURing enables the io_uring commit path (Linux 5.6+ only).
     // Submits all commit I/O as a single io_uring batch instead of
     // individual pwrite() + fdatasync() syscalls. Falls back to pwrite
-    // silently if io_uring is unavailable. Ignored in writemap mode.
+    // silently if io_uring is unavailable. Ignored in direct write mode.
     // Default: false.
     UseIOURing bool
 
@@ -2688,8 +2689,8 @@ type Options struct {
     MaxReaders int
 
     // MaxDirtyPages is the maximum number of dirty pages held in memory
-    // before spilling to disk. Default: 65536. Ignored in writemap mode
-    // (spilling does not apply — see Page Spilling).
+    // before evicting to disk. Default: 65536. Ignored in direct write mode
+    // (eviction does not apply — see Page Eviction).
     MaxDirtyPages int
 
     // MergeThreshold is the B+tree page fill percentage below which a
@@ -2699,10 +2700,10 @@ type Options struct {
     // Default: 25 (merge when page is less than 25% full).
     MergeThreshold int
 
-    // SlowReader is called when a long-lived reader is blocking RPL
+    // LaggingReader is called when a long-lived reader is blocking RPL
     // reclamation during page allocation. If nil, pageAlloc() falls
     // through to file extension when reclamation is blocked.
-    SlowReader func(info SlowReaderInfo) SlowReaderAction
+    LaggingReader func(info LaggingReaderInfo) LaggingReaderAction
 
     // MaxBatchSize is the maximum number of Batch() calls to collect
     // before executing them in a single transaction. Default: 1000.
@@ -2723,11 +2724,11 @@ type Options struct {
     // FileMode for newly created files. Default: 0644.
     FileMode os.FileMode
 
-    // Prefault pre-faults the mmap into the page cache at open time
+    // PreloadPages pre-faults the mmap into the page cache at open time
     // via madvise(MADV_POPULATE_READ) (Linux 5.14+). Eliminates page
     // faults on first access at the cost of slower Open(). Ignored if
     // the kernel does not support MADV_POPULATE_READ. Default: false.
-    Prefault bool
+    PreloadPages bool
 
     // HugePages enables transparent huge page support via
     // madvise(MADV_HUGEPAGE) on the data file mmap (Linux only).
@@ -2737,13 +2738,13 @@ type Options struct {
     // (2MB huge pages). Ignored on non-Linux platforms. Default: false.
     HugePages bool
 
-    // ColdAdvise calls madvise(MADV_COLD) on the mmap region accessed
+    // ReclaimOnClose calls madvise(MADV_COLD) on the mmap region accessed
     // by a read transaction when the transaction closes (Linux 5.4+).
     // This hints the kernel to reclaim page cache for pages that are
     // no longer hot, reducing memory pressure after large scans.
     // Useful for batch readers that scan the entire database. Ignored
     // on non-Linux platforms or older kernels. Default: false.
-    ColdAdvise bool
+    ReclaimOnClose bool
 
     // ReadOnly opens the database in read-only mode.
     ReadOnly bool
@@ -2777,20 +2778,20 @@ type FileFormat struct {
     ShrinkThreshold uint64
 }
 
-// SlowReaderInfo describes a reader that is blocking RPL reclamation.
-type SlowReaderInfo struct {
-    PID       int    // process ID of the slow reader
+// LaggingReaderInfo describes a reader that is blocking RPL reclamation.
+type LaggingReaderInfo struct {
+    PID       int    // process ID of the lagging reader
     TxnID     uint64 // transaction ID the reader is holding
     Lag       uint64 // number of transactions behind current
     HeldPages uint64 // estimated number of pages held unreclaimable
 }
 
-// SlowReaderAction determines how pageAlloc responds to a slow reader.
-type SlowReaderAction int
+// LaggingReaderAction determines how pageAlloc responds to a lagging reader.
+type LaggingReaderAction int
 
 const (
-    SlowReaderWait  SlowReaderAction = iota // retry, reader may release
-    SlowReaderAbort                         // abort with ErrDBFull
+    LaggingReaderWait  LaggingReaderAction = iota // retry, reader may release
+    LaggingReaderAbort                            // abort with ErrDBFull
 )
 
 // DB is a handle to an open database.
@@ -2888,7 +2889,7 @@ const (
 func (tx *Tx) OpenKeyspace(name []byte) (*Keyspace, error)
 
 // CreateKeyspace creates a new named keyspace within this transaction.
-// Returns ErrKeyExist if the keyspace already exists. Flags are set at
+// Returns ErrKeyExists if the keyspace already exists. Flags are set at
 // creation time and immutable after. fixedSize is only used when flags
 // includes KfDupFixed — it sets the fixed duplicate value size in bytes.
 // Ignored otherwise.
@@ -3035,7 +3036,7 @@ type DBStats struct {
     FileSize     uint64 // current data file size in bytes
     MinSize     uint64 // minimum file size in bytes
     MaxSize     uint64 // maximum file size in bytes
-    FirstUnalloc uint64 // first unallocated page ID (high-water mark)
+    HighWaterMark uint64 // first unallocated page ID (high-water mark)
 
     // Readers
     ActiveReaders int // currently occupied reader slots
@@ -3074,7 +3075,7 @@ type CheckIssue struct {
 //   - Page accounting (all pages accounted for: data + bitmap + RPL + free + unallocated)
 //   - Leaked pages (bitmap bit clear but page not reachable from any structure —
 //     reported as CheckWarning, not CheckError, since tree integrity is unaffected;
-//     common after writemap crash, recoverable via CopyTo(compact=true))
+//     common after direct write crash, recoverable via CopyTo(compact=true))
 //   - Leaf page prefix compression integrity (restart table offsets within page
 //     bounds, restart entries at correct positions, delta chain consistency within
 //     each restart group, reconstructed keys in sorted order)
@@ -3121,7 +3122,7 @@ type TxStats struct {
     DirtyPages     uint64 // pages dirtied (CoW copies)
     LoosePages     uint64 // pages dirtied then freed in this txn
     ReclaimedPages uint64 // pages reclaimed from RPL into bitmap
-    SpilledPages   uint64 // pages spilled to disk mid-transaction
+    EvictedPages   uint64 // pages evicted to disk mid-transaction
     WrittenPages   uint64 // pages written at commit time
 
     // B+tree operations
@@ -3268,21 +3269,21 @@ organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding (8-byte header: Type uint8, Flags uint8, Count uint16, Overflow uint32 — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. DUPSORT subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including file format fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
+| `page.go` | Page header encoding/decoding (8-byte header: Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. DUPSORT subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including file format fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
 | `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. DUPSORT bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs, key reconstruction buffer (`keyBuf []byte`) for incremental forward decoding, restart group cache (`[16][]byte`) for reverse traversal. DUPSORT: subpage management (inline sorted list), nested B+tree promotion/demotion, dup cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
 | `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
-| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → slow reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |
-| `spill.go` | Dirty page spilling to disk mid-transaction (pwrite mode only, no-op in writemap mode). Clock-based eviction via `tx.clockRing` circular buffer with reference bit sweep and tombstones for spilled entries. Spilled pages moved to `tx.spilledPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
+| `freelist.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → lagging reader check → file extension. Tail page refund for auto-compaction. Commit-time update: append retired pages to RPL via new segment pages allocated from bitmap (bounded, non-recursive, no old-head CoW). |
+| `evict.go` | Dirty page eviction to disk mid-transaction (pwrite mode only, no-op in direct write mode). Clock-based eviction via `tx.clockRing` circular buffer with reference bit sweep and tombstones for evicted entries. Evicted pages moved to `tx.evictedPages` map for re-dirtying detection. Adjacent page grouping for efficient I/O. |
 | `fileformat.go` | File format management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetFileFormat()` for runtime modification of `MinSize`, `GrowStep`, `ShrinkThreshold` (rejects `MaxSize` changes — bitmap region is fixed at creation). |
-| `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to MaxSize). Supports both read-only (pwrite mode) and read-write (writemap mode) mappings. |
-| `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` prefaulting (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
+| `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to MaxSize). Supports both read-only (pwrite mode) and read-write (direct write mode) mappings. |
+| `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` page preloading (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
 | `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
 | `iouring_linux.go` | io_uring commit path (Linux 5.6+). Ring initialization with `IORING_REGISTER_FILES` for fixed fd. SQE batch construction (data writes + linked fsync + meta write + linked fsync). `IORING_OP_FTRUNCATE` for file format changes (Linux 6.9+). CQE completion handling. Registered buffer management with `RLIMIT_MEMLOCK` checking. Fallback detection. |
-| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime, context-aware, zero goroutine accumulation). Stale writer recovery (PID liveness + start time comparison). Reader table: hint-based scan+CAS slot acquire (stores PID + ProcessStartTime), atomic store release, stale reader detection via PID liveness + start time comparison (PID reuse safe). Oldest-reader query for RPL reclamation. Slow reader detection and callback invocation. |
+| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime, context-aware, zero goroutine accumulation). Stale writer recovery (PID liveness + start time comparison). Reader table: hint-based scan+CAS slot acquire (stores PID + ProcessStartTime), atomic store release, stale reader detection via PID liveness + start time comparison (PID reuse safe). Oldest-reader query for RPL reclamation. Lagging reader detection and callback invocation. |
 | `process_linux.go` | `processStartTime(pid) (uint64, error)`: reads `/proc/[pid]/stat` field 22 (`starttime`, clock ticks since boot). Pure Go, no cgo. |
 | `process_darwin.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
 | `process_freebsd.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.ki_start`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in writemap), clock ring (`[]uint64` circular buffer + hand index, pwrite only), spilled page map, CoW operations, page lookup (dirty → spilled → mmap), spill trigger (pwrite only), commit (`slices.Sorted(maps.Keys(...))` + sequential pwrite/pwritev2 + RPL append + bitmap update + meta swap + sync per SyncMode + file format shrink), rollback. Dirty page buffer allocation from anonymous mmap slab (pwrite mode). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]*dirtyPage` in pwrite, `map[uint64]struct{}` in direct write), clock ring (`[]uint64` circular buffer + hand index, pwrite only), evicted page map, CoW operations, page lookup (dirty → evicted → mmap), eviction trigger (pwrite only), commit (`slices.Sorted(maps.Keys(...))` + sequential pwrite/pwritev2 + RPL append + bitmap update + meta swap + sync per SyncMode + file format shrink), rollback. Dirty page buffer allocation from anonymous mmap slab (pwrite mode). Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
 | `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap, lock file, file format, write mode selection, AllowSyncUnsafe validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, rollback+retry on failure. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Checkpoint(). Check(). CopyTo(). |
 | `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with `Encoder` calls. |
 | `errors.go` | Sentinel error definitions. |
@@ -3439,7 +3440,7 @@ pages, the overhead is measurable but bounded by memory bandwidth (the
 CRC computation runs at memory speed with hardware acceleration).
 
 Pages in `tx.dirtyPages` (pwrite mode) bypass verification — they are
-in-memory copies that have not been written to disk. Spilled pages that
+in-memory copies that have not been written to disk. Evicted pages that
 are re-read from the mmap are verified on re-read.
 
 #### Computation (Write Path)
@@ -3448,7 +3449,7 @@ When checksums are enabled, the checksum is computed before writing:
 
 - **pwrite mode**: CRC32C is computed on the dirty page buffer before
   `pwrite()`. The footer bytes are written as part of the page.
-- **writemap mode**: CRC32C is computed on the mmap page content after
+- **direct write mode**: CRC32C is computed on the mmap page content after
   all modifications are complete, before the commit-time sync. The footer
   is written directly into the mmap.
 
@@ -3466,7 +3467,7 @@ When checksums are enabled, the checksum is computed before writing:
   computed on the same buffer that is written — if the buffer is corrupt,
   the checksum matches the corrupt data).
 - Corruption introduced by the application via stray pointers in
-  writemap mode (the checksum is computed on the already-corrupted page).
+  direct write mode (the checksum is computed on the already-corrupted page).
 
 #### Default
 
@@ -3498,7 +3499,7 @@ run on storage without integrity guarantees.
   or recycled PID (via start time comparison), cleans up reader slots from
   the crashed process, and proceeds — CoW guarantees the tree is consistent.
   In pwrite mode, no bitmap corruption occurs (dirty pages never reached
-  disk). In writemap mode, some bitmap bits may leak (allocated but
+   disk). In direct write mode, some bitmap bits may leak (allocated but
   uncommitted pages); recoverable via `Check()` or `CopyTo(compact=true)`.
 - **Silent bitrot detection**: When `PageChecksum` is enabled, every data page
   read is verified against its CRC32C footer. Corruption is detected at read
