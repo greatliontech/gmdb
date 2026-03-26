@@ -83,13 +83,20 @@ func (t *Tree) insert(pageID uint64, e page.LeafEntry) (
 	}
 
 	// CoW this branch.
-	newPageID, err = t.cowPage(pageID)
+	var fresh bool
+	newPageID, fresh, err = t.cowPageFresh(pageID)
 	if err != nil {
 		return 0, nil, 0, page.LeafEntry{}, false, err
 	}
 
 	// Read cells and update the child pointer.
-	ptr0, cells := t.collectBranchCells(newPageID)
+	var ptr0 uint64
+	var cells []branchCell
+	if fresh {
+		ptr0, cells = t.collectBranchCellsBorrowed(pageID)
+	} else {
+		ptr0, cells = t.collectBranchCells(newPageID)
+	}
 	if childIdx == -1 {
 		ptr0 = newChildID
 	} else {
@@ -123,19 +130,32 @@ func (t *Tree) insertIntoLeaf(pageID uint64, e page.LeafEntry) (
 	newPageID uint64, splitSep []byte, splitRight uint64,
 	old page.LeafEntry, replaced bool, err error,
 ) {
-	newPageID, err = t.cowPage(pageID)
+	newPageID, fresh, err := t.cowPageFresh(pageID)
 	if err != nil {
 		return 0, nil, 0, page.LeafEntry{}, false, err
 	}
 
-	entries := t.collectEntries(newPageID)
+	// When freshly CoW'd, read from the retired original page — values
+	// borrow from its buffer (safe: retired pages are never overwritten
+	// this txn). When already CoW'd, rebuild will overwrite the page
+	// in place so all slices must be owned.
+	var entries []page.LeafEntry
+	if fresh {
+		entries = t.collectEntriesBorrowed(pageID)
+	} else {
+		entries = t.collectEntries(newPageID)
+	}
 
 	idx, found := findKey(entries, e.Key)
 	if found {
-		old = entries[idx]
+		if fresh {
+			old = cloneEntry(entries[idx])
+		} else {
+			old = entries[idx] // Already fully cloned by collectEntries.
+		}
 		replaced = true
 		entries[idx] = e
-		// Ensure the replaced entry's key is the cloned version from collectEntries.
+		// Ensure the replaced entry's key is the cloned version.
 		entries[idx].Key = old.Key
 	} else {
 		entries = slices.Insert(entries, idx, e)

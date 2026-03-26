@@ -101,6 +101,35 @@ func BenchmarkGet(b *testing.B) {
 	}
 }
 
+// BenchmarkPutFreshTxn simulates real transaction patterns: each put hits
+// a leaf that hasn't been CoW'd in this transaction (Reset between ops).
+func BenchmarkPutFreshTxn(b *testing.B) {
+	tr := benchTree(b, 65536)
+	populateTree(b, tr, 10000, 20, 100)
+	root := tr.Root()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := range b.N {
+		tr.Reset(root)
+		key := fmt.Appendf(nil, "key:%08d", i%10000)
+		tr.Put(inlineEntry(key, []byte("new-value-that-is-about-100-bytes-long-to-match-the-original-value-size-in-the-tree-padding")))
+	}
+}
+
+// BenchmarkDeleteFreshTxn simulates single-delete transactions.
+func BenchmarkDeleteFreshTxn(b *testing.B) {
+	tr := benchTree(b, 65536)
+	populateTree(b, tr, 10000, 20, 100)
+	root := tr.Root()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := range b.N {
+		tr.Reset(root)
+		key := fmt.Appendf(nil, "key:%08d", i%10000)
+		tr.Delete(key)
+	}
+}
+
 func BenchmarkDelete(b *testing.B) {
 	tr := benchTree(b, 65536)
 	populateTree(b, tr, 50000, 20, 100)
@@ -173,17 +202,15 @@ func BenchmarkDeleteRange(b *testing.B) {
 			tr := benchTree(b, pages)
 			n := rangeSize * 3
 			populateTree(b, tr, n, 20, 100)
+			root := tr.Root()
+			// Pick a stable range in the middle of the key space.
+			start := fmt.Appendf(nil, "key:%08d", n/3)
+			end := fmt.Appendf(nil, "key:%08d", n/3+rangeSize)
 			b.ResetTimer()
 			b.ReportAllocs()
-			for i := range b.N {
-				// Each iteration re-creates the tree since DeleteRange mutates it.
-				b.StopTimer()
-				tr2 := benchTree(b, pages)
-				populateTree(b, tr2, n, 20, 100)
-				start := fmt.Appendf(nil, "key:%08d", (i*rangeSize)%n)
-				end := fmt.Appendf(nil, "key:%08d", (i*rangeSize+rangeSize)%n+rangeSize)
-				b.StartTimer()
-				tr2.DeleteRange(start, end)
+			for range b.N {
+				tr.Reset(root)
+				tr.DeleteRange(start, end)
 			}
 		})
 	}

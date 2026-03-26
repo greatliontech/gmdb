@@ -101,6 +101,24 @@ func (t *Tree) cowPage(pageID uint64) (uint64, error) {
 	return newID, nil
 }
 
+// cowPageFresh is like cowPage but skips copying the page content. The caller
+// must fully rebuild the new page (via rebuildLeaf/rebuildBranch). Returns the
+// new page ID and whether a fresh page was allocated (true) or the page was
+// already CoW'd (false). When fresh is true, the original pageID is retired
+// but its buffer remains readable for the duration of this transaction.
+func (t *Tree) cowPageFresh(pageID uint64) (newID uint64, fresh bool, err error) {
+	if _, ok := t.cow[pageID]; ok {
+		return pageID, false, nil
+	}
+	id, ok := t.bm.FindFirstFree()
+	if !ok {
+		return 0, false, ErrNoSpace
+	}
+	t.cow[id] = struct{}{}
+	t.retired = append(t.retired, pageID)
+	return id, true, nil
+}
+
 // freePage releases a page that was allocated or CoW'd in this transaction.
 // The page is returned to the bitmap as a loose page. Panics if the page
 // was not CoW'd in this transaction — the caller must never free a page

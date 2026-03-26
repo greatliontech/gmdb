@@ -36,6 +36,19 @@ func computeSeparator(left, right []byte) []byte {
 // owned (cloned) keys and values. The returned entries are safe to use after
 // the page buffer is overwritten.
 func (t *Tree) collectEntries(pageID uint64) []page.LeafEntry {
+	return t.collectEntriesFrom(pageID, true)
+}
+
+// collectEntriesBorrowed reads all entries from a leaf page, cloning only
+// keys. Values/SubpageData are borrowed slices into the page buffer. The
+// caller must ensure the source page buffer is not overwritten while the
+// returned entries are in use (satisfied when reading from a retired page
+// after cowPageFresh).
+func (t *Tree) collectEntriesBorrowed(pageID uint64) []page.LeafEntry {
+	return t.collectEntriesFrom(pageID, false)
+}
+
+func (t *Tree) collectEntriesFrom(pageID uint64, cloneValues bool) []page.LeafEntry {
 	buf := t.pageSlice(pageID)
 	lr := page.NewLeafReader(buf, t.cfg)
 	count := lr.Count()
@@ -43,13 +56,15 @@ func (t *Tree) collectEntries(pageID uint64) []page.LeafEntry {
 	var keyBuf []byte
 	keyBuf = lr.IterEntries(keyBuf, func(_ int, e page.LeafEntry) bool {
 		e.Key = bytes.Clone(e.Key)
-		if e.CellFlags == 0 && e.Value != nil {
-			e.Value = bytes.Clone(e.Value)
-		}
-		if e.CellFlags&page.CellFlagMultiValue != 0 &&
-			e.CellFlags&page.CellFlagNestedTree == 0 &&
-			e.SubpageData != nil {
-			e.SubpageData = bytes.Clone(e.SubpageData)
+		if cloneValues {
+			if e.CellFlags == 0 && e.Value != nil {
+				e.Value = bytes.Clone(e.Value)
+			}
+			if e.CellFlags&page.CellFlagMultiValue != 0 &&
+				e.CellFlags&page.CellFlagNestedTree == 0 &&
+				e.SubpageData != nil {
+				e.SubpageData = bytes.Clone(e.SubpageData)
+			}
 		}
 		entries = append(entries, e)
 		return true
@@ -61,14 +76,29 @@ func (t *Tree) collectEntries(pageID uint64) []page.LeafEntry {
 // collectBranchCells reads Ptr0 and all cells from a branch page,
 // returning owned (cloned) keys.
 func (t *Tree) collectBranchCells(pageID uint64) (ptr0 uint64, cells []branchCell) {
+	return t.collectBranchCellsFrom(pageID, true)
+}
+
+// collectBranchCellsBorrowed reads Ptr0 and all cells from a branch page.
+// Keys are borrowed slices into the page buffer. The caller must ensure the
+// source page buffer is not overwritten while the returned cells are in use.
+func (t *Tree) collectBranchCellsBorrowed(pageID uint64) (ptr0 uint64, cells []branchCell) {
+	return t.collectBranchCellsFrom(pageID, false)
+}
+
+func (t *Tree) collectBranchCellsFrom(pageID uint64, cloneKeys bool) (ptr0 uint64, cells []branchCell) {
 	buf := t.pageSlice(pageID)
 	br := page.NewBranchReader(buf)
 	ptr0 = br.Ptr0()
 	count := br.Count()
 	cells = make([]branchCell, count)
 	for i := range count {
+		key := br.Key(i)
+		if cloneKeys {
+			key = bytes.Clone(key)
+		}
 		cells[i] = branchCell{
-			key:      bytes.Clone(br.Key(i)),
+			key:      key,
 			childPtr: br.ChildPtr(i),
 		}
 	}

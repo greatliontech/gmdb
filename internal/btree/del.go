@@ -58,12 +58,19 @@ func (t *Tree) remove(pageID uint64, key []byte) (
 		return pageID, old, true, false, nil
 	}
 
-	newPageID, err = t.cowPage(pageID)
+	var fresh bool
+	newPageID, fresh, err = t.cowPageFresh(pageID)
 	if err != nil {
 		return 0, page.LeafEntry{}, false, false, err
 	}
 
-	ptr0, cells := t.collectBranchCells(newPageID)
+	var ptr0 uint64
+	var cells []branchCell
+	if fresh {
+		ptr0, cells = t.collectBranchCellsBorrowed(pageID)
+	} else {
+		ptr0, cells = t.collectBranchCells(newPageID)
+	}
 	if childIdx == -1 {
 		ptr0 = newChildID
 	} else {
@@ -96,12 +103,17 @@ func (t *Tree) removeFromLeaf(pageID uint64, key []byte) (
 
 	old = cloneEntry(entry)
 
-	newPageID, err = t.cowPage(pageID)
+	newPageID, fresh, err := t.cowPageFresh(pageID)
 	if err != nil {
 		return 0, page.LeafEntry{}, false, false, err
 	}
 
-	entries := t.collectEntries(newPageID)
+	var entries []page.LeafEntry
+	if fresh {
+		entries = t.collectEntriesBorrowed(pageID)
+	} else {
+		entries = t.collectEntries(newPageID)
+	}
 	entries = slices.Delete(entries, searchIdx, searchIdx+1)
 
 	if len(entries) == 0 {

@@ -74,12 +74,17 @@ func (t *Tree) deleteRangeLeaf(pageID uint64, start, end []byte) (uint64, int, e
 		return pageID, 0, nil // empty range in this leaf
 	}
 
-	newPageID, err := t.cowPage(pageID)
+	newPageID, fresh, err := t.cowPageFresh(pageID)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	entries := t.collectEntries(newPageID)
+	var entries []page.LeafEntry
+	if fresh {
+		entries = t.collectEntriesBorrowed(pageID)
+	} else {
+		entries = t.collectEntries(newPageID)
+	}
 	deleted := rightIdx - leftIdx + 1
 
 	for i := leftIdx; i <= rightIdx; i++ {
@@ -116,12 +121,18 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 	}
 
 	// CoW this branch.
-	newPageID, err := t.cowPage(pageID)
+	newPageID, fresh, err := t.cowPageFresh(pageID)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	ptr0, cells := t.collectBranchCells(newPageID)
+	var ptr0 uint64
+	var cells []branchCell
+	if fresh {
+		ptr0, cells = t.collectBranchCellsBorrowed(pageID)
+	} else {
+		ptr0, cells = t.collectBranchCells(newPageID)
+	}
 	totalDeleted := 0
 
 	// Process children from left to right.
