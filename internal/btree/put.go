@@ -76,6 +76,12 @@ func (t *Tree) insert(pageID uint64, e page.LeafEntry) (
 		return 0, nil, 0, page.LeafEntry{}, false, err
 	}
 
+	// No structural change — child page ID unchanged and no split.
+	// Skip CoW and rebuild of this branch and all ancestors.
+	if newChildID == childPtr && childSplitSep == nil {
+		return pageID, nil, 0, old, replaced, nil
+	}
+
 	// CoW this branch.
 	newPageID, err = t.cowPage(pageID)
 	if err != nil {

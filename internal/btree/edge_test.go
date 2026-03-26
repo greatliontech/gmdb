@@ -1207,3 +1207,291 @@ func TestCursorPrevFromFirstEntryMultiLeaf(t *testing.T) {
 		t.Error("cursor should not be valid after Prev past beginning")
 	}
 }
+
+// --- Insert early return when child unchanged ---
+
+func TestInsertEarlyReturnOnReplace(t *testing.T) {
+	// Replacing a value when the leaf is already CoW'd in this transaction
+	// should not CoW or rebuild ancestor branches.
+	tr := newTestTree(t, 256)
+	bigVal := bytes.Repeat([]byte("v"), 300)
+
+	// Insert enough entries to create a multi-level tree.
+	for i := range 60 {
+		_, _, err := tr.Put(inlineEntry(testKey(i), bigVal))
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	// First replace: CoWs the leaf and all ancestors.
+	_, replaced, err := tr.Put(inlineEntry(testKey(30), []byte("new-val-1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced {
+		t.Fatal("expected replaced=true")
+	}
+	cowAfterFirst := len(tr.CowPages())
+
+	// Second replace of the same key: leaf is already CoW'd, so the early
+	// return should fire — no additional pages CoW'd.
+	_, replaced, err = tr.Put(inlineEntry(testKey(30), []byte("new-val-2")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced {
+		t.Fatal("expected replaced=true")
+	}
+	cowAfterSecond := len(tr.CowPages())
+
+	if cowAfterSecond != cowAfterFirst {
+		t.Errorf("second replace CoW'd %d additional pages, want 0",
+			cowAfterSecond-cowAfterFirst)
+	}
+
+	// Verify the value was actually updated.
+	e, found := tr.Get(testKey(30))
+	if !found {
+		t.Fatal("key not found after replace")
+	}
+	if !bytes.Equal(e.Value, []byte("new-val-2")) {
+		t.Errorf("value = %q, want %q", e.Value, "new-val-2")
+	}
+}
+
+func TestInsertEarlyReturnDifferentKeys(t *testing.T) {
+	// Replacing two different keys that share a branch but have different
+	// leaves should CoW the branch once, then the early return fires for
+	// the second replace if the branch was already CoW'd.
+	tr := newTestTree(t, 256)
+	bigVal := bytes.Repeat([]byte("v"), 300)
+
+	for i := range 60 {
+		_, _, err := tr.Put(inlineEntry(testKey(i), bigVal))
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	// Replace key 10.
+	tr.Put(inlineEntry(testKey(10), []byte("x")))
+	cowAfterFirst := len(tr.CowPages())
+
+	// Replace key 10 again — same leaf, early return.
+	tr.Put(inlineEntry(testKey(10), []byte("y")))
+	if len(tr.CowPages()) != cowAfterFirst {
+		t.Errorf("same-leaf re-replace CoW'd extra pages")
+	}
+
+	// Verify both values correct.
+	e, _ := tr.Get(testKey(10))
+	if !bytes.Equal(e.Value, []byte("y")) {
+		t.Errorf("value = %q, want %q", e.Value, "y")
+	}
+}
+
+// --- DeleteRange boundary-only rebalance ---
+
+func TestDeleteRangeNoSpuriousRebalance(t *testing.T) {
+	// Build a tree with enough entries to have multiple branch children.
+	// Delete a thin range in the middle, verify non-boundary children
+	// are not CoW'd unnecessarily.
+	tr := newTestTree(t, 1024)
+	bigVal := bytes.Repeat([]byte("v"), 200)
+
+	n := 200
+	for i := range n {
+		_, _, err := tr.Put(inlineEntry(testKey(i), bigVal))
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	// Start a fresh transaction to reset CoW tracking.
+	root := tr.Root()
+	tr.Reset(root)
+
+	// Delete a range in the middle.
+	deleted, err := tr.DeleteRange(testKey(90), testKey(110))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 20 {
+		t.Errorf("deleted = %d, want 20", deleted)
+	}
+
+	// Verify all non-deleted keys are intact.
+	for i := range n {
+		if i >= 90 && i < 110 {
+			continue
+		}
+		_, found := tr.Get(testKey(i))
+		if !found {
+			t.Errorf("key %d not found after DeleteRange", i)
+		}
+	}
+	// Verify deleted keys are gone.
+	for i := 90; i < 110; i++ {
+		_, found := tr.Get(testKey(i))
+		if found {
+			t.Errorf("key %d still found after DeleteRange", i)
+		}
+	}
+}
+
+func TestDeleteRangeBranchChildFreeSpaceAccurate(t *testing.T) {
+	// Regression test: previously branch children used UsableSpace() as
+	// freeSpace estimate, making isUnderfull return true for every branch
+	// child. This test verifies that a DeleteRange leaving well-filled
+	// branch children does not trigger unnecessary rebalancing.
+	tr := newTestTree(t, 2048)
+	bigVal := bytes.Repeat([]byte("v"), 150)
+
+	// Build a tree deep enough to have branch children of branches.
+	n := 500
+	for i := range n {
+		_, _, err := tr.Put(inlineEntry(testKey(i), bigVal))
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	root := tr.Root()
+	tr.Reset(root)
+
+	// Delete a small range — boundary children should be checked,
+	// but well-filled non-boundary children should be skipped.
+	deleted, err := tr.DeleteRange(testKey(200), testKey(210))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 10 {
+		t.Errorf("deleted = %d, want 10", deleted)
+	}
+
+	// Verify tree integrity with a full scan.
+	c := tr.NewCursor()
+	var prev []byte
+	count := 0
+	for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		if prev != nil && bytes.Compare(prev, k) >= 0 {
+			t.Fatalf("keys out of order: %q >= %q", prev, k)
+		}
+		prev = bytes.Clone(k)
+		count++
+	}
+	if count != n-10 {
+		t.Errorf("cursor count = %d, want %d", count, n-10)
+	}
+}
+
+// --- canMerge with actual separator key ---
+
+func TestCanMergeWithSeparator(t *testing.T) {
+	// Build a tree, delete entries to trigger branch rebalance where
+	// canMerge is called with the real separator key. Verify correctness.
+	tr := newTestTree(t, 512)
+	bigVal := bytes.Repeat([]byte("v"), 300)
+
+	for i := range 80 {
+		_, _, err := tr.Put(inlineEntry(testKey(i), bigVal))
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	// Delete entries to make a child underfull and trigger rebalance.
+	for i := range 80 {
+		if i%4 != 0 {
+			continue
+		}
+		_, found, err := tr.Delete(testKey(i))
+		if err != nil {
+			t.Fatalf("Delete(%d): %v", i, err)
+		}
+		if !found {
+			t.Fatalf("Delete(%d): not found", i)
+		}
+	}
+
+	// Verify all remaining keys.
+	for i := range 80 {
+		if i%4 == 0 {
+			continue
+		}
+		e, found := tr.Get(testKey(i))
+		if !found {
+			t.Errorf("key %d not found", i)
+			continue
+		}
+		if !bytes.Equal(e.Value, bigVal) {
+			t.Errorf("key %d: value length = %d, want %d", i, len(e.Value), len(bigVal))
+		}
+	}
+}
+
+// --- Cursor group cache with DecodeGroup ---
+
+func TestCursorGroupCacheAcrossGroups(t *testing.T) {
+	// Verify that the cursor correctly populates group cache when scanning
+	// across restart group boundaries.
+	tr := newTestTree(t, 512)
+
+	// Insert 40 entries with small values so they all fit in one or two leaves.
+	// This gives us at least 2 restart groups (entries 0-15, 16-31, 32-39).
+	for i := range 40 {
+		_, _, err := tr.Put(inlineEntry(testKey(i), testVal(i)))
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	c := tr.NewCursor()
+	count := 0
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		wantKey := testKey(count)
+		wantVal := testVal(count)
+		if !bytes.Equal(k, wantKey) {
+			t.Errorf("entry %d: key = %q, want %q", count, k, wantKey)
+		}
+		if !bytes.Equal(v, wantVal) {
+			t.Errorf("entry %d: val = %q, want %q", count, v, wantVal)
+		}
+		count++
+	}
+	if count != 40 {
+		t.Errorf("scanned %d entries, want 40", count)
+	}
+}
+
+func TestCursorGroupCacheBackward(t *testing.T) {
+	// Scan backward across group boundaries to verify populateGroup handles
+	// reverse traversal (new group populated on each boundary crossing).
+	tr := newTestTree(t, 512)
+
+	for i := range 40 {
+		_, _, err := tr.Put(inlineEntry(testKey(i), testVal(i)))
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	c := tr.NewCursor()
+	count := 0
+	for k, v := c.Last(); k != nil; k, v = c.Prev() {
+		idx := 39 - count
+		wantKey := testKey(idx)
+		wantVal := testVal(idx)
+		if !bytes.Equal(k, wantKey) {
+			t.Errorf("entry %d (reverse): key = %q, want %q", count, k, wantKey)
+		}
+		if !bytes.Equal(v, wantVal) {
+			t.Errorf("entry %d (reverse): val = %q, want %q", count, v, wantVal)
+		}
+		count++
+	}
+	if count != 40 {
+		t.Errorf("scanned %d entries, want 40", count)
+	}
+}

@@ -130,13 +130,28 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 	// leftChildIdx and rightChildIdx are boundary children: recurse into them.
 
 	// Process left boundary child.
+	// When the range spans multiple children, the left boundary child needs
+	// everything >= start deleted — pass nil as end so its right spine is
+	// retired in bulk rather than recursed level by level.
 	leftChildPageID := childFromIndex(ptr0, cells, leftChildIdx)
-	newLeftChild, deleted, err := t.deleteRange(leftChildPageID, start, end)
+	leftEnd := end
+	if leftChildIdx != rightChildIdx {
+		leftEnd = nil
+	}
+	newLeftChild, deleted, err := t.deleteRange(leftChildPageID, start, leftEnd)
 	if err != nil {
 		return 0, 0, err
 	}
 	totalDeleted += deleted
 	ptr0, cells = updateChildInCells(ptr0, cells, leftChildIdx, newLeftChild)
+
+	// Track boundary children that may need rebalancing after cleanup.
+	var boundaryIDs [2]uint64
+	boundaryCount := 0
+	if newLeftChild != 0 {
+		boundaryIDs[boundaryCount] = newLeftChild
+		boundaryCount++
+	}
 
 	if leftChildIdx != rightChildIdx {
 		// Process interior children: retire their subtrees entirely.
@@ -154,6 +169,10 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 		}
 		totalDeleted += deleted
 		ptr0, cells = updateChildInCells(ptr0, cells, rightChildIdx, newRightChild)
+		if newRightChild != 0 {
+			boundaryIDs[boundaryCount] = newRightChild
+			boundaryCount++
+		}
 	}
 
 	// Remove cells for retired/empty children. Walk in reverse to preserve indices.
@@ -174,14 +193,14 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 	}
 
 	// Rebalance underfull boundary children with their surviving siblings.
-	// After removing interior children, the boundary children may be
-	// adjacent to different siblings than before. Check each and rebalance
-	// if needed and if a sibling exists.
-	if len(cells) > 0 {
-		// Rebalance boundary children by checking all remaining children.
-		// A child is underfull if its page reports high free space.
+	// Only boundary children (those we recursed into) can be underfull;
+	// other surviving children were not modified.
+	if len(cells) > 0 && boundaryCount > 0 {
 		for ci := len(cells) - 1; ci >= -1; ci-- {
 			childID := childFromIndex(ptr0, cells, ci)
+			if childID != boundaryIDs[0] && (boundaryCount < 2 || childID != boundaryIDs[1]) {
+				continue
+			}
 			buf := t.pageSlice(childID)
 			typ, _, count, _ := page.ReadHeader(buf)
 			var freeSpace int
@@ -194,9 +213,14 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 				}
 				freeSpace = lb.FreeSpace()
 			} else {
-				_, brCells := t.collectBranchCells(childID)
-				freeSpace = t.cfg.UsableSpace() // estimate
-				_ = brCells
+				brPtr0, brCells := t.collectBranchCells(childID)
+				tempBuf := make([]byte, t.cfg.PageSize)
+				bb := page.NewBranchBuilder(tempBuf, t.cfg)
+				bb.SetPtr0(brPtr0)
+				for _, c := range brCells {
+					bb.AddCell(c.key, c.childPtr)
+				}
+				freeSpace = bb.FreeSpace()
 				count = uint16(len(brCells))
 			}
 			if t.isUnderfull(int(count), freeSpace) {

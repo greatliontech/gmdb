@@ -504,6 +504,123 @@ func TestLeafSecondGroupBoundary(t *testing.T) {
 	}
 }
 
+func TestLeafDecodeGroup(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	// 35 entries = group 0 (16), group 1 (16), group 2 (3).
+	b := NewLeafBuilder(buf, cfg)
+	for i := range 35 {
+		key := fmt.Sprintf("key-%04d", i)
+		val := fmt.Sprintf("val-%04d", i)
+		b.AddInline([]byte(key), []byte(val))
+	}
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+
+	// Collect all entries via IterEntries as reference.
+	type kv struct{ key, val string }
+	var ref []kv
+	r.IterEntries(nil, func(_ int, e LeafEntry) bool {
+		ref = append(ref, kv{string(e.Key), string(e.Value)})
+		return true
+	})
+
+	// Verify DecodeGroup matches for each group.
+	groups := []struct {
+		groupIdx int
+		startIdx int
+		count    int
+	}{
+		{0, 0, 16},  // full group
+		{1, 16, 16}, // full group
+		{2, 32, 3},  // partial last group
+	}
+	for _, g := range groups {
+		var got []kv
+		r.DecodeGroup(g.groupIdx, nil, func(idx int, e LeafEntry) bool {
+			got = append(got, kv{string(e.Key), string(e.Value)})
+			if idx != g.startIdx+len(got)-1 {
+				t.Errorf("group %d: callback idx=%d, want %d", g.groupIdx, idx, g.startIdx+len(got)-1)
+			}
+			return true
+		})
+		if len(got) != g.count {
+			t.Errorf("group %d: decoded %d entries, want %d", g.groupIdx, len(got), g.count)
+			continue
+		}
+		for i, e := range got {
+			if e != ref[g.startIdx+i] {
+				t.Errorf("group %d entry %d: got %v, want %v", g.groupIdx, i, e, ref[g.startIdx+i])
+			}
+		}
+	}
+}
+
+func TestLeafDecodeGroupSingleEntry(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	// 1 entry = group 0 with 1 restart entry, no deltas.
+	b := NewLeafBuilder(buf, cfg)
+	b.AddInline([]byte("only-key"), []byte("only-val"))
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+	var count int
+	r.DecodeGroup(0, nil, func(idx int, e LeafEntry) bool {
+		if idx != 0 {
+			t.Errorf("idx = %d, want 0", idx)
+		}
+		if !bytes.Equal(e.Key, []byte("only-key")) {
+			t.Errorf("key = %q, want %q", e.Key, "only-key")
+		}
+		if !bytes.Equal(e.Value, []byte("only-val")) {
+			t.Errorf("value = %q, want %q", e.Value, "only-val")
+		}
+		count++
+		return true
+	})
+	if count != 1 {
+		t.Errorf("decoded %d entries, want 1", count)
+	}
+}
+
+func TestLeafDecodeGroupEarlyBreak(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	b := NewLeafBuilder(buf, cfg)
+	for i := range 16 {
+		key := fmt.Sprintf("key-%04d", i)
+		b.AddInline([]byte(key), []byte("v"))
+	}
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+
+	// Stop after 3 entries.
+	var count int
+	r.DecodeGroup(0, nil, func(_ int, _ LeafEntry) bool {
+		count++
+		return count < 3
+	})
+	if count != 3 {
+		t.Errorf("decoded %d entries, want 3", count)
+	}
+
+	// Stop at restart entry (first entry).
+	count = 0
+	r.DecodeGroup(0, nil, func(_ int, _ LeafEntry) bool {
+		count++
+		return false
+	})
+	if count != 1 {
+		t.Errorf("decoded %d entries, want 1", count)
+	}
+}
+
 func TestLeafIterEarlyBreak(t *testing.T) {
 	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
 	buf := make([]byte, cfg.PageSize)

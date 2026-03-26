@@ -228,6 +228,31 @@ func (r LeafReader) SearchLeaf(target, keyBuf []byte) (index int, entry LeafEntr
 	return endIdx, LeafEntry{}, false
 }
 
+// DecodeGroup decodes all entries in the restart group at groupIdx.
+// fn receives the absolute entry index (0-based within the page) and the
+// decoded entry. keyBuf is reused for key reconstruction of delta entries.
+// Returns the updated keyBuf. If fn returns false, iteration stops early.
+func (r LeafReader) DecodeGroup(groupIdx int, keyBuf []byte, fn func(idx int, e LeafEntry) bool) []byte {
+	startIdx := groupIdx * r.ri
+	endIdx := min(startIdx+r.ri, r.count)
+	off := r.restartOffset(groupIdx)
+
+	e, off := r.decodeRestartEntry(off)
+	if !fn(startIdx, e) {
+		return keyBuf
+	}
+
+	prevKey := e.Key
+	for idx := startIdx + 1; idx < endIdx; idx++ {
+		e, off, keyBuf = r.decodeDeltaEntry(off, prevKey, keyBuf)
+		if !fn(idx, e) {
+			break
+		}
+		prevKey = keyBuf
+	}
+	return keyBuf
+}
+
 // EntryAt decodes the entry at position idx. keyBuf is used for key
 // reconstruction of delta entries.
 func (r LeafReader) EntryAt(idx int, keyBuf []byte) (LeafEntry, []byte) {

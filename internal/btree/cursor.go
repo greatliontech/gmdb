@@ -242,21 +242,22 @@ func (c *Cursor) cachedCurrent() (key, value []byte) {
 }
 
 // populateGroup decodes all entries in the restart group starting at base
-// and caches them.
+// and caches them. Uses a single forward scan through the group — O(ri)
+// entry decodings instead of O(ri²).
 func (c *Cursor) populateGroup(base int) {
 	buf := c.tree.pageSlice(c.leaf)
 	lr := page.NewLeafReader(buf, c.tree.cfg)
-	end := min(base+16, c.count)
+	group := base / 16
 
-	var keyBuf []byte
-	for i := base; i < end; i++ {
-		entry, kb := lr.EntryAt(i, keyBuf)
-		keyBuf = kb
-		entry.Key = bytes.Clone(entry.Key)
-		c.groupCache[i-base] = entry
-	}
+	n := 0
+	lr.DecodeGroup(group, nil, func(_ int, e page.LeafEntry) bool {
+		e.Key = bytes.Clone(e.Key)
+		c.groupCache[n] = e
+		n++
+		return true
+	})
 	c.groupBase = base
-	c.groupLen = end - base
+	c.groupLen = n
 }
 
 // keyFromEntry copies the entry key into the cursor's keyBuf for stability.

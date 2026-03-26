@@ -151,7 +151,7 @@ func (t *Tree) rebalanceChild(ptr0 uint64, cells []branchCell, childIdx int) (
 	for _, c := range candidates {
 		leftID := childFromIndex(ptr0, cells, c.leftIdx)
 		rightID := childFromIndex(ptr0, cells, c.rightIdx)
-		if t.canMerge(leftID, rightID) {
+		if t.canMerge(leftID, rightID, cells[c.sepCellIdx].key) {
 			best = c
 			break
 		}
@@ -179,9 +179,11 @@ func (t *Tree) rebalanceChild(ptr0 uint64, cells []branchCell, childIdx int) (
 }
 
 // canMerge returns true if two sibling pages can be merged into one.
+// sep is the parent's separator key between the two children (used for
+// branch merges where the separator is demoted into the merged node).
 // This is a quick check without CoW — it reads both pages and estimates
 // whether combined content fits in one page.
-func (t *Tree) canMerge(leftID, rightID uint64) bool {
+func (t *Tree) canMerge(leftID, rightID uint64, sep []byte) bool {
 	leftBuf := t.pageSlice(leftID)
 	leftTyp, _, _, _ := page.ReadHeader(leftBuf)
 
@@ -199,14 +201,12 @@ func (t *Tree) canMerge(leftID, rightID uint64) bool {
 		return true
 	}
 
-	// Branch: collect cells, add demoted separator placeholder.
+	// Branch: collect cells and demote the parent separator.
 	_, leftCells := t.collectBranchCells(leftID)
 	rightPtr0, rightCells := t.collectBranchCells(rightID)
-	// The demoted separator is unknown here (it's in the parent), but we can
-	// estimate with a zero-length key. If even that doesn't fit, merge is impossible.
 	combined := make([]branchCell, 0, len(leftCells)+1+len(rightCells))
 	combined = append(combined, leftCells...)
-	combined = append(combined, branchCell{childPtr: rightPtr0})
+	combined = append(combined, branchCell{key: sep, childPtr: rightPtr0})
 	combined = append(combined, rightCells...)
 	buf := make([]byte, t.cfg.PageSize)
 	bb := page.NewBranchBuilder(buf, t.cfg)
