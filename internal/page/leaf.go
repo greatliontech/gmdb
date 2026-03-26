@@ -204,15 +204,8 @@ func (r LeafReader) SearchLeaf(target, keyBuf []byte) (index int, entry LeafEntr
 	off := r.restartOffset(group)
 	startIdx := group * r.restartInterval
 
+	// Phase 1 guarantees this group's restart key < target.
 	e, off := r.decodeRestartEntry(off)
-	cmp := bytes.Compare(e.Key, target)
-	if cmp == 0 {
-		return startIdx, e, true
-	}
-	if cmp > 0 {
-		return startIdx, LeafEntry{}, false
-	}
-
 	prevKey := e.Key
 	endIdx := min(startIdx+r.restartInterval, r.count)
 
@@ -222,7 +215,7 @@ func (r LeafReader) SearchLeaf(target, keyBuf []byte) (index int, entry LeafEntr
 		// shared prefix is already in place (self-copy is a no-op),
 		// and the unshared suffix is appended after it.
 		e, off, keyBuf = r.decodeDeltaEntry(off, prevKey, keyBuf)
-		cmp = bytes.Compare(e.Key, target)
+		cmp := bytes.Compare(e.Key, target)
 		if cmp == 0 {
 			return idx, e, true
 		}
