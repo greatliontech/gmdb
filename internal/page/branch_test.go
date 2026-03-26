@@ -154,3 +154,45 @@ func TestBranchWithChecksum(t *testing.T) {
 		t.Fatalf("Count() = %d, want 2", r.Count())
 	}
 }
+
+func TestBranchEmpty(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	b := NewBranchBuilder(buf, cfg)
+	b.SetPtr0(42)
+	b.Finish()
+
+	r := NewBranchReader(buf)
+	if r.Count() != 0 {
+		t.Errorf("Count() = %d, want 0", r.Count())
+	}
+	if r.Ptr0() != 42 {
+		t.Errorf("Ptr0() = %d, want 42", r.Ptr0())
+	}
+
+	// Search with 0 cells should return Ptr0.
+	child, idx := r.Search([]byte("anything"))
+	if child != 42 || idx != -1 {
+		t.Errorf("Search on empty branch: child=%d idx=%d, want 42 -1", child, idx)
+	}
+}
+
+func TestBranchBuilderCount(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	b := NewBranchBuilder(buf, cfg)
+	b.SetPtr0(1)
+	if b.Count() != 0 {
+		t.Errorf("Count() = %d, want 0", b.Count())
+	}
+	b.AddCell([]byte("a"), 2)
+	if b.Count() != 1 {
+		t.Errorf("Count() = %d, want 1", b.Count())
+	}
+	b.AddCell([]byte("b"), 3)
+	if b.Count() != 2 {
+		t.Errorf("Count() = %d, want 2", b.Count())
+	}
+}

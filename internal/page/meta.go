@@ -146,6 +146,6 @@ func ComputeMetaChecksum(buf []byte) uint64 {
 }
 
 // HasFlag returns true if the meta flags have the given flag bit set.
-func (m *Meta) HasFlag(flag uint32) bool {
+func (m Meta) HasFlag(flag uint32) bool {
 	return m.Flags&flag != 0
 }

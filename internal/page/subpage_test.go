@@ -167,3 +167,37 @@ func TestSubpageSearchFixed(t *testing.T) {
 		t.Errorf("Search(15): index = %d, want 1", idx)
 	}
 }
+
+func TestSubpageDataSizeAndTotalSize(t *testing.T) {
+	values := [][]byte{[]byte("aa"), []byte("bb"), []byte("cc")}
+	size := SubpageSize(values, 0)
+	buf := make([]byte, size)
+	b := NewSubpageBuilder(buf, 0)
+	for _, v := range values {
+		b.AddValue(v)
+	}
+	total := b.Finish()
+
+	r := NewSubpageReader(buf[:total], 0)
+	// DataSize = 3 entries × (2 len + 2 data) = 12.
+	if r.DataSize() != 12 {
+		t.Errorf("DataSize() = %d, want 12", r.DataSize())
+	}
+	// TotalSize = header(4) + data(12) = 16.
+	if r.TotalSize() != 16 {
+		t.Errorf("TotalSize() = %d, want 16", r.TotalSize())
+	}
+}
+
+func TestSubpageBuilderFull(t *testing.T) {
+	buf := make([]byte, 10) // header(4) + room for 1 variable entry
+	b := NewSubpageBuilder(buf, 0)
+	// "abcd" needs 2 (len) + 4 (data) = 6 bytes. header(4)+6=10, fits exactly.
+	if !b.AddValue([]byte("abcd")) {
+		t.Fatal("first AddValue failed")
+	}
+	// No room for another.
+	if b.AddValue([]byte("x")) {
+		t.Fatal("second AddValue should have failed")
+	}
+}

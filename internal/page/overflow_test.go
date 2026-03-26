@@ -110,3 +110,64 @@ func TestOverflowWriteRead(t *testing.T) {
 		t.Error("read value does not match written value")
 	}
 }
+
+func TestOverflowWithChecksum(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: true}
+	o := NewOverflowConfig(cfg)
+
+	// Verify capacities account for CRC footer.
+	if o.FirstPageCapacity() != 4084 {
+		t.Fatalf("FirstPageCapacity = %d, want 4084", o.FirstPageCapacity())
+	}
+	if o.FollowerPageCapacity() != 4092 {
+		t.Fatalf("FollowerPageCapacity = %d, want 4092", o.FollowerPageCapacity())
+	}
+
+	// Value spanning 2 pages.
+	valueLen := 4084 + 100
+	value := make([]byte, valueLen)
+	for i := range value {
+		value[i] = byte(i % 199)
+	}
+
+	pages := o.PagesNeeded(valueLen)
+	if pages != 2 {
+		t.Fatalf("PagesNeeded(%d) = %d, want 2", valueLen, pages)
+	}
+
+	bufs := make([][]byte, pages)
+	for i := range bufs {
+		bufs[i] = make([]byte, cfg.PageSize)
+	}
+
+	offset := 0
+	n := o.WriteFirstPage(bufs[0], uint32(pages-1), value[offset:])
+	offset += n
+	WriteCRC32C(bufs[0])
+
+	n = o.WriteFollowerPage(bufs[1], value[offset:])
+	offset += n
+	WriteCRC32C(bufs[1])
+
+	// Verify checksums.
+	if !VerifyCRC32C(bufs[0]) {
+		t.Fatal("first page checksum failed")
+	}
+	if !VerifyCRC32C(bufs[1]) {
+		t.Fatal("follower page checksum failed")
+	}
+
+	// Read back.
+	var result []byte
+	firstData := o.ReadFirstPage(bufs[0])
+	result = append(result, firstData[:min(o.FirstPageCapacity(), valueLen)]...)
+	remaining := valueLen - len(result)
+	if remaining > 0 {
+		followerData := o.ReadFollowerPage(bufs[1])
+		result = append(result, followerData[:remaining]...)
+	}
+
+	if !bytes.Equal(result, value) {
+		t.Error("read value does not match written value")
+	}
+}

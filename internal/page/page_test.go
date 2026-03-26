@@ -89,3 +89,14 @@ func TestPageConfigContentEnd(t *testing.T) {
 		t.Errorf("ContentEnd() with checksum = %d, want 4092", got)
 	}
 }
+
+func TestPageConfigFirstDataPage(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096}
+	// 2 meta pages + 2048 bitmap pages = 2050.
+	if got := cfg.FirstDataPage(2048); got != 2050 {
+		t.Errorf("FirstDataPage(2048) = %d, want 2050", got)
+	}
+	if got := cfg.FirstDataPage(0); got != 2 {
+		t.Errorf("FirstDataPage(0) = %d, want 2", got)
+	}
+}

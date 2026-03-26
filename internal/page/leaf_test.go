@@ -308,6 +308,16 @@ func TestLeafEmpty(t *testing.T) {
 	if idx != 0 {
 		t.Errorf("SearchLeaf on empty leaf: index = %d, want 0", idx)
 	}
+
+	// IterEntries on empty leaf should be a no-op.
+	visited := 0
+	r.IterEntries(keyBuf, func(idx int, e LeafEntry) bool {
+		visited++
+		return true
+	})
+	if visited != 0 {
+		t.Errorf("IterEntries on empty leaf visited %d entries", visited)
+	}
 }
 
 func TestLeafMixedCellTypes(t *testing.T) {
@@ -401,6 +411,178 @@ func TestSharedPrefixLen(t *testing.T) {
 			t.Errorf("sharedPrefixLen(%q, %q) = %d, want %d", tt.a, tt.b, got, tt.want)
 		}
 	}
+}
+
+func TestLeafSingleEntry(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	b := NewLeafBuilder(buf, cfg)
+	b.AddInline([]byte("only"), []byte("one"))
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+	if r.Count() != 1 {
+		t.Fatalf("Count() = %d, want 1", r.Count())
+	}
+	if r.RestartCount() != 1 {
+		t.Errorf("RestartCount() = %d, want 1", r.RestartCount())
+	}
+
+	keyBuf := make([]byte, 0, 64)
+	idx, e, found := r.SearchLeaf([]byte("only"), keyBuf)
+	if !found || idx != 0 {
+		t.Errorf("SearchLeaf(only): idx=%d found=%v", idx, found)
+	}
+	if !bytes.Equal(e.Value, []byte("one")) {
+		t.Errorf("value = %q, want %q", e.Value, "one")
+	}
+}
+
+func TestLeafExactRestartInterval(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	// Exactly 16 entries = 1 full restart group.
+	b := NewLeafBuilder(buf, cfg)
+	for i := range 16 {
+		key := fmt.Sprintf("key-%04d", i)
+		b.AddInline([]byte(key), []byte("v"))
+	}
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+	if r.Count() != 16 {
+		t.Fatalf("Count() = %d, want 16", r.Count())
+	}
+	if r.RestartCount() != 1 {
+		t.Errorf("RestartCount() = %d, want 1", r.RestartCount())
+	}
+
+	// Search for last entry (delta at position 15).
+	keyBuf := make([]byte, 0, 64)
+	_, _, found := r.SearchLeaf([]byte("key-0015"), keyBuf)
+	if !found {
+		t.Error("SearchLeaf(key-0015): not found")
+	}
+}
+
+func TestLeafSecondGroupBoundary(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	// 17 entries = first group (16) + second group (1 restart).
+	b := NewLeafBuilder(buf, cfg)
+	for i := range 17 {
+		key := fmt.Sprintf("key-%04d", i)
+		b.AddInline([]byte(key), []byte("v"))
+	}
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+	if r.Count() != 17 {
+		t.Fatalf("Count() = %d, want 17", r.Count())
+	}
+	if r.RestartCount() != 2 {
+		t.Errorf("RestartCount() = %d, want 2", r.RestartCount())
+	}
+
+	// Search for entry 16 (first entry of second group, a restart).
+	keyBuf := make([]byte, 0, 64)
+	idx, _, found := r.SearchLeaf([]byte("key-0016"), keyBuf)
+	if !found {
+		t.Error("SearchLeaf(key-0016): not found")
+	}
+	if idx != 16 {
+		t.Errorf("index = %d, want 16", idx)
+	}
+
+	// EntryAt for entry 16 should also work.
+	e, _ := r.EntryAt(16, keyBuf)
+	if !bytes.Equal(e.Key, []byte("key-0016")) {
+		t.Errorf("EntryAt(16): key = %q, want %q", e.Key, "key-0016")
+	}
+}
+
+func TestLeafIterEarlyBreak(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	b := NewLeafBuilder(buf, cfg)
+	for i := range 10 {
+		key := fmt.Sprintf("key-%04d", i)
+		b.AddInline([]byte(key), []byte("v"))
+	}
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+	visited := 0
+	r.IterEntries(nil, func(idx int, e LeafEntry) bool {
+		visited++
+		return idx < 2 // stop after index 2
+	})
+	if visited != 3 {
+		t.Errorf("visited %d entries, want 3", visited)
+	}
+}
+
+func TestLeafBuilderFreeSpaceAndCount(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	b := NewLeafBuilder(buf, cfg)
+	if b.Count() != 0 {
+		t.Errorf("Count() = %d, want 0", b.Count())
+	}
+
+	initialFree := b.FreeSpace()
+	if initialFree <= 0 {
+		t.Fatalf("FreeSpace() = %d, want > 0", initialFree)
+	}
+
+	b.AddInline([]byte("key"), []byte("val"))
+	if b.Count() != 1 {
+		t.Errorf("Count() = %d, want 1", b.Count())
+	}
+	if b.FreeSpace() >= initialFree {
+		t.Error("FreeSpace did not decrease after AddInline")
+	}
+}
+
+func TestLeafBuilderFull(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	b := NewLeafBuilder(buf, cfg)
+	count := 0
+	for {
+		key := fmt.Sprintf("k%06d", count)
+		val := fmt.Sprintf("v%06d", count)
+		if !b.AddInline([]byte(key), []byte(val)) {
+			break
+		}
+		count++
+	}
+	b.Finish()
+
+	if count == 0 {
+		t.Fatal("expected at least one entry to fit")
+	}
+
+	// Verify all entries round-trip.
+	r := NewLeafReader(buf, cfg)
+	if r.Count() != count {
+		t.Fatalf("Count() = %d, want %d", r.Count(), count)
+	}
+
+	keyBuf := make([]byte, 0, 64)
+	r.IterEntries(keyBuf, func(idx int, e LeafEntry) bool {
+		wantKey := fmt.Sprintf("k%06d", idx)
+		if !bytes.Equal(e.Key, []byte(wantKey)) {
+			t.Errorf("entry %d: key = %q, want %q", idx, e.Key, wantKey)
+		}
+		return true
+	})
 }
 
 func FuzzLeafRoundTrip(f *testing.F) {

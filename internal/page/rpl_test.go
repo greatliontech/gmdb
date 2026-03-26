@@ -96,4 +96,8 @@ func TestRPLSegmentFull(t *testing.T) {
 	if b.AddPageID(9999) {
 		t.Fatal("AddPageID succeeded past capacity")
 	}
+
+	if b.Count() != 508 {
+		t.Errorf("Count() = %d, want 508", b.Count())
+	}
 }
