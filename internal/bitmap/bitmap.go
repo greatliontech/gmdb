@@ -79,19 +79,9 @@ func (b *Bitmap) SetHint(pageID uint64) {
 	b.hint = pageID / 64
 }
 
-// Hint returns the current hint as a page ID (first page in the hint word).
-func (b *Bitmap) Hint() uint64 {
-	return b.hint * 64
-}
-
 // FreeCount returns the cached logical number of free pages.
 func (b *Bitmap) FreeCount() uint64 {
 	return b.freeCount
-}
-
-// TotalPages returns the total number of pages in the database.
-func (b *Bitmap) TotalPages() uint64 {
-	return b.totalPages
 }
 
 // PendingAllocs returns the set of pages allocated in this transaction.

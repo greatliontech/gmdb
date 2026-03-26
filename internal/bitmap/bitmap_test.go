@@ -25,14 +25,14 @@ func TestNewBitmap(t *testing.T) {
 	data := makeBitmapData(256)
 	b := New(data, 256, 10) // 10 reserved pages
 
-	if b.TotalPages() != 256 {
-		t.Errorf("TotalPages() = %d, want 256", b.TotalPages())
+	if b.totalPages != 256 {
+		t.Errorf("TotalPages() = %d, want 256", b.totalPages)
 	}
 	if b.FreeCount() != 0 {
 		t.Errorf("FreeCount() = %d, want 0", b.FreeCount())
 	}
-	if b.Hint() != 0 {
-		t.Errorf("Hint() = %d, want 0", b.Hint())
+	if b.hint * 64 != 0 {
+		t.Errorf("Hint() = %d, want 0", b.hint * 64)
 	}
 }
 
@@ -54,8 +54,8 @@ func TestSetHint(t *testing.T) {
 	b := New(data, 256, 10)
 
 	b.SetHint(130) // word 2 (130/64 = 2)
-	if b.Hint() != 128 { // word 2 * 64 = 128
-		t.Errorf("Hint() = %d, want 128", b.Hint())
+	if b.hint * 64 != 128 { // word 2 * 64 = 128
+		t.Errorf("Hint() = %d, want 128", b.hint * 64)
 	}
 }
 

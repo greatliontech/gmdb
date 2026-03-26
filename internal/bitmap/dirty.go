@@ -30,7 +30,7 @@ func (b *Bitmap) DirtyPages(pageSize uint32) []DirtyPage {
 	result := make([]DirtyPage, 0, len(dirtySet))
 	for pageIdx := range dirtySet {
 		buf := make([]byte, pageSize)
-		b.ApplyToPage(buf, pageIdx, pageSize)
+		b.applyToPage(buf, pageIdx, pageSize)
 		result = append(result, DirtyPage{PageIndex: pageIdx, Data: buf})
 	}
 
@@ -40,9 +40,9 @@ func (b *Bitmap) DirtyPages(pageSize uint32) []DirtyPage {
 	return result
 }
 
-// ApplyToPage copies the on-disk bitmap page content into dst and applies
+// applyToPage copies the on-disk bitmap page content into dst and applies
 // all pending changes that affect this page. dst must be pageSize bytes.
-func (b *Bitmap) ApplyToPage(dst []byte, bitmapPageIndex uint32, pageSize uint32) {
+func (b *Bitmap) applyToPage(dst []byte, bitmapPageIndex uint32, pageSize uint32) {
 	srcOff := uint64(bitmapPageIndex) * uint64(pageSize)
 	srcEnd := srcOff + uint64(pageSize)
 	if srcEnd > uint64(len(b.data)) {

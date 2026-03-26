@@ -87,7 +87,7 @@ func TestApplyToPagePartialData(t *testing.T) {
 	b.Set(50) // page 50 in word 0
 
 	dst := make([]byte, 4096)
-	b.ApplyToPage(dst, 0, 4096)
+	b.applyToPage(dst, 0, 4096)
 
 	// Bit 50 should be set.
 	w := binary.LittleEndian.Uint64(dst[0:])
@@ -105,7 +105,7 @@ func TestApplyToPage(t *testing.T) {
 	b.Set(30)   // free page 30 (pending free)
 
 	dst := make([]byte, 4096)
-	b.ApplyToPage(dst, 0, 4096)
+	b.applyToPage(dst, 0, 4096)
 
 	// Page 20 should be clear in dst (allocated).
 	w0 := binary.LittleEndian.Uint64(dst[0:])
