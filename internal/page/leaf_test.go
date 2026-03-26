@@ -39,8 +39,8 @@ func TestLeafInlineRoundTrip(t *testing.T) {
 	if r.Count() != len(entries) {
 		t.Fatalf("Count() = %d, want %d", r.Count(), len(entries))
 	}
-	if r.RestartInterval() != RestartInterval {
-		t.Errorf("RestartInterval() = %d, want %d", r.RestartInterval(), RestartInterval)
+	if r.RestartInterval() != restartInterval {
+		t.Errorf("RestartInterval() = %d, want %d", r.RestartInterval(), restartInterval)
 	}
 
 	keyBuf := make([]byte, 0, 256)
@@ -439,7 +439,7 @@ func TestLeafSingleEntry(t *testing.T) {
 	}
 }
 
-func TestLeafExactRestartInterval(t *testing.T) {
+func TestLeafExactrestartInterval(t *testing.T) {
 	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
 	buf := make([]byte, cfg.PageSize)
 

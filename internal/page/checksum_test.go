@@ -5,7 +5,7 @@ import "testing"
 func TestCRC32CRoundTrip(t *testing.T) {
 	buf := make([]byte, 4096)
 	// Write some data.
-	for i := range buf[:len(buf)-CRC32Size] {
+	for i := range buf[:len(buf)-crc32Size] {
 		buf[i] = byte(i)
 	}
 	WriteCRC32C(buf)
@@ -17,7 +17,7 @@ func TestCRC32CRoundTrip(t *testing.T) {
 
 func TestCRC32CDetectsCorruption(t *testing.T) {
 	buf := make([]byte, 4096)
-	for i := range buf[:len(buf)-CRC32Size] {
+	for i := range buf[:len(buf)-crc32Size] {
 		buf[i] = byte(i * 3)
 	}
 	WriteCRC32C(buf)
@@ -32,7 +32,7 @@ func TestCRC32CDetectsCorruption(t *testing.T) {
 
 func TestCRC32CDetectsFooterCorruption(t *testing.T) {
 	buf := make([]byte, 4096)
-	for i := range buf[:len(buf)-CRC32Size] {
+	for i := range buf[:len(buf)-crc32Size] {
 		buf[i] = byte(i)
 	}
 	WriteCRC32C(buf)

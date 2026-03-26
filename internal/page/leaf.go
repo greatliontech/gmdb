@@ -7,7 +7,7 @@ import "bytes"
 // Layout:
 //
 //	Page Header (8 bytes)
-//	RestartInterval uint16    fixed: 16
+//	restartInterval uint16    fixed: 16
 //	RestartCount    uint16    number of restart points
 //	Entry 0 (restart)         entries in forward order, starting at fixed offset 12
 //	Entry 1 (delta)
@@ -25,9 +25,9 @@ import "bytes"
 
 // Leaf header offsets (relative to start of page).
 const (
-	leafOffRestartInterval = HeaderSize     // 8
-	leafOffRestartCount    = HeaderSize + 2 // 10
-	leafEntryStart         = HeaderSize + 4 // 12 — fixed start of entry data
+	leafOffRestartInterval = headerSize     // 8
+	leafOffRestartCount    = headerSize + 2 // 10
+	leafEntryStart         = headerSize + 4 // 12 — fixed start of entry data
 )
 
 // Restart table entry size.
@@ -59,7 +59,7 @@ type LeafReader struct {
 	cfg             PageConfig
 	count           int
 	restartCount    int
-	restartInterval int
+	ri              int // restart interval
 	restartTableOff int // byte offset of the restart table
 }
 
@@ -73,7 +73,7 @@ func NewLeafReader(buf []byte, cfg PageConfig) LeafReader {
 		cfg:             cfg,
 		count:           int(count),
 		restartCount:    rc,
-		restartInterval: ri,
+		ri:              ri,
 		restartTableOff: cfg.ContentEnd() - rc*restartTableEntrySize,
 	}
 }
@@ -85,7 +85,7 @@ func (r LeafReader) Count() int { return r.count }
 func (r LeafReader) RestartCount() int { return r.restartCount }
 
 // RestartInterval returns the restart interval.
-func (r LeafReader) RestartInterval() int { return r.restartInterval }
+func (r LeafReader) RestartInterval() int { return r.ri }
 
 // restartOffset returns the byte offset of the i-th restart point entry.
 func (r LeafReader) restartOffset(i int) int {
@@ -187,7 +187,7 @@ func (r LeafReader) SearchLeaf(target, keyBuf []byte) (index int, entry LeafEntr
 		if cmp < 0 {
 			lo = mid + 1
 		} else if cmp == 0 {
-			return mid * r.restartInterval, e, true
+			return mid * r.ri, e, true
 		} else {
 			hi = mid
 		}
@@ -202,12 +202,12 @@ func (r LeafReader) SearchLeaf(target, keyBuf []byte) (index int, entry LeafEntr
 
 	// Phase 2: linear scan within the restart group.
 	off := r.restartOffset(group)
-	startIdx := group * r.restartInterval
+	startIdx := group * r.ri
 
 	// Phase 1 guarantees this group's restart key < target.
 	e, off := r.decodeRestartEntry(off)
 	prevKey := e.Key
-	endIdx := min(startIdx+r.restartInterval, r.count)
+	endIdx := min(startIdx+r.ri, r.count)
 
 	for idx := startIdx + 1; idx < endIdx; idx++ {
 		// After the first iteration, prevKey and keyBuf alias the same
@@ -231,8 +231,8 @@ func (r LeafReader) SearchLeaf(target, keyBuf []byte) (index int, entry LeafEntr
 // EntryAt decodes the entry at position idx. keyBuf is used for key
 // reconstruction of delta entries.
 func (r LeafReader) EntryAt(idx int, keyBuf []byte) (LeafEntry, []byte) {
-	group := idx / r.restartInterval
-	groupStart := group * r.restartInterval
+	group := idx / r.ri
+	groupStart := group * r.ri
 	off := r.restartOffset(group)
 
 	e, off := r.decodeRestartEntry(off)
@@ -261,7 +261,7 @@ func (r LeafReader) IterEntries(keyBuf []byte, fn func(idx int, e LeafEntry) boo
 
 	for idx := range r.count {
 		var e LeafEntry
-		if idx%r.restartInterval == 0 {
+		if idx%r.ri == 0 {
 			e, off = r.decodeRestartEntry(off)
 			prevKey = e.Key
 		} else {
@@ -299,7 +299,7 @@ func NewLeafBuilder(buf []byte, cfg PageConfig) *LeafBuilder {
 
 // isRestart returns true if the next entry will be a restart point.
 func (b *LeafBuilder) isRestart() bool {
-	return b.count%RestartInterval == 0
+	return b.count%restartInterval == 0
 }
 
 // restartTableSize returns the byte size of the restart table with the
@@ -404,7 +404,7 @@ func (b *LeafBuilder) FreeSpace() int {
 func (b *LeafBuilder) Finish() uint16 {
 	count := uint16(b.count)
 	WriteHeader(b.buf, TypeLeaf, 0, count, 0)
-	le.PutUint16(b.buf[leafOffRestartInterval:], RestartInterval)
+	le.PutUint16(b.buf[leafOffRestartInterval:], restartInterval)
 	le.PutUint16(b.buf[leafOffRestartCount:], uint16(len(b.restartOffsets)))
 
 	// Write restart table at the content end.

@@ -13,7 +13,7 @@ package page
 
 // RPL segment header offsets (relative to start of page).
 const (
-	rplOffTxnID        = HeaderSize      // 8
+	rplOffTxnID        = headerSize      // 8
 	rplOffOlderSegment = rplOffTxnID + 8 // 16
 	rplOffEntryCount   = rplOffOlderSegment + 8 // 24
 	rplOffPadding      = rplOffEntryCount + 2   // 26
@@ -70,7 +70,7 @@ type RPLSegmentBuilder struct {
 // NewRPLSegmentBuilder initializes a builder for writing into buf.
 func NewRPLSegmentBuilder(buf []byte, cfg PageConfig) *RPLSegmentBuilder {
 	// Zero the segment header area (padding included).
-	clear(buf[HeaderSize:rplDataStart])
+	clear(buf[headerSize:rplDataStart])
 	return &RPLSegmentBuilder{
 		buf: buf,
 		cfg: cfg,

@@ -18,7 +18,7 @@ func TestValidPageSize(t *testing.T) {
 }
 
 func TestReadWriteHeader(t *testing.T) {
-	buf := make([]byte, HeaderSize)
+	buf := make([]byte, headerSize)
 	WriteHeader(buf, TypeLeaf, 0, 42, 3)
 
 	typ, flags, count, additional := ReadHeader(buf)

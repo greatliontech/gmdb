@@ -35,17 +35,20 @@ const (
 	MetaFlagCheckpoint   uint32 = 1 << 1
 )
 
-// Size constants.
+// Exported size constants.
 const (
-	HeaderSize       = 8  // common page header
-	Ptr0Size         = 8  // leftmost child pointer in branch pages
-	CellDirEntrySize = 4  // branch cell directory entry: Offset(2) + KeyLen(2)
-	ChildPtrSize     = 8  // child pointer in branch cell data
-	CRC32Size        = 4  // CRC32C footer
 	MetaPayloadSize  = 144 // meta page payload (Magic through Checksum)
-	KeyspaceDescSize       = 32 // keyspace descriptor
+	KeyspaceDescSize = 32  // keyspace descriptor
+)
 
-	RestartInterval = 16 // leaf prefix compression restart interval
+// Internal size constants — encapsulated by public API methods.
+const (
+	headerSize       = 8  // common page header
+	ptr0Size         = 8  // leftmost child pointer in branch pages
+	cellDirEntrySize = 4  // branch cell directory entry: Offset(2) + KeyLen(2)
+	childPtrSize     = 8  // child pointer in branch cell data
+	crc32Size        = 4  // CRC32C footer
+	restartInterval  = 16 // leaf prefix compression restart interval
 )
 
 // Header field offsets within a page.
@@ -79,18 +82,18 @@ type PageConfig struct {
 // UsableSpace returns the number of content bytes available in a standard
 // data page (PageSize minus header, minus optional CRC32C footer).
 func (c PageConfig) UsableSpace() int {
-	n := int(c.PageSize) - HeaderSize
+	n := int(c.PageSize) - headerSize
 	if c.PageChecksum {
-		n -= CRC32Size
+		n -= crc32Size
 	}
 	return n
 }
 
 // ContentEnd returns the byte offset where content ends in a page
-// (PageSize, or PageSize - CRC32Size when checksums are enabled).
+// (PageSize, or PageSize - crc32Size when checksums are enabled).
 func (c PageConfig) ContentEnd() int {
 	if c.PageChecksum {
-		return int(c.PageSize) - CRC32Size
+		return int(c.PageSize) - crc32Size
 	}
 	return int(c.PageSize)
 }
@@ -102,7 +105,7 @@ func (c PageConfig) MaxKeySize() int {
 	usable := c.UsableSpace()
 	// Branch layout after header: Ptr0(8) + N*(CellDirEntry(4)) + N*(Key + ChildPtr(8))
 	// Minimum N=2: usable >= 8 + 2*4 + 2*(keyLen + 8) = 32 + 2*keyLen
-	return (usable - Ptr0Size - 2*CellDirEntrySize - 2*ChildPtrSize) / 2
+	return (usable - ptr0Size - 2*cellDirEntrySize - 2*childPtrSize) / 2
 }
 
 // BitmapPages returns the number of bitmap pages required for the given

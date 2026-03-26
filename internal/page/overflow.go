@@ -14,11 +14,11 @@ type Overflow struct {
 
 // NewOverflow creates an Overflow for the given PageConfig.
 func NewOverflow(cfg PageConfig) Overflow {
-	firstCap := int(cfg.PageSize) - HeaderSize
+	firstCap := int(cfg.PageSize) - headerSize
 	followerCap := int(cfg.PageSize)
 	if cfg.PageChecksum {
-		firstCap -= CRC32Size
-		followerCap -= CRC32Size
+		firstCap -= crc32Size
+		followerCap -= crc32Size
 	}
 	return Overflow{
 		cfg:               cfg,
@@ -51,7 +51,7 @@ func (o Overflow) PagesNeeded(totalLen int) int {
 // The returned slice is borrowed from buf.
 func (o Overflow) ReadFirstPage(buf []byte) []byte {
 	end := o.cfg.ContentEnd()
-	return buf[HeaderSize:end]
+	return buf[headerSize:end]
 }
 
 // ReadFollowerPage returns the value data from a follower page.
@@ -66,7 +66,7 @@ func (o Overflow) ReadFollowerPage(buf []byte) []byte {
 func (o Overflow) WriteFirstPage(buf []byte, additionalPages uint32, data []byte) int {
 	WriteHeader(buf, TypeOverflow, 0, 0, additionalPages)
 	end := o.cfg.ContentEnd()
-	n := copy(buf[HeaderSize:end], data)
+	n := copy(buf[headerSize:end], data)
 	return n
 }
 

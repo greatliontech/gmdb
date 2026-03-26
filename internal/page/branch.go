@@ -14,7 +14,7 @@ import "bytes"
 
 // Branch header offsets (relative to start of page).
 const (
-	branchOffPtr0    = HeaderSize            // 8
+	branchOffPtr0    = headerSize            // 8
 	branchDirStart   = branchOffPtr0 + 8     // 16
 )
 
@@ -42,7 +42,7 @@ func (r BranchReader) Ptr0() uint64 {
 
 // cellDir returns (offset, keyLen) for cell i from the cell directory.
 func (r BranchReader) cellDir(i int) (offset uint16, keyLen uint16) {
-	dirOff := branchDirStart + i*CellDirEntrySize
+	dirOff := branchDirStart + i*cellDirEntrySize
 	offset = le.Uint16(r.buf[dirOff:])
 	keyLen = le.Uint16(r.buf[dirOff+2:])
 	return
@@ -116,8 +116,8 @@ func (b *BranchBuilder) SetPtr0(pageID uint64) {
 // AddCell appends a cell (key + child pointer) to the branch.
 // Cells must be added in sorted key order. Returns false if insufficient space.
 func (b *BranchBuilder) AddCell(key []byte, childPtr uint64) bool {
-	cellSize := len(key) + ChildPtrSize
-	needed := CellDirEntrySize + cellSize
+	cellSize := len(key) + childPtrSize
+	needed := cellDirEntrySize + cellSize
 	if b.FreeSpace() < needed {
 		return false
 	}
@@ -130,7 +130,7 @@ func (b *BranchBuilder) AddCell(key []byte, childPtr uint64) bool {
 	// Write cell directory entry.
 	le.PutUint16(b.buf[b.dirEnd:], uint16(b.dataPos))
 	le.PutUint16(b.buf[b.dirEnd+2:], uint16(len(key)))
-	b.dirEnd += CellDirEntrySize
+	b.dirEnd += cellDirEntrySize
 
 	b.count++
 	return true
