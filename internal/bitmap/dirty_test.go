@@ -79,6 +79,23 @@ func TestDirtyPagesWithAlloc(t *testing.T) {
 	}
 }
 
+func TestApplyToPagePartialData(t *testing.T) {
+	// Data is shorter than one full page. ApplyToPage should handle gracefully.
+	data := make([]byte, 100) // less than a 4096-byte page
+	b := New(data, 100, 4)
+
+	b.Set(50) // page 50 in word 0
+
+	dst := make([]byte, 4096)
+	b.ApplyToPage(dst, 0, 4096)
+
+	// Bit 50 should be set.
+	w := binary.LittleEndian.Uint64(dst[0:])
+	if w&(1<<50) == 0 {
+		t.Error("bit 50 should be set in applied page")
+	}
+}
+
 func TestApplyToPage(t *testing.T) {
 	data := makeBitmapData(256)
 	setBitInData(data, 20) // on-disk: page 20 free

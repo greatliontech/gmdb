@@ -349,6 +349,65 @@ func TestLogicalWordPartialLastWithOverlay(t *testing.T) {
 	}
 }
 
+func TestFindContiguousAtEndOfBitmap(t *testing.T) {
+	data := makeBitmapData(256)
+	// Free pages 250-255 (6 pages at the end).
+	for i := uint64(250); i < 256; i++ {
+		setBitInData(data, i)
+	}
+	b := New(data, 256, 10)
+
+	start, ok := b.FindContiguous(6)
+	if !ok {
+		t.Fatal("FindContiguous(6): not found")
+	}
+	if start != 250 {
+		t.Errorf("FindContiguous(6) = %d, want 250", start)
+	}
+}
+
+func TestFindContiguousNEqualsFreeCount(t *testing.T) {
+	data := makeBitmapData(256)
+	// Exactly 10 contiguous free pages.
+	for i := uint64(20); i < 30; i++ {
+		setBitInData(data, i)
+	}
+	b := New(data, 256, 10)
+
+	start, ok := b.FindContiguous(10)
+	if !ok {
+		t.Fatal("FindContiguous(10): not found")
+	}
+	if start != 20 {
+		t.Errorf("FindContiguous(10) = %d, want 20", start)
+	}
+	if b.FreeCount() != 0 {
+		t.Errorf("FreeCount = %d, want 0", b.FreeCount())
+	}
+}
+
+func TestFindFirstFreeLastPage(t *testing.T) {
+	data := makeBitmapData(256)
+	setBitInData(data, 255) // only free page is the very last
+	b := New(data, 256, 10)
+
+	p, ok := b.FindFirstFree()
+	if !ok || p != 255 {
+		t.Errorf("FindFirstFree = (%d, %v), want (255, true)", p, ok)
+	}
+}
+
+func TestFindFirstFreeFirstValidPage(t *testing.T) {
+	data := makeBitmapData(256)
+	setBitInData(data, 10) // first valid page
+	b := New(data, 256, 10)
+
+	p, ok := b.FindFirstFree()
+	if !ok || p != 10 {
+		t.Errorf("FindFirstFree = (%d, %v), want (10, true)", p, ok)
+	}
+}
+
 func TestFindContiguousInsufficientFreeCount(t *testing.T) {
 	data := makeBitmapData(256)
 	setBitInData(data, 20)

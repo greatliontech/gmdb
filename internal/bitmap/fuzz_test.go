@@ -48,6 +48,53 @@ func FuzzSetClear(f *testing.F) {
 	})
 }
 
+func FuzzFindContiguous(f *testing.F) {
+	f.Add(uint8(3), uint64(0xFF00FF00FF00FF00), uint64(0x00FF00FF00FF00FF))
+
+	f.Fuzz(func(t *testing.T, n uint8, w0, w1 uint64) {
+		const totalPages = 128
+		const reserved = 4
+
+		if n == 0 || n > 64 {
+			return
+		}
+
+		data := makeBitmapData(totalPages)
+		le.PutUint64(data[0:], w0)
+		le.PutUint64(data[8:], w1)
+		// Clear reserved bits.
+		mask := uint64((1 << reserved) - 1)
+		w := le.Uint64(data[0:])
+		w &^= mask
+		le.PutUint64(data[0:], w)
+
+		bm := New(data, totalPages, reserved)
+		start, ok := bm.FindContiguous(int(n))
+		if !ok {
+			return
+		}
+
+		// Verify: all n pages starting at start were free before allocation.
+		// After allocation they should be in pendingAllocs.
+		for i := uint64(0); i < uint64(n); i++ {
+			pid := start + i
+			if pid >= totalPages {
+				t.Fatalf("allocated page %d >= totalPages", pid)
+			}
+			if pid < reserved {
+				t.Fatalf("allocated reserved page %d", pid)
+			}
+			if _, ok := bm.PendingAllocs()[pid]; !ok {
+				t.Fatalf("page %d not in PendingAllocs", pid)
+			}
+		}
+
+		if bm.CountFree() != bm.FreeCount() {
+			t.Errorf("CountFree=%d != FreeCount=%d", bm.CountFree(), bm.FreeCount())
+		}
+	})
+}
+
 func FuzzFindFirstFree(f *testing.F) {
 	f.Add(uint64(0xFF00FF00FF00FF00))
 
