@@ -76,6 +76,9 @@ func (t *Tree) collectBranchCells(pageID uint64) (ptr0 uint64, cells []branchCel
 }
 
 // addEntry adds a LeafEntry to a LeafBuilder, dispatching by CellFlags.
+// NestedTree is checked before MultiValue because NestedTree implies
+// MultiValue (flags 0x06). Reordering these cases would misroute nested
+// tree entries to the subpage path.
 func addEntry(lb *page.LeafBuilder, e page.LeafEntry) bool {
 	switch {
 	case e.CellFlags&page.CellFlagOverflow != 0:

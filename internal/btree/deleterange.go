@@ -196,6 +196,7 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 	// Only boundary children (those we recursed into) can be underfull;
 	// other surviving children were not modified.
 	if len(cells) > 0 && boundaryCount > 0 {
+		tempBuf := make([]byte, t.cfg.PageSize)
 		for ci := len(cells) - 1; ci >= -1; ci-- {
 			childID := childFromIndex(ptr0, cells, ci)
 			if childID != boundaryIDs[0] && (boundaryCount < 2 || childID != boundaryIDs[1]) {
@@ -206,7 +207,6 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 			var freeSpace int
 			if typ == page.TypeLeaf {
 				entries := t.collectEntries(childID)
-				tempBuf := make([]byte, t.cfg.PageSize)
 				lb := page.NewLeafBuilder(tempBuf, t.cfg)
 				for _, e := range entries {
 					addEntry(lb, e)
@@ -214,7 +214,6 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 				freeSpace = lb.FreeSpace()
 			} else {
 				brPtr0, brCells := t.collectBranchCells(childID)
-				tempBuf := make([]byte, t.cfg.PageSize)
 				bb := page.NewBranchBuilder(tempBuf, t.cfg)
 				bb.SetPtr0(brPtr0)
 				for _, c := range brCells {

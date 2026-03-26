@@ -52,6 +52,12 @@ func (t *Tree) remove(pageID uint64, key []byte) (
 		return pageID, old, found, false, err
 	}
 
+	// No structural change — child page ID unchanged and no underflow.
+	// Skip CoW and rebuild of this branch and all ancestors.
+	if newChildID == childPtr && !childUnderflow {
+		return pageID, old, true, false, nil
+	}
+
 	newPageID, err = t.cowPage(pageID)
 	if err != nil {
 		return 0, page.LeafEntry{}, false, false, err

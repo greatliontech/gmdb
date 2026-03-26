@@ -160,13 +160,17 @@ func (t *Tree) insertIntoLeaf(pageID uint64, e page.LeafEntry) (
 func (t *Tree) splitLeaf(pageID uint64, entries []page.LeafEntry) (sep []byte, rightPageID uint64, err error) {
 	split := t.findLeafSplitPoint(entries)
 
-	t.rebuildLeaf(pageID, entries[:split])
+	if t.rebuildLeaf(pageID, entries[:split]) < 0 {
+		panic("btree: left leaf half does not fit after byte-balanced split")
+	}
 
 	rightPageID, err = t.allocPage()
 	if err != nil {
 		return nil, 0, err
 	}
-	t.rebuildLeaf(rightPageID, entries[split:])
+	if t.rebuildLeaf(rightPageID, entries[split:]) < 0 {
+		panic("btree: right leaf half does not fit after byte-balanced split")
+	}
 
 	sep = computeSeparator(entries[split-1].Key, entries[split].Key)
 	return sep, rightPageID, nil
@@ -178,7 +182,9 @@ func (t *Tree) splitLeaf(pageID uint64, entries []page.LeafEntry) (sep []byte, r
 func (t *Tree) splitBranch(pageID uint64, ptr0 uint64, cells []branchCell) (promotedSep []byte, rightPageID uint64, err error) {
 	split := t.findBranchSplitPoint(ptr0, cells)
 
-	t.rebuildBranch(pageID, ptr0, cells[:split])
+	if t.rebuildBranch(pageID, ptr0, cells[:split]) < 0 {
+		panic("btree: left branch half does not fit after byte-balanced split")
+	}
 
 	promotedSep = cells[split].key
 
@@ -186,7 +192,9 @@ func (t *Tree) splitBranch(pageID uint64, ptr0 uint64, cells []branchCell) (prom
 	if err != nil {
 		return nil, 0, err
 	}
-	t.rebuildBranch(rightPageID, cells[split].childPtr, cells[split+1:])
+	if t.rebuildBranch(rightPageID, cells[split].childPtr, cells[split+1:]) < 0 {
+		panic("btree: right branch half does not fit after byte-balanced split")
+	}
 
 	return promotedSep, rightPageID, nil
 }
