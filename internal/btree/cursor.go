@@ -25,6 +25,7 @@ type Cursor struct {
 	count int         // entry count of current leaf
 
 	keyBuf     []byte             // reusable key reconstruction buffer
+	keyArena   []byte             // reusable arena for group cache keys
 	groupCache [16]page.LeafEntry // cached decoded entries for current restart group
 	groupBase  int                // first entry index of the cached group (-1 = invalid)
 	groupLen   int                // number of valid entries in groupCache
@@ -243,19 +244,40 @@ func (c *Cursor) cachedCurrent() (key, value []byte) {
 
 // populateGroup decodes all entries in the restart group starting at base
 // and caches them. Uses a single forward scan through the group — O(ri)
-// entry decodings instead of O(ri²).
+// entry decodings instead of O(ri²). Keys are copied into a reusable arena
+// (0 allocations after the first group population).
 func (c *Cursor) populateGroup(base int) {
 	buf := c.tree.pageSlice(c.leaf)
 	lr := page.NewLeafReader(buf, c.tree.cfg)
 	group := base / 16
 
+	// Reset the key arena, keeping the backing array.
+	c.keyArena = c.keyArena[:0]
+
+	// Record start/end offsets into the arena for each key.
+	var keyOff [16]uint32
 	n := 0
 	lr.DecodeGroup(group, nil, func(_ int, e page.LeafEntry) bool {
-		e.Key = bytes.Clone(e.Key)
+		keyOff[n] = uint32(len(c.keyArena))
+		c.keyArena = append(c.keyArena, e.Key...)
+		e.Key = nil // resolved below
 		c.groupCache[n] = e
 		n++
 		return true
 	})
+
+	// Resolve Key slices into the final (stable) arena.
+	for i := range n {
+		start := keyOff[i]
+		var end uint32
+		if i+1 < n {
+			end = keyOff[i+1]
+		} else {
+			end = uint32(len(c.keyArena))
+		}
+		c.groupCache[i].Key = c.keyArena[start:end:end]
+	}
+
 	c.groupBase = base
 	c.groupLen = n
 }

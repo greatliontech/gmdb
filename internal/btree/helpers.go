@@ -53,9 +53,18 @@ func (t *Tree) collectEntriesFrom(pageID uint64, cloneValues bool) []page.LeafEn
 	lr := page.NewLeafReader(buf, t.cfg)
 	count := lr.Count()
 	entries := make([]page.LeafEntry, 0, count)
+
+	// Key arena: all reconstructed keys are copied into a single contiguous
+	// buffer instead of N individual bytes.Clone calls. After iteration,
+	// Key slices are resolved into the final arena.
+	keyArena := make([]byte, 0, count*24)
+	keyOff := make([]uint16, 0, count)
+
 	var keyBuf []byte
 	keyBuf = lr.IterEntries(keyBuf, func(_ int, e page.LeafEntry) bool {
-		e.Key = bytes.Clone(e.Key)
+		keyOff = append(keyOff, uint16(len(keyArena)))
+		keyArena = append(keyArena, e.Key...)
+		e.Key = nil // resolved below
 		if cloneValues {
 			if e.CellFlags == 0 && e.Value != nil {
 				e.Value = bytes.Clone(e.Value)
@@ -70,6 +79,19 @@ func (t *Tree) collectEntriesFrom(pageID uint64, cloneValues bool) []page.LeafEn
 		return true
 	})
 	_ = keyBuf
+
+	// Resolve Key slices into the final (stable) arena.
+	for i := range entries {
+		start := int(keyOff[i])
+		var end int
+		if i+1 < len(entries) {
+			end = int(keyOff[i+1])
+		} else {
+			end = len(keyArena)
+		}
+		entries[i].Key = keyArena[start:end:end]
+	}
+
 	return entries
 }
 
