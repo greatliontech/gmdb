@@ -60,6 +60,25 @@ func TestDirtyPagesMultiple(t *testing.T) {
 	}
 }
 
+func TestDirtyPagesWithAlloc(t *testing.T) {
+	data := makeBitmapData(256)
+	setBitInData(data, 20) // free on disk
+	b := New(data, 256, 10)
+
+	b.Clear(20) // allocate → creates allocMask entry
+
+	pages := b.DirtyPages(4096)
+	if len(pages) != 1 {
+		t.Fatalf("DirtyPages len = %d, want 1", len(pages))
+	}
+
+	// Bit 20 should be clear in the dirty page (allocated).
+	w := binary.LittleEndian.Uint64(pages[0].Data[0:])
+	if w&(1<<20) != 0 {
+		t.Error("bit 20 should be clear in dirty page (allocated)")
+	}
+}
+
 func TestApplyToPage(t *testing.T) {
 	data := makeBitmapData(256)
 	setBitInData(data, 20) // on-disk: page 20 free

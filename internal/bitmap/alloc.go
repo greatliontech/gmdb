@@ -34,24 +34,21 @@ func (b *Bitmap) scanForFree(from, to uint64) (uint64, bool) {
 			continue
 		}
 
-		// Jump to the first set bit in the (masked) summary word.
+		// Jump to the first non-empty detail word. The summary is kept
+		// consistent with logicalWord by updateSummaryBit on every
+		// Set/Clear, so the target word is guaranteed non-zero and
+		// within [from, to) (the first pass covers [hint, totalWords)
+		// and the second covers [0, hint) — any word the summary
+		// points to in one range was already found by the other).
 		nextBit := uint64(bits.TrailingZeros64(sw))
 		di = si*64 + nextBit
-		if di >= to {
-			break
-		}
 
 		dw := b.logicalWord(di)
-		// logicalWord already masks out reserved pages and bits
-		// beyond totalPages, so any set bit is a valid free page.
-		if dw != 0 {
-			bitPos := uint64(bits.TrailingZeros64(dw))
-			pageID := di*64 + bitPos
-			b.Clear(pageID)
-			b.hint = di
-			return pageID, true
-		}
-		di++
+		bitPos := uint64(bits.TrailingZeros64(dw))
+		pageID := di*64 + bitPos
+		b.Clear(pageID)
+		b.hint = di
+		return pageID, true
 	}
 	return 0, false
 }
@@ -148,10 +145,9 @@ func (b *Bitmap) scanWordRuns(w uint64, base uint64, n int) (uint64, bool) {
 		remaining >>= zeros
 		pos += zeros
 
-		// Count ones.
-		if remaining == 0 {
-			break
-		}
+		// Count ones. remaining is guaranteed non-zero here because
+		// TrailingZeros64 on non-zero input returns < 64, and the shift
+		// leaves bit 0 set.
 		ones := bits.TrailingZeros64(^remaining)
 		if ones >= n {
 			return b.allocRun(base+uint64(pos), n), true

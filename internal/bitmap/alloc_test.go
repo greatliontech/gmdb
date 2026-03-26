@@ -540,6 +540,26 @@ func TestFindContiguousFullWordRun(t *testing.T) {
 	}
 }
 
+func TestFindRunTrailingZeroResetsCarry(t *testing.T) {
+	// Word 0: bits 20-30 set (11 contiguous), MSB clear → trailing = 0.
+	// Word 1: bits 0-4 set (5 contiguous).
+	// Ask for 15: no single run is long enough, and carry can't bridge
+	// because word 0 ends with 0-bits (trailing = 0). Should fail.
+	data := makeBitmapData(256)
+	for i := uint64(20); i < 31; i++ {
+		setBitInData(data, i)
+	}
+	for i := uint64(64); i < 69; i++ {
+		setBitInData(data, i)
+	}
+	b := New(data, 256, 10)
+
+	_, ok := b.FindContiguous(15)
+	if ok {
+		t.Error("FindContiguous(15): should not find (trailing=0 resets carry)")
+	}
+}
+
 func TestAllocAndFreeInterleaved(t *testing.T) {
 	data := makeBitmapData(256)
 	for i := uint64(10); i < 20; i++ {
