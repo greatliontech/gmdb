@@ -25,7 +25,7 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Lagging readers | Callback-based notification | Application controls policy; no silent unbounded growth |
 | mmap | Read-write mmap (`MAP_SHARED \| PROT_READ \| PROT_WRITE`) | Single write mode; CoW to fresh pages in mmap; bitmap/meta via pwrite for ordered commits |
 | Huge pages | `MADV_HUGEPAGE` (opt-in, Linux) | Reduces TLB pressure for large databases; transparent huge pages for file-backed mmap |
-| Dirty page tracking | Hash map (`map[uint64]struct{}`) of dirtied page IDs | O(1) insert/lookup; `pendingAllocs`/`pendingFrees` track bitmap changes; commit writes only bitmap + meta via pwrite |
+| CoW page tracking | Hash map (`map[uint64]struct{}`) of CoW'd page IDs | O(1) insert/lookup; `pendingAllocs`/`pendingFrees` track bitmap changes; commit writes only bitmap + meta via pwrite |
 | Branch keys | Prefix-truncated separators | Shortest distinguishing prefix; maximizes fan-out; shallower trees; full keys in leaves only |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
@@ -50,8 +50,9 @@ A memory-mapped, multi-process, embedded key-value database for Go.
 | Named snapshots | Not supported (explicit decision) | Requires preserving historical meta roots and pinning TxnIDs (permanently blocking RPL reclamation); dual meta pages don't preserve old roots past two commits; `CopyTo()` covers the backup use case without ongoing space cost |
 | Merge operators | Not supported (explicit decision) | LSM optimization (defer reads during writes); B+tree read and write paths traverse the same pages — no asymmetry to exploit; `Get` + `Put` does the same work |
 | Sequences | `NextSeq uint64` in keyspace descriptor | Per-keyspace auto-incrementing counter; eliminates the need for a separate SeqKeyspace type — sequential-key workloads use a regular Keyspace with `NextSequence()` + big-endian uint64 keys (prefix compression makes the density gap negligible) |
-| Per-keyspace page sizes | Not supported (explicit decision) | Requires either multi-block nodes in a shared bitmap (adds keyspace context to every page operation, non-uniform dirty tracking) or per-keyspace files (breaks cross-keyspace atomic commit); single file with uniform page size is a core design strength |
+| Per-keyspace page sizes | Not supported (explicit decision) | Requires either multi-block nodes in a shared bitmap (adds keyspace context to every page operation, non-uniform CoW tracking) or per-keyspace files (breaks cross-keyspace atomic commit); single file with uniform page size is a core design strength |
 | Encryption at rest | Not supported (explicit decision) | Same mmap conflict as compression — encrypted pages can't be read in place, requires decryption buffer pool; LMDB and libmdbx also omit encryption for this reason; filesystem-level encryption (LUKS, FileVault, dm-crypt) covers the primary threat model transparently |
+| Background maintenance | Periodic goroutine: bitmap leak reclamation, stale reader cleanup, checksum scrubbing, incremental compaction | Avoids accumulating issues that require offline intervention; coordinated across processes via lock file timestamp; one pass per interval regardless of process count |
 
 ## File Layout
 
@@ -312,17 +313,25 @@ Leaf Page
 | RestartInterval uint16|  fixed: 16
 | RestartCount uint16   |  number of restart points
 +-----------------------+
-| Restart Table         |  array of (Offset uint16), one per restart point
-| ...                   |  RestartCount × 2 bytes, grows forward
+| Entry 0 (restart)     |  entries in forward order, starting at fixed offset 12
+| Entry 1 (delta)       |
+| ...                   |
+| Entry N               |
 +-----------------------+
 |       free space      |
 +-----------------------+
-| ...                   |
-| Entry N               |  packed from end of page, grows backward
-| Entry 1 (delta)       |
-| Entry 0 (restart)     |
+| Restart Table         |  array of (Offset uint16), one per restart point
+| ...                   |  RestartCount × 2 bytes, packed at content end
 +-----------------------+
 ```
+
+Entries are stored in forward memory order starting at a fixed offset (12)
+because prefix compression requires sequential scanning — each delta entry
+reconstructs its key from the previous entry's key. The restart table is at
+the end of the page (before the optional CRC32C footer) rather than after
+the header, so that entries can be written directly as they are added without
+knowing the final restart count upfront. The reader locates the restart table
+at `contentEnd - RestartCount × 2`.
 
 Entries at positions 0, 16, 32, ... are **restart points** that store full
 keys. All other entries are **delta entries** that encode the key as a
@@ -1026,7 +1035,7 @@ as LMDB's LIFO reclamation.
 
 #### Loose Pages
 
-Pages that are dirtied (copied via CoW) and then freed within the **same
+Pages that are CoW'd and then freed within the **same
 write transaction** are called "loose pages." This commonly occurs during
 B+tree rebalancing: a merge operation may CoW a node, then free one of the
 two original nodes. The CoW'd copy becomes unnecessary if its contents are
@@ -1112,7 +1121,7 @@ state.
 #### Freeing Pages
 
 When a CoW operation replaces an old page with a new copy:
-- If the old page was **dirtied in this transaction** (i.e., it was itself a
+- If the old page was **CoW'd in this transaction** (i.e., it was itself a
   CoW copy made earlier in this transaction), it becomes a **loose page** —
   added to `tx.loosePages`.
 - If the old page was **from a previous transaction** (an immutable page in
@@ -1146,42 +1155,42 @@ If the bitmap has no free pages and file extension would exceed MaxSize, RPL seg
 
 Steps 1-4 happen before the bitmap pwrite and meta page swap.
 
-## Dirty Page Tracking
+## CoW Page Tracking
 
-A write transaction must track which pages have been modified (dirtied via
-CoW) for two purposes: avoiding double-CoW when the same page is modified
-multiple times within a transaction, and tracking bitmap changes for
-commit-time pwrite.
+A write transaction must track which pages have been copied via CoW for
+two purposes: avoiding double-CoW when the same page is modified multiple
+times within a transaction, and tracking bitmap changes for commit-time
+pwrite.
 
 ### Data Structure
 
-The dirty set is a **hash map** of page IDs:
+The CoW set is a **hash map** of page IDs:
 
 ```
-tx.dirtyPages    map[uint64]struct{} // page IDs dirtied in this transaction
+tx.cowPages      map[uint64]struct{} // page IDs CoW'd in this transaction
 tx.pendingAllocs map[uint64]struct{} // pages allocated — bitmap bits to clear at commit
 tx.pendingFrees  map[uint64]struct{} // pages freed — bitmap bits to set at commit
 ```
 
 All B+tree page modifications happen directly in the read-write mmap.
-`tx.dirtyPages` records which pages were modified so that double-CoW is
-avoided (if a page is already in the dirty set, it can be modified in place
+`tx.cowPages` records which pages were CoW'd so that double-CoW is
+avoided (if a page is already in the CoW set, it can be modified in place
 without allocating a new copy). `tx.pendingAllocs` and `tx.pendingFrees`
 track deferred bitmap changes — the mmap bitmap is never modified directly
 during a transaction; instead, these sets accumulate the changes and the
 bitmap pages are written via `pwrite()` at commit time.
 
 Page lookup is always `mmap[pageID * pageSize]` — a single level with no
-branches. There is no dirty page buffer, no evicted page set, and no
-multi-level lookup.
+branches. There is no page buffer, no evicted page set, and no multi-level
+lookup. The OS page cache manages all page memory.
 
 ### Operations
 
 | Operation | Method | Complexity |
 |-----------|--------|------------|
-| Add dirty page | `tx.dirtyPages[pageID] = struct{}{}` | O(1) amortized |
-| Check if dirty | `_, ok := tx.dirtyPages[pageID]` | O(1) |
-| Count | `len(tx.dirtyPages)` | O(1) |
+| Add CoW'd page | `tx.cowPages[pageID] = struct{}{}` | O(1) amortized |
+| Check if CoW'd | `_, ok := tx.cowPages[pageID]` | O(1) |
+| Count | `len(tx.cowPages)` | O(1) |
 
 The hash map replaces the sorted-array approach used in LMDB/libmdbx, where
 insertions required maintaining sort order (O(n) shift) and lookups required
@@ -1203,14 +1212,14 @@ pages are candidates for reallocation within the same transaction.
 
 #### Map Reuse Across Transactions
 
-The dirty page map (`tx.dirtyPages`), pending maps (`tx.pendingAllocs`,
+The CoW page map (`tx.cowPages`), pending maps (`tx.pendingAllocs`,
 `tx.pendingFrees`), and the loose page map (`tx.loosePages`) are pooled
 on the `DB` struct and reused across write transactions. On rollback or
 after commit cleanup, the maps are reset via the `clear` builtin rather
 than discarded:
 
 ```go
-clear(tx.dirtyPages)      // O(1): resets to empty, retains allocated buckets
+clear(tx.cowPages)        // O(1): resets to empty, retains allocated buckets
 clear(tx.pendingAllocs)
 clear(tx.pendingFrees)
 clear(tx.loosePages)
@@ -1261,38 +1270,34 @@ dirty pages for that file, including pages dirtied via `MAP_SHARED` mmap.
 This is because the kernel's page cache is shared between the pwrite and
 mmap paths. gmdb relies on this behavior for crash safety — the fdatasync
 after bitmap pwrite also flushes the CoW'd data pages that were modified
-directly in the mmap. On platforms where fdatasync does not flush mmap dirty
-pages, an additional `msync(MS_SYNC)` call on the data region would be
-needed before the bitmap pwrite. The current implementation targets Linux;
-portability to other platforms requires verifying this behavior or adding
-msync.
+directly in the mmap.
+
+On macOS (and potentially other platforms), `fdatasync()` does **not**
+guarantee that `MAP_SHARED` mmap dirty pages are flushed. On these
+platforms, the commit path inserts an `msync(MS_SYNC)` call on the dirty
+data page region before the bitmap pwrite. This ensures CoW'd data pages
+are on stable storage before the bitmap and meta updates that reference
+them. The msync call is implemented in `mmap_darwin.go` and gated by
+platform — Linux skips it (fdatasync is sufficient). The commit sequence
+on macOS becomes: `msync(MS_SYNC)` → bitmap pwrite → `fdatasync()` →
+meta pwrite → `fdatasync()`.
 
 **Bitmap leakage on crash.** A crash between the bitmap pwrite and the meta
 pwrite can leak pages. The bitmap on disk has cleared bits (pages allocated
 for the crashed transaction's CoW) but the meta on disk does not reference
 those pages. These pages appear allocated but are unreferenced — they are
 leaked, not free. The leaked page count is bounded by the number of pages
-the crashed transaction allocated (typically small). `Check()` detects
-leaked pages as `CheckWarning` severity. `CopyTo(compact=true)` recovers
-them. In `SyncLazy` mode, the OS may also flush bitmap pwrite pages from
+the crashed transaction allocated (typically small — a transaction
+modifying a few keys in a depth-4 tree leaks 4-20 pages per crash).
+`Check()` detects leaked pages as `CheckWarning` severity.
+`CheckWithOptions(&CheckOptions{Repair: true})` reclaims leaked pages
+in place (offline, exclusive access). `CopyTo(compact=true)` also
+recovers them by rebuilding the file from scratch. In `SyncLazy` mode, the OS may also flush bitmap pwrite pages from
 uncommitted (post-checkpoint) transactions, causing additional leakage on
 crash. This is an accepted tradeoff of the deferred bitmap approach — the
 alternative (versioned/CoW bitmap) would add significant complexity. The
 B+tree structure is always consistent; only free space accounting may be
 affected.
-
-## Dirty Page Memory Management
-
-Dirty page memory is managed by the OS via the mmap page cache. All B+tree
-modifications happen directly in the read-write mmap, so dirty pages are
-backed by the OS page cache like any other file-backed mmap page. When
-memory pressure is high, the kernel writes dirty mmap pages to disk and
-reclaims physical memory. No application-level eviction is needed.
-
-This approach eliminates the need for anonymous mmap slabs, clock-based
-eviction algorithms, dirty page count limits, and evicted page tracking.
-The OS is better positioned to make eviction decisions because it has
-global visibility into memory pressure across all processes.
 
 ## Copy-on-Write (CoW) Transaction Model
 
@@ -1310,10 +1315,10 @@ global visibility into memory pressure across all processes.
      position A to mmap position B, then modify position B in place.
    - Allocate new pages via `pageAlloc()` (loose pages → bitmap →
       RPL reclamation → lagging reader check → file extension).
-   - The dirty set (`tx.dirtyPages`) tracks page IDs. Bitmap changes are
+   - The CoW set (`tx.cowPages`) tracks page IDs. Bitmap changes are
      deferred in `tx.pendingAllocs` and `tx.pendingFrees`.
    - Old pages are tracked: pages from previous transactions go to
-     `tx.retiredPages`; pages dirtied then freed in this transaction become
+     `tx.retiredPages`; pages CoW'd then freed in this transaction become
      loose pages in `tx.loosePages`.
 4. Commit-time free space update:
    a. Perform tail page refund: check the bitmap for free pages at the end of
@@ -1346,8 +1351,12 @@ global visibility into memory pressure across all processes.
 
 1. Reader checks `ctx` — returns `context.Cause(ctx)` if already cancelled.
 2. Reader acquires a slot in the reader table (shared memory) via scan+CAS
-   and records the current TxnID from the active meta page. Returns
-   `ErrReadersFull` immediately if no slots are available (no blocking).
+   and records the current TxnID from the active meta page. If no slots are
+   available and the context has a deadline, the reader retries with short
+   backoff (1ms) until a slot becomes free or the context expires. If the
+   context has no deadline, returns `ErrReadersFull` immediately (no
+   blocking). This allows callers to control wait behavior per-call via
+   `context.WithTimeout`.
 3. Reader traverses the B+tree using page pointers from that meta page. Because
    of CoW, all pages referenced by this TxnID are immutable — the writer will
    never modify them in place.
@@ -1355,9 +1364,8 @@ global visibility into memory pressure across all processes.
 
 Readers never need locks on the data file. They never block writers. Writers
 never block readers. The only contention point is the reader table slot
-acquisition, which is a simple atomic CAS. The context is checked once before
-acquisition but is not stored on the transaction — slot acquisition is
-non-blocking so there is nothing to cancel.
+acquisition, which is a simple atomic CAS. The context governs the retry
+window for slot acquisition but is not stored on the transaction.
 
 ### Write Batching
 
@@ -1487,14 +1495,14 @@ if err != nil {
 **Child begin** — snapshot the parent's state:
 - Copy `tx.pendingAllocs` (or record its length for truncation)
 - Copy `tx.pendingFrees` (or record its length)
-- Copy `tx.dirtyPages` (the set of dirtied page IDs)
+- Copy `tx.cowPages` (the set of CoW'd page IDs)
 - Copy `tx.loosePages`
 - Copy `tx.retiredPages` (or record its length)
 - Snapshot keyspace root page IDs and counts
 
 **Child does work:**
 - CoW allocates fresh pages in the mmap, adding to `pendingAllocs` and
-  `dirtyPages`. Old pages go to `retiredPages`. All modifications happen
+  `cowPages`. Old pages go to `retiredPages`. All modifications happen
   on the same maps as the parent — the child doesn't have its own maps.
 
 **Child commit:**
@@ -1503,7 +1511,7 @@ if err != nil {
   continues with the merged state.
 
 **Child rollback:**
-- Restore `pendingAllocs`, `pendingFrees`, `dirtyPages`, `loosePages`,
+- Restore `pendingAllocs`, `pendingFrees`, `cowPages`, `loosePages`,
   and `retiredPages` from the saved snapshots.
 - Restore keyspace roots to their pre-child state.
 - The child's CoW'd pages in the mmap are abandoned — they hold modified
@@ -1699,29 +1707,29 @@ A separate file (`<dbname>.lock`) is mmap'd as shared memory by all processes.
 
 ```
 Lock File
-+-------------------------------+
-| Header (48 bytes)             |
-| Magic            | uint64    |  identifies file as gmdb lock file
-| MaxReaders       | uint32    |  number of reader slots (set at creation)
-| Padding          | 4 bytes   |  alignment
-| UUID             | [16]byte  |  must match data file's UUID
-| WriterPID        | uint64    |  PID of current write txn holder (0 = no writer)
-| WriterStartTime  | uint64    |  process start time of writer (for PID reuse detection)
-+-------------------------------+
-| Reader Table                  |
-| +---------+---------+-------+ |
-| | TxnID   | PID     | PST   | | Slot 0
-| | uint64  | uint64  | uint64| |
-| +---------+---------+-------+ |
-| | TxnID   | PID     | PST   | | Slot 1
-| | ...                        | |
-| +---------+---------+-------+ |
-| | ...                        | | up to MaxReaders slots
-| +---------+---------+-------+ |
-+-------------------------------+
++---------------------------------------+
+| Header (72 bytes)                     |
+| Magic              | uint64          |  identifies file as gmdb lock file
+| MaxReaders         | uint32          |  number of reader slots (set at creation)
+| Padding            | 4 bytes         |  alignment
+| UUID               | [16]byte        |  must match data file's UUID
+| WriterPID          | uint64          |  PID of current write txn holder (0 = no writer)
+| WriterStartTime    | uint64          |  process start time of writer
+| WriterPIDNamespace | uint64          |  PID namespace inode of writer
+| WriterHeartbeat    | uint64          |  monotonic clock, updated periodically
+| LastMaintenanceTime| uint64          |  monotonic clock, updated after maintenance pass
++---------------------------------------+
+| Reader Table                          |
+| +-------+-----+-----+------+-------+ |
+| | TxnID | PID | PST | PIDN | HB    | | Slot 0
+| | u64   | u64 | u64 | u64  | u64   | |
+| +-------+-----+-----+------+-------+ |
+| | ...                                | | up to MaxReaders slots
+| +-------+-----+-----+------+-------+ |
++---------------------------------------+
 ```
 
-PST = Process Start Time.
+PST = Process Start Time. PIDN = PID Namespace. HB = Heartbeat.
 
 The lock file structures are defined as Go structs with `structs.HostLayout`
 (Go 1.24+), which guarantees the struct uses the host platform's C ABI
@@ -1731,20 +1739,25 @@ on unspecified Go compiler layout behavior:
 
 ```go
 type LockFileHeader struct {
-    _               structs.HostLayout
-    Magic           uint64
-    MaxReaders      uint32
-    _               [4]byte  // explicit padding for 8-byte alignment
-    UUID            [16]byte // must match data file's UUID
-    WriterPID       uint64
-    WriterStartTime uint64   // process start time of writer (PID reuse detection)
+    _                  structs.HostLayout
+    Magic              uint64
+    MaxReaders         uint32
+    _                  [4]byte  // explicit padding for 8-byte alignment
+    UUID               [16]byte // must match data file's UUID
+    WriterPID          uint64
+    WriterStartTime    uint64   // process start time of writer (PID reuse detection)
+    WriterPIDNamespace uint64   // PID namespace inode of writer (0 = unknown/non-Linux)
+    WriterHeartbeat    uint64   // CLOCK_BOOTTIME nanos, updated by heartbeat goroutine
+    LastMaintenanceTime uint64  // CLOCK_BOOTTIME nanos, updated after maintenance pass
 }
 
 type ReaderSlot struct {
-    _              structs.HostLayout
-    TxnID          uint64
-    PID            uint64
+    _                structs.HostLayout
+    TxnID            uint64
+    PID              uint64
     ProcessStartTime uint64 // process start time when slot was acquired
+    PIDNamespace     uint64 // PID namespace inode (0 = unknown/non-Linux)
+    Heartbeat        uint64 // CLOCK_BOOTTIME nanos, updated by heartbeat goroutine
 }
 ```
 
@@ -1753,7 +1766,7 @@ the lock file's shared memory structures. Data file page formats remain
 defined as raw byte layouts with explicit encode/decode functions, since
 those must be endian-aware and portable across architectures.
 
-**Header (48 bytes):**
+**Header (72 bytes):**
 - `Magic` (uint64): Identifies the file as a gmdb lock file. Validates that
   the lock file belongs to this database and has not been corrupted.
 - `MaxReaders` (uint32): Number of reader slots. Set at lock file creation
@@ -1775,20 +1788,39 @@ those must be endian-aware and portable across architectures.
   and the PID is alive, the start time is compared against the PID's current
   start time — a mismatch means the PID was recycled and the original writer
   crashed. See Stale Writer Recovery and Process Start Time below.
+- `WriterPIDNamespace` (uint64): PID namespace inode of the writer process
+  (from `/proc/self/ns/pid` on Linux, 0 on other platforms). Used to
+  determine whether the stale writer check can trust PID-based liveness
+  detection. See PID Namespace Awareness below.
+- `WriterHeartbeat` (uint64): Monotonic clock value (`CLOCK_BOOTTIME` on
+  Linux, `CLOCK_MONOTONIC` on other platforms), updated periodically by
+  the heartbeat goroutine while the write lock is held. Used as a fallback
+  for stale writer detection when PID namespaces differ.
+- `LastMaintenanceTime` (uint64): Monotonic clock value, updated after a
+  maintenance pass completes. Used to coordinate maintenance across
+  processes — each process checks this value before starting a pass and
+  skips if a recent pass was completed within `MaintenanceOptions.Interval`.
+  See Background Maintenance.
 
-**Reader Slot (24 bytes):**
+**Reader Slot (40 bytes):**
 - `TxnID` (uint64, atomic): The snapshot transaction ID held by this reader.
   A value of 0 means the slot is free. Non-zero means the slot is active.
 - `PID` (uint64, atomic): Process ID that owns this slot. Used for stale
-  reader detection. Stored as uint64 for alignment consistency with TxnID
-  and forward safety.
+  reader detection in the same PID namespace. Stored as uint64 for alignment
+  consistency with TxnID and forward safety.
 - `ProcessStartTime` (uint64, atomic): Process start time when the slot was
   acquired. Used alongside `PID` for PID reuse detection — if the PID is
   alive but its current start time differs from the stored value, the PID
   was recycled and the slot is stale. See Process Start Time below.
+- `PIDNamespace` (uint64, atomic): PID namespace inode of the process that
+  acquired this slot (from `/proc/self/ns/pid` on Linux, 0 on other
+  platforms). See PID Namespace Awareness below.
+- `Heartbeat` (uint64, atomic): Monotonic clock value, updated periodically
+  (~1s) by the owning process's heartbeat goroutine. Used for stale
+  detection when PID namespaces differ or PID-based checks are unavailable.
 
-Total lock file size: 48 + (24 × MaxReaders). With default MaxReaders=4096:
-48 + 98304 = 98352 bytes (~96KB).
+Total lock file size: 72 + (40 × MaxReaders). With default MaxReaders=4096:
+72 + 163840 = 163912 bytes (~160KB).
 
 The lock file is mmap'd with `MAP_SHARED` by all processes for the reader table.
 The write lock is a separate concern handled via `flock()` (see below).
@@ -1907,28 +1939,32 @@ If a process crashes while holding the write lock, `WriterPID` remains non-zero
 and the `flock()` is automatically released by the kernel (flock locks are
 released on fd close / process exit). On `Open()` or when attempting to acquire
 the write lock, if `WriterPID` is non-zero, the process determines whether the
-writer is still alive using two checks:
+writer is still alive using the same namespace-aware logic as reader stale
+detection:
 
-1. `kill(pid, 0)` — if it returns `ESRCH`, the process is dead.
-2. If the PID is alive, compare `WriterStartTime` against the PID's current
-   start time (via `processStartTime(pid)`). If they differ, the PID was
-   recycled — the original writer crashed.
+1. **Same PID namespace** (`WriterPIDNamespace` == checker's, both non-zero):
+   a. `kill(pid, 0)` — if it returns `ESRCH`, the process is dead.
+   b. If alive, compare `WriterStartTime` — if different, PID was recycled.
+2. **Different PID namespace** (or either is 0): check `WriterHeartbeat`.
+   If `now - WriterHeartbeat > StaleTimeout`, the writer is dead.
 
 Based on the result:
 
-- If alive and start time matches: the writer is still running — proceed with
-  normal `flock()` which will block until the writer finishes.
-- If dead or PID recycled: the writer crashed. The flock is already released
-  by the kernel. The new writer acquires the flock, then performs recovery:
+- If alive (PID check or fresh heartbeat): the writer is still running —
+  proceed with normal `flock()` which will block until the writer finishes.
+- If dead (PID check or stale heartbeat): the writer crashed. The flock is
+  already released by the kernel. The new writer acquires the flock, then
+  performs recovery:
   1. Read both meta pages and select the valid one (highest TxnID with valid
      checksum). The crashed writer's partial commit is invisible — CoW ensures
      the previous meta page points to a consistent tree.
-  2. Scan the reader table for slots with the dead writer's PID and clear them
-     (the crashed process may have also held read transactions). Each slot is
-     also validated via `ProcessStartTime` to avoid clearing slots from a
-     different process that reused the same PID.
-  3. Clear `WriterPID` and `WriterStartTime` to 0 (they will be set to the
-     new writer's values shortly).
+  2. Scan the reader table for slots with the dead writer's PID (in the same
+     PID namespace) and clear them (the crashed process may have also held
+     read transactions). Each slot is validated via `ProcessStartTime` and
+     `PIDNamespace` to avoid clearing slots from a different process.
+  3. Clear `WriterPID`, `WriterStartTime`, `WriterPIDNamespace`, and
+     `WriterHeartbeat` to 0 (they will be set to the new writer's values
+     shortly).
 
 No special rollback logic is needed for tree consistency — the CoW model
 guarantees that the previous meta page points to a fully consistent tree.
@@ -1944,7 +1980,7 @@ bitmap) so their content is irrelevant.
 ### Reader Table
 
 Slot allocation uses a simple scan with atomic CAS — no free stack or other
-auxiliary data structure. The reader table is a flat array of 24-byte slots
+auxiliary data structure. The reader table is a flat array of 40-byte slots
 stored in the lock file's shared mmap. All operations use atomic memory
 operations visible across processes.
 
@@ -1957,19 +1993,21 @@ operations visible across processes.
 3. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID.
    If the CAS fails (another goroutine or process claimed the slot
    concurrently), continue scanning.
-4. After successful CAS, store the caller's PID and cached process start
-   time (`db.processStartTime`) in the slot's `PID` and `ProcessStartTime`
-   fields. The CAS establishes ownership — only the CAS winner writes
-   PID and ProcessStartTime.
-5. Update `db.readerSlotHint` to the acquired slot's index.
-6. If all slots are occupied (full wraparound), return `ErrReadersFull`.
+4. After successful CAS, store the caller's PID, cached process start
+   time (`db.processStartTime`), PID namespace (`db.pidNamespace`), and
+   current monotonic clock in the slot's `PID`, `ProcessStartTime`,
+   `PIDNamespace`, and `Heartbeat` fields. The CAS establishes ownership
+   — only the CAS winner writes these fields.
+5. Register the slot index with the heartbeat goroutine's active slot list.
+6. Update `db.readerSlotHint` to the acquired slot's index.
+7. If all slots are occupied (full wraparound), return `ErrReadersFull`.
 
 The CAS on `TxnID` establishes slot ownership. Only the CAS winner writes
-PID and ProcessStartTime — there is no race because the CAS serializes
-access to the slot. The writer's stale-reader scan treats slots with
-non-zero TxnID and zero PID as "being acquired" and skips them (does not
-clear them as stale). This window is brief — the time between a successful
-CAS and the subsequent PID/ProcessStartTime stores.
+PID, ProcessStartTime, PIDNamespace, and Heartbeat — there is no race
+because the CAS serializes access to the slot. The writer's stale-reader
+scan treats slots with non-zero TxnID and zero PID as "being acquired"
+and skips them (does not clear it as stale). This window is brief — the
+time between a successful CAS and the subsequent field stores.
 
 The hint is process-local (stored on the `DB` struct, not in shared
 memory) and updated with a relaxed atomic store — no cross-process
@@ -1979,8 +2017,8 @@ and the scan completes in 1–2 iterations. In the worst case (all slots
 before the hint are occupied), the scan wraps around and degrades to
 O(MaxReaders) — no worse than scanning from slot 0.
 
-The CAS on `TxnID` is the serialization point. With 24-byte slots,
-4096 slots = 96KB — fits in L2 cache, sequential scan with hardware
+The CAS on `TxnID` is the serialization point. With 40-byte slots,
+4096 slots = 160KB — fits in L2 cache, sequential scan with hardware
 prefetching.
 
 **Slot release (`Commit`/`Rollback` read transaction):**
@@ -2000,20 +2038,29 @@ that acquired the slot:
    has won the CAS on TxnID but has not yet stored its PID. The writer
    skips this slot (does not clear it as stale). This avoids a race where
    the writer clears a slot between the reader's CAS and its PID store.
-1. `kill(pid, 0)` — if it returns `ESRCH`, the process is dead. The slot
-   is stale. Clear `TxnID = 0`.
-2. If the PID is alive, compare the slot's `ProcessStartTime` against the
-   PID's current start time (via `processStartTime(pid)`). If they differ,
-   the PID was recycled — a different process now occupies that PID. The
-   slot is stale. Clear `TxnID = 0`.
-3. If both PID and start time match, the original process is still alive
-   and holding the slot legitimately.
+1. **Same PID namespace** (slot's `PIDNamespace` == checker's, both non-zero):
+   use the fast PID + StartTime path:
+   a. `kill(pid, 0)` — if it returns `ESRCH`, the process is dead. Stale.
+   b. If alive, compare `ProcessStartTime` — if different, PID was recycled.
+      Stale.
+   c. If both match, the process is alive and holding the slot legitimately.
+2. **Different PID namespace** (or either is 0): PID-based checks would
+   inspect the wrong process. Fall back to heartbeat:
+   a. If `now - Heartbeat > StaleTimeout` → stale. Clear `TxnID = 0`.
+   b. If heartbeat is fresh → not stale. The owning process is still
+      updating the slot.
+3. If neither PID nor heartbeat can determine liveness (e.g., `PIDNamespace`
+   is 0 and `Heartbeat` is 0 — a slot from a process that predates heartbeat
+   support), fall back to PID-only liveness (`kill(pid, 0)`). This is the
+   legacy path, vulnerable to cross-namespace false results but safe within
+   a single namespace.
 
-This two-step check eliminates the PID reuse vulnerability that affects
-containerized environments where PID namespaces cause rapid PID recycling.
-Without the start time check, a recycled PID would appear alive, permanently
-leaking the reader slot and blocking RPL reclamation. See Process Start Time
-below for platform-specific details.
+The PID namespace check prevents the dangerous cross-namespace failure mode
+where `kill(pid, 0)` inspects a different process than the slot owner. When
+two containers share a database file via volume mount, each process stores
+its PID namespace inode in the slot. A writer in container B sees that
+container A's slot has a different namespace and uses the heartbeat instead
+of trusting `kill()`. See PID Namespace Awareness below.
 
 #### Go Goroutine Model
 
@@ -2066,9 +2113,79 @@ All implementations are pure Go (no cgo required). The
 (`process_linux.go`, `process_darwin.go`, `process_freebsd.go`).
 
 If `processStartTime` fails (e.g., insufficient permissions to read
-another process's info), the stale check falls back to PID-only liveness
-(`kill(pid, 0)`) — the same behavior as before, which is correct in the
-common case and only vulnerable to PID reuse.
+another process's info), the stale check falls back to heartbeat-based
+detection if a heartbeat is available, or PID-only liveness
+(`kill(pid, 0)`) as a last resort.
+
+#### PID Namespace Awareness
+
+PID-based liveness detection (`kill(pid, 0)` and `/proc/[pid]/stat`)
+operates within the caller's PID namespace. When multiple containers
+share a database file via volume mount, each container has its own PID
+namespace — a PID in one namespace refers to a different (or nonexistent)
+process in another. This causes two failure modes:
+
+- **False dead**: Container A holds a reader slot at PID 42. Container B
+  has no PID 42. `kill(42, 0)` from B returns `ESRCH` — B clears the
+  slot, removing snapshot protection for A's active reader.
+- **False alive**: Container A crashes with PID 42 in a slot. Container B
+  happens to also have a PID 42. `kill(42, 0)` from B succeeds — the
+  slot is never reclaimed.
+
+To prevent this, each reader slot and the writer header store the
+process's **PID namespace inode** alongside the PID. On Linux, this is
+read from `/proc/self/ns/pid` via `readlink` at `Open()` time and cached
+on the `DB` struct (`db.pidNamespace uint64`). On non-Linux platforms,
+the value is 0 (no PID namespaces).
+
+During stale detection, the writer compares its own PID namespace against
+the slot's. If they match (same namespace), the PID + StartTime fast path
+is safe. If they differ (cross-namespace), the writer uses the heartbeat
+instead. This eliminates both false-dead and false-alive cross-namespace
+failures.
+
+**Platform-specific implementations:**
+
+| Platform | Source | Value | Notes |
+|----------|--------|-------|-------|
+| Linux | `readlink /proc/self/ns/pid` | Inode number (`uint64`) | Unique per PID namespace. Pure Go: `os.Readlink`. |
+| macOS | N/A | 0 | No PID namespaces. PID-based checks always valid. |
+| FreeBSD | N/A | 0 | No PID namespaces (jails use different mechanism). PID-based checks always valid within the same jail. |
+
+#### Heartbeat Goroutine
+
+The `DB` struct maintains a **heartbeat goroutine** (started at `Open()`
+time, stopped at `Close()`) that periodically updates the `Heartbeat`
+field on all reader slots and the writer header held by this process.
+
+The goroutine ticks every ~1 second and writes the current monotonic clock
+value (`CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on other platforms)
+to each active slot. The `DB` struct maintains an in-process list of
+active reader slot indices (appended on `Begin()`, removed on
+`Commit()`/`Rollback()`). Each tick iterates this list and performs one
+atomic store per slot.
+
+`CLOCK_BOOTTIME` is used on Linux because it is monotonic, survives
+suspend/resume, and is shared across all containers on the same host (it
+is a kernel-wide clock, not per-PID-namespace). Two containers mmap'ing
+the same lock file see consistent clock values.
+
+The `StaleTimeout` option (default: 10 seconds) controls how long a
+heartbeat must be stale before the slot is reclaimed. This must be
+significantly larger than the heartbeat interval (1s) to account for
+scheduling delays under heavy load.
+
+```go
+// StaleTimeout is the duration after which a reader slot with a stale
+// heartbeat is considered abandoned. Only used for cross-PID-namespace
+// stale detection (same-namespace detection uses instant PID liveness
+// checks). Default: 10s.
+StaleTimeout time.Duration
+```
+
+The heartbeat goroutine is a fixed-cost resource: one goroutine per `DB`
+handle (~8KB stack), one atomic store per active reader slot per second.
+No syscalls, no allocations. Same lifecycle pattern as the flock goroutine.
 
 #### Atomic Operations Convention
 
@@ -2082,8 +2199,9 @@ memory being accessed:
   enforces that all access goes through the atomic methods. These fields
   are never visible to other processes.
 
-- **Shared-memory fields** (reader table `TxnID`, `PID`, and
-  `ProcessStartTime`; header `WriterPID` and `WriterStartTime` in the
+- **Shared-memory fields** (reader table `TxnID`, `PID`,
+  `ProcessStartTime`, `PIDNamespace`, `Heartbeat`; header `WriterPID`,
+  `WriterStartTime`, `WriterPIDNamespace`, `WriterHeartbeat` in the
   mmap'd lock file) use the **function-based atomics**
   (`atomic.LoadUint64`, `atomic.StoreUint64`,
   `atomic.CompareAndSwapUint64`) on `unsafe.Pointer`-derived addresses.
@@ -2131,6 +2249,17 @@ only. Write transactions are rejected with `ErrReadOnly`. The lock file
 remains writable for reader slot acquisition (CAS operations). This allows
 opening databases on read-only media or with read-only filesystem
 permissions, provided the lock file is on writable storage.
+
+### Page Memory Management
+
+All page memory is managed by the OS page cache. CoW'd pages in the mmap
+are backed by the kernel's page cache like any other file-backed
+`MAP_SHARED` page. When memory pressure is high, the kernel writes modified
+mmap pages to disk and reclaims physical memory. gmdb performs no
+application-level page eviction. This eliminates the need for anonymous
+mmap slabs, eviction algorithms, or page count limits. The OS has global
+visibility into memory pressure across all processes and is better
+positioned to make eviction decisions.
 
 ### Read Path
 
@@ -2310,6 +2439,9 @@ On recovery after a crash, `Open()` performs the following:
    meta page with the higher TxnID. In this case, the database has no
    checkpoint to fall back to — data integrity depends on whether
    the OS flushed pages in the right order, which is not guaranteed.
+   `Open()` logs a warning via the configured `slog.Logger` when recovery
+   selects a meta page with no checkpoint flag set, indicating the database
+   was running in `SyncLazy` mode without periodic `Checkpoint()` calls.
 4. Non-checkpoint meta pages (checkpoint flag clear) are never preferred over
    checkpoint ones, regardless of TxnID. A checkpoint meta at TxnID 100 is
    chosen over a non-checkpoint meta at TxnID 105 — the 5 transactions
@@ -2675,6 +2807,13 @@ type Options struct {
     // delay (batch fires immediately when the coordinator runs).
     MaxBatchDelay time.Duration
 
+    // StaleTimeout is the duration after which a reader slot or writer
+    // with a stale heartbeat is considered abandoned. Only used for
+    // cross-PID-namespace stale detection (same-namespace detection uses
+    // instant PID liveness checks). Must be significantly larger than the
+    // heartbeat interval (1s). Default: 10s.
+    StaleTimeout time.Duration
+
     // Logger for diagnostic messages (leaked transactions, stale reader
     // recovery, stale writer recovery). If nil, diagnostics are discarded.
     // Default: nil.
@@ -2713,6 +2852,11 @@ type Options struct {
     // read-only media or has read-only filesystem permissions, provided
     // the lock file is on writable storage.
     ReadOnly bool
+
+    // Maintenance controls the background maintenance goroutine.
+    // See Background Maintenance for details. If nil, default options
+    // are used (maintenance enabled, 5m interval).
+    Maintenance *MaintenanceOptions
 }
 
 // FileFormat controls the database file size bounds and growth/shrink behavior.
@@ -2808,9 +2952,11 @@ func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error
 //   - For write transactions: blocks on the write lock, respecting
 //     context cancellation. Returns context.Cause(ctx) if cancelled
 //     while waiting.
-//   - For read transactions: returns ErrReadersFull immediately if no
-//     slots are available (no blocking). The context is checked once
-//     before attempting slot acquisition.
+//   - For read transactions: if no reader slots are available and the
+//     context has a deadline, retries with backoff until a slot becomes
+//     free or the context expires. If the context has no deadline,
+//     returns ErrReadersFull immediately (no blocking). Use
+//     context.WithTimeout to control the wait window.
 //
 // Once Begin returns a *Tx, the context is not stored — the caller
 // controls the transaction lifetime via Commit()/Rollback().
@@ -3127,6 +3273,7 @@ type CheckIssue struct {
     PageID   uint64 // page where the issue was found (0 if N/A)
     Keyspace string // keyspace name (empty if global/bitmap/RPL)
     Message  string // human-readable description
+    Repaired bool   // true if the issue was fixed (only when CheckOptions.Repair is true)
 }
 
 // Check performs a full structural integrity walk of the database. It opens
@@ -3167,6 +3314,32 @@ type CheckIssue struct {
 //   require.Empty(t, slices.Collect(db.Check()))
 func (db *DB) Check() iter.Seq[CheckIssue]
 
+// CheckOptions controls Check behavior.
+type CheckOptions struct {
+    // Repair enables offline repair of detected issues. When true, the
+    // database must be opened with exclusive access (no concurrent
+    // readers or writers). Check walks the full tree to build the set
+    // of referenced pages, then corrects the allocation bitmap for any
+    // leaked pages (allocated but unreferenced). Leaked pages are set
+    // free in the bitmap; the corrected bitmap pages are written via
+    // pwrite + fdatasync.
+    //
+    // Repair only fixes bitmap leakage — pages that appear allocated
+    // but are not reachable from any tree structure. It does not fix
+    // structural B+tree corruption (CheckError/CheckFatal issues).
+    // For structural corruption, use CopyTo(compact=true) to rebuild
+    // from the intact portion of the tree.
+    //
+    // Repaired issues are yielded as CheckIssue with the original
+    // severity and an additional Repaired bool field set to true.
+    Repair bool
+}
+
+// CheckWithOptions performs a full structural integrity walk with
+// optional repair. See Check for the list of verified invariants.
+// When opts is nil, behaves identically to Check.
+func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue]
+
 // CopyTo creates a consistent copy of the database at the given path.
 // The copy is taken from a read transaction snapshot — writers are not
 // blocked. When compact is true, the copy is compacted: free pages are
@@ -3177,12 +3350,36 @@ func (db *DB) Check() iter.Seq[CheckIssue]
 // and then re-open it with the desired settings via SetFileFormat().
 func (db *DB) CopyTo(path string, compact bool) error
 
+// Compact rebuilds the database file in place. It creates a compacted
+// copy via CopyTo(compact=true) to a temporary file in the same
+// directory, then atomically renames it over the original. The
+// temporary file is cleaned up on error.
+//
+// Compact runs the copy in a read transaction — writers are not blocked
+// during the copy phase. The atomic rename requires briefly closing and
+// reopening the database. Callers must ensure no transactions are open
+// when Compact returns (the DB handle is still valid — the underlying
+// file has changed).
+//
+// Effects:
+//   - Reclaims leaked pages (bitmap allocated but unreferenced).
+//   - Defragments the file — B+tree pages are written sequentially,
+//     restoring contiguous free runs for overflow page allocation.
+//   - Shrinks the file to its minimum size.
+//
+// Compact requires enough free disk space for the temporary copy
+// (up to the size of the live data). For databases where temporary
+// disk space is not available, an incremental in-place compaction
+// (relocating pages in batches across multiple write transactions)
+// is a possible future addition.
+func (db *DB) Compact() error
+
 // TxStats contains per-transaction statistics. Accumulated during the
 // transaction's lifetime and returned as a snapshot.
 type TxStats struct {
     // Page management
-    DirtyPages     uint64 // pages dirtied (CoW copies)
-    LoosePages     uint64 // pages dirtied then freed in this txn
+    CowPages       uint64 // pages copied via CoW
+    LoosePages     uint64 // pages CoW'd then freed in this txn
     ReclaimedPages uint64 // pages reclaimed from RPL into bitmap
     WrittenPages   uint64 // bitmap + meta pages written at commit time
 
@@ -3332,13 +3529,13 @@ organized by file:
 | `fileformat.go` | File format management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetFileFormat()` for runtime modification of `MinSize`, `GrowStep`, `ShrinkThreshold` (rejects `MaxSize` changes — bitmap region is fixed at creation). |
 | `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to MaxSize). Read-write by default (`MAP_SHARED \| PROT_READ \| PROT_WRITE`); read-only when `Options.ReadOnly` is set (`MAP_SHARED \| PROT_READ`). |
 | `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` page preloading (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
-| `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. |
-| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime, context-aware, zero goroutine accumulation). Stale writer recovery (PID liveness + start time comparison). Reader table: hint-based scan+CAS slot acquire (stores PID + ProcessStartTime), atomic store release, stale reader detection via PID liveness + start time comparison (PID reuse safe). Oldest-reader query for RPL reclamation. Lagging reader detection and callback invocation. |
-| `process_linux.go` | `processStartTime(pid) (uint64, error)`: reads `/proc/[pid]/stat` field 22 (`starttime`, clock ticks since boot). Pure Go, no cgo. |
+| `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. Commit-time `msync(MS_SYNC)` before bitmap pwrite (required because macOS `fdatasync` does not flush mmap dirty pages). |
+| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times + PID namespace inodes + heartbeats). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime/WriterPIDNamespace/WriterHeartbeat, context-aware, zero goroutine accumulation). Stale writer recovery (namespace-aware: same-namespace uses PID liveness + start time; cross-namespace uses heartbeat timeout). Reader table: hint-based scan+CAS slot acquire (stores PID + ProcessStartTime + PIDNamespace + Heartbeat), atomic store release, namespace-aware stale reader detection. Heartbeat goroutine (started at Open, stopped at Close, updates active slots every ~1s). Oldest-reader query for RPL reclamation. Lagging reader detection and callback invocation. |
+| `process_linux.go` | `processStartTime(pid) (uint64, error)`: reads `/proc/[pid]/stat` field 22 (`starttime`, clock ticks since boot). `pidNamespace() uint64`: reads `/proc/self/ns/pid` inode via `os.Readlink`. Pure Go, no cgo. |
 | `process_darwin.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
 | `process_freebsd.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.ki_start`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, dirty page map (`map[uint64]struct{}`), pending bitmap changes (`tx.pendingAllocs`, `tx.pendingFrees`), CoW operations (allocate fresh page, copy from mmap position A to B, modify B in place), page lookup (`mmap[pageID * pageSize]` — single level), commit (apply pending bitmap changes via pwrite + fdatasync + meta pwrite + fdatasync + RPL append + file format shrink), rollback (discard pending maps). Nested transactions: `BeginChild()` snapshots pending maps and keyspace roots; child commit discards snapshot (no-op merge); child rollback restores from snapshot. Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
-| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap with read-write mapping, lock file, file format, AllowSyncUnsafe validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, per-closure child transactions. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Checkpoint(). Check(). CopyTo(). |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, CoW page map (`tx.cowPages map[uint64]struct{}`), pending bitmap changes (`tx.pendingAllocs`, `tx.pendingFrees`), CoW operations (allocate fresh page, copy from mmap position A to B, modify B in place), page lookup (`mmap[pageID * pageSize]` — single level), commit (apply pending bitmap changes via pwrite + fdatasync + meta pwrite + fdatasync + RPL append + file format shrink), rollback (discard pending maps). Nested transactions: `BeginChild()` snapshots pending maps and keyspace roots; child commit discards snapshot (no-op merge); child rollback restores from snapshot. Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
+| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap with read-write mapping, lock file, file format, AllowSyncUnsafe validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, per-closure child transactions. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Checkpoint(). Check(). CheckWithOptions(). CopyTo(). Compact(). Background maintenance goroutine (bitmap leak reclamation, stale reader cleanup, checksum scrubbing, incremental compaction; coordinated across processes via LastMaintenanceTime in lock file). |
 | `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with `Encoder` calls. |
 | `errors.go` | Sentinel error definitions. |
 | `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
@@ -3492,7 +3689,7 @@ and potential page fault cost. For full-database scans reading millions of
 pages, the overhead is measurable but bounded by memory bandwidth (the
 CRC computation runs at memory speed with hardware acceleration).
 
-Pages in `tx.dirtyPages` that have been modified in the current transaction
+Pages in `tx.cowPages` that have been CoW'd in the current transaction
 are verified against their checksum when first read from the mmap (before
 CoW). After CoW and modification, the new checksum is computed before the
 commit-time fdatasync.
@@ -3502,7 +3699,7 @@ commit-time fdatasync.
 When checksums are enabled, the CRC32C checksum is computed on the mmap
 page content after all modifications are complete, before the commit-time
 `fdatasync()`. The footer is written directly into the mmap at the last 4
-bytes of each dirtied page.
+bytes of each CoW'd page.
 
 #### What Checksums Do and Do Not Catch
 
@@ -3539,7 +3736,7 @@ run on storage without integrity guarantees.
 - **Atomic commit**: A single meta page write (< page size, aligned) is the
   commit point. Even if it's torn, the checksum will fail and the DB falls
   back to the other meta page.
-- **Write ordering**: In `SyncDurable` mode, dirty pages are fdatasync'd
+- **Write ordering**: In `SyncDurable` mode, CoW'd data pages are fdatasync'd
   BEFORE the meta page update, and the meta page is fdatasync'd AFTER writing
   it. In other sync modes, ordering relies on CoW (see Durability Modes).
 - **Reader isolation**: Readers see an immutable snapshot. Pages they reference
@@ -3561,3 +3758,162 @@ run on storage without integrity guarantees.
   read is verified against its CRC32C footer. Corruption is detected at read
   time with `ErrCorrupted` identifying the affected page.
 - **Disk full (ENOSPC)**: If `ftruncate()` (file growth) or `pwrite()` (bitmap/meta) fails with ENOSPC, the operation returns an error. A failed `pwrite()` during commit may result in a partially written bitmap page on disk. Since the meta page has not been updated, recovery falls back to the previous meta — the partially written bitmap page is superseded by the next successful commit. File growth failures during the transaction (before commit) cause `pageAlloc()` to return `ErrDBFull`.
+
+## Background Maintenance
+
+The `DB` struct runs a **maintenance goroutine** (started at `Open()`,
+stopped at `Close()`) that performs periodic housekeeping to prevent
+issues from accumulating during normal operation. The goal is to avoid
+reaching a state that requires offline intervention.
+
+### Coordination
+
+Multiple processes sharing the same database coordinate via a
+`LastMaintenanceTime` field in the lock file header — a `uint64`
+monotonic clock value (`CLOCK_BOOTTIME` on Linux) updated after each
+maintenance pass. Before starting a pass, the goroutine checks this
+timestamp. If a recent pass was completed by any process (within
+`MaintenanceOptions.Interval`), the goroutine skips. This ensures
+only one process runs maintenance per interval, regardless of how
+many processes have the database open.
+
+### Tasks
+
+The maintenance goroutine performs four tasks per pass:
+
+#### 1. Bitmap Leak Reclamation
+
+Reclaims pages that are allocated in the bitmap but unreferenced by any
+tree structure — "leaked" pages caused by crashes between the bitmap
+pwrite and meta pwrite (see Bitmap leakage on crash).
+
+**Detection phase** (read transaction, non-blocking):
+1. Open a read transaction.
+2. Walk the full tree (all keyspaces, RPL segments, overflow pages) to
+   build the set of all referenced page IDs.
+3. Scan the allocation bitmap. Any page with its bit clear (allocated)
+   that is not in the referenced set and is not a meta page, bitmap
+   page, or RPL segment page is leaked.
+4. Close the read transaction.
+
+**Reclamation phase** (write transaction):
+1. Open a write transaction.
+2. For each leaked page ID, set its bitmap bit (free the page).
+3. Commit. The reclaimed pages are now available for allocation.
+
+**Safety**: A leaked page is permanently stuck — its bitmap bit is clear
+so no future transaction can allocate it, and no tree node references it.
+A page identified as leaked in the read transaction's snapshot cannot
+become un-leaked by the time the write transaction runs. Detection in a
+read transaction is therefore safe.
+
+**Trigger**: Runs on every maintenance pass. Additionally, if `Open()`
+detects crash recovery (selected a fallback meta page), the first
+maintenance pass is scheduled immediately rather than waiting for the
+interval.
+
+#### 2. Stale Reader Slot Cleanup
+
+Proactively scans the reader table and clears slots owned by dead
+processes. This uses the same namespace-aware detection logic as the
+writer's stale reader scan (see Stale reader detection): same PID
+namespace uses PID + StartTime, cross-namespace uses heartbeat timeout.
+
+No transaction is needed — slot cleanup is an atomic store (`TxnID = 0`)
+on the shared mmap.
+
+**Why this matters**: The writer already clears stale slots during RPL
+reclamation, but only when it needs free pages. If no writer is active
+for an extended period, stale slots from crashed containers sit
+indefinitely, blocking RPL reclamation for the next writer. The
+maintenance goroutine clears them proactively so the next write
+transaction starts with a clean reader table.
+
+#### 3. Checksum Scrubbing
+
+When `PageChecksum` is enabled, the maintenance goroutine performs a
+background read-only scan that verifies CRC32C checksums on data pages
+proactively — before they are accessed by a user transaction. This
+catches silent bitrot early, rather than surfacing `ErrCorrupted`
+during a user read.
+
+Each maintenance pass verifies `ScrubBatchSize` pages (default: 4096)
+in a read transaction, advancing through the file sequentially across
+passes. A `ScrubCursor` (the next page ID to verify) is tracked on the
+`DB` struct and wraps around when it reaches `HighWaterMark`. A full
+scrub cycle covers the entire database over
+`ceil(HighWaterMark / ScrubBatchSize)` maintenance passes.
+
+Detected corruption is logged via `slog.Logger` as a `CheckWarning`
+with the affected page ID. The scrubber does not repair — it only
+reports. Repair requires `CheckWithOptions(Repair)` or
+`CopyTo(compact=true)`.
+
+Scrubbing is skipped when `PageChecksum` is not enabled.
+
+#### 4. Incremental Compaction
+
+Defragments the database file by relocating pages in batches to restore
+contiguous free runs for overflow page allocation. This is the online
+alternative to `Compact()` (CopyTo + atomic rename).
+
+**Trigger**: The allocator tracks the contiguous allocation failure
+rate — the fraction of multi-page `pageAlloc(n)` calls (n > 1) that
+fail to find a contiguous run on the first bitmap scan despite
+sufficient total free pages. When this rate exceeds
+`CompactionThreshold` (default: 0.5), the maintenance goroutine
+schedules compaction work.
+
+**Mechanism**: Each maintenance pass opens a write transaction and
+relocates up to `CompactionBatchSize` pages (default: 1024):
+1. Identify fragmented regions — pages that interrupt potential
+   contiguous runs in the bitmap.
+2. For each such page, CoW it to a new location (allocated from
+   a region with more free neighbors).
+3. The old page goes to the RPL and is reclaimed in a future
+   transaction.
+4. Commit.
+
+Over multiple maintenance passes, scattered pages consolidate and
+contiguous free runs emerge. The compaction converges when the failure
+rate drops below the threshold.
+
+**Cost per pass**: `CompactionBatchSize` CoW copies (memcpy +
+parent pointer update). At 1024 pages × 4KB = 4MB of I/O per pass
+plus the cascading CoW up the tree for each moved page. This is
+bounded and amortized across the maintenance interval.
+
+### Options
+
+```go
+type MaintenanceOptions struct {
+    // Disable disables the background maintenance goroutine.
+    // Default: false (maintenance enabled).
+    Disable bool
+
+    // Interval is the minimum time between maintenance runs.
+    // Coordinated across processes via the lock file.
+    // Default: 5m.
+    Interval time.Duration
+
+    // ScrubBatchSize is the number of pages to verify per
+    // checksum scrubbing pass. Only meaningful when PageChecksum
+    // is enabled. Default: 4096.
+    ScrubBatchSize int
+
+    // CompactionThreshold triggers incremental compaction when the
+    // contiguous allocation failure rate exceeds this fraction.
+    // Range: 0.0 (disabled) to 1.0. Default: 0.5.
+    CompactionThreshold float64
+
+    // CompactionBatchSize is the number of pages to relocate per
+    // write transaction during incremental compaction.
+    // Default: 1024.
+    CompactionBatchSize int
+}
+```
+
+Maintenance is a fixed-cost resource: one goroutine per `DB` handle.
+Same lifecycle pattern as the flock and heartbeat goroutines. The
+explicit tools (`Check`, `CheckWithOptions`, `Compact`, `CopyTo`)
+remain available for on-demand use.
