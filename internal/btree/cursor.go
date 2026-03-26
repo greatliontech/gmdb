@@ -24,11 +24,12 @@ type Cursor struct {
 	idx   int         // current entry index within leaf
 	count int         // entry count of current leaf
 
-	keyBuf     []byte             // reusable key reconstruction buffer
-	keyArena   []byte             // reusable arena for group cache keys
-	groupCache [16]page.LeafEntry // cached decoded entries for current restart group
-	groupBase  int                // first entry index of the cached group (-1 = invalid)
-	groupLen   int                // number of valid entries in groupCache
+	keyBuf       []byte             // reusable key reconstruction buffer
+	keyArena     []byte             // reusable arena for group cache keys
+	decodeKeyBuf []byte             // reusable buffer for delta key reconstruction
+	groupCache   [16]page.LeafEntry // cached decoded entries for current restart group
+	groupBase    int                // first entry index of the cached group (-1 = invalid)
+	groupLen     int                // number of valid entries in groupCache
 
 	gen   uint64 // tree generation at last positioning
 	valid bool   // cursor is positioned on a valid entry
@@ -243,28 +244,25 @@ func (c *Cursor) cachedCurrent() (key, value []byte) {
 }
 
 // populateGroup decodes all entries in the restart group starting at base
-// and caches them. Uses a single forward scan through the group — O(ri)
-// entry decodings instead of O(ri²). Keys are copied into a reusable arena
-// (0 allocations after the first group population).
+// and caches them. Uses a pull-based iterator with cursor-owned buffers —
+// zero allocations after warmup.
 func (c *Cursor) populateGroup(base int) {
 	buf := c.tree.pageSlice(c.leaf)
 	lr := page.NewLeafReader(buf, c.tree.cfg)
-	group := base / 16
 
-	// Reset the key arena, keeping the backing array.
 	c.keyArena = c.keyArena[:0]
-
-	// Record start/end offsets into the arena for each key.
 	var keyOff [16]uint32
 	n := 0
-	lr.DecodeGroup(group, nil, func(_ int, e page.LeafEntry) bool {
+
+	it := lr.GroupIter(base/16, c.decodeKeyBuf)
+	for e, ok := it.Next(); ok; e, ok = it.Next() {
 		keyOff[n] = uint32(len(c.keyArena))
 		c.keyArena = append(c.keyArena, e.Key...)
-		e.Key = nil // resolved below
+		e.Key = nil
 		c.groupCache[n] = e
 		n++
-		return true
-	})
+	}
+	c.decodeKeyBuf = it.KeyBuf()
 
 	// Resolve Key slices into the final (stable) arena.
 	for i := range n {

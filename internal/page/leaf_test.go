@@ -43,19 +43,20 @@ func TestLeafInlineRoundTrip(t *testing.T) {
 		t.Errorf("RestartInterval() = %d, want %d", r.RestartInterval(), restartInterval)
 	}
 
-	keyBuf := make([]byte, 0, 256)
-	r.IterEntries(keyBuf, func(idx int, e LeafEntry) bool {
-		if !bytes.Equal(e.Key, []byte(entries[idx].key)) {
-			t.Errorf("entry %d: key = %q, want %q", idx, e.Key, entries[idx].key)
+	var keyBuf []byte
+	for i, want := range entries {
+		e, kb := r.EntryAt(i, keyBuf)
+		keyBuf = kb
+		if !bytes.Equal(e.Key, []byte(want.key)) {
+			t.Errorf("entry %d: key = %q, want %q", i, e.Key, want.key)
 		}
-		if !bytes.Equal(e.Value, []byte(entries[idx].value)) {
-			t.Errorf("entry %d: value = %q, want %q", idx, e.Value, entries[idx].value)
+		if !bytes.Equal(e.Value, []byte(want.value)) {
+			t.Errorf("entry %d: value = %q, want %q", i, e.Value, want.value)
 		}
 		if e.CellFlags != 0 {
-			t.Errorf("entry %d: CellFlags = %d, want 0", idx, e.CellFlags)
+			t.Errorf("entry %d: CellFlags = %d, want 0", i, e.CellFlags)
 		}
-		return true
-	})
+	}
 }
 
 func TestLeafPrefixCompression(t *testing.T) {
@@ -86,14 +87,15 @@ func TestLeafPrefixCompression(t *testing.T) {
 		t.Errorf("RestartCount() = %d, want 2", r.RestartCount())
 	}
 
-	// Verify all keys decode correctly.
-	keyBuf := make([]byte, 0, 256)
-	r.IterEntries(keyBuf, func(idx int, e LeafEntry) bool {
+	// Verify all keys decode correctly via Iter.
+	idx := 0
+	it := r.Iter(nil)
+	for e, ok := it.Next(); ok; e, ok = it.Next() {
 		if !bytes.Equal(e.Key, []byte(keys[idx])) {
 			t.Errorf("entry %d: key = %q, want %q", idx, e.Key, keys[idx])
 		}
-		return true
-	})
+		idx++
+	}
 }
 
 func TestLeafSearchInline(t *testing.T) {
@@ -309,14 +311,10 @@ func TestLeafEmpty(t *testing.T) {
 		t.Errorf("SearchLeaf on empty leaf: index = %d, want 0", idx)
 	}
 
-	// IterEntries on empty leaf should be a no-op.
-	visited := 0
-	r.IterEntries(keyBuf, func(idx int, e LeafEntry) bool {
-		visited++
-		return true
-	})
-	if visited != 0 {
-		t.Errorf("IterEntries on empty leaf visited %d entries", visited)
+	// Iter on empty leaf should produce nothing.
+	it := r.Iter(nil)
+	if _, ok := it.Next(); ok {
+		t.Error("Iter on empty leaf produced an entry")
 	}
 }
 
@@ -504,7 +502,7 @@ func TestLeafSecondGroupBoundary(t *testing.T) {
 	}
 }
 
-func TestLeafDecodeGroup(t *testing.T) {
+func TestLeafIter(t *testing.T) {
 	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
 	buf := make([]byte, cfg.PageSize)
 
@@ -519,127 +517,119 @@ func TestLeafDecodeGroup(t *testing.T) {
 
 	r := NewLeafReader(buf, cfg)
 
-	// Collect all entries via IterEntries as reference.
-	type kv struct{ key, val string }
-	var ref []kv
-	r.IterEntries(nil, func(_ int, e LeafEntry) bool {
-		ref = append(ref, kv{string(e.Key), string(e.Value)})
-		return true
-	})
+	// Iter over all entries.
+	idx := 0
+	it := r.Iter(nil)
+	for e, ok := it.Next(); ok; e, ok = it.Next() {
+		wantKey := fmt.Sprintf("key-%04d", idx)
+		wantVal := fmt.Sprintf("val-%04d", idx)
+		if !bytes.Equal(e.Key, []byte(wantKey)) {
+			t.Errorf("entry %d: key = %q, want %q", idx, e.Key, wantKey)
+		}
+		if !bytes.Equal(e.Value, []byte(wantVal)) {
+			t.Errorf("entry %d: value = %q, want %q", idx, e.Value, wantVal)
+		}
+		idx++
+	}
+	if idx != 35 {
+		t.Errorf("iterated %d entries, want 35", idx)
+	}
+}
 
-	// Verify DecodeGroup matches for each group.
+func TestLeafGroupIter(t *testing.T) {
+	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+
+	// 35 entries = group 0 (16), group 1 (16), group 2 (3).
+	b := NewLeafBuilder(buf, cfg)
+	for i := range 35 {
+		key := fmt.Sprintf("key-%04d", i)
+		val := fmt.Sprintf("val-%04d", i)
+		b.AddInline([]byte(key), []byte(val))
+	}
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+
 	groups := []struct {
 		groupIdx int
 		startIdx int
 		count    int
 	}{
-		{0, 0, 16},  // full group
-		{1, 16, 16}, // full group
-		{2, 32, 3},  // partial last group
+		{0, 0, 16},
+		{1, 16, 16},
+		{2, 32, 3},
 	}
 	for _, g := range groups {
-		var got []kv
-		r.DecodeGroup(g.groupIdx, nil, func(idx int, e LeafEntry) bool {
-			got = append(got, kv{string(e.Key), string(e.Value)})
-			if idx != g.startIdx+len(got)-1 {
-				t.Errorf("group %d: callback idx=%d, want %d", g.groupIdx, idx, g.startIdx+len(got)-1)
+		n := 0
+		it := r.GroupIter(g.groupIdx, nil)
+		for e, ok := it.Next(); ok; e, ok = it.Next() {
+			wantKey := fmt.Sprintf("key-%04d", g.startIdx+n)
+			if !bytes.Equal(e.Key, []byte(wantKey)) {
+				t.Errorf("group %d entry %d: key = %q, want %q", g.groupIdx, n, e.Key, wantKey)
 			}
-			return true
-		})
-		if len(got) != g.count {
-			t.Errorf("group %d: decoded %d entries, want %d", g.groupIdx, len(got), g.count)
-			continue
+			n++
 		}
-		for i, e := range got {
-			if e != ref[g.startIdx+i] {
-				t.Errorf("group %d entry %d: got %v, want %v", g.groupIdx, i, e, ref[g.startIdx+i])
-			}
+		if n != g.count {
+			t.Errorf("group %d: iterated %d entries, want %d", g.groupIdx, n, g.count)
 		}
 	}
 }
 
-func TestLeafDecodeGroupSingleEntry(t *testing.T) {
+func TestLeafGroupIterSingleEntry(t *testing.T) {
 	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
 	buf := make([]byte, cfg.PageSize)
 
-	// 1 entry = group 0 with 1 restart entry, no deltas.
 	b := NewLeafBuilder(buf, cfg)
 	b.AddInline([]byte("only-key"), []byte("only-val"))
 	b.Finish()
 
 	r := NewLeafReader(buf, cfg)
-	var count int
-	r.DecodeGroup(0, nil, func(idx int, e LeafEntry) bool {
-		if idx != 0 {
-			t.Errorf("idx = %d, want 0", idx)
-		}
-		if !bytes.Equal(e.Key, []byte("only-key")) {
-			t.Errorf("key = %q, want %q", e.Key, "only-key")
-		}
-		if !bytes.Equal(e.Value, []byte("only-val")) {
-			t.Errorf("value = %q, want %q", e.Value, "only-val")
-		}
-		count++
-		return true
-	})
-	if count != 1 {
-		t.Errorf("decoded %d entries, want 1", count)
+	it := r.GroupIter(0, nil)
+	e, ok := it.Next()
+	if !ok {
+		t.Fatal("GroupIter produced no entries")
+	}
+	if !bytes.Equal(e.Key, []byte("only-key")) {
+		t.Errorf("key = %q, want %q", e.Key, "only-key")
+	}
+	if !bytes.Equal(e.Value, []byte("only-val")) {
+		t.Errorf("value = %q, want %q", e.Value, "only-val")
+	}
+	if _, ok := it.Next(); ok {
+		t.Error("GroupIter produced extra entry")
 	}
 }
 
-func TestLeafDecodeGroupEarlyBreak(t *testing.T) {
+func TestLeafIterKeyBufReuse(t *testing.T) {
 	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
 	buf := make([]byte, cfg.PageSize)
 
 	b := NewLeafBuilder(buf, cfg)
-	for i := range 16 {
-		key := fmt.Sprintf("key-%04d", i)
-		b.AddInline([]byte(key), []byte("v"))
+	for i := range 20 {
+		b.AddInline([]byte(fmt.Sprintf("key-%04d", i)), []byte("v"))
 	}
 	b.Finish()
 
 	r := NewLeafReader(buf, cfg)
 
-	// Stop after 3 entries.
-	var count int
-	r.DecodeGroup(0, nil, func(_ int, _ LeafEntry) bool {
-		count++
-		return count < 3
-	})
-	if count != 3 {
-		t.Errorf("decoded %d entries, want 3", count)
+	// First iteration seeds the keyBuf.
+	it1 := r.GroupIter(0, nil)
+	for _, ok := it1.Next(); ok; _, ok = it1.Next() {
 	}
 
-	// Stop at restart entry (first entry).
-	count = 0
-	r.DecodeGroup(0, nil, func(_ int, _ LeafEntry) bool {
-		count++
-		return false
-	})
-	if count != 1 {
-		t.Errorf("decoded %d entries, want 1", count)
+	// Second iteration reuses the keyBuf — should not allocate.
+	it2 := r.GroupIter(1, it1.KeyBuf())
+	n := 0
+	for e, ok := it2.Next(); ok; e, ok = it2.Next() {
+		wantKey := fmt.Sprintf("key-%04d", 16+n)
+		if !bytes.Equal(e.Key, []byte(wantKey)) {
+			t.Errorf("entry %d: key = %q, want %q", n, e.Key, wantKey)
+		}
+		n++
 	}
-}
-
-func TestLeafIterEarlyBreak(t *testing.T) {
-	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
-	buf := make([]byte, cfg.PageSize)
-
-	b := NewLeafBuilder(buf, cfg)
-	for i := range 10 {
-		key := fmt.Sprintf("key-%04d", i)
-		b.AddInline([]byte(key), []byte("v"))
-	}
-	b.Finish()
-
-	r := NewLeafReader(buf, cfg)
-	visited := 0
-	r.IterEntries(nil, func(idx int, e LeafEntry) bool {
-		visited++
-		return idx < 2 // stop after index 2
-	})
-	if visited != 3 {
-		t.Errorf("visited %d entries, want 3", visited)
+	if n != 4 {
+		t.Errorf("iterated %d entries, want 4", n)
 	}
 }
 
@@ -692,14 +682,15 @@ func TestLeafBuilderFull(t *testing.T) {
 		t.Fatalf("Count() = %d, want %d", r.Count(), count)
 	}
 
-	keyBuf := make([]byte, 0, 64)
-	r.IterEntries(keyBuf, func(idx int, e LeafEntry) bool {
+	idx := 0
+	it := r.Iter(nil)
+	for e, ok := it.Next(); ok; e, ok = it.Next() {
 		wantKey := fmt.Sprintf("k%06d", idx)
 		if !bytes.Equal(e.Key, []byte(wantKey)) {
 			t.Errorf("entry %d: key = %q, want %q", idx, e.Key, wantKey)
 		}
-		return true
-	})
+		idx++
+	}
 }
 
 func FuzzLeafRoundTrip(f *testing.F) {

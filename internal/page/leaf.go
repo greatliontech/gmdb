@@ -95,6 +95,7 @@ func (r LeafReader) restartOffset(i int) int {
 
 // decodeRestartEntry decodes a restart entry (full key) at the given byte
 // offset. Returns the entry and the next byte offset after the entry.
+// The returned Key is a borrowed slice into the page buffer.
 func (r LeafReader) decodeRestartEntry(off int) (LeafEntry, int) {
 	var e LeafEntry
 	e.CellFlags = r.buf[off]
@@ -111,7 +112,8 @@ func (r LeafReader) decodeRestartEntry(off int) (LeafEntry, int) {
 
 // decodeDeltaEntry decodes a delta entry at the given byte offset, using
 // prevKey to reconstruct the full key. keyBuf is used for key reconstruction
-// (appended to, may be resliced). Returns the entry and the next byte offset.
+// (appended to, may be resliced). Returns the entry, the next byte offset,
+// and the updated keyBuf. The returned Key aliases keyBuf.
 func (r LeafReader) decodeDeltaEntry(off int, prevKey, keyBuf []byte) (LeafEntry, int, []byte) {
 	var e LeafEntry
 	e.CellFlags = r.buf[off]
@@ -130,6 +132,68 @@ func (r LeafReader) decodeDeltaEntry(off int, prevKey, keyBuf []byte) (LeafEntry
 
 	e, off = r.decodeValue(e, off)
 	return e, off, keyBuf
+}
+
+// LeafIter provides pull-based iteration over leaf entries. The caller
+// drives the loop via Next(). No closures, no allocations — the iterator
+// is a value type intended to live on the stack.
+type LeafIter struct {
+	r       LeafReader
+	idx     int
+	endIdx  int
+	off     int
+	prevKey []byte
+	keyBuf  []byte
+}
+
+// Iter returns an iterator over all entries in the leaf. keyBuf is a
+// reusable buffer for delta key reconstruction; pass nil for a fresh one.
+func (r LeafReader) Iter(keyBuf []byte) LeafIter {
+	return LeafIter{
+		r:      r,
+		endIdx: r.count,
+		off:    leafEntryStart,
+		keyBuf: keyBuf,
+	}
+}
+
+// GroupIter returns an iterator over entries in a single restart group.
+// keyBuf is a reusable buffer for delta key reconstruction.
+func (r LeafReader) GroupIter(groupIdx int, keyBuf []byte) LeafIter {
+	startIdx := groupIdx * r.ri
+	return LeafIter{
+		r:      r,
+		idx:    startIdx,
+		endIdx: min(startIdx+r.ri, r.count),
+		off:    r.restartOffset(groupIdx),
+		keyBuf: keyBuf,
+	}
+}
+
+// Next decodes the next entry and advances the iterator. Returns false
+// when all entries have been consumed. The returned entry's Key borrows
+// from the page buffer (restart entries) or from the iterator's keyBuf
+// (delta entries); it is valid until the next Next() call.
+func (it *LeafIter) Next() (LeafEntry, bool) {
+	if it.idx >= it.endIdx {
+		return LeafEntry{}, false
+	}
+	var e LeafEntry
+	if it.idx%it.r.ri == 0 {
+		e, it.off = it.r.decodeRestartEntry(it.off)
+		it.prevKey = e.Key
+	} else {
+		e, it.off, it.keyBuf = it.r.decodeDeltaEntry(it.off, it.prevKey, it.keyBuf)
+		it.prevKey = it.keyBuf
+	}
+	it.idx++
+	return e, true
+}
+
+// KeyBuf returns the iterator's key reconstruction buffer for reuse
+// by the caller after iteration completes.
+func (it *LeafIter) KeyBuf() []byte {
+	return it.keyBuf
 }
 
 // decodeValue decodes the value portion of an entry starting at off.
@@ -228,31 +292,6 @@ func (r LeafReader) SearchLeaf(target, keyBuf []byte) (index int, entry LeafEntr
 	return endIdx, LeafEntry{}, false
 }
 
-// DecodeGroup decodes all entries in the restart group at groupIdx.
-// fn receives the absolute entry index (0-based within the page) and the
-// decoded entry. keyBuf is reused for key reconstruction of delta entries.
-// Returns the updated keyBuf. If fn returns false, iteration stops early.
-func (r LeafReader) DecodeGroup(groupIdx int, keyBuf []byte, fn func(idx int, e LeafEntry) bool) []byte {
-	startIdx := groupIdx * r.ri
-	endIdx := min(startIdx+r.ri, r.count)
-	off := r.restartOffset(groupIdx)
-
-	e, off := r.decodeRestartEntry(off)
-	if !fn(startIdx, e) {
-		return keyBuf
-	}
-
-	prevKey := e.Key
-	for idx := startIdx + 1; idx < endIdx; idx++ {
-		e, off, keyBuf = r.decodeDeltaEntry(off, prevKey, keyBuf)
-		if !fn(idx, e) {
-			break
-		}
-		prevKey = keyBuf
-	}
-	return keyBuf
-}
-
 // EntryAt decodes the entry at position idx. keyBuf is used for key
 // reconstruction of delta entries.
 func (r LeafReader) EntryAt(idx int, keyBuf []byte) (LeafEntry, []byte) {
@@ -273,32 +312,6 @@ func (r LeafReader) EntryAt(idx int, keyBuf []byte) (LeafEntry, []byte) {
 	return e, keyBuf
 }
 
-// IterEntries decodes all entries in the leaf, calling fn for each.
-// fn receives the 0-based index and the decoded entry. If fn returns false,
-// iteration stops. keyBuf is reused across delta entries.
-func (r LeafReader) IterEntries(keyBuf []byte, fn func(idx int, e LeafEntry) bool) []byte {
-	if r.count == 0 {
-		return keyBuf
-	}
-
-	off := leafEntryStart
-	var prevKey []byte
-
-	for idx := range r.count {
-		var e LeafEntry
-		if idx%r.ri == 0 {
-			e, off = r.decodeRestartEntry(off)
-			prevKey = e.Key
-		} else {
-			e, off, keyBuf = r.decodeDeltaEntry(off, prevKey, keyBuf)
-			prevKey = keyBuf
-		}
-		if !fn(idx, e) {
-			break
-		}
-	}
-	return keyBuf
-}
 
 // LeafBuilder constructs a prefix-compressed leaf page by writing entries
 // directly into the page buffer in forward order starting at offset 12.

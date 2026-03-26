@@ -255,10 +255,10 @@ func (t *Tree) retireSubtree(pageID uint64) int {
 
 	if typ == page.TypeLeaf {
 		lr := page.NewLeafReader(buf, t.cfg)
-		lr.IterEntries(nil, func(_ int, e page.LeafEntry) bool {
+		it := lr.Iter(nil)
+		for e, ok := it.Next(); ok; e, ok = it.Next() {
 			t.retireEntryPages(e)
-			return true
-		})
+		}
 		t.retirePage(pageID)
 		return int(count)
 	}
