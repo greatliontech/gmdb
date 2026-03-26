@@ -183,7 +183,7 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 		for ci := len(cells) - 1; ci >= -1; ci-- {
 			childID := childFromIndex(ptr0, cells, ci)
 			if childID == 0 {
-				continue
+				panic("btree: zero childID after deleteRange cleanup")
 			}
 			buf := t.pageSlice(childID)
 			typ, _, count, _ := page.ReadHeader(buf)

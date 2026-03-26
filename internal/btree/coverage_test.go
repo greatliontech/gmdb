@@ -627,3 +627,39 @@ func TestDeleteRangeRightBoundaryError(t *testing.T) {
 		t.Fatalf("expected ErrNoSpace from right boundary, got %v", err)
 	}
 }
+
+// TestDeleteRangeRebalanceChildError tests error propagation from
+// rebalanceChild during the post-range-delete rebalance loop.
+// Setup: 4 leaves + 1 branch. Delete within one leaf making it underfull.
+// 2 free pages cover cowPage(branch) + cowPage(leaf). Rebalance needs
+// cowPage on the non-CoW'd sibling → ErrNoSpace.
+func TestDeleteRangeRebalanceChildError(t *testing.T) {
+	tr := newTestTree(t, 64)
+	val := bytes.Repeat([]byte("v"), 900)
+
+	// 12 entries with 900-byte values: 4 entries fit per leaf, 5th overflows.
+	// Tree: Ptr0→[00,01,02], cell0→[03,04,05], cell1→[06,07,08], cell2→[09,10,11].
+	// 4 leaves + 1 branch = 5 pages.
+	for i := range 12 {
+		key := fmt.Appendf(nil, "key:%02d", i)
+		if _, _, err := tr.Put(page.LeafEntry{Key: key, Value: val}); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	tr.Reset(tr.Root())
+
+	// Leave exactly 2 free pages: cowPage(branch) + cowPage(leaf).
+	for tr.bm.FreeCount() > 2 {
+		tr.bm.FindFirstFree()
+	}
+
+	// Delete within the first leaf (Ptr0). Both "key:01" and "key:025" are
+	// below the separator "key:03", so leftChildIdx == rightChildIdx == -1.
+	// Remaining: [key:00] → 1 entry (~22% of usable space → underfull).
+	// Rebalance picks sibling cell0 (not CoW'd) → cowPage fails.
+	_, err := tr.DeleteRange([]byte("key:01"), []byte("key:025"))
+	if !errors.Is(err, ErrNoSpace) {
+		t.Fatalf("expected ErrNoSpace from rebalance, got %v", err)
+	}
+}
