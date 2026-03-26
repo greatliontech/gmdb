@@ -2,8 +2,8 @@ package page
 
 import "testing"
 
-func TestKsDescRoundTrip(t *testing.T) {
-	orig := KsDesc{
+func TestKeyspaceDescRoundTrip(t *testing.T) {
+	orig := KeyspaceDesc{
 		Root:           12345,
 		Count:          67890,
 		Kind:           KindSetKeyspace,
@@ -11,37 +11,37 @@ func TestKsDescRoundTrip(t *testing.T) {
 		NextSeq:        42,
 	}
 
-	buf := make([]byte, KsDescSize)
-	EncodeKsDesc(buf, &orig)
-	got := DecodeKsDesc(buf)
+	buf := make([]byte, KeyspaceDescSize)
+	EncodeKeyspaceDesc(buf, &orig)
+	got := DecodeKeyspaceDesc(buf)
 
 	if got != orig {
 		t.Errorf("round-trip mismatch:\n got: %+v\nwant: %+v", got, orig)
 	}
 }
 
-func TestKsDescZeroReserved(t *testing.T) {
-	d := KsDesc{Root: 1, Count: 2, Kind: KindKeyspace, NextSeq: 3}
-	buf := make([]byte, KsDescSize)
+func TestKeyspaceDescZeroReserved(t *testing.T) {
+	d := KeyspaceDesc{Root: 1, Count: 2, Kind: KindKeyspace, NextSeq: 3}
+	buf := make([]byte, KeyspaceDescSize)
 	// Pre-fill with non-zero to verify reserved bytes are zeroed.
 	for i := range buf {
 		buf[i] = 0xFF
 	}
-	EncodeKsDesc(buf, &d)
+	EncodeKeyspaceDesc(buf, &d)
 
 	// Check reserved bytes (27..31) are zero.
-	for i := ksOffReserved; i < KsDescSize; i++ {
+	for i := ksOffReserved; i < KeyspaceDescSize; i++ {
 		if buf[i] != 0 {
 			t.Errorf("reserved byte at offset %d = 0x%02x, want 0x00", i, buf[i])
 		}
 	}
 }
 
-func TestKsDescKeyspaceType(t *testing.T) {
-	d := KsDesc{Kind: KindKeyspace, FixedValueSize: 0}
-	buf := make([]byte, KsDescSize)
-	EncodeKsDesc(buf, &d)
-	got := DecodeKsDesc(buf)
+func TestKeyspaceDescKeyspaceType(t *testing.T) {
+	d := KeyspaceDesc{Kind: KindKeyspace, FixedValueSize: 0}
+	buf := make([]byte, KeyspaceDescSize)
+	EncodeKeyspaceDesc(buf, &d)
+	got := DecodeKeyspaceDesc(buf)
 	if got.Kind != KindKeyspace {
 		t.Errorf("Kind = %d, want %d", got.Kind, KindKeyspace)
 	}

@@ -18,7 +18,7 @@ func TestOverflowCapacity(t *testing.T) {
 	}
 	for _, tt := range tests {
 		cfg := PageConfig{PageSize: tt.pageSize, PageChecksum: tt.checksum}
-		o := NewOverflowConfig(cfg)
+		o := NewOverflow(cfg)
 		if got := o.FirstPageCapacity(); got != tt.wantFirst {
 			t.Errorf("FirstPageCapacity(ps=%d,ck=%v) = %d, want %d",
 				tt.pageSize, tt.checksum, got, tt.wantFirst)
@@ -32,7 +32,7 @@ func TestOverflowCapacity(t *testing.T) {
 
 func TestOverflowPagesNeeded(t *testing.T) {
 	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
-	o := NewOverflowConfig(cfg)
+	o := NewOverflow(cfg)
 
 	tests := []struct {
 		totalLen int
@@ -55,7 +55,7 @@ func TestOverflowPagesNeeded(t *testing.T) {
 
 func TestOverflowWriteRead(t *testing.T) {
 	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
-	o := NewOverflowConfig(cfg)
+	o := NewOverflow(cfg)
 
 	// Value spanning 3 pages.
 	valueLen := 4088 + 4096 + 1000
@@ -113,7 +113,7 @@ func TestOverflowWriteRead(t *testing.T) {
 
 func TestOverflowWithChecksum(t *testing.T) {
 	cfg := PageConfig{PageSize: 4096, PageChecksum: true}
-	o := NewOverflowConfig(cfg)
+	o := NewOverflow(cfg)
 
 	// Verify capacities account for CRC footer.
 	if o.FirstPageCapacity() != 4084 {

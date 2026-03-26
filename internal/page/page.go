@@ -43,7 +43,7 @@ const (
 	ChildPtrSize     = 8  // child pointer in branch cell data
 	CRC32Size        = 4  // CRC32C footer
 	MetaPayloadSize  = 144 // meta page payload (Magic through Checksum)
-	KsDescSize       = 32 // keyspace descriptor
+	KeyspaceDescSize       = 32 // keyspace descriptor
 
 	RestartInterval = 16 // leaf prefix compression restart interval
 )
