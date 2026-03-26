@@ -182,9 +182,6 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 		// A child is underfull if its page reports high free space.
 		for ci := len(cells) - 1; ci >= -1; ci-- {
 			childID := childFromIndex(ptr0, cells, ci)
-			if childID == 0 {
-				panic("btree: zero childID after deleteRange cleanup")
-			}
 			buf := t.pageSlice(childID)
 			typ, _, count, _ := page.ReadHeader(buf)
 			var freeSpace int
