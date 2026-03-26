@@ -211,12 +211,12 @@ func (t *Tree) findLeafSplitPoint(entries []page.LeafEntry) int {
 			return i
 		}
 		if lb.FreeSpace() < target && i > 0 {
-			return i + 1
+			return min(i+1, len(entries)-1)
 		}
 	}
 	// All entries fit — caller only splits on overflow, so this means the
 	// entries fit with fresh prefix compression. Split at midpoint.
-	return len(entries) / 2
+	return max(len(entries)/2, 1)
 }
 
 // findBranchSplitPoint finds the byte-balanced split point for branch cells.
@@ -233,10 +233,10 @@ func (t *Tree) findBranchSplitPoint(ptr0 uint64, cells []branchCell) int {
 			return i
 		}
 		if bb.FreeSpace() < target && i > 0 {
-			return i + 1
+			return min(i+1, len(cells)-1)
 		}
 	}
-	return len(cells) / 2
+	return max(len(cells)/2, 1)
 }
 
 // cloneEntry returns a deep copy of a LeafEntry with all borrowed slices cloned.

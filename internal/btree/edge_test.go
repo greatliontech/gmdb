@@ -1495,3 +1495,215 @@ func TestCursorGroupCacheBackward(t *testing.T) {
 		t.Errorf("scanned %d entries, want 40", count)
 	}
 }
+
+// --- Split point correctness: both halves must fit ---
+
+// verifyLeafSplitFits calls findLeafSplitPoint and rebuilds both halves,
+// asserting both fit in a page.
+func verifyLeafSplitFits(t *testing.T, tr *Tree, entries []page.LeafEntry) {
+	t.Helper()
+	if len(entries) < 2 {
+		return
+	}
+	split := tr.findLeafSplitPoint(entries)
+	if split < 1 || split >= len(entries) {
+		t.Fatalf("findLeafSplitPoint returned %d for %d entries", split, len(entries))
+	}
+
+	leftPage, err := tr.allocPage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.rebuildLeaf(leftPage, entries[:split]) < 0 {
+		t.Errorf("left half (%d entries) does not fit", split)
+	}
+
+	rightPage, err := tr.allocPage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.rebuildLeaf(rightPage, entries[split:]) < 0 {
+		t.Errorf("right half (%d entries) does not fit", len(entries)-split)
+	}
+}
+
+func TestFindLeafSplitPointSmallValues(t *testing.T) {
+	tr := newTestTree(t, 256)
+	var entries []page.LeafEntry
+	for i := 0; ; i++ {
+		e := inlineEntry(
+			[]byte(fmt.Sprintf("key:%08d", i)),
+			[]byte(fmt.Sprintf("val:%08d", i)),
+		)
+		entries = append(entries, e)
+		if tr.rebuildLeaf(3, entries) < 0 {
+			break // one past capacity
+		}
+	}
+	verifyLeafSplitFits(t, tr, entries)
+}
+
+func TestFindLeafSplitPointLargeValues(t *testing.T) {
+	tr := newTestTree(t, 256)
+	bigVal := bytes.Repeat([]byte("v"), 500)
+	var entries []page.LeafEntry
+	for i := 0; ; i++ {
+		e := inlineEntry([]byte(fmt.Sprintf("key:%08d", i)), bigVal)
+		entries = append(entries, e)
+		if tr.rebuildLeaf(3, entries) < 0 {
+			break
+		}
+	}
+	verifyLeafSplitFits(t, tr, entries)
+}
+
+func TestFindLeafSplitPointLongSharedPrefix(t *testing.T) {
+	tr := newTestTree(t, 256)
+	prefix := bytes.Repeat([]byte("p"), 200)
+	var entries []page.LeafEntry
+	for i := 0; ; i++ {
+		key := append(bytes.Clone(prefix), []byte(fmt.Sprintf("%08d", i))...)
+		e := inlineEntry(key, []byte("v"))
+		entries = append(entries, e)
+		if tr.rebuildLeaf(3, entries) < 0 {
+			break
+		}
+	}
+	verifyLeafSplitFits(t, tr, entries)
+}
+
+func TestFindLeafSplitPointTwoEntries(t *testing.T) {
+	tr := newTestTree(t, 256)
+	big := bytes.Repeat([]byte("x"), 1500)
+	entries := []page.LeafEntry{
+		inlineEntry([]byte("aaa"), big),
+		inlineEntry([]byte("zzz"), big),
+	}
+	verifyLeafSplitFits(t, tr, entries)
+}
+
+func TestFindLeafSplitPointMixedCellTypes(t *testing.T) {
+	tr := newTestTree(t, 256)
+	spBuf := make([]byte, 64)
+	spb := page.NewSubpageBuilder(spBuf, 0)
+	spb.AddValue([]byte("a"))
+	spSize := spb.Finish()
+
+	var entries []page.LeafEntry
+	for i := 0; ; i++ {
+		key := []byte(fmt.Sprintf("key:%08d", i))
+		var e page.LeafEntry
+		switch i % 3 {
+		case 0:
+			e = inlineEntry(key, bytes.Repeat([]byte("v"), 100))
+		case 1:
+			e = page.LeafEntry{Key: key, CellFlags: page.CellFlagOverflow, OvflPage: uint64(i), TotalLen: 99999}
+		case 2:
+			e = page.LeafEntry{Key: key, CellFlags: page.CellFlagMultiValue, SubpageData: spBuf[:spSize]}
+		}
+		entries = append(entries, e)
+		if tr.rebuildLeaf(3, entries) < 0 {
+			break
+		}
+	}
+	verifyLeafSplitFits(t, tr, entries)
+}
+
+func TestFindLeafSplitPointOneHugeEntry(t *testing.T) {
+	// When one entry doesn't fit at all, findLeafSplitPoint returns 1
+	// (split after that entry caused the overflow).
+	tr := newTestTree(t, 256)
+	huge := bytes.Repeat([]byte("x"), int(tr.cfg.UsableSpace()))
+	entries := []page.LeafEntry{
+		inlineEntry([]byte("a"), huge),
+		inlineEntry([]byte("b"), []byte("small")),
+	}
+	split := tr.findLeafSplitPoint(entries)
+	if split != 1 {
+		t.Errorf("split = %d, want 1", split)
+	}
+}
+
+// verifyBranchSplitFits calls findBranchSplitPoint and rebuilds both halves.
+func verifyBranchSplitFits(t *testing.T, tr *Tree, ptr0 uint64, cells []branchCell) {
+	t.Helper()
+	if len(cells) < 2 {
+		return
+	}
+	split := tr.findBranchSplitPoint(ptr0, cells)
+	if split < 1 || split >= len(cells) {
+		t.Fatalf("findBranchSplitPoint returned %d for %d cells", split, len(cells))
+	}
+
+	leftPage, err := tr.allocPage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.rebuildBranch(leftPage, ptr0, cells[:split]) < 0 {
+		t.Errorf("left half (%d cells) does not fit", split)
+	}
+
+	rightPage, err := tr.allocPage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.rebuildBranch(rightPage, cells[split].childPtr, cells[split+1:]) < 0 {
+		t.Errorf("right half (%d cells) does not fit", len(cells)-split-1)
+	}
+}
+
+func TestFindBranchSplitPointShortKeys(t *testing.T) {
+	tr := newTestTree(t, 256)
+	var cells []branchCell
+	for i := 0; ; i++ {
+		cells = append(cells, branchCell{
+			key:      []byte(fmt.Sprintf("k:%06d", i)),
+			childPtr: uint64(i + 10),
+		})
+		if tr.rebuildBranch(3, 9, cells) < 0 {
+			break
+		}
+	}
+	verifyBranchSplitFits(t, tr, 9, cells)
+}
+
+func TestFindBranchSplitPointLongKeys(t *testing.T) {
+	tr := newTestTree(t, 256)
+	var cells []branchCell
+	for i := 0; ; i++ {
+		key := append(bytes.Repeat([]byte("k"), 200), []byte(fmt.Sprintf("%06d", i))...)
+		cells = append(cells, branchCell{key: key, childPtr: uint64(i + 10)})
+		if tr.rebuildBranch(3, 9, cells) < 0 {
+			break
+		}
+	}
+	verifyBranchSplitFits(t, tr, 9, cells)
+}
+
+func TestFindBranchSplitPointTwoCells(t *testing.T) {
+	tr := newTestTree(t, 256)
+	big := bytes.Repeat([]byte("x"), 1500)
+	cells := []branchCell{
+		{key: big, childPtr: 10},
+		{key: big, childPtr: 11},
+	}
+	verifyBranchSplitFits(t, tr, 9, cells)
+}
+
+func TestFindBranchSplitPointVaryingKeySizes(t *testing.T) {
+	tr := newTestTree(t, 256)
+	var cells []branchCell
+	for i := 0; ; i++ {
+		var key []byte
+		if i%2 == 0 {
+			key = []byte(fmt.Sprintf("s%04d", i))
+		} else {
+			key = append(bytes.Repeat([]byte("L"), 300), []byte(fmt.Sprintf("%04d", i))...)
+		}
+		cells = append(cells, branchCell{key: key, childPtr: uint64(i + 10)})
+		if tr.rebuildBranch(3, 9, cells) < 0 {
+			break
+		}
+	}
+	verifyBranchSplitFits(t, tr, 9, cells)
+}
