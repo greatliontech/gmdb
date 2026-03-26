@@ -177,29 +177,120 @@ func TestDeleteReverseOrder(t *testing.T) {
 	}
 }
 
-// assertNoZeroChildren walks every branch in the tree and fails if any
-// branch has Ptr0==0 or a cell with childPtr==0.
-func assertNoZeroChildren(t *testing.T, tr *Tree, pageID uint64) {
-	t.Helper()
-	if pageID == 0 {
-		return
-	}
+// subtreeKeyRange returns the smallest and largest key in the subtree
+// rooted at pageID. Panics if pageID is 0 or the subtree is empty.
+func subtreeKeyRange(tr *Tree, pageID uint64) (minKey, maxKey []byte) {
 	buf := tr.pageSlice(pageID)
 	typ, _, _, _ := page.ReadHeader(buf)
 	if typ == page.TypeLeaf {
-		return
+		lr := page.NewLeafReader(buf, tr.cfg)
+		if lr.Count() == 0 {
+			return nil, nil
+		}
+		first, _ := lr.EntryAt(0, nil)
+		last, _ := lr.EntryAt(lr.Count()-1, nil)
+		return bytes.Clone(first.Key), bytes.Clone(last.Key)
 	}
 	br := page.NewBranchReader(buf)
-	if br.Ptr0() == 0 {
-		t.Fatalf("branch page %d has zero Ptr0", pageID)
+	// Min key is in the leftmost subtree (Ptr0).
+	minKey, _ = subtreeKeyRange(tr, br.Ptr0())
+	// Max key is in the rightmost subtree (last child pointer).
+	if br.Count() > 0 {
+		_, maxKey = subtreeKeyRange(tr, br.ChildPtr(br.Count()-1))
+	} else {
+		_, maxKey = subtreeKeyRange(tr, br.Ptr0())
 	}
-	assertNoZeroChildren(t, tr, br.Ptr0())
-	for i := range br.Count() {
-		if br.ChildPtr(i) == 0 {
-			t.Fatalf("branch page %d cell %d has zero childPtr", pageID, i)
+	return minKey, maxKey
+}
+
+// assertTreeValid checks all structural invariants of the B+tree:
+//  1. No zero children: every branch has non-zero Ptr0 and child pointers.
+//  2. Separator correctness: for each branch, every key in the left subtree
+//     of a separator is strictly less than the separator, and every key in
+//     the right subtree is >= the separator.
+//  3. Uniform leaf depth: all leaves are at the same depth from the root.
+//  4. Retired and CoW pages are disjoint sets.
+func assertTreeValid(t *testing.T, tr *Tree) {
+	t.Helper()
+	root := tr.Root()
+	if root == 0 {
+		return
+	}
+
+	// Invariant 4: retired and CoW pages are disjoint.
+	cow := tr.CowPages()
+	for _, rp := range tr.Retired() {
+		if _, ok := cow[rp]; ok {
+			t.Fatalf("retired page %d is also in CoW set", rp)
 		}
-		assertNoZeroChildren(t, tr, br.ChildPtr(i))
 	}
+
+	// Walk the tree checking invariants 1-3.
+	leafDepth := -1
+	var walk func(pageID uint64, depth int)
+	walk = func(pageID uint64, depth int) {
+		t.Helper()
+		buf := tr.pageSlice(pageID)
+		typ, _, _, _ := page.ReadHeader(buf)
+
+		if typ == page.TypeLeaf {
+			// Invariant 3: all leaves at the same depth.
+			if leafDepth == -1 {
+				leafDepth = depth
+			} else if depth != leafDepth {
+				t.Fatalf("leaf page %d at depth %d, expected %d", pageID, depth, leafDepth)
+			}
+			return
+		}
+
+		br := page.NewBranchReader(buf)
+
+		// Invariant 1: no zero children.
+		if br.Ptr0() == 0 {
+			t.Fatalf("branch page %d has zero Ptr0", pageID)
+		}
+		for i := range br.Count() {
+			if br.ChildPtr(i) == 0 {
+				t.Fatalf("branch page %d cell %d has zero childPtr", pageID, i)
+			}
+		}
+
+		// Invariant 2: separator correctness.
+		// For separator Key[i]:
+		//   - The left child (Ptr0 for i==0, ChildPtr(i-1) for i>0) must
+		//     have all keys < Key[i].
+		//   - The right child ChildPtr(i) must have all keys >= Key[i].
+		for i := range br.Count() {
+			sep := br.Key(i)
+
+			// Left subtree of separator i.
+			var leftChild uint64
+			if i == 0 {
+				leftChild = br.Ptr0()
+			} else {
+				leftChild = br.ChildPtr(i - 1)
+			}
+			_, leftMax := subtreeKeyRange(tr, leftChild)
+			if leftMax != nil && bytes.Compare(leftMax, sep) >= 0 {
+				t.Fatalf("branch page %d separator[%d]=%q: left subtree max key %q >= separator",
+					pageID, i, sep, leftMax)
+			}
+
+			rightChild := br.ChildPtr(i)
+			rightMin, _ := subtreeKeyRange(tr, rightChild)
+			if rightMin != nil && bytes.Compare(rightMin, sep) < 0 {
+				t.Fatalf("branch page %d separator[%d]=%q: right subtree min key %q < separator",
+					pageID, i, sep, rightMin)
+			}
+		}
+
+		// Recurse into all children.
+		walk(br.Ptr0(), depth+1)
+		for i := range br.Count() {
+			walk(br.ChildPtr(i), depth+1)
+		}
+	}
+	walk(root, 0)
 }
 
 // TestRebalanceChildLeafMerge exercises leaf merge and verifies no zero
@@ -216,7 +307,7 @@ func TestRebalanceChildLeafMerge(t *testing.T) {
 	for i := range n / 2 {
 		key := fmt.Appendf(nil, "key:%05d", i)
 		tr.Delete(key)
-		assertNoZeroChildren(t, tr, tr.Root())
+		assertTreeValid(t, tr)
 	}
 }
 
@@ -235,7 +326,7 @@ func TestRebalanceChildLeafRedistribute(t *testing.T) {
 	for i := 0; i < n; i += 3 {
 		key := fmt.Appendf(nil, "key:%05d", i)
 		tr.Delete(key)
-		assertNoZeroChildren(t, tr, tr.Root())
+		assertTreeValid(t, tr)
 	}
 }
 
@@ -253,7 +344,7 @@ func TestRebalanceChildBranchMerge(t *testing.T) {
 	for i := range n {
 		key := fmt.Appendf(nil, "key:%05d", i)
 		tr.Delete(key)
-		assertNoZeroChildren(t, tr, tr.Root())
+		assertTreeValid(t, tr)
 	}
 }
 
@@ -273,10 +364,10 @@ func TestRebalanceChildBranchRedistribute(t *testing.T) {
 		key := fmt.Appendf(prefix[:100:100], "%04d", i)
 		tr.Delete(key)
 		if i%100 == 0 {
-			assertNoZeroChildren(t, tr, tr.Root())
+			assertTreeValid(t, tr)
 		}
 	}
-	assertNoZeroChildren(t, tr, tr.Root())
+	assertTreeValid(t, tr)
 }
 
 // TestRebalanceChildRemoveEmptyPtr0 exercises removeChild: Ptr0's child
@@ -288,11 +379,11 @@ func TestRebalanceChildRemoveEmptyPtr0(t *testing.T) {
 	tr.Put(page.LeafEntry{Key: []byte("aaa"), Value: bigVal})
 	tr.Put(page.LeafEntry{Key: []byte("bbb"), Value: bigVal})
 	tr.Put(page.LeafEntry{Key: []byte("ccc"), Value: bigVal})
-	assertNoZeroChildren(t, tr, tr.Root())
+	assertTreeValid(t, tr)
 
 	// Delete Ptr0's only entry → empty child → removeChild promotes sibling.
 	tr.Delete([]byte("aaa"))
-	assertNoZeroChildren(t, tr, tr.Root())
+	assertTreeValid(t, tr)
 
 	if _, found := tr.Get([]byte("bbb")); !found {
 		t.Error("bbb should exist")
@@ -337,7 +428,7 @@ func TestRebalanceChildAfterDeleteRange(t *testing.T) {
 			if err != nil {
 				t.Fatalf("DeleteRange: %v", err)
 			}
-			assertNoZeroChildren(t, tr, tr.Root())
+			assertTreeValid(t, tr)
 
 			// Full cursor scan to verify no corruption.
 			c := tr.NewCursor()

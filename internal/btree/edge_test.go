@@ -3,6 +3,7 @@ package btree
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -761,5 +762,448 @@ func TestMultipleResetCycles(t *testing.T) {
 	_, found = tr.Get(testKey(100))
 	if !found {
 		t.Error("tx3: key 100 should exist")
+	}
+}
+
+// --- computeSeparator edge: empty left ---
+
+func TestComputeSeparatorEmptyLeft(t *testing.T) {
+	sep := computeSeparator([]byte{}, []byte{0x42})
+	if !bytes.Equal(sep, []byte{0x42}) {
+		t.Errorf("sep = %x, want 42", sep)
+	}
+	// Verify invariant: left < sep <= right.
+	if bytes.Compare([]byte{}, sep) >= 0 {
+		t.Error("left >= sep")
+	}
+	if bytes.Compare(sep, []byte{0x42}) > 0 {
+		t.Error("sep > right")
+	}
+}
+
+// --- DeleteRange with start == end (empty range) ---
+
+func TestDeleteRangeStartEqualsEnd(t *testing.T) {
+	tr := newTestTree(t, 128)
+	for i := range 20 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	deleted, err := tr.DeleteRange(testKey(10), testKey(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0", deleted)
+	}
+
+	// Verify all 20 keys still exist.
+	for i := range 20 {
+		_, found := tr.Get(testKey(i))
+		if !found {
+			t.Errorf("key %d missing after empty DeleteRange", i)
+		}
+	}
+}
+
+// --- DeleteRange with start > end (inverted range) ---
+
+func TestDeleteRangeStartGreaterThanEnd(t *testing.T) {
+	tr := newTestTree(t, 128)
+	for i := range 20 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	deleted, err := tr.DeleteRange(testKey(15), testKey(5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0", deleted)
+	}
+
+	// Verify all 20 keys still exist via cursor scan.
+	c := tr.NewCursor()
+	count := 0
+	for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		count++
+	}
+	if count != 20 {
+		t.Errorf("cursor scan count = %d, want 20", count)
+	}
+}
+
+// --- CoW preserves old pages ---
+
+func TestCowPreservesOldPages(t *testing.T) {
+	tr := newTestTree(t, 128)
+	for i := range 10 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	root := tr.Root()
+	tr.Reset(root)
+
+	// Snapshot the old root page content before any mutation.
+	oldRoot := tr.Root()
+	ps := int(tr.cfg.PageSize)
+	snapshot := make([]byte, ps)
+	copy(snapshot, tr.data[oldRoot*uint64(ps):(oldRoot+1)*uint64(ps)])
+
+	// Mutate the tree — this should CoW the root, not modify the old page.
+	tr.Put(inlineEntry([]byte("zzz_new"), []byte("value")))
+
+	// The old root page must be untouched.
+	oldPageContent := tr.data[oldRoot*uint64(ps) : (oldRoot+1)*uint64(ps)]
+	if !bytes.Equal(oldPageContent, snapshot) {
+		t.Error("old root page was modified after CoW; expected it to be preserved")
+	}
+}
+
+// --- Multiple independent cursors ---
+
+func TestMultipleCursors(t *testing.T) {
+	tr := newTestTree(t, 128)
+	for i := range 20 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	// Collect sorted keys for reference.
+	ref := tr.NewCursor()
+	var allKeys []string
+	for k, _ := ref.First(); k != nil; k, _ = ref.Next() {
+		allKeys = append(allKeys, string(k))
+	}
+
+	// Create two independent cursors.
+	a := tr.NewCursor()
+	b := tr.NewCursor()
+
+	// Position A at First, B at Last.
+	a.First()
+	b.Last()
+
+	// Advance A forward 5 times.
+	for range 5 {
+		a.Next()
+	}
+	ka, _ := a.Current()
+	if string(ka) != allKeys[5] {
+		t.Errorf("cursor A at index 5: got %q, want %q", ka, allKeys[5])
+	}
+
+	// Advance B backward 5 times.
+	for range 5 {
+		b.Prev()
+	}
+	kb, _ := b.Current()
+	if string(kb) != allKeys[len(allKeys)-6] {
+		t.Errorf("cursor B at index %d: got %q, want %q", len(allKeys)-6, kb, allKeys[len(allKeys)-6])
+	}
+
+	// Mutate tree — cursor A becomes stale, cursor B created after mutation works.
+	aKey, _ := a.Current()
+	_ = aKey
+	tr.Put(inlineEntry([]byte("zzz_extra"), []byte("val")))
+
+	// A is stale.
+	k, _ := a.Next()
+	if k != nil {
+		t.Error("cursor A Next after mutation should return nil")
+	}
+	if !errors.Is(a.Err(), ErrCursorStale) {
+		t.Errorf("cursor A Err = %v, want ErrCursorStale", a.Err())
+	}
+
+	// B created after mutation works fine.
+	bNew := tr.NewCursor()
+	kFirst, _ := bNew.First()
+	if kFirst == nil {
+		t.Error("new cursor B First should return a key")
+	}
+	if string(kFirst) != allKeys[0] {
+		t.Errorf("new cursor B First = %q, want %q", kFirst, allKeys[0])
+	}
+}
+
+// --- Cursor stale after Reset ---
+
+func TestCursorStaleAfterReset(t *testing.T) {
+	tr := newTestTree(t, 128)
+	for i := range 10 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	c := tr.NewCursor()
+	c.First()
+
+	// Reset increments gen, making the cursor stale.
+	tr.Reset(tr.Root())
+
+	k, _ := c.Next()
+	if k != nil {
+		t.Error("Next after Reset should return nil")
+	}
+	if !errors.Is(c.Err(), ErrCursorStale) {
+		t.Errorf("Err = %v, want ErrCursorStale", c.Err())
+	}
+}
+
+// --- Put replace causes split ---
+
+func TestPutReplaceCausesSplit(t *testing.T) {
+	tr := newTestTree(t, 256)
+
+	// Insert entries with small values to fill a leaf near capacity.
+	n := 40
+	for i := range n {
+		tr.Put(inlineEntry(testKey(i), []byte("s")))
+	}
+
+	// Replace one entry with a very large value to cause overflow and split.
+	bigVal := bytes.Repeat([]byte("X"), 2000)
+	tr.Put(page.LeafEntry{Key: testKey(20), Value: bigVal})
+
+	// Verify all keys are still retrievable.
+	for i := range n {
+		e, found := tr.Get(testKey(i))
+		if !found {
+			t.Errorf("key %d not found after replace-induced split", i)
+			continue
+		}
+		if i == 20 {
+			if !bytes.Equal(e.Value, bigVal) {
+				t.Errorf("key 20 value len = %d, want %d", len(e.Value), len(bigVal))
+			}
+		}
+	}
+}
+
+// --- Consecutive cursor deletes ---
+
+func TestConsecutiveCursorDeletes(t *testing.T) {
+	tr := newTestTree(t, 128)
+	for i := range 10 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	// Collect sorted keys for reference.
+	ref := tr.NewCursor()
+	var allKeys []string
+	for k, _ := ref.First(); k != nil; k, _ = ref.Next() {
+		allKeys = append(allKeys, string(k))
+	}
+
+	c := tr.NewCursor()
+	c.First()
+
+	// Delete 3 entries consecutively.
+	for i := range 3 {
+		err := c.Delete()
+		if err != nil {
+			t.Fatalf("Delete %d: %v", i, err)
+		}
+	}
+
+	// Verify the first 3 keys are gone.
+	for i := range 3 {
+		_, found := tr.Get([]byte(allKeys[i]))
+		if found {
+			t.Errorf("key %q should have been deleted", allKeys[i])
+		}
+	}
+
+	// Verify the remaining 7 keys exist.
+	for i := 3; i < len(allKeys); i++ {
+		_, found := tr.Get([]byte(allKeys[i]))
+		if !found {
+			t.Errorf("key %q should still exist", allKeys[i])
+		}
+	}
+}
+
+// --- Cursor seek recovery after stale ---
+
+func TestCursorSeekRecoveryAfterStale(t *testing.T) {
+	tr := newTestTree(t, 128)
+	for i := range 20 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	c := tr.NewCursor()
+	c.First()
+
+	// Mutate tree to make cursor stale.
+	tr.Put(inlineEntry([]byte("zzz_mutation"), []byte("val")))
+
+	// Verify cursor is stale.
+	k, _ := c.Next()
+	if k != nil {
+		t.Error("Next after mutation should return nil")
+	}
+	if !errors.Is(c.Err(), ErrCursorStale) {
+		t.Fatalf("Err = %v, want ErrCursorStale", c.Err())
+	}
+
+	// Seek (exact match) should succeed and recover the cursor.
+	k, _ = c.Seek(testKey(10))
+	if k == nil || !bytes.Equal(k, testKey(10)) {
+		t.Errorf("Seek after stale = %q, want %q", k, testKey(10))
+	}
+	if c.Err() != nil {
+		t.Errorf("Err after Seek = %v, want nil", c.Err())
+	}
+
+	// SeekGE should also succeed.
+	k, _ = c.SeekGE(testKey(15))
+	if k == nil || !bytes.Equal(k, testKey(15)) {
+		t.Errorf("SeekGE after stale = %q, want %q", k, testKey(15))
+	}
+	if c.Err() != nil {
+		t.Errorf("Err after SeekGE = %v, want nil", c.Err())
+	}
+}
+
+// --- Retired and CoW pages are disjoint ---
+
+func TestRetiredAndCowDisjoint(t *testing.T) {
+	tr := newTestTree(t, 256)
+	for i := range 50 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	root := tr.Root()
+	tr.Reset(root)
+
+	// Do mutations: puts and deletes.
+	for i := range 10 {
+		tr.Put(inlineEntry(testKey(i), []byte("updated")))
+	}
+	for i := 40; i < 50; i++ {
+		tr.Delete(testKey(i))
+	}
+
+	retired := tr.Retired()
+	cowPages := tr.CowPages()
+
+	for _, pid := range retired {
+		if _, ok := cowPages[pid]; ok {
+			t.Errorf("page %d appears in both retired and cow sets", pid)
+		}
+	}
+}
+
+// --- Reset clears state ---
+
+func TestResetClearsState(t *testing.T) {
+	tr := newTestTree(t, 256)
+	for i := range 50 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	root := tr.Root()
+	tr.Reset(root)
+
+	// Do mutations to populate cow and retired.
+	for i := range 10 {
+		tr.Put(inlineEntry(testKey(i), []byte("updated")))
+	}
+	tr.Delete(testKey(49))
+
+	if len(tr.CowPages()) == 0 {
+		t.Fatal("expected non-empty cow pages before reset")
+	}
+	if len(tr.Retired()) == 0 {
+		t.Fatal("expected non-empty retired pages before reset")
+	}
+
+	// Reset should clear both.
+	root2 := tr.Root()
+	tr.Reset(root2)
+
+	if len(tr.CowPages()) != 0 {
+		t.Errorf("CowPages after Reset = %d, want 0", len(tr.CowPages()))
+	}
+	if len(tr.Retired()) != 0 {
+		t.Errorf("Retired after Reset = %d, want 0", len(tr.Retired()))
+	}
+}
+
+// --- DeleteRange after Put in same transaction ---
+
+func TestDeleteRangeAfterPutSameTx(t *testing.T) {
+	tr := newTestTree(t, 256)
+	for i := range 20 {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	// In the same transaction (no Reset), put new entries then delete them.
+	for i := 20; i < 30; i++ {
+		tr.Put(inlineEntry(testKey(i), testVal(i)))
+	}
+
+	// DeleteRange covers the newly inserted entries.
+	deleted, err := tr.DeleteRange(testKey(20), testKey(30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 10 {
+		t.Errorf("deleted = %d, want 10", deleted)
+	}
+
+	// Verify the original 20 entries still exist.
+	for i := range 20 {
+		_, found := tr.Get(testKey(i))
+		if !found {
+			t.Errorf("key %d should still exist", i)
+		}
+	}
+
+	// Verify deleted entries are gone.
+	for i := 20; i < 30; i++ {
+		_, found := tr.Get(testKey(i))
+		if found {
+			t.Errorf("key %d should be deleted", i)
+		}
+	}
+
+	// Verify tree is consistent via full cursor scan.
+	c := tr.NewCursor()
+	count := 0
+	var prev []byte
+	for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		if prev != nil && bytes.Compare(prev, k) >= 0 {
+			t.Fatalf("keys out of order: %q >= %q", prev, k)
+		}
+		prev = bytes.Clone(k)
+		count++
+	}
+	if count != 20 {
+		t.Errorf("cursor scan count = %d, want 20", count)
+	}
+}
+
+// --- Cursor Prev from first entry in multi-leaf tree ---
+
+func TestCursorPrevFromFirstEntryMultiLeaf(t *testing.T) {
+	tr := newTestTree(t, 256)
+	// Use big values to force multiple leaves.
+	bigVal := bytes.Repeat([]byte("v"), 500)
+	n := 50
+	for i := range n {
+		key := fmt.Appendf(nil, "key:%04d", i)
+		tr.Put(page.LeafEntry{Key: key, Value: bigVal})
+	}
+
+	c := tr.NewCursor()
+	c.First()
+
+	// Prev from the first entry should return nil.
+	k, _ := c.Prev()
+	if k != nil {
+		t.Errorf("Prev from first entry = %q, want nil", k)
+	}
+	if c.Valid() {
+		t.Error("cursor should not be valid after Prev past beginning")
 	}
 }
