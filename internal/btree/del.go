@@ -95,7 +95,7 @@ func (t *Tree) removeFromLeaf(pageID uint64, key []byte) (
 	newPageID uint64, old page.LeafEntry, found bool, underflow bool, err error,
 ) {
 	buf := t.pageSlice(pageID)
-	lr := page.NewLeafReader(buf, t.cfg)
+	lr := page.NewLeafReader(buf, t.cfg.Page)
 	searchIdx, entry, found := lr.SearchLeaf(key, nil)
 	if !found {
 		return pageID, page.LeafEntry{}, false, false, nil
@@ -209,7 +209,7 @@ func (t *Tree) canMerge(leftID, rightID uint64, sep []byte) bool {
 		leftEntries := t.collectEntries(leftID)
 		rightEntries := t.collectEntries(rightID)
 		combined := append(leftEntries, rightEntries...)
-		lb := page.NewLeafBuilder(t.scratch, t.cfg)
+		lb := page.NewLeafBuilder(t.scratch, t.cfg.Page)
 		for _, e := range combined {
 			if !addEntry(lb, e) {
 				return false
@@ -225,7 +225,7 @@ func (t *Tree) canMerge(leftID, rightID uint64, sep []byte) bool {
 	combined = append(combined, leftCells...)
 	combined = append(combined, branchCell{key: sep, childPtr: rightPtr0})
 	combined = append(combined, rightCells...)
-	bb := page.NewBranchBuilder(t.scratch, t.cfg)
+	bb := page.NewBranchBuilder(t.scratch, t.cfg.Page)
 	bb.SetPtr0(0)
 	for _, c := range combined {
 		if !bb.AddCell(c.key, c.childPtr) {
@@ -251,8 +251,8 @@ func (t *Tree) rebalanceLeaves(
 		return t.removeSepAndChild(ptr0, cells, leftIdx, rightIdx, sepCellIdx, leftChildID)
 	}
 
-	// Redistribute with byte-balanced split.
-	split := t.findLeafSplitPoint(combined)
+	// Redistribute with byte-balanced split (no bias).
+	split := t.findLeafSplitPoint(combined, -1)
 	t.rebuildLeaf(leftChildID, combined[:split])
 	t.rebuildLeaf(rightChildID, combined[split:])
 

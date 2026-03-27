@@ -183,7 +183,7 @@ func subtreeKeyRange(tr *Tree, pageID uint64) (minKey, maxKey []byte) {
 	buf := tr.pageSlice(pageID)
 	typ, _, _, _ := page.ReadHeader(buf)
 	if typ == page.TypeLeaf {
-		lr := page.NewLeafReader(buf, tr.cfg)
+		lr := page.NewLeafReader(buf, tr.cfg.Page)
 		if lr.Count() == 0 {
 			return nil, nil
 		}

@@ -12,7 +12,7 @@ func (t *Tree) Get(key []byte) (page.LeafEntry, bool) {
 	}
 	leafPageID := t.descendToLeaf(key)
 	buf := t.pageSlice(leafPageID)
-	lr := page.NewLeafReader(buf, t.cfg)
+	lr := page.NewLeafReader(buf, t.cfg.Page)
 	_, entry, found := lr.SearchLeaf(key, nil)
 	return entry, found
 }

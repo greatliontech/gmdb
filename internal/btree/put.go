@@ -17,7 +17,7 @@ func (t *Tree) Put(e page.LeafEntry) (old page.LeafEntry, replaced bool, err err
 			return page.LeafEntry{}, false, err
 		}
 		buf := t.pageSlice(pageID)
-		lb := page.NewLeafBuilder(buf, t.cfg)
+		lb := page.NewLeafBuilder(buf, t.cfg.Page)
 		if !addEntry(lb, e) {
 			t.freePage(pageID)
 			return page.LeafEntry{}, false, fmt.Errorf("btree: entry too large for page")
@@ -39,7 +39,7 @@ func (t *Tree) Put(e page.LeafEntry) (old page.LeafEntry, replaced bool, err err
 			return page.LeafEntry{}, false, err
 		}
 		buf := t.pageSlice(rootID)
-		bb := page.NewBranchBuilder(buf, t.cfg)
+		bb := page.NewBranchBuilder(buf, t.cfg.Page)
 		bb.SetPtr0(newRoot)
 		bb.AddCell(splitSep, splitRight)
 		bb.Finish()
@@ -167,7 +167,7 @@ func (t *Tree) insertIntoLeaf(pageID uint64, e page.LeafEntry) (
 	}
 
 	// Leaf overflows: split.
-	splitSep, splitRight, err = t.splitLeaf(newPageID, entries)
+	splitSep, splitRight, err = t.splitLeaf(newPageID, entries, idx)
 	if err != nil {
 		return 0, nil, 0, page.LeafEntry{}, false, err
 	}
@@ -177,8 +177,8 @@ func (t *Tree) insertIntoLeaf(pageID uint64, e page.LeafEntry) (
 // splitLeaf splits entries across the current page (left) and a new page
 // (right) using a byte-balanced split point. Returns the separator and
 // the right page ID.
-func (t *Tree) splitLeaf(pageID uint64, entries []page.LeafEntry) (sep []byte, rightPageID uint64, err error) {
-	split := t.findLeafSplitPoint(entries)
+func (t *Tree) splitLeaf(pageID uint64, entries []page.LeafEntry, insertIdx int) (sep []byte, rightPageID uint64, err error) {
+	split := t.findLeafSplitPoint(entries, insertIdx)
 
 	t.rebuildLeaf(pageID, entries[:split])
 

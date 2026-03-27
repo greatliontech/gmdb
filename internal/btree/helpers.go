@@ -50,7 +50,7 @@ func (t *Tree) collectEntriesBorrowed(pageID uint64) []page.LeafEntry {
 
 func (t *Tree) collectEntriesFrom(pageID uint64, cloneValues bool) []page.LeafEntry {
 	buf := t.pageSlice(pageID)
-	lr := page.NewLeafReader(buf, t.cfg)
+	lr := page.NewLeafReader(buf, t.cfg.Page)
 	count := lr.Count()
 	if count == 0 {
 		return nil
@@ -150,7 +150,7 @@ func addEntry(lb *page.LeafBuilder, e page.LeafEntry) bool {
 // if the entries don't fit in the page.
 func (t *Tree) rebuildLeaf(pageID uint64, entries []page.LeafEntry) int {
 	buf := t.pageSlice(pageID)
-	lb := page.NewLeafBuilder(buf, t.cfg)
+	lb := page.NewLeafBuilder(buf, t.cfg.Page)
 	for _, e := range entries {
 		if !addEntry(lb, e) {
 			return -1
@@ -165,7 +165,7 @@ func (t *Tree) rebuildLeaf(pageID uint64, entries []page.LeafEntry) int {
 // Returns the free space remaining, or -1 if the cells don't fit.
 func (t *Tree) rebuildBranch(pageID uint64, ptr0 uint64, cells []branchCell) int {
 	buf := t.pageSlice(pageID)
-	bb := page.NewBranchBuilder(buf, t.cfg)
+	bb := page.NewBranchBuilder(buf, t.cfg.Page)
 	bb.SetPtr0(ptr0)
 	for _, c := range cells {
 		if !bb.AddCell(c.key, c.childPtr) {
@@ -192,16 +192,27 @@ func (t *Tree) isUnderfull(count int, freeSpace int) bool {
 	if count == 0 {
 		return true
 	}
-	usable := t.cfg.UsableSpace()
+	usable := t.cfg.Page.UsableSpace()
 	return freeSpace*100 > usable*(100-mergeThresholdPercent)
 }
 
-// findLeafSplitPoint finds the byte-balanced split point for leaf entries.
-// Returns the index where the right half starts. Both halves will fit in
-// one page after fresh prefix compression encoding.
-func (t *Tree) findLeafSplitPoint(entries []page.LeafEntry) int {
-	target := t.cfg.UsableSpace() / 2
-	lb := page.NewLeafBuilder(t.scratch, t.cfg)
+// findLeafSplitPoint finds the split point for leaf entries. insertIdx is the
+// position of the newly inserted key (-1 for no bias, e.g. redistribute).
+// When the insert is at the end (append) or beginning (prepend), the split
+// is biased according to splitBias to pack the "done" side, leaving room on
+// the active side.
+func (t *Tree) findLeafSplitPoint(entries []page.LeafEntry, insertIdx int) int {
+	usable := t.cfg.Page.UsableSpace()
+	target := usable / 2
+	if t.cfg.SplitBias > 50 && insertIdx >= 0 {
+		switch {
+		case insertIdx == len(entries)-1: // append: pack left
+			target = usable * (100 - t.cfg.SplitBias) / 100
+		case insertIdx == 0: // prepend: pack right
+			target = usable * t.cfg.SplitBias / 100
+		}
+	}
+	lb := page.NewLeafBuilder(t.scratch, t.cfg.Page)
 	for i, e := range entries {
 		if !addEntry(lb, e) {
 			if i == 0 {
@@ -220,8 +231,8 @@ func (t *Tree) findLeafSplitPoint(entries []page.LeafEntry) int {
 
 // findBranchSplitPoint finds the byte-balanced split point for branch cells.
 func (t *Tree) findBranchSplitPoint(ptr0 uint64, cells []branchCell) int {
-	target := t.cfg.UsableSpace() / 2
-	bb := page.NewBranchBuilder(t.scratch, t.cfg)
+	target := t.cfg.Page.UsableSpace() / 2
+	bb := page.NewBranchBuilder(t.scratch, t.cfg.Page)
 	bb.SetPtr0(ptr0)
 	for i, c := range cells {
 		if !bb.AddCell(c.key, c.childPtr) {

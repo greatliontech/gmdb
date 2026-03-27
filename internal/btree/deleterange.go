@@ -52,7 +52,7 @@ func (t *Tree) deleteRange(pageID uint64, start, end []byte) (uint64, int, error
 // deleteRangeLeaf removes entries in [start, end) from a leaf page.
 func (t *Tree) deleteRangeLeaf(pageID uint64, start, end []byte) (uint64, int, error) {
 	buf := t.pageSlice(pageID)
-	lr := page.NewLeafReader(buf, t.cfg)
+	lr := page.NewLeafReader(buf, t.cfg.Page)
 
 	// Find the index range to delete.
 	leftIdx := 0
@@ -217,14 +217,14 @@ func (t *Tree) deleteRangeBranch(pageID uint64, start, end []byte) (uint64, int,
 			var freeSpace int
 			if typ == page.TypeLeaf {
 				entries := t.collectEntries(childID)
-				lb := page.NewLeafBuilder(t.scratch, t.cfg)
+				lb := page.NewLeafBuilder(t.scratch, t.cfg.Page)
 				for _, e := range entries {
 					addEntry(lb, e)
 				}
 				freeSpace = lb.FreeSpace()
 			} else {
 				brPtr0, brCells := t.collectBranchCells(childID)
-				bb := page.NewBranchBuilder(t.scratch, t.cfg)
+				bb := page.NewBranchBuilder(t.scratch, t.cfg.Page)
 				bb.SetPtr0(brPtr0)
 				for _, c := range brCells {
 					bb.AddCell(c.key, c.childPtr)
@@ -253,7 +253,7 @@ func (t *Tree) retireSubtree(pageID uint64) int {
 	typ, _, count, _ := page.ReadHeader(buf)
 
 	if typ == page.TypeLeaf {
-		lr := page.NewLeafReader(buf, t.cfg)
+		lr := page.NewLeafReader(buf, t.cfg.Page)
 		it := lr.Iter(nil)
 		for e, ok := it.Next(); ok; e, ok = it.Next() {
 			t.retireEntryPages(e)

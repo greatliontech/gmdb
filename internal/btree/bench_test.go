@@ -11,10 +11,10 @@ import (
 )
 
 // benchTree creates a Tree with a given page count for benchmarks.
-func benchTree(b *testing.B, numPages int) *Tree {
+func benchTree(b *testing.B, numPages int, bias ...int) *Tree {
 	b.Helper()
-	cfg := page.PageConfig{PageSize: testPageSize}
-	bitmapPages := cfg.BitmapPages(uint64(numPages))
+	pcfg := page.PageConfig{PageSize: testPageSize}
+	bitmapPages := pcfg.BitmapPages(uint64(numPages))
 	reservedPages := 2 + uint64(bitmapPages)
 
 	data := make([]byte, numPages*testPageSize)
@@ -22,6 +22,10 @@ func benchTree(b *testing.B, numPages int) *Tree {
 	bm := bitmap.New(bitmapData, uint64(numPages), reservedPages)
 	for i := reservedPages; i < uint64(numPages); i++ {
 		bm.Set(i)
+	}
+	cfg := Config{Page: pcfg}
+	if len(bias) > 0 {
+		cfg.SplitBias = bias[0]
 	}
 	return New(data, cfg, bm, 0)
 }
@@ -39,48 +43,58 @@ func populateTree(b *testing.B, tr *Tree, n int, keySize, valSize int) {
 	}
 }
 
+var splitBiases = []int{50, 75, 90}
+
 // --- Point operation benchmarks ---
 
 func BenchmarkPutSequential(b *testing.B) {
-	for _, valSize := range []int{8, 100, 500} {
-		b.Run(fmt.Sprintf("val=%d", valSize), func(b *testing.B) {
-			tr := benchTree(b, 65536)
-			val := bytes.Repeat([]byte("v"), valSize)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := range b.N {
-				key := fmt.Appendf(nil, "key:%08d", i)
-				tr.Put(inlineEntry(key, val))
-			}
-		})
+	for _, bias := range splitBiases {
+		for _, valSize := range []int{8, 100, 500} {
+			b.Run(fmt.Sprintf("bias=%d/val=%d", bias, valSize), func(b *testing.B) {
+				tr := benchTree(b, 65536, bias)
+				val := bytes.Repeat([]byte("v"), valSize)
+				b.ResetTimer()
+				b.ReportAllocs()
+				for i := range b.N {
+					key := fmt.Appendf(nil, "key:%08d", i)
+					tr.Put(inlineEntry(key, val))
+				}
+			})
+		}
 	}
 }
 
 func BenchmarkPutRandom(b *testing.B) {
-	for _, valSize := range []int{8, 100, 500} {
-		b.Run(fmt.Sprintf("val=%d", valSize), func(b *testing.B) {
-			tr := benchTree(b, 65536)
-			val := bytes.Repeat([]byte("v"), valSize)
-			rng := rand.New(rand.NewPCG(42, 0))
-			b.ResetTimer()
-			b.ReportAllocs()
-			for range b.N {
-				key := fmt.Appendf(nil, "key:%08d", rng.IntN(10_000_000))
-				tr.Put(inlineEntry(key, val))
-			}
-		})
+	for _, bias := range splitBiases {
+		for _, valSize := range []int{8, 100, 500} {
+			b.Run(fmt.Sprintf("bias=%d/val=%d", bias, valSize), func(b *testing.B) {
+				tr := benchTree(b, 65536, bias)
+				val := bytes.Repeat([]byte("v"), valSize)
+				rng := rand.New(rand.NewPCG(42, 0))
+				b.ResetTimer()
+				b.ReportAllocs()
+				for range b.N {
+					key := fmt.Appendf(nil, "key:%08d", rng.IntN(10_000_000))
+					tr.Put(inlineEntry(key, val))
+				}
+			})
+		}
 	}
 }
 
 func BenchmarkPutReplace(b *testing.B) {
-	tr := benchTree(b, 65536)
-	populateTree(b, tr, 10000, 20, 100)
-	val := bytes.Repeat([]byte("x"), 100)
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := range b.N {
-		key := fmt.Appendf(nil, "key:%08d", i%10000)
-		tr.Put(inlineEntry(key, val))
+	for _, bias := range splitBiases {
+		b.Run(fmt.Sprintf("bias=%d", bias), func(b *testing.B) {
+			tr := benchTree(b, 65536, bias)
+			populateTree(b, tr, 10000, 20, 100)
+			val := bytes.Repeat([]byte("x"), 100)
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := range b.N {
+				key := fmt.Appendf(nil, "key:%08d", i%10000)
+				tr.Put(inlineEntry(key, val))
+			}
+		})
 	}
 }
 
@@ -104,15 +118,19 @@ func BenchmarkGet(b *testing.B) {
 // BenchmarkPutFreshTxn simulates real transaction patterns: each put hits
 // a leaf that hasn't been CoW'd in this transaction (Reset between ops).
 func BenchmarkPutFreshTxn(b *testing.B) {
-	tr := benchTree(b, 65536)
-	populateTree(b, tr, 10000, 20, 100)
-	root := tr.Root()
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := range b.N {
-		tr.Reset(root)
-		key := fmt.Appendf(nil, "key:%08d", i%10000)
-		tr.Put(inlineEntry(key, []byte("new-value-that-is-about-100-bytes-long-to-match-the-original-value-size-in-the-tree-padding")))
+	for _, bias := range splitBiases {
+		b.Run(fmt.Sprintf("bias=%d", bias), func(b *testing.B) {
+			tr := benchTree(b, 65536, bias)
+			populateTree(b, tr, 10000, 20, 100)
+			root := tr.Root()
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := range b.N {
+				tr.Reset(root)
+				key := fmt.Appendf(nil, "key:%08d", i%10000)
+				tr.Put(inlineEntry(key, []byte("new-value-that-is-about-100-bytes-long-to-match-the-original-value-size-in-the-tree-padding")))
+			}
+		})
 	}
 }
 
@@ -219,18 +237,20 @@ func BenchmarkDeleteRange(b *testing.B) {
 // --- Key size impact benchmarks ---
 
 func BenchmarkPutKeySize(b *testing.B) {
-	for _, keySize := range []int{8, 32, 128, 512} {
-		b.Run(fmt.Sprintf("keylen=%d", keySize), func(b *testing.B) {
-			tr := benchTree(b, 131072)
-			val := []byte("v")
-			prefix := bytes.Repeat([]byte("p"), keySize-8)
-			b.ResetTimer()
-			b.ReportAllocs()
-			for i := range b.N {
-				key := append(prefix, fmt.Appendf(nil, "%08d", i)...)
-				tr.Put(inlineEntry(key, val))
-			}
-		})
+	for _, bias := range splitBiases {
+		for _, keySize := range []int{8, 32, 128, 512} {
+			b.Run(fmt.Sprintf("bias=%d/keylen=%d", bias, keySize), func(b *testing.B) {
+				tr := benchTree(b, 131072, bias)
+				val := []byte("v")
+				prefix := bytes.Repeat([]byte("p"), keySize-8)
+				b.ResetTimer()
+				b.ReportAllocs()
+				for i := range b.N {
+					key := append(prefix, fmt.Appendf(nil, "%08d", i)...)
+					tr.Put(inlineEntry(key, val))
+				}
+			})
+		}
 	}
 }
 

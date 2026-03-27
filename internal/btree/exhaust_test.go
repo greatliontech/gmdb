@@ -14,10 +14,10 @@ import (
 // Useful for testing allocation failure at precise points.
 func newTinyTree(t *testing.T, nDataPages int) *Tree {
 	t.Helper()
-	cfg := page.PageConfig{PageSize: testPageSize}
+	pcfg := page.PageConfig{PageSize: testPageSize}
 	// 2 meta + 1 bitmap = 3 reserved pages.
 	numPages := 3 + nDataPages
-	bitmapPages := cfg.BitmapPages(uint64(numPages))
+	bitmapPages := pcfg.BitmapPages(uint64(numPages))
 	if bitmapPages != 1 {
 		t.Fatal("expected 1 bitmap page")
 	}
@@ -30,7 +30,7 @@ func newTinyTree(t *testing.T, nDataPages int) *Tree {
 	for i := reservedPages; i < uint64(numPages); i++ {
 		bm.Set(i)
 	}
-	return New(data, cfg, bm, 0)
+	return New(data, Config{Page: pcfg}, bm, 0)
 }
 
 // TestPutAllocFailEmptyTree tests Put failing on initial leaf allocation.
@@ -329,14 +329,14 @@ func TestSplitBranchAllocFail(t *testing.T) {
 	// Insert enough to fill one branch + a few more to trigger branch split.
 	// Leave just enough free pages for leaf splits but not the branch split.
 	prefix := bytes.Repeat([]byte("a"), 300)
-	cfg := page.PageConfig{PageSize: testPageSize}
+	pcfg := page.PageConfig{PageSize: testPageSize}
 
 	// We need enough pages for: leaves + branches during insert, then exhaust
 	// during the branch split. This is hard to control precisely.
 	// Instead, create a tree, Reset, then do inserts that trigger branch split
 	// with limited pages.
 	numPages := 256
-	bitmapPages := cfg.BitmapPages(uint64(numPages))
+	bitmapPages := pcfg.BitmapPages(uint64(numPages))
 	reservedPages := 2 + uint64(bitmapPages)
 	data := make([]byte, numPages*testPageSize)
 	bitmapData := data[2*testPageSize : (2+int(bitmapPages))*testPageSize]
@@ -344,7 +344,7 @@ func TestSplitBranchAllocFail(t *testing.T) {
 	for i := reservedPages; i < uint64(numPages); i++ {
 		bm.Set(i)
 	}
-	tr := New(data, cfg, bm, 0)
+	tr := New(data, Config{Page: pcfg}, bm, 0)
 
 	// Insert entries with long keys until the tree is several levels deep.
 	for i := range 200 {
@@ -474,8 +474,8 @@ func TestSplitBranchAllocFailPrecise(t *testing.T) {
 	// overflows the branch → splitBranch needs 1 page for right branch.
 	// Try numPages 17-22 (14-19 data pages) to find the exact budget.
 	for numPages := 17; numPages <= 22; numPages++ {
-		cfg := page.PageConfig{PageSize: testPageSize}
-		bitmapPages := cfg.BitmapPages(uint64(numPages))
+		pcfg := page.PageConfig{PageSize: testPageSize}
+		bitmapPages := pcfg.BitmapPages(uint64(numPages))
 		reservedPages := 2 + uint64(bitmapPages)
 
 		data := make([]byte, numPages*testPageSize)
@@ -484,7 +484,7 @@ func TestSplitBranchAllocFailPrecise(t *testing.T) {
 		for i := reservedPages; i < uint64(numPages); i++ {
 			bm.Set(i)
 		}
-		tr := New(data, cfg, bm, 0)
+		tr := New(data, Config{Page: pcfg}, bm, 0)
 
 		for i := range 3000 {
 			key := fmt.Appendf(prefix[:300:300], "%04d", i)

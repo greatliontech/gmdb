@@ -18,11 +18,37 @@ var ErrNoSpace = errors.New("btree: no free pages")
 // tree was mutated externally (via Put, Delete, or DeleteRange).
 var ErrCursorStale = errors.New("btree: cursor stale after tree mutation")
 
+// Config holds tree-level configuration set once at creation.
+type Config struct {
+	Page page.PageConfig
+
+	// SplitBias controls the fill percentage for the packed side during
+	// biased leaf splits. When sequential inserts are detected (append or
+	// prepend), the split is biased so the "done" side is filled to this
+	// percentage. Range: 50–100. Values ≤ 50 disable biasing (always
+	// 50/50). 0 is treated as the default (90).
+	SplitBias int
+}
+
+// normalize returns a copy with defaults applied and values clamped.
+func (c Config) normalize() Config {
+	if c.SplitBias == 0 {
+		c.SplitBias = 90
+	}
+	if c.SplitBias < 50 {
+		c.SplitBias = 50
+	}
+	if c.SplitBias > 100 {
+		c.SplitBias = 100
+	}
+	return c
+}
+
 // Tree manages a B+tree over a contiguous page buffer.
 type Tree struct {
-	data []byte          // page buffer (mmap or test)
-	cfg  page.PageConfig // page size + checksum config
-	bm   *bitmap.Bitmap  // allocation bitmap
+	data []byte         // page buffer (mmap or test)
+	cfg  Config         // tree + page config
+	bm   *bitmap.Bitmap // allocation bitmap
 
 	root    uint64              // current root page ID (0 = empty tree)
 	cow     map[uint64]struct{} // pages CoW'd in this transaction
@@ -32,14 +58,15 @@ type Tree struct {
 }
 
 // New creates a Tree. root=0 means empty tree.
-func New(data []byte, cfg page.PageConfig, bm *bitmap.Bitmap, root uint64) *Tree {
+func New(data []byte, cfg Config, bm *bitmap.Bitmap, root uint64) *Tree {
+	cfg = cfg.normalize()
 	return &Tree{
 		data:    data,
 		cfg:     cfg,
 		bm:      bm,
 		root:    root,
 		cow:     make(map[uint64]struct{}),
-		scratch: make([]byte, cfg.PageSize),
+		scratch: make([]byte, cfg.Page.PageSize),
 	}
 }
 
@@ -69,8 +96,8 @@ func (t *Tree) Reset(root uint64) {
 
 // pageSlice returns the page-sized buffer for the given page ID.
 func (t *Tree) pageSlice(pageID uint64) []byte {
-	off := pageID * uint64(t.cfg.PageSize)
-	return t.data[off : off+uint64(t.cfg.PageSize)]
+	off := pageID * uint64(t.cfg.Page.PageSize)
+	return t.data[off : off+uint64(t.cfg.Page.PageSize)]
 }
 
 // allocPage allocates a fresh zeroed page from the bitmap and adds it

@@ -119,7 +119,7 @@ func (c *Cursor) Seek(target []byte) (key, value []byte) {
 	c.setLeaf(leafPageID)
 
 	buf := c.tree.pageSlice(leafPageID)
-	lr := page.NewLeafReader(buf, c.tree.cfg)
+	lr := page.NewLeafReader(buf, c.tree.cfg.Page)
 	idx, entry, found := lr.SearchLeaf(target, c.keyBuf)
 	if !found {
 		return nil, nil
@@ -141,7 +141,7 @@ func (c *Cursor) SeekGE(target []byte) (key, value []byte) {
 	c.setLeaf(leafPageID)
 
 	buf := c.tree.pageSlice(leafPageID)
-	lr := page.NewLeafReader(buf, c.tree.cfg)
+	lr := page.NewLeafReader(buf, c.tree.cfg.Page)
 	idx, entry, found := lr.SearchLeaf(target, c.keyBuf)
 
 	if found {
@@ -220,7 +220,7 @@ func (c *Cursor) Delete() error {
 // group cache is not yet populated.
 func (c *Cursor) entryAt() (key, value []byte) {
 	buf := c.tree.pageSlice(c.leaf)
-	lr := page.NewLeafReader(buf, c.tree.cfg)
+	lr := page.NewLeafReader(buf, c.tree.cfg.Page)
 	entry, kb := lr.EntryAt(c.idx, c.keyBuf)
 	c.keyBuf = kb
 	return c.keyFromEntry(entry), entry.Value
@@ -248,7 +248,7 @@ func (c *Cursor) cachedCurrent() (key, value []byte) {
 // zero allocations after warmup.
 func (c *Cursor) populateGroup(base int) {
 	buf := c.tree.pageSlice(c.leaf)
-	lr := page.NewLeafReader(buf, c.tree.cfg)
+	lr := page.NewLeafReader(buf, c.tree.cfg.Page)
 
 	c.keyArena = c.keyArena[:0]
 	var keyOff [16]uint32
@@ -304,7 +304,7 @@ func (c *Cursor) invalidate() {
 func (c *Cursor) setLeaf(pageID uint64) {
 	c.leaf = pageID
 	buf := c.tree.pageSlice(pageID)
-	lr := page.NewLeafReader(buf, c.tree.cfg)
+	lr := page.NewLeafReader(buf, c.tree.cfg.Page)
 	c.count = lr.Count()
 	c.groupBase = -1
 }

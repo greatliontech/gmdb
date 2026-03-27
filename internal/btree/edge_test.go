@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"testing"
 
@@ -846,7 +847,7 @@ func TestCowPreservesOldPages(t *testing.T) {
 
 	// Snapshot the old root page content before any mutation.
 	oldRoot := tr.Root()
-	ps := int(tr.cfg.PageSize)
+	ps := int(tr.cfg.Page.PageSize)
 	snapshot := make([]byte, ps)
 	copy(snapshot, tr.data[oldRoot*uint64(ps):(oldRoot+1)*uint64(ps)])
 
@@ -1505,7 +1506,7 @@ func verifyLeafSplitFits(t *testing.T, tr *Tree, entries []page.LeafEntry) {
 	if len(entries) < 2 {
 		return
 	}
-	split := tr.findLeafSplitPoint(entries)
+	split := tr.findLeafSplitPoint(entries, -1)
 	if split < 1 || split >= len(entries) {
 		t.Fatalf("findLeafSplitPoint returned %d for %d entries", split, len(entries))
 	}
@@ -1613,14 +1614,228 @@ func TestFindLeafSplitPointOneHugeEntry(t *testing.T) {
 	// When one entry doesn't fit at all, findLeafSplitPoint returns 1
 	// (split after that entry caused the overflow).
 	tr := newTestTree(t, 256)
-	huge := bytes.Repeat([]byte("x"), int(tr.cfg.UsableSpace()))
+	huge := bytes.Repeat([]byte("x"), int(tr.cfg.Page.UsableSpace()))
 	entries := []page.LeafEntry{
 		inlineEntry([]byte("a"), huge),
 		inlineEntry([]byte("b"), []byte("small")),
 	}
-	split := tr.findLeafSplitPoint(entries)
+	split := tr.findLeafSplitPoint(entries, -1)
 	if split != 1 {
 		t.Errorf("split = %d, want 1", split)
+	}
+}
+
+// verifyBiasedSplitFits calls findLeafSplitPoint with the given insertIdx
+// and verifies both halves rebuild successfully.
+func verifyBiasedSplitFits(t *testing.T, tr *Tree, entries []page.LeafEntry, insertIdx int) {
+	t.Helper()
+	if len(entries) < 2 {
+		return
+	}
+	split := tr.findLeafSplitPoint(entries, insertIdx)
+	if split < 1 || split >= len(entries) {
+		t.Fatalf("findLeafSplitPoint(insertIdx=%d) returned %d for %d entries", insertIdx, split, len(entries))
+	}
+
+	leftPage, err := tr.allocPage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.rebuildLeaf(leftPage, entries[:split]) < 0 {
+		t.Errorf("left half (%d entries) does not fit (insertIdx=%d)", split, insertIdx)
+	}
+
+	rightPage, err := tr.allocPage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.rebuildLeaf(rightPage, entries[split:]) < 0 {
+		t.Errorf("right half (%d entries) does not fit (insertIdx=%d)", len(entries)-split, insertIdx)
+	}
+}
+
+// buildOverflowEntries builds an entry list that overflows one leaf page.
+func buildOverflowEntries(tr *Tree, valSize int) []page.LeafEntry {
+	val := bytes.Repeat([]byte("v"), valSize)
+	var entries []page.LeafEntry
+	for i := 0; ; i++ {
+		e := inlineEntry([]byte(fmt.Sprintf("key:%08d", i)), val)
+		entries = append(entries, e)
+		if tr.rebuildLeaf(3, entries) < 0 {
+			break // one past capacity
+		}
+	}
+	return entries
+}
+
+func TestBiasedSplitAppendFits(t *testing.T) {
+	for _, bias := range []int{50, 75, 90, 100} {
+		for _, valSize := range []int{8, 100, 500, 1500} {
+			t.Run(fmt.Sprintf("bias=%d/val=%d", bias, valSize), func(t *testing.T) {
+				tr := newTestTree(t, 256)
+				tr.cfg.SplitBias = bias
+				entries := buildOverflowEntries(tr, valSize)
+				// insertIdx = last entry (append pattern)
+				verifyBiasedSplitFits(t, tr, entries, len(entries)-1)
+			})
+		}
+	}
+}
+
+func TestBiasedSplitPrependFits(t *testing.T) {
+	for _, bias := range []int{50, 75, 90, 100} {
+		for _, valSize := range []int{8, 100, 500, 1500} {
+			t.Run(fmt.Sprintf("bias=%d/val=%d", bias, valSize), func(t *testing.T) {
+				tr := newTestTree(t, 256)
+				tr.cfg.SplitBias = bias
+				entries := buildOverflowEntries(tr, valSize)
+				// insertIdx = 0 (prepend pattern)
+				verifyBiasedSplitFits(t, tr, entries, 0)
+			})
+		}
+	}
+}
+
+func TestBiasedSplitTwoEntries(t *testing.T) {
+	// Edge case: only 2 entries, split must produce 1 per side regardless of bias.
+	for _, bias := range []int{50, 75, 90, 100} {
+		t.Run(fmt.Sprintf("bias=%d", bias), func(t *testing.T) {
+			tr := newTestTree(t, 256)
+			tr.cfg.SplitBias = bias
+			big := bytes.Repeat([]byte("x"), 1500)
+			entries := []page.LeafEntry{
+				inlineEntry([]byte("aaa"), big),
+				inlineEntry([]byte("zzz"), big),
+			}
+			// Append
+			split := tr.findLeafSplitPoint(entries, 1)
+			if split != 1 {
+				t.Errorf("append: split = %d, want 1", split)
+			}
+			// Prepend
+			split = tr.findLeafSplitPoint(entries, 0)
+			if split != 1 {
+				t.Errorf("prepend: split = %d, want 1", split)
+			}
+		})
+	}
+}
+
+func TestBiasedSplitMixedCellTypes(t *testing.T) {
+	for _, bias := range []int{75, 90, 100} {
+		t.Run(fmt.Sprintf("bias=%d", bias), func(t *testing.T) {
+			tr := newTestTree(t, 256)
+			tr.cfg.SplitBias = bias
+
+			spBuf := make([]byte, 64)
+			spb := page.NewSubpageBuilder(spBuf, 0)
+			spb.AddValue([]byte("a"))
+			spSize := spb.Finish()
+
+			var entries []page.LeafEntry
+			for i := 0; ; i++ {
+				key := []byte(fmt.Sprintf("key:%08d", i))
+				var e page.LeafEntry
+				switch i % 3 {
+				case 0:
+					e = inlineEntry(key, bytes.Repeat([]byte("v"), 100))
+				case 1:
+					e = page.LeafEntry{Key: key, CellFlags: page.CellFlagOverflow, OvflPage: uint64(i), TotalLen: 99999}
+				case 2:
+					e = page.LeafEntry{Key: key, CellFlags: page.CellFlagMultiValue, SubpageData: spBuf[:spSize]}
+				}
+				entries = append(entries, e)
+				if tr.rebuildLeaf(3, entries) < 0 {
+					break
+				}
+			}
+			verifyBiasedSplitFits(t, tr, entries, len(entries)-1) // append
+			verifyBiasedSplitFits(t, tr, entries, 0)              // prepend
+		})
+	}
+}
+
+// TestSequentialInsertThenDelete verifies that trees built with biased splits
+// remain correct after deletions that trigger merge/redistribute.
+func TestSequentialInsertThenDelete(t *testing.T) {
+	for _, bias := range []int{50, 75, 90} {
+		t.Run(fmt.Sprintf("bias=%d", bias), func(t *testing.T) {
+			tr := newTestTree(t, 1024)
+			tr.cfg.SplitBias = bias
+			n := 1000
+			val := bytes.Repeat([]byte("v"), 100)
+
+			for i := range n {
+				key := fmt.Appendf(nil, "key:%04d", i)
+				tr.Put(page.LeafEntry{Key: key, Value: val})
+			}
+
+			// Delete every other key to trigger rebalancing.
+			for i := 0; i < n; i += 2 {
+				key := fmt.Appendf(nil, "key:%04d", i)
+				_, found, err := tr.Delete(key)
+				if err != nil {
+					t.Fatalf("Delete(%d): %v", i, err)
+				}
+				if !found {
+					t.Fatalf("Delete(%d): not found", i)
+				}
+			}
+
+			// Verify remaining entries.
+			c := tr.NewCursor()
+			var prev []byte
+			count := 0
+			for k, _ := c.First(); k != nil; k, _ = c.Next() {
+				if prev != nil && bytes.Compare(prev, k) >= 0 {
+					t.Fatalf("keys not sorted: %q >= %q", prev, k)
+				}
+				prev = bytes.Clone(k)
+				count++
+			}
+			if count != n/2 {
+				t.Fatalf("got %d entries, want %d", count, n/2)
+			}
+		})
+	}
+}
+
+// TestMixedInsertPattern verifies that a tree receiving both sequential and
+// random inserts (triggering both biased and unbiased splits) stays correct.
+func TestMixedInsertPattern(t *testing.T) {
+	tr := newTestTree(t, 2048)
+	val := bytes.Repeat([]byte("v"), 50)
+	rng := rand.New(rand.NewPCG(42, 0))
+	n := 2000
+	keys := make(map[string]bool)
+
+	// Alternate: 10 sequential, 10 random.
+	seq := 0
+	for i := range n {
+		var key []byte
+		if i%20 < 10 {
+			key = fmt.Appendf(nil, "seq:%06d", seq)
+			seq++
+		} else {
+			key = fmt.Appendf(nil, "rnd:%06d", rng.IntN(1_000_000))
+		}
+		tr.Put(page.LeafEntry{Key: key, Value: val})
+		keys[string(key)] = true
+	}
+
+	// Verify all unique keys are present and sorted.
+	c := tr.NewCursor()
+	var prev []byte
+	count := 0
+	for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		if prev != nil && bytes.Compare(prev, k) >= 0 {
+			t.Fatalf("keys not sorted: %q >= %q", prev, k)
+		}
+		prev = bytes.Clone(k)
+		count++
+	}
+	if count != len(keys) {
+		t.Fatalf("got %d entries, want %d", count, len(keys))
 	}
 }
 

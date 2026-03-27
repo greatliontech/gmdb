@@ -14,8 +14,8 @@ const testPageSize = 4096
 // layout: meta pages (0-1), bitmap pages (2..2+bitmapPages-1), data pages.
 func newTestTree(t *testing.T, numPages int) *Tree {
 	t.Helper()
-	cfg := page.PageConfig{PageSize: testPageSize}
-	bitmapPages := cfg.BitmapPages(uint64(numPages))
+	pcfg := page.PageConfig{PageSize: testPageSize}
+	bitmapPages := pcfg.BitmapPages(uint64(numPages))
 	reservedPages := 2 + uint64(bitmapPages)
 
 	data := make([]byte, numPages*testPageSize)
@@ -27,7 +27,7 @@ func newTestTree(t *testing.T, numPages int) *Tree {
 		bm.Set(i)
 	}
 
-	return New(data, cfg, bm, 0)
+	return New(data, Config{Page: pcfg}, bm, 0)
 }
 
 // testKey returns a key like "key:0042" for deterministic testing.

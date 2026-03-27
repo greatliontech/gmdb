@@ -537,7 +537,7 @@ func TestFindLeafSplitPointOverflowFirst(t *testing.T) {
 		{Key: hugeKey, Value: []byte("v")},
 		{Key: []byte("b"), Value: []byte("v")},
 	}
-	idx := tr.findLeafSplitPoint(entries)
+	idx := tr.findLeafSplitPoint(entries, -1)
 	if idx != 1 {
 		t.Errorf("split point = %d, want 1", idx)
 	}
@@ -553,7 +553,7 @@ func TestFindLeafSplitPointAllFit(t *testing.T) {
 		{Key: []byte("c"), Value: []byte("3")},
 		{Key: []byte("d"), Value: []byte("4")},
 	}
-	idx := tr.findLeafSplitPoint(entries)
+	idx := tr.findLeafSplitPoint(entries, -1)
 	if idx != len(entries)/2 {
 		t.Errorf("split point = %d, want %d", idx, len(entries)/2)
 	}
@@ -630,7 +630,8 @@ func TestDeleteRangeRightBoundaryError(t *testing.T) {
 
 // TestDeleteRangeRebalanceChildError tests error propagation from
 // rebalanceChild during the post-range-delete rebalance loop.
-// Setup: 4 leaves + 1 branch. Delete within one leaf making it underfull.
+// Setup: 3 leaves + 1 branch (adaptive split packs sequential inserts
+// to 4 entries per leaf). Delete within one leaf making it underfull.
 // 2 free pages cover cowPage(branch) + cowPage(leaf). Rebalance needs
 // cowPage on the non-CoW'd sibling → ErrNoSpace.
 func TestDeleteRangeRebalanceChildError(t *testing.T) {
@@ -638,8 +639,9 @@ func TestDeleteRangeRebalanceChildError(t *testing.T) {
 	val := bytes.Repeat([]byte("v"), 900)
 
 	// 12 entries with 900-byte values: 4 entries fit per leaf, 5th overflows.
-	// Tree: Ptr0→[00,01,02], cell0→[03,04,05], cell1→[06,07,08], cell2→[09,10,11].
-	// 4 leaves + 1 branch = 5 pages.
+	// Adaptive split packs left page full for sequential inserts.
+	// Tree: Ptr0→[00,01,02,03], cell0→[04,05,06,07], cell1→[08,09,10,11].
+	// 3 leaves + 1 branch = 4 pages.
 	for i := range 12 {
 		key := fmt.Appendf(nil, "key:%02d", i)
 		if _, _, err := tr.Put(page.LeafEntry{Key: key, Value: val}); err != nil {
@@ -654,12 +656,110 @@ func TestDeleteRangeRebalanceChildError(t *testing.T) {
 		tr.bm.FindFirstFree()
 	}
 
-	// Delete within the first leaf (Ptr0). Both "key:01" and "key:025" are
-	// below the separator "key:03", so leftChildIdx == rightChildIdx == -1.
+	// Delete within the first leaf (Ptr0). Both "key:01" and "key:035" are
+	// below the separator "key:04", so leftChildIdx == rightChildIdx == -1.
 	// Remaining: [key:00] → 1 entry (~22% of usable space → underfull).
 	// Rebalance picks sibling cell0 (not CoW'd) → cowPage fails.
-	_, err := tr.DeleteRange([]byte("key:01"), []byte("key:025"))
+	_, err := tr.DeleteRange([]byte("key:01"), []byte("key:035"))
 	if !errors.Is(err, ErrNoSpace) {
 		t.Fatalf("expected ErrNoSpace from rebalance, got %v", err)
+	}
+}
+
+// TestConfigNormalize tests Config.normalize clamping.
+func TestConfigNormalize(t *testing.T) {
+	tests := []struct {
+		in, want int
+	}{
+		{0, 90},   // zero → default
+		{30, 50},  // below min → clamp to 50
+		{50, 50},  // at min → keep
+		{75, 75},  // in range → keep
+		{100, 100}, // at max → keep
+		{150, 100}, // above max → clamp to 100
+	}
+	for _, tt := range tests {
+		cfg := Config{SplitBias: tt.in}.normalize()
+		if cfg.SplitBias != tt.want {
+			t.Errorf("normalize(%d) = %d, want %d", tt.in, cfg.SplitBias, tt.want)
+		}
+	}
+}
+
+// TestPutPrependBias tests that inserting in descending order triggers the
+// prepend bias path (insertIdx == 0), producing a small left page and a
+// packed right page.
+func TestPutPrependBias(t *testing.T) {
+	tr := newTestTree(t, 256)
+	val := bytes.Repeat([]byte("v"), 100)
+
+	// Insert in descending order to trigger prepend bias.
+	for i := 500; i >= 0; i-- {
+		key := fmt.Appendf(nil, "key:%04d", i)
+		if _, _, err := tr.Put(page.LeafEntry{Key: key, Value: val}); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	// Verify tree integrity: forward scan should produce sorted keys.
+	c := tr.NewCursor()
+	var prev []byte
+	count := 0
+	for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		if prev != nil && bytes.Compare(prev, k) >= 0 {
+			t.Fatalf("keys not sorted: %q >= %q", prev, k)
+		}
+		prev = bytes.Clone(k)
+		count++
+	}
+	if count != 501 {
+		t.Fatalf("got %d entries, want 501", count)
+	}
+}
+
+// TestDeleteRangeRetiresBranchSubtree tests that DeleteRange correctly
+// retires interior subtrees containing branch pages (3+ level trees).
+func TestDeleteRangeRetiresBranchSubtree(t *testing.T) {
+	tr := newTestTree(t, 16384)
+
+	// Use 500-byte values so each leaf holds ~7 entries (with bias=90).
+	// 10000 entries → ~1400 leaves → ~6 level-1 branches → 3-level tree.
+	// Deleting the middle half retires interior branches via retireSubtree.
+	val := bytes.Repeat([]byte("v"), 500)
+	n := 10000
+	for i := range n {
+		key := fmt.Appendf(nil, "key:%06d", i)
+		if _, _, err := tr.Put(page.LeafEntry{Key: key, Value: val}); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	// Delete a wide range in the middle — interior subtrees (including
+	// branches) should be retired in bulk.
+	deleted, err := tr.DeleteRange(
+		fmt.Appendf(nil, "key:%06d", n/4),
+		fmt.Appendf(nil, "key:%06d", 3*n/4),
+	)
+	if err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	if deleted == 0 {
+		t.Fatal("DeleteRange deleted 0 entries")
+	}
+
+	// Verify remaining entries.
+	c := tr.NewCursor()
+	var prev []byte
+	remaining := 0
+	for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		if prev != nil && bytes.Compare(prev, k) >= 0 {
+			t.Fatalf("keys not sorted: %q >= %q", prev, k)
+		}
+		prev = bytes.Clone(k)
+		remaining++
+	}
+	expected := n - deleted
+	if remaining != expected {
+		t.Fatalf("got %d remaining entries, want %d", remaining, expected)
 	}
 }
