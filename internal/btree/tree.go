@@ -28,16 +28,18 @@ type Tree struct {
 	cow     map[uint64]struct{} // pages CoW'd in this transaction
 	retired []uint64            // pages from previous txns to retire via RPL
 	gen     uint64              // mutation generation counter for cursor staleness
+	scratch []byte              // reusable page-sized buffer for split/merge probes
 }
 
 // New creates a Tree. root=0 means empty tree.
 func New(data []byte, cfg page.PageConfig, bm *bitmap.Bitmap, root uint64) *Tree {
 	return &Tree{
-		data: data,
-		cfg:  cfg,
-		bm:   bm,
-		root: root,
-		cow:  make(map[uint64]struct{}),
+		data:    data,
+		cfg:     cfg,
+		bm:      bm,
+		root:    root,
+		cow:     make(map[uint64]struct{}),
+		scratch: make([]byte, cfg.PageSize),
 	}
 }
 

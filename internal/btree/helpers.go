@@ -201,8 +201,7 @@ func (t *Tree) isUnderfull(count int, freeSpace int) bool {
 // one page after fresh prefix compression encoding.
 func (t *Tree) findLeafSplitPoint(entries []page.LeafEntry) int {
 	target := t.cfg.UsableSpace() / 2
-	buf := make([]byte, t.cfg.PageSize)
-	lb := page.NewLeafBuilder(buf, t.cfg)
+	lb := page.NewLeafBuilder(t.scratch, t.cfg)
 	for i, e := range entries {
 		if !addEntry(lb, e) {
 			if i == 0 {
@@ -222,8 +221,7 @@ func (t *Tree) findLeafSplitPoint(entries []page.LeafEntry) int {
 // findBranchSplitPoint finds the byte-balanced split point for branch cells.
 func (t *Tree) findBranchSplitPoint(ptr0 uint64, cells []branchCell) int {
 	target := t.cfg.UsableSpace() / 2
-	buf := make([]byte, t.cfg.PageSize)
-	bb := page.NewBranchBuilder(buf, t.cfg)
+	bb := page.NewBranchBuilder(t.scratch, t.cfg)
 	bb.SetPtr0(ptr0)
 	for i, c := range cells {
 		if !bb.AddCell(c.key, c.childPtr) {

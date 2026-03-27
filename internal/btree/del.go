@@ -209,8 +209,7 @@ func (t *Tree) canMerge(leftID, rightID uint64, sep []byte) bool {
 		leftEntries := t.collectEntries(leftID)
 		rightEntries := t.collectEntries(rightID)
 		combined := append(leftEntries, rightEntries...)
-		buf := make([]byte, t.cfg.PageSize)
-		lb := page.NewLeafBuilder(buf, t.cfg)
+		lb := page.NewLeafBuilder(t.scratch, t.cfg)
 		for _, e := range combined {
 			if !addEntry(lb, e) {
 				return false
@@ -226,8 +225,7 @@ func (t *Tree) canMerge(leftID, rightID uint64, sep []byte) bool {
 	combined = append(combined, leftCells...)
 	combined = append(combined, branchCell{key: sep, childPtr: rightPtr0})
 	combined = append(combined, rightCells...)
-	buf := make([]byte, t.cfg.PageSize)
-	bb := page.NewBranchBuilder(buf, t.cfg)
+	bb := page.NewBranchBuilder(t.scratch, t.cfg)
 	bb.SetPtr0(0)
 	for _, c := range combined {
 		if !bb.AddCell(c.key, c.childPtr) {
