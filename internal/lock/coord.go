@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -20,6 +21,12 @@ var ErrClosed = errors.New("lock: coord closed")
 // another process holds the lock; 50 ms keeps Close-latency at one
 // tick worst-case while keeping the contended-syscall rate at 20/s.
 const defaultRetryInterval = 50 * time.Millisecond
+
+// defaultHeartbeatInterval matches the cross-process.md §Heartbeat
+// Goroutine default ("ticks every ~1 s"). Must remain well under
+// StaleTimeout (10 s) so a few missed ticks don't trip false-stale
+// detection.
+const defaultHeartbeatInterval = 1 * time.Second
 
 // Coord owns cross-process write-lock acquisition for one *File. A
 // single "flock goroutine" runs for the lifetime of the Coord and is
@@ -51,6 +58,30 @@ type Coord struct {
 	doneCh   chan struct{}
 
 	retryInterval time.Duration
+
+	// holdingWriter is true iff the flock goroutine currently holds
+	// LOCK_EX on this process's behalf. Set true between the publish-
+	// identity step (3) and the clear-before-unlock step (4). The
+	// heartbeat goroutine reads it under a benign-race contract: a
+	// stale read can stomp WriterHeartbeat by at most one tick's
+	// worth (the next acquirer's publish-heartbeat in step 3
+	// immediately overwrites; intermediate values are still monotonic
+	// and within a small delta, so cross-namespace stale-detection
+	// using StaleTimeout=10s default tolerates this). See heartbeat()
+	// for the discussion.
+	holdingWriter atomic.Bool
+
+	// activeSlotsMu protects activeSlots. cross-process.md §Heartbeat
+	// Goroutine: RegisterReaderSlot / UnregisterReaderSlot mutate
+	// under the mutex; the heartbeat goroutine snapshots-and-releases
+	// before writing slot Heartbeats outside the lock to keep tick
+	// cost bounded.
+	activeSlotsMu sync.Mutex
+	activeSlots   []uint32
+
+	heartbeatInterval time.Duration
+	clock             func() uint64
+	heartbeatDoneCh   chan struct{}
 
 	closeOnce sync.Once
 }
@@ -123,6 +154,19 @@ type CoordOptions struct {
 	// defaultRetryInterval (50 ms). Bounds Close() and per-writer
 	// ctx-cancellation latency under sustained contention.
 	RetryInterval time.Duration
+
+	// HeartbeatInterval is how often the heartbeat goroutine refreshes
+	// WriterHeartbeat (while holding LOCK_EX) and the Heartbeat field
+	// of every reader slot in the active list. Zero ⇒
+	// defaultHeartbeatInterval (1 s). Must remain well under
+	// StaleTimeout (10 s, per cross-process.md §Heartbeat Goroutine).
+	HeartbeatInterval time.Duration
+
+	// Clock returns the monotonic clock value in nanoseconds. Nil ⇒
+	// the per-platform default (CLOCK_BOOTTIME on Linux,
+	// CLOCK_MONOTONIC elsewhere). Tests inject deterministic clocks
+	// here to assert heartbeat values without flakiness.
+	Clock func() uint64
 }
 
 // NewCoord constructs a Coord and starts its flock goroutine. The
@@ -133,32 +177,50 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 	if retry <= 0 {
 		retry = defaultRetryInterval
 	}
+	hbInterval := opts.HeartbeatInterval
+	if hbInterval <= 0 {
+		hbInterval = defaultHeartbeatInterval
+	}
+	clock := opts.Clock
+	if clock == nil {
+		clock = nowMonotonic
+	}
 	c := &Coord{
-		f:             f,
-		pid:           opts.PID,
-		startTime:     opts.ProcessStartTime,
-		pidNS:         opts.PIDNamespace,
-		writerCh:      make(chan writerRequest),
-		stopCh:        make(chan struct{}),
-		doneCh:        make(chan struct{}),
-		retryInterval: retry,
+		f:                 f,
+		pid:               opts.PID,
+		startTime:         opts.ProcessStartTime,
+		pidNS:             opts.PIDNamespace,
+		writerCh:          make(chan writerRequest),
+		stopCh:            make(chan struct{}),
+		doneCh:            make(chan struct{}),
+		retryInterval:     retry,
+		heartbeatInterval: hbInterval,
+		clock:             clock,
+		heartbeatDoneCh:   make(chan struct{}),
 	}
 	go c.run()
+	go c.heartbeat()
 	return c
 }
 
-// Close stops the flock goroutine and waits for it to exit. If a
-// writer holds the lock at Close time, the goroutine clears the
-// writer-header fields and releases flock before returning — so the
-// next opener does not see a (PID set, flock free) inconsistency
-// (cross-process.md entailed invariant: header write/clear is paired
-// with flock acquire/release under LOCK_EX).
+// Close stops the flock + heartbeat goroutines and waits for both to
+// exit. If a writer holds the lock at Close time, the flock goroutine
+// clears the writer-header fields and releases flock before
+// returning — so the next opener does not see a (PID set, flock free)
+// inconsistency (cross-process.md clear-before-unlock + Close-
+// releases invariants).
+//
+// The heartbeat goroutine is also drained before Close returns
+// (cross-process.md §Heartbeat Goroutine shutdown coordination): a
+// final tick must not race the *File's munmap. Callers must complete
+// Coord.Close before Closing the underlying *File.
 //
 // Idempotent.
 func (c *Coord) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.stopCh)
 		<-c.doneCh
+		<-c.heartbeatDoneCh
 	})
 	return nil
 }
@@ -321,9 +383,19 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 	// taking LOCK_SH or LOCK_EX, both of which we exclude via our held
 	// LOCK_EX. The publish-before-flock-release ordering is what's
 	// load-bearing (the clear-before-unlock invariant, step 4).
+	//
+	// WriterHeartbeat: published synchronously under LOCK_EX so any
+	// peer observing WriterPID != 0 immediately also sees a non-zero
+	// recent heartbeat. The heartbeat goroutine refreshes it on each
+	// tick while holdingWriter is true; without this initial
+	// publication, a cross-namespace stale-detection scan between
+	// grant and the first tick would see WriterHeartbeat = 0 and
+	// false-stale this fresh writer.
 	c.f.SetWriterPID(c.pid)
 	c.f.SetWriterStartTime(c.startTime)
 	c.f.SetWriterPIDNamespace(c.pidNS)
+	c.f.SetWriterHeartbeat(c.clock())
+	c.holdingWriter.Store(true)
 	req.result <- nil
 
 	// Step 4: hold until release or stopCh.
@@ -334,13 +406,97 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 		stopped = true
 	}
 
+	// Stop heartbeat writes BEFORE clearing identity / unlocking. A
+	// stale Load in the heartbeat goroutine can still write
+	// WriterHeartbeat one tick after this Store — that race is benign
+	// (the next acquirer's publish-heartbeat overwrites; intermediate
+	// values are still monotonic and within a small delta of the
+	// new holder's clock).
+	c.holdingWriter.Store(false)
+
 	// Clear header BEFORE unlock — entailed invariant: a peer that
 	// observes WriterPID != 0 under LOCK_SH must find LOCK_EX still
 	// held. Clear-then-unlock preserves that ordering even under
-	// rapid LOCK_EX hand-off across processes.
+	// rapid LOCK_EX hand-off across processes. WriterHeartbeat is
+	// NOT cleared — stale-detection only consults it when WriterPID
+	// != 0, so leaving it as the last-known value is harmless and
+	// avoids a redundant atomic store.
 	c.f.SetWriterPID(0)
 	c.f.SetWriterStartTime(0)
 	c.f.SetWriterPIDNamespace(0)
 	_ = syscall.Flock(int(c.f.Fd()), syscall.LOCK_UN)
 	return stopped
+}
+
+// heartbeat is the periodic-refresh goroutine started by NewCoord
+// and stopped by Close. Per cross-process.md §Heartbeat Goroutine it
+// refreshes WriterHeartbeat (while this process holds LOCK_EX) and
+// every active reader slot's Heartbeat field once per
+// HeartbeatInterval. The activeSlotsMu snapshot pattern keeps tick
+// cost bounded — the lock is held only long enough to copy the slot
+// index list; atomic stores happen outside the lock so a slow
+// Register/Unregister cannot stall the tick.
+func (c *Coord) heartbeat() {
+	defer close(c.heartbeatDoneCh)
+	ticker := time.NewTicker(c.heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			now := c.clock()
+			if c.holdingWriter.Load() {
+				c.f.SetWriterHeartbeat(now)
+			}
+			c.activeSlotsMu.Lock()
+			// Snapshot to a local. activeSlots is typically O(active
+			// readers) — small. The alloc is the only per-tick
+			// allocation; acceptable given a 1 s default cadence.
+			slots := append([]uint32(nil), c.activeSlots...)
+			c.activeSlotsMu.Unlock()
+			for _, idx := range slots {
+				slot := c.f.Slot(idx)
+				Store64(&slot.Heartbeat, now)
+			}
+		}
+	}
+}
+
+// RegisterReaderSlot adds slot index i to the heartbeat goroutine's
+// active list. Callers (the read-tx Begin path landing in chunk
+// 2.6+) invoke this AFTER successful slot acquisition. The heartbeat
+// goroutine refreshes the slot's Heartbeat field on each subsequent
+// tick until UnregisterReaderSlot is called.
+//
+// No deduplication: registering the same index twice will produce
+// two heartbeat writes per tick (harmless — both stores write the
+// same value) but UnregisterReaderSlot removes only the first match.
+// Internal callers are trusted not to double-register.
+func (c *Coord) RegisterReaderSlot(i uint32) {
+	c.activeSlotsMu.Lock()
+	c.activeSlots = append(c.activeSlots, i)
+	c.activeSlotsMu.Unlock()
+}
+
+// UnregisterReaderSlot removes slot index i from the active list.
+// MUST be called BEFORE the reader-side clears the slot's
+// PID/Heartbeat/etc. on release (cross-process.md §Heartbeat
+// Goroutine "Race note"): otherwise the next heartbeat tick can
+// stomp a freshly-reacquired slot with our process's clock value.
+//
+// Idempotent — removing an absent index is a no-op (no error).
+func (c *Coord) UnregisterReaderSlot(i uint32) {
+	c.activeSlotsMu.Lock()
+	for j, s := range c.activeSlots {
+		if s == i {
+			// Swap-with-last + truncate. Order doesn't matter; the
+			// heartbeat snapshot walks the whole slice per tick.
+			last := len(c.activeSlots) - 1
+			c.activeSlots[j] = c.activeSlots[last]
+			c.activeSlots = c.activeSlots[:last]
+			break
+		}
+	}
+	c.activeSlotsMu.Unlock()
 }
