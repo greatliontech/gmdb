@@ -70,19 +70,37 @@ Invariant: kind=clause-explicit;
     callers use to size the budget.
 
 Invariant: kind=entailed;
-  property=Commit step 0 (pre-pwrite assembly) issues no syscalls and
-    is fully reversible: any failure (`ErrTxTooLarge`, `ErrDBFull`, RPL
-    capacity exhaustion) returns the transaction to a state
-    indistinguishable from never having attempted commit;
-  from=entailed: the spec calls commit step 0 "no syscalls, fully
-    reversible" and "rollback is clean (no disk writes have occurred)"
-    — entailed because every callee in step 0 (tail refund, loose-page
-    move, RPL alloc, bitmap-page assembly, meta-page construction)
-    must be syscall-free for the property to hold;
-  violation=A pwrite or fdatasync hidden inside step 0 leaks
-    half-written commit state to disk after a step-0 abort, so the
-    next Open can select a meta whose data/bitmap pages were never
-    pwritten as a coherent set — silent tree corruption.
+  property=Commit step 0 (pre-pwrite assembly) issues no syscall that
+    publishes content reachable from any active or recoverable meta.
+    `pwrite` on any page id is forbidden until step 1; `fdatasync` is
+    forbidden until step 2; `ftruncate` (both directions) is permitted
+    because it changes file size only, not the bytes of pages an
+    active-meta reader can observe (pages above HighWaterMark are
+    out of bounds for readers per `file-layout.md` invariants, and
+    POSIX ftruncate-up fills new pages with zeros independent of
+    content). Step 0 failure rolls back to in-memory bookkeeping
+    only; the on-disk content of every page in the active meta's
+    tree is byte-identical to its pre-step-0 state. The file may
+    carry bounded trailing slack the next commit's tail refund or
+    `maybeShrink` reclaims;
+  from=entailed: the meta-swap at step 3 is the sole publication
+    point (clause-explicit, §Commit Write Ordering). Any syscall
+    that does not modify reader-observable bytes is reversible by
+    construction — readers cannot tell it happened. The bounding of
+    reversibility to "reader-observable bytes" is the *narrowest*
+    invariant the spec's atomic-commit guarantee depends on; any
+    stronger statement (e.g. "no syscalls at all") would be an
+    over-approximation, and `free-space.md §Commit-Time Free Space
+    Update` sub-step 3 already explicitly contemplates allocator
+    activity (including bitmap reclamation and, transitively, file
+    extension) inside step 0;
+  violation=A pwrite or fdatasync hidden inside step 0 publishes
+    half-written commit state — the next Open can select a meta
+    whose data/bitmap pages are partially pwritten, surfacing as
+    silent tree corruption. Note: an ftruncate-up inside step 0 is
+    *not* a violation because no reader of the active meta accesses
+    pages above HighWaterMark; ftruncate-down is permitted only as
+    far as HighWaterMark for the same reason.
 
 Invariant: kind=entailed;
   property=A crash between step 2 (data/RPL/bitmap fdatasync) and step
@@ -216,11 +234,13 @@ indexes)`. Bulk operations have a dedicated escape hatch — see
 
 ## Commit Write Ordering
 
-Commit is partitioned into a **pure-buffer assembly phase** (no
-syscalls, fully reversible) followed by a **pwrite phase** whose
-failures are bounded to crash-equivalent leakage.
+Commit is partitioned into a **pre-publish assembly phase** (no
+syscall publishes reader-observable bytes; `ftruncate` is permitted
+because file-size changes are not reader-observable) followed by a
+**pwrite phase** whose failures are bounded to crash-equivalent
+leakage.
 
-### Step 0 — Pre-pwrite assembly (no syscalls)
+### Step 0 — Pre-publish assembly (no publishing syscalls)
 
 - Tail page refund: check the bitmap for tail free pages, decrement
   `HighWaterMark`.
@@ -242,10 +262,16 @@ failures are bounded to crash-equivalent leakage.
   in step 3).
 
 Any step-0 failure (`ErrTxTooLarge`, `ErrDBFull`, RPL capacity
-exhausted) is fully reversible: rollback releases buffers, drops
-`tx.pendingAllocs` (re-availing any RPL-segment page IDs to the
-next transaction's allocator), reverts the in-memory RPL segment list
-appends, and leaves the on-disk state untouched.
+exhausted) is fully reversible *with respect to reader-observable
+state*: rollback releases buffers, drops `tx.pendingAllocs` (re-
+availing any RPL-segment page IDs to the next transaction's
+allocator), reverts the in-memory RPL segment list appends, and
+restores the in-memory bitmap + HighWaterMark from the snapshot
+taken at tx begin. Any `ftruncate`-up that happened during step 0
+(file extension to back newly-allocated pages) leaves trailing
+slack the next commit's tail refund or `maybeShrink` reclaims —
+this is not a reader-visible side effect, so the reversibility
+contract still holds.
 
 ### Step 1 — Data + RPL + bitmap pwrite
 

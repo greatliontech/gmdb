@@ -66,6 +66,21 @@ Invariant: kind=entailed;
     (torn write — caught by checksum, but only if the rule is honoured).
 
 Invariant: kind=entailed;
+  property=A successful commit writes a strictly-greater `TxnID` than
+    the previously-active meta's `TxnID`. `TxnID` rises monotonically by
+    at least one per committed transaction;
+  from=entailed: meta active-selection rule (preceding invariant) plus
+    `pager-slab.md §Commit Write Ordering` — selection is unambiguous
+    only when the two metas carry distinct `TxnID`s after the first
+    commit;
+  violation=Two metas with equal non-zero `TxnID`s leave active-meta
+    selection undefined; a reader can observe a previous tree the
+    writer thought it had superseded, or vice-versa. The dual-meta
+    swap protocol is the only path that writes a meta, so any equal-
+    `TxnID` pair on disk after the first commit is a commit-protocol
+    bug.
+
+Invariant: kind=entailed;
   property=`HighWaterMark` in the meta page is monotonically
     non-decreasing within any single recoverable commit chain (it
     only retreats when a successful tail-page-refund commit lowers it

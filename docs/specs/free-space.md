@@ -219,12 +219,10 @@ Storing the TxnID once per segment doubles capacity.
 ```
 RPL Segment Page
 +--------------------------+
-| Page Header (8 bytes)    |
+| Page Header (8 bytes)    |  Count = N (number of PageID entries)
 +--------------------------+
 | TxnID          | uint64  |  transaction that retired these pages
 | OlderSegment   | uint64  |  page ID of the next older segment (0 = tail)
-| EntryCount     | uint16  |  number of PageID entries
-| Padding        | 6 bytes |
 +--------------------------+
 | PageID 0       | uint64  |
 | PageID 1       | uint64  |
@@ -232,11 +230,15 @@ RPL Segment Page
 +--------------------------+
 ```
 
-Segment capacity at 4 KB: 8 (header) + 8 (TxnID) + 8 (link) + 2
-(EntryCount) + 6 (padding) = 32 bytes overhead. Remaining
-`4096 - 32 = 4064` / 8 = **508 entries per segment** (507 with
-checksums enabled, due to the 8-byte xxhash64 footer:
-`4096 - 32 - 8 = 4056` / 8 = 507).
+The page-header `Count` field carries the entry count for RPL segments
+(per `file-layout.md §Page Header`: "Count ... entry count for RPL
+segment"). No separate count field exists; the encoder writes `Count`,
+the decoder reads it.
+
+Segment capacity at 4 KB: 8 (header) + 8 (TxnID) + 8 (link) = 24
+bytes overhead. Remaining `4096 - 24 = 4072` / 8 = **509 entries per
+segment** (508 with checksums enabled, due to the 8-byte xxhash64
+footer: `4096 - 24 - 8 = 4064` / 8 = 508).
 
 Meta stores `RPLHeadPage` (newest) and `RPLTailPage` (oldest).
 Segments are singly linked head → tail via `OlderSegment`. The

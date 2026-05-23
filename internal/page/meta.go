@@ -1,57 +1,31 @@
 package page
 
 import (
+	"fmt"
+
 	"github.com/cespare/xxhash/v2"
 )
 
-// Meta holds deserialized meta page fields. The meta page has its own layout
-// (no standard page header). Two meta pages occupy pages 0 and 1.
-//
-// Byte layout (144 bytes):
-//
-//	  0..3:   Magic            uint32
-//	  4..7:   Version          uint32
-//	  8..11:  PageSize         uint32
-//	 12..15:  Flags            uint32
-//	 16..19:  BitmapPages      uint32
-//	 20..23:  Padding          (4 bytes)
-//	 24..39:  UUID             [16]byte
-//	 40..47:  MinSize          uint64
-//	 48..55:  MaxSize          uint64
-//	 56..63:  GrowStep         uint64
-//	 64..71:  ShrinkThreshold  uint64
-//	 72..79:  HighWaterMark    uint64
-//	 80..87:  RPLHeadPage      uint64
-//	 88..95:  RPLTailPage      uint64
-//	 96..103: RPLEntryCount    uint64
-//	104..111: NumFreePages     uint64
-//	112..119: KeyspaceRoot     uint64
-//	120..127: NumKeyspaces     uint64
-//	128..135: TxnID            uint64
-//	136..143: Checksum         uint64 (xxhash64 of bytes 0..135)
-type Meta struct {
-	Magic           uint32
-	Version         uint32
-	PageSize        uint32
-	Flags           uint32
-	BitmapPages     uint32
-	UUID            [16]byte
-	MinSize         uint64
-	MaxSize         uint64
-	GrowStep        uint64
-	ShrinkThreshold uint64
-	HighWaterMark   uint64
-	RPLHeadPage     uint64
-	RPLTailPage     uint64
-	RPLEntryCount   uint64
-	NumFreePages    uint64
-	KeyspaceRoot    uint64
-	NumKeyspaces    uint64
-	TxnID           uint64
-	Checksum        uint64
-}
+// Meta-page Flags bit assignments. Per file-layout.md §Meta Page:
+//   - Bit 0 (PageChecksum) is immutable across the file's lifetime.
+//   - Bit 1 (Checkpoint)   is mutable per commit.
+//   - Bits 2..31 are reserved; Open() rejects unknown bits set.
+const (
+	MetaFlagPageChecksum uint32 = 1 << 0
+	MetaFlagCheckpoint   uint32 = 1 << 1
 
-// Meta field offsets.
+	// MetaFlagKnownMask is the union of currently-defined meta flag bits.
+	// Open() must reject metas where (Flags &^ MetaFlagKnownMask) != 0.
+	MetaFlagKnownMask = MetaFlagPageChecksum | MetaFlagCheckpoint
+)
+
+// MetaPayloadSize is the fixed on-disk byte length of the meta-page payload:
+// 4×4 + 4 (padding) + 16 (UUID) + 13×8 = 144 bytes. Fits in any supported
+// page size.
+const MetaPayloadSize = 144
+
+// Meta-page field offsets within the 144-byte payload. Meta pages do not
+// carry the common page header.
 const (
 	metaOffMagic           = 0
 	metaOffVersion         = 4
@@ -75,8 +49,35 @@ const (
 	metaOffChecksum        = 136
 )
 
-// DecodeMeta reads a meta page from buf into a Meta struct.
-// Does NOT verify the checksum — use VerifyMeta for that.
+// Meta is the decoded view of one meta page. Field order matches the on-disk
+// layout in file-layout.md §Meta Page.
+type Meta struct {
+	Magic           uint32
+	Version         uint32
+	PageSize        uint32
+	Flags           uint32
+	BitmapPages     uint32
+	UUID            [16]byte
+	MinSize         uint64
+	MaxSize         uint64
+	GrowStep        uint64
+	ShrinkThreshold uint64
+	HighWaterMark   uint64
+	RPLHeadPage     uint64
+	RPLTailPage     uint64
+	RPLEntryCount   uint64
+	NumFreePages    uint64
+	KeyspaceRoot    uint64
+	NumKeyspaces    uint64
+	TxnID           uint64
+	Checksum        uint64
+}
+
+// HasFlag reports whether all bits in mask are set.
+func (m Meta) HasFlag(mask uint32) bool { return m.Flags&mask == mask }
+
+// DecodeMeta reads a Meta from the first MetaPayloadSize bytes of buf. Does
+// not verify the checksum; use VerifyMeta separately.
 func DecodeMeta(buf []byte) Meta {
 	_ = buf[MetaPayloadSize-1] // bounds check
 	var m Meta
@@ -102,8 +103,10 @@ func DecodeMeta(buf []byte) Meta {
 	return m
 }
 
-// EncodeMeta writes the Meta fields into buf (must be >= MetaPayloadSize bytes),
-// computes and stores the xxhash64 checksum.
+// EncodeMeta writes m into the first MetaPayloadSize bytes of buf and
+// stores the xxhash64 checksum of the preceding fields into the Checksum
+// slot. Padding bytes are zeroed. m.Checksum is updated in place to the
+// value written.
 func EncodeMeta(buf []byte, m *Meta) {
 	_ = buf[MetaPayloadSize-1] // bounds check
 	le.PutUint32(buf[metaOffMagic:], m.Magic)
@@ -111,7 +114,6 @@ func EncodeMeta(buf []byte, m *Meta) {
 	le.PutUint32(buf[metaOffPageSize:], m.PageSize)
 	le.PutUint32(buf[metaOffFlags:], m.Flags)
 	le.PutUint32(buf[metaOffBitmapPages:], m.BitmapPages)
-	// Zero padding bytes.
 	clear(buf[metaOffPadding : metaOffPadding+4])
 	copy(buf[metaOffUUID:], m.UUID[:])
 	le.PutUint64(buf[metaOffMinSize:], m.MinSize)
@@ -126,26 +128,98 @@ func EncodeMeta(buf []byte, m *Meta) {
 	le.PutUint64(buf[metaOffKeyspaceRoot:], m.KeyspaceRoot)
 	le.PutUint64(buf[metaOffNumKeyspaces:], m.NumKeyspaces)
 	le.PutUint64(buf[metaOffTxnID:], m.TxnID)
-	// Compute and store checksum.
 	m.Checksum = ComputeMetaChecksum(buf)
 	le.PutUint64(buf[metaOffChecksum:], m.Checksum)
 }
 
-// VerifyMeta checks the xxhash64 checksum of a meta page. Returns true if valid.
-func VerifyMeta(buf []byte) bool {
-	_ = buf[MetaPayloadSize-1] // bounds check
-	expected := ComputeMetaChecksum(buf)
-	stored := le.Uint64(buf[metaOffChecksum:])
-	return expected == stored
-}
-
-// ComputeMetaChecksum returns the xxhash64 of bytes 0 through metaOffChecksum-1
-// (all fields preceding the Checksum field).
+// ComputeMetaChecksum returns the xxhash64 of the fields preceding the
+// Checksum slot: bytes 0 through metaOffChecksum-1. The meta-page Magic /
+// Version / PageSize / Flags / ... are all covered; the trailing 8 bytes
+// are the checksum itself.
 func ComputeMetaChecksum(buf []byte) uint64 {
 	return xxhash.Sum64(buf[:metaOffChecksum])
 }
 
-// HasFlag returns true if the meta flags have the given flag bit set.
-func (m Meta) HasFlag(flag uint32) bool {
-	return m.Flags&flag != 0
+// ValidateMeta reports whether m is a well-formed meta-page payload as
+// observed after decoding from disk. Magic and Version are checked
+// against the package constants; PageSize must satisfy ValidPageSize;
+// Flags must not carry any bits outside MetaFlagKnownMask
+// (file-layout.md §Meta Page: "Open() must reject databases where any
+// unknown flag bit is set").
+//
+// Does NOT verify the checksum — that requires the encoded byte buffer
+// and is exposed via VerifyMeta. Callers typically VerifyMeta first to
+// detect torn writes, then ValidateMeta on the decoded struct to detect
+// out-of-band fields.
+func ValidateMeta(m Meta) error {
+	if m.Magic != Magic {
+		return fmt.Errorf("page: meta Magic mismatch: got 0x%08x, want 0x%08x", m.Magic, Magic)
+	}
+	if m.Version != FormatVersion {
+		return fmt.Errorf("page: meta Version mismatch: got %d, want %d", m.Version, FormatVersion)
+	}
+	if !ValidPageSize(m.PageSize) {
+		return fmt.Errorf("page: meta PageSize invalid: %d", m.PageSize)
+	}
+	if unknown := m.Flags &^ MetaFlagKnownMask; unknown != 0 {
+		return fmt.Errorf("page: meta Flags has unknown bits set: 0x%x", unknown)
+	}
+	return nil
+}
+
+// VerifyMeta recomputes the xxhash64 of the meta-page prefix and compares
+// it against the stored Checksum field. Returns true on match.
+func VerifyMeta(buf []byte) bool {
+	_ = buf[MetaPayloadSize-1] // bounds check
+	want := ComputeMetaChecksum(buf)
+	got := le.Uint64(buf[metaOffChecksum:])
+	return want == got
+}
+
+// ActiveMeta selects the active meta page given the two candidate
+// payloads. Per file-layout.md §Meta Page and the entailed dual-meta
+// invariant: the active meta is the one with the highest TxnID whose
+// checksum is valid.
+//
+// Tie-break rules:
+//   - One meta valid, one not → the valid one wins.
+//   - Both valid, distinct TxnIDs → the higher wins.
+//   - Both valid, TxnIDs both zero → meta 0 wins. Tie-at-zero is the
+//     expected immediately-post-initialisation state, when both metas
+//     are byte-identical.
+//   - Both valid, equal non-zero TxnIDs → ok=false (corruption). The
+//     commit protocol writes a strictly-greater TxnID per commit, so
+//     observing two metas with equal non-zero TxnIDs means the protocol
+//     was violated; active-meta selection is undefined and the caller
+//     must surface this rather than guess.
+//   - Neither valid → ok=false.
+//
+// The checkpoint-flag precedence rule from durability.md is layered on
+// top by the SyncMode-aware caller (chunk 3); this function returns the
+// raw highest-valid-TxnID winner.
+func ActiveMeta(meta0, meta1 []byte) (active int, ok bool) {
+	ok0 := VerifyMeta(meta0)
+	ok1 := VerifyMeta(meta1)
+	switch {
+	case ok0 && ok1:
+		txn0 := le.Uint64(meta0[metaOffTxnID:])
+		txn1 := le.Uint64(meta1[metaOffTxnID:])
+		switch {
+		case txn1 > txn0:
+			return 1, true
+		case txn0 > txn1:
+			return 0, true
+		case txn0 == 0:
+			return 0, true
+		default:
+			// Equal non-zero TxnIDs — commit-protocol violation.
+			return 0, false
+		}
+	case ok0:
+		return 0, true
+	case ok1:
+		return 1, true
+	default:
+		return 0, false
+	}
 }

@@ -1,102 +1,137 @@
 package page
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestValidPageSize(t *testing.T) {
-	valid := []uint32{4096, 8192, 16384, 32768, 65536}
-	for _, s := range valid {
-		if !ValidPageSize(s) {
-			t.Errorf("ValidPageSize(%d) = false, want true", s)
-		}
-	}
-	invalid := []uint32{0, 1, 2048, 4095, 4097, 6000, 131072}
-	for _, s := range invalid {
-		if ValidPageSize(s) {
-			t.Errorf("ValidPageSize(%d) = true, want false", s)
-		}
-	}
-}
-
-func TestReadWriteHeader(t *testing.T) {
-	buf := make([]byte, headerSize)
-	WriteHeader(buf, TypeLeaf, 0, 42, 3)
-
-	typ, flags, count, additional := ReadHeader(buf)
-	if typ != TypeLeaf {
-		t.Errorf("Type = %d, want %d", typ, TypeLeaf)
-	}
-	if flags != 0 {
-		t.Errorf("Flags = %d, want 0", flags)
-	}
-	if count != 42 {
-		t.Errorf("Count = %d, want 42", count)
-	}
-	if additional != 3 {
-		t.Errorf("AdditionalPages = %d, want 3", additional)
-	}
-}
-
-func TestPageConfigUsableSpace(t *testing.T) {
-	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
-	if got := cfg.UsableSpace(); got != 4088 {
-		t.Errorf("UsableSpace() = %d, want 4088", got)
-	}
-
-	cfg.PageChecksum = true
-	if got := cfg.UsableSpace(); got != 4084 {
-		t.Errorf("UsableSpace() with checksum = %d, want 4084", got)
-	}
-}
-
-func TestPageConfigMaxKeySize(t *testing.T) {
-	tests := []struct {
-		pageSize uint32
-		checksum bool
-		want     int
+	cases := []struct {
+		size uint32
+		want bool
 	}{
-		{4096, false, 2028},
-		{4096, true, 2026},
-		{8192, false, 4076},
-		{65536, false, 32748},
+		{0, false},
+		{512, false},
+		{2048, false},
+		{4095, false},
+		{4096, true},
+		{4097, false},
+		{8192, true},
+		{16384, true},
+		{32768, true},
+		{65536, true},
+		{65537, false},
+		{131072, false},
 	}
-	for _, tt := range tests {
-		cfg := PageConfig{PageSize: tt.pageSize, PageChecksum: tt.checksum}
-		got := cfg.MaxKeySize()
-		if got != tt.want {
-			t.Errorf("MaxKeySize(pageSize=%d, checksum=%v) = %d, want %d",
-				tt.pageSize, tt.checksum, got, tt.want)
+	for _, c := range cases {
+		if got := ValidPageSize(c.size); got != c.want {
+			t.Errorf("ValidPageSize(%d) = %v, want %v", c.size, got, c.want)
 		}
 	}
 }
 
-func TestPageConfigBitmapPages(t *testing.T) {
-	cfg := PageConfig{PageSize: 4096}
-	// 256GB / 4KB = 67,108,864 pages. BitsPerPage = 4096*8 = 32768.
-	// 67108864 / 32768 = 2048.
-	got := cfg.BitmapPages(67108864)
-	if got != 2048 {
-		t.Errorf("BitmapPages(67108864) = %d, want 2048", got)
+func TestHeaderRoundTrip(t *testing.T) {
+	buf := make([]byte, 16)
+	WriteHeader(buf, TypeBranch, 0x1234, 0xDEADBEEF)
+	typ, flags, count, additional := ReadHeader(buf)
+	if typ != TypeBranch || flags != 0 || count != 0x1234 || additional != 0xDEADBEEF {
+		t.Fatalf("round-trip mismatch: %d %d %d %d", typ, flags, count, additional)
 	}
 }
 
-func TestPageConfigContentEnd(t *testing.T) {
-	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
-	if got := cfg.ContentEnd(); got != 4096 {
-		t.Errorf("ContentEnd() = %d, want 4096", got)
-	}
-	cfg.PageChecksum = true
-	if got := cfg.ContentEnd(); got != 4092 {
-		t.Errorf("ContentEnd() with checksum = %d, want 4092", got)
+func TestPageFooterRoundTrip(t *testing.T) {
+	for _, sz := range []uint32{4096, 8192, 65536} {
+		buf := make([]byte, sz)
+		for i := range buf[:sz-FooterSize] {
+			buf[i] = byte(i)
+		}
+		WritePageFooter(buf, sz)
+		if !VerifyPageFooter(buf, sz) {
+			t.Fatalf("verify failed for page size %d", sz)
+		}
+		// Flip one byte in the content; verify must fail.
+		buf[10] ^= 0x01
+		if VerifyPageFooter(buf, sz) {
+			t.Fatalf("expected verify failure after content tamper (size %d)", sz)
+		}
+		buf[10] ^= 0x01 // restore
+		if !VerifyPageFooter(buf, sz) {
+			t.Fatalf("restore failed (size %d)", sz)
+		}
+		// Flip one byte in the footer; verify must fail.
+		buf[sz-1] ^= 0x01
+		if VerifyPageFooter(buf, sz) {
+			t.Fatalf("expected verify failure after footer tamper (size %d)", sz)
+		}
 	}
 }
 
-func TestPageConfigFirstDataPage(t *testing.T) {
-	cfg := PageConfig{PageSize: 4096}
-	// 2 meta pages + 2048 bitmap pages = 2050.
-	if got := cfg.FirstDataPage(2048); got != 2050 {
-		t.Errorf("FirstDataPage(2048) = %d, want 2050", got)
+func TestPageFooterRejectsWrongSize(t *testing.T) {
+	for _, name := range []string{"larger", "smaller"} {
+		var buf []byte
+		if name == "larger" {
+			buf = make([]byte, 8192)
+		} else {
+			buf = make([]byte, 2048)
+		}
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("%s: WritePageFooter did not panic on wrong-size buf", name)
+				}
+			}()
+			WritePageFooter(buf, 4096)
+		}()
 	}
-	if got := cfg.FirstDataPage(0); got != 2 {
-		t.Errorf("FirstDataPage(0) = %d, want 2", got)
+}
+
+func TestConfigContentEndAndUsable(t *testing.T) {
+	cases := []struct {
+		cfg     Config
+		end     int
+		usable  int
+	}{
+		{Config{PageSize: 4096, PageChecksum: true}, 4088, 4080},
+		{Config{PageSize: 4096, PageChecksum: false}, 4096, 4088},
+		{Config{PageSize: 65536, PageChecksum: true}, 65528, 65520},
+	}
+	for _, c := range cases {
+		if got := c.cfg.ContentEnd(); got != c.end {
+			t.Errorf("ContentEnd(%+v) = %d, want %d", c.cfg, got, c.end)
+		}
+		if got := c.cfg.UsableSpace(); got != c.usable {
+			t.Errorf("UsableSpace(%+v) = %d, want %d", c.cfg, got, c.usable)
+		}
+	}
+}
+
+func TestComputePageChecksumDeterministic(t *testing.T) {
+	const sz uint32 = 4096
+	buf := bytes.Repeat([]byte{0xAB}, int(sz))
+	a := ComputePageChecksum(buf, sz)
+	b := ComputePageChecksum(buf, sz)
+	if a != b {
+		t.Fatalf("non-deterministic: %d vs %d", a, b)
+	}
+	// All-zero footer slot should not affect the prefix hash.
+	clear(buf[len(buf)-FooterSize:])
+	c := ComputePageChecksum(buf, sz)
+	if a != c {
+		t.Fatalf("footer-region affected prefix hash: %d vs %d", a, c)
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	if err := (Config{PageSize: 4096}).Validate(); err != nil {
+		t.Errorf("Validate(4096) = %v, want nil", err)
+	}
+	if err := (Config{PageSize: 0}).Validate(); err == nil {
+		t.Error("Validate(0) = nil, want error")
+	}
+	if err := (Config{PageSize: 4095}).Validate(); err == nil {
+		t.Error("Validate(non-power-of-two) = nil, want error")
+	}
+	if err := (Config{PageSize: 4096, PageChecksum: true}).Validate(); err != nil {
+		t.Errorf("Validate with checksum = %v, want nil", err)
 	}
 }

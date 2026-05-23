@@ -1,14 +1,15 @@
-// Package page implements serialization and deserialization for all gmdb
-// on-disk page formats. It operates on []byte slices with no I/O or OS
-// dependencies. All multi-byte integers use little-endian byte order via
-// encoding/binary.
 package page
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+
+	"github.com/cespare/xxhash/v2"
+)
 
 var le = binary.LittleEndian
 
-// Page type constants (stored in the Type field of the page header).
+// Page type constants stored in the Type field of the page header.
 const (
 	TypeBranch     uint8 = 1
 	TypeLeaf       uint8 = 2
@@ -16,42 +17,29 @@ const (
 	TypeRPLSegment uint8 = 4
 )
 
-// CellFlags bit masks for leaf entry cell flags.
+// Magic identifies a gmdb file. LE encoding produces bytes
+// [0x67, 0x6D, 0x64, 0x62] = "gmdb" readable in hex dumps.
+const Magic uint32 = 0x62646D67
+
+// FormatVersion is the current on-disk format version.
+const FormatVersion uint32 = 1
+
+// Supported page-size range. PageSize is set at database creation, persisted
+// on the meta page, and immutable.
 const (
-	CellFlagOverflow   uint8 = 1 << 0 // value stored in overflow pages
-	CellFlagMultiValue uint8 = 1 << 1 // multi-value (subpage or nested B+tree)
-	CellFlagNestedTree uint8 = 1 << 2 // nested B+tree (only valid when MultiValue is set)
+	MinPageSize uint32 = 4096
+	MaxPageSize uint32 = 65536
 )
 
-// Keyspace descriptor Kind values.
-const (
-	KindKeyspace    uint8 = 0
-	KindSetKeyspace uint8 = 1
-)
+// HeaderSize is the byte length of the common page header carried by every
+// non-meta, non-bitmap page.
+const HeaderSize = 8
 
-// Meta flag bit masks.
-const (
-	MetaFlagPageChecksum uint32 = 1 << 0
-	MetaFlagCheckpoint   uint32 = 1 << 1
-)
+// FooterSize is the byte length of the xxhash64 footer when PageChecksum is
+// enabled. Footer occupies the last FooterSize bytes of the page.
+const FooterSize = 8
 
-// Exported size constants.
-const (
-	MetaPayloadSize  = 144 // meta page payload (Magic through Checksum)
-	KeyspaceDescSize = 32  // keyspace descriptor
-)
-
-// Internal size constants — encapsulated by public API methods.
-const (
-	headerSize       = 8  // common page header
-	ptr0Size         = 8  // leftmost child pointer in branch pages
-	cellDirEntrySize = 4  // branch cell directory entry: Offset(2) + KeyLen(2)
-	childPtrSize     = 8  // child pointer in branch cell data
-	crc32Size        = 4  // CRC32C footer
-	restartInterval  = 16 // leaf prefix compression restart interval
-)
-
-// Header field offsets within a page.
+// Page header field offsets within the 8-byte header.
 const (
 	offType            = 0
 	offFlags           = 1
@@ -59,71 +47,68 @@ const (
 	offAdditionalPages = 4
 )
 
-// Supported page size range.
-const (
-	MinPageSize = 4096
-	MaxPageSize = 65536
-)
+// ValidPageSize reports whether size is a supported page size: a power of
+// two within [MinPageSize, MaxPageSize].
+func ValidPageSize(size uint32) bool {
+	if size < MinPageSize || size > MaxPageSize {
+		return false
+	}
+	return size&(size-1) == 0
+}
 
-// Magic number identifying a gmdb file. LE encoding produces bytes
-// [0x67, 0x6D, 0x64, 0x62] = "gmdb" readable in hex dumps.
-const Magic uint32 = 0x62646D67
-
-// FormatVersion is the current database format version.
-const FormatVersion uint32 = 1
-
-// PageConfig holds page-size-dependent constants. Created once per database
-// open and threaded through all reader/builder constructors.
-type PageConfig struct {
+// Config bundles the page-size-dependent values that callers thread through
+// the package. Built once per database Open from the meta page. Validate
+// before use — every consumer (encoders, decoders, checksum helpers,
+// RPLEntriesPerSegment) assumes a valid Config, and the data file's
+// PageSize invariant (`file-layout.md`) is encoded against that assumption.
+type Config struct {
 	PageSize     uint32
 	PageChecksum bool
 }
 
-// UsableSpace returns the number of content bytes available in a standard
-// data page (PageSize minus header, minus optional CRC32C footer).
-func (c PageConfig) UsableSpace() int {
-	n := int(c.PageSize) - headerSize
-	if c.PageChecksum {
-		n -= crc32Size
+// Validate reports whether c describes a supported page configuration.
+// Returns an error when PageSize is not a power of two in [MinPageSize,
+// MaxPageSize]; PageChecksum is unconstrained (either bool is legal).
+// Boundary consumers (Open, pager construction) Validate at entry; the
+// rest of the package panics on a Config it knows to be invalid since
+// reaching it indicates a programming error upstream.
+func (c Config) Validate() error {
+	if !ValidPageSize(c.PageSize) {
+		return fmt.Errorf("page: invalid PageSize %d (must be a power of two in [%d, %d])",
+			c.PageSize, MinPageSize, MaxPageSize)
 	}
-	return n
+	return nil
 }
 
-// ContentEnd returns the byte offset where content ends in a page
-// (PageSize, or PageSize - crc32Size when checksums are enabled).
-func (c PageConfig) ContentEnd() int {
+// mustValidate panics with the Validate error. Used at the package's
+// internal boundaries where Config reaching the function with an invalid
+// PageSize signals a caller bug.
+func (c Config) mustValidate() {
+	if err := c.Validate(); err != nil {
+		panic(err)
+	}
+}
+
+// ContentEnd returns the byte offset where in-page content ends: PageSize
+// when checksums are disabled, PageSize - FooterSize when enabled. Callers
+// use this as the end of the encoded payload (the footer, if any, lives
+// after).
+func (c Config) ContentEnd() int {
 	if c.PageChecksum {
-		return int(c.PageSize) - crc32Size
+		return int(c.PageSize) - FooterSize
 	}
 	return int(c.PageSize)
 }
 
-// MaxKeySize returns the maximum key size determined by branch page
-// constraints: a branch must fit at least 2 keys. Each key needs a
-// 4-byte cell directory entry, the key bytes, and an 8-byte child pointer.
-func (c PageConfig) MaxKeySize() int {
-	usable := c.UsableSpace()
-	// Branch layout after header: Ptr0(8) + N*(CellDirEntry(4)) + N*(Key + ChildPtr(8))
-	// Minimum N=2: usable >= 8 + 2*4 + 2*(keyLen + 8) = 32 + 2*keyLen
-	return (usable - ptr0Size - 2*cellDirEntrySize - 2*childPtrSize) / 2
+// UsableSpace returns the number of content bytes between the header and
+// the (optional) footer on a standard data page.
+func (c Config) UsableSpace() int {
+	return c.ContentEnd() - HeaderSize
 }
 
-// BitmapPages returns the number of bitmap pages required for the given
-// MaxSize (in pages).
-func (c PageConfig) BitmapPages(maxSizePages uint64) uint32 {
-	bitsPerPage := uint64(c.PageSize) * 8
-	totalPages := maxSizePages
-	return uint32((totalPages + bitsPerPage - 1) / bitsPerPage)
-}
-
-// FirstDataPage returns the first data page ID (after meta + bitmap pages).
-func (c PageConfig) FirstDataPage(bitmapPages uint32) uint64 {
-	return 2 + uint64(bitmapPages)
-}
-
-// ReadHeader reads the common 8-byte page header from buf.
+// ReadHeader decodes the 8-byte page header at the start of buf.
 func ReadHeader(buf []byte) (typ uint8, flags uint8, count uint16, additional uint32) {
-	_ = buf[7] // bounds check
+	_ = buf[HeaderSize-1] // bounds check
 	typ = buf[offType]
 	flags = buf[offFlags]
 	count = le.Uint16(buf[offCount:])
@@ -131,20 +116,48 @@ func ReadHeader(buf []byte) (typ uint8, flags uint8, count uint16, additional ui
 	return
 }
 
-// WriteHeader writes the common 8-byte page header into buf.
-func WriteHeader(buf []byte, typ uint8, flags uint8, count uint16, additional uint32) {
-	_ = buf[7] // bounds check
+// WriteHeader encodes the 8-byte page header at the start of buf. The
+// Flags byte is written as zero per file-layout.md §Page Header ("Must be
+// zero on write"); future flag bits will land via a separate setter so
+// the common write path can't accidentally encode a non-zero value.
+func WriteHeader(buf []byte, typ uint8, count uint16, additional uint32) {
+	_ = buf[HeaderSize-1] // bounds check
 	buf[offType] = typ
-	buf[offFlags] = flags
+	buf[offFlags] = 0
 	le.PutUint16(buf[offCount:], count)
 	le.PutUint32(buf[offAdditionalPages:], additional)
 }
 
-// ValidPageSize returns true if size is a supported page size
-// (power of 2 between MinPageSize and MaxPageSize).
-func ValidPageSize(size uint32) bool {
-	if size < MinPageSize || size > MaxPageSize {
-		return false
+// ComputePageChecksum returns the xxhash64 of bytes 0 through
+// pageSize-FooterSize-1 inclusive (the spec-mandated coverage region per
+// checksums.md §Storage). buf must be exactly pageSize bytes — passing a
+// larger or smaller slice panics.
+//
+// The pageSize parameter (rather than relying on len(buf)) is the
+// load-bearing choice: it pins the coverage region to the configured
+// PageSize even if the caller hands over a backing buffer of unintended
+// size, which is the exact failure mode silent-bitrot detection must not
+// have.
+func ComputePageChecksum(buf []byte, pageSize uint32) uint64 {
+	if len(buf) != int(pageSize) {
+		panic(fmt.Sprintf("page: ComputePageChecksum buf len %d != PageSize %d", len(buf), pageSize))
 	}
-	return size&(size-1) == 0
+	return xxhash.Sum64(buf[:int(pageSize)-FooterSize])
+}
+
+// WritePageFooter computes the xxhash64 footer of buf and writes it into
+// the last FooterSize bytes of the page region. Used at commit time on
+// each dirty slab buffer, before pwrite. Panics under the same condition
+// as ComputePageChecksum.
+func WritePageFooter(buf []byte, pageSize uint32) {
+	c := ComputePageChecksum(buf, pageSize)
+	le.PutUint64(buf[int(pageSize)-FooterSize:int(pageSize)], c)
+}
+
+// VerifyPageFooter recomputes the xxhash64 footer of buf and compares it
+// to the stored last 8 bytes. Returns true on match.
+func VerifyPageFooter(buf []byte, pageSize uint32) bool {
+	want := ComputePageChecksum(buf, pageSize)
+	got := le.Uint64(buf[int(pageSize)-FooterSize : int(pageSize)])
+	return want == got
 }

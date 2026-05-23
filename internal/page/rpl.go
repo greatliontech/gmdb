@@ -1,118 +1,113 @@
 package page
 
-// RPL segment pages store retired page IDs grouped by transaction. Each
-// segment has a single TxnID and a linked-list pointer to the older segment.
-//
-// Byte layout after the 8-byte page header:
-//
-//	 8..15:  TxnID          uint64
-//	16..23:  OlderSegment   uint64 (page ID of next older segment, 0 = tail)
-//	24..25:  EntryCount     uint16
-//	26..31:  Padding        (6 bytes)
-//	32..:    PageID array   []uint64
+import "fmt"
 
-// RPL segment header offsets (relative to start of page).
+// Retired Page Log segment-page layout, per free-space.md §Retired Page Log.
+//
+// Layout:
+//
+//	  0..7:   Common 8-byte page header (Type = TypeRPLSegment, Count = N entries)
+//	  8..15:  TxnID         uint64  — transaction that retired these pages
+//	 16..23:  OlderSegment  uint64  — page ID of the next older segment (0 = tail)
+//	 24..24+8N: PageID array (N uint64 entries)
+//
+// Total per-segment overhead: 24 bytes. The page-header Count field
+// carries the entry count — no separate EntryCount field exists. With
+// PageChecksum enabled, the last 8 bytes of the page are the xxhash64
+// footer, costing one entry slot.
+
+// RPL segment field offsets.
 const (
-	rplOffTxnID        = headerSize      // 8
-	rplOffOlderSegment = rplOffTxnID + 8 // 16
-	rplOffEntryCount   = rplOffOlderSegment + 8 // 24
-	rplOffPadding      = rplOffEntryCount + 2   // 26
-	rplDataStart       = rplOffPadding + 6      // 32
+	rplOffTxnID        = 8
+	rplOffOlderSegment = 16
+	RPLHeaderSize      = 24 // common header + TxnID + OlderSegment
 )
 
-// RPLSegmentCapacity returns the maximum number of PageID entries for the
-// given PageConfig.
-func RPLSegmentCapacity(cfg PageConfig) int {
-	avail := cfg.ContentEnd() - rplDataStart
-	return avail / 8
-}
-
-// RPLSegmentReader provides zero-copy read access to an RPL segment page.
-type RPLSegmentReader struct {
-	buf []byte
-	cfg PageConfig
-}
-
-// NewRPLSegmentReader wraps buf as an RPL segment page reader.
-func NewRPLSegmentReader(buf []byte, cfg PageConfig) RPLSegmentReader {
-	return RPLSegmentReader{buf: buf, cfg: cfg}
-}
-
-// TxnID returns the segment's transaction ID.
-func (r RPLSegmentReader) TxnID() uint64 {
-	return le.Uint64(r.buf[rplOffTxnID:])
-}
-
-// OlderSegment returns the page ID of the next older segment (0 = this is tail).
-func (r RPLSegmentReader) OlderSegment() uint64 {
-	return le.Uint64(r.buf[rplOffOlderSegment:])
-}
-
-// EntryCount returns the number of PageID entries in this segment.
-func (r RPLSegmentReader) EntryCount() int {
-	return int(le.Uint16(r.buf[rplOffEntryCount:]))
-}
-
-// PageID returns the i-th retired page ID.
-func (r RPLSegmentReader) PageID(i int) uint64 {
-	off := rplDataStart + i*8
-	return le.Uint64(r.buf[off:])
-}
-
-// RPLSegmentBuilder constructs an RPL segment page in a []byte buffer.
-type RPLSegmentBuilder struct {
-	buf   []byte
-	cfg   PageConfig
-	count int
-	cap   int
-}
-
-// NewRPLSegmentBuilder initializes a builder for writing into buf.
-func NewRPLSegmentBuilder(buf []byte, cfg PageConfig) *RPLSegmentBuilder {
-	// Zero the segment header area (padding included).
-	clear(buf[headerSize:rplDataStart])
-	return &RPLSegmentBuilder{
-		buf: buf,
-		cfg: cfg,
-		cap: RPLSegmentCapacity(cfg),
+// RPLEntriesPerSegment returns the maximum number of PageID entries that
+// fit in a single RPL segment for the given page configuration. Per
+// free-space.md §Retired Page Log: 509 at 4 KB without checksum, 508 at
+// 4 KB with checksum.
+//
+// Panics if cfg is invalid (per the package's "Config must be Validated
+// at boundaries" rule).
+func RPLEntriesPerSegment(cfg Config) int {
+	cfg.mustValidate()
+	usable := int(cfg.PageSize) - RPLHeaderSize
+	if cfg.PageChecksum {
+		usable -= FooterSize
 	}
+	return usable / 8
 }
 
-// SetTxnID writes the transaction ID.
-func (b *RPLSegmentBuilder) SetTxnID(txnID uint64) {
-	le.PutUint64(b.buf[rplOffTxnID:], txnID)
+// RPLSegment is the decoded view of one RPL segment page. PageIDs is a
+// snapshot copy — callers may mutate it independently of the source buffer.
+type RPLSegment struct {
+	TxnID        uint64
+	OlderSegment uint64
+	PageIDs      []uint64
 }
 
-// SetOlderSegment writes the older segment link.
-func (b *RPLSegmentBuilder) SetOlderSegment(pageID uint64) {
-	le.PutUint64(b.buf[rplOffOlderSegment:], pageID)
-}
+// EntryCount returns len(PageIDs). Convenience for callers that want the
+// segment's count without recomputing.
+func (s RPLSegment) EntryCount() int { return len(s.PageIDs) }
 
-// AddPageID appends a retired page ID. Returns false if at capacity.
-func (b *RPLSegmentBuilder) AddPageID(pageID uint64) bool {
-	if b.count >= b.cap {
-		return false
+// DecodeRPLSegment reads an RPL segment page from buf and returns the
+// decoded view. The boolean return is the structural-validity signal:
+// false means the buffer is malformed (wrong page type, entry count out
+// of range, or buf too short for cfg.PageSize). Callers must treat false
+// as corruption.
+//
+// Does NOT verify the xxhash64 footer; the pager performs footer
+// verification before calling DecodeRPLSegment, and the cached
+// verification result satisfies the per-tx verification cache invariant
+// from checksums.md.
+func DecodeRPLSegment(buf []byte, cfg Config) (RPLSegment, bool) {
+	cfg.mustValidate()
+	if len(buf) < int(cfg.PageSize) {
+		return RPLSegment{}, false
 	}
-	off := rplDataStart + b.count*8
-	le.PutUint64(b.buf[off:], pageID)
-	b.count++
-	return true
+	typ, _, count, _ := ReadHeader(buf)
+	if typ != TypeRPLSegment {
+		return RPLSegment{}, false
+	}
+	if int(count) > RPLEntriesPerSegment(cfg) {
+		return RPLSegment{}, false
+	}
+	txnID := le.Uint64(buf[rplOffTxnID:])
+	older := le.Uint64(buf[rplOffOlderSegment:])
+	ids := make([]uint64, count)
+	for i := range ids {
+		ids[i] = le.Uint64(buf[RPLHeaderSize+i*8:])
+	}
+	return RPLSegment{TxnID: txnID, OlderSegment: older, PageIDs: ids}, true
 }
 
-// Finish writes the page header and entry count. Returns the number of entries.
-func (b *RPLSegmentBuilder) Finish() uint16 {
-	count := uint16(b.count)
-	WriteHeader(b.buf, TypeRPLSegment, 0, count, 0)
-	le.PutUint16(b.buf[rplOffEntryCount:], count)
-	return count
-}
-
-// Count returns the current number of entries added.
-func (b *RPLSegmentBuilder) Count() int {
-	return b.count
-}
-
-// Capacity returns the maximum number of entries this segment can hold.
-func (b *RPLSegmentBuilder) Capacity() int {
-	return b.cap
+// EncodeRPLSegment writes an RPL segment into buf. The caller is
+// responsible for writing the xxhash64 footer (via WritePageFooter) when
+// PageChecksum is enabled, after EncodeRPLSegment returns. Padding and
+// the unused entry tail (between the last entry and ContentEnd) are
+// zeroed.
+//
+// Panics if cfg is invalid, if buf is shorter than cfg.PageSize, or if
+// len(pageIDs) > RPLEntriesPerSegment(cfg). All three are programming
+// errors — wrong-size buf in particular would land mid-write without
+// the upfront bounds check.
+func EncodeRPLSegment(buf []byte, cfg Config, txnID, olderSegment uint64, pageIDs []uint64) {
+	cfg.mustValidate()
+	if len(buf) < int(cfg.PageSize) {
+		panic(fmt.Sprintf("page: EncodeRPLSegment buf len %d < PageSize %d", len(buf), cfg.PageSize))
+	}
+	if max := RPLEntriesPerSegment(cfg); len(pageIDs) > max {
+		panic(fmt.Sprintf("page: RPL segment overflow: %d entries > capacity %d", len(pageIDs), max))
+	}
+	count := uint16(len(pageIDs))
+	WriteHeader(buf, TypeRPLSegment, count, 0)
+	le.PutUint64(buf[rplOffTxnID:], txnID)
+	le.PutUint64(buf[rplOffOlderSegment:], olderSegment)
+	for i, id := range pageIDs {
+		le.PutUint64(buf[RPLHeaderSize+i*8:], id)
+	}
+	// Zero the unused tail up to ContentEnd (the footer slot, if any,
+	// is written by the caller after this returns).
+	clear(buf[RPLHeaderSize+len(pageIDs)*8 : cfg.ContentEnd()])
 }

@@ -1,103 +1,140 @@
 package page
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
-func TestRPLSegmentCapacity(t *testing.T) {
-	tests := []struct {
-		pageSize uint32
-		checksum bool
-		want     int
+func TestRPLEntriesPerSegment(t *testing.T) {
+	cases := []struct {
+		cfg  Config
+		want int
 	}{
-		{4096, false, 508},  // (4096 - 32) / 8 = 508
-		{4096, true, 507},   // (4096 - 32 - 4) / 8 = 507.5 → 507
-		{8192, false, 1020}, // (8192 - 32) / 8 = 1020
+		{Config{PageSize: 4096, PageChecksum: false}, 509},
+		{Config{PageSize: 4096, PageChecksum: true}, 508},
+		{Config{PageSize: 8192, PageChecksum: false}, 1021},
+		{Config{PageSize: 8192, PageChecksum: true}, 1020},
+		{Config{PageSize: 65536, PageChecksum: true}, 8188},
 	}
-	for _, tt := range tests {
-		cfg := PageConfig{PageSize: tt.pageSize, PageChecksum: tt.checksum}
-		got := RPLSegmentCapacity(cfg)
-		if got != tt.want {
-			t.Errorf("RPLSegmentCapacity(ps=%d,ck=%v) = %d, want %d",
-				tt.pageSize, tt.checksum, got, tt.want)
+	for _, c := range cases {
+		if got := RPLEntriesPerSegment(c.cfg); got != c.want {
+			t.Errorf("RPLEntriesPerSegment(%+v) = %d, want %d", c.cfg, got, c.want)
 		}
 	}
 }
 
 func TestRPLSegmentRoundTrip(t *testing.T) {
-	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+	cfg := Config{PageSize: 4096, PageChecksum: true}
 	buf := make([]byte, cfg.PageSize)
 
-	b := NewRPLSegmentBuilder(buf, cfg)
-	b.SetTxnID(100)
-	b.SetOlderSegment(42)
-
-	pageIDs := []uint64{10, 20, 30, 50, 100, 200}
-	for _, pid := range pageIDs {
-		if !b.AddPageID(pid) {
-			t.Fatalf("AddPageID(%d) failed", pid)
-		}
-	}
-	count := b.Finish()
-	if count != uint16(len(pageIDs)) {
-		t.Fatalf("Finish() = %d, want %d", count, len(pageIDs))
+	ids := []uint64{3, 5, 7, 11, 13, 17, 19, 23}
+	EncodeRPLSegment(buf, cfg, 42, 100, ids)
+	WritePageFooter(buf, cfg.PageSize)
+	if !VerifyPageFooter(buf, cfg.PageSize) {
+		t.Fatal("footer verify failed")
 	}
 
-	// Verify header.
-	typ, flags, hcount, additional := ReadHeader(buf)
+	// Page header should report Count and Type.
+	typ, _, count, _ := ReadHeader(buf)
 	if typ != TypeRPLSegment {
 		t.Errorf("Type = %d, want %d", typ, TypeRPLSegment)
 	}
-	if flags != 0 {
-		t.Errorf("Flags = %d, want 0", flags)
-	}
-	if hcount != uint16(len(pageIDs)) {
-		t.Errorf("header Count = %d, want %d", hcount, len(pageIDs))
-	}
-	if additional != 0 {
-		t.Errorf("AdditionalPages = %d, want 0", additional)
+	if count != uint16(len(ids)) {
+		t.Errorf("Count = %d, want %d", count, len(ids))
 	}
 
-	// Read back.
-	r := NewRPLSegmentReader(buf, cfg)
-	if r.TxnID() != 100 {
-		t.Errorf("TxnID = %d, want 100", r.TxnID())
+	got, ok := DecodeRPLSegment(buf, cfg)
+	if !ok {
+		t.Fatal("DecodeRPLSegment returned ok=false on valid segment")
 	}
-	if r.OlderSegment() != 42 {
-		t.Errorf("OlderSegment = %d, want 42", r.OlderSegment())
+	want := RPLSegment{TxnID: 42, OlderSegment: 100, PageIDs: ids}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("decoded mismatch:\n got=%+v\nwant=%+v", got, want)
 	}
-	if r.EntryCount() != len(pageIDs) {
-		t.Errorf("EntryCount = %d, want %d", r.EntryCount(), len(pageIDs))
+}
+
+func TestRPLSegmentEmpty(t *testing.T) {
+	cfg := Config{PageSize: 4096, PageChecksum: true}
+	buf := make([]byte, cfg.PageSize)
+	EncodeRPLSegment(buf, cfg, 1, 0, nil)
+	WritePageFooter(buf, cfg.PageSize)
+	if !VerifyPageFooter(buf, cfg.PageSize) {
+		t.Fatal("footer verify failed for empty segment")
 	}
-	for i, want := range pageIDs {
-		got := r.PageID(i)
-		if got != want {
-			t.Errorf("PageID(%d) = %d, want %d", i, got, want)
+	got, ok := DecodeRPLSegment(buf, cfg)
+	if !ok {
+		t.Fatal("DecodeRPLSegment returned ok=false on empty segment")
+	}
+	if got.TxnID != 1 || got.OlderSegment != 0 || got.EntryCount() != 0 {
+		t.Fatalf("empty segment decoded wrong: %+v", got)
+	}
+}
+
+func TestRPLSegmentDecodeRejectsWrongType(t *testing.T) {
+	cfg := Config{PageSize: 4096, PageChecksum: true}
+	buf := make([]byte, cfg.PageSize)
+	EncodeRPLSegment(buf, cfg, 1, 0, []uint64{42})
+	// Corrupt the Type byte: pretend it's a leaf page.
+	buf[0] = TypeLeaf
+	if _, ok := DecodeRPLSegment(buf, cfg); ok {
+		t.Fatal("Decode accepted wrong page type")
+	}
+}
+
+func TestRPLSegmentDecodeRejectsOversizedCount(t *testing.T) {
+	cfg := Config{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+	EncodeRPLSegment(buf, cfg, 1, 0, []uint64{42})
+	// Tamper the page-header Count to claim more entries than fit.
+	le.PutUint16(buf[offCount:], uint16(RPLEntriesPerSegment(cfg)+1))
+	if _, ok := DecodeRPLSegment(buf, cfg); ok {
+		t.Fatal("Decode accepted out-of-range count")
+	}
+}
+
+func TestRPLSegmentDecodeRejectsShortBuf(t *testing.T) {
+	cfg := Config{PageSize: 4096}
+	short := make([]byte, 1024)
+	if _, ok := DecodeRPLSegment(short, cfg); ok {
+		t.Fatal("Decode accepted short buffer")
+	}
+}
+
+func TestEncodeRPLSegmentPanicsOnShortBuf(t *testing.T) {
+	cfg := Config{PageSize: 4096}
+	short := make([]byte, 1024)
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("EncodeRPLSegment did not panic on short buf")
+		}
+	}()
+	EncodeRPLSegment(short, cfg, 1, 0, nil)
+}
+
+func TestRPLSegmentTailZeroed(t *testing.T) {
+	cfg := Config{PageSize: 4096, PageChecksum: false}
+	buf := make([]byte, cfg.PageSize)
+	// Pre-fill with garbage so we can verify EncodeRPLSegment zeroes the tail.
+	for i := range buf {
+		buf[i] = 0xAA
+	}
+	ids := []uint64{1, 2, 3}
+	EncodeRPLSegment(buf, cfg, 5, 0, ids)
+	for i := RPLHeaderSize + len(ids)*8; i < cfg.ContentEnd(); i++ {
+		if buf[i] != 0 {
+			t.Fatalf("tail byte %d not zeroed: %x", i, buf[i])
 		}
 	}
 }
 
-func TestRPLSegmentFull(t *testing.T) {
-	cfg := PageConfig{PageSize: 4096, PageChecksum: false}
+func TestRPLSegmentOverflowPanics(t *testing.T) {
+	cfg := Config{PageSize: 4096, PageChecksum: true}
 	buf := make([]byte, cfg.PageSize)
-
-	b := NewRPLSegmentBuilder(buf, cfg)
-	b.SetTxnID(1)
-
-	cap := b.Capacity()
-	if cap != 508 {
-		t.Fatalf("Capacity = %d, want 508", cap)
-	}
-
-	for i := range cap {
-		if !b.AddPageID(uint64(i + 100)) {
-			t.Fatalf("AddPageID failed at %d", i)
+	tooMany := make([]uint64, RPLEntriesPerSegment(cfg)+1)
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on overflow")
 		}
-	}
-	// One more should fail.
-	if b.AddPageID(9999) {
-		t.Fatal("AddPageID succeeded past capacity")
-	}
-
-	if b.Count() != 508 {
-		t.Errorf("Count() = %d, want 508", b.Count())
-	}
+	}()
+	EncodeRPLSegment(buf, cfg, 1, 0, tooMany)
 }

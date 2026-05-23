@@ -51,38 +51,31 @@ the future installed base requires.
 
 ## Codebase layout
 
-All code lives in a single `gmdb` package (flat, no sub-packages —
-avoids circular dependency issues between tightly-coupled
-components and keeps the public API to one import path).
-Organized by file:
+The root `gmdb` package is the **public API surface**. Implementation
+lives under `internal/<subsystem>/` sub-packages, kept narrow enough
+to avoid circular dependencies between tightly coupled subsystems.
+This trades the flat-file layout's single-import simplicity (still
+preserved at the public surface) for clearer internal seams and
+package-level testability.
 
-| File | Responsibility |
+| Path | Responsibility |
 |------|---------------|
-| `page.go` | Page header encode/decode (8-byte header: Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID). xxhash64 footer (compute on write, verify on read) when PageChecksum enabled. Meta page encode/decode/validate (including file format fields, bitmap/RPL pointers, Flags). RPL segment encode/decode. |
-| `branch.go` | Branch page format, cell directory binary search, prefix-truncated separator computation, insert, split. |
-| `leaf.go` | Prefix-compressed leaf format with per-page `RestartInterval`, restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Compressed-leaf splice operations (`tryInsertAtCompressed`, `tryDeleteAtCompressed`) for hot-path in-place edits without full decode+re-encode. Overflow references in both restart and delta entry formats. |
-| `subpage.go` | Set keyspace subpage encode/decode (uncompressed inline list, variable or fixed-value-size). |
-| `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. Set keyspace bulk free: recursive subtree retirement for nested B+trees. Set keyspace operations: subpage management (inline sorted list), nested B+tree promotion/demotion. All operations work on page byte slices, never Go heap objects. |
-| `cursor.go` | Stateful cursor: stack of (pageID, index) pairs, key reconstruction buffer for incremental forward decoding, restart group cache for reverse traversal. SetCursor operations (key + intra-key value navigation). |
-| `iter.go` | `iter.Seq2`-based read-only iterators (`All`, `Range`, `Prefix`) for both byte-oriented and typed APIs. |
-| `bulkload.go` | Bottom-up B+tree construction from sorted input. Per-level in-progress page, direct pwrite of completed pages (slab bypass). Index sort + spill to `Options.ScratchDir`. |
-| `alloc.go` | Allocation bitmap: two-level (detail + in-memory summary) at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Pending bitmap changes (`tx.pendingAllocs`, `tx.pendingFrees`). RPL: append-only singly-linked segment chain (per-segment TxnID + PageID arrays), in-memory segment list rebuilt at Open, whole-segment reclamation. Loose page tracking (hash map). Page allocation priority: loose → bitmap → RPL reclamation → lagging reader check → file extension. Tail page refund. Commit-time update: apply pending bitmap changes via pwrite, append retired pages to RPL. |
-| `pager.go` | Single unified `Pager` type for read and write paths. `Page(id) []byte` resolves via `dirty[id]` then mmap. Writable pager owns the slab `map[uint64]*[]byte`, `dirtyBytes` accounting, `sync.Pool` of page-sized buffers, `MaxTxBufferBytes` enforcement. Read-only pager rejects mutating ops. CoW: allocate fresh page ID, copy old content into a slab buffer, mutate buffer. |
-| `commit.go` | Commit-time pwrite ordering: dirty data pages → bitmap pages → meta. Per-`SyncMode` fdatasync placement. File shrink after commit point. |
-| `fileformat.go` | File format management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetFileFormat()` (rejects `MaxSize` changes). |
-| `mmap.go` | Read-only mmap of the data file (`MAP_SHARED \| PROT_READ`). `mprotect(PROT_READ)` after open. mmap reservation sized to `MaxSize`. Platform-agnostic interface; per-platform shims in `mmap_linux.go` / `mmap_darwin.go` / `mmap_freebsd.go` only for `madvise` and `mmap` syscall differences. No platform-conditional code in the commit path. |
-| `mmap_linux.go` | Linux mmap/munmap syscalls. `MADV_POPULATE_READ` (Linux 5.14+, opt-in). `MADV_HUGEPAGE` (opt-in). `MADV_COLD` (Linux 5.4+, opt-in). |
-| `mmap_darwin.go` | macOS mmap/munmap syscalls. No `msync(MS_SYNC)` in commit path — the writer never touches the mmap. |
-| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times + PID namespace inodes + heartbeats). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime/WriterPIDNamespace/WriterHeartbeat, context-aware, zero goroutine accumulation). Stale writer recovery (namespace-aware). Reader table: hint-based scan+CAS slot acquire, atomic store release, namespace-aware stale reader detection. Heartbeat goroutine (started at Open, stopped at Close, updates active slots every ~1s). Oldest-reader query for RPL reclamation. Lagging reader detection and callback invocation. |
-| `process_linux.go` | `processStartTime(pid)`: reads `/proc/[pid]/stat` field 22. `pidNamespace()`: reads `/proc/self/ns/pid` inode via `os.Readlink`. Pure Go, no cgo. |
-| `process_darwin.go` | `processStartTime(pid)`: sysctl `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime`. |
-| `process_freebsd.go` | `processStartTime(pid)`: sysctl `KERN_PROC_PID` → `kinfo_proc.ki_start`. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, slab-based CoW (`tx.pendingAllocs`, `tx.pendingFrees`, `tx.cowPages`, `tx.loosePages`, `tx.retiredPages`), pager dirty map, commit (commit.go), rollback (release slab buffers, clear pending sets). Nested transactions: `BeginChild()` snapshots pending state and keyspace roots; child commit discards snapshot; child rollback releases child slab buffers + restores snapshot. Per-tx pooling of slab buffer pool via `sync.Pool`. Pool of `ReadTx` structs to reduce allocations on high-throughput read paths. Leak detection via `runtime.AddCleanup`. Stats accumulation. |
-| `index.go` | Index registry per keyspace (sub-B+tree at `IndexRegistryRoot`). IndexDecl validation (schema-hash computation, fingerprint compare). NUL-escape column encoding (`escape`, `unescape`, terminator append). Index write path: extractor invocation on Put/Delete, diff old/new entry sets, unique-index probes, atomic application within the parent transaction. `Index` query type: `Lookup`, `LookupKeys`, `Range`, `Prefix`, `Get`. `RebuildIndex`, `DropIndex`. Index storage as engine-internal keyspaces (`Kind = 2`). |
-| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap with read-only mapping, `mprotect`, lock file, file format, AllowSyncUnsafe validation, MaxTxBufferBytes default, RestartGroupTarget default). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: `Batch()` channel, coordinator goroutine, per-closure child transactions. Keyspace management (Open/Create variants, `DeleteKeyspace`, `SetKeyspaceConfig`, `RebuildIndex`, `DropIndex`). Keyspace name interning via `unique.Handle[string]`. Checkpoint(). Check(). CheckWithOptions(). CopyTo(). Compact(). Background maintenance goroutine (bitmap leak reclamation, stale reader cleanup, checksum scrubbing, incremental compaction; coordinated across processes via `LastMaintenanceTime` in the lock file). |
-| `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. `TypedIndex[K, V, IK]` and `TypedIndexQuery[K, V, IK]` for typed index declarations and queries. Delegates all operations to byte-oriented `Keyspace`/`Cursor`/`Index` with `Encoder` calls. |
-| `errors.go` | Sentinel error definitions. |
-| `stats.go` | DBStats, TxStats, KeyspaceStats, IndexStats types and collection. |
+| `*.go` (root `gmdb`) | Public surface only. `DB`, `Tx`, `Keyspace`, `SetKeyspace`, `Cursor`, `SetCursor`, `Open`, the typed-generics layer (`Encoder[T]`, `TypedKeyspace[K, V]`, `TypedIndex[K, V, IK]`), sentinel errors, stats types, options. Wires internal subsystems together; no algorithmic code beyond thin glue. Files: `db.go`, `tx.go`, `keyspace.go`, `cursor.go`, `iter.go`, `typed.go`, `index.go` (query API; storage lives in `internal/index`), `errors.go`, `stats.go`, `options.go`. |
+| `internal/page/*.go` | Pure byte-slice page codecs: 8-byte page header (Type/Flags/Count/AdditionalPages), meta page encode/decode/validate (incl. file-format fields, bitmap/RPL pointers, Flags), RPL segment encode/decode, branch page format with prefix-truncated separators, prefix-compressed leaf format with per-page `RestartInterval`, overflow page header, subpage (set-keyspace inline list), xxhash64 footer compute/verify. No I/O, no OS dependency. |
+| `internal/bitmap/*.go` | Allocation bitmap data structure: two-level (detail + in-memory summary), bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking, dirty-page tracking. Pure data structure — operates on `[]byte` for the detail level and `[]uint64` for the summary; no file I/O. |
+| `internal/pager/*.go` | The unified `Pager` (read + write paths), slab `map[uint64]*[]byte`, `MaxTxBufferBytes` accounting, sync.Pool of page-sized buffers, CoW (`Page(id)` resolves via slab then mmap; write path copies old content into a slab buffer). Owns the file handle, the read-only mmap (`MAP_SHARED \| PROT_READ`, `mprotect` after open, reservation sized to `MaxSize`), the freespace state (RPL append-only chain, loose-page set, tail-refund machinery, allocation priority loose → bitmap → RPL reclamation → file extension), the file-format machinery (grow/shrink via `ftruncate`), and the commit pipeline (pwrite ordering dirty data → bitmap → fdatasync → meta → fdatasync per `SyncMode`, plus file shrink after the commit point). Platform mmap/madvise shims live in build-tagged `mmap_linux.go`, `mmap_darwin.go`, `mmap_freebsd.go` siblings. Imports `internal/page`, `internal/bitmap`. |
+| `internal/btree/*.go` | B+tree algorithms over the pager: search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (merge/rebalance with configurable `MergeThreshold`, separator recomputation), range delete (boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance), cursor state machine (stack of `(pageID, index)`, key reconstruction buffer, restart-group cache for `Prev`). Set-keyspace bulk free (recursive subtree retirement) and subpage / nested-B+tree promotion/demotion at the 50% threshold. Bottom-up bulk construction (slab bypass via streaming pwrite, index sort + spill via `Options.ScratchDir`). All operations work on page byte slices, never Go heap objects. Imports `internal/page`, `internal/pager`. |
+| `internal/lock/*.go` | Lock-file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times + PID namespace inodes + heartbeats). Writer lock (single flock goroutine with intra-process writer queue + cross-process flock, context-aware, zero goroutine accumulation). Stale writer recovery (namespace-aware). Reader table (hint-based scan + CAS slot acquire, atomic-ordered store release, namespace-aware stale-reader detection, `HintEpoch` orphan anchor). Heartbeat goroutine. Oldest-reader query for RPL reclamation. Lagging-reader detection + callback. Platform process helpers (`process_linux.go`: `/proc/[pid]/stat` field 22 + `/proc/self/ns/pid` inode; `process_darwin.go` / `process_freebsd.go`: sysctl `KERN_PROC_PID`). Pure Go, no cgo. |
+| `internal/index/*.go` | Per-keyspace index registry (sub-B+tree at `IndexRegistryRoot`), `IndexDecl` validation (schema-hash computation, fingerprint compare), NUL-escape composite-key encoding (`escape`, `unescape`, terminator append), write-path atomic maintenance (extractor invocation on Put/Delete, diff old/new entry sets, unique-index probes, all within the parent transaction), `RebuildIndex`, `DropIndex`. Index storage as engine-internal keyspaces (`Kind = 2`). Query helpers (`Lookup`, `LookupKeys`, `Range`, `Prefix`, `Get`) — the public `Index` type in the root package wraps these. Imports `internal/btree`, `internal/pager`, `internal/page`. |
+
+**Boundary discipline.** Sub-packages depend strictly downward
+(`btree → pager → bitmap`, `btree → page`, `pager → page`,
+`pager → bitmap`, `index → btree`); no upward or sibling imports.
+The root package imports any internal sub-package. If a chunk's
+adversarial review surfaces a forced upward / sibling import, that
+is the seam to redraw — file a spec-amend candidate rather than
+introducing an interface to "break the cycle" inside the layout
+the plan committed to.
 
 ## Coding conventions
 
@@ -141,11 +134,18 @@ Primary specs: `pager-slab.md`, `file-layout.md`,
 `free-space.md`, `mmap-strategy.md`, `checksums.md`,
 `durability.md`, `file-format.md`, `limits.md`.
 
-Primary files: `page.go`, `pager.go`, `commit.go`, `alloc.go`,
-`fileformat.go`, `mmap.go`, `mmap_linux.go`, `mmap_darwin.go`.
+Primary paths: `internal/page/`, `internal/bitmap/`,
+`internal/pager/` (incl. its build-tagged mmap shims). Root
+package gains the minimum `Open`/`Close` glue + a write-tx
+end-to-end harness needed to exercise the commit pipeline.
 
 Sub-chunks `1.1` (planning + invariant triage) and final
 close-out are fixed; intermediate sub-chunks filled lazily.
+
+Other chunks' "Primary files" lines still use the original
+flat-layout names; they are updated at each chunk's own `N.1`
+planning gate (per the workflow) rather than rewritten en masse
+now.
 
 ### Chunk 2 — Lock file + cross-process write lock
 
