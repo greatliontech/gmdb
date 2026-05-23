@@ -290,29 +290,50 @@ func (t *TypedSetKS[K, V]) Prefix(prefix K) iter.Seq2[K, V]
 
 ### Keyspace Descriptor (On-Disk)
 
-The keyspace B+tree stores a descriptor per keyspace. The finalized
-descriptor layout (defined in the main design doc):
+The keyspace B+tree stores a descriptor per keyspace. The canonical
+layout is defined in the main design doc (Keyspaces → Keyspace
+Descriptor); reproduced here for cross-reference:
 
 ```
-Keyspace Descriptor (32 bytes)
-+----------+----------+----------+----------------+----------+----------+
-| Root     | Count    | Kind     | FixedValueSize | NextSeq  | Reserved |
-| uint64   | uint64   | uint8    | uint16         | uint64   | [5]byte  |
-+----------+----------+----------+----------------+----------+----------+
+Keyspace Descriptor (40 bytes)
++----------+----------+----------+----------------+----------+--------------+--------------------+----------+
+| Root     | Count    | Kind     | FixedValueSize | NextSeq  | RestartGroup | IndexRegistryRoot  | Reserved |
+| uint64   | uint64   | uint8    | uint16         | uint64   | uint16       | uint64             | [3]byte  |
++----------+----------+----------+----------------+----------+--------------+--------------------+----------+
 ```
 
-- **Kind**: `0` = Keyspace, `1` = SetKeyspace. `Open()` rejects unknown
-  values.
+- **Kind**: `0` = Keyspace, `1` = SetKeyspace, `2` = engine-internal
+  index keyspace (not openable via the user API). `Open()` rejects
+  unknown values.
 - **FixedValueSize**: Only meaningful when `Kind == 1` and non-zero.
-  Zero means variable-size values. Must be 0 when Kind=0.
+  Zero means variable-size values. Must be 0 when `Kind == 0`.
 - **NextSeq**: Per-keyspace sequence counter for `NextSequence()`.
   Available on both Keyspace and SetKeyspace.
-- **Reserved**: Must be zero. Reserved for future fields.
+- **RestartGroupTarget**: Per-keyspace target for the leaf
+  prefix-compression restart interval. 0 ⇒ engine default (16). Tune
+  per keyspace via `Tx.SetKeyspaceConfig()`. New value applies to
+  leaves written after the change; existing leaves keep their stored
+  `RestartInterval` until they next split or are rewritten.
+- **IndexRegistryRoot**: Page ID of this keyspace's per-keyspace
+  secondary-index registry sub-tree. 0 ⇒ no indexes declared. See the
+  main design doc → Indexing → Storage Layout for the registry-entry
+  format.
+- **Reserved**: 3 bytes. Must be zero. `Open()` rejects descriptors
+  with non-zero reserved bytes.
 
 `Kind` replaces the old `Flags` uint16 field. This eliminates the
 `ErrIncompatibleFlags` error — opening a `Keyspace` as a `SetKeyspace`
 (or vice versa) is a type mismatch detected by comparing `Kind`,
 reported as `ErrKeyspaceKindMismatch`.
+
+**SetKeyspace and secondary indexes are independent.** A SetKeyspace
+can carry declared secondary indexes via the same `IndexRegistryRoot`
+mechanism — the extractor signature is the same `func(key, value)
+[]IndexEntry`, invoked **per (key, value) set member** rather than
+per top-level key. The "primary key" embedded in non-unique index
+entries is the (key, value) pair encoded as `escape(key) || 0x00 0x00
+|| escape(value)`. See the main design doc → Indexing → Indexes on
+SetKeyspaces.
 
 ### Error Changes
 
@@ -344,13 +365,13 @@ demotion) remain unchanged — only the user-facing terminology changes.
 The on-disk page format is identical. The split is purely at the API level:
 
 - `SetKeyspace` uses the same subpage and nested B+tree storage as
-  the current DUPSORT implementation.
+  the original DUPSORT implementation.
 - `FixedValueSize` maps to the same flat-array subpage optimization.
 - `CellFlags` bits are renamed (`MultiValue`, `NestedTree`) but the
   bit positions and semantics are unchanged.
-- The keyspace descriptor layout is updated (32 bytes with `Kind`,
-  `FixedValueSize`, `NextSeq`, and reserved bytes) but the page format
-  for data pages is unchanged.
+- The keyspace descriptor layout is updated to 40 bytes
+  (`RestartGroupTarget` and `IndexRegistryRoot` added; reserved bytes
+  reduced from 5 to 3) but the page format for data pages is unchanged.
 
 ### Delete Semantics
 

@@ -2,63 +2,76 @@
 
 A memory-mapped, multi-process, embedded key-value database for Go.
 
-**Minimum Go version: 1.24.** gmdb uses `runtime.AddCleanup` (Go 1.24), `structs.HostLayout` (Go 1.24), `os.OpenRoot` (Go 1.24), `testing/synctest` (Go 1.24), `unique.Make` (Go 1.23), `cmp.Or` (Go 1.22), and `iter.Seq2` (Go 1.23).
+gmdb targets two concrete consumers: metadata stores for filesystem-like
+systems (gitfs replacing SQLite) and document stores for read-heavy
+multi-daemon services (notes shared across LLM sessions over MCP). Both
+are read-dominated with intermittent small writes from multiple processes,
+need atomic cross-keyspace commits, and benefit from declarative
+secondary indexes maintained by the engine.
+
+**Minimum Go version: 1.24.** gmdb uses `runtime.AddCleanup` (Go 1.24),
+`structs.HostLayout` (Go 1.24), `os.OpenRoot` (Go 1.24), `testing/synctest`
+(Go 1.24), `unique.Make` (Go 1.23), `cmp.Or` (Go 1.22), and `iter.Seq2`
+(Go 1.23).
 
 ## Design Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
 | Data structure | B+tree on fixed-size pages | Only viable option for multi-process mmap |
-| Concurrency | Single writer + N readers (MVCC/CoW) | Proven (LMDB), readers never block writer |
+| Concurrency | Single writer + N readers (MVCC/CoW) | Proven (LMDB); readers never block writer; cross-process per-keyspace concurrent writers (grove model) incompatible with single shared meta root |
+| Mmap mode | `MAP_SHARED \| PROT_READ` for every process (writer included), `mprotect(PROT_READ)` after Open | Read-only mmap eliminates stray-pointer corruption of the data file; one commit path across OSes; no macOS `msync(MS_SYNC)` special case |
+| Write path | Pager + slab: read through mmap, copy into slab buffer on first modify, pwrite at commit | Reuses existing Linux/macOS pwrite + fdatasync semantics uniformly; bounded per-txn memory via `MaxTxBufferBytes`; bulk operations bypass the slab via streaming pwrites |
 | File layout | Fixed-size pages (4KB–64KB, configurable, immutable after creation) | Matches OS page size, mmap-friendly |
 | Page header | 8 bytes (Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID) | PageID is redundant (computable from file offset); Type/Flags split reserves 8 flag bits for future per-page metadata at zero cost |
 | Value storage | Inline + overflow pages | Simple single read path, overflow for large values |
-| Multiple values per key | Set keyspace with subpage + nested B+tree | Subpage for small sets, nested B+tree for large; fixed-size values for fixed-size optimization |
+| Multiple values per key | Set keyspace with subpage + nested B+tree | First-class data primitive for set-shaped data (graph adjacency, postings lists, ZSET-shaped storage). **Not the indexing mechanism** — secondary indexes use composite-key plain keyspaces |
+| Secondary indexes | Engine-maintained, composite-key storage, declarative extractor with persisted drift guard | Removes the manual-maintenance bug class without giving up the single-keyspace primitive; schema hash + user version tag catches drift at Open |
 | Free space | Allocation bitmap + retired page log (RPL) | O(1) alloc via bitmap, no self-referential allocation, RPL tracks MVCC retirement |
 | RPL entry format | Per-segment TxnID + array of PageIDs | TxnID stored once per segment (not per entry); doubles segment capacity |
 | File format | Dynamic grow/shrink with configurable bounds; MaxSize immutable after creation | Auto-compaction via tail refund, no manual compaction needed; MaxSize fixed because bitmap region size depends on it |
 | Isolation | Dual meta pages + CoW | No WAL needed, atomic commit |
-| Crash safety | CoW + atomic meta page swap | File is always consistent |
+| Crash safety | CoW + atomic meta page swap; lazy bitmap-leak reclamation via background maintenance | Tree is always consistent (CoW); on-disk bitmap leakage bounded by crashed txn's allocations and reclaimed by background maintenance — fast Open after crash |
 | Durability | Three sync modes (Durable, DataOnly, Lazy) + unsafe opt-in Unsafe | Configurable ACID vs. performance; SyncUnsafe requires explicit `AllowSyncUnsafe` flag |
-| Cross-process | Shared memory lock file (`structs.HostLayout` structs, uint64 PIDs + process start times) | C ABI layout guarantee for mmap'd structs; fixed-size reader table (scan+CAS), stale writer/reader recovery via PID liveness + start time comparison (PID reuse safe); uint64 PIDs for forward safety |
+| Cross-process | Shared memory lock file (`structs.HostLayout` structs, uint64 PIDs + process start times + PID namespace inodes + heartbeats) | C ABI layout guarantee for mmap'd structs; fixed-size reader table (scan+CAS); stale writer/reader recovery via PID liveness + start time comparison; cross-namespace via heartbeat |
 | Write lock | Intra-process writer queue (channel) + single flock goroutine (cross-process) | Context-aware blocking; zero goroutine accumulation on cancellation; flock alone doesn't block same-process goroutines |
+| Lock ordering | Documented globally (lifecycle → registry → per-keyspace → commit → bitmap) | Prevents deadlock; mandatory acquisition order for all internal mutex paths |
 | Lagging readers | Callback-based notification | Application controls policy; no silent unbounded growth |
-| mmap | Read-write mmap (`MAP_SHARED \| PROT_READ \| PROT_WRITE`) | Single write mode; CoW to fresh pages in mmap; bitmap/meta via pwrite for ordered commits |
-| Huge pages | `MADV_HUGEPAGE` (opt-in, Linux) | Reduces TLB pressure for large databases; transparent huge pages for file-backed mmap |
-| CoW page tracking | Hash map (`map[uint64]struct{}`) of CoW'd page IDs | O(1) insert/lookup; `pendingAllocs`/`pendingFrees` track bitmap changes; commit writes only bitmap + meta via pwrite |
 | Branch keys | Prefix-truncated separators | Shortest distinguishing prefix; maximizes fan-out; shallower trees; full keys in leaves only |
+| Leaf compression | Prefix-compressed restart groups; per-keyspace `RestartGroupTarget` | Density gains for shared-prefix workloads (directory listings, composite keys); per-keyspace tuning lets each keyspace pick its own restart interval |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
-| Checksums | Meta: xxhash64 (always); Data: CRC32C footer (optional) | Meta checksum detects torn commits; optional data checksum catches silent bitrot |
-| API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime; `context.Cause(ctx)` preserves cancellation reasons from `WithCancelCause` |
+| Checksums | Unified xxhash64 footer (8 bytes) on meta and data pages; on by default | One hash family across the file; software-fast (benchmark-favored over CRC32C); defense against silent bitrot on commodity filesystems |
+| API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime; `context.Cause(ctx)` preserves cancellation reasons |
 | Iteration | Cursor (stateful, bidirectional, mutable) + `iter.Seq2` (read-only, composable) | Cursor for mutation and bidirectional movement; `iter.Seq2` for idiomatic `for range` loops |
-| Write batching | Channel-based `Batch()` API with nested transactions | Amortizes commit cost (fdatasync) across concurrent callers; each closure runs in a child transaction — no rollback+retry, closures execute exactly once |
-| Nested transactions | Child transactions with snapshot-and-restore | In-memory only (no disk I/O); CoW to fresh pages means child rollback is just discarding bookkeeping; enables `Batch()` without idempotency requirement |
+| Bulk insert | `BulkLoad` API (sorted-input bottom-up tree construction; streaming pwrite, bypasses slab) | Fast SQLite→gmdb migration in gitfs, initial import in notes; bounded memory regardless of input size |
+| Write batching | Channel-based `Batch()` API with nested transactions | Amortizes commit cost (fdatasync) across concurrent callers in one process; each closure runs in a child transaction — no rollback+retry, closures execute exactly once |
+| Nested transactions | Child transactions snapshot pending maps and keyspace roots; CoW-to-fresh-slab-buffer | Rollback drops child's slab buffers and returns page IDs — same simplicity as a hypothetical "CoW to fresh mmap position" model, achieved with the pager/slab |
 | Leak detection | `runtime.AddCleanup` on `Tx` and `DB` | Detects leaked transactions (releases reader slots) and leaked DB handles (releases mmap, fds, flock goroutine); logs origin stack trace |
-| Range delete | Subtree retirement via `DeleteRange` | O(pages) not O(entries); bulk-free for set keyspace nested B+trees |
-| Commit I/O | pwrite (bitmap + meta pages only) + fdatasync | Data pages are already in the mmap; only bitmap and meta need ordered writes; typically 2-5 pwrite calls per commit |
+| Range delete | Subtree retirement via `DeleteRange` (per-row walk fallback for indexed keyspaces) | O(pages) on un-indexed keyspaces; O(entries × indexes) on indexed keyspaces (engine must compute prior-index-keys per row before retiring entries) |
+| Commit I/O | pwrite (dirty data pages + bitmap pages + meta) + fdatasync | Slab buffers flushed at commit in defined order; one commit path across OSes |
 | Prefaulting | `MADV_POPULATE_READ` at open (opt-in, Linux 5.14+) | Eliminates first-access page faults; sequential kernel readahead; silent no-op on older kernels |
-| Read txn cooldown | `MADV_COLD` on close (opt-in, Linux 5.4+) | Hints kernel to reclaim page cache after large scans; reduces memory pressure |
-| Typed keyspaces | Generic `TypedKeyspace[K, V]` with `Encoder[T]` interface | Zero-cost type-safe API over byte-oriented Keyspace; append-style `AppendEncode(dst, v) ([]byte, error)` enables buffer reuse and surfaces encode/decode failures; interface enables stateful encoders and buffer pooling |
+| Huge pages | `MADV_HUGEPAGE` (opt-in, Linux) | Reduces TLB pressure for large databases |
+| Read txn cooldown | `MADV_COLD` on close (opt-in, Linux 5.4+) | Hints kernel to reclaim page cache after large scans |
+| Typed keyspaces | Generic `TypedKeyspace[K, V]` with `Encoder[T]` interface; `TypedIndex[K, V, IK]` follow-on | Zero-cost type-safe API over byte-oriented Keyspace; index extractors as `func(K, V) []IK` |
 | Keyspace names | `unique.Handle[string]` interning | Avoids repeated allocations for frequently opened keyspace names across transactions |
-| Integrity check | `Check() iter.Seq[CheckIssue]` with `CheckFatal` severity | All results (issues + walk failures) are uniform `CheckIssue` values; streaming via `iter.Seq`; `slices.Collect` for batch use; `break` for early abort |
-| Byte slice ownership | Borrowed references: values valid until tx close, keys valid until next cursor op | Zero-copy from mmap; prefix compression requires key reconstruction buffer (reused per cursor movement); same contract as LMDB/libmdbx/BoltDB |
-| Nil/empty semantics | Nil/empty keys invalid; nil values treated as empty; nil return = not found or end-of-iteration | Catches bugs at API boundary; empty values enable set-of-keys pattern; unambiguous nil semantics |
-| Namespaces | Named keyspaces (separate Open/Create API) | Multiple B+trees in one file; clear creation vs. opening semantics |
-| Block compression | Not supported (explicit decision) | Incompatible with mmap zero-copy read path; would require a decompression buffer pool, cache management, and eviction — fundamentally changing the architecture; key-level prefix compression provides density gains within the mmap model |
-| TTL / Expiry | Not supported (explicit decision) | Adds per-cell overhead or a shadow index for a use case (caches, sessions) that gmdb doesn't target; users can implement TTL with a separate expiry keyspace and periodic cleanup using existing primitives |
-| Named snapshots | Not supported (explicit decision) | Requires preserving historical meta roots and pinning TxnIDs (permanently blocking RPL reclamation); dual meta pages don't preserve old roots past two commits; `CopyTo()` covers the backup use case without ongoing space cost |
-| Merge operators | Not supported (explicit decision) | LSM optimization (defer reads during writes); B+tree read and write paths traverse the same pages — no asymmetry to exploit; `Get` + `Put` does the same work |
-| Sequences | `NextSeq uint64` in keyspace descriptor | Per-keyspace auto-incrementing counter; eliminates the need for a separate SeqKeyspace type — sequential-key workloads use a regular Keyspace with `NextSequence()` + big-endian uint64 keys (prefix compression makes the density gap negligible) |
-| Per-keyspace page sizes | Not supported (explicit decision) | Requires either multi-block nodes in a shared bitmap (adds keyspace context to every page operation, non-uniform CoW tracking) or per-keyspace files (breaks cross-keyspace atomic commit); single file with uniform page size is a core design strength |
-| Encryption at rest | Not supported (explicit decision) | Same mmap conflict as compression — encrypted pages can't be read in place, requires decryption buffer pool; LMDB and libmdbx also omit encryption for this reason; filesystem-level encryption (LUKS, FileVault, dm-crypt) covers the primary threat model transparently |
-| Background maintenance | Periodic goroutine: bitmap leak reclamation, stale reader cleanup, checksum scrubbing, incremental compaction | Avoids accumulating issues that require offline intervention; coordinated across processes via lock file timestamp; one pass per interval regardless of process count |
+| Integrity check | `Check() iter.Seq[CheckIssue]` with `CheckFatal` severity; opt-in `CheckIndexes` mode | Streaming `iter.Seq`; index-content verification is opt-in because it re-runs every extractor (O(rows × indexes)) |
+| Byte slice ownership | Borrowed references: values valid until tx close, keys valid until next cursor op | Zero-copy from mmap; prefix compression requires key reconstruction buffer (reused per cursor movement) |
+| Nil/empty semantics | Nil/empty keys invalid; nil values treated as empty; nil return = not found or end-of-iteration | Catches bugs at API boundary; empty values enable set-of-keys pattern |
+| Block compression | Not supported (explicit decision) | Incompatible with mmap zero-copy read path; key-level prefix compression provides density gains within the mmap model |
+| TTL / Expiry | Not supported (explicit decision) | Adds per-cell overhead for a use case (caches, sessions) gmdb doesn't target; users can implement TTL with a separate expiry keyspace |
+| Named snapshots | Not supported (explicit decision) | Requires preserving historical meta roots; `CopyTo()` covers the backup use case |
+| Merge operators | Not supported (explicit decision) | LSM optimization; B+tree read and write paths traverse the same pages |
+| Sequences | `NextSeq uint64` in keyspace descriptor | Per-keyspace auto-incrementing counter |
+| Per-keyspace page sizes | Not supported (explicit decision) | Single file with uniform page size is a core design strength |
+| Encryption at rest | Not supported (explicit decision) | Mmap conflict; filesystem-level encryption (LUKS, FileVault, dm-crypt) covers the threat model transparently |
+| Background maintenance | Periodic goroutine: bitmap leak reclamation, stale reader cleanup, checksum scrubbing, incremental compaction | Avoids accumulating issues that require offline intervention; coordinated across processes via lock file timestamp |
 
 ## File Layout
 
-The database is a single file, divided into fixed-size pages. All pages are the
-same size (configurable at creation time, immutable after). Supported page sizes
-are powers of 2 from 4KB to 64KB. Default: 4096 bytes (OS page size).
+The database is a single file, divided into fixed-size pages. All pages are
+the same size (configurable at creation time, immutable after). Supported
+page sizes are powers of 2 from 4KB to 64KB. Default: 4096 bytes.
 
 All multi-byte integers are stored in little-endian byte order.
 
@@ -77,46 +90,38 @@ the bitmap region. See Allocation Bitmap for details.
 
 ### Page Types
 
-Every page starts with a common header:
+Every page starts with a common 8-byte header:
 
 ```
 Page Header (8 bytes)
-+----------+----------+----------+----------+
++----------+----------+----------+-----------------+
 | Type     | Flags    | Count    | AdditionalPages |
 | uint8    | uint8    | uint16   | uint32          |
-+----------+----------+----------+----------+
++----------+----------+----------+-----------------+
 ```
 
 - **Type** (uint8): One of: Branch, Leaf, Overflow, RPLSegment.
-  Meta pages and bitmap pages do not carry the page header — meta pages
-  have their own layout (see Meta Page) and bitmap pages are raw bitfield
-  data (see Allocation Bitmap). RPLSegment pages are the retired page
-  log (see Free Space Management).
+  Meta pages and bitmap pages do not carry the page header.
 - **Flags** (uint8): Reserved for future per-page flags. Must be zero.
   Readers must reject pages with unknown flags set.
-- **Count** (uint16): Number of items (keys in branch, key/value pairs in
-  leaf, entries in RPL segment).
-- **AdditionalPages** (uint32): Number of contiguous overflow pages following this
-  one (0 for single-page nodes).
+- **Count** (uint16): Number of items.
+- **AdditionalPages** (uint32): Number of contiguous overflow pages
+  following this one (0 for single-page nodes).
 
-The page header does not contain a PageID field. A page's ID is implicit —
-computable from its file offset (`offset / PageSize`). This avoids wasting
-8 bytes per page on redundant information and eliminates any possibility of
-inconsistency between the stored PageID and the actual file position.
-`Check()` verifies page type and structural validity at each offset; no
-stored PageID is needed for integrity checking.
+A page's ID is implicit — computable from its file offset
+(`offset / PageSize`). This avoids wasting 8 bytes per page on redundant
+information and eliminates any possibility of inconsistency between the
+stored PageID and the actual file position. `Check()` verifies page type
+and structural validity at each offset; no stored PageID is needed.
 
-When `Options.PageChecksum` is enabled, every data page (branch, leaf,
-overflow, RPL segment) also carries a 4-byte CRC32C footer in the last 4
-bytes of the page. See Checksums for details.
+When page checksums are enabled (the default), every data page (branch,
+leaf, overflow, RPL segment) carries an 8-byte xxhash64 footer in the
+last 8 bytes of the page. See Checksums for details.
 
 #### Meta Page
 
-Two meta pages occupy pages 0 and 1. They alternate — the writer always
-updates the one NOT currently active. Meta pages do not carry the standard
-page header — their position is fixed (byte 0 and byte PageSize), so the
-Type field is redundant, and Count/AdditionalPages are meaningless for metadata.
-The meta layout starts directly with Magic:
+Two meta pages occupy pages 0 and 1. The writer always updates the one
+NOT currently active. Meta pages do not carry the standard page header.
 
 ```
 Meta Page
@@ -124,15 +129,15 @@ Meta Page
 | Magic            | uint32 - identifies file as gmdb
 | Version          | uint32 - format version
 | PageSize         | uint32 - page size in bytes
-| Flags            | uint32 - bit 0: PageChecksum (immutable); bit 1: Checkpoint (mutable); bits 2-31: reserved (must be zero)
+| Flags            | uint32 - bit 0: PageChecksum (immutable); bit 1: Checkpoint (mutable); bits 2-31: reserved
 | BitmapPages      | uint32 - number of pages in the allocation bitmap
-| Padding          | 4 bytes - alignment
+| Padding          | 4 bytes
 | UUID             | [16]byte - database identity, generated at creation, immutable
 | MinSize          | uint64 - minimum database size in pages
 | MaxSize          | uint64 - maximum database size in pages
 | GrowStep         | uint64 - growth step in pages
 | ShrinkThreshold  | uint64 - shrink threshold in pages
-| HighWaterMark    | uint64 - first unallocated page ID (high-water mark)
+| HighWaterMark    | uint64 - first unallocated page ID
 | RPLHeadPage      | uint64 - page ID of the newest RPL segment (0 = empty)
 | RPLTailPage      | uint64 - page ID of the oldest RPL segment (0 = empty)
 | RPLEntryCount    | uint64 - total entries across all RPL segments
@@ -140,37 +145,29 @@ Meta Page
 | KeyspaceRoot     | uint64 - root page of keyspace B+tree
 | NumKeyspaces     | uint64 - number of keyspaces
 | TxnID            | uint64 - transaction ID that wrote this meta
-| Checksum         | uint64 - xxhash64 of all preceding bytes (Magic through TxnID)
+| Checksum         | uint64 - xxhash64 of all preceding bytes
 +------------------+
 ```
 
-Total meta page payload: 4×4 (Magic, Version, PageSize, Flags) +
-4 (BitmapPages) + 4 (padding) + 16 (UUID) + 13×8 (uint64 fields
-including Checksum) = 144 bytes. Fits comfortably in any supported
-page size (min 4KB).
+Total meta page payload: 4×4 + 4 + 4 + 16 + 13×8 = 144 bytes. Fits
+comfortably in any supported page size (min 4KB).
 
-`UUID` is a 128-bit random identifier generated at database creation time
-and copied identically to both meta pages. It uniquely identifies this
-database instance — useful for backup validation ("is this backup from
-the same database?") and lock file association ("does this lock file
-belong to this data file?"). Immutable after creation.
+`UUID` is a 128-bit random identifier generated at database creation
+time and copied identically to both meta pages. Useful for backup
+validation and lock file association. Immutable after creation.
 
 `Flags` policy: `Open()` must reject databases where any unknown flag
-bit is set (bits 2-31 in the current version). This prevents old code
-from silently ignoring features it does not understand, which could
-lead to data corruption. Bit 0 (PageChecksum) is immutable — set at
-creation, never changes. Bit 1 (Checkpoint) is mutable — set/cleared per
-commit depending on whether the commit's data pages have been confirmed
-on stable storage.
+bit is set. Bit 0 (PageChecksum) is immutable. Bit 1 (Checkpoint) is
+mutable — set/cleared per commit depending on whether the commit's data
+pages have been confirmed on stable storage.
 
 The file format fields (`MinSize`, `MaxSize`, `GrowStep`,
-`ShrinkThreshold`) are stored in the meta page so that they persist across
-opens and are available to all processes (see File Format).
+`ShrinkThreshold`) persist across opens.
 
-The active meta page is the one with the highest TxnID whose checksum is valid.
-If a crash happens mid-write to the meta page, the checksum will be invalid and
-the database falls back to the other meta page — which points to the previous
-consistent state.
+The active meta page is the one with the highest TxnID whose checksum
+is valid. If a crash happens mid-write to the meta page, the checksum
+will be invalid and the database falls back to the other meta page —
+which points to the previous consistent state.
 
 #### Branch Page (Internal B+tree Node)
 
@@ -204,113 +201,77 @@ Branch Cell
 +----------+----------+
 ```
 
-Keys are stored in sorted order. For a branch with N cells (N keys), there are
-N+1 child pointers: `Ptr[0]` (leftmost, stored after the page header) plus one
-`ChildPtr` per cell.
+Keys are stored in sorted order. For a branch with N cells (N keys), there
+are N+1 child pointers: `Ptr[0]` (leftmost, stored after the page header)
+plus one `ChildPtr` per cell.
 
 Search algorithm: binary search the cell directory to find the first
-separator `Key[i]` where `target < Key[i]` (i.e., the first separator
-greater than the target). If found, descend to the child to the left of
-that separator — `ChildPtr` of cell `i-1`, or `Ptr[0]` if `i == 0`. If
-no separator is greater than the target (`target >= all keys`), descend
-to the last cell's `ChildPtr` (rightmost child). Note: when
-`target == Key[i]`, the target belongs in the right child (since
-separators are lower bounds of the right child), so the search correctly
-continues past that separator.
+separator `Key[i]` where `target < Key[i]`. If found, descend to the
+child to the left of that separator — `ChildPtr` of cell `i-1`, or
+`Ptr[0]` if `i == 0`. If no separator is greater than the target,
+descend to the last cell's `ChildPtr` (rightmost child). When
+`target == Key[i]`, the target belongs in the right child since
+separators are lower bounds of the right child.
 
-The cell directory stores `(Offset, KeyLen)` per cell, enabling binary search
-over variable-length keys without parsing the key data area.
+The cell directory stores `(Offset, KeyLen)` per cell, enabling binary
+search over variable-length keys without parsing the key data area.
 
 ##### Prefix-Truncated Branch Keys
 
-Branch pages store **prefix-truncated separator keys** — the shortest byte
-string that distinguishes the left subtree from the right — rather than
-full keys copied from leaf pages. A branch separator must satisfy:
+Branch pages store **prefix-truncated separator keys** — the shortest
+byte string that distinguishes the left subtree from the right — rather
+than full keys copied from leaf pages. A branch separator must satisfy:
 
 - Every key in the left child compares **strictly less than** the separator.
 - Every key in the right child compares **greater than or equal to** the separator.
 
 Equivalently: `max(left) < separator <= min(right)`. The separator is a
-lower bound of the right child. This convention matches the descent
-algorithm: find the first separator where `target < sep` and descend to
-that child (so `target == sep` descends right, which is correct since
-the separator is the right child's lower bound).
+lower bound of the right child.
 
 For example, if the left child's largest key is `"user:alice:profile"`
 and the right child's smallest key is `"user:bob:settings"`, the
 separator stored in the branch is `"user:b"` (7 bytes) instead of
-the full key (20 bytes). The separator is the common prefix of the two
-boundary keys extended by one byte from the right key at the divergence
-point — always a prefix of the right child's first key (see Separator
-computation below).
+the full key (20 bytes).
 
 **Benefits:**
 - **Higher fan-out**: smaller keys → more separators per branch page →
-  wider tree. For workloads with long keys sharing common prefixes
-  (URLs, file paths, composite keys like `tenant:user:resource`), a
-  200-byte key might compress to 10–20 bytes in the branch, increasing
-  fan-out by 10–20x.
+  wider tree.
 - **Shallower trees**: higher fan-out → fewer levels → fewer page
-  accesses per lookup. A tree that would be depth 4 with full keys
-  might be depth 3 with truncated keys.
+  accesses per lookup.
 - **Reduced I/O**: less data read per branch page traversal.
 
-**Separator computation:**
+**Separator computation** at leaf split: let `L` = the last key of the
+left leaf, `R` = the first key of the right leaf. Compute the shortest
+byte string `S` such that `L < S <= R` — the common prefix of `L` and
+`R`, extended by one byte from `R` at the first divergence position:
+`S = R[0 : len(commonPrefix) + 1]`. Insert `S` (not `R`) into the
+parent branch page.
 
-At **leaf split** time, when a leaf page overflows and is split into
-two halves:
-1. Let `L` = the last key of the left leaf (the split point).
-2. Let `R` = the first key of the right leaf.
-3. Compute the shortest byte string `S` such that `L < S <= R`.
-   This is the common prefix of `L` and `R`, extended by one byte
-   from `R` at the first divergence position: `S = R[0 : len(commonPrefix) + 1]`.
-   `S` is always a prefix of `R`, guaranteeing `S <= R`. Since `L`
-   either diverges at a lower byte value or is a proper prefix of `R`,
-   `L < S` holds.
-4. Insert `S` (not `R`) into the parent branch page.
+At merge time, the separator is removed from the parent. At redistribute
+time, the separator is recomputed from the new boundary keys and the
+parent updated.
 
-At **merge** time, when two siblings are merged:
-1. Remove the separator from the parent branch.
-2. If the merge produces a new sibling boundary, recompute the
-   separator from the new boundary keys using the same algorithm.
-
-At **redistribute** time, when keys are moved between siblings to
-balance fill ratios:
-1. Recompute the separator from the new boundary keys (last key of
-   left sibling, first key of right sibling).
-2. Replace the old separator in the parent branch.
-
-**Complementary with leaf prefix compression**: branch pages use
-prefix-truncated separators (compressing keys *across* tree levels —
-the separator is shorter than either boundary key). Leaf pages use
-prefix compression (compressing redundancy *within* a page — each key
-is stored as a delta from its neighbor). The two techniques are
-independent and complementary: branch truncation reduces tree depth,
-leaf compression increases leaf density. Cursor navigation reconstructs
-full keys from the leaf delta encoding and compares against truncated
-separators in branches; the B+tree search algorithm handles this
-naturally since branch comparisons only determine which child to
-descend into.
+**Complementary with leaf prefix compression**: branch pages compress
+keys *across* tree levels (the separator is shorter than either boundary
+key); leaf pages compress redundancy *within* a page. The two techniques
+are independent and complementary.
 
 **Interaction with maximum key size**: the maximum key size limit
-(see Limits) applies to full keys stored in leaf pages (reconstructed
-from delta encoding). Branch page separators are always shorter than or
-equal to the full keys, so they never exceed the limit.
+applies to full keys stored in leaves (reconstructed from delta
+encoding). Branch separators are always shorter than or equal to the
+full keys.
 
 #### Leaf Page
 
 Leaf pages store the actual key-value pairs using **prefix compression** —
-keys that share common prefixes with their neighbors are stored as deltas
-rather than full keys. This increases leaf density significantly for
-workloads with hierarchical or composite keys (e.g., `tenant:user:resource`
-patterns).
+keys that share common prefixes with their neighbors are stored as deltas.
 
 ```
 Leaf Page
 +-----------------------+
 | Page Header (8 bytes) |
 +-----------------------+
-| RestartInterval uint16|  fixed: 16
+| RestartInterval uint16|  per-keyspace target (default 16)
 | RestartCount uint16   |  number of restart points
 +-----------------------+
 | Entry 0 (restart)     |  entries in forward order, starting at fixed offset 12
@@ -325,36 +286,37 @@ Leaf Page
 +-----------------------+
 ```
 
-Entries are stored in forward memory order starting at a fixed offset (12)
-because prefix compression requires sequential scanning — each delta entry
-reconstructs its key from the previous entry's key. The restart table is at
-the end of the page (before the optional CRC32C footer) rather than after
-the header, so that entries can be written directly as they are added without
-knowing the final restart count upfront. The reader locates the restart table
-at `contentEnd - RestartCount × 2`.
+`RestartInterval` is the target restart interval set per keyspace via
+`RestartGroupTarget` in the keyspace descriptor (see Per-Keyspace
+Configuration). Stored per page rather than read from the descriptor
+so the leaf is self-describing for `Check()` and cursor decode.
 
-Entries at positions 0, 16, 32, ... are **restart points** that store full
-keys. All other entries are **delta entries** that encode the key as a
-difference from the previous entry.
+Entries are stored in forward memory order starting at a fixed offset
+(12) because prefix compression requires sequential scanning. The
+restart table is at the end of the page (before the optional xxhash64
+footer). The reader locates the restart table at
+`contentEnd - RestartCount × 2`.
 
-Each entry carries a `CellFlags` byte in its header to distinguish cell
-formats (inline value, overflow reference, set keyspace subpage, or nested
+Entries at positions 0, RestartInterval, 2×RestartInterval, ... are
+**restart points** that store full keys. All other entries are **delta
+entries** that encode the key as a difference from the previous entry.
+
+Each entry carries a `CellFlags` byte to distinguish cell formats
+(inline value, overflow reference, set keyspace subpage, or nested
 B+tree reference).
 
 CellFlags bit layout:
 
 ```
-Bit 0:    Overflow (0 = inline value, 1 = overflow reference)
-Bit 1:    MultiValue (0 = single value, 1 = multi-value data — subpage or nested B+tree)
-Bit 2:    NestedTree (only when Bit 1 is set: 0 = subpage, 1 = nested B+tree)
+Bit 0:    Overflow    (0 = inline value, 1 = overflow reference)
+Bit 1:    MultiValue  (0 = single value, 1 = multi-value data — subpage or nested B+tree)
+Bit 2:    NestedTree  (only when Bit 1 is set: 0 = subpage, 1 = nested B+tree)
 Bits 3-7: Reserved (must be 0)
 ```
 
-Note: `Overflow` (bit 0) and `MultiValue` (bit 1) are mutually exclusive in
-practice — a cell is either a single inline value, an overflow reference, or
-a multi-value data container, never a combination.
+`Overflow` and `MultiValue` are mutually exclusive in practice.
 
-**Restart entry** (full key, at positions 0, 16, 32, ...):
+**Restart entry** (full key, at positions 0, K, 2K, …):
 
 ```
 Restart Entry (inline)
@@ -364,7 +326,7 @@ Restart Entry (inline)
 +-----------+----------+----------+-----------+-----------+
 ```
 
-**Delta entry** (between restart points):
+**Delta entry**:
 
 ```
 Delta Entry (inline)
@@ -374,20 +336,19 @@ Delta Entry (inline)
 +-----------+-----------+-------------+----------+---------------+-----------+
 ```
 
-`SharedLen` is the number of leading bytes shared with the previous entry in
-the same restart group. `UnsharedKey` contains only the bytes after the shared
-prefix. The full key is reconstructed by taking the first `SharedLen` bytes of
-the previous entry's full key and appending `UnsharedKey`.
+`SharedLen` = leading bytes shared with the previous entry in the same
+restart group. `UnsharedKey` contains only the bytes after the shared
+prefix. Full key = first `SharedLen` bytes of previous entry's full key
++ `UnsharedKey`.
 
-Delta entries cost 2 extra bytes (`SharedLen`) per entry but save `SharedLen`
-bytes of key data. The net saving per entry is `SharedLen - 2` bytes — positive
-whenever keys share more than a 2-byte prefix. For keys with no shared prefix,
-`SharedLen` is 0 and the overhead is 2 bytes per entry — negligible.
+Delta entries cost 2 extra bytes per entry but save `SharedLen` bytes of
+key data. Net saving per entry is `SharedLen - 2` bytes — positive whenever
+keys share more than a 2-byte prefix.
 
-`ValueLen` is uint32 (max ~4GB for inline values). In practice, inline values
-are limited by leaf page free space — far below 4GB. Values that exceed leaf
-page capacity are stored as overflow pages, referenced via the overflow format
-below which uses uint64 `TotalLen` for unbounded value sizes.
+`ValueLen` is uint32 (max ~4GB for inline values, bounded in practice by
+leaf page free space). Values exceeding leaf page capacity are stored as
+overflow pages, referenced via the overflow format below which uses uint64
+`TotalLen`.
 
 **Overflow reference** at a restart point (CellFlags bit 0 set):
 
@@ -409,141 +370,120 @@ Delta Overflow Reference
 +-----------+-----------+-------------+---------------+----------+----------+
 ```
 
-The reader checks `CellFlags.Overflow` to determine which format to parse:
-inline (key + ValueLen + Value) or overflow (key + OvflPage + TotalLen).
-The key portion uses the restart or delta encoding depending on position.
-
 ##### Leaf Lookup
 
-Binary search in a prefix-compressed leaf operates in two phases:
+Two-phase binary search:
 
-1. **Binary search over restart points**: the restart table stores byte
-   offsets to entries at positions 0, 16, 32, .... Each restart entry has
-   a full key, so comparison is direct. This finds the restart group
-   containing the target key. Cost: O(log R) where R = RestartCount.
+1. **Binary search over restart points** using the restart table. O(log R)
+   where R = RestartCount.
+2. **Linear scan within the restart group**, decoding delta entries until
+   the target is found or passed. O(K) where K = RestartInterval.
 
-2. **Linear scan within the restart group**: decode delta entries
-   sequentially from the restart point, reconstructing each full key,
-   until the target is found or passed. Cost: O(K) where K = RestartInterval
-   (16).
-
-Total lookup cost: O(log(n/16) + 16). For a leaf with 30 entries, this is
-~17 comparisons. For a leaf with 200 entries (high-prefix workload), this
-is ~20 comparisons. The linear scan operates on data already in L1 cache
-(the entire leaf page was fetched for the restart point binary search), so
-the per-comparison cost is a memcpy + compare on short suffixes.
+Total: O(log(n/K) + K). For a leaf with 30 entries at K=16, ~17 comparisons.
+The linear scan operates on data already in L1 cache.
 
 ##### Leaf Density
 
-The density improvement depends on the ratio of shared prefix length to
-total key length. Example with 200-byte keys sharing a 150-byte common
-prefix and 50-byte values, on a 4KB page:
+Depends on the ratio of shared prefix length to total key length.
+200-byte keys sharing a 150-byte common prefix + 50-byte values at 4KB:
 
 | Format | Bytes/entry (avg) | Entries/page | Improvement |
 |--------|-------------------|-------------|-------------|
 | Full keys | ~260 | ~15 | baseline |
 | Prefix compressed (K=16) | ~117 | ~33 | 2.2x |
 
-For short keys with minimal sharing (20-byte keys, 2-byte shared prefix),
-the improvement is negligible (~5%). The compression adapts automatically —
-high-prefix workloads benefit; random-key workloads pay only 2 bytes per
-entry overhead.
+Short low-prefix keys see ~5% improvement. Compression adapts
+automatically — high-prefix workloads benefit; random keys pay 2
+bytes/entry overhead.
 
 ##### Insert and Delete
 
 Inserting a key between two delta entries within a restart group:
 
 1. Encode the new entry as a delta against its predecessor.
-2. Recompute the successor entry's delta — its `SharedLen` is now relative
-   to the new entry instead of the old predecessor. Only this one entry's
-   encoding changes; entries beyond the successor still delta against their
-   own predecessors, which are unchanged.
-3. If the insertion shifts entry indices, restart point positions change
-   (restarts are at indices 0, K, 2K, ...). The affected restart group
-   must be re-encoded — one entry becomes a restart (full key) and one
-   becomes a delta, or vice versa. This re-encoding is confined to the
-   entries at the old and new restart boundaries.
+2. Recompute the successor entry's delta (its `SharedLen` is now
+   relative to the new entry).
+3. If insertion shifts entry indices, restart point positions may
+   change — re-encode the affected group boundaries.
 
-Deletion is symmetric: remove the entry, recompute one successor's delta,
-adjust restart boundaries if an index shifted.
+Deletion is symmetric. The restart table is rebuilt after any insert
+or delete — O(RestartCount), at most ~20 entries for a full leaf page.
 
-The restart table (array of offsets) is rebuilt after any insert or delete.
-This is O(RestartCount) — at most ~20 entries for a full leaf page.
+**Implementation guidance: compressed-leaf splice.** Hot-path insert
+and delete should splice the page in place rather than full
+decode+re-encode of all entries (the `tryInsertAtCompressed` /
+`tryDeleteAtCompressed` pattern from grove). Decoded-form fallback only
+when the splice cannot determine the layout impact locally (group
+boundary crossing).
 
 ##### Leaf Split
 
-When a leaf page overflows, it is split into two halves. Each half is
-re-encoded independently with fresh restart points starting at index 0.
-The boundary keys (last key of the left leaf, first key of the right
-leaf) are full keys reconstructed from the delta encoding. Separator
-computation for the parent branch page is unchanged — it operates on
-full keys.
+On overflow, the leaf is split into two halves. Each half is re-encoded
+independently with fresh restart points starting at index 0. Boundary
+keys (last key of left leaf, first key of right leaf) are full keys
+reconstructed from the delta encoding. Separator computation for the
+parent branch uses these full keys.
 
 ##### Cursor Key Reconstruction
 
 The cursor maintains a **key reconstruction buffer** (`cursor.keyBuf
-[]byte`) that holds the full key at the current position. On forward
-movement (`Next()`), the buffer is updated incrementally: truncate to
-`SharedLen`, append `UnsharedKey`. This is O(1) amortized.
+[]byte`) holding the full key at the current position. On forward
+movement (`Next()`), truncate to `SharedLen` and append `UnsharedKey`.
+O(1) amortized.
 
-For reverse movement (`Prev()`), incremental reconstruction is not
-possible — delta entries encode forward, not backward. The cursor
-addresses this by caching all decoded keys for the current restart group
-(**group cache**). When the cursor first enters a restart group (via
-`Seek`, `Next` crossing a group boundary, or `Prev`), all K entries in
-the group are decoded into the cache. Subsequent `Prev()` within the
-group reads from the cache in O(1). Crossing a group boundary triggers
-decoding the previous group.
-
-The group cache is a `[16][]byte` array on the cursor struct. At K=16
-and a maximum key size of ~2KB, the worst-case memory cost is ~32KB per
-cursor — acceptable for a cursor that already holds a page-ID stack for
-tree traversal. In practice, keys are much shorter and the cache is
-small.
+For reverse movement (`Prev()`), delta entries encode forward only.
+The cursor caches all decoded keys for the current restart group
+(**group cache**, `[K][]byte` array). When the cursor first enters a
+group, all K entries are decoded into the cache; subsequent `Prev()`
+within the group reads from cache in O(1). At K=16 and max key size
+~2KB, worst-case ~32KB per cursor — acceptable.
 
 #### Overflow Page
 
-Overflow pages are contiguous runs of pages that store large values. The
-first page in the run carries the standard 8-byte page header with
-`AdditionalPages` set to the number of follower pages; the remaining bytes of
-the first page are value data. Follower pages carry no header — they are
-entirely value data (minus 4 bytes for the CRC32C footer when
-`PageChecksum` is enabled). Total value capacity for a run of `1 + N`
-pages:
-`(PageSize - 8) + N * PageSize` bytes (or subtract 4 from the first page
-and from each follower when `PageChecksum` is enabled).
+Overflow pages are contiguous runs that store large values. The first
+page in the run carries the standard 8-byte page header with
+`AdditionalPages` set to the number of follower pages; the remaining
+bytes are value data. Follower pages carry no header — they are
+entirely value data (minus 8 bytes for the xxhash64 footer when page
+checksums are enabled). Total value capacity for a run of `1 + N`
+pages: `(PageSize - 8) + N * PageSize` bytes (subtract 8 per page for
+the footer when enabled).
 
-When `PageChecksum` is enabled, each page in the run carries its own
-independent CRC32C footer. The first page checksums its header + data;
-each follower checksums its data. Per-page checksums allow identifying
-which specific page in the run is corrupted.
+When checksums are enabled, each page in the run carries its own
+independent xxhash64 footer. The first page checksums its header +
+data; each follower checksums its data. Per-page footers allow
+identifying which specific page is corrupted.
 
 #### Set Keyspace Storage (Multiple Values Per Key)
 
-Set keyspaces allow multiple sorted values per key.
-Each key maps to a sorted set of values. This is the primary
-mechanism for secondary indexes (e.g., an index key mapping to a sorted set of
-primary key IDs).
+Set keyspaces allow multiple sorted values per key. Each key maps to a
+sorted set of values. This is a **general-purpose data primitive** for
+set-shaped data: graph adjacency lists, inverted-index postings lists,
+many-to-many relationships, pub/sub subscription registries,
+Redis-ZSET-shaped storage (score-prefixed members), and audit logs per
+entity.
+
+**SetKeyspace is not the secondary-index mechanism.** Secondary indexes
+use the dedicated indexing subsystem, which stores composite-key entries
+in a plain keyspace internally (see Indexing). Set keyspaces are
+exposed for data models whose natural shape is "key → set of values."
 
 ##### Storage Strategy
 
-Set keyspaces use two storage strategies based on the size of the value set:
+Two storage strategies based on value-set size:
 
-**Subpage (small value sets):** When a key's values fit within
-the leaf cell, they are stored inline as a **subpage** — a mini sorted list
-embedded directly in the cell's value area. No extra page allocation is needed.
+**Subpage (small value sets):** values fit within the leaf cell, stored
+inline as a mini sorted list. No extra page allocation.
 
-**Nested B+tree (large value sets):** When values grow too large for a
-subpage, they are promoted to a full B+tree whose root page ID is stored in
-the leaf cell. Each value in the set becomes a key in the nested
-B+tree (with empty values).
+**Nested B+tree (large value sets):** promoted to a full B+tree whose
+root page ID is stored in the leaf cell. Each value becomes a key in
+the nested B+tree (with empty values).
 
 ##### Subpage Format
 
-A subpage is stored in the leaf entry's value area. The `CellFlags.MultiValue` bit
+A subpage is stored in the leaf entry's value area. `CellFlags.MultiValue`
 is set and `CellFlags.NestedTree` is clear. The entry uses the standard
-restart/delta key encoding (see Leaf Page); the subpage replaces the value
-portion. At a restart point:
+restart/delta key encoding; the subpage replaces the value portion.
 
 ```
 SetKeyspace Subpage Entry (restart)
@@ -559,7 +499,7 @@ Subpage (embedded in cell value area):
 +----------+----------+---------+---------+-----+
 ```
 
-For **variable-size values** (standard set keyspace):
+For **variable-size values**:
 ```
 Entry (variable):
 +----------+-----------+
@@ -568,7 +508,7 @@ Entry (variable):
 +----------+-----------+
 ```
 
-For **fixed-size values** (set keyspace with fixed-size values):
+For **fixed-size values** (keyspace declared with `FixedValueSize`):
 ```
 Entry (fixed):
 +-----------+
@@ -576,44 +516,33 @@ Entry (fixed):
 +-----------+
 ```
 
-`Count` is the number of entries. `DataSize` is the total byte size of all
-entries (used to quickly compute the subpage's total size for cell allocation).
+`Count` is the number of entries. `DataSize` is the total byte size of
+all entries.
 
-Values within the subpage are stored in sorted (lexicographic) order. Lookup
-is binary search. For fixed-size value subpages, entries are a flat array — binary
-search is O(log N) with direct offset calculation (no scanning).
+Values within the subpage are stored in sorted (lexicographic) order.
+Lookup is binary search. For fixed-size subpages, entries are a flat
+array — binary search is O(log N) with direct offset calculation.
 
-Subpage entries are **not prefix-compressed**. Subpages store
-*values* for a single key, which typically do not share prefixes with each
-other (e.g., post IDs in a secondary index, user IDs in a reverse index).
-The subpage is also small by definition — it exists precisely because the
-data fits inline within a leaf cell (below the 50% promotion threshold).
-When a value set grows large enough for prefix compression to matter,
-it is promoted to a nested B+tree whose leaf pages use prefix compression
-like all other leaf pages.
+Subpage entries are **not prefix-compressed**. Subpages store *values*
+for a single key, which typically don't share prefixes by construction
+(e.g., post IDs in a postings list). The subpage is also small by
+definition (below the 50% promotion threshold).
 
 ##### Subpage Promotion Threshold
 
 A subpage is promoted to a nested B+tree when inserting a new value
-would cause the subpage to exceed **50% of the leaf page's usable space**
-(PageSize minus page header, restart metadata, and restart table overhead). This threshold
-ensures:
-- The leaf page can still hold other keys alongside the promoted cell.
-- Promotion happens before the subpage dominates the leaf page.
+would cause the subpage to exceed **50% of the leaf page's usable
+space** (PageSize minus header, restart metadata, restart table, and
+optional checksum footer).
 
 Promotion:
 1. Allocate a new leaf page for the nested B+tree.
-2. Copy all subpage entries into the new leaf page as regular key-value cells
+2. Copy all subpage entries into the new leaf page as regular cells
    (where "keys" are the values from the set and "values" are empty).
 3. Replace the subpage cell with a nested B+tree reference cell.
 4. Insert the new value into the nested B+tree.
 
 ##### Nested B+tree Reference Cell
-
-When a key's values are stored in a nested B+tree, the entry has
-`CellFlags.MultiValue` and `CellFlags.NestedTree` both set. The entry uses the
-standard restart/delta key encoding; the nested B+tree reference replaces
-the value portion. At a restart point:
 
 ```
 SetKeyspace Nested B+tree Entry (restart)
@@ -623,140 +552,106 @@ SetKeyspace Nested B+tree Entry (restart)
 +-----------+----------+-----------+----------+----------+
 ```
 
-- **Root**: Page ID of the nested B+tree's root page.
-- **Count**: Number of values in the set.
+- **Root**: Page ID of the nested B+tree's root.
+- **Count**: Number of values in the set (O(1) access).
 
-Depth (tree height) is not persisted — it is derived by reading the root
-page on first access (a leaf root means depth 1; a branch root means
-depth > 1, determined by descent). This avoids maintaining an extra field
-across promotion, demotion, split, merge, and delete operations.
-
-The nested B+tree uses the same B+tree implementation as the main keyspace,
-with one difference: its "keys" are the values from the set, and all "values" are
-empty (zero-length). The nested B+tree's leaf pages use prefix compression
-(same format as all other leaf pages), which benefits value sets with
-shared value prefixes (e.g., timestamp-keyed data). The nested B+tree's pages
-are subject to normal CoW, free space management, and page allocation.
+Depth is not persisted — derived by reading the root page on first
+access. The nested B+tree uses the same B+tree implementation as the
+main keyspace; its "keys" are the values from the set, all "values" are
+empty (zero-length). Nested-tree leaves use prefix compression like all
+other leaves.
 
 ##### Demotion
 
-When deletions reduce a nested B+tree to a single leaf page that would fit as
-a subpage (below the promotion threshold), the B+tree is demoted back to a
-subpage. The leaf page is freed (retired), and the entries are packed
-inline into the parent leaf cell.
+When deletions reduce a nested B+tree to a single leaf page that would
+fit as a subpage, the B+tree is demoted back to a subpage. The leaf
+page is freed; entries are packed inline into the parent leaf cell.
 
-When the last value for a key is deleted, the key's cell is
-removed from the parent leaf entirely — empty nested trees and empty
-subpages never exist, not even transiently within a write transaction.
+When the last value for a key is deleted, the key's cell is removed
+from the parent leaf entirely — empty nested trees and empty subpages
+never exist, not even transiently within a write transaction.
 
 ##### Fixed-Size Value Sets
 
-When a set keyspace is created with fixed-size values, all
-values must be the same fixed byte size (set at keyspace creation). This
-enables:
-- **No per-value length prefix** in subpages — entries are a flat array.
-- **Direct offset binary search** — `entry[i]` is at offset `i * valueSize`.
-- **Compact nested B+tree leaves** — no `ValueLen` field per cell.
+When a set keyspace is created with `FixedValueSize`, all values must
+be exactly that byte size. Enables:
+- No per-value length prefix in subpages (flat array).
+- Direct offset binary search (`entry[i]` at `i * valueSize`).
+- Compact nested B+tree leaves (no `ValueLen` field per cell).
 
-The fixed value size is stored in the keyspace descriptor (see Keyspaces).
-A `Put()` call with a value of the wrong size returns an error.
+A `Put()` with a value of the wrong size returns `ErrValueSizeMismatch`.
 
 ### Range Delete
 
-`Keyspace.DeleteRange(start, end)` deletes all keys in the range
-`[start, end)` in a single operation. This is significantly more efficient
-than iterating with a cursor and deleting one key at a time, because it
-can retire entire B+tree subtrees without visiting individual leaf entries.
+`Keyspace.DeleteRange(start, end)` deletes all keys in `[start, end)` in
+a single operation. **For un-indexed keyspaces**, this is significantly
+more efficient than cursor iteration because it retires entire subtrees
+without visiting individual leaves. **For indexed keyspaces**, the
+engine must compute prior-index-keys per row before retiring, so the
+operation falls back to a per-row walk — see Bulk Operations on Indexed
+Keyspaces in the Indexing section.
 
-#### Algorithm
+#### Algorithm (un-indexed keyspaces)
 
-The range delete operates in three phases:
+Three phases:
 
-**Phase 1: Find boundary paths.**
+**Phase 1: Find boundary paths.** Descend the B+tree twice to find the
+left and right boundary paths (path = stack of `(pageID, index)` pairs).
 
-Descend the B+tree twice to find:
-- The **left boundary path**: the path from root to the leaf containing
-  `start` (or the first key, if `start` is nil).
-- The **right boundary path**: the path from root to the leaf containing
-  the last key before `end` (or the last key, if `end` is nil).
+**Phase 2: Identify and retire interior subtrees.** Walk up from the
+two boundary paths to find their lowest common ancestor (LCA). At each
+level between LCA and leaves:
+- **Interior children** (between left and right boundaries) are
+  entirely within the range — their entire subtrees are retired
+  without visiting individual leaves.
+- **Boundary children** are partially within the range and must be
+  descended.
 
-Each path is a stack of `(pageID, index)` pairs — the same structure used
-by the cursor.
-
-**Phase 2: Identify and retire interior subtrees.**
-
-Walk up from the two boundary paths to find their **lowest common
-ancestor** (LCA) — the deepest branch page that contains both boundaries.
-At each level between the LCA and the leaves:
-
-- **Interior children** — child pointers in branch pages that fall
-  strictly between the left and right boundary indices — are entirely
-  within the delete range. Their entire subtrees are retired without
-  visiting individual leaves.
-- **Boundary children** — the leftmost and rightmost child at each level
-  — are partially within the range and must be descended into.
-
-Retiring a subtree: walk the branch pages of the subtree recursively. For
-each page encountered (branch or leaf), add its page ID to
-`tx.retiredPages`. For leaf pages, accumulate the entry count for the
-return value. For overflow pages referenced by leaf cells, retire the
-entire overflow run. The walk visits every page in the subtree exactly
-once — O(pages in subtree), not O(entries in subtree). Since branch pages
-fan out by hundreds of keys, the number of pages is dramatically smaller
-than the number of entries.
+Retiring a subtree: walk the branch pages recursively. For each page
+encountered, add its page ID to `tx.retiredPages`. For leaf pages,
+accumulate the entry count. For overflow pages referenced by leaf
+cells, retire the entire overflow run. The walk visits every page in
+the subtree exactly once — O(pages in subtree).
 
 **Phase 3: Clean up boundary leaves and rebalance.**
 
-- In the left boundary leaf: delete entries from `start` (or the cell
-  matching `start`) through the end of the leaf (CoW the leaf first).
-- In the right boundary leaf: delete entries from the beginning through
-  the last key before `end` (CoW the leaf first).
-- If the left and right boundaries are in the same leaf, delete the
-  entries between them.
+- In the left boundary leaf: delete entries from `start` through end of leaf.
+- In the right boundary leaf: delete entries from start through last key before `end`.
+- If both boundaries are in the same leaf, delete entries between them.
 - Retire any overflow pages referenced by deleted entries.
-- Walk up from the boundary leaves to the LCA, removing the interior
-  child pointers that were retired in Phase 2 from each branch page
-  (CoW each branch).
-- Rebalance: check fill ratios on the modified branch and leaf pages.
-  Merge or redistribute with siblings as needed, following the normal
-  `MergeThreshold` logic. The rebalance propagates upward, potentially
-  reducing tree depth if the root becomes empty.
+- Walk up from boundary leaves to LCA, removing the retired interior
+  child pointers from each branch (CoW each branch).
+- Rebalance: check fill ratios on modified branches and leaves. Merge
+  or redistribute per `MergeThreshold`.
+- **Root collapse.** If rebalance reduces the keyspace's root to a
+  single child (a branch with one child pointer and no separators),
+  retire the root and promote the surviving child to the new root —
+  update the keyspace descriptor's `Root` field. If `DeleteRange`
+  emptied the keyspace entirely, retire the root and set `Root = 0`
+  (empty keyspace). The descriptor update is part of the same write
+  transaction and propagates up through the keyspace B+tree via CoW.
 
 #### Complexity
 
 | Operation | Naive (cursor loop) | Range delete |
 |-----------|-------------------|--------------|
 | Delete N keys spanning P pages | O(N × depth) | O(P + depth²) |
-| CoW'd pages | O(N × depth) | O(depth²) — only boundary paths |
+| CoW'd pages | O(N × depth) | O(depth²) |
 | Retired pages | N leaf cells + splits | P pages (bulk) + boundary cleanup |
 
-For a range covering 1 million keys across 10,000 leaf pages in a tree of
-depth 4: naive deletion does ~4 million CoW operations; range delete walks
-~10,000 pages for retirement + ~16 CoW operations on boundary paths.
+For 1M keys across 10K leaves at depth 4: naive ~4M CoWs; range delete
+walks ~10K pages + ~16 CoWs on boundary paths.
 
 #### Set Keyspace Bulk Free
 
-When deleting a key in a set keyspace whose values are stored in a
-nested B+tree, the nested tree is freed using the same subtree retirement
-mechanism:
-
-1. Read the nested B+tree root page ID and count from the leaf cell.
-2. Walk the nested B+tree's branch pages recursively, retiring every page.
-3. Remove the key's cell from the parent leaf page.
-
-This is O(pages in nested tree), not O(values). A key with 1
-million values stored across 10,000 pages is freed by visiting ~10,000
-pages — not 1 million individual delete operations.
-
-The same bulk-free applies when `DeleteRange` encounters keys with nested
-B+trees within the range: the nested trees are retired as part of the
-subtree retirement in Phase 2, or individually for keys in boundary leaves
-in Phase 3.
+Deleting a key in a set keyspace whose values are in a nested B+tree
+frees the nested tree via the same subtree retirement: read root + count
+from the cell, walk the nested tree recursively retiring every page,
+remove the cell. O(pages in nested tree), not O(values).
 
 #### Cursor-Based Range Delete
 
-For callers who need finer control (e.g., conditional deletion, progress
-reporting), cursor-based deletion remains available:
+For callers needing finer control:
 
 ```go
 c := ks.Cursor()
@@ -765,28 +660,26 @@ for k, _ := c.SeekGE(start); k != nil && bytes.Compare(k, end) < 0; k, _ = c.Nex
 }
 ```
 
-This uses the naive one-at-a-time path. `DeleteRange` should be preferred
-when deleting a contiguous range unconditionally.
+One-at-a-time path. `DeleteRange` should be preferred for contiguous
+unconditional deletes.
 
 ### Free Space Management
 
-Free space is managed by two on-disk structures that separate the two
-concerns: **what is free** (the allocation bitmap) and **when it became free**
-(the retired page log). This separation eliminates the self-referential
-allocation problem found in LMDB/libmdbx's freelist B+tree, where modifying
-the freelist during commit could itself allocate or free pages, requiring
-complex convergence loops.
+Free space is managed by two on-disk structures separating the two
+concerns: **what is free** (the allocation bitmap) and **when it became
+free** (the retired page log). This separation eliminates the
+self-referential allocation problem found in freelist-B+tree designs,
+where modifying the freelist during commit could itself allocate or
+free pages.
 
 #### Allocation Bitmap
 
-The allocation bitmap is a flat bitfield — one bit per page in the database.
-A set bit means the page is **free and safe to allocate**. A clear bit means
-the page is either in use or retired but not yet reclaimable (still visible
-to an active reader's snapshot).
+A flat bitfield — one bit per page in the database. Set bit = free and
+safe to allocate. Clear bit = in use OR retired but not yet reclaimable
+(still visible to an active reader's snapshot).
 
-The bitmap occupies a contiguous region of pages starting at page 2 (after the
-two meta pages). The number of bitmap pages is fixed at database creation time
-based on `MaxSize`:
+Stored in a contiguous region starting at page 2. Number of bitmap
+pages fixed at creation:
 
 ```
 BitmapPages = ceil(MaxSize / PageSize / BitsPerPage)
@@ -799,92 +692,76 @@ BitsPerPage = PageSize * 8
 | 64GB     | 4KB      | 16,777,216  | 512         | 2MB         |
 | 256GB    | 4KB      | 67,108,864  | 2,048       | 8MB         |
 | 1TB      | 4KB      | 268,435,456 | 8,192       | 32MB        |
-| 256GB    | 64KB     | 4,194,304   | 8           | 512KB       |
 
-The bitmap pages themselves are never marked as free in the bitmap — their
-bits are permanently clear (reserved). The same applies to meta pages (pages
-0 and 1). Data pages start at page `2 + BitmapPages`.
+Bitmap pages are never marked free in the bitmap (bits permanently
+clear). Same for meta pages. Data pages start at `2 + BitmapPages`.
 
 ##### Bitmap Storage
 
-The bitmap is stored directly in the mmap but treated as **read-only during
-transactions**. Bitmap modifications are deferred in memory: `tx.pendingAllocs`
-tracks pages allocated during the transaction (bitmap bits to clear at commit)
-and `tx.pendingFrees` tracks pages freed during the transaction (bitmap bits to
-set at commit). At commit time, the modified bitmap pages are written to disk
-via `pwrite()`, followed by `fdatasync()`, before the meta page is updated.
-This ensures the bitmap on disk is only ever modified via ordered pwrite+fdatasync
-— never directly via the mmap.
+The bitmap is stored in the data file and accessed via the mmap (read
+path) and pwrite (write path). Bitmap modifications are deferred in
+memory: `tx.pendingAllocs` tracks pages allocated during the
+transaction (bits to clear at commit), `tx.pendingFrees` tracks pages
+freed (bits to set at commit). At commit, modified bitmap pages are
+pwritten before the meta page. Bitmap pages on disk are only ever
+modified via ordered pwrite + fdatasync — never via the mmap (which is
+read-only across all processes).
 
-Bitmap pages do not use the standard page header. The entire page is usable
-as bitmap data (PageSize × 8 bits per page). The page type is identified by
-its position in the file (pages 2 through `2 + BitmapPages - 1`), not by a
-header field.
+Bitmap pages do not use the standard page header. The entire page is
+usable as bitmap data. The page type is identified by position in the
+file (pages 2 through `2 + BitmapPages - 1`).
 
 ##### Two-Level Summary
 
-To accelerate allocation searches over large databases, the bitmap uses a
-two-level structure:
+The bitmap uses a two-level structure for fast allocation searches:
 
-- **Level 0 (detail):** One bit per page in the database, covering page IDs
-  0 through `MaxSize / PageSize - 1`. Stored across bitmap pages 2
-  through `2 + BitmapPages - 1`. Bits for meta pages (0, 1) and bitmap
-  pages (2 through `2 + BitmapPages - 1`) are permanently clear.
-- **Level 1 (summary):** A separate in-memory array, one bit per uint64
-  word of the detail level. A summary bit is set if the corresponding
-  64-page word in the detail level has **any** set bits (any free pages).
-  Size: `ceil(TotalPages / 64 / 64)` uint64 words. The summary is rebuilt
-  from the detail bitmap when the database is opened and maintained
-  incrementally during transactions.
+- **Level 0 (detail):** one bit per page in the database, across bitmap
+  pages 2 through `2 + BitmapPages - 1`.
+- **Level 1 (summary):** in-memory `[]uint64`, one bit per uint64 word
+  of the detail level. Set if the corresponding 64-page word has any
+  set bits. Size: `ceil(TotalPages / 64 / 64)` uint64 words. Rebuilt
+  from detail at Open and maintained incrementally.
 
-At 4KB page size with 256GB `MaxSize` (67M pages): the detail level is
-~1M uint64 words (8MB across 2048 bitmap pages). The summary level is
-~16K uint64 words = 128KB in memory. The summary allows skipping 64-page
-regions with no free space during allocation scans.
+At 4KB pages with 256GB MaxSize (67M pages): detail is ~1M uint64 words
+(8MB); summary is ~16K uint64 words (128KB in memory). The summary
+allows skipping 64-page regions during allocation scans.
 
-For contiguous-run searches (overflow page allocation), the writer scans
-summary words to find regions with free pages, then scans detail words
-within those regions using `math/bits.TrailingZeros64` and
-`math/bits.LeadingZeros64` to find runs. A single uint64 word covers 64
-pages — a run of N < 64 can be found within one word; larger runs span
-word boundaries with a carry-forward scan.
+For contiguous-run searches (overflow allocation), the writer scans
+summary words for regions with free pages, then scans detail words
+within using `math/bits.TrailingZeros64` / `LeadingZeros64`. A single
+uint64 word covers 64 pages — a run of N < 64 can be found within one
+word; larger runs span word boundaries with a carry-forward scan.
 
 ##### Bitmap Operations
 
-**Set bit (free a page):** Load the uint64 word containing the page's bit,
-OR in the bit, write the word back. Update the summary word if the detail
-word transitioned from 0 to non-zero. O(1).
+**Set bit (free a page):** load uint64 word, OR in the bit, write back.
+Update summary if word transitioned 0 → non-zero. O(1).
 
-**Clear bit (allocate a page):** Load the uint64 word, AND out the bit,
-write back. Update the summary word if the detail word transitioned from
-non-zero to 0. O(1).
+**Clear bit (allocate a page):** load word, AND out bit, write back.
+Update summary if word transitioned non-zero → 0. O(1).
 
-**Find first free (single-page alloc):** Scan summary words starting from
-the LIFO hint (see LIFO Allocation Locality) for a non-zero word. Within
-that summary region, scan detail words for a set bit. Clear it and return.
-O(1) amortized with the LIFO hint; O(TotalPages/64) worst case.
+**Find first free (single-page alloc):** scan summary from the LIFO
+hint for a non-zero word, then scan detail words within. Clear and
+return. O(1) amortized with hint; O(TotalPages/64) worst case.
 
-**Find N contiguous free (multi-page alloc):** Scan detail words for runs
-of consecutive set bits. Within a word, `math/bits.TrailingZeros64` on the
-complement finds the length of a run from the LSB. Across word boundaries,
-track the trailing run of one word and the leading run of the next. O(scanned
-words).
+**Find N contiguous free:** scan detail words for runs of consecutive
+set bits. `math/bits.TrailingZeros64` on the complement finds run
+length from LSB. Across word boundaries, track trailing run of one
+word + leading run of next. O(scanned words).
 
-**Count free pages:** `math/bits.OnesCount64` (hardware `popcnt`) across
-all detail words. Cached in `NumFreePages` in the meta page and maintained
-incrementally.
+**Count free pages:** `math/bits.OnesCount64` (hardware `popcnt`)
+across all detail words. Cached in `NumFreePages` in the meta page.
 
 #### Retired Page Log (RPL)
 
-The retired page log tracks which pages were freed by which transaction. This
-information is needed for MVCC safety: a page freed by transaction T cannot be
-moved into the allocation bitmap until no active reader holds a snapshot ≤ T.
+The RPL tracks which pages were freed by which transaction — needed for
+MVCC safety: a page freed by transaction T cannot move into the
+allocation bitmap until no active reader holds a snapshot ≤ T.
 
-The RPL is an append-only singly-linked list of segment pages. Each segment
-page stores a single TxnID (the transaction that retired these pages) plus
-an array of PageIDs. Each commit creates new segment pages — existing
-segments are never modified. All entries in a segment share the same
-TxnID — storing it once per segment instead of per entry doubles capacity:
+Append-only singly-linked list of segment pages. Each segment stores a
+single TxnID + an array of PageIDs. Each commit creates new segment
+pages — existing segments are never modified. All entries in a segment
+share the same TxnID — storing it once doubles capacity:
 
 ```
 RPL Segment Page
@@ -892,8 +769,8 @@ RPL Segment Page
 | Page Header (8 bytes)    |
 +--------------------------+
 | TxnID          | uint64  |  transaction that retired these pages
-| OlderSegment   | uint64  |  page ID of the next older segment (0 = this is tail)
-| EntryCount     | uint16  |  number of PageID entries in this segment
+| OlderSegment   | uint64  |  page ID of the next older segment (0 = tail)
+| EntryCount     | uint16  |  number of PageID entries
 | Padding        | 6 bytes |
 +--------------------------+
 | PageID 0       | uint64  |
@@ -902,481 +779,531 @@ RPL Segment Page
 +--------------------------+
 ```
 
-Segment capacity at 4KB page size: 8 (page header) + 8 (TxnID) + 8
-(link pointer) + 2 (EntryCount) + 6 (padding) = 32 bytes overhead.
-Remaining `4096 - 32 = 4064` bytes / 8 bytes per PageID = **508 entries
-per segment page** (507 with PageChecksum enabled, due to the 4-byte CRC
-footer reducing available space: `4096 - 32 - 4 = 4060` / 8 = 507). A transaction freeing 10,000 pages fills ~20 segment pages
-(compared to ~40 with per-entry TxnID).
+Segment capacity at 4KB: 8 (header) + 8 (TxnID) + 8 (link) + 2
+(EntryCount) + 6 (padding) = 32 bytes overhead. Remaining `4096 - 32
+= 4064` / 8 = **508 entries per segment** (507 with checksums enabled,
+due to the 8-byte xxhash64 footer: `4096 - 32 - 8 = 4056` / 8 = 507).
 
-The meta page stores `RPLHeadPage` (newest segment) and `RPLTailPage` (oldest
-segment). Segments are singly linked from head toward tail via
-`OlderSegment`. The forward direction (tail toward head) is maintained
-as an in-memory segment list rebuilt at `Open()` time (see RPL Segment
-List below).
+Meta stores `RPLHeadPage` (newest) and `RPLTailPage` (oldest). Segments
+are singly linked head → tail via `OlderSegment`. Tail-toward-head
+direction is maintained as an in-memory segment list rebuilt at Open.
 
 ##### RPL Append (At Commit Time)
 
 When a write transaction commits with retired pages:
 
-1. Allocate one or more new segment pages from the bitmap (or file extension).
-   Each commit always creates **new** segment pages — existing segments are
-   never modified (they belong to previous transactions' snapshots and may
-   be referenced by active readers).
-2. Fill segment pages with the current TxnID in the segment header and
-   PageID entries sorted by page ID for cache-friendly processing during
-   reclamation. If the retired list exceeds one segment page's capacity
-   (508 entries at 4KB page size), allocate additional segment pages and
-   link them via `OlderSegment`.
-3. Set the new head's `OlderSegment` to the old `RPLHeadPage`. No
-   modification of the old head is needed — segments are singly linked
-   (head toward tail only).
-4. Update `RPLHeadPage` in the meta page to point to the new head. If the
-   RPL was empty, also set `RPLTailPage`.
-5. Append the new segment page ID(s) to the in-memory segment list
-   (see RPL Segment List).
+1. Allocate one or more new segment pages from the bitmap (or file
+   extension). Each commit creates **new** segment pages — existing
+   segments are never modified (they belong to previous snapshots).
+2. Fill segments with current TxnID in the segment header and PageID
+   entries sorted by page ID. If retired list exceeds one segment's
+   `EntriesPerSegment` capacity (508 at 4KB without checksums; 507
+   with the xxhash64 footer), allocate additional segments linked
+   via `OlderSegment`.
+3. Set the new head's `OlderSegment` to the old `RPLHeadPage`.
+4. Update `RPLHeadPage` (and `RPLTailPage` if RPL was empty).
+5. Append the new segment page ID(s) to the in-memory segment list.
 
-RPL segment pages are allocated from the bitmap like any other data page.
-Allocating a segment page clears a bit in the bitmap — O(1), no further
-allocation needed. A transaction retiring N pages needs at most
-`ceil(N / 508)` page allocations (segment pages only — no old-head CoW).
-This is bounded and non-recursive.
+A transaction retiring N pages needs at most
+`ceil(N / EntriesPerSegment)` segment allocations
+(`EntriesPerSegment` = 508 at 4KB without checksums, 507 with).
+Bounded, non-recursive.
 
 ##### RPL Reclamation
 
-At the start of a write transaction (or lazily on first `pageAlloc()`), the
-writer reclaims RPL entries whose pages are safe to reuse:
+At the start of a write transaction (or lazily on first `pageAlloc()`),
+the writer reclaims RPL entries safe to reuse:
 
-1. Compute the **reclamation bound**: the minimum of the oldest active
-   reader's TxnID (from the reader table) and the last checkpoint's TxnID
-   (from the meta page). In `SyncDurable` and `SyncDataOnly` modes, every
-   commit is a checkpoint, so the checkpoint TxnID equals the current
-   TxnID — no restriction beyond active readers. In `SyncLazy` mode, the
-   checkpoint TxnID may be older than the current TxnID, restricting
-   reclamation to ensure the bitmap on disk is consistent with the
-   checkpoint meta that crash recovery would select.
-2. Walk the in-memory segment list from the **tail** (oldest segments first).
-3. For each segment where `TxnID < reclaimBound`:
-   a. Set the corresponding bits in the allocation bitmap for all PageIDs
-      in the segment.
-4. When a segment is fully reclaimed, free the segment page itself (set its
-   bit in the bitmap), remove it from the in-memory segment list, and
-   advance `RPLTailPage` to the next segment in the list.
-5. Update `RPLEntryCount` and `NumFreePages` in the meta page.
+1. Compute the **reclamation bound**: minimum of (oldest active reader's
+   TxnID, last checkpoint's TxnID). In `SyncDurable`/`SyncDataOnly`,
+   every commit is a checkpoint. In `SyncLazy`, the checkpoint TxnID
+   may be older than current, restricting reclamation.
+2. Walk the in-memory segment list from **tail** (oldest first).
+3. For each segment where `TxnID < reclaimBound`: set bitmap bits for
+   all PageIDs in the segment.
+4. When a segment is fully reclaimed, free the segment page itself,
+   remove it from the in-memory list, advance `RPLTailPage`.
+5. Update `RPLEntryCount` and `NumFreePages`.
 
-The checkpoint TxnID bound prevents a crash-recovery scenario where the
+The checkpoint bound prevents a crash-recovery scenario where the
 on-disk bitmap reflects a newer transaction's reclamation but recovery
-selects an older checkpoint meta. Without this bound, a page retired by
-T100 and reclaimed by T101 could be reallocated for new data by T101.
-If recovery selects T100's checkpoint meta, T100's tree references the
-page expecting its original content, but the page now contains T101's
-data. The checkpoint bound ensures reclamation only processes pages freed
-by transactions older than the last checkpoint — pages that are no longer
-reachable from any recoverable tree state.
+selects an older checkpoint meta. Reclamation only processes pages
+freed by transactions older than the last checkpoint — pages
+unreachable from any recoverable tree state.
 
-Reclamation is performed oldest-first so that the RPL shrinks from the tail.
-Empty segment pages are immediately freed — their bitmap bits are set, making
-them available for allocation in the same transaction.
+**Why the bound is sufficient.** Suppose the last checkpoint is at
+TxnID `C`. Reclamation at any later TxnID `T > C` uses
+`reclaimBound = min(oldestReader, C) ≤ C`, so it can only set bitmap
+bits for pages freed by transactions with `TxnID < C`. Those pages
+were freed *before* the checkpoint, so the checkpoint's tree does
+not reference them. If a crash forces recovery to fall back to the
+checkpoint meta `C`, the on-disk bitmap may show those pages as free
+(reclaimed between `C` and the crash) or as not-yet-reclaimed (still
+in the RPL at `C`) — either is consistent with `C`'s tree, because
+`C`'s tree never referenced them in the first place. Pages freed
+*after* `C` (`TxnID ≥ C`) are excluded by the bound, so the bitmap
+never gains spurious free-bits for pages the recovered tree might
+still reference.
 
-Reclamation consumes **whole segments** — a segment is either fully
-reclaimed or left untouched. Since each segment has a single TxnID, this
-is a clean boundary: either all entries in a segment are safe to reclaim
-(TxnID < reclaimBound) or none are. This avoids partial segment
-modification and the CoW overhead it would require. Segments are immutable
-on disk from the moment they are written.
+**SyncLazy and partial bitmap flush.** In `SyncLazy` mode the
+bitmap-update pwrites for intermediate (post-checkpoint) transactions
+happen without `fdatasync`. The OS may flush some of those bitmap
+pwrites before a crash and not others. On recovery to checkpoint `C`,
+the on-disk bitmap can therefore be in a partial state: some pages
+freed by transactions in `(C, crash]` may have their bits set on
+disk; others may not. The argument above guarantees the *tree* is
+safe (no tree reference points into pages the bitmap is wrong about),
+but the meta's `NumFreePages` counter (last written at `C`) may
+disagree with the actual bit-count of the on-disk bitmap.
+
+This is handled by background maintenance's bitmap-leak reclamation
+pass: it walks the tree from `C`'s roots, identifies pages that are
+allocated-but-unreferenced (the partial-flush leaks), and either
+sets their bits free (if they're truly unreferenced) or recomputes
+`NumFreePages` from the current bitmap. `Check()` does not trust
+`NumFreePages` — it recomputes the free count directly from the
+bitmap bits via `math/bits.OnesCount64` and reports any discrepancy
+with the meta as a `CheckWarning`.
+
+Reclamation is oldest-first so the RPL shrinks from the tail. Empty
+segments are immediately freed.
+
+Reclamation consumes **whole segments** — clean boundary since each
+segment has a single TxnID. Avoids partial segment modification.
 
 ##### Oldest Reader Caching
 
-Scanning the reader table to find the minimum active TxnID is O(MaxReaders).
-The writer caches this value (`tx.cachedOldestReader`) and combines it with
-the last checkpoint TxnID to form the reclamation bound. The cache is
-refreshed lazily — only when the bitmap has no free pages and reclamation
-might unlock more. Reading a stale (higher) value is conservative: it
-delays reclamation but never causes incorrect behavior.
+Scanning the reader table is O(MaxReaders). The writer caches
+(`tx.cachedOldestReader`) and combines with last checkpoint TxnID to
+form the reclamation bound. Refreshed lazily — only when the bitmap
+has no free pages and reclamation might unlock more. Reading a stale
+(higher) value is conservative — delays reclamation but never
+incorrect.
 
 ##### RPL Segment List
 
-The on-disk RPL is singly linked from head (newest) toward tail (oldest)
-via `OlderSegment`. Reclamation needs to walk in the opposite direction
-(tail to head). To avoid a full chain traversal on every reclamation pass,
-the writer maintains an in-memory **segment list** — a `[]uint64` slice of
-RPL segment page IDs ordered from tail (index 0) to head (last index).
+On-disk RPL is singly linked head → tail. Reclamation walks tail → head.
+To avoid full chain traversal, the writer maintains an in-memory list
+— a `[]uint64` of segment page IDs ordered tail (index 0) to head (last).
 
-The list is rebuilt at `Open()` time by walking the on-disk chain from
-`RPLHeadPage` via `OlderSegment` links to `RPLTailPage`, then reversing
-the collected page IDs. This is O(RPL segments) — typically tens to low
-hundreds — and happens once.
+Rebuilt at `Open()` by walking the on-disk chain head → tail then
+reversing. O(RPL segments) — typically tens to low hundreds.
 
-During normal operation the list is maintained incrementally:
-- **Append** (commit with retired pages): new segment page IDs are
-  appended to the end of the slice.
-- **Reclaim** (tail consumption): consumed segment page IDs are removed
-  from the front of the slice (advance a start index or re-slice).
+Maintained incrementally:
+- **Append** (commit with retired pages): new segment IDs appended.
+- **Reclaim** (tail consumption): consumed segment IDs removed from
+  the front.
 
-The list is stored on the `DB` struct and protected by the write lock
-(only the writer modifies it). Readers do not access the RPL segment list.
+Stored on the `DB` struct, protected by the write lock.
 
 #### LIFO Allocation Locality
 
-The allocation bitmap does not inherently provide LIFO (most-recently-freed
-first) behavior, which is important for cache efficiency and SSD write
-amplification. To achieve LIFO locality without complicating the bitmap:
+The bitmap doesn't inherently provide LIFO. The writer maintains a
+**LIFO hint** (`tx.allocHint`) — the page ID of the last page
+reclaimed during the most recent reclamation pass. `pageAlloc()`
+begins its scan at this hint. Reclamation walks RPL oldest → newest,
+so the last entries processed are most-recently-freed pages — the hint
+naturally points to recently-freed regions.
 
-The writer maintains a **LIFO hint** (`tx.allocHint`) — the page ID of the
-last page reclaimed during the most recent reclamation pass. `pageAlloc()`
-begins its bitmap scan at this hint and wraps around. Reclamation walks the
-RPL from oldest to newest (tail to head). The last entries processed are
-from the newest reclaimable transaction — the most recently freed pages.
-The hint therefore naturally points to recently-freed regions.
-
-For workloads with steady write/free/reuse cycles, this keeps the active
-page set small and concentrated, achieving the same cache locality benefits
-as LMDB's LIFO reclamation.
+For workloads with steady write/free/reuse cycles, this keeps the
+active page set small and concentrated.
 
 #### Loose Pages
 
-Pages that are CoW'd and then freed within the **same
-write transaction** are called "loose pages." This commonly occurs during
-B+tree rebalancing: a merge operation may CoW a node, then free one of the
-two original nodes. The CoW'd copy becomes unnecessary if its contents are
-merged into a sibling.
+Pages CoW'd and then freed within the **same write transaction**.
+Common during rebalancing: a merge CoWs a node then frees one of two
+originals.
 
-Loose pages are tracked in a **hash map** (`tx.loosePages map[uint64]struct{}`).
-This provides O(1) insertion, O(1) membership check, and O(1) deletion.
-When a page becomes loose, its page ID is added to `tx.pendingFrees` (so
-the bitmap bit can be set at commit time) or made available for immediate
-reallocation within the same transaction.
+Tracked in a hash map (`tx.loosePages map[uint64]struct{}`) for O(1)
+insert/lookup/delete. The hash map is required because **tail page
+refund** does up to n membership lookups by page ID against n loose
+pages — O(n²) with a slice vs. O(n) with a map.
 
-A hash map is used instead of a simpler `[]uint64` slice because of the
-**tail page refund** operation at commit time. Tail refund checks whether
-consecutive page IDs at the file tail (`HighWaterMark - 1`,
-`HighWaterMark - 2`, ...) are loose, requiring membership lookups by
-page ID. With a slice, each lookup is O(n) where n is the loose page
-count. In the worst case — a large `DeleteRange` triggering cascading
-merges followed by rebalancing — the loose set can be very large. If
-the loose pages are concentrated at
-the file tail (e.g., the transaction extended the file, did work, then
-freed most of it), tail refund performs up to n membership checks against
-n loose pages: O(n²) with a slice vs. O(n) with a map.
-
-| Loose pages (n) | Tail checks (t) | `[]uint64` total ops | `map` total ops |
-|-----------------|------------------|----------------------|-----------------|
-| 100             | 10               | 1,000                | 10              |
-| 1,000           | 100              | 100,000              | 100             |
-| 5,000           | 500              | 2,500,000            | 500             |
-| 65,536          | 65,536           | ~4.3 billion         | 65,536          |
-
-Loose pages are **immediately reusable** within the same transaction without
-any bitmap or RPL interaction:
-- `pageAlloc()` checks `tx.loosePages` first. For single-page allocations,
-  any entry is popped from the map (O(1) amortized via `range` + `delete`).
-- Loose pages that are reused via `pageAlloc()` never touch the bitmap or RPL
-  — they were allocated and freed within the same transaction, so no reader
-  can ever reference them.
-- At commit time, any loose pages still in the map (allocated a page ID but
-  never reused) are added to `tx.pendingFrees` — their bitmap bits are set
-  directly, bypassing the RPL. Since loose pages were allocated and freed
-  within the same transaction, no reader can reference them, so MVCC
-  retirement via the RPL is unnecessary.
+Loose pages are immediately reusable within the same transaction:
+- `pageAlloc()` checks `tx.loosePages` first (single-page allocs).
+- Loose pages reused via `pageAlloc()` never touch the bitmap or RPL.
+- At commit time, any loose pages still in the map are added to
+  `tx.pendingFrees` (bypass RPL — same-txn pages cannot be referenced
+  by any reader).
 
 #### Page Allocation Priority
 
-`pageAlloc(n)` allocates `n` contiguous pages using this priority:
+`pageAlloc(n)` allocates `n` contiguous pages in priority order:
 
-1. **Loose pages** (n=1 only): pop any entry from `tx.loosePages` map. O(1) amortized.
-2. **Allocation bitmap**: scan the bitmap for a free page (n=1) or a
-   contiguous run of free pages (n>1), starting from the LIFO hint.
-3. **RPL reclamation**: if the bitmap has no suitable free pages, reclaim
-   entries from the RPL (TxnID < oldest reader) into the bitmap, then retry
-   step 2.
-4. **Lagging reader check**: if reclamation is blocked by a long-lived reader,
-   invoke the lagging reader callback (see Cross-Process Coordination). If the
-   reader releases, refresh the oldest reader cache and retry step 3.
-5. **File extension**: if no free pages are available, grow the file according
-   to the file format growth step and advance `HighWaterMark`.
+1. **Loose pages** (n=1 only): pop from `tx.loosePages`. O(1).
+2. **Allocation bitmap**: scan for free page (n=1) or contiguous run
+   (n>1) starting at LIFO hint.
+3. **RPL reclamation**: if bitmap exhausted, reclaim entries with
+   TxnID < oldest reader.
+4. **Lagging reader check**: if reclamation blocked by long-lived
+   reader, invoke `LaggingReader` callback.
+5. **File extension**: if no free pages, grow per file format and
+   advance `HighWaterMark`.
 
 ##### Tail Page Refund
 
-After reclamation or at commit time, the writer checks if any pages at the
-tail of the database file (page IDs equal to `HighWaterMark - 1`,
-`HighWaterMark - 2`, etc.) are free in the bitmap. If so, those bits are
-cleared and `HighWaterMark` is decremented. This reclaims file space and
-enables file shrinkage at commit time (see File Format).
-
-The refund process iterates: clearing tail bits may expose new tail pages.
-It runs until no more tail pages are free. Loose pages are checked first
-(by O(1) lookup in the `tx.loosePages` map for each tail page ID), then
-the bitmap (by checking bits from `HighWaterMark - 1` downward).
+After reclamation or at commit time, the writer checks if any tail
+pages (`HighWaterMark - 1`, `HighWaterMark - 2`, …) are free in the
+bitmap. If so, bits cleared and `HighWaterMark` decremented. Reclaims
+file space and enables file shrinkage at commit. Iterates until no
+more tail pages free.
 
 **Safety with concurrent readers.** Tail refund only decrements
-HighWaterMark for pages that are free in the bitmap. Pages held by an
-active reader's snapshot are not in the bitmap — they remain in the RPL
-until the reclamation bound (oldest reader and checkpoint TxnID) allows
-their reclamation. Therefore, tail refund cannot remove pages that an
-active reader references. The subsequent file shrinkage via `ftruncate()`
-at commit time only truncates pages beyond HighWaterMark, which are
-guaranteed to be unreferenced by any active reader or recoverable tree
-state.
+HighWaterMark for pages free in the bitmap. Pages held by an active
+reader remain in the RPL until the reclamation bound allows their
+reclamation. Tail refund cannot remove pages a reader references.
+File shrinkage via `ftruncate()` only truncates pages beyond
+HighWaterMark.
 
 #### Freeing Pages
 
 When a CoW operation replaces an old page with a new copy:
-- If the old page was **CoW'd in this transaction** (i.e., it was itself a
-  CoW copy made earlier in this transaction), it becomes a **loose page** —
+- If the old page was **CoW'd in this transaction** (already a CoW
+  copy from earlier in this txn), it becomes a **loose page** —
   added to `tx.loosePages`.
-- If the old page was **from a previous transaction** (an immutable page in
-  the mmap), its page ID is added to `tx.retiredPages` — a list of page IDs
-  to append to the RPL at commit time (the TxnID is stored once per RPL
-  segment, not per entry).
+- If the old page was **from a previous transaction** (an immutable
+  page accessible via mmap), its page ID is added to `tx.retiredPages`
+  — a list of page IDs appended to the RPL at commit time (TxnID
+  stored once per RPL segment).
 
-Note: retired pages are NOT immediately marked free in the bitmap. They enter
-the RPL and are moved to the bitmap only when reclamation determines they are
-safe to reuse (no active reader holds their snapshot).
+Retired pages are NOT immediately marked free. They enter the RPL and
+move to the bitmap only when reclamation deems them safe (no active
+reader holds their snapshot).
 
 #### Commit-Time Free Space Update
 
-During commit, the writer:
-1. Performs tail page refund: check the bitmap for free pages at the end of
-   the file, decrement `HighWaterMark`.
-2. Moves any remaining loose pages into `tx.pendingFrees` (bypasses RPL —
-   no reader can reference same-transaction pages).
-3. Appends all `tx.retiredPages` to the RPL by allocating new segment
-   pages from the bitmap and appending them to the in-memory segment list.
-4. Updates `NumFreePages`, `RPLHeadPage`, `RPLTailPage`, and `RPLEntryCount`
-   in the meta page.
+The free-space side of commit happens entirely inside step 0 of
+Commit Write Ordering (pre-pwrite assembly). The work is:
 
-Step 3 may allocate RPL segment pages from the bitmap. This is a bounded,
-non-recursive operation: each segment page holds 508 entries (at 4KB page
-size), so a transaction retiring N pages needs at most `ceil(N / 508)`
-page allocations (segment pages only — no old-head CoW). Each allocation
-is a single bitmap bit flip — no further cascading allocations.
+1. Tail page refund: check bitmap for tail free pages, decrement
+   `HighWaterMark`.
+2. Move remaining loose pages into `tx.pendingFrees` (bypass RPL).
+3. Append all `tx.retiredPages` to the RPL by allocating new segment
+   pages and appending to the in-memory segment list. The newly
+   allocated segment pages enter `p.dirty` and are flushed by Commit
+   Write Ordering step 1 alongside data and bitmap pages.
+4. Update `NumFreePages`, `RPLHeadPage`, `RPLTailPage`,
+   `RPLEntryCount` in the new meta-page buffer.
 
-If the bitmap has no free pages and file extension would exceed MaxSize, RPL segment allocation fails and the commit returns `ErrTxTooLarge`. The transaction must be rolled back. This can happen when the database is near capacity and a large number of pages are retired in a single transaction.
+Sub-step 3 may allocate RPL segments from the bitmap — bounded,
+non-recursive. Each segment holds `EntriesPerSegment` entries
+(508 at 4KB pages without checksums, 507 with the xxhash64 footer),
+so a transaction retiring N pages needs `ceil(N / EntriesPerSegment)`
+allocations.
 
-Steps 1-4 happen before the bitmap pwrite and meta page swap.
+If the bitmap has no free pages and file extension would exceed
+MaxSize, RPL segment allocation fails and commit returns
+`ErrTxTooLarge` or `ErrDBFull` from step 0 — no pwrite has happened,
+so rollback is clean.
 
-## CoW Page Tracking
+## Pager and Slab Architecture
 
-A write transaction must track which pages have been copied via CoW for
-two purposes: avoiding double-CoW when the same page is modified multiple
-times within a transaction, and tracking bitmap changes for commit-time
-pwrite.
+The data file is memory-mapped read-only by every process, including
+the writer. All page modifications go through a **pager** that owns a
+**slab** of page-sized buffers; modifications happen in slab buffers
+and are pwritten to disk at commit time.
 
-### Data Structure
+This is a deliberate move away from a direct-write mmap design:
 
-The CoW set is a **hash map** of page IDs:
+- **Portability.** One commit path on all OSes — no macOS-specific
+  `msync(MS_SYNC)` round trip, no platform-conditional code in the
+  commit hot path.
+- **Defense in depth.** A stray pointer or `unsafe` misuse anywhere in
+  the host process produces SIGSEGV instead of silently corrupting the
+  data file (the data mmap is `PROT_READ`-only, enforced by
+  `mprotect` after Open).
+- **Crash semantics.** On-disk state is exactly what has been
+  pwritten and fsynced. There is no "kernel may have flushed dirty
+  CoW mmap pages at arbitrary times" failure window; bitmap leakage
+  between bitmap-pwrite and meta-pwrite remains the only crash failure
+  mode and is bounded by the crashed transaction's allocations.
+- **Read coherence across pwrite and mmap.** Both Linux and macOS
+  use a unified page cache for `MAP_SHARED` + `pwrite` on the same
+  file: a `pwrite()` updates the page cache directly, and a
+  subsequent read through the `MAP_SHARED` mapping (regardless of
+  `PROT_READ`-only vs `PROT_READ | PROT_WRITE`) returns the new
+  contents. `msync(MS_SYNC)` is only required when *writes go through
+  the mmap pointer itself* — gmdb's writer never does this, so no
+  `msync` call is needed on any supported OS.
+
+### Pager Roles
+
+A single `Pager` type per transaction handles both reads and writes.
+Read transactions get a read-only pager that only resolves pages from
+mmap. Write transactions get a writable pager that maintains the dirty
+slab.
 
 ```
-tx.cowPages      map[uint64]struct{} // page IDs CoW'd in this transaction
-tx.pendingAllocs map[uint64]struct{} // pages allocated — bitmap bits to clear at commit
-tx.pendingFrees  map[uint64]struct{} // pages freed — bitmap bits to set at commit
+type Pager struct {
+    mmap        []byte                // read-only view of the data file
+    pageSize    int
+    dirty       map[uint64]*[]byte    // page ID → slab buffer (write txn only)
+    dirtyBytes  int                   // current slab usage in bytes
+    maxBytes    int                   // Options.MaxTxBufferBytes
+    bufPool     *sync.Pool            // page-sized scratch buffers
+    readOnly    bool
+}
 ```
 
-All B+tree page modifications happen directly in the read-write mmap.
-`tx.cowPages` records which pages were CoW'd so that double-CoW is
-avoided (if a page is already in the CoW set, it can be modified in place
-without allocating a new copy). `tx.pendingAllocs` and `tx.pendingFrees`
-track deferred bitmap changes — the mmap bitmap is never modified directly
-during a transaction; instead, these sets accumulate the changes and the
-bitmap pages are written via `pwrite()` at commit time.
+### Page Resolution
 
-Page lookup is always `mmap[pageID * pageSize]` — a single level with no
-branches. There is no page buffer, no evicted page set, and no multi-level
-lookup. The OS page cache manages all page memory.
+`pager.Page(id) []byte` returns a borrowed byte slice for the page at
+`id`:
 
-### Operations
-
-| Operation | Method | Complexity |
-|-----------|--------|------------|
-| Add CoW'd page | `tx.cowPages[pageID] = struct{}{}` | O(1) amortized |
-| Check if CoW'd | `_, ok := tx.cowPages[pageID]` | O(1) |
-| Count | `len(tx.cowPages)` | O(1) |
-
-The hash map replaces the sorted-array approach used in LMDB/libmdbx, where
-insertions required maintaining sort order (O(n) shift) and lookups required
-binary search (O(log n)). The map provides O(1) for all single-element
-operations.
-
-### Page Allocation with Pending Bitmap Changes
-
-`pageAlloc()` must account for pages that have been allocated in this
-transaction but whose bitmap bits have not yet been cleared on disk.
-Before scanning the mmap bitmap, `pageAlloc()` checks `tx.pendingAllocs`
-— if a page appears in the pending set, it is already allocated and must
-not be returned again. This ensures correct allocation even though the
-on-disk bitmap still shows the page as free.
-
-Similarly, pages in `tx.pendingFrees` are logically free within this
-transaction but their bitmap bits have not yet been set on disk. These
-pages are candidates for reallocation within the same transaction.
-
-#### Map Reuse Across Transactions
-
-The CoW page map (`tx.cowPages`), pending maps (`tx.pendingAllocs`,
-`tx.pendingFrees`), and the loose page map (`tx.loosePages`) are pooled
-on the `DB` struct and reused across write transactions. On rollback or
-after commit cleanup, the maps are reset via the `clear` builtin rather
-than discarded:
-
-```go
-clear(tx.cowPages)        // O(1): resets to empty, retains allocated buckets
-clear(tx.pendingAllocs)
-clear(tx.pendingFrees)
-clear(tx.loosePages)
+```
+if buf, ok := p.dirty[id]; ok {
+    return *buf            // writer's own dirty page
+}
+return p.mmap[id*p.pageSize : (id+1)*p.pageSize]    // read from mmap
 ```
 
-`clear` resets a map to empty without deallocating its internal hash table
-storage. The next transaction inherits pre-allocated buckets sized for the
-previous transaction's workload, avoiding the incremental growth phase
-(repeated allocations and rehashes as the map doubles from its minimum
-size). For write-heavy workloads with consistent transaction sizes, this
-eliminates per-transaction map allocation overhead entirely.
+Branches: one. No layered buffer cache, no eviction policy. The OS page
+cache handles everything except the writer's own in-flight changes.
 
-The same pattern applies to `tx.retiredPages` (the `[]uint64` of page IDs
-to append to the RPL): the slice is reset via `tx.retiredPages = tx.retiredPages[:0]`,
-retaining its backing array for the next transaction.
+### CoW via the Slab
 
-### Commit-Time Write Ordering
+When the writer modifies a page from a prior transaction:
 
-At commit time, data pages are already in the mmap — no data page writes
-are needed. The commit path writes only bitmap and meta pages via
-`pwrite()`:
+1. Allocate a fresh page ID via `pageAlloc()`.
+2. Acquire a page-sized buffer from `bufPool`.
+3. Copy current page content (from `pager.Page(oldID)` — which may be
+   the mmap or a same-txn dirty buffer) into the slab buffer.
+4. Insert the buffer into `p.dirty[newID]`.
+5. `dirtyBytes += pageSize`. If `dirtyBytes > maxBytes`, return
+   `ErrTxTooLarge` — the caller must roll back.
+6. Track the old page ID for retirement (`tx.retiredPages` or
+   `tx.loosePages` depending on origin).
+7. Track the new page ID in `tx.pendingAllocs` and `tx.cowPages`.
+8. Mutate the slab buffer in place.
 
-1. Compute the modified bitmap pages: for each entry in `tx.pendingAllocs`
-   and `tx.pendingFrees`, determine which bitmap page contains that bit.
-   Collect the set of modified bitmap pages.
-2. For each modified bitmap page, construct the updated page content by
-   applying the pending bit changes to the current mmap bitmap content.
-   Write each modified bitmap page via `pwrite()`.
-3. `fdatasync()` — ensures all bitmap changes are on stable storage.
-4. Write the meta page via `pwrite()` with updated root pointers, TxnID,
-   `HighWaterMark`, and checksum.
-5. `fdatasync()` — ensures the meta page is on stable storage. This is the
-   **atomic commit point**.
+When the writer modifies a page already CoW'd in this transaction (same
+page ID, already in `p.dirty`), it mutates the existing slab buffer in
+place — no new allocation. `tx.cowPages` records this so the writer
+knows the page is already CoW'd.
 
-This ordering guarantees that the bitmap is always updated before the meta
-page. If a crash occurs after step 3 but before step 5, the bitmap may
-reflect the new transaction's allocations but the meta page still points
-to the previous consistent state — the allocated pages are unreferenced
-free pages (harmless). If a crash occurs before step 3, no bitmap changes
-reach disk and the database is fully consistent.
+### Slab Budget and `ErrTxTooLarge`
 
-Typically a commit writes 2-5 bitmap pages (the pages containing the bits
-for allocated and freed pages) plus 1 meta page — a small, bounded number
-of pwrite calls regardless of transaction size.
+`Options.MaxTxBufferBytes` (default: 256 MiB) bounds the slab. A write
+transaction that dirties more pages than the budget allows fails the
+next CoW with `ErrTxTooLarge`. The transaction must be rolled back;
+the caller chunks the work into smaller transactions.
 
-**Platform note:** On Linux, `fdatasync()` on a file descriptor flushes all
-dirty pages for that file, including pages dirtied via `MAP_SHARED` mmap.
-This is because the kernel's page cache is shared between the pwrite and
-mmap paths. gmdb relies on this behavior for crash safety — the fdatasync
-after bitmap pwrite also flushes the CoW'd data pages that were modified
-directly in the mmap.
+The slab budget covers every page-sized buffer the transaction has
+allocated — live (currently routed via `dirty[id]`), loose (CoW'd
+then freed within the same tx, retained for the byte-slice ownership
+contract — see Byte Slice Ownership), and any buffers held by the
+commit machinery (RPL segment pages and modified bitmap pages, both
+assembled in step 0 of Commit Write Ordering before any pwrite).
+`ErrTxTooLarge` can therefore also fire at commit time when the
+step-0 assembly pushes the slab over budget — detected before any
+pwrite begins, so rollback is clean (no disk writes have occurred).
 
-On macOS (and potentially other platforms), `fdatasync()` does **not**
-guarantee that `MAP_SHARED` mmap dirty pages are flushed. On these
-platforms, the commit path inserts an `msync(MS_SYNC)` call on the dirty
-data page region before the bitmap pwrite. This ensures CoW'd data pages
-are on stable storage before the bitmap and meta updates that reference
-them. The msync call is implemented in `mmap_darwin.go` and gated by
-platform — Linux skips it (fdatasync is sufficient). The commit sequence
-on macOS becomes: `msync(MS_SYNC)` → bitmap pwrite → `fdatasync()` →
-meta pwrite → `fdatasync()`.
+**Cost-model note for callers.** Because slab buffers stay alive
+until commit/rollback (the loose-page retention rule above), a
+transaction that CoWs the *same logical page* multiple times
+accumulates one buffer per CoW. The budget should be sized relative
+to the transaction's expected count of *unique CoW destinations*
+(typically: leaves touched × tree depth, plus index entries × indexed
+columns), not the operation count.
 
-**Bitmap leakage on crash.** A crash between the bitmap pwrite and the meta
-pwrite can leak pages. The bitmap on disk has cleared bits (pages allocated
-for the crashed transaction's CoW) but the meta on disk does not reference
-those pages. These pages appear allocated but are unreferenced — they are
-leaked, not free. The leaked page count is bounded by the number of pages
-the crashed transaction allocated (typically small — a transaction
-modifying a few keys in a depth-4 tree leaks 4-20 pages per crash).
-`Check()` detects leaked pages as `CheckWarning` severity.
-`CheckWithOptions(&CheckOptions{Repair: true})` reclaims leaked pages
-in place (offline, exclusive access). `CopyTo(compact=true)` also
-recovers them by rebuilding the file from scratch. In `SyncLazy` mode, the OS may also flush bitmap pwrite pages from
-uncommitted (post-checkpoint) transactions, causing additional leakage on
-crash. This is an accepted tradeoff of the deferred bitmap approach — the
-alternative (versioned/CoW bitmap) would add significant complexity. The
-B+tree structure is always consistent; only free space accounting may be
-affected.
+Bulk operations have a dedicated escape hatch — see BulkLoad.
 
-## Copy-on-Write (CoW) Transaction Model
+The slab itself is backed by anonymous mmap pages obtained via
+`sync.Pool` of `[]byte` slices. Returning a buffer to the pool clears it
+(zero-fill) and makes it available for reuse. Cross-transaction reuse
+keeps allocator pressure low for steady write loads.
+
+Buffers are **not** returned to the pool when a page becomes loose
+within the transaction — only at commit or rollback. This preserves
+the byte-slice ownership contract (a borrowed `[]byte` pointing into
+a loose-page buffer remains valid for the full transaction). The
+buffer pool is shared process-wide via `sync.Pool`; cross-process
+slab usage is not visible from any one DB handle.
+
+### Commit Write Ordering
+
+The commit path is partitioned into a **pure-buffer assembly phase**
+(no syscalls, fully reversible) followed by a **pwrite phase** whose
+failures are bounded to crash-equivalent leakage. The split keeps the
+"abort is clean" guarantee unambiguous.
+
+0. **Pre-pwrite assembly (no syscalls, no pwrite).**
+   - Tail page refund: check the bitmap for tail free pages, decrement
+     `HighWaterMark`.
+   - Move remaining loose pages into `tx.pendingFrees`.
+   - Allocate any required RPL segment pages and fill them with
+     retired-page entries. Insert the new segment pages into
+     `p.dirty` (counts against `MaxTxBufferBytes`).
+   - For each modified bitmap page (derived from `tx.pendingAllocs` ∪
+     `tx.pendingFrees`), read the current bitmap page from the mmap,
+     apply the pending bit changes into a freshly allocated slab
+     buffer, and insert the buffer into `p.dirty` keyed by its bitmap
+     page ID (counts against `MaxTxBufferBytes`).
+   - Construct the new meta page payload (new roots, new TxnID,
+     updated `HighWaterMark`, recomputed xxhash64 checksum) into a
+     fresh buffer held on the transaction (not in `p.dirty`; the meta
+     page lives at a fixed slot and is pwritten in step 3).
+   - Newly-allocated RPL segment page IDs are also appended to the
+     in-memory segment list (see RPL Segment List) as part of
+     sub-step 3 — keeps the in-memory view consistent with what
+     step 1 will pwrite.
+   - Any failure in step 0 (slab budget exceeded, RPL alloc cannot
+     find capacity, file extension would exceed `MaxSize`) returns
+     `ErrTxTooLarge` or `ErrDBFull` and is **fully reversible** — no
+     pwrite has been issued, so rollback releases buffers and leaves
+     the on-disk state untouched. Rollback's clearing of
+     `tx.pendingAllocs` is what unwinds any RPL segment page
+     allocations made during step 0: those page IDs were drawn from
+     the bitmap's pending-allocs set but never had their on-disk
+     bits cleared (bitmap pwrite is step 1), so dropping the
+     pendingAllocs entries makes the IDs immediately re-available
+     to the next transaction's allocator. The in-memory segment
+     list appends from sub-step 3 are also rolled back at this point.
+
+1. **Data + RPL + bitmap pwrite.** For each `(pageID, buf)` in
+   `p.dirty` — which now contains data pages, RPL segment pages, and
+   modified bitmap pages all together — compute the xxhash64 footer
+   (if checksums enabled) and `pwrite(fd, *buf, pageID*pageSize)`.
+   Order within step 1 is unspecified; on Linux the implementation
+   may coalesce contiguous runs via `pwritev2`. A partial-success
+   pwrite (some pages reach the page cache, others fail mid-step) is
+   crash-equivalent: meta is untouched, so on next Open the previous
+   meta is selected and the partially-written pages are unreferenced
+   bounded leakage.
+
+2. **`fdatasync(fd)`** (skipped in `SyncLazy` and below) — data, RPL,
+   and bitmap pages on stable storage.
+
+3. **Meta pwrite.** `pwrite()` the meta-page buffer constructed in
+   step 0 to the inactive meta slot.
+
+4. **`fdatasync(fd)`** (skipped in `SyncDataOnly` and below) — this
+   is the **atomic commit point**.
+
+After step 2 succeeds, data + RPL + bitmap are durable. After step 4
+succeeds, the commit is durable end-to-end. A crash between 2 and 4
+leaves the previous meta page active; the new data, RPL, and bitmap
+pages are unreferenced free space until the next commit reclaims them
+(bounded leakage — see Crash Safety).
+
+**Commit-failure cleanup.** A pwrite error during step 1 or step 3
+returns the error to the caller; the transaction must be rolled back.
+Rollback releases every slab buffer (live, loose, assembled bitmap,
+RPL segments, and the meta-page buffer) back to the pool. The on-disk
+meta is untouched, so the database remains consistent with the
+previous meta; any partially-pwritten data, RPL, or bitmap pages are
+unreferenced and become bounded crash leakage reclaimed by background
+maintenance.
+
+Typical commit: tens to low hundreds of data-page pwrites + 0–N RPL
+segment pwrites + 2–5 bitmap pwrites (all in step 1) + 1 meta pwrite
+(step 3), with two fdatasync calls total (step 2 + step 4). On Linux,
+`pwritev2` may issue multiple contiguous-run pwrites in one syscall.
+
+### Slab Lifecycle Across Nested Transactions
+
+Child transactions never modify a parent's slab buffer in place.
+Every child CoW allocates a fresh page ID and a fresh slab buffer
+(copied from the current value of the parent's view of that page).
+On child commit, the child's `(pageID, buf)` entries are merged into
+the parent's `p.dirty` and the child's allocations join the parent's
+`tx.pendingAllocs`. On child rollback, the child's buffers are released
+back to the pool and the child's page IDs are returned to the
+allocator (cleared from `tx.pendingAllocs`).
+
+This preserves the simplicity of "rollback discards bookkeeping, never
+restores prior buffer state" — at the slab layer rather than the mmap
+layer. See Nested Transactions for full mechanics.
+
+### Read-Path Memory
+
+Reads go directly through the mmap; no copies are made on the read
+path. The OS page cache backs the data. Page lookup is
+`mmap[pageID * pageSize : (pageID+1) * pageSize]` — one level, no
+branches.
+
+CoW'd pages from a write transaction become visible through the mmap
+to other processes only **after** the commit's data-page pwrites
+complete (Linux/macOS unified page cache). Readers serialize their
+snapshot via the meta page's `TxnID`; a reader at TxnID T sees only
+pages reachable from meta-page-T's roots, which are all already on
+stable storage by the time meta-T is published.
+
+## Copy-on-Write Transaction Model
 
 ### Write Transaction
 
-1. Writer submits a request to the flock goroutine's writer queue and waits
-   for the lock grant, respecting `ctx` cancellation (see Write Lock).
-   Returns `context.Cause(ctx)` if cancelled while waiting, preserving the
-   original cancellation reason.
-2. Writer reads the active meta page to get current roots, TxnID, and file format.
-3. For each modification (insert, update, delete):
-   - Traverse the B+tree from root to leaf.
-   - Copy each page along the path (CoW): allocate a fresh page from the
-     bitmap via `pageAlloc()`, copy the old page's content from mmap
-     position A to mmap position B, then modify position B in place.
-   - Allocate new pages via `pageAlloc()` (loose pages → bitmap →
-      RPL reclamation → lagging reader check → file extension).
-   - The CoW set (`tx.cowPages`) tracks page IDs. Bitmap changes are
-     deferred in `tx.pendingAllocs` and `tx.pendingFrees`.
-   - Old pages are tracked: pages from previous transactions go to
-     `tx.retiredPages`; pages CoW'd then freed in this transaction become
-     loose pages in `tx.loosePages`.
-4. Commit-time free space update:
-   a. Perform tail page refund: check the bitmap for free pages at the end of
-      the file, clear those bits, decrement `HighWaterMark`.
-   b. Move remaining loose pages into `tx.pendingFrees` (bypass RPL — no
-      reader can reference same-transaction pages).
-   c. Append all `tx.retiredPages` to the RPL (allocating new segment pages
-      from the bitmap if needed — bounded, non-recursive).
-   d. Update `NumFreePages`, `RPLHeadPage`, `RPLTailPage`, `RPLEntryCount`.
-5. Write modified bitmap pages to stable storage:
-   - Compute modified bitmap pages from `tx.pendingAllocs` and
-     `tx.pendingFrees`. Apply pending bit changes and write each modified
-     bitmap page via `pwrite()`.
-   - `fdatasync()` if `SyncMode` is `SyncDurable` or `SyncDataOnly`. Skipped for
-     `SyncLazy` and `SyncUnsafe`. Data pages are already in the mmap —
-     no data page writes are needed.
-6. Update the inactive meta page with new root pointers, new TxnID, updated
-   `HighWaterMark`, and checksum. Written via `pwrite()`.
-7. `fdatasync()` the meta page if `SyncMode` is `SyncDurable`. Skipped for all
-   other modes. This is the **atomic commit point**.
-8. If the OS file size exceeds `HighWaterMark` by more than
-   `ShrinkThreshold`, truncate the file via `ftruncate()`. This happens
-   after the commit point — a crash before truncation leaves the file
-   larger than necessary but consistent. The next commit will retry.
-9. Writer signals the flock goroutine to release the lock (clears
-   `WriterPID` and `WriterStartTime`, releases the flock, makes the
-   goroutine available for the next writer in the queue).
+1. Writer submits a request to the flock goroutine's writer queue and
+   waits for the lock grant, respecting `ctx` cancellation (see Write
+   Lock). Returns `context.Cause(ctx)` if cancelled while waiting.
+2. Writer reads the active meta page to get current roots, TxnID, and
+   file format.
+3. For each modification:
+   - Traverse the B+tree from root to leaf via `pager.Page(id)`.
+   - On modify: pager CoWs to a fresh page ID + fresh slab buffer
+     (see Pager and Slab Architecture).
+   - Allocate new pages via `pageAlloc()` (loose → bitmap → RPL
+     reclamation → lagging reader check → file extension).
+   - Old pages from previous transactions go to `tx.retiredPages`;
+     pages CoW'd then freed in this transaction become loose pages.
+   - For modifications to indexed keyspaces, the engine invokes the
+     index extractor on old + new values and applies the index delta
+     in the same write — see Indexing.
+4. Run **Commit Write Ordering** (see Pager and Slab Architecture):
+   - Step 0: pre-pwrite assembly (tail page refund, loose-page move,
+     RPL segment allocation, modified-bitmap-page assembly,
+     meta-page buffer construction). All buffers enter `p.dirty` or
+     the per-transaction meta-page buffer. No syscalls. May abort
+     with `ErrTxTooLarge` or `ErrDBFull` — clean rollback.
+   - Step 1: pwrite all of `p.dirty` (data + RPL + bitmap).
+   - Step 2: `fdatasync(fd)` (skipped in `SyncLazy` and below).
+   - Step 3: pwrite the meta-page buffer to the inactive meta slot.
+   - Step 4: `fdatasync(fd)` (skipped in all modes below `SyncDurable`).
+     **Atomic commit point.**
+5. If OS file size exceeds `HighWaterMark` by more than
+   `ShrinkThreshold`, `ftruncate()`. After the commit point — a crash
+   before truncation leaves the file larger than necessary but
+   consistent.
+6. Release all slab buffers (live, loose, assembled bitmap, RPL
+   segments, meta-page buffer) back to the pool; clear the pager's
+   `p.dirty` map and the transaction's `tx.pendingAllocs`,
+   `tx.pendingFrees`, `tx.cowPages`, `tx.loosePages`,
+   `tx.retiredPages`.
+7. Signal the flock goroutine to release the lock.
 
 ### Read Transaction
 
 1. Reader checks `ctx` — returns `context.Cause(ctx)` if already cancelled.
-2. Reader acquires a slot in the reader table (shared memory) via scan+CAS
-   and records the current TxnID from the active meta page. If no slots are
-   available and the context has a deadline, the reader retries with short
-   backoff (1ms) until a slot becomes free or the context expires. If the
-   context has no deadline, returns `ErrReadersFull` immediately (no
-   blocking). This allows callers to control wait behavior per-call via
-   `context.WithTimeout`.
-3. Reader traverses the B+tree using page pointers from that meta page. Because
-   of CoW, all pages referenced by this TxnID are immutable — the writer will
-   never modify them in place.
+2. Reader acquires a slot in the reader table via scan+CAS and records
+   the current TxnID from the active meta page. If no slots are
+   available and the context has a deadline, the reader retries with
+   short backoff until a slot becomes free or the context expires. With
+   no deadline, returns `ErrReadersFull` immediately. Use
+   `context.WithTimeout` to control the wait window.
+3. Reader traverses the B+tree using page pointers from that meta page
+   via the read-only pager. Because of CoW, all pages referenced by
+   this TxnID are immutable — the writer will never modify them in place.
 4. When done, the reader clears its slot in the reader table.
 
-Readers never need locks on the data file. They never block writers. Writers
-never block readers. The only contention point is the reader table slot
-acquisition, which is a simple atomic CAS. The context governs the retry
+Readers never need locks on the data file. They never block writers.
+Writers never block readers. The only contention point is the reader
+table slot acquisition (atomic CAS). The context governs the retry
 window for slot acquisition but is not stored on the transaction.
+
+**Lagging-reader contract (critical for multi-daemon workloads).** A
+read transaction holds its snapshot's TxnID, which pins every page in
+the snapshot against RPL reclamation. Daemons that keep a single read
+transaction open across many client operations cause unbounded file
+growth — pages freed by intervening write transactions accumulate in
+the RPL and cannot be reclaimed. The correct pattern in a service
+(MCP server, request handler, RPC) is a **short read transaction per
+request**, not per session. The `LaggingReader` callback exists as a
+last-resort signal, not a substitute for short-lived snapshots.
 
 ### Write Batching
 
 `DB.Batch()` amortizes write transaction commit costs across multiple
-concurrent callers. Instead of each goroutine acquiring the write lock and
-committing independently (paying fdatasync per transaction), multiple
-callers' closures are collected and executed within a single transaction.
-
-#### Mechanics
-
-The `DB` struct maintains a batch channel and a batch coordinator:
+concurrent in-process callers.
 
 ```
 db.batchCh chan batchCall
@@ -1388,97 +1315,80 @@ type batchCall struct {
 }
 ```
 
-1. A caller invokes `db.Batch(ctx, fn)`. The closure, context, and a result
-   channel are sent to `db.batchCh`. The caller blocks on the result channel.
+1. `db.Batch(ctx, fn)` sends the closure, context, and a result
+   channel to `db.batchCh`. The caller blocks on the result channel.
+2. A coordinator goroutine reads from `db.batchCh`, collecting calls
+   until either `Options.MaxBatchSize` calls have accumulated (default
+   1000) or `Options.MaxBatchDelay` has elapsed since the first call
+   in the batch (default 10ms). Lower delay reduces latency; higher
+   increases throughput. Set 0 to fire as soon as the coordinator runs.
+3. The coordinator opens a write transaction via `db.Begin(ctx, true)`
+   using `context.Background()` — caller contexts are checked separately.
+4. Each collected closure runs in its own **child transaction** (see
+   Nested Transactions). Before executing, the caller's `ctx` is
+   checked — if cancelled, the closure is skipped and the caller
+   receives `context.Cause(ctx)`.
+5. If a closure returns an error, its child is **rolled back**. The
+   parent transaction is unaffected — other closures' children remain
+   intact. The failing caller receives the error.
+6. If a closure succeeds, its child is **committed** (merged into the
+   parent). The caller will receive `nil` when the parent commits.
+7. After all closures have run, the parent commits. All callers whose
+   closures succeeded receive `nil`. If commit fails, all callers in
+   the batch receive the commit error.
 
-2. A coordinator goroutine (started lazily on first `Batch` call) reads from
-   `db.batchCh`. It collects calls until either:
-   - `Options.MaxBatchSize` calls have accumulated (default: 1000), or
-   - `Options.MaxBatchDelay` has elapsed since the first call in the current
-     batch (default: 10ms).
+Each closure is **invoked exactly once** — there is no rollback-and-retry
+loop. This guarantee is about invocation count, NOT about the
+atomicity of the closure's external side effects against the
+database write. External side effects (logging, metrics, channel
+sends, gRPC calls) run *inside* the closure and are unconditional;
+the parent batch commit can still fail afterward (e.g., ENOSPC at
+fdatasync), in which case the caller receives the commit error
+while the side effect has already taken place. Closures whose side
+effects must be atomic with the write should defer the side effect
+until after `Batch()` returns nil:
 
-   This delay allows more callers to join the batch, increasing throughput.
-   The tradeoff is added latency — callers wait up to `MaxBatchDelay` for
-   the batch to fill. For latency-sensitive workloads, set `MaxBatchDelay`
-   to 0 (batch fires as soon as the coordinator goroutine runs).
+```go
+err := db.Batch(ctx, func(tx *Tx) error {
+    // database write only — no external side effects here
+    return ks.Put(key, value)
+})
+if err != nil { return err }
+// safe to notify now: this caller's write is durable
+notifyChan <- key
+```
 
-3. The coordinator opens a write transaction via `db.Begin(ctx, true)` (using
-   `context.Background()` — individual caller contexts are checked separately).
+**Cross-closure side-effect ordering.** Closures within a single
+batch run sequentially in implementation-defined order during the
+parent transaction. In-closure side effects from closures A and B
+fire in whatever order the coordinator dispatched them; the
+deferred-notification pattern above guarantees per-caller
+*durability* but does NOT guarantee any ordering relative to
+*other* callers' in-closure side effects. If a downstream observer
+must see caller A's notification before caller B's notification,
+the callers must coordinate that ordering themselves — Batch does
+not provide it.
 
-4. Each collected closure is executed in its own **child transaction**
-   (see Nested Transactions). Before executing a closure, its `ctx` is
-   checked — if already cancelled, the closure is skipped and the caller
-   receives `context.Cause(ctx)` to preserve the original cancellation
-   reason.
-
-5. If a closure returns an error, its child transaction is **rolled back**.
-   The parent transaction is unaffected — other closures' child transactions
-   remain intact. The failing caller receives the error.
-
-6. If a closure succeeds, its child transaction is **committed** (merged
-   into the parent). The caller will receive `nil` when the parent commits.
-
-7. After all closures have run, the parent transaction is committed. All
-   callers whose closures succeeded receive `nil` on their result channels.
-
-8. If `Commit()` itself fails (e.g., I/O error), all callers in the batch
-   receive the commit error.
-
-#### Error Isolation
-
-Each closure runs in its own child transaction. A failing closure is
-rolled back independently — its modifications are discarded without
-affecting other closures in the batch. Successful closures are committed
-together in the parent transaction. This provides the same semantics as
-`Update` from each caller's perspective: either their closure's effects
-are committed, or they receive an error.
-
-No rollback-and-retry is needed. No closure is ever re-executed. Each
-closure runs **exactly once**.
-
-#### When to Use Batch
-
-`Batch` is optimal for workloads with many goroutines performing small,
-independent writes (e.g., incrementing counters, appending log entries,
-updating individual keys). The throughput improvement scales with the
-number of concurrent callers — with N callers, commit cost is amortized
-N-ways.
-
-`Batch` is NOT suitable for:
-- Large transactions that modify many keys (use `Update` directly).
-- Transactions that depend on reading their own writes across callers
-  (closures within a batch see each other's writes, which may cause
-  unexpected interactions).
-- Transactions that need exclusive control over commit timing.
-
-#### Closure Contract
-
-Each `Batch` closure executes **exactly once** within its own child
-transaction. There is no rollback-and-retry — if a closure fails, only
-its child transaction is rolled back. Closures may safely:
-
-- Perform side effects (logging, metrics, channel sends) — they will
-  not be replayed.
-- Read and branch on values written by prior closures in the same
-  batch (prior closures' child transactions have been committed into
-  the parent, so their writes are visible).
-
-The only constraint: the closure receives a `*Tx` (the child transaction)
-and must perform all database operations through it, not through a
-captured outer `*Tx`.
+**Cross-process group commit is not provided.** Each process has its
+own batch coordinator. Cross-process write coalescing would require
+shipping closures/redo records between processes — a large complexity
+addition not warranted by the target workloads. Cross-process writers
+serialize via the flock; each individual commit is short enough
+(microseconds to low milliseconds in cheap-commit modes) that queuing
+is not a bottleneck for the target N-daemon profiles.
 
 #### Coordinator Lifecycle
 
-The batch coordinator goroutine is started lazily on the first `Batch()` call. It is stopped when `DB.Close()` is called: the close method closes `db.batchCh`, which causes the coordinator to drain any pending calls (returning `ErrTxClosed` to each), then exit. In-flight batch transactions are committed or rolled back before the coordinator exits.
+Started lazily on the first `Batch()` call. Stopped when `DB.Close()`
+is called: `db.batchCh` is closed, the coordinator drains pending
+calls (returning `ErrTxClosed` to each), then exits.
 
 ### Nested Transactions
 
-A write transaction can create child transactions that can be independently
-committed (merged into the parent) or rolled back (discarded) without
-affecting the parent's state. This is an in-memory mechanism — child
-transactions never write to disk. Only the top-level parent commits.
-
-#### Mechanics
+A write transaction can create child transactions independently
+committed (merged into parent) or rolled back (discarded) without
+affecting the parent. Children never write to disk; only the top-level
+parent commits.
 
 ```go
 child, err := tx.BeginChild()
@@ -1493,72 +1403,68 @@ if err != nil {
 ```
 
 **Child begin** — snapshot the parent's state:
-- Copy `tx.pendingAllocs` (or record its length for truncation)
-- Copy `tx.pendingFrees` (or record its length)
-- Copy `tx.cowPages` (the set of CoW'd page IDs)
-- Copy `tx.loosePages`
-- Copy `tx.retiredPages` (or record its length)
-- Snapshot keyspace root page IDs and counts
+- Snapshot `tx.pendingAllocs` length (or copy).
+- Snapshot `tx.pendingFrees` length.
+- Snapshot `tx.cowPages` (CoW'd page IDs).
+- Snapshot `tx.loosePages`.
+- Snapshot `tx.retiredPages` length.
+- Snapshot keyspace root page IDs and counts.
+- Snapshot the slab `dirty` map (which page IDs the parent has dirtied)
+  — for rollback comparison, not for state restoration. The child does
+  not get its own slab; it shares the parent's pager but never modifies
+  a page already in the parent's `dirty` set in place.
 
-**Child does work:**
-- CoW allocates fresh pages in the mmap, adding to `pendingAllocs` and
-  `cowPages`. Old pages go to `retiredPages`. All modifications happen
-  on the same maps as the parent — the child doesn't have its own maps.
+**Child does work.** CoW always allocates a fresh page ID and a fresh
+slab buffer. If the page being CoW'd is already in the parent's `dirty`
+set, the child copies the parent's buffer into a new buffer at a new
+page ID. The child never mutates a parent's slab buffer in place.
 
-**Child commit:**
-- Discard the saved snapshots. The child's modifications remain in the
-  parent's maps. No-op beyond freeing the snapshot memory. The parent
-  continues with the merged state.
+**Child commit.** Discard the saved snapshots. The child's
+modifications (slab buffers, pending sets, retired list, root
+updates) remain in the parent's pager. No-op beyond freeing the
+snapshot memory.
 
-**Child rollback:**
+**Child rollback.**
+- Release child's slab buffers (those added since child begin) back to
+  the pool; remove from the parent pager's `dirty` map.
 - Restore `pendingAllocs`, `pendingFrees`, `cowPages`, `loosePages`,
-  and `retiredPages` from the saved snapshots.
+  `retiredPages` from snapshots.
 - Restore keyspace roots to their pre-child state.
-- The child's CoW'd pages in the mmap are abandoned — they hold modified
-  content at freshly allocated positions, but nobody references them.
-  The bitmap on disk still shows them as free (bitmap modifications are
-  deferred), so their content is irrelevant.
-- Done. No buffer copying, no undo of mmap writes. The direct write
-  architecture makes this cheap — CoW always writes to fresh pages, so
-  the parent's pages are untouched.
+- The child's CoW'd page IDs are returned to the allocator (they were
+  pending allocations and never reached disk).
+- Done. No buffer-content restoration needed — every page the child
+  touched lives at a fresh page ID, with a fresh slab buffer; dropping
+  the buffer drops the modification.
 
 **Nesting depth:** children can create their own children (arbitrary
-nesting). Each level snapshots the current state. Rollback at any level
-restores to that level's snapshot. Cost is proportional to the number
-of pages modified at each level, not the total database size.
+nesting). Each level snapshots its current state. Rollback at any
+level restores to that level's snapshot. Cost is proportional to
+pages modified at that level, not total database size.
 
-#### Why This Is Simple
+#### Why This Is Cheap
 
-In a pwrite/slab architecture, child rollback is hard: the child may
-have modified a page buffer in the slab that the parent also uses.
-Restoring the buffer requires saving its content before modification
-(copy-on-first-write within the child) or maintaining layered buffer
-sets.
-
-With direct write mode, CoW **always** allocates a fresh page in the
-mmap. The old page at the old position is untouched. Rolling back
-means discarding the bookkeeping for the new pages. The mmap has
-modified content at the abandoned positions, but since bitmap changes
-are deferred (pwrite at commit), the on-disk bitmap still shows those
-pages as free. No buffer restoration needed.
+A page CoW'd by a child lives in a fresh slab buffer at a fresh page
+ID. Nothing the parent holds was overwritten. Rolling back means
+releasing the buffer (back to a `sync.Pool`) and clearing the page ID
+from the bookkeeping sets — no buffer-content restoration, no
+parent-state reconstruction. This is the slab analogue of the
+fresh-mmap-position CoW model: same simplicity, different storage.
 
 #### Interaction with Write Batching
 
-Nested transactions eliminate the rollback-and-retry mechanism in
-`Batch()`. Each closure runs in a child transaction. If a closure
-fails, its child is rolled back — other closures' children are
+Each `Batch()` closure runs in a child transaction. If a closure
+fails, its child is rolled back — other closures' children
 unaffected. Closures execute **exactly once** and do not need to be
-idempotent or side-effect-free. See Write Batching for details.
+idempotent. See Write Batching.
 
 ### Transaction Leak Detection
 
-A transaction that is garbage collected without `Commit()` or `Rollback()`
-is a resource leak: the reader slot (or write lock) is held indefinitely,
-blocking RPL reclamation and potentially causing unbounded file growth.
-This is the most common user error with LMDB/libmdbx-style databases.
+A transaction garbage-collected without `Commit()` or `Rollback()` is a
+resource leak: the reader slot (or write lock) is held indefinitely,
+blocking RPL reclamation. The most common user error with
+LMDB/BoltDB-style databases.
 
-gmdb uses `runtime.AddCleanup` (Go 1.24+) to detect and recover from
-leaked transactions automatically.
+gmdb uses `runtime.AddCleanup` (Go 1.24+) to detect and recover.
 
 #### Setup
 
@@ -1577,19 +1483,18 @@ tx.cleanup = runtime.AddCleanup(tx, func(info txCleanupInfo) {
 })
 ```
 
-`txCleanupInfo` is a separate struct — not the `Tx` itself. This is
-required by `AddCleanup`: the cleanup function must not reference the
-object being cleaned up (no resurrection). The struct contains only the
-information needed to release resources and log a diagnostic.
+`txCleanupInfo` is a separate struct — `AddCleanup` requires that the
+cleanup function not reference the object being cleaned up (no
+resurrection). The struct contains only what's needed to release
+resources and log a diagnostic.
 
 `captureStack()` calls `runtime.Callers()` at `Begin()` time to record
-the call stack. This is stored in `txCleanupInfo` and included in the
-warning message so the user can identify exactly where the leaked
-transaction was opened.
+the call stack — included in the warning so the user can identify
+where the leaked transaction was opened.
 
 #### Normal Close
 
-When `Commit()` or `Rollback()` is called, the cleanup is cancelled:
+`Commit()` or `Rollback()` cancels the cleanup:
 
 ```go
 func (tx *Tx) Commit() error {
@@ -1598,1116 +1503,2145 @@ func (tx *Tx) Commit() error {
 }
 ```
 
-`runtime.Cleanup.Stop()` prevents the cleanup function from running. In
-the normal (non-leak) case, `AddCleanup` at `Begin()` time and `Stop()`
-at close time are the only overhead — both are cheap operations with no
-allocation.
+In the non-leak case, `AddCleanup` at `Begin()` + `Stop()` at close are
+both cheap, allocation-free operations.
 
 #### Cleanup Behavior
 
 When the GC collects a leaked `Tx`:
 
-1. **Log a warning** via the `*slog.Logger` on the `DB` struct (see
-   Options). The message includes:
-   - Whether it was a read or write transaction.
-   - The TxnID held by the transaction.
-   - The stack trace from `Begin()` showing where the leak originated.
+0. **Check `db.closed` first.** `db.closed` is a `*atomic.Bool`
+   allocated on the heap and **shared by pointer** between the `DB`
+   struct, every `txCleanupInfo`, and the `dbCleanupInfo` itself.
+   The pointer is captured into each cleanup at `runtime.AddCleanup`
+   time. Allocating the flag separately (not as an inline field of
+   `DB`) is required because `runtime.AddCleanup` provides no
+   ordering guarantee between a `DB` cleanup and the `Tx` cleanups
+   that depend on observing the close state — if `DB` is collected
+   first, an inline-on-`DB` flag would become a dangling pointer.
+   With the shared-heap flag, the underlying `atomic.Bool` lives
+   until the last referencing cleanup releases its capture.
+   `Close()` sets `*db.closed = true` (release-store) *before* it
+   begins unmapping. If a Tx cleanup observes `*db.closed == true`,
+   it logs the warning and returns immediately — it does NOT touch
+   the reader-table mmap (already unmapped or about to be) or signal
+   the flock goroutine (already stopped). Without this guard, a
+   leaked `Tx` collected after `Close()` would SIGSEGV the GC goroutine.
+1. **Log a warning** via the `*slog.Logger` on the `DB` struct (read
+   txn / write txn, TxnID, Begin stack).
+2. **Release the reader slot** by storing `TxnID = 0` (atomic) in the
+   reader table.
+3. **Release the write lock** (if writable): non-blocking signal to
+   the flock goroutine (channel send with `default:` branch — if the
+   channel is closed because `Close()` raced us past the guard at
+   step 0, the cleanup logs and returns).
 
-2. **Release the reader slot** by storing `TxnID = 0` (atomic store) in
-   the reader table. This unblocks RPL reclamation for pages held by the
-   leaked transaction's snapshot.
-
-3. **Release the write lock** (if writable): signal the flock goroutine
-   to clear `WriterPID` and `WriterStartTime`, release the flock, and
-   serve the next writer in the queue.
-
-The cleanup runs on a GC background goroutine — it must not block or
-panic. All operations above are non-blocking (atomic store, syscall
-flock/funlock, channel send).
+Cleanup runs on a GC background goroutine — must not block or panic.
+All operations are non-blocking.
 
 #### Limitations
 
-- **Timing is non-deterministic**: the cleanup runs when the GC collects
-  the `Tx`, which depends on memory pressure and GC scheduling. A leaked
-  transaction may hold its reader slot for an extended period before the
-  GC runs. This is a safety net, not a substitute for correct resource
-  management.
-- **Cross-process**: the cleanup only runs in the process that created
-  the transaction. If a process exits without closing transactions, the
-  reader slots are reclaimed via PID-based stale detection (see Reader
-  Table), not via cleanup.
-- **Debug, not control flow**: applications should not rely on cleanup
-  for normal operation. It exists solely to detect bugs and limit their
-  blast radius.
+- **Non-deterministic timing**: GC-collection-dependent. A leaked
+  transaction may hold its slot for an extended period.
+- **Cross-process**: cleanup only runs in the creating process. Other
+  processes' leaks are reclaimed via PID-based stale detection
+  (Reader Table).
+- **Debug, not control flow**: applications should not rely on
+  cleanup. Safety net only.
 
 ### Database Handle Leak Detection
 
-The same `runtime.AddCleanup` pattern is applied to the `DB` struct
-itself to detect `DB.Close()` leaks. A leaked `DB` holds open file
-descriptors, mmap regions, and the flock goroutine — all of which are
-process-scoped resources that outlive any individual transaction.
+`runtime.AddCleanup` applied to the `DB` struct too. A leaked `DB`
+holds open file descriptors, mmap regions, and the flock goroutine —
+process-scoped resources outliving any individual transaction.
 
-#### Setup
+Same pattern: cleanup logs a warning with the Open stack trace, stops
+the flock goroutine, munmaps data + lock files, closes file
+descriptors. `Close()` cancels the cleanup.
 
-When `Open()` creates a `DB`, a cleanup is registered:
+#### `Close()` Ordering
 
-```go
-db := &DB{...}
-db.cleanup = runtime.AddCleanup(db, func(info dbCleanupInfo) {
-    // 1. Log warning with the stack trace captured at Open() time.
-    // 2. Stop the flock goroutine.
-    // 3. munmap the data file and lock file mappings.
-    // 4. Close all file descriptors (data file, lock fd).
-}, dbCleanupInfo{
-    openStack: captureStack(),
-    logger:    opts.Logger,
-    // ... fd and mmap references needed for cleanup ...
-})
-```
+To make per-Tx leak cleanups safe against an early `Close()` (see
+Cleanup Behavior step 0 above), `Close()` runs in this order:
 
-`dbCleanupInfo` is a separate struct — not the `DB` itself — to avoid
-preventing GC collection. It contains only the information needed to
-release resources and log a diagnostic.
+1. Store `*db.closed = true` (release-store on the shared
+   `*atomic.Bool`) — visible to any subsequent Tx cleanup invocation
+   regardless of `runtime.AddCleanup` ordering between the DB and
+   its Txs.
+2. Stop the heartbeat goroutine via its stop channel and wait for
+   its done channel (bounded by the tick interval).
+3. Stop the flock goroutine: close `db.stopCh` (the goroutine's
+   `select` honors it within at most `Options.LockRetryInterval`).
+   Wait for the goroutine's done channel to signal exit; on exit
+   it has released any held flock and cleared its writer header
+   fields. **After** the done signal, `Close()`'s own goroutine
+   closes `db.writerCh` and ranges over it, sending `ErrTxClosed`
+   on each pending `writerRequest.result` channel — the flock
+   goroutine is no longer reading from the channel at this point,
+   so `Close()` is the sole drainer.
+4. Stop the batch coordinator (if started): close `db.batchCh`,
+   drain pending calls with `ErrTxClosed`, wait for exit.
+5. Stop the maintenance goroutine (if running): stop channel + wait.
+6. Munmap the data file and lock file.
+7. Close all file descriptors.
 
-#### Normal Close
+Any Tx cleanup invoked between steps 1 and 6 sees `db.closed = true`
+and exits without touching the soon-to-be-unmapped memory. After
+step 6 the mmap is gone but the cleanup's guard at step 0 prevents
+the SEGV. Any Tx cleanup invoked *after* step 7 is fine — the guard
+still prevents access.
 
-When `Close()` is called, the cleanup is cancelled:
-
-```go
-func (db *DB) Close() error {
-    db.cleanup.Stop()
-    // ... normal close logic ...
-}
-```
-
-#### Cleanup Behavior
-
-When the GC collects a leaked `DB`:
-
-1. **Log a warning** via the `*slog.Logger` captured at `Open()` time.
-   The message includes the stack trace from `Open()` showing where
-   the leaked handle was created.
-
-2. **Stop the flock goroutine** by closing `db.writerCh`. The goroutine
-   exits its loop and releases the flock if currently held.
-
-3. **munmap** the data file mapping and the lock file mapping.
-
-4. **Close file descriptors**: data file fd, lock file fd.
-
-The same limitations apply as for `Tx` leak detection: timing is
-non-deterministic (GC-dependent), the cleanup is a safety net for
-debugging, and applications should not rely on it for normal operation.
+`Close()` is **not** safe to call concurrently with active write or
+batch transactions in the same process. Active *read* transactions
+hold reader slots that `Close()` will leave occupied; they continue
+to operate against the now-unmapped lock file ⇒ undefined behavior.
+Callers must ensure all transactions in the process are committed or
+rolled back before calling `Close()` — see also `Compact()` for the
+related drain pattern.
 
 ## Cross-Process Coordination
 
 ### Lock File Layout
 
-A separate file (`<dbname>.lock`) is mmap'd as shared memory by all processes.
+A separate file (`<dbname>.lock`) is mmap'd as shared memory by all
+processes.
 
 ```
 Lock File
-+---------------------------------------+
-| Header (72 bytes)                     |
-| Magic              | uint64          |  identifies file as gmdb lock file
-| MaxReaders         | uint32          |  number of reader slots (set at creation)
-| Padding            | 4 bytes         |  alignment
-| UUID               | [16]byte        |  must match data file's UUID
-| WriterPID          | uint64          |  PID of current write txn holder (0 = no writer)
-| WriterStartTime    | uint64          |  process start time of writer
-| WriterPIDNamespace | uint64          |  PID namespace inode of writer
-| WriterHeartbeat    | uint64          |  monotonic clock, updated periodically
-| LastMaintenanceTime| uint64          |  monotonic clock, updated after maintenance pass
-+---------------------------------------+
-| Reader Table                          |
-| +-------+-----+-----+------+-------+ |
-| | TxnID | PID | PST | PIDN | HB    | | Slot 0
-| | u64   | u64 | u64 | u64  | u64   | |
-| +-------+-----+-----+------+-------+ |
-| | ...                                | | up to MaxReaders slots
-| +-------+-----+-----+------+-------+ |
-+---------------------------------------+
++----------------------------------------------+
+| Header (72 bytes)                            |
+| Magic              | uint64                  |
+| MaxReaders         | uint32                  |
+| Padding            | 4 bytes                 |
+| UUID               | [16]byte                |  must match data file's UUID
+| WriterPID          | uint64                  |
+| WriterStartTime    | uint64                  |
+| WriterPIDNamespace | uint64                  |
+| WriterHeartbeat    | uint64                  |
+| LastMaintenanceTime| uint64                  |
++----------------------------------------------+
+| Reader Table                                 |
+| +-------+-----+-----+------+-------+-------+ |
+| | TxnID | PID | PST | PIDN | HB    | HEpoch| | Slot 0 (48 bytes)
+| | u64   | u64 | u64 | u64  | u64   | u64   | |
+| +-------+-----+-----+------+-------+-------+ |
+| | ...                                       | | up to MaxReaders slots
+| +-------+-----+-----+------+-------+-------+ |
++----------------------------------------------+
 ```
 
 PST = Process Start Time. PIDN = PID Namespace. HB = Heartbeat.
+HEpoch = HintEpoch (cross-process orphan-detection anchor for slots
+stuck mid-acquire; see Stale reader detection).
 
-The lock file structures are defined as Go structs with `structs.HostLayout`
-(Go 1.24+), which guarantees the struct uses the host platform's C ABI
-layout rules. This allows safely overlaying Go structs on the mmap'd
-shared memory region without manual byte offset arithmetic or reliance
-on unspecified Go compiler layout behavior:
+The lock file structures use Go structs with `structs.HostLayout` (Go
+1.24+) which guarantees the host platform's C ABI layout. This allows
+safely overlaying Go structs on the mmap'd shared memory region without
+manual byte offset arithmetic.
 
 ```go
 type LockFileHeader struct {
     _                  structs.HostLayout
     Magic              uint64
     MaxReaders         uint32
-    _                  [4]byte  // explicit padding for 8-byte alignment
-    UUID               [16]byte // must match data file's UUID
+    _                  [4]byte
+    UUID               [16]byte
     WriterPID          uint64
-    WriterStartTime    uint64   // process start time of writer (PID reuse detection)
-    WriterPIDNamespace uint64   // PID namespace inode of writer (0 = unknown/non-Linux)
-    WriterHeartbeat    uint64   // CLOCK_BOOTTIME nanos, updated by heartbeat goroutine
-    LastMaintenanceTime uint64  // CLOCK_BOOTTIME nanos, updated after maintenance pass
+    WriterStartTime    uint64
+    WriterPIDNamespace uint64
+    WriterHeartbeat    uint64
+    LastMaintenanceTime uint64
 }
 
 type ReaderSlot struct {
     _                structs.HostLayout
     TxnID            uint64
     PID              uint64
-    ProcessStartTime uint64 // process start time when slot was acquired
-    PIDNamespace     uint64 // PID namespace inode (0 = unknown/non-Linux)
-    Heartbeat        uint64 // CLOCK_BOOTTIME nanos, updated by heartbeat goroutine
+    ProcessStartTime uint64
+    PIDNamespace     uint64
+    Heartbeat        uint64
+    HintEpoch        uint64 // monotonic clock; first observer of PID==0+Heartbeat==0 sets this
 }
 ```
 
-The `HostLayout` marker is a compile-time guarantee — it applies only to
-the lock file's shared memory structures. Data file page formats remain
-defined as raw byte layouts with explicit encode/decode functions, since
-those must be endian-aware and portable across architectures.
+The `HostLayout` marker applies only to the lock file's shared-memory
+structures. Data file page formats remain raw byte layouts with
+explicit endian-aware encode/decode functions for portability.
+
+**Cross-platform portability of the lock file is not a goal.** The
+lock file is ephemeral (deleted when all processes exit) and its
+layout deliberately follows the host platform's C ABI via
+`HostLayout`. A lock file written by a little-endian process is not
+readable by a big-endian process; mounting the database on a
+different architecture requires deleting any stale lock file
+(which the next opener does automatically when the UUID does not
+match the data file's). The data file itself is fully portable
+(little-endian, explicit encode/decode) and is not affected.
 
 **Header (72 bytes):**
-- `Magic` (uint64): Identifies the file as a gmdb lock file. Validates that
-  the lock file belongs to this database and has not been corrupted.
-- `MaxReaders` (uint32): Number of reader slots. Set at lock file creation
-  time via `Options.MaxReaders` (default: 4096). Immutable after creation.
-- Padding (4 bytes): Alignment to 8-byte boundary.
-- `UUID` ([16]byte): Database UUID, copied from the data file's meta page
-  at lock file creation time. On `Open()`, the lock file's UUID is compared
-  against the data file's UUID. If they differ, the lock file is stale
-  (belongs to a different database or the data file was replaced) — it is
-  deleted and recreated. This prevents cross-database lock file confusion
-  when files are moved, renamed, or replaced.
-- `WriterPID` (uint64): PID of the process currently holding the write lock.
-  Set when the write lock is acquired, cleared to 0 on release. Used for
-  stale writer detection (see Stale Writer Recovery). Stored as uint64 for
-  forward safety — Linux `pid_max` can reach 2^22 on 64-bit kernels, and
-  uint64 provides consistent alignment with other fields.
-- `WriterStartTime` (uint64): Process start time of the writer, stored
-  alongside `WriterPID` for PID reuse detection. If `WriterPID` is non-zero
-  and the PID is alive, the start time is compared against the PID's current
-  start time — a mismatch means the PID was recycled and the original writer
-  crashed. See Stale Writer Recovery and Process Start Time below.
-- `WriterPIDNamespace` (uint64): PID namespace inode of the writer process
-  (from `/proc/self/ns/pid` on Linux, 0 on other platforms). Used to
-  determine whether the stale writer check can trust PID-based liveness
-  detection. See PID Namespace Awareness below.
-- `WriterHeartbeat` (uint64): Monotonic clock value (`CLOCK_BOOTTIME` on
-  Linux, `CLOCK_MONOTONIC` on other platforms), updated periodically by
-  the heartbeat goroutine while the write lock is held. Used as a fallback
-  for stale writer detection when PID namespaces differ.
-- `LastMaintenanceTime` (uint64): Monotonic clock value, updated after a
-  maintenance pass completes. Used to coordinate maintenance across
-  processes — each process checks this value before starting a pass and
-  skips if a recent pass was completed within `MaintenanceOptions.Interval`.
-  See Background Maintenance.
+- `Magic`: identifies the file as a gmdb lock file.
+- `MaxReaders`: number of reader slots, set at lock file creation via
+  `Options.MaxReaders` (default 4096). Immutable.
+- `UUID`: copied from data file's meta at creation. On `Open()`, the
+  lock file's UUID is compared to the data file's UUID; mismatch ⇒
+  stale lock file ⇒ deleted and recreated.
+- `WriterPID`: PID of the current write-lock holder (0 = no writer).
+  uint64 for forward safety (Linux `pid_max` can reach 2^22).
+- `WriterStartTime`: process start time of the writer for PID-reuse
+  detection.
+- `WriterPIDNamespace`: PID namespace inode of the writer (Linux), 0
+  on other platforms.
+- `WriterHeartbeat`: `CLOCK_BOOTTIME` nanos (Linux) /
+  `CLOCK_MONOTONIC` elsewhere, updated periodically by the heartbeat
+  goroutine while the write lock is held.
+- `LastMaintenanceTime`: updated after a maintenance pass completes;
+  coordinates maintenance across processes.
 
-**Reader Slot (40 bytes):**
-- `TxnID` (uint64, atomic): The snapshot transaction ID held by this reader.
-  A value of 0 means the slot is free. Non-zero means the slot is active.
-- `PID` (uint64, atomic): Process ID that owns this slot. Used for stale
-  reader detection in the same PID namespace. Stored as uint64 for alignment
-  consistency with TxnID and forward safety.
-- `ProcessStartTime` (uint64, atomic): Process start time when the slot was
-  acquired. Used alongside `PID` for PID reuse detection — if the PID is
-  alive but its current start time differs from the stored value, the PID
-  was recycled and the slot is stale. See Process Start Time below.
-- `PIDNamespace` (uint64, atomic): PID namespace inode of the process that
-  acquired this slot (from `/proc/self/ns/pid` on Linux, 0 on other
-  platforms). See PID Namespace Awareness below.
-- `Heartbeat` (uint64, atomic): Monotonic clock value, updated periodically
-  (~1s) by the owning process's heartbeat goroutine. Used for stale
-  detection when PID namespaces differ or PID-based checks are unavailable.
+**Reader Slot (48 bytes):**
+- `TxnID` (atomic): snapshot TxnID held by this reader. 0 = free.
+- `PID` (atomic): owning process. uint64 for alignment + forward safety.
+- `ProcessStartTime` (atomic): owning process's start time when slot
+  was acquired.
+- `PIDNamespace` (atomic): PID namespace inode of owner.
+- `Heartbeat` (atomic): monotonic clock, updated periodically (~1s) by
+  owning process's heartbeat goroutine.
+- `HintEpoch` (atomic): cross-process orphan-detection anchor. Zero
+  during normal operation. The first writer-scan that observes the
+  slot in the "stuck mid-acquire" state (`TxnID != 0 AND PID == 0 AND
+  Heartbeat == 0`) CAS-stores its current monotonic clock here;
+  subsequent scans by *any* process compare against this stored
+  epoch, so the orphan timer survives writer-process turnover (M1 of
+  Round 2: transient cron-style writers cycling faster than
+  StaleTimeout no longer leave an orphan permanently pinned).
+  Cleared back to 0 by slot release and by successful acquire's
+  field-write phase.
 
-Total lock file size: 72 + (40 × MaxReaders). With default MaxReaders=4096:
-72 + 163840 = 163912 bytes (~160KB).
+Total: 72 + (48 × MaxReaders). Default 4096: 72 + 196608 = 196680
+bytes (~192 KB).
 
-The lock file is mmap'd with `MAP_SHARED` by all processes for the reader table.
-The write lock is a separate concern handled via `flock()` (see below).
+The lock file is mmap'd `MAP_SHARED` by all processes for the reader
+table. The write lock is a separate concern via `flock()`.
 
 ### Lock File Lifecycle
 
-The lock file is ephemeral. The first process to open the database creates the
-lock file, writes the header (including `Magic`, `MaxReaders`, `WriterPID=0`,
-`WriterStartTime=0`), and initializes all reader slots to zero. Subsequent processes validate `Magic`,
-read `MaxReaders` from the header, and mmap the file at the corresponding size.
-If the lock file is deleted (e.g., after all processes exit), the next opener
-recreates it. `MaxReaders` is NOT stored in the data file — it is a runtime
-coordination property, not a data property.
+Ephemeral. The first process to open the database creates the lock
+file, writes the header (Magic, MaxReaders, WriterPID=0,
+WriterStartTime=0), initializes all slots to zero. Subsequent
+processes validate `Magic`, read `MaxReaders`, mmap at the
+corresponding size. If deleted (e.g., after all processes exit), the
+next opener recreates it. `MaxReaders` is NOT in the data file — it's
+a runtime coordination property.
 
-On open, if the lock file already exists, the opener checks `WriterPID`. If
-non-zero, the opener determines whether the writer is still alive using
-`kill(pid, 0)` and `WriterStartTime` comparison (see Process Start Time).
-If the writer is dead or the PID was recycled, the writer crashed while
-holding the lock — see Stale Writer Recovery.
+On open, if the lock file exists, the opener checks `WriterPID`.
+Non-zero: determine whether the writer is still alive via
+`kill(pid, 0)` + `WriterStartTime` comparison (see Process Start Time).
+Dead or recycled: writer crashed; see Stale Writer Recovery.
 
 ### Write Lock
 
-Write serialization uses two layers:
+Two layers:
 
-- **Intra-process**: a writer queue managed by a single **flock goroutine**
-  on the `DB` struct. Writers submit requests via a channel and receive
-  the lock grant via a per-request response channel. This prevents two
-  goroutines in the same process from attempting concurrent writes while
-  supporting context-aware cancellation with zero goroutine accumulation.
+- **Intra-process**: a writer queue managed by a single **flock
+  goroutine** on the `DB` struct. Writers submit via a channel and
+  receive the lock grant via a per-request response channel. Prevents
+  two same-process goroutines from concurrent writes while supporting
+  context-aware cancellation with zero goroutine accumulation.
 - **Cross-process**: `flock(LOCK_EX)` on the lock file, acquired and
-  released exclusively by the flock goroutine. This prevents writers in
-  different processes.
+  released by the flock goroutine.
 
 #### Flock Goroutine
 
-The `DB` struct maintains a single persistent goroutine (started at
-`Open()` time, stopped at `Close()`) that is the sole owner of flock
-acquisition and release. At most one goroutine is ever blocked in the
-`flock()` syscall.
+A single persistent goroutine (started at Open, stopped at Close)
+solely owns flock acquisition/release. At most one goroutine is ever
+attempting `flock()`. The goroutine never **blocks indefinitely** in
+the kernel — it uses `flock(LOCK_EX | LOCK_NB)` (non-blocking) in a
+retry loop with a `select` on the stop channel, so `Close()` can
+always unwind the goroutine even when another process holds the
+write lock for an extended period.
 
 ```
 db.writerCh chan writerRequest
+db.stopCh   chan struct{}     // closed by Close()
+db.lockTry  *time.Ticker      // retry interval, default 50ms
 
 type writerRequest struct {
     ctx    context.Context
+    ctxDone <-chan struct{}    // equivalent to req.ctx.Done()
     result chan<- error  // nil = lock granted; non-nil = cancelled/error
 }
 ```
 
-The flock goroutine runs a loop:
+Loop:
 
-1. Read the next `writerRequest` from `db.writerCh`.
-2. Check `req.ctx` — if already cancelled, send `context.Cause(req.ctx)`
-   on `req.result` and loop back to step 1.
-3. If the flock is not currently held (no cross-process contention),
-   acquire `flock(LOCK_EX)` — this blocks in the kernel until granted.
-4. While blocked in `flock`, the goroutine cannot check `req.ctx`.
-   However, since this is the only goroutine that ever calls `flock`,
-   there is no goroutine accumulation. The flock completes when the
-   external writer releases it.
-5. On flock acquisition, check `req.ctx` again — if cancelled while
-   waiting, release the flock immediately and send the cancellation
-   error. Loop back to step 1 to serve the next waiter.
-6. If `req.ctx` is still valid, store the caller's PID and process start
-   time in the lock file header's `WriterPID` and `WriterStartTime`
-   fields and send `nil` on `req.result` — the writer now holds the lock.
-7. Wait for the writer to signal completion (via a release channel
-   provided alongside the request). On release: clear `WriterPID` and
-   `WriterStartTime` to 0, release the flock, loop back to step 1.
+1. `select` on `db.writerCh` (next request), `db.stopCh` (Close
+   signal), and (when flock is held) the writer's release channel.
+   On `db.stopCh`: release flock if held, exit.
+2. On a new `writerRequest`:
+   a. Check `req.ctx` — if already cancelled, send
+      `context.Cause(req.ctx)` on `req.result` and loop.
+   b. Enter the **non-blocking acquisition loop**:
+      - `flock(db.lockFd, LOCK_EX | LOCK_NB)`.
+      - On success: proceed to step 3.
+      - On `EWOULDBLOCK`: `select` on
+        (`db.lockTry.C`, `req.ctxDone`, `db.stopCh`):
+          - tick → retry the `flock` syscall.
+          - `req.ctxDone` → caller cancelled; send
+            `context.Cause(req.ctx)` and loop to step 1 (slot is
+            free for the next request).
+          - `db.stopCh` → release flock if held, exit.
+      - On any other error: send the error to `req.result` and loop.
+3. Store `WriterPID`, `WriterStartTime`, `WriterPIDNamespace` in the
+   lock file header; send `nil` on `req.result` — writer holds the
+   lock.
+4. `select` on (writer's release channel, `db.stopCh`).
+   - Release: clear `WriterPID`/`WriterStartTime`/`WriterPIDNamespace`,
+     `flock(LOCK_UN)`, loop to step 1.
+   - `db.stopCh`: clear writer header fields, `flock(LOCK_UN)`, exit.
+
+The non-blocking + ticker pattern is a small CPU/syscall cost
+(`Options.LockRetryInterval`, default 50 ms; one extra syscall per
+tick while contention persists) in exchange for bounded `Close()`
+latency and bounded cancellation latency.
 
 #### Writer Acquisition Flow
 
-A `Begin(ctx, writable=true)` call:
+`Begin(ctx, writable=true)`:
 
-1. Send a `writerRequest{ctx, result}` to `db.writerCh`.
+1. Send `writerRequest{ctx, result}` to `db.writerCh`.
 2. `select` on `result` and `ctx.Done()`:
-   - If `result` receives `nil`: lock is granted. Proceed with the
-     write transaction.
-   - If `result` receives a non-nil error: lock was not granted (e.g.,
-     the flock goroutine detected a stale writer and recovery failed).
-   - If `ctx.Done()` fires first: the writer gives up. The flock
-     goroutine will detect the cancelled context when it processes the
-     request (step 2 or 5 above) and skip or release accordingly.
-     Return `context.Cause(ctx)`.
+   - `result` ← `nil`: lock granted. Proceed.
+   - `result` ← non-nil error: lock not granted.
+   - `ctx.Done()` first: writer gives up. The flock goroutine will
+     detect cancellation when it processes the request and skip or
+     release. Return `context.Cause(ctx)`.
 
-`Commit()` and `Rollback()` signal the flock goroutine to release the
-lock via the release channel.
+`Commit()` and `Rollback()` signal the flock goroutine to release.
 
 #### Why This Design
 
-The previous approach — spawning a new goroutine per write lock attempt
-to call `flock(LOCK_EX)` — suffered from goroutine accumulation under
-rapid context cancellation. Each cancelled attempt left a goroutine
-blocked in `flock` until it acquired and released, draining one-by-one.
-Under pathological cancellation patterns (e.g., request timeouts in a
-web server), this could accumulate hundreds of goroutines.
+A goroutine-per-attempt model would suffer under rapid context
+cancellation: each cancelled attempt leaves a goroutine blocked in
+`flock` until it acquires-and-releases. Under pathological cancel
+patterns this accumulates hundreds of goroutines.
 
-The single flock goroutine eliminates this: at most one goroutine is
-ever in the `flock` syscall. Cancelled writers simply dequeue — they
-never touch flock. The goroutine is a fixed-cost resource (one per `DB`
-instance, ~8KB stack) that exists for the lifetime of the database
-handle.
+Single flock goroutine eliminates that. Cancelled writers simply
+dequeue — they never touch flock. Fixed cost (one goroutine per DB
+handle, ~8 KB stack + one `time.Ticker`) for the lifetime of the
+database handle.
 
-This two-layer approach (intra-process queue + cross-process flock) is
-necessary because `flock()` is per-fd and per-process — a second
-goroutine calling `flock()` on the same fd would succeed immediately
-(the kernel considers the lock already held by this process).
+The non-blocking `flock` + retry pattern (rather than blocking
+`flock(LOCK_EX)`) means the goroutine is always cooperatively
+cancellable: `Close()` and per-writer `ctx` cancellation are both
+honored within at most one retry interval, even when another process
+holds the lock indefinitely. The cost is one wasted syscall per tick
+of contention.
 
-The `DB` struct holds a single dedicated fd for the write lock
-(`db.lockFd`), opened separately from the fd used for the reader table
-mmap. This fd is used exclusively for `flock()`/`funlock()` calls.
+The DB holds a dedicated fd for the write lock (`db.lockFd`), separate
+from the fd for the reader-table mmap. Used exclusively for
+`flock()`/`funlock()`.
+
+**Cancellation latency under pathological queue patterns.** When a
+writer's `ctx` cancels while the request sits in `db.writerCh` behind
+a still-pending predecessor, the cancelled writer's caller returns
+immediately with `context.Cause(ctx)`. The request itself remains in
+the channel and is processed in turn by the flock goroutine, which
+discards already-cancelled requests via the step-2a check *before*
+attempting `flock`. Under sustained high-cancellation load this
+produces no extra flock syscalls — cancelled requests cost only a
+channel receive and a `select`.
 
 #### Stale Writer Recovery
 
-If a process crashes while holding the write lock, `WriterPID` remains non-zero
-and the `flock()` is automatically released by the kernel (flock locks are
-released on fd close / process exit). On `Open()` or when attempting to acquire
-the write lock, if `WriterPID` is non-zero, the process determines whether the
-writer is still alive using the same namespace-aware logic as reader stale
-detection:
+If a process crashes holding the write lock, `WriterPID` remains
+non-zero and the `flock()` is automatically released by the kernel (fd
+close on process exit). On `Open()` or write-lock acquisition with
+`WriterPID` non-zero, the process determines whether the writer is
+alive using the same namespace-aware logic as reader stale detection:
 
-1. **Same PID namespace** (`WriterPIDNamespace` == checker's, both non-zero):
-   a. `kill(pid, 0)` — if it returns `ESRCH`, the process is dead.
-   b. If alive, compare `WriterStartTime` — if different, PID was recycled.
-2. **Different PID namespace** (or either is 0): check `WriterHeartbeat`.
-   If `now - WriterHeartbeat > StaleTimeout`, the writer is dead.
+1. **Same PID namespace** (`WriterPIDNamespace` == checker's, both
+   non-zero):
+   a. `kill(pid, 0)` — `ESRCH` ⇒ dead.
+   b. If alive, compare `WriterStartTime` — different ⇒ PID recycled.
+2. **Different PID namespace** (or either 0): check `WriterHeartbeat`.
+   `now - WriterHeartbeat > StaleTimeout` ⇒ dead.
 
-Based on the result:
+If dead, recovery:
+1. Read both meta pages, select the valid one (highest TxnID + valid
+   checksum). The crashed writer's partial commit is invisible — CoW
+   guarantees the previous meta points to a consistent tree.
+2. Scan the reader table for slots with the dead writer's PID (in the
+   same PID namespace) and clear them.
+3. Clear `WriterPID`, `WriterStartTime`, `WriterPIDNamespace`,
+   `WriterHeartbeat`.
 
-- If alive (PID check or fresh heartbeat): the writer is still running —
-  proceed with normal `flock()` which will block until the writer finishes.
-- If dead (PID check or stale heartbeat): the writer crashed. The flock is
-  already released by the kernel. The new writer acquires the flock, then
-  performs recovery:
-  1. Read both meta pages and select the valid one (highest TxnID with valid
-     checksum). The crashed writer's partial commit is invisible — CoW ensures
-     the previous meta page points to a consistent tree.
-  2. Scan the reader table for slots with the dead writer's PID (in the same
-     PID namespace) and clear them (the crashed process may have also held
-     read transactions). Each slot is validated via `ProcessStartTime` and
-     `PIDNamespace` to avoid clearing slots from a different process.
-  3. Clear `WriterPID`, `WriterStartTime`, `WriterPIDNamespace`, and
-     `WriterHeartbeat` to 0 (they will be set to the new writer's values
-     shortly).
+No special rollback logic for tree consistency — CoW guarantees the
+previous meta points to a fully consistent tree.
 
-No special rollback logic is needed for tree consistency — the CoW model
-guarantees that the previous meta page points to a fully consistent tree.
-
-Bitmap modifications are deferred in memory (`tx.pendingAllocs` and
-`tx.pendingFrees`) and only written to disk via `pwrite()` at commit time.
-If the writer crashes before commit, no bitmap modifications reach disk —
-the on-disk bitmap is fully consistent with the previous meta page. No
-leaked pages. CoW'd data pages at new positions in the mmap may have been
-flushed by the kernel, but they are unreferenced (free pages in the on-disk
-bitmap) so their content is irrelevant.
+Bitmap modifications are deferred in memory (`tx.pendingAllocs` /
+`tx.pendingFrees`) and only written to disk via pwrite at commit time.
+If the writer crashes before commit, no bitmap modifications reach
+disk — the on-disk bitmap is fully consistent with the previous meta.
+No leaked pages. The slab buffers were anonymous mmap pages that are
+released to the OS on process exit — no on-disk artifacts.
 
 ### Reader Table
 
-Slot allocation uses a simple scan with atomic CAS — no free stack or other
-auxiliary data structure. The reader table is a flat array of 40-byte slots
-stored in the lock file's shared mmap. All operations use atomic memory
-operations visible across processes.
+Slot allocation uses a simple scan with atomic CAS — no free stack or
+other auxiliary data structure. The reader table is a flat array of
+48-byte slots in the lock file's shared mmap. All operations use atomic
+memory ops visible across processes.
 
 **Slot acquire (`Begin` read transaction):**
+
+The acquire sequence is structured so that a crash at *any* point
+after the CAS leaves the slot in a state the stale-detector can
+reclaim. Heartbeat is written first (so a crash mid-acquire still
+gives the slot a "recent liveness" anchor that will eventually go
+stale); PID is written last (so the detector's PID-based fast path
+is only used once the full identity has been populated).
+
 1. Start scanning from the **slot hint** (`db.readerSlotHint`, an
-   `atomic.Uint32` on the `DB` struct) rather than slot 0. The hint
-   caches the index of the last successfully acquired slot, so the scan
-   begins in a region likely to contain free slots.
-2. Scan forward (with wraparound) for a slot where `TxnID == 0` (free).
-3. Atomically CAS the `TxnID` field from 0 to the current meta page's TxnID.
-   If the CAS fails (another goroutine or process claimed the slot
-   concurrently), continue scanning.
-4. After successful CAS, store the caller's PID, cached process start
-   time (`db.processStartTime`), PID namespace (`db.pidNamespace`), and
-   current monotonic clock in the slot's `PID`, `ProcessStartTime`,
-   `PIDNamespace`, and `Heartbeat` fields. The CAS establishes ownership
-   — only the CAS winner writes these fields.
-5. Register the slot index with the heartbeat goroutine's active slot list.
-6. Update `db.readerSlotHint` to the acquired slot's index.
-7. If all slots are occupied (full wraparound), return `ErrReadersFull`.
+   `atomic.Uint32` on the DB struct) rather than slot 0.
+2. Scan forward (with wraparound) for `TxnID == 0` (free).
+3. Atomically CAS the `TxnID` field from 0 to the current meta page's
+   TxnID. CAS failure ⇒ continue scanning.
+4. Immediately after a successful CAS, in this exact order:
+   a. Store `Heartbeat = nowMonotonic()` (atomic).
+   b. Store `HintEpoch = 0` (atomic, clears any prior orphan-anchor
+      left over from a stale-cleared slot).
+   c. Store `PIDNamespace = db.pidNamespace` (atomic).
+   d. Store `ProcessStartTime = db.processStartTime` (atomic).
+   e. Store `PID = currentPID` (atomic).
+5. Register the slot index with the heartbeat goroutine's active list.
+6. Update `db.readerSlotHint`.
+7. If all slots occupied (full wraparound), return `ErrReadersFull`.
 
-The CAS on `TxnID` establishes slot ownership. Only the CAS winner writes
-PID, ProcessStartTime, PIDNamespace, and Heartbeat — there is no race
-because the CAS serializes access to the slot. The writer's stale-reader
-scan treats slots with non-zero TxnID and zero PID as "being acquired"
-and skips them (does not clear it as stale). This window is brief — the
-time between a successful CAS and the subsequent field stores.
+The hint is process-local, updated with a relaxed atomic store — no
+cross-process coordination. Under steady-state load, the hint points
+to a recently-freed slot and the scan completes in 1–2 iterations.
+Worst case wraps around to O(MaxReaders).
 
-The hint is process-local (stored on the `DB` struct, not in shared
-memory) and updated with a relaxed atomic store — no cross-process
-coordination. Under steady-state load where a process repeatedly opens
-and closes read transactions, the hint points to a recently-freed slot
-and the scan completes in 1–2 iterations. In the worst case (all slots
-before the hint are occupied), the scan wraps around and degrades to
-O(MaxReaders) — no worse than scanning from slot 0.
-
-The CAS on `TxnID` is the serialization point. With 40-byte slots,
-4096 slots = 160KB — fits in L2 cache, sequential scan with hardware
-prefetching.
+The CAS on `TxnID` is the serialization point. 48-byte slots × 4096
+= 192 KB — fits in L2 cache, sequential scan with hardware prefetching.
 
 **Slot release (`Commit`/`Rollback` read transaction):**
-1. Store `TxnID = 0` (atomic store). This single operation makes the slot
-   free. The PID field is left as-is — it is only meaningful when `TxnID`
-   is non-zero.
 
-The release is a single atomic store. No CAS needed — only the slot owner
-writes to its own slot.
+In order:
+1. `PID = 0` (atomic store). Prevents the next stale-reader scan from
+   inspecting this process's (about-to-be-stale) PID after release.
+2. `Heartbeat = 0` (atomic store). Resets the heartbeat-based
+   liveness marker so a subsequent acquirer is in a clean state.
+   *Race note:* the heartbeat goroutine may concurrently store a
+   fresh value to `Heartbeat` for this slot if it has not yet
+   observed the corresponding `activeSlotsMu`-protected
+   `Begin/Commit` list update. The race is benign — both stores
+   are valid uint64 values and step 4 (`TxnID = 0`) lands shortly
+   after, putting the slot in the unambiguously-free state. The
+   active-slot list removal happens *before* this step 2 store, so
+   the heartbeat goroutine's next tick will not target this slot.
+3. `HintEpoch = 0` (atomic store). Clears any orphan-detection
+   anchor.
+4. `TxnID = 0` (atomic store). Final release — slot is now free.
 
-**Stale reader detection:** During the writer's reader table scan (to find
-the minimum active TxnID), if a slot has a non-zero `TxnID`, the writer
-checks whether the owning process is still alive and is the *same* process
-that acquired the slot:
+No CAS — only the slot owner writes its own slot. Step 1 before
+step 4 closes the prior-owner-PID race: a writer scanning between
+the next acquirer's CAS and its PID store sees `PID == 0` and falls
+through to the heartbeat path rather than running `kill()` against
+the previous (now-exited) owner's PID.
 
-0. If `PID == 0` (but `TxnID != 0`), the slot is being acquired — a reader
-   has won the CAS on TxnID but has not yet stored its PID. The writer
-   skips this slot (does not clear it as stale). This avoids a race where
-   the writer clears a slot between the reader's CAS and its PID store.
-1. **Same PID namespace** (slot's `PIDNamespace` == checker's, both non-zero):
-   use the fast PID + StartTime path:
-   a. `kill(pid, 0)` — if it returns `ESRCH`, the process is dead. Stale.
-   b. If alive, compare `ProcessStartTime` — if different, PID was recycled.
-      Stale.
-   c. If both match, the process is alive and holding the slot legitimately.
-2. **Different PID namespace** (or either is 0): PID-based checks would
-   inspect the wrong process. Fall back to heartbeat:
-   a. If `now - Heartbeat > StaleTimeout` → stale. Clear `TxnID = 0`.
-   b. If heartbeat is fresh → not stale. The owning process is still
-      updating the slot.
-3. If neither PID nor heartbeat can determine liveness (e.g., `PIDNamespace`
-   is 0 and `Heartbeat` is 0 — a slot from a process that predates heartbeat
-   support), fall back to PID-only liveness (`kill(pid, 0)`). This is the
-   legacy path, vulnerable to cross-namespace false results but safe within
-   a single namespace.
+**Stale reader detection:** during the writer's reader-table scan (to
+find min active TxnID), if a slot has non-zero `TxnID`, classify it
+by inspecting `PID` and `Heartbeat`:
 
-The PID namespace check prevents the dangerous cross-namespace failure mode
-where `kill(pid, 0)` inspects a different process than the slot owner. When
-two containers share a database file via volume mount, each process stores
-its PID namespace inode in the slot. A writer in container B sees that
-container A's slot has a different namespace and uses the heartbeat instead
-of trusting `kill()`. See PID Namespace Awareness below.
+0. **PID == 0 path** (slot is mid-acquire, mid-release, or orphaned):
+
+   a. **Fresh heartbeat** (`Heartbeat != 0 AND now - Heartbeat ≤
+      StaleTimeout`): a live owner is mid-acquire/release. **Skip.**
+   b. **Stale heartbeat** (`Heartbeat != 0 AND now - Heartbeat >
+      StaleTimeout`): the acquirer made it past step 4a (heartbeat
+      store) but crashed before step 4e (PID store), and the
+      heartbeat has now aged out. **Orphan: clear `TxnID = 0`.**
+   c. **Zero heartbeat** (`Heartbeat == 0`): the acquirer crashed
+      *before* step 4a, leaving the slot with `TxnID != 0, PID == 0,
+      Heartbeat == 0`. There is no per-slot age signal yet; use
+      `HintEpoch` as the cross-process orphan anchor:
+        - If `HintEpoch == 0`: this is the first observation. CAS
+          `HintEpoch` from 0 to `now`. **Skip** this round; the next
+          scan (from any process) compares against the stored epoch.
+        - If `HintEpoch != 0 AND now - HintEpoch > StaleTimeout`:
+          confirmed orphan. **Clear `TxnID = 0`** (and `HintEpoch`
+          via the post-clear cleanup below).
+        - Otherwise: **skip**.
+1. **PID != 0, same PID namespace** (slot's `PIDNamespace` == checker's,
+   both non-zero):
+   a. `kill(pid, 0)` — `ESRCH` ⇒ stale.
+   b. If alive, compare `ProcessStartTime` — different ⇒ PID recycled,
+      stale.
+   c. Match ⇒ alive and holding the slot legitimately.
+2. **PID != 0, different PID namespace** (or either namespace inode
+   is 0): heartbeat check.
+   a. `now - Heartbeat > StaleTimeout` ⇒ stale, clear `TxnID = 0`.
+   b. Fresh ⇒ not stale.
+3. If neither PID nor heartbeat can determine liveness, fall back to
+   PID-only liveness (legacy path).
+
+When the writer clears a stale slot, it stores in this exact order:
+1. `HintEpoch = 0` (atomic). Resets the orphan-detection anchor
+   *while the slot is still observably non-free*, so no acquirer
+   can race into the slot and inherit a stale epoch.
+2. `TxnID = 0` (atomic). Final release — slot is now free.
+
+The slot's PID/PST/PIDN/Heartbeat are left as-is and will be
+overwritten by the next acquirer per the acquire ordering above.
+
+The HintEpoch-first ordering is load-bearing: if these two stores
+were reversed, a window would exist between `TxnID = 0` and
+`HintEpoch = 0` during which a fresh acquirer could CAS-win TxnID
+and crash before step 4a (heartbeat store). A subsequent stale-
+detection scan would then see `TxnID != 0, PID == 0, Heartbeat == 0,
+HintEpoch = <stale value from prior cycle>` and immediately
+re-clear the slot via case (c)'s timer (already aged out), evicting
+the (genuinely dead) new acquirer faster than StaleTimeout — which
+is benign for *that* slot but violates the per-occupant timer
+invariant. Zeroing HintEpoch first closes the window.
+
+**Why `HintEpoch` lives in shared memory.** A process-local epoch
+would not survive writer-process turnover: short-lived writers
+(cron jobs, batch scripts) each observe the orphaned slot once,
+record their own local epoch, and exit before the StaleTimeout
+elapses, leaving the slot permanently pinned. The shared-memory
+`HintEpoch` accumulates observation time across all writer
+processes — the first observer sets it; any later writer in any
+process clears the slot once `now - HintEpoch > StaleTimeout`.
+
+The PID namespace check prevents cross-namespace failure modes (false
+dead when containers don't share PIDs; false alive when distinct
+processes happen to share a PID).
 
 #### Go Goroutine Model
 
-Go multiplexes goroutines across OS threads, but this does not affect the
-reader table design. Each concurrent read transaction — regardless of which
-goroutine or OS thread runs it — claims its own slot via atomic CAS. Multiple
-slots may share the same PID (same process), which is correct:
+Multiple slots may share the same PID (same process running multiple
+read transactions). This is correct:
 
-- **Slot allocation**: the CAS on the TxnID field serializes slot claims across
-  both goroutines (same process) and external processes.
-- **Stale detection**: `kill(pid, 0)` checks process liveness, not thread
-  liveness. If a process crashes, all its slots (potentially many) are stale
-  and can be reclaimed. This is the desired behavior.
-- **Oldest reader scan**: the writer finds the minimum TxnID across all
-  occupied slots. Multiple slots from the same process with different TxnIDs
-  are handled naturally — the oldest one governs RPL reclamation.
+- **Slot allocation**: CAS on TxnID serializes claims across goroutines
+  and external processes.
+- **Stale detection**: `kill(pid, 0)` checks process liveness, not
+  thread liveness. If a process crashes, all its slots are stale.
+- **Oldest reader scan**: writer finds min TxnID across all occupied
+  slots. Multiple slots from one process with different TxnIDs handled
+  naturally.
 
-The consequence is that a single Go process running N concurrent read
-transactions consumes N reader slots. Applications must set `MaxReaders`
-high enough to accommodate the expected total across all processes.
+A single Go process running N concurrent read transactions consumes N
+reader slots. Set `MaxReaders` high enough for the expected total
+across all processes.
 
 #### Process Start Time
 
-To detect PID reuse (where a new process is assigned the same PID as a
-crashed process), both reader slots and the writer header store the
-process's **start time** alongside its PID. The start time is a
-monotonically-increasing value that changes when a PID is recycled,
-providing a unique `(PID, StartTime)` tuple per process lifetime.
+PID reuse detection: both reader slots and writer header store
+**start time** alongside PID. Monotonically-increasing value that
+changes when a PID is recycled — unique `(PID, StartTime)` per
+process lifetime.
 
-At `Open()` time, the process reads its own start time once and caches it
-on the `DB` struct (`db.processStartTime uint64`). This cached value is
-stored in reader slots on `Begin()` and in `WriterStartTime` on write lock
-acquisition.
+At `Open()`, the process reads its own start time once and caches it
+on the DB struct (`db.processStartTime uint64`). Stored in reader
+slots on `Begin()` and in `WriterStartTime` on write lock acquisition.
 
 During stale detection, the writer reads the current start time for a
-given PID via `processStartTime(pid int) (uint64, error)`. If the PID is
-alive but its current start time differs from the stored value, the PID
-was recycled and the slot/writer is stale.
-
-**Platform-specific implementations:**
+given PID via `processStartTime(pid int) (uint64, error)`. If the PID
+is alive but the current start time differs from the stored value, the
+PID was recycled.
 
 | Platform | Source | Value | Notes |
 |----------|--------|-------|-------|
-| Linux | `/proc/[pid]/stat` field 22 (`starttime`) | Clock ticks since boot (`uint64`) | Readable without privileges. Monotonic, survives PID reuse. Pure Go: `os.ReadFile` + parse. |
-| macOS | `sysctl` with `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime` | `timeval` packed as `sec*1_000_000 + usec` (`uint64`) | Accessible for same-user processes. Pure Go via `syscall.Sysctl`. |
-| FreeBSD | `sysctl` with `KERN_PROC_PID` → `kinfo_proc.ki_start` | `timeval` packed as `sec*1_000_000 + usec` (`uint64`) | Same interface as macOS. Pure Go via `syscall.Sysctl`. |
+| Linux | `/proc/[pid]/stat` field 22 | Clock ticks since boot (uint64) | No privileges. Pure Go: `os.ReadFile` + parse. |
+| macOS | `sysctl KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime` | timeval packed as `sec*1e6+usec` | Same-user processes. Pure Go via `syscall.Sysctl`. |
+| FreeBSD | `sysctl KERN_PROC_PID` → `kinfo_proc.ki_start` | timeval packed | Same as macOS interface. |
 
-All implementations are pure Go (no cgo required). The
-`processStartTime` function is defined per platform via build tags
-(`process_linux.go`, `process_darwin.go`, `process_freebsd.go`).
+All pure Go. `processStartTime` per-platform via build tags.
 
-If `processStartTime` fails (e.g., insufficient permissions to read
-another process's info), the stale check falls back to heartbeat-based
-detection if a heartbeat is available, or PID-only liveness
-(`kill(pid, 0)`) as a last resort.
+If `processStartTime` fails, falls back to heartbeat (if available) or
+PID-only liveness.
+
+**Resolution caveat.** `ProcessStartTime` is *non-decreasing*, not
+strictly unique. Linux `/proc/[pid]/stat` field 22 reports clock
+ticks since boot (typically 100 Hz = 10 ms resolution); two processes
+spawned within the same tick share a start time. macOS / FreeBSD
+sysctl encodes `sec*1e6 + usec` which is microsecond-resolution but
+still collision-prone under heavy fork bursts. In particular,
+container PID 1 typically has a start time very near zero relative
+to the container's boot. The protocol's correctness does **not**
+rely on uniqueness of `(PID, StartTime)` — it relies on the
+*combination* of (same-namespace PID liveness, start-time match,
+fresh heartbeat) and the heartbeat path being available as a
+fallback. A same-namespace `(PID, StartTime)` collision between
+distinct process lifetimes is benign because either (a) the prior
+holder is dead and the heartbeat is stale (caught by the heartbeat
+goroutine if the new holder rebooted heartbeat tracking, or by the
+zero-heartbeat orphan rule in stale detection) or (b) the prior
+holder is alive and legitimately holds the slot.
 
 #### PID Namespace Awareness
 
-PID-based liveness detection (`kill(pid, 0)` and `/proc/[pid]/stat`)
-operates within the caller's PID namespace. When multiple containers
-share a database file via volume mount, each container has its own PID
-namespace — a PID in one namespace refers to a different (or nonexistent)
-process in another. This causes two failure modes:
+PID-based liveness operates within the caller's PID namespace. When
+multiple containers share a database file via volume mount, each
+container has its own PID namespace — a PID in one refers to a
+different (or nonexistent) process in another. Two failure modes:
 
-- **False dead**: Container A holds a reader slot at PID 42. Container B
-  has no PID 42. `kill(42, 0)` from B returns `ESRCH` — B clears the
-  slot, removing snapshot protection for A's active reader.
-- **False alive**: Container A crashes with PID 42 in a slot. Container B
-  happens to also have a PID 42. `kill(42, 0)` from B succeeds — the
-  slot is never reclaimed.
+- **False dead**: container A holds slot at PID 42; container B has
+  no PID 42; `kill(42, 0)` from B returns `ESRCH` — B clears the slot,
+  removing snapshot protection for A's active reader.
+- **False alive**: container A crashes with PID 42 in a slot;
+  container B also has a PID 42; `kill(42, 0)` from B succeeds — slot
+  never reclaimed.
 
-To prevent this, each reader slot and the writer header store the
-process's **PID namespace inode** alongside the PID. On Linux, this is
-read from `/proc/self/ns/pid` via `readlink` at `Open()` time and cached
-on the `DB` struct (`db.pidNamespace uint64`). On non-Linux platforms,
-the value is 0 (no PID namespaces).
+Each slot and the writer header store the process's **PID namespace
+inode** alongside the PID. On Linux, read from `/proc/self/ns/pid` via
+`readlink` at Open and cached on the DB struct. On non-Linux, 0. If
+the `readlink` fails (no `/proc` mounted, hardened sandbox), the DB
+caches 0 and logs the failure via `slog.Logger` — this forces every
+cross-process stale check involving this process to fall through to
+the heartbeat path, which is safe but slower than PID-based.
 
-During stale detection, the writer compares its own PID namespace against
-the slot's. If they match (same namespace), the PID + StartTime fast path
-is safe. If they differ (cross-namespace), the writer uses the heartbeat
-instead. This eliminates both false-dead and false-alive cross-namespace
-failures.
-
-**Platform-specific implementations:**
-
-| Platform | Source | Value | Notes |
-|----------|--------|-------|-------|
-| Linux | `readlink /proc/self/ns/pid` | Inode number (`uint64`) | Unique per PID namespace. Pure Go: `os.Readlink`. |
-| macOS | N/A | 0 | No PID namespaces. PID-based checks always valid. |
-| FreeBSD | N/A | 0 | No PID namespaces (jails use different mechanism). PID-based checks always valid within the same jail. |
+The writer compares its own PID namespace to the slot's. Match ⇒ PID
++ StartTime fast path is safe. Differ ⇒ use heartbeat. A process
+with `PIDNamespace == 0` (Linux without `/proc`, or non-Linux) is
+treated as "different namespace" for the purposes of stale detection
+when the peer has a non-zero namespace inode — the asymmetry routes
+both directions through heartbeat, which is the correct conservative
+behavior.
 
 #### Heartbeat Goroutine
 
-The `DB` struct maintains a **heartbeat goroutine** (started at `Open()`
-time, stopped at `Close()`) that periodically updates the `Heartbeat`
-field on all reader slots and the writer header held by this process.
+The DB struct maintains a **heartbeat goroutine** (started at Open,
+stopped at Close) that periodically updates the `Heartbeat` field on
+all reader slots and the writer header held by this process.
 
-The goroutine ticks every ~1 second and writes the current monotonic clock
-value (`CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on other platforms)
-to each active slot. The `DB` struct maintains an in-process list of
-active reader slot indices (appended on `Begin()`, removed on
-`Commit()`/`Rollback()`). Each tick iterates this list and performs one
-atomic store per slot.
+Ticks every ~1s. Writes current monotonic clock (`CLOCK_BOOTTIME` on
+Linux, `CLOCK_MONOTONIC` on other platforms) to each active slot.
+The DB maintains an in-process **active slot list** — a `[]uint32`
+of slot indices protected by `db.activeSlotsMu` (a `sync.Mutex`).
+`Begin()` appends under the mutex; `Commit()`/`Rollback()` removes
+under the mutex; the heartbeat goroutine takes a brief snapshot of
+the list under the mutex each tick and issues the atomic stores
+outside the lock to keep tick cost bounded.
 
-`CLOCK_BOOTTIME` is used on Linux because it is monotonic, survives
-suspend/resume, and is shared across all containers on the same host (it
-is a kernel-wide clock, not per-PID-namespace). Two containers mmap'ing
-the same lock file see consistent clock values.
+`CLOCK_BOOTTIME` on Linux because it is monotonic, survives
+suspend/resume, and is shared across all containers on the same host
+(kernel-wide, not per-PID-namespace). `CLOCK_MONOTONIC` on macOS /
+FreeBSD does not survive suspend; on a laptop that resumes after a
+long sleep, the heartbeat clock jumps forward by less than wall-time
+elapsed, so `StaleTimeout`'s 10-second default is safe — false-stale
+detection requires a heartbeat older than 10 s of *monotonic* time,
+which a suspended process cannot accumulate.
 
-The `StaleTimeout` option (default: 10 seconds) controls how long a
-heartbeat must be stale before the slot is reclaimed. This must be
-significantly larger than the heartbeat interval (1s) to account for
-scheduling delays under heavy load.
+`StaleTimeout` (default 10s) controls how long a heartbeat must be
+stale before the slot is reclaimed. Must be significantly larger than
+the heartbeat interval (1s) for scheduling jitter.
 
-```go
-// StaleTimeout is the duration after which a reader slot with a stale
-// heartbeat is considered abandoned. Only used for cross-PID-namespace
-// stale detection (same-namespace detection uses instant PID liveness
-// checks). Default: 10s.
-StaleTimeout time.Duration
-```
+**Shutdown coordination.** `Close()` sets `db.closed = true`
+(atomic, see Database Handle Leak Detection), closes the heartbeat
+goroutine's stop channel, and **waits** for the goroutine to
+acknowledge via a done channel before unmapping the lock file. The
+heartbeat goroutine checks the stop channel before each tick and
+exits promptly. Without the wait, a final tick could race with the
+munmap and SIGSEGV. The wait is bounded by the tick interval (~1s)
+since the goroutine sleeps in a `select` that includes the stop
+channel.
 
-The heartbeat goroutine is a fixed-cost resource: one goroutine per `DB`
-handle (~8KB stack), one atomic store per active reader slot per second.
-No syscalls, no allocations. Same lifecycle pattern as the flock goroutine.
+Fixed-cost resource: one goroutine per DB handle, one atomic store
+per active slot per second. No syscalls, no allocations.
 
 #### Atomic Operations Convention
 
-The codebase uses two distinct atomic access patterns depending on the
-memory being accessed:
-
-- **In-process fields** (`DB`, `Tx` struct fields such as
-  `db.readerSlotHint`, stats counters, the clock hand, etc.) use Go's
-  **typed atomics** (`atomic.Uint64`, `atomic.Uint32`, `atomic.Int64`).
-  Typed atomics prevent accidental non-atomic reads — the compiler
-  enforces that all access goes through the atomic methods. These fields
-  are never visible to other processes.
-
-- **Shared-memory fields** (reader table `TxnID`, `PID`,
-  `ProcessStartTime`, `PIDNamespace`, `Heartbeat`; header `WriterPID`,
-  `WriterStartTime`, `WriterPIDNamespace`, `WriterHeartbeat` in the
-  mmap'd lock file) use the **function-based atomics**
+- **In-process fields** (DB/Tx struct fields like `db.readerSlotHint`)
+  use Go's **typed atomics** (`atomic.Uint64`, `atomic.Uint32`,
+  `atomic.Int64`).
+- **Shared-memory fields** (reader table fields, header writer fields
+  in the mmap'd lock file) use **function-based atomics**
   (`atomic.LoadUint64`, `atomic.StoreUint64`,
   `atomic.CompareAndSwapUint64`) on `unsafe.Pointer`-derived addresses.
-  Typed atomics cannot be used here because the memory is not a Go
-  struct field — it is a raw region in a `MAP_SHARED` mmap visible
-  across processes.
+  Typed atomics cannot be used here because the memory is a raw region
+  in `MAP_SHARED` mmap visible across processes.
+
+**Memory-model caveat.** Go's memory model formally describes
+synchronization only on memory the Go runtime owns. Cross-process
+shared memory via `MAP_SHARED` is outside that model — the protocol's
+correctness rests on (a) Go's `sync/atomic` functions emitting
+hardware atomic instructions (`LOCK CMPXCHG` / aligned `MOV` on
+amd64; `LDAR` / `STLR` / `LDXR`-`STXR` on arm64) and (b) the
+underlying hardware guaranteeing single-copy atomicity for
+naturally-aligned 64-bit loads and stores. Both gmdb-supported
+architectures (amd64, arm64) satisfy this.
+
+All shared-memory fields are 8-byte aligned at runtime by composition:
+each field is a `uint64` whose natural C ABI alignment is 8 bytes
+(enforced inside the struct by `structs.HostLayout`'s "no Go-internal
+reordering" guarantee), and the struct's base address is page-aligned
+because it lives inside a `MAP_SHARED` mapping (≥ 4096-byte alignment).
+`HostLayout` itself controls field layout, not struct-pointer alignment
+— the page-aligned mmap base is what makes the struct-start address
+naturally aligned. Ports to architectures with weaker single-copy
+atomicity guarantees would require revisiting this section.
+
+### Lock Ordering
+
+gmdb maintains several mutex/lock primitives. To prevent deadlock,
+they are acquired in the following strict order. Code that violates
+this order is a bug.
+
+```
+Outer  →  flock goroutine queue (db.writerCh)
+       →  cross-process flock(LOCK_EX) on lock file fd
+       →  intra-process write lock (held implicitly by write txn)
+       →  per-keyspace open registry (db.keyspaceRegistry.mu)
+       →  active-slot list (db.activeSlotsMu — for heartbeat coord)
+       →  pager mutex (per write txn, db.pager.mu — for slab map updates)
+       →  reader-table slot CAS (no mutex — atomic CAS only)
+Inner  →  bitmap mutex (in-process, db.bitmap.mu — for two-level summary)
+```
+
+Notes:
+
+- A read transaction only ever touches the reader-table CAS path and
+  the active-slot list mutex (briefly, on Begin/Commit/Rollback). It
+  does not enter any of the writer-side locks above.
+- The flock goroutine never calls into the application; application
+  goroutines never call into the flock goroutine except by sending on
+  `db.writerCh`. This breaks any potential cycle through application
+  code.
+- The maintenance goroutine acquires the same locks as a writer when
+  performing reclamation or compaction; it must respect this order.
+- The heartbeat goroutine only acquires `activeSlotsMu` (briefly, to
+  snapshot the slot list) and issues atomic stores to shared-memory
+  reader-slot fields outside the mutex. It does not enter any
+  writer-side lock.
+- A write transaction must NOT open an internal read snapshot
+  (which would acquire `activeSlotsMu`) while holding `pager.mu`,
+  because that would invert the documented order. Internal read
+  snapshots taken by write-flow operations (e.g., the read-snapshot
+  side of `Compact()`'s copy phase) must be initiated *before* the
+  writer's pager work begins, or after it completes.
+- Cleanup callbacks (`runtime.AddCleanup`) run on GC background
+  goroutines and only do non-blocking operations (atomic check of
+  `db.closed`, atomic store on reader slot, non-blocking channel send
+  to flock goroutine) — they do not acquire any of the above locks.
+- The snapshot/reader-table mmap and the data-file mmap are separate
+  mappings; no lock is required to access either, only the atomic
+  conventions above.
 
 ### Writer's Page Reclamation
 
-Before reclaiming retired pages, the writer scans the reader table to find the
-minimum active TxnID. Any RPL entries with TxnID < min_active are safe to
-reclaim — their bits are set in the allocation bitmap, making them available
-for allocation.
+Before reclaiming retired pages, the writer scans the reader table to
+find the minimum active TxnID. Any RPL entries with `TxnID <
+min_active` are safe to reclaim — their bits are set in the bitmap.
 
 ### Lagging Reader Handling
 
-A single long-lived reader prevents all RPL reclamation for transactions
-newer than its snapshot, causing unbounded file growth. To address this, the
-application can register a `LaggingReader` callback via `Options` (see API
-Surface) that is invoked when a reader is blocking page allocation.
+A single long-lived reader prevents all RPL reclamation for
+transactions newer than its snapshot, causing unbounded file growth.
 
-The callback is invoked from `pageAlloc()` when:
-1. The allocation bitmap has no suitable free pages.
-2. The RPL has no more reclaimable entries (all remaining entries have
-   `TxnID >= oldestReader`).
+The application can register a `LaggingReader` callback via `Options`
+that is invoked when a reader is blocking allocation. Invoked from
+`pageAlloc()` when:
+1. The bitmap has no suitable free pages.
+2. The RPL has no more reclaimable entries.
 3. A reader in the reader table is blocking reclamation.
 
-The callback receives information about the lagging reader and returns an
-action. `LaggingReaderWait` causes `pageAlloc()` to refresh the reader table
-and retry (the reader may have released its slot in the meantime).
-`LaggingReaderAbort` causes `pageAlloc()` to return `ErrDBFull`.
+The callback receives `LaggingReaderInfo` and returns an action.
+`LaggingReaderWait` causes `pageAlloc()` to refresh the reader table
+and retry. `LaggingReaderAbort` causes `pageAlloc()` to return
+`ErrDBFull`.
 
-The callback is invoked at most once per `pageAlloc()` call to avoid busy
-loops. The application can use the callback to log warnings, send alerts,
-or take corrective action (e.g., killing a stuck process identified by PID).
+Invoked at most once per `pageAlloc()` call to avoid busy loops. The
+application can log warnings, send alerts, or take corrective action
+(e.g., killing a stuck process identified by PID).
+
+**The callback is a safety net, not a substitute for short read
+transactions.** Services should structure read access as "one read
+transaction per request/operation," not per session. See Read
+Transaction.
 
 ## mmap Strategy
 
-The data file is mapped read-write by default. All B+tree page modifications
-happen directly in the mmap. Bitmap and meta pages are written via
-`pwrite()` at commit time to ensure ordered writes.
+The data file is mapped `MAP_SHARED | PROT_READ` by every process,
+including the writer. `mprotect(PROT_READ)` is applied after Open as a
+belt-and-suspenders guard against accidental writable mappings.
 
-When `Options.ReadOnly` is true, the data file is mapped with `PROT_READ`
-only. Write transactions are rejected with `ErrReadOnly`. The lock file
-remains writable for reader slot acquisition (CAS operations). This allows
-opening databases on read-only media or with read-only filesystem
-permissions, provided the lock file is on writable storage.
+All writes go through pwrite (see Pager and Slab Architecture and
+Commit Write Ordering). The read-only mapping ensures that:
+
+- A stray pointer or `unsafe` misuse in the host process produces
+  SIGSEGV instead of silently corrupting the file.
+- Cross-process readers observe a stable, well-defined view of any
+  page: a page transitions atomically (relative to the meta swap) from
+  "previous content visible via mmap" to "new content visible via mmap"
+  because the writer pwrites the new content into the unified page
+  cache before publishing the meta page that references it.
 
 ### Page Memory Management
 
-All page memory is managed by the OS page cache. CoW'd pages in the mmap
-are backed by the kernel's page cache like any other file-backed
-`MAP_SHARED` page. When memory pressure is high, the kernel writes modified
-mmap pages to disk and reclaims physical memory. gmdb performs no
-application-level page eviction. This eliminates the need for anonymous
-mmap slabs, eviction algorithms, or page count limits. The OS has global
+OS-managed. Reads through the mmap are file-cache-backed; the kernel
+handles eviction under memory pressure. No application-level page
+buffer, no eviction algorithm, no page-count limit. The OS has global
 visibility into memory pressure across all processes and is better
 positioned to make eviction decisions.
+
+The writer additionally holds slab buffers (page-sized) for pages it
+has CoW'd in the current transaction. Slab usage is bounded by
+`Options.MaxTxBufferBytes`; exceeded ⇒ `ErrTxTooLarge`.
 
 ### Read Path
 
 All processes mmap the data file with:
+
 ```
-MAP_SHARED | PROT_READ | PROT_WRITE    (default)
-MAP_SHARED | PROT_READ                 (ReadOnly mode)
+MAP_SHARED | PROT_READ
 ```
 
-Reads go directly through the mmap. No system calls, no copies. The OS page
-cache serves the data. Page lookup is always `mmap[pageID * pageSize]` — one
-level, no branches.
+Page lookup is `mmap[pageID * pageSize]` — one level, no branches.
+Branch + leaf page reads go directly through this mmap. The OS page
+cache serves the data.
+
+`Options.ReadOnly` controls whether the writer path is initialized at
+all (the data mmap mode does not change — it is always read-only).
+When `ReadOnly = true`, the lock file is not opened for write, the
+flock goroutine is not started, and write transactions return
+`ErrReadOnly`. Suitable for read-only media or read-only filesystem
+permissions.
 
 ### Write Path
 
-The writer modifies B+tree pages directly in the mmap:
-- CoW applies: the writer allocates a fresh page from the bitmap via
-  `pageAlloc()`, copies the old page's content from mmap position A to mmap
-  position B, then modifies position B in place.
-- Bitmap modifications are deferred in memory (`tx.pendingAllocs` and
-  `tx.pendingFrees`) — the mmap bitmap is read-only during transactions.
-- At commit time, modified bitmap pages are written via `pwrite()` →
-  `fdatasync()` → meta page via `pwrite()` → `fdatasync()`. This ensures
-  the bitmap is always updated on disk before the meta page.
-- Data pages are already in the mmap and do not need explicit writes.
-  The OS page cache flushes them to disk in the background; the commit-time
-  `fdatasync()` before the meta page write ensures they are on stable
-  storage before the meta page makes them reachable.
+The writer does **not** modify the mmap. All modifications:
 
-**Crash safety**: bitmap and meta on disk are only updated via ordered
-pwrite+fdatasync. CoW'd data pages at new positions in the mmap may be
-flushed by the kernel at any time, but they are unreferenced (free pages
-in the on-disk bitmap) until the commit completes — so their content is
-irrelevant if a crash occurs before commit.
+1. Read current page content via `pager.Page(id)` (which checks
+   `dirty[id]` first, falling back to mmap).
+2. Allocate fresh page ID + slab buffer; copy old content into buffer.
+3. Mutate buffer.
+4. At commit: pwrite buffers, bitmap pages, then meta page (see Commit
+   Write Ordering).
 
-**Rollback**: discard `tx.pendingAllocs` and `tx.pendingFrees`, done.
-The mmap bitmap is unchanged (it was never modified directly). CoW'd pages
-in the mmap are at positions that the on-disk bitmap considers free, so
-they are harmless.
-
-The full commit path is described in the Write Transaction section (see
-Copy-on-Write Transaction Model, steps 5–7).
+There is no platform-specific code in the commit path. Linux and macOS
+both use `pwrite + fdatasync`. No `msync(MS_SYNC)` is needed because
+the writer never writes through the mmap.
 
 ### mmap Resizing
 
-The mmap region is sized to `MaxSize` (the maximum database size in pages).
-This over-allocates virtual address space — only the file-backed portion is
-usable, but the mapping does not need to change as the file grows or shrinks.
-The unmapped region beyond the file size will SIGBUS if accessed, so readers
-must check `HighWaterMark` from the meta page.
+The mmap region is sized to `MaxSize`. This over-allocates virtual
+address space — only the file-backed portion is usable, but the
+mapping does not need to change as the file grows or shrinks. The
+unmapped region beyond the file size will SIGBUS if accessed, so
+readers must check `HighWaterMark` from the meta page.
 
-**Note**: `MAP_SHARED` file-backed mappings are not charged against Linux
-`vm.overcommit_memory` accounting — the file is the backing store, not swap.
-However, per-process `RLIMIT_AS` limits do apply to virtual address space
-reservations regardless of mapping type. On most default configurations
-`RLIMIT_AS` is unlimited and this is not an issue. Users with restrictive
-`RLIMIT_AS` settings may need to lower `MaxSize`.
+`MAP_SHARED` file-backed mappings are not charged against Linux
+`vm.overcommit_memory` accounting (the file is the backing store). But
+per-process `RLIMIT_AS` does apply to virtual address space
+reservations regardless of mapping type. Most defaults are unlimited;
+restricted environments may need a lower `MaxSize`.
 
 ### Prefaulting (Linux 5.14+)
 
 When `Options.PreloadPages` is true, the database calls
 `madvise(MADV_POPULATE_READ)` on the file-backed portion of the mmap
-(pages 0 through `HighWaterMark - 1`) at open time. This pre-faults
-all pages into the OS page cache, eliminating page faults on first access.
+(pages 0 through `HighWaterMark - 1`) at open time. Pre-faults all
+pages into the OS page cache, eliminating page faults on first access.
 
-Benefits:
-- **Predictable latency**: the first read transaction after open does not
-  pay per-page fault costs. Useful for latency-sensitive workloads where
-  cold-start performance matters.
-- **Sequential I/O**: the kernel reads pages sequentially during prefault,
-  which is more efficient than the random-access pattern of demand paging.
+- **Predictable latency**: first read txn doesn't pay per-page fault
+  costs.
+- **Sequential I/O**: kernel reads pages sequentially during prefault,
+  more efficient than random-access demand paging.
 
-`MADV_POPULATE_READ` (Linux 5.14+) is used instead of `MAP_POPULATE`
-because it works on `MAP_SHARED` mappings and returns errors synchronously
-(e.g., if the file is truncated concurrently). If the kernel does not
-support `MADV_POPULATE_READ`, the madvise call fails silently and pages
-are faulted on demand as usual.
+`MADV_POPULATE_READ` (Linux 5.14+) works on `MAP_SHARED` and returns
+errors synchronously. Silent no-op on older kernels.
 
-Prefaulting is also performed internally during `CopyTo()` on the source
-database's mmap, since the copy reads the entire file sequentially.
+Prefaulting is also performed internally during `CopyTo()` on the
+source database's mmap.
 
-The `PreloadPages` option defaults to false — most workloads benefit from
-demand paging where only accessed pages enter the page cache.
+Default: false — most workloads benefit from demand paging where only
+accessed pages enter the cache.
 
 ### Huge Pages (Linux)
 
 When `Options.HugePages` is true, the database calls
-`madvise(MADV_HUGEPAGE)` on the data file mmap after mapping. This enables
-transparent huge page (THP) backing for the file-mapped region, allowing the
-kernel to use 2MB pages instead of 4KB pages where possible.
+`madvise(MADV_HUGEPAGE)` on the data file mmap. Enables transparent
+huge page (THP) backing, allowing the kernel to use 2MB pages instead
+of 4KB.
 
-Benefits:
-- **Reduced TLB pressure**: A 1GB database at 4KB pages requires 262,144
-  TLB entries. With 2MB huge pages, only 512 entries are needed — a 512x
-  reduction. This is significant for random-access workloads (B+tree
-  traversals) where TLB misses dominate latency.
-- **Fewer page faults**: Each fault maps 2MB instead of 4KB, reducing total
-  fault count for sequential access patterns.
+- **Reduced TLB pressure**: a 1GB database drops from 262,144 TLB
+  entries to 512 (4KB → 2MB).
+- **Fewer page faults**: each fault maps 2MB instead of 4KB.
 
-THP for file-backed `MAP_SHARED` mappings is mature on Linux 6.x kernels.
-The kernel promotes pages to huge pages opportunistically based on alignment
-and availability — not all pages will be huge-page-backed.
+THP for file-backed `MAP_SHARED` is mature on Linux 6.x. Kernel
+promotes opportunistically based on alignment and availability.
 
-The `HugePages` option defaults to false. On non-Linux platforms the option
-is ignored. On Linux kernels without THP support for file-backed mappings,
-the madvise call has no effect.
+Default: false. Ignored on non-Linux and on kernels without THP for
+file-backed mappings.
 
 ### Read Transaction Cooldown (Linux 5.4+)
 
-When `Options.ReclaimOnClose` is true, closing a read transaction calls
-`madvise(MADV_COLD)` on the mmap region that the transaction accessed.
-This hints the kernel that the pages are no longer actively used and may
-be reclaimed from the page cache under memory pressure.
+When `Options.ReclaimOnClose` is true, closing a read transaction
+calls `madvise(MADV_COLD)` on the mmap region the transaction
+accessed. Hints the kernel that the pages are no longer actively used
+and may be reclaimed under memory pressure.
 
-This is useful for batch processing workloads that perform large sequential
-scans (e.g., exports, analytics queries) and then release the transaction.
-Without `MADV_COLD`, the scanned pages remain in the page cache, potentially
-evicting more useful pages from other workloads.
+Useful for batch processing workloads with large sequential scans
+(exports, analytics queries). Without `MADV_COLD`, scanned pages
+remain in the cache, potentially evicting more useful pages.
 
-The implementation tracks the min/max page IDs accessed during the
-transaction (lightweight — just two atomic min/max updates per page read)
-and issues a single `madvise(MADV_COLD, min*PageSize, (max-min+1)*PageSize)`
-on close.
+Implementation tracks min/max page IDs accessed during the
+transaction (two atomic min/max updates per page read) and issues a
+single `madvise(MADV_COLD, min*PageSize, (max-min+1)*PageSize)` on
+close.
 
-The `ReclaimOnClose` option defaults to false. On non-Linux platforms or kernels
-older than 5.4, the madvise call is silently ignored.
+Default: false. Silent no-op on non-Linux or kernels < 5.4.
 
 ## Durability Modes
 
-The database supports three safe durability modes and one unsafe mode,
-configurable via `Options.SyncMode`. The mode controls which `fdatasync()`
-calls are performed during commit. All safe modes preserve **database
-integrity** (the file is always structurally valid). `SyncUnsafe` is the
-unsafe mode — it risks corruption on crash and requires explicit opt-in
-via `Options.AllowSyncUnsafe = true`. The tradeoff is between commit latency
-and how much data may be lost on a crash.
+Three safe modes and one unsafe mode, configurable via
+`Options.SyncMode`. The mode controls which `fdatasync()` calls are
+performed during commit. All safe modes preserve **database integrity**
+(the file is always structurally valid). `SyncUnsafe` requires explicit
+opt-in via `Options.AllowSyncUnsafe = true`.
 
 | Mode | Data Sync | Meta Sync | On Crash | Performance |
 |------|-----------|-----------|----------|-------------|
 | `SyncDurable` (default) | `fdatasync()` | `fdatasync()` | No data loss. Full ACID. | Slowest |
 | `SyncDataOnly` | `fdatasync()` | skip | Last committed transaction may be lost. DB is consistent — falls back to previous meta page. | ~2x faster |
-| `SyncLazy` | skip | skip | Rolls back to the last **checkpoint** (the last commit that was explicitly synced via `DB.Checkpoint()` or the last `SyncDurable`/`SyncDataOnly` commit). DB is always consistent — no corruption. | Much faster |
-| `SyncUnsafe` | skip | skip | **Risk of corruption.** No guarantees. Requires `Options.AllowSyncUnsafe = true`. For benchmarks and ephemeral data only. | Fastest |
+| `SyncLazy` | skip | skip | Rolls back to the last **checkpoint**. DB is always consistent — no corruption. | Much faster |
+| `SyncUnsafe` | skip | skip | **Risk of corruption.** Requires `AllowSyncUnsafe`. Benchmarks and ephemeral data only. | Fastest |
 
 ### Checkpoints
 
-In `SyncLazy` mode, a commit writes bitmap and meta pages via `pwrite()`
-but skips all `fdatasync()` calls. Data pages are already in the mmap. The
-OS page cache holds the writes, which will eventually reach disk, but the
-order is not guaranteed.
+In `SyncLazy` mode, commits pwrite bitmap, data, and meta but skip all
+`fdatasync()` calls. The OS page cache holds the writes; order is not
+guaranteed.
 
 A **checkpoint** is a commit whose data pages have been confirmed on
-stable storage. (The meta page itself may or may not be synced — what
-matters is that the data it references is durable. If the meta survived a
-crash, recovery can trust it without further validation.) Checkpoints
-occur when:
-- `DB.Checkpoint()` is called explicitly (forces `fdatasync()` of the data file).
-- A commit happens in `SyncDurable` or `SyncDataOnly` mode (these sync data
-  pages as part of their normal commit path).
+stable storage. Checkpoints occur when:
+- `DB.Checkpoint()` is called explicitly (`fdatasync` of the data file).
+- A commit happens in `SyncDurable` or `SyncDataOnly` mode (these sync
+  data pages as part of their normal commit path).
 
-Each meta page carries a **checkpoint flag** — a boolean indicating whether the
-data pages it references have been confirmed on stable storage. The checkpoint flag
-is set when `fdatasync()` completes successfully (either from a
-`SyncDurable`/`SyncDataOnly` commit or an explicit `DB.Checkpoint()` call). In
-`SyncLazy` mode, commits write the meta page with the checkpoint flag **clear**.
-A subsequent `DB.Checkpoint()` re-writes the meta page with the checkpoint flag
-**set** (this is safe — the meta page is small and atomic).
+Each meta page carries a **checkpoint flag** (Flags bit 1). Set when
+`fdatasync()` completes. In `SyncLazy`, commits write meta with the
+flag **clear**. `DB.Checkpoint()` re-writes meta with the flag **set**.
 
-On recovery after a crash, `Open()` performs the following:
+**Checkpoint() mechanics:**
 
-1. Read both meta pages. Discard any with an invalid xxhash64 checksum.
-2. Of the valid meta pages, select the one with the higher TxnID whose
-   checkpoint flag is **set**. This is the last commit whose data pages are
-   confirmed on stable storage.
-3. If neither meta page has the checkpoint flag set (the user never called
-   `DB.Checkpoint()` and never used `SyncDurable`/`SyncDataOnly`), select the
-   meta page with the higher TxnID. In this case, the database has no
-   checkpoint to fall back to — data integrity depends on whether
-   the OS flushed pages in the right order, which is not guaranteed.
-   `Open()` logs a warning via the configured `slog.Logger` when recovery
-   selects a meta page with no checkpoint flag set, indicating the database
-   was running in `SyncLazy` mode without periodic `Checkpoint()` calls.
-4. Non-checkpoint meta pages (checkpoint flag clear) are never preferred over
-   checkpoint ones, regardless of TxnID. A checkpoint meta at TxnID 100 is
-   chosen over a non-checkpoint meta at TxnID 105 — the 5 transactions
-   since the last checkpoint are lost.
+1. Acquire the write lock via the flock goroutine — same path as
+   `Begin(writable=true)`, respecting the supplied `ctx`. This
+   serializes Checkpoint against any concurrent write transaction
+   and any concurrent `Compact()` in the queue; concurrent reads
+   are unaffected. Returns `context.Cause(ctx)` if cancelled before
+   the lock is acquired.
+2. `fdatasync(fd)` to flush all data, RPL, bitmap, and meta pages
+   pwritten by prior `SyncLazy` commits that are sitting in the OS
+   page cache. (The data mmap is `PROT_READ` and the writer never
+   writes through it, so there are no mmap dirty pages from gmdb;
+   the fdatasync's job is purely to flush pwritten page-cache
+   contents.)
+3. Read the currently active meta page; toggle its checkpoint flag
+   on; recompute the xxhash64 checksum over the full meta payload
+   (flag change shifts the hash); `pwrite()` it back to the same
+   slot. The TxnID is unchanged — Checkpoint records that the
+   already-committed state is durable, not a new transaction.
+4. `fdatasync(fd)` again so the flag set itself reaches stable
+   storage.
+5. Release the write lock.
 
-Recovery does not attempt to validate a non-checkpoint meta's tree (e.g.,
-by checking the root page checksum). A valid root page does not prove
-that all reachable child pages, bitmap state, and RPL segments are
-durable — the OS may have flushed pages in any order. Accepting a
-partially-durable tree would risk surfacing `ErrCorrupted` on later
-reads when traversals reach unflushed pages. The checkpoint's tree
-is guaranteed intact because CoW never modifies existing pages.
+Steps 2 and 4 are both required: step 2 makes prior lazy commits
+durable; step 4 makes the flag-set durable so recovery can trust it.
+The single-meta-slot pwrite in step 3 is atomic because it stays
+within one page (an unaligned tear cannot affect a single contiguous
+sub-page region, and the xxhash64 checksum catches any partial
+write — recovery falls back to the other slot).
+
+On recovery:
+
+1. Read both meta pages. Discard any with invalid xxhash64 checksum.
+2. Of the valid metas, select the one with the highest TxnID whose
+   checkpoint flag is **set**.
+3. If neither meta has the checkpoint flag set (the user never called
+   `Checkpoint()` and never used `SyncDurable`/`SyncDataOnly`), select
+   the higher-TxnID valid meta. Data integrity depends on whether the
+   OS flushed pages in the right order — not guaranteed. `Open()`
+   logs a warning via `slog.Logger`.
+4. Non-checkpoint metas are never preferred over checkpoint ones,
+   regardless of TxnID.
+
+Recovery does not attempt to validate a non-checkpoint meta's tree.
+Accepting a partially-durable tree would risk surfacing `ErrCorrupted`
+on later reads when traversals reach unflushed pages. The checkpoint's
+tree is guaranteed intact because CoW never modifies existing pages.
 
 ### SyncUnsafe Warning
 
-`SyncUnsafe` provides no crash safety whatsoever. Because `pwrite()` ordering
-is not guaranteed without `fdatasync()`, the meta page could reach disk before
-the bitmap pages. A crash in this state leaves the meta page pointing to a
-tree whose bitmap state is inconsistent — the database may be **corrupted**.
-Use this mode only for ephemeral data or benchmarks where the database can
-be discarded after a crash.
+Provides no crash safety. Without `fdatasync()` after pwrite, the
+meta page could reach disk before the bitmap pages. A crash leaves
+the meta pointing to a tree whose bitmap state is inconsistent — the
+database may be **corrupted**.
 
-To prevent accidental use, `SyncUnsafe` requires `Options.AllowSyncUnsafe = true`
-to be set explicitly. Setting `SyncMode = SyncUnsafe` without `AllowSyncUnsafe`
-returns an error from `Open()`. This ensures that unsafe mode is always a
-deliberate choice, never an accidental misconfiguration.
+`SyncUnsafe` requires `Options.AllowSyncUnsafe = true`. Setting it
+without the opt-in returns an error from `Open()`.
 
-The full commit path with mode-dependent behavior is described in the
-Write Transaction section (see Copy-on-Write Transaction Model, steps 5–7).
+**Cross-process SyncMode interleaving.** `SyncMode` is a per-process
+`Options` setting, not stored on disk. Different processes attached
+to the same database may run with different SyncModes. The on-disk
+checkpoint flag reflects whichever mode the *committer* used: a
+commit by a `SyncDurable` process sets the flag; a commit by a
+`SyncLazy` process clears it. Recovery selects the highest-TxnID
+**checkpoint-flagged** meta, so interleaving `SyncLazy` and
+`SyncDurable` writers across processes works correctly — a crash
+rolls back to the most recent `SyncDurable`-or-`Checkpoint`-set
+meta, possibly losing intervening `SyncLazy` commits from any
+process. This is the same trade-off as `SyncLazy` within a single
+process; the multi-process composition is consistent with that.
 
 ## File Format
 
-The database file size is managed dynamically between configurable lower and
-upper bounds. The file format is stored in the meta page and controls how the
-file grows and shrinks.
+The database file size is managed dynamically between configurable
+lower and upper bounds. File format is stored in the meta page.
 
 ### File Format Parameters
 
 | Parameter | Meta Field | Description | Default |
 |-----------|-----------|-------------|---------|
-| Lower bound | `MinSize` | Minimum file size in pages. File never shrinks below this. | `2 + BitmapPages` (meta + bitmap) |
+| Lower bound | `MinSize` | Minimum file size in pages. | `2 + BitmapPages` |
 | Upper bound | `MaxSize` | Maximum file size in pages. Determines mmap reservation and bitmap size. **Immutable after creation.** | 256GB / PageSize |
-| Growth step | `GrowStep` | Number of pages to grow by when extending the file. | 65536 pages (256MB at 4KB pages) |
-| Shrink threshold | `ShrinkThreshold` | Shrink the file when `fileSize - HighWaterMark > threshold`. | 131072 pages (512MB at 4KB pages) |
+| Growth step | `GrowStep` | Pages to grow by when extending. | 65536 (256MB at 4KB) |
+| Shrink threshold | `ShrinkThreshold` | Shrink when `fileSize - HighWaterMark > threshold`. | 131072 (512MB at 4KB) |
 
-File format is set at database creation time via `Options` and persisted in the
-meta page. `MinSize`, `GrowStep`, and `ShrinkThreshold` can be modified
-by calling `Tx.SetFileFormat()` on a write transaction — the new values take
-effect when the transaction commits.
+Set at creation via `Options` and persisted. `MinSize`, `GrowStep`,
+and `ShrinkThreshold` can be modified via `Tx.SetFileFormat()`.
 
-**`MaxSize` is immutable after creation.** The allocation bitmap occupies a
-fixed region of pages (starting at page 2) whose size is determined by
-`MaxSize` at creation time (see Allocation Bitmap). Increasing `MaxSize`
-would require expanding the bitmap region, which would shift all data page
-offsets — every page ID in every B+tree, RPL segment, and keyspace descriptor
-would become invalid. Decreasing `MaxSize` below the current
-`HighWaterMark` would orphan allocated pages. Neither operation is
-feasible without a full database rebuild.
-
-To change `MaxSize`, use `CopyTo(path, compact)` to create a new database
-with different `Options.FileFormat.MaxSize`, then replace the original file.
-`SetFileFormat()` returns an error if the caller attempts to change `MaxSize`.
+**`MaxSize` is immutable.** The bitmap region size is fixed at
+creation; changing `MaxSize` would shift all data page offsets,
+invalidating every page ID. To change `MaxSize`, use `CopyTo(path,
+compact)` to create a new database.
 
 ### File Growth
 
-When `pageAlloc()` needs to extend the file:
-1. Calculate new size: `alignUp(HighWaterMark + needed, GrowStep)`.
-2. Clamp to `MaxSize`. If the new size would exceed `MaxSize`, return
-   `ErrDBFull`.
-3. Extend the file via `ftruncate()`. The existing mmap (which reserves up to
-   `MaxSize`) covers the new pages automatically — no remap needed.
+When `pageAlloc()` needs to extend:
+1. `newSize = alignUp(HighWaterMark + needed, GrowStep)`.
+2. Clamp to `MaxSize`. Exceeded ⇒ `ErrDBFull`.
+3. `ftruncate()` the file. The existing mmap (sized to `MaxSize`)
+   covers new pages automatically — no second `mprotect` call is
+   needed, because the `mprotect(PROT_READ)` applied at Open covers
+   the full `MaxSize` virtual reservation, and the newly file-backed
+   pages inherit `PROT_READ` from that reservation. This inheritance
+   holds on all supported targets (Linux, macOS, FreeBSD): on each,
+   `MAP_SHARED` over the reservation is a single VMA that `ftruncate`
+   does not split, so the VMA's protection applies uniformly to the
+   newly-backed pages without additional syscalls. Ports to other
+   OSes must re-verify this property.
 
 ### File Shrinkage
 
-After the commit point (step 7 of the write transaction), if the OS file size
-exceeds `HighWaterMark` by more than `ShrinkThreshold`:
-1. Calculate new size: `alignUp(HighWaterMark, GrowStep)`.
+After the commit point, if file size exceeds `HighWaterMark` by more
+than `ShrinkThreshold`:
+1. `newSize = alignUp(HighWaterMark, GrowStep)`.
 2. Clamp to `MinSize`.
-3. Truncate the file via `ftruncate()`. The mmap reservation remains at
-   `MaxSize` — the truncated region becomes unmapped (SIGBUS on access),
-   which is safe because `HighWaterMark` in the meta page prevents any
-   reader from accessing those pages.
+3. `ftruncate()`. The mmap reservation remains at `MaxSize` — the
+   truncated region becomes unmapped (SIGBUS on access), safe because
+   `HighWaterMark` in the meta page prevents any reader from
+   accessing those pages.
 
-File shrinkage is automatic and zero-overhead — it happens as a natural
-consequence of the tail page refund mechanism during commit. No explicit
-compaction is needed for the common case of data deletion.
+Automatic and zero-overhead — happens as a natural consequence of
+tail page refund during commit. No explicit compaction needed for
+the common case.
 
 ## Keyspaces
 
-The root meta page points to a "keyspace B+tree" — a B+tree whose keys are
-keyspace names (byte strings) and whose values are keyspace descriptors:
+The root meta page points to a **keyspace B+tree** — a B+tree whose
+keys are keyspace names (byte strings) and whose values are keyspace
+descriptors. Both user keyspaces and engine-internal keyspaces (per-index
+storage, per-index registries) live in this tree.
+
+### Keyspace Descriptor
+
+The descriptor is a fixed-layout 40-byte struct stored as the value
+for the keyspace's entry in the keyspace B+tree:
 
 ```
-Keyspace Descriptor (32 bytes)
-+----------+----------+----------+----------------+----------+----------+
-| Root     | Count    | Kind     | FixedValueSize | NextSeq  | Reserved |
-| uint64   | uint64   | uint8    | uint16         | uint64   | [5]byte  |
-+----------+----------+----------+----------------+----------+----------+
+Keyspace Descriptor (40 bytes)
++----------+----------+----------+----------------+----------+--------------+--------------------+----------+
+| Root     | Count    | Kind     | FixedValueSize | NextSeq  | RestartGroup | IndexRegistryRoot  | Reserved |
+| uint64   | uint64   | uint8    | uint16         | uint64   | uint16       | uint64             | [3]byte  |
++----------+----------+----------+----------------+----------+--------------+--------------------+----------+
 ```
 
-Total descriptor size: 8 + 8 + 1 + 2 + 8 + 5 = 32 bytes.
+Total: 8 + 8 + 1 + 2 + 8 + 2 + 8 + 3 = 40 bytes.
 
-- **Root** (uint64): Page ID of this keyspace's B+tree root. 0 = empty
-  keyspace (no data yet).
-- **Count** (uint64): Number of key-value pairs. For SetKeyspace, this is
-  the total number of key-value pairs across all value sets.
+- **Root** (uint64): page ID of this keyspace's B+tree root. 0 = empty.
+- **Count** (uint64): number of key-value pairs. For SetKeyspace, total
+  pairs across all value sets.
+- **Kind** (uint8): `0` = Keyspace (key → value), `1` = SetKeyspace
+  (key → sorted set of values). `2` = engine-internal index keyspace
+  (not directly openable by users). `Open()` rejects unknown values.
+  Set at creation, immutable.
+- **FixedValueSize** (uint16): for SetKeyspace, the fixed value size in
+  bytes (0 = variable). Must be 0 when Kind != 1.
+- **NextSeq** (uint64): next sequence number for `NextSequence()`. First
+  call returns 1.
+- **RestartGroupTarget** (uint16): per-keyspace target leaf
+  restart-group size. 0 ⇒ engine default (16). Set at creation, mutable
+  via `Tx.SetKeyspaceConfig()` — new value applies to leaves written
+  after the change; existing leaves keep their stored `RestartInterval`
+  until they next split or are rewritten.
+- **IndexRegistryRoot** (uint64): page ID of this keyspace's per-keyspace
+  index registry sub-tree (see Indexing → Storage Layout). 0 ⇒ no
+  indexes declared on this keyspace.
+- **Reserved** (3 bytes): must be zero. `Open()` rejects descriptors
+  with non-zero reserved bytes.
 
-Depth (tree height) is not persisted — it is derived by reading the root
-page on first access, consistent with the nested B+tree reference format
-(see Set Keyspace Storage). This avoids maintaining a redundant
-field across split, merge, and rebalance operations.
-- **Kind** (uint8): Keyspace type. `0` = Keyspace (key → value),
-  `1` = SetKeyspace (key → sorted set of values). `Open()` rejects
-  unknown Kind values. Set at creation time, immutable after. Opening a
-  keyspace with the wrong type (e.g., `OpenKeyspace` on a SetKeyspace)
-  returns `ErrKeyspaceKindMismatch`.
-- **FixedValueSize** (uint16): Fixed value size in bytes for SetKeyspace.
-  0 = variable-size values. Must be 0 when Kind=0. A `Put()` with a
-  value of the wrong size returns `ErrValueSizeMismatch`. Set at creation
-  time, immutable after.
-- **NextSeq** (uint64): Next sequence number for `NextSequence()`. Starts
-  at 0 (first call returns 1). Updated on each `NextSequence()` call
-  within a write transaction, persisted when the transaction commits.
-  Available on both Keyspace and SetKeyspace.
-- **Reserved** ([5]byte): Must be zero. Reserved for future fields.
-  `Open()` rejects descriptors with non-zero reserved bytes.
+Depth (tree height) is not persisted — derived by reading the root
+page on first access. Avoids maintaining a redundant field across
+split/merge/rebalance.
 
-Opening a keyspace within a transaction reads the descriptor from the keyspace
-B+tree. Modifications to the keyspace update the descriptor (and its root)
-which propagates up through the keyspace B+tree via CoW.
+Opening a keyspace reads the descriptor from the keyspace B+tree.
+Modifications update the descriptor (and its root) which propagates
+up through the keyspace B+tree via CoW.
+
+Opening a keyspace with the wrong type (`OpenKeyspace` on a
+SetKeyspace, etc.) returns `ErrKeyspaceKindMismatch`. Attempting to
+open an engine-internal index keyspace via the user API returns
+`ErrKeyspaceReserved`.
+
+### Per-Keyspace Configuration
+
+Two per-keyspace properties currently:
+
+- `FixedValueSize` — SetKeyspace only, immutable after creation.
+- `RestartGroupTarget` — mutable via `Tx.SetKeyspaceConfig()`. Defaults
+  to engine-global 16. Tune higher (e.g., 32) for keyspaces with very
+  long shared prefixes (directory listings, deeply nested composite
+  keys); tune lower (e.g., 8) for keyspaces with mostly distinct keys
+  to reduce per-`Prev()` group decode cost.
+
+Per-keyspace page size is **not** supported — see Design Decisions.
 
 ### Keyspace Name Interning
 
 Keyspace names are interned via `unique.Make[string]` (Go 1.23+). The
-`TypedKeyspace[K, V]` descriptor and internal keyspace lookup caches store
-a `unique.Handle[string]` instead of a raw `string` or `[]byte`. This
-avoids repeated allocations when the same keyspace is opened across many
-transactions (a common pattern). The `unique.Handle` provides O(1) equality
-comparison and is safe for concurrent use.
+internal keyspace lookup cache stores a `unique.Handle[string]` instead
+of a raw `string` or `[]byte`. Avoids repeated allocations when the
+same keyspace is opened across many transactions. `unique.Handle`
+provides O(1) equality comparison and is safe for concurrent use.
+
+## Indexing
+
+gmdb maintains secondary indexes on keyspaces declaratively. The
+caller declares one or more indexes per keyspace at open time,
+supplying an extractor function that produces index entries from a
+row. The engine applies index changes inside every write transaction
+that modifies the keyspace, atomic with the row write.
+
+### Overview
+
+```go
+// IndexDecl describes one secondary index on a byte-oriented keyspace.
+type IndexDecl struct {
+    Name     string             // unique within the keyspace
+    Columns  []IndexColumn      // ordered; concatenated lex-safely
+    Covering []CoveringColumn   // optional; stored in the index value
+    Unique   bool               // engine rejects extractor-produced duplicates
+    Version  string             // user-supplied; bump after extractor-logic changes
+    Extract  IndexExtractor
+}
+
+type IndexColumn struct {
+    // Name is a semantic anchor for the column: it identifies the
+    // logical role of this position in the column tuple and contributes
+    // to the index's schema-hash fingerprint. The Name is never
+    // interpreted by the engine at read time — column storage is
+    // purely positional. Renaming a column changes the schema hash and
+    // forces RebuildIndex. Reusing a name for a column whose semantic
+    // content has changed is the user's responsibility — bump Version
+    // in that case (see Drift Guard).
+    Name string
+}
+
+type CoveringColumn struct {
+    Name string // same semantics as IndexColumn.Name
+}
+
+type IndexEntry struct {
+    Cols  [][]byte // one byte slice per IndexColumn; lex-safe encoded by caller
+    Cover [][]byte // one per CoveringColumn (omit when Covering is nil)
+}
+
+// IndexExtractor produces zero or more IndexEntry values for a row.
+// Returning a nil slice or a zero-length slice both signal "do not
+// index this row" (partial-index semantics) and are equivalent.
+type IndexExtractor func(key, value []byte) []IndexEntry
+```
+
+A row that should not be indexed (partial-index case) is signaled by
+returning an empty slice or `nil` from the extractor — both are
+equivalent.
+
+For typed callers, `TypedIndex[K, V, IK]` wraps `IndexDecl` and
+generates column bytes automatically from a typed `Encoder[IK]` — see
+Typed Keyspaces.
+
+### Index Declaration
+
+Indexes are declared at the call that opens the keyspace for write
+access:
+
+```go
+ks, err := tx.OpenKeyspace("workspaces",
+    &IndexDecl{
+        Name:    "by_repository",
+        Columns: []IndexColumn{{Name: "repository_id"}},
+        Unique:  false,
+        Version: "v1",
+        Extract: func(key, value []byte) []IndexEntry {
+            repoID := decodeRepoID(value)
+            return []IndexEntry{{Cols: [][]byte{repoID}}}
+        },
+    },
+    &IndexDecl{
+        Name:    "active_lease_unique",
+        Columns: []IndexColumn{{Name: "workspace_id"}, {Name: "lease_kind"}},
+        Unique:  true,
+        Version: "v1",
+        Extract: func(key, value []byte) []IndexEntry {
+            r := decodeLease(value)
+            if r.State != "active" {
+                return nil
+            }
+            return []IndexEntry{{Cols: [][]byte{r.WorkspaceID, r.LeaseKind}}}
+        },
+    },
+)
+```
+
+Every transaction that opens this keyspace for write must supply
+matching `IndexDecl`s — same name set, same column specs, same
+`Unique` flag, same `Version`. Mismatch surfaces as
+`ErrIndexFingerprintMismatch` at open time.
+
+Duplicate `IndexDecl.Name` values in one `OpenKeyspace` call's
+variadic slice (programmer error) are rejected with `ErrIndexExists`
+naming the offending duplicate. Index names are keys in the schema
+hash and in the on-disk registry — duplicates would either collide
+on the registry write or render the recovery-loop's linear search
+non-deterministic.
+
+### Drift Guard: Schema Hash + Version Tag
+
+For each declared index, the engine computes a deterministic
+**schema hash**:
+
+```
+xxhash64(
+  index.Name ||
+  uvarint(len(Columns)) || for each col: uvarint(len(Name)) || Name ||
+  uvarint(len(Covering)) || for each col: uvarint(len(Name)) || Name ||
+  uint8(Unique)
+)
+```
+
+The schema hash + the user-supplied `Version` string are stored on
+disk in the per-index registry entry. At Open, the engine compares
+the **supplied** schema hash and version against the **stored** ones.
+Any mismatch returns an `ErrIndexFingerprintMismatch` value whose
+error message names (a) the drifted index, (b) which field differed
+(`schema-hash` vs `version`), and (c) the stored and supplied values
+so the operator can attribute the change at a glance:
+
+```
+gmdb: index "by_repository" fingerprint mismatch (schema-hash):
+  stored=0x3f2a... supplied=0xc104... — caller must RebuildIndex
+```
+
+The caller's recovery path is `tx.RebuildIndex` — see Rebuild below
+for the signature, which takes the `*IndexDecl` directly and bypasses
+the fingerprint check that gated the failed open.
+
+The schema hash catches structural drift (column add/remove/reorder,
+unique flag flipped, covering changes). The user `Version` tag catches
+extractor-logic drift that the engine cannot inspect (e.g., the
+extractor now masks a column, returns entries in a different order,
+or applies a different partial-index predicate). Bump `Version` after
+any extractor change that produces different output for the same input.
+
+The engine never auto-rebuilds. Auto-rebuild would silently double the
+cost of an Open after a deploy and obscure the schema change in
+operational logs.
+
+The schema hash inputs are exclusively byte sequences with explicit
+`uvarint` length prefixes — no `gob`, no JSON, no struct layout — so
+the hash is deterministic across Go versions, build flags, and host
+architectures.
+
+### Column Encoding
+
+The byte API treats `IndexEntry.Cols[i]` as opaque, lex-ordered bytes.
+The caller is responsible for producing encodings whose byte order
+matches the desired index order (e.g., big-endian for ordered
+numerics).
+
+The engine concatenates columns into a single index key using a
+**NUL-escaped, NUL-terminated** scheme:
+
+- Within each column's bytes, every `0x00` is escaped to `0x00 0xFF`.
+- After each column's escaped bytes, the engine appends a `0x00 0x00`
+  terminator.
+- The full index key is the concatenation of escaped columns + their
+  terminators, followed (for non-unique indexes) by the escaped row PK
+  + a final `0x00 0x00`.
+
+This encoding is prefix-free — no escaped column is a prefix of
+another — so concatenated columns sort lex-correctly regardless of
+contents (including columns containing arbitrary binary data with
+embedded NULs).
+
+**Worked example.** Two tuples to encode:
+
+| Tuple | Col A | Col B | Encoded bytes |
+|-------|-------|-------|---------------|
+| T1 | `[]` (empty) | `[0x00]` | `00 00`  `00 FF 00 00` |
+| T2 | `[0x00]` | `[]` (empty) | `00 FF 00 00`  `00 00` |
+| T3 | `[0x00, 0xFF]` | `[0x00]` | `00 FF FF 00 00`  `00 FF 00 00` |
+
+Byte-wise comparison: T1 < T2 < T3, matching the lex order of the
+original tuples. The terminator `00 00` cannot appear inside any
+escaped column (every internal `0x00` is followed by `0xFF`), so a
+decoder finds column boundaries unambiguously.
+
+The typed layer (`TypedIndex[K, V, IK]`) automates lex-safe encoding
+via stable `Encoder[T]` implementations. See Typed Keyspaces.
+
+### Storage Layout
+
+Each keyspace has its own per-keyspace **index registry** — a B+tree
+rooted at `IndexRegistryRoot` in the keyspace descriptor. Keys are
+index names; values are the per-index descriptor:
+
+```
+Index Registry Entry (value bytes)
++----------------+----------------------------------+
+| SchemaHash     | uint64                           |
+| Unique         | uint8                            |
+| Padding        | [7]byte                          |
+| Root           | uint64    (index B+tree root)    |
+| Count          | uint64    (entries in the index) |
+| UserVersionLen | uint16                           |
+| UserVersion    | bytes                            |
+| ColumnCount    | uint16                           |
+| For each col:                                     |
+|   NameLen      | uint16                           |
+|   Name         | bytes                            |
+| CoveringCount  | uint16                           |
+| For each col:                                     |
+|   NameLen      | uint16                           |
+|   Name         | bytes                            |
++----------------+----------------------------------+
+```
+
+Variable-length. Stored as a single byte string value in the index
+registry tree. Padding after the `Unique` byte aligns the subsequent
+`Root` / `Count` uint64s.
+
+Each index's data lives in its own engine-internal keyspace
+descriptor (`Kind = 2`) referenced indirectly through `Root` in the
+registry entry. Internal keyspaces do not appear in the user
+keyspace B+tree directly — their descriptors are reachable only via
+the parent keyspace's index registry. This keeps the user-facing
+keyspace namespace clean.
+
+Index entries are stored as plain B+tree key-value pairs:
+
+- **Unique index**: key = concatenated lex-safe columns; value =
+  `(PK bytes, optional Covering bytes)`.
+- **Non-unique index**: key = concatenated lex-safe columns + escaped
+  PK; value = optional covering tuple.
+
+The `Count` field on the index descriptor is maintained incrementally
+on Put/Delete. `Stats()` returns it in O(1).
+
+### Unique Indexes
+
+When `Unique` is true, the engine rejects extractor output that would
+introduce a duplicate index key. `Put` on the indexed keyspace returns
+`ErrIndexUniqueViolation` (with the index name) instead of writing the
+row.
+
+Implementation: before writing index entries, the engine probes each
+new index key. If found, abort with `ErrIndexUniqueViolation`. The
+row write does not happen — the caller's `Put` returns the error and
+the transaction can `Rollback()` or continue with other work.
+
+A single extractor invocation may return multiple `IndexEntry`
+values. If two of those entries produce the same index key for a
+unique index, the `Put` is rejected with `ErrIndexUniqueViolation`
+naming the offending key — the row is not written, no index entries
+are written. The check happens against the candidate-set, so the
+collision is detected even when the index keyspace is empty.
+
+Unique indexes naturally model partial-unique constraints by combining
+with extractor filtering: the extractor returns entries only for rows
+matching the condition; uniqueness is enforced over the filtered set.
+
+### Covering Indexes
+
+When `Covering` is non-empty, the index entry value carries the
+covering columns (in declaration order, concatenated with the same
+NUL-escape scheme used for keys). `Lookup` returns covering bytes
+directly, skipping the back-lookup to the row keyspace.
+
+A covering column declaration is identified by its `Name`; the
+extractor populates `IndexEntry.Cover[i]` with the corresponding lex-
+safe bytes. The schema hash includes covering column names in
+declaration order, so adding/removing/reordering covering columns
+triggers `ErrIndexFingerprintMismatch`.
+
+**Names are semantic anchors, not positional labels.** Covering and
+indexed column names are inputs to the schema hash specifically to
+catch *structural* changes. They do not catch the case where a caller
+reuses the same name for a column whose meaning has changed (e.g.,
+renaming `"price"` to `"qty"` and `"qty"` to `"price"`, then
+populating each with the other's value — schema hash unchanged,
+stored entries silently decode into the wrong logical columns). That
+case requires bumping `Version` — the `Version` tag exists precisely
+to catch logic-level drift the engine cannot see.
+
+### Partial Indexes
+
+The extractor returns an empty `[]IndexEntry` for rows that should not
+be indexed. The engine does not write any entries for those rows. On
+Update, the old and new entry sets are diffed: an entry present in the
+old set but absent from the new is deleted; one present in the new but
+absent from the old is inserted.
+
+There is no separate "predicate" primitive — the extractor *is* the
+predicate. Simpler API, equivalent expressive power.
+
+### Lookup API
+
+```go
+type Index struct { /* unexported */ }
+
+// Lookup returns matching (pk, value) pairs for an exact match on the
+// declared columns. If the index is covering and covers the requested
+// columns, value is read from the index entry's covering bytes;
+// otherwise value is fetched via back-lookup against the row keyspace.
+// Iteration ends when no more matches; check Err() for errors.
+//
+// Intra-transaction consistency: index cursor and back-lookup both
+// read the current transaction's dirty state. Row writes and index
+// updates happen atomically in the same Put/Delete/Cursor.Delete,
+// so a back-lookup for an index entry always finds the row. If a
+// back-lookup ever fails to find its PK (engine bug or external
+// corruption), the entry is silently skipped from iteration and the
+// inconsistency is reportable via Check().
+func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
+
+// LookupKeys returns matching primary keys without back-lookup or
+// covering decode. Iteration cost is O(matches) leaf scans only.
+// Because LookupKeys never probes the row keyspace, it does not
+// observe missing-PK inconsistencies (the silent-skip case noted
+// on Lookup) — every index entry yields its raw PK, even if the
+// corresponding row has somehow vanished. Use Check() for
+// row/index consistency verification.
+func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
+
+// Range returns matches in [start, end). start and end are slices of
+// per-column tuples; nil tuple = open-ended.
+func (idx *Index) Range(start, end []TupleValue) iter.Seq2[[]byte, []byte]
+
+// Prefix returns matches whose leading columns match the given prefix.
+func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
+
+// Get is shorthand for unique indexes: returns the single (pk, value)
+// for an exact column match, or ErrNotFound. Returns
+// ErrIndexNotUnique when called on a non-unique index.
+func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error)
+
+// Err returns the first error encountered during iteration of the
+// last sequence returned by Lookup / Range / Prefix.
+//
+// Index handles are not safe for concurrent use by multiple
+// goroutines. The Err state is per-handle, so two overlapping
+// iterators on the same *Index would race. Open the keyspace in
+// separate transactions, or call ks.Index(name) once per goroutine,
+// for concurrent index queries.
+func (idx *Index) Err() error
+```
+
+Both `Lookup` and `LookupKeys` are provided. `Lookup` is the default
+API; `LookupKeys` is the escape hatch for cost-sensitive callers
+iterating large result sets where the back-lookup or covering decode
+is unnecessary.
+
+In the API Surface below, `Range` takes `[][]byte` per side (one
+slice per declared column; the slice itself is `nil` for an
+open-ended bound).
+
+### Write Path: Atomic Index Maintenance
+
+For an indexed keyspace, every `Put`, `Delete`, and `Cursor.Delete`
+operation is wrapped:
+
+**Put(key, newValue):**
+1. Read the existing value at `key` (if present), call it `oldValue`.
+2. Call `extract(key, oldValue)` → `oldEntries` (empty list if no
+   existing row).
+3. Call `extract(key, newValue)` → `newEntries`.
+4. Diff `oldEntries` and `newEntries`: compute deletes (in old, not in
+   new) and inserts (in new, not in old).
+5. For each unique-index insert, probe the index for an existing
+   entry; conflict ⇒ return `ErrIndexUniqueViolation` (no row write,
+   no index write).
+6. Apply index deletes.
+7. Apply index inserts (each writes to the index's internal keyspace).
+8. Write the row to the main keyspace.
+9. Update each index's `Count` in the registry.
+
+All steps happen in the same CoW transaction. A failure at any step
+(including the unique probe) leaves the transaction in a consistent
+state — either rolled back, or continuing with the row unchanged.
+
+**Delete(key):**
+1. Read the existing value at `key` (if present). Absent ⇒ no-op.
+2. Call `extract(key, oldValue)` → `oldEntries`.
+3. Delete all entries in `oldEntries` from their indexes.
+4. Decrement each affected index's `Count`.
+5. Delete the row.
+
+**Cursor.Delete():** same as Delete but uses the cursor's current
+key/value (already in-hand).
+
+### Bulk Operations on Indexed Keyspaces
+
+`DeleteRange(start, end)` on an indexed keyspace **does not** use
+the O(pages) subtree-retirement fast path. The engine cannot retire
+a subtree without knowing the prior-index-keys for every row in it
+(the extractor output depends on the row's value, which the
+subtree-retirement walk does not visit).
+
+Implementation: the engine iterates the range with a cursor, calling
+`Delete()` for each row. Cost is O(entries × (indexes + extractor)).
+The cursor must remain stable across CoW + rebalance triggered by the
+per-row deletes — `Cursor.Delete()` followed by `Cursor.Next()` is
+defined to correctly resume at the post-delete successor (see Cursor
+State Machine in the Cursor API).
+
+This is the same cost a SQL engine pays for `DELETE … WHERE … IN
+range` with secondary indexes. Predictable and correct.
+
+Callers needing the O(pages) fast path on indexed data can:
+- Drop the indexes before the bulk operation, run `DeleteRange`, then
+  rebuild the indexes (`tx.RebuildIndex`).
+- Or use `DeleteKeyspace` to drop the whole keyspace (which also
+  drops its indexes — engine cleans up internal index keyspaces and
+  the per-keyspace index registry).
+
+### Rebuild
+
+```go
+// RebuildIndex drops the named index's data and re-runs the extractor
+// supplied in decl over every row in the keyspace, writing fresh
+// index entries. Blocking — runs inside the current write transaction.
+// The previous index is preserved until commit; mid-rebuild crash
+// leaves the old index intact.
+//
+// decl.Name must match the name of an index already declared on
+// the keyspace (the registry entry's stored Name). The supplied
+// decl replaces the stored SchemaHash and Version on success; this
+// is the canonical recovery path after ErrIndexFingerprintMismatch
+// because the rebuild bypasses the open-time fingerprint check.
+//
+// The keyspace itself is opened internally for cursor iteration
+// without re-validating other indexes' fingerprints. If the same
+// transaction also needs to open the keyspace for writes, it must
+// supply matching IndexDecls for every still-drifted index — or
+// call RebuildIndex once per drifted index before calling
+// OpenKeyspace.
+//
+// decl.Extract MUST be non-nil; a nil Extract returns
+// ErrIndexExtractorRequired (admin tools that need to rebuild
+// without the application's extractor functions cannot —
+// reconstruction requires the extractor logic, by definition).
+func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error
+```
+
+**Recovery pattern after `ErrIndexFingerprintMismatch`.** A single
+`OpenKeyspace` call reports drift on *one* index at a time (the
+first mismatch encountered while iterating the declared set). When
+multiple indexes have drifted simultaneously — common during a
+schema-bumping deploy — the recovery requires a loop: rebuild the
+named index, retry the open, rebuild whichever index the *next*
+mismatch names, retry, until OpenKeyspace succeeds. The decl set
+passed to OpenKeyspace stays constant; only the RebuildIndex calls
+fire in succession:
+
+```go
+// defer tx.Rollback() — partial rebuilds discard cleanly if the
+// loop exits with an error.
+decls := []*IndexDecl{byRepoDecl, activeLeaseDecl}
+for {
+    ks, err = tx.OpenKeyspace("workspaces", decls...)
+    if err == nil {
+        break
+    }
+    var fpErr *IndexFingerprintError
+    if !errors.As(err, &fpErr) {
+        return err // some other error — propagate
+    }
+    // Find the matching decl by Name and rebuild.
+    var d *IndexDecl
+    for _, candidate := range decls {
+        if candidate.Name == fpErr.IndexName {
+            d = candidate
+            break
+        }
+    }
+    if d == nil {
+        return fmt.Errorf("drifted index %q not in supplied decls", fpErr.IndexName)
+    }
+    if err := tx.RebuildIndex("workspaces", d); err != nil {
+        // Distinguish recoverable from terminal:
+        //  - ErrTxTooLarge → the keyspace exceeds MaxTxBufferBytes;
+        //    rollback and use BulkLoad / a chunked rebuild instead.
+        //  - ErrIndexUniqueViolation → the new extractor produces
+        //    duplicates that the unique constraint rejects; the
+        //    extractor logic is wrong, fix it and retry in a fresh tx.
+        //  - Any other error (I/O, ErrDBFull, ...): hard failure;
+        //    rollback and bubble up.
+        return err
+    }
+}
+// ks is now usable.
+```
+
+**Recovery on RebuildIndex failure.** A `RebuildIndex` call that
+returns an error leaves the transaction in a partially-rebuilt
+state — earlier indexes in the loop iteration may already have their
+new SchemaHash/Version staged for commit, while the failing index
+was rolled back to its prior state. The transaction is **not** safe
+to commit in that state; the caller must `tx.Rollback()` (the
+`defer` above) and start a fresh transaction. Specifically:
+
+- `ErrTxTooLarge` from RebuildIndex means the keyspace's row corpus
+  exceeds `MaxTxBufferBytes` for a single rebuild. Use `BulkLoad`
+  (which bypasses the slab) into a fresh keyspace, or chunk the
+  rebuild manually across multiple write transactions using a
+  shadow-index + cutover pattern.
+- `ErrIndexUniqueViolation` means the new extractor produced
+  duplicate keys that the unique constraint rejected. The extractor
+  logic is wrong (or the partial-index predicate is wrong);
+  rollback, fix the extractor in source, redeploy, retry.
+- Any other error (I/O, `ErrDBFull`, etc.) is a hard failure;
+  rollback and surface upstream.
+
+A degenerate-but-safe simplification for callers that don't care
+about per-index reporting is to call `RebuildIndex` for *every*
+declared index unconditionally on first mismatch — at the cost of
+rebuilding indexes that may not have drifted.
+
+Implementation:
+1. Allocate a new internal index keyspace (fresh root page).
+2. Cursor-iterate the parent keyspace. The internal cursor sees the
+   current write transaction's dirty state — rows Put earlier in the
+   same transaction are included in the rebuilt index. For each row,
+   run the extractor from `decl` and write entries into the new
+   index keyspace. For unique indexes, any extractor-produced
+   duplicate aborts the rebuild with `ErrIndexUniqueViolation` —
+   the rebuild does not commit and the existing registry entry is
+   unchanged.
+3. Update the registry entry: new `Root`, new `Count`, new
+   `SchemaHash` (computed from `decl`), new `UserVersion` (from
+   `decl.Version`). The old internal index keyspace's pages enter
+   `tx.retiredPages`.
+4. On `tx.Commit()`, the new index becomes active; old pages reclaim
+   via the RPL.
+
+`Index.Stats()` called on a handle to the still-rebuilding index
+returns the *old* registry entry's count and tree statistics until
+the transaction commits — the new index is invisible until the
+registry write in step 3 lands at commit. A caller calling Stats()
+mid-RebuildIndex therefore sees the pre-rebuild state, not an
+intermediate.
+
+`RebuildIndex` runs in one write transaction. For very large
+keyspaces this may exceed `MaxTxBufferBytes` — the rebuild fails
+with `ErrTxTooLarge` and the caller must use `BulkLoad` instead (see
+BulkLoad → Interaction with Indexes), or chunk the rebuild manually.
+
+### Indexes on SetKeyspaces
+
+A SetKeyspace can carry indexes. The extractor signature is the same
+`func(key, value []byte) []IndexEntry`, but it runs **per (key, value)
+set member**, not per top-level key. The "primary key" in non-unique
+index entries is the (key, value) pair — neither alone identifies the
+set member.
+
+**Compound-PK encoding.** Because the column terminator `0x00 0x00`
+is already used to delimit columns in the index key, the PK's
+internal split between its `key` and `value` halves uses a distinct
+separator `0x00 0x01`. The PK is encoded as:
+
+```
+escape(key) || 0x00 0x01 || escape(value)
+```
+
+then appended to the index key (after the trailing `0x00 0x00`
+column terminator), followed by a final `0x00 0x00` to terminate the
+PK portion. `0x00 0x01` is lex-safely distinguishable from both the
+column terminator (`0x00 0x00`) and any escaped byte sequence
+(`0x00 0xFF`), and never appears inside an escaped column (the only
+`0x00` bytes in an escaped column are immediately followed by
+`0xFF`). The full grammar for a non-unique SetKeyspace index key:
+
+```
+indexKey := escapedCol (0x00 0x00 escapedCol)* 0x00 0x00 escapedPK 0x00 0x00
+escapedPK := escape(setKey) 0x00 0x01 escape(setValue)
+```
+
+A decoder splits the index key on the first `0x00 0x00` after the
+last column terminator, then splits the PK on `0x00 0x01` to recover
+`(setKey, setValue)`.
+
+`Cursor.Delete()` on a set keyspace deletes one set member; index
+updates affect only that member's contribution. `Delete(key)` on a
+set keyspace removes all members; index updates run the extractor on
+each removed (key, value) pair.
+
+Bulk-free of a key's nested B+tree (via `Delete(key)`) reverts to a
+per-member walk when the SetKeyspace has indexes — same reasoning as
+`DeleteRange` on indexed keyspaces.
+
+### Open Semantics
+
+Two distinct open functions:
+
+```go
+// OpenKeyspace opens a keyspace for read+write. Requires every
+// declared index on the keyspace to be supplied with a matching
+// IndexDecl. Missing or extra IndexDecls return
+// ErrIndexExtractorRequired or ErrIndexUnknown. Drift returns
+// ErrIndexFingerprintMismatch (caller must RebuildIndex).
+func (tx *Tx) OpenKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, error)
+
+// OpenKeyspaceReadOnly opens a keyspace for reads only. No IndexDecls
+// required (and none accepted — pass them via OpenKeyspace if you
+// want write access). Index lookups still work — they read stored
+// index entries directly.
+func (tx *Tx) OpenKeyspaceReadOnly(name string) (*Keyspace, error)
+```
+
+Strict — opening for write without the extractors is unrepresentable.
+Two open functions instead of "open succeeds, writes error" because
+the failure-at-open path:
+- Surfaces drift / missing extractors immediately, before any work.
+- Lets backup/inspector/read-only-tools open without schema awareness,
+  using `OpenKeyspaceReadOnly`.
+- Avoids the "open succeeded, but every subsequent write fails" state
+  that's easy to miss in operational settings.
+
+`OpenSetKeyspace` / `OpenSetKeyspaceReadOnly` follow the same pattern.
+
+A keyspace handle returned from `OpenKeyspaceReadOnly` rejects all
+mutating operations with `ErrReadOnly`. Index lookups, cursor reads,
+and range iteration work normally.
+
+**Re-opening a keyspace in the same transaction.** A second
+`OpenKeyspace` call for the same name within one transaction:
+
+- If the supplied IndexDecl set is identical to the first call's set
+  by **all hashable inputs** — names, Unique flags, schema hashes,
+  Versions, and (for typed indexes) encoder IDs — returns the
+  *same* `*Keyspace` handle (idempotent).
+- If the supplied IndexDecl set differs by any hashable input —
+  even by one decl — returns `ErrKeyspaceAlreadyOpen` with the
+  conflicting index name(s). Indexes declared on a keyspace are
+  pinned for the lifetime of the transaction at first open.
+
+**First-Extract-wins.** Go function values are not comparable, so
+the `Extract` function pointer is NOT part of the hashable-inputs
+comparison. Two `OpenKeyspace` calls with structurally identical
+IndexDecls but **different** `Extract` functions are treated as
+identical: the first call's `Extract` is registered and wins for
+all subsequent index maintenance within the transaction; the second
+call's `Extract` is silently dropped.
+
+The two callers receive the *same* `*Keyspace` handle by design
+(idempotent re-open), so writes from either caller through that
+shared handle go through the first-registered `Extract`. If both
+goroutines legitimately want distinct extractor behaviors, the only
+correct pattern is **separate transactions** — there is no
+in-transaction recovery path because index maintenance is pinned
+at first open. Forcing recognition via a hashable input (typically
+bumping `Version`) is *not* recovery: it converts the second call
+to `ErrKeyspaceAlreadyOpen` (the schema-hash now differs), which
+also doesn't yield a working second handle in the same txn.
+
+If two callers happen to share a transaction and one needs a
+different extractor, the design treats this as a coordination
+requirement at the caller layer (typically: route writes for that
+keyspace through a single owner in each transaction). The shared
+`*Keyspace` handle is not safe for concurrent goroutine use anyway —
+the per-handle contract is single-goroutine — so the coordination
+needed here is the same coordination already needed for any shared
+keyspace access within one txn.
+
+Mixing `OpenKeyspace` and `OpenKeyspaceReadOnly` for the same name in
+one transaction is also rejected with `ErrKeyspaceAlreadyOpen`. The
+rationale: the read-only handle and the read-write handle have
+different operational contracts (Extractors required vs. forbidden;
+Put/Delete allowed vs. ErrReadOnly), and pinning one shape per
+transaction keeps the per-keyspace open-registry invariants simple.
+Callers needing both shapes use separate transactions.
+
+### Removing an Index
+
+```go
+func (tx *Tx) DropIndex(keyspace, indexName string) error
+```
+
+Removes the index entry from the per-keyspace registry and retires the
+index's internal keyspace pages. Future `OpenKeyspace` calls must omit
+the corresponding `IndexDecl`, or a fresh declaration with the same
+name re-creates the index empty (next `Put` populates it as rows are
+written; existing rows are NOT auto-indexed — call `RebuildIndex` if
+you want existing rows indexed).
+
+### Statistics
+
+`Index.Stats()` returns the index's persistent count + B+tree
+statistics (depth, pages). Iteration via `Lookup` does not count
+under-the-hood pages read; that comes from `Tx.Stats()`.
+
+## BulkLoad
+
+`BulkLoad` constructs a keyspace's B+tree bottom-up from a sorted
+input stream, bypassing the per-key insert path entirely. Targets two
+concrete scenarios:
+
+- **gitfs**: one-shot migration of SQLite tables into gmdb at first
+  open.
+- **notes**: initial import of a corpus from filesystem dumps.
+
+### API
+
+```go
+// BulkLoad replaces the contents of an empty keyspace with the
+// sorted key-value stream produced by yield. Input MUST be in
+// strictly ascending lex key order; a non-ascending key returns
+// ErrBulkLoadOutOfOrder.
+//
+// The keyspace must be empty (Count == 0); otherwise returns
+// ErrBulkLoadNonEmpty. Use ks.DeleteRange(nil, nil) to clear first
+// if necessary.
+//
+// For indexed keyspaces, BulkLoad runs the index extractor on every
+// row and bulk-loads each index in parallel using the same bottom-up
+// algorithm. Indexes are written to fresh index keyspace roots; the
+// existing index keyspace data is retired at commit. Unique-index
+// violations abort the BulkLoad with ErrIndexUniqueViolation; nothing
+// is written to disk before the abort because all bulk-loaded pages
+// are at fresh page IDs invisible until the meta swap.
+//
+// For SetKeyspaces, input is a stream of (key, value) pairs in
+// (key, value) lex order; duplicate (key, value) pairs are silently
+// deduplicated.
+//
+// BulkLoad bypasses the per-txn slab budget: pages are pwritten
+// directly to fresh page IDs as they are constructed, not buffered.
+// Memory usage is O(depth × pageSize), independent of input size.
+//
+// Returns the number of input pairs written.
+func (ks *Keyspace) BulkLoad(yield func(yield func(key, value []byte) bool)) (uint64, error)
+func (ks *SetKeyspace) BulkLoad(yield func(yield func(key, value []byte) bool)) (uint64, error)
+```
+
+### Algorithm
+
+Standard bottom-up B+tree construction:
+
+1. Allocate a fresh leaf page from `pageAlloc()`. Fill with input
+   entries (prefix-compressed with the keyspace's `RestartGroupTarget`)
+   until the page is full or the input is exhausted.
+2. When a leaf page is full, pwrite it directly to its allocated page
+   ID (slab bypass — see below), free the page-sized scratch buffer
+   back to the buffer pool, and start a new leaf page.
+3. Each completed leaf contributes one (separator, pageID) pair to the
+   in-progress branch page at the level above.
+4. Recurse: when a branch page is full, write it directly and start a
+   new branch at that level.
+5. When input is exhausted, finalize all in-progress branches up to
+   the root.
+6. Set the keyspace descriptor's `Root` to the final root page ID.
+   Increment `Count` by the input count.
+7. At commit, the keyspace's old pages (the empty tree's root or a
+   prior population) are retired and the meta page is swapped.
+
+For each level of the tree there is exactly one in-progress page at a
+time. Memory is O(depth × pageSize) — for a depth-5 tree at 4KB pages,
+20 KB.
+
+### Slab Bypass
+
+Bulk-loaded pages are written to disk as they are completed, not held
+in the slab. The pwrite goes to a fresh page ID — invisible until the
+meta swap commits the new tree, so the partial write is safe (a crash
+before commit leaves the pages as unreferenced "leaked" pages in the
+bitmap, reclaimed by the next maintenance pass exactly like any other
+crash leakage).
+
+This bypass keeps memory usage flat regardless of input size and makes
+BulkLoad the recommended path for inputs that would otherwise exceed
+`MaxTxBufferBytes`.
+
+### Interaction with Indexes
+
+For an indexed keyspace, the engine runs the extractor on every row
+and accumulates index entries per index. Each index's entries are
+**re-sorted** to lex order (the extractor may produce entries in
+arbitrary order even if rows are sorted by primary key) and bulk-loaded
+into a fresh index keyspace using the same algorithm. The sort is
+external (chunked sort with disk-spill if needed; chunk size bounded
+by `MaxTxBufferBytes`).
+
+When the sort fits in memory the indexes load in a single in-memory
+pass. When it does not, spill chunks are written to a per-DB scratch
+directory (configurable via `Options.ScratchDir`, default `os.TempDir`)
+and merge-sorted in the final pass. Scratch files are best-effort
+deleted on success and failure; an unremovable scratch file (e.g.,
+`ScratchDir` on a vanishing tmpfs) is logged via `slog.Logger` and
+does not fail the operation. A spill *write* failure (ENOSPC on
+`ScratchDir`) aborts the BulkLoad with the underlying I/O error
+wrapped; no rebuilt index entries are committed.
+
+**Unique-violation detection happens at the merge output** — the
+external sort's final merge pass yields entries in sorted order, and
+the bulk-loader observes the first adjacent-duplicate pair as it
+consumes the stream. Detection therefore happens *during* the index
+pwrite phase, not before it:
+
+- For in-memory sorts (the row count fits in `MaxTxBufferBytes`),
+  the sort completes before any index-page pwrite, so the first
+  duplicate is found *before* the index pwrite phase starts — the
+  abort is fully reversible at the index layer.
+- For spilling sorts, the merge output is consumed interleaved with
+  index-page pwrites; the first duplicate may be found after some
+  index pages have already been pwritten.
+
+Either way, when `ErrIndexUniqueViolation` fires, BulkLoad returns
+naming the index and offending key. Any pages already pwritten to
+disk — row pages, index pages, RPL segments — are at fresh page IDs
+**unreferenced by the un-swapped meta**. They become bounded leakage
+reclaimed by the next bitmap-leak reclamation pass (see Background
+Maintenance), identical in mechanism to any other mid-commit crash
+leakage. The transaction's caller observes a clean error and can
+roll back; the on-disk state is consistent with the pre-BulkLoad
+meta.
+
+**Leakage scale warning.** "Bounded" here refers to crash-safety
+(no UB, no tree corruption), not magnitude. For a spilling-sort
+BulkLoad that aborts on a late index unique violation, the row
+corpus is *already on disk* as unreferenced pages — leakage is
+O(input size), potentially gigabytes for a large migration (e.g.,
+gitfs SQLite-→-gmdb import). Background maintenance's bitmap-leak
+reclamation does reclaim it, but only on its next scheduled pass;
+in the meantime the leaked pages are invisible to the allocator
+(bits clear in the on-disk bitmap until the reclamation pass sets
+them), so subsequent write transactions cannot reuse the space.
+Callers performing large BulkLoads that may fail should trigger
+`CheckWithOptions(&CheckOptions{Repair: true})` or wait for a
+maintenance pass before retrying.
+
+A two-pass (validate-then-load) mode that guarantees "no pwrite
+before violation detection" even for spilling sorts is straightforward
+to add later as an option; v1 ships the single-pass merge-output
+detection above.
+
+### Atomicity
+
+BulkLoad is a transactional operation. It runs inside a write
+transaction and only takes effect on commit. Either the entire load
+(keyspace data + all index data + count updates) commits atomically,
+or none of it does. Mid-BulkLoad crash leaks pages exactly as a
+mid-commit crash does — bounded leakage reclaimed by background
+maintenance.
 
 ## API Surface
 
 ```go
 // Sentinel errors.
 var (
-    ErrNotFound           = errors.New("gmdb: key not found")
-    ErrKeyExists          = errors.New("gmdb: key already exists")
-    ErrDBFull             = errors.New("gmdb: database full (MaxSize reached)")
-    ErrTxTooLarge         = errors.New("gmdb: transaction too large") // returned when RPL segment allocation fails at commit (database near full)
-    ErrReadersFull        = errors.New("gmdb: no reader slots available")
-    ErrKeyTooLarge        = errors.New("gmdb: key exceeds maximum size")
-    ErrKeyEmpty           = errors.New("gmdb: key is nil or empty")
-    ErrCorrupted          = errors.New("gmdb: database corrupted")
-    ErrVersionMismatch    = errors.New("gmdb: format version mismatch")
-    ErrReadOnly           = errors.New("gmdb: write operation on read-only transaction")
-    ErrTxClosed           = errors.New("gmdb: transaction already committed or rolled back")
-    ErrCursorUnpositioned = errors.New("gmdb: cursor not positioned")
-    ErrKeyspaceKindMismatch = errors.New("gmdb: keyspace kind does not match existing keyspace")
-    ErrValueSizeMismatch    = errors.New("gmdb: value size does not match fixed value size")
+    ErrNotFound                = errors.New("gmdb: key not found")
+    ErrKeyExists               = errors.New("gmdb: key already exists")
+    ErrDBFull                  = errors.New("gmdb: database full (MaxSize reached)")
+    ErrTxTooLarge              = errors.New("gmdb: transaction too large")
+    ErrReadersFull             = errors.New("gmdb: no reader slots available")
+    ErrKeyTooLarge             = errors.New("gmdb: key exceeds maximum size")
+    ErrKeyEmpty                = errors.New("gmdb: key is nil or empty")
+    ErrCorrupted               = errors.New("gmdb: database corrupted")
+    ErrBadPageChecksum         = errors.New("gmdb: page checksum mismatch")
+    ErrVersionMismatch         = errors.New("gmdb: format version mismatch")
+    ErrReadOnly                = errors.New("gmdb: write operation on read-only transaction")
+    ErrTxClosed                = errors.New("gmdb: transaction already committed or rolled back")
+    ErrCursorUnpositioned      = errors.New("gmdb: cursor not positioned")
+    ErrKeyspaceKindMismatch    = errors.New("gmdb: keyspace kind does not match existing keyspace")
+    ErrKeyspaceReserved        = errors.New("gmdb: keyspace name reserved for engine use")
+    ErrValueSizeMismatch       = errors.New("gmdb: value size does not match fixed value size")
+
+    // Indexing.
+    ErrIndexExtractorRequired   = errors.New("gmdb: index extractor required for OpenKeyspace")
+    ErrIndexUnknown             = errors.New("gmdb: IndexDecl supplied for index not declared in registry")
+    ErrIndexFingerprintMismatch = errors.New("gmdb: index fingerprint mismatch — RebuildIndex required")
+    ErrIndexUniqueViolation     = errors.New("gmdb: unique index violation")
+    ErrIndexNotUnique           = errors.New("gmdb: Get called on non-unique index")
+    ErrIndexExists              = errors.New("gmdb: index already exists")
+    ErrIndexNotFound            = errors.New("gmdb: index not found")
+    ErrIndexEncoderIDEmpty      = errors.New("gmdb: typed index encoder returned empty ID() — encoder IDs must be unique non-empty strings")
+
+    // Keyspace lifecycle.
+    ErrKeyspaceAlreadyOpen      = errors.New("gmdb: keyspace already opened in this transaction with a different index set")
+    ErrKeyspaceClosed           = errors.New("gmdb: keyspace handle is invalid (keyspace deleted in this transaction)")
+
+    // Compact.
+    ErrCompactReadersActive     = errors.New("gmdb: Compact drain timed out — in-process read transactions still active")
+
+    // BulkLoad.
+    ErrBulkLoadOutOfOrder       = errors.New("gmdb: BulkLoad input not in ascending key order")
+    ErrBulkLoadNonEmpty         = errors.New("gmdb: BulkLoad requires an empty keyspace")
 )
+
+// ErrIndexFingerprintMismatch is returned wrapped in an
+// *IndexFingerprintError whose fields name the drifted index and
+// distinguish schema-hash vs version-tag drift.
+//
+// Field is the discriminant; callers MUST inspect Field before
+// reading the corresponding pair:
+//   - Field == "schema-hash" → StoredHash and SuppliedHash are valid;
+//     StoredVersion and SuppliedVersion are empty strings (not
+//     meaningful).
+//   - Field == "version" → StoredVersion and SuppliedVersion are
+//     valid; StoredHash and SuppliedHash are zero (not meaningful).
+// The zero values for the inactive pair are NOT a real hash/version
+// collision — they are sentinel placeholders. Callers logging the
+// error should branch on Field, not on uint64==0 or string=="".
+type IndexFingerprintError struct {
+    Keyspace        string
+    IndexName       string
+    Field           string // "schema-hash" or "version"
+    StoredHash      uint64 // valid when Field == "schema-hash"
+    SuppliedHash    uint64 // valid when Field == "schema-hash"
+    StoredVersion   string // valid when Field == "version"
+    SuppliedVersion string // valid when Field == "version"
+}
+
+func (e *IndexFingerprintError) Error() string { /* ... */ }
+func (e *IndexFingerprintError) Unwrap() error { return ErrIndexFingerprintMismatch }
 
 // Open a database. Creates the file if it doesn't exist.
 //
 // The data file is created with O_CREATE|O_EXCL to prevent races when
-// multiple processes call Open() simultaneously on a non-existent path.
-// If the exclusive create fails with EEXIST, Open() retries as a normal
-// open (the other process created the file). The lock file uses the
-// same pattern.
+// multiple processes call Open() simultaneously on a non-existent
+// path. If exclusive create fails with EEXIST, Open() retries as a
+// normal open. The lock file uses the same pattern.
 func Open(path string, opts *Options) (*DB, error)
 ```
 
 ### Byte Slice Ownership
 
-All `[]byte` slices returned by gmdb (from `Get`, `Cursor.Next`, `Cursor.Seek`,
-etc.) are **borrowed references** — they point into either the mmap or an
-internal cursor buffer. The caller does not own them.
+All `[]byte` slices returned by gmdb (from `Get`, `Cursor.Next`,
+`Cursor.Seek`, etc.) are **borrowed references** — they point into
+either the mmap, the writer's slab buffer (when reading own writes
+in a write txn), or an internal cursor buffer. The caller does not
+own them.
 
-**Value slices** point directly into the mmap (for inline values) or into
-overflow pages in the mmap. They are valid until the **read transaction
-closes** (`Commit()` or `Rollback()`). No copy, no allocation — true
-zero-copy from the mmap.
+**Value slices** point directly into the mmap (for inline values from
+committed pages) or into overflow pages in the mmap, or into the
+writer's slab buffer (for inline values from same-txn modifications).
+Valid until the **transaction closes** (`Commit()` or `Rollback()`).
 
 **Key slices** may point into the mmap (for keys at restart points in
-prefix-compressed leaves) or into the cursor's key reconstruction buffer
-(`keyBuf`). The reconstruction buffer is reused on each cursor movement.
-Key slices are valid until the **next cursor operation** (`Next()`,
-`Prev()`, `Seek()`, `First()`, `Last()`, etc.) or transaction close,
-whichever comes first.
+prefix-compressed leaves), into a slab buffer, or into the cursor's
+key reconstruction buffer (`keyBuf`). The reconstruction buffer is
+reused on each cursor movement. Key slices are valid until the
+**next cursor operation** or transaction close, whichever comes first.
+
+**Slab buffer lifetime guarantee.** Within a write transaction, a
+value or key slice that points into a slab buffer (own-writes read
+path) remains valid for the entire transaction even if the page that
+buffer represented is subsequently CoW'd, rebalanced, or freed within
+the same transaction. The pager **does not** return a slab buffer to
+its `sync.Pool` until commit or rollback, even when the buffer
+becomes a loose page mid-transaction. Loose-page tracking
+(`tx.loosePages`) only removes the page ID from active routing — the
+underlying `[]byte` remains alive and untouched until tx close. This
+preserves the "valid until tx close" contract under any intra-tx
+mutation pattern. The cost is bounded by `MaxTxBufferBytes`, since
+every slab buffer in the transaction (live or loose) counts against
+the same budget.
 
 Callers who need a key or value to outlive these scopes must copy it:
 
 ```go
 k, v := c.Next()
-savedKey := bytes.Clone(k)    // key survives next cursor movement
-savedVal := bytes.Clone(v)    // value survives transaction close
+savedKey := bytes.Clone(k)
+savedVal := bytes.Clone(v)
 ```
 
-`Keyspace.Get()` returns a value slice pointing into the mmap — valid
-until transaction close. No cursor buffer is involved, so the value
-remains stable for the entire transaction.
+`Keyspace.Get()` returns a value slice; valid until transaction close.
 
 This contract is the standard for mmap-based B+tree databases (LMDB,
-libmdbx, BoltDB). The zero-copy read path is a core performance
-property of gmdb's architecture.
+libmdbx, BoltDB). Zero-copy reads are a core performance property.
 
 ### Nil and Empty Semantics
 
-**Keys:**
+**Keys:** empty (`[]byte{}`) and nil keys are both **invalid**. Any
+operation taking a key returns `ErrKeyEmpty` if the key is nil or empty.
 
-Empty keys (`[]byte{}`) and nil keys (`nil`) are both **invalid**. Any
-operation that takes a key (`Get`, `Put`, `Delete`, `Seek`, etc.) returns
-an error if the key is nil or empty. There is no technical reason a
-zero-length key can't exist in a B+tree, but it is almost always a bug.
-Rejecting it at the API boundary catches errors early.
-
-**Values:**
-
-Empty values (`[]byte{}`) are **valid**. A key can exist with no associated
-data — this is useful for using a keyspace as a set of keys
-(presence/absence). Nil values are treated as empty values: `Put(key, nil)`
-stores the key with a zero-length value, equivalent to `Put(key, []byte{})`.
+**Values:** empty (`[]byte{}`) are **valid**. A key can exist with no
+associated data — useful for using a keyspace as a set of keys. Nil
+values are treated as empty: `Put(key, nil)` stores a zero-length value.
 
 **Return value conventions:**
 
-| Call | Key exists (empty value) | Key exists (non-empty value) | Key not found | End of iteration |
-|------|--------------------------|------------------------------|---------------|------------------|
+| Call | Key exists (empty value) | Key exists (non-empty) | Key not found | End of iteration |
+|------|--------------------------|------------------------|---------------|------------------|
 | `Keyspace.Get(k)` | `([]byte{}, nil)` | `(value, nil)` | `(nil, ErrNotFound)` | N/A |
 | `Cursor.Next()` | `(key, []byte{})` | `(key, value)` | N/A | `(nil, nil)` |
-| `Cursor.Err()` | — | — | — | returns non-nil if iteration ended due to error |
+| `Cursor.Err()` | — | — | — | non-nil if iteration ended due to error |
 
-Nil return from `Get` always means "not found" (accompanied by
-`ErrNotFound`). Nil return from cursor navigation always means "end of
-iteration" (check `Err()` to distinguish normal end from error). Empty
-`[]byte{}` return from `Get` means "key exists, value is empty."
+Nil return from `Get` always means "not found" with `ErrNotFound`. Nil
+return from cursor navigation always means "end of iteration" (check
+`Err()` to distinguish normal end from error). Empty `[]byte{}` return
+from `Get` means "key exists, value is empty."
 
 ### Database Initialization
 
-When `Open()` creates a new database (file does not exist):
+When `Open()` creates a new database:
 
-1. Create the data file with `O_CREATE|O_EXCL` to prevent races when
-   multiple processes call `Open()` simultaneously. If the exclusive
-   create fails with `EEXIST`, `Open()` retries as a normal open.
+1. Create the data file with `O_CREATE|O_EXCL`. If `EEXIST`, retry as
+   normal open.
 2. Write both meta pages identically:
    - TxnID = 0
-   - HighWaterMark = 2 + BitmapPages (first data page)
-   - KeyspaceRoot = 0 (empty keyspace B+tree)
+   - HighWaterMark = 2 + BitmapPages
+   - KeyspaceRoot = 0 (empty)
    - NumKeyspaces = 0
    - RPLHeadPage = 0, RPLTailPage = 0, RPLEntryCount = 0
    - NumFreePages = 0
-   - Checkpoint flag set on both meta pages
-   - All file format fields from `Options.FileFormat` (or defaults)
-   - UUID generated via `crypto/rand`
-3. Initialize the bitmap region (pages 2 through 2 + BitmapPages - 1):
-   all bits clear (no free pages — all data pages are beyond
-   HighWaterMark and will be allocated via file extension).
-4. Create the lock file with `O_CREATE|O_EXCL`, matching UUID, and
-   empty reader table.
-5. fdatasync the data file.
+   - Checkpoint flag set on both
+   - File format fields from `Options.FileFormat` (or defaults)
+   - UUID via `crypto/rand`
+3. Initialize the bitmap region: all bits clear.
+4. Create the lock file with `O_CREATE|O_EXCL`, matching UUID, empty
+   reader table.
+5. `fdatasync` the data file.
 
 The first write transaction increments TxnID to 1.
 
 ### Path Traversal Safety
 
-`Open()` uses `os.OpenRoot` (Go 1.24+) to confine all file operations
-to the database directory. The path argument is split into a directory
-and base name:
+`Open()` uses `os.OpenRoot` (Go 1.24+) to confine file operations to
+the database directory:
 
 ```go
 root, err := os.OpenRoot(filepath.Dir(path))
@@ -2716,250 +3650,243 @@ dataFile, err := root.Open(filepath.Base(path), ...)
 lockFile, err := root.Open(filepath.Base(path)+".lock", ...)
 ```
 
-`os.OpenRoot` returns an `os.Root` handle that rejects symlink traversal
-outside the root directory. This prevents an attacker who controls the
-database path (e.g., in multi-tenant or container environments) from
-redirecting file operations to arbitrary locations via symlinks. Without
-this, a symlink at the database path could cause `Open()` to create or
+`os.OpenRoot` rejects symlink traversal outside the root directory.
+Prevents an attacker who controls the database path from redirecting
+file operations to arbitrary locations via symlinks. Without this, a
+symlink at the database path could cause `Open()` to create or
 overwrite files outside the intended directory.
 
-The `os.Root` handle is used for all file creation and opening during
-`Open()` — both the data file and the lock file. After `Open()` returns,
-the resolved file descriptors are used directly and the `os.Root` is
-closed.
+Used for both the data file and the lock file during `Open()`. After
+return, resolved fds are used directly and the `os.Root` is closed.
+
+### Types and Options
 
 ```go
 // SyncMode controls the durability guarantees of committed transactions.
 type SyncMode int
 
 const (
-    // SyncDurable syncs both data and meta pages. Full ACID. Default.
-    SyncDurable SyncMode = iota
-    // SyncDataOnly syncs data pages but not the meta page. Last transaction
-    // may be lost on crash, but the database is always consistent.
-    SyncDataOnly
-    // SyncLazy skips all syncs. The database rolls back to the last checkpoint
-    // on crash. No corruption risk. Use DB.Checkpoint() to create
-    // checkpoints.
-    SyncLazy
-    // SyncUnsafe skips all syncs with no safety net. Risk of corruption on
-    // crash. For benchmarks and ephemeral data only. Requires
-    // Options.AllowSyncUnsafe = true.
-    SyncUnsafe
+    SyncDurable    SyncMode = iota // syncs data + meta. Full ACID. Default.
+    SyncDataOnly                   // syncs data; not meta. Last txn may be lost on crash.
+    SyncLazy                       // skips all syncs. Rolls back to last Checkpoint() on crash.
+    SyncUnsafe                     // skips all syncs, no safety net. Requires AllowSyncUnsafe.
 )
 
 // Options for opening a database.
 type Options struct {
     // PageSize in bytes. Only used when creating a new database.
-    // Must be a power of 2 in range [4096, 65536]. Default: 4096.
-    // Ignored when opening an existing database (read from meta page).
+    // Must be a power of 2 in [4096, 65536]. Default: 4096.
     PageSize int
 
-    // PageChecksum enables CRC32C checksums on data pages (branch, leaf,
-    // overflow, RPL segment). Stored as a flag in the meta page — immutable
-    // after creation. When enabled, every page read is verified and every
-    // page write computes a checksum footer. Default: false.
-    // Only used when creating a new database. Ignored when opening an
-    // existing database (read from meta page Flags).
+    // PageChecksum enables xxhash64 footers on data pages. Stored as
+    // a flag in the meta page — immutable after creation. Default: true.
+    // Only used when creating; ignored when opening existing.
     PageChecksum bool
 
-    // FileFormat controls database file size bounds and growth behavior.
-    // Only used when creating a new database. When opening an existing
-    // database, file format is read from the meta page. Use Tx.SetFileFormat()
-    // to modify file format of an existing database.
+    // FileFormat controls database file size bounds and growth.
+    // Only used when creating; modify via Tx.SetFileFormat() at runtime.
     FileFormat FileFormat
 
-    // SyncMode controls the durability guarantees of committed
-    // transactions. Default: SyncDurable.
+    // SyncMode controls durability. Default: SyncDurable.
     SyncMode SyncMode
 
-    // AllowSyncUnsafe must be set to true when using SyncUnsafe mode.
-    // This explicit opt-in prevents accidental use of the unsafe mode.
-    // Open() returns an error if SyncMode is SyncUnsafe and AllowSyncUnsafe
-    // is false. Default: false.
+    // AllowSyncUnsafe must be true when using SyncUnsafe mode.
+    // Without it, Open() returns an error when SyncMode = SyncUnsafe.
+    // Default: false.
     AllowSyncUnsafe bool
 
     // MaxReaders is the maximum number of concurrent reader slots.
     // Default: 4096. Only used when creating a new lock file.
-    // Ignored when the lock file already exists (read from lock file header).
     MaxReaders int
 
+    // MaxTxBufferBytes bounds the per-write-transaction slab (live +
+    // loose + commit-time assembly buffers). A write transaction
+    // that dirties more pages than this fails the next CoW (or
+    // step 0 of commit) with ErrTxTooLarge.
+    //
+    // Sizing guide: each Put/Delete on an indexed keyspace with I
+    // indexes can CoW up to depth × (I + 1) pages in the worst case
+    // (row tree + each index tree, one CoW per level). At 4 KB
+    // pages, depth 5, and 3 indexes: ~80 KB of unique CoW
+    // destinations per maximally-touching Put; the 256 MiB default
+    // accommodates ~3,000–3,200 such Puts before ErrTxTooLarge. For
+    // larger workloads, use BulkLoad (which bypasses the slab via
+    // streaming pwrite) or chunk the work across multiple write
+    // transactions. Default: 256 MiB.
+    MaxTxBufferBytes int64
+
+    // RestartGroupTarget is the engine-wide default for the leaf
+    // prefix-compression restart interval. Per-keyspace overrides via
+    // Tx.SetKeyspaceConfig(). Default: 16.
+    RestartGroupTarget int
+
     // MergeThreshold is the B+tree page fill percentage below which a
-    // page is merged with a sibling after a deletion. Range: 1-50.
-    // Lower values waste more space but reduce merge/split churn.
-    // Higher values keep pages fuller but cause more rebalancing.
-    // Default: 25 (merge when page is less than 25% full).
+    // page is merged with a sibling after deletion. Range: 1-50.
+    // Default: 25.
     MergeThreshold int
 
-    // LaggingReader is called when a long-lived reader is blocking RPL
-    // reclamation during page allocation. If nil, pageAlloc() falls
-    // through to file extension when reclamation is blocked.
+    // LaggingReader is called when a long-lived reader is blocking
+    // RPL reclamation during page allocation. If nil, pageAlloc()
+    // falls through to file extension when reclamation is blocked.
     LaggingReader func(info LaggingReaderInfo) LaggingReaderAction
 
-    // MaxBatchSize is the maximum number of Batch() calls to collect
-    // before executing them in a single transaction. Default: 1000.
+    // MaxBatchSize is the maximum number of Batch() calls collected
+    // before executing in one transaction. Default: 1000.
     MaxBatchSize int
 
-    // MaxBatchDelay is the maximum time to wait for additional Batch()
-    // calls before executing the current batch. Lower values reduce
-    // latency; higher values increase throughput by collecting more
-    // callers per transaction. Default: 10ms. Set to 0 to disable
-    // delay (batch fires immediately when the coordinator runs).
+    // MaxBatchDelay is the maximum time to wait for additional
+    // Batch() calls before executing the current batch. Set to 0 to
+    // fire immediately. Default: 10ms.
     MaxBatchDelay time.Duration
 
-    // StaleTimeout is the duration after which a reader slot or writer
-    // with a stale heartbeat is considered abandoned. Only used for
-    // cross-PID-namespace stale detection (same-namespace detection uses
-    // instant PID liveness checks). Must be significantly larger than the
-    // heartbeat interval (1s). Default: 10s.
+    // StaleTimeout for cross-PID-namespace stale detection via
+    // heartbeats. Default: 10s.
     StaleTimeout time.Duration
 
-    // Logger for diagnostic messages (leaked transactions, stale reader
-    // recovery, stale writer recovery). If nil, diagnostics are discarded.
-    // Default: nil.
+    // LockRetryInterval is the polling interval the flock goroutine
+    // uses when flock(LOCK_EX|LOCK_NB) returns EWOULDBLOCK. Bounds
+    // both Close() shutdown latency and per-writer ctx cancellation
+    // latency under cross-process write-lock contention. Default: 50ms.
+    LockRetryInterval time.Duration
+
+    // Logger for diagnostic messages. If nil, discarded.
     Logger *slog.Logger
 
     // FileMode for newly created files. Default: 0644.
     FileMode os.FileMode
 
-    // PreloadPages pre-faults the mmap into the page cache at open time
-    // via madvise(MADV_POPULATE_READ) (Linux 5.14+). Eliminates page
-    // faults on first access at the cost of slower Open(). Ignored if
-    // the kernel does not support MADV_POPULATE_READ. Default: false.
+    // PreloadPages calls madvise(MADV_POPULATE_READ) at open
+    // (Linux 5.14+). Default: false.
     PreloadPages bool
 
-    // HugePages enables transparent huge page support via
-    // madvise(MADV_HUGEPAGE) on the data file mmap (Linux only).
-    // Reduces TLB pressure for large databases by allowing the kernel
-    // to back the mmap with 2MB huge pages where possible. A 1GB
-    // database drops from 262,144 TLB entries (4KB pages) to 512
-    // (2MB huge pages). Ignored on non-Linux platforms. Default: false.
+    // HugePages calls madvise(MADV_HUGEPAGE) on the data mmap
+    // (Linux). Default: false.
     HugePages bool
 
-    // ReclaimOnClose calls madvise(MADV_COLD) on the mmap region accessed
-    // by a read transaction when the transaction closes (Linux 5.4+).
-    // This hints the kernel to reclaim page cache for pages that are
-    // no longer hot, reducing memory pressure after large scans.
-    // Useful for batch readers that scan the entire database. Ignored
-    // on non-Linux platforms or older kernels. Default: false.
+    // ReclaimOnClose calls madvise(MADV_COLD) on the accessed mmap
+    // region when a read transaction closes (Linux 5.4+).
+    // Default: false.
     ReclaimOnClose bool
 
-    // ReadOnly opens the database in read-only mode. The data file is
-    // mapped with PROT_READ only (no PROT_WRITE). Write transactions
-    // return ErrReadOnly. The lock file is still writable — reader slot
-    // acquisition requires atomic CAS operations on the shared mmap.
-    // ReadOnly is suitable for deployments where the data file is on
-    // read-only media or has read-only filesystem permissions, provided
-    // the lock file is on writable storage.
+    // ReadOnly opens the database in read-only mode: lock file not
+    // opened for write, flock goroutine not started, write
+    // transactions return ErrReadOnly. The data mmap is always
+    // PROT_READ regardless.
+    //
+    // When ReadOnly is true and the data file does not exist, Open()
+    // returns the underlying os.ErrNotExist (it never creates a
+    // database in read-only mode — that would be a contradiction).
+    // Default: false.
     ReadOnly bool
 
+    // ScratchDir is the directory used for BulkLoad sort spill on
+    // indexed keyspaces. Must be on the same filesystem as the
+    // database file when Compact() is used (atomic rename
+    // requirement). Default: os.TempDir().
+    ScratchDir string
+
+    // CompactDrainTimeout bounds how long Compact() waits for active
+    // in-process read transactions to commit/rollback before
+    // proceeding with the copy. Exceeded → Compact returns
+    // ErrCompactReadersActive without doing any work. Default: 30s.
+    CompactDrainTimeout time.Duration
+
     // Maintenance controls the background maintenance goroutine.
-    // See Background Maintenance for details. If nil, default options
-    // are used (maintenance enabled, 5m interval).
+    // If nil, defaults are used (maintenance enabled, 5m interval).
     Maintenance *MaintenanceOptions
 }
 
-// FileFormat controls the database file size bounds and growth/shrink behavior.
-// All sizes are specified in bytes and must be multiples of PageSize. They are
-// converted to pages internally and stored in the meta page as page counts.
-// All fields are uint64 — negative sizes are meaningless for file format,
-// and uint64 matches the internal meta page representation.
+// FileFormat controls file size bounds and growth/shrink behavior.
+// All sizes are in bytes and must be multiples of PageSize.
 type FileFormat struct {
-    // Lower is the minimum database file size in bytes. The file never
-    // shrinks below this. Must be a multiple of PageSize.
-    // Default: (2 + BitmapPages) * PageSize (meta + bitmap pages).
+    // Lower is the minimum file size in bytes. File never shrinks below.
+    // Default: (2 + BitmapPages) * PageSize.
     Lower uint64
 
-    // Upper is the maximum database file size in bytes. Determines mmap
-    // reservation size and allocation bitmap size. Must be a multiple of
-    // PageSize. Immutable after creation — SetFileFormat cannot change this;
-    // use CopyTo to create a new database with different Upper.
-    // Default: 256GB.
+    // Upper is the maximum file size in bytes. Determines mmap
+    // reservation size and bitmap size. Must be a multiple of PageSize.
+    // Immutable after creation. Default: 256 GiB.
     Upper uint64
 
-    // GrowStep is the number of bytes to grow by when extending the file.
-    // Must be a multiple of PageSize. Default: 256MB.
+    // GrowStep is the number of bytes to grow by when extending.
+    // Must be a multiple of PageSize. Default: 256 MiB.
     GrowStep uint64
 
-    // ShrinkThreshold is the minimum number of bytes of unused space at
-    // the end of the file before shrinking occurs. Must be a multiple of
-    // PageSize. Default: 512MB.
+    // ShrinkThreshold is the minimum unused bytes at file tail before
+    // shrink occurs. Must be a multiple of PageSize. Default: 512 MiB.
     ShrinkThreshold uint64
 }
 
-// LaggingReaderInfo describes a reader that is blocking RPL reclamation.
+// LaggingReaderInfo describes a reader blocking RPL reclamation.
 type LaggingReaderInfo struct {
-    PID       int    // process ID of the lagging reader
-    TxnID     uint64 // transaction ID the reader is holding
+    PID       uint64
+    TxnID     uint64
     Lag       uint64 // number of transactions behind current
-    HeldPages uint64 // estimated number of pages held unreclaimable
+    HeldPages uint64 // estimated pages held unreclaimable
 }
 
-// LaggingReaderAction determines how pageAlloc responds to a lagging reader.
 type LaggingReaderAction int
 
 const (
-    LaggingReaderWait  LaggingReaderAction = iota // retry, reader may release
+    LaggingReaderWait  LaggingReaderAction = iota // retry; reader may release
     LaggingReaderAbort                            // abort with ErrDBFull
 )
+```
 
+### Database and Transaction API
+
+```go
 // DB is a handle to an open database.
 type DB struct { ... }
 
 func (db *DB) Close() error
 
-// Checkpoint flushes all outstanding writes to stable storage. In SyncLazy mode,
-// this creates a checkpoint — the database will roll back to this
-// point (at most) on crash. In SyncDurable and SyncDataOnly modes, this is a
-// no-op (commits already sync). In SyncUnsafe mode, this syncs but does not
-// retroactively fix the lack of ordering guarantees from prior commits.
-func (db *DB) Checkpoint() error
+// Checkpoint flushes all outstanding writes to stable storage. In
+// SyncLazy mode this creates a checkpoint (database will roll back to
+// this point at most on crash). In SyncDurable/SyncDataOnly modes,
+// no-op (commits already sync). In SyncUnsafe, syncs but does not
+// retroactively fix ordering from prior commits.
+//
+// Checkpoint acquires the write lock for its duration via the flock
+// goroutine's FIFO queue; it serializes with concurrent write
+// transactions and Compact(). Concurrent reads are not affected.
+//
+// The context governs the wait for the write lock — if Compact() is
+// running ahead of this call in the queue, the wait can be long
+// (Compact takes the lock for CopyTo's full duration). Callers on a
+// timer (periodic Checkpoint in a service) should pass a context
+// with a deadline. Once Checkpoint has the lock, ctx is not checked
+// further — the fsync + pwrite sequence completes unconditionally
+// (it is bounded and short relative to a Compact wait).
+func (db *DB) Checkpoint(ctx context.Context) error
 
 // View executes a read-only transaction. The context governs slot
-// acquisition only — once the transaction callback is entered, the
-// context is not checked. Use context.Background() when no cancellation
-// is needed.
+// acquisition only — once the callback is entered, the context is not
+// checked by the engine. Long-scan cancellation is a caller concern:
+// the supplied fn can capture ctx and poll it (ctx.Err()) at natural
+// break points (e.g., between cursor pages, between key ranges) and
+// return early if cancelled. For request-driven services, the right
+// pattern is one short View per request, not a long View polled for
+// cancellation.
 func (db *DB) View(ctx context.Context, fn func(tx *Tx) error) error
 
-// Update executes a read-write transaction. The context governs write
-// lock acquisition — if the lock is held by another writer, the caller
-// blocks until the lock is available or the context is cancelled. Once
-// the transaction callback is entered, the context is not checked.
+// Update executes a read-write transaction.
 func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
 
 // Batch submits a write operation to be batched with other concurrent
-// callers into a single transaction. Multiple goroutines calling Batch
-// concurrently will have their closures executed in one write transaction,
-// amortizing the commit cost (fdatasync) across all of them.
+// callers into a single transaction. The context governs the wait for
+// batch inclusion. Each closure runs in its own child transaction and
+// executes exactly once. See Write Batching.
 //
-// The context governs the wait for batch inclusion — if cancelled before
-// the caller's closure executes, Batch returns context.Cause(ctx). Once
-// the closure begins executing, the context is not checked.
-//
-// Each closure runs in its own child transaction (see Nested Transactions).
-// If fn returns an error, only its child transaction is rolled back —
-// other closures in the batch are unaffected. fn executes exactly once
-// and may safely perform external side effects (logging, metrics, etc.).
-// See Write Batching for details.
-//
-// Batch is a throughput optimization for workloads with many concurrent
-// small writes. For exclusive write access or large transactions, use
-// Update or Begin directly.
+// The closure MUST NOT call Commit() or Rollback() on the supplied
+// *Tx — the batch coordinator owns child-transaction lifecycle. A
+// closure that calls either causes the coordinator's subsequent
+// child-commit-or-rollback to error with ErrTxClosed, which
+// propagates to the caller as the closure's result.
 func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error
 
 // Begin starts a transaction manually. The context governs lock/slot
-// acquisition:
-//   - For write transactions: blocks on the write lock, respecting
-//     context cancellation. Returns context.Cause(ctx) if cancelled
-//     while waiting.
-//   - For read transactions: if no reader slots are available and the
-//     context has a deadline, retries with backoff until a slot becomes
-//     free or the context expires. If the context has no deadline,
-//     returns ErrReadersFull immediately (no blocking). Use
-//     context.WithTimeout to control the wait window.
-//
-// Once Begin returns a *Tx, the context is not stored — the caller
-// controls the transaction lifetime via Commit()/Rollback().
+// acquisition; once Begin returns a *Tx the context is not stored.
 func (db *DB) Begin(ctx context.Context, writable bool) (*Tx, error)
 
 // Tx is a database transaction.
@@ -2969,293 +3896,403 @@ func (tx *Tx) Commit() error
 func (tx *Tx) Rollback() error
 
 // BeginChild creates a child transaction within the current write
-// transaction. The child can be independently committed (merged into
-// the parent) or rolled back (discarded) without affecting the parent.
-// Only valid on a write transaction. Children can be nested arbitrarily.
-// The child receives the same *Tx type — all Keyspace/SetKeyspace
-// operations work identically.
+// transaction. Children can be committed (merged into parent) or
+// rolled back (discarded) independently. Only valid on a write txn.
 func (tx *Tx) BeginChild() (*Tx, error)
 
-// SetFileFormat updates the file format. Only valid on a write
-// transaction. The new file format takes effect when the transaction commits.
-//
-// MaxSize (FileFormat.MaxSize) is immutable after creation — the allocation
-// bitmap size is fixed at creation time based on MaxSize, and changing it
-// would invalidate all page IDs. SetFileFormat returns an error if
-// FileFormat.MaxSize differs from the current MaxSize. To change MaxSize,
-// use CopyTo to create a new database with different file format.
-//
-// MinSize, GrowStep, and ShrinkThreshold may be modified freely.
-func (tx *Tx) SetFileFormat(g FileFormat) error
+// SetFileFormat updates the file format. MaxSize is immutable and
+// cannot be changed; returns an error if FileFormat.Upper differs.
+// Only valid on a write transaction.
+func (tx *Tx) SetFileFormat(f FileFormat) error
+```
 
-// OpenKeyspace opens an existing named keyspace (single-value) within this
-// transaction. Returns ErrNotFound if the keyspace does not exist. Returns
-// ErrKeyspaceKindMismatch if the keyspace is a SetKeyspace.
-func (tx *Tx) OpenKeyspace(name []byte) (*Keyspace, error)
+### Keyspace API
 
-// CreateKeyspace creates a new named single-value keyspace within this
-// transaction. Returns ErrKeyExists if the keyspace already exists.
-func (tx *Tx) CreateKeyspace(name []byte) (*Keyspace, error)
+```go
+// OpenKeyspace opens an existing single-value keyspace for read+write.
+// Every declared index on the keyspace must be supplied as an
+// IndexDecl. Missing indexes return ErrIndexExtractorRequired; extras
+// return ErrIndexUnknown; drifted fingerprints return
+// ErrIndexFingerprintMismatch.
+func (tx *Tx) OpenKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, error)
 
-// CreateKeyspaceIfNotExists opens a single-value keyspace if it exists,
-// or creates it if it does not. If the keyspace already exists as a
-// SetKeyspace, returns ErrKeyspaceKindMismatch.
-func (tx *Tx) CreateKeyspaceIfNotExists(name []byte) (*Keyspace, error)
+// OpenKeyspaceReadOnly opens an existing keyspace for reads only.
+// No IndexDecls required (and none accepted). Index lookups still work.
+func (tx *Tx) OpenKeyspaceReadOnly(name string) (*Keyspace, error)
 
-// OpenSetKeyspace opens an existing named set keyspace (multiple sorted
-// values per key) within this transaction. Returns ErrNotFound if the
-// keyspace does not exist. Returns ErrKeyspaceKindMismatch if the
-// keyspace is a single-value Keyspace.
-func (tx *Tx) OpenSetKeyspace(name []byte) (*SetKeyspace, error)
+// CreateKeyspace creates a new single-value keyspace and (optionally)
+// declares indexes. Returns ErrKeyExists if the keyspace exists.
+func (tx *Tx) CreateKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, error)
 
-// SetKeyspaceOptions controls set keyspace behavior. All fields are set
-// at creation time and immutable after.
+// CreateKeyspaceIfNotExists opens the keyspace if it exists (matching
+// indexes required) or creates it (with the supplied indexes).
+// ErrKeyspaceKindMismatch if it exists as a SetKeyspace.
+func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Keyspace, error)
+
+// OpenSetKeyspace, OpenSetKeyspaceReadOnly, CreateSetKeyspace,
+// CreateSetKeyspaceIfNotExists follow the same pattern.
 type SetKeyspaceOptions struct {
-    // FixedValueSize, when non-zero, requires all values in the set to
-    // be exactly this many bytes. Enables storage optimizations: no
-    // per-value length prefix in subpages, direct offset binary search.
-    // A Put() with a value of the wrong size returns ErrValueSizeMismatch.
     FixedValueSize int
 }
 
-// CreateSetKeyspace creates a new named set keyspace within this
-// transaction. Returns ErrKeyExists if the keyspace already exists.
-// If opts is nil, default options are used.
-func (tx *Tx) CreateSetKeyspace(name []byte, opts *SetKeyspaceOptions) (*SetKeyspace, error)
+func (tx *Tx) OpenSetKeyspace(name string, indexes ...*IndexDecl) (*SetKeyspace, error)
+func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error)
+func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions, indexes ...*IndexDecl) (*SetKeyspace, error)
+func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions, indexes ...*IndexDecl) (*SetKeyspace, error)
 
-// CreateSetKeyspaceIfNotExists opens a set keyspace if it exists, or
-// creates it if it does not. If the keyspace already exists as a
-// single-value Keyspace, returns ErrKeyspaceKindMismatch.
-func (tx *Tx) CreateSetKeyspaceIfNotExists(name []byte, opts *SetKeyspaceOptions) (*SetKeyspace, error)
+// DeleteKeyspace removes a keyspace and everything reachable from
+// its descriptor as a single atomic CoW operation. Three sub-trees
+// are retired together:
+//
+//   1. The keyspace's own B+tree (row data, including SetKeyspace
+//      nested B+trees for value sets) — bulk subtree retirement.
+//   2. Each engine-internal index keyspace (Kind=2) referenced from
+//      the per-keyspace index registry — bulk subtree retirement
+//      per index.
+//   3. The per-keyspace index registry sub-tree itself (rooted at
+//      IndexRegistryRoot in the keyspace descriptor) — bulk
+//      subtree retirement.
+//
+// All three retirements happen inside the same write transaction.
+// The keyspace descriptor is then removed from the keyspace B+tree
+// (which propagates CoW to the meta page's KeyspaceRoot). On commit,
+// the meta swap publishes all of (1)+(2)+(3)+descriptor-removal
+// atomically; a mid-DeleteKeyspace crash leaves the prior meta
+// active and none of the work visible.
+//
+// For indexed keyspaces, no per-row extractor call is needed because
+// no index entries survive after step (2).
+//
+// Errors: ErrNotFound if the keyspace does not exist.
+// ErrKeyspaceReserved if the supplied name is an engine-internal
+// index keyspace (Kind=2 — not enumerable, not user-deletable).
+//
+// Any Keyspace/SetKeyspace/Cursor/Index handle previously opened on
+// the named keyspace within this transaction is invalidated by
+// DeleteKeyspace — subsequent operations on those handles return
+// ErrKeyspaceClosed. **Re-creating the keyspace in the same
+// transaction via CreateKeyspace does NOT reactivate the old
+// handle**: invalidation is permanent for the handle's lifetime.
+// The new CreateKeyspace returns a fresh *Keyspace; the old handle
+// stays dead until it is dropped by the caller.
+func (tx *Tx) DeleteKeyspace(name string) error
 
-// DeleteKeyspace removes a keyspace and all of its data. For set
-// keyspaces, all nested B+trees are retired via bulk subtree
-// retirement. Returns ErrNotFound if the keyspace does not exist.
-// Works for both Keyspace and SetKeyspace types — the Kind field
-// is not checked. Only valid on a write transaction.
-func (tx *Tx) DeleteKeyspace(name []byte) error
+// ListKeyspaces returns the names of all user keyspaces (Kind=0
+// Keyspace or Kind=1 SetKeyspace). Engine-internal index keyspaces
+// (Kind=2) are filtered out — they are addressable only via their
+// parent keyspace's index registry, not by name.
+func (tx *Tx) ListKeyspaces() ([]string, error)
 
-// Keyspace is a handle to a named single-value keyspace within a transaction.
+// SetKeyspaceConfig updates mutable per-keyspace settings.
+// Currently only RestartGroupTarget. Returns an error for invalid
+// values (e.g. RestartGroupTarget = 0 means engine default).
+// Only valid on a write transaction.
+func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error
+
+type KeyspaceConfig struct {
+    RestartGroupTarget uint16 // 0 = leave unchanged
+}
+
+// RebuildIndex drops and re-populates the named index using the
+// supplied IndexDecl (whose Name must match an existing registry
+// entry on the keyspace). Bypasses the open-time fingerprint check;
+// this is the recovery path after ErrIndexFingerprintMismatch.
+// Blocking — runs inside the current write transaction. See the
+// Indexing → Rebuild section for the recovery pattern.
+func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error
+
+// DropIndex removes the named index entirely.
+func (tx *Tx) DropIndex(keyspace, indexName string) error
+
+// Keyspace is a handle to a named single-value keyspace.
 type Keyspace struct { ... }
 
-// Get returns the value for the given key. Returns ErrNotFound if the key
-// does not exist.
 func (ks *Keyspace) Get(key []byte) ([]byte, error)
-
-// Put inserts or updates a key-value pair. An existing value is replaced.
 func (ks *Keyspace) Put(key, value []byte) error
-
-// Delete removes the key and its value. If the key does not exist,
-// Delete is a no-op and returns nil — Delete means "ensure this key
-// does not exist."
 func (ks *Keyspace) Delete(key []byte) error
-
-// DeleteRange deletes all keys in the range [start, end). Returns the
-// number of deleted key-value pairs. If start is nil, deletes from the
-// first key. If end is nil, deletes through the last key. If both are
-// nil, deletes all keys.
-//
-// DeleteRange retires entire B+tree subtrees that fall within the range
-// without visiting individual leaf entries — O(pages) not O(entries).
-// See Range Delete for the algorithm.
 func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error)
-
-// NextSequence returns the next auto-incrementing sequence number for
-// this keyspace. The counter starts at 0; the first call returns 1.
-// The counter is persisted in the keyspace descriptor and updated when
-// the transaction commits. Only valid on a write transaction.
 func (ks *Keyspace) NextSequence() (uint64, error)
-
-// Cursor for iterating over key-value pairs.
 func (ks *Keyspace) Cursor() *Cursor
 
+// Index returns a handle for querying the named index on this
+// keyspace. Returns ErrIndexNotFound if no index with this name is
+// registered.
+//
+// For handles returned by OpenKeyspace: the engine resolves against
+// the IndexDecl set supplied to OpenKeyspace, which is enforced to
+// match the on-disk registry (every on-disk index must be supplied
+// as an IndexDecl, else ErrIndexExtractorRequired). ErrIndexNotFound
+// therefore means the supplied name is genuinely absent from the
+// registry — not a timing or race condition.
+//
+// For handles returned by OpenKeyspaceReadOnly: no IndexDecls were
+// supplied; the engine resolves the name against the on-disk index
+// registry directly. ErrIndexNotFound means no index with this name
+// is registered on disk. Index reads (Lookup/LookupKeys/Range/
+// Prefix/Get) do not need an extractor — they read stored index
+// entries — so a read-only handle's Index resolution and queries
+// work identically to a read-write handle's.
+//
+// The returned *Index is not safe for concurrent use; see
+// Index.Err godoc.
+func (ks *Keyspace) Index(name string) (*Index, error)
+
+func (ks *Keyspace) BulkLoad(yield func(yield func(key, value []byte) bool)) (uint64, error)
+
+// Cursor for iterating over key-value pairs. See "Cursor State
+// Machine" below for state semantics, Delete-post-state rules, and
+// invalidation conditions.
 type Cursor struct { ... }
 
 func (c *Cursor) First() (key, value []byte)
 func (c *Cursor) Last() (key, value []byte)
 func (c *Cursor) Next() (key, value []byte)
 func (c *Cursor) Prev() (key, value []byte)
-
-// Seek positions the cursor at the exact key. Returns the key-value pair,
-// or nil if the key does not exist.
 func (c *Cursor) Seek(target []byte) (key, value []byte)
-
-// SeekGE positions the cursor at the first key >= target.
-// Returns the key-value pair, or nil if no such key exists.
 func (c *Cursor) SeekGE(target []byte) (key, value []byte)
-
-// Current returns the key-value pair at the current cursor position
-// without moving the cursor.
 func (c *Cursor) Current() (key, value []byte)
 
-// Delete removes the current key-value pair. After deletion, the
-// cursor is positioned at the next key (the key that followed the
-// deleted key). If the deleted key was the last key, the cursor
-// becomes unpositioned (Next() returns nil). Only valid on a write
-// transaction cursor.
+// Delete removes the current entry. Cursor must be Positioned;
+// otherwise returns ErrCursorUnpositioned. After delete, advances
+// to the next entry or transitions to End-of-iteration. Possible
+// errors: ErrCursorUnpositioned, ErrReadOnly (on a read-only
+// transaction or keyspace handle), ErrTxClosed, ErrKeyspaceClosed
+// (parent keyspace deleted), ErrIndexUniqueViolation (only on
+// indexed keyspaces if the engine's bookkeeping discovers an
+// inconsistency).
 func (c *Cursor) Delete() error
 
-// Err returns the first error encountered during cursor navigation.
-// Navigation methods (First, Last, Next, Prev, Seek, SeekGE) do not
-// return errors directly — they return nil key/value when iteration
-// ends or an error occurs. After a navigation loop, the caller checks
-// Err() to distinguish normal end-of-range (nil) from an error (e.g.,
-// ErrCorrupted from a page checksum failure). This follows the
-// bufio.Scanner / sql.Rows pattern.
 func (c *Cursor) Err() error
 
-// SetKeyspace is a handle to a named set keyspace (multiple sorted values
-// per key) within a transaction.
+// SetKeyspace handle to a named set keyspace.
 type SetKeyspace struct { ... }
 
-// Has reports whether the key exists (has at least one value).
 func (ks *SetKeyspace) Has(key []byte) (bool, error)
-
-// HasValue reports whether a specific key-value pair exists.
 func (ks *SetKeyspace) HasValue(key, value []byte) (bool, error)
-
-// Put adds a value to the key's sorted value set (no-op if the exact
-// key-value pair already exists).
 func (ks *SetKeyspace) Put(key, value []byte) error
-
-// Delete removes the key and all of its values. If the key does not
-// exist, Delete is a no-op and returns nil. Uses bulk subtree
-// retirement for nested B+trees. To remove a single value, use
-// DeleteValue.
 func (ks *SetKeyspace) Delete(key []byte) error
-
-// DeleteValue removes a single value from the key's sorted set.
-// Returns ErrNotFound if the key or value does not exist. When the last
-// value is removed, the key is also removed — empty sets never exist.
 func (ks *SetKeyspace) DeleteValue(key, value []byte) error
-
-// CountValues returns the number of values for the given key.
-// Returns 0 if the key does not exist.
 func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
-
-// DeleteRange deletes all keys in the range [start, end). Returns the
-// number of deleted key-value pairs (each value counts as one). If start
-// is nil, deletes from the first key. If end is nil, deletes through
-// the last key. If both are nil, deletes all keys.
-//
-// DeleteRange retires entire B+tree subtrees that fall within the range
-// without visiting individual leaf entries — O(pages) not O(entries).
-// See Range Delete for the algorithm.
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error)
-
-// NextSequence returns the next auto-incrementing sequence number for
-// this keyspace. See Keyspace.NextSequence for details.
 func (ks *SetKeyspace) NextSequence() (uint64, error)
-
-// Cursor for iterating over key-value pairs in a set keyspace.
 func (ks *SetKeyspace) Cursor() *SetCursor
+func (ks *SetKeyspace) Index(name string) (*Index, error)
+func (ks *SetKeyspace) BulkLoad(yield func(yield func(key, value []byte) bool)) (uint64, error)
 
+// SetCursor for iterating over set keyspace key-value pairs.
 type SetCursor struct { ... }
 
-// --- Core navigation ---
-
+// Core navigation (same as Cursor).
 func (c *SetCursor) First() (key, value []byte)
 func (c *SetCursor) Last() (key, value []byte)
 func (c *SetCursor) Next() (key, value []byte)
 func (c *SetCursor) Prev() (key, value []byte)
-
-// Seek positions the cursor at the exact key. Returns the key and the
-// first (smallest) value for the key, or nil if the key does not exist.
 func (c *SetCursor) Seek(target []byte) (key, value []byte)
-
-// SeekGE positions the cursor at the first key >= target.
-// Returns the key and the first value for that key, or nil if no such key exists.
 func (c *SetCursor) SeekGE(target []byte) (key, value []byte)
-
-// Current returns the key-value pair at the current cursor position
-// without moving the cursor.
 func (c *SetCursor) Current() (key, value []byte)
-
-// Delete removes the current value from the current key's set. After
-// deletion, the cursor is positioned at the next value for the
-// current key. If the deleted value was the last value for the key,
-// the cursor advances to the first value of the next key. If there
-// is no next key, the cursor becomes unpositioned. When the last
-// value for a key is deleted, the key itself is removed.
 func (c *SetCursor) Delete() error
-
-// Err returns the first error encountered during cursor navigation.
 func (c *SetCursor) Err() error
 
-// --- Set cursor operations (value navigation within a key) ---
-
-// FirstValue positions the cursor at the first value for the
-// current key. Returns the value, or nil if the cursor is not positioned.
-func (c *SetCursor) FirstValue() (value []byte)
-
-// LastValue positions the cursor at the last value for the
-// current key.
-func (c *SetCursor) LastValue() (value []byte)
-
-// NextValue moves to the next value for the current key.
-// Returns nil when there are no more values (the cursor does NOT
-// advance to the next key). The key does not change during value
-// navigation — use Current() to read the key.
+// Value navigation (within current key's set).
+func (c *SetCursor) FirstValue() []byte
+func (c *SetCursor) LastValue() []byte
 func (c *SetCursor) NextValue() (value []byte)
-
-// PrevValue moves to the previous value for the current key.
-// Returns nil when at the first value.
 func (c *SetCursor) PrevValue() (value []byte)
-
-// NextKey moves to the first value of the next key, skipping
-// remaining values of the current key.
 func (c *SetCursor) NextKey() (key, value []byte)
-
-// PrevKey moves to the last value of the previous key,
-// skipping remaining values of the current key.
 func (c *SetCursor) PrevKey() (key, value []byte)
-
-// SeekValue positions the cursor at the first value >= target
-// for the current key. The cursor must already be positioned on a key
-// (via Seek, SeekGE, First, etc.). Returns the value, or nil if no
-// value >= target exists for the current key.
 func (c *SetCursor) SeekValue(target []byte) (value []byte)
-
-// CountValues returns the number of values for the current key.
 func (c *SetCursor) CountValues() (uint64, error)
+```
 
-// --- Range iterators (read-only, for use with for-range) ---
+#### Cursor State Machine
 
-// All returns an iterator over all key-value pairs in the keyspace.
-// The iterator yields pairs in key order.
+Every cursor (Keyspace `Cursor`, SetCursor, TypedCursor) is at any
+moment in exactly one of three states:
+
+| State | Meaning | Behavior |
+|-------|---------|----------|
+| Unpositioned | Cursor was created but never moved, or was Reset | `Current()` returns `(nil, nil)` and `Err()` returns `ErrCursorUnpositioned`. `Next`/`Prev` from this state behaves like `First`/`Last`. |
+| Positioned | Cursor refers to an existing entry | `Current()` returns `(key, value)`. `Next`/`Prev`/`Seek*` move; `Delete()` removes the entry and transitions per the rules below. |
+| End-of-iteration | Last `Next`/`Prev`/`Seek*`/`Delete()` advanced past the end | `Current()` returns `(nil, nil)` (no error). `Err()` returns nil (normal end). The next `Next`/`Prev` returns `(nil, nil)` again. `First`/`Last`/`Seek*` re-positions. |
+
+Distinguishing end-of-iteration from unpositioned: end-of-iteration's
+`Err()` is nil; unpositioned-state `Err()` is `ErrCursorUnpositioned`.
+
+**`Cursor.Delete()` post-delete state** (single-value Keyspace cursor):
+- Cursor must be Positioned. Otherwise returns `ErrCursorUnpositioned`.
+- After successful delete, the cursor advances to the entry that
+  followed the deleted entry. If no such entry exists, the cursor
+  transitions to End-of-iteration (subsequent `Next` returns
+  `(nil, nil)`, `Err()` is nil).
+- The cursor stack tolerates CoW + rebalance triggered by the delete:
+  `Next()` after `Delete()` is the supported pattern and always
+  resumes correctly at the post-delete successor.
+- Possible errors: `ErrReadOnly` (cursor on a read-only txn or
+  read-only keyspace), `ErrCursorUnpositioned`, `ErrTxClosed`.
+
+**`SetCursor.Delete()` post-delete state**:
+- Cursor must be Positioned on a (key, value) pair.
+- Deletes the current value from the current key's set.
+- If the deleted value was not the last value for the key, advances
+  to the next value for the same key.
+- If the deleted value was the last value for the key, the key itself
+  is removed (empty sets never exist) and the cursor advances to the
+  first value of the next key. If there is no next key, transitions
+  to End-of-iteration.
+- The cursor stack tolerates CoW + rebalance triggered by the
+  key-removal case — the same guarantee as `Cursor.Delete()` — so
+  `Next()` after `Delete()` always resumes correctly at the
+  post-delete successor, including across leaf splits and merges
+  caused by the parent-keyspace key removal.
+- Same error set as `Cursor.Delete()`.
+
+**Cursor invalidation by `DeleteKeyspace`.** Calling
+`tx.DeleteKeyspace(name)` invalidates every cursor and Index handle
+previously opened on that keyspace within the same transaction.
+Subsequent use of an invalidated cursor or Index returns
+`ErrKeyspaceClosed`. The caller is responsible for not retaining
+handles past a `DeleteKeyspace` call.
+
+### Range Iterators
+
+```go
+// Read-only iterators on Keyspace.
 func (ks *Keyspace) All() iter.Seq2[[]byte, []byte]
-
-// Range returns an iterator over key-value pairs in [start, end).
-// If start is nil, iteration begins at the first key. If end is nil,
-// iteration continues through the last key.
 func (ks *Keyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte]
-
-// Prefix returns an iterator over all key-value pairs whose keys
-// share the given prefix.
 func (ks *Keyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte]
 
-// --- Statistics ---
+// On SetKeyspace, each (key, value) pair yields separately.
+func (ks *SetKeyspace) All() iter.Seq2[[]byte, []byte]
+func (ks *SetKeyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte]
+func (ks *SetKeyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte]
+```
 
-// DBStats contains environment-level statistics.
+### Index Lookup API
+
+```go
+type Index struct { /* unexported */ }
+
+// Lookup returns (pk, value) pairs matching the exact column tuple.
+// value is read from the index's covering bytes when the index covers
+// the requested column set; otherwise via back-lookup to the row
+// keyspace. Iteration ends when no more matches.
+func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
+
+// LookupKeys returns just primary keys — no back-lookup, no covering
+// decode. Use for cost-sensitive iteration over large result sets.
+func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
+
+// Range returns matches in [start, end). Each tuple is a slice of
+// per-column byte slices; nil tuple = open-ended.
+func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
+
+// Prefix returns matches whose leading columns match the prefix.
+func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
+
+// Get is shorthand for unique indexes: returns the single (pk, value)
+// or ErrNotFound. Returns ErrIndexNotUnique when called on a
+// non-unique index.
+func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error)
+
+// Err returns the first error encountered during the last sequence
+// returned by Lookup / Range / Prefix.
+func (idx *Index) Err() error
+
+// Stats returns the index's persistent count + tree statistics.
+func (idx *Index) Stats() (IndexStats, error)
+```
+
+### Statistics
+
+```go
 type DBStats struct {
-    // Free space
-    FreePages    uint64 // total free pages (set bits in allocation bitmap)
-    RetiredPages uint64 // pages in RPL, not yet reclaimable (held by readers)
+    FreePages     uint64
+    RetiredPages  uint64
+    FileSize      uint64
+    MinSize       uint64
+    MaxSize       uint64
+    HighWaterMark uint64
+    // ActiveReaders is a non-atomic scan of the lock-file reader
+    // table (cluster-wide). The count can be off by ±N for N reader
+    // transitions in flight during the scan. Use for metrics and
+    // health diagnostics only — never as a synchronization barrier
+    // ("ActiveReaders == 0" does NOT imply no reads are starting).
+    ActiveReaders int
+    MaxReaders    int
 
-    // File format
-    FileSize     uint64 // current data file size in bytes
-    MinSize     uint64 // minimum file size in bytes
-    MaxSize     uint64 // maximum file size in bytes
-    HighWaterMark uint64 // first unallocated page ID (high-water mark)
-
-    // Readers
-    ActiveReaders int // currently occupied reader slots
-    MaxReaders    int // total reader slots
+    // SlabBytes reports slab usage for THIS PROCESS's current write
+    // transaction (0 when no write txn is open in this process).
+    // Cross-process writer slab usage is not visible from any one DB
+    // handle — only the holder of the cross-process write lock has a
+    // local view of it. Aggregate cluster-wide slab usage is not
+    // tracked.
+    SlabBytes int64
 }
 
 func (db *DB) Stats() DBStats
 
-// CheckSeverity indicates the severity of an integrity issue.
+type TxStats struct {
+    CowPages       uint64
+    LoosePages     uint64
+    ReclaimedPages uint64
+    WrittenPages   uint64 // data + bitmap + meta pages pwritten at commit
+
+    // SlabPeakBytes is the maximum slab usage observed during the
+    // transaction's lifetime. Useful for tuning MaxTxBufferBytes.
+    //
+    // Reset behavior is a deliberate choice, not a forced contract:
+    // Rollback resets the value to 0 because the rolled-back work is
+    // not representative of steady-state need (rollbacks are
+    // exceptional and the peak they reach should not influence
+    // tuning); Commit preserves it so the caller can read it
+    // immediately before the *Tx becomes invalid. Tooling that
+    // wants visibility into rolled-back peaks should snapshot
+    // SlabPeakBytes from a Stats() call inside the txn before
+    // calling Rollback.
+    SlabPeakBytes int64
+
+    Gets    uint64
+    Puts    uint64
+    Deletes uint64
+    Splits  uint64
+    Merges  uint64
+
+    // Indexing.
+    IndexEntriesInserted uint64
+    IndexEntriesDeleted  uint64
+    IndexUniqueProbes    uint64
+
+    Duration time.Duration
+}
+
+func (tx *Tx) Stats() TxStats
+
+type KeyspaceStats struct {
+    Depth         int
+    BranchPages   uint64
+    LeafPages     uint64
+    OverflowPages uint64
+    Entries       uint64
+    IndexCount    int
+}
+
+func (ks *Keyspace) Stats() (KeyspaceStats, error)
+func (ks *SetKeyspace) Stats() (KeyspaceStats, error)
+
+type IndexStats struct {
+    Depth         int
+    BranchPages   uint64
+    LeafPages     uint64
+    Entries       uint64
+    Unique        bool
+    Covering      bool
+    SizeBytes     uint64
+}
+```
+
+### Check, CopyTo, Compact
+
+```go
 type CheckSeverity int
 
 const (
@@ -3264,208 +4301,211 @@ const (
     CheckFatal                        // walk could not continue past this point
 )
 
-// CheckIssue describes a single integrity problem found during a database check.
-// All results — including walk failures — are represented as issues. A
-// CheckFatal issue means the walk stopped at that point and nothing beyond
-// it was checked.
 type CheckIssue struct {
     Severity CheckSeverity
-    PageID   uint64 // page where the issue was found (0 if N/A)
-    Keyspace string // keyspace name (empty if global/bitmap/RPL)
-    Message  string // human-readable description
-    Repaired bool   // true if the issue was fixed (only when CheckOptions.Repair is true)
+    // Code is a stable, machine-parseable token for the issue class
+    // (e.g., "BitmapLeak", "CheckIndexes.KeyspaceNotFound",
+    // "BadPageChecksum", "RPLChainBroken"). Stable across gmdb
+    // versions for the purposes of tooling that pattern-matches on
+    // issues; new codes may be added but existing ones never change
+    // meaning. Use Code for programmatic decisions; use Message for
+    // human-facing display.
+    Code     string
+    PageID   uint64
+    Keyspace string
+    Index    string // empty for non-index issues
+    // Message is a human-readable description of the issue. Free-form
+    // and free to change between versions; do NOT pattern-match on it.
+    Message  string
+    Repaired bool
 }
 
-// Check performs a full structural integrity walk of the database. It opens
-// a read transaction, walks all B+trees (keyspace trees), the allocation
-// bitmap, and the RPL, and verifies:
-//   - Meta page checksum validity
-//   - B+tree structural integrity (page reachability, no cycles, key ordering)
-//   - Bitmap consistency (no overlap between free and in-use pages)
-//   - RPL consistency (valid segment chain, no duplicate entries)
-//   - Page accounting (all pages accounted for: data + bitmap + RPL + free + unallocated)
-//   - Leaked pages (bitmap bit clear but page not reachable from any structure —
-//     reported as CheckWarning, not CheckError, since tree integrity is unaffected;
-//     recoverable via CopyTo(compact=true))
-//   - Leaf page prefix compression integrity (restart table offsets within page
-//     bounds, restart entries at correct positions, delta chain consistency within
-//     each restart group, reconstructed keys in sorted order)
-//   - Keyspace descriptor consistency (root page validity, counts)
-//   - Set keyspace subpage and nested B+tree integrity
+// Check performs a structural integrity walk. Verifies meta + page
+// checksums, B+tree integrity, bitmap consistency, RPL chain, page
+// accounting, prefix-compression integrity, keyspace descriptor
+// consistency, and set keyspace subpage / nested B+tree integrity.
+// Returns issues as an iter.Seq.
 //
-// Check returns an iter.Seq[CheckIssue] that yields issues as they are
-// found during the walk. All results — including walk failures (I/O
-// errors, unreadable pages) — are represented as CheckIssue values.
-// Walk failures are reported as CheckFatal severity and are always the
-// last issue yielded.
+// Walk failures (I/O errors, unreadable pages) are reported as
+// CheckFatal severity and are always the last issue yielded.
 //
-// The caller can break early, collect all issues via
-// slices.Collect(db.Check()), or stream issues for immediate display.
-//
-//   // Health check
-//   issues := slices.Collect(db.Check())
-//
-//   // Streaming display
-//   for issue := range db.Check() {
-//       fmt.Println(issue.Severity, issue.PageID, issue.Message)
-//   }
-//
-//   // Testing
-//   require.Empty(t, slices.Collect(db.Check()))
+// Check internally opens a read transaction. The transaction is
+// released when the iterator is exhausted OR when the caller
+// abandons iteration (a runtime.AddCleanup attached to the iter.Seq
+// closure releases the reader slot on GC). Callers iterating to
+// completion always see the slot released promptly; callers that
+// break early should not assume immediate release.
 func (db *DB) Check() iter.Seq[CheckIssue]
 
-// CheckOptions controls Check behavior.
 type CheckOptions struct {
-    // Repair enables offline repair of detected issues. When true, the
-    // database must be opened with exclusive access (no concurrent
-    // readers or writers). Check walks the full tree to build the set
-    // of referenced pages, then corrects the allocation bitmap for any
-    // leaked pages (allocated but unreferenced). Leaked pages are set
-    // free in the bitmap; the corrected bitmap pages are written via
-    // pwrite + fdatasync.
-    //
-    // Repair only fixes bitmap leakage — pages that appear allocated
-    // but are not reachable from any tree structure. It does not fix
-    // structural B+tree corruption (CheckError/CheckFatal issues).
-    // For structural corruption, use CopyTo(compact=true) to rebuild
-    // from the intact portion of the tree.
-    //
-    // Repaired issues are yielded as CheckIssue with the original
-    // severity and an additional Repaired bool field set to true.
+    // Repair enables offline repair: reclaims leaked pages in the
+    // bitmap. Requires exclusive access (no concurrent readers or
+    // writers).
     Repair bool
+
+    // CheckIndexes additionally verifies that stored index entries
+    // match what the supplied extractors would produce. Re-runs every
+    // extractor over every row — O(rows × indexes). Off by default.
+    //
+    // When true, Indexes below MUST contain an IndexDecl set for each
+    // indexed keyspace whose indexes should be verified. Indexed
+    // keyspaces absent from the map are skipped for the
+    // extractor-equivalence check (structural integrity is still
+    // verified) and reported as a CheckWarning with
+    // Code = "CheckIndexes.KeyspaceNotSupplied". Mismatched
+    // fingerprints for a supplied IndexDecl are reported as
+    // CheckError issues with Code = "CheckIndexes.FingerprintDrift"
+    // and the offending index name — they do NOT abort the walk and
+    // do NOT trigger a rebuild.
+    CheckIndexes bool
+
+    // Indexes supplies extractors for the CheckIndexes mode, keyed by
+    // keyspace name. Ignored when CheckIndexes is false.
+    //
+    // Entries in Indexes whose keyspace name does not exist in the
+    // database are reported as CheckWarning with
+    // Code = "CheckIndexes.KeyspaceNotFound". Entries whose
+    // IndexDecl.Name does not match any index registered on the
+    // existing keyspace are reported as CheckWarning with
+    // Code = "CheckIndexes.IndexNotInRegistry". Both surface common
+    // misconfiguration (typos, out-of-date callers) instead of
+    // silently skipping.
+    Indexes map[string][]*IndexDecl
 }
 
-// CheckWithOptions performs a full structural integrity walk with
-// optional repair. See Check for the list of verified invariants.
-// When opts is nil, behaves identically to Check.
 func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue]
 
-// CopyTo creates a consistent copy of the database at the given path.
-// The copy is taken from a read transaction snapshot — writers are not
-// blocked. When compact is true, the copy is compacted: free pages are
-// omitted and B+tree pages are written sequentially for optimal read
-// performance. The new database inherits the source's PageSize,
-// BitmapPages, and MaxSize. To create a copy with different FileFormat
-// settings (e.g., a different MaxSize), use CopyTo to create the copy
-// and then re-open it with the desired settings via SetFileFormat().
+// CopyTo creates a consistent copy at the given path. Taken from a
+// read-tx snapshot — writers are not blocked. When compact is true,
+// the copy is compacted: free pages omitted, B+tree pages written
+// sequentially. Inherits source's PageSize, BitmapPages, MaxSize.
+// To change file format, re-open the copy and use SetFileFormat.
 func (db *DB) CopyTo(path string, compact bool) error
 
-// Compact rebuilds the database file in place. It creates a compacted
-// copy via CopyTo(compact=true) to a temporary file in the same
-// directory, then atomically renames it over the original. The
-// temporary file is cleaned up on error.
+// Compact rebuilds the database file in place. CopyTo(compact=true)
+// to a temporary file in the same directory, then atomic rename.
 //
-// Compact runs the copy in a read transaction — writers are not blocked
-// during the copy phase. The atomic rename requires briefly closing and
-// reopening the database. Callers must ensure no transactions are open
-// when Compact returns (the DB handle is still valid — the underlying
-// file has changed).
+// Coordination protocol (Compact is the most invasive single-process
+// operation; the caller does not have to "ensure no transactions are
+// open" — Compact arranges this itself):
 //
-// Effects:
-//   - Reclaims leaked pages (bitmap allocated but unreferenced).
-//   - Defragments the file — B+tree pages are written sequentially,
-//     restoring contiguous free runs for overflow page allocation.
-//   - Shrinks the file to its minimum size.
+//  1. Acquire the cross-process write lock via the flock goroutine,
+//     blocking concurrent writers and Checkpoint() for the duration.
+//  2. Wait up to Options.CompactDrainTimeout (default 30s) for active
+//     read transactions in THIS process to commit/rollback. If any
+//     read transaction remains after the timeout, abort with
+//     ErrCompactReadersActive (no copy is started, no file rename).
+//  3. Open a read snapshot at the current TxnID and run
+//     CopyTo(tmpPath, compact=true) — writers in other processes are
+//     blocked (the cross-process flock is held), but reads in other
+//     processes that already opened a snapshot continue to work
+//     against the original inode via their existing mmap; new
+//     read-open attempts from other processes during this window
+//     succeed against the original inode (open() resolves before
+//     rename).
+//  4. fsync(tmpPath); atomic rename(tmpPath, originalPath); reopen
+//     the file descriptors and mmap; release the cross-process write
+//     lock.
 //
-// Compact requires enough free disk space for the temporary copy
-// (up to the size of the live data). For databases where temporary
-// disk space is not available, an incremental in-place compaction
-// (relocating pages in batches across multiple write transactions)
-// is a possible future addition.
+// Cross-process readers post-rename: pre-rename readers' mmap still
+// references the original inode (rename unlinks the directory entry
+// but the inode stays alive until the last mapping is released);
+// SIGBUS is not possible. Post-rename openers (in other processes)
+// observe the new inode via a fresh open() — their UUID check
+// matches (Compact preserves UUID), so coordination continues
+// normally. There is no observable inconsistency window for
+// cross-process readers.
+//
+// Effects: reclaims leaked pages; defragments file; shrinks to
+// minimum size.
+//
+// Requires enough free disk space for the temporary copy (up to the
+// size of the live data) on the SAME filesystem as originalPath
+// (otherwise the atomic rename degrades to a copy + delete, breaking
+// atomicity).
+//
+// Fallback when Compact() returns ErrCompactReadersActive: long-lived
+// readers cannot be drained in this process. Use
+// CopyTo(path, compact=true) instead — it runs from a read snapshot
+// without draining in-process readers and produces an offline
+// compacted copy you can swap in during scheduled downtime.
 func (db *DB) Compact() error
-
-// TxStats contains per-transaction statistics. Accumulated during the
-// transaction's lifetime and returned as a snapshot.
-type TxStats struct {
-    // Page management
-    CowPages       uint64 // pages copied via CoW
-    LoosePages     uint64 // pages CoW'd then freed in this txn
-    ReclaimedPages uint64 // pages reclaimed from RPL into bitmap
-    WrittenPages   uint64 // bitmap + meta pages written at commit time
-
-    // B+tree operations
-    Gets    uint64 // key lookups
-    Puts    uint64 // key inserts/updates
-    Deletes uint64 // key deletions
-    Splits  uint64 // page splits
-    Merges  uint64 // page merges
-
-    // Timing
-    Duration time.Duration // time from Begin to Stats() call
-}
-
-func (tx *Tx) Stats() TxStats
-
-// KeyspaceStats contains per-keyspace statistics.
-type KeyspaceStats struct {
-    Depth         int    // B+tree height
-    BranchPages   uint64 // number of branch pages
-    LeafPages     uint64 // number of leaf pages
-    OverflowPages uint64 // number of overflow pages
-    Entries       uint64 // total key-value pairs (for set keyspaces, each value counts)
-}
-
-func (ks *Keyspace) Stats() (KeyspaceStats, error)
 ```
 
 ### Typed Keyspaces (Generics)
 
-A higher-level API layer built on top of the byte-oriented `Keyspace` API.
-`TypedKeyspace[K, V]` provides type-safe access to a keyspace by handling
-key/value serialization automatically via the `Encoder[T]` interface:
+Higher-level API on top of the byte-oriented `Keyspace`. Provides
+type-safe access by handling key/value serialization via the
+`Encoder[T]` interface.
 
 ```go
 // Encoder handles serialization between a Go type and byte slices.
-// Implementations may be stateful (e.g., buffer pooling).
 //
 // AppendEncode appends the encoded form of v to dst and returns the
 // extended buffer. Callers pass dst[:0] from a sync.Pool to reuse
-// allocations on the hot path. Returning an error allows encoders to
-// reject values that cannot be represented (e.g., keys exceeding the
-// maximum size).
+// allocations on the hot path. Returns an error to reject values that
+// cannot be represented (e.g., keys exceeding the maximum size).
 //
-// Decode deserializes src into a value of type T. Returning an error
-// allows encoders to surface malformed or truncated data rather than
-// panicking or silently producing corrupt values.
+// Decode deserializes src into a value of type T. Returns an error to
+// surface malformed or truncated data rather than panicking.
+//
+// ID returns a stable, non-empty string identifier for this encoder
+// type. The ID is hashed into the schema fingerprint of any typed
+// index that uses the encoder, so two distinct encoders with the
+// same ID make a schema change undetectable. The caller MUST mint a
+// unique ID per encoder.
+//
+// Recommended naming convention: "<pkg>/<type>[/<version>]".
+// Examples:
+//   - "gmdb/string"               // engine-provided
+//   - "gmdb/be-uint64"            // engine-provided
+//   - "myapp/User-json/v2"        // application-defined
+//   - "myapp/Timestamp-be-nanos"  // application-defined
+//
+// Empty IDs are rejected at OpenKeyspace / CreateKeyspace time with
+// ErrIndexEncoderIDEmpty, naming the offending encoder by index name
+// and column position. This catches the common misconfiguration of
+// declaring a FuncEncoder without setting EncoderID.
 type Encoder[T any] interface {
     AppendEncode(dst []byte, v T) ([]byte, error)
     Decode(src []byte) (T, error)
+    ID() string
 }
 
 // FuncEncoder adapts plain functions into the Encoder interface for
-// simple cases where no state is needed.
+// simple stateless cases.
 type FuncEncoder[T any] struct {
     EncodeFunc func(dst []byte, v T) ([]byte, error)
     DecodeFunc func(src []byte) (T, error)
+    EncoderID  string
 }
 
 func (f FuncEncoder[T]) AppendEncode(dst []byte, v T) ([]byte, error) { return f.EncodeFunc(dst, v) }
 func (f FuncEncoder[T]) Decode(src []byte) (T, error)                 { return f.DecodeFunc(src) }
+func (f FuncEncoder[T]) ID() string                                   { return f.EncoderID }
 
-// TypedKeyspace wraps a single-value Keyspace with type-safe key/value encoding.
+// TypedKeyspace wraps a single-value Keyspace with type-safe encoding.
 type TypedKeyspace[K, V any] struct {
-    name   []byte
+    name   string
     keyEnc Encoder[K]
     valEnc Encoder[V]
 }
 
-// NewTypedKeyspace creates a typed single-value keyspace descriptor. The key
-// encoder MUST produce lexicographically ordered output for the desired key
-// ordering — the underlying B+tree sorts keys as raw bytes.
+// NewTypedKeyspace creates a typed keyspace descriptor. The key
+// encoder MUST produce lexicographically ordered output for the
+// desired key ordering.
 func NewTypedKeyspace[K, V any](
     name string,
     keyEnc Encoder[K],
     valEnc Encoder[V],
 ) *TypedKeyspace[K, V]
 
-// Open opens an existing typed keyspace within a transaction.
-func (tks *TypedKeyspace[K, V]) Open(tx *Tx) (*TypedKS[K, V], error)
-
-// Create creates a new typed keyspace within a transaction.
-func (tks *TypedKeyspace[K, V]) Create(tx *Tx) (*TypedKS[K, V], error)
-
-// CreateIfNotExists opens or creates the typed keyspace.
-func (tks *TypedKeyspace[K, V]) CreateIfNotExists(tx *Tx) (*TypedKS[K, V], error)
+// Open / Create / CreateIfNotExists within a transaction.
+// The variadic indexes are TypedIndex declarations.
+func (tks *TypedKeyspace[K, V]) Open(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKS[K, V], error)
+func (tks *TypedKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedKS[K, V], error)
+func (tks *TypedKeyspace[K, V]) Create(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKS[K, V], error)
+func (tks *TypedKeyspace[K, V]) CreateIfNotExists(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKS[K, V], error)
 
 // TypedKS is a handle to an opened typed keyspace within a transaction.
 type TypedKS[K, V any] struct { ... }
@@ -3478,6 +4518,7 @@ func (t *TypedKS[K, V]) Cursor() *TypedCursor[K, V]
 func (t *TypedKS[K, V]) All() iter.Seq2[K, V]
 func (t *TypedKS[K, V]) Range(start, end *K) iter.Seq2[K, V]
 func (t *TypedKS[K, V]) Prefix(prefix K) iter.Seq2[K, V]
+func (t *TypedKS[K, V]) Index(name string) (*TypedIndexHandle, error)
 
 type TypedCursor[K, V any] struct { ... }
 
@@ -3487,161 +4528,328 @@ func (c *TypedCursor[K, V]) Next() (K, V, bool)
 func (c *TypedCursor[K, V]) Prev() (K, V, bool)
 func (c *TypedCursor[K, V]) Seek(target K) (K, V, bool)
 func (c *TypedCursor[K, V]) SeekGE(target K) (K, V, bool)
+func (c *TypedCursor[K, V]) Current() (K, V, bool)
+
+// Delete removes the current entry. Same semantics as Cursor.Delete
+// — see Cursor State Machine. The third bool in the navigation
+// methods is `ok` (false when the cursor is at end-of-iteration or
+// unpositioned); Err() distinguishes those two states.
+func (c *TypedCursor[K, V]) Delete() error
 func (c *TypedCursor[K, V]) Err() error
 ```
 
 The typed layer is a **zero-cost abstraction** at the API level — all
-methods delegate to the underlying `Keyspace` and `Cursor` methods with
-`Encoder` calls. The `AppendEncode` signature follows the standard Go
-append pattern (`strconv.AppendInt`, `time.AppendFormat`, etc.), allowing
-callers to pass a reusable `[]byte` buffer (e.g., from `sync.Pool`) to
-eliminate per-call allocations on the hot path. Returning `error` from both
-`AppendEncode` and `Decode` ensures malformed data is surfaced cleanly
-rather than panicking or silently producing corrupt values. Using an
-interface instead of closures allows stateful encoders (e.g., with buffer
-pooling via `sync.Pool`) and is more idiomatic Go — encoders can be
-implemented as method sets on types. The `FuncEncoder` adapter is provided
-for simple stateless cases.
+methods delegate to the underlying `Keyspace` and `Cursor` methods
+with `Encoder` calls. `AppendEncode` follows the standard Go append
+pattern, allowing callers to pass reusable buffers (e.g., from
+`sync.Pool`) to eliminate per-call allocations.
 
-**Key ordering constraint**: The key encoder must produce byte sequences
-whose lexicographic order matches the desired key order. For `uint64` keys,
-this means big-endian encoding. For `string` keys, the natural byte
-representation already sorts lexicographically. The typed API does not
-support custom comparators — the underlying B+tree always uses byte ordering.
+**Key ordering constraint**: key encoder must produce byte sequences
+whose lex order matches the desired key order. For `uint64` keys,
+big-endian. For `string` keys, natural byte representation.
 
-The typed API is a convenience layer. Callers who need full control over
-serialization or need to avoid allocation overhead from encoder calls use
-the byte-oriented `Keyspace` API directly.
+#### Typed Indexes
+
+```go
+// TypedIndex declares a typed index on TypedKeyspace[K, V] with
+// extracted index key type IK.
+type TypedIndex[K, V, IK any] struct {
+    Name     string
+    IKEnc    Encoder[IK]            // produces lex-safe bytes from IK
+    Unique   bool
+    Version  string                 // bump on extractor logic changes
+    Extract  func(K, V) []IK        // empty slice ⇒ skip (partial index)
+    Covering []TypedCoveringColumn  // optional (currently parameterized by name + Encoder)
+}
+
+// AnyTypedIndex is the type-erased interface satisfied by every
+// TypedIndex[K, V, IK]. It exists solely so a single
+// Open / Create / CreateIfNotExists call can declare indexes with
+// heterogeneous IK types in one variadic argument.
+//
+// The interface is intentionally SEALED — the method indexDecl() is
+// unexported, so only types in the gmdb package can implement it (in
+// practice: only *TypedIndex[K, V, IK]). This is deliberate: the
+// engine relies on every supplied *IndexDecl having been constructed
+// through the typed-index path, which guarantees encoder ID
+// consistency, deterministic schema-hash, and well-formed extractor
+// wiring. A user-supplied implementation could bypass these
+// invariants.
+//
+// Library code that needs to wrap or decorate a typed index (for
+// observability, retry, etc.) must compose at the *extractor
+// function* level — wrap the user's Extract func inside a fresh
+// TypedIndex[K, V, IK] declaration. Wrapping at the IndexDecl level
+// is not supported and not needed.
+type AnyTypedIndex[K, V any] interface {
+    indexDecl() *IndexDecl
+}
+
+func (t *TypedIndex[K, V, IK]) indexDecl() *IndexDecl { /* implements AnyTypedIndex */ }
+
+// TypedIndexHandle is the typed wrapper around Index for queries
+// where IK is known.
+type TypedIndexHandle struct { /* unexported */ }
+
+// For static-type lookup, NewTypedIndexQuery binds an open
+// TypedIndexHandle with a specific IK type.
+func NewTypedIndexQuery[K, V, IK any](h *TypedIndexHandle, ikEnc Encoder[IK]) *TypedIndexQuery[K, V, IK]
+
+type TypedIndexQuery[K, V, IK any] struct { ... }
+
+func (q *TypedIndexQuery[K, V, IK]) Lookup(ik IK) iter.Seq2[K, V]
+func (q *TypedIndexQuery[K, V, IK]) LookupKeys(ik IK) iter.Seq[K]
+func (q *TypedIndexQuery[K, V, IK]) Range(start, end *IK) iter.Seq2[K, V]
+func (q *TypedIndexQuery[K, V, IK]) Prefix(prefix IK) iter.Seq2[K, V]
+func (q *TypedIndexQuery[K, V, IK]) Get(ik IK) (K, V, error) // unique only
+func (q *TypedIndexQuery[K, V, IK]) Err() error
+```
+
+The schema-hash inputs for a typed index include the encoder IDs of
+the index-key encoder and any covering encoders — so changing from
+`be-uint64` to `varint-zigzag` for the same column triggers
+`ErrIndexFingerprintMismatch` at Open.
+
+A typed extractor returning multiple `IK` values models composite
+indexes naturally (the `IK` type is itself a struct whose `Encoder[IK]`
+produces the concatenated lex-safe bytes). For columns of different
+types where a single `IK` struct is awkward, fall back to the
+byte-oriented `IndexDecl` API.
+
+**Limitation: partial-prefix queries through the typed API.** When
+`IK` is a composite struct, the typed layer treats the whole IK as
+one opaque column (one `Encoder[IK]` → one byte slice). Consequently
+`TypedIndexQuery.Range(start, end *IK)` compares full IK values;
+there is **no partial-prefix Range on a sub-field of IK** through the
+typed API. Workarounds:
+
+- Use the byte-oriented `IndexDecl` directly, declaring each
+  sub-field as a separate `IndexColumn` (one column per sub-field).
+  Byte-API `Range` and `Prefix` then accept per-column tuples and
+  support partial prefixes naturally.
+- Design `Encoder[IK]` so the desired prefix sort key is exactly a
+  byte prefix of the full encoding; then callers can construct
+  partial-key `IK` values that serialize to the desired prefix and
+  pass them to `Range`. This requires careful encoding design and
+  loses generality.
+
+#### Engine-Provided Canonical Encoders
+
+The engine ships canonical `Encoder[T]` implementations for common
+column types. The full canonical set:
+
+| Encoder | ID() | Lex order matches | Notes |
+|---|---|---|---|
+| `gmdb.StringEncoder` | `"gmdb/string"` | natural string order | UTF-8 bytes, no normalization |
+| `gmdb.BytesEncoder` | `"gmdb/bytes"` | natural byte order | identity |
+| `gmdb.BEUint64Encoder` | `"gmdb/be-uint64"` | natural uint64 order | 8-byte big-endian |
+| `gmdb.BEUint32Encoder` | `"gmdb/be-uint32"` | natural uint32 order | 4-byte big-endian |
+| `gmdb.BEInt64Encoder` | `"gmdb/be-int64"` | natural int64 order | 8-byte big-endian with sign bit XOR'd (XOR `0x80` on the top byte); maps two's-complement to lex order |
+| `gmdb.BEInt32Encoder` | `"gmdb/be-int32"` | natural int32 order | 4-byte big-endian with sign bit XOR'd |
+| `gmdb.BENanosEncoder` | `"gmdb/be-time-nanos"` | natural time order | int64 nanos since epoch, same sign-bit-XOR transform as `be-int64` |
+| `gmdb.UUIDv4Encoder` | `"gmdb/uuid-v4"` | natural lex (random) | 16 bytes raw |
+| `gmdb.UUIDv7Encoder` | `"gmdb/uuid-v7"` | natural time order | 16 bytes raw; v7 timestamp prefix preserves lex=time |
+
+The transform is sign-bit XOR (`x ^ 0x8000000000000000`), not
+zigzag — zigzag is a different protobuf-style transform that
+interleaves negatives among positives and is *not* lex-preserving
+for big-endian byte order. The naming uses plain `gmdb/be-intN` to
+avoid the misleading "zigzag" label.
+
+**Canonical engine encoder IDs are forever immutable.** Once shipped,
+an engine-provided `ID()` string cannot change — any change to the
+encoding logic for an existing ID would silently corrupt every
+on-disk index built with the old encoder. If a bug is discovered in
+a canonical encoder, the fix ships under a NEW ID (e.g.,
+`"gmdb/be-int64/v2"`) with a separate type (e.g.,
+`gmdb.BEInt64EncoderV2`); the old type and ID remain available for
+backward read of existing indexes. Operators migrating from the
+buggy encoder rebuild the affected indexes via `tx.RebuildIndex`
+with the new typed decl. This convention extends to
+application-defined encoders (`"<pkg>/<type>[/<version>]"` — bump
+the version segment when the encoding logic changes; see
+`Encoder.ID()` godoc).
+
+**Empty encoder IDs on TypedKeyspace without indexes.** The
+`Encoder.ID()` empty check fires only when an encoder is referenced
+by a typed index's schema hash (`IKEnc`, covering encoders). The
+key and value encoders on `TypedKeyspace[K, V]` *without* indexes
+are not validated for empty IDs — a TypedKeyspace with no declared
+indexes may use encoders with empty `ID()` without error. This is
+inadvisable if indexes may be added later (declaring a typed index
+that depends on the key encoder will then fail at OpenKeyspace with
+`ErrIndexEncoderIDEmpty`); application code should set non-empty
+encoder IDs as a matter of hygiene regardless.
 
 ## Implementation Layout
 
-All code lives in a single `gmdb` package (flat, no sub-packages). This avoids
-circular dependency issues between tightly coupled components (pages, B+tree,
-transactions, mmap) and keeps the public API to one import path. The code is
-organized by file:
+All code lives in a single `gmdb` package (flat, no sub-packages —
+avoids circular dependency issues between tightly-coupled components
+and keeps the public API to one import path). Organized by file:
 
 | File | Responsibility |
 |------|---------------|
-| `page.go` | Page header encoding/decoding (8-byte header: Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID). Optional CRC32C footer: compute on write, verify on read (when PageChecksum enabled). Branch page: cell directory, key lookup (binary search), insert/split. Leaf page: prefix-compressed format with restart table (interval 16), restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Overflow references in both restart and delta entry formats. Set keyspace subpage format (uncompressed). Meta page: encode/decode/validate xxhash64 checksum (including file format fields, bitmap/RPL pointers, Flags). RPL segment page: per-segment TxnID + PageID array, encode/decode. |
-| `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. Set keyspace bulk free: recursive subtree retirement for nested B+trees. Cursor: stateful iterator holding a stack of (pageID, index) pairs, key reconstruction buffer (`keyBuf []byte`) for incremental forward decoding, restart group cache (`[16][]byte`) for reverse traversal. Set keyspace: subpage management (inline sorted list), nested B+tree promotion/demotion, set cursor operations. All operations work on page byte slices (from mmap), never Go heap objects. |
-| `iter.go` | `iter.Seq2`-based read-only iterators: `All()`, `Range()`, `Prefix()` for both byte-oriented `Keyspace` and generic `TypedKS[K, V]`. Built on top of cursor operations. |
-| `alloc.go` | Allocation bitmap: two-level (detail + in-memory summary) bitmap at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Pending bitmap changes: `tx.pendingAllocs` and `tx.pendingFrees` track deferred bit changes; `pageAlloc()` checks pending sets before scanning the mmap bitmap. Retired page log (RPL): append-only singly-linked list of immutable segment pages (per-segment TxnID + PageID arrays), in-memory segment list (`[]uint64` tail-to-head) rebuilt at open for forward traversal, whole-segment reclamation (walk from tail, move entries to bitmap, free empty segments). Loose page tracking: hash map (`map[uint64]struct{}`) of intra-transaction recycled page IDs for O(1) tail refund lookups. Page allocation priority: loose pages → bitmap → RPL reclamation → lagging reader check → file extension. Tail page refund for auto-compaction. Commit-time update: apply pending bitmap changes via pwrite, append retired pages to RPL via new segment pages (bounded, non-recursive). |
-| `fileformat.go` | File format management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetFileFormat()` for runtime modification of `MinSize`, `GrowStep`, `ShrinkThreshold` (rejects `MaxSize` changes — bitmap region is fixed at creation). |
-| `mmap.go` | Platform-agnostic mmap interface. Initial mapping with over-allocated virtual address space (sized to MaxSize). Read-write by default (`MAP_SHARED \| PROT_READ \| PROT_WRITE`); read-only when `Options.ReadOnly` is set (`MAP_SHARED \| PROT_READ`). |
-| `mmap_linux.go` | Linux mmap/munmap/msync syscalls. `MADV_POPULATE_READ` page preloading (Linux 5.14+, opt-in). `MADV_HUGEPAGE` for transparent huge pages (opt-in). `MADV_COLD` for read transaction cooldown (Linux 5.4+, opt-in). |
-| `mmap_darwin.go` | macOS mmap/munmap/msync syscalls. Commit-time `msync(MS_SYNC)` before bitmap pwrite (required because macOS `fdatasync` does not flush mmap dirty pages). |
-| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times + PID namespace inodes + heartbeats). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime/WriterPIDNamespace/WriterHeartbeat, context-aware, zero goroutine accumulation). Stale writer recovery (namespace-aware: same-namespace uses PID liveness + start time; cross-namespace uses heartbeat timeout). Reader table: hint-based scan+CAS slot acquire (stores PID + ProcessStartTime + PIDNamespace + Heartbeat), atomic store release, namespace-aware stale reader detection. Heartbeat goroutine (started at Open, stopped at Close, updates active slots every ~1s). Oldest-reader query for RPL reclamation. Lagging reader detection and callback invocation. |
-| `process_linux.go` | `processStartTime(pid) (uint64, error)`: reads `/proc/[pid]/stat` field 22 (`starttime`, clock ticks since boot). `pidNamespace() uint64`: reads `/proc/self/ns/pid` inode via `os.Readlink`. Pure Go, no cgo. |
-| `process_darwin.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
-| `process_freebsd.go` | `processStartTime(pid) (uint64, error)`: `sysctl` with `KERN_PROC_PID` → `kinfo_proc.ki_start`. Packed as `sec*1_000_000 + usec`. Pure Go via `syscall.Sysctl`. |
-| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, CoW page map (`tx.cowPages map[uint64]struct{}`), pending bitmap changes (`tx.pendingAllocs`, `tx.pendingFrees`), CoW operations (allocate fresh page, copy from mmap position A to B, modify B in place), page lookup (`mmap[pageID * pageSize]` — single level), commit (apply pending bitmap changes via pwrite + fdatasync + meta pwrite + fdatasync + RPL append + file format shrink), rollback (discard pending maps). Nested transactions: `BeginChild()` snapshots pending maps and keyspace roots; child commit discards snapshot (no-op merge); child rollback restores from snapshot. Leak detection: `runtime.AddCleanup` at Begin, `cleanup.Stop()` at Commit/Rollback. Stats accumulation. |
-| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap with read-write mapping, lock file, file format, AllowSyncUnsafe validation). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: Batch() channel, coordinator goroutine, per-closure child transactions. Keyspace management (OpenKeyspace, CreateKeyspace, CreateKeyspaceIfNotExists, DeleteKeyspace). Keyspace name interning via `unique.Handle[string]`. Checkpoint(). Check(). CheckWithOptions(). CopyTo(). Compact(). Background maintenance goroutine (bitmap leak reclamation, stale reader cleanup, checksum scrubbing, incremental compaction; coordinated across processes via LastMaintenanceTime in lock file). |
-| `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. Delegates all operations to byte-oriented `Keyspace`/`Cursor` with `Encoder` calls. |
+| `page.go` | Page header encode/decode (8-byte header: Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID). xxhash64 footer (compute on write, verify on read) when PageChecksum enabled. Meta page encode/decode/validate (including file format fields, bitmap/RPL pointers, Flags). RPL segment encode/decode. |
+| `branch.go` | Branch page format, cell directory binary search, prefix-truncated separator computation, insert, split. |
+| `leaf.go` | Prefix-compressed leaf format with per-page `RestartInterval`, restart/delta entry encode/decode, restart-point binary search + linear group scan for lookup, delta recomputation on insert/delete, restart table rebuild, full-page re-encoding on split. Compressed-leaf splice operations (`tryInsertAtCompressed`, `tryDeleteAtCompressed`) for hot-path in-place edits without full decode+re-encode. Overflow references in both restart and delta entry formats. |
+| `subpage.go` | Set keyspace subpage encode/decode (uncompressed inline list, variable or fixed-value-size). |
+| `btree.go` | B+tree search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (CoW, merge/rebalance with configurable `MergeThreshold`, separator recomputation). Range delete: boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance. Set keyspace bulk free: recursive subtree retirement for nested B+trees. Set keyspace operations: subpage management (inline sorted list), nested B+tree promotion/demotion. All operations work on page byte slices, never Go heap objects. |
+| `cursor.go` | Stateful cursor: stack of (pageID, index) pairs, key reconstruction buffer for incremental forward decoding, restart group cache for reverse traversal. SetCursor operations (key + intra-key value navigation). |
+| `iter.go` | `iter.Seq2`-based read-only iterators (`All`, `Range`, `Prefix`) for both byte-oriented and typed APIs. |
+| `bulkload.go` | Bottom-up B+tree construction from sorted input. Per-level in-progress page, direct pwrite of completed pages (slab bypass). Index sort + spill to `Options.ScratchDir`. |
+| `alloc.go` | Allocation bitmap: two-level (detail + in-memory summary) at fixed page offsets, bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking. Pending bitmap changes (`tx.pendingAllocs`, `tx.pendingFrees`). RPL: append-only singly-linked segment chain (per-segment TxnID + PageID arrays), in-memory segment list rebuilt at Open, whole-segment reclamation. Loose page tracking (hash map). Page allocation priority: loose → bitmap → RPL reclamation → lagging reader check → file extension. Tail page refund. Commit-time update: apply pending bitmap changes via pwrite, append retired pages to RPL. |
+| `pager.go` | Single unified `Pager` type for read and write paths. `Page(id) []byte` resolves via `dirty[id]` then mmap. Writable pager owns the slab `map[uint64]*[]byte`, `dirtyBytes` accounting, `sync.Pool` of page-sized buffers, `MaxTxBufferBytes` enforcement. Read-only pager rejects mutating ops. CoW: allocate fresh page ID, copy old content into a slab buffer, mutate buffer. |
+| `commit.go` | Commit-time pwrite ordering: dirty data pages → bitmap pages → meta. Per-`SyncMode` fdatasync placement. File shrink after commit point. |
+| `fileformat.go` | File format management: grow/shrink bounds, growth step, shrink threshold. File growth via `ftruncate()`. File shrinkage at commit time after tail refund. `Tx.SetFileFormat()` (rejects `MaxSize` changes). |
+| `mmap.go` | Read-only mmap of the data file (`MAP_SHARED \| PROT_READ`). `mprotect(PROT_READ)` after open. mmap reservation sized to `MaxSize`. Platform-agnostic interface; per-platform shims in `mmap_linux.go` / `mmap_darwin.go` / `mmap_freebsd.go` only for `madvise` and `mmap` syscall differences. No platform-conditional code in the commit path. |
+| `mmap_linux.go` | Linux mmap/munmap syscalls. `MADV_POPULATE_READ` (Linux 5.14+, opt-in). `MADV_HUGEPAGE` (opt-in). `MADV_COLD` (Linux 5.4+, opt-in). |
+| `mmap_darwin.go` | macOS mmap/munmap syscalls. No `msync(MS_SYNC)` in commit path — the writer never touches the mmap. |
+| `lock.go` | Lock file creation and mmap (shared memory, `structs.HostLayout` structs, uint64 PIDs + process start times + PID namespace inodes + heartbeats). Writer lock (single flock goroutine with intra-process writer queue + flock cross-process + WriterPID/WriterStartTime/WriterPIDNamespace/WriterHeartbeat, context-aware, zero goroutine accumulation). Stale writer recovery (namespace-aware). Reader table: hint-based scan+CAS slot acquire, atomic store release, namespace-aware stale reader detection. Heartbeat goroutine (started at Open, stopped at Close, updates active slots every ~1s). Oldest-reader query for RPL reclamation. Lagging reader detection and callback invocation. |
+| `process_linux.go` | `processStartTime(pid)`: reads `/proc/[pid]/stat` field 22. `pidNamespace()`: reads `/proc/self/ns/pid` inode via `os.Readlink`. Pure Go, no cgo. |
+| `process_darwin.go` | `processStartTime(pid)`: sysctl `KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime`. |
+| `process_freebsd.go` | `processStartTime(pid)`: sysctl `KERN_PROC_PID` → `kinfo_proc.ki_start`. |
+| `tx.go` | Read transaction: snapshot meta, acquire reader slot, read-only B+tree access, optional MADV_COLD on close. Write transaction: snapshot meta, acquire write lock, slab-based CoW (`tx.pendingAllocs`, `tx.pendingFrees`, `tx.cowPages`, `tx.loosePages`, `tx.retiredPages`), pager dirty map, commit (commit.go), rollback (release slab buffers, clear pending sets). Nested transactions: `BeginChild()` snapshots pending state and keyspace roots; child commit discards snapshot; child rollback releases child slab buffers + restores snapshot. Per-tx pooling of slab buffer pool via `sync.Pool`. Pool of `ReadTx` structs to reduce allocations on high-throughput read paths. Leak detection via `runtime.AddCleanup`. Stats accumulation. |
+| `index.go` | Index registry per keyspace (sub-B+tree at `IndexRegistryRoot`). IndexDecl validation (schema-hash computation, fingerprint compare). NUL-escape column encoding (`escape`, `unescape`, terminator append). Index write path: extractor invocation on Put/Delete, diff old/new entry sets, unique-index probes, atomic application within the parent transaction. `Index` query type: `Lookup`, `LookupKeys`, `Range`, `Prefix`, `Get`. `RebuildIndex`, `DropIndex`. Index storage as engine-internal keyspaces (`Kind = 2`). |
+| `db.go` | Open/Close (path traversal safety via `os.OpenRoot`). Environment setup (mmap with read-only mapping, `mprotect`, lock file, file format, AllowSyncUnsafe validation, MaxTxBufferBytes default, RestartGroupTarget default). DB handle leak detection via `runtime.AddCleanup`. Transaction lifecycle (Begin/Commit/Rollback, View/Update helpers). Write batching: `Batch()` channel, coordinator goroutine, per-closure child transactions. Keyspace management (Open/Create variants, `DeleteKeyspace`, `SetKeyspaceConfig`, `RebuildIndex`, `DropIndex`). Keyspace name interning via `unique.Handle[string]`. Checkpoint(). Check(). CheckWithOptions(). CopyTo(). Compact(). Background maintenance goroutine (bitmap leak reclamation, stale reader cleanup, checksum scrubbing, incremental compaction; coordinated across processes via `LastMaintenanceTime` in the lock file). |
+| `typed.go` | `Encoder[T]` interface, `FuncEncoder[T]` adapter. `TypedKeyspace[K, V]` and `TypedKS[K, V]` generic wrappers with `iter.Seq2` iterators. `TypedCursor[K, V]`. `TypedIndex[K, V, IK]` and `TypedIndexQuery[K, V, IK]` for typed index declarations and queries. Delegates all operations to byte-oriented `Keyspace`/`Cursor`/`Index` with `Encoder` calls. |
 | `errors.go` | Sentinel error definitions. |
-| `stats.go` | DBStats, TxStats, KeyspaceStats types and collection. |
+| `stats.go` | DBStats, TxStats, KeyspaceStats, IndexStats types and collection. |
 
 ### Coding Conventions
 
-**Default values via `cmp.Or`** (Go 1.22+): Options fields with zero-value
-defaults use `cmp.Or` for concise initialization:
+**Default values via `cmp.Or`** (Go 1.22+):
 
 ```go
 pageSize := cmp.Or(opts.PageSize, 4096)
 maxReaders := cmp.Or(opts.MaxReaders, 4096)
 maxBatchSize := cmp.Or(opts.MaxBatchSize, 1000)
+maxTxBufferBytes := cmp.Or(opts.MaxTxBufferBytes, 256<<20)
+restartGroupTarget := cmp.Or(opts.RestartGroupTarget, 16)
 ```
 
-`cmp.Or` returns the first non-zero argument. This replaces verbose
+`cmp.Or` returns the first non-zero argument. Replaces verbose
 `if field == 0 { field = default }` blocks throughout `Open()` and
-transaction setup, reducing boilerplate and making the defaults
-scannable at a glance.
+transaction setup.
 
-**Concurrency tests via `testing/synctest`** (Go 1.24+): All
-concurrency-critical code paths use `synctest.Run` for deterministic
-testing. `synctest.Run` controls goroutine scheduling in tests,
-eliminating flaky timing-dependent assertions. Key areas:
+**Concurrency tests via `testing/synctest`** (Go 1.24+):
 
-- **Batch coordinator**: verifying `MaxBatchDelay` timeout fires at the
-  correct time, batch collection fills to `MaxBatchSize`, and
-  per-closure child transactions commit/rollback correctly — without
-  `time.Sleep` or racy channel coordination.
-- **Flock goroutine**: verifying context cancellation while the flock is
-  pending correctly dequeues the writer, and that the flock goroutine
-  releases the lock on behalf of a cancelled waiter.
-- **Reader table**: verifying concurrent slot acquisition via CAS under
-  contention, and stale reader detection clearing the correct slots.
+- **Batch coordinator**: verify `MaxBatchDelay` timeout fires at the
+  correct time, batch collection fills to `MaxBatchSize`, per-closure
+  child txns commit/rollback correctly — without `time.Sleep` or racy
+  channel coordination.
+- **Flock goroutine**: verify context cancellation while flock is
+  pending correctly dequeues the writer.
+- **Reader table**: verify concurrent slot acquisition via CAS under
+  contention, stale reader detection clearing the correct slots.
+
+**Read-only pager reuse**: read transactions reuse `*Pager` instances
+via a `sync.Pool` on the DB. Each `ReadTx` is also pooled to avoid
+per-transaction allocations under high read load.
+
+**Slab buffers**: page-sized `[]byte` buffers are pooled via a
+process-global `sync.Pool` on the DB. Returning a buffer to the pool
+clears it (zero-fill); reuse avoids GC pressure for steady write
+workloads.
 
 ## Limits
 
 ### Page Size
 
-Configurable at database creation time. Must be a power of 2 in the range
-4096–65536 (4KB–64KB). Stored in the meta page and immutable after creation.
-Default: 4096 bytes.
+Configurable at creation. Power of 2 in [4KB, 64KB]. Stored in meta,
+immutable. Default: 4096 bytes.
 
 ### Maximum Key Size
 
-Determined by page size. A branch page must fit at least 2 keys to allow
-splitting. The fixed overhead is 16 bytes (8-byte page header + 8-byte
-leftmost child pointer). Each key requires 4 bytes (cell directory entry) +
-key bytes + 8 bytes (child pointer). The maximum key size is approximately
-`(PageSize - 40) / 2` (or `(PageSize - 44) / 2` with PageChecksum enabled):
+Determined by page size. A branch page must fit at least 2 keys to
+allow splitting. Fixed overhead: 16 bytes (8-byte header + 8-byte
+leftmost child pointer). Each key needs 4 bytes (cell directory) + key
+bytes + 8 bytes (child pointer). Maximum key size approx
+`(PageSize - 40) / 2`, less 4 bytes when PageChecksum is enabled
+(8-byte footer instead of 4-byte CRC32C in previous designs):
 
-| Page Size | Max Key Size (approx) | With PageChecksum |
-|-----------|----------------------|-------------------|
-| 4KB       | ~2028 bytes          | ~2026 bytes       |
-| 8KB       | ~4076 bytes          | ~4074 bytes       |
-| 16KB      | ~8172 bytes          | ~8170 bytes       |
-| 64KB      | ~32748 bytes         | ~32746 bytes      |
+| Page Size | Max Key Size (no checksum) | With PageChecksum (xxhash64) |
+|-----------|----------------------------|------------------------------|
+| 4KB       | ~2028 bytes                | ~2024 bytes                  |
+| 8KB       | ~4076 bytes                | ~4072 bytes                  |
+| 16KB      | ~8172 bytes                | ~8168 bytes                  |
+| 64KB      | ~32748 bytes               | ~32744 bytes                 |
 
-Enforced at `Put()` time. Keys exceeding the limit return an error.
+Enforced at `Put()`. Keys exceeding return `ErrKeyTooLarge`.
 
-Note: this limit is determined by branch pages, not leaf pages. Leaf pages
-with prefix compression can store keys up to this size at restart points
-(full keys). Delta entries store only the unshared suffix, so their on-disk
-size is smaller, but the reconstructed full key must still be within the
-branch page limit to allow splitting at any level.
+The limit applies to branch separator capacity. Leaf prefix
+compression can store keys up to this size at restart points (full
+keys). Delta entries store only the unshared suffix, so their on-disk
+size is smaller, but the reconstructed full key must still fit the
+branch limit.
 
 ### Maximum Value Size
 
-For single-value keyspaces: inline values are limited by available space in the
-leaf page. Values that exceed this are automatically stored as overflow pages.
-There is no practical upper limit on value size (bounded only by disk space and
-`MaxSize`). Note that leaf prefix compression reduces per-entry key overhead,
-leaving more page space for inline values — a leaf with high prefix sharing
-can fit larger inline values before triggering overflow.
+Single-value keyspaces: inline values limited by leaf page free space.
+Larger values automatically stored as overflow pages. No practical
+upper limit (bounded by disk space and `MaxSize`).
 
 ### Maximum Value Size (Set Keyspaces)
 
-For set keyspaces, each value becomes a key in the nested B+tree
-(or an entry in a subpage). The maximum value size is therefore the
-same as the maximum key size — approximately `(PageSize - 40) / 2`. Overflow
-pages are not used for set keyspace values. A `Put()` call with a value
-exceeding this limit returns an error.
+Each value becomes a key in the nested B+tree (or entry in a subpage).
+Maximum value size = maximum key size — approximately `(PageSize -
+40) / 2`. Overflow pages are not used for set keyspace values. A
+`Put()` with an over-sized value returns `ErrKeyTooLarge`.
+
+### Maximum Index Key Size
+
+Composite index key = NUL-escaped column tuple (+ PK suffix for
+non-unique indexes). After escaping, the key is stored in the index
+keyspace's leaf, subject to the same maximum key size as ordinary
+keys. The escape encoding can up to double the byte count for
+columns with many NULs; tooling should reject column values that
+would exceed the limit at the declaration layer.
+
+### Maximum Indexes Per Keyspace
+
+Bounded only by the per-keyspace index registry tree's capacity
+(thousands per keyspace at typical page sizes). The engine does not
+enforce a hard limit — practical limits come from the cost of
+running every extractor on every write.
 
 ## Checksums
 
-### Meta Page Checksums (Always On)
+gmdb uses a single hash algorithm across the entire file: **xxhash64**
+(`github.com/cespare/xxhash/v2`, `xxhash.Sum64`). The same algorithm
+covers the meta page (mandatory, always on) and data pages (optional,
+on by default). One hash family means one implementation, one
+performance profile, and no algorithm version flags.
 
-Both meta pages carry an xxhash64 checksum of all preceding fields. This is
-mandatory and cannot be disabled. The meta page is the atomic commit point —
-a torn write here would silently point to an inconsistent tree. The checksum
-detects this and triggers fallback to the other meta page.
+### Meta Page Checksum (Always On)
 
-### Data Page Checksums (Optional)
+Both meta pages carry an xxhash64 checksum of all preceding fields.
+Mandatory, cannot be disabled. The meta page is the atomic commit
+point — a torn write here would silently point to an inconsistent
+tree. The checksum detects this and triggers fallback to the other
+meta page.
 
-Data pages (branch, leaf, overflow, RPL segment) optionally carry a CRC32C
-checksum for defense against silent bitrot, firmware bugs, and storage
-corruption that the filesystem does not detect.
+Stored as the trailing `uint64` of the meta page payload (see Meta
+Page format).
 
-Enabled via `Options.PageChecksum = true` at database creation time. The
-setting is stored as a flag in the meta page's `Flags` field (bit 0) and
-is **immutable after creation** — all pages in a checksummed database have
-checksums, all pages in a non-checksummed database do not.
+### Data Page Checksums (On by Default)
 
-#### Storage
+Data pages (branch, leaf, overflow, RPL segment) carry an 8-byte
+xxhash64 footer in the last 8 bytes of the page when checksums are
+enabled.
 
-The checksum is stored as a **page footer** — the last 4 bytes of the page:
+Enabled via `Options.PageChecksum = true` at creation. Default: true.
+The setting is stored as a flag in the meta page's `Flags` field
+(bit 0) and is **immutable after creation** — all pages in a checksummed
+database have checksums; all pages in a non-checksummed database do
+not.
+
+The default is on (a deliberate change from earlier designs). xxhash64
+is fast enough in software (no hardware-acceleration requirement
+unlike CRC32C) that the cost is negligible compared to mmap page-fault
+and B+tree traversal costs, and the protection against silent bitrot
+on commodity filesystems (ext4 without `data=journal`, xfs without
+checksums) is worth the 0.2% page-space overhead.
+
+### Storage
 
 ```
 Page (with checksum enabled)
@@ -3649,239 +4857,267 @@ Page (with checksum enabled)
 | Page Header (8 bytes) |
 +-----------------------+
 | Page Content          |
-| (PageSize - 12 bytes) |
+| (PageSize - 16 bytes) |
 +-----------------------+
-| CRC32C (4 bytes)      |  footer: checksum of bytes 0 through PageSize-5
+| xxhash64 (8 bytes)    |  footer: hash of bytes 0 through PageSize-9
 +-----------------------+
 ```
 
-The footer approach keeps the page header unchanged at 8 bytes. Usable
-page content shrinks by 4 bytes when checksums are enabled — negligible
-(0.1% at 4KB page size). The checksum covers the entire page from byte 0
-through byte `PageSize - 5` (inclusive), including the page header.
+The footer keeps the page header at 8 bytes. Usable content shrinks
+by 8 bytes when checksums are enabled — 0.2% at 4KB. The checksum
+covers the entire page from byte 0 through `PageSize - 9` inclusive,
+including the page header.
 
-Bitmap pages do not carry checksums (they have no page header or footer).
-Bitmap integrity is guaranteed by the CoW model and meta page checksum.
+Bitmap pages do not carry checksums (no page header or footer; the
+entire page is bitfield data). Bitmap integrity is guaranteed by the
+CoW model and the meta page checksum (the meta references the bitmap
+indirectly through `NumFreePages` and the page-allocation invariants
+that `Check()` verifies).
 
-#### Algorithm: CRC32C
+### Algorithm: xxhash64
 
-CRC32C (Castagnoli) is used for data page checksums:
-- **Hardware-accelerated** on amd64 (SSE4.2) and arm64 (CRC instructions).
-  Go's `hash/crc32` package uses these automatically.
-- **4 bytes** — minimal space overhead.
-- **~200ns for a 4KB page** with hardware acceleration — comparable to a
-  TLB miss, dominated by memory access rather than computation.
+`xxhash.Sum64` from `github.com/cespare/xxhash/v2`. Pure Go,
+SIMD-accelerated on amd64/arm64 where the compiler can vectorize.
 
-xxhash is faster for large inputs but CRC32C is sufficient for page-sized
-data and has the advantage of hardware acceleration and smaller output.
+- ~4 ns per 64 bytes; ~50–80 ns per 4KB page in practice.
+- Faster than CRC32C in pure software; competitive with CRC32C+SSE4.2
+  on amd64.
+- 8-byte output — slightly larger than CRC32C's 4 bytes but a stronger
+  hash and consistent with the meta page checksum.
 
-#### Verification (Read Path)
+The same library and algorithm power the meta page checksum, so the
+runtime cost is amortized across one hash implementation in the binary.
 
-When checksums are enabled, every page read from the mmap is verified:
+### Verification (Read Path)
 
-1. Compute CRC32C of bytes 0 through `PageSize - 5`.
-2. Compare with the 4-byte footer.
-3. If mismatch, return `ErrCorrupted` with the page ID.
+When checksums are enabled, every page read from the pager is verified
+on first access in a transaction:
 
-This adds ~200ns per page read. For a point lookup traversing 3-4 B+tree
-levels, the overhead is ~800ns — negligible compared to the tree traversal
-and potential page fault cost. For full-database scans reading millions of
-pages, the overhead is measurable but bounded by memory bandwidth (the
-CRC computation runs at memory speed with hardware acceleration).
+1. Compute xxhash64 of bytes 0 through `PageSize - 9`.
+2. Compare with the 8-byte footer.
+3. Mismatch ⇒ return `ErrBadPageChecksum` with the page ID.
 
-Pages in `tx.cowPages` that have been CoW'd in the current transaction
-are verified against their checksum when first read from the mmap (before
-CoW). After CoW and modification, the new checksum is computed before the
-commit-time fdatasync.
+Per-page verification is cached on the pager — a page verified once in
+a transaction is not re-verified on subsequent accesses within the
+same transaction. For a depth-4 lookup the cost is ~200–320 ns —
+negligible compared to traversal and potential page-fault costs. For
+full-database scans the cost is bounded by memory bandwidth.
 
-#### Computation (Write Path)
+Pages CoW'd in the current transaction have their footers computed at
+commit time on the dirty slab buffer, before the pwrite.
 
-When checksums are enabled, the CRC32C checksum is computed on the mmap
-page content after all modifications are complete, before the commit-time
-`fdatasync()`. The footer is written directly into the mmap at the last 4
-bytes of each CoW'd page.
+### Computation (Write Path)
 
-#### What Checksums Do and Do Not Catch
+When checksums are enabled, the xxhash64 footer is computed on each
+dirty slab buffer at commit time, before the pwrite. The footer is
+written into the last 8 bytes of the buffer.
+
+### What Checksums Do and Do Not Catch
 
 **Catches:**
 - Silent bitrot on disk (bit flips in stored data).
 - Firmware bugs in SSD/NVMe controllers that corrupt data at rest.
 - RAID controller or storage stack corruption.
-- Kernel bugs that corrupt the page cache after successful write.
+- Kernel bugs that corrupt the page cache after a successful write.
 
 **Does not catch:**
-- Torn writes (already handled by CoW + meta page checksum).
-- In-memory corruption between `pwrite()` and disk (the checksum is
-  computed on the same buffer that is written — if the buffer is corrupt,
-  the checksum matches the corrupt data).
-- Corruption introduced by the application via stray pointers or
-  `unsafe.Pointer` misuse (the mmap is writable; the checksum is computed
-  on the already-corrupted page).
+- Torn writes (handled by CoW + meta page checksum).
+- In-memory corruption between buffer-fill and pwrite (the checksum is
+  computed on the same buffer that is written — if the buffer is
+  corrupt, the checksum matches the corrupt data).
+- Corruption introduced by the application via stray pointers — the
+  data mmap is `PROT_READ` only, so stray writes there SIGSEGV
+  immediately; the slab buffer is application memory, where typical
+  unsafe-pointer bugs would land. Defense via `mprotect` mitigates the
+  most common variant.
 
-#### Default
+### Default
 
-Checksums are **disabled by default**. The rationale: CoW already provides
-crash consistency, and most production deployments use filesystems (ZFS,
-btrfs, ext4 with metadata checksums) or storage controllers that detect
-bitrot. The optional checksum is for users who want defense-in-depth or
-run on storage without integrity guarantees.
+Checksums are **enabled by default** (`Options.PageChecksum = true`).
+Disable via `PageChecksum = false` at creation only when running on a
+filesystem with end-to-end checksums (ZFS, btrfs, ReFS) or storage
+controllers with built-in integrity — and the 0.2% page-space saving
+is meaningful for the workload.
 
 ## Integrity and Safety
 
-- **No partial writes visible**: CoW ensures all modifications happen on new
-  pages. The old tree is intact until the meta page swap. Bitmap leakage
-  (pages that appear allocated but are unreferenced) is possible on crash
-  between the bitmap pwrite and the meta pwrite, but tree integrity is always
-  preserved. See "Bitmap leakage on crash" in Commit-Time Write Ordering.
-- **Atomic commit**: A single meta page write (< page size, aligned) is the
-  commit point. Even if it's torn, the checksum will fail and the DB falls
-  back to the other meta page.
-- **Write ordering**: In `SyncDurable` mode, CoW'd data pages are fdatasync'd
-  BEFORE the meta page update, and the meta page is fdatasync'd AFTER writing
-  it. In other sync modes, ordering relies on CoW (see Durability Modes).
-- **Reader isolation**: Readers see an immutable snapshot. Pages they reference
-  cannot be reused until all readers on that TxnID have finished.
-- **Stale reader recovery**: If a process crashes without releasing its reader
-  slot, the PID liveness check + process start time comparison allows the
-  writer to reclaim the slot — even if the PID has been recycled by a new
-  process (common in containerized environments with PID namespaces).
-- **Stale writer recovery**: If the writer process crashes, `WriterPID` and
-  `WriterStartTime` in the lock file header identify the dead process. The
-  kernel releases the flock automatically. The next writer detects the dead
-  or recycled PID (via start time comparison), cleans up reader slots from
-  the crashed process, and proceeds — CoW guarantees the tree is consistent.
-  Bitmap integrity is guaranteed by the deferred pwrite approach: bitmap
-  modifications are held in memory (`tx.pendingAllocs`/`tx.pendingFrees`)
-  and only written to disk via `pwrite()` at commit time. If the writer
-  crashes before commit, no bitmap modifications reach disk — no leaked pages.
-- **Silent bitrot detection**: When `PageChecksum` is enabled, every data page
-  read is verified against its CRC32C footer. Corruption is detected at read
-  time with `ErrCorrupted` identifying the affected page.
-- **Disk full (ENOSPC)**: If `ftruncate()` (file growth) or `pwrite()` (bitmap/meta) fails with ENOSPC, the operation returns an error. A failed `pwrite()` during commit may result in a partially written bitmap page on disk. Since the meta page has not been updated, recovery falls back to the previous meta — the partially written bitmap page is superseded by the next successful commit. File growth failures during the transaction (before commit) cause `pageAlloc()` to return `ErrDBFull`.
+- **No partial writes visible**: CoW ensures all modifications happen
+  on new pages. The old tree is intact until the meta page swap.
+  Bitmap leakage (pages that appear allocated but are unreferenced)
+  is possible on crash between the bitmap pwrite and the meta pwrite,
+  but tree integrity is always preserved.
+- **Atomic commit**: A single meta page write (< page size, aligned)
+  is the commit point. Even if torn, the checksum fails and the DB
+  falls back to the other meta page.
+- **Write ordering**: In `SyncDurable`, data + bitmap pwrites are
+  fdatasync'd BEFORE the meta page write, and the meta is fdatasync'd
+  AFTER. In other sync modes, ordering relies on CoW (see Durability
+  Modes).
+- **Reader isolation**: Readers see an immutable snapshot. Pages they
+  reference cannot be reused until all readers on that TxnID have
+  finished.
+- **mmap is `PROT_READ`**: a stray pointer in the host process
+  produces SIGSEGV rather than silently corrupting the file. The
+  writer's mutations live in slab buffers (process memory), where
+  unsafe-pointer bugs can still cause harm — but they cannot reach
+  disk except via the controlled pwrite path.
+- **Stale reader recovery**: If a process crashes without releasing
+  its reader slot, the PID liveness check + process start time
+  comparison allows the writer to reclaim the slot — even if the PID
+  has been recycled.
+- **Stale writer recovery**: If the writer process crashes, the
+  kernel releases the flock automatically. The next writer detects
+  the dead or recycled PID, cleans up reader slots from the crashed
+  process, and proceeds — CoW guarantees the tree is consistent.
+  Bitmap integrity is guaranteed by the deferred pwrite approach:
+  bitmap modifications are held in memory (`tx.pendingAllocs` /
+  `tx.pendingFrees`) and only written to disk via `pwrite()` at
+  commit time. If the writer crashes before commit, no bitmap
+  modifications reach disk — no leaked pages. Slab buffers in
+  anonymous mmap are released to the OS on process exit; no on-disk
+  artifacts.
+- **Index consistency**: Every index update happens in the same CoW
+  transaction as the row write. Either both succeed or both are
+  rolled back. Index drift can only occur if the user changes the
+  extractor without bumping `Version` (or vice versa) — caught at
+  Open by the schema-hash + version fingerprint check; the engine
+  refuses to open the keyspace until `RebuildIndex` is called.
+- **Silent bitrot detection**: When `PageChecksum` is enabled (the
+  default), every data page read is verified against its xxhash64
+  footer. Corruption is detected at read time with
+  `ErrBadPageChecksum` identifying the affected page.
+- **Disk full (ENOSPC)**: If `ftruncate()` (growth) or `pwrite()`
+  (data / bitmap / meta) fails with ENOSPC, the operation returns an
+  error. A failed `pwrite()` during commit may result in a partially
+  written page on disk. Since the meta page has not been updated,
+  recovery falls back to the previous meta — the partially written
+  pages are superseded by the next successful commit. File growth
+  failures during the transaction cause `pageAlloc()` to return
+  `ErrDBFull`. Slab-buffer pwrite failures during commit abort the
+  commit (the transaction must be rolled back at the application
+  level; the on-disk state is consistent with the previous meta).
 
 ## Background Maintenance
 
 The `DB` struct runs a **maintenance goroutine** (started at `Open()`,
 stopped at `Close()`) that performs periodic housekeeping to prevent
-issues from accumulating during normal operation. The goal is to avoid
-reaching a state that requires offline intervention.
+issues from accumulating. Goal: avoid reaching a state that requires
+offline intervention.
 
 ### Coordination
 
 Multiple processes sharing the same database coordinate via a
 `LastMaintenanceTime` field in the lock file header — a `uint64`
 monotonic clock value (`CLOCK_BOOTTIME` on Linux) updated after each
-maintenance pass. Before starting a pass, the goroutine checks this
-timestamp. If a recent pass was completed by any process (within
-`MaintenanceOptions.Interval`), the goroutine skips. This ensures
-only one process runs maintenance per interval, regardless of how
-many processes have the database open.
+pass. Before starting a pass, the goroutine checks this timestamp. If
+a recent pass was completed by any process (within
+`MaintenanceOptions.Interval`), the goroutine skips. Ensures only one
+process runs maintenance per interval.
 
 ### Tasks
 
-The maintenance goroutine performs four tasks per pass:
+Four tasks per pass:
 
 #### 1. Bitmap Leak Reclamation
 
-Reclaims pages that are allocated in the bitmap but unreferenced by any
-tree structure — "leaked" pages caused by crashes between the bitmap
-pwrite and meta pwrite (see Bitmap leakage on crash).
+Reclaims pages allocated in the bitmap but unreferenced by any tree
+structure — "leaked" pages caused by crashes between bitmap pwrite
+and meta pwrite, or by slab-flush partial writes interrupted by ENOSPC.
 
 **Detection phase** (read transaction, non-blocking):
 1. Open a read transaction.
-2. Walk the full tree (all keyspaces, RPL segments, overflow pages) to
+2. Walk the full tree (all keyspaces incl. internal index keyspaces,
+   per-keyspace index registries, RPL segments, overflow pages) to
    build the set of all referenced page IDs.
-3. Scan the allocation bitmap. Any page with its bit clear (allocated)
-   that is not in the referenced set and is not a meta page, bitmap
-   page, or RPL segment page is leaked.
+3. Scan the bitmap. Any page with its bit clear (allocated) that is
+   not in the referenced set and is not meta / bitmap / RPL is leaked.
 4. Close the read transaction.
 
 **Reclamation phase** (write transaction):
 1. Open a write transaction.
-2. For each leaked page ID, set its bitmap bit (free the page).
-3. Commit. The reclaimed pages are now available for allocation.
+2. For each leaked page, set its bitmap bit.
+3. Commit.
 
-**Safety**: A leaked page is permanently stuck — its bitmap bit is clear
-so no future transaction can allocate it, and no tree node references it.
-A page identified as leaked in the read transaction's snapshot cannot
-become un-leaked by the time the write transaction runs. Detection in a
-read transaction is therefore safe.
+**Safety**: a leaked page is permanently stuck — its bitmap bit is
+clear so no future transaction can allocate it, and no tree references
+it. A page identified as leaked in the read snapshot cannot become
+un-leaked by the time the write transaction runs.
 
-**Trigger**: Runs on every maintenance pass. Additionally, if `Open()`
-detects crash recovery (selected a fallback meta page), the first
-maintenance pass is scheduled immediately rather than waiting for the
-interval.
+**Trigger**: every maintenance pass. Additionally, if `Open()` detects
+crash recovery (selected a fallback meta), the first maintenance pass
+is scheduled immediately rather than waiting for the interval.
 
 #### 2. Stale Reader Slot Cleanup
 
 Proactively scans the reader table and clears slots owned by dead
-processes. This uses the same namespace-aware detection logic as the
-writer's stale reader scan (see Stale reader detection): same PID
-namespace uses PID + StartTime, cross-namespace uses heartbeat timeout.
+processes. Same namespace-aware logic as the writer's stale reader
+scan: same-namespace uses PID + StartTime, cross-namespace uses
+heartbeat timeout.
 
-No transaction is needed — slot cleanup is an atomic store (`TxnID = 0`)
+No transaction needed — slot cleanup is an atomic store (`TxnID = 0`)
 on the shared mmap.
 
-**Why this matters**: The writer already clears stale slots during RPL
-reclamation, but only when it needs free pages. If no writer is active
-for an extended period, stale slots from crashed containers sit
-indefinitely, blocking RPL reclamation for the next writer. The
-maintenance goroutine clears them proactively so the next write
-transaction starts with a clean reader table.
+**Why this matters**: the writer already clears stale slots during RPL
+reclamation, but only when it needs free pages. If no writer is
+active for an extended period, stale slots from crashed containers
+sit indefinitely, blocking RPL reclamation for the next writer.
+Proactive cleanup keeps the reader table clean.
 
 #### 3. Checksum Scrubbing
 
 When `PageChecksum` is enabled, the maintenance goroutine performs a
-background read-only scan that verifies CRC32C checksums on data pages
-proactively — before they are accessed by a user transaction. This
-catches silent bitrot early, rather than surfacing `ErrCorrupted`
-during a user read.
+background read-only scan that verifies xxhash64 footers on data
+pages proactively — before they are accessed by a user transaction.
+Catches silent bitrot early.
 
-Each maintenance pass verifies `ScrubBatchSize` pages (default: 4096)
-in a read transaction, advancing through the file sequentially across
-passes. A `ScrubCursor` (the next page ID to verify) is tracked on the
-`DB` struct and wraps around when it reaches `HighWaterMark`. A full
-scrub cycle covers the entire database over
-`ceil(HighWaterMark / ScrubBatchSize)` maintenance passes.
+Each pass verifies `ScrubBatchSize` pages (default 4096) in a read
+transaction, advancing through the file sequentially across passes.
+A `ScrubCursor` on the DB tracks the next page ID to verify, wrapping
+at `HighWaterMark`. A full scrub cycle covers the database over
+`ceil(HighWaterMark / ScrubBatchSize)` passes.
 
-Detected corruption is logged via `slog.Logger` as a `CheckWarning`
-with the affected page ID. The scrubber does not repair — it only
-reports. Repair requires `CheckWithOptions(Repair)` or
-`CopyTo(compact=true)`.
+Detected corruption is logged via `slog.Logger` as `CheckWarning`
+with the affected page ID. The scrubber does not repair — only
+reports. Repair: `CheckWithOptions(Repair)` or `CopyTo(compact=true)`.
 
-Scrubbing is skipped when `PageChecksum` is not enabled.
+Skipped when `PageChecksum` is not enabled.
 
 #### 4. Incremental Compaction
 
-Defragments the database file by relocating pages in batches to restore
-contiguous free runs for overflow page allocation. This is the online
-alternative to `Compact()` (CopyTo + atomic rename).
+Defragments the database by relocating pages in batches to restore
+contiguous free runs for overflow allocation. Online alternative to
+`Compact()`.
 
-**Trigger**: The allocator tracks the contiguous allocation failure
+**Trigger**: the allocator tracks the contiguous-allocation failure
 rate — the fraction of multi-page `pageAlloc(n)` calls (n > 1) that
 fail to find a contiguous run on the first bitmap scan despite
 sufficient total free pages. When this rate exceeds
-`CompactionThreshold` (default: 0.5), the maintenance goroutine
+`CompactionThreshold` (default 0.5), the maintenance goroutine
 schedules compaction work.
 
-**Mechanism**: Each maintenance pass opens a write transaction and
-relocates up to `CompactionBatchSize` pages (default: 1024):
+**Mechanism**: each pass opens a write transaction and relocates up
+to `CompactionBatchSize` pages (default 1024):
 1. Identify fragmented regions — pages that interrupt potential
-   contiguous runs in the bitmap.
-2. For each such page, CoW it to a new location (allocated from
-   a region with more free neighbors).
-3. The old page goes to the RPL and is reclaimed in a future
-   transaction.
+   contiguous runs.
+2. For each, CoW it to a new location (allocated from a region with
+   more free neighbors).
+3. The old page goes to the RPL and is reclaimed in a future txn.
 4. Commit.
 
-Over multiple maintenance passes, scattered pages consolidate and
-contiguous free runs emerge. The compaction converges when the failure
-rate drops below the threshold.
+Over multiple passes, scattered pages consolidate and contiguous
+free runs emerge. Converges when the failure rate drops below the
+threshold.
 
-**Cost per pass**: `CompactionBatchSize` CoW copies (memcpy +
-parent pointer update). At 1024 pages × 4KB = 4MB of I/O per pass
-plus the cascading CoW up the tree for each moved page. This is
-bounded and amortized across the maintenance interval.
+**Cost per pass**: each moved leaf forces a CoW cascade up the tree
+(every ancestor branch needs CoW + new child pointer), so worst-case
+I/O is `CompactionBatchSize × (1 + depth) × PageSize` plus
+`CompactionBatchSize × (1 + depth)` RPL entries for the retired
+originals. At 1024 pages, depth 5, 4 KB pages: ~24 MB of pwrite I/O
+per pass, ~6 K RPL entries (~12 segment pages at 508
+entries/segment). Size `CompactionBatchSize` against
+`MaxTxBufferBytes` accordingly — the slab must hold the whole
+cascade plus assembly buffers in step 0 of the commit. Bounded and
+amortized across the maintenance interval.
 
 ### Options
 
@@ -3896,24 +5132,24 @@ type MaintenanceOptions struct {
     // Default: 5m.
     Interval time.Duration
 
-    // ScrubBatchSize is the number of pages to verify per
-    // checksum scrubbing pass. Only meaningful when PageChecksum
-    // is enabled. Default: 4096.
+    // ScrubBatchSize is the number of pages to verify per checksum
+    // scrubbing pass. Only meaningful when PageChecksum is enabled.
+    // Default: 4096.
     ScrubBatchSize int
 
     // CompactionThreshold triggers incremental compaction when the
-    // contiguous allocation failure rate exceeds this fraction.
+    // contiguous-allocation failure rate exceeds this fraction.
     // Range: 0.0 (disabled) to 1.0. Default: 0.5.
     CompactionThreshold float64
 
-    // CompactionBatchSize is the number of pages to relocate per
-    // write transaction during incremental compaction.
+    // CompactionBatchSize is the number of pages relocated per write
+    // transaction during incremental compaction.
     // Default: 1024.
     CompactionBatchSize int
 }
 ```
 
-Maintenance is a fixed-cost resource: one goroutine per `DB` handle.
+Maintenance is a fixed-cost resource: one goroutine per DB handle.
 Same lifecycle pattern as the flock and heartbeat goroutines. The
 explicit tools (`Check`, `CheckWithOptions`, `Compact`, `CopyTo`)
 remain available for on-demand use.
