@@ -49,10 +49,21 @@ var (
 	// Close() and re-Open() to recover. Close() works normally on a
 	// poisoned handle.
 	ErrPoisoned = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
+
+	// ErrClosed is returned by operations against a DB handle whose
+	// Close has been called (or is concurrently in progress). Surfaces
+	// from Begin when the cross-process coordinator's goroutine has
+	// already shut down. The full db.closed semantics (cross-process.md
+	// §Heartbeat Goroutine + leak-detection.md §Close Ordering) are
+	// promoted to a spec-tier project invariant in a later sub-chunk
+	// — this sentinel is the user-facing surface that invariant
+	// requires.
+	ErrClosed = errors.New("gmdb: database is closed")
 )
 
 var (
 	errInvalidPageSize   = errors.New("gmdb: PageSize must be a power of two in [4096, 65536]")
 	errInvalidSizeBounds = errors.New("gmdb: MaxSize must be > 0 and >= MinSize")
 	errInvalidTxBuffer   = errors.New("gmdb: MaxTxBufferBytes must be > 0")
+	errInvalidMaxReaders = errors.New("gmdb: MaxReaders must be in [1, 65536]")
 )

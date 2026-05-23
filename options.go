@@ -11,6 +11,7 @@ import (
 	"cmp"
 	"crypto/rand"
 
+	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -40,6 +41,12 @@ type Options struct {
 	// this returns ErrTxTooLarge. Default 256 MiB.
 	MaxTxBufferBytes int
 
+	// MaxReaders is the reader-table capacity in the lock file
+	// (cross-process.md §Lock File Layout). Set at lock-file creation
+	// and immutable afterwards (re-openers honour the on-disk header).
+	// Default 4096. Bounded [1, 65536] by the lock package.
+	MaxReaders uint32
+
 	// UUID may be supplied for deterministic database identity in
 	// tests; if zero, a random UUID is generated at creation.
 	UUID [16]byte
@@ -52,6 +59,7 @@ func (o Options) applyDefaults() Options {
 	o.GrowStep = cmp.Or(o.GrowStep, uint64(64))
 	o.ShrinkThreshold = cmp.Or(o.ShrinkThreshold, uint64(128))
 	o.MaxTxBufferBytes = cmp.Or(o.MaxTxBufferBytes, 256<<20)
+	o.MaxReaders = cmp.Or(o.MaxReaders, lock.DefaultMaxReaders)
 	if o.UUID == ([16]byte{}) {
 		_, _ = rand.Read(o.UUID[:])
 	}
@@ -67,6 +75,14 @@ func (o Options) validate() error {
 	}
 	if o.MaxTxBufferBytes <= 0 {
 		return errInvalidTxBuffer
+	}
+	// Pre-check the lock-package's MaxReaders bound so an
+	// out-of-range value fails Open before the data file is touched,
+	// rather than after pager.Open + lock.Open. The lock package
+	// re-validates as defense-in-depth (mapLockErr's
+	// ErrInvalidMaxReaders branch handles the late failure path).
+	if o.MaxReaders < lock.MinMaxReaders || o.MaxReaders > lock.MaxMaxReaders {
+		return errInvalidMaxReaders
 	}
 	return nil
 }

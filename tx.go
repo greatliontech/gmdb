@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
@@ -25,16 +26,24 @@ type Tx struct {
 	writable   bool
 	closed     bool
 
-	// held tracks ownership of db.writeMu for the lifetime of this Tx.
-	// Begin sets it to true; Commit, Rollback, and the runtime.AddCleanup
-	// callback each attempt a single CompareAndSwap(true, false) — the
-	// winner is responsible for the Unlock + AbortTx, so double-release
-	// (race between an explicit Close path and the GC cleanup) is
-	// structurally impossible. Stored as a pointer so the cleanup info
-	// struct can hold it without referencing the *Tx (runtime.AddCleanup
-	// forbids cleanup args from referencing the cleaned-up object —
-	// resurrection is not permitted).
+	// held tracks whether this Tx still owns the cross-process write
+	// grant. Begin sets it to true; Commit, Rollback, and the
+	// runtime.AddCleanup callback each attempt a single
+	// CompareAndSwap(true, false) — the winner is responsible for
+	// grant.Release + (in the cleanup case) the leak-warning log +
+	// AbortTx. lock.Grant.Release is already sync.Once-guarded, so
+	// double-release is structurally impossible; held coordinates the
+	// "did the user already close?" decision for leak warnings.
+	// Stored as a pointer so the cleanup info struct can hold it
+	// without referencing the *Tx (runtime.AddCleanup forbids cleanup
+	// args from referencing the cleaned-up object — resurrection is
+	// not permitted).
 	held *atomic.Bool
+
+	// grant is the cross-process write-lock grant from
+	// db.coord.AcquireWriter; nil for read transactions. Released via
+	// grant.Release() on Commit / Rollback / GC cleanup.
+	grant *lock.Grant
 
 	// cleanup is the AddCleanup handle, Stop()'d by Commit/Rollback in
 	// the normal close path so the leak-detection warning doesn't fire
@@ -46,31 +55,29 @@ type Tx struct {
 // Deliberately omits the *Tx: runtime.AddCleanup rejects an arg that
 // reaches the obj, since resurrecting the obj would defeat collection.
 //
-// Captures *Pager directly (not via *DB.pgr) so a concurrent Close —
-// which sets db.pgr = nil — does not nil-deref this callback. The
-// Pager is heap-allocated and remains alive as long as txCleanupInfo
-// holds it; AbortTx touches only Go-heap pager state (slab maps,
-// bitmap struct, RPL chain slice), not the mmap, so it is safe to call
-// even after pager.Close has unmapped.
+// Captures *Pager and *Grant directly (not via *DB) so a concurrent
+// DB.Close — which sets db.pgr = nil and db.coord = nil — does not
+// nil-deref this callback. *Pager and *Grant are heap-allocated and
+// remain alive as long as txCleanupInfo holds them; AbortTx and
+// Grant.Release both operate purely on Go-heap state (pager: slab
+// maps, bitmap, RPL chain; grant: a channel close) and are safe
+// under a concurrent DB.Close.
 type txCleanupInfo struct {
-	db        *DB
 	pgr       *pager.Pager
+	grant     *lock.Grant
 	held      *atomic.Bool
 	originPCs []uintptr
 }
 
-// txCleanupFn is the leak-detection callback invoked by runtime.AddCleanup
-// some time after the *Tx becomes unreachable. The CompareAndSwap on
-// info.held ensures a single releaser — Commit/Rollback's call to
-// releaseWriteLock contests the same atomic, so the cleanup is a no-op
-// for transactions the caller closed normally.
+// txCleanupFn is the leak-detection callback invoked by
+// runtime.AddCleanup some time after the *Tx becomes unreachable. The
+// CompareAndSwap on info.held ensures a single releaser —
+// Commit/Rollback's call to releaseGrant contests the same atomic, so
+// the cleanup is a no-op for transactions the caller closed normally.
 //
-// Per leak-detection.md §Cleanup Behavior: chunk-2's mmap/goroutine-
-// touching cleanups will need to check a shared db.closed flag before
-// proceeding; chunk 1 has neither (the reader-table mmap and flock
-// goroutine arrive in chunk 2), so the guard is unnecessary here.
-// pager.AbortTx and sync.Mutex.Unlock both operate purely on Go-heap
-// state and are safe under a concurrent DB.Close.
+// Note: Grant.Release is itself sync.Once-guarded so double-release on
+// the grant channel cannot panic; held still serves as the leak-
+// detection coordinator (warn iff WE are the releaser, not the user).
 func txCleanupFn(info txCleanupInfo) {
 	if !info.held.CompareAndSwap(true, false) {
 		return
@@ -79,12 +86,15 @@ func txCleanupFn(info txCleanupInfo) {
 		"gmdb: write transaction leaked without Commit/Rollback",
 		"origin", formatStack(info.originPCs),
 	)
-	// Restore in-memory pager state to pre-tx, then release the write
-	// lock. AbortTx must precede Unlock — once Unlock fires, the next
-	// Begin's BeginTx snapshot would capture the unaborted state and
-	// see allocations the leaked tx made but never committed.
+	// Restore in-memory pager state to pre-tx, then release the
+	// cross-process write lock. AbortTx must precede grant.Release —
+	// once the grant is released the flock goroutine clears the
+	// writer header and unlocks; another process or this process's
+	// next Begin observes the now-released lock and runs BeginTx,
+	// snapshotting state that would otherwise include allocations
+	// the leaked tx made but never committed.
 	info.pgr.AbortTx()
-	info.db.writeMu.Unlock()
+	info.grant.Release()
 }
 
 // captureOriginPCs records the call stack at Begin so the cleanup
@@ -195,7 +205,7 @@ func (tx *Tx) Commit() error {
 	// cleanup has already executed (Stop is idempotent per
 	// runtime.AddCleanup's contract).
 	tx.cleanup.Stop()
-	defer tx.releaseWriteLock()
+	defer tx.releaseGrant()
 	tx.closed = true
 	tx.db.pgr.SetCurrentTxnID(tx.newTxnID)
 	flags := tx.prevMeta.Flags
@@ -247,7 +257,7 @@ func (tx *Tx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.cleanup.Stop()
-	defer tx.releaseWriteLock()
+	defer tx.releaseGrant()
 	tx.closed = true
 	tx.db.pgr.AbortTx()
 	return nil
@@ -263,16 +273,21 @@ func (tx *Tx) requireOpen(needsWrite bool) error {
 	return nil
 }
 
-// releaseWriteLock unlocks db.writeMu if this tx still holds it. The CAS
-// on tx.held ensures exactly one releaser across Commit, Rollback, and
-// the GC cleanup — a leaked-then-explicitly-closed tx (or any other
-// double-close race) cannot trip a "unlock of unlocked mutex" panic.
-func (tx *Tx) releaseWriteLock() {
+// releaseGrant releases the cross-process write grant if this tx
+// still holds it. The CAS on tx.held ensures exactly one releaser
+// across Commit, Rollback, and the GC cleanup — a leaked-then-
+// explicitly-closed tx (or any other double-close race) cannot
+// double-warn or double-fire AbortTx. Grant.Release itself is
+// sync.Once-guarded; the held atomic only coordinates the leak-
+// detection branch.
+func (tx *Tx) releaseGrant() {
 	if !tx.writable || tx.held == nil {
 		return
 	}
 	if tx.held.CompareAndSwap(true, false) {
-		tx.db.writeMu.Unlock()
+		if tx.grant != nil {
+			tx.grant.Release()
+		}
 	}
 }
 

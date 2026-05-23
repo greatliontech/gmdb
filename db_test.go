@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -199,6 +201,9 @@ func TestInvalidOptions(t *testing.T) {
 		{PageSize: 3000},
 		{PageSize: 4096, MinSize: 100, MaxSize: 50},
 		{PageSize: 4096, MaxSize: 64, MaxTxBufferBytes: -1},
+		// MaxReaders above MaxMaxReaders fails validate() before
+		// the data file is touched (chunk 2.7 pre-check).
+		{PageSize: 4096, MaxSize: 64, MaxReaders: lock.MaxMaxReaders + 1},
 	}
 	for i, opts := range bad {
 		if _, err := Open(ctx, tmpPath(t), opts); !errors.Is(err, ErrInvalidOptions) {
@@ -539,7 +544,8 @@ func TestCommitFailurePoisonsHandle(t *testing.T) {
 	}
 	db.pgr.SetCommitStep4HookForTest(nil)
 
-	// Next Begin must surface ErrPoisoned without blocking on writeMu.
+	// Next Begin must surface ErrPoisoned without blocking on the
+	// cross-process write grant.
 	if _, err := db.Begin(ctx, true); !errors.Is(err, ErrPoisoned) {
 		t.Errorf("post-failure Begin: got %v, want ErrPoisoned", err)
 	}
@@ -591,10 +597,11 @@ func leakWriteTx(t *testing.T, db *DB, ctx context.Context) {
 func TestLeakedTxReleasesWriteLock(t *testing.T) {
 	// Transaction leak detection (leak-detection.md §Transaction Leak
 	// Detection): a *Tx dropped without Commit/Rollback must not leave
-	// db.writeMu locked forever. runtime.AddCleanup on the *Tx fires
-	// after GC marks it unreachable; the cleanup CAS's the held flag
-	// and unlocks. The test leaks a tx in an isolated stack frame,
-	// forces GC, and asserts the next Begin succeeds without blocking.
+	// the cross-process write grant held forever. runtime.AddCleanup
+	// on the *Tx fires after GC marks it unreachable; the cleanup
+	// CAS's the held flag and releases the grant. The test leaks a tx
+	// in an isolated stack frame, forces GC, and asserts the next
+	// Begin succeeds without blocking.
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	if err != nil {
@@ -610,8 +617,8 @@ func TestLeakedTxReleasesWriteLock(t *testing.T) {
 	runtime.GC()
 	runtime.GC()
 
-	// The cleanup runs on a separate goroutine; wait for the writeMu
-	// to be released by attempting Begin with a timeout. Block on a
+	// The cleanup runs on a separate goroutine; wait for the write
+	// grant to be released by attempting Begin with a timeout. Block on a
 	// channel rather than polling — if cleanup fires within the
 	// timeout, Begin unblocks immediately; if it never fires (bug),
 	// the timeout triggers a failure.
@@ -629,16 +636,16 @@ func TestLeakedTxReleasesWriteLock(t *testing.T) {
 			t.Errorf("Begin after GC of leaked tx: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Begin blocked — leaked tx did not release writeMu via GC cleanup")
+		t.Fatal("Begin blocked — leaked tx did not release write grant via GC cleanup")
 	}
 }
 
 func TestCommitStopsCleanup(t *testing.T) {
 	// Regression: a normal Commit must Stop() the leak-detection
 	// cleanup so no spurious leak warning fires after the tx closed
-	// cleanly. Also verifies that releaseWriteLock's CAS prevents the
-	// cleanup from double-Unlock'ing if it ran anyway (and that the
-	// next Begin works normally).
+	// cleanly. Also verifies that releaseGrant's CAS prevents the
+	// cleanup from double-releasing the grant if it ran anyway (and
+	// that the next Begin works normally).
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	if err != nil {
@@ -695,5 +702,187 @@ func TestMultipleCommits(t *testing.T) {
 		if got := db.Meta().TxnID; got != uint64(i) {
 			t.Errorf("after commit %d: TxnID=%d, want %d", i, got, i)
 		}
+	}
+}
+
+func TestLockFileCreatedOnOpen(t *testing.T) {
+	// The lock file is opened/created during Open per chunk 2.7
+	// wiring. Pins three properties:
+	//   1. The lock file appears on disk at <path>.lock.
+	//   2. Its on-disk size matches lock.FileSize(MaxReaders) — the
+	//      cross-process.md mmap-size invariant.
+	//   3. Its UUID matches the data file's meta UUID — the
+	//      cross-process.md UUID invariant.
+	ctx := context.Background()
+	path := tmpPath(t)
+	uuid := [16]byte{0xAA, 0xBB, 0xCC, 0xDD}
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64,
+		UUID:       uuid,
+		MaxReaders: 32,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if got := db.lockFile.UUID(); got != uuid {
+		t.Errorf("lock-file UUID = %x, want %x (UUID-match invariant)", got, uuid)
+	}
+	if got := db.lockFile.MaxReaders(); got != 32 {
+		t.Errorf("lock-file MaxReaders = %d, want 32", got)
+	}
+
+	lockPath := path + ".lock"
+	st, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatalf("lock file not created: %v", err)
+	}
+	wantSize := lock.FileSize(32)
+	if st.Size() != wantSize {
+		t.Errorf("lock file on-disk size = %d, want %d (mmap-size invariant)", st.Size(), wantSize)
+	}
+}
+
+func TestBeginRespectsCtxCancellation(t *testing.T) {
+	// 2.7 behavior change: Begin now honors ctx (chunk 1 ignored it).
+	// Cancelling ctx while waiting for the write grant returns
+	// context.Cause(ctx); no goroutine leak, no held grant.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Hold the writer with a foreground tx.
+	hold, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin hold: %v", err)
+	}
+	defer hold.Rollback()
+
+	// Second Begin with a ctx that fires before the first releases.
+	cctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		_, e := db.Begin(cctx, true)
+		done <- e
+	}()
+	// Let the second Begin enter the AcquireWriter retry loop.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Begin: got %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Begin did not return within 2s after ctx cancel")
+	}
+}
+
+func TestBeginAfterCloseReturnsErrClosed(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	_, err = db.Begin(ctx, true)
+	if !errors.Is(err, ErrClosed) {
+		t.Errorf("got %v, want ErrClosed", err)
+	}
+}
+
+func TestConcurrentWritersSerialised(t *testing.T) {
+	// Cross-process.md §Write Lock — within a single process, the
+	// Coord's channel-based serialisation must enforce at-most-one
+	// writer. Pre-2.7 this was a sync.Mutex; 2.7 routes it through
+	// the flock goroutine. N goroutines spin up concurrent Begin →
+	// Commit cycles; we just need them all to succeed without
+	// corruption (final TxnID equals N, no errors).
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const N = 20
+	var wg sync.WaitGroup
+	wg.Add(N)
+	errs := make(chan error, N)
+	for range N {
+		go func() {
+			defer wg.Done()
+			if err := db.Update(ctx, func(tx *Tx) error {
+				_, err := tx.AllocPage()
+				return err
+			}); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Errorf("Update: %v", e)
+	}
+	if got := db.Meta().TxnID; got != N {
+		t.Errorf("final TxnID = %d, want %d", got, N)
+	}
+}
+
+func TestCloseDuringBlockedBegin(t *testing.T) {
+	// Pin Close-vs-blocked-Begin ordering: a Begin in flight (blocked
+	// in AcquireWriter retry while another tx holds) when Close fires
+	// must return promptly, and Close must complete without deadlock.
+	//
+	// The held tx is deliberately orphaned (not Rollback'd) — the
+	// Rollback-vs-Close race is chunk-2.8 territory (db.closed
+	// promotion). What 2.7 strictly guarantees here is: Close drains
+	// the Coord's flock goroutine even with a grant outstanding (the
+	// stopCh path clears header + unlocks), and a blocked Begin sees
+	// stopCh fire and returns ErrClosed.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	hold, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin hold: %v", err)
+	}
+	_ = hold // orphan deliberately — see comment above.
+
+	beginErr := make(chan error, 1)
+	go func() {
+		_, e := db.Begin(ctx, true)
+		beginErr <- e
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- db.Close() }()
+
+	select {
+	case err := <-beginErr:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("blocked Begin during Close: got %v, want ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("blocked Begin did not return within 2s after Close")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("Close did not complete within 2s")
 	}
 }

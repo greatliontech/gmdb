@@ -119,6 +119,7 @@ var (
     ErrReadOnly                = errors.New("gmdb: write operation on read-only transaction")
     ErrTxClosed                = errors.New("gmdb: transaction already committed or rolled back")
     ErrPoisoned                = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
+    ErrClosed                  = errors.New("gmdb: database is closed")
     ErrCursorUnpositioned      = errors.New("gmdb: cursor not positioned")
     ErrKeyspaceKindMismatch    = errors.New("gmdb: keyspace kind does not match existing keyspace")
     ErrKeyspaceReserved        = errors.New("gmdb: keyspace name reserved for engine use")
@@ -392,7 +393,11 @@ type Options struct {
 
     // MaxReaders is the maximum number of concurrent reader slots.
     // Default: 4096. Only used when creating a new lock file.
-    MaxReaders int
+    // Type is `uint32` to match the lock-file header field
+    // (cross-process.md §Lock File Layout `LockFileHeader.MaxReaders`)
+    // and to carry the [1, 65536] bound at the type level (no
+    // runtime int→uint32 conversion needed).
+    MaxReaders uint32
 
     // MaxTxBufferBytes bounds the per-write-transaction slab (live +
     // loose + commit-time assembly buffers). A write transaction
@@ -437,6 +442,14 @@ type Options struct {
     // StaleTimeout for cross-PID-namespace stale detection via
     // heartbeats. Default: 10s.
     StaleTimeout time.Duration
+
+    // HeartbeatInterval is how often the heartbeat goroutine
+    // refreshes `WriterHeartbeat` (while this process holds
+    // `LOCK_EX`) and the `Heartbeat` field of every active reader
+    // slot. Must be significantly less than `StaleTimeout` for
+    // scheduling jitter. Default: 1s. See cross-process.md §Heartbeat
+    // Goroutine.
+    HeartbeatInterval time.Duration
 
     // LockRetryInterval is the polling interval the flock goroutine
     // uses when flock(LOCK_EX|LOCK_NB) returns EWOULDBLOCK. Bounds
@@ -866,7 +879,7 @@ type DBStats struct {
     // health diagnostics only — never as a synchronization barrier
     // ("ActiveReaders == 0" does NOT imply no reads are starting).
     ActiveReaders int
-    MaxReaders    int
+    MaxReaders    uint32
 
     // SlabBytes reports slab usage for THIS PROCESS's current write
     // transaction (0 when no write txn is open in this process).
