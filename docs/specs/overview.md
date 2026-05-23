@@ -22,7 +22,7 @@ invariants explicitly, and is self-contained for a reader scoped to
 that file. Cross-references are by spec file + section heading.
 
 The implementation roadmap derived from these specs lives under
-`docs/plans/` — start with `docs/plans/v1-implementation.md`. Tracked
+`docs/plans/` — start with `docs/plans/v0-implementation.md`. Tracked
 follow-ups live under `docs/issues/`.
 
 ## Invariants

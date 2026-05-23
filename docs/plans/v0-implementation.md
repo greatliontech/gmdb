@@ -1,13 +1,53 @@
-# gmdb v1 Implementation Plan
+# gmdb v0 Implementation Plan
 
 Implementation roadmap for bringing the gmdb design (`docs/specs/`)
-to a working v1.
+to a working v0.
 
 Derived from every spec in `docs/specs/`. Chunks listed in
 dependency order; sub-chunks `N.1` (planning/triage) and the
 final close-out are fixed anchors per chunk, intermediate sub-
 chunks are filled in during implementation per the adversarial-
 review loop in `~/.claude/CLAUDE.md`.
+
+## v0 stance: clean breaks, no installed base
+
+This is **v0**. `.semrel.yaml` sets `development: true`; gmdb has
+no released binary, no deployments, no on-disk state any user is
+attached to. Implementation chunks default to **clean breaks**:
+when a spec change implies a different on-disk encoding, a
+different API shape, or a different protocol step, the change
+lands directly and old code/state is replaced outright. No
+dual-read shims, no format discriminators bridging "v0a → v0b",
+no deprecation aliases on renamed identifiers, no migration code
+for a non-existent installed base.
+
+This follows the Breaking-changes rule in `~/.claude/CLAUDE.md`
+("Clean break is the default before v1 / with no installed
+base"): backwards-compatibility scaffolding for state that does
+not exist is **over-engineering**, which the Quality bar
+classifies as a defect. The same rule's distinction applies:
+runtime feature semantics required for correctness once the
+system is in use (e.g., CoW + meta-swap atomicity, reader
+isolation) are always real and must be preserved — those live
+in the spec invariants and are not affected by the clean-break
+default.
+
+Two practical consequences for the chunks below:
+
+- A spec amendment landed mid-chunk does not require a separate
+  migration sub-chunk; the implementation is brought into line
+  with the new spec in the same change set, old encodings are
+  removed, and tests are updated.
+- When a chunk's adversarial review surfaces a better protocol
+  shape than what an earlier chunk shipped (a spec-amend
+  candidate per `~/.claude/CLAUDE.md`), the amend is applied
+  and the earlier chunk's code rewritten in place; no
+  "back-compat opt-in" is added.
+
+The clean-break default holds until the first tagged release
+that promises stability to external users; the plan will then
+gain a §Stability stance and grow whatever migration discipline
+the future installed base requires.
 
 ## Codebase layout
 
