@@ -3,6 +3,10 @@ package gmdb
 import (
 	"errors"
 	"fmt"
+	"log/slog"
+	"runtime"
+	"strings"
+	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
@@ -20,6 +24,99 @@ type Tx struct {
 	newTxnID   uint64
 	writable   bool
 	closed     bool
+
+	// held tracks ownership of db.writeMu for the lifetime of this Tx.
+	// Begin sets it to true; Commit, Rollback, and the runtime.AddCleanup
+	// callback each attempt a single CompareAndSwap(true, false) — the
+	// winner is responsible for the Unlock + AbortTx, so double-release
+	// (race between an explicit Close path and the GC cleanup) is
+	// structurally impossible. Stored as a pointer so the cleanup info
+	// struct can hold it without referencing the *Tx (runtime.AddCleanup
+	// forbids cleanup args from referencing the cleaned-up object —
+	// resurrection is not permitted).
+	held *atomic.Bool
+
+	// cleanup is the AddCleanup handle, Stop()'d by Commit/Rollback in
+	// the normal close path so the leak-detection warning doesn't fire
+	// for a tx the caller properly closed.
+	cleanup runtime.Cleanup
+}
+
+// txCleanupInfo is the argument bundle for the AddCleanup callback.
+// Deliberately omits the *Tx: runtime.AddCleanup rejects an arg that
+// reaches the obj, since resurrecting the obj would defeat collection.
+//
+// Captures *Pager directly (not via *DB.pgr) so a concurrent Close —
+// which sets db.pgr = nil — does not nil-deref this callback. The
+// Pager is heap-allocated and remains alive as long as txCleanupInfo
+// holds it; AbortTx touches only Go-heap pager state (slab maps,
+// bitmap struct, RPL chain slice), not the mmap, so it is safe to call
+// even after pager.Close has unmapped.
+type txCleanupInfo struct {
+	db        *DB
+	pgr       *pager.Pager
+	held      *atomic.Bool
+	originPCs []uintptr
+}
+
+// txCleanupFn is the leak-detection callback invoked by runtime.AddCleanup
+// some time after the *Tx becomes unreachable. The CompareAndSwap on
+// info.held ensures a single releaser — Commit/Rollback's call to
+// releaseWriteLock contests the same atomic, so the cleanup is a no-op
+// for transactions the caller closed normally.
+//
+// Per leak-detection.md §Cleanup Behavior: chunk-2's mmap/goroutine-
+// touching cleanups will need to check a shared db.closed flag before
+// proceeding; chunk 1 has neither (the reader-table mmap and flock
+// goroutine arrive in chunk 2), so the guard is unnecessary here.
+// pager.AbortTx and sync.Mutex.Unlock both operate purely on Go-heap
+// state and are safe under a concurrent DB.Close.
+func txCleanupFn(info txCleanupInfo) {
+	if !info.held.CompareAndSwap(true, false) {
+		return
+	}
+	slog.Default().Warn(
+		"gmdb: write transaction leaked without Commit/Rollback",
+		"origin", formatStack(info.originPCs),
+	)
+	// Restore in-memory pager state to pre-tx, then release the write
+	// lock. AbortTx must precede Unlock — once Unlock fires, the next
+	// Begin's BeginTx snapshot would capture the unaborted state and
+	// see allocations the leaked tx made but never committed.
+	info.pgr.AbortTx()
+	info.db.writeMu.Unlock()
+}
+
+// captureOriginPCs records the call stack at Begin so the cleanup
+// warning can point at where the leaked transaction was opened.
+// Returns raw PCs; formatting is deferred to log time via formatStack.
+//
+// skip=3 drops three frames from the trace: runtime.Callers itself
+// (per its docs, skip=0 is its own frame), captureOriginPCs, and
+// (*DB).Begin. The first recorded frame is therefore the user's
+// caller — what the warning actually wants to point at.
+func captureOriginPCs() []uintptr {
+	pcs := make([]uintptr, 32)
+	n := runtime.Callers(3, pcs)
+	return pcs[:n]
+}
+
+// formatStack renders PCs from captureOriginPCs into a human-readable
+// multi-line trace, lazy so a never-fired cleanup pays nothing.
+func formatStack(pcs []uintptr) string {
+	if len(pcs) == 0 {
+		return "(stack unavailable)"
+	}
+	var b strings.Builder
+	frames := runtime.CallersFrames(pcs)
+	for {
+		f, more := frames.Next()
+		fmt.Fprintf(&b, "\n  %s\n    %s:%d", f.Function, f.File, f.Line)
+		if !more {
+			break
+		}
+	}
+	return b.String()
 }
 
 // AllocPage allocates a single page following the freespace priority
@@ -93,6 +190,11 @@ func (tx *Tx) Commit() error {
 	if err := tx.requireOpen(true); err != nil {
 		return err
 	}
+	// Cancel the leak-detection cleanup first — it must not fire if the
+	// caller is closing the tx explicitly. Safe to Stop even if the
+	// cleanup has already executed (Stop is idempotent per
+	// runtime.AddCleanup's contract).
+	tx.cleanup.Stop()
 	defer tx.releaseWriteLock()
 	tx.closed = true
 	tx.db.pgr.SetCurrentTxnID(tx.newTxnID)
@@ -104,6 +206,25 @@ func (tx *Tx) Commit() error {
 		Flags:        flags,
 	}, tx.prevMeta, tx.prevActive)
 	if err != nil {
+		// pager.Commit failure modes all leave the handle in a state
+		// where in-memory disagrees with disk:
+		//   - Step 1 succeeded → data / bitmap / RPL pages have been
+		//     pwritten before the error; kernel cache may not have
+		//     flushed (step 2 fdatasync state is uncertain on EIO).
+		//   - Step 3 succeeded → the new meta is on disk; ActiveMeta
+		//     selection on a fresh Open picks the new tree even though
+		//     the in-process tx.Commit returned an error.
+		// AbortTx has rolled the pager's in-memory bitmap /
+		// HighWaterMark / RPL chain to pre-tx; the in-memory snapshot
+		// no longer reflects what step 1's pwrites put on disk. The
+		// handle cannot safely allocate further (the bitmap divergence
+		// would leak pages or — when combined with a since-advanced
+		// on-disk meta — write through pages the on-disk active tree
+		// references). Poison; the caller's recovery is the same
+		// machinery cross-process Open uses after a writer crash:
+		// Close, re-Open, the new handle reads everything from disk
+		// and is internally consistent.
+		tx.db.poisoned.Store(true)
 		return mapPagerErr(err)
 	}
 	tx.db.mu.Lock()
@@ -125,6 +246,7 @@ func (tx *Tx) Rollback() error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	tx.cleanup.Stop()
 	defer tx.releaseWriteLock()
 	tx.closed = true
 	tx.db.pgr.AbortTx()
@@ -141,14 +263,26 @@ func (tx *Tx) requireOpen(needsWrite bool) error {
 	return nil
 }
 
+// releaseWriteLock unlocks db.writeMu if this tx still holds it. The CAS
+// on tx.held ensures exactly one releaser across Commit, Rollback, and
+// the GC cleanup — a leaked-then-explicitly-closed tx (or any other
+// double-close race) cannot trip a "unlock of unlocked mutex" panic.
 func (tx *Tx) releaseWriteLock() {
-	if tx.writable {
+	if !tx.writable || tx.held == nil {
+		return
+	}
+	if tx.held.CompareAndSwap(true, false) {
 		tx.db.writeMu.Unlock()
 	}
 }
 
 // mapPagerErr translates pager package sentinels to the root package's
 // public sentinels. Other errors pass through verbatim.
+//
+// ErrCorrupted is wrapped (not replaced) so the descriptive pager-side
+// message ("RPL chain cycle at page N", "meta0 PageSize invalid", etc.)
+// is preserved in the error chain; callers using errors.Is satisfy
+// both gmdb.ErrCorrupted and pager.ErrCorrupted.
 func mapPagerErr(err error) error {
 	switch {
 	case err == nil:
@@ -159,6 +293,8 @@ func mapPagerErr(err error) error {
 		return ErrTxTooLarge
 	case errors.Is(err, pager.ErrDBFull):
 		return ErrDBFull
+	case errors.Is(err, pager.ErrCorrupted):
+		return fmt.Errorf("%w: %w", ErrCorrupted, err)
 	default:
 		return fmt.Errorf("gmdb: %w", err)
 	}

@@ -118,6 +118,7 @@ var (
     ErrVersionMismatch         = errors.New("gmdb: format version mismatch")
     ErrReadOnly                = errors.New("gmdb: write operation on read-only transaction")
     ErrTxClosed                = errors.New("gmdb: transaction already committed or rolled back")
+    ErrPoisoned                = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
     ErrCursorUnpositioned      = errors.New("gmdb: cursor not positioned")
     ErrKeyspaceKindMismatch    = errors.New("gmdb: keyspace kind does not match existing keyspace")
     ErrKeyspaceReserved        = errors.New("gmdb: keyspace name reserved for engine use")
@@ -181,6 +182,50 @@ type IndexFingerprintError struct {
 func (e *IndexFingerprintError) Error() string { /* ... */ }
 func (e *IndexFingerprintError) Unwrap() error { return ErrIndexFingerprintMismatch }
 ```
+
+## `ErrPoisoned`
+
+`ErrPoisoned` is returned by `Begin` (and therefore `Update`) after
+a previous write transaction's commit failed in the publication
+phase: step-3 pwrite of the new meta page, or step-4 fdatasync of
+the meta. See `pager-slab.md §Commit Write Ordering` for the
+four-step protocol; the publication boundary is step 3.
+
+After such a failure, the on-disk active meta may have advanced
+to the new tree (step-3 success + step-4 EIO leaves the new meta
+visible to a fresh `Open`), while the in-process pager's
+in-memory bitmap, `HighWaterMark`, and RPL chain were restored
+to pre-tx by `AbortTx`. The handle's view of the file is
+therefore inconsistent with disk: a subsequent `AllocPage` off
+this handle would draw from the stale bitmap and could hand back
+a page the on-disk active tree already references — a subsequent
+commit would then overwrite that page's content, and the next
+`Open` (in this or another process) would see a tree pointing
+at clobbered data.
+
+`ErrPoisoned` directs the caller to discard the handle:
+
+```go
+err := db.Update(ctx, fn)
+if errors.Is(err, gmdb.ErrPoisoned) {
+    _ = db.Close()
+    db, err = gmdb.Open(ctx, path, opts)
+    // The re-opened handle reads everything from disk via the
+    // same machinery cross-process Open uses after a writer
+    // crash; it is internally consistent.
+}
+```
+
+`Close` works normally on a poisoned handle (releases the mmap,
+closes the file). Recovery is unconditionally Close + re-Open;
+there is no in-process repair API in v0 (a future chunk-11
+`Check()`-driven repair may offer one).
+
+A poisoned handle's `Begin` returns `ErrPoisoned` without
+acquiring the write lock, so a poisoned handle does not block
+unrelated callers — they observe the sentinel and act on it.
+The poison state is process-local; cross-process `Open` of the
+same file is unaffected by another process's poisoned handle.
 
 ## `Open`
 

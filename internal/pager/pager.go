@@ -34,6 +34,20 @@ var (
 	// TailRefund when the writer has not yet been seeded with bitmap +
 	// commit state via AttachBitmap and SetCommitState.
 	ErrFreespaceUnconfigured = errors.New("pager: freespace state not configured")
+
+	// ErrCorrupted is returned when a structural integrity violation
+	// is detected, either on-disk (Open: malformed RPL segment, chain
+	// cycle, meta payload invalid, dual-meta selection ambiguous) or
+	// in the about-to-be-written commit assembly buffer (Commit:
+	// pre-write defense-in-depth checks that catch reservation bugs
+	// that would produce on-disk corruption if encoded). The
+	// caller-side recovery is the same regardless of where the
+	// integrity failure was caught — discard the handle, re-Open if
+	// possible — so a single sentinel covers both. The root package's
+	// mapPagerErr translates this into gmdb.ErrCorrupted, the public
+	// api-surface.md sentinel; the descriptive message is preserved
+	// in the wrapped chain.
+	ErrCorrupted = errors.New("pager: structural corruption detected")
 )
 
 // Pager resolves page bytes for one transaction. Read transactions get a
@@ -92,6 +106,15 @@ type Pager struct {
 	hwmSnapshot      uint64
 	rplChainSnapshot []RPLSegmentRef
 	haveTxSnapshot   bool
+
+	// commitStep4HookForTest is a test-only injection point. When
+	// non-nil, Commit invokes it after step 3 has written the new
+	// meta to disk but before step 4's fdatasync, treating a returned
+	// error as if fdatasync itself failed. Used by the root package's
+	// poison-on-publication-failure regression test to simulate the
+	// step-3-success / step-4-fail window without mocking the file.
+	// Production callers must not set this.
+	commitStep4HookForTest func() error
 }
 
 // RPLSegmentRef is the in-memory descriptor of one on-disk RPL segment
@@ -292,6 +315,14 @@ func (p *Pager) Close() error {
 
 // Config returns the page configuration.
 func (p *Pager) Config() page.Config { return p.cfg }
+
+// SetCommitStep4HookForTest installs the test-only step-4-failure
+// injection hook described on the Pager struct's commitStep4HookForTest
+// field. Pass nil to clear. Test-only — production callers must not
+// use this.
+func (p *Pager) SetCommitStep4HookForTest(fn func() error) {
+	p.commitStep4HookForTest = fn
+}
 
 // FileSize returns the file size observed at Open. Used to bound reads
 // (callers must additionally respect HighWaterMark from the active meta).

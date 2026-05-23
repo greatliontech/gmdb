@@ -1,7 +1,9 @@
 package pager
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -141,6 +143,14 @@ type OpenedDB struct {
 // first write transaction.
 //
 // The returned Pager's pool is op.Pool; it must outlive the pager.
+//
+// Meta-0 corruption recovery: when meta-0 fails its checksum verify
+// (whether the PageSize bytes are invalid, or any other field has been
+// tampered), the PageSize is rediscovered by probing each supported
+// page size against meta-1's offset. The file-layout.md dual-meta
+// atomicity invariant guarantees recoverability if at least one meta
+// has a passing checksum at its correct offset; the probe is the
+// chunk-1 mechanism that honours it.
 func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 	if op.Pool == nil {
 		return nil, fmt.Errorf("pager: Pool must not be nil")
@@ -148,41 +158,56 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 	if op.MaxTxBufferBytes <= 0 {
 		return nil, fmt.Errorf("pager: MaxTxBufferBytes must be > 0")
 	}
-	// 1) Read both meta-page payloads. We don't know PageSize yet, so we
-	//    read MetaPayloadSize bytes from byte 0 and from PageSize away —
-	//    but PageSize is unknown. Strategy: read enough at offset 0 to
-	//    decode meta0 (MetaPayloadSize=144 bytes), validate it, then
-	//    use meta0.PageSize to locate meta1. (If meta0 is corrupt, fall
-	//    back to scanning a range of page-size guesses to find meta1.
-	//    For chunk 1 we assume meta0 is recoverable; chunk 11 Check()
-	//    addresses the fully-corrupt-meta0 case.)
+	// 1) Discover PageSize. Prefer meta-0's PageSize when meta-0
+	//    verifies; otherwise probe meta-1 candidate offsets. A passing
+	//    checksum is the only thing that authorizes trust in any meta
+	//    field — `ValidPageSize` alone is not enough because a flip
+	//    that breaks the checksum can still produce a syntactically
+	//    valid (but wrong) PageSize value.
 	meta0Bytes := make([]byte, page.MetaPayloadSize)
 	if _, err := file.ReadAt(meta0Bytes, 0); err != nil {
 		return nil, fmt.Errorf("pager: read meta0: %w", err)
 	}
-	m0 := page.DecodeMeta(meta0Bytes)
-	if !page.ValidPageSize(m0.PageSize) {
-		return nil, fmt.Errorf("pager: meta0 PageSize invalid (%d); chunk-1 Open requires a recoverable meta0", m0.PageSize)
+	var pageSize uint32
+	var meta1Bytes []byte
+	if isGmdbMeta(meta0Bytes) {
+		pageSize = page.DecodeMeta(meta0Bytes).PageSize
+		if !page.ValidPageSize(pageSize) {
+			// Checksum agrees with a value that the format rejects:
+			// the file was written by a different format version or
+			// the checksum collided. Either way, ErrCorrupted.
+			return nil, fmt.Errorf("pager: meta0 verified but PageSize %d invalid: %w", pageSize, ErrCorrupted)
+		}
+	} else {
+		var perr error
+		pageSize, meta1Bytes, perr = probeMetaPageSize(file)
+		if perr != nil {
+			return nil, fmt.Errorf("pager: meta1 probe read: %w", perr)
+		}
+		if pageSize == 0 {
+			return nil, fmt.Errorf("pager: meta0 verify failed and meta1 probe found no recoverable meta: %w", ErrCorrupted)
+		}
 	}
-	pageSize := m0.PageSize
-	meta1Bytes := make([]byte, page.MetaPayloadSize)
-	if _, err := file.ReadAt(meta1Bytes, int64(pageSize)); err != nil {
-		return nil, fmt.Errorf("pager: read meta1: %w", err)
+	if meta1Bytes == nil {
+		meta1Bytes = make([]byte, page.MetaPayloadSize)
+		if _, err := file.ReadAt(meta1Bytes, int64(pageSize)); err != nil {
+			return nil, fmt.Errorf("pager: read meta1: %w", err)
+		}
 	}
 
 	// 2) Active-meta selection + validation.
 	active, ok := page.ActiveMeta(meta0Bytes, meta1Bytes)
 	if !ok {
-		return nil, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation")
+		return nil, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
 	}
 	var m page.Meta
 	if active == 0 {
-		m = m0
+		m = page.DecodeMeta(meta0Bytes)
 	} else {
 		m = page.DecodeMeta(meta1Bytes)
 	}
 	if err := page.ValidateMeta(m); err != nil {
-		return nil, fmt.Errorf("pager: %w", err)
+		return nil, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
 	}
 
 	cfg := page.Config{PageSize: pageSize, PageChecksum: m.HasFlag(page.MetaFlagPageChecksum)}
@@ -232,6 +257,86 @@ func newBitmapForOpen(detail []byte, pageSize uint32, bitmapPages uint32, totalP
 	return bitmapWrap(detail, pageSize, bitmapPages, totalPages)
 }
 
+// DiscoverPageSize returns the page size of the gmdb file by reading
+// meta-0 and verifying its checksum + identity (Magic, Version). When
+// meta-0 fails any of those, it probes meta-1 at each supported page
+// size — the same fallback Open uses internally — exported so the gmdb
+// root package can size its buffer pool before calling Open.
+//
+// Returns ErrCorrupted (wrapped) when no candidate produces a verifying
+// meta. Propagates non-EOF read errors (EIO, permission, etc.) verbatim
+// so the caller can distinguish a genuine I/O failure from a probe miss.
+func DiscoverPageSize(file *os.File) (uint32, error) {
+	meta0 := make([]byte, page.MetaPayloadSize)
+	if _, err := file.ReadAt(meta0, 0); err != nil {
+		return 0, fmt.Errorf("pager: read meta0: %w", err)
+	}
+	if isGmdbMeta(meta0) {
+		ps := page.DecodeMeta(meta0).PageSize
+		if page.ValidPageSize(ps) {
+			return ps, nil
+		}
+	}
+	ps, _, err := probeMetaPageSize(file)
+	if err != nil {
+		return 0, fmt.Errorf("pager: meta1 probe read: %w", err)
+	}
+	if ps != 0 {
+		return ps, nil
+	}
+	return 0, fmt.Errorf("pager: meta0 invalid and meta1 probe found no recoverable PageSize: %w", ErrCorrupted)
+}
+
+// probeMetaPageSize iterates the supported page sizes and looks for a
+// recognizably-gmdb meta page at the corresponding offset whose
+// PageSize field matches the offset. The first match wins; the
+// returned bytes are the payload Open uses as meta-1 (already known to
+// verify, so the caller can avoid a re-read).
+//
+// "Recognizably gmdb" requires the checksum to verify AND Magic +
+// Version to match the package constants. Without the identity check
+// any 144-byte slice that happens to be self-checksum-consistent would
+// be accepted — a 2^-64 random match per offset, but a structured
+// non-gmdb file (or a different-version gmdb file) could collide
+// intentionally. The dual-meta atomicity invariant in file-layout.md
+// requires recoverability when "one meta verifies at its proper
+// offset"; "verifies" implies a gmdb meta, not an arbitrary blob.
+//
+// File-too-short reads return (0, nil, nil) — those offsets are
+// legitimately absent. Other read errors (EIO, permission) bubble up
+// so the caller can surface them rather than mislabel as "no
+// recoverable PageSize."
+func probeMetaPageSize(file *os.File) (uint32, []byte, error) {
+	for ps := page.MinPageSize; ps <= page.MaxPageSize; ps *= 2 {
+		buf := make([]byte, page.MetaPayloadSize)
+		if _, err := file.ReadAt(buf, int64(ps)); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				continue
+			}
+			return 0, nil, err
+		}
+		if !isGmdbMeta(buf) {
+			continue
+		}
+		if page.DecodeMeta(buf).PageSize == ps {
+			return ps, buf, nil
+		}
+	}
+	return 0, nil, nil
+}
+
+// isGmdbMeta reports whether buf is a recognizably-gmdb meta payload:
+// the xxhash64 footer verifies AND Magic + Version match the package
+// constants. Used by DiscoverPageSize and probeMetaPageSize as a
+// single point of trust for "this 144-byte slice is one of our metas."
+func isGmdbMeta(buf []byte) bool {
+	if !page.VerifyMeta(buf) {
+		return false
+	}
+	m := page.DecodeMeta(buf)
+	return m.Magic == page.Magic && m.Version == page.FormatVersion
+}
+
 // rebuildRPLChain walks the on-disk RPL chain head → tail via
 // OlderSegment links, then reverses the result so index 0 is tail
 // (oldest). Defense in depth: refuses to walk a self-referential
@@ -255,19 +360,19 @@ func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
 	id := m.RPLHeadPage
 	for id != 0 {
 		if _, seen := visited[id]; seen {
-			return nil, fmt.Errorf("pager: RPL chain cycle at page %d", id)
+			return nil, fmt.Errorf("pager: RPL chain cycle at page %d: %w", id, ErrCorrupted)
 		}
 		if uint64(len(headFirst)) > maxSegs {
-			return nil, fmt.Errorf("pager: RPL chain exceeds bound %d (likely cycle)", maxSegs)
+			return nil, fmt.Errorf("pager: RPL chain exceeds bound %d (likely cycle): %w", maxSegs, ErrCorrupted)
 		}
 		visited[id] = struct{}{}
 		buf := p.Page(id)
 		seg, ok := page.DecodeRPLSegment(buf, p.cfg)
 		if !ok {
-			return nil, fmt.Errorf("pager: RPL segment at page %d malformed", id)
+			return nil, fmt.Errorf("pager: RPL segment at page %d malformed: %w", id, ErrCorrupted)
 		}
 		if seg.OlderSegment == id {
-			return nil, fmt.Errorf("pager: RPL segment at page %d is self-referential", id)
+			return nil, fmt.Errorf("pager: RPL segment at page %d is self-referential: %w", id, ErrCorrupted)
 		}
 		headFirst = append(headFirst, RPLSegmentRef{
 			PageID: id,
@@ -282,4 +387,3 @@ func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
 	}
 	return headFirst, nil
 }
-

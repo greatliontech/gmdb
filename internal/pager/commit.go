@@ -104,6 +104,17 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 		return CommitResult{}, fmt.Errorf("pager: step 3 write meta %d: %w", newActive, err)
 	}
 
+	// Test injection point — see commitStep4HookForTest doc on Pager.
+	// Fires after step 3's pwrite has placed the new meta on disk so
+	// the test observes the same step-3-success / step-4-fail state
+	// the publication-phase failure mode produces in production.
+	if p.commitStep4HookForTest != nil {
+		if err := p.commitStep4HookForTest(); err != nil {
+			p.AbortTx()
+			return CommitResult{}, fmt.Errorf("pager: step 4 fdatasync meta (test-injected): %w", err)
+		}
+	}
+
 	// Step 4 — fdatasync (atomic commit point).
 	if err := p.file.Sync(); err != nil {
 		p.AbortTx()
@@ -231,7 +242,7 @@ func (p *Pager) appendRPL() error {
 		// (Open's chain walk would loop), and the only way to reach
 		// it here is a bug in reservation. Refuse rather than encode.
 		if older == segPageID {
-			return fmt.Errorf("pager: RPL segment self-reference at page %d", segPageID)
+			return fmt.Errorf("pager: RPL segment self-reference at page %d: %w", segPageID, ErrCorrupted)
 		}
 		page.EncodeRPLSegment(buf, p.cfg, p.currentTxnID, older, segIDs)
 		newSegs[i] = RPLSegmentRef{
@@ -337,4 +348,3 @@ func (p *Pager) maybeShrink(shrinkThreshold uint64) error {
 	p.fileSize = target
 	return nil
 }
-

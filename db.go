@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -34,6 +36,17 @@ type DB struct {
 	currentMeta   page.Meta
 	activeMetaIdx int
 	pgr           *pager.Pager
+
+	// poisoned is set when a write tx's commit failed past the
+	// publication boundary (step-3 pwrite or step-4 fdatasync). The
+	// on-disk active meta may have advanced while the pager's
+	// in-memory state was rolled back by AbortTx — bitmap /
+	// HighWaterMark / RPL chain disagree with disk, and any further
+	// allocation off this handle could overwrite pages the on-disk
+	// tree references. Subsequent Begin returns ErrPoisoned. Close +
+	// re-Open is the recovery path: the new handle reads everything
+	// from disk and is internally consistent.
+	poisoned atomic.Bool
 }
 
 // Open opens the database at path. If the file does not exist, it is
@@ -121,7 +134,7 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 	if err != nil {
 		_ = file.Close()
 		_ = root.Close()
-		return nil, err
+		return nil, mapPagerErr(err)
 	}
 
 	return &DB{
@@ -175,30 +188,55 @@ func (db *DB) Begin(_ context.Context, write bool) (*Tx, error) {
 	if !write {
 		return nil, ErrReadOnly
 	}
+	// Poison check before acquiring writeMu so a poisoned handle does
+	// not block legitimate concurrent callers.
+	if db.poisoned.Load() {
+		return nil, ErrPoisoned
+	}
 	db.writeMu.Lock()
+	// Re-check under the lock — a concurrent commit could have poisoned
+	// the handle while we were waiting.
+	if db.poisoned.Load() {
+		db.writeMu.Unlock()
+		return nil, ErrPoisoned
+	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
 	prevMeta := db.currentMeta
 	prevActive := db.activeMetaIdx
 	db.pgr.BeginTx()
-	return &Tx{
+
+	held := &atomic.Bool{}
+	held.Store(true)
+	tx := &Tx{
 		db:         db,
 		prevMeta:   prevMeta,
 		prevActive: prevActive,
 		newTxnID:   prevMeta.TxnID + 1,
 		writable:   true,
-	}, nil
+		held:       held,
+	}
+	// Wire the leak-detection cleanup per leak-detection.md. The
+	// cleanup info captures *DB, *Pager, the shared held atomic, and
+	// the origin stack — never the *Tx itself (resurrection-forbidden).
+	tx.cleanup = runtime.AddCleanup(tx, txCleanupFn, txCleanupInfo{
+		db:        db,
+		pgr:       db.pgr,
+		held:      held,
+		originPCs: captureOriginPCs(),
+	})
+	return tx, nil
 }
 
-// readPersistedPageSize reads meta-0's PageSize field. When we took
-// the EEXIST-retry fallback (raceWindow=true), another process may
-// still be inside pager.Init; the file exists but bytes 0..143 may
-// be zeros. Retry the read with bounded backoff so the loser of an
-// O_CREATE|O_EXCL race waits for the winner to finish init.
-//
-// On a clean (non-race) reopen the first iteration succeeds and the
-// retry budget costs one extra ReadAt at most.
+// readPersistedPageSize discovers the file's PageSize via pager.DiscoverPageSize,
+// retrying on the EEXIST-retry fallback (raceWindow=true) so the loser
+// of an O_CREATE|O_EXCL race waits for the winner to finish Init. The
+// retry catches the partial-initialisation window only; a permanent
+// corruption falls through to the wrapped ErrCorrupted from
+// DiscoverPageSize after the final attempt. Chunk-2's lock file
+// resolves the race window structurally; the retry remains here as a
+// chunk-1 defensive measure.
 func readPersistedPageSize(file *os.File, raceWindow bool) (uint32, error) {
 	const (
 		maxAttempts = 50
@@ -208,20 +246,18 @@ func readPersistedPageSize(file *os.File, raceWindow bool) (uint32, error) {
 	if raceWindow {
 		attempts = maxAttempts
 	}
-	metaPrefix := make([]byte, page.MetaPayloadSize)
+	var lastErr error
 	for i := range attempts {
-		if _, err := file.ReadAt(metaPrefix, 0); err != nil {
-			return 0, fmt.Errorf("gmdb: read meta-0 prefix: %w", err)
-		}
-		ps := page.DecodeMeta(metaPrefix).PageSize
-		if page.ValidPageSize(ps) {
+		ps, err := pager.DiscoverPageSize(file)
+		if err == nil {
 			return ps, nil
 		}
+		lastErr = err
 		if i+1 < attempts {
 			time.Sleep(backoff)
 		}
 	}
-	return 0, fmt.Errorf("gmdb: persisted PageSize invalid (file may be partially initialised by a concurrent Open; chunk-2 lock-file work resolves this)")
+	return 0, mapPagerErr(lastErr)
 }
 
 // Update is a convenience wrapper: begin a write tx, call fn, commit on

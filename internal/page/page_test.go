@@ -87,9 +87,9 @@ func TestPageFooterRejectsWrongSize(t *testing.T) {
 
 func TestConfigContentEndAndUsable(t *testing.T) {
 	cases := []struct {
-		cfg     Config
-		end     int
-		usable  int
+		cfg    Config
+		end    int
+		usable int
 	}{
 		{Config{PageSize: 4096, PageChecksum: true}, 4088, 4080},
 		{Config{PageSize: 4096, PageChecksum: false}, 4096, 4088},

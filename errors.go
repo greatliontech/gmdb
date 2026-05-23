@@ -38,6 +38,17 @@ var (
 	// does not match the engine's FormatVersion. Reserved for future
 	// format evolutions; never returned in v0.
 	ErrVersionMismatch = errors.New("gmdb: on-disk format version mismatch")
+
+	// ErrPoisoned is returned by Begin / Update after a previous
+	// transaction's commit failed in the publication phase (step-3
+	// pwrite or step-4 fdatasync), leaving the on-disk active meta
+	// potentially advanced while the in-memory pager state has been
+	// rolled back to pre-tx. The DB handle is in a state where it
+	// cannot safely allocate new pages (its in-memory bitmap /
+	// HighWaterMark / RPL chain disagree with disk); the caller must
+	// Close() and re-Open() to recover. Close() works normally on a
+	// poisoned handle.
+	ErrPoisoned = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
 )
 
 var (

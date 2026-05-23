@@ -65,14 +65,24 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=Cleanup callbacks run on a GC background goroutine and
-    perform only non-blocking operations (atomic check of
+    perform only non-blocking operations: atomic check of
     `db.closed`, atomic store on reader slot, non-blocking channel
-    send to flock goroutine). No mutex acquisition, no syscall, no
-    panic;
+    send to flock goroutine, `sync.Mutex.Unlock` of a lock the
+    leaked owner held (wait-free; not a contended acquisition),
+    and non-blocking diagnostic logging via the configured `slog`
+    handler. No mutex *acquisition* (no `Lock`/`RLock`/spin), no
+    blocking syscall (other than the slog handler's bounded
+    diagnostic write), no panic;
   from=this spec §Cleanup Behavior;
   violation=A blocking cleanup stalls all subsequent GC cleanups,
     backing up the whole process; a panicking cleanup aborts the
     program — the safety net becomes a single point of failure.
+    `sync.Mutex.Unlock` and the standard slog handlers are
+    explicitly admitted because (a) `Unlock` is wait-free and is
+    the only way a leak cleanup can release the resource it owns,
+    and (b) the §Cleanup Behavior contract itself requires writing
+    a warning, so a strict no-syscall reading would be
+    self-contradicting.
 
 ## Transaction Leak Detection
 
@@ -145,7 +155,11 @@ When the GC collects a leaked `Tx`:
    guard at step 0, the cleanup logs and returns).
 
 Cleanup runs on a GC background goroutine — must not block or
-panic. All operations are non-blocking.
+panic. Permitted operations: atomic loads/stores, non-blocking
+channel sends, `sync.Mutex.Unlock` of a lock the leaked owner
+held (wait-free), and the configured `slog` handler's
+diagnostic write (a bounded syscall, not a blocking operation).
+Forbidden: mutex `Lock`/`RLock`/spin, blocking I/O, panic.
 
 ### Limitations
 
