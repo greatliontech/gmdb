@@ -105,12 +105,22 @@ func staleByHeartbeat(f *File, nowNanos uint64, staleTimeoutNanos uint64) bool {
 func RecoverStaleWriter(f *File, ourPIDNamespace uint64) {
 	deadPID := f.WriterPID()
 	deadNS := f.WriterPIDNamespace()
+	deadStartTime := f.WriterStartTime()
 
 	// Reader-slot cleanup is only attempted for the same-namespace
 	// case — cross-namespace PIDs are not directly comparable, so
 	// reader-stale-detection's heartbeat path will clean those up
 	// asynchronously (cross-process.md §Reader Table stale
 	// detection case 2).
+	//
+	// Match condition is (PID, PIDNamespace, ProcessStartTime) —
+	// all three must agree (cross-process.md §Stale Writer Recovery
+	// step 2). Matching only on (PID, PIDNamespace) would wipe a
+	// live reader's slot if the OS recycled deadPID to another
+	// in-namespace process that subsequently opened a read tx:
+	// new reader's slot has the same PID + namespace but a
+	// different ProcessStartTime (its own spawn-tick), so the
+	// startTime check distinguishes them and skips the clear.
 	if deadPID != 0 && deadNS != 0 && ourPIDNamespace != 0 && deadNS == ourPIDNamespace {
 		max := f.MaxReaders()
 		for i := range max {
@@ -119,6 +129,12 @@ func RecoverStaleWriter(f *File, ourPIDNamespace uint64) {
 				continue
 			}
 			if Load64(&slot.PIDNamespace) != deadNS {
+				continue
+			}
+			if Load64(&slot.ProcessStartTime) != deadStartTime {
+				// Same (PID, namespace) but different start time
+				// — PID recycled; this slot belongs to a
+				// different (live) process. Skip.
 				continue
 			}
 			// Spec slot-release ordering (§Reader Table slot

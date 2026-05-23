@@ -152,15 +152,19 @@ func TestRecoverStaleWriterClearsHeader(t *testing.T) {
 
 func TestRecoverStaleWriterClearsMatchingSlots(t *testing.T) {
 	// Seed three reader slots: one matches the dead writer's
-	// (PID, namespace), one matches PID but not namespace, one
-	// matches neither. Only the first should be cleared.
-	const deadPID, deadNS = uint64(444), uint64(42)
-	f := staleWriterFile(t, deadPID, 7, deadNS, 100)
+	// (PID, namespace, startTime), one matches PID + NS but not
+	// startTime (PID-reuse — see TestRecoverStaleWriterSkips-
+	// RecycledPIDSlots for the dedicated test), one matches PID
+	// but not namespace, one matches neither. Only the first
+	// should be cleared.
+	const deadPID, deadNS, deadStart = uint64(444), uint64(42), uint64(7)
+	f := staleWriterFile(t, deadPID, deadStart, deadNS, 100)
 
 	s0 := f.Slot(0)
 	Store64(&s0.TxnID, 0x111)
 	Store64(&s0.PID, deadPID)
 	Store64(&s0.PIDNamespace, deadNS)
+	Store64(&s0.ProcessStartTime, deadStart)
 	Store64(&s0.Heartbeat, 5_000)
 	Store64(&s0.HintEpoch, 0x222)
 
@@ -168,12 +172,14 @@ func TestRecoverStaleWriterClearsMatchingSlots(t *testing.T) {
 	Store64(&s1.TxnID, 0x333)
 	Store64(&s1.PID, deadPID)
 	Store64(&s1.PIDNamespace, deadNS+1) // different namespace
+	Store64(&s1.ProcessStartTime, deadStart)
 	Store64(&s1.Heartbeat, 6_000)
 
 	s2 := f.Slot(2)
 	Store64(&s2.TxnID, 0x555)
 	Store64(&s2.PID, 999) // different PID
 	Store64(&s2.PIDNamespace, deadNS)
+	Store64(&s2.ProcessStartTime, deadStart)
 
 	RecoverStaleWriter(f, deadNS)
 
@@ -202,6 +208,54 @@ func TestRecoverStaleWriterClearsMatchingSlots(t *testing.T) {
 	// Slot 2: untouched (different PID).
 	if got := Load64(&s2.TxnID); got != 0x555 {
 		t.Errorf("slot 2 TxnID = %x, want 0x555 (different PID)", got)
+	}
+}
+
+func TestRecoverStaleWriterSkipsRecycledPIDSlots(t *testing.T) {
+	// PID-reuse safety (cross-process.md §Stale Writer Recovery
+	// step 2): a slot matching (PID, PIDNamespace) but with a
+	// DIFFERENT ProcessStartTime belongs to a recycled-PID live
+	// reader, NOT the dead writer — recovery MUST NOT clear it.
+	// Without the ProcessStartTime term, recovery wipes the live
+	// reader's snapshot (snapshot loss).
+	const deadPID, deadNS, deadStart = uint64(444), uint64(42), uint64(0xAAAA)
+	const liveReaderStart = uint64(0xBBBB) // recycled PID, different start
+	f := staleWriterFile(t, deadPID, deadStart, deadNS, 100)
+
+	// Slot 0: belongs to the recycled-PID LIVE reader. Same PID
+	// and namespace as the dead writer, but different start time.
+	s0 := f.Slot(0)
+	Store64(&s0.TxnID, 0xCAFE)
+	Store64(&s0.PID, deadPID)
+	Store64(&s0.PIDNamespace, deadNS)
+	Store64(&s0.ProcessStartTime, liveReaderStart)
+	Store64(&s0.Heartbeat, 5_000)
+
+	// Slot 1: belongs to the actual dead writer's reader-tx (same
+	// PID, same namespace, same start time). MUST be cleared.
+	s1 := f.Slot(1)
+	Store64(&s1.TxnID, 0xDEAD)
+	Store64(&s1.PID, deadPID)
+	Store64(&s1.PIDNamespace, deadNS)
+	Store64(&s1.ProcessStartTime, deadStart)
+	Store64(&s1.Heartbeat, 6_000)
+
+	RecoverStaleWriter(f, deadNS)
+
+	// Slot 0: must NOT be touched (recycled-PID live reader).
+	if got := Load64(&s0.TxnID); got != 0xCAFE {
+		t.Errorf("slot 0 TxnID = %x, want 0xCAFE (recycled-PID live reader wiped — PID-reuse bug)", got)
+	}
+	if got := Load64(&s0.PID); got != deadPID {
+		t.Errorf("slot 0 PID = %d, want %d (live reader stomped)", got, deadPID)
+	}
+
+	// Slot 1: MUST have been cleared (dead writer's actual slot).
+	if got := Load64(&s1.TxnID); got != 0 {
+		t.Errorf("slot 1 TxnID = %x, want 0 (dead writer's slot not cleared)", got)
+	}
+	if got := Load64(&s1.PID); got != 0 {
+		t.Errorf("slot 1 PID = %d, want 0", got)
 	}
 }
 

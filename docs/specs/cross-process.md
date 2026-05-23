@@ -553,8 +553,16 @@ If dead, recovery:
    valid checksum). The crashed writer's partial commit is
    invisible — CoW guarantees the previous meta points to a
    consistent tree.
-2. Scan the reader table for slots with the dead writer's PID
-   (in the same PID namespace) and clear them.
+2. Scan the reader table for slots matching the dead writer by
+   `(PID, PIDNamespace, ProcessStartTime)` — all three must
+   agree with the corresponding header fields — and clear them.
+   Matching only on `(PID, PIDNamespace)` would wipe a live
+   reader's slot if the OS recycled the dead writer's PID to
+   another in-namespace process that subsequently opened a read
+   transaction (snapshot loss for that reader). The
+   ProcessStartTime term distinguishes PID lifetimes per the
+   same logic the reader-stale-detection same-namespace path
+   uses (§Reader Table case 1).
 3. Clear `WriterPID`, `WriterStartTime`, `WriterPIDNamespace`,
    `WriterHeartbeat`.
 
@@ -906,6 +914,12 @@ slow atomic-store latency. No syscalls.
   addresses. Typed atomics cannot be used here because the
   memory is a raw region in `MAP_SHARED` mmap visible across
   processes.
+  The single 32-bit shared-memory field
+  (`LockFileHeader.MaxReaders`) uses `atomic.LoadUint32` /
+  `atomic.StoreUint32` by the same convention. Its alignment
+  is guaranteed by `structs.HostLayout` placing it at offset 8
+  (4-byte aligned, sufficient for the architecture's u32
+  single-copy atomicity).
 
 **Memory-model caveat.** Go's memory model formally describes
 synchronization only on memory the Go runtime owns. Cross-
