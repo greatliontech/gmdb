@@ -288,6 +288,13 @@ encode/decode).
 Total size: `72 + (48 × MaxReaders)`. Default 4096 readers:
 `72 + 196608 = 196680` bytes (~192 KB).
 
+`MaxReaders` is bounded `[1, 65536]`. The lower bound is one slot
+(degenerate but legal); the upper bound caps the mmap at
+`72 + 48 × 65536 ≈ 3 MiB`, so a corrupted or maliciously-crafted
+header value cannot demand a petabyte-scale mmap. A header
+`MaxReaders` value outside this range is treated as `ErrCorrupted`
+by `Open`.
+
 The lock file is mmap'd `MAP_SHARED` by all processes for the
 reader table. The write lock is a separate concern via `flock()`.
 
@@ -307,6 +314,29 @@ Non-zero: determine whether the writer is still alive via
 `kill(pid, 0)` + `WriterStartTime` comparison (see Process Start
 Time). Dead or recycled: writer crashed; see Stale Writer
 Recovery.
+
+### Creator-side flock protocol
+
+The creator opens the file with `O_CREATE|O_EXCL`, then takes
+`flock(LOCK_EX)` and holds it across `ftruncate(2)` +
+`pwrite(header)` + `fsync(2)`; `LOCK_EX` is released only after
+the header has been published. Adopters take `flock(LOCK_SH)`
+immediately after open and validate the header under that lock.
+
+Because `open()` and `flock()` are separate POSIX syscalls, an
+adopter can land between the creator's `O_CREATE|O_EXCL` and
+its first `flock(LOCK_EX)` and observe `size < HeaderSize` or
+`Magic == 0` (`ftruncate` zero-fills the extended region, so the
+post-truncate / pre-write header reads as all-zero); this is
+mid-init, not corruption. Adopters retry with bounded
+exponential backoff (10 attempts capped at 256 ms each,
+≈ 800 ms total); budget exhaustion surfaces `ErrCorrupted` (a
+creator that crashed inside the open→flock window or external
+tampering left a zero-Magic file at this path).
+
+A failed creator (crash mid-init, or `initLockFile` error from
+syscall) unlinks the in-progress file before exit so subsequent
+adopters do not waste the retry budget on a known-stuck file.
 
 ## Write Lock
 
