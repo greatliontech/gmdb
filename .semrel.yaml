@@ -1,0 +1,3 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/greatliontech/semrel/refs/heads/main/config.schema.json
+version: v0
+development: true
