@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -52,6 +53,25 @@ type DB struct {
 	// re-Open is the recovery path: the new handle reads everything
 	// from disk and is internally consistent.
 	poisoned atomic.Bool
+
+	// closed is a heap-allocated *atomic.Bool shared by pointer with
+	// every txCleanupInfo and the dbCleanupInfo (leak-detection.md
+	// §Cleanup Behavior + §Close Ordering — clause-explicit
+	// invariants). Heap allocation is required because
+	// runtime.AddCleanup provides no ordering between the DB cleanup
+	// and the Tx cleanups that depend on observing it; an inline
+	// db.closed field would dangle if the DB were collected first.
+	//
+	// Close() sets *closed = true (release-store) BEFORE unmapping
+	// or stopping goroutines so any concurrent Tx cleanup or use-
+	// after-Close caller observes the close state and exits without
+	// touching torn-down resources.
+	closed *atomic.Bool
+
+	// cleanup is the runtime.AddCleanup handle for THIS *DB; Stop()'d
+	// by Close so a normal teardown doesn't fire the leak-warning
+	// path.
+	cleanup runtime.Cleanup
 }
 
 // Open opens the database at path. If the file does not exist, it is
@@ -176,7 +196,7 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 		// caller needs to tune them.
 	})
 
-	return &DB{
+	db := &DB{
 		file:          file,
 		root:          root,
 		pool:          pool,
@@ -186,53 +206,167 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 		currentMeta:   opened.Meta,
 		activeMetaIdx: opened.ActiveMetaIdx,
 		pgr:           opened.Pager,
-	}, nil
+		closed:        new(atomic.Bool),
+	}
+	// DB-level leak-detection cleanup. The cleanup info captures
+	// resources by pointer (not via *DB) so a leaked-then-collected
+	// DB doesn't nil-deref when the cleanup fires. The shared
+	// db.closed atomic is the gate: if Close() ran, the cleanup
+	// is Stop()'d AND a defensive Swap(true) returns true → cleanup
+	// exits silently.
+	db.cleanup = runtime.AddCleanup(db, dbCleanupFn, dbCleanupInfo{
+		closed:    db.closed,
+		coord:     coord,
+		lockFile:  lockFile,
+		pgr:       opened.Pager,
+		file:      file,
+		root:      root,
+		originPCs: captureOriginPCs(),
+	})
+	return db, nil
+}
+
+// dbCleanupInfo bundles the resources a leaked-DB cleanup needs to
+// tear down. Captures the shared *atomic.Bool by pointer (leak-
+// detection.md clause-explicit invariant); resource pointers are
+// independent of the *DB so a collected *DB doesn't dangle them.
+type dbCleanupInfo struct {
+	closed    *atomic.Bool
+	coord     *lock.Coord
+	lockFile  *lock.File
+	pgr       *pager.Pager
+	file      *os.File
+	root      *os.Root
+	originPCs []uintptr
+}
+
+// dbCleanupFn is the runtime.AddCleanup callback for a leaked *DB.
+// Swap(true) is the same gate as Close uses; whoever wins releases
+// the resources. If Close ran first, its Stop() also de-registered
+// the cleanup, so the callback usually doesn't fire at all — this
+// path covers the race where the cleanup was queued before Stop
+// could cancel it.
+//
+// Unlike the Tx cleanup, the DB cleanup CAN block on coord.Close
+// (which waits for goroutine done-channels). Per leak-detection.md
+// the non-blocking constraint is scoped to the Tx cleanup
+// (high-frequency); only one DB cleanup ever fires per *DB and the
+// drain is bounded by Options.LockRetryInterval +
+// Options.HeartbeatInterval.
+func dbCleanupFn(info dbCleanupInfo) {
+	if info.closed.Swap(true) {
+		// Close() ran first; nothing to tear down.
+		return
+	}
+	slog.Default().Warn(
+		"gmdb: DB handle leaked without Close",
+		"origin", formatStack(info.originPCs),
+	)
+	if info.coord != nil {
+		_ = info.coord.Close()
+	}
+	if info.lockFile != nil {
+		_ = info.lockFile.Close()
+	}
+	if info.pgr != nil {
+		_ = info.pgr.Close()
+	}
+	if info.file != nil {
+		_ = info.file.Close()
+	}
+	if info.root != nil {
+		_ = info.root.Close()
+	}
 }
 
 // Close releases all resources held by the DB handle. After Close, the
-// handle is unusable; subsequent Begin returns ErrClosed.
+// handle is unusable; subsequent Begin returns ErrClosed. Idempotent.
 //
-// Resource teardown order (cross-process.md §Heartbeat Goroutine
-// "Shutdown coordination" + the Close-releases clause-explicit
-// invariant):
+// Spec contract (leak-detection.md §Close Ordering clause-explicit
+// invariant + cross-process.md Close-releases invariant):
 //
-//  1. Coord.Close — drains the flock + heartbeat goroutines. The
-//     flock goroutine clears writer-header fields and unlocks if a
-//     writer was held at Close time. The heartbeat goroutine exits
-//     before the *File becomes unmappable. Both close-acks are
-//     synchronously awaited.
-//  2. lock.File.Close — munmaps the lock file and closes its fd.
-//     Safe only after step 1: a final heartbeat tick must not race
-//     the munmap (SIGSEGV).
-//  3. pager.Close — releases data-file mmap.
-//  4. data file close + root close.
+//  1. Store `*db.closed = true` (release-store on the shared
+//     *atomic.Bool). Visible to any subsequent Tx cleanup callback
+//     regardless of runtime.AddCleanup ordering between the DB and
+//     its Txs — they observe the close state and exit without
+//     touching torn-down resources.
+//  2. Drain the heartbeat + flock goroutines via Coord.Close (which
+//     blocks on done-channels). The flock goroutine clears writer-
+//     header fields and unlocks if a writer was held at Close time;
+//     the heartbeat goroutine exits before any unmap.
+//  3. Munmap the lock file. Safe only after step 2.
+//  4. Close pager (munmaps data file).
+//  5. Close data-file fd.
+//  6. Close *os.Root.
 //
-// Reversing 1 and 2 (close the lock file before draining the Coord
-// goroutines) is the classic SIGSEGV path the spec invariant
-// exists to prevent.
+// Steps 1 → 2 ordering: ANY swap is the public release-store. Steps
+// 2 → 3 ordering: the SIGSEGV path the spec exists to prevent
+// (final heartbeat tick on unmapped memory).
+//
+// Not safe to call concurrently with active write or batch
+// transactions in the same process; per leak-detection.md
+// §Close Ordering, callers must commit or rollback all
+// transactions before Close.
+//
+// Close-vs-dbCleanupFn race: the shared *db.closed atomic guards
+// against double-drain (cleanup's Swap(true) returns true if Close
+// won the CAS first; Close returns nil if the cleanup won the
+// Swap first). The race is unreachable under normal use — for
+// Close() to be invoked, *DB must be reachable from the calling
+// goroutine, but for dbCleanupFn to fire, GC must have determined
+// *DB unreachable. The gate exists as defense-in-depth against
+// runtime.AddCleanup ordering pathologies. See leak-detection.md
+// §Database Handle Leak Detection for the full discussion.
 func (db *DB) Close() error {
+	// Step 1 — release-store, atomic so the cleanup goroutines see
+	// it. CAS for idempotency: a second Close returns immediately.
+	if !db.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	// Capture resource pointers under db.mu so a concurrent Begin
+	// (which snapshots db.coord under db.mu) sees a consistent view
+	// — either pre-close (non-nil) or post-nil (nil). The captured
+	// locals are then used outside db.mu for the actual drain, which
+	// can take milliseconds.
 	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.coord != nil {
-		_ = db.coord.Close()
-		db.coord = nil
+	coord := db.coord
+	lockFile := db.lockFile
+	pgr := db.pgr
+	file := db.file
+	root := db.root
+	db.coord = nil
+	db.lockFile = nil
+	db.pgr = nil
+	db.file = nil
+	db.root = nil
+	db.mu.Unlock()
+
+	// Step 2 — drain goroutines. Coord.Close blocks until both the
+	// flock goroutine and the heartbeat goroutine have exited; with
+	// a writer held at Close time, the stopCh path clears the
+	// writer-header fields and issues flock(LOCK_UN) before exit.
+	if coord != nil {
+		_ = coord.Close()
 	}
-	if db.lockFile != nil {
-		_ = db.lockFile.Close()
-		db.lockFile = nil
+	// Step 3 — munmap the lock file.
+	if lockFile != nil {
+		_ = lockFile.Close()
 	}
-	if db.pgr != nil {
-		_ = db.pgr.Close()
-		db.pgr = nil
+	// Step 4 — release pager (munmaps data file).
+	if pgr != nil {
+		_ = pgr.Close()
 	}
-	if db.file != nil {
-		_ = db.file.Close()
-		db.file = nil
+	// Steps 5–6 — close fds.
+	if file != nil {
+		_ = file.Close()
 	}
-	if db.root != nil {
-		_ = db.root.Close()
-		db.root = nil
+	if root != nil {
+		_ = root.Close()
 	}
+
+	// Cancel the DB-level leak cleanup — we closed cleanly.
+	db.cleanup.Stop()
 	return nil
 }
 
@@ -253,6 +387,15 @@ func (db *DB) Meta() page.Meta {
 //   - ErrClosed if the DB's coordination goroutines have shut down.
 //   - ErrPoisoned if a previous tx's commit poisoned the handle.
 //
+// Internal structure: two short db.mu critical sections bracket the
+// (potentially long-blocking) coord.AcquireWriter call. The first
+// snapshots db.coord + db.pgr (race-safe vs Close which nil's them
+// under db.mu); the second post-acquire critical section captures
+// prev meta + builds the Tx + registers leak-detection cleanup. db.mu
+// is NOT held across AcquireWriter — doing so would let Close
+// deadlock waiting for db.mu while the coord's stopCh is closed but
+// the flock goroutine still holds the result-channel send.
+//
 // Read transactions are not yet wired (chunk 3 territory); calling
 // Begin(write=false) returns ErrReadOnly to signal the unimplemented
 // path explicitly.
@@ -260,6 +403,17 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 	if !write {
 		return nil, ErrReadOnly
 	}
+	// Fast-path close check. db.closed is the spec-tier
+	// *atomic.Bool gate (leak-detection.md §Close Ordering); a
+	// release-store at the top of Close makes this Load-true any
+	// time after Close begins. The subsequent snapshot under db.mu
+	// is still required: a Begin that interleaves between this
+	// Load and Close's CAS sees closed==false here but a nil coord
+	// after the snapshot — same ErrClosed result.
+	if db.closed.Load() {
+		return nil, ErrClosed
+	}
+
 	// Poison check before acquiring the cross-process lock so a
 	// poisoned handle does not block legitimate concurrent callers
 	// across processes.
@@ -267,18 +421,16 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 		return nil, ErrPoisoned
 	}
 
-	// Snapshot db.coord under db.mu so the read is synchronized with
-	// Close (which nil's db.coord under db.mu). If Close has already
-	// run, coord is nil — return ErrClosed without entering the
-	// goroutine path. If Close runs concurrently AFTER our snapshot,
-	// coord points to an already-closed Coord; its AcquireWriter
-	// returns lock.ErrClosed via the stopCh path, which we map below.
-	// Chunk 2.8 promotes this to a single db.closed atomic.Bool with
-	// a tighter ordering contract.
+	// Snapshot db.coord + db.pgr under db.mu so the read is
+	// synchronized with Close (which nil's both under db.mu). The
+	// captured pointers are stable for this Tx's lifetime
+	// (independent of subsequent Close calls that nil the *DB
+	// fields).
 	db.mu.Lock()
 	coord := db.coord
+	pgr := db.pgr
 	db.mu.Unlock()
-	if coord == nil {
+	if coord == nil || pgr == nil {
 		return nil, ErrClosed
 	}
 
@@ -301,24 +453,23 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 	defer db.mu.Unlock()
 
 	// Race-with-Close: if Close ran while we were waiting in
-	// AcquireWriter, the goroutine may have returned a grant moments
-	// before the stopCh path cleaned up — grant.Release on a Coord
-	// whose goroutine has exited is a no-op (channel close against
-	// nothing), but we still need to surface ErrClosed rather than
-	// hand back a Tx against a torn-down pager.
-	if db.pgr == nil {
+	// AcquireWriter, db.closed is now true. Release the grant we
+	// just got and surface ErrClosed rather than hand back a Tx
+	// against a torn-down pager.
+	if db.closed.Load() {
 		grant.Release()
 		return nil, ErrClosed
 	}
 
 	prevMeta := db.currentMeta
 	prevActive := db.activeMetaIdx
-	db.pgr.BeginTx()
+	pgr.BeginTx()
 
 	held := &atomic.Bool{}
 	held.Store(true)
 	tx := &Tx{
 		db:         db,
+		pgr:        pgr,
 		prevMeta:   prevMeta,
 		prevActive: prevActive,
 		newTxnID:   prevMeta.TxnID + 1,
@@ -327,11 +478,14 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 		grant:      grant,
 	}
 	// Wire the leak-detection cleanup per leak-detection.md. The
-	// cleanup info captures *Pager, *Grant, the shared held atomic,
-	// and the origin stack — never the *Tx itself
-	// (resurrection-forbidden).
+	// cleanup info captures the shared *db.closed atomic by pointer
+	// (clause-explicit invariant — required for cleanup to observe
+	// Close without nil-deref'ing through a potentially-collected
+	// *DB) plus *Pager, *Grant, the held atomic, and the origin
+	// stack. Never references *Tx itself (resurrection-forbidden).
 	tx.cleanup = runtime.AddCleanup(tx, txCleanupFn, txCleanupInfo{
-		pgr:       db.pgr,
+		closed:    db.closed,
+		pgr:       pgr,
 		grant:     grant,
 		held:      held,
 		originPCs: captureOriginPCs(),

@@ -17,4 +17,5 @@ cites are repointed at the new home, and the issue file is deleted.
 |------|-------|---------|
 | [keyspace-delete-missing-key](keyspace-delete-missing-key.md) | 5 | `Keyspace.Delete` / `SetKeyspace.Delete` / `SetKeyspace.DeleteValue` semantics on missing key — `ErrNotFound` vs silent no-op; needs a single decision applied uniformly. |
 | [setkeyspace-put-added-bool](setkeyspace-put-added-bool.md) | 6 | Whether `SetKeyspace.Put` should return `(added bool, err error)`; the membership probe is already paid by the insert. |
+| [slog-default-vs-spec](slog-default-vs-spec.md) | when DB gains an `Options.Logger` field (chunk 4+) | Cleanup callbacks use `slog.Default()`; spec describes a per-DB `*slog.Logger`. Wire `Options.Logger` through to cleanup-captured logger. |
 | [bitmap-rollback-undo-log](bitmap-rollback-undo-log.md) | when profiling shows BeginTx allocation pressure is material | `Bitmap.Snapshot()` clones the full detail+summary per `Pager.BeginTx()` — 8 MB at 256 GB MaxSize. Replace with an undo log if profiling shows the per-tx allocation is hot. |

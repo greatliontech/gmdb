@@ -54,35 +54,60 @@ Invariant: kind=clause-explicit;
     cleanups race the unmap and SIGSEGV.
 
 Invariant: kind=clause-explicit;
-  property=A `Commit()` or `Rollback()` on a `Tx` (or `Close()` on
-    a `DB`) cancels its `runtime.AddCleanup` callback before
-    releasing the resource;
-  from=this spec §Normal Close;
+  property=A `Commit()` or `Rollback()` on a `Tx` cancels its
+    `runtime.AddCleanup` callback (via `.Stop()`) BEFORE releasing
+    the resource. A `Close()` on a `DB` achieves the same property
+    via a different pattern: it sets the shared `*db.closed`
+    atomic to `true` BEFORE the resource drain and `.Stop()`s the
+    DB-level cleanup at the end; the cleanup callback itself
+    consults the same shared atomic and short-circuits when it
+    observes `true`. Both patterns prevent a cleanup from re-
+    releasing a resource the normal-close path is already
+    releasing;
+  from=this spec §Normal Close (Tx path) + §`Close()` Ordering
+    (DB path);
   violation=A cleanup that fires after a normal close re-releases
     the resource (e.g., re-clears a reader slot the next acquirer
     has taken over), introducing slot aliasing and snapshot
     corruption.
 
 Invariant: kind=clause-explicit;
-  property=Cleanup callbacks run on a GC background goroutine and
-    perform only non-blocking operations: atomic check of
-    `db.closed`, atomic store on reader slot, non-blocking channel
-    send to flock goroutine, `sync.Mutex.Unlock` of a lock the
-    leaked owner held (wait-free; not a contended acquisition),
-    and non-blocking diagnostic logging via the configured `slog`
-    handler. No mutex *acquisition* (no `Lock`/`RLock`/spin), no
-    blocking syscall (other than the slog handler's bounded
-    diagnostic write), no panic;
+  property=**Tx cleanup callbacks** run on a GC background
+    goroutine and perform only non-blocking operations: atomic
+    check of `db.closed`, atomic store on reader slot, non-
+    blocking channel send to flock goroutine, `sync.Mutex.Unlock`
+    of a lock the leaked owner held (wait-free; not a contended
+    acquisition), and non-blocking diagnostic logging via the
+    configured `slog` handler. No mutex *acquisition* (no
+    `Lock`/`RLock`/spin), no blocking syscall (other than the
+    slog handler's bounded diagnostic write), no panic. The DB
+    cleanup callback is a separate concern (see next invariant);
   from=this spec §Cleanup Behavior;
   violation=A blocking cleanup stalls all subsequent GC cleanups,
     backing up the whole process; a panicking cleanup aborts the
     program — the safety net becomes a single point of failure.
-    `sync.Mutex.Unlock` and the standard slog handlers are
-    explicitly admitted because (a) `Unlock` is wait-free and is
-    the only way a leak cleanup can release the resource it owns,
-    and (b) the §Cleanup Behavior contract itself requires writing
-    a warning, so a strict no-syscall reading would be
-    self-contradicting.
+
+Invariant: kind=clause-explicit;
+  property=The **DB cleanup callback** may perform a bounded
+    blocking drain — specifically the same goroutine-stop +
+    munmap + fd-close sequence as `Close()` — because exactly one
+    DB cleanup fires per `*DB` over the process lifetime, so it
+    cannot back up other cleanups in the way a per-`Tx` cleanup
+    could. The drain duration is bounded by
+    `Options.LockRetryInterval` (for the flock goroutine) +
+    `Options.HeartbeatInterval` (for the heartbeat goroutine).
+    Close + DB-cleanup racing is a caller-error pattern (a real
+    `*DB` leak requires a still-reachable handle the GC can't
+    reclaim mid-Close); the spec does not require synchronous
+    completion between them — Close may return while a racing
+    DB-cleanup is mid-drain;
+  from=this spec §Database Handle Leak Detection;
+  violation=A "no blocking" reading of the cleanup-callback rules
+    would forbid the only safe way to release per-`*DB`
+    resources (the heartbeat goroutine MUST be stopped before
+    the lock-file mmap is released, else SIGSEGV). The Tx-cleanup
+    non-blocking rule exists because Tx leaks are high-frequency;
+    DB leaks are low-frequency and one-shot.
 
 ## Transaction Leak Detection
 
@@ -177,9 +202,25 @@ Forbidden: mutex `Lock`/`RLock`/spin, blocking I/O, panic.
 holds open file descriptors, mmap regions, and the flock goroutine
 — process-scoped resources outliving any individual transaction.
 
-Same pattern: cleanup logs a warning with the Open stack trace,
-stops the flock goroutine, munmaps data + lock files, closes file
-descriptors. `Close()` cancels the cleanup.
+The cleanup logs a warning with the Open stack trace, stops the
+flock + heartbeat goroutines, munmaps data + lock files, and
+closes file descriptors. The Close-vs-cleanup coordination uses
+the shared-`*atomic.Bool` gate pattern (invariant 4): the cleanup
+calls `Swap(true)` on `*db.closed` — if the prior value was true
+(i.e., `Close()` already stored it via `CompareAndSwap(false,
+true)`), the cleanup exits silently with no drain. Otherwise the
+cleanup wins the gate, logs, and drains the resources itself.
+`Close()` additionally calls `db.cleanup.Stop()` at the end of
+its drain, but the gate is the load-bearing safety against
+double-drain — Stop is a courtesy that prevents the cleanup
+from firing at all on the common path.
+
+The Close-vs-cleanup race itself is unreachable under normal use:
+for `Close()` to be invoked, `*DB` must be reachable from the
+calling goroutine, but for the cleanup to fire, GC must have
+determined `*DB` unreachable. The gate exists as a defense-in-
+depth against `runtime.AddCleanup` ordering pathologies, not as
+a contended fast path.
 
 ## `Close()` Ordering
 

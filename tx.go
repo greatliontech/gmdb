@@ -19,7 +19,16 @@ import (
 // / Mutate are valid until Commit / Rollback completes; do not retain
 // them past tx close.
 type Tx struct {
-	db         *DB
+	db *DB
+
+	// pgr is captured at Begin so Tx methods don't race a concurrent
+	// db.Close (which nil's db.pgr under db.mu). Once Begin returns
+	// a *Tx, pgr is stable for the tx's lifetime; the pager's heap
+	// state survives independently of db.pgr nil'ing. Use-after-Close
+	// is gated by db.closed checks at method entry rather than by
+	// re-reading db.pgr.
+	pgr *pager.Pager
+
 	prevMeta   page.Meta
 	prevActive int
 	newTxnID   uint64
@@ -55,14 +64,14 @@ type Tx struct {
 // Deliberately omits the *Tx: runtime.AddCleanup rejects an arg that
 // reaches the obj, since resurrecting the obj would defeat collection.
 //
-// Captures *Pager and *Grant directly (not via *DB) so a concurrent
+// Captures the shared *db.closed atomic by pointer (leak-detection.md
+// clause-explicit invariant — required because runtime.AddCleanup
+// provides no ordering between the DB cleanup and Tx cleanups). Also
+// captures *Pager and *Grant directly (not via *DB) so a concurrent
 // DB.Close — which sets db.pgr = nil and db.coord = nil — does not
-// nil-deref this callback. *Pager and *Grant are heap-allocated and
-// remain alive as long as txCleanupInfo holds them; AbortTx and
-// Grant.Release both operate purely on Go-heap state (pager: slab
-// maps, bitmap, RPL chain; grant: a channel close) and are safe
-// under a concurrent DB.Close.
+// nil-deref this callback.
 type txCleanupInfo struct {
+	closed    *atomic.Bool
 	pgr       *pager.Pager
 	grant     *lock.Grant
 	held      *atomic.Bool
@@ -75,9 +84,17 @@ type txCleanupInfo struct {
 // Commit/Rollback's call to releaseGrant contests the same atomic, so
 // the cleanup is a no-op for transactions the caller closed normally.
 //
-// Note: Grant.Release is itself sync.Once-guarded so double-release on
-// the grant channel cannot panic; held still serves as the leak-
-// detection coordinator (warn iff WE are the releaser, not the user).
+// Spec contract (leak-detection.md §Cleanup Behavior clause-explicit
+// invariants): observing `*db.closed == true` MUST return without
+// touching the reader-table mmap or signalling the flock goroutine.
+// We DO log the leak warning either way — the warning is the user-
+// facing signal that they forgot to Commit/Rollback; suppressing it
+// during Close would lose the diagnostic.
+//
+// Non-blocking constraint: this callback runs on the GC background
+// goroutine. atomic ops + grant.Release (sync.Once → channel close)
+// + slog handler diagnostic write are all admitted; no mutex
+// acquisition, no blocking syscall, no panic.
 func txCleanupFn(info txCleanupInfo) {
 	if !info.held.CompareAndSwap(true, false) {
 		return
@@ -86,6 +103,15 @@ func txCleanupFn(info txCleanupInfo) {
 		"gmdb: write transaction leaked without Commit/Rollback",
 		"origin", formatStack(info.originPCs),
 	)
+	if info.closed.Load() {
+		// DB closed — its Close path drained the Coord goroutines
+		// and Released any held grants. Touching info.pgr (whose
+		// internal mmap is unmapped) would risk SIGSEGV on a future
+		// pager change that touches mmap from AbortTx; skip per
+		// spec invariant. The Coord-bound grant channel's other
+		// side is gone, so grant.Release would be a no-op anyway.
+		return
+	}
 	// Restore in-memory pager state to pre-tx, then release the
 	// cross-process write lock. AbortTx must precede grant.Release —
 	// once the grant is released the flock goroutine clears the
@@ -137,8 +163,8 @@ func (tx *Tx) AllocPage() (uint64, error) {
 	if err := tx.requireOpen(true); err != nil {
 		return 0, err
 	}
-	tx.db.pgr.SetCurrentTxnID(tx.newTxnID)
-	id, err := tx.db.pgr.AllocPage()
+	tx.pgr.SetCurrentTxnID(tx.newTxnID)
+	id, err := tx.pgr.AllocPage()
 	return id, mapPagerErr(err)
 }
 
@@ -148,7 +174,7 @@ func (tx *Tx) FreePage(id uint64) error {
 	if err := tx.requireOpen(true); err != nil {
 		return err
 	}
-	return mapPagerErr(tx.db.pgr.FreePage(id))
+	return mapPagerErr(tx.pgr.FreePage(id))
 }
 
 // Page resolves id to a borrowed byte slice. Resolution: slab (own
@@ -157,7 +183,7 @@ func (tx *Tx) Page(id uint64) ([]byte, error) {
 	if err := tx.requireOpen(false); err != nil {
 		return nil, err
 	}
-	return tx.db.pgr.Page(id), nil
+	return tx.pgr.Page(id), nil
 }
 
 // CoW copies the content of srcID into a fresh slab buffer keyed at
@@ -167,7 +193,7 @@ func (tx *Tx) CoW(srcID, dstID uint64) ([]byte, error) {
 	if err := tx.requireOpen(true); err != nil {
 		return nil, err
 	}
-	buf, err := tx.db.pgr.CoW(srcID, dstID)
+	buf, err := tx.pgr.CoW(srcID, dstID)
 	return buf, mapPagerErr(err)
 }
 
@@ -179,7 +205,7 @@ func (tx *Tx) AllocSlab(id uint64) ([]byte, error) {
 	if err := tx.requireOpen(true); err != nil {
 		return nil, err
 	}
-	buf, err := tx.db.pgr.AllocSlab(id)
+	buf, err := tx.pgr.AllocSlab(id)
 	return buf, mapPagerErr(err)
 }
 
@@ -189,7 +215,7 @@ func (tx *Tx) Mutate(id uint64) ([]byte, error) {
 	if err := tx.requireOpen(true); err != nil {
 		return nil, err
 	}
-	buf, err := tx.db.pgr.Mutate(id)
+	buf, err := tx.pgr.Mutate(id)
 	return buf, mapPagerErr(err)
 }
 
@@ -207,9 +233,9 @@ func (tx *Tx) Commit() error {
 	tx.cleanup.Stop()
 	defer tx.releaseGrant()
 	tx.closed = true
-	tx.db.pgr.SetCurrentTxnID(tx.newTxnID)
+	tx.pgr.SetCurrentTxnID(tx.newTxnID)
 	flags := tx.prevMeta.Flags
-	result, err := tx.db.pgr.Commit(pager.CommitParams{
+	result, err := tx.pgr.Commit(pager.CommitParams{
 		NewTxnID:     tx.newTxnID,
 		KeyspaceRoot: tx.prevMeta.KeyspaceRoot,
 		NumKeyspaces: tx.prevMeta.NumKeyspaces,
@@ -241,7 +267,7 @@ func (tx *Tx) Commit() error {
 	tx.db.currentMeta = result.Meta
 	tx.db.activeMetaIdx = result.ActiveMetaIdx
 	// Re-seed commit state for the next tx.
-	tx.db.pgr.SetCommitState(result.Meta.HighWaterMark, result.Meta.MaxSize, result.Meta.TxnID)
+	tx.pgr.SetCommitState(result.Meta.HighWaterMark, result.Meta.MaxSize, result.Meta.TxnID)
 	tx.db.mu.Unlock()
 	return nil
 }
@@ -259,7 +285,7 @@ func (tx *Tx) Rollback() error {
 	tx.cleanup.Stop()
 	defer tx.releaseGrant()
 	tx.closed = true
-	tx.db.pgr.AbortTx()
+	tx.pgr.AbortTx()
 	return nil
 }
 
@@ -269,6 +295,18 @@ func (tx *Tx) requireOpen(needsWrite bool) error {
 	}
 	if needsWrite && !tx.writable {
 		return ErrReadOnly
+	}
+	// Use-after-Close graceful-fail. Per leak-detection.md
+	// §Close Ordering, Close is not safe concurrent with active
+	// transactions in the same process — but a buggy caller still
+	// returns ErrClosed rather than SIGSEGV'ing on the now-unmapped
+	// mmap. The check is atomic and race-clean; the eventual pager
+	// op below this point still races a concurrent Close that
+	// hasn't yet stored db.closed, but tx.pgr (captured at Begin)
+	// is a stable Go-heap pointer so the field access itself is
+	// race-clean.
+	if tx.db.closed.Load() {
+		return ErrClosed
 	}
 	return nil
 }
