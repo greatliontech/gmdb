@@ -149,6 +149,27 @@ Invariant: kind=clause-explicit;
     or compiler reordering can produce reader-slot states the
     detection logic doesn't anticipate.
 
+Invariant: kind=clause-explicit;
+  property=Every process that mmaps a lock file does so with
+    size = 72 + (48 × LockFileHeader.MaxReaders), where
+    MaxReaders is the value of the lock file's MaxReaders field
+    at the moment the mmap is established. The mmap size is
+    established once at Open and is never resized; MaxReaders is
+    immutable for the life of the lock file (re-derivable from
+    the on-disk header by any opener);
+  from=this spec §Lock File Layout (size formula) and §Lock File
+    Lifecycle (MaxReaders is NOT in the data file — it is a
+    runtime coordination property read from the lock-file
+    header);
+  violation=A mmap smaller than the header dictates makes
+    high-index reader slots invisible to writer scans
+    (false-stale clears against slots the scanner cannot see;
+    legitimately-alive readers missed; reader-slot exhaustion
+    surfacing prematurely). A mmap larger than the file's
+    on-disk size SIGBUSes the process on first access to the
+    over-mapped region, defeating the cooperatively-cancellable
+    design.
+
 ## Lock File Layout
 
 ```
