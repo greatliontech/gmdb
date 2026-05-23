@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -324,6 +325,30 @@ func tryAdoptExisting(p OpenParams) (*File, error) {
 	return out, nil
 }
 
+// createInitHookForTest is a test-only injection point invoked
+// between the creator's O_CREATE|O_EXCL and its first flock(LOCK_EX).
+// Production paths leave the pointer nil. Tests use
+// SetCreateInitHookForTest to exercise the adopter-side
+// errPartialInit retry success branch: a concurrent adopter that
+// lands inside the open→flock window must converge via backoff retry,
+// not return ErrCorrupted.
+//
+// Storage is atomic.Pointer so the hook setter races safely against
+// concurrent createAndInit calls — required by tests that spawn the
+// creator in a goroutine before installing the cleanup.
+var createInitHookForTest atomic.Pointer[func()]
+
+// SetCreateInitHookForTest installs (or clears with nil) the
+// createAndInit injection point. Tests should restore the prior
+// value via t.Cleanup(func() { SetCreateInitHookForTest(nil) }).
+func SetCreateInitHookForTest(hook func()) {
+	if hook == nil {
+		createInitHookForTest.Store(nil)
+		return
+	}
+	createInitHookForTest.Store(&hook)
+}
+
 // createAndInit creates Base via Root.OpenFile with O_CREATE|O_EXCL,
 // takes flock(LOCK_EX) immediately, and inits the file under the
 // lock so adopters in any process taking LOCK_SH block until init
@@ -355,6 +380,10 @@ func createAndInit(p OpenParams) (*File, error) {
 			_ = p.Root.Remove(p.Base)
 		}
 	}()
+
+	if hook := createInitHookForTest.Load(); hook != nil {
+		(*hook)()
+	}
 
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		return nil, fmt.Errorf("lock: flock(LOCK_EX) on freshly-created %q: %w", p.Base, err)

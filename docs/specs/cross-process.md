@@ -127,6 +127,41 @@ Invariant: kind=clause-explicit;
     "cooperatively cancellable" property breaks.
 
 Invariant: kind=clause-explicit;
+  property=The flock goroutine clears `WriterPID`,
+    `WriterStartTime`, and `WriterPIDNamespace` (all to 0) BEFORE
+    issuing `flock(LOCK_UN)`. Equivalently, while this process
+    holds `LOCK_EX`, `WriterPID != 0` implies the publication is
+    live and ours, and `WriterPID == 0` implies we are mid-clear
+    or pre-publish — but `LOCK_EX` is never released with stale
+    `WriterPID` set;
+  from=this spec §Write Lock step 4 (release path);
+  violation=A peer process that acquires `flock(LOCK_EX)`
+    immediately after our `LOCK_UN` reads our stale `WriterPID`
+    and runs stale-writer-recovery against what it concludes is a
+    crashed writer — but the writer those fields named is *us*,
+    which has cleanly finished and released. Recovery clears
+    state mid-tx for a newly-granted live writer, or worse,
+    treats the peer's fresh ownership as a continuation of the
+    "stale" state and skips initialisation.
+
+Invariant: kind=clause-explicit;
+  property=When `Close()` runs while the flock goroutine holds
+    `LOCK_EX`, the goroutine clears the writer-header fields and
+    issues `flock(LOCK_UN)` before exiting; `Close()` blocks
+    until the goroutine has exited (i.e., `doneCh` closed). This
+    is the application of the clear-before-unlock invariant to
+    the stopCh-during-hold path;
+  from=this spec §Write Lock step 4 (stopCh branch);
+  violation=`Close()` returning with the kernel-side `LOCK_EX`
+    still held (released only when the process exits or the fd
+    is finally closed by GC) lets peer processes block
+    indefinitely on `flock(LOCK_EX|LOCK_NB)` retries for a writer
+    this process has already torn down. If the application keeps
+    the data-file open after `db.Close()` (e.g., for `Check`
+    or `CopyTo`), the held flock is permanent for the lifetime
+    of the data-file fd in the worst case.
+
+Invariant: kind=clause-explicit;
   property=Stale writer recovery only proceeds when the writer is
     confirmed dead via same-namespace `kill(pid, 0)` returning
     `ESRCH` (plus `WriterStartTime` mismatch on PID reuse) or
@@ -394,13 +429,18 @@ Loop:
       - On any other error: send the error to `req.result` and
         loop.
 3. Store `WriterPID`, `WriterStartTime`, `WriterPIDNamespace` in
-   the lock-file header; send `nil` on `req.result` — writer
-   holds the lock.
+   the lock-file header (relative store order is not load-bearing
+   — peers inspect all three jointly under §Stale Writer Recovery,
+   unlike the reader-slot acquire sequence whose order *is*
+   load-bearing — see §Reader Table (slot acquire) for the
+   asymmetry); send `nil` on `req.result` — writer holds the
+   lock.
 4. `select` on (writer's release channel, `db.stopCh`).
    - Release: clear `WriterPID` / `WriterStartTime` /
-     `WriterPIDNamespace`, `flock(LOCK_UN)`, loop to step 1.
-   - `db.stopCh`: clear writer header fields, `flock(LOCK_UN)`,
-     exit.
+     `WriterPIDNamespace` *before* `flock(LOCK_UN)` (see the
+     clear-before-unlock invariant), then loop to step 1.
+   - `db.stopCh`: clear writer header fields *before*
+     `flock(LOCK_UN)` (same invariant), then exit.
 
 The non-blocking + ticker pattern is a small CPU/syscall cost
 (`Options.LockRetryInterval`, default 50 ms; one extra syscall per

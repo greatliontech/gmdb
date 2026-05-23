@@ -1,0 +1,346 @@
+package lock
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// ErrClosed is returned by AcquireWriter when the Coord is closed
+// before the call can be served — either because Close ran before the
+// request entered the goroutine, or because Close raced an in-flight
+// request and the goroutine exited before granting.
+var ErrClosed = errors.New("lock: coord closed")
+
+// defaultRetryInterval bounds Close() and per-writer ctx-cancellation
+// latency under sustained cross-process contention. The goroutine
+// burns one wasted flock(LOCK_EX|LOCK_NB) syscall per tick while
+// another process holds the lock; 50 ms keeps Close-latency at one
+// tick worst-case while keeping the contended-syscall rate at 20/s.
+const defaultRetryInterval = 50 * time.Millisecond
+
+// Coord owns cross-process write-lock acquisition for one *File. A
+// single "flock goroutine" runs for the lifetime of the Coord and is
+// the only goroutine in the process that ever calls flock() on the
+// lock file (cross-process.md §Write Lock invariant). Writers queue
+// via AcquireWriter; the goroutine grants one at a time, writes the
+// writer-identity fields into the lock-file header under flock(LOCK_EX),
+// and clears them before releasing the flock.
+//
+// Lifecycle:
+//   - NewCoord starts the goroutine. The Coord borrows *File — the
+//     caller retains ownership and must not Close the *File until
+//     after Coord.Close returns.
+//   - AcquireWriter is safe to call from any goroutine; concurrent
+//     callers are serialised by the channel into the flock goroutine.
+//   - Close stops the goroutine. If the lock is held when Close runs,
+//     the goroutine clears the header and releases flock before exit.
+//     Close blocks until the goroutine has fully exited so the caller
+//     can subsequently unmap / close the *File without racing the
+//     final unlock.
+type Coord struct {
+	f         *File
+	pid       uint64
+	startTime uint64
+	pidNS     uint64
+
+	writerCh chan writerRequest
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+
+	retryInterval time.Duration
+
+	closeOnce sync.Once
+}
+
+// writerRequest is the in-process message from a caller to the flock
+// goroutine. The caller allocates all three channels per call so two
+// in-flight requests cannot cross-signal each other.
+type writerRequest struct {
+	ctx     context.Context
+	release chan struct{} // closed by Grant.Release; signals step-4 release
+	result  chan error    // single value: nil = grant, non-nil = denied
+}
+
+// Grant is returned by AcquireWriter on success. Release MUST be
+// called exactly once per Grant when the writer is done — failing to
+// call Release leaves the flock held until Coord.Close.
+//
+// Release is safe to call from any goroutine and is idempotent
+// (sync.Once-guarded). Calling Release after Coord.Close runs
+// `close(g.release)` against a no-longer-listening goroutine; the
+// close itself is non-panicking because the goroutine never closes
+// `release` — only the caller side does, via Grant.Release when a
+// Grant escapes or via AcquireWriter's ctx-cancel drain path when
+// it does not. Two caller-side close sites both flow through
+// sync.Once-guarded code (Grant.once for Release; the drain path
+// is single-shot per call), so no two closes ever race. A future
+// re-design must preserve "no goroutine-side close" — that is the
+// invariant that makes Release-after-Close non-panicking. The
+// goroutine's stopCh path is what actually releases the kernel
+// flock during Close.
+type Grant struct {
+	release chan<- struct{}
+	once    sync.Once
+}
+
+// Release signals the flock goroutine to clear the writer-header
+// fields and release flock(LOCK_UN). Idempotent.
+func (g *Grant) Release() {
+	if g == nil {
+		return
+	}
+	g.once.Do(func() { close(g.release) })
+}
+
+// CoordOptions configures NewCoord. The PID/ProcessStartTime/
+// PIDNamespace are the caller's *cached* identity values, computed
+// once at db.Open and passed in here — see cross-process.md §Process
+// Start Time and §PID Namespace Awareness for the caching rationale.
+// The Coord does not re-derive them per grant.
+type CoordOptions struct {
+	// PID is the value written into the lock-file's WriterPID field
+	// on grant. Typically uint64(os.Getpid()). Zero is allowed but
+	// causes peer-process stale detection to route through the
+	// heartbeat path (see cross-process.md §Stale writer recovery,
+	// case 2).
+	PID uint64
+
+	// ProcessStartTime is the value written into WriterStartTime.
+	// Sourced via lock.ProcessStartTime(os.Getpid()); on error the
+	// caller passes 0 and peer stale-detection falls back to the
+	// heartbeat path.
+	ProcessStartTime uint64
+
+	// PIDNamespace is the value written into WriterPIDNamespace.
+	// Sourced via lock.PIDNamespace(); 0 on non-Linux or hardened-
+	// sandbox /proc-unavailable hosts.
+	PIDNamespace uint64
+
+	// RetryInterval is the flock(LOCK_EX|LOCK_NB) retry tick. Zero ⇒
+	// defaultRetryInterval (50 ms). Bounds Close() and per-writer
+	// ctx-cancellation latency under sustained contention.
+	RetryInterval time.Duration
+}
+
+// NewCoord constructs a Coord and starts its flock goroutine. The
+// goroutine runs until Close is called. The caller retains ownership
+// of f — Close on the Coord does not close the underlying *File.
+func NewCoord(f *File, opts CoordOptions) *Coord {
+	retry := opts.RetryInterval
+	if retry <= 0 {
+		retry = defaultRetryInterval
+	}
+	c := &Coord{
+		f:             f,
+		pid:           opts.PID,
+		startTime:     opts.ProcessStartTime,
+		pidNS:         opts.PIDNamespace,
+		writerCh:      make(chan writerRequest),
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
+		retryInterval: retry,
+	}
+	go c.run()
+	return c
+}
+
+// Close stops the flock goroutine and waits for it to exit. If a
+// writer holds the lock at Close time, the goroutine clears the
+// writer-header fields and releases flock before returning — so the
+// next opener does not see a (PID set, flock free) inconsistency
+// (cross-process.md entailed invariant: header write/clear is paired
+// with flock acquire/release under LOCK_EX).
+//
+// Idempotent.
+func (c *Coord) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.stopCh)
+		<-c.doneCh
+	})
+	return nil
+}
+
+// AcquireWriter blocks until the flock goroutine grants the write
+// lock, ctx fires, or the Coord is closed. On success the returned
+// *Grant.Release MUST be called when the writer is done.
+//
+// Cancellation semantics. If ctx fires after the request has been
+// queued, AcquireWriter does not leak a held flock: it drains the
+// result channel to discover whether the goroutine had already
+// granted, and closes the release channel in that case so the
+// goroutine immediately clears + unlocks.
+//
+// On ErrClosed, no flock is held and no header fields were written
+// against this caller — Close ordering guarantees that a request
+// observed as denied via stopCh was never granted.
+func (c *Coord) AcquireWriter(ctx context.Context) (*Grant, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, context.Cause(ctx)
+	}
+
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	req := writerRequest{ctx: ctx, release: release, result: result}
+
+	select {
+	case c.writerCh <- req:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	case <-c.stopCh:
+		return nil, ErrClosed
+	}
+
+	select {
+	case err := <-result:
+		if err != nil {
+			return nil, err
+		}
+		return &Grant{release: release}, nil
+	case <-ctx.Done():
+		// ctx fired after submit. The goroutine may have already
+		// granted (and is now in step 4 holding flock). Drain to find
+		// out — and release on our behalf if so. The select on stopCh
+		// covers the (rare) case where the goroutine shut down before
+		// processing our request: stopCh ensures we don't block
+		// forever on result.
+		select {
+		case err := <-result:
+			if err == nil {
+				close(release)
+			}
+		case <-c.stopCh:
+			// Goroutine already exited; if it had granted us, its
+			// stopCh path cleared the header and released flock —
+			// nothing left for us to do.
+		}
+		return nil, context.Cause(ctx)
+	case <-c.stopCh:
+		// Goroutine exited before granting. No flock held; no header
+		// fields written. The request itself sits abandoned in the
+		// goroutine-receive side of writerCh (which is unbuffered, so
+		// either the goroutine did receive it before exiting — in
+		// which case it ran through to a result write or to its stopCh
+		// branch — or our send case wouldn't have selected). Either
+		// way, no held resources.
+		return nil, ErrClosed
+	}
+}
+
+// run is the flock goroutine's main loop. It is the only goroutine in
+// the process permitted to call flock() on c.f.
+func (c *Coord) run() {
+	defer close(c.doneCh)
+	ticker := time.NewTicker(c.retryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case req := <-c.writerCh:
+			if c.process(req, ticker.C) {
+				return
+			}
+		}
+	}
+}
+
+// process handles one writer request end-to-end. Returns true iff
+// stopCh fired during processing — in that case any held flock has
+// already been released and the goroutine should exit.
+//
+// Send-on-result discipline: exactly one value is sent to req.result
+// per call, except on the stopCh-during-step-4 branch where the result
+// was sent at grant time (step 3) and the stopCh return signals the
+// goroutine to exit after releasing flock. The acquireLoop-stopCh
+// branch returns true *without* a result send (caller's outer
+// AcquireWriter select handles stopCh directly).
+func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
+	// Step 2a: pre-flock cancellation check. An optimisation, not a
+	// correctness guarantee — the ctx can race during step 2b's
+	// EWOULDBLOCK loop, which has its own ctx select.
+	if err := req.ctx.Err(); err != nil {
+		req.result <- context.Cause(req.ctx)
+		return false
+	}
+
+	// Step 2b: non-blocking acquisition with retry. cross-process.md
+	// §Write Lock invariant: never blocking flock(LOCK_EX) — the
+	// LOCK_NB variant lets us interleave the ticker / ctxDone / stopCh
+	// select between retries.
+	//
+	// EINTR handling: LOCK_NB shouldn't sleep, but the Go runtime's
+	// SIGURG-based preemption can interrupt the syscall and surface
+	// EINTR. Treat it like "no decision yet" — retry immediately
+	// without consuming a tick (the kernel didn't determine
+	// contention; we should not stall a writer on a signal artifact).
+	// The pre-retry non-blocking select keeps stopCh/ctx responsive
+	// even under a hypothetical sustained EINTR stream — a fully-
+	// preempting kernel still cannot starve shutdown.
+	for {
+		err := syscall.Flock(int(c.f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, syscall.EINTR) {
+			select {
+			case <-c.stopCh:
+				return true
+			case <-req.ctx.Done():
+				req.result <- context.Cause(req.ctx)
+				return false
+			default:
+				continue
+			}
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			req.result <- err
+			return false
+		}
+		select {
+		case <-tick:
+			continue
+		case <-req.ctx.Done():
+			req.result <- context.Cause(req.ctx)
+			return false
+		case <-c.stopCh:
+			return true
+		}
+	}
+
+	// Step 3: publish writer identity. Order among these three is NOT
+	// load-bearing — same-namespace stale-writer detection inspects
+	// all three jointly under cross-process.md §Stale Writer Recovery,
+	// unlike reader-slot acquire (cross-process.md §Reader Table)
+	// whose Heartbeat→HintEpoch→PIDNamespace→ProcessStartTime→PID
+	// ordering IS load-bearing. The flock-as-mutex is what makes the
+	// asymmetry safe: no peer can observe these fields without first
+	// taking LOCK_SH or LOCK_EX, both of which we exclude via our held
+	// LOCK_EX. The publish-before-flock-release ordering is what's
+	// load-bearing (the clear-before-unlock invariant, step 4).
+	c.f.SetWriterPID(c.pid)
+	c.f.SetWriterStartTime(c.startTime)
+	c.f.SetWriterPIDNamespace(c.pidNS)
+	req.result <- nil
+
+	// Step 4: hold until release or stopCh.
+	stopped := false
+	select {
+	case <-req.release:
+	case <-c.stopCh:
+		stopped = true
+	}
+
+	// Clear header BEFORE unlock — entailed invariant: a peer that
+	// observes WriterPID != 0 under LOCK_SH must find LOCK_EX still
+	// held. Clear-then-unlock preserves that ordering even under
+	// rapid LOCK_EX hand-off across processes.
+	c.f.SetWriterPID(0)
+	c.f.SetWriterStartTime(0)
+	c.f.SetWriterPIDNamespace(0)
+	_ = syscall.Flock(int(c.f.Fd()), syscall.LOCK_UN)
+	return stopped
+}
