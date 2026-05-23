@@ -373,6 +373,21 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 		}
 	}
 
+	// Step 2c: stale-writer recovery. Now that we hold LOCK_EX, any
+	// non-zero WriterPID in the header MUST be stale — the clear-
+	// before-unlock invariant (cross-process.md §Invariants)
+	// guarantees a clean releaser stores PID = 0 before LOCK_UN, so
+	// a non-zero PID we observe here is from a process that crashed
+	// or was killed without reaching its step-4 cleanup. RecoverStale-
+	// Writer clears the header and (if same-namespace) cleans up any
+	// reader slots owned by the dead writer. This is the only place
+	// in the lock package that ever issues a same-OFD reader-slot
+	// clear; activating it before the publish ensures step-3's
+	// header values aren't immediately overwritten by recovery.
+	if c.f.WriterPID() != 0 {
+		RecoverStaleWriter(c.f, c.pidNS)
+	}
+
 	// Step 3: publish writer identity. Order among these three is NOT
 	// load-bearing — same-namespace stale-writer detection inspects
 	// all three jointly under cross-process.md §Stale Writer Recovery,
@@ -414,18 +429,51 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 	// new holder's clock).
 	c.holdingWriter.Store(false)
 
-	// Clear header BEFORE unlock — entailed invariant: a peer that
-	// observes WriterPID != 0 under LOCK_SH must find LOCK_EX still
-	// held. Clear-then-unlock preserves that ordering even under
-	// rapid LOCK_EX hand-off across processes. WriterHeartbeat is
-	// NOT cleared — stale-detection only consults it when WriterPID
-	// != 0, so leaving it as the last-known value is harmless and
-	// avoids a redundant atomic store.
+	// Clear header BEFORE unlock — clause-explicit invariant
+	// (cross-process.md §Invariants): a peer that acquires LOCK_EX
+	// immediately after our LOCK_UN must NOT observe stale
+	// WriterPID. Clear-then-unlock preserves that even under rapid
+	// LOCK_EX hand-off across processes. WriterHeartbeat is NOT
+	// cleared on normal release — stale-detection only consults it
+	// when WriterPID != 0, so leaving the last-known value avoids a
+	// redundant atomic store. (Recovery-side clearing differs and
+	// does clear all four fields; see RecoverStaleWriter.)
 	c.f.SetWriterPID(0)
 	c.f.SetWriterStartTime(0)
 	c.f.SetWriterPIDNamespace(0)
+
+	// Release test hook fires AFTER the header clear and BEFORE the
+	// LOCK_UN syscall — i.e., inside the clear-before-unlock window.
+	// Production paths leave the pointer nil. Tests use
+	// SetReleaseHookForTest to install a witness pause so a peer
+	// goroutine can verify (a) the header is already cleared and
+	// (b) the flock is still held — directly enforcing the
+	// clear-before-unlock invariant. See recovery_test.go's
+	// TestClearBeforeUnlockOrdering.
+	if hook := releaseHookForTest.Load(); hook != nil {
+		(*hook)()
+	}
+
 	_ = syscall.Flock(int(c.f.Fd()), syscall.LOCK_UN)
 	return stopped
+}
+
+// releaseHookForTest is the post-clear / pre-unlock injection point.
+// Production paths leave the pointer nil. atomic.Pointer storage so
+// concurrent SetReleaseHookForTest does not race the goroutine's
+// Load. cf. lock.createInitHookForTest.
+var releaseHookForTest atomic.Pointer[func()]
+
+// SetReleaseHookForTest installs (or clears with nil) the post-clear
+// / pre-unlock test injection point in the flock-goroutine's release
+// path. Tests must restore the prior value via t.Cleanup. See
+// recovery_test.go's TestClearBeforeUnlockOrdering for usage.
+func SetReleaseHookForTest(hook func()) {
+	if hook == nil {
+		releaseHookForTest.Store(nil)
+		return
+	}
+	releaseHookForTest.Store(&hook)
 }
 
 // heartbeat is the periodic-refresh goroutine started by NewCoord
@@ -464,10 +512,10 @@ func (c *Coord) heartbeat() {
 }
 
 // RegisterReaderSlot adds slot index i to the heartbeat goroutine's
-// active list. Callers (the read-tx Begin path landing in chunk
-// 2.6+) invoke this AFTER successful slot acquisition. The heartbeat
-// goroutine refreshes the slot's Heartbeat field on each subsequent
-// tick until UnregisterReaderSlot is called.
+// active list. Callers (the read-tx Begin path) invoke this AFTER
+// successful slot acquisition. The heartbeat goroutine refreshes
+// the slot's Heartbeat field on each subsequent tick until
+// UnregisterReaderSlot is called.
 //
 // No deduplication: registering the same index twice will produce
 // two heartbeat writes per tick (harmless — both stores write the
