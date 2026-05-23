@@ -15,4 +15,5 @@ cites are repointed at the new home, and the issue file is deleted.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [refactor-design-to-specs](refactor-design-to-specs.md) | next session | Split monolithic `docs/design.md` (5155 lines) + `docs/set-keyspace.md` into structured `docs/specs/*.md` with explicit invariants; bootstrap `docs/plans/`. |
+| [keyspace-delete-missing-key](keyspace-delete-missing-key.md) | 5 | `Keyspace.Delete` / `SetKeyspace.Delete` / `SetKeyspace.DeleteValue` semantics on missing key — `ErrNotFound` vs silent no-op; needs a single decision applied uniformly. |
+| [setkeyspace-put-added-bool](setkeyspace-put-added-bool.md) | 6 | Whether `SetKeyspace.Put` should return `(added bool, err error)`; the membership probe is already paid by the insert. |

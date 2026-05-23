@@ -1,0 +1,278 @@
+# Set Keyspace Storage
+
+A SetKeyspace maps each key to a **sorted set of values**. This spec
+covers the on-disk storage strategies (subpage and nested B+tree),
+the promotion/demotion thresholds between them, fixed-size value
+sets, and the SetKeyspace-specific encoding for secondary-index
+primary keys.
+
+Scope:
+- Subpage format (variable and fixed-size).
+- Nested B+tree reference cells.
+- Promotion / demotion rules.
+- Indexes-on-SetKeyspaces PK encoding.
+
+The user-facing API split between `Keyspace` and `SetKeyspace` lives
+in `keyspaces.md` and `api-surface.md`. Range delete on
+SetKeyspaces uses the bulk-free mechanism described here plus the
+range-delete walk of `range-delete.md`. Indexing semantics for
+SetKeyspaces live in `indexing.md`.
+
+SetKeyspaces are a general-purpose data primitive for set-shaped
+data: graph adjacency lists, inverted-index postings lists,
+many-to-many relationships, pub/sub subscription registries,
+Redis-ZSET-shaped storage (score-prefixed members), and audit logs
+per entity. **SetKeyspace is not the secondary-index mechanism** —
+secondary indexes use the dedicated indexing subsystem
+(`indexing.md`).
+
+## Invariants
+
+Invariant: kind=clause-explicit;
+  property=Empty value sets do not exist on disk, not even
+    transiently within a write transaction. The last `DeleteValue`
+    for a key also removes the key cell from its parent leaf;
+  from=this spec §Demotion;
+  violation=A "valued" key with zero stored values yields no rows on
+    iteration but `Has(key)` returns true — the user-visible
+    membership model breaks (set with no elements is observationally
+    indistinguishable from a non-existent key, yet the engine
+    reports it as existing).
+
+Invariant: kind=clause-explicit;
+  property=A subpage stores values in sorted (lexicographic) order;
+    a nested B+tree's keys are the set values in sorted order with
+    empty (zero-length) values;
+  from=this spec §Storage Strategy + §Subpage Format;
+  violation=An unsorted subpage breaks `HasValue` binary search
+    (membership false-negative); duplicate or wrong-order entries in
+    a nested B+tree cause range and set-cursor iteration to skip or
+    repeat values.
+
+Invariant: kind=clause-explicit;
+  property=When a SetKeyspace is created with non-zero
+    `FixedValueSize`, every value stored in any subpage or nested
+    B+tree leaf for that keyspace is exactly that many bytes — and
+    no subpage entry or nested leaf cell carries a per-value
+    `ValueLen` prefix;
+  from=this spec §Fixed-Size Value Sets;
+  violation=A variable-size value smuggled into a fixed-size
+    SetKeyspace decodes garbage entries (the binary-search direct
+    offset arithmetic assumes uniform stride).
+
+Invariant: kind=clause-explicit;
+  property=Subpage promotion to a nested B+tree fires when inserting
+    a new value would cause the subpage to exceed 50% of the leaf
+    page's usable space (PageSize minus header, restart metadata,
+    restart table, and optional checksum footer);
+  from=this spec §Subpage Promotion Threshold;
+  violation=Crossing the threshold without promoting overflows the
+    parent leaf and corrupts the surrounding restart-group encoding;
+    promoting too aggressively wastes a full page per small set and
+    blows out leaf density.
+
+Invariant: kind=clause-explicit;
+  property=A SetKeyspace key whose nested B+tree shrinks to a single
+    leaf page that would fit as a subpage is demoted back to a
+    subpage in the same operation that deleted the precipitating
+    value; the nested root leaf is freed;
+  from=this spec §Demotion;
+  violation=Persistent over-promotion leaves orphan one-leaf nested
+    trees consuming a full page each, defeating the density goal of
+    the subpage strategy.
+
+Invariant: kind=clause-explicit;
+  property=The SetKeyspace compound-PK separator `0x00 0x01` is
+    lex-distinct from the NUL-escape terminator `0x00 0x00` and the
+    escape sequence `0x00 0xFF`, and never appears inside an escaped
+    column (the only `0x00` bytes in an escaped column are followed
+    by `0xFF`);
+  from=this spec §Indexes on SetKeyspaces;
+  violation=A PK encoding that collides with a column terminator or
+    escape produces an index key that decodes ambiguously to two
+    different (column-tuple, PK) pairs — non-unique indexes can
+    return wrong primary keys at lookup, and the index registry's
+    fingerprint guarantees do not catch it.
+
+## Storage Strategy
+
+Two storage strategies based on value-set size:
+
+- **Subpage (small value sets).** Values fit within the leaf cell,
+  stored inline as a mini sorted list. No extra page allocation.
+- **Nested B+tree (large value sets).** Promoted to a full B+tree
+  whose root page ID is stored in the leaf cell. Each value becomes
+  a key in the nested B+tree (with empty values).
+
+## Subpage Format
+
+A subpage is stored in the leaf entry's value area.
+`CellFlags.MultiValue` is set and `CellFlags.NestedTree` is clear.
+The entry uses the standard restart/delta key encoding from
+`page-formats.md`; the subpage replaces the value portion.
+
+```
+SetKeyspace Subpage Entry (restart)
++-----------+----------+-----------+-----------+
+| CellFlags | KeyLen   | Key bytes | Subpage   |
+| uint8     | uint16   |           |           |
++-----------+----------+-----------+-----------+
+
+Subpage (embedded in cell value area):
++----------+----------+---------+---------+-----+
+| Count    | DataSize | Entry 0 | Entry 1 | ... |
+| uint16   | uint16   |         |         |     |
++----------+----------+---------+---------+-----+
+```
+
+For **variable-size values**:
+
+```
+Entry (variable):
++----------+-----------+
+| ValueLen | Val bytes |
+| uint16   |           |
++----------+-----------+
+```
+
+For **fixed-size values** (keyspace declared with `FixedValueSize`):
+
+```
+Entry (fixed):
++-----------+
+| Val bytes |  (size = keyspace's fixed value size, no length prefix)
++-----------+
+```
+
+`Count` is the number of entries. `DataSize` is the total byte size
+of all entries.
+
+Values within the subpage are stored in sorted (lexicographic) order.
+Lookup is binary search. For fixed-size subpages, entries are a flat
+array — binary search is `O(log N)` with direct offset calculation.
+
+Subpage entries are **not prefix-compressed**. Subpages store
+*values* for a single key, which typically do not share prefixes by
+construction (e.g., post IDs in a postings list). The subpage is
+also small by definition (below the 50% promotion threshold).
+
+## Subpage Promotion Threshold
+
+A subpage is promoted to a nested B+tree when inserting a new value
+would cause the subpage to exceed **50% of the leaf page's usable
+space** (PageSize minus header, restart metadata, restart table, and
+optional checksum footer).
+
+Promotion:
+
+1. Allocate a new leaf page for the nested B+tree.
+2. Copy all subpage entries into the new leaf page as regular cells
+   (where "keys" are the values from the set and "values" are
+   empty).
+3. Replace the subpage cell with a nested B+tree reference cell.
+4. Insert the new value into the nested B+tree.
+
+## Nested B+tree Reference Cell
+
+```
+SetKeyspace Nested B+tree Entry (restart)
++-----------+----------+-----------+----------+----------+
+| CellFlags | KeyLen   | Key bytes | Root     | Count    |
+| uint8     | uint16   |           | uint64   | uint64   |
++-----------+----------+-----------+----------+----------+
+```
+
+- **Root**: page ID of the nested B+tree's root.
+- **Count**: number of values in the set (O(1) access).
+
+Depth is not persisted — derived by reading the root page on first
+access. The nested B+tree uses the same B+tree implementation as the
+main keyspace; its "keys" are the values from the set, all "values"
+are empty (zero-length). Nested-tree leaves use prefix compression
+like all other leaves.
+
+## Demotion
+
+When deletions reduce a nested B+tree to a single leaf page that
+would fit as a subpage, the B+tree is demoted back to a subpage. The
+leaf page is freed; entries are packed inline into the parent leaf
+cell.
+
+When the last value for a key is deleted, the key's cell is removed
+from the parent leaf entirely — empty nested trees and empty
+subpages never exist, not even transiently within a write
+transaction.
+
+## Bulk Free (Delete on a key with a nested tree)
+
+Deleting a key whose values are in a nested B+tree frees the nested
+tree via subtree retirement: read `Root` + `Count` from the cell,
+walk the nested tree recursively retiring every page, remove the
+cell. `O(pages in nested tree)`, not `O(values)`. See
+`range-delete.md §Set Keyspace Bulk Free`.
+
+If the SetKeyspace has secondary indexes declared, the engine cannot
+use the bulk-free fast path — it must walk every `(key, value)` set
+member and call the extractor to compute prior index entries for
+deletion. See `indexing.md §Indexes on SetKeyspaces` and
+`§Bulk Operations on Indexed Keyspaces`.
+
+## Fixed-Size Value Sets
+
+When a SetKeyspace is created with `FixedValueSize` (non-zero), all
+values must be exactly that byte size. Enables:
+
+- No per-value length prefix in subpages (flat array).
+- Direct offset binary search (`entry[i]` at `i * valueSize`).
+- Compact nested B+tree leaves (no `ValueLen` field per cell).
+
+A `Put` with a value of the wrong size returns `ErrValueSizeMismatch`.
+
+## Indexes on SetKeyspaces
+
+A SetKeyspace can carry secondary indexes. The extractor signature
+is the same `func(key, value []byte) []IndexEntry`, but it runs
+**per (key, value) set member**, not per top-level key. The
+"primary key" in non-unique index entries is the `(key, value)` pair
+— neither alone identifies the set member.
+
+### Compound-PK encoding
+
+Because the column terminator `0x00 0x00` already delimits columns
+in the index key, the PK's internal split between its `key` and
+`value` halves uses a distinct separator `0x00 0x01`. The PK is
+encoded as:
+
+```
+escape(key) || 0x00 0x01 || escape(value)
+```
+
+then appended to the index key after the trailing `0x00 0x00`
+column terminator, followed by a final `0x00 0x00` to terminate the
+PK portion. `0x00 0x01` is lex-safely distinguishable from the
+column terminator (`0x00 0x00`) and any escaped byte sequence
+(`0x00 0xFF`), and never appears inside an escaped column (the only
+`0x00` bytes in an escaped column are immediately followed by
+`0xFF`).
+
+Full grammar for a non-unique SetKeyspace index key:
+
+```
+indexKey  := escapedCol (0x00 0x00 escapedCol)* 0x00 0x00 escapedPK 0x00 0x00
+escapedPK := escape(setKey) 0x00 0x01 escape(setValue)
+```
+
+A decoder splits the index key on the first `0x00 0x00` after the
+last column terminator, then splits the PK on `0x00 0x01` to recover
+`(setKey, setValue)`.
+
+### Cursor delete and bulk-key delete
+
+`SetCursor.Delete()` deletes one set member; index updates affect
+only that member's contribution. `SetKeyspace.Delete(key)` removes
+all members; index updates run the extractor on each removed
+`(key, value)` pair.
+
+Bulk-free of a key's nested B+tree (via `Delete(key)`) reverts to a
+per-member walk when the SetKeyspace has indexes — same reasoning as
+`DeleteRange` on indexed keyspaces.
