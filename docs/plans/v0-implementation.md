@@ -219,6 +219,47 @@ delete yet, no SetKeyspace, no indexing. Target: a Keyspace can
 `Put`/`Get`/`Delete`/`Cursor` over byte-oriented key-value pairs
 on a single keyspace.
 
+**Sub-chunk progress.**
+
+- **4.1** ✅ Triage + invariant derivation (commit context only).
+- **4.2** ✅ `068232d` Branch + leaf + overflow page codecs in
+  `internal/page` (branch.go, leaf.go, overflow.go). Round-trip
+  tests pin invariants 2 (delta SharedLen correctness), 3
+  (restart-table position), 4 (overflow run-length). Decoder
+  robustness contract: total over input, never panics on slice
+  OOR — pins via M1 (forged KeyLen) and M3 (forged
+  RestartCount) regression tests.
+- **4.3** ✅ `d4cb485` `internal/btree` foundation: read-only
+  `Get(rootID, key)` descending root→branch→leaf, `Has` membership.
+  `page.LeafLookup` two-phase binary search (restart-table phase 1
+  + delta scan phase 2). Tests cover empty/single-leaf/single-
+  branch/three-level descent, corrupted-page-type and null-child
+  rejection wrapped as `btree.ErrCorrupted`. Overflow-flagged leaf
+  entry returns `ErrOverflowValueUnsupported` (lifted in 4.7).
+- **4.4** ✅ `afe2b92` `Put` + split + CoW propagation + root
+  growth. `PageWriter` interface (PageReader + AllocPage/CoW/
+  AllocSlab/FreePage; *pager.Pager satisfies it). `page.Shortest
+  Separator(L, R)` per page-formats.md §Prefix-Truncated Branch
+  Keys. Tests cover empty-tree, single-leaf, key-update, leaf
+  split + root growth, 500-key round-trip, 400-large-key forced
+  multi-level tree, insertion-order content invariance, oversize-
+  on-both-empty-and-non-empty paths, and the slab-leak invariant
+  (every allocated page is reachable or freed, never neither).
+  **Decode→Encode aliasing fix** (load-bearing): the btree's CoW-
+  then-re-encode flow uses the same buffer as decode source AND
+  encode target; `Encode*` clears the buffer before write,
+  zeroing slices `Decode*` returned by zero-copy borrow. Fixed
+  by deep-copying Keys/Values immediately after every Decode in
+  `leafEntriesAsEncoded` and inline in `ascendWithSplit`.
+- **4.5** ⏳ Delete + merge/redistribute (MergeThreshold option).
+- **4.6** ⏳ Cursor: forward Next, reverse Prev with group cache,
+  key reconstruction buffer, Cursor.Delete state machine per
+  transactions.md §Cursor State Machine.
+- **4.7** ⏳ Overflow inline-value Put + Get (lifts the
+  `ErrOverflowValueUnsupported` sentinel from 4.3).
+- **4.8** ⏳ Close-out: chunk close-out gate (cite sweep, spec-
+  tier invariant promotions, delete resolved issues).
+
 Primary specs: `page-formats.md`, `transactions.md §Cursor State
 Machine`.
 
