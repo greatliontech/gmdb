@@ -61,7 +61,7 @@ package-level testability.
 | Path | Responsibility |
 |------|---------------|
 | `*.go` (root `gmdb`) | Public surface only. `DB`, `Tx`, `Keyspace`, `SetKeyspace`, `Cursor`, `SetCursor`, `Open`, the typed-generics layer (`Encoder[T]`, `TypedKeyspace[K, V]`, `TypedIndex[K, V, IK]`), sentinel errors, stats types, options. Wires internal subsystems together; no algorithmic code beyond thin glue. Files: `db.go`, `tx.go`, `keyspace.go`, `cursor.go`, `iter.go`, `typed.go`, `index.go` (query API; storage lives in `internal/index`), `errors.go`, `stats.go`, `options.go`. |
-| `internal/page/*.go` | Pure byte-slice page codecs: 8-byte page header (Type/Flags/Count/AdditionalPages), meta page encode/decode/validate (incl. file-format fields, bitmap/RPL pointers, Flags), RPL segment encode/decode, branch page format with prefix-truncated separators, prefix-compressed leaf format with per-page `RestartInterval`, overflow page header, subpage (set-keyspace inline list), xxhash64 footer compute/verify. No I/O, no OS dependency. |
+| `internal/page/*.go` | Pure byte-slice page codecs: 8-byte page header (Type/Flags/Count/AdditionalPages), meta page encode/decode/validate (incl. file-format fields, bitmap/RPL pointers, Flags), RPL segment encode/decode, branch page format with prefix-truncated separators, leaf page in two variants (compressed: variable-size restart groups + prefix-compressed delta entries; uncompressed: full keys + positional offset table — selected per `Config.RestartGroupTarget`) exposed via `LeafReader` / `LeafBuilder` / `LeafIter`, overflow page header, subpage (set-keyspace inline list), xxhash64 footer compute/verify. No I/O, no OS dependency. |
 | `internal/bitmap/*.go` | Allocation bitmap data structure: two-level (detail + in-memory summary), bit set/clear, contiguous-run search with `math/bits` intrinsics, LIFO hint tracking, dirty-page tracking. Pure data structure — operates on `[]byte` for the detail level and `[]uint64` for the summary; no file I/O. |
 | `internal/pager/*.go` | The unified `Pager` (read + write paths), slab `map[uint64]*[]byte`, `MaxTxBufferBytes` accounting, sync.Pool of page-sized buffers, CoW (`Page(id)` resolves via slab then mmap; write path copies old content into a slab buffer). Owns the file handle, the read-only mmap (`MAP_SHARED \| PROT_READ`, `mprotect` after open, reservation sized to `MaxSize`), the freespace state (RPL append-only chain, loose-page set, tail-refund machinery, allocation priority loose → bitmap → RPL reclamation → file extension), the file-format machinery (grow/shrink via `ftruncate`), and the commit pipeline (pwrite ordering dirty data → bitmap → fdatasync → meta → fdatasync per `SyncMode`, plus file shrink after the commit point). Platform mmap/madvise shims live in build-tagged `mmap_linux.go`, `mmap_darwin.go`, `mmap_freebsd.go` siblings. Imports `internal/page`, `internal/bitmap`. |
 | `internal/btree/*.go` | B+tree algorithms over the pager: search, insert (CoW path from leaf to root, split with prefix-truncated separator computation), delete (merge/rebalance with configurable `MergeThreshold`, separator recomputation), range delete (boundary path finding, interior subtree retirement, boundary leaf cleanup, rebalance), cursor state machine (stack of `(pageID, index)`, key reconstruction buffer, restart-group cache for `Prev`). Set-keyspace bulk free (recursive subtree retirement) and subpage / nested-B+tree promotion/demotion at the 50% threshold. Bottom-up bulk construction (slab bypass via streaming pwrite, index sort + spill via `Options.ScratchDir`). All operations work on page byte slices, never Go heap objects. Imports `internal/page`, `internal/pager`. |
@@ -280,11 +280,67 @@ on a single keyspace.
   before `FreePage`, never re-read). Round-2 folded in a
   defense-in-depth `<3 combined cells` guard on branch
   redistribute.
-- **4.6** ⏳ Cursor: forward Next, reverse Prev with group cache,
-  key reconstruction buffer, Cursor.Delete state machine per
-  transactions.md §Cursor State Machine.
+- **4.6** Leaf format reset + cursor. The original 4.6 sub-chunk
+  (cursor on the chunk-4.2 spec-literal `RestartInterval` +
+  per-leaf keyBuf design) was reset mid-chunk after the
+  adversarial review surfaced that variable-size restart groups,
+  an uncompressed-variant escape hatch, and a page-package-owned
+  bidirectional iterator were a structurally better shape than
+  the spec-literal one. Pre-v1 clean-break policy applied: the
+  chunk-4.2 leaf codecs were deleted outright (no migration, no
+  format discriminator) and the page surface rewritten before
+  the cursor landed on top.
+  - **4.6α** ✅ `55492c4` Spec amend: `docs/specs/page-formats.md`
+    §Leaf Page rewritten to specify variable-size restart groups
+    (`RestartGroupTarget` is a *target* not a hard interval;
+    natural breaks at SharedLen=0; restart-table entry carries
+    `Count` so group boundaries can be derived from the table
+    alone), the uncompressed leaf variant (`TypeLeafUncompressed`,
+    selected via `RestartGroupTarget = 1`), and the cursor-side
+    `LeafIter` contract. `api-surface.md` Options
+    `RestartGroupTarget` semantics aligned (0 = engine default;
+    1 = uncompressed; 2..255 = compressed group target).
+  - **4.6β** ✅ `37ce80a` Page-package rewrite. New surface:
+    `LeafReader` (variant-dispatching reader; O(1) construction +
+    explicit `Validate` at pager-resolve boundary), `LeafBuilder`
+    (variant-dispatching builder with natural-break heuristic +
+    inline scratch arrays for zero-allocation steady state),
+    `LeafIter` (bidirectional iterator with forward-streaming +
+    buffered-mode group-boundary handling), `LeafEntry` struct.
+    Old codecs (`DecodeLeaf` / `EncodeLeaf` / `LeafLookup` /
+    `LeafEncodedSize` / `LeafRestartInterval` / `EncodedEntry`)
+    deleted outright per the clean-break policy.
+  - **4.6γ** ✅ `5636fad` Btree port. `internal/btree/{put,delete,
+    btree}.go` and tests ported onto `LeafReader` / `LeafBuilder`.
+    `Put` lost its `restartInterval uint16` parameter (now in
+    `Config.RestartGroupTarget`). Decode→encode aliasing fix
+    preserved via `readLeafEntriesDeepCopy`; CoW + FreePage
+    ordering preserved; spec-tier invariants (all-leaves-same-
+    depth, every-non-root-≥-threshold, slab-partition) survive
+    the port. New test
+    `TestPutDeleteGetUncompressedLeafVariant` covers
+    `RestartGroupTarget=1` end-to-end through Put + Get +
+    Delete + merge. Pre-existing adjacent finding filed:
+    `docs/issues/put-overflow-replace-orphans-chain.md`
+    (Lands: 4.7).
+  - **4.6δ** ✅ `b7730c4` Bidirectional cursor + generation
+    counter. `internal/btree/cursor.go` implements the
+    state machine per `transactions.md §Cursor State Machine`
+    (Unpositioned / Positioned / End-of-iteration). Methods:
+    `First / Last / Next / Prev / Seek (exact) / SeekGE (≥) /
+    Current / Delete / Err / MarkStale`. Path-based descent
+    with leaf-to-leaf transitions; scratch buffers
+    (`keyBuf` / `bufKeys` / `bufEnts`) reclaimed across leaf
+    transitions for zero-allocation steady state. Cursor.Delete
+    tolerates CoW + merge cascade via internal `SeekGE(deletedKey)`
+    re-position. Three spec-tier invariants pinned by tests:
+    Unpositioned-distinct-from-EOI; Delete-advances-to-successor;
+    Delete-tolerates-CoW-cascade. Forward-compat scaffolding for
+    chunk-5 external-mutation invalidation filed:
+    `docs/issues/cursor-markstale-clear-cur.md`.
 - **4.7** ⏳ Overflow inline-value Put + Get (lifts the
-  `ErrOverflowValueUnsupported` sentinel from 4.3).
+  `ErrOverflowValueUnsupported` sentinel from 4.3, resolves
+  `docs/issues/put-overflow-replace-orphans-chain.md`).
 - **4.8** ⏳ Close-out: chunk close-out gate (cite sweep, spec-
   tier invariant promotions, delete resolved issues).
 
