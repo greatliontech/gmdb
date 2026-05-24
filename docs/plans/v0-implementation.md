@@ -537,33 +537,63 @@ the keyspace subtree atomically.
   restored) rather than the prior-tx `retiredPages` branch.
   Regression test:
   `internal/pager/freespace_run_test.go::TestLoosePoolPopDetachesStaleBuffer`.
-- **5.5** ⏳ `Keyspace.Get` / `Put` / `Delete` on `Kind = 0`
-  wires chunk-4 `btree.*` through `descriptor.Root` +
-  `descriptor.Count` maintenance + descriptor CoW propagation;
-  external `MarkStale` call-sites on sibling cursors;
-  `Tx.SetKeyspaceConfig` (RestartGroupTarget mutation —
-  Kind-agnostic at the descriptor layer; chunk 6 adds Kind=1
-  test coverage on a SetKeyspace fixture);
-  `Options.LaggingReader` callback wiring through
-  `pager.AllocPage`. Promotes the Kind=0 portion of the
-  Delete-on-miss invariant and `keyspaces.md` #6 (the
-  RestartGroupTarget mutability semantics — new value is a
-  builder hint for leaves written after; existing leaves
-  preserved). Resolves:
-  `docs/issues/cursor-markstale-clear-cur.md`,
-  `docs/issues/lagging-reader-callback.md`. Also resolves the
-  `docs/issues/tx-setkeyspaceconfig-missing-name-behavior.md`
-  missing-name sentinel question (decide + record before
-  implementation). 5.5.1 chunk-start gate should re-fire the
-  triage on `docs/issues/slog-default-vs-spec.md` (the
-  `Options.LaggingReader` callback is a logger-relevant
-  surface even though it does not add `Options.Logger`) and
-  surface to the user the 5.5 diff-width trade-off (the
-  chunk-5.1 Round 1 M-2 finding noted that 5.5 bundles four
-  features — `Get/Put/Delete` + `SetKeyspaceConfig` +
-  `MarkStale` + `LaggingReader`; the chunk-5.1 user-bundling
-  decision accepts this on API-adjacency grounds, but
-  re-confirming at 5.5 chunk-start before lock-in is cheap).
+- **5.5** ✅ Keyspace data ops + cursor surface +
+  SetKeyspaceConfig + LaggingReader + Options.Logger. User
+  re-confirmed the chunk-5.1 bundling at 5.5.1 and added
+  Options.Logger to the bundle (folded `slog-default-vs-spec.md`).
+  Surface (in `keyspace.go`):
+  `Keyspace.Get` / `Put` / `Delete` on Kind=0 wires chunk-4
+  `btree.*` through `desc.Root` + `desc.Count` maintenance +
+  descriptor CoW propagation (each mutation re-encodes the
+  descriptor and writes it back via `tx.storeDescriptor`).
+  `Keyspace.Cursor()` returns a public `*Cursor` wrapping the
+  chunk-4 internal cursor; cursors register on the keyspace so
+  Put/Delete `MarkStale`'s them. Internal MarkStale fix
+  (`internal/btree/cursor.go`): nils `curKey` / `curValue` and
+  resets `iter` per `cursor-markstale-clear-cur.md` — a caller
+  bypassing the gen check now sees nil rather than dangling
+  references to potentially-freed leaf-buffer slices.
+  `Tx.SetKeyspaceConfig(name, KeyspaceConfig)`: Kind-agnostic
+  at the descriptor layer; `cfg.RestartGroupTarget == 0` is
+  "leave unchanged"; `[1, 255]` updates; `> 255` returns
+  `ErrInvalidOptions`; missing name returns `ErrNotFound`
+  (the user-locked decision recorded as a spec amend at
+  `api-surface.md §Keyspace API SetKeyspaceConfig` godoc per
+  the chunk-5.4-filed `tx-setkeyspaceconfig-missing-name-
+  behavior.md`).
+  `Options.LaggingReader` callback + `LaggingReaderInfo` /
+  `LaggingReaderAction` types added to the public surface.
+  Pager-side: new `Pager.SetLaggingReaderCallback` /
+  `Pager.SetReclamationBoundRefresh` + `AllocPage` /
+  `AllocContiguous` step 4 invokes the callback when bitmap-
+  exhausted AND RPL is non-empty (bound-blocked). At most once
+  per AllocPage call; Wait → refresh bound + retry once; Abort
+  → ErrDBFull. `DB.Begin` wires the user callback through with
+  a coord-driven bound-refresh closure.
+  `Options.Logger` + `DB.logger` field captured at Open with
+  nil → discard handler (clean-break vs the chunk-1
+  `slog.Default()` default per pre-v1 policy). Cleanup paths in
+  `tx.go` / `read_tx.go` / `db.go` use the captured logger via
+  cleanup-closure-captured `*slog.Logger` (resolves
+  `slog-default-vs-spec.md`).
+  `Options` additions: `MergeThreshold` (default 25),
+  `RestartGroupTarget` (default 0 = engine default),
+  `LaggingReader`, `Logger`. New sentinels:
+  `ErrCursorUnpositioned`, `ErrCursorStale`.
+  Resolves: `docs/issues/cursor-markstale-clear-cur.md`,
+  `docs/issues/lagging-reader-callback.md`,
+  `docs/issues/slog-default-vs-spec.md`,
+  `docs/issues/tx-setkeyspaceconfig-missing-name-behavior.md`.
+  Tests promote four chunk-5.5 invariants: Inv-A
+  (Put/Get round-trip), Inv-B (descriptor CoW across commit +
+  re-Open), Inv-C (Count tracks leaf entries; Put-replace does
+  not bump Count; Delete decrements), Inv-D (sibling cursor
+  MarkStale'd by Put/Delete; cur*/iter cleared; subsequent ops
+  return `ErrCursorStale`); Inv-E (SetKeyspaceConfig 0/[1,255]
+  />255/missing semantics); Inv-F (LaggingReader at-most-once
+  + Wait/Abort + nil-callback-falls-through-to-file-extension).
+  Plus chunk-5.1 Kind=0 portion of Delete-on-miss invariant
+  promoted at `Keyspace.Delete` (`ErrNotFound` on miss).
 - **5.6** ⏳ `DeleteKeyspace` — single-keyspace subtree
   retirement (chunk 6 adds the SetKeyspace nested-tree
   bulk-free path; chunk 7 adds the index-keyspace + registry

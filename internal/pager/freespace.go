@@ -120,7 +120,35 @@ func (p *Pager) AllocPage() (uint64, error) {
 		}
 	}
 
-	// 4. Lagging-reader callback — not in chunk 1.
+	// 4. Lagging-reader callback per chunk-5.5 wiring.
+	// Reclamation just returned 0 entries — either the RPL was
+	// empty (no callback to make: nothing to reclaim regardless of
+	// readers) or the bound is blocking advance. Distinguish via
+	// the RPL chain: non-empty + still-blocked ⇒ reader is the
+	// factor; invoke the callback.
+	if p.laggingReader != nil && len(p.rplSegments) > 0 {
+		info := p.buildLaggingReaderInfo()
+		switch p.laggingReader(info) {
+		case LaggingReaderAbort:
+			return 0, ErrDBFull
+		case LaggingReaderWait:
+			if p.refreshReclamationBound != nil {
+				p.reclamationBound = p.refreshReclamationBound()
+				if p.reclaimRPL() > 0 {
+					if id, ok := p.bitmap.FindFirst(); ok {
+						p.bitmap.Clear(id)
+						p.bitmap.SetHint(id)
+						p.pendingAllocs[id] = struct{}{}
+						delete(p.pendingFrees, id)
+						return id, nil
+					}
+				}
+			}
+			// Fall through to file extension if Wait + refresh + retry
+			// did not free a page (matches the spec's "at most once
+			// per AllocPage" invariant — no second callback).
+		}
+	}
 
 	// 5. File extension. Advance HighWaterMark by one page. Cap at
 	// maxSizePages; ErrDBFull when reached. ftruncate is issued if
@@ -332,6 +360,27 @@ func (p *Pager) ResetFreespace() {
 	p.retiredPages = p.retiredPages[:0]
 }
 
+// buildLaggingReaderInfo constructs the info struct for the
+// LaggingReader callback. The pager has access to TxnID (the
+// reclamationBound is the youngest TxnID that the RPL is waiting on
+// — a proxy for "the blocking reader's TxnID") and currentTxnID;
+// PID and HeldPages are zero today (no coord access at this layer,
+// no cheap RPL-by-TxnID count). The DB-layer wrapper around
+// Options.LaggingReader can enrich the info before forwarding to
+// the user callback.
+func (p *Pager) buildLaggingReaderInfo() LaggingReaderInfo {
+	lag := uint64(0)
+	if p.currentTxnID > p.reclamationBound {
+		lag = p.currentTxnID - p.reclamationBound
+	}
+	return LaggingReaderInfo{
+		PID:       0,
+		TxnID:     p.reclamationBound,
+		Lag:       lag,
+		HeldPages: 0,
+	}
+}
+
 // AllocContiguous returns the first page ID of a contiguous run of n
 // pages allocated atomically per free-space.md §Page Allocation Priority
 // (the n>1 path: bitmap.FindContiguous → RPL reclamation + retry → file
@@ -381,7 +430,26 @@ func (p *Pager) AllocContiguous(n uint32) (uint64, error) {
 		}
 	}
 
-	// 3. (Lagging-reader callback — chunk 5.5 territory.)
+	// 3. Lagging-reader callback per chunk-5.5 wiring (free-space.md
+	// step 4 for the n>1 path). Same shape as AllocPage: invoke at
+	// most once when RPL is non-empty AND reclamation is blocked.
+	if p.laggingReader != nil && len(p.rplSegments) > 0 {
+		info := p.buildLaggingReaderInfo()
+		switch p.laggingReader(info) {
+		case LaggingReaderAbort:
+			return 0, ErrDBFull
+		case LaggingReaderWait:
+			if p.refreshReclamationBound != nil {
+				p.reclamationBound = p.refreshReclamationBound()
+				if p.reclaimRPL() > 0 {
+					if firstID, ok := p.bitmap.FindContiguous(int(n)); ok {
+						p.reserveBitmapRun(firstID, n)
+						return firstID, nil
+					}
+				}
+			}
+		}
+	}
 
 	// 4. File extension. Advance HighWaterMark by n. Pages past the
 	// prior HWM had no bitmap bit set (bits at and above totalPages

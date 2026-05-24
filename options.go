@@ -10,6 +10,7 @@ package gmdb
 import (
 	"cmp"
 	"crypto/rand"
+	"log/slog"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -41,6 +42,53 @@ const (
 	SyncDataOnly                 // syncs data; not meta. Last txn may be lost on crash.
 	SyncLazy                     // skips all syncs. Rolls back to last Checkpoint() on crash.
 	SyncUnsafe                   // skips all syncs, no safety net. Requires AllowSyncUnsafe.
+)
+
+// LaggingReaderInfo carries the diagnostic context the
+// Options.LaggingReader callback needs to decide whether to wait or
+// abort. Per lock-ordering.md §Lagging Reader Handling, the engine
+// constructs this from the reader table + the in-memory RPL state at
+// the moment AllocPage detects that bitmap and RPL reclamation are
+// both exhausted and a specific reader is the blocking factor.
+type LaggingReaderInfo struct {
+	// PID is the process ID of the blocking reader (the process that
+	// holds the oldest in-progress read tx whose TxnID gates RPL
+	// reclamation).
+	PID uint32
+
+	// TxnID is the reader's snapshot transaction ID — the value that
+	// determines how far the RPL reclamation bound can advance.
+	TxnID uint64
+
+	// Lag is the difference between the current write-tx TxnID and
+	// the reader's TxnID. Larger values indicate the reader has been
+	// pinned longer; callers can use this as a coarse "is this
+	// reader hung?" signal.
+	Lag uint64
+
+	// HeldPages estimates the page count the reader is pinning
+	// unreclaimable in the RPL (count of RPL entries with this
+	// reader's TxnID, plus the segment-page overhead). Zero if the
+	// engine cannot cheaply derive a count.
+	HeldPages uint64
+}
+
+// LaggingReaderAction is the return type of the Options.LaggingReader
+// callback per lock-ordering.md §Lagging Reader Handling.
+type LaggingReaderAction int
+
+const (
+	// LaggingReaderWait directs AllocPage to refresh the reader table
+	// and retry reclamation. Use this when the blocking reader is
+	// expected to commit/rollback soon (interactive workload).
+	LaggingReaderWait LaggingReaderAction = iota
+
+	// LaggingReaderAbort directs AllocPage to return ErrDBFull
+	// immediately, surfacing the back-pressure to the writer. Use
+	// this when the blocking reader is suspected hung or when the
+	// caller wants deterministic failure rather than indefinite
+	// retry.
+	LaggingReaderAbort
 )
 
 // Options configures a fresh database at creation time. For an existing
@@ -90,6 +138,39 @@ type Options struct {
 	// §SyncUnsafe Warning — "a silently-enabled SyncUnsafe lets a
 	// benchmark configuration leak into a production deploy."
 	AllowSyncUnsafe bool
+
+	// RestartGroupTarget is the engine-wide default for the leaf
+	// restart-group target — the maximum entries per group on
+	// compressed leaves. Per-keyspace overrides via
+	// Tx.SetKeyspaceConfig. Bounded to [0, 255]: 0 ⇒ engine default
+	// (16); 1 ⇒ uncompressed leaf variant; [2, 255] ⇒ compressed
+	// with that target. Open rejects values > 255 with
+	// ErrInvalidOptions — the compressed-leaf restart-table Count
+	// is uint8. Default: 16.
+	RestartGroupTarget uint16
+
+	// MergeThreshold is the B+tree page fill percentage below which
+	// a page is merged with a sibling after deletion. Range: 1-50.
+	// Default: 25 (DefaultMergeThreshold). Above 50% redistribute
+	// thrash becomes pathological — two siblings each hovering just
+	// below 50% would never have room to merge.
+	MergeThreshold uint8
+
+	// LaggingReader is called by pager.AllocPage when bitmap +
+	// RPL-reclamation are both exhausted AND a specific reader is
+	// the blocking factor for further RPL advance, per
+	// lock-ordering.md §Lagging Reader Handling. The callback decides
+	// Wait (refresh + retry) or Abort (ErrDBFull). Invoked at most
+	// once per AllocPage call (lock-ordering.md invariant) to avoid
+	// busy loops. Nil ⇒ AllocPage falls through to file extension
+	// when reclamation is blocked.
+	LaggingReader func(info LaggingReaderInfo) LaggingReaderAction
+
+	// Logger receives diagnostic messages — leak detection warnings,
+	// non-fatal recovery events. Default: nil = discard. Set to
+	// slog.Default() to route to the process-wide handler, or to a
+	// custom *slog.Logger for structured per-DB logging.
+	Logger *slog.Logger
 }
 
 func (o Options) applyDefaults() Options {
@@ -100,11 +181,18 @@ func (o Options) applyDefaults() Options {
 	o.ShrinkThreshold = cmp.Or(o.ShrinkThreshold, uint64(128))
 	o.MaxTxBufferBytes = cmp.Or(o.MaxTxBufferBytes, 256<<20)
 	o.MaxReaders = cmp.Or(o.MaxReaders, lock.DefaultMaxReaders)
+	o.MergeThreshold = cmp.Or(o.MergeThreshold, defaultMergeThreshold)
+	// RestartGroupTarget defaults to 0 (engine default at the leaf
+	// codec layer — currently 16 per page-formats.md §Compressed
+	// Leaf). 0 is the canonical "use engine default" sentinel.
 	if o.UUID == ([16]byte{}) {
 		_, _ = rand.Read(o.UUID[:])
 	}
 	return o
 }
+
+const defaultMergeThreshold uint8 = 25
+const maxMergeThreshold uint8 = 50
 
 func (o Options) validate() error {
 	if !page.ValidPageSize(o.PageSize) {
@@ -133,6 +221,12 @@ func (o Options) validate() error {
 		}
 	default:
 		return errInvalidSyncMode
+	}
+	if o.MergeThreshold < 1 || o.MergeThreshold > maxMergeThreshold {
+		return errInvalidMergeThreshold
+	}
+	if o.RestartGroupTarget > page.MaxRestartGroupTarget {
+		return errInvalidRestartGroupTarget
 	}
 	return nil
 }

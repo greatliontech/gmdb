@@ -1097,6 +1097,7 @@ func TestTxCleanupFnDirectClosedSkipsRelease(t *testing.T) {
 		pgr:       tx.pgr,
 		grant:     tx.grant,
 		held:      held,
+		logger:    db.logger,
 		originPCs: nil,
 	}
 	txCleanupFn(info)
@@ -1161,6 +1162,7 @@ func TestTxCleanupFnDirectClosedFalseRunsRelease(t *testing.T) {
 		pgr:       tx.pgr,
 		grant:     tx.grant,
 		held:      held,
+		logger:    db.logger,
 		originPCs: nil,
 	}
 	txCleanupFn(info) // runs AbortTx + grant.Release (the real branch)

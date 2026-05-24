@@ -101,6 +101,7 @@ type readTxCleanupInfo struct {
 	coord     *lock.Coord
 	held      *atomic.Bool
 	slot      uint32
+	logger    *slog.Logger
 	originPCs []uintptr
 }
 
@@ -140,7 +141,7 @@ func readTxCleanupFn(info readTxCleanupInfo) {
 	if !info.held.CompareAndSwap(true, false) {
 		return
 	}
-	slog.Default().Warn(
+	info.logger.Warn(
 		"gmdb: read transaction leaked without Commit/Rollback",
 		"origin", formatStack(info.originPCs),
 	)
@@ -246,6 +247,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		coord:     coord,
 		held:      held,
 		slot:      slot,
+		logger:    db.logger,
 		originPCs: captureOriginPCs(),
 	})
 	return rtx, nil

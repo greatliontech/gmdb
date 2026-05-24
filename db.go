@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -27,6 +28,13 @@ type DB struct {
 
 	pool *pager.BufPool
 	opts Options
+
+	// logger captures Options.Logger at Open with the nil → discard
+	// fallback per the chunk-5.5 spec amend (slog-default-vs-spec.md
+	// resolution). Cleanup paths reference this via the cleanup-
+	// closure captures rather than slog.Default() so per-DB logging
+	// is honored even after the *DB is collected.
+	logger *slog.Logger
 
 	// Cross-process coordination. lockFile is the mmap'd lock file
 	// (cross-process.md §Lock File Layout); coord owns the flock +
@@ -171,15 +179,9 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 	// non-checkpoint meta because no checkpoint-flagged meta exists
 	// (SyncLazy-only DB never Checkpoint()'d). Warn — data
 	// integrity depends on whether the OS flushed pages in the
-	// right order, which is not guaranteed.
-	if opened.NoCheckpoint {
-		slog.Default().Warn(
-			"gmdb: Open accepted non-checkpoint meta",
-			"path", path,
-			"txn_id", opened.Meta.TxnID,
-			"detail", "no checkpoint-flagged meta found; data integrity depends on OS flush ordering",
-		)
-	}
+	// right order, which is not guaranteed. Emitted via the
+	// Options.Logger (or discard) once it has been resolved.
+	openWarnNoCheckpoint := opened.NoCheckpoint
 
 	// Open the lock file under the same os.Root — symlink-escape
 	// protection is shared with the data file. The DataUUID is the
@@ -215,17 +217,34 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 		// caller needs to tune them.
 	})
 
+	// Capture Options.Logger with the spec-amend default (nil → discard
+	// handler). slog-default-vs-spec.md is resolved here.
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+
 	db := &DB{
 		file:          file,
 		root:          root,
 		pool:          pool,
 		opts:          opts,
+		logger:        logger,
 		lockFile:      lockFile,
 		coord:         coord,
 		currentMeta:   opened.Meta,
 		activeMetaIdx: opened.ActiveMetaIdx,
 		pgr:           opened.Pager,
 		closeGate:     newCloseGate(),
+	}
+
+	if openWarnNoCheckpoint {
+		db.logger.Warn(
+			"gmdb: Open accepted non-checkpoint meta",
+			"path", path,
+			"txn_id", opened.Meta.TxnID,
+			"detail", "no checkpoint-flagged meta found; data integrity depends on OS flush ordering",
+		)
 	}
 	// DB-level leak-detection cleanup. The cleanup info captures
 	// resources by pointer (not via *DB) so a leaked-then-collected
@@ -240,6 +259,7 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 		pgr:       opened.Pager,
 		file:      file,
 		root:      root,
+		logger:    db.logger,
 		originPCs: captureOriginPCs(),
 	})
 	return db, nil
@@ -257,6 +277,7 @@ type dbCleanupInfo struct {
 	pgr       *pager.Pager
 	file      *os.File
 	root      *os.Root
+	logger    *slog.Logger
 	originPCs []uintptr
 }
 
@@ -278,7 +299,7 @@ func dbCleanupFn(info dbCleanupInfo) {
 		// Close() ran first; nothing to tear down.
 		return
 	}
-	slog.Default().Warn(
+	info.logger.Warn(
 		"gmdb: DB handle leaked without Close",
 		"origin", formatStack(info.originPCs),
 	)
@@ -522,6 +543,56 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 	bound := min(coord.OldestReaderTxnID(), prevMeta.TxnID)
 	pgr.SetCommitState(prevMeta.HighWaterMark, prevMeta.MaxSize, bound)
 	pgr.BeginTx()
+	// Seed currentTxnID at tx-start so the chunk-5.5 LaggingReader
+	// callback's Lag = currentTxnID - reclamationBound is meaningful
+	// when AllocPage fires from the user path (Keyspace.Put →
+	// btree.Put → pw.AllocPage). Without this, currentTxnID stays
+	// 0 until Tx.AllocPage or Tx.Commit explicitly sets it — and the
+	// public Keyspace ops never go through Tx.AllocPage.
+	newTxnID := prevMeta.TxnID + 1
+	pgr.SetCurrentTxnID(newTxnID)
+
+	// Chunk-5.5 LaggingReader wiring: pass the user's callback into
+	// the pager, plus a bound-refresh closure that re-derives
+	// min(coord.OldestReaderTxnID(), prevMeta.TxnID) after Wait.
+	//
+	// The wrapper checks coord.OldestReaderTxnID() before invoking
+	// the user callback — when no reader is active, OldestReaderTxnID
+	// returns MaxUint64 and the RPL-blocked condition is a checkpoint-
+	// boundary effect (segments retired by prevMeta's commit pinned
+	// by `< bound` strict-inequality), not a lagging-reader case.
+	// Per lock-ordering.md §Lagging Reader Handling, the callback
+	// fires only when "a reader in the reader table is blocking
+	// reclamation." Skip the user callback in the no-reader case and
+	// return Wait so the pager falls through to file extension.
+	if userCallback := db.opts.LaggingReader; userCallback != nil {
+		const noReader = ^uint64(0)
+		pgr.SetLaggingReaderCallback(func(info pager.LaggingReaderInfo) pager.LaggingReaderAction {
+			if coord.OldestReaderTxnID() == noReader {
+				return pager.LaggingReaderWait
+			}
+			publicInfo := LaggingReaderInfo{
+				PID:       info.PID,
+				TxnID:     info.TxnID,
+				Lag:       info.Lag,
+				HeldPages: info.HeldPages,
+			}
+			switch userCallback(publicInfo) {
+			case LaggingReaderWait:
+				return pager.LaggingReaderWait
+			case LaggingReaderAbort:
+				return pager.LaggingReaderAbort
+			default:
+				return pager.LaggingReaderWait
+			}
+		})
+		pgr.SetReclamationBoundRefresh(func() uint64 {
+			return min(coord.OldestReaderTxnID(), prevMeta.TxnID)
+		})
+	} else {
+		pgr.SetLaggingReaderCallback(nil)
+		pgr.SetReclamationBoundRefresh(nil)
+	}
 
 	held := &atomic.Bool{}
 	held.Store(true)
@@ -530,7 +601,7 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 		pgr:          pgr,
 		prevMeta:     prevMeta,
 		prevActive:   prevActive,
-		newTxnID:     prevMeta.TxnID + 1,
+		newTxnID:     newTxnID,
 		writable:     true,
 		held:         held,
 		grant:        grant,
@@ -548,6 +619,7 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 		pgr:       pgr,
 		grant:     grant,
 		held:      held,
+		logger:    db.logger,
 		originPCs: captureOriginPCs(),
 	})
 	return tx, nil

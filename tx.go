@@ -99,6 +99,7 @@ type txCleanupInfo struct {
 	pgr       *pager.Pager
 	grant     *lock.Grant
 	held      *atomic.Bool
+	logger    *slog.Logger
 	originPCs []uintptr
 }
 
@@ -123,7 +124,7 @@ func txCleanupFn(info txCleanupInfo) {
 	if !info.held.CompareAndSwap(true, false) {
 		return
 	}
-	slog.Default().Warn(
+	info.logger.Warn(
 		"gmdb: write transaction leaked without Commit/Rollback",
 		"origin", formatStack(info.originPCs),
 	)

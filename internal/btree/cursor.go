@@ -416,12 +416,20 @@ func (c *Cursor) Delete() error {
 
 // MarkStale bumps the cursor's generation counter, causing the
 // next non-repositioning op (Next / Prev / Current / Delete) to
-// return / surface ErrCursorStale. The chunk-5 keyspace layer
+// return / surface ErrCursorStale. The chunk-5.5 keyspace layer
 // calls this on cursors whose state may have been invalidated by
 // a sibling mutator (keyspace.Put / Delete, or a sibling cursor's
-// Delete). Unused at chunk-4.6δ; the cursor's own Delete bumps
-// gen internally and clears stale via its self-re-Seek.
-func (c *Cursor) MarkStale() { c.gen++ }
+// Delete). Also clears curKey / curValue / iter so a caller that
+// bypasses the gen check (e.g. a profiling hook or debug accessor
+// reading c.curKey directly) sees nil rather than dangling
+// references to potentially-freed leaf-buffer slices — per the
+// chunk-5.4-filed cursor-markstale-clear-cur.md (resolved here at
+// chunk 5.5).
+func (c *Cursor) MarkStale() {
+	c.gen++
+	c.curKey, c.curValue = nil, nil
+	c.iter = page.LeafIter{}
+}
 
 // resetPath releases the active iter's scratch buffers back to
 // the cursor so the next leaf transition can re-thread them, then

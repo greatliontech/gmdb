@@ -103,13 +103,27 @@ var (
 	// storage). These are addressable only via their parent
 	// keyspace's index registry, never by name through the user API.
 	ErrKeyspaceReserved = errors.New("gmdb: keyspace name reserved for engine use")
+
+	// ErrCursorUnpositioned is returned by Cursor methods that
+	// require Positioned state (Current / Delete) when the cursor
+	// is Unpositioned or at End-of-iteration. The caller re-
+	// positions via First / Last / Seek / SeekGE.
+	ErrCursorUnpositioned = errors.New("gmdb: cursor not positioned")
+
+	// ErrCursorStale is returned by Cursor non-repositioning ops
+	// (Current / Next / Prev / Delete) when a sibling mutator
+	// invalidated the cursor. Per transactions.md §Cursor State
+	// Machine, the caller re-positions to recover.
+	ErrCursorStale = errors.New("gmdb: cursor invalidated by sibling mutation")
 )
 
 var (
-	errInvalidPageSize         = errors.New("gmdb: PageSize must be a power of two in [4096, 65536]")
-	errInvalidSizeBounds       = errors.New("gmdb: MaxSize must be > 0 and >= MinSize")
-	errInvalidTxBuffer         = errors.New("gmdb: MaxTxBufferBytes must be > 0")
-	errInvalidMaxReaders       = errors.New("gmdb: MaxReaders must be in [1, 65536]")
-	errInvalidSyncMode         = errors.New("gmdb: SyncMode out of range")
-	errSyncUnsafeRequiresOptIn = errors.New("gmdb: SyncUnsafe requires AllowSyncUnsafe=true")
+	errInvalidPageSize           = errors.New("gmdb: PageSize must be a power of two in [4096, 65536]")
+	errInvalidSizeBounds         = errors.New("gmdb: MaxSize must be > 0 and >= MinSize")
+	errInvalidTxBuffer           = errors.New("gmdb: MaxTxBufferBytes must be > 0")
+	errInvalidMaxReaders         = errors.New("gmdb: MaxReaders must be in [1, 65536]")
+	errInvalidSyncMode           = errors.New("gmdb: SyncMode out of range")
+	errSyncUnsafeRequiresOptIn   = errors.New("gmdb: SyncUnsafe requires AllowSyncUnsafe=true")
+	errInvalidMergeThreshold     = errors.New("gmdb: MergeThreshold must be in [1, 50]")
+	errInvalidRestartGroupTarget = errors.New("gmdb: RestartGroupTarget must be in [0, 255]")
 )

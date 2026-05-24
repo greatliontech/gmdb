@@ -128,7 +128,45 @@ type Pager struct {
 	// step-3-success / step-4-fail window without mocking the file.
 	// Production callers must not set this.
 	commitStep4HookForTest func() error
+
+	// laggingReader is the chunk-5.5 LaggingReader callback per
+	// lock-ordering.md §Lagging Reader Handling and free-space.md
+	// §Page Allocation Priority step 4. Invoked when AllocPage /
+	// AllocContiguous detect bitmap-exhausted AND RPL-reclaim-
+	// blocked-by-bound. At most once per AllocPage call to avoid
+	// busy loops.
+	laggingReader func(LaggingReaderInfo) LaggingReaderAction
+
+	// refreshReclamationBound is the chunk-5.5 plumb-through for
+	// "go re-poll the reader table and re-compute the bound." Used
+	// after LaggingReaderWait. DB.Begin captures coord and supplies
+	// a closure that re-derives the bound from coord.OldestReaderTxnID
+	// + the prev meta's TxnID. nil ⇒ no refresh attempted (the
+	// pager falls through to file extension after Wait).
+	refreshReclamationBound func() uint64
 }
+
+// LaggingReaderInfo is the pager-side mirror of gmdb.LaggingReaderInfo.
+// Passed to the chunk-5.5 callback by AllocPage / AllocContiguous when
+// reclamation is blocked by a reader. PID/HeldPages are zero when the
+// pager cannot cheaply derive them — the chunk-5.5 wiring fills only
+// TxnID and Lag from local state.
+type LaggingReaderInfo struct {
+	PID       uint32
+	TxnID     uint64
+	Lag       uint64
+	HeldPages uint64
+}
+
+// LaggingReaderAction is the return type of the callback.
+type LaggingReaderAction int
+
+const (
+	// LaggingReaderWait directs AllocPage to refresh and retry.
+	LaggingReaderWait LaggingReaderAction = iota
+	// LaggingReaderAbort directs AllocPage to return ErrDBFull.
+	LaggingReaderAbort
+)
 
 // RPLSegmentRef is the in-memory descriptor of one on-disk RPL segment
 // page. The pager maintains a slice of these ordered tail (index 0,
@@ -335,6 +373,22 @@ func (p *Pager) Config() page.Config { return p.cfg }
 // use this.
 func (p *Pager) SetCommitStep4HookForTest(fn func() error) {
 	p.commitStep4HookForTest = fn
+}
+
+// SetLaggingReaderCallback installs the chunk-5.5 LaggingReader
+// callback. nil clears. AllocPage / AllocContiguous invoke this when
+// bitmap-exhausted AND reclamation-blocked-by-bound. At most once per
+// AllocPage call.
+func (p *Pager) SetLaggingReaderCallback(cb func(LaggingReaderInfo) LaggingReaderAction) {
+	p.laggingReader = cb
+}
+
+// SetReclamationBoundRefresh installs the bound-refresh closure used
+// after LaggingReaderWait. nil clears (no refresh, fall through to
+// file extension). DB.Begin captures coord and supplies a closure
+// that recomputes min(coord.OldestReaderTxnID(), prevMeta.TxnID).
+func (p *Pager) SetReclamationBoundRefresh(refresh func() uint64) {
+	p.refreshReclamationBound = refresh
 }
 
 // FileSize returns the file size observed at Open. Used to bound reads

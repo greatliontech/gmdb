@@ -804,7 +804,10 @@ func (tx *Tx) ListKeyspaces() ([]string, error)
 // page-formats.md §Compressed Leaf). The KeyspaceConfig
 // RestartGroupTarget uses 0 as the "leave unchanged" sentinel
 // (distinct from the descriptor's 0 = engine-default semantic).
-// Only valid on a write transaction.
+// Returns ErrNotFound when name does not resolve to an existing
+// keyspace (chunk-5.5 lock-in matching Tx.DeleteKeyspace and the
+// Delete-on-miss invariant family). Only valid on a write
+// transaction.
 func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error
 
 type KeyspaceConfig struct {
