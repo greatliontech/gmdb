@@ -123,13 +123,20 @@ func (p *Pager) ensureFileCovers(pages uint64) error {
 // FreePage marks id for retirement. The disposition depends on whether
 // id was allocated within this transaction:
 //
-//   - In p.dirty (CoW'd or freshly-allocated this tx): becomes a loose
+//   - In p.dirty (CoW'd or AllocSlab'd this tx): becomes a loose
 //     page. Reusable via AllocPage; if not reused, its bitmap bit is set
 //     at commit (bypassing the RPL because no other process holds a
 //     snapshot referencing a same-tx page).
-//   - Not in p.dirty (mmap-backed, from a prior tx): joins retiredPages.
-//     Appended to the RPL at commit so the page survives in MVCC until
-//     the reclamation bound advances past this tx's TxnID.
+//   - In pendingAllocs but not yet in p.dirty (allocated this tx but
+//     never CoW'd / AllocSlab'd — the chunk-4.7 overflow rollback path
+//     reaches here when AllocContiguous succeeds but AllocSlabRun fails
+//     mid-run): bitmap bit is restored to free, pendingAllocs entry is
+//     dropped. No retiredPages entry: no prior-tx reader holds a
+//     snapshot referencing this page.
+//   - Not in p.dirty and not in pendingAllocs (mmap-backed, from a
+//     prior tx): joins retiredPages. Appended to the RPL at commit so
+//     the page survives in MVCC until the reclamation bound advances
+//     past this tx's TxnID.
 //
 // Errors: ErrReadOnly on a read-only pager.
 func (p *Pager) FreePage(id uint64) error {
@@ -145,6 +152,18 @@ func (p *Pager) FreePage(id uint64) error {
 		// cleared because the page no longer needs its bitmap bit
 		// cleared at commit — it was never published as in-use.
 		p.loosePages[id] = struct{}{}
+		delete(p.pendingAllocs, id)
+		return nil
+	}
+	if _, justAllocated := p.pendingAllocs[id]; justAllocated {
+		// Allocated this tx via AllocPage / AllocContiguous but never
+		// CoW'd / AllocSlab'd. Restore the bitmap bit (no slab buffer
+		// to retain) and drop the pendingAllocs entry — no prior-tx
+		// snapshot references this page, so it does not enter the
+		// RPL. Reachable today via AllocContiguous + AllocSlabRun
+		// rollback when AllocSlabRun fails on the budget check after
+		// AllocContiguous already cleared the bitmap bits.
+		p.bitmap.Set(id)
 		delete(p.pendingAllocs, id)
 		return nil
 	}
@@ -272,4 +291,124 @@ func (p *Pager) ResetFreespace() {
 	clear(p.pendingFrees)
 	clear(p.loosePages)
 	p.retiredPages = p.retiredPages[:0]
+}
+
+// AllocContiguous returns the first page ID of a contiguous run of n
+// pages allocated atomically per free-space.md §Page Allocation Priority
+// (the n>1 path: bitmap.FindContiguous → RPL reclamation + retry → file
+// extension). Implements the chunk-4.7 PageWriter contract used by the
+// overflow-chain Put path (internal/btree.overflow).
+//
+// Atomicity: on success, all n pages [firstID, firstID+n) are reserved
+// (bitmap bits cleared on the bitmap-hit branch; pendingAllocs entries
+// added on every branch) in a single transition. On error, no run is
+// reserved — pendingAllocs and the bitmap allocation set are unchanged.
+// Concurrent reclamation and LIFO-hint side effects that happened
+// during the call (reclaimRPL's bitmap.Set, SetHint) are retained,
+// matching AllocPage's contract: they are speculative free-pool
+// accounting, not allocation reservations.
+//
+// Loose pages are not consulted: chunk-4.7 overflow runs require
+// contiguous addressing (followers have no header and must be
+// addressable as firstID+i), and the loose-page set holds individually
+// freed pages with no contiguity guarantee. n==1 delegates to AllocPage
+// so the loose-page priority + LIFO hint behaviour is preserved.
+func (p *Pager) AllocContiguous(n uint32) (uint64, error) {
+	if p.readOnly {
+		return 0, ErrReadOnly
+	}
+	if p.bitmap == nil {
+		return 0, ErrFreespaceUnconfigured
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("pager: AllocContiguous: n must be > 0")
+	}
+	if n == 1 {
+		return p.AllocPage()
+	}
+
+	// 1. Bitmap contiguous-run search.
+	if firstID, ok := p.bitmap.FindContiguous(int(n)); ok {
+		p.reserveBitmapRun(firstID, n)
+		return firstID, nil
+	}
+
+	// 2. RPL reclamation + retry. Reclamation may set bits free in a
+	// region that contains a contiguous run.
+	if p.reclaimRPL() > 0 {
+		if firstID, ok := p.bitmap.FindContiguous(int(n)); ok {
+			p.reserveBitmapRun(firstID, n)
+			return firstID, nil
+		}
+	}
+
+	// 3. (Lagging-reader callback — chunk 5.5 territory.)
+
+	// 4. File extension. Advance HighWaterMark by n. Pages past the
+	// prior HWM had no bitmap bit set (bits at and above totalPages
+	// are forced clear; the same is conceptually true for pages
+	// between HWM and totalPages until first used). They join
+	// pendingAllocs without a bitmap.Clear call. One ensureFileCovers
+	// covers the whole run.
+	if p.highWaterMark+uint64(n) > p.maxSizePages {
+		return 0, ErrDBFull
+	}
+	firstID := p.highWaterMark
+	newHWM := p.highWaterMark + uint64(n)
+	for id := firstID; id < newHWM; id++ {
+		p.pendingAllocs[id] = struct{}{}
+	}
+	p.highWaterMark = newHWM
+	if err := p.ensureFileCovers(p.highWaterMark); err != nil {
+		// Roll back the HWM bump + pendingAllocs entries on truncate
+		// failure. Atomicity per the chunk-5.2 Inv-1 contract.
+		for id := firstID; id < newHWM; id++ {
+			delete(p.pendingAllocs, id)
+		}
+		p.highWaterMark = firstID
+		return 0, err
+	}
+	return firstID, nil
+}
+
+// reserveBitmapRun reserves [firstID, firstID+n) on the bitmap path:
+// clears the bitmap bits, records pendingAllocs, drops any pendingFrees
+// entries that were scheduled (a loose-page free that hadn't been
+// committed). Sets the LIFO hint just past the run for locality.
+func (p *Pager) reserveBitmapRun(firstID uint64, n uint32) {
+	end := firstID + uint64(n)
+	for id := firstID; id < end; id++ {
+		p.bitmap.Clear(id)
+		p.pendingAllocs[id] = struct{}{}
+		delete(p.pendingFrees, id)
+	}
+	p.bitmap.SetHint(end - 1)
+}
+
+// FreeRun retires a contiguous run of n pages starting at firstID. Each
+// ID in [firstID, firstID+n) is dispositioned by FreePage's per-ID
+// rules: same-tx p.dirty page → loose; same-tx allocated-but-never-
+// written → bitmap-bit restored; prior-tx → retiredPages.
+//
+// The chunk-4.7 rollback path calls FreeRun after AllocContiguous
+// succeeds but AllocSlabRun fails — every page in the run is in
+// pendingAllocs but not in p.dirty, so FreeRun restores all n bitmap
+// bits and drops the pendingAllocs entries. No retiredPages growth.
+func (p *Pager) FreeRun(firstID uint64, n uint32) error {
+	if p.readOnly {
+		return ErrReadOnly
+	}
+	if p.bitmap == nil {
+		return ErrFreespaceUnconfigured
+	}
+	if n == 0 {
+		return fmt.Errorf("pager: FreeRun: n must be > 0")
+	}
+	end := firstID + uint64(n)
+	for id := firstID; id < end; id++ {
+		if err := p.FreePage(id); err != nil {
+			return err
+		}
+	}
+	return nil
 }

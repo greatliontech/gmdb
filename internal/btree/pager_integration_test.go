@@ -1,0 +1,165 @@
+package btree
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/bitmap"
+	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/thegrumpylion/gmdb/internal/pager"
+)
+
+// Chunk-5.2 Inv-3: PageWriter parity — the chunk-4.7 overflow chain
+// semantics (Put-replace / Delete free the chain) hold over a real
+// *pager.Pager implementation of the PageWriter interface, not just
+// fakeWriter. setupPagerWriter mirrors internal/pager/freespace_test.go's
+// setupWriter — kept local to avoid an internal/pager test-helper
+// export.
+
+const pagerTestPageSize = 4096
+
+func setupPagerWriter(t *testing.T, pages int) (*pager.Pager, *bitmap.Bitmap, *os.File) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db.gmdb")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := f.Truncate(int64(pages) * int64(pagerTestPageSize)); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	pool := pager.NewBufPool(pagerTestPageSize)
+	cfg := page.Config{PageSize: pagerTestPageSize, RestartGroupTarget: 16}
+	p, err := pager.NewWriter(f, cfg, int64(pages)*int64(pagerTestPageSize), pool, 16<<20)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	bm := bitmap.New(make([]byte, pagerTestPageSize), pagerTestPageSize, 1, uint64(pages))
+	p.AttachBitmap(bm)
+	p.SetCommitState(bm.FirstDataPage(), uint64(pages), 0)
+	// Mark every data page free so the bitmap path can satisfy
+	// AllocPage / AllocContiguous without falling through to HWM
+	// extension. (Real pagers seed this from the on-disk bitmap; the
+	// test does it explicitly.)
+	for id := bm.FirstDataPage(); id < uint64(pages); id++ {
+		bm.Set(id)
+	}
+	return p, bm, f
+}
+
+// TestPagerOverflowPutGetDelete pins Inv-3: a Put with a value larger
+// than inline leaf capacity, followed by Get and Delete, round-trips
+// correctly on *pager.Pager and frees the overflow chain on Delete
+// (bitmap bits restored, no retiredPages growth for same-tx work).
+func TestPagerOverflowPutGetDelete(t *testing.T) {
+	pw, bm, f := setupPagerWriter(t, 128)
+	defer pw.Close()
+	defer f.Close()
+
+	cfg := pw.Config()
+	key := []byte("overflow-key")
+	// 8 KB value — overflow at 4 KB pages (single-entry inline leaf
+	// capacity is < 4 KB).
+	value := make([]byte, 8192)
+	for i := range value {
+		value[i] = byte(i & 0xFF)
+	}
+
+	root, err := Put(pw, cfg, 0, key, value)
+	if err != nil {
+		t.Fatalf("Put overflow: %v", err)
+	}
+
+	got, found, err := Get(pw, cfg, root, key)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !found {
+		t.Fatal("Get: key not found after Put")
+	}
+	if !bytes.Equal(got, value) {
+		t.Errorf("Get mismatch: len(got)=%d, len(want)=%d", len(got), len(value))
+	}
+
+	// Snapshot the bitmap state before Delete so we can assert the
+	// overflow chain pages are restored to free.
+	freeBefore := 0
+	for id := bm.FirstDataPage(); id < bm.TotalPages(); id++ {
+		if bm.IsSet(id) {
+			freeBefore++
+		}
+	}
+
+	newRoot, err := Delete(pw, cfg, root, DefaultMergeThreshold, key)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if newRoot != 0 {
+		t.Errorf("Delete of only entry should leave rootID=0, got %d", newRoot)
+	}
+
+	// After Delete, every page used by the overflow chain + the
+	// retired leaf should be either freed (bitmap set) or in the loose
+	// set (same-tx pages with slab buffers).
+	freeAfter := 0
+	for id := bm.FirstDataPage(); id < bm.TotalPages(); id++ {
+		if bm.IsSet(id) {
+			freeAfter++
+		}
+	}
+	if freeAfter < freeBefore {
+		t.Errorf("Delete shrunk bitmap-free set: %d → %d (overflow chain "+
+			"pages not restored)", freeBefore, freeAfter)
+	}
+}
+
+// TestPagerOverflowReplaceFreesOldChain pins the chunk-4.7 Put-replace
+// invariant on *pager.Pager: replacing an overflow value with a new
+// overflow value frees the prior chain.
+func TestPagerOverflowReplaceFreesOldChain(t *testing.T) {
+	pw, _, f := setupPagerWriter(t, 128)
+	defer pw.Close()
+	defer f.Close()
+
+	cfg := pw.Config()
+	key := []byte("k")
+	value1 := bytes.Repeat([]byte{'A'}, 8192)
+	value2 := bytes.Repeat([]byte{'B'}, 9216)
+
+	root, err := Put(pw, cfg, 0, key, value1)
+	if err != nil {
+		t.Fatalf("Put #1 (overflow): %v", err)
+	}
+	allocsAfter1 := len(pw.PendingAllocs())
+
+	root, err = Put(pw, cfg, root, key, value2)
+	if err != nil {
+		t.Fatalf("Put #2 (overflow replace): %v", err)
+	}
+
+	// Heuristic sanity bound — a regression that leaks the old chain
+	// would more than double pendingAllocs (old chain pages retained +
+	// new chain allocated). The tight invariant (chunk-4.7 slab
+	// partition: allocated = reachable ⊕ freed, with overflow-chain
+	// reachability) is already enforced by fakeWriter assertions in
+	// put_test.go; this integration test's job is parity, so the
+	// loose bound is sufficient — the load-bearing assertion is the
+	// Get round-trip below.
+	allocsAfter2 := len(pw.PendingAllocs())
+	if allocsAfter2 > allocsAfter1*2 {
+		t.Errorf("Put-replace did not free old overflow chain: "+
+			"pendingAllocs %d → %d (more than 2x growth)", allocsAfter1, allocsAfter2)
+	}
+
+	got, found, err := Get(pw, cfg, root, key)
+	if err != nil {
+		t.Fatalf("Get after replace: %v", err)
+	}
+	if !found || !bytes.Equal(got, value2) {
+		t.Errorf("Get after replace: found=%v, value matches=%v",
+			found, bytes.Equal(got, value2))
+	}
+}

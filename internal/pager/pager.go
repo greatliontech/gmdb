@@ -421,6 +421,56 @@ func (p *Pager) AllocSlab(id uint64) ([]byte, error) {
 	return *buf, nil
 }
 
+// AllocSlabRun installs n fresh zero-filled slab buffers covering the
+// contiguous run [firstID, firstID+n) previously reserved via
+// AllocContiguous. pages[i] is the buffer for firstID + uint64(i).
+// Implements the chunk-4.7 PageWriter contract used by the
+// overflow-chain Put path (internal/btree.overflow).
+//
+// Atomicity: the slab budget is checked once against the full n*PageSize
+// before any buffer is installed. On budget exceed (ErrTxTooLarge),
+// nothing is installed — the caller is expected to FreeRun(firstID, n)
+// to roll back the prior AllocContiguous.
+//
+// Idempotence: per-page, AllocSlab semantics are preserved — a buffer
+// already installed at any id in the run is returned unchanged and no
+// budget is charged for that id. The pre-flight budget check uses the
+// count of NOT-already-installed pages so an idempotent re-run of the
+// same firstID does not double-bill.
+func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
+	if p.readOnly {
+		return nil, ErrReadOnly
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("pager: AllocSlabRun: n must be > 0")
+	}
+	end := firstID + uint64(n)
+	fresh := int64(0)
+	for id := firstID; id < end; id++ {
+		if _, ok := p.dirty[id]; !ok {
+			fresh++
+		}
+	}
+	// int64 arithmetic on the budget check so GOARCH=386/arm overflow
+	// isn't reachable for large n (uint32 max × 64 KB PageSize ≈ 2^48).
+	if int64(p.dirtyBytes)+fresh*int64(p.cfg.PageSize) > int64(p.maxBytes) {
+		return nil, ErrTxTooLarge
+	}
+	out := make([][]byte, n)
+	for i := uint32(0); i < n; i++ {
+		id := firstID + uint64(i)
+		if existing, ok := p.dirty[id]; ok {
+			out[i] = *existing
+			continue
+		}
+		buf := p.bufPool.Get()
+		p.dirty[id] = buf
+		p.dirtyBytes += int(p.cfg.PageSize)
+		out[i] = *buf
+	}
+	return out, nil
+}
+
 // Mutate returns the writable slab buffer at id. Returns ErrPageNotDirty
 // if id has not been CoW'd or AllocSlab'd in this transaction (the
 // caller must CoW first); ErrReadOnly on a read-only pager. The returned

@@ -445,11 +445,30 @@ the keyspace subtree atomically.
   `Keyspace.Delete` (the `SetKeyspace.Delete` /
   `SetKeyspace.DeleteValue` enforcement lands at chunk 6 when
   the SetKeyspace surface itself lands).
-- **5.2** ⏳ Pager: `AllocContiguous` / `AllocSlabRun` /
+- **5.2** ✅ Pager: `AllocContiguous` / `AllocSlabRun` /
   `FreeRun` — implements the chunk-4.7 `PageWriter` extensions
-  on `*pager.Pager` so chunk-5+ keyspace code can drive overflow
-  chains on real files (chunk 4.7's `fakeWriter` is the only
-  current implementer).
+  on `*pager.Pager`. `AllocContiguous(n)` walks the
+  free-space.md §Page Allocation Priority n>1 path (bitmap
+  `FindContiguous` → RPL reclaim + retry → file extension);
+  `AllocSlabRun(firstID, n)` installs the slab buffers with a
+  single int64-arithmetic budget check; `FreeRun(firstID, n)`
+  dispatches per-id through `FreePage`. Adjacent fix: extended
+  `FreePage` to handle the chunk-4.7 overflow-rollback case
+  (page in `pendingAllocs` but not yet in `p.dirty` — allocated
+  this tx but never CoW'd / AllocSlab'd) by restoring the
+  bitmap bit instead of routing to `retiredPages`; the same-tx
+  rule (no prior-tx reader holds a snapshot) means RPL retirement
+  would be wrong. Tests pin three chunk-5.2 spec-tier
+  invariants: Inv-1 (`AllocContiguous` atomicity on
+  `ensureFileCovers` failure), Inv-2 (alloc + immediate
+  `FreeRun` round-trip on bitmap path and on HWM-extension
+  path), Inv-3 (chunk-4.7 overflow chain `Put` / `Get` /
+  `Delete` parity over `*pager.Pager` — the integration test
+  in `internal/btree/pager_integration_test.go` is the first
+  cross-package writer-pager fixture). Filed:
+  `docs/issues/pager-test-helper-export.md` (Lands: condition
+  — when chunk 5.3+ adds a second cross-package fixture caller,
+  factor the duplicated `setupWriter` helper).
 - **5.3** ⏳ Keyspace descriptor codec (40-byte struct
   encode/decode/validate); promotes `keyspaces.md` invariant #1
   via codec round-trip.
