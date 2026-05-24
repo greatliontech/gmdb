@@ -135,8 +135,15 @@ func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID
 		case cmp > 0:
 			hi = mid
 		default:
+			// Capture the removed entry's overflow chain (if any)
+			// BEFORE splicing it out of the slice — the chain is
+			// freed AFTER the new leaf is committed so a transient
+			// CoW failure can't orphan the chain (the entry is
+			// still reachable from the original leaf at that
+			// point).
+			removed := entries[mid]
 			entries = append(entries[:mid], entries[mid+1:]...)
-			return rebuildLeafAfterDelete(pw, cfg, mergeThreshold, pageID, entries)
+			return rebuildLeafAfterDelete(pw, cfg, mergeThreshold, pageID, entries, removed)
 		}
 	}
 	return pageID, false, false, nil
@@ -144,12 +151,20 @@ func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID
 
 // rebuildLeafAfterDelete handles the post-removal encode for a leaf:
 // empty result → return newID=0 (parent removes the slot); otherwise
-// CoW the leaf and re-build via LeafBuilder.
-func rebuildLeafAfterDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, entries []page.LeafEntry) (uint64, bool, bool, error) {
+// CoW the leaf and re-build via LeafBuilder. After the leaf-level
+// CoW lands, frees the removed entry's overflow chain (if any) per
+// the Invariant: Delete of an overflow entry frees its chain in the
+// same write tx.
+func rebuildLeafAfterDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, entries []page.LeafEntry, removed page.LeafEntry) (uint64, bool, bool, error) {
 	if len(entries) == 0 {
 		// Last entry removed → signal "subtree gone" via newID=0.
 		// The recursive parent removes the corresponding child slot.
 		// No CoW allocation needed since there's nothing to encode.
+		// Order: chain-free first (still reachable via the
+		// not-yet-retired leaf), then leaf-free.
+		if err := freeOverflowChainIfPresent(pw, cfg, removed); err != nil {
+			return 0, false, false, err
+		}
 		if err := pw.FreePage(pageID); err != nil {
 			return 0, false, false, fmt.Errorf("btree: free emptied leaf %d: %w", pageID, err)
 		}
@@ -174,7 +189,17 @@ func rebuildLeafAfterDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8
 		}
 	}
 	b.Finish()
+	// Post-build cleanup ordering: chain-free first (still
+	// reachable via the OLD leaf which has not been retired yet),
+	// then the OLD leaf. On either failure roll back the newly-
+	// allocated leaf so the chunk's "any pages allocated during
+	// this Delete are freed on error" contract holds.
+	if err := freeOverflowChainIfPresent(pw, cfg, removed); err != nil {
+		_ = pw.FreePage(newID)
+		return 0, false, false, err
+	}
 	if err := pw.FreePage(pageID); err != nil {
+		_ = pw.FreePage(newID)
 		return 0, false, false, fmt.Errorf("btree: free old leaf %d: %w", pageID, err)
 	}
 	return newID, leafUnderflow(newBuf, cfg, mergeThreshold), true, nil

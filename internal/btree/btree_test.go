@@ -354,29 +354,59 @@ func TestHasMembership(t *testing.T) {
 	}
 }
 
-func TestGetOverflowEntryReturnsSentinel(t *testing.T) {
-	// Chunk-4.3 contract: matching an overflow-flagged leaf entry
-	// returns ErrOverflowValueUnsupported. The chunk-4.7 wiring
-	// replaces this with the actual overflow-run assembly.
+func TestGetOverflowEntryAssemblesValueChain(t *testing.T) {
+	// Chunk-4.7 contract (replaces the chunk-4.3 sentinel test):
+	// matching an overflow-flagged leaf entry assembles the
+	// chain bytes into a heap-allocated value slice. Pin: round-
+	// trip a known value across a 1+N-page chain.
 	cfg := page.Config{PageSize: 4096}
 	pr := newFakeReader(t, 4096)
+
+	// Encode a 10 KB value across an overflow chain rooted at
+	// page 42. At 4 KB pages with no checksum, the chain is:
+	//   page 42 (header + 4088 value bytes) +
+	//   page 43 (4096 value bytes) +
+	//   page 44 (1816 value bytes + 2280 zero pad).
+	const totalLen = 10000
+	value := make([]byte, totalLen)
+	for i := range totalLen {
+		value[i] = byte(i % 251) // non-trivial pattern
+	}
+	runLen := page.OverflowRunLength(cfg, totalLen)
+	if runLen != 3 {
+		t.Fatalf("setup: runLen = %d; want 3 (10000B / 4 KB page with header gap)", runLen)
+	}
+	pages := make([][]byte, runLen)
+	for i := range runLen {
+		pages[i] = make([]byte, cfg.PageSize)
+	}
+	if err := page.EncodeOverflowRun(pages, cfg, value); err != nil {
+		t.Fatalf("setup: EncodeOverflowRun: %v", err)
+	}
+	for i := range runLen {
+		pr.put(42+uint64(i), pages[i])
+	}
+
 	pr.put(1, makeLeaf(t, cfg, []page.LeafEntry{
 		{
 			Key:          []byte("big"),
 			Flags:        page.CellFlagOverflow,
 			OverflowPage: 42,
-			TotalLen:     100000,
+			TotalLen:     totalLen,
 		},
 	}))
-	_, found, err := Get(pr, cfg, 1, []byte("big"))
-	if !errors.Is(err, ErrOverflowValueUnsupported) {
-		t.Errorf("Get on overflow entry: err = %v, want ErrOverflowValueUnsupported", err)
+	got, found, err := Get(pr, cfg, 1, []byte("big"))
+	if err != nil {
+		t.Fatalf("Get on overflow entry: err = %v", err)
 	}
 	if !found {
-		t.Errorf("Get on overflow entry: found = false; want true (key matched even if value pending)")
+		t.Fatalf("Get on overflow entry: found = false; want true")
 	}
-	// Has should NOT surface the sentinel — membership is
-	// determinable regardless of value-assembly support.
+	if !bytes.Equal(got, value) {
+		t.Errorf("Get assembled wrong bytes (len=%d/%d, first mismatch undisclosed)", len(got), len(value))
+	}
+	// Has should NOT pay the chain read — membership is
+	// determinable from the leaf entry alone.
 	has, err := Has(pr, cfg, 1, []byte("big"))
 	if err != nil || !has {
 		t.Errorf("Has on overflow entry: (%v, %v); want (true, nil)", has, err)

@@ -67,7 +67,7 @@ type cursorFrame struct {
 //
 // Slice ownership. The (key, value) byte slices returned by
 // Current / First / Last / Next / Prev / Seek / SeekGE are
-// borrowed:
+// borrowed for inline entries:
 //   - Value aliases the leaf page buffer; valid until the next
 //     cursor operation that crosses a leaf transition (a Next /
 //     Prev / Delete that moves to a different leaf), or the
@@ -78,6 +78,15 @@ type cursorFrame struct {
 //     cursor movement. Key for restart entries and uncompressed
 //     leaves aliases the leaf page buffer with the same lifetime
 //     as Value.
+//
+// Overflow-entry values diverge from the borrowed-reference rule:
+// the value is assembled from a 1+N-page contiguous chain that
+// has header/footer gaps between value bytes, so a single
+// contiguous mmap slice can't span it. The cursor eagerly
+// assembles into a heap-allocated slice on every step that lands
+// on an overflow entry; the returned Value is caller-owned with
+// caller-controlled lifetime. (Future: lazy-on-Current assembly
+// + a tx-scoped arena could amortize.)
 //
 // Callers that need to retain a returned key past the next cursor
 // op must bytes.Clone before moving the cursor — per api-surface.md
@@ -245,7 +254,7 @@ func (c *Cursor) Seek(target []byte) (key, value []byte) {
 	c.posGen = c.gen
 	c.state = csPositioned
 	c.adoptTargetKey(target)
-	c.curValue = entry.Value
+	c.curValue = c.valueFor(entry)
 	return c.curKey, c.curValue
 }
 
@@ -268,7 +277,7 @@ func (c *Cursor) SeekGE(target []byte) (key, value []byte) {
 		c.posGen = c.gen
 		c.state = csPositioned
 		c.adoptTargetKey(target)
-		c.curValue = entry.Value
+		c.curValue = c.valueFor(entry)
 		return c.curKey, c.curValue
 	}
 	// Miss: idx is the in-leaf successor index. If idx < the
@@ -450,9 +459,33 @@ func (c *Cursor) reclaimIterBuffers() {
 // returned Key aliases keyBuf which the next iter call may
 // clobber; the api-surface.md contract permits this (Key valid
 // until next cursor op).
+//
+// Overflow entries: the value is eagerly assembled from the
+// overflow chain into a heap-allocated slice. Heap ownership
+// diverges from the inline-value mmap-borrow rule; see Cursor
+// type doc for the full lifetime contract. On assembly error the
+// cursor's err is set and curValue is left nil — state stays
+// csPositioned (the key was found), but Err() surfaces the
+// failure so the caller can decide whether to continue.
 func (c *Cursor) adoptEntry(e page.LeafEntry) {
 	c.curKey = e.Key
-	c.curValue = e.Value
+	c.curValue = c.valueFor(e)
+}
+
+// valueFor returns the value bytes for entry e: e.Value verbatim
+// for inline entries; the heap-assembled chain bytes for overflow
+// entries. Records assembly errors via c.err and returns nil in
+// that case.
+func (c *Cursor) valueFor(e page.LeafEntry) []byte {
+	if !e.IsOverflow() {
+		return e.Value
+	}
+	val, err := readOverflowValue(c.pr, c.cfg, e)
+	if err != nil {
+		c.err = err
+		return nil
+	}
+	return val
 }
 
 // adoptTargetKey stashes the caller's `target` into the cursor's

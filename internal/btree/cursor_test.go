@@ -421,24 +421,44 @@ func TestCursorDeleteCowMergeCascadeTolerance(t *testing.T) {
 }
 
 func TestCursorOverflowEntryNavigation(t *testing.T) {
-	// Chunk 4.3 contract: Get on an overflow entry returns
-	// ErrOverflowValueUnsupported. The cursor doesn't fetch the
-	// value via Get — it streams from the leaf via SearchLeaf /
-	// IterForReuse, which both return the overflow-flagged entry
-	// with Value == nil. The cursor surfaces (key, nil) at that
-	// position; the chunk-4.7 overflow-assembly wiring replaces
-	// this. Pin that the cursor doesn't panic on an overflow
-	// entry and that surrounding inline entries navigate
-	// correctly.
+	// Chunk-4.7 contract (replaces the chunk-4.3 sentinel test):
+	// the cursor eagerly assembles overflow-entry values on
+	// adoptEntry, returning the assembled bytes via Current /
+	// Next / Prev. Pin: a leaf with mixed inline + overflow
+	// entries walks correctly and the overflow entry's value
+	// matches the chain bytes.
 	cfg := page.Config{PageSize: 4096}
 	pr := newFakeReader(t, 4096)
+
+	// Set up an overflow chain rooted at page 42 with a known
+	// 6000-byte value (≥ 4 KB single-page capacity → 2-page run).
+	const totalLen = 6000
+	value := make([]byte, totalLen)
+	for i := range totalLen {
+		value[i] = byte(i % 251)
+	}
+	runLen := page.OverflowRunLength(cfg, totalLen)
+	if runLen != 2 {
+		t.Fatalf("setup: runLen = %d; want 2", runLen)
+	}
+	pages := make([][]byte, runLen)
+	for i := range runLen {
+		pages[i] = make([]byte, cfg.PageSize)
+	}
+	if err := page.EncodeOverflowRun(pages, cfg, value); err != nil {
+		t.Fatalf("setup: EncodeOverflowRun: %v", err)
+	}
+	for i := range runLen {
+		pr.put(42+uint64(i), pages[i])
+	}
+
 	pr.put(1, makeLeaf(t, cfg, []page.LeafEntry{
 		{Key: []byte("a"), Value: []byte("A")},
 		{
 			Key:          []byte("big"),
 			Flags:        page.CellFlagOverflow,
 			OverflowPage: 42,
-			TotalLen:     100000,
+			TotalLen:     totalLen,
 		},
 		{Key: []byte("z"), Value: []byte("Z")},
 	}))
@@ -453,10 +473,39 @@ func TestCursorOverflowEntryNavigation(t *testing.T) {
 	if got[1][0] != "big" {
 		t.Errorf("overflow entry key = %q; want big", got[1][0])
 	}
-	// Value is empty (nil) for overflow entries at the cursor
-	// surface. Chunk-4.7 wires assembly.
-	if got[1][1] != "" {
-		t.Errorf("overflow entry value = %q; want empty (chunk-4.7 will assemble)", got[1][1])
+	// Cursor now assembles the overflow value into a heap slice;
+	// the assembled bytes must match the original.
+	if got[1][1] != string(value) {
+		t.Errorf("overflow entry value mismatch (got len=%d, want len=%d)", len(got[1][1]), len(value))
+	}
+}
+
+func TestCursorSeekGEExactMatchOverflowAssemblesValue(t *testing.T) {
+	// Regression for chunk-4.7 round-1 H1: SeekGE's exact-match
+	// path previously did `c.curValue = entry.Value` directly,
+	// bypassing valueFor — so an exact match on an overflow
+	// entry returned (key, nil) instead of (key, assembled).
+	cfg := page.Config{PageSize: 4096}
+	pw := newFakeWriter(t, 4096)
+	big := bytes.Repeat([]byte{'q'}, 8000)
+	root, err := Put(pw, cfg, 0, []byte("k"), big)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	c := NewCursor(pw, cfg, root, DefaultMergeThreshold)
+
+	k, v := c.SeekGE([]byte("k"))
+	if !bytes.Equal(k, []byte("k")) {
+		t.Errorf("SeekGE key = %q; want k", k)
+	}
+	if !bytes.Equal(v, big) {
+		t.Errorf("SeekGE overflow value mismatch (got len=%d, want len=%d)", len(v), len(big))
+	}
+
+	// Symmetric sanity check on Seek.
+	k, v = c.Seek([]byte("k"))
+	if !bytes.Equal(k, []byte("k")) || !bytes.Equal(v, big) {
+		t.Errorf("Seek (exact) overflow value mismatch")
 	}
 }
 

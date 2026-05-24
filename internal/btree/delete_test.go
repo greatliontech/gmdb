@@ -441,6 +441,168 @@ func TestDeleteFreesEveryRetiredPage(t *testing.T) {
 	checkSlabPartition(t, pw, cfg, root)
 }
 
+func TestDeleteOverflowEntryFreesChain(t *testing.T) {
+	// Chunk-4.7 contract: Delete of an overflow-flagged leaf entry
+	// frees the associated chain in the same write tx. Pinned via
+	// the slab-partition invariant (chunk-4.7 extension walks
+	// overflow chains as reachable). Both shapes covered:
+	//   (a) Delete that empties the leaf (newID=0 path) — the
+	//       chain must still be freed.
+	//   (b) Delete that leaves the leaf non-empty (rebuild path).
+	cfg := page.Config{PageSize: 4096}
+	big := bytes.Repeat([]byte{'x'}, 8000)
+
+	// (a) Single-entry overflow tree → delete empties it.
+	pw := newFakeWriter(t, 4096)
+	root, err := Put(pw, cfg, 0, []byte("k"), big)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	newRoot, err := Delete(pw, cfg, root, DefaultMergeThreshold, []byte("k"))
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if newRoot != 0 {
+		t.Errorf("Delete last entry: root = %d, want 0 (empty tree)", newRoot)
+	}
+	// Slab partition with rootID=0: every page is freed (no
+	// reachable set). The orphan-chain failure mode would surface
+	// as "allocated but neither reachable nor freed."
+	checkSlabPartition(t, pw, cfg, newRoot)
+
+	// (b) Multi-entry leaf with one overflow entry → delete that
+	// entry; the leaf survives, the chain is freed.
+	pw2 := newFakeWriter(t, 4096)
+	root, err = Put(pw2, cfg, 0, []byte("inline"), []byte("v"))
+	if err != nil {
+		t.Fatalf("seed Put inline: %v", err)
+	}
+	root, err = Put(pw2, cfg, root, []byte("ovfl"), big)
+	if err != nil {
+		t.Fatalf("Put overflow: %v", err)
+	}
+	root, err = Delete(pw2, cfg, root, DefaultMergeThreshold, []byte("ovfl"))
+	if err != nil {
+		t.Fatalf("Delete overflow: %v", err)
+	}
+	// Inline entry survives.
+	got, found, err := Get(pw2, cfg, root, []byte("inline"))
+	if err != nil || !found || !bytes.Equal(got, []byte("v")) {
+		t.Errorf("Get(inline) after delete-ovfl: %q found=%v err=%v", got, found, err)
+	}
+	// Overflow entry gone.
+	_, found, err = Get(pw2, cfg, root, []byte("ovfl"))
+	if err != nil || found {
+		t.Errorf("Get(ovfl) after delete: found=%v err=%v; want (false, nil)", found, err)
+	}
+	checkSlabPartition(t, pw2, cfg, root)
+}
+
+func TestMergeRedistributePreservesOverflowEntries(t *testing.T) {
+	// Chunk-4.7 contract via merge/redistribute: an overflow leaf
+	// entry moved between leaves during a merge or redistribute
+	// keeps its OverflowPage / TotalLen — the chain is NOT
+	// re-allocated, it just changes which leaf entry references
+	// it. The slab-partition invariant survives the move.
+	//
+	// Build a tree with several overflow entries that forces a
+	// multi-leaf topology; delete enough inline-padding entries
+	// to trigger a merge; verify (a) overflow values still
+	// round-trip and (b) the slab partition holds.
+	cfg := page.Config{PageSize: 4096}
+	pw := newFakeWriter(t, 4096)
+	root := uint64(0)
+
+	// Three overflow entries with distinct payloads + inline
+	// padding to force multi-leaf topology.
+	overflowValues := map[string][]byte{
+		"k-01-ovfl": bytes.Repeat([]byte{'a'}, 6000),
+		"k-05-ovfl": bytes.Repeat([]byte{'b'}, 6000),
+		"k-09-ovfl": bytes.Repeat([]byte{'c'}, 6000),
+	}
+	for k, v := range overflowValues {
+		nr, err := Put(pw, cfg, root, []byte(k), v)
+		if err != nil {
+			t.Fatalf("Put(%q): %v", k, err)
+		}
+		root = nr
+	}
+	// Inline padding entries between the overflow keys — large
+	// enough that the entries can't fit in a single 4 KB leaf.
+	// 1 KB values × 8 entries = 8 KB, forcing ≥2 leaves.
+	inlineKeys := []string{"k-02", "k-03", "k-04", "k-06", "k-07", "k-08", "k-10", "k-11"}
+	for _, k := range inlineKeys {
+		val := bytes.Repeat([]byte{'i'}, 1000)
+		nr, err := Put(pw, cfg, root, []byte(k), val)
+		if err != nil {
+			t.Fatalf("Put(%q): %v", k, err)
+		}
+		root = nr
+	}
+
+	if treeDepth(t, pw, root) < 1 {
+		t.Fatalf("setup: tree depth < 1; need multi-leaf topology")
+	}
+
+	// Delete every inline-padding key with threshold=50 to force
+	// merges; overflow entries stay alive and move between
+	// leaves as siblings merge.
+	for _, k := range inlineKeys {
+		nr, err := Delete(pw, cfg, root, 50, []byte(k))
+		if err != nil {
+			t.Fatalf("Delete(%q): %v", k, err)
+		}
+		root = nr
+	}
+
+	// Overflow values still retrievable post-merge.
+	for k, want := range overflowValues {
+		got, found, err := Get(pw, cfg, root, []byte(k))
+		if err != nil || !found {
+			t.Errorf("Get(%q) post-merge: found=%v err=%v", k, found, err)
+			continue
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("Get(%q) post-merge: value mismatch (got len=%d, want len=%d)", k, len(got), len(want))
+		}
+	}
+	// Slab partition holds — no chain orphans across the merge.
+	checkSlabPartition(t, pw, cfg, root)
+}
+
+func TestCursorDeleteOverflowEntryFreesChain(t *testing.T) {
+	// Chunk-4.7 contract via the cursor: Cursor.Delete delegates
+	// to btree.Delete; an overflow entry's chain must be freed
+	// the same way as a direct btree.Delete.
+	cfg := page.Config{PageSize: 4096}
+	big := bytes.Repeat([]byte{'x'}, 8000)
+	pw := newFakeWriter(t, 4096)
+	root, err := Put(pw, cfg, 0, []byte("a"), []byte("A"))
+	if err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+	root, err = Put(pw, cfg, root, []byte("big"), big)
+	if err != nil {
+		t.Fatalf("Put overflow: %v", err)
+	}
+	root, err = Put(pw, cfg, root, []byte("z"), []byte("Z"))
+	if err != nil {
+		t.Fatalf("Put trailing: %v", err)
+	}
+
+	c := NewCursor(pw, cfg, root, DefaultMergeThreshold)
+	c.Seek([]byte("big"))
+	if err := c.Delete(); err != nil {
+		t.Fatalf("Cursor.Delete on overflow entry: %v", err)
+	}
+	root = c.RootID()
+	// Successor advanced to "z".
+	if k, _ := c.Current(); !bytes.Equal(k, []byte("z")) {
+		t.Errorf("post-Cursor.Delete current key = %q; want z", k)
+	}
+	checkSlabPartition(t, pw, cfg, root)
+}
+
 // checkBalance walks the tree and asserts every leaf is at the same
 // depth from the root. A B+tree must be perfectly height-balanced;
 // any path-length disagreement indicates the delete cascade dropped a

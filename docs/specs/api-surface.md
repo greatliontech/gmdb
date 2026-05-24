@@ -248,11 +248,21 @@ into either the mmap, the writer's slab buffer (when reading
 own writes in a write txn), or an internal cursor buffer. The
 caller does not own them.
 
-**Value slices** point directly into the mmap (for inline values
-from committed pages) or into overflow pages in the mmap, or
-into the writer's slab buffer (for inline values from same-txn
-modifications). Valid until the **transaction closes**
-(`Commit()` or `Rollback()`).
+**Value slices for inline entries** point directly into the mmap
+(for committed pages) or into the writer's slab buffer (for same-
+txn modifications). Borrowed; valid until the **transaction
+closes** (`Commit()` or `Rollback()`).
+
+**Value slices for overflow entries** are heap-allocated and
+caller-owned. The overflow run's first page carries the page
+header at offset `[0, 8)` and (when `PageChecksum` is enabled)
+every page in the run carries an 8-byte footer at its tail, so
+the value bytes span non-contiguous regions of the mmap and a
+single contiguous borrowed slice cannot represent the assembled
+value. `Get` / `Cursor` assemble the chain into a freshly-
+allocated `[]byte` of length `TotalLen`; lifetime is caller-
+controlled (independent of the transaction). The borrowed-
+reference rule above does not apply to these slices.
 
 **Key slices** may point into the mmap (any key in an
 uncompressed leaf — `page-formats.md §Uncompressed Leaf` — or

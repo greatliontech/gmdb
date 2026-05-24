@@ -78,6 +78,56 @@ func (f *fakeWriter) FreePage(id uint64) error {
 	return nil
 }
 
+// AllocContiguous returns a run of n consecutive ids. Mirrors the
+// pager's bitmap contiguous-run search semantics (free-space.md
+// §Contiguous-run search) at the test layer: ids are monotonically
+// increasing across the writer's lifetime, never recycled within
+// the same tx — matching production except that production may
+// reuse loose pages.
+func (f *fakeWriter) AllocContiguous(n uint32) (uint64, error) {
+	if n == 0 {
+		return 0, fmt.Errorf("fakeWriter.AllocContiguous: n=0 invalid")
+	}
+	first := f.nextID
+	f.nextID += uint64(n)
+	return first, nil
+}
+
+// AllocSlabRun returns fresh zero-filled slab buffers for each id
+// in [firstID, firstID+n). Mirrors AllocSlab semantics page-by-
+// page; the caller (writeOverflowChain) writes via
+// page.EncodeOverflowRun.
+func (f *fakeWriter) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
+	if n == 0 {
+		return nil, fmt.Errorf("fakeWriter.AllocSlabRun: n=0 invalid")
+	}
+	pages := make([][]byte, n)
+	for i := range n {
+		buf := make([]byte, f.pageSize)
+		f.pages[firstID+uint64(i)] = buf
+		pages[i] = buf
+	}
+	return pages, nil
+}
+
+// FreeRun retires n consecutive pages starting at firstID. Each
+// id is checked against the no-double-free invariant (same as
+// FreePage), so a btree bug that retires an overflow chain twice
+// surfaces as a test failure.
+func (f *fakeWriter) FreeRun(firstID uint64, n uint32) error {
+	if n == 0 {
+		return fmt.Errorf("fakeWriter.FreeRun: n=0 invalid")
+	}
+	for i := range n {
+		id := firstID + uint64(i)
+		if _, alreadyFreed := f.freed[id]; alreadyFreed {
+			f.t.Errorf("fakeWriter.FreeRun: double-free of page %d (in run %d..%d)", id, firstID, firstID+uint64(n)-1)
+		}
+		f.freed[id] = struct{}{}
+	}
+	return nil
+}
+
 func TestPutEmptyTreeCreatesGenesisLeaf(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)
@@ -471,28 +521,139 @@ func TestPutContentsInvariantUnderInsertOrder(t *testing.T) {
 	}
 }
 
-func TestPutRejectsTooBigSingleEntry(t *testing.T) {
+func TestPutPromotesLargeValueToOverflow(t *testing.T) {
+	// Chunk-4.7 contract: a value exceeding inline single-entry
+	// leaf capacity is automatically promoted to an overflow
+	// chain (limits.md §Maximum Value Size). Round-trip via Get
+	// must return the assembled value. Replaces the chunk-4.4
+	// "reject oversize value" test — values no longer have a
+	// hard upper bound short of disk space.
 	cfg := page.Config{PageSize: 4096}
 	big := bytes.Repeat([]byte{'x'}, 8192)
-	// (a) Empty-tree path: goes through putEmpty.
+
+	// (a) Empty-tree path: putEmpty promotes the genesis entry.
 	pw := newFakeWriter(t, 4096)
-	_, err := Put(pw, cfg, 0, []byte("k"), big)
-	if !errors.Is(err, ErrKeyTooLarge) {
-		t.Errorf("Put oversize on empty tree: err = %v, want ErrKeyTooLarge", err)
+	root, err := Put(pw, cfg, 0, []byte("k"), big)
+	if err != nil {
+		t.Fatalf("Put oversize on empty tree: %v", err)
 	}
-	// (b) Existing-tree path: pre-populate with a small entry,
-	// then insert an oversize value. Goes through Put → CoW leaf
-	// → insertOrReplace → fit-ahead fail → split → len(enc) < 2
-	// guard fires (the oversize entry can't be split off into
-	// its own half because the other half would be empty).
+	got, found, err := Get(pw, cfg, root, []byte("k"))
+	if err != nil || !found {
+		t.Fatalf("Get after oversize Put: found=%v err=%v", found, err)
+	}
+	if !bytes.Equal(got, big) {
+		t.Errorf("Get returned wrong bytes (len=%d vs %d)", len(got), len(big))
+	}
+
+	// (b) Existing-tree path: a small entry already lives in the
+	// leaf, then an oversize value is inserted at a new key. The
+	// new entry goes overflow; the existing inline entry stays
+	// in place.
 	pw2 := newFakeWriter(t, 4096)
-	root, err := Put(pw2, cfg, 0, []byte("seed"), []byte("v"))
+	root, err = Put(pw2, cfg, 0, []byte("seed"), []byte("v"))
 	if err != nil {
 		t.Fatalf("seed Put: %v", err)
 	}
-	_, err = Put(pw2, cfg, root, []byte("big"), big)
+	root, err = Put(pw2, cfg, root, []byte("big"), big)
+	if err != nil {
+		t.Fatalf("Put oversize on non-empty tree: %v", err)
+	}
+	got, found, err = Get(pw2, cfg, root, []byte("big"))
+	if err != nil || !found || !bytes.Equal(got, big) {
+		t.Errorf("Get(big) after overflow Put: found=%v err=%v len=%d", found, err, len(got))
+	}
+	// The pre-existing small entry survives.
+	got, found, err = Get(pw2, cfg, root, []byte("seed"))
+	if err != nil || !found || !bytes.Equal(got, []byte("v")) {
+		t.Errorf("Get(seed) after overflow Put: found=%v err=%v val=%q", found, err, got)
+	}
+}
+
+func TestPutOverflowReplaceFreesOldChain(t *testing.T) {
+	// Spec-tier invariant (chunk-4.7): a same-key Put-replace
+	// where the displaced entry was overflow must free the prior
+	// chain in the same write tx. The failure class is "chain
+	// orphan after replace": the leaf's new entry references a
+	// freshly-allocated chain while the prior chain stays
+	// bitmap-allocated but unreachable from any live leaf entry.
+	//
+	// Pinned via the slab-partition invariant — checkSlabPartition
+	// (chunk-4.7 extension) walks overflow chains as reachable;
+	// a freed chain stays out of `reachable`, an orphan would
+	// trip the "allocated but neither reachable nor freed" arm.
+	cfg := page.Config{PageSize: 4096}
+	pw := newFakeWriter(t, 4096)
+
+	// (a) Insert with a large value (→ overflow).
+	big1 := bytes.Repeat([]byte{'a'}, 8000)
+	root, err := Put(pw, cfg, 0, []byte("k"), big1)
+	if err != nil {
+		t.Fatalf("Put #1: %v", err)
+	}
+	// Confirm we did produce an overflow chain.
+	pagesAfter1 := len(pw.pages)
+	if pagesAfter1 < 3 { // 1 leaf + ≥2 overflow pages for 8 KB at 4 KB pages
+		t.Fatalf("Put #1: only %d pages allocated; expected ≥3 (leaf + chain)", pagesAfter1)
+	}
+
+	// (b) Replace with another large value (→ different chain).
+	big2 := bytes.Repeat([]byte{'b'}, 8000)
+	root, err = Put(pw, cfg, root, []byte("k"), big2)
+	if err != nil {
+		t.Fatalf("Put #2 (replace): %v", err)
+	}
+	// Get must return the new value.
+	got, found, err := Get(pw, cfg, root, []byte("k"))
+	if err != nil || !found {
+		t.Fatalf("Get after replace: found=%v err=%v", found, err)
+	}
+	if !bytes.Equal(got, big2) {
+		t.Errorf("Get after replace returned old value (len=%d)", len(got))
+	}
+
+	// (c) Slab-partition invariant: the old overflow chain pages
+	// are now in `pw.freed`; the new chain pages are reachable
+	// from the live leaf. Nothing is both / neither.
+	checkSlabPartition(t, pw, cfg, root)
+
+	// (d) Replace overflow → inline. The chain is freed.
+	root, err = Put(pw, cfg, root, []byte("k"), []byte("small"))
+	if err != nil {
+		t.Fatalf("Put #3 (overflow → inline): %v", err)
+	}
+	got, found, err = Get(pw, cfg, root, []byte("k"))
+	if err != nil || !found || !bytes.Equal(got, []byte("small")) {
+		t.Errorf("Get after overflow→inline replace: %q found=%v err=%v", got, found, err)
+	}
+	checkSlabPartition(t, pw, cfg, root)
+
+	// (e) Replace inline → overflow. Symmetric: no chain to free
+	// on the old side, new chain allocated.
+	root, err = Put(pw, cfg, root, []byte("k"), big1)
+	if err != nil {
+		t.Fatalf("Put #4 (inline → overflow): %v", err)
+	}
+	got, found, err = Get(pw, cfg, root, []byte("k"))
+	if err != nil || !found || !bytes.Equal(got, big1) {
+		t.Errorf("Get after inline→overflow replace: found=%v err=%v len=%d", found, err, len(got))
+	}
+	checkSlabPartition(t, pw, cfg, root)
+}
+
+func TestPutRejectsOversizeKey(t *testing.T) {
+	// Chunk-4.7 contract: ErrKeyTooLarge fires only on keys too
+	// large for the overflow-reference leaf entry (a small fixed
+	// header per limits.md §Maximum Key Size). At 4 KB pages the
+	// overflow-reference entry overhead is 19 bytes plus the
+	// key; a key > ~4076 bytes can't fit a single-entry leaf.
+	cfg := page.Config{PageSize: 4096}
+	pw := newFakeWriter(t, 4096)
+	// Key larger than any single-entry leaf can hold even with
+	// overflow value reference.
+	bigKey := bytes.Repeat([]byte{'k'}, 5000)
+	_, err := Put(pw, cfg, 0, bigKey, []byte("v"))
 	if !errors.Is(err, ErrKeyTooLarge) {
-		t.Errorf("Put oversize on non-empty tree: err = %v, want ErrKeyTooLarge", err)
+		t.Errorf("Put oversize key on empty tree: err = %v, want ErrKeyTooLarge", err)
 	}
 }
 
@@ -549,6 +710,36 @@ func collectReachable(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, 
 	out[id] = struct{}{}
 	typ, _, _, _ := page.ReadHeader(pw.Page(id))
 	if page.IsLeafType(typ) {
+		// Walk overflow chains owned by any overflow leaf entries:
+		// each chain page is reachable via the leaf entry's
+		// OverflowPage + i for i in [0, OverflowRunLength). The
+		// slab-partition invariant (chunk-4.7 extension) requires
+		// overflow chains to be reachable from a live leaf entry
+		// — orphan chains are the chunk-4.7 chain-orphan failure
+		// class (chain bitmap-allocated but no leaf entry
+		// references it; pinned by
+		// TestPutOverflowReplaceFreesOldChain +
+		// TestDeleteOverflowEntryFreesChain).
+		r := page.NewLeafReader(pw.Page(id), cfg)
+		it := r.IterForReuse(nil, nil, nil)
+		for {
+			e, ok := it.Next()
+			if !ok {
+				break
+			}
+			if !e.IsOverflow() {
+				continue
+			}
+			runLen := page.OverflowRunLength(cfg, e.TotalLen)
+			for i := range runLen {
+				chainID := e.OverflowPage + uint64(i)
+				if _, seen := out[chainID]; seen {
+					t.Errorf("overflow chain page %d reachable from two leaf entries", chainID)
+					continue
+				}
+				out[chainID] = struct{}{}
+			}
+		}
 		return
 	}
 	if typ != page.TypeBranch {

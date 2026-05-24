@@ -13,9 +13,10 @@ import (
 //
 // Lifecycle contract: every page the btree allocates is either
 // (a) installed in the tree (chain reachable from the returned new
-// rootID), or (b) freed via FreePage before Put returns. The
-// pager's slab manages the byte buffers; btree never owns them
-// past the Put call.
+// rootID), or (b) freed (via FreePage for single pages, FreeRun
+// for overflow chains) before Put returns. The pager's slab
+// manages the byte buffers; btree never owns them past the Put
+// call.
 type PageWriter interface {
 	PageReader
 
@@ -39,14 +40,37 @@ type PageWriter interface {
 	// Put or the same write tx) become loose pages reusable
 	// within the tx; prior-tx pages enter the RPL at commit.
 	FreePage(id uint64) error
+
+	// AllocContiguous returns the first page ID of a fresh
+	// contiguous run of n pages. Used for overflow-chain
+	// allocation per page-formats.md §Overflow Page (followers
+	// have no header and must be addressable as firstID+1,
+	// firstID+2, ..., firstID+n-1). The pager's bitmap
+	// contiguous-run search backs this (free-space.md
+	// §Contiguous-run search).
+	AllocContiguous(n uint32) (uint64, error)
+
+	// AllocSlabRun returns the slab buffers for the n pages of a
+	// run previously allocated via AllocContiguous. pages[i] is
+	// the buffer for firstID + uint64(i). All buffers are fresh
+	// zero-filled page-sized slices.
+	AllocSlabRun(firstID uint64, n uint32) (pages [][]byte, err error)
+
+	// FreeRun retires a contiguous run of n pages starting at
+	// firstID. Each id [firstID, firstID+n) is treated like an
+	// individual FreePage by the pager's bookkeeping (loose
+	// within this tx; RPL'd at commit if prior-tx).
+	FreeRun(firstID uint64, n uint32) error
 }
 
-// ErrKeyTooLarge is returned by Put when the combined key/value
-// would not fit in a single leaf page even after split. The chunk-
-// 4.7 overflow-value path lifts the value limit; the chunk-7
-// limits.md max-key-size rule lifts via tree-depth constraints —
-// for now, callers must keep (key+value) below leaf capacity.
-var ErrKeyTooLarge = errors.New("btree: key/value too large for leaf split")
+// ErrKeyTooLarge is returned by Put when the key is too large even
+// for an overflow-reference leaf entry (key + overflow-ref header
+// exceeds a single-entry leaf page's capacity). Per limits.md
+// §Maximum Key Size the cap is ~(PageSize-40)/2; the chunk-7
+// tree-depth bound lifts this further. Values exceeding inline
+// capacity are automatically promoted to an overflow chain — the
+// sentinel fires only on oversize KEYS, never on oversize values.
+var ErrKeyTooLarge = errors.New("btree: key too large for overflow-reference leaf entry")
 
 // pathFrame records one level of the descent path for the CoW-
 // propagation pass. pageID is the page descended through;
@@ -127,7 +151,32 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 	if err != nil {
 		return 0, err
 	}
-	entries = insertOrReplaceLeaf(entries, key, value)
+
+	// Determine if the new value needs overflow promotion.
+	// Allocate the chain BEFORE the leaf re-build so a chain-alloc
+	// failure rolls back via FreeRun without leaving the leaf in a
+	// half-written state.
+	newEntry, err := buildPutEntry(pw, cfg, key, value)
+	if err != nil {
+		_ = pw.FreePage(leftID)
+		return 0, err
+	}
+
+	// insertOrReplaceLeaf returns the displaced entry (zero-valued
+	// on insert) so we can free its overflow chain after the new
+	// leaf is committed.
+	var displaced page.LeafEntry
+	entries, displaced = insertOrReplaceLeaf(entries, newEntry)
+
+	// Helper: rollback the freshly-allocated new chain (if any) on
+	// failure paths below. Mirrors the AllocPage→CoW→mutate→FreePage
+	// ordering for chains.
+	rollbackNewChain := func() {
+		if newEntry.IsOverflow() {
+			runLen := page.OverflowRunLength(cfg, newEntry.TotalLen)
+			_ = pw.FreeRun(newEntry.OverflowPage, runLen)
+		}
+	}
 
 	// Attempt single-page build into leftBuf. LeafBuilder's
 	// AddEntry returns false on page-full — no partial mutation is
@@ -143,18 +192,40 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 	}
 	if fits {
 		b.Finish()
+		// Post-build cleanup ordering: free the displaced chain
+		// FIRST while the OLD leaf still references it (so a
+		// chain-free fault can't observably orphan the chain —
+		// the entry is still reachable from the old leaf, which
+		// hasn't been retired yet). Then free the old leaf. On
+		// either failure roll back the new state (leftID + the
+		// new chain if it was allocated) so the chunk's
+		// "any pages allocated during this Put are freed on
+		// error" contract holds.
+		if err := freeOverflowChainIfPresent(pw, cfg, displaced); err != nil {
+			_ = pw.FreePage(leftID)
+			rollbackNewChain()
+			return 0, err
+		}
 		if err := pw.FreePage(leafID); err != nil {
+			_ = pw.FreePage(leftID)
+			rollbackNewChain()
 			return 0, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
 		}
 		return ascendNoSplit(pw, cfg, path, leftID)
 	}
 
-	// Split required. Per limits.md max-key-size, no single entry
-	// alone exceeds half a page, so a count-based midpoint split
-	// guarantees each half fits — UNLESS the newly-inserted entry
-	// is itself oversize (chunk 4.7 overflow-value lifts that).
+	// Split required. Since the new entry has been promoted to
+	// overflow when it'd otherwise exceed single-page capacity,
+	// the only remaining unfit case is "multi-entry leaf that
+	// overflows on one entry's growth" — count-balanced midpoint
+	// split. With limits.md key-size bounds + overflow promotion,
+	// `len(entries) < 2` is unreachable from valid input: an
+	// overflow-promoted single entry fits trivially, and an inline
+	// single entry below the overflow threshold fits trivially.
+	// Guard remains as defense in depth.
 	if len(entries) < 2 {
 		_ = pw.FreePage(leftID)
+		rollbackNewChain()
 		return 0, ErrKeyTooLarge
 	}
 	mid := len(entries) / 2
@@ -168,6 +239,7 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 	for _, e := range entries[:mid] {
 		if !b.AddEntry(e) {
 			_ = pw.FreePage(leftID)
+			rollbackNewChain()
 			return 0, ErrKeyTooLarge
 		}
 	}
@@ -177,12 +249,14 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 	rightID, err := pw.AllocPage()
 	if err != nil {
 		_ = pw.FreePage(leftID)
+		rollbackNewChain()
 		return 0, fmt.Errorf("btree: alloc split-right leaf: %w", err)
 	}
 	rightBuf, err := pw.AllocSlab(rightID)
 	if err != nil {
 		_ = pw.FreePage(leftID)
 		_ = pw.FreePage(rightID)
+		rollbackNewChain()
 		return 0, fmt.Errorf("btree: alloc split-right buf: %w", err)
 	}
 	rb := page.NewLeafBuilder(rightBuf, cfg)
@@ -190,12 +264,26 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 		if !rb.AddEntry(e) {
 			_ = pw.FreePage(leftID)
 			_ = pw.FreePage(rightID)
+			rollbackNewChain()
 			return 0, ErrKeyTooLarge
 		}
 	}
 	rb.Finish()
 
+	// Post-build cleanup ordering: free the displaced chain first
+	// (still reachable via the not-yet-retired old leaf), then
+	// the old leaf. On either failure roll back leftID + rightID
+	// + the new chain.
+	if err := freeOverflowChainIfPresent(pw, cfg, displaced); err != nil {
+		_ = pw.FreePage(leftID)
+		_ = pw.FreePage(rightID)
+		rollbackNewChain()
+		return 0, err
+	}
 	if err := pw.FreePage(leafID); err != nil {
+		_ = pw.FreePage(leftID)
+		_ = pw.FreePage(rightID)
+		rollbackNewChain()
 		return 0, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
 	}
 
@@ -204,20 +292,56 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 	return ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
 }
 
+// buildPutEntry constructs the LeafEntry for a Put: an inline entry
+// when the value fits, or an overflow-referencing entry (with the
+// chain freshly allocated + encoded) when the inline form exceeds
+// single-entry leaf capacity. Returns ErrKeyTooLarge if even the
+// overflow-reference form doesn't fit (key alone is too large).
+func buildPutEntry(pw PageWriter, cfg page.Config, key, value []byte) (page.LeafEntry, error) {
+	if !needsOverflow(cfg, key, value) {
+		return page.LeafEntry{Key: key, Value: value}, nil
+	}
+	if !overflowRefFitsLeaf(cfg, key) {
+		return page.LeafEntry{}, ErrKeyTooLarge
+	}
+	return writeOverflowChain(pw, cfg, key, value)
+}
+
 // putEmpty allocates a single-leaf root containing just (key,
-// value). The genesis path for an empty tree.
+// value). The genesis path for an empty tree. Routes through
+// buildPutEntry so a large value gets overflow-promoted the same
+// way as a non-empty-tree Put.
 func putEmpty(pw PageWriter, cfg page.Config, key, value []byte) (uint64, error) {
+	newEntry, err := buildPutEntry(pw, cfg, key, value)
+	if err != nil {
+		return 0, err
+	}
 	id, err := pw.AllocPage()
 	if err != nil {
+		if newEntry.IsOverflow() {
+			_ = pw.FreeRun(newEntry.OverflowPage, page.OverflowRunLength(cfg, newEntry.TotalLen))
+		}
 		return 0, fmt.Errorf("btree: alloc genesis leaf: %w", err)
 	}
 	buf, err := pw.AllocSlab(id)
 	if err != nil {
+		_ = pw.FreePage(id)
+		if newEntry.IsOverflow() {
+			_ = pw.FreeRun(newEntry.OverflowPage, page.OverflowRunLength(cfg, newEntry.TotalLen))
+		}
 		return 0, fmt.Errorf("btree: alloc genesis slab: %w", err)
 	}
 	b := page.NewLeafBuilder(buf, cfg)
-	if !b.AddInline(key, value) {
+	if !b.AddEntry(newEntry) {
 		_ = pw.FreePage(id)
+		if newEntry.IsOverflow() {
+			_ = pw.FreeRun(newEntry.OverflowPage, page.OverflowRunLength(cfg, newEntry.TotalLen))
+		}
+		// Genesis single entry must fit by construction (overflow
+		// promotion sized it down to a small reference); reaching
+		// this branch implies an oversize key past
+		// overflowRefFitsLeaf's check — keep ErrKeyTooLarge as the
+		// surface.
 		return 0, ErrKeyTooLarge
 	}
 	b.Finish()
@@ -260,32 +384,39 @@ func readLeafEntriesDeepCopy(buf []byte, cfg page.Config, pageID uint64) ([]page
 	return out, nil
 }
 
-// insertOrReplaceLeaf finds the position of `key` in the sorted-
-// by-key entries slice and either replaces the entry's Value (key
-// exists) or inserts a new inline entry at the right position.
-// Returns the new slice. The original may be shared with the
-// caller — do not retain. The replace path resets Flags so an old
-// overflow entry's bookkeeping (OverflowPage / TotalLen) doesn't
-// survive a same-key inline update.
-func insertOrReplaceLeaf(entries []page.LeafEntry, key, value []byte) []page.LeafEntry {
+// insertOrReplaceLeaf finds the position of `newEntry.Key` in the
+// sorted-by-key entries slice and either replaces the entry there
+// (key exists) or inserts newEntry at the correct sorted position.
+// Returns the modified slice plus the DISPLACED entry — non-zero
+// on replace (the LeafEntry that was at the replaced slot, used
+// by the caller to free any owned overflow chain) and zero-valued
+// on insert.
+//
+// The original entries slice may be shared with the caller — do
+// not retain. The replace path overwrites the slot wholesale so a
+// stale Flags / OverflowPage / TotalLen from the old entry doesn't
+// survive into the rebuilt leaf; the displaced entry is returned
+// separately so the chain-free path runs on the OLD overflow info.
+func insertOrReplaceLeaf(entries []page.LeafEntry, newEntry page.LeafEntry) ([]page.LeafEntry, page.LeafEntry) {
 	lo, hi := 0, len(entries)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
-		cmp := bytes.Compare(entries[mid].Key, key)
+		cmp := bytes.Compare(entries[mid].Key, newEntry.Key)
 		switch {
 		case cmp < 0:
 			lo = mid + 1
 		case cmp > 0:
 			hi = mid
 		default:
-			entries[mid] = page.LeafEntry{Key: key, Value: value}
-			return entries
+			displaced := entries[mid]
+			entries[mid] = newEntry
+			return entries, displaced
 		}
 	}
 	entries = append(entries, page.LeafEntry{})
 	copy(entries[lo+1:], entries[lo:])
-	entries[lo] = page.LeafEntry{Key: key, Value: value}
-	return entries
+	entries[lo] = newEntry
+	return entries, page.LeafEntry{}
 }
 
 // ascendNoSplit walks the path in reverse, CoWing each branch and

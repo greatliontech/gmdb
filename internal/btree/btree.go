@@ -42,26 +42,27 @@ var ErrCorrupted = errors.New("btree: structural corruption detected")
 // callers can errors.Is past either sentinel.
 var ErrTreeTooDeep = fmt.Errorf("%w: descent exceeded MaxTreeDepth (cycle or corrupt tree)", ErrCorrupted)
 
-// ErrOverflowValueUnsupported is returned by Get when the matched
-// leaf entry is an overflow reference. Overflow value assembly
-// lands in chunk 4.7 — until then, the caller surfaces this to the
-// user as a "value too large to inline" failure rather than
-// silently returning nil. This sentinel is the chunk-4.3-bounded
-// surface; replaced by an actual assembly path in 4.7.
-var ErrOverflowValueUnsupported = errors.New("btree: overflow value assembly not yet implemented (chunk 4.7)")
-
 // Get traverses the tree rooted at rootID looking for key. Returns
-// the value bytes (borrowed from the page buffer, valid for the
-// tx's lifetime) on hit; (nil, false, nil) on miss; an error on
-// structural corruption (bad page type, null child pointer,
-// malformed leaf, cyclic chain, or overflow value).
+// the value bytes on hit, (nil, false, nil) on miss, or an error
+// on structural corruption (bad page type, null child pointer,
+// malformed leaf, cyclic chain).
 //
 // Empty tree (rootID == 0) returns (nil, false, nil) — the
 // convention used by keyspace descriptors for "no entries yet."
 //
+// Value ownership. For an inline entry the returned slice is
+// BORROWED from the leaf page buffer (valid for the tx's
+// lifetime), matching api-surface.md §Byte Slice Ownership. For
+// an overflow entry the returned slice is HEAP-ALLOCATED — the
+// value is assembled from a 1+N-page contiguous run that has
+// header / footer gaps between value bytes, so a single
+// contiguous mmap slice can't span it. Caller-owned, lifetime is
+// caller-controlled.
+//
 // The PageReader's Page(id) is called at every level: O(depth)
-// page resolutions. With a typical depth of 3–5 and 4 KB pages,
-// each Get touches a small handful of cache-warm pages.
+// page resolutions plus 1+N more for an overflow read. With a
+// typical depth of 3–5 and 4 KB pages, each inline Get touches a
+// small handful of cache-warm pages.
 //
 // Validation boundary. Every leaf page resolved during descent is
 // passed through LeafReader.Validate before SearchLeaf — the
@@ -97,7 +98,11 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 				return nil, false, nil
 			}
 			if entry.IsOverflow() {
-				return nil, true, ErrOverflowValueUnsupported
+				val, err := readOverflowValue(pr, cfg, entry)
+				if err != nil {
+					return nil, true, err
+				}
+				return val, true, nil
 			}
 			return entry.Value, true, nil
 		default:
@@ -112,17 +117,39 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 // without materialising the value bytes (still calls SearchLeaf
 // internally — the optimisation is in the caller's allocation
 // avoidance, not in the lookup cost). Returns the same error set
-// as Get.
+// as Get, sans the overflow-value assembly path.
 //
-// For an overflow value, Has returns (true, nil) — membership is
-// well-defined even without the assembled value, unlike Get which
-// must return ErrOverflowValueUnsupported until 4.7.
+// Overflow entries: Has returns (true, nil) without paying the
+// chain read — membership is determinable from the leaf entry's
+// presence alone.
 func Has(pr PageReader, cfg page.Config, rootID uint64, key []byte) (bool, error) {
-	_, found, err := Get(pr, cfg, rootID, key)
-	if err != nil && errors.Is(err, ErrOverflowValueUnsupported) {
-		// Membership is determinable even when value assembly
-		// isn't yet implemented.
-		return true, nil
+	if rootID == 0 {
+		return false, nil
 	}
-	return found, err
+	cur := rootID
+	for depth := 0; depth <= MaxTreeDepth; depth++ {
+		buf := pr.Page(cur)
+		typ, _, _, _ := page.ReadHeader(buf)
+		switch {
+		case typ == page.TypeBranch:
+			i := page.BranchSearch(buf, cfg, key)
+			next := page.BranchChildAt(buf, cfg, i)
+			if next == 0 {
+				return false, fmt.Errorf("%w: null child pointer in branch page %d at descent index %d",
+					ErrCorrupted, cur, i)
+			}
+			cur = next
+		case page.IsLeafType(typ):
+			r := page.NewLeafReader(buf, cfg)
+			if err := r.Validate(); err != nil {
+				return false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
+			}
+			_, _, found := r.SearchLeaf(key)
+			return found, nil
+		default:
+			return false, fmt.Errorf("%w: page %d has unexpected type %d (expected branch=%d or leaf=%d/%d)",
+				ErrCorrupted, cur, typ, page.TypeBranch, page.TypeLeaf, page.TypeLeafUncompressed)
+		}
+	}
+	return false, ErrTreeTooDeep
 }

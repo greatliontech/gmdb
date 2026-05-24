@@ -320,9 +320,9 @@ on a single keyspace.
     the port. New test
     `TestPutDeleteGetUncompressedLeafVariant` covers
     `RestartGroupTarget=1` end-to-end through Put + Get +
-    Delete + merge. Pre-existing adjacent finding filed:
-    `docs/issues/put-overflow-replace-orphans-chain.md`
-    (Lands: 4.7).
+    Delete + merge. Pre-existing adjacent same-key-overflow-
+    replace chain-orphan finding filed for chunk-4.7
+    resolution (issue history in `git log`).
   - **4.6δ** ✅ `b7730c4` Bidirectional cursor + generation
     counter. `internal/btree/cursor.go` implements the
     state machine per `transactions.md §Cursor State Machine`
@@ -338,9 +338,17 @@ on a single keyspace.
     Delete-tolerates-CoW-cascade. Forward-compat scaffolding for
     chunk-5 external-mutation invalidation filed:
     `docs/issues/cursor-markstale-clear-cur.md`.
-- **4.7** ⏳ Overflow inline-value Put + Get (lifts the
-  `ErrOverflowValueUnsupported` sentinel from 4.3, resolves
-  `docs/issues/put-overflow-replace-orphans-chain.md`).
+- **4.7** ✅ Overflow inline-value Put + Get + chain free on
+  replace/Delete. Lifts the `ErrOverflowValueUnsupported`
+  sentinel from 4.3; resolves the chunk-4.6γ-filed chain-orphan
+  finding via `TestPutOverflowReplaceFreesOldChain` +
+  `TestDeleteOverflowEntryFreesChain`. `PageWriter` interface
+  extended with `AllocContiguous` / `AllocSlabRun` / `FreeRun`;
+  pager-side implementation lands in chunk 5+. `api-surface.md
+  §Byte Slice Ownership` amended (overflow values are heap-
+  allocated, caller-owned — the first-page header + optional
+  per-page footers make a single contiguous mmap slice
+  structurally impossible).
 - **4.8** ⏳ Close-out: chunk close-out gate (cite sweep, spec-
   tier invariant promotions, delete resolved issues).
 
