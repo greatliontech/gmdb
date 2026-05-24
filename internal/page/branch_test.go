@@ -125,6 +125,43 @@ func TestBranchEncodeRejectsOversized(t *testing.T) {
 	}
 }
 
+func TestShortestSeparatorBoundaryCases(t *testing.T) {
+	// Spec inv 1 (page-formats.md §Prefix-Truncated Branch Keys):
+	// the separator S satisfies max(L) < S <= min(R).
+	cases := []struct {
+		left, right, want string
+	}{
+		{"abc", "abd", "abd"},   // divergence at i=2; sep = right[:3]
+		{"abc", "abz", "abz"},   // divergence at i=2
+		{"a", "b", "b"},         // divergence at i=0
+		{"abc", "abcd", "abcd"}, // left is strict prefix of right; sep extends by one
+		{"a", "ab", "ab"},       // same
+		{"", "x", "x"},          // empty left, single-byte right
+	}
+	for _, c := range cases {
+		got := ShortestSeparator([]byte(c.left), []byte(c.right))
+		if string(got) != c.want {
+			t.Errorf("ShortestSeparator(%q, %q) = %q, want %q", c.left, c.right, got, c.want)
+		}
+		// Spec invariant: left < S <= right.
+		if bytes.Compare([]byte(c.left), got) >= 0 {
+			t.Errorf("invariant violated: %q !< %q", c.left, got)
+		}
+		if bytes.Compare(got, []byte(c.right)) > 0 {
+			t.Errorf("invariant violated: %q > %q", got, c.right)
+		}
+	}
+}
+
+func TestShortestSeparatorPanicsOnInvalidInput(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on left >= right")
+		}
+	}()
+	ShortestSeparator([]byte("b"), []byte("a"))
+}
+
 func TestBranchChecksumPageRoundTrip(t *testing.T) {
 	cfg := Config{PageSize: 4096, PageChecksum: true}
 	buf := newBranchPage(t, cfg)

@@ -81,6 +81,23 @@ func BranchCellCount(buf []byte) uint16 {
 	return count
 }
 
+// SetBranchCellChild rewrites the child pointer of cell i in place.
+// Used by the btree's in-place CoW updates when only a child
+// pointer changes (no cell directory churn). i must be a valid
+// cell index [0, N); the leftmost child (Ptr[0]) is rewritten via
+// SetBranchLeftmostChild instead.
+func SetBranchCellChild(buf []byte, cfg Config, i uint16, child uint64) {
+	cfg.mustValidate()
+	n := BranchCellCount(buf)
+	if i >= n {
+		panic(fmt.Sprintf("page: SetBranchCellChild(%d) out of range [0, %d)", i, n))
+	}
+	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
+	off := le.Uint16(buf[dirOff:])
+	klen := le.Uint16(buf[dirOff+2:])
+	le.PutUint64(buf[int(off)+int(klen):], child)
+}
+
 // BranchCellAt returns the i-th branch cell. Panics on a malformed
 // page (cell directory entry points outside the page) or on
 // out-of-range index.
@@ -263,6 +280,53 @@ func BranchSearch(buf []byte, cfg Config, target []byte) uint16 {
 		}
 	}
 	return uint16(lo)
+}
+
+// ShortestSeparator returns the shortest byte string S satisfying
+// `left < S <= right` — the prefix-truncated separator used at
+// branch insertion time per page-formats.md §Prefix-Truncated
+// Branch Keys. Constructed as the common prefix of left and right
+// extended by exactly one byte from right at the first divergence
+// position.
+//
+// Precondition: left < right (strict). Callers compute this from
+// the boundary keys of a freshly-split pair (last key of left leaf,
+// first key of right leaf), which are always strictly ordered
+// because the source leaf had no duplicate keys.
+//
+// Edge cases:
+//   - left is a strict prefix of right: returns right[:len(left)+1]
+//     — one byte past the prefix.
+//   - left and right differ at position p < min(len): returns
+//     right[:p+1]. The separator equals right at the divergence
+//     byte, so right ≥ S (with right == S iff right's length is
+//     p+1). left differs at p, so left < S (left's byte at p is
+//     strictly less than right's byte at p, since left < right).
+//
+// Panics if left >= right — that violates the precondition and
+// indicates the caller (splitter) generated an invalid boundary.
+func ShortestSeparator(left, right []byte) []byte {
+	if bytes.Compare(left, right) >= 0 {
+		panic(fmt.Sprintf("page: ShortestSeparator left >= right: left=%q right=%q", left, right))
+	}
+	n := len(left)
+	if len(right) < n {
+		n = len(right)
+	}
+	for i := range n {
+		if left[i] != right[i] {
+			// Divergence at i — separator is right[:i+1].
+			sep := make([]byte, i+1)
+			copy(sep, right[:i+1])
+			return sep
+		}
+	}
+	// Common prefix exhausted without divergence — left is a strict
+	// prefix of right (we ruled out left==right via the precondition
+	// check). Extend by the byte at position n in right.
+	sep := make([]byte, n+1)
+	copy(sep, right[:n+1])
+	return sep
 }
 
 // BranchChildAt returns the child pointer at descent index `i` from
