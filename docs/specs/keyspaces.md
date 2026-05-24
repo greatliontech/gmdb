@@ -27,8 +27,10 @@ Scope:
 Depends on / interacts with:
 - `file-layout.md` for the meta-page `KeyspaceRoot` /
   `NumKeyspaces`.
-- `page-formats.md` for the leaf restart interval that
-  `RestartGroupTarget` configures.
+- `page-formats.md` for the leaf restart-group structure (and
+  the uncompressed-leaf variant selected at
+  `RestartGroupTarget == 1`) that `RestartGroupTarget`
+  configures.
 - `set-keyspace.md` for SetKeyspace storage and per-member API
   detail.
 - `indexing.md` for `IndexRegistryRoot` semantics.
@@ -94,12 +96,18 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=`RestartGroupTarget` is mutable via
-    `Tx.SetKeyspaceConfig()`. New value applies to leaves
-    written after the change; existing leaves keep their
-    stored `RestartInterval` until they next split or are
-    rewritten (the per-leaf interval lives on the leaf page;
-    see `page-formats.md §Leaf Page`);
-  from=this spec §Per-Keyspace Configuration;
+    `Tx.SetKeyspaceConfig()`. The new value is a builder hint
+    for leaves written after the change. Existing leaves keep
+    their stored group structure — the per-page restart table
+    records explicit group counts (see `page-formats.md §Leaf
+    Page §Compressed Leaf`) — and are not retroactively
+    re-encoded; they migrate to the new shape only when they
+    next split, merge, or are rebuilt. `RestartGroupTarget == 1`
+    selects the uncompressed leaf variant
+    (`TypeLeafUncompressed`); the keyspace can hold a mix of
+    compressed and uncompressed pages during a transition;
+  from=this spec §Per-Keyspace Configuration + `page-formats.md
+    §Leaf Page`;
   violation=Retroactively rewriting all leaves on
     `SetKeyspaceConfig` is an unbounded write cost the API
     does not advertise; conversely, ignoring the new value
@@ -145,11 +153,21 @@ Total: `8 + 8 + 1 + 2 + 8 + 2 + 8 + 3 = 40` bytes.
 - **NextSeq** (uint64): next sequence number for `NextSequence()`.
   First call returns `1`.
 - **RestartGroupTarget** (uint16): per-keyspace target leaf
-  restart-group size. `0` ⇒ engine default (16). Set at
-  creation, mutable via `Tx.SetKeyspaceConfig()` — new value
-  applies to leaves written after the change; existing leaves
-  keep their stored `RestartInterval` until they next split or
-  are rewritten.
+  restart-group size, bounded to `[0, 255]`. `0` ⇒ engine
+  default (16). `1` ⇒ uncompressed leaves
+  (`TypeLeafUncompressed`); `[2, 255]` ⇒ compressed leaves
+  (`TypeLeaf`) with variable-size groups capped at the target.
+  Values `> 255` are rejected by `Open()` and
+  `Tx.SetKeyspaceConfig()` with `ErrInvalidOptions` — the
+  compressed-leaf restart-table `Count` field is `uint8`, so 255
+  is the hard physical cap (see `page-formats.md §Compressed
+  Leaf`). Set at creation, mutable via `Tx.SetKeyspaceConfig()`
+  — new value is a builder hint for leaves written after the
+  change; existing leaves keep their stored group structure
+  until they next split, merge, or are rewritten. The keyspace
+  can hold a mix of compressed and uncompressed leaves during
+  a transition (per the per-keyspace invariant above and
+  `page-formats.md §Leaf Page`).
 - **IndexRegistryRoot** (uint64): page ID of this keyspace's
   per-keyspace index registry sub-tree (see `indexing.md
   §Storage Layout`). `0` ⇒ no indexes declared on this

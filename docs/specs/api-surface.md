@@ -254,12 +254,16 @@ into the writer's slab buffer (for inline values from same-txn
 modifications). Valid until the **transaction closes**
 (`Commit()` or `Rollback()`).
 
-**Key slices** may point into the mmap (for keys at restart
-points in prefix-compressed leaves), into a slab buffer, or
-into the cursor's key reconstruction buffer (`keyBuf`). The
-reconstruction buffer is reused on each cursor movement. Key
-slices are valid until the **next cursor operation** or
-transaction close, whichever comes first.
+**Key slices** may point into the mmap (any key in an
+uncompressed leaf — `page-formats.md §Uncompressed Leaf` — or
+the restart-point keys of a prefix-compressed leaf), into a
+slab buffer, or into the cursor's key reconstruction buffer
+(`keyBuf` — the per-cursor backing the `LeafIter`
+forward-streaming mode appends into; see `page-formats.md
+§Cursor Iteration`). The reconstruction buffer is reused on
+each cursor movement. Key slices are valid until the **next
+cursor operation** or transaction close, whichever comes
+first.
 
 **Slab buffer lifetime guarantee.** Within a write transaction,
 a value or key slice that points into a slab buffer (own-writes
@@ -416,8 +420,17 @@ type Options struct {
     MaxTxBufferBytes int64
 
     // RestartGroupTarget is the engine-wide default for the leaf
-    // prefix-compression restart interval. Per-keyspace overrides via
-    // Tx.SetKeyspaceConfig(). Default: 16.
+    // restart-group target (the maximum entries per group on
+    // compressed leaves). Per-keyspace overrides via
+    // Tx.SetKeyspaceConfig(). Bounded to [0, 255]: 0 ⇒ engine
+    // default (16); 1 ⇒ uncompressed leaf variant
+    // (page-formats.md §Leaf Page §Uncompressed Leaf), the
+    // operational choice for keyspaces whose keys don't share
+    // prefixes (random, hash, unique-id); [2, 255] ⇒ compressed
+    // leaves with that target. Open() rejects values > 255 with
+    // ErrInvalidOptions — the compressed-leaf restart-table
+    // Count field is uint8, so 255 is the hard physical cap.
+    // Default: 16.
     RestartGroupTarget int
 
     // MergeThreshold is the B+tree page fill percentage below which a
@@ -739,13 +752,17 @@ func (tx *Tx) DeleteKeyspace(name string) error
 func (tx *Tx) ListKeyspaces() ([]string, error)
 
 // SetKeyspaceConfig updates mutable per-keyspace settings.
-// Currently only RestartGroupTarget. Returns an error for invalid
-// values (e.g. RestartGroupTarget = 0 means engine default).
+// Currently only RestartGroupTarget. Returns ErrInvalidOptions for
+// out-of-range values (RestartGroupTarget > 255 — the
+// compressed-leaf restart-table Count field is uint8, see
+// page-formats.md §Compressed Leaf). The KeyspaceConfig
+// RestartGroupTarget uses 0 as the "leave unchanged" sentinel
+// (distinct from the descriptor's 0 = engine-default semantic).
 // Only valid on a write transaction.
 func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error
 
 type KeyspaceConfig struct {
-    RestartGroupTarget uint16 // 0 = leave unchanged
+    RestartGroupTarget uint16 // 0 = leave unchanged; otherwise [1, 255]
 }
 
 // RebuildIndex drops and re-populates the named index using the

@@ -142,14 +142,54 @@ Page Header (8 bytes)
 ```
 
 - **Type** (uint8): one of `Branch`, `Leaf`, `Overflow`,
-  `RPLSegment`. Meta pages and bitmap pages do not carry the page
-  header.
+  `RPLSegment`, `LeafUncompressed`. `Leaf` is the
+  prefix-compressed leaf variant; `LeafUncompressed` is the
+  variant selected by `RestartGroupTarget == 1` (see
+  `page-formats.md §Leaf Page`). Meta pages and bitmap pages do
+  not carry the page header.
 - **Flags** (uint8): reserved for future per-page flags. Must be
   zero on write. Readers must reject pages with unknown flags set.
 - **Count** (uint16): number of items (cell count for branch / leaf,
   entry count for RPL segment).
 - **AdditionalPages** (uint32): number of contiguous overflow pages
   following this one (0 for single-page nodes).
+
+### Reserved-byte policy (project-wide)
+
+Three distinct categories of "reserved" bytes appear across
+on-disk structures, with different read-time rules:
+
+- **Reserved flag bits** (page header `Flags`, leaf `CellFlags`).
+  *Strict-reject* on read: a page with unknown flag bits set is
+  rejected as structural corruption. This catches accidental
+  cross-format reads and forbids silent semantic drift if a
+  future writer sets a bit a reader doesn't understand.
+- **Reserved padding bytes — per-page** (restart-table entry's
+  `Reserved uint8` in `page-formats.md §Compressed Leaf`, the
+  uncompressed-leaf header's `Reserved uint16` in `§Uncompressed
+  Leaf`). *Ignored on read*: must be zero on write, but readers
+  tolerate any value for forward-compatibility — these slots
+  exist precisely to be repurposed without a format break, since
+  each leaf page is self-describing and a mixed-version
+  keyspace can hold pages from multiple encoder eras.
+- **Reserved bytes in fixed-format meta structures** (keyspace
+  descriptor `Reserved [3]byte` in `keyspaces.md §Keyspace
+  Descriptor`; future analogous slots in the meta page). *Strict-
+  reject* on read: the descriptor is part of the meta-page atomic
+  unit and extending it requires a meta-page format version bump,
+  not a silent per-record extension. Forward-compatibility for
+  these slots is achieved at the file-format level, not by
+  ignoring stray bytes.
+
+When a per-page reserved slot is consumed by a future format,
+the spec promotes the corresponding padding byte(s) from
+"reserved" to the field's name; readers compiled against the new
+spec read it normally; readers compiled against the old spec
+continue to ignore it (degraded but safe). When a meta-format
+reserved slot is consumed, the meta-page format version bumps
+and the strict-reject contract enforces a clean cutover. Spec
+sites should cite this section by category rather than restate
+the policy.
 
 A page's ID is implicit — computable from its file offset
 (`offset / PageSize`). This avoids wasting 8 bytes per page on

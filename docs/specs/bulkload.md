@@ -121,8 +121,10 @@ func (ks *SetKeyspace) BulkLoad(yield func(yield func(key, value []byte) bool)) 
 Standard bottom-up B+tree construction:
 
 1. Allocate a fresh leaf page from `pageAlloc()`. Fill with input
-   entries (prefix-compressed with the keyspace's
-   `RestartGroupTarget`) until the page is full or the input is
+   entries — encoded per the keyspace's `RestartGroupTarget`
+   (prefix-compressed `TypeLeaf` for target `≥ 2`, uncompressed
+   `TypeLeafUncompressed` for target `= 1`; see `page-formats.md
+   §Leaf Page`) — until the page is full or the input is
    exhausted.
 2. When a leaf page is full, pwrite it directly to its allocated
    page ID (slab bypass — see below), free the page-sized

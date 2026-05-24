@@ -80,7 +80,7 @@ Invariant: kind=entailed;
     followed the deleted entry — regardless of mid-iteration CoW or
     rebalance triggered by the delete;
   from=entailed: cursor state machine (this spec) + cursor stack
-    tolerance (`page-formats.md` §Cursor Key Reconstruction);
+    tolerance (`page-formats.md` §Cursor Iteration);
   violation=Cursor desync after delete causes the delete-range loop
     pattern to either skip entries (silent retention) or revisit
     entries (re-delete attempts on already-deleted rows).

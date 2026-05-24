@@ -1,17 +1,20 @@
 # Page Formats
 
 On-disk formats for the per-page structures stored in data pages:
-branch pages (internal B+tree nodes), leaf pages (prefix-compressed
-key-value storage), and overflow pages (large value storage). Set-
-keyspace subpages and nested B+tree references are leaf-cell variants
-defined in `set-keyspace.md`. RPL segment pages live in
-`free-space.md`.
+branch pages (internal B+tree nodes), leaf pages (two variants —
+prefix-compressed `TypeLeaf` and uncompressed `TypeLeafUncompressed`),
+and overflow pages (large value storage). Set-keyspace subpages and
+nested B+tree references are leaf-cell variants defined in
+`set-keyspace.md`. RPL segment pages live in `free-space.md`.
 
 Scope:
 - Branch page layout, prefix-truncated separator computation.
-- Leaf page layout with prefix-compressed restart groups, restart
-  vs delta entries, overflow references.
-- Leaf lookup, insert/delete, split, cursor key reconstruction.
+- Compressed leaf page layout with variable-size restart groups,
+  restart vs delta entries, overflow references.
+- Uncompressed leaf page layout (selected when `RestartGroupTarget
+  == 1`).
+- Leaf lookup, insert/delete, split, and the `LeafIter`
+  bidirectional iterator used by `btree.Cursor`.
 - Overflow page format and run construction.
 - NUL-escape encoding for composite index keys.
 
@@ -47,15 +50,34 @@ Invariant: kind=clause-explicit;
     binary search lands in the wrong group.
 
 Invariant: kind=clause-explicit;
-  property=A leaf's `RestartCount × 2` bytes immediately before the
-    optional 8-byte xxhash64 footer constitute the restart table;
-    the restart table indexes the byte offsets of restart-point
-    entries in this page (and only this page);
-  from=this spec §Leaf Page (page layout);
+  property=A compressed leaf's `RestartCount × 4` bytes immediately
+    before the optional 8-byte xxhash64 footer constitute the
+    restart table; each entry stores the group's first-entry byte
+    offset (uint16), the group's entry count in `[1, 255]` (uint8),
+    and a reserved byte; the restart table indexes only entries on
+    this page;
+  from=this spec §Leaf Page (Compressed Leaf — page layout);
   violation=Misplacing the restart table (relative to the optional
     checksum footer) corrupts the binary-search index — lookups
     diverge into delta entries treated as restart points and decode
-    garbage keys.
+    garbage keys. A `Count` of zero in any restart-table entry
+    leaves the next group's start ambiguous (the variable-group
+    format derives group ranges by summing counts), so readers
+    must treat `Count == 0` as structural corruption.
+
+Invariant: kind=clause-explicit;
+  property=An uncompressed leaf's `Count × 2` bytes immediately
+    before the optional 8-byte xxhash64 footer constitute the
+    offset table; the table is **positional** — slot `i` holds
+    the byte offset of entry `i`'s first byte (`CellFlags`).
+    Entries themselves are key-sorted, so iterating the table in
+    slot order yields entries in key order, but the table is
+    indexed by position, not by key;
+  from=this spec §Leaf Page (Uncompressed Leaf — page layout);
+  violation=An offset that points outside the entry-data region
+    yields out-of-bounds reads in the UC decoder; swapping slots
+    `i` and `j` for `i < j` with `entries[i].Key > entries[j].Key`
+    silently violates the binary-search contract.
 
 Invariant: kind=clause-explicit;
   property=An overflow run of `1 + N` pages stores
@@ -180,49 +202,25 @@ per lookup; less data read per branch traversal.
 
 ## Leaf Page
 
-Leaf pages store the actual key-value pairs using **prefix
-compression** — keys that share common prefixes with their neighbours
-are stored as deltas.
+gmdb supports two leaf page variants chosen per-page at build time
+by the keyspace's `RestartGroupTarget`:
 
-```
-Leaf Page
-+-----------------------+
-| Page Header (8 bytes) |
-+-----------------------+
-| RestartInterval uint16|  per-keyspace target (default 16)
-| RestartCount uint16   |  number of restart points
-+-----------------------+
-| Entry 0 (restart)     |  entries in forward order, starting at fixed offset 12
-| Entry 1 (delta)       |
-| ...                   |
-| Entry N               |
-+-----------------------+
-|       free space      |
-+-----------------------+
-| Restart Table         |  array of (Offset uint16), one per restart point
-| ...                   |  RestartCount × 2 bytes, packed at content end
-+-----------------------+
-```
+- **`TypeLeaf` (prefix-compressed, default).** Keys that share common
+  prefixes with their neighbours are stored as deltas grouped into
+  **variable-size restart groups**; two-phase lookup (binary search
+  over the restart table + linear scan within the matched group).
+  Selected when `RestartGroupTarget ≥ 2`.
+- **`TypeLeafUncompressed`.** Every key stored in full; lookup is a
+  single O(log N) binary search via an offset table. Selected when
+  `RestartGroupTarget == 1`.
 
-`RestartInterval` is the target restart interval set per keyspace via
-`RestartGroupTarget` (see `keyspaces.md`). It is stored per page
-so the leaf is self-describing for `Check()` and cursor decode —
-changing the keyspace's `RestartGroupTarget` does not retroactively
-recode existing leaves.
+Both variants share the 8-byte common page header and the
+"entries-forward, lookup-table-backward" layout; only the per-entry
+encoding and lookup machinery differ. The two type bytes let
+`Check()` and the readers dispatch without probing further.
 
-Entries are stored in forward memory order starting at a fixed offset
-(12) because prefix compression requires sequential scanning. The
-restart table is at the end of the page (before the optional xxhash64
-footer). The reader locates the restart table at
-`contentEnd - RestartCount × 2`, where `contentEnd = PageSize - 8`
-when checksums are enabled and `PageSize` otherwise.
-
-Entries at positions `0`, `K`, `2K`, … (where `K = RestartInterval`)
-are **restart points** that store full keys. All other entries are
-**delta entries** that encode the key as a difference from the
-previous entry.
-
-Each entry carries a `CellFlags` byte to distinguish cell formats:
+Each entry carries a `CellFlags` byte (same definitions across both
+variants):
 
 ```
 CellFlags bit layout
@@ -234,7 +232,80 @@ Bits 3-7: Reserved (must be 0)
 
 `Overflow` and `MultiValue` are mutually exclusive in practice.
 
-### Restart entry (full key, at positions 0, K, 2K, …)
+`ValueLen` is `uint32` (max ~4 GB for inline values; bounded in
+practice by leaf-page free space). Values exceeding leaf-page
+capacity are stored as overflow pages, referenced via the formats
+below which use `uint64 TotalLen`.
+
+### Compressed Leaf (`TypeLeaf`)
+
+```
+Compressed Leaf Page
++-----------------------+ offset 0
+| Page Header (8 bytes) | Type=TypeLeaf, Count=N
++-----------------------+ offset 8
+| RestartCount uint16   |  number of restart groups
+| DataEnd      uint16   |  byte offset after the last entry's bytes
++-----------------------+ offset 12
+| Entry 0 (restart)     |  entries in forward order starting at offset 12
+| Entry 1 (delta)       |
+| ...                   |
+| Entry N-1             |
++-----------------------+ DataEnd
+|       free space      |
++-----------------------+
+| Restart Table         |  RestartCount × 4 bytes, packed at content end
++-----------------------+ ContentEnd (PageSize - optional 8-byte footer)
+```
+
+`RestartCount` and `DataEnd` are little-endian `uint16` (per the
+project-wide byte-order rule in `overview.md`). `DataEnd` is the
+byte offset where entry data ends; `[DataEnd, ContentEnd -
+RestartCount × 4)` is the free-space region used by the in-place
+insert / delete splice helpers (`tryAppendCompressed`,
+`tryInsertAtCompressed`, `tryDeleteAtCompressed`). The restart
+table is located at `ContentEnd - RestartCount × 4`.
+
+**Restart table entry** (4 bytes per group):
+
+```
++----------+--------+-----------+
+| Offset   | Count  | Reserved  |
+| uint16   | uint8  | uint8     |
++----------+--------+-----------+
+```
+
+- `Offset`: byte offset within the page of the group's first
+  (restart) entry. Little-endian.
+- `Count`: number of entries in this group, in `[1, 255]`. The
+  `uint8` width is the hard physical cap; `RestartGroupTarget` is
+  bounded to `[1, 255]` correspondingly (see `keyspaces.md
+  §Keyspace Descriptor` and `api-surface.md` Options). Groups end
+  either at `RestartGroupTarget` entries (the cap), or earlier when
+  the builder's split heuristic chooses a natural break — e.g.,
+  a key that shares no prefix with its predecessor is a poor
+  candidate for delta encoding, so the builder may start a fresh
+  group at it rather than spend the 2-byte delta-header overhead
+  on negative savings. There is no minimum group size other than 1
+  (a single-entry group is the degenerate-but-valid case for keys
+  with no prefix sharing); for workloads with systematically zero
+  prefix sharing the keyspace should select `RestartGroupTarget =
+  1` for the uncompressed variant rather than relying on the
+  builder to detect the pattern.
+- `Reserved`: zero on write; reserved-byte read policy is the
+  project-wide rule in `file-layout.md §Reserved-byte policy
+  (project-wide)` — per-page padding bytes are ignored on read
+  and kept available for future format extensions.
+
+The variable-group design replaces the prior uniform-K mapping
+(`entryIndex / K` derived the group) with explicit per-group counts
+read directly from the table. This decouples per-page group structure
+from the keyspace's `RestartGroupTarget`: the target is a *builder
+hint*, not a per-page invariant — old pages keep their group
+structure across `RestartGroupTarget` config changes; new pages use
+the new target.
+
+#### Restart entry (full key, first entry of each group)
 
 ```
 Restart Entry (inline)
@@ -244,7 +315,7 @@ Restart Entry (inline)
 +-----------+----------+----------+-----------+-----------+
 ```
 
-### Delta entry
+#### Delta entry (subsequent entries within a group)
 
 ```
 Delta Entry (inline)
@@ -256,19 +327,17 @@ Delta Entry (inline)
 
 `SharedLen` = leading bytes shared with the previous entry in the
 same restart group. `UnsharedKey` contains only the bytes after the
-shared prefix. Full key = first `SharedLen` bytes of the previous
-entry's full key + `UnsharedKey`.
+shared prefix. Full key = `prevEntry.Key[:SharedLen] || UnsharedKey`.
 
-Delta entries cost 2 extra bytes per entry but save `SharedLen` bytes
-of key data. Net saving per entry is `SharedLen - 2` bytes — positive
-whenever keys share more than a 2-byte prefix.
+Per-entry overhead comparison: the restart-entry header is `1 + 2 +
+4 = 7` bytes (`CellFlags + KeyLen + ValueLen`); the delta-entry
+header is `1 + 2 + 2 + 4 = 9` bytes (`CellFlags + SharedLen +
+UnsharedLen + ValueLen`). The delta header costs 2 extra bytes
+beyond the restart header, and the delta avoids `SharedLen` bytes
+of key data. Net saving per delta entry is `SharedLen - 2` bytes —
+positive whenever keys share more than a 2-byte prefix.
 
-`ValueLen` is `uint32` (max ~4 GB for inline values; bounded in
-practice by leaf-page free space). Values exceeding leaf-page
-capacity are stored as overflow pages, referenced via the formats
-below which use `uint64 TotalLen`.
-
-### Overflow reference at a restart point (CellFlags bit 0 set)
+#### Overflow reference at a restart point (CellFlags bit 0 set)
 
 ```
 Restart Overflow Reference
@@ -278,7 +347,7 @@ Restart Overflow Reference
 +-----------+----------+-----------+----------+----------+
 ```
 
-### Overflow reference at a delta position
+#### Overflow reference at a delta position
 
 ```
 Delta Overflow Reference
@@ -288,77 +357,204 @@ Delta Overflow Reference
 +-----------+-----------+-------------+---------------+----------+----------+
 ```
 
+### Uncompressed Leaf (`TypeLeafUncompressed`)
+
+```
+Uncompressed Leaf Page
++-----------------------+ offset 0
+| Page Header (8 bytes) | Type=TypeLeafUncompressed, Count=N
++-----------------------+ offset 8
+| DataEnd      uint16   |  byte offset after the last entry's bytes
+| Reserved     uint16   |  zero on write
++-----------------------+ offset 12
+| Entry 0               |  entries in forward order starting at offset 12
+| Entry 1               |
+| ...                   |
++-----------------------+ DataEnd
+|       free space      |
++-----------------------+
+| Offset Table          |  N × 2 bytes, packed at content end
++-----------------------+ ContentEnd
+```
+
+The 2-byte `Reserved` at offset 10 keeps `Entry 0`'s offset at 12,
+identical to the compressed variant. Readers and the `Check()` walk
+don't need a per-variant entry-start offset. Reserved-byte read
+policy is the project-wide rule in `file-layout.md §Reserved-byte
+policy (project-wide)`: per-page padding bytes are zero on write
+and ignored on read.
+
+Every entry is a full key with no shared / unshared distinction:
+
+```
+Entry (inline)
++-----------+----------+----------+-----------+-----------+
+| CellFlags | KeyLen   | ValueLen | Key bytes | Val bytes |
+| uint8     | uint16   | uint32   |           |           |
++-----------+----------+----------+-----------+-----------+
+```
+
+(Overflow form: `ValueLen` replaced by `OvflPage uint64 + TotalLen
+uint64`, same as the compressed restart-entry overflow form.)
+
+Lookup is a single O(log N) binary search via the offset table. The
+uncompressed variant motivation is **operational simplicity**, not
+density: per-entry overhead in the uncompressed variant
+(`CellFlags + KeyLen + ValueLen + 2-byte offset-table slot = 9`
+bytes) equals the compressed delta-entry overhead at zero shared
+prefix (`CellFlags + SharedLen + UnsharedLen + ValueLen = 9` bytes,
+no per-entry offset). At `SharedLen == 0` the two formats consume
+identical per-entry bytes; the only delta is the compressed
+variant's 4-byte-per-group restart-table cost (~0.25 bytes/entry at
+`RestartGroupTarget = 16`), which is negligible.
+
+The uncompressed variant is the right choice when:
+
+- Lookup determinism matters: single O(log N) binary search vs the
+  compressed `O(log G + K)` two-phase walk.
+- `Prev` cost matters: O(1) via offset table vs the compressed
+  `LeafIter` buffered-mode group reload.
+- Decode simplicity matters: no `LeafIter` machinery; `Check()` /
+  recovery walks per-entry without delta-decode bookkeeping.
+
+For keys with systematic prefix sharing (file paths, composite
+indexes, ordered IDs), the compressed variant wins on density — see
+§Leaf Density below. For keys that don't share prefixes, the two
+variants are density-equivalent and the uncompressed variant is
+operationally simpler.
+
 ### Leaf Lookup
 
-Two-phase binary search:
+Both variants expose the same `SearchLeaf(target) → (index, entry,
+found)` and `SearchLeafIter(target, …) → (index, entry, found, iter)`
+contracts; the variant-specific machinery is encapsulated.
 
-1. **Binary search over restart points** using the restart table.
-   `O(log R)` where `R = RestartCount`.
-2. **Linear scan within the restart group**, decoding delta entries
-   until the target is found or passed. `O(K)` where
-   `K = RestartInterval`.
+- **Compressed**: phase 1 binary search over restart-table offsets,
+  `O(log G)` where G = `RestartCount`. Each probe decodes one
+  restart entry's full key (no delta state needed). Phase 2 linear
+  scan within the matched group, `O(K)` where K is the matched
+  group's `Count` (≤ `RestartGroupTarget`). Total `O(log(N/K) + K)`.
+- **Uncompressed**: single O(log N) binary search over the offset
+  table.
 
-Total: `O(log(n/K) + K)`. For a leaf with 30 entries at `K = 16`,
-about 17 comparisons; the linear scan operates on data already in L1
-cache.
+`SearchLeafIter` is the cursor-friendly form: returns the lookup
+result plus a `LeafIter` whose **next** `Next()` call returns the
+entry immediately *after* the returned (found-or-successor) entry —
+i.e. the iterator is positioned past the result, ready to stream
+forward without re-emitting the entry the caller just received. It
+carries the delta-decode state accumulated during the scan, so
+Cursor `Seek` / `SeekGE` avoid a second group walk.
+
+### Cursor Iteration
+
+The cursor delegates leaf traversal to a `LeafIter` exposed by the
+page package. `LeafIter` is a bidirectional iterator that owns the
+decode state for the current leaf; the cursor stack stays slim, and
+the per-leaf-format machinery (compressed vs uncompressed) stays
+encapsulated. `LeafIter` operates in two modes:
+
+- **Forward-streaming mode** (initial state for compressed leaves).
+  Maintains a `keyBuf []byte` carrying the current full key. `Next()`
+  reads the next delta entry's `SharedLen` and `UnsharedKey` directly
+  from the page, truncates `keyBuf` to `SharedLen`, and appends
+  `UnsharedKey` in place — amortized O(1) without per-step
+  allocation. Crossing into a new restart group reads the group's
+  first (full) restart key directly from the page.
+- **Buffered mode** (entered on the first `Prev()` or `At()` call
+  on a compressed leaf). Decodes the current restart group into
+  `bufEnts []LeafEntry + bufKeys []byte`. All subsequent
+  `Next`/`Prev`/`At` calls serve from the buffer; group-boundary
+  crossings reload the adjacent group. The buffer storage
+  (`bufEnts`, `bufKeys`, and the `keyBuf`) is passed in to
+  `IterAtForReuse` / `IterForReuse` and returned via `KeyBuf` /
+  `BufKeys` / `BufEnts` so the cursor reclaims it across leaf
+  transitions — per-cursor allocation amortizes to zero in the
+  steady-state cursor loop.
+
+Uncompressed leaves don't need the streaming/buffered distinction:
+`Next`/`Prev`/`At` are all O(1) via the offset table.
+
+This unifies what the original spec called the "key reconstruction
+buffer" and the "group cache" behind a single iterator interface,
+so all leaf-walking callers — `btree.Cursor`, `btree.Get` (via
+`SearchLeaf`), and the chunk-5 range-delete scanner — share decode
+infrastructure.
 
 ### Leaf Density
 
-Depends on the ratio of shared-prefix length to total key length. For
-200-byte keys sharing a 150-byte common prefix + 50-byte values at
-4 KB:
+Depends on the ratio of shared-prefix length to total key length.
+For 200-byte keys sharing a 150-byte common prefix + 50-byte values
+at 4 KB (`ContentEnd = 4088` with checksums):
 
 | Format | Bytes/entry (avg) | Entries/page | Improvement |
 |--------|-------------------|-------------|-------------|
-| Full keys | ~260 | ~15 | baseline |
-| Prefix compressed (K=16) | ~117 | ~33 | 2.2× |
+| Uncompressed (`TypeLeafUncompressed`) | ~259 | ~15 | baseline |
+| Compressed (`TypeLeaf`, target K=16) | ~118 | ~34 | 2.2× |
 
-Short low-prefix keys see ~5% improvement. Compression adapts
-automatically — high-prefix workloads benefit; random keys pay 2
-bytes/entry overhead.
+For keys with **no** shared prefix (50-byte random keys + 50-byte
+values), the two variants are essentially identical: compressed
+~109.25 bytes/entry (≈37 entries/page) vs uncompressed ~109
+bytes/entry (≈37 entries/page). The ~0.25 byte delta per entry is
+the compressed variant's per-group restart-table overhead
+(`4 / RestartGroupTarget` bytes amortized) — not material.
+
+So `RestartGroupTarget = 1` (uncompressed) is **not** chosen for
+density on random-key workloads — both formats are
+density-equivalent there — but for the operational properties listed
+in §Uncompressed Leaf above (single-phase O(log N) lookup, trivial
+`Prev`, simpler `Check()` walk).
 
 ### Insert and Delete
 
-Inserting a key between two delta entries within a restart group:
+Insert and delete within a leaf splice the page in place when the
+resulting layout fits — `tryAppendCompressed`,
+`tryInsertAtCompressed`, `tryDeleteAtCompressed` for the compressed
+variant; `tryAppendUncompressed`, `tryInsertAtUncompressed`,
+`tryDeleteAtUncompressed` for the uncompressed. Inserting between
+two compressed delta entries re-encodes the successor entry's delta
+against the new predecessor and may shift the containing group's
+boundaries; the splice helpers return false when the layout impact
+crosses a boundary in a way the local rewrite can't predict, at
+which point the caller falls back to the full
+decode-and-rebuild path (`tryInsertAt` / `tryDeleteAt` callers in
+`internal/btree`).
 
-1. Encode the new entry as a delta against its predecessor.
-2. Recompute the successor entry's delta (its `SharedLen` is now
-   relative to the new entry).
-3. If insertion shifts entry indices, restart-point positions may
-   change — re-encode the affected group boundaries.
-
-Deletion is symmetric. The restart table is rebuilt after any insert
-or delete — `O(RestartCount)`, at most ~20 entries for a full leaf
-page.
-
-Hot-path insert/delete should splice the page in place rather than
-full decode + re-encode of all entries
-(`tryInsertAtCompressed` / `tryDeleteAtCompressed`). Decoded-form
-fallback is used only when the splice cannot determine the layout
-impact locally (group-boundary crossing).
+The restart table is rebuilt only when group composition changes —
+not on every insert / delete. Uncompressed leaves rebuild only the
+offset table; the per-entry data shifts but no key re-encoding
+occurs.
 
 ### Leaf Split
 
-On overflow, the leaf is split into two halves. Each half is
-re-encoded independently with fresh restart points starting at
-index 0. Boundary keys (last key of left leaf, first key of right
-leaf) are full keys reconstructed from the delta encoding.
-Separator computation for the parent branch uses these full keys
-(see §Prefix-Truncated Branch Keys).
+On overflow, the leaf is split into two halves at a *group boundary*
+(compressed) or *entry boundary* (uncompressed) chosen by split
+bias — typically 50% of data bytes. The `FindSplitGroup` /
+`FindSplitIndex` helpers walk the restart / offset table for the
+boundary closest to the bias target. **Tiebreak**: when two adjacent
+boundaries are equidistant from the bias target, the lower-index
+boundary wins. Each half is then encoded independently with fresh
+group structure (compressed) or fresh offset table (uncompressed).
 
-### Cursor Key Reconstruction
+Boundary keys (last key of left leaf, first key of right leaf) are
+reconstructed from the source page (full decode for the boundary
+positions only — not the whole leaf). Separator computation for the
+parent branch uses these full keys (see §Prefix-Truncated Branch
+Keys).
 
-The cursor maintains a **key reconstruction buffer**
-(`cursor.keyBuf []byte`) holding the full key at the current
-position. On forward movement (`Next()`), truncate to `SharedLen`
-and append `UnsharedKey`. `O(1)` amortized.
-
-For reverse movement (`Prev()`), delta entries encode forward only.
-The cursor caches all decoded keys for the current restart group
-(**group cache**, `[K][]byte` array). When the cursor first enters a
-group, all `K` entries are decoded into the cache; subsequent
-`Prev()` within the group reads from cache in `O(1)`. At `K = 16`
-and max key size ~2 KB, worst case ~32 KB per cursor — acceptable.
+**Deterministic encoding invariant** (consequence of the tiebreak +
+the per-page group-target policy): the **same encoder version**
+given the same input sequence, `RestartGroupTarget`, `PageSize`,
+and `PageChecksum` configuration must produce byte-identical pages.
+This is the property `Check()` repair, recovery testing, and any
+future cross-process determinism tooling rely on; any encoder
+change that breaks within-version determinism is a format break in
+the same sense as a layout change. The spec deliberately does *not*
+mandate byte-identical output across encoder versions: the §Compressed
+Leaf "natural break" heuristic and the "typically 50%" split bias
+are policy knobs the encoder may tune over time; what's pinned is
+that any single deployed encoder produces the same bytes for the
+same input, so a `Check()` repair re-encoding a page yields the
+same bytes the original writer would have written.
 
 ## Overflow Page
 
