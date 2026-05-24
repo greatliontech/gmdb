@@ -251,7 +251,35 @@ on a single keyspace.
   zeroing slices `Decode*` returned by zero-copy borrow. Fixed
   by deep-copying Keys/Values immediately after every Decode in
   `leafEntriesAsEncoded` and inline in `ascendWithSplit`.
-- **4.5** ⏳ Delete + merge/redistribute (MergeThreshold option).
+- **4.5** ✅ `2810eef` `Delete` + merge/redistribute. Recursive
+  descent, leaf CoW + entry removal, merge with sibling (combined
+  fits in one page) or count-balanced redistribute; cascade
+  through branches; root collapse when root branch shrinks to a
+  single child; `rootID=0` when the only leaf entry is deleted.
+  Separator handling per page-formats.md §Prefix-Truncated Branch
+  Keys (removed at merge, recomputed via `ShortestSeparator` at
+  leaf-redistribute, lifted from the middle cell at branch-
+  redistribute). `MergeThreshold` is the `uint8` percentage
+  parameter (range 1-50, default 25) from api-surface.md Options;
+  `DefaultMergeThreshold` and `MaxMergeThreshold` constants re-
+  exported. `ErrNotFound` is the provisional missing-key surface
+  pending chunk-5 keyspace-level resolution
+  (`docs/issues/keyspace-delete-missing-key.md`).
+  `fakeWriter.FreePage` now asserts no-double-free so silent
+  reclamation regressions surface. Tests pin three spec-tier
+  invariants as the strongest artifact this stage affords:
+  all-leaves-same-depth, every-non-root-≥-threshold, and slab-
+  partition (allocated = reachable ⊕ freed) — the same partition
+  test 4.4 introduced extended for delete-heavy workloads.
+  Adversarial review: two rounds; round-1 surfaced H-1
+  (empty-separator data-loss guard), M-1 (fakeWriter double-free
+  detection), M-2 (merge `leftInterval` policy comment), M-3
+  (`ErrCorrupted` wrap on redistribute oversize/<2 errors), L-1
+  (test rootID=0 tightening); H-2 (root-collapse read-after-
+  free) disputed with explanatory comment (`child` captured
+  before `FreePage`, never re-read). Round-2 folded in a
+  defense-in-depth `<3 combined cells` guard on branch
+  redistribute.
 - **4.6** ⏳ Cursor: forward Next, reverse Prev with group cache,
   key reconstruction buffer, Cursor.Delete state machine per
   transactions.md §Cursor State Machine.
