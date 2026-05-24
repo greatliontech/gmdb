@@ -1,10 +1,12 @@
 // Package page implements pure byte-slice encoders and decoders for every
-// gmdb on-disk page format: the 8-byte page header, the meta page, the RPL
-// segment, the branch page (prefix-truncated separators), the leaf page in
-// two variants (compressed with variable-size restart groups + prefix-
-// compressed delta entries; uncompressed with full keys + a positional
-// offset table — selected per Config.RestartGroupTarget), the overflow
-// page header, the set-keyspace subpage, and the xxhash64 footer.
+// gmdb on-disk binary format: the 8-byte page header, the meta page, the
+// RPL segment, the branch page (prefix-truncated separators), the leaf
+// page in two variants (compressed with variable-size restart groups +
+// prefix-compressed delta entries; uncompressed with full keys + a
+// positional offset table — selected per Config.RestartGroupTarget), the
+// overflow page header, the set-keyspace subpage, the 40-byte keyspace
+// descriptor (stored as the value for a keyspace's entry in the keyspace
+// B+tree per keyspaces.md §Keyspace Descriptor), and the xxhash64 footer.
 //
 // The leaf surface is exposed via LeafReader (variant-dispatching read
 // path) and LeafBuilder (variant-dispatching write path); LeafIter

@@ -469,9 +469,30 @@ the keyspace subtree atomically.
   `docs/issues/pager-test-helper-export.md` (Lands: condition
   — when chunk 5.3+ adds a second cross-package fixture caller,
   factor the duplicated `setupWriter` helper).
-- **5.3** ⏳ Keyspace descriptor codec (40-byte struct
-  encode/decode/validate); promotes `keyspaces.md` invariant #1
-  via codec round-trip.
+- **5.3** ✅ Keyspace descriptor codec
+  (`internal/page/keyspace_descriptor.go`). 40-byte struct
+  encode/decode/validate per `keyspaces.md §Keyspace Descriptor`.
+  Surface: `KeyspaceDescriptor` struct, `KeyspaceDescriptorSize`
+  constant, `KeyspaceKind{Keyspace,SetKeyspace,IndexInternal}`
+  constants, `EncodeKeyspaceDescriptor` / `DecodeKeyspaceDescriptor`
+  / `ValidateKeyspaceDescriptor`. Encode zeroes the 3 reserved
+  bytes; Decode does not validate (use `ValidateKeyspaceDescriptor`
+  separately, matching the chunk-1 `DecodeMeta` / `ValidateMeta`
+  pattern). Tests promote four spec-tier invariants:
+  `keyspaces.md` #1 (40-byte format + field offsets) →
+  `TestKeyspaceDescriptorRoundTripAllFields` with per-field
+  offset/width assertions; #2 (Kind ∈ {0,1,2}) →
+  `TestKeyspaceDescriptorValidateRejectsUnknownKind`; #5
+  (FixedValueSize ≠ 0 ⇒ Kind == 1) →
+  `TestKeyspaceDescriptorValidateRejectsFixedValueSizeOnNonSet`;
+  the reserved-bytes-zero clause →
+  `TestKeyspaceDescriptorValidateRejectsNonZeroReserved`. Plus
+  `TestKeyspaceDescriptorValidateRejectsRestartGroupTargetOverflow`
+  pins the 255-cap from `page-formats.md §Compressed Leaf` (the
+  uint8 Count field). The chunk-5.1 enforcement schedule attributed
+  the Kind/FixedValueSize/RestartGroupTarget rejections to 5.4 —
+  refined here at 5.3 because the codec is the rejection
+  mechanism; 5.4's API surface inherits via callsite.
 - **5.4** ⏳ Keyspace B+tree machinery + `Open*` / `Create*` /
   `CreateKeyspaceIfNotExists` / `ListKeyspaces` + name
   interning via `unique.Handle[string]`. `meta.KeyspaceRoot`
