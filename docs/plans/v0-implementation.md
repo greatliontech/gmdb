@@ -349,8 +349,35 @@ on a single keyspace.
   allocated, caller-owned — the first-page header + optional
   per-page footers make a single contiguous mmap slice
   structurally impossible).
-- **4.8** ⏳ Close-out: chunk close-out gate (cite sweep, spec-
-  tier invariant promotions, delete resolved issues).
+- **4.8** ✅ Chunk-4 close-out gate. Cite sweep (wrap-aware: date-
+  stem + rejoined-comment grep, not single-line `git grep`) of
+  `docs/specs/**/*.md` and `internal/**/*.go` for cites to chunk-4-
+  resolved tracking artifacts: 0 hits — `put-overflow-replace-
+  orphans-chain.md` was already promoted (load-bearing rationale
+  moved into `TestPutOverflowReplaceFreesOldChain` docstring +
+  `collectReachable` overflow-chain extension + 4.7 plan entry) and
+  deleted by 4.7. Spec-tier invariant audit: all 7 chunk-4
+  invariants confirmed enforced at the strongest artifact this
+  stage affords (each pinned by a test):
+  all-leaves-same-depth → `checkBalance` (delete_test.go);
+  every-non-root ≥ MergeThreshold% → `checkUnderflowInvariant`
+  (delete_test.go); slab partition (allocated = reachable ⊕ freed,
+  extended for overflow chains) → `checkSlabPartition` +
+  `collectReachable` (delete_test.go / put_test.go); cursor state
+  machine (Unpositioned ≠ EOI; Delete advances to successor;
+  Delete at last entry transitions to End; Delete tolerates CoW +
+  merge cascade) → four `TestCursor*` cases (cursor_test.go);
+  overflow run capacity → `TestOverflowRunLengthBoundaries`
+  (page/overflow_test.go); overflow chain reachability →
+  `collectReachable` overflow-chain walk (put_test.go); overflow
+  Put-replace / Delete frees chain →
+  `TestPutOverflowReplaceFreesOldChain` +
+  `TestDeleteOverflowEntryFreesChain` +
+  `TestCursorDeleteOverflowEntryFreesChain`. Zero spec-tier
+  invariants promote at this gate (every chunk-4 invariant was
+  encoded as a test at its introducing sub-chunk, never recorded-
+  only). README index current: 6 open entries, all `Lands:` in
+  chunks 5+ or condition-triggered, none fire on chunk-4 work.
 
 Primary specs: `page-formats.md`, `transactions.md §Cursor State
 Machine`.
