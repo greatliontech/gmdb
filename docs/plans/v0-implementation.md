@@ -167,20 +167,46 @@ Primary files: `lock.go`, `process_linux.go`, `process_darwin.go`,
 
 ### Chunk 3 — Write transaction lifecycle + reader table
 
-**Scope.** Begin/Commit/Rollback for write transactions, reader-
-slot acquire (scan + CAS) and release (atomic-ordered stores)
-with the `HintEpoch` orphan anchor, RPL reclamation bound
-(oldest-reader scan + checkpoint TxnID), loose-page tracking,
-tail-refund commit step. Leak-detection cleanups on `Tx` and
-`DB`. Target: a write transaction observes its own modifications;
-a concurrent read transaction observes the pre-commit snapshot;
-RPL reclamation respects active-reader pinning.
+**Scope.** Reader-slot acquire (scan + CAS) and release (atomic-
+ordered stores) with the `HintEpoch` orphan anchor; RPL
+reclamation bound from real oldest-reader scan + checkpoint TxnID;
+reader transactions (`*ReadTx`, `DB.BeginRead`, `DB.View`); the
+SyncMode surface (`Options.SyncMode`, `MetaFlagCheckpoint` per
+commit, `DB.Checkpoint`, recovery preference for checkpoint-
+flagged metas, `AllowSyncUnsafe` opt-in). Reader leak-detection
+cleanup with the heap-shared `*closeGate` (drains in-flight Tx
+cleanups in `Close` before unmap — the chunk-2.8 `*atomic.Bool`
+gate was insufficient for the read-tx slot-release path).
 
-Primary specs: `transactions.md`, `leak-detection.md`,
-`free-space.md §RPL Reclamation` and §Loose Pages, §Tail Page
-Refund.
+Write-tx Begin/Commit/Rollback, loose-page tracking, and tail-
+refund commit step landed in chunks 1–2 and are exercised by
+chunk-3's reader-pin tests.
 
-Primary files: `tx.go`, `lock.go`, `alloc.go`, `db.go`.
+Target: a write transaction observes its own modifications; a
+concurrent read transaction observes the pre-commit snapshot;
+RPL reclamation respects active-reader pinning; recovery picks
+the checkpoint-flagged meta over a higher-TxnID non-checkpoint
+meta; SyncUnsafe is rejected without explicit opt-in.
+
+Primary specs: `transactions.md`, `cross-process.md §Reader
+Table`, `leak-detection.md` (chunk-3.3 refcount-drain amend),
+`free-space.md §RPL Reclamation`, `durability.md`.
+
+Spec amends landed: `cross-process.md` (hint placement on Coord;
+case 0c min-inclusion), `leak-detection.md` (txInflight drain
+clause), `api-surface.md` (*ReadTx / *Tx split).
+
+Primary files: `read_tx.go`, `checkpoint.go`, `closegate.go`
+(new); `tx.go`, `db.go`, `options.go`, `errors.go` (modified);
+`internal/lock/reader.go`, `internal/lock/coord_reader.go`
+(new); `internal/lock/coord.go` (hint field); `internal/pager/
+commit.go` (SyncPolicy); `internal/pager/init.go` (checkpoint-
+preferring active-meta selector); `internal/page/meta.go`
+(ActiveMetaCheckpointPreferring).
+
+Filed: `docs/issues/lagging-reader-callback.md` (Lands: 5 —
+defer until `Keyspace.Put` is the first real `AllocPage`
+consumer).
 
 ### Chunk 4 — B+tree primitives + cursor
 

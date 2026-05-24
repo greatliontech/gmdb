@@ -54,6 +54,31 @@ Invariant: kind=clause-explicit;
     cleanups race the unmap and SIGSEGV.
 
 Invariant: kind=clause-explicit;
+  property=`Close()` drains in-flight Tx cleanups via a heap-shared
+    atomic refcount (`gate.txInflight`, incremented at cleanup
+    entry, decremented at cleanup exit regardless of the skip-vs-
+    work branch) BEFORE unmapping the lock file. A cleanup that
+    observed `*db.closed == false` (and therefore proceeded into
+    the resource-touching path) MUST complete before `Close`
+    advances to unmap. The drain pairs with the release-store on
+    `*db.closed` to close the read-tx-leak race that the original
+    closed-only gate left open: a leaked-ReadTx cleanup that
+    passed the gate could otherwise race `Close`'s subsequent
+    `lockFile.Close` and SIGSEGV writing to the unmapped reader
+    slot;
+  from=this spec §`Close()` Ordering + the chunk-3.3 read-tx
+    slot-release path (the demonstrated fault — write-tx cleanup
+    doesn't touch the lock-file mmap, so chunks 1–2 didn't
+    surface the race);
+  violation=Without the refcount drain, a leaked-ReadTx cleanup
+    can SIGSEGV writing to `ReleaseReaderSlot`'s atomic stores
+    against `f.slots` after `File.Close` has nilled the overlay
+    slice. The closed-only gate is necessary but insufficient:
+    closed-store + cleanup-load + cleanup-work + Close-unmap is
+    a four-step race where the cleanup-work can land after the
+    Close-unmap.
+
+Invariant: kind=clause-explicit;
   property=A `Commit()` or `Rollback()` on a `Tx` cancels its
     `runtime.AddCleanup` callback (via `.Stop()`) BEFORE releasing
     the resource. A `Close()` on a `DB` achieves the same property
@@ -228,9 +253,16 @@ To make per-Tx leak cleanups safe against an early `Close()` (see
 Cleanup Behavior step 0 above), `Close()` runs in this order:
 
 1. Store `*db.closed = true` (release-store on the shared
-   `*atomic.Bool`) — visible to any subsequent Tx cleanup
-   invocation regardless of `runtime.AddCleanup` ordering between
-   the DB and its Txs.
+   `*atomic.Bool` field of the heap-shared `closeGate`) — visible
+   to any subsequent Tx cleanup invocation regardless of
+   `runtime.AddCleanup` ordering between the DB and its Txs.
+1a. Drain in-flight Tx cleanups by spinning on
+   `gate.txInflight == 0`. A cleanup that has passed the
+   release-store gate but not yet finished its resource-touching
+   work (e.g., a leaked-ReadTx mid-`ReleaseReader`) must complete
+   before any unmap. The spin is bounded by cleanup work
+   duration — two atomic stores on the reader slot — so a true
+   sleep would over-pessimise the common case.
 2. Stop the heartbeat goroutine via its stop channel and wait for
    its done channel (bounded by the tick interval).
 3. Stop the flock goroutine: close `db.stopCh` (the goroutine's
@@ -254,7 +286,10 @@ Any Tx cleanup invoked between steps 1 and 6 sees
 `db.closed = true` and exits without touching the soon-to-be-
 unmapped memory. After step 6 the mmap is gone but the cleanup's
 guard at step 0 prevents the SEGV. Any Tx cleanup invoked *after*
-step 7 is fine — the guard still prevents access.
+step 7 is fine — the guard still prevents access. Cleanups that
+*had already passed* the guard at the moment step 1 fired
+complete fully before step 6 runs, because step 1a spins on the
+in-flight refcount until they decrement.
 
 `Close()` is **not** safe to call concurrently with active write
 or batch transactions in the same process. Active *read*

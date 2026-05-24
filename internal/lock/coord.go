@@ -83,6 +83,15 @@ type Coord struct {
 	clock             func() uint64
 	heartbeatDoneCh   chan struct{}
 
+	// readerSlotHint is the process-local scan-start offset for
+	// AcquireReader (cross-process.md §Reader Table: "Start scanning
+	// from the slot hint ... rather than slot 0"). atomic.Uint32 to
+	// allow concurrent reader-tx Begins to read/CAS without taking a
+	// mutex; updates are relaxed stores per spec ("no cross-process
+	// coordination") because the hint is a steady-state optimisation,
+	// not a correctness mechanism.
+	readerSlotHint atomic.Uint32
+
 	closeOnce sync.Once
 }
 

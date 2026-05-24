@@ -59,11 +59,22 @@ var (
 	// — this sentinel is the user-facing surface that invariant
 	// requires.
 	ErrClosed = errors.New("gmdb: database is closed")
+
+	// ErrReadersFull is returned by BeginRead / View when every
+	// reader slot in the lock-file table is occupied (cross-process.md
+	// §Reader Table, transactions.md §Read Transaction step 2). With
+	// a deadline-bearing context the call retries until a slot
+	// becomes free or the deadline fires; with no deadline the call
+	// returns ErrReadersFull immediately so callers can distinguish
+	// "table at capacity" from other Begin failures.
+	ErrReadersFull = errors.New("gmdb: no reader slots available")
 )
 
 var (
-	errInvalidPageSize   = errors.New("gmdb: PageSize must be a power of two in [4096, 65536]")
-	errInvalidSizeBounds = errors.New("gmdb: MaxSize must be > 0 and >= MinSize")
-	errInvalidTxBuffer   = errors.New("gmdb: MaxTxBufferBytes must be > 0")
-	errInvalidMaxReaders = errors.New("gmdb: MaxReaders must be in [1, 65536]")
+	errInvalidPageSize         = errors.New("gmdb: PageSize must be a power of two in [4096, 65536]")
+	errInvalidSizeBounds       = errors.New("gmdb: MaxSize must be > 0 and >= MinSize")
+	errInvalidTxBuffer         = errors.New("gmdb: MaxTxBufferBytes must be > 0")
+	errInvalidMaxReaders       = errors.New("gmdb: MaxReaders must be in [1, 65536]")
+	errInvalidSyncMode         = errors.New("gmdb: SyncMode out of range")
+	errSyncUnsafeRequiresOptIn = errors.New("gmdb: SyncUnsafe requires AllowSyncUnsafe=true")
 )

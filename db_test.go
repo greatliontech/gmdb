@@ -900,14 +900,14 @@ func TestCloseSetsDBClosedFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if got := db.closed.Load(); got {
-		t.Errorf("db.closed pre-Close = %v, want false", got)
+	if got := db.closeGate.IsClosed(); got {
+		t.Errorf("db.closeGate pre-Close = %v, want false", got)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if got := db.closed.Load(); !got {
-		t.Errorf("db.closed post-Close = %v, want true", got)
+	if got := db.closeGate.IsClosed(); !got {
+		t.Errorf("db.closeGate post-Close = %v, want true", got)
 	}
 }
 
@@ -1012,20 +1012,21 @@ func TestTxLeakAfterCloseNoCrash(t *testing.T) {
 }
 
 func TestDBClosedFlagSharedByPointer(t *testing.T) {
-	// Spec-tier invariant: db.closed is a *atomic.Bool shared by
-	// pointer between DB, every txCleanupInfo, and dbCleanupInfo.
-	// We pin this by verifying that the pointer captured in a Tx's
-	// cleanup info points to the same atomic.Bool as the DB struct
-	// — so a Close() store is observable to a leaked-Tx cleanup
-	// even if the *DB itself is GC'd first.
+	// Spec-tier invariant (leak-detection.md, chunk-3.3 promotion):
+	// the close coordination state is a *closeGate shared by
+	// pointer between DB, every txCleanupInfo, every
+	// readTxCleanupInfo, and dbCleanupInfo. We pin this by
+	// verifying the DB's closeGate pointer is non-nil so a
+	// Close() store is observable to a leaked-Tx cleanup even if
+	// the *DB itself is GC'd first.
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	if db.closed == nil {
-		t.Fatal("db.closed is nil — should be heap-allocated *atomic.Bool")
+	if db.closeGate == nil {
+		t.Fatal("db.closeGate is nil — should be heap-allocated *closeGate")
 	}
 	// Confirm Begin captures the same pointer.
 	tx, err := db.Begin(ctx, true)
@@ -1035,7 +1036,7 @@ func TestDBClosedFlagSharedByPointer(t *testing.T) {
 	defer tx.Rollback()
 	// We can't directly inspect tx.cleanup's info struct from a
 	// test, but the contract is enforced by construction in db.go's
-	// Begin (closed: db.closed). The non-nil check above + the
+	// Begin (gate: db.closeGate). The non-nil check above + the
 	// TestTxLeakAfterCloseNoCrash test exercise the shared-pointer
 	// invariant end-to-end.
 }
@@ -1075,9 +1076,9 @@ func TestTxCleanupFnDirectClosedSkipsRelease(t *testing.T) {
 	// Cancel the real cleanup so we can synthesize our own info.
 	tx.cleanup.Stop()
 
-	// Simulate "DB is closed" by setting the captured atomic.
-	closedFlag := &atomic.Bool{}
-	closedFlag.Store(true)
+	// Simulate "DB is closed" by setting the captured gate.
+	gate := newCloseGate()
+	gate.SwapClosed(true)
 
 	held := &atomic.Bool{}
 	held.Store(true)
@@ -1092,7 +1093,7 @@ func TestTxCleanupFnDirectClosedSkipsRelease(t *testing.T) {
 	// later Rollback below.
 
 	info := txCleanupInfo{
-		closed:    closedFlag,
+		gate:      gate,
 		pgr:       tx.pgr,
 		grant:     tx.grant,
 		held:      held,
@@ -1151,12 +1152,12 @@ func TestTxCleanupFnDirectClosedFalseRunsRelease(t *testing.T) {
 	}
 	tx.cleanup.Stop()
 
-	closedFlag := &atomic.Bool{} // false
+	gate := newCloseGate() // closed=false
 	held := &atomic.Bool{}
 	held.Store(true)
 
 	info := txCleanupInfo{
-		closed:    closedFlag,
+		gate:      gate,
 		pgr:       tx.pgr,
 		grant:     tx.grant,
 		held:      held,

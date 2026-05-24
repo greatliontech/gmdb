@@ -1,0 +1,502 @@
+package gmdb
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/thegrumpylion/gmdb/internal/page"
+)
+
+func TestBeginReadGenesis(t *testing.T) {
+	// Spec-tier invariant pin (transactions.md §Read Transaction):
+	// BeginRead on a fresh database succeeds, returns a ReadTx
+	// whose snapshot meta is the genesis (TxnID=0), and Commit
+	// releases the slot cleanly.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	if got := rtx.Meta().TxnID; got != 0 {
+		t.Errorf("genesis ReadTx.Meta().TxnID = %d, want 0", got)
+	}
+	if err := rtx.Commit(); err != nil {
+		t.Errorf("Commit: %v", err)
+	}
+}
+
+func TestReadTxObservesPreCommitSnapshot(t *testing.T) {
+	// Spec-tier invariant (transactions.md §Read Transaction): a
+	// read transaction's snapshot is identified by the TxnID
+	// recorded at Begin; every page reachable from that snapshot's
+	// meta is immutable for the read's duration. Pin the contract:
+	// open a write tx that allocates a page, commit; open a reader
+	// at TxnID=1; a CONCURRENT write tx that retires that page +
+	// commits cannot modify the reader's view of it.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// W1: allocate page A, populate, commit.
+	var idA uint64
+	if err := db.Update(ctx, func(tx *Tx) error {
+		id, e := tx.AllocPage()
+		if e != nil {
+			return e
+		}
+		idA = id
+		buf, e := tx.AllocSlab(id)
+		if e != nil {
+			return e
+		}
+		page.WriteHeader(buf, page.TypeLeaf, 1, 0)
+		copy(buf[page.HeaderSize:], []byte("snapshot-A"))
+		return nil
+	}); err != nil {
+		t.Fatalf("W1: %v", err)
+	}
+
+	// R1: open read tx; snapshot pins TxnID=1.
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	defer rtx.Rollback()
+	if rtx.Meta().TxnID != 1 {
+		t.Fatalf("ReadTx snapshot TxnID = %d, want 1", rtx.Meta().TxnID)
+	}
+	readBuf, err := rtx.Page(idA)
+	if err != nil {
+		t.Fatalf("rtx.Page: %v", err)
+	}
+	if !bytes.HasPrefix(readBuf[page.HeaderSize:], []byte("snapshot-A")) {
+		t.Fatalf("ReadTx initial view: %x", readBuf[page.HeaderSize:page.HeaderSize+16])
+	}
+
+	// W2: retire page A; commit. Under CoW the page bytes at idA
+	// remain immutable for the reader's snapshot — the writer
+	// allocates a new page elsewhere and leaves idA's content as-is
+	// until reclamation, which the reader pins.
+	if err := db.Update(ctx, func(tx *Tx) error {
+		return tx.FreePage(idA)
+	}); err != nil {
+		t.Fatalf("W2: %v", err)
+	}
+
+	// R1 re-read of the same id: should still see "snapshot-A".
+	readBuf2, err := rtx.Page(idA)
+	if err != nil {
+		t.Fatalf("rtx.Page after W2: %v", err)
+	}
+	if !bytes.HasPrefix(readBuf2[page.HeaderSize:], []byte("snapshot-A")) {
+		t.Errorf("ReadTx snapshot corrupted after concurrent write+retire: got %x",
+			readBuf2[page.HeaderSize:page.HeaderSize+16])
+	}
+}
+
+func TestBeginReadAfterCloseReturnsErrClosed(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	_, err = db.BeginRead(ctx)
+	if !errors.Is(err, ErrClosed) {
+		t.Errorf("BeginRead after Close: got %v, want ErrClosed", err)
+	}
+}
+
+func TestBeginReadRespectsCtxCancellation(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = db.BeginRead(cctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("BeginRead on cancelled ctx: got %v, want context.Canceled", err)
+	}
+}
+
+func TestBeginReadFullTableNoDeadline(t *testing.T) {
+	// MaxReaders=1; one BeginRead fills the table; second returns
+	// ErrReadersFull immediately because the second ctx has no
+	// deadline.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64, MaxReaders: 1,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("first BeginRead: %v", err)
+	}
+	defer rtx.Rollback()
+	_, err = db.BeginRead(ctx)
+	if !errors.Is(err, ErrReadersFull) {
+		t.Errorf("second BeginRead: got %v, want ErrReadersFull", err)
+	}
+}
+
+func TestBeginReadFullTableWithDeadlineRetries(t *testing.T) {
+	// With a deadline, a full table retries; expect
+	// context.DeadlineExceeded after the deadline fires.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64, MaxReaders: 1,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	defer rtx.Rollback()
+	dctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err = db.BeginRead(dctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("deadlined second BeginRead: got %v, want DeadlineExceeded", err)
+	}
+}
+
+func TestViewReleasesSlot(t *testing.T) {
+	// View must release the slot even when fn errors.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64, MaxReaders: 1,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	probeErr := errors.New("fn fail")
+	err = db.View(ctx, func(rtx *ReadTx) error { return probeErr })
+	if !errors.Is(err, probeErr) {
+		t.Errorf("View fn err: got %v, want probeErr", err)
+	}
+	// Slot should be free — a subsequent View must succeed.
+	if err := db.View(ctx, func(rtx *ReadTx) error { return nil }); err != nil {
+		t.Errorf("View after probe: %v", err)
+	}
+}
+
+func TestReadTxPageAfterCloseReturnsErrTxClosed(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	if err := rtx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if _, err := rtx.Page(0); !errors.Is(err, ErrTxClosed) {
+		t.Errorf("Page after Commit: got %v, want ErrTxClosed", err)
+	}
+}
+
+func TestReadTxRollbackIdempotent(t *testing.T) {
+	// First close (via Commit) succeeds; second close (via Rollback)
+	// returns ErrTxClosed cleanly. No panic, no double-release.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	if err := rtx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := rtx.Rollback(); !errors.Is(err, ErrTxClosed) {
+		t.Errorf("second close: got %v, want ErrTxClosed", err)
+	}
+}
+
+func TestReadTxConcurrentReadersDoNotBlockEachOther(t *testing.T) {
+	// MaxReaders=4; spawn 4 concurrent BeginRead, all should
+	// succeed without contention.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64, MaxReaders: 4,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	var wg sync.WaitGroup
+	var errCount atomic.Int32
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rtx, err := db.BeginRead(ctx)
+			if err != nil {
+				errCount.Add(1)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+			rtx.Rollback()
+		}()
+	}
+	wg.Wait()
+	if e := errCount.Load(); e != 0 {
+		t.Errorf("%d concurrent BeginRead errors", e)
+	}
+}
+
+func TestReadTxDoesNotBlockWriter(t *testing.T) {
+	// Per transactions.md: "Readers never block writers." A live
+	// reader holding a snapshot must not prevent a concurrent write
+	// tx from committing.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	defer rtx.Rollback()
+	// Writer must proceed even with rtx holding a snapshot.
+	done := make(chan error, 1)
+	go func() {
+		done <- db.Update(ctx, func(tx *Tx) error {
+			_, e := tx.AllocPage()
+			return e
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Update: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Update blocked by concurrent reader")
+	}
+}
+
+//go:noinline
+func leakReadTx(t *testing.T, db *DB, ctx context.Context) {
+	t.Helper()
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead (to leak): %v", err)
+	}
+	_ = rtx
+}
+
+func TestLeakedReadTxReleasesSlotViaCleanup(t *testing.T) {
+	// Leak-detection.md §Transaction Leak Detection contract for
+	// read transactions: a *ReadTx dropped without Commit/Rollback
+	// must not pin its reader slot forever — runtime.AddCleanup
+	// fires after GC, the cleanup CAS's the held flag and releases
+	// the slot. We pin the contract by leaking a ReadTx, forcing
+	// GC, and asserting the next BeginRead on a max-1-slots table
+	// succeeds.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64, MaxReaders: 1,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	leakReadTx(t, db, ctx)
+	runtime.GC()
+	runtime.GC()
+	// Cleanup runs on a separate goroutine; wait via a channel for
+	// the slot to free. If cleanup fires within the timeout,
+	// BeginRead unblocks immediately.
+	done := make(chan error, 1)
+	go func() {
+		rtx, err := db.BeginRead(ctx)
+		if err == nil {
+			_ = rtx.Rollback()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("BeginRead after GC of leaked ReadTx: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("BeginRead blocked — leaked ReadTx did not release slot via GC cleanup")
+	}
+}
+
+func TestReaderPinsRPLAgainstReclamation(t *testing.T) {
+	// Project invariant 1 (clause-explicit, transactions.md): an
+	// active reader at TxnID T pins every page retired at TxnID
+	// > T against RPL reclamation. The chunk-3.4 wiring of the
+	// reclamation bound (min(oldestReaderTxnID, lastCheckpointTxnID))
+	// is the mechanism. Pin the contract: open writer, alloc + free
+	// page A across two commits so A lands in the RPL at TxnID=2;
+	// open a reader pinned at TxnID=2; run further write txs that
+	// allocate-and-free pages so the writer's allocator hits the
+	// "bitmap exhausted" → reclaimRPL path; assert A is NOT
+	// reclaimed while the reader holds its slot, and IS reclaimable
+	// once the reader closes.
+	ctx := context.Background()
+	// Tight MaxSize forces the allocator into the bitmap-exhausted /
+	// RPL-reclaim path quickly. Bitmap covers 16 pages at PageSize
+	// 4096 (16/4096*8 = ceil(16/(4096*8))=1 bitmap page); meta(2) +
+	// bitmap(1) = 3 reserved; effective data pages = 13.
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 16,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// W1: alloc page A.
+	var idA uint64
+	if err := db.Update(ctx, func(tx *Tx) error {
+		id, e := tx.AllocPage()
+		if e != nil {
+			return e
+		}
+		idA = id
+		_, e = tx.AllocSlab(id)
+		return e
+	}); err != nil {
+		t.Fatalf("W1: %v", err)
+	}
+	// W2: free A — retires to RPL at TxnID=2.
+	if err := db.Update(ctx, func(tx *Tx) error {
+		return tx.FreePage(idA)
+	}); err != nil {
+		t.Fatalf("W2: %v", err)
+	}
+	if db.Meta().RPLEntryCount == 0 {
+		t.Fatalf("RPL empty after W2; expected page A retired")
+	}
+
+	// R1: snapshot at TxnID=2 pinning A in the RPL.
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	if rtx.Meta().TxnID != 2 {
+		t.Fatalf("R1 snapshot TxnID = %d, want 2", rtx.Meta().TxnID)
+	}
+
+	// W3..Wn: keep allocating until the writer would need to
+	// reclaim. Each alloc consumes a free bitmap slot. With 13
+	// data pages, after a few allocs the bitmap empties and the
+	// allocator falls into reclaimRPL. With R1 pinning the bound
+	// at TxnID=2, reclaimRPL is a no-op (rpl[0].TxnID == 2 is NOT
+	// strictly less than bound=2), so the allocator falls through
+	// to file extension. Since MaxSize=16 caps file extension,
+	// eventually ErrDBFull surfaces.
+	gotErrDBFull := false
+	for range 20 {
+		err := db.Update(ctx, func(tx *Tx) error {
+			_, e := tx.AllocPage()
+			return e
+		})
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, ErrDBFull) {
+			gotErrDBFull = true
+			break
+		}
+		t.Fatalf("unexpected Update err: %v", err)
+	}
+	if !gotErrDBFull {
+		t.Errorf("expected ErrDBFull while reader pins RPL; got no error")
+	}
+	// Critical assertion: A is still in the RPL (NOT reclaimed)
+	// because R1 pinned the bound.
+	if db.Meta().RPLEntryCount == 0 {
+		t.Errorf("RPL was reclaimed despite live reader pinning")
+	}
+
+	// Release the reader; the NEXT write tx should now reclaim
+	// (oldestReader == MaxUint64, bound advances to current
+	// activeMeta.TxnID).
+	if err := rtx.Rollback(); err != nil {
+		t.Fatalf("rtx.Rollback: %v", err)
+	}
+	// One more write — bitmap will be exhausted again, but now
+	// reclaim succeeds because bound > 2.
+	if err := db.Update(ctx, func(tx *Tx) error {
+		_, e := tx.AllocPage()
+		return e
+	}); err != nil {
+		t.Errorf("post-reader-close Update: %v", err)
+	}
+	// After post-reader-close commit the writer must have either
+	// reclaimed RPL entries OR alloced from a freshly-extended
+	// page. With MaxSize=16 and HWM previously at 16 (forced by
+	// the ErrDBFull loop), extension would re-hit DBFull — so
+	// success implies reclamation fired.
+	if db.Meta().RPLEntryCount > 0 && db.Meta().HighWaterMark == 16 {
+		// RPL still non-empty + HWM still pinned at MaxSize: the
+		// post-close Update must have reclaimed at least one entry
+		// to find a free page. The remaining RPL entries are
+		// post-reader retires; we can't deterministically count
+		// them without knowing the exact alloc/retire sequence,
+		// so the structural assertion above is the right level.
+	}
+}
+
+func TestReadTxLeakAfterCloseNoCrash(t *testing.T) {
+	// Symmetric to TestTxLeakAfterCloseNoCrash for writes: a
+	// leaked-ReadTx cleanup that observes *db.closed == true MUST
+	// return without touching the (already-unmapped) reader-table
+	// mmap.
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64, MaxReaders: 4,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	leakReadTx(t, db, ctx)
+	// Close BEFORE GC — the cleanup observes db.closed=true.
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	runtime.GC()
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+}

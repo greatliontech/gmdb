@@ -593,8 +593,8 @@ gives the slot a "recent liveness" anchor that will eventually go
 stale); PID is written last (so the detector's PID-based fast
 path is only used once the full identity has been populated).
 
-1. Start scanning from the **slot hint** (`db.readerSlotHint`, an
-   `atomic.Uint32` on the DB struct) rather than slot 0.
+1. Start scanning from the **slot hint** (`coord.readerSlotHint`, an
+   `atomic.Uint32` on the Coord struct) rather than slot 0.
 2. Scan forward (with wraparound) for `TxnID == 0` (free).
 3. Atomically CAS the `TxnID` field from `0` to the current meta
    page's TxnID. CAS failure ⇒ continue scanning.
@@ -607,7 +607,7 @@ path is only used once the full identity has been populated).
    e. Store `PID = currentPID` (atomic).
 5. Register the slot index with the heartbeat goroutine's active
    list.
-6. Update `db.readerSlotHint`.
+6. Update `coord.readerSlotHint`.
 7. If all slots occupied (full wraparound), return
    `ErrReadersFull`.
 
@@ -671,12 +671,19 @@ c. **Zero heartbeat** (`Heartbeat == 0`): the acquirer crashed
    yet; use `HintEpoch` as the cross-process orphan anchor:
 
    - If `HintEpoch == 0`: this is the first observation. CAS
-     `HintEpoch` from 0 to `now`. **Skip** this round; the next
-     scan (from any process) compares against the stored epoch.
+     `HintEpoch` from 0 to `now`. **Skip clearing this round AND
+     include `TxnID` in the oldest-min computation**: the acquirer
+     may be a live mid-publish reader about to stamp PID;
+     advancing the reclamation bound past its TxnID would let the
+     writer reclaim pages the reader will snapshot. The next scan
+     (from any process) compares against the stored epoch.
    - If `HintEpoch != 0 AND now - HintEpoch > StaleTimeout`:
      confirmed orphan. **Clear `TxnID = 0`** (and `HintEpoch`
      via the post-clear cleanup below).
-   - Otherwise: **skip**.
+   - Otherwise (`HintEpoch != 0`, epoch set but not yet aged out):
+     **skip clearing AND include `TxnID` in the oldest-min
+     computation** — same safety rationale as the first-observer
+     case.
 
 **1. `PID != 0`, same PID namespace** (slot's `PIDNamespace` ==
 checker's, both non-zero):
@@ -904,8 +911,8 @@ slow atomic-store latency. No syscalls.
 
 ## Atomic Operations Convention
 
-- **In-process fields** (DB/Tx struct fields like
-  `db.readerSlotHint`) use Go's **typed atomics**
+- **In-process fields** (DB/Coord/Tx struct fields like
+  `coord.readerSlotHint`) use Go's **typed atomics**
   (`atomic.Uint64`, `atomic.Uint32`, `atomic.Int64`).
 - **Shared-memory fields** (reader-table fields, header writer
   fields in the mmap'd lock file) use **function-based

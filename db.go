@@ -54,19 +54,24 @@ type DB struct {
 	// from disk and is internally consistent.
 	poisoned atomic.Bool
 
-	// closed is a heap-allocated *atomic.Bool shared by pointer with
-	// every txCleanupInfo and the dbCleanupInfo (leak-detection.md
-	// §Cleanup Behavior + §Close Ordering — clause-explicit
-	// invariants). Heap allocation is required because
-	// runtime.AddCleanup provides no ordering between the DB cleanup
-	// and the Tx cleanups that depend on observing it; an inline
-	// db.closed field would dangle if the DB were collected first.
+	// closeGate is a heap-allocated coordination struct shared by
+	// pointer with every txCleanupInfo, every readTxCleanupInfo, and
+	// the dbCleanupInfo. Composes the (closed bool, txInflight
+	// counter) pair the chunk-3.3 promotion of leak-detection.md
+	// §Cleanup Behavior + §Close Ordering requires — see closegate.go
+	// for the full rationale.
 	//
-	// Close() sets *closed = true (release-store) BEFORE unmapping
-	// or stopping goroutines so any concurrent Tx cleanup or use-
-	// after-Close caller observes the close state and exits without
-	// touching torn-down resources.
-	closed *atomic.Bool
+	// Heap allocation is required because runtime.AddCleanup provides
+	// no ordering between the DB cleanup and the Tx cleanups that
+	// depend on observing the close state; an inline DB field would
+	// dangle if the DB were collected first.
+	//
+	// Close() stores closed=true (release-store) AND drains
+	// txInflight to zero BEFORE unmapping the lock file — so a
+	// leaked-Tx cleanup that passed the closed gate cannot race the
+	// unmap. The drain is a bounded spin (cleanup work is two
+	// atomic stores).
+	closeGate *closeGate
 
 	// cleanup is the runtime.AddCleanup handle for THIS *DB; Stop()'d
 	// by Close so a normal teardown doesn't fire the leak-warning
@@ -162,6 +167,20 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 		return nil, mapPagerErr(err)
 	}
 
+	// durability.md §Recovery step 3: recovery accepted a
+	// non-checkpoint meta because no checkpoint-flagged meta exists
+	// (SyncLazy-only DB never Checkpoint()'d). Warn — data
+	// integrity depends on whether the OS flushed pages in the
+	// right order, which is not guaranteed.
+	if opened.NoCheckpoint {
+		slog.Default().Warn(
+			"gmdb: Open accepted non-checkpoint meta",
+			"path", path,
+			"txn_id", opened.Meta.TxnID,
+			"detail", "no checkpoint-flagged meta found; data integrity depends on OS flush ordering",
+		)
+	}
+
 	// Open the lock file under the same os.Root — symlink-escape
 	// protection is shared with the data file. The DataUUID is the
 	// just-opened pager's meta UUID; a stale lock file with a
@@ -206,7 +225,7 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 		currentMeta:   opened.Meta,
 		activeMetaIdx: opened.ActiveMetaIdx,
 		pgr:           opened.Pager,
-		closed:        new(atomic.Bool),
+		closeGate:     newCloseGate(),
 	}
 	// DB-level leak-detection cleanup. The cleanup info captures
 	// resources by pointer (not via *DB) so a leaked-then-collected
@@ -215,7 +234,7 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 	// is Stop()'d AND a defensive Swap(true) returns true → cleanup
 	// exits silently.
 	db.cleanup = runtime.AddCleanup(db, dbCleanupFn, dbCleanupInfo{
-		closed:    db.closed,
+		gate:      db.closeGate,
 		coord:     coord,
 		lockFile:  lockFile,
 		pgr:       opened.Pager,
@@ -227,11 +246,12 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 }
 
 // dbCleanupInfo bundles the resources a leaked-DB cleanup needs to
-// tear down. Captures the shared *atomic.Bool by pointer (leak-
-// detection.md clause-explicit invariant); resource pointers are
-// independent of the *DB so a collected *DB doesn't dangle them.
+// tear down. Captures the shared *closeGate by pointer (leak-
+// detection.md clause-explicit invariant — gate must survive a
+// collected-first *DB); resource pointers are independent of the
+// *DB so a collected *DB doesn't dangle them.
 type dbCleanupInfo struct {
-	closed    *atomic.Bool
+	gate      *closeGate
 	coord     *lock.Coord
 	lockFile  *lock.File
 	pgr       *pager.Pager
@@ -254,7 +274,7 @@ type dbCleanupInfo struct {
 // drain is bounded by Options.LockRetryInterval +
 // Options.HeartbeatInterval.
 func dbCleanupFn(info dbCleanupInfo) {
-	if info.closed.Swap(true) {
+	if info.gate.SwapClosed(true) {
 		// Close() ran first; nothing to tear down.
 		return
 	}
@@ -318,11 +338,26 @@ func dbCleanupFn(info dbCleanupInfo) {
 // runtime.AddCleanup ordering pathologies. See leak-detection.md
 // §Database Handle Leak Detection for the full discussion.
 func (db *DB) Close() error {
-	// Step 1 — release-store, atomic so the cleanup goroutines see
-	// it. CAS for idempotency: a second Close returns immediately.
-	if !db.closed.CompareAndSwap(false, true) {
+	// Step 1a — release-store closed=true via gate.CAS. Idempotency:
+	// a second Close returns immediately because only one caller
+	// wins the CAS.
+	if !db.closeGate.CompareAndSwapClosed(false, true) {
 		return nil
 	}
+	// Step 1b — drain in-flight Tx cleanups. Cleanups that observed
+	// closed=false BEFORE our store may still be mid-work touching
+	// the lock-file mmap (the read-tx slot-release path); we MUST
+	// wait for them to complete before unmapping. The gate's
+	// txInflight counter (incremented at the top of every cleanup,
+	// decremented at the bottom regardless of skip/work) lets us
+	// spin until quiescence. See closegate.go for the interleaving
+	// analysis. Cleanups that fire AFTER this step observe
+	// closed=true and skip the resource-touching work.
+	//
+	// We've already won the CAS — perform the drain via the same
+	// gate. BeginClose stores closed=true (idempotent — already
+	// true from our CAS above) and drains.
+	db.closeGate.BeginClose()
 
 	// Capture resource pointers under db.mu so a concurrent Begin
 	// (which snapshots db.coord under db.mu) sees a consistent view
@@ -349,7 +384,10 @@ func (db *DB) Close() error {
 	if coord != nil {
 		_ = coord.Close()
 	}
-	// Step 3 — munmap the lock file.
+	// Step 3 — munmap the lock file. Safe: closeGate.BeginClose
+	// drained Tx cleanups that might still write to lockFile's
+	// mmap; Coord.Close drained heartbeat + flock goroutines that
+	// also touch lockFile mmap.
 	if lockFile != nil {
 		_ = lockFile.Close()
 	}
@@ -396,21 +434,26 @@ func (db *DB) Meta() page.Meta {
 // deadlock waiting for db.mu while the coord's stopCh is closed but
 // the flock goroutine still holds the result-channel send.
 //
-// Read transactions are not yet wired (chunk 3 territory); calling
-// Begin(write=false) returns ErrReadOnly to signal the unimplemented
-// path explicitly.
+// Per the chunk-3 spec amend in api-surface.md, read and write
+// transactions live in distinct types — write goes through Begin
+// (returning *Tx); read goes through BeginRead (returning *ReadTx).
+// The legacy `Begin(ctx, false)` path is preserved as a hard error
+// (ErrReadOnly) so existing callers fail loud rather than silently
+// pass the wrong-typed handle to write-only code; the spec amend
+// removed the unified-Tx writable=false case entirely.
 func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 	if !write {
 		return nil, ErrReadOnly
 	}
-	// Fast-path close check. db.closed is the spec-tier
-	// *atomic.Bool gate (leak-detection.md §Close Ordering); a
-	// release-store at the top of Close makes this Load-true any
-	// time after Close begins. The subsequent snapshot under db.mu
-	// is still required: a Begin that interleaves between this
-	// Load and Close's CAS sees closed==false here but a nil coord
-	// after the snapshot — same ErrClosed result.
-	if db.closed.Load() {
+	// Fast-path close check. db.closeGate.IsClosed() is the
+	// spec-tier *closeGate gate (leak-detection.md §Close Ordering
+	// + chunk-3.3 refcount-drain promotion); a release-store at the
+	// top of Close makes this Load-true any time after Close begins.
+	// The subsequent snapshot under db.mu is still required: a Begin
+	// that interleaves between this Load and Close's CAS sees
+	// closed==false here but a nil coord after the snapshot — same
+	// ErrClosed result.
+	if db.closeGate.IsClosed() {
 		return nil, ErrClosed
 	}
 
@@ -453,16 +496,31 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 	defer db.mu.Unlock()
 
 	// Race-with-Close: if Close ran while we were waiting in
-	// AcquireWriter, db.closed is now true. Release the grant we
-	// just got and surface ErrClosed rather than hand back a Tx
+	// AcquireWriter, db.closeGate is now closed. Release the grant
+	// we just got and surface ErrClosed rather than hand back a Tx
 	// against a torn-down pager.
-	if db.closed.Load() {
+	if db.closeGate.IsClosed() {
 		grant.Release()
 		return nil, ErrClosed
 	}
 
 	prevMeta := db.currentMeta
 	prevActive := db.activeMetaIdx
+
+	// Compute the RPL reclamation bound per free-space.md §RPL
+	// Reclamation: min(oldestActiveReaderTxnID, lastCheckpointTxnID).
+	// We hold flock(LOCK_EX) via the grant (cross-process.md
+	// §Writer's Page Reclamation), so OldestReaderTxnID's
+	// LOCK_EX precondition is satisfied. In chunk 3.4 (SyncMode
+	// not yet wired — that's 3.5), every commit is a checkpoint,
+	// so lastCheckpointTxnID == prevMeta.TxnID; the SyncLazy split
+	// arrives in 3.5 alongside the MetaFlagCheckpoint-bit
+	// interpretation. OldestReaderTxnID returns math.MaxUint64
+	// when no readers are active, which the `min` reduces to
+	// lastCheckpointTxnID — the old chunk-2 behaviour preserved
+	// when no readers exist.
+	bound := min(coord.OldestReaderTxnID(), prevMeta.TxnID)
+	pgr.SetCommitState(prevMeta.HighWaterMark, prevMeta.MaxSize, bound)
 	pgr.BeginTx()
 
 	held := &atomic.Bool{}
@@ -478,13 +536,13 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 		grant:      grant,
 	}
 	// Wire the leak-detection cleanup per leak-detection.md. The
-	// cleanup info captures the shared *db.closed atomic by pointer
+	// cleanup info captures the shared *closeGate by pointer
 	// (clause-explicit invariant — required for cleanup to observe
 	// Close without nil-deref'ing through a potentially-collected
 	// *DB) plus *Pager, *Grant, the held atomic, and the origin
 	// stack. Never references *Tx itself (resurrection-forbidden).
 	tx.cleanup = runtime.AddCleanup(tx, txCleanupFn, txCleanupInfo{
-		closed:    db.closed,
+		gate:      db.closeGate,
 		pgr:       pgr,
 		grant:     grant,
 		held:      held,

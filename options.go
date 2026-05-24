@@ -15,6 +15,34 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
+// SyncMode controls the durability guarantees of committed
+// transactions. Per durability.md §Durability Modes:
+//
+//   - SyncDurable (default): full ACID. fdatasync at commit step 2
+//     (data + RPL + bitmap) AND step 4 (meta). Slowest.
+//   - SyncDataOnly: fdatasync at step 2; skip step 4. Last txn may
+//     be lost on crash; DB stays consistent (falls back to previous
+//     meta). ~2× faster than SyncDurable.
+//   - SyncLazy: skip both syncs. Recovery rolls back to the last
+//     `Checkpoint()`. DB is always consistent (no corruption).
+//   - SyncUnsafe: skip both syncs, no safety net. Requires explicit
+//     AllowSyncUnsafe=true. Risk of corruption on crash; benchmarks
+//     and ephemeral data only.
+//
+// SyncMode is a per-process option, not persisted on disk —
+// different processes attached to the same database may use
+// different SyncModes. The on-disk checkpoint flag reflects
+// whichever mode the committer used (durability.md §Cross-process
+// SyncMode interleaving).
+type SyncMode int
+
+const (
+	SyncDurable  SyncMode = iota // syncs data + meta. Full ACID. Default.
+	SyncDataOnly                 // syncs data; not meta. Last txn may be lost on crash.
+	SyncLazy                     // skips all syncs. Rolls back to last Checkpoint() on crash.
+	SyncUnsafe                   // skips all syncs, no safety net. Requires AllowSyncUnsafe.
+)
+
 // Options configures a fresh database at creation time. For an existing
 // database the persisted meta is authoritative; Options is consulted
 // only for the runtime fields (MaxTxBufferBytes, ReadOnly) that have no
@@ -50,6 +78,18 @@ type Options struct {
 	// UUID may be supplied for deterministic database identity in
 	// tests; if zero, a random UUID is generated at creation.
 	UUID [16]byte
+
+	// SyncMode controls per-commit durability — see SyncMode
+	// constants. Zero value is SyncDurable (full ACID, the default).
+	// Per-process, not persisted; cross-process composition uses the
+	// on-disk MetaFlagCheckpoint to coordinate recovery.
+	SyncMode SyncMode
+
+	// AllowSyncUnsafe must be true when SyncMode == SyncUnsafe.
+	// Without it, Open returns ErrInvalidOptions per durability.md
+	// §SyncUnsafe Warning — "a silently-enabled SyncUnsafe lets a
+	// benchmark configuration leak into a production deploy."
+	AllowSyncUnsafe bool
 }
 
 func (o Options) applyDefaults() Options {
@@ -83,6 +123,16 @@ func (o Options) validate() error {
 	// ErrInvalidMaxReaders branch handles the late failure path).
 	if o.MaxReaders < lock.MinMaxReaders || o.MaxReaders > lock.MaxMaxReaders {
 		return errInvalidMaxReaders
+	}
+	switch o.SyncMode {
+	case SyncDurable, SyncDataOnly, SyncLazy:
+		// All safe modes.
+	case SyncUnsafe:
+		if !o.AllowSyncUnsafe {
+			return errSyncUnsafeRequiresOptIn
+		}
+	default:
+		return errInvalidSyncMode
 	}
 	return nil
 }

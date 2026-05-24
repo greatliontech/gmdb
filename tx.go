@@ -64,14 +64,17 @@ type Tx struct {
 // Deliberately omits the *Tx: runtime.AddCleanup rejects an arg that
 // reaches the obj, since resurrecting the obj would defeat collection.
 //
-// Captures the shared *db.closed atomic by pointer (leak-detection.md
+// Captures the shared *closeGate by pointer (leak-detection.md
 // clause-explicit invariant — required because runtime.AddCleanup
-// provides no ordering between the DB cleanup and Tx cleanups). Also
-// captures *Pager and *Grant directly (not via *DB) so a concurrent
+// provides no ordering between the DB cleanup and Tx cleanups, and
+// chunk-3.3 promoted the gate from a plain *atomic.Bool to a
+// *closeGate with an additional inflight-cleanup refcount so
+// Close can drain in-flight cleanups before unmap). Also captures
+// *Pager and *Grant directly (not via *DB) so a concurrent
 // DB.Close — which sets db.pgr = nil and db.coord = nil — does not
 // nil-deref this callback.
 type txCleanupInfo struct {
-	closed    *atomic.Bool
+	gate      *closeGate
 	pgr       *pager.Pager
 	grant     *lock.Grant
 	held      *atomic.Bool
@@ -103,15 +106,19 @@ func txCleanupFn(info txCleanupInfo) {
 		"gmdb: write transaction leaked without Commit/Rollback",
 		"origin", formatStack(info.originPCs),
 	)
-	if info.closed.Load() {
+	if !info.gate.EnterCleanup() {
 		// DB closed — its Close path drained the Coord goroutines
 		// and Released any held grants. Touching info.pgr (whose
 		// internal mmap is unmapped) would risk SIGSEGV on a future
 		// pager change that touches mmap from AbortTx; skip per
 		// spec invariant. The Coord-bound grant channel's other
 		// side is gone, so grant.Release would be a no-op anyway.
+		// gate.ExitCleanup still required so Close's drain doesn't
+		// see a phantom inflight counter.
+		info.gate.ExitCleanup()
 		return
 	}
+	defer info.gate.ExitCleanup()
 	// Restore in-memory pager state to pre-tx, then release the
 	// cross-process write lock. AbortTx must precede grant.Release —
 	// once the grant is released the flock goroutine clears the
@@ -234,12 +241,36 @@ func (tx *Tx) Commit() error {
 	defer tx.releaseGrant()
 	tx.closed = true
 	tx.pgr.SetCurrentTxnID(tx.newTxnID)
-	flags := tx.prevMeta.Flags
+	// Compose Flags + SyncPolicy per durability.md §Durability
+	// Modes. The PageChecksum bit is immutable across commits
+	// (carried forward from prev); the Checkpoint bit is computed
+	// per SyncMode policy:
+	//   - SyncDurable / SyncDataOnly: SET Checkpoint (data IS
+	//     durable post-step-2 fsync; meta MAY not be durable in
+	//     DataOnly mode but the previous meta is — recovery picks
+	//     whichever survives).
+	//   - SyncLazy / SyncUnsafe: CLEAR Checkpoint (data MAY NOT
+	//     be durable; recovery's checkpoint-preferring selector
+	//     will fall back to the last checkpoint-flagged meta).
+	flags := tx.prevMeta.Flags & page.MetaFlagPageChecksum
+	syncPolicy := pager.SyncBoth
+	switch tx.db.opts.SyncMode {
+	case SyncDurable:
+		flags |= page.MetaFlagCheckpoint
+		syncPolicy = pager.SyncBoth
+	case SyncDataOnly:
+		flags |= page.MetaFlagCheckpoint
+		syncPolicy = pager.SyncDataOnly
+	case SyncLazy, SyncUnsafe:
+		// Checkpoint NOT set.
+		syncPolicy = pager.SyncNone
+	}
 	result, err := tx.pgr.Commit(pager.CommitParams{
 		NewTxnID:     tx.newTxnID,
 		KeyspaceRoot: tx.prevMeta.KeyspaceRoot,
 		NumKeyspaces: tx.prevMeta.NumKeyspaces,
 		Flags:        flags,
+		Sync:         syncPolicy,
 	}, tx.prevMeta, tx.prevActive)
 	if err != nil {
 		// pager.Commit failure modes all leave the handle in a state
@@ -266,9 +297,14 @@ func (tx *Tx) Commit() error {
 	tx.db.mu.Lock()
 	tx.db.currentMeta = result.Meta
 	tx.db.activeMetaIdx = result.ActiveMetaIdx
-	// Re-seed commit state for the next tx.
-	tx.pgr.SetCommitState(result.Meta.HighWaterMark, result.Meta.MaxSize, result.Meta.TxnID)
 	tx.db.mu.Unlock()
+	// The pager's commit-state seeding (HighWaterMark, MaxSize,
+	// reclamationBound) moved to the next write-tx Begin path in
+	// chunk 3.4 so the reclamation bound reflects the reader-table
+	// scan AT begin-time rather than at the previous commit-time.
+	// Between Commit and the next Begin, no Tx-bound alloc fires;
+	// the writer pager's stale highWaterMark / reclamationBound
+	// fields are harmless until the next Begin re-seeds them.
 	return nil
 }
 
@@ -305,7 +341,7 @@ func (tx *Tx) requireOpen(needsWrite bool) error {
 	// hasn't yet stored db.closed, but tx.pgr (captured at Begin)
 	// is a stable Go-heap pointer so the field access itself is
 	// race-clean.
-	if tx.db.closed.Load() {
+	if tx.db.closeGate.IsClosed() {
 		return ErrClosed
 	}
 	return nil

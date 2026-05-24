@@ -576,7 +576,7 @@ func (db *DB) Checkpoint(ctx context.Context) error
 // return early if cancelled. For request-driven services, the right
 // pattern is one short View per request, not a long View polled for
 // cancellation.
-func (db *DB) View(ctx context.Context, fn func(tx *Tx) error) error
+func (db *DB) View(ctx context.Context, fn func(rtx *ReadTx) error) error
 
 // Update executes a read-write transaction.
 func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
@@ -593,15 +593,62 @@ func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
 // propagates to the caller as the closure's result.
 func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error
 
-// Begin starts a transaction manually. The context governs lock/slot
-// acquisition; once Begin returns a *Tx the context is not stored.
+// Begin starts a write transaction. The context governs the wait
+// for the cross-process write lock; once Begin returns a *Tx the
+// context is not stored. For read transactions use BeginRead.
+//
+// **Chunk-3 spec amend.** The original surface declared
+// `Begin(ctx, writable bool) (*Tx, error)` returning a unified
+// *Tx whose write methods returned ErrReadOnly at runtime on a
+// read snapshot. The chunk-3.3 implementation split write and read
+// into distinct types so the type system rejects write methods on
+// read snapshots at compile time; `Begin(ctx, false)` is preserved
+// as an ErrReadOnly hard-error path for the loud-fail of legacy
+// callers, and the read-tx surface lives on db.BeginRead /
+// db.View / *ReadTx.
 func (db *DB) Begin(ctx context.Context, writable bool) (*Tx, error)
 
-// Tx is a database transaction.
+// BeginRead opens a snapshot read transaction. The returned *ReadTx
+// pins the active meta's TxnID via a reader-table slot; callers
+// MUST eventually call Commit or Rollback (both equivalent —
+// release the slot) so RPL reclamation can advance past the
+// snapshot.
+//
+// Errors:
+//   - context.Cause(ctx) if ctx fires before slot acquisition.
+//   - ErrClosed if the DB's coordination goroutines have shut down.
+//   - ErrReadersFull if the reader table is at capacity and ctx has
+//     no deadline. With a deadline, the call retries until a slot
+//     frees or the deadline fires (context.DeadlineExceeded).
+func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error)
+
+// Tx is a write transaction.
 type Tx struct { ... }
 
 func (tx *Tx) Commit() error
 func (tx *Tx) Rollback() error
+
+// ReadTx is a snapshot read transaction. Distinct type from *Tx so
+// the type system rejects write methods on read snapshots at
+// compile time. See db.BeginRead / db.View.
+type ReadTx struct { ... }
+
+// Page resolves the snapshot's view of page id. Returned slice is
+// borrowed from the read-only mmap and is valid until ReadTx close.
+// Callers MUST gate id by the snapshot's meta.HighWaterMark — the
+// chunk-4 cursor/B+tree layer enforces this by only visiting page
+// IDs reachable from the snapshot's KeyspaceRoot.
+func (rtx *ReadTx) Page(id uint64) ([]byte, error)
+
+// Meta returns a copy of the snapshot's meta at Begin time.
+func (rtx *ReadTx) Meta() page.Meta
+
+// Commit and Rollback are equivalent for ReadTx — both release the
+// reader slot and close the snapshot. The pair exists for symmetry
+// with the write-tx surface and the standard `defer rtx.Rollback()`
+// pattern in caller code.
+func (rtx *ReadTx) Commit() error
+func (rtx *ReadTx) Rollback() error
 
 // BeginChild creates a child transaction within the current write
 // transaction. Children can be committed (merged into parent) or

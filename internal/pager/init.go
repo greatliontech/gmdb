@@ -129,10 +129,19 @@ type OpenParams struct {
 // write transactions), the active meta (snapshot), and the active-meta
 // index. The caller advances PrevActive on commit and re-snapshots Meta
 // from the post-commit return.
+//
+// NoCheckpoint surfaces the durability.md §Recovery step-3 case: the
+// active meta was selected despite NOT having MetaFlagCheckpoint set.
+// The root package's caller logs a warning via slog when this is true
+// — recovery accepted a non-checkpoint meta because no
+// checkpoint-flagged meta exists; data integrity depends on whether
+// the OS flushed pages in the right order (SyncLazy-only DB never
+// Checkpoint()'d).
 type OpenedDB struct {
 	Pager         *Pager
 	Meta          page.Meta
 	ActiveMetaIdx int
+	NoCheckpoint  bool
 }
 
 // Open reads the file's two meta pages, selects the active one,
@@ -195,8 +204,12 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		}
 	}
 
-	// 2) Active-meta selection + validation.
-	active, ok := page.ActiveMeta(meta0Bytes, meta1Bytes)
+	// 2) Active-meta selection + validation. Chunk-3.5: prefer
+	// the highest-TxnID valid meta whose MetaFlagCheckpoint is set;
+	// fall back to highest-TxnID valid meta if no checkpoint exists
+	// (durability.md §Recovery step 3 — caller logs warning via
+	// noCheckpoint).
+	active, noCheckpoint, ok := page.ActiveMetaCheckpointPreferring(meta0Bytes, meta1Bytes)
 	if !ok {
 		return nil, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
 	}
@@ -247,6 +260,7 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		Pager:         p,
 		Meta:          m,
 		ActiveMetaIdx: active,
+		NoCheckpoint:  noCheckpoint,
 	}, nil
 }
 

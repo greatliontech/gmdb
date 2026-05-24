@@ -7,6 +7,26 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
+// SyncPolicy selects which fdatasync calls fire during commit. The
+// chunk-3.5 promotion of durability.md §Durability Modes; mapped 1:1
+// onto the root package's gmdb.SyncMode but kept narrow here so the
+// pager doesn't import the root.
+//
+//   - SyncBoth: fdatasync at step 2 AND step 4. Maps from
+//     SyncDurable. Sets MetaFlagCheckpoint on the new meta.
+//   - SyncDataOnly: fdatasync at step 2; skip step 4. Maps from
+//     SyncDataOnly. Sets MetaFlagCheckpoint (data is durable).
+//   - SyncNone: skip both. Maps from SyncLazy and SyncUnsafe.
+//     Caller decides MetaFlagCheckpoint via the Flags field
+//     (SyncLazy clears it; SyncUnsafe also clears).
+type SyncPolicy uint8
+
+const (
+	SyncBoth     SyncPolicy = iota // step 2 + step 4 fdatasync. SyncDurable.
+	SyncDataOnly                   // step 2 fdatasync only. SyncDataOnly.
+	SyncNone                       // no fdatasync. SyncLazy / SyncUnsafe.
+)
+
 // CommitParams supplies the meta-level updates a commit publishes.
 //   - NewTxnID: TxnID for the new meta page. Per the file-layout.md
 //     strict-increase invariant, this must be strictly greater than
@@ -16,12 +36,19 @@ import (
 //     meta. Chunk 1 leaves these zero; chunk 5+ wires them.
 //   - Flags: meta-page Flags for the new meta. The caller composes
 //     MetaFlagPageChecksum (from prev) and MetaFlagCheckpoint (per
-//     SyncMode policy — chunk 1 is SyncDurable, always checkpoint).
+//     SyncMode policy). The pager does NOT auto-set Checkpoint based
+//     on Sync — that decision is the caller's, because durability.md
+//     ties Checkpoint to "data-pages on stable storage" which is the
+//     step-2 fsync (SyncBoth, SyncDataOnly) but not step-4 (meta
+//     fsync). Caller composes per the SyncMode table in
+//     durability.md.
+//   - Sync: which fdatasync calls fire (see SyncPolicy doc).
 type CommitParams struct {
 	NewTxnID     uint64
 	KeyspaceRoot uint64
 	NumKeyspaces uint64
 	Flags        uint32
+	Sync         SyncPolicy
 }
 
 // CommitResult bundles the post-commit meta state for the caller.
@@ -84,10 +111,19 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 		return CommitResult{}, fmt.Errorf("pager: step 1: %w", err)
 	}
 
-	// Step 2 — fdatasync (SyncDurable mode in chunk 1).
-	if err := p.file.Sync(); err != nil {
-		p.AbortTx()
-		return CommitResult{}, fmt.Errorf("pager: step 2 fdatasync: %w", err)
+	// Step 2 — fdatasync per SyncPolicy. SyncBoth + SyncDataOnly
+	// fsync; SyncNone skips. Per durability.md §Durability Modes
+	// table, skipping step 2 in SyncLazy means data pages may not
+	// reach disk before the meta does — recovery's checkpoint-
+	// preferring meta selector compensates: a SyncLazy commit
+	// writes its meta with MetaFlagCheckpoint CLEAR, so recovery
+	// falls back to the last checkpoint-flagged meta whose data
+	// IS durable.
+	if cp.Sync != SyncNone {
+		if err := p.file.Sync(); err != nil {
+			p.AbortTx()
+			return CommitResult{}, fmt.Errorf("pager: step 2 fdatasync: %w", err)
+		}
 	}
 
 	// Step 3 — pwrite the new meta to its slot. From this point on a
@@ -115,10 +151,18 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 		}
 	}
 
-	// Step 4 — fdatasync (atomic commit point).
-	if err := p.file.Sync(); err != nil {
-		p.AbortTx()
-		return CommitResult{}, fmt.Errorf("pager: step 4 fdatasync meta: %w", err)
+	// Step 4 — fdatasync (atomic commit point) per SyncPolicy.
+	// SyncBoth fsyncs; SyncDataOnly + SyncNone skip — but the
+	// MetaFlagCheckpoint composition in cp.Flags reflects that
+	// fact (caller has cleared the flag on SyncLazy / SyncUnsafe;
+	// SyncDataOnly KEEPS the flag because data IS durable per
+	// step 2). Recovery's checkpoint-preferring selector reads
+	// the flag.
+	if cp.Sync == SyncBoth {
+		if err := p.file.Sync(); err != nil {
+			p.AbortTx()
+			return CommitResult{}, fmt.Errorf("pager: step 4 fdatasync meta: %w", err)
+		}
 	}
 
 	// Success path: shrink, then clean up without restoring snapshot.

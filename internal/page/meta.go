@@ -176,6 +176,82 @@ func VerifyMeta(buf []byte) bool {
 	return want == got
 }
 
+// ActiveMetaCheckpointPreferring implements durability.md §Recovery:
+//
+//  1. Discard metas with invalid xxhash64 checksum.
+//  2. Of the valid metas, select the one with the highest TxnID
+//     whose MetaFlagCheckpoint flag is **set**.
+//  3. If neither valid meta has Checkpoint set (SyncLazy-only DB
+//     never Checkpoint()'d), select the higher-TxnID valid meta
+//     and return noCheckpoint=true so the caller can warn.
+//  4. Neither valid → ok=false.
+//
+// The chunk-3.5 promotion of the durability.md §Recovery rule; the
+// raw highest-TxnID selector (ActiveMeta) is preserved for tests and
+// callers who want the pre-checkpoint behaviour.
+//
+// Tie-break rules within (2): identical to ActiveMeta — equal
+// non-zero TxnIDs is a commit-protocol violation (ok=false).
+func ActiveMetaCheckpointPreferring(meta0, meta1 []byte) (active int, noCheckpoint bool, ok bool) {
+	ok0 := VerifyMeta(meta0)
+	ok1 := VerifyMeta(meta1)
+	switch {
+	case ok0 && ok1:
+		txn0 := le.Uint64(meta0[metaOffTxnID:])
+		txn1 := le.Uint64(meta1[metaOffTxnID:])
+		flags0 := le.Uint32(meta0[metaOffFlags:])
+		flags1 := le.Uint32(meta1[metaOffFlags:])
+		cp0 := flags0&MetaFlagCheckpoint != 0
+		cp1 := flags1&MetaFlagCheckpoint != 0
+		switch {
+		case cp0 && cp1:
+			// Both have Checkpoint; highest TxnID wins, tie-break
+			// matches ActiveMeta (zero-tie → 0; equal-non-zero →
+			// protocol violation).
+			switch {
+			case txn1 > txn0:
+				return 1, false, true
+			case txn0 > txn1:
+				return 0, false, true
+			case txn0 == 0:
+				return 0, false, true
+			default:
+				return 0, false, false
+			}
+		case cp0:
+			return 0, false, true
+		case cp1:
+			return 1, false, true
+		default:
+			// Neither checkpointed — fall back to highest-TxnID
+			// selection per durability.md step 3, but signal
+			// noCheckpoint so the caller logs a warning.
+			switch {
+			case txn1 > txn0:
+				return 1, true, true
+			case txn0 > txn1:
+				return 0, true, true
+			case txn0 == 0:
+				return 0, true, true
+			default:
+				return 0, true, false
+			}
+		}
+	case ok0:
+		// Only one valid meta — its Checkpoint flag is informational;
+		// we still surface noCheckpoint=true if it's clear so the
+		// caller can warn that recovery accepted a non-checkpoint
+		// meta.
+		flags0 := le.Uint32(meta0[metaOffFlags:])
+		return 0, flags0&MetaFlagCheckpoint == 0, true
+	case ok1:
+		flags1 := le.Uint32(meta1[metaOffFlags:])
+		return 1, flags1&MetaFlagCheckpoint == 0, true
+	default:
+		return 0, false, false
+	}
+}
+
 // ActiveMeta selects the active meta page given the two candidate
 // payloads. Per file-layout.md §Meta Page and the entailed dual-meta
 // invariant: the active meta is the one with the highest TxnID whose
