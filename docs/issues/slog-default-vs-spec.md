@@ -1,7 +1,14 @@
 # `slog.Default()` vs spec's `Options.Logger` / `DB.Logger`
 
-**Lands:** when DB gains an `Options.Logger` field (likely chunk 4+
-when first user-tunable logging surfaces).
+**Lands:** when DB gains an `Options.Logger` field. Re-evaluated
+at chunk-5.1 — chunk 5 wires the Keyspace API on existing DB
+infrastructure without surfacing a new `Options.Logger` field,
+so this stays redeferred with `Lands:` unchanged. Note for the
+chunk-5.5 chunk-start gate: 5.5 introduces `Options.LaggingReader`
+— a user-tunable callback that *uses* logging but does not add an
+`Options.Logger` field. If 5.5 ends up needing a logger reference
+for the callback's cleanup path, fold this issue then; otherwise
+the redefer holds.
 
 ## Problem
 

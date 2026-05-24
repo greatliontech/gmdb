@@ -1,6 +1,7 @@
 # `Cursor.MarkStale` does not clear `curKey` / `curValue`
 
-Lands: when chunk-5 keyspace integration wires `MarkStale` call-sites
+Lands: chunk 5.5 — folded by the chunk-5.1 triage gate when the
+keyspace integration first wires `MarkStale` call-sites.
 
 ## Symptom
 

@@ -60,7 +60,9 @@ no-cite invariant in `~/.claude/CLAUDE.md`.
 
 ## Notes
 
-Like the sibling `keyspace-delete-missing-key.md` issue, this is
-purely API-surface; storage is unaffected. The chunk-6
-implementer should pick a decision in a brief `6.1` (planning)
-sub-chunk and surface it to the user before lock-in.
+Same shape as the chunk-5.1 Delete-on-miss decision (pinned at
+`api-surface.md §Invariants`; see `git log --all -- docs/issues/
+keyspace-delete-missing-key.md` for the chunk-5.1 lock-in
+context). Purely API-surface; storage is unaffected. The
+chunk-6 implementer should pick a decision in a brief `6.1`
+(planning) sub-chunk and surface it to the user before lock-in.

@@ -1,14 +1,15 @@
 # LaggingReader callback
 
-**Lands:** chunk 5 — `Keyspace.Put/Delete` and `DeleteRange` are the
-first call sites that drive `pager.AllocPage` from B+tree-shaped
-workloads, which is the natural exerciser of the "bitmap exhausted →
-RPL reclamation blocked → LaggingReader" path. Building the callback
-in chunk 3 means stand-alone test scaffolding (synthetic readers,
-synthetic allocation pressure) with no production caller exercising
-the same code path — i.e., dead-on-arrival code by chunk-4-5 time
-unless the spec's callback semantics survive untouched, which itself
-is unverified without a real caller.
+**Lands:** chunk 5.5 — folded by the chunk-5.1 triage gate.
+`Keyspace.Put/Delete` and `DeleteRange` are the first call sites
+that drive `pager.AllocPage` from B+tree-shaped workloads, which is
+the natural exerciser of the "bitmap exhausted → RPL reclamation
+blocked → LaggingReader" path. Building the callback in chunk 3
+means stand-alone test scaffolding (synthetic readers, synthetic
+allocation pressure) with no production caller exercising the same
+code path — i.e., dead-on-arrival code by chunk-4-5 time unless the
+spec's callback semantics survive untouched, which itself is
+unverified without a real caller.
 
 ## Summary
 

@@ -8,13 +8,11 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// ErrNotFound is returned by Delete when the key is absent. The
-// public Keyspace.Delete / SetKeyspace.Delete semantics on a missing
-// key are decided in chunk 5 — see docs/issues/keyspace-delete-
-// missing-key.md (Lands: 5). The internal btree.Delete commits to
-// the strict variant for chunk 4.5 so the tree-mechanics tests can
-// assert key presence; the chunk-5 keyspace mapping is free to coerce
-// to a silent no-op without changing this surface.
+// ErrNotFound is returned by Delete when the key is absent.
+// api-surface.md §Invariants pins ErrNotFound at the public
+// Keyspace.Delete / SetKeyspace.Delete / SetKeyspace.DeleteValue
+// surface, so the btree's strict variant is propagated, not
+// coerced to a silent no-op.
 var ErrNotFound = errors.New("btree: key not found")
 
 // MaxMergeThreshold caps the per-call MergeThreshold percentage per

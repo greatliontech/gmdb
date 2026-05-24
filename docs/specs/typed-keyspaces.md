@@ -170,7 +170,13 @@ type TypedKS[K, V any] struct { ... }
 
 func (t *TypedKS[K, V]) Get(key K) (V, error)
 func (t *TypedKS[K, V]) Put(key K, value V) error
+
+// Delete returns ErrNotFound when the key does not exist
+// (per api-surface.md §Invariants — keyed-removal returns
+// ErrNotFound on miss; applies to TypedKS / TypedSetKS too).
 func (t *TypedKS[K, V]) Delete(key K) error
+
+// DeleteRange returns (0, nil) for an empty range.
 func (t *TypedKS[K, V]) DeleteRange(start, end *K) (uint64, error)
 func (t *TypedKS[K, V]) Cursor() *TypedCursor[K, V]
 func (t *TypedKS[K, V]) All() iter.Seq2[K, V]
@@ -230,9 +236,18 @@ type TypedSetKS[K, V any] struct { /* ... */ }
 func (t *TypedSetKS[K, V]) Has(key K) (bool, error)
 func (t *TypedSetKS[K, V]) HasValue(key K, value V) (bool, error)
 func (t *TypedSetKS[K, V]) Put(key K, value V) error
+
+// Delete returns ErrNotFound when the key does not exist (per
+// api-surface.md §Invariants).
 func (t *TypedSetKS[K, V]) Delete(key K) error
+
+// DeleteValue returns ErrNotFound when the (key, value) pair
+// does not exist (per api-surface.md §Invariants).
 func (t *TypedSetKS[K, V]) DeleteValue(key K, value V) error
+
 func (t *TypedSetKS[K, V]) CountValues(key K) (uint64, error)
+
+// DeleteRange returns (0, nil) for an empty range.
 func (t *TypedSetKS[K, V]) DeleteRange(start, end *K) (uint64, error)
 func (t *TypedSetKS[K, V]) Cursor() *TypedSetCursor[K, V]
 func (t *TypedSetKS[K, V]) All() iter.Seq2[K, V]

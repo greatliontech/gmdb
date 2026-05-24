@@ -262,9 +262,10 @@ on a single keyspace.
   redistribute). `MergeThreshold` is the `uint8` percentage
   parameter (range 1-50, default 25) from api-surface.md Options;
   `DefaultMergeThreshold` and `MaxMergeThreshold` constants re-
-  exported. `ErrNotFound` is the provisional missing-key surface
-  pending chunk-5 keyspace-level resolution
-  (`docs/issues/keyspace-delete-missing-key.md`).
+  exported. `ErrNotFound` is the missing-key surface (the
+  chunk-5.1 spec amendment pinned `ErrNotFound` at the public
+  Keyspace.Delete surface, so the chunk-4 strict variant
+  propagates unchanged).
   `fakeWriter.FreePage` now asserts no-double-free so silent
   reclamation regressions surface. Tests pin three spec-tier
   invariants as the strongest artifact this stage affords:
@@ -396,10 +397,121 @@ keyspace-name interning. `Tx.SetKeyspaceConfig` for
 database; `DeleteRange` is O(pages); `DeleteKeyspace` retires
 the keyspace subtree atomically.
 
+**Sub-chunk progress.**
+
+- **5.1** ✅ Triage + invariant derivation + API decisions
+  (docs-only).
+  *Triage gate (chunk-start).* Two `Lands: 5` entries matched:
+  `keyspace-delete-missing-key.md` (folded into 5.1 then **closed**
+  — decision recorded in spec, rationale promoted, file deleted);
+  `lagging-reader-callback.md` (folded into 5.5 — chunk 5.5's
+  `Keyspace.Put` is the first real `pager.AllocPage` consumer).
+  Two condition-triggered entries resolved:
+  `cursor-markstale-clear-cur.md` (folded into 5.5 — keyspace
+  integration wires the first external `MarkStale` call-sites);
+  `slog-default-vs-spec.md` (**redeferred** — chunk 5 does not
+  introduce `Options.Logger`). `bitmap-rollback-undo-log.md`
+  (profiling-driven, no match).
+  *API decision (user-locked).* Missing-key Delete semantics:
+  `ErrNotFound` everywhere (LMDB-style) — applies to
+  `Keyspace.Delete`, `SetKeyspace.Delete`,
+  `SetKeyspace.DeleteValue`, and their `TypedKS` /
+  `TypedSetKS` equivalents. `DeleteRange` returns `(0, nil)`
+  for an empty range (bulk semantics: rows-affected, not
+  membership). `Cursor.Delete` / `SetCursor.Delete` stay
+  state-bound (`ErrCursorUnpositioned`), never membership-bound.
+  Recorded as a new `Invariant: kind=clause-explicit` block in
+  `api-surface.md §Invariants`; signatures in `api-surface.md
+  §Keyspace API` / `§SetKeyspace API` and
+  `typed-keyspaces.md` carry inline pointers.
+  *Spec-tier invariant enforcement schedule.* 5.1 lands **zero**
+  invariant promotions itself — the new Delete-on-miss invariant
+  is spec-tier (recorded in `api-surface.md §Invariants`) until
+  its enforcing test lands at 5.5. Each later sub-chunk runs its
+  own chunk-start gate and promotes the relevant spec-tier
+  invariants via tests at the introducing sub-chunk. The schedule
+  below is informational, not a 5.1 commitment:
+  `keyspaces.md` #1 (40-byte descriptor) → 5.3 codec round-trip
+  test; #2 (Kind enumeration / immutability) and #3
+  (`ErrKeyspaceKindMismatch`) → 5.4, **Kind=0 portions only** —
+  the Kind=1 / Kind=2 reachability lands at chunks 6 / 7
+  respectively; #5 (`FixedValueSize != 0 AND Kind != 1`
+  rejection) → 5.4 promotes the **Kind=0 portion** (reject
+  `FixedValueSize != 0` when creating a Kind=0 keyspace); the
+  full `FixedValueSize` immutability + Kind=1 meaningfulness
+  promotes at chunk 6 when Kind=1 lands; #6 (`SetKeyspaceConfig`
+  mutability semantics) → 5.5; `range-delete.md` #1/#2/#3 →
+  5.7; the new Delete-on-miss invariant → 5.5 tests across
+  `Keyspace.Delete` (the `SetKeyspace.Delete` /
+  `SetKeyspace.DeleteValue` enforcement lands at chunk 6 when
+  the SetKeyspace surface itself lands).
+- **5.2** ⏳ Pager: `AllocContiguous` / `AllocSlabRun` /
+  `FreeRun` — implements the chunk-4.7 `PageWriter` extensions
+  on `*pager.Pager` so chunk-5+ keyspace code can drive overflow
+  chains on real files (chunk 4.7's `fakeWriter` is the only
+  current implementer).
+- **5.3** ⏳ Keyspace descriptor codec (40-byte struct
+  encode/decode/validate); promotes `keyspaces.md` invariant #1
+  via codec round-trip.
+- **5.4** ⏳ Keyspace B+tree machinery + `Open*` / `Create*` /
+  `CreateKeyspaceIfNotExists` / `ListKeyspaces` + name
+  interning via `unique.Handle[string]`. `meta.KeyspaceRoot`
+  wiring through `*pager.Pager`. Promotes the Kind=0 portions
+  of `keyspaces.md` invariants #2/#3/#5: Kind=0 keyspace
+  creation+open round-trip with decode-time rejection of
+  unknown Kind on open (the immutable-Kind property is testable
+  here by forging a Kind byte in a serialized descriptor and
+  asserting reload rejection — `Kind` has no public-API setter,
+  so this is a codec/decoder-level test); decode-time rejection
+  of `FixedValueSize != 0 AND Kind == 0` (also forged at the
+  codec level — `CreateKeyspace` takes no `FixedValueSize`
+  parameter, so the rejection guards against on-disk
+  corruption); the cross-Kind `ErrKeyspaceKindMismatch` cases
+  (e.g. `OpenKeyspace` on a Kind=1 descriptor) land at chunk 6
+  when Kind=1 keyspaces can be created to test against.
+- **5.5** ⏳ `Keyspace.Get` / `Put` / `Delete` on `Kind = 0`
+  wires chunk-4 `btree.*` through `descriptor.Root` +
+  `descriptor.Count` maintenance + descriptor CoW propagation;
+  external `MarkStale` call-sites on sibling cursors;
+  `Tx.SetKeyspaceConfig` (RestartGroupTarget mutation —
+  Kind-agnostic at the descriptor layer; chunk 6 adds Kind=1
+  test coverage on a SetKeyspace fixture);
+  `Options.LaggingReader` callback wiring through
+  `pager.AllocPage`. Promotes the Kind=0 portion of the
+  Delete-on-miss invariant and `keyspaces.md` #6 (the
+  RestartGroupTarget mutability semantics — new value is a
+  builder hint for leaves written after; existing leaves
+  preserved). Resolves:
+  `docs/issues/cursor-markstale-clear-cur.md`,
+  `docs/issues/lagging-reader-callback.md`. Also resolves the
+  `docs/issues/tx-setkeyspaceconfig-missing-name-behavior.md`
+  missing-name sentinel question (decide + record before
+  implementation). 5.5.1 chunk-start gate should re-fire the
+  triage on `docs/issues/slog-default-vs-spec.md` (the
+  `Options.LaggingReader` callback is a logger-relevant
+  surface even though it does not add `Options.Logger`) and
+  surface to the user the 5.5 diff-width trade-off (the
+  chunk-5.1 Round 1 M-2 finding noted that 5.5 bundles four
+  features — `Get/Put/Delete` + `SetKeyspaceConfig` +
+  `MarkStale` + `LaggingReader`; the chunk-5.1 user-bundling
+  decision accepts this on API-adjacency grounds, but
+  re-confirming at 5.5 chunk-start before lock-in is cheap).
+- **5.6** ⏳ `DeleteKeyspace` — single-keyspace subtree
+  retirement (chunk 6 adds the SetKeyspace nested-tree
+  bulk-free path; chunk 7 adds the index-keyspace + registry
+  bulk-free).
+- **5.7** ⏳ `DeleteRange` — three-phase algorithm
+  (boundary paths + interior-subtree retire + boundary cleanup
+  with rebalance + root collapse). Promotes `range-delete.md`
+  #1/#2/#3.
+- **5.8** ⏳ Close-out: cite sweep, spec-tier invariant audit,
+  delete resolved issues.
+
 Primary specs: `keyspaces.md` (`Kind = 0` parts), `range-
 delete.md`.
 
-Primary files: `db.go`, `btree.go`, `tx.go`.
+Primary files: `db.go`, `btree.go`, `tx.go`,
+`internal/pager/*.go` (5.2), `keyspace.go` (5.4 onward).
 
 ### Chunk 6 — SetKeyspace storage + API
 

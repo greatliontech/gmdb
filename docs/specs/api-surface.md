@@ -66,6 +66,42 @@ Invariant: kind=clause-explicit;
     (pool clear) or another transaction's data (pool reuse).
 
 Invariant: kind=clause-explicit;
+  property=Every keyspace-content keyed-removal API returns
+    `ErrNotFound` when the addressed item is absent. The scope is
+    `Keyspace.Delete(k)` / `SetKeyspace.Delete(k)` /
+    `SetKeyspace.DeleteValue(k, v)` and their typed equivalents
+    (`TypedKS.Delete`, `TypedSetKS.Delete`,
+    `TypedSetKS.DeleteValue`): all return `ErrNotFound` iff the
+    addressed item (the key, or the `(key, value)` pair for the
+    value-level variant) does not exist at call time, never
+    `nil` for a no-op miss. `Cursor.Delete()` and
+    `SetCursor.Delete()` are explicitly **out of scope** for this
+    invariant: they are state-bound, not membership-bound, and
+    return `ErrCursorUnpositioned` when the cursor is not in the
+    Positioned state. A Positioned cursor by construction points
+    at a live entry — the gen-counter / `MarkStale` contract in
+    `transactions.md §Cursor State Machine` is the membership
+    guarantee — so `ErrNotFound` is unreachable there. Bulk-range
+    surfaces (`Keyspace.DeleteRange` / `SetKeyspace.DeleteRange`
+    and typed equivalents) are also out of scope: they return
+    `(0, nil)` for an empty range — "no rows matched" is success
+    for a bulk op, not absence. Index-namespace removal
+    (`Tx.DropIndex(keyspace, indexName)`) uses a distinct
+    sentinel (`ErrIndexNotFound`) by namespace, not a different
+    policy — out of scope here. Keyspace-management
+    (`Tx.DeleteKeyspace(name)` returning `ErrNotFound`) is
+    consistent with this invariant and documented inline at
+    §Keyspace API;
+  from=this spec §Invariants (this clause) + signature comments
+    in §Keyspace API / §SetKeyspace API + the typed mirror in
+    `typed-keyspaces.md`;
+  violation=A silent-no-op-on-miss conflates "operation completed
+    and changed state" with "operation completed and changed
+    nothing" — a caller batching deletes and tracking work-done
+    via `err == nil` over-counts effective deletions, breaking
+    audit logs and downstream-invalidation triggers.
+
+Invariant: kind=clause-explicit;
   property=`Open()` opens both the data file and the lock file
     via `os.OpenRoot`-confined operations, rejecting symlink
     traversal outside the database directory;
@@ -791,7 +827,13 @@ type Keyspace struct { ... }
 
 func (ks *Keyspace) Get(key []byte) ([]byte, error)
 func (ks *Keyspace) Put(key, value []byte) error
+
+// Delete returns ErrNotFound when the key does not exist (per
+// §Invariants — keyed-removal returns ErrNotFound on miss).
 func (ks *Keyspace) Delete(key []byte) error
+
+// DeleteRange returns (0, nil) for an empty range — bulk
+// operations report "rows affected", not membership.
 func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error)
 func (ks *Keyspace) NextSequence() (uint64, error)
 func (ks *Keyspace) Cursor() *Cursor
@@ -834,9 +876,18 @@ type SetKeyspace struct { ... }
 func (ks *SetKeyspace) Has(key []byte) (bool, error)
 func (ks *SetKeyspace) HasValue(key, value []byte) (bool, error)
 func (ks *SetKeyspace) Put(key, value []byte) error
+
+// Delete returns ErrNotFound when the key does not exist (per
+// §Invariants — keyed-removal returns ErrNotFound on miss).
 func (ks *SetKeyspace) Delete(key []byte) error
+
+// DeleteValue returns ErrNotFound when the (key, value) pair
+// does not exist (per §Invariants — value-level removal).
 func (ks *SetKeyspace) DeleteValue(key, value []byte) error
+
 func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
+
+// DeleteRange returns (0, nil) for an empty range.
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error)
 func (ks *SetKeyspace) NextSequence() (uint64, error)
 func (ks *SetKeyspace) Cursor() *SetCursor
