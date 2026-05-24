@@ -491,6 +491,127 @@ func decodeLeafEntry(buf []byte, off, contentEnd int, isRestart bool, prev []byt
 	}, valStart + valLen, nil
 }
 
+// LeafLookup performs the two-phase binary search from
+// page-formats.md §Leaf Lookup:
+//
+//  1. Binary search over restart points using the restart table —
+//     O(log R) where R = RestartCount.
+//  2. Linear scan within the restart group, decoding delta entries
+//     until the target is found or passed — O(K) where K =
+//     RestartInterval.
+//
+// Returns (entry, true, nil) on hit; (zero-value entry, false, nil)
+// on miss; error on malformed page (same robustness contract as
+// DecodeLeaf — total over its input, never panics on slice-OOR).
+//
+// Hot-path leaf lookup; the btree consumer (chunk 4.3) calls this
+// once per leaf descent.
+func LeafLookup(buf []byte, cfg Config, target []byte) (LeafEntry, bool, error) {
+	cfg.mustValidate()
+	if len(buf) != int(cfg.PageSize) {
+		return LeafEntry{}, false, fmt.Errorf("page: LeafLookup buf len %d != PageSize %d", len(buf), cfg.PageSize)
+	}
+	n := LeafEntryCount(buf)
+	if n == 0 {
+		return LeafEntry{}, false, nil
+	}
+	interval := LeafRestartInterval(buf)
+	if interval == 0 {
+		return LeafEntry{}, false, fmt.Errorf("page: LeafLookup RestartInterval=0")
+	}
+	rc := LeafRestartCount(buf)
+	expectRC := uint16((uint32(n) + uint32(interval) - 1) / uint32(interval))
+	if rc != expectRC {
+		return LeafEntry{}, false, fmt.Errorf("page: LeafLookup RestartCount %d != ceil(%d/%d)=%d",
+			rc, n, interval, expectRC)
+	}
+	tableStart := leafRestartTableStart(cfg, rc)
+
+	// Phase 1: binary-search over restart points for the LARGEST
+	// i with restart[i].Key <= target. Equivalently: find the
+	// smallest i with restart[i].Key > target, then groupStart =
+	// i - 1. If groupStart < 0, target precedes every key in the
+	// leaf — not found.
+	lo, hi := 0, int(rc)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		off := int(LeafRestartOffset(buf, cfg, uint16(mid)))
+		key, err := leafRestartKey(buf, off, tableStart)
+		if err != nil {
+			return LeafEntry{}, false, fmt.Errorf("page: LeafLookup restart[%d]: %w", mid, err)
+		}
+		if bytes.Compare(key, target) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	groupStartIdx := lo - 1
+	if groupStartIdx < 0 {
+		return LeafEntry{}, false, nil
+	}
+
+	// Phase 2: linear scan from restart[groupStartIdx], decoding
+	// deltas until hit, pass, or end-of-group.
+	entryIdx := groupStartIdx * int(interval)
+	end := entryIdx + int(interval)
+	if end > int(n) {
+		end = int(n)
+	}
+	pos := int(LeafRestartOffset(buf, cfg, uint16(groupStartIdx)))
+	var prev []byte
+	for i := entryIdx; i < end; i++ {
+		isRestart := i == entryIdx
+		entry, next, err := decodeLeafEntry(buf, pos, tableStart, isRestart, prev)
+		if err != nil {
+			return LeafEntry{}, false, fmt.Errorf("page: LeafLookup entry %d: %w", i, err)
+		}
+		cmp := bytes.Compare(entry.Key, target)
+		if cmp == 0 {
+			return entry, true, nil
+		}
+		if cmp > 0 {
+			return LeafEntry{}, false, nil
+		}
+		prev = entry.Key
+		pos = next
+	}
+	return LeafEntry{}, false, nil
+}
+
+// leafRestartKey returns the Key bytes of the restart entry at
+// offset `off`. Avoids the full decodeLeafEntry call in the hot
+// binary-search phase of LeafLookup — only KeyLen + Key bytes are
+// needed per probe, not the value or overflow fields.
+//
+// The decoder's robustness contract applies: returns an error on
+// any length-out-of-range condition, never panics on slice OOR.
+func leafRestartKey(buf []byte, off, contentEnd int) ([]byte, error) {
+	if off < 0 || off+3 > contentEnd {
+		return nil, fmt.Errorf("restart entry header truncated at off=%d", off)
+	}
+	flags := buf[off]
+	if flags&^cellFlagKnownMask != 0 {
+		return nil, fmt.Errorf("unknown CellFlags 0x%x at off=%d", flags&^cellFlagKnownMask, off)
+	}
+	keyLen := int(le.Uint16(buf[off+1:]))
+	var keyStart int
+	if flags&CellFlagOverflow != 0 {
+		keyStart = off + 3
+	} else {
+		// Inline restart entry: skip ValueLen u32 between KeyLen
+		// and Key bytes.
+		if off+7 > contentEnd {
+			return nil, fmt.Errorf("restart entry inline-header truncated at off=%d", off)
+		}
+		keyStart = off + 7
+	}
+	if keyStart+keyLen > contentEnd {
+		return nil, fmt.Errorf("restart entry key out of bounds: off=%d keyLen=%d", off, keyLen)
+	}
+	return buf[keyStart : keyStart+keyLen], nil
+}
+
 // commonPrefixLen returns the length of the shared prefix between
 // a and b.
 func commonPrefixLen(a, b []byte) int {
