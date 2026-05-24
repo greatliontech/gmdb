@@ -317,3 +317,15 @@ func (it *LeafIter) BufEnts() []LeafEntry { return it.bufEnts }
 // return. Used by the cursor to record its absolute position and to
 // detect end-of-iteration.
 func (it *LeafIter) Idx() int { return it.idx }
+
+// Count returns the iterator's exclusive upper bound (`endIdx`) —
+// the absolute index one past the last entry the iter ranges
+// over. For whole-leaf iters constructed via IterForReuse /
+// IterAtForReuse this equals LeafReader.Count(); for group-scoped
+// iters from the package-private groupIter it equals
+// `startIdx + groupEntryCount` (NOT the group's relative entry
+// count). Used by the btree cursor's Last() to position at the
+// last entry via At(Count()-1), since LeafIter.Prev's "step back
+// from just-Nexted" semantic doesn't directly support "position
+// at last entry."
+func (it *LeafIter) Count() int { return it.endIdx }
