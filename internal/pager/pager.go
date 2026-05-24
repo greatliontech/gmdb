@@ -86,6 +86,19 @@ type Pager struct {
 	retiredPages  []uint64
 	loosePages    map[uint64]struct{}
 
+	// detachedBufs holds slab buffers that were severed from
+	// p.dirty when their page id was loose-popped by AllocPage.
+	// Required by the chunk-5.4 fix to the loose-page reuse contract:
+	// the original-tx caller of the slab buffer holds a borrowed
+	// []byte (byte-slice ownership valid through tx close), so the
+	// buffer must stay alive; but a fresh CoW / AllocSlab on the
+	// loose-popped id needs to install a NEW buffer (not return the
+	// stale one via CoW's idempotent re-CoW shortcut). Detach moves
+	// the old buffer here so the new buffer can land in p.dirty.
+	// ReleaseAll / AbortTx pool-Put every detached buffer alongside
+	// the live p.dirty buffers.
+	detachedBufs []*[]byte
+
 	// currentTxnID is the TxnID of the in-progress write transaction.
 	// Set by SetCurrentTxnID; consumed by commit-step-0's RPL segment
 	// builder. Zero on read-only pagers and between transactions on
@@ -519,17 +532,27 @@ func (p *Pager) Discard(id uint64) {
 	p.bufPool.Put(buf)
 }
 
-// ReleaseAll returns every slab buffer to the pool and empties the dirty
-// map. Used by commit (after pwrites complete) and by rollback. The
-// pager is left in a state where Page() returns mmap-only views.
+// ReleaseAll returns every slab buffer to the pool and empties the
+// dirty map. Used by commit (after pwrites complete) and by rollback.
+// Also drains p.detachedBufs (buffers detached from p.dirty by the
+// AllocPage loose-pop path — see the chunk-5.4 fix comment on
+// detachedBufs). The pager is left in a state where Page() returns
+// mmap-only views.
 func (p *Pager) ReleaseAll() {
-	if p.readOnly || len(p.dirty) == 0 {
+	if p.readOnly {
+		return
+	}
+	if len(p.dirty) == 0 && len(p.detachedBufs) == 0 {
 		return
 	}
 	for _, buf := range p.dirty {
 		p.bufPool.Put(buf)
 	}
 	p.dirty = make(map[uint64]*[]byte)
+	for _, buf := range p.detachedBufs {
+		p.bufPool.Put(buf)
+	}
+	p.detachedBufs = p.detachedBufs[:0]
 	p.dirtyBytes = 0
 }
 

@@ -526,14 +526,16 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 	held := &atomic.Bool{}
 	held.Store(true)
 	tx := &Tx{
-		db:         db,
-		pgr:        pgr,
-		prevMeta:   prevMeta,
-		prevActive: prevActive,
-		newTxnID:   prevMeta.TxnID + 1,
-		writable:   true,
-		held:       held,
-		grant:      grant,
+		db:           db,
+		pgr:          pgr,
+		prevMeta:     prevMeta,
+		prevActive:   prevActive,
+		newTxnID:     prevMeta.TxnID + 1,
+		writable:     true,
+		held:         held,
+		grant:        grant,
+		keyspaceRoot: prevMeta.KeyspaceRoot,
+		numKeyspaces: prevMeta.NumKeyspaces,
 	}
 	// Wire the leak-detection cleanup per leak-detection.md. The
 	// cleanup info captures the shared *closeGate by pointer

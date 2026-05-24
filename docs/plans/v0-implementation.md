@@ -493,22 +493,50 @@ the keyspace subtree atomically.
   the Kind/FixedValueSize/RestartGroupTarget rejections to 5.4 —
   refined here at 5.3 because the codec is the rejection
   mechanism; 5.4's API surface inherits via callsite.
-- **5.4** ⏳ Keyspace B+tree machinery + `Open*` / `Create*` /
-  `CreateKeyspaceIfNotExists` / `ListKeyspaces` + name
-  interning via `unique.Handle[string]`. `meta.KeyspaceRoot`
-  wiring through `*pager.Pager`. Promotes the Kind=0 portions
-  of `keyspaces.md` invariants #2/#3/#5: Kind=0 keyspace
-  creation+open round-trip with decode-time rejection of
-  unknown Kind on open (the immutable-Kind property is testable
-  here by forging a Kind byte in a serialized descriptor and
-  asserting reload rejection — `Kind` has no public-API setter,
-  so this is a codec/decoder-level test); decode-time rejection
-  of `FixedValueSize != 0 AND Kind == 0` (also forged at the
-  codec level — `CreateKeyspace` takes no `FixedValueSize`
-  parameter, so the rejection guards against on-disk
-  corruption); the cross-Kind `ErrKeyspaceKindMismatch` cases
-  (e.g. `OpenKeyspace` on a Kind=1 descriptor) land at chunk 6
-  when Kind=1 keyspaces can be created to test against.
+- **5.4** ✅ Keyspace B+tree machinery + `Open*` / `Create*` /
+  `CreateKeyspaceIfNotExists` / `ListKeyspaces` + name interning
+  via `unique.Handle[string]` + `meta.KeyspaceRoot` /
+  `NumKeyspaces` CoW propagation through `*pager.Pager`. New
+  files: `keyspace.go`, `keyspace_test.go`. Tx state extended
+  with `keyspaceRoot` + `numKeyspaces` + per-tx open-keyspace
+  cache (seeded from `prevMeta` at `Begin`; passed to
+  `pager.Commit` at `Commit`). Public sentinels added:
+  `ErrNotFound`, `ErrKeyExists`, `ErrKeyEmpty`,
+  `ErrKeyspaceKindMismatch`, `ErrKeyspaceReserved`. Open uses
+  `btree.Get` on the keyspace B+tree (cfg from pager); Create
+  uses `btree.Put`; List uses `btree.NewReadCursor` and filters
+  Kind=2 entries per `keyspaces.md §Keyspace Descriptor` (Kind=2
+  internals are not name-addressable from user API).
+  Promotes four chunk-5.4 invariants (Inv-A `ErrNotFound`/
+  `ErrKeyExists` semantics; Inv-B CoW propagation across commit;
+  Inv-C `numKeyspaces` matches B+tree-leaf-entry count;
+  Inv-D ListKeyspaces filters Kind=2) and the API-level
+  inheritance of `keyspaces.md` #2/#3/#4/#5 (forged-descriptor
+  tests for Kind=3 → wrapped `ErrCorrupted`, Kind=1 →
+  `ErrKeyspaceKindMismatch`, Kind=2 → `ErrKeyspaceReserved`,
+  `FixedValueSize ≠ 0` on Kind=0 → wrapped `ErrCorrupted`).
+  Cross-Kind `ErrKeyspaceKindMismatch` tested at 5.4 via codec-
+  level forging (chunk-5.1 plan deferred this to chunk 6 on
+  the basis that chunk 5 lacks CreateSetKeyspace; refined at
+  5.4 since codec-forging makes the path testable now).
+  Adjacent fix (chunk-1 latent bug, demonstrated-fault anchor
+  via `TestListKeyspacesReturnsSortedNames`): the `AllocPage`
+  loose-pop branch left the previously-CoW'd slab buffer in
+  `p.dirty[id]` with stale content; subsequent `pw.CoW(srcID,
+  loose-popped-id)` hit CoW's idempotent-re-CoW shortcut and
+  returned the stale buffer instead of refreshing from srcID,
+  silently losing data on multi-Put workloads against the same
+  B+tree. Fix: AllocPage's loose-pop now detaches the buffer
+  into a new `p.detachedBufs` slice (preserving byte-slice
+  ownership — the original caller's borrowed `[]byte` stays
+  valid through tx close; the buffer is pool-Put'd by
+  `ReleaseAll` alongside `p.dirty`'s buffers). loose-pop also
+  adds the id to `pendingAllocs` so a subsequent `FreePage` on
+  the loose-popped id without intermediate `CoW`/`AllocSlab`
+  takes the chunk-5.2 `pendingAllocs` branch (bitmap-bit
+  restored) rather than the prior-tx `retiredPages` branch.
+  Regression test:
+  `internal/pager/freespace_run_test.go::TestLoosePoolPopDetachesStaleBuffer`.
 - **5.5** ⏳ `Keyspace.Get` / `Put` / `Delete` on `Kind = 0`
   wires chunk-4 `btree.*` through `descriptor.Root` +
   `descriptor.Count` maintenance + descriptor CoW propagation;

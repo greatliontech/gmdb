@@ -68,6 +68,41 @@ var (
 	// returns ErrReadersFull immediately so callers can distinguish
 	// "table at capacity" from other Begin failures.
 	ErrReadersFull = errors.New("gmdb: no reader slots available")
+
+	// ErrNotFound is returned by keyed-removal and lookup APIs when
+	// the addressed item is absent: Tx.OpenKeyspace on a missing
+	// keyspace name; Tx.DeleteKeyspace on a missing name;
+	// Keyspace.Delete / SetKeyspace.Delete / SetKeyspace.DeleteValue
+	// per the chunk-5.1 Delete-on-miss invariant
+	// (api-surface.md §Invariants).
+	ErrNotFound = errors.New("gmdb: key not found")
+
+	// ErrKeyExists is returned by Tx.CreateKeyspace and
+	// Tx.CreateSetKeyspace when a keyspace with the supplied name
+	// already exists. CreateKeyspaceIfNotExists silently opens the
+	// existing keyspace instead.
+	ErrKeyExists = errors.New("gmdb: key already exists")
+
+	// ErrKeyEmpty is returned by every operation taking a key when
+	// the key argument is nil or zero-length, per the api-surface.md
+	// §Invariants clause-explicit invariant. Empty keys are invalid
+	// at the API surface because they ambiguate the "no key found"
+	// sentinel.
+	ErrKeyEmpty = errors.New("gmdb: key is nil or empty")
+
+	// ErrKeyspaceKindMismatch is returned by Tx.OpenKeyspace when
+	// the stored descriptor's Kind does not match the API used (e.g.
+	// OpenKeyspace on a Kind=1 SetKeyspace, OpenSetKeyspace on a
+	// Kind=0 Keyspace) per keyspaces.md invariant #3. The call leaves
+	// state unmodified.
+	ErrKeyspaceKindMismatch = errors.New("gmdb: keyspace kind does not match existing keyspace")
+
+	// ErrKeyspaceReserved is returned by Tx.OpenKeyspace /
+	// OpenSetKeyspace / DeleteKeyspace when the supplied name
+	// resolves to an engine-internal keyspace (Kind=2 — per-index
+	// storage). These are addressable only via their parent
+	// keyspace's index registry, never by name through the user API.
+	ErrKeyspaceReserved = errors.New("gmdb: keyspace name reserved for engine use")
 )
 
 var (

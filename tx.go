@@ -35,6 +35,27 @@ type Tx struct {
 	writable   bool
 	closed     bool
 
+	// keyspaceRoot and numKeyspaces track the in-progress state of
+	// the keyspace B+tree (see keyspaces.md + file-layout.md §Meta
+	// Page). Seeded from prevMeta at Begin; CreateKeyspace /
+	// DeleteKeyspace mutate them via btree.Put/Delete on the keyspace
+	// B+tree (with the pager as PageWriter); Commit passes the updated
+	// values to pager.Commit so they land in the new meta. A
+	// transaction that does not touch the keyspace surface leaves
+	// these at their prevMeta values.
+	keyspaceRoot uint64
+	numKeyspaces uint64
+
+	// openKeyspaces caches *Keyspace handles by interned name within
+	// this transaction. unique.Make[string] guarantees that repeated
+	// OpenKeyspace calls for the same name produce the same
+	// unique.Handle[string], so cache lookup is O(1) pointer compare
+	// (keyspaces.md §Keyspace Name Interning). Populated on
+	// successful Open / Create; the chunk-5.5 wiring will add
+	// invalidation on the same-tx data-op paths, and chunk-5.6's
+	// DeleteKeyspace will route through here to invalidate.
+	openKeyspaces map[uniqueNameHandle]*Keyspace
+
 	// held tracks whether this Tx still owns the cross-process write
 	// grant. Begin sets it to true; Commit, Rollback, and the
 	// runtime.AddCleanup callback each attempt a single
@@ -267,8 +288,8 @@ func (tx *Tx) Commit() error {
 	}
 	result, err := tx.pgr.Commit(pager.CommitParams{
 		NewTxnID:     tx.newTxnID,
-		KeyspaceRoot: tx.prevMeta.KeyspaceRoot,
-		NumKeyspaces: tx.prevMeta.NumKeyspaces,
+		KeyspaceRoot: tx.keyspaceRoot,
+		NumKeyspaces: tx.numKeyspaces,
 		Flags:        flags,
 		Sync:         syncPolicy,
 	}, tx.prevMeta, tx.prevActive)

@@ -42,16 +42,55 @@ func (p *Pager) AllocPage() (uint64, error) {
 	// 1. Loose pages.
 	for id := range p.loosePages {
 		delete(p.loosePages, id)
-		// No bookkeeping update needed here. Trace the lifecycle:
-		// the id was initially allocated (bitmap.Clear + pendingAllocs
-		// add), then FreePage removed it from pendingAllocs and put
-		// it in loosePages. Reusing here just hands the id back —
-		// the bitmap bit is still clear (correct on-disk state for
-		// "allocated"), and the id has no pendingAllocs entry. That
-		// matches the desired commit state: the id is in active use
-		// but its on-disk bit doesn't need to flip (it was already
-		// clear from the initial alloc). The slab buffer remains in
-		// p.dirty per the byte-slice ownership invariant.
+		// Bookkeeping: the id was initially allocated (bitmap.Clear +
+		// pendingAllocs add), then FreePage moved it to loosePages.
+		// Re-allocating it now:
+		//
+		//   - Detach the existing slab buffer at p.dirty[id] into
+		//     p.detachedBufs. Required by the chunk-5.4 fix to the
+		//     loose-page reuse contract: the buffer in p.dirty[id]
+		//     holds STALE content from when id was previously CoW'd
+		//     before being freed. If we left it in p.dirty, the next
+		//     pw.CoW(srcID, id) would hit CoW's idempotent re-CoW
+		//     shortcut and return the stale buffer instead of
+		//     refreshing with srcID's content (chunk-4 btree workloads
+		//     that CoW a leaf, free it, then alloc+CoW it again to a
+		//     different src silently lose data). Detach lets the
+		//     subsequent CoW / AllocSlab take the fresh-allocation
+		//     path. The detached buffer stays alive in p.detachedBufs
+		//     for the byte-slice ownership invariant (any borrowed
+		//     []byte the original caller holds remains valid through
+		//     tx close); pool-Put'd at ReleaseAll / AbortTx alongside
+		//     p.dirty's buffers.
+		//
+		//   - Add to pendingAllocs so a subsequent FreePage on this
+		//     id (without intermediate CoW/AllocSlab to install a new
+		//     slab buffer — e.g., the rollback path after a budget
+		//     error) takes the chunk-5.2 pendingAllocs branch
+		//     (bitmap.Set, drop pendingAllocs) rather than the
+		//     prior-tx retiredPages branch. delete(pendingFrees) is
+		//     defensive — loose-popped ids should not be in
+		//     pendingFrees, but the mirror to the bitmap step keeps
+		//     the surface uniform.
+		//
+		// dirtyBytes is unchanged: the detached buffer is still
+		// "held by the transaction" per pager-slab.md, so it
+		// continues to count toward MaxTxBufferBytes. A subsequent
+		// CoW that installs a fresh buffer adds another PageSize to
+		// dirtyBytes — correct, both buffers are live.
+		if buf, ok := p.dirty[id]; ok {
+			p.detachedBufs = append(p.detachedBufs, buf)
+			delete(p.dirty, id)
+		}
+		p.pendingAllocs[id] = struct{}{}
+		// Defensive symmetry with the bitmap-path branch below. The
+		// commit pipeline is the only writer of pendingFrees and runs
+		// strictly after all tx-body AllocPage calls, so this delete
+		// is unreachable today — kept for uniformity with the chunk-
+		// 5.2 FreePage contract (allocation removes a pending-free
+		// scheduling) and to make a future commit-step rearrangement
+		// safe by construction.
+		delete(p.pendingFrees, id)
 		return id, nil
 	}
 

@@ -1,6 +1,7 @@
 package pager
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
@@ -473,6 +474,170 @@ func TestFreeRunReadOnlyErrors(t *testing.T) {
 	}
 	if _, err := p.AllocSlabRun(2, 2); !errors.Is(err, ErrReadOnly) {
 		t.Errorf("AllocSlabRun on read-only: got %v, want ErrReadOnly", err)
+	}
+}
+
+// TestLoosePoolPopDetachesStaleBuffer pins the chunk-5.4 fix to the
+// AllocPage loose-pop branch: when a previously-CoW'd page is freed
+// (becomes loose) and then re-popped by AllocPage, the stale buffer
+// in p.dirty must be detached so a subsequent CoW(srcID, popped) on
+// a DIFFERENT source installs srcID's content rather than returning
+// the loose-popped page's prior content via CoW's idempotent re-CoW
+// shortcut.
+//
+// Repro shape: AllocPage A; CoW(srcA, A); mutate A; FreePage A
+// (loose); AllocPage returns A; CoW(srcB, A); the buffer must
+// contain srcB's content, not srcA's.
+func TestLoosePoolPopDetachesStaleBuffer(t *testing.T) {
+	p, bm, f := setupWriter(t, 16)
+	defer p.Close()
+	defer f.Close()
+
+	first := bm.FirstDataPage()
+	// Make several pages free in the bitmap so AllocPage has options.
+	for i := uint64(0); i < 4; i++ {
+		bm.Set(first + i)
+	}
+
+	// Step 1: alloc page (call it P1), AllocSlab to seed content.
+	p1, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage #1: %v", err)
+	}
+	buf1, err := p.AllocSlab(p1)
+	if err != nil {
+		t.Fatalf("AllocSlab #1: %v", err)
+	}
+	// Mark with a sentinel byte pattern so we can detect stale content.
+	for i := range buf1 {
+		buf1[i] = 0xAA
+	}
+
+	// Step 2: free P1 → loose.
+	if err := p.FreePage(p1); err != nil {
+		t.Fatalf("FreePage: %v", err)
+	}
+	if _, ok := p.loosePages[p1]; !ok {
+		t.Fatalf("page %d not in loosePages after FreePage", p1)
+	}
+
+	// Step 3: AllocPage pops P1 from loose. With the chunk-5.4 fix,
+	// the stale buffer is detached from p.dirty.
+	p2, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage #2 (loose-pop): %v", err)
+	}
+	if p2 != p1 {
+		t.Fatalf("AllocPage did not loose-pop p1=%d (got %d)", p1, p2)
+	}
+	if _, stillDirty := p.dirty[p2]; stillDirty {
+		t.Error("loose-popped page still in p.dirty (stale buffer not detached)")
+	}
+	if _, inPendingAllocs := p.pendingAllocs[p2]; !inPendingAllocs {
+		t.Error("loose-popped page not in pendingAllocs (FreePage-without-CoW " +
+			"would mis-route to retiredPages)")
+	}
+
+	// Step 4: AllocSlab to install a fresh zero-filled buffer at p2.
+	// Without the chunk-5.4 fix, AllocSlab's idempotent shortcut
+	// would return the 0xAA-filled stale buffer; with the fix, it
+	// allocates fresh and returns a zero-filled buffer.
+	buf2, err := p.AllocSlab(p2)
+	if err != nil {
+		t.Fatalf("AllocSlab #2: %v", err)
+	}
+	for i, b := range buf2 {
+		if b != 0 {
+			t.Fatalf("loose-popped page AllocSlab returned stale (non-zero) "+
+				"buffer at idx %d = 0x%02x — chunk-5.4 detach not effective",
+				i, b)
+		}
+	}
+	// And the detached buffer's bytes are still 0xAA (proves the
+	// original borrower's slice is intact, byte-slice ownership
+	// preserved).
+	for _, b := range buf1 {
+		if b != 0xAA {
+			t.Fatalf("detached buffer mutated: byte-slice ownership broken")
+		}
+	}
+}
+
+// TestLoosePoolPopDetachesStaleBufferCoW is the CoW-path counterpart
+// to TestLoosePoolPopDetachesStaleBuffer. The chunk-5.4 demonstrated
+// fault routed through CoW (chunk-4 btree's leaf-CoW pattern); this
+// test exercises that path directly.
+func TestLoosePoolPopDetachesStaleBufferCoW(t *testing.T) {
+	// makeFile pre-fills pages with a deterministic byte pattern so
+	// we can distinguish srcA's content from srcB's via the
+	// expectedPageBytes helper. setupWriter's empty file gives all-
+	// zero pages, indistinguishable from a fresh slab buffer.
+	f, _ := makeFile(t, 16)
+	defer f.Close()
+	pool := NewBufPool(testPageSize)
+	cfg := page.Config{PageSize: testPageSize}
+	p, err := NewWriter(f, cfg, 16*testPageSize, pool, 16<<20)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer p.Close()
+	bm := bitmap.New(make([]byte, testPageSize), testPageSize, 1, 16)
+	p.AttachBitmap(bm)
+	p.SetCommitState(bm.FirstDataPage(), 16, 0)
+	first := bm.FirstDataPage()
+	for i := uint64(0); i < 4; i++ {
+		bm.Set(first + i)
+	}
+
+	// Step 1: AllocPage + CoW from source page 0 (pre-filled bytes).
+	p1, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage #1: %v", err)
+	}
+	buf1, err := p.CoW(0, p1)
+	if err != nil {
+		t.Fatalf("CoW #1 src=0 dst=p1: %v", err)
+	}
+	if !bytes.Equal(buf1, expectedPageBytes(0)) {
+		t.Fatalf("CoW #1 buf != src=0 content")
+	}
+
+	// Step 2: free p1 → loose.
+	if err := p.FreePage(p1); err != nil {
+		t.Fatalf("FreePage: %v", err)
+	}
+
+	// Step 3: AllocPage loose-pops p1; the stale buf1 content (page
+	// 0's bytes) is detached.
+	p2, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage #2 (loose-pop): %v", err)
+	}
+	if p2 != p1 {
+		t.Fatalf("AllocPage did not loose-pop p1=%d (got %d)", p1, p2)
+	}
+
+	// Step 4: CoW from a DIFFERENT source (page 1). Without the
+	// chunk-5.4 fix, CoW's idempotent shortcut would return the
+	// stale buf1 (page 0's content); with the fix, buf2 contains
+	// page 1's content.
+	buf2, err := p.CoW(1, p2)
+	if err != nil {
+		t.Fatalf("CoW #2 src=1 dst=p2 (loose-popped): %v", err)
+	}
+	if !bytes.Equal(buf2, expectedPageBytes(1)) {
+		// Diagnose: did we get the stale buf1 content instead?
+		if bytes.Equal(buf2, expectedPageBytes(0)) {
+			t.Errorf("loose-pop + CoW returned stale buffer (page 0's " +
+				"content from the first CoW), not src=1's content")
+		} else {
+			t.Errorf("loose-pop + CoW: buf2 matches neither src=0 (stale) " +
+				"nor src=1 (correct)")
+		}
+	}
+	// Byte-slice ownership: buf1 must still hold page 0's content.
+	if !bytes.Equal(buf1, expectedPageBytes(0)) {
+		t.Errorf("detached buffer mutated: byte-slice ownership broken")
 	}
 }
 
