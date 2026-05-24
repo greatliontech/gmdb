@@ -16,6 +16,7 @@ import (
 // — actually freed at the end of a logical commit; for tests we
 // don't release).
 type fakeWriter struct {
+	t        *testing.T
 	pageSize uint32
 	pages    map[uint64][]byte
 	nextID   uint64
@@ -25,6 +26,7 @@ type fakeWriter struct {
 func newFakeWriter(t *testing.T, pageSize uint32) *fakeWriter {
 	t.Helper()
 	return &fakeWriter{
+		t:        t,
 		pageSize: pageSize,
 		pages:    make(map[uint64][]byte),
 		nextID:   1,
@@ -63,6 +65,15 @@ func (f *fakeWriter) AllocSlab(id uint64) ([]byte, error) {
 }
 
 func (f *fakeWriter) FreePage(id uint64) error {
+	// Pin the no-double-free invariant: a single Delete (or Put)
+	// must not retire the same page twice — that masks reclamation
+	// bugs (a freed page later read or freed a second time) under
+	// the production *pager.Pager. Surface as t.Errorf so the test
+	// run fails loudly rather than silently coalescing the double
+	// FreePage into one set membership.
+	if _, alreadyFreed := f.freed[id]; alreadyFreed {
+		f.t.Errorf("fakeWriter.FreePage: double-free of page %d", id)
+	}
 	f.freed[id] = struct{}{}
 	return nil
 }
