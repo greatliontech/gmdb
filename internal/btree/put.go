@@ -75,12 +75,16 @@ type pathFrame struct {
 // via the pager's FreePage (they become loose pages for re-use
 // within this tx). The returned rootID is meaningful only when
 // err == nil; on err the caller retains the prior rootID.
-func Put(pw PageWriter, cfg page.Config, rootID uint64, restartInterval uint16, key, value []byte) (uint64, error) {
-	if restartInterval == 0 {
-		return 0, fmt.Errorf("btree: Put RestartInterval must be > 0")
-	}
+//
+// Leaf format. Every leaf produced by Put is built via
+// page.LeafBuilder against cfg.RestartGroupTarget (compressed when
+// ≥2 / 0, uncompressed when ==1 — see internal/page/leaf_builder.go
+// for variant dispatch). The chunk-4.6β builder owns natural-break
+// heuristics + table layout; btree treats leaves as opaque past
+// the LeafReader / LeafBuilder interface.
+func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint64, error) {
 	if rootID == 0 {
-		return putEmpty(pw, cfg, restartInterval, key, value)
+		return putEmpty(pw, cfg, key, value)
 	}
 
 	// Phase 1: descend, recording the path.
@@ -89,7 +93,7 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, restartInterval uint16, 
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
 		buf := pw.Page(cur)
 		typ, _, _, _ := page.ReadHeader(buf)
-		if typ == page.TypeLeaf {
+		if page.IsLeafType(typ) {
 			break
 		}
 		if typ != page.TypeBranch {
@@ -108,8 +112,9 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, restartInterval uint16, 
 	}
 	leafID := cur
 
-	// Phase 2: leaf mutation. CoW the leaf, decode entries,
-	// insert/update, re-encode (or split).
+	// Phase 2: leaf mutation. CoW the leaf, decode entries (deep-
+	// copy), apply insert/replace, re-build into the CoW
+	// destination (or split into two).
 	leftID, err := pw.AllocPage()
 	if err != nil {
 		return 0, fmt.Errorf("btree: alloc CoW leaf: %w", err)
@@ -118,63 +123,57 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, restartInterval uint16, 
 	if err != nil {
 		return 0, fmt.Errorf("btree: CoW leaf: %w", err)
 	}
-	entries, err := page.DecodeLeaf(leftBuf, cfg)
+	entries, err := readLeafEntriesDeepCopy(leftBuf, cfg, leafID)
 	if err != nil {
-		return 0, fmt.Errorf("%w: decode leaf %d for insert: %w", ErrCorrupted, leafID, err)
+		return 0, err
 	}
-	interval := page.LeafRestartInterval(leftBuf)
-	if interval == 0 {
-		interval = restartInterval
-	}
-	enc := leafEntriesAsEncoded(entries)
-	enc = insertOrReplace(enc, key, value)
+	entries = insertOrReplaceLeaf(entries, key, value)
 
-	// Attempt single-leaf encode. EncodeLeaf returns errors for
-	// either oversize OR malformed input (unsorted keys, unknown
-	// flags). The fit-ahead probe distinguishes: if the encoded
-	// size exceeds the page's content area, the split path is
-	// the right response; otherwise the error is a real defect
-	// (caller bug or btree-internal logic error) and must
-	// surface.
-	predicted := page.LeafEncodedSize(cfg, interval, enc)
-	if predicted <= cfg.ContentEnd() {
-		if err := page.EncodeLeaf(leftBuf, cfg, interval, enc); err != nil {
-			return 0, fmt.Errorf("btree: encode leaf rejected after fit-ahead check passed: %w", err)
+	// Attempt single-page build into leftBuf. LeafBuilder's
+	// AddEntry returns false on page-full — no partial mutation is
+	// committed at that point per internal/page/leaf_builder.go
+	// (the fit check fires before any byte is written).
+	b := page.NewLeafBuilder(leftBuf, cfg)
+	fits := true
+	for _, e := range entries {
+		if !b.AddEntry(e) {
+			fits = false
+			break
 		}
-		// Fits. Retire the old leaf, ascend the path swapping
-		// (oldLeafID → leftID) at the descent index of each
-		// branch.
+	}
+	if fits {
+		b.Finish()
 		if err := pw.FreePage(leafID); err != nil {
 			return 0, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
 		}
 		return ascendNoSplit(pw, cfg, path, leftID)
 	}
 
-	// Split required. Pick a midpoint by entry count (chunk 4.4
-	// scope — byte-balanced split lands later if profiling shows
-	// imbalance hurts). Per limits.md max-key-size, no single
-	// entry alone exceeds half a page, so a count-based split
-	// guarantees each half fits — UNLESS the newly-inserted
-	// entry is itself oversize (chunk 4.7 overflow-value lifts
-	// that). Pre-check each half's predicted size; if either
-	// can't fit even with the rest peeled off, surface
-	// ErrKeyTooLarge.
-	if len(enc) < 2 {
+	// Split required. Per limits.md max-key-size, no single entry
+	// alone exceeds half a page, so a count-based midpoint split
+	// guarantees each half fits — UNLESS the newly-inserted entry
+	// is itself oversize (chunk 4.7 overflow-value lifts that).
+	if len(entries) < 2 {
 		_ = pw.FreePage(leftID)
 		return 0, ErrKeyTooLarge
 	}
-	mid := len(enc) / 2
-	leftEntries := enc[:mid]
-	rightEntries := enc[mid:]
-	if page.LeafEncodedSize(cfg, interval, leftEntries) > cfg.ContentEnd() ||
-		page.LeafEncodedSize(cfg, interval, rightEntries) > cfg.ContentEnd() {
-		// A half with a single oversize entry: the value is too
-		// large for leaf storage even after split. Free the CoW
-		// destination so it returns to the loose pool.
-		_ = pw.FreePage(leftID)
-		return 0, ErrKeyTooLarge
-	}
+	mid := len(entries) / 2
 
+	// Re-Reset the builder on leftBuf and emit the left half.
+	// The previous (partial) write into leftBuf is overwritten —
+	// LeafBuilder writes entries from leafEntryStart forward and
+	// Finish zeros the unused middle, so the resulting page is
+	// byte-identical to a Builder run on a freshly-zeroed buffer.
+	b.Reset(leftBuf, cfg)
+	for _, e := range entries[:mid] {
+		if !b.AddEntry(e) {
+			_ = pw.FreePage(leftID)
+			return 0, ErrKeyTooLarge
+		}
+	}
+	b.Finish()
+
+	// Allocate + build right.
 	rightID, err := pw.AllocPage()
 	if err != nil {
 		_ = pw.FreePage(leftID)
@@ -186,28 +185,28 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, restartInterval uint16, 
 		_ = pw.FreePage(rightID)
 		return 0, fmt.Errorf("btree: alloc split-right buf: %w", err)
 	}
-	if err := page.EncodeLeaf(leftBuf, cfg, interval, leftEntries); err != nil {
-		_ = pw.FreePage(leftID)
-		_ = pw.FreePage(rightID)
-		return 0, fmt.Errorf("btree: encode left split: %w", err)
+	rb := page.NewLeafBuilder(rightBuf, cfg)
+	for _, e := range entries[mid:] {
+		if !rb.AddEntry(e) {
+			_ = pw.FreePage(leftID)
+			_ = pw.FreePage(rightID)
+			return 0, ErrKeyTooLarge
+		}
 	}
-	if err := page.EncodeLeaf(rightBuf, cfg, interval, rightEntries); err != nil {
-		_ = pw.FreePage(leftID)
-		_ = pw.FreePage(rightID)
-		return 0, fmt.Errorf("btree: encode right split: %w", err)
-	}
+	rb.Finish()
+
 	if err := pw.FreePage(leafID); err != nil {
 		return 0, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
 	}
 
 	// Separator: shortest S with leftLast < S <= rightFirst.
-	sep := page.ShortestSeparator(leftEntries[len(leftEntries)-1].Key, rightEntries[0].Key)
+	sep := page.ShortestSeparator(entries[mid-1].Key, entries[mid].Key)
 	return ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
 }
 
 // putEmpty allocates a single-leaf root containing just (key,
 // value). The genesis path for an empty tree.
-func putEmpty(pw PageWriter, cfg page.Config, restartInterval uint16, key, value []byte) (uint64, error) {
+func putEmpty(pw PageWriter, cfg page.Config, key, value []byte) (uint64, error) {
 	id, err := pw.AllocPage()
 	if err != nil {
 		return 0, fmt.Errorf("btree: alloc genesis leaf: %w", err)
@@ -216,56 +215,59 @@ func putEmpty(pw PageWriter, cfg page.Config, restartInterval uint16, key, value
 	if err != nil {
 		return 0, fmt.Errorf("btree: alloc genesis slab: %w", err)
 	}
-	entries := []page.EncodedEntry{{Key: key, Value: value}}
-	if err := page.EncodeLeaf(buf, cfg, restartInterval, entries); err != nil {
+	b := page.NewLeafBuilder(buf, cfg)
+	if !b.AddInline(key, value) {
 		_ = pw.FreePage(id)
-		// Single-entry encode failure: the only reachable cause
-		// is "too big to fit a page" — ordering, flag, and
-		// overflow-with-value validations all trivially pass for
-		// a single inline entry constructed from (key, value).
-		// Surface as ErrKeyTooLarge (same class as the split-
-		// time check). When EncodeLeaf grows a page.ErrOversize
-		// sentinel, swap the string match for errors.Is.
 		return 0, ErrKeyTooLarge
 	}
+	b.Finish()
 	return id, nil
 }
 
-// leafEntriesAsEncoded converts the LeafEntry slice (post-decode
-// form) back into the EncodedEntry shape EncodeLeaf consumes.
-// Lossless because LeafEntry already carries every field
-// EncodedEntry has.
+// readLeafEntriesDeepCopy reads every entry of leaf `buf` into a
+// fresh LeafEntry slice with independently-allocated Key and Value
+// bytes. Validates the leaf at the boundary and surfaces structural
+// faults as ErrCorrupted.
 //
-// **Deep-copies Key and Value.** DecodeLeaf returns slices that
-// borrow from the input page buffer (zero-copy fast path); the
-// btree's CoW-then-re-encode flow uses the SAME buffer as both
-// input and output (the CoW'd leaf becomes the new leaf). When
-// EncodeLeaf runs `clear(buf)` at the top of its write phase, the
-// borrowed Key/Value slices in `entries` would become all-zero.
-// The deep copy here is the correctness boundary that lets the
-// re-encode pass read the original bytes from a fresh allocation
-// instead of the about-to-be-cleared page bytes.
-func leafEntriesAsEncoded(entries []page.LeafEntry) []page.EncodedEntry {
-	out := make([]page.EncodedEntry, len(entries))
-	for i, e := range entries {
-		out[i] = page.EncodedEntry{
-			Flags:        e.Flags,
-			Key:          bytes.Clone(e.Key),
-			Value:        bytes.Clone(e.Value),
-			OverflowPage: e.OverflowPage,
-			TotalLen:     e.TotalLen,
-		}
+// **Deep copy boundary.** LeafReader returns entries whose Key
+// aliases the iterator's keyBuf (for compressed delta entries) or
+// the page buffer (for restart entries and uncompressed entries);
+// Value always aliases the page buffer. The btree's CoW-then-
+// re-build flow reuses the SAME buffer as both decode source and
+// builder destination (the CoW'd leaf becomes the new leaf's
+// scratch). LeafBuilder writes entries from leafEntryStart forward
+// and zeros the unused middle on Finish — so any borrowed bytes
+// would be clobbered before the builder finished reading them. The
+// per-entry bytes.Clone here is the aliasing-safe boundary that
+// lets the post-decode entry slice survive arbitrarily many builder
+// passes into the source buffer.
+func readLeafEntriesDeepCopy(buf []byte, cfg page.Config, pageID uint64) ([]page.LeafEntry, error) {
+	r := page.NewLeafReader(buf, cfg)
+	if err := r.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, pageID, err)
 	}
-	return out
+	out := make([]page.LeafEntry, 0, r.Count())
+	it := r.IterForReuse(nil, nil, nil)
+	for {
+		e, ok := it.Next()
+		if !ok {
+			break
+		}
+		e.Key = bytes.Clone(e.Key)
+		e.Value = bytes.Clone(e.Value)
+		out = append(out, e)
+	}
+	return out, nil
 }
 
-// insertOrReplace finds the position of `key` in the sorted-by-key
-// entries slice and either replaces the entry's value (key exists)
-// or inserts a new entry at the right position. Returns the new
-// slice. The original may be shared with the caller — do not
-// retain.
-func insertOrReplace(entries []page.EncodedEntry, key, value []byte) []page.EncodedEntry {
-	// Binary search for the insertion index.
+// insertOrReplaceLeaf finds the position of `key` in the sorted-
+// by-key entries slice and either replaces the entry's Value (key
+// exists) or inserts a new inline entry at the right position.
+// Returns the new slice. The original may be shared with the
+// caller — do not retain. The replace path resets Flags so an old
+// overflow entry's bookkeeping (OverflowPage / TotalLen) doesn't
+// survive a same-key inline update.
+func insertOrReplaceLeaf(entries []page.LeafEntry, key, value []byte) []page.LeafEntry {
 	lo, hi := 0, len(entries)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -276,15 +278,13 @@ func insertOrReplace(entries []page.EncodedEntry, key, value []byte) []page.Enco
 		case cmp > 0:
 			hi = mid
 		default:
-			// Replace.
-			entries[mid] = page.EncodedEntry{Key: key, Value: value}
+			entries[mid] = page.LeafEntry{Key: key, Value: value}
 			return entries
 		}
 	}
-	// Insert at position lo. Grow the slice by one and shift.
-	entries = append(entries, page.EncodedEntry{})
+	entries = append(entries, page.LeafEntry{})
 	copy(entries[lo+1:], entries[lo:])
-	entries[lo] = page.EncodedEntry{Key: key, Value: value}
+	entries[lo] = page.LeafEntry{Key: key, Value: value}
 	return entries
 }
 
@@ -359,7 +359,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		// clears the buffer before writing. Without the deep
 		// copy, the borrowed Keys go all-zero between decode and
 		// encode-read. Same correctness boundary as
-		// leafEntriesAsEncoded.
+		// readLeafEntriesDeepCopy.
 		leftmost, cells := page.DecodeBranch(buf, cfg)
 		for i := range cells {
 			cells[i].Key = bytes.Clone(cells[i].Key)
@@ -479,11 +479,6 @@ func branchReplaceChild(buf []byte, cfg page.Config, i uint16, child uint64) err
 	if i > n {
 		return fmt.Errorf("btree: branchReplaceChild i=%d > count=%d", i, n)
 	}
-	// Cell at index i-1: read directory entry to find offset +
-	// key length, then write the child pointer immediately
-	// after the key bytes. Reuse page.BranchCellAt — it returns
-	// (Key, Child); we only need the offset arithmetic so do it
-	// directly via the page-internal directory layout.
 	page.SetBranchCellChild(buf, cfg, i-1, child)
 	return nil
 }

@@ -81,7 +81,7 @@ func (f *fakeWriter) FreePage(id uint64) error {
 func TestPutEmptyTreeCreatesGenesisLeaf(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)
-	root, err := Put(pw, cfg, 0, 16, []byte("k"), []byte("v"))
+	root, err := Put(pw, cfg, 0, []byte("k"), []byte("v"))
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestPutMultipleSingleLeafGetAllBack(t *testing.T) {
 		"alpha": "A", "beta": "B", "gamma": "G", "delta": "D", "epsilon": "E",
 	}
 	for k, v := range want {
-		newRoot, err := Put(pw, cfg, root, 16, []byte(k), []byte(v))
+		newRoot, err := Put(pw, cfg, root, []byte(k), []byte(v))
 		if err != nil {
 			t.Fatalf("Put(%q): %v", k, err)
 		}
@@ -122,15 +122,154 @@ func TestPutMultipleSingleLeafGetAllBack(t *testing.T) {
 	}
 }
 
+// TestPutDeleteGetUncompressedLeafVariant exercises the uncompressed
+// leaf variant (cfg.RestartGroupTarget = 1) end-to-end through Put,
+// Get, and Delete. The chunk-4.6γ btree port is variant-agnostic
+// past LeafReader / LeafBuilder; this pins that the uncompressed
+// dispatch is actually wired through the mutation paths and not
+// accidentally compressed-only.
+func TestPutDeleteGetUncompressedLeafVariant(t *testing.T) {
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 1}
+	pw := newFakeWriter(t, 4096)
+	root := uint64(0)
+
+	// Enough entries to force at least one split, exercising the
+	// uncompressed dispatch through ascendWithSplit as well as the
+	// single-leaf path.
+	const N = 60
+	want := make(map[string]string, N)
+	for i := range N {
+		key := fmt.Appendf(nil, "uc-%05d", i)
+		val := bytes.Repeat([]byte{byte('a' + i%26)}, 100)
+		nr, err := Put(pw, cfg, root, key, val)
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+		root = nr
+		want[string(key)] = string(val)
+	}
+
+	// Pin: every Put produced an uncompressed-typed leaf. Walk the
+	// live tree and check the type byte on every leaf. Also assert
+	// the test actually exercised the split path — a future leaf-
+	// density change that fits everything in one leaf would silently
+	// downgrade this test's coverage from "split + merge variant
+	// pin" to "single-leaf variant pin" without failing.
+	walkLeavesUC(t, pw, cfg, root)
+	if leafCount := countLeaves(t, pw, cfg, root); leafCount < 2 {
+		t.Fatalf("test no longer exercises split path: %d leaf(s) after %d Puts; expected ≥ 2", leafCount, N)
+	}
+
+	// Round-trip every key.
+	for k, v := range want {
+		got, found, err := Get(pw, cfg, root, []byte(k))
+		if err != nil || !found {
+			t.Errorf("Get(%q): found=%v err=%v", k, found, err)
+			continue
+		}
+		if !bytes.Equal(got, []byte(v)) {
+			t.Errorf("Get(%q): value mismatch", k)
+		}
+	}
+
+	// Delete half, exercising the merge/redistribute dispatch under
+	// the uncompressed variant.
+	for i := 0; i < N; i += 2 {
+		key := fmt.Appendf(nil, "uc-%05d", i)
+		nr, err := Delete(pw, cfg, root, DefaultMergeThreshold, key)
+		if err != nil {
+			t.Fatalf("Delete(%d): %v", i, err)
+		}
+		root = nr
+		delete(want, string(key))
+	}
+
+	// Re-verify type byte after delete-driven merges.
+	walkLeavesUC(t, pw, cfg, root)
+
+	// Surviving keys still retrievable.
+	for k, v := range want {
+		got, found, err := Get(pw, cfg, root, []byte(k))
+		if err != nil || !found {
+			t.Errorf("post-delete Get(%q): found=%v err=%v", k, found, err)
+			continue
+		}
+		if !bytes.Equal(got, []byte(v)) {
+			t.Errorf("post-delete Get(%q): value mismatch", k)
+		}
+	}
+}
+
+// countLeaves returns the number of leaf pages reachable from root.
+// Used by variant-pin tests to assert the split path actually fired
+// — a coverage guard against future leaf-density changes silently
+// degrading the test.
+func countLeaves(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64) int {
+	t.Helper()
+	if root == 0 {
+		return 0
+	}
+	n := 0
+	var walk func(id uint64)
+	walk = func(id uint64) {
+		buf := pw.Page(id)
+		typ, _, _, _ := page.ReadHeader(buf)
+		switch {
+		case page.IsLeafType(typ):
+			n++
+		case typ == page.TypeBranch:
+			lm, cells := page.DecodeBranch(buf, cfg)
+			walk(lm)
+			for _, c := range cells {
+				walk(c.Child)
+			}
+		}
+	}
+	walk(root)
+	return n
+}
+
+// walkLeavesUC asserts every leaf reachable from root has
+// page.TypeLeafUncompressed. Independent of the existing
+// walkLeavesXxx helpers so the uncompressed-variant test can pin
+// the variant choice flowed all the way through Put / merge /
+// redistribute.
+func walkLeavesUC(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64) {
+	t.Helper()
+	if root == 0 {
+		return
+	}
+	var walk func(id uint64)
+	walk = func(id uint64) {
+		buf := pw.Page(id)
+		typ, _, _, _ := page.ReadHeader(buf)
+		switch typ {
+		case page.TypeLeafUncompressed:
+			return
+		case page.TypeLeaf:
+			t.Errorf("page %d encoded as compressed (TypeLeaf) under RestartGroupTarget=1; want TypeLeafUncompressed", id)
+		case page.TypeBranch:
+			lm, cells := page.DecodeBranch(buf, cfg)
+			walk(lm)
+			for _, c := range cells {
+				walk(c.Child)
+			}
+		default:
+			t.Errorf("page %d unexpected type %d", id, typ)
+		}
+	}
+	walk(root)
+}
+
 func TestPutUpdatesExistingKey(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
-	root, err := Put(pw, cfg, root, 16, []byte("k"), []byte("v1"))
+	root, err := Put(pw, cfg, root, []byte("k"), []byte("v1"))
 	if err != nil {
 		t.Fatalf("Put initial: %v", err)
 	}
-	root, err = Put(pw, cfg, root, 16, []byte("k"), []byte("v2"))
+	root, err = Put(pw, cfg, root, []byte("k"), []byte("v2"))
 	if err != nil {
 		t.Fatalf("Put update: %v", err)
 	}
@@ -155,7 +294,7 @@ func TestPutForcesLeafSplitAndRootGrows(t *testing.T) {
 	for i := range N {
 		key := fmt.Appendf(nil, "key-%04d", i)
 		val := bytes.Repeat([]byte{byte('a' + i)}, 1024)
-		newRoot, err := Put(pw, cfg, root, 16, key, val)
+		newRoot, err := Put(pw, cfg, root, key, val)
 		if err != nil {
 			t.Fatalf("Put(%q): %v", key, err)
 		}
@@ -194,7 +333,7 @@ func TestPutManyKeysAllRetrievable(t *testing.T) {
 	for i := range N {
 		key := fmt.Appendf(nil, "k-%05d", i)
 		val := fmt.Appendf(nil, "v-%05d-%s", i, bytes.Repeat([]byte{'x'}, 50))
-		newRoot, err := Put(pw, cfg, root, 16, key, val)
+		newRoot, err := Put(pw, cfg, root, key, val)
 		if err != nil {
 			t.Fatalf("Put(%q): %v at i=%d", key, err, i)
 		}
@@ -237,7 +376,7 @@ func TestPutForcesMultiLevelTreeAndBranchSplit(t *testing.T) {
 	for i := range N {
 		key := fmt.Appendf(nil, "%s-%05d", keyPrefix, i)
 		val := bytes.Repeat([]byte{byte('a' + i%26)}, 512)
-		newRoot, err := Put(pw, cfg, root, 16, key, val)
+		newRoot, err := Put(pw, cfg, root, key, val)
 		if err != nil {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
@@ -271,7 +410,7 @@ func treeDepth(t *testing.T, pw *fakeWriter, root uint64) int {
 	cur := root
 	for {
 		typ, _, _, _ := page.ReadHeader(pw.Page(cur))
-		if typ == page.TypeLeaf {
+		if page.IsLeafType(typ) {
 			return depth
 		}
 		if typ != page.TypeBranch {
@@ -307,7 +446,7 @@ func TestPutContentsInvariantUnderInsertOrder(t *testing.T) {
 		for _, i := range order {
 			key := fmt.Appendf(nil, "k-%04d", i)
 			val := fmt.Appendf(nil, "v-%04d", i)
-			newRoot, err := Put(pw, cfg, root, 16, key, val)
+			newRoot, err := Put(pw, cfg, root, key, val)
 			if err != nil {
 				t.Fatalf("ordering %d Put(%d): %v", o, i, err)
 			}
@@ -337,7 +476,7 @@ func TestPutRejectsTooBigSingleEntry(t *testing.T) {
 	big := bytes.Repeat([]byte{'x'}, 8192)
 	// (a) Empty-tree path: goes through putEmpty.
 	pw := newFakeWriter(t, 4096)
-	_, err := Put(pw, cfg, 0, 16, []byte("k"), big)
+	_, err := Put(pw, cfg, 0, []byte("k"), big)
 	if !errors.Is(err, ErrKeyTooLarge) {
 		t.Errorf("Put oversize on empty tree: err = %v, want ErrKeyTooLarge", err)
 	}
@@ -347,11 +486,11 @@ func TestPutRejectsTooBigSingleEntry(t *testing.T) {
 	// guard fires (the oversize entry can't be split off into
 	// its own half because the other half would be empty).
 	pw2 := newFakeWriter(t, 4096)
-	root, err := Put(pw2, cfg, 0, 16, []byte("seed"), []byte("v"))
+	root, err := Put(pw2, cfg, 0, []byte("seed"), []byte("v"))
 	if err != nil {
 		t.Fatalf("seed Put: %v", err)
 	}
-	_, err = Put(pw2, cfg, root, 16, []byte("big"), big)
+	_, err = Put(pw2, cfg, root, []byte("big"), big)
 	if !errors.Is(err, ErrKeyTooLarge) {
 		t.Errorf("Put oversize on non-empty tree: err = %v, want ErrKeyTooLarge", err)
 	}
@@ -375,7 +514,7 @@ func TestPutFreesEveryRetiredPageAfterSplits(t *testing.T) {
 	for i := range N {
 		key := fmt.Appendf(nil, "k-%05d", i)
 		val := bytes.Repeat([]byte{byte('a' + i%26)}, 200)
-		newRoot, err := Put(pw, cfg, root, 16, key, val)
+		newRoot, err := Put(pw, cfg, root, key, val)
 		if err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
@@ -409,7 +548,7 @@ func collectReachable(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, 
 	}
 	out[id] = struct{}{}
 	typ, _, _, _ := page.ReadHeader(pw.Page(id))
-	if typ == page.TypeLeaf {
+	if page.IsLeafType(typ) {
 		return
 	}
 	if typ != page.TypeBranch {

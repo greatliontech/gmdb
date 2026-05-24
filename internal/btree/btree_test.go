@@ -37,13 +37,20 @@ func (f *fakeReader) put(id uint64, buf []byte) {
 	f.pages[id] = buf
 }
 
-// makeLeaf encodes a leaf page with the given entries.
-func makeLeaf(t *testing.T, cfg page.Config, interval uint16, entries []page.EncodedEntry) []byte {
+// makeLeaf builds a leaf page with the given entries via the chunk-
+// 4.6β LeafBuilder. cfg.RestartGroupTarget selects the variant
+// (0/≥2 → compressed; 1 → uncompressed). The interval parameter
+// from the chunk-4.2 API is gone — the builder owns group sizing.
+func makeLeaf(t *testing.T, cfg page.Config, entries []page.LeafEntry) []byte {
 	t.Helper()
 	buf := make([]byte, cfg.PageSize)
-	if err := page.EncodeLeaf(buf, cfg, interval, entries); err != nil {
-		t.Fatalf("makeLeaf: %v", err)
+	b := page.NewLeafBuilder(buf, cfg)
+	for i, e := range entries {
+		if !b.AddEntry(e) {
+			t.Fatalf("makeLeaf: AddEntry %d (%q) returned full", i, e.Key)
+		}
 	}
+	b.Finish()
 	return buf
 }
 
@@ -70,7 +77,7 @@ func TestGetEmptyTreeReturnsNotFound(t *testing.T) {
 func TestGetSingleLeafHit(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pr := newFakeReader(t, 4096)
-	pr.put(1, makeLeaf(t, cfg, 16, []page.EncodedEntry{
+	pr.put(1, makeLeaf(t, cfg, []page.LeafEntry{
 		{Key: []byte("apple"), Value: []byte("fruit-A")},
 		{Key: []byte("banana"), Value: []byte("fruit-B")},
 		{Key: []byte("cherry"), Value: []byte("fruit-C")},
@@ -103,19 +110,19 @@ func TestGetSingleLeafHit(t *testing.T) {
 
 func TestGetSingleLeafExercisesDeltaCompression(t *testing.T) {
 	// Pin that Get works correctly across restart-group boundaries
-	// — keys with high shared prefix at small interval forces
-	// multiple groups and exercises both phase-1 binary search
-	// and phase-2 delta decode.
-	cfg := page.Config{PageSize: 4096}
+	// — keys with high shared prefix at a small RestartGroupTarget
+	// forces multiple groups and exercises both phase-1 binary
+	// search and phase-2 delta decode.
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 4}
 	pr := newFakeReader(t, 4096)
-	entries := make([]page.EncodedEntry, 0, 32)
+	entries := make([]page.LeafEntry, 0, 32)
 	for i := range 32 {
-		entries = append(entries, page.EncodedEntry{
+		entries = append(entries, page.LeafEntry{
 			Key:   fmt.Appendf(nil, "prefix-key-%03d", i),
 			Value: fmt.Appendf(nil, "v%03d", i),
 		})
 	}
-	pr.put(1, makeLeaf(t, cfg, 4, entries))
+	pr.put(1, makeLeaf(t, cfg, entries))
 
 	// Hit every key.
 	for i, e := range entries {
@@ -154,12 +161,12 @@ func TestGetSingleBranchDescent(t *testing.T) {
 	//   leaf 2: m, n, o
 	cfg := page.Config{PageSize: 4096}
 	pr := newFakeReader(t, 4096)
-	pr.put(1, makeLeaf(t, cfg, 16, []page.EncodedEntry{
+	pr.put(1, makeLeaf(t, cfg, []page.LeafEntry{
 		{Key: []byte("a"), Value: []byte("A")},
 		{Key: []byte("b"), Value: []byte("B")},
 		{Key: []byte("c"), Value: []byte("C")},
 	}))
-	pr.put(2, makeLeaf(t, cfg, 16, []page.EncodedEntry{
+	pr.put(2, makeLeaf(t, cfg, []page.LeafEntry{
 		{Key: []byte("m"), Value: []byte("M")},
 		{Key: []byte("n"), Value: []byte("N")},
 		{Key: []byte("o"), Value: []byte("O")},
@@ -220,14 +227,14 @@ func TestGetMultiLevelDescent(t *testing.T) {
 		13: {"s", "t", "u"},
 	}
 	for id, keys := range leaves {
-		entries := make([]page.EncodedEntry, 0, len(keys))
+		entries := make([]page.LeafEntry, 0, len(keys))
 		for _, k := range keys {
-			entries = append(entries, page.EncodedEntry{
+			entries = append(entries, page.LeafEntry{
 				Key:   []byte(k),
 				Value: bytes.ToUpper([]byte(k)),
 			})
 		}
-		pr.put(id, makeLeaf(t, cfg, 16, entries))
+		pr.put(id, makeLeaf(t, cfg, entries))
 	}
 	pr.put(4, makeBranch(t, cfg, 1, []page.BranchCell{
 		{Key: []byte("c"), Child: 2},
@@ -304,22 +311,25 @@ func TestGetRejectsNullChildPointer(t *testing.T) {
 	}
 }
 
-func TestGetWrapsLeafLookupErrorsAsCorrupted(t *testing.T) {
-	// btree.Get wraps page.LeafLookup decoder errors with
+func TestGetWrapsLeafValidateErrorsAsCorrupted(t *testing.T) {
+	// btree.Get wraps page.LeafReader.Validate failures with
 	// ErrCorrupted so a single errors.Is check covers all
 	// structural-corruption surfaces (branch type, null child,
-	// leaf decode). Pin by forging the RestartCount on a leaf
-	// page — the leaf decoder rejects it per the chunk-4.2 M3
-	// gate, and Get must surface ErrCorrupted.
+	// leaf structural fault). Pin by forging the RestartCount on
+	// a compressed leaf — sum-of-group-counts diverges from the
+	// header Count and Validate surfaces page.ErrCorrupted, which
+	// Get's wrap routes to btree.ErrCorrupted.
 	cfg := page.Config{PageSize: 4096}
 	pr := newFakeReader(t, 4096)
-	buf := makeLeaf(t, cfg, 16, []page.EncodedEntry{
+	buf := makeLeaf(t, cfg, []page.LeafEntry{
 		{Key: []byte("k"), Value: []byte("v")},
 	})
-	// RestartCount field at offset 10 (HeaderSize+2). Correct
-	// value is 1; forge to 2 to fail the cross-check.
-	buf[10] = 2
-	buf[11] = 0
+	// RestartCount field at offset 8 (HeaderSize) for the
+	// compressed-leaf variant (TypeLeaf) per leaf_compressed.go.
+	// Correct value is 1; forge to 2 to fail Validate's
+	// sum-of-group-counts == Count cross-check.
+	buf[8] = 2
+	buf[9] = 0
 	pr.put(1, buf)
 	_, _, err := Get(pr, cfg, 1, []byte("k"))
 	if !errors.Is(err, ErrCorrupted) {
@@ -330,7 +340,7 @@ func TestGetWrapsLeafLookupErrorsAsCorrupted(t *testing.T) {
 func TestHasMembership(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pr := newFakeReader(t, 4096)
-	pr.put(1, makeLeaf(t, cfg, 16, []page.EncodedEntry{
+	pr.put(1, makeLeaf(t, cfg, []page.LeafEntry{
 		{Key: []byte("k1"), Value: []byte("v1")},
 		{Key: []byte("k2"), Value: []byte("v2")},
 	}))
@@ -350,7 +360,7 @@ func TestGetOverflowEntryReturnsSentinel(t *testing.T) {
 	// replaces this with the actual overflow-run assembly.
 	cfg := page.Config{PageSize: 4096}
 	pr := newFakeReader(t, 4096)
-	pr.put(1, makeLeaf(t, cfg, 16, []page.EncodedEntry{
+	pr.put(1, makeLeaf(t, cfg, []page.LeafEntry{
 		{
 			Key:          []byte("big"),
 			Flags:        page.CellFlagOverflow,

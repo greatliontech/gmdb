@@ -9,15 +9,24 @@
 //
 // Chunk 4 surface, in landing order:
 //
-//   - 4.3 (this) — read-only descent: Get(rootID, key) ⇒ value.
-//     PageReader interface, recursive descent from root through
-//     branches to a leaf, leaf binary search via page.LeafLookup.
+//   - 4.3 — read-only descent: Get(rootID, key) ⇒ value. PageReader
+//     interface, recursive descent from root through branches to a
+//     leaf, leaf binary search via page.LeafReader.SearchLeaf.
 //   - 4.4 — Insert + split: CoW from leaf to root, prefix-truncated
 //     separator computation for new branch entries.
 //   - 4.5 — Delete + merge/redistribute. MergeThreshold option.
-//   - 4.6 — Cursor: forward Next, reverse Prev with group cache,
-//     key reconstruction buffer, Cursor.Delete state machine per
-//     transactions.md §Cursor State Machine.
+//   - 4.6 — Leaf format reset + cursor.
+//     · α — spec amend (variable-size restart groups +
+//       uncompressed-variant + LeafIter + gen counter).
+//     · β — page-package rewrite: LeafReader / LeafBuilder /
+//       LeafIter; old encoders (DecodeLeaf / EncodeLeaf /
+//       LeafLookup / LeafEncodedSize / LeafRestartInterval) dropped.
+//     · γ (this) — btree port onto the new leaf surface: Put,
+//       Delete, Get, merge/redistribute all migrated to
+//       LeafReader + LeafBuilder. Validate runs at the pager-
+//       resolve boundary per the chunk-4.6β leaf-doc contract.
+//     · δ — bidirectional cursor on LeafIter + generation counter
+//       per transactions.md §Cursor State Machine.
 //   - 4.7 — Overflow inline-value support: Put with values >
 //     leaf-page capacity writes an overflow run.
 //

@@ -110,10 +110,10 @@ func Delete(pw PageWriter, cfg page.Config, rootID uint64, mergeThreshold uint8,
 func deleteFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, key []byte) (newID uint64, underflow, found bool, err error) {
 	buf := pw.Page(pageID)
 	typ, _, _, _ := page.ReadHeader(buf)
-	switch typ {
-	case page.TypeLeaf:
+	switch {
+	case page.IsLeafType(typ):
 		return deleteFromLeaf(pw, cfg, mergeThreshold, pageID, buf, key)
-	case page.TypeBranch:
+	case typ == page.TypeBranch:
 		return deleteFromBranch(pw, cfg, mergeThreshold, pageID, buf, key)
 	default:
 		return 0, false, false, fmt.Errorf("%w: page %d unexpected type %d during Delete descent", ErrCorrupted, pageID, typ)
@@ -121,9 +121,9 @@ func deleteFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uin
 }
 
 func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, srcBuf []byte, key []byte) (uint64, bool, bool, error) {
-	entries, err := page.DecodeLeaf(srcBuf, cfg)
+	entries, err := readLeafEntriesDeepCopy(srcBuf, cfg, pageID)
 	if err != nil {
-		return 0, false, false, fmt.Errorf("%w: decode leaf %d for delete: %w", ErrCorrupted, pageID, err)
+		return 0, false, false, err
 	}
 	lo, hi := 0, len(entries)
 	for lo < hi {
@@ -135,27 +135,18 @@ func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID
 		case cmp > 0:
 			hi = mid
 		default:
-			// Hit. Deep-copy via leafEntriesAsEncoded (Decode borrows
-			// from srcBuf which we're about to CoW + EncodeLeaf-clear,
-			// the same aliasing boundary Put exposes) and drop
-			// entries[mid].
-			enc := leafEntriesAsEncoded(entries)
-			enc = append(enc[:mid], enc[mid+1:]...)
-			return encodeAfterLeafDelete(pw, cfg, mergeThreshold, pageID, srcBuf, enc)
+			entries = append(entries[:mid], entries[mid+1:]...)
+			return rebuildLeafAfterDelete(pw, cfg, mergeThreshold, pageID, entries)
 		}
 	}
 	return pageID, false, false, nil
 }
 
-// encodeAfterLeafDelete handles the post-removal encode for a leaf:
+// rebuildLeafAfterDelete handles the post-removal encode for a leaf:
 // empty result → return newID=0 (parent removes the slot); otherwise
-// CoW the leaf and re-encode in place.
-func encodeAfterLeafDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, srcBuf []byte, enc []page.EncodedEntry) (uint64, bool, bool, error) {
-	interval := page.LeafRestartInterval(srcBuf)
-	if interval == 0 {
-		return 0, false, false, fmt.Errorf("%w: leaf %d RestartInterval=0", ErrCorrupted, pageID)
-	}
-	if len(enc) == 0 {
+// CoW the leaf and re-build via LeafBuilder.
+func rebuildLeafAfterDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, entries []page.LeafEntry) (uint64, bool, bool, error) {
+	if len(entries) == 0 {
 		// Last entry removed → signal "subtree gone" via newID=0.
 		// The recursive parent removes the corresponding child slot.
 		// No CoW allocation needed since there's nothing to encode.
@@ -172,22 +163,31 @@ func encodeAfterLeafDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	if err != nil {
 		return 0, false, false, fmt.Errorf("btree: CoW leaf %d for delete: %w", pageID, err)
 	}
-	if err := page.EncodeLeaf(newBuf, cfg, interval, enc); err != nil {
-		return 0, false, false, fmt.Errorf("btree: encode deleted leaf: %w", err)
+	b := page.NewLeafBuilder(newBuf, cfg)
+	for _, e := range entries {
+		if !b.AddEntry(e) {
+			// Deletion strictly shrinks the entry set — a build
+			// that doesn't fit after removing an entry would
+			// have failed at the original encode too. Treat as
+			// structural corruption.
+			return 0, false, false, fmt.Errorf("%w: leaf %d re-build after delete overflowed page", ErrCorrupted, pageID)
+		}
 	}
+	b.Finish()
 	if err := pw.FreePage(pageID); err != nil {
 		return 0, false, false, fmt.Errorf("btree: free old leaf %d: %w", pageID, err)
 	}
-	return newID, leafUnderflow(cfg, interval, enc, mergeThreshold), true, nil
+	return newID, leafUnderflow(newBuf, cfg, mergeThreshold), true, nil
 }
 
-// leafUnderflow reports whether a leaf encoded with the given entries
-// + interval falls strictly below mergeThreshold% of ContentEnd. The
-// strict inequality matches "below the threshold" in api-surface.md
-// (at exactly threshold the page is large enough, no merge).
-func leafUnderflow(cfg page.Config, interval uint16, enc []page.EncodedEntry, mergeThreshold uint8) bool {
-	size := page.LeafEncodedSize(cfg, interval, enc)
-	return size*100 < int(mergeThreshold)*cfg.ContentEnd()
+// leafUnderflow reports whether the leaf at `buf` falls strictly
+// below mergeThreshold% of ContentEnd. The strict inequality matches
+// "below the threshold" in api-surface.md (at exactly threshold the
+// page is large enough, no merge).
+func leafUnderflow(buf []byte, cfg page.Config, mergeThreshold uint8) bool {
+	r := page.NewLeafReader(buf, cfg)
+	used := cfg.ContentEnd() - r.FreeSpace()
+	return used*100 < int(mergeThreshold)*cfg.ContentEnd()
 }
 
 // branchUnderflow is the analogue for a branch page.
@@ -332,12 +332,18 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 
 	// Sibling types must match — all children of a branch live at
 	// the same depth per the B+tree balance invariant. A mismatch
-	// is structural corruption.
+	// is structural corruption. Leaf-vs-leaf is the only valid
+	// leaf pairing; the dispatcher tolerates either compressed or
+	// uncompressed variant on either side (the chunk-4.6β leaf
+	// format permits per-leaf variant choice — merge/redistribute
+	// just rebuilds via cfg.RestartGroupTarget).
 	leftSrc := pw.Page(leftPairID)
 	rightSrc := pw.Page(rightPairID)
 	leftTyp, _, _, _ := page.ReadHeader(leftSrc)
 	rightTyp, _, _, _ := page.ReadHeader(rightSrc)
-	if leftTyp != rightTyp {
+	leftIsLeaf := page.IsLeafType(leftTyp)
+	rightIsLeaf := page.IsLeafType(rightTyp)
+	if leftIsLeaf != rightIsLeaf {
 		return 0, false, false, fmt.Errorf("%w: sibling page types differ left=%d right=%d", ErrCorrupted, leftTyp, rightTyp)
 	}
 
@@ -348,10 +354,10 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 		newRightID   uint64
 		newSeparator []byte
 	)
-	switch leftTyp {
-	case page.TypeLeaf:
+	switch {
+	case leftIsLeaf:
 		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID)
-	case page.TypeBranch:
+	case leftTyp == page.TypeBranch && rightTyp == page.TypeBranch:
 		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, leftPairID, rightPairID, separator)
 	default:
 		return 0, false, false, fmt.Errorf("%w: sibling page %d unexpected type %d", ErrCorrupted, leftPairID, leftTyp)
@@ -403,68 +409,68 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 //
 // In both outcomes the input leftID and rightID are freed.
 //
-// Decision: if the combined entries fit in one page, merge — that
-// reclaims a page and reduces tree fanout pressure. Otherwise
-// redistribute, balancing by entry count and recomputing the
-// boundary separator via page.ShortestSeparator.
+// Decision: build into a freshly-allocated mergedBuf via
+// LeafBuilder.AddEntry; if every entry fits in one page, the merge
+// is committed. Otherwise the merge buffer is freed (returning to
+// the loose-page pool for re-use inside this tx) and the entries
+// are redistributed across two newly-allocated pages, balancing by
+// entry count and recomputing the boundary separator via
+// page.ShortestSeparator.
+//
+// Variant policy. The surviving page(s) are built via
+// cfg.RestartGroupTarget — the input leaves' on-page variant is
+// not preserved. With the chunk-4.6β format the per-leaf variant
+// is a build-time policy choice, not a per-page invariant; merge/
+// redistribute homogenizes toward the keyspace-level target. No
+// spec clause requires variant preservation across merge.
 func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID uint64) (bool, uint64, uint64, uint64, []byte, error) {
 	leftSrc := pw.Page(leftID)
 	rightSrc := pw.Page(rightID)
-	leftEntries, err := page.DecodeLeaf(leftSrc, cfg)
+	leftEntries, err := readLeafEntriesDeepCopy(leftSrc, cfg, leftID)
 	if err != nil {
-		return false, 0, 0, 0, nil, fmt.Errorf("%w: decode left leaf %d: %w", ErrCorrupted, leftID, err)
+		return false, 0, 0, 0, nil, err
 	}
-	rightEntries, err := page.DecodeLeaf(rightSrc, cfg)
+	rightEntries, err := readLeafEntriesDeepCopy(rightSrc, cfg, rightID)
 	if err != nil {
-		return false, 0, 0, 0, nil, fmt.Errorf("%w: decode right leaf %d: %w", ErrCorrupted, rightID, err)
+		return false, 0, 0, 0, nil, err
 	}
-	leftInterval := page.LeafRestartInterval(leftSrc)
-	rightInterval := page.LeafRestartInterval(rightSrc)
-	if leftInterval == 0 || rightInterval == 0 {
-		return false, 0, 0, 0, nil, fmt.Errorf("%w: leaves %d/%d RestartInterval=0", ErrCorrupted, leftID, rightID)
-	}
-
-	encLeft := leafEntriesAsEncoded(leftEntries)
-	encRight := leafEntriesAsEncoded(rightEntries)
 
 	// Sibling key-ordering invariant: left.lastKey < right.firstKey.
 	// A violation is structural corruption — surface ErrCorrupted
-	// rather than producing an out-of-order merged page (EncodeLeaf
-	// would reject it anyway, but with a misleading "not strictly
-	// ascending" message at the encoder boundary).
-	if len(encLeft) > 0 && len(encRight) > 0 &&
-		bytes.Compare(encLeft[len(encLeft)-1].Key, encRight[0].Key) >= 0 {
+	// rather than producing an out-of-order merged page (LeafBuilder
+	// would panic on out-of-order AddEntry anyway, but with a less
+	// informative message).
+	if len(leftEntries) > 0 && len(rightEntries) > 0 &&
+		bytes.Compare(leftEntries[len(leftEntries)-1].Key, rightEntries[0].Key) >= 0 {
 		return false, 0, 0, 0, nil, fmt.Errorf("%w: leaf siblings %d/%d not ordered across boundary", ErrCorrupted, leftID, rightID)
 	}
 
-	combined := make([]page.EncodedEntry, 0, len(encLeft)+len(encRight))
-	combined = append(combined, encLeft...)
-	combined = append(combined, encRight...)
+	combined := make([]page.LeafEntry, 0, len(leftEntries)+len(rightEntries))
+	combined = append(combined, leftEntries...)
+	combined = append(combined, rightEntries...)
 
-	// Merge if combined entries fit in one page. The surviving page
-	// inherits the LEFT page's RestartInterval — `rightInterval` is
-	// discarded. The RestartInterval is a per-page header field per
-	// page-formats.md §Leaf Page and is permitted to differ across
-	// pages; picking one is forced at merge time, and choosing left
-	// is a deterministic policy. A chain of left-biased merges
-	// homogenizes the surviving leaves toward whichever interval the
-	// leftmost-pre-merge leaf had — recorded behavior, not a defect,
-	// since no spec clause requires interval preservation across
-	// merge.
-	if page.LeafEncodedSize(cfg, leftInterval, combined) <= cfg.ContentEnd() {
-		mergedID, err := pw.AllocPage()
-		if err != nil {
-			return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc merged leaf: %w", err)
+	// Try merge: build into a fresh page; succeed iff every entry
+	// fits. If the build overflows, free the merge destination and
+	// fall through to redistribute.
+	mergedID, err := pw.AllocPage()
+	if err != nil {
+		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc merged leaf: %w", err)
+	}
+	mergedBuf, err := pw.AllocSlab(mergedID)
+	if err != nil {
+		_ = pw.FreePage(mergedID)
+		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc merged leaf slab: %w", err)
+	}
+	b := page.NewLeafBuilder(mergedBuf, cfg)
+	mergeFits := true
+	for _, e := range combined {
+		if !b.AddEntry(e) {
+			mergeFits = false
+			break
 		}
-		mergedBuf, err := pw.AllocSlab(mergedID)
-		if err != nil {
-			_ = pw.FreePage(mergedID)
-			return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc merged leaf slab: %w", err)
-		}
-		if err := page.EncodeLeaf(mergedBuf, cfg, leftInterval, combined); err != nil {
-			_ = pw.FreePage(mergedID)
-			return false, 0, 0, 0, nil, fmt.Errorf("btree: encode merged leaf: %w", err)
-		}
+	}
+	if mergeFits {
+		b.Finish()
 		if err := pw.FreePage(leftID); err != nil {
 			return false, 0, 0, 0, nil, fmt.Errorf("btree: free left leaf %d: %w", leftID, err)
 		}
@@ -472,6 +478,11 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 			return false, 0, 0, 0, nil, fmt.Errorf("btree: free right leaf %d: %w", rightID, err)
 		}
 		return true, mergedID, 0, 0, nil, nil
+	}
+	// Merge overflowed — release the scratch destination back to
+	// the loose-page pool inside this tx and redistribute instead.
+	if err := pw.FreePage(mergedID); err != nil {
+		return false, 0, 0, 0, nil, fmt.Errorf("btree: free unused merge slab %d: %w", mergedID, err)
 	}
 
 	// Redistribute: split by count and validate per-half fits. With
@@ -490,12 +501,6 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 	mid := len(combined) / 2
 	leftSplit := combined[:mid]
 	rightSplit := combined[mid:]
-	if page.LeafEncodedSize(cfg, leftInterval, leftSplit) > cfg.ContentEnd() {
-		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute leaf left half exceeds page capacity", ErrCorrupted)
-	}
-	if page.LeafEncodedSize(cfg, rightInterval, rightSplit) > cfg.ContentEnd() {
-		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute leaf right half exceeds page capacity", ErrCorrupted)
-	}
 
 	newLeftID, err := pw.AllocPage()
 	if err != nil {
@@ -506,6 +511,15 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 		_ = pw.FreePage(newLeftID)
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-left slab: %w", err)
 	}
+	lb := page.NewLeafBuilder(newLeftBuf, cfg)
+	for _, e := range leftSplit {
+		if !lb.AddEntry(e) {
+			_ = pw.FreePage(newLeftID)
+			return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute leaf left half exceeds page capacity", ErrCorrupted)
+		}
+	}
+	lb.Finish()
+
 	newRightID, err := pw.AllocPage()
 	if err != nil {
 		_ = pw.FreePage(newLeftID)
@@ -517,16 +531,16 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 		_ = pw.FreePage(newRightID)
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-right slab: %w", err)
 	}
-	if err := page.EncodeLeaf(newLeftBuf, cfg, leftInterval, leftSplit); err != nil {
-		_ = pw.FreePage(newLeftID)
-		_ = pw.FreePage(newRightID)
-		return false, 0, 0, 0, nil, fmt.Errorf("btree: encode redistribute-left leaf: %w", err)
+	rb := page.NewLeafBuilder(newRightBuf, cfg)
+	for _, e := range rightSplit {
+		if !rb.AddEntry(e) {
+			_ = pw.FreePage(newLeftID)
+			_ = pw.FreePage(newRightID)
+			return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute leaf right half exceeds page capacity", ErrCorrupted)
+		}
 	}
-	if err := page.EncodeLeaf(newRightBuf, cfg, rightInterval, rightSplit); err != nil {
-		_ = pw.FreePage(newLeftID)
-		_ = pw.FreePage(newRightID)
-		return false, 0, 0, 0, nil, fmt.Errorf("btree: encode redistribute-right leaf: %w", err)
-	}
+	rb.Finish()
+
 	if err := pw.FreePage(leftID); err != nil {
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: free left leaf %d: %w", leftID, err)
 	}

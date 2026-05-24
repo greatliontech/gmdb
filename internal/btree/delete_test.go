@@ -27,7 +27,7 @@ func TestDeleteOnEmptyTreeReturnsNotFound(t *testing.T) {
 func TestDeleteMissingKeyReturnsNotFoundUnchanged(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)
-	root, err := Put(pw, cfg, 0, 16, []byte("a"), []byte("A"))
+	root, err := Put(pw, cfg, 0, []byte("a"), []byte("A"))
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestDeleteMissingKeyReturnsNotFoundUnchanged(t *testing.T) {
 func TestDeleteSingleLeafEntryEmptiesTree(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)
-	root, err := Put(pw, cfg, 0, 16, []byte("k"), []byte("v"))
+	root, err := Put(pw, cfg, 0, []byte("k"), []byte("v"))
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestDeleteFromMultiEntryLeaf(t *testing.T) {
 		{"alpha", "A"}, {"beta", "B"}, {"gamma", "G"}, {"delta", "D"},
 	}
 	for _, p := range pairs {
-		nr, err := Put(pw, cfg, root, 16, []byte(p.k), []byte(p.v))
+		nr, err := Put(pw, cfg, root, []byte(p.k), []byte(p.v))
 		if err != nil {
 			t.Fatalf("Put(%q): %v", p.k, err)
 		}
@@ -117,7 +117,7 @@ func TestDeleteCausesRootCollapseAfterLeafMerge(t *testing.T) {
 	for i := range N {
 		key := fmt.Appendf(nil, "k-%02d", i)
 		val := bytes.Repeat([]byte{byte('a' + i)}, valSize)
-		nr, err := Put(pw, cfg, root, 16, key, val)
+		nr, err := Put(pw, cfg, root, key, val)
 		if err != nil {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
@@ -144,8 +144,8 @@ func TestDeleteCausesRootCollapseAfterLeafMerge(t *testing.T) {
 
 	// Root should now be a single leaf (collapse fired).
 	typ, _, _, _ = page.ReadHeader(pw.Page(root))
-	if typ != page.TypeLeaf {
-		t.Errorf("after merge+collapse: root type = %d, want TypeLeaf (root branch should have collapsed)", typ)
+	if !page.IsLeafType(typ) {
+		t.Errorf("after merge+collapse: root type = %d, want leaf variant (root branch should have collapsed)", typ)
 	}
 
 	// Surviving keys retrievable.
@@ -179,7 +179,7 @@ func TestDeleteRedistributesWhenSiblingFull(t *testing.T) {
 	for i := range N {
 		key := fmt.Appendf(nil, "k-%03d", i)
 		val := bytes.Repeat([]byte{byte('a' + i%26)}, 500)
-		nr, err := Put(pw, cfg, root, 16, key, val)
+		nr, err := Put(pw, cfg, root, key, val)
 		if err != nil {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
@@ -237,7 +237,7 @@ func TestDeleteCascadesBranchMergeAndRootCollapse(t *testing.T) {
 	for i := range N {
 		keys[i] = fmt.Appendf(nil, "%s-%05d", keyPrefix, i)
 		val := bytes.Repeat([]byte{byte('a' + i%26)}, 512)
-		nr, err := Put(pw, cfg, root, 16, keys[i], val)
+		nr, err := Put(pw, cfg, root, keys[i], val)
 		if err != nil {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
@@ -304,7 +304,7 @@ func TestDeleteForcesBranchMergeAndRedistribute(t *testing.T) {
 	for i := range N {
 		keys[i] = fmt.Appendf(nil, "%s-%05d", keyPrefix, i)
 		val := bytes.Repeat([]byte{byte('a' + i%26)}, 512)
-		nr, err := Put(pw, cfg, root, 16, keys[i], val)
+		nr, err := Put(pw, cfg, root, keys[i], val)
 		if err != nil {
 			t.Fatalf("Put(%d): %v", i, err)
 		}
@@ -382,7 +382,7 @@ func TestDeleteThenPutRoundTrips(t *testing.T) {
 		switch rng.IntN(3) {
 		case 0, 1:
 			val := fmt.Appendf(nil, "v-%d", rng.Int())
-			nr, err := Put(pw, cfg, root, 16, key, val)
+			nr, err := Put(pw, cfg, root, key, val)
 			if err != nil {
 				t.Fatalf("Put(%q): %v", key, err)
 			}
@@ -423,7 +423,7 @@ func TestDeleteFreesEveryRetiredPage(t *testing.T) {
 	for i := range N {
 		key := fmt.Appendf(nil, "k-%05d", i)
 		val := bytes.Repeat([]byte{byte('a' + i%26)}, 200)
-		nr, err := Put(pw, cfg, root, 16, key, val)
+		nr, err := Put(pw, cfg, root, key, val)
 		if err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
@@ -454,10 +454,10 @@ func checkBalance(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64) {
 	var walk func(id uint64, depth int)
 	walk = func(id uint64, depth int) {
 		typ, _, _, _ := page.ReadHeader(pw.Page(id))
-		switch typ {
-		case page.TypeLeaf:
+		switch {
+		case page.IsLeafType(typ):
 			leafDepths[depth]++
-		case page.TypeBranch:
+		case typ == page.TypeBranch:
 			lm, cells := page.DecodeBranch(pw.Page(id), cfg)
 			walk(lm, depth+1)
 			for _, c := range cells {
@@ -486,18 +486,16 @@ func checkUnderflowInvariant(t *testing.T, pw *fakeWriter, cfg page.Config, root
 		buf := pw.Page(id)
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch typ {
-		case page.TypeLeaf:
-			entries, err := page.DecodeLeaf(buf, cfg)
-			if err != nil {
-				t.Errorf("checkUnderflowInvariant: decode leaf %d: %v", id, err)
+		case page.TypeLeaf, page.TypeLeafUncompressed:
+			r := page.NewLeafReader(buf, cfg)
+			if err := r.Validate(); err != nil {
+				t.Errorf("checkUnderflowInvariant: validate leaf %d: %v", id, err)
 				return
 			}
 			if isRoot {
 				return
 			}
-			interval := page.LeafRestartInterval(buf)
-			enc := leafEntriesAsEncoded(entries)
-			size := page.LeafEncodedSize(cfg, interval, enc)
+			size := cfg.ContentEnd() - r.FreeSpace()
 			if size*100 < int(threshold)*cfg.ContentEnd() {
 				t.Errorf("non-root leaf %d underflowed: size=%d (%.1f%% of %d), threshold=%d%%",
 					id, size, float64(size)*100/float64(cfg.ContentEnd()), cfg.ContentEnd(), threshold)

@@ -31,9 +31,9 @@ const MaxTreeDepth = 64
 
 // ErrCorrupted is returned by Get/Has on any structural integrity
 // violation observed during descent: bad page type, null child
-// pointer, malformed leaf lookup result, cyclic branch chain. The
-// chunk-5 db-level mapping translates this to gmdb.ErrCorrupted —
-// same pattern as pager.ErrCorrupted.
+// pointer, leaf structural fault, cyclic branch chain. The chunk-5
+// db-level mapping translates this to gmdb.ErrCorrupted — same
+// pattern as pager.ErrCorrupted.
 var ErrCorrupted = errors.New("btree: structural corruption detected")
 
 // ErrTreeTooDeep is returned by Get when the descent loop hits
@@ -62,6 +62,14 @@ var ErrOverflowValueUnsupported = errors.New("btree: overflow value assembly not
 // The PageReader's Page(id) is called at every level: O(depth)
 // page resolutions. With a typical depth of 3–5 and 4 KB pages,
 // each Get touches a small handful of cache-warm pages.
+//
+// Validation boundary. Every leaf page resolved during descent is
+// passed through LeafReader.Validate before SearchLeaf — the
+// chunk-4.6β contract per internal/page/leaf.go (NewLeafReader is
+// O(1) and assumes structural validity; arbitrary on-disk pages
+// must be validated by their first resolver). Any validation
+// failure surfaces as ErrCorrupted, preserving the chunk-4.3
+// errors.Is contract under the new leaf format.
 func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, bool, error) {
 	if rootID == 0 {
 		return nil, false, nil
@@ -70,8 +78,8 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
 		buf := pr.Page(cur)
 		typ, _, _, _ := page.ReadHeader(buf)
-		switch typ {
-		case page.TypeBranch:
+		switch {
+		case typ == page.TypeBranch:
 			i := page.BranchSearch(buf, cfg, key)
 			next := page.BranchChildAt(buf, cfg, i)
 			if next == 0 {
@@ -79,17 +87,12 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 					ErrCorrupted, cur, i)
 			}
 			cur = next
-		case page.TypeLeaf:
-			entry, found, err := page.LeafLookup(buf, cfg, key)
-			if err != nil {
-				// LeafLookup's decode errors describe structural
-				// corruption (out-of-bounds lengths, forged
-				// RestartCount, unknown flag bits). Wrap with
-				// ErrCorrupted so callers using errors.Is can
-				// branch on the corruption class regardless of
-				// the specific subsystem that detected it.
+		case page.IsLeafType(typ):
+			r := page.NewLeafReader(buf, cfg)
+			if err := r.Validate(); err != nil {
 				return nil, false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
 			}
+			_, entry, found := r.SearchLeaf(key)
 			if !found {
 				return nil, false, nil
 			}
@@ -98,15 +101,15 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 			}
 			return entry.Value, true, nil
 		default:
-			return nil, false, fmt.Errorf("%w: page %d has unexpected type %d (expected branch=%d or leaf=%d)",
-				ErrCorrupted, cur, typ, page.TypeBranch, page.TypeLeaf)
+			return nil, false, fmt.Errorf("%w: page %d has unexpected type %d (expected branch=%d or leaf=%d/%d)",
+				ErrCorrupted, cur, typ, page.TypeBranch, page.TypeLeaf, page.TypeLeafUncompressed)
 		}
 	}
 	return nil, false, ErrTreeTooDeep
 }
 
 // Has reports whether key is present in the tree rooted at rootID,
-// without materialising the value bytes (still calls LeafLookup
+// without materialising the value bytes (still calls SearchLeaf
 // internally — the optimisation is in the caller's allocation
 // avoidance, not in the lookup cost). Returns the same error set
 // as Get.
