@@ -2,366 +2,721 @@ package page
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"testing"
 )
 
-func newLeafPage(t *testing.T, cfg Config) []byte {
+// Helper: build a leaf page from a sorted (key, value) sequence using the
+// supplied Config. Returns the page bytes. Fails the test on builder
+// fit error — tests should keep their inputs small enough to fit a page.
+func buildLeaf(t *testing.T, cfg Config, entries [][2]string) []byte {
 	t.Helper()
-	return make([]byte, cfg.PageSize)
+	buf := make([]byte, cfg.PageSize)
+	b := NewLeafBuilder(buf, cfg)
+	for _, e := range entries {
+		if !b.AddInline([]byte(e[0]), []byte(e[1])) {
+			t.Fatalf("buildLeaf: AddInline(%q) returned false (page full)", e[0])
+		}
+	}
+	b.Finish()
+	return buf
 }
 
-func TestLeafEmptyRoundTrip(t *testing.T) {
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	if err := EncodeLeaf(buf, cfg, 16, nil); err != nil {
-		t.Fatalf("EncodeLeaf empty: %v", err)
-	}
-	if got := LeafEntryCount(buf); got != 0 {
-		t.Errorf("count = %d, want 0", got)
-	}
-	if got := LeafRestartInterval(buf); got != 16 {
-		t.Errorf("interval = %d, want 16", got)
-	}
-	if got := LeafRestartCount(buf); got != 0 {
-		t.Errorf("restart count = %d, want 0", got)
-	}
-	got, err := DecodeLeaf(buf, cfg)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(got) != 0 {
-		t.Errorf("decoded %d entries, want 0", len(got))
-	}
-}
+// ---------------------------------------------------------------------------
+// Reader basics — both variants
+// ---------------------------------------------------------------------------
 
-func TestLeafSingleEntryRoundTrip(t *testing.T) {
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	entries := []EncodedEntry{
-		{Key: []byte("apple"), Value: []byte("fruit-A")},
+func TestLeafReader_Compressed_RoundTrip(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	entries := [][2]string{
+		{"apple", "A"}, {"apricot", "A2"}, {"banana", "B"}, {"blueberry", "B2"},
+		{"cherry", "C"}, {"date", "D"}, {"durian", "D2"}, {"elderberry", "E"},
 	}
-	if err := EncodeLeaf(buf, cfg, 16, entries); err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	if got := LeafRestartCount(buf); got != 1 {
-		t.Errorf("restart count = %d, want 1 (single entry is its own restart)", got)
-	}
-	decoded, err := DecodeLeaf(buf, cfg)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(decoded) != 1 {
-		t.Fatalf("decoded %d entries, want 1", len(decoded))
-	}
-	if !bytes.Equal(decoded[0].Key, []byte("apple")) {
-		t.Errorf("Key: got %q, want apple", decoded[0].Key)
-	}
-	if !bytes.Equal(decoded[0].Value, []byte("fruit-A")) {
-		t.Errorf("Value: got %q", decoded[0].Value)
-	}
-}
+	buf := buildLeaf(t, cfg, entries)
 
-func TestLeafDeltaCompressionRoundTrip(t *testing.T) {
-	// Spec invariant 2 (page-formats.md §Leaf Page): a delta entry's
-	// SharedLen counts leading bytes shared with the PREVIOUS entry
-	// in the same restart group. The reconstructed key must equal
-	// previous[0:SharedLen] || UnsharedKey. Pin with a high-prefix
-	// workload at interval=4 so two restart groups exist.
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	entries := []EncodedEntry{
-		{Key: []byte("aaaa-000"), Value: []byte("v0")},
-		{Key: []byte("aaaa-001"), Value: []byte("v1")},
-		{Key: []byte("aaaa-002"), Value: []byte("v2")},
-		{Key: []byte("aaaa-003"), Value: []byte("v3")},
-		{Key: []byte("bbbb-000"), Value: []byte("v4")}, // new restart at i=4
-		{Key: []byte("bbbb-001"), Value: []byte("v5")},
+	typ, _, count, _ := ReadHeader(buf)
+	if typ != TypeLeaf {
+		t.Fatalf("type = %d, want TypeLeaf=%d", typ, TypeLeaf)
 	}
-	if err := EncodeLeaf(buf, cfg, 4, entries); err != nil {
-		t.Fatalf("encode: %v", err)
+	if int(count) != len(entries) {
+		t.Fatalf("count = %d, want %d", count, len(entries))
 	}
-	if got := LeafRestartCount(buf); got != 2 {
-		t.Errorf("restart count = %d, want 2 (entries at i=0 + i=4)", got)
+
+	r := NewLeafReader(buf, cfg)
+	if !r.Compressed() {
+		t.Error("Compressed() = false, want true")
 	}
-	decoded, err := DecodeLeaf(buf, cfg)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
+	if r.Count() != len(entries) {
+		t.Errorf("Count = %d, want %d", r.Count(), len(entries))
 	}
-	if len(decoded) != len(entries) {
-		t.Fatalf("decoded %d entries, want %d", len(decoded), len(entries))
+	if got := r.RestartCount(); got < 2 {
+		t.Errorf("RestartCount = %d, want ≥ 2 (target=4, %d entries)", got, len(entries))
 	}
+
+	// Every key must be findable; every value must round-trip.
 	for i, e := range entries {
-		if !bytes.Equal(decoded[i].Key, e.Key) {
-			t.Errorf("entry %d Key: got %q, want %q", i, decoded[i].Key, e.Key)
+		idx, ent, found := r.SearchLeaf([]byte(e[0]))
+		if !found {
+			t.Errorf("SearchLeaf(%q): not found", e[0])
+			continue
 		}
-		if !bytes.Equal(decoded[i].Value, e.Value) {
-			t.Errorf("entry %d Value: got %q, want %q", i, decoded[i].Value, e.Value)
+		if idx != i {
+			t.Errorf("SearchLeaf(%q): idx = %d, want %d", e[0], idx, i)
+		}
+		if !bytes.Equal(ent.Value, []byte(e[1])) {
+			t.Errorf("SearchLeaf(%q): value = %q, want %q", e[0], ent.Value, e[1])
 		}
 	}
-	// Spec inv 2 strengthening (chunk-4.2 close-out finding L1):
-	// the test name promises "delta compression" — assert
-	// compression actually fired by comparing the encoded size
-	// against the no-compression alternative (interval=1, every
-	// entry its own restart with full key). With a 4-byte shared
-	// prefix on every delta, interval=4 must produce a strictly
-	// smaller page than interval=1.
-	compressed := LeafEncodedSize(cfg, 4, entries)
-	uncompressed := LeafEncodedSize(cfg, 1, entries)
-	if compressed >= uncompressed {
-		t.Errorf("compression didn't shrink page: interval=4 size=%d, interval=1 size=%d (want < )",
-			compressed, uncompressed)
+
+	// Misses on either side and gaps.
+	for _, miss := range []string{"", "aa", "carrot", "elderberryX", "zzzzz"} {
+		_, _, found := r.SearchLeaf([]byte(miss))
+		if found {
+			t.Errorf("SearchLeaf(%q): unexpectedly found", miss)
+		}
 	}
 }
 
-func TestLeafRestartTablePosition(t *testing.T) {
-	// Spec invariant 3 (page-formats.md §Leaf Page): "A leaf's
-	// RestartCount × 2 bytes immediately before the optional 8-byte
-	// xxhash64 footer constitute the restart table." Pin by reading
-	// the restart entries' offsets via the public accessor and
-	// verifying they point to where entries actually live.
-	for _, withChecksum := range []bool{false, true} {
-		t.Run(fmt.Sprintf("checksum=%v", withChecksum), func(t *testing.T) {
-			cfg := Config{PageSize: 4096, PageChecksum: withChecksum}
-			buf := newLeafPage(t, cfg)
-			entries := []EncodedEntry{
-				{Key: []byte("a"), Value: []byte("1")},
-				{Key: []byte("b"), Value: []byte("2")},
-				{Key: []byte("c"), Value: []byte("3")},
-				{Key: []byte("d"), Value: []byte("4")},
-				{Key: []byte("e"), Value: []byte("5")},
-				{Key: []byte("f"), Value: []byte("6")},
+func TestLeafReader_Uncompressed_RoundTrip(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	entries := [][2]string{
+		{"alpha", "1"}, {"beta", "2"}, {"gamma", "3"}, {"delta", "4"},
+	}
+	// Builder accepts only sorted entries — pre-sort.
+	sorted := [][2]string{{"alpha", "1"}, {"beta", "2"}, {"delta", "4"}, {"gamma", "3"}}
+	buf := buildLeaf(t, cfg, sorted)
+
+	typ, _, count, _ := ReadHeader(buf)
+	if typ != TypeLeafUncompressed {
+		t.Fatalf("type = %d, want TypeLeafUncompressed=%d", typ, TypeLeafUncompressed)
+	}
+	if int(count) != len(entries) {
+		t.Fatalf("count = %d, want %d", count, len(entries))
+	}
+
+	r := NewLeafReader(buf, cfg)
+	if r.Compressed() {
+		t.Error("Compressed() = true, want false for uncompressed leaf")
+	}
+	if r.RestartCount() != len(entries) {
+		// uncompressed: every entry is its own "group"
+		t.Errorf("RestartCount = %d, want %d (one group per entry)", r.RestartCount(), len(entries))
+	}
+
+	for _, e := range sorted {
+		_, ent, found := r.SearchLeaf([]byte(e[0]))
+		if !found {
+			t.Errorf("SearchLeaf(%q): not found", e[0])
+			continue
+		}
+		if !bytes.Equal(ent.Value, []byte(e[1])) {
+			t.Errorf("SearchLeaf(%q): value = %q, want %q", e[0], ent.Value, e[1])
+		}
+	}
+	for _, miss := range []string{"", "alphabet", "z"} {
+		_, _, found := r.SearchLeaf([]byte(miss))
+		if found {
+			t.Errorf("SearchLeaf(%q): unexpectedly found", miss)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Variable-size restart groups
+// ---------------------------------------------------------------------------
+
+func TestLeafBuilder_NaturalBreakStartsNewGroup(t *testing.T) {
+	// Keys that share zero prefix with each other should trigger the
+	// natural-break heuristic — each new key starts a fresh group
+	// rather than accruing 2-byte delta-header overhead with no
+	// SharedLen recoup.
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	entries := [][2]string{
+		{"aaa-1", "v"}, {"aaa-2", "v"}, // shared prefix → same group
+		{"bbb-1", "v"}, {"bbb-2", "v"}, // new prefix → natural break
+		{"ccc-1", "v"}, {"ccc-2", "v"}, // another natural break
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+	if r.RestartCount() < 3 {
+		t.Errorf("RestartCount = %d, want ≥ 3 (natural breaks should split the 3 prefix runs)", r.RestartCount())
+	}
+	// All keys still findable.
+	for _, e := range entries {
+		_, _, found := r.SearchLeaf([]byte(e[0]))
+		if !found {
+			t.Errorf("SearchLeaf(%q): not found", e[0])
+		}
+	}
+}
+
+func TestLeafBuilder_GroupTargetCap(t *testing.T) {
+	// With RestartGroupTarget=4 and 12 prefix-sharing entries, expect
+	// at least 3 groups (12/4) so no group exceeds the cap.
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	entries := make([][2]string, 12)
+	for i := range entries {
+		entries[i] = [2]string{fmt.Sprintf("prefix-key-%02d", i), "v"}
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+	if r.RestartCount() < 3 {
+		t.Errorf("RestartCount = %d, want ≥ 3 (target=4, 12 entries)", r.RestartCount())
+	}
+	for g := range r.RestartCount() {
+		if cnt := r.GroupEntryCount(g); cnt > 4 {
+			t.Errorf("group %d has %d entries, exceeds target 4", g, cnt)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Iter — forward + backward
+// ---------------------------------------------------------------------------
+
+func TestLeafIter_ForwardStreaming_Compressed(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	entries := make([][2]string, 20)
+	for i := range entries {
+		entries[i] = [2]string{fmt.Sprintf("prefix-key-%03d", i), fmt.Sprintf("v%03d", i)}
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+	it := r.IterForReuse(nil, nil, nil)
+	got := 0
+	for e, ok := it.Next(); ok; e, ok = it.Next() {
+		want := entries[got]
+		if !bytes.Equal(e.Key, []byte(want[0])) {
+			t.Errorf("Next[%d]: key = %q, want %q", got, e.Key, want[0])
+		}
+		if !bytes.Equal(e.Value, []byte(want[1])) {
+			t.Errorf("Next[%d]: value = %q, want %q", got, e.Value, want[1])
+		}
+		got++
+	}
+	if got != len(entries) {
+		t.Errorf("Next yielded %d entries, want %d", got, len(entries))
+	}
+}
+
+func TestLeafIter_ForwardStreaming_Uncompressed(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	entries := make([][2]string, 10)
+	for i := range entries {
+		entries[i] = [2]string{fmt.Sprintf("k%02d", i), fmt.Sprintf("v%02d", i)}
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+	it := r.IterForReuse(nil, nil, nil)
+	got := 0
+	for e, ok := it.Next(); ok; e, ok = it.Next() {
+		want := entries[got]
+		if !bytes.Equal(e.Key, []byte(want[0])) {
+			t.Errorf("Next[%d]: key=%q want=%q", got, e.Key, want[0])
+		}
+		if !bytes.Equal(e.Value, []byte(want[1])) {
+			t.Errorf("Next[%d]: value=%q want=%q", got, e.Value, want[1])
+		}
+		got++
+	}
+	if got != len(entries) {
+		t.Errorf("yield = %d want %d", got, len(entries))
+	}
+}
+
+func TestLeafIter_BackwardBuffered_Compressed(t *testing.T) {
+	// Walk a compressed leaf forward to the last entry, then backward
+	// to entry 0. Pin: every Prev returns the structurally-correct
+	// entry in reverse order, the buffered-mode transition handles
+	// group-boundary crossings, and the same key bytes round-trip.
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	entries := make([][2]string, 16)
+	for i := range entries {
+		entries[i] = [2]string{fmt.Sprintf("shared-prefix-%03d", i), fmt.Sprintf("v%03d", i)}
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+
+	// Start at the last entry via IterAtForReuse(count) + At(last).
+	it := r.IterAtForReuse(len(entries), nil, nil, nil)
+	last, ok := it.At(len(entries) - 1)
+	if !ok {
+		t.Fatalf("At(last): !ok")
+	}
+	if !bytes.Equal(last.Key, []byte(entries[len(entries)-1][0])) {
+		t.Errorf("At(last) key = %q, want %q", last.Key, entries[len(entries)-1][0])
+	}
+
+	// Walk backward.
+	for i := len(entries) - 1; i > 0; i-- {
+		e, ok := it.Prev()
+		if !ok {
+			t.Fatalf("Prev at index %d: !ok", i-1)
+		}
+		want := entries[i-1]
+		if !bytes.Equal(e.Key, []byte(want[0])) {
+			t.Errorf("Prev[%d]: key=%q want=%q", i-1, e.Key, want[0])
+		}
+		if !bytes.Equal(e.Value, []byte(want[1])) {
+			t.Errorf("Prev[%d]: value=%q want=%q", i-1, e.Value, want[1])
+		}
+	}
+
+	// One more Prev should fail (at first entry).
+	if _, ok := it.Prev(); ok {
+		t.Error("Prev past first entry: returned ok=true; want false")
+	}
+}
+
+func TestLeafIter_BackwardBuffered_Uncompressed(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	entries := make([][2]string, 10)
+	for i := range entries {
+		entries[i] = [2]string{fmt.Sprintf("k%02d", i), fmt.Sprintf("v%02d", i)}
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+	it := r.IterAtForReuse(len(entries), nil, nil, nil)
+	if _, ok := it.At(len(entries) - 1); !ok {
+		t.Fatalf("At(last): !ok")
+	}
+	for i := len(entries) - 1; i > 0; i-- {
+		e, ok := it.Prev()
+		if !ok {
+			t.Fatalf("Prev at %d: !ok", i-1)
+		}
+		want := entries[i-1]
+		if !bytes.Equal(e.Key, []byte(want[0])) {
+			t.Errorf("Prev[%d]: key=%q want=%q", i-1, e.Key, want[0])
+		}
+	}
+	if _, ok := it.Prev(); ok {
+		t.Error("Prev past first entry returned ok=true")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SearchLeafIter — cursor seed
+// ---------------------------------------------------------------------------
+
+func TestSearchLeafIter_ExactMatch_Compressed(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	entries := make([][2]string, 16)
+	for i := range entries {
+		entries[i] = [2]string{fmt.Sprintf("k-%03d", i), fmt.Sprintf("v%03d", i)}
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+
+	for i, e := range entries {
+		idx, ent, found, it := r.SearchLeafIter([]byte(e[0]), nil, nil, nil)
+		if !found {
+			t.Errorf("SearchLeafIter(%q): not found", e[0])
+			continue
+		}
+		if idx != i {
+			t.Errorf("SearchLeafIter(%q): idx=%d want=%d", e[0], idx, i)
+		}
+		if !bytes.Equal(ent.Value, []byte(e[1])) {
+			t.Errorf("SearchLeafIter(%q): value=%q want=%q", e[0], ent.Value, e[1])
+		}
+		// The iter should be positioned past idx — next Next is idx+1.
+		if i+1 < len(entries) {
+			nxt, ok := it.Next()
+			if !ok {
+				t.Errorf("SearchLeafIter(%q): Next after match: !ok", e[0])
+				continue
 			}
-			if err := EncodeLeaf(buf, cfg, 3, entries); err != nil {
-				t.Fatalf("encode: %v", err)
+			wantNext := entries[i+1]
+			if !bytes.Equal(nxt.Key, []byte(wantNext[0])) {
+				t.Errorf("SearchLeafIter(%q): Next.Key=%q want=%q", e[0], nxt.Key, wantNext[0])
 			}
-			// Restart count = ceil(6/3) = 2 (entries at i=0, i=3).
-			rc := LeafRestartCount(buf)
-			if rc != 2 {
-				t.Fatalf("restart count = %d, want 2", rc)
+		}
+	}
+}
+
+func TestSearchLeafIter_Successor_Compressed(t *testing.T) {
+	// Seek to a key that doesn't exist; iter should land on the
+	// successor's index and the returned entry should be the successor.
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	entries := make([][2]string, 16)
+	for i := range entries {
+		// even numbers only — odd-numbered targets are misses with a
+		// well-defined successor.
+		entries[i] = [2]string{fmt.Sprintf("k-%03d", i*2), fmt.Sprintf("v%03d", i)}
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+	for i := range entries {
+		target := fmt.Sprintf("k-%03d", i*2+1) // between entries[i] and entries[i+1]
+		idx, ent, found, _ := r.SearchLeafIter([]byte(target), nil, nil, nil)
+		if found {
+			t.Errorf("SearchLeafIter(%q): unexpectedly found", target)
+			continue
+		}
+		wantIdx := i + 1
+		if wantIdx >= len(entries) {
+			if idx != len(entries) {
+				t.Errorf("SearchLeafIter(%q): idx=%d want=%d (past end)", target, idx, len(entries))
 			}
-			tableStart := leafRestartTableStart(cfg, rc)
-			wantTableStart := cfg.ContentEnd() - 2*2 // rc * 2 bytes/entry
-			if tableStart != wantTableStart {
-				t.Errorf("table start = %d, want %d", tableStart, wantTableStart)
+			continue
+		}
+		if idx != wantIdx {
+			t.Errorf("SearchLeafIter(%q): idx=%d want=%d", target, idx, wantIdx)
+			continue
+		}
+		if !bytes.Equal(ent.Key, []byte(entries[wantIdx][0])) {
+			t.Errorf("SearchLeafIter(%q): ent.Key=%q want=%q", target, ent.Key, entries[wantIdx][0])
+		}
+	}
+}
+
+func TestSearchLeafIter_Empty(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	buf := make([]byte, cfg.PageSize)
+	b := NewLeafBuilder(buf, cfg)
+	b.Finish()
+	r := NewLeafReader(buf, cfg)
+	idx, _, found, _ := r.SearchLeafIter([]byte("k"), nil, nil, nil)
+	if found || idx != 0 {
+		t.Errorf("SearchLeafIter on empty: idx=%d found=%v want=(0,false)", idx, found)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Overflow entries
+// ---------------------------------------------------------------------------
+
+func TestLeafBuilder_OverflowEntry_Compressed(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	buf := make([]byte, cfg.PageSize)
+	b := NewLeafBuilder(buf, cfg)
+	b.AddInline([]byte("a"), []byte("inline-A"))
+	b.AddOverflow([]byte("b-big"), 42, 100000)
+	b.AddInline([]byte("c"), []byte("inline-C"))
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+	_, ent, found := r.SearchLeaf([]byte("b-big"))
+	if !found {
+		t.Fatal("SearchLeaf(b-big): not found")
+	}
+	if !ent.IsOverflow() {
+		t.Errorf("ent.IsOverflow() = false; want true")
+	}
+	if ent.OverflowPage != 42 || ent.TotalLen != 100000 {
+		t.Errorf("overflow fields: page=%d totalLen=%d want=(42, 100000)", ent.OverflowPage, ent.TotalLen)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LastKey + FirstKey
+// ---------------------------------------------------------------------------
+
+func TestLeafReader_FirstLast_Compressed(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	entries := [][2]string{
+		{"alpha", "1"}, {"beta", "2"}, {"gamma", "3"}, {"omega", "4"}, {"zeta", "5"},
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+	if got := r.FirstKey(); !bytes.Equal(got, []byte("alpha")) {
+		t.Errorf("FirstKey = %q, want alpha", got)
+	}
+	last, _ := r.LastKey(nil)
+	if !bytes.Equal(last, []byte("zeta")) {
+		t.Errorf("LastKey = %q, want zeta", last)
+	}
+}
+
+func TestLeafReader_FirstLast_Uncompressed(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	entries := [][2]string{
+		{"a", "1"}, {"b", "2"}, {"c", "3"}, {"d", "4"},
+	}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+	if got := r.FirstKey(); !bytes.Equal(got, []byte("a")) {
+		t.Errorf("FirstKey = %q, want a", got)
+	}
+	last, _ := r.LastKey(nil)
+	if !bytes.Equal(last, []byte("d")) {
+		t.Errorf("LastKey = %q, want d", last)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Determinism — same input, same bytes
+// ---------------------------------------------------------------------------
+
+func TestLeafBuilder_DeterministicEncoding(t *testing.T) {
+	// page-formats.md §Leaf Split deterministic-encoding invariant:
+	// same encoder version + same input + same Config → byte-identical
+	// pages. Cover both shared-prefix (compression dense) and
+	// mixed-prefix (natural-break heuristic fires) inputs to pin the
+	// invariant across the builder's branches.
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+
+	sharedPrefix := make([][2]string, 30)
+	for i := range sharedPrefix {
+		sharedPrefix[i] = [2]string{fmt.Sprintf("k-%05d", i), fmt.Sprintf("v-%05d", i)}
+	}
+	t.Run("shared-prefix", func(t *testing.T) {
+		a := buildLeaf(t, cfg, sharedPrefix)
+		b := buildLeaf(t, cfg, sharedPrefix)
+		if !bytes.Equal(a, b) {
+			t.Errorf("non-deterministic encoding on shared-prefix input")
+		}
+	})
+
+	// Mixed prefixes — exercises the natural-break code path
+	// (sharedPrefixLen == 0 between adjacent keys forces a fresh
+	// group). If the builder's group-split decision were
+	// nondeterministic (e.g., depended on a map iteration order or
+	// time), this test would catch it.
+	mixedPrefix := [][2]string{
+		{"aaa-1", "v1"}, {"aaa-2", "v2"},
+		{"bbb-1", "v3"}, {"bbb-2", "v4"},
+		{"ccc-1", "v5"}, {"ccc-2", "v6"},
+		{"ddd-1", "v7"}, {"ddd-2", "v8"},
+	}
+	t.Run("mixed-prefix-natural-breaks", func(t *testing.T) {
+		a := buildLeaf(t, cfg, mixedPrefix)
+		b := buildLeaf(t, cfg, mixedPrefix)
+		if !bytes.Equal(a, b) {
+			t.Errorf("non-deterministic encoding on mixed-prefix input")
+		}
+	})
+
+	// Uncompressed variant determinism.
+	t.Run("uncompressed", func(t *testing.T) {
+		ucCfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+		a := buildLeaf(t, ucCfg, sharedPrefix)
+		b := buildLeaf(t, ucCfg, sharedPrefix)
+		if !bytes.Equal(a, b) {
+			t.Errorf("non-deterministic encoding on uncompressed leaf")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Validate — spec invariants on read
+// ---------------------------------------------------------------------------
+
+func TestLeafReader_Validate_AcceptsWellFormed(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+		keys [][2]string
+	}{
+		{"compressed-shared", Config{PageSize: 4096, RestartGroupTarget: 4},
+			[][2]string{{"aaa-1", "v"}, {"aaa-2", "v"}, {"aaa-3", "v"}}},
+		{"compressed-natural-breaks", Config{PageSize: 4096, RestartGroupTarget: 16},
+			[][2]string{{"aaa", "v"}, {"bbb", "v"}, {"ccc", "v"}}},
+		{"uncompressed", Config{PageSize: 4096, RestartGroupTarget: 1},
+			[][2]string{{"a", "1"}, {"b", "2"}, {"c", "3"}}},
+		{"empty-compressed", Config{PageSize: 4096, RestartGroupTarget: 4}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := make([]byte, tc.cfg.PageSize)
+			b := NewLeafBuilder(buf, tc.cfg)
+			for _, e := range tc.keys {
+				b.AddInline([]byte(e[0]), []byte(e[1]))
 			}
-			// Restart entry 0 should be at leafHeaderEnd (=12).
-			if got := LeafRestartOffset(buf, cfg, 0); got != leafHeaderEnd {
-				t.Errorf("restart[0] offset = %d, want %d", got, leafHeaderEnd)
-			}
-			// Restart entry 1's offset must point at the
-			// first entry of the second group (i=3, "d"). Decode
-			// at that offset and verify it's a restart-format
-			// entry with the full key — pins that the restart
-			// table contents agree with the encoded layout, not
-			// just the table's position.
-			r1 := LeafRestartOffset(buf, cfg, 1)
-			if r1 <= leafHeaderEnd {
-				t.Errorf("restart[1] offset = %d, expected > %d", r1, leafHeaderEnd)
-			}
-			entry, _, err := decodeLeafEntry(buf, int(r1), cfg.ContentEnd(), true, nil)
-			if err != nil {
-				t.Fatalf("decode entry at restart[1] offset %d: %v", r1, err)
-			}
-			if !bytes.Equal(entry.Key, []byte("d")) {
-				t.Errorf("restart[1] entry Key = %q, want %q", entry.Key, "d")
-			}
-			// Footer-aware: with checksum, applying WritePageFooter
-			// shouldn't clobber the restart table (it lives below
-			// the footer).
-			if withChecksum {
-				WritePageFooter(buf, cfg.PageSize)
-				if got := LeafRestartCount(buf); got != rc {
-					t.Errorf("restart count after footer: got %d, want %d", got, rc)
-				}
-				decoded, err := DecodeLeaf(buf, cfg)
-				if err != nil || len(decoded) != len(entries) {
-					t.Errorf("decode after footer failed: %v decoded=%d", err, len(decoded))
-				}
+			b.Finish()
+			r := NewLeafReader(buf, tc.cfg)
+			if err := r.Validate(); err != nil {
+				t.Errorf("Validate on well-formed %s: %v", tc.name, err)
 			}
 		})
 	}
 }
 
-func TestLeafOverflowEntryRoundTrip(t *testing.T) {
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	// Order: "big" < "small" lexicographically.
-	entries := []EncodedEntry{
-		{
-			Key:          []byte("big"),
-			Flags:        CellFlagOverflow,
-			OverflowPage: 12345,
-			TotalLen:     999999,
-		},
-		{Key: []byte("small"), Value: []byte("inline")},
-	}
-	if err := EncodeLeaf(buf, cfg, 16, entries); err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	decoded, err := DecodeLeaf(buf, cfg)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if !decoded[0].IsOverflow() || decoded[0].OverflowPage != 12345 || decoded[0].TotalLen != 999999 {
-		t.Errorf("overflow entry round-trip: %+v", decoded[0])
-	}
-	if decoded[1].IsOverflow() {
-		t.Errorf("inline entry IsOverflow incorrectly set")
-	}
-	if !bytes.Equal(decoded[1].Value, []byte("inline")) {
-		t.Errorf("inline value: %q", decoded[1].Value)
-	}
-}
-
-func TestLeafRejectsUnsortedEntries(t *testing.T) {
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	entries := []EncodedEntry{
-		{Key: []byte("b"), Value: []byte("1")},
-		{Key: []byte("a"), Value: []byte("2")},
-	}
-	if err := EncodeLeaf(buf, cfg, 16, entries); err == nil {
-		t.Error("expected error on unsorted entries")
-	}
-}
-
-func TestLeafRejectsDuplicateKeys(t *testing.T) {
-	// EncodeLeaf rejects non-strictly-ascending entries: equal keys
-	// surface as the same error path as out-of-order.
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	entries := []EncodedEntry{
-		{Key: []byte("k"), Value: []byte("1")},
-		{Key: []byte("k"), Value: []byte("2")},
-	}
-	if err := EncodeLeaf(buf, cfg, 16, entries); err == nil {
-		t.Error("expected error on duplicate keys")
-	}
-}
-
-func TestLeafRejectsUnknownCellFlags(t *testing.T) {
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	entries := []EncodedEntry{
-		{Key: []byte("k"), Value: []byte("v"), Flags: 1 << 5}, // reserved bit
-	}
-	if err := EncodeLeaf(buf, cfg, 16, entries); err == nil {
-		t.Error("expected error on unknown CellFlags bits")
-	}
-}
-
-func TestLeafRejectsOverflowWithValue(t *testing.T) {
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	entries := []EncodedEntry{
-		{
-			Key:          []byte("k"),
-			Flags:        CellFlagOverflow,
-			Value:        []byte("nope"),
-			OverflowPage: 1,
-			TotalLen:     100,
-		},
-	}
-	if err := EncodeLeaf(buf, cfg, 16, entries); err == nil {
-		t.Error("expected error: Overflow flag with non-empty Value")
-	}
-}
-
-func TestDecodeLeafRejectsCorruptedKeyLen(t *testing.T) {
-	// Decoder robustness contract (M1 from the 4.2 adversarial
-	// review): a leaf page with a forged restart-entry KeyLen
-	// must surface as an error from DecodeLeaf, NOT a slice-
-	// out-of-bounds panic. Without this property, Check() —
-	// which calls DecodeLeaf on potentially-corrupt on-disk pages
-	// (PageChecksum=false is a supported configuration) — would
-	// crash instead of reporting the bad page.
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	entries := []EncodedEntry{
-		{Key: []byte("k"), Value: []byte("v")},
-	}
-	if err := EncodeLeaf(buf, cfg, 16, entries); err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	// Restart entry at offset 12: [Flags u8][KeyLen u16][ValueLen u32][Key][Val].
-	// KeyLen lives at offset 13..14. Forge to 0xFFFF.
-	le.PutUint16(buf[13:], 0xFFFF)
-	_, err := DecodeLeaf(buf, cfg)
+func TestLeafReader_Validate_RejectsCountZero(t *testing.T) {
+	// Forge a restart-table Count byte to 0 on a compressed leaf —
+	// per page-formats.md §Compressed Leaf invariant, this is
+	// structural corruption.
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	entries := [][2]string{{"a-1", "v"}, {"a-2", "v"}, {"b-1", "v"}, {"b-2", "v"}}
+	buf := buildLeaf(t, cfg, entries)
+	r := NewLeafReader(buf, cfg)
+	// Restart table starts at ContentEnd - RestartCount*4. Zero the
+	// Count byte of group 0 (which sits at table[0] + offset 2).
+	tableStart := cfg.ContentEnd() - r.rt.RestartCount()*restartTableEntrySize
+	buf[tableStart+2] = 0
+	r2 := NewLeafReader(buf, cfg)
+	err := r2.Validate()
 	if err == nil {
-		t.Error("DecodeLeaf accepted forged KeyLen 0xFFFF; expected error")
+		t.Fatal("Validate accepted Count==0 restart-table entry; want ErrCorrupted")
+	}
+	if !errors.Is(err, ErrCorrupted) {
+		t.Errorf("Validate returned %v; want errors.Is(ErrCorrupted)", err)
 	}
 }
 
-func TestDecodeLeafRejectsForgedRestartCount(t *testing.T) {
-	// Decoder robustness contract (M3 from the 4.2 adversarial
-	// review + spec invariant 3): DecodeLeaf cross-checks the
-	// per-page RestartCount against ceil(N/K). A forged value
-	// mislocates the restart table and would let
-	// LeafRestartOffset return offsets into the entries region,
-	// producing silently-wrong lookup results.
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	entries := []EncodedEntry{
-		{Key: []byte("a"), Value: []byte("1")},
-		{Key: []byte("b"), Value: []byte("2")},
-		{Key: []byte("c"), Value: []byte("3")},
-		{Key: []byte("d"), Value: []byte("4")},
-	}
-	if err := EncodeLeaf(buf, cfg, 2, entries); err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	// Correct rc = ceil(4/2) = 2. Forge to 1.
-	le.PutUint16(buf[leafRestartCountOff:], 1)
-	_, err := DecodeLeaf(buf, cfg)
+func TestLeafReader_Validate_RejectsUnknownCellFlags(t *testing.T) {
+	// Forge a CellFlags byte to set bit 7 (reserved). Per
+	// file-layout.md §Reserved-byte policy + page-formats.md §Leaf
+	// Page, unknown CellFlags bits are strict-reject.
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	buf := buildLeaf(t, cfg, [][2]string{{"alpha", "1"}, {"beta", "2"}})
+	r := NewLeafReader(buf, cfg)
+	off := r.ucOffset(0)
+	buf[off] = 0x80 // bit 7 — outside cellFlagKnownMask
+	err := NewLeafReader(buf, cfg).Validate()
 	if err == nil {
-		t.Error("DecodeLeaf accepted forged RestartCount; expected error")
+		t.Fatal("Validate accepted unknown CellFlags; want ErrCorrupted")
+	}
+	if !errors.Is(err, ErrCorrupted) {
+		t.Errorf("Validate returned %v; want errors.Is(ErrCorrupted)", err)
 	}
 }
 
-func TestLeafEncodedSizeMatchesEncodedConsumption(t *testing.T) {
-	// LeafEncodedSize predicts the bytes a leaf will consume
-	// (header + per-entry bytes + restart-table bytes). Verify the
-	// prediction against the ACTUAL on-disk encoding by walking
-	// decodeLeafEntry's returned `next` offsets — that exercises
-	// a different code path (the decoder) than the predictor
-	// (which uses leafEntrySize). A bug in either surfaces as a
-	// mismatch.
-	cfg := Config{PageSize: 4096}
-	buf := newLeafPage(t, cfg)
-	entries := []EncodedEntry{
-		{Key: []byte("aaa-1"), Value: []byte("v1")},
-		{Key: []byte("aaa-2"), Value: []byte("v2")},
-		{Key: []byte("aaa-3"), Value: []byte("v3")},
-		{Key: []byte("aaa-4"), Value: []byte("v4")},
-		{Key: []byte("aaa-5"), Value: []byte("v5")},
+func TestLeafReader_Validate_RejectsCompressedCellFlags(t *testing.T) {
+	// Same as the uncompressed case, but on a compressed leaf — both
+	// restart and delta entries are walked by Validate. Forge the
+	// restart entry's flags.
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	buf := buildLeaf(t, cfg, [][2]string{{"k-1", "v"}, {"k-2", "v"}, {"k-3", "v"}})
+	r := NewLeafReader(buf, cfg)
+	off := r.rt.Offset(0)
+	buf[off] = 0x40 // arbitrary reserved bit
+	err := NewLeafReader(buf, cfg).Validate()
+	if err == nil {
+		t.Fatal("Validate accepted unknown CellFlags in compressed restart; want ErrCorrupted")
 	}
-	predicted := LeafEncodedSize(cfg, 16, entries)
-	if err := EncodeLeaf(buf, cfg, 16, entries); err != nil {
-		t.Fatalf("encode: %v", err)
+	if !errors.Is(err, ErrCorrupted) {
+		t.Errorf("Validate returned %v; want errors.Is(ErrCorrupted)", err)
 	}
-	// Walk the actually-encoded entries via the decoder; the
-	// final `pos` is the byte offset directly after the last
-	// entry — i.e., the start of free space.
-	rc := LeafRestartCount(buf)
-	tableStart := leafRestartTableStart(cfg, rc)
-	pos := leafHeaderEnd
-	var prev []byte
-	for i := range entries {
-		isRestart := i%16 == 0
-		var p []byte
-		if !isRestart {
-			p = prev
+}
+
+// TestLeafReader_Validate_TotalOverInput is the load-bearing
+// "Validate is total over arbitrary input" probe — for each forged
+// length field, Validate must return ErrCorrupted, NOT panic with a
+// slice-out-of-range. The corresponding panics in the prior
+// (decoder-using) implementation were the Round-2 H finding; this
+// test pins the regression boundary.
+func TestLeafReader_Validate_TotalOverInput(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	mk := func() []byte {
+		// Build a small compressed leaf as the base; tests mutate it.
+		return buildLeaf(t, cfg, [][2]string{
+			{"alpha", "v1"}, {"beta", "v2"}, {"gamma", "v3"},
+		})
+	}
+
+	t.Run("compressed-restart-KeyLen-oversize", func(t *testing.T) {
+		buf := mk()
+		r := NewLeafReader(buf, cfg)
+		off := r.rt.Offset(0)
+		// Restart-entry KeyLen is at off+1 (after Flags). Forge to 0xFFFF.
+		le.PutUint16(buf[off+1:], 0xFFFF)
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged restart KeyLen=0xFFFF: err=%v; want ErrCorrupted", err)
 		}
-		entry, next, err := decodeLeafEntry(buf, pos, tableStart, isRestart, p)
-		if err != nil {
-			t.Fatalf("decode entry %d at off=%d: %v", i, pos, err)
+	})
+
+	t.Run("compressed-delta-UnsharedLen-oversize", func(t *testing.T) {
+		buf := mk()
+		r := NewLeafReader(buf, cfg)
+		// Walk to the first delta entry: restart at rt.Offset(0),
+		// delta starts after the restart's body.
+		restartOff := r.rt.Offset(0)
+		_, deltaOff := r.decodeRestartEntry(restartOff)
+		// Delta entry layout: [Flags][SharedLen u16][UnsharedLen u16]...
+		// UnsharedLen at deltaOff+3.
+		le.PutUint16(buf[deltaOff+3:], 0xFFFF)
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged delta UnsharedLen=0xFFFF: err=%v; want ErrCorrupted", err)
 		}
-		prev = entry.Key
-		pos = next
+	})
+
+	t.Run("compressed-header-RestartCount-oversize", func(t *testing.T) {
+		buf := mk()
+		// RestartCount is at offset 8 (leafOffRestartCount). Forge to
+		// 0xFFFF — newRestartTable's tableOff computation would go
+		// negative; Validate must catch and return ErrCorrupted.
+		le.PutUint16(buf[leafOffRestartCount:], 0xFFFF)
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged RestartCount=0xFFFF: err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("uncompressed-KeyLen-oversize", func(t *testing.T) {
+		ucCfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+		buf := buildLeaf(t, ucCfg, [][2]string{{"alpha", "v1"}, {"beta", "v2"}})
+		r := NewLeafReader(buf, ucCfg)
+		off := r.ucOffset(0)
+		// UC entry: [Flags][KeyLen u16]... so KeyLen at off+1.
+		le.PutUint16(buf[off+1:], 0xFFFF)
+		err := NewLeafReader(buf, ucCfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged UC KeyLen=0xFFFF: err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("uncompressed-ValueLen-oversize", func(t *testing.T) {
+		ucCfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+		buf := buildLeaf(t, ucCfg, [][2]string{{"alpha", "v1"}, {"beta", "v2"}})
+		r := NewLeafReader(buf, ucCfg)
+		off := r.ucOffset(0)
+		// UC inline entry: [Flags][KeyLen u16][ValueLen u32]...
+		// ValueLen at off+3.
+		le.PutUint32(buf[off+3:], 0xFFFFFFFF)
+		err := NewLeafReader(buf, ucCfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged UC ValueLen=0xFFFFFFFF: err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("compressed-DataEnd-out-of-range", func(t *testing.T) {
+		buf := mk()
+		// DataEnd at offset 10 (leafOffDataEnd). Forge to 0xFFFF.
+		le.PutUint16(buf[leafOffDataEnd:], 0xFFFF)
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged DataEnd=0xFFFF: err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("compressed-sum-counts-mismatch", func(t *testing.T) {
+		buf := mk()
+		r := NewLeafReader(buf, cfg)
+		// Bump every group's Count by 1 — sum will exceed header
+		// Count, triggering the sum-of-counts check.
+		tableStart := cfg.ContentEnd() - r.rt.RestartCount()*restartTableEntrySize
+		for g := range r.rt.RestartCount() {
+			off := tableStart + g*restartTableEntrySize + 2
+			buf[off] = buf[off] + 1
+		}
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged sum-of-counts: err=%v; want ErrCorrupted", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Config validation
+// ---------------------------------------------------------------------------
+
+func TestConfig_ValidateRejectsBadRestartGroupTarget(t *testing.T) {
+	for _, bad := range []uint16{256, 1000, 65535} {
+		cfg := Config{PageSize: 4096, RestartGroupTarget: bad}
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate(RestartGroupTarget=%d): expected error", bad)
+		}
 	}
-	encodedConsumed := pos + int(rc)*leafRestartTableEntrySize
-	if predicted != encodedConsumed {
-		t.Errorf("LeafEncodedSize=%d, on-disk consumption=%d", predicted, encodedConsumed)
+	// Valid range.
+	for _, ok := range []uint16{0, 1, 2, 16, 255} {
+		cfg := Config{PageSize: 4096, RestartGroupTarget: ok}
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate(RestartGroupTarget=%d): %v; want nil", ok, err)
+		}
 	}
 }

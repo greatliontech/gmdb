@@ -10,12 +10,25 @@ import (
 var le = binary.LittleEndian
 
 // Page type constants stored in the Type field of the page header.
+// TypeLeaf is the prefix-compressed leaf variant (variable-size restart
+// groups per page-formats.md §Compressed Leaf); TypeLeafUncompressed is the
+// variant selected by RestartGroupTarget == 1 (full keys + positional
+// offset table per §Uncompressed Leaf). Both share the 8-byte common
+// header and place entry data at offset 12.
 const (
-	TypeBranch     uint8 = 1
-	TypeLeaf       uint8 = 2
-	TypeOverflow   uint8 = 3
-	TypeRPLSegment uint8 = 4
+	TypeBranch           uint8 = 1
+	TypeLeaf             uint8 = 2
+	TypeOverflow         uint8 = 3
+	TypeRPLSegment       uint8 = 4
+	TypeLeafUncompressed uint8 = 5
 )
+
+// IsLeafType reports whether typ is any leaf variant (compressed or
+// uncompressed). The btree dispatcher uses this to gate descent on a
+// page's type byte without committing to a specific encoding.
+func IsLeafType(typ uint8) bool {
+	return typ == TypeLeaf || typ == TypeLeafUncompressed
+}
 
 // Magic identifies a gmdb file. LE encoding produces bytes
 // [0x67, 0x6D, 0x64, 0x62] = "gmdb" readable in hex dumps.
@@ -56,26 +69,64 @@ func ValidPageSize(size uint32) bool {
 	return size&(size-1) == 0
 }
 
+// DefaultRestartGroupTarget is the engine default restart-group target
+// applied when Config.RestartGroupTarget == 0. Mirrors the spec at
+// api-surface.md Options.RestartGroupTarget default.
+const DefaultRestartGroupTarget uint16 = 16
+
+// MaxRestartGroupTarget is the hard physical cap on RestartGroupTarget: the
+// compressed-leaf restart-table entry's Count field is uint8 (per
+// page-formats.md §Compressed Leaf), so groups can hold at most 255 entries.
+// Config.Validate rejects values above this; callers translate to
+// gmdb.ErrInvalidOptions at the public surface.
+const MaxRestartGroupTarget uint16 = 255
+
 // Config bundles the page-size-dependent values that callers thread through
-// the package. Built once per database Open from the meta page. Validate
-// before use — every consumer (encoders, decoders, checksum helpers,
-// RPLEntriesPerSegment) assumes a valid Config, and the data file's
-// PageSize invariant (`file-layout.md`) is encoded against that assumption.
+// the package. Built once per database Open from the meta page (PageSize,
+// PageChecksum) and threaded with the per-keyspace RestartGroupTarget when
+// building or reading leaf pages. Validate before use — every consumer
+// (encoders, decoders, checksum helpers, RPLEntriesPerSegment) assumes a
+// valid Config, and the data file's PageSize invariant (`file-layout.md`)
+// is encoded against that assumption.
+//
+// RestartGroupTarget bounds (per page-formats.md):
+//   - 0   ⇒ engine default (DefaultRestartGroupTarget = 16).
+//   - 1   ⇒ uncompressed-leaf variant (TypeLeafUncompressed).
+//   - 2.. ⇒ compressed-leaf variant (TypeLeaf) with target as the maximum
+//           group entry count.
+//   - >255 ⇒ rejected by Validate (restart-table Count field is uint8).
 type Config struct {
-	PageSize     uint32
-	PageChecksum bool
+	PageSize           uint32
+	PageChecksum       bool
+	RestartGroupTarget uint16
+}
+
+// EffectiveRestartGroupTarget returns the effective target — the configured
+// value if non-zero, otherwise DefaultRestartGroupTarget. Used by the leaf
+// builder to decide which variant to produce and how many entries to pack
+// per compressed group.
+func (c Config) EffectiveRestartGroupTarget() uint16 {
+	if c.RestartGroupTarget == 0 {
+		return DefaultRestartGroupTarget
+	}
+	return c.RestartGroupTarget
 }
 
 // Validate reports whether c describes a supported page configuration.
 // Returns an error when PageSize is not a power of two in [MinPageSize,
-// MaxPageSize]; PageChecksum is unconstrained (either bool is legal).
-// Boundary consumers (Open, pager construction) Validate at entry; the
-// rest of the package panics on a Config it knows to be invalid since
-// reaching it indicates a programming error upstream.
+// MaxPageSize], or when RestartGroupTarget exceeds MaxRestartGroupTarget;
+// PageChecksum is unconstrained (either bool is legal). Boundary consumers
+// (Open, pager construction) Validate at entry; the rest of the package
+// panics on a Config it knows to be invalid since reaching it indicates a
+// programming error upstream.
 func (c Config) Validate() error {
 	if !ValidPageSize(c.PageSize) {
 		return fmt.Errorf("page: invalid PageSize %d (must be a power of two in [%d, %d])",
 			c.PageSize, MinPageSize, MaxPageSize)
+	}
+	if c.RestartGroupTarget > MaxRestartGroupTarget {
+		return fmt.Errorf("page: RestartGroupTarget %d exceeds MaxRestartGroupTarget %d (Count field is uint8)",
+			c.RestartGroupTarget, MaxRestartGroupTarget)
 	}
 	return nil
 }

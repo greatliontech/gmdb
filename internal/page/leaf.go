@@ -1,42 +1,44 @@
 package page
 
+// Leaf-page formats per page-formats.md §Leaf Page. Two variants share the
+// 8-byte common header and the "entries forward / lookup table backward"
+// layout; only the per-entry encoding and lookup machinery differ:
+//
+//   - TypeLeaf (compressed): variable-size restart groups, prefix-compressed
+//     delta entries within each group. Format details in leaf_compressed.go.
+//   - TypeLeafUncompressed: full keys per entry, positional offset table.
+//     Format details in leaf_uncompressed.go.
+//
+// The dispatch surface is LeafReader (read-side) and LeafBuilder
+// (write-side). Both inspect the page's Type byte and route to the
+// variant-specific implementation. The btree consumer uses LeafReader /
+// LeafBuilder / LeafIter exclusively — never the variant-specific helpers
+// directly.
+
 import (
 	"bytes"
+	"errors"
 	"fmt"
 )
 
-// Leaf-page layout per page-formats.md §Leaf Page:
-//
-//	+-----------------------+ offset 0
-//	| Page Header (8 bytes) | Type=TypeLeaf, Count=N (entry count)
-//	+-----------------------+ offset 8
-//	| RestartInterval u16   | per-keyspace target (default 16)
-//	| RestartCount    u16   | number of restart points
-//	+-----------------------+ offset 12
-//	| Entry 0 (restart)     | entries forward-packed from offset 12
-//	| Entry 1 (delta)       |
-//	| ...                   |
-//	+-----------------------+ grows forward
-//	|       free space      |
-//	+-----------------------+
-//	| Restart Table         | RestartCount × 2 bytes, packed at
-//	|                       | content end
-//	+-----------------------+ ContentEnd (PageSize - optional 8-byte footer)
-
+// Common header offsets for both leaf variants. The 4 bytes after the
+// 8-byte common page header are variant-specific (DataEnd + (RestartCount
+// or Reserved)), but the entry-data region always starts at offset 12.
 const (
-	// leafHeaderEnd is the byte offset where entries begin: after
-	// the common header (8) + RestartInterval (2) + RestartCount
-	// (2) = 12.
-	leafHeaderEnd = 12
+	// leafEntryStart is the byte offset where leaf entries begin in
+	// either variant. Holding this constant across variants lets the
+	// split helpers + Check() walk per-entry without per-variant offset
+	// branches.
+	leafEntryStart = HeaderSize + 4 // 12
 
-	// leafRestartTableEntrySize is the byte length of one restart
-	// table entry — a uint16 offset into the page.
-	leafRestartTableEntrySize = 2
+	// Per-variant header field offsets (within the 4 bytes after the
+	// common 8-byte header).
+	leafOffRestartCount = HeaderSize     // compressed: RestartCount uint16
+	leafOffDataEnd      = HeaderSize + 2 // both:       DataEnd uint16
+	ucLeafOffDataEnd    = HeaderSize     // uncompressed: DataEnd uint16 (no RestartCount)
 
-	// leafRestartIntervalOff / leafRestartCountOff are the offsets
-	// of the per-page leaf-header fields.
-	leafRestartIntervalOff = HeaderSize
-	leafRestartCountOff    = HeaderSize + 2
+	// Offset-table entry size for uncompressed leaves (positional table).
+	ucOffsetEntrySize = 2
 )
 
 // CellFlags bit assignments per page-formats.md §Leaf Page.
@@ -45,19 +47,31 @@ const (
 	CellFlagMultiValue uint8 = 1 << 1
 	CellFlagNestedTree uint8 = 1 << 2
 
-	// cellFlagKnownMask is the union of currently-defined cell
-	// flag bits. Decoders reject any flag outside this mask.
+	// cellFlagKnownMask is the union of currently-defined cell flag
+	// bits. The strict-reject rule from file-layout.md §Reserved-byte
+	// policy is enforced via LeafReader.Validate (not in the hot-path
+	// decoders, which assume well-formed input); see Validate's doc
+	// for the boundary discipline.
 	cellFlagKnownMask = CellFlagOverflow | CellFlagMultiValue | CellFlagNestedTree
 )
 
-// LeafEntry is the decoded form of one leaf cell. Key and Value
-// slices borrow from the page buffer (and, for delta entries, the
-// Key field is materialised by reconstruction — see LeafCursor).
-// Callers MUST NOT modify or retain past page-buffer lifetime.
+// ErrCorrupted is the leaf-decoder corruption sentinel. Wraps a
+// human-readable description of the structural fault (out-of-bounds
+// length, unknown flag bit, restart-table Count=0, etc.). The btree
+// caller maps to btree.ErrCorrupted at its boundary.
+var ErrCorrupted = errors.New("page: leaf structural corruption")
+
+// LeafEntry holds the decoded fields of one leaf entry. Used by both the
+// compressed and uncompressed variants and by the Iter / Search return
+// types. Slice ownership:
 //
-// For overflow references, Value is nil and OverflowPage / TotalLen
-// are populated; the caller is responsible for assembling the
-// large value by walking the overflow run.
+//   - Key: backed by the page buffer for restart entries in compressed
+//     leaves and for all entries in uncompressed leaves; backed by the
+//     iterator's keyBuf for compressed delta entries (since the full key
+//     must be reconstructed). Caller MUST NOT retain past the next
+//     iterator move or leaf transition.
+//   - Value: backed by the page buffer when Flags&Overflow == 0; nil for
+//     overflow entries (consult OverflowPage + TotalLen for the run).
 type LeafEntry struct {
 	Flags        uint8
 	Key          []byte
@@ -66,563 +80,476 @@ type LeafEntry struct {
 	TotalLen     uint64
 }
 
-// IsOverflow reports whether the entry's value lives in an overflow
-// run rather than inline on the leaf.
+// IsOverflow reports whether the entry's value lives in an overflow run
+// rather than inline on the leaf.
 func (e LeafEntry) IsOverflow() bool { return e.Flags&CellFlagOverflow != 0 }
 
-// LeafRestartInterval / LeafRestartCount expose the per-page leaf
-// header fields. RestartInterval is the per-keyspace target K;
-// RestartCount is the number of restart points = ceil(N / K).
-func LeafRestartInterval(buf []byte) uint16 {
-	_ = buf[leafRestartIntervalOff+1]
-	return le.Uint16(buf[leafRestartIntervalOff:])
+// LeafReader provides read access over both compressed and uncompressed
+// leaf pages. Constructed once per Page-resolution boundary in the btree
+// descent; cheap by value, holds only a slice header into the page buffer
+// plus precomputed extents.
+type LeafReader struct {
+	buf        []byte
+	cfg        Config
+	count      int
+	dataEnd    int
+	compressed bool
+	// Compressed variant only:
+	rt restartTable
+	// Uncompressed variant only:
+	ucTableOff int // byte offset of the positional offset table
 }
 
-func LeafRestartCount(buf []byte) uint16 {
-	_ = buf[leafRestartCountOff+1]
-	return le.Uint16(buf[leafRestartCountOff:])
-}
-
-// LeafEntryCount returns the total entry count N from the page
-// header. Wraps ReadHeader for type-safety on leaf pages.
-func LeafEntryCount(buf []byte) uint16 {
-	typ, _, count, _ := ReadHeader(buf)
-	if typ != TypeLeaf {
-		panic(fmt.Sprintf("page: LeafEntryCount on type %d (want %d)", typ, TypeLeaf))
-	}
-	return count
-}
-
-// leafRestartTableStart returns the byte offset where the restart
-// table begins. Per page-formats.md the table sits immediately
-// before the optional checksum footer; given RestartCount restart
-// points each of 2 bytes, the table occupies
-// [ContentEnd - RestartCount*2, ContentEnd).
-func leafRestartTableStart(cfg Config, restartCount uint16) int {
-	return cfg.ContentEnd() - int(restartCount)*leafRestartTableEntrySize
-}
-
-// LeafRestartOffset returns the byte offset of the i-th restart
-// entry, read from the restart table. Used by leaf lookup's
-// binary-search phase.
-func LeafRestartOffset(buf []byte, cfg Config, i uint16) uint16 {
-	cfg.mustValidate()
-	rc := LeafRestartCount(buf)
-	if i >= rc {
-		panic(fmt.Sprintf("page: LeafRestartOffset(%d) out of range [0, %d)", i, rc))
-	}
-	tableStart := leafRestartTableStart(cfg, rc)
-	return le.Uint16(buf[tableStart+int(i)*leafRestartTableEntrySize:])
-}
-
-// EncodedEntry is one entry to feed into EncodeLeaf. The caller
-// supplies the full (Flags, Key, Value/OverflowPage+TotalLen) for
-// every entry in the page's logical order; the codec decides which
-// entries land at restart positions and applies delta compression
-// to the rest.
-//
-// For inline values, set Flags=0 (or just CellFlagMultiValue for
-// subpage cells) and Value to the inline bytes. For overflow
-// references, set Flags|=CellFlagOverflow and OverflowPage +
-// TotalLen; Value must be nil.
-type EncodedEntry struct {
-	Flags        uint8
-	Key          []byte
-	Value        []byte
-	OverflowPage uint64
-	TotalLen     uint64
-}
-
-// EncodeLeaf writes entries into buf with restart-grouping at
-// intervals of `interval` (the leaf's RestartInterval, persisted
-// per-page; see page-formats.md). Entries MUST be in ascending Key
-// order (the codec verifies and errors on violation rather than
-// silently mis-encoding).
-//
-// Returns an error if the entries don't fit. Caller can check
-// fit-ahead with LeafEncodedSize.
-//
-// Encoding format per page-formats.md §Leaf Page:
-//
-//   - Restart entry (index 0, K, 2K, ...): full key.
-//     Inline:    [Flags u8][KeyLen u16][ValueLen u32][Key][Value]
-//     Overflow:  [Flags u8|=Overflow][KeyLen u16][Key][OvflPage u64][TotalLen u64]
-//
-//   - Delta entry (other indices): shared prefix omitted.
-//     Inline:    [Flags u8][SharedLen u16][UnsharedLen u16][ValueLen u32][UnsharedKey][Value]
-//     Overflow:  [Flags u8|=Overflow][SharedLen u16][UnsharedLen u16][UnsharedKey][OvflPage u64][TotalLen u64]
-func EncodeLeaf(buf []byte, cfg Config, interval uint16, entries []EncodedEntry) error {
+// NewLeafReader wraps buf as a leaf page reader. It dispatches on the
+// page's Type byte and initializes variant-specific state. Panics on a
+// non-leaf type (programming error at the call site — callers gate via
+// IsLeafType or read the header themselves).
+func NewLeafReader(buf []byte, cfg Config) LeafReader {
 	cfg.mustValidate()
 	if len(buf) != int(cfg.PageSize) {
-		return fmt.Errorf("page: EncodeLeaf buf len %d != PageSize %d", len(buf), cfg.PageSize)
+		panic(fmt.Sprintf("page: NewLeafReader buf len %d != PageSize %d", len(buf), cfg.PageSize))
 	}
-	if interval == 0 {
-		return fmt.Errorf("page: EncodeLeaf RestartInterval must be > 0")
+	typ, _, count, _ := ReadHeader(buf)
+	if !IsLeafType(typ) {
+		panic(fmt.Sprintf("page: NewLeafReader on non-leaf type %d", typ))
 	}
-	for i := 1; i < len(entries); i++ {
-		if bytes.Compare(entries[i-1].Key, entries[i].Key) >= 0 {
-			return fmt.Errorf("page: EncodeLeaf entries not strictly ascending at index %d", i)
+	contentEnd := cfg.ContentEnd()
+	if typ == TypeLeafUncompressed {
+		return LeafReader{
+			buf:        buf,
+			cfg:        cfg,
+			count:      int(count),
+			dataEnd:    int(le.Uint16(buf[ucLeafOffDataEnd:])),
+			compressed: false,
+			ucTableOff: contentEnd - int(count)*ucOffsetEntrySize,
 		}
 	}
-	for i, e := range entries {
-		if e.Flags&^cellFlagKnownMask != 0 {
-			return fmt.Errorf("page: EncodeLeaf entry %d: unknown flag bits 0x%x", i, e.Flags&^cellFlagKnownMask)
+	rc := int(le.Uint16(buf[leafOffRestartCount:]))
+	return LeafReader{
+		buf:        buf,
+		cfg:        cfg,
+		count:      int(count),
+		dataEnd:    int(le.Uint16(buf[leafOffDataEnd:])),
+		compressed: true,
+		rt:         newRestartTable(buf, rc, contentEnd),
+	}
+}
+
+// Buf returns the underlying page buffer for callers that need to perform
+// further page-level inspection (e.g. ReadHeader for type-byte checks in a
+// generic walker). The returned slice is borrowed; do not retain past the
+// reader's lifetime.
+func (r LeafReader) Buf() []byte { return r.buf }
+
+// Compressed reports whether this leaf is a compressed (variable-restart-
+// groups, delta-encoded) page. False ⇒ uncompressed (positional offset
+// table, full keys).
+func (r LeafReader) Compressed() bool { return r.compressed }
+
+// Count returns the number of entries in the leaf.
+func (r LeafReader) Count() int { return r.count }
+
+// DataEnd returns the byte offset after the last entry's data. Useful for
+// fit checks and free-space computation in the in-place splice helpers.
+func (r LeafReader) DataEnd() int { return r.dataEnd }
+
+// RestartCount returns the number of restart groups. For uncompressed
+// leaves every entry is its own "group" (a positional slot), so this
+// returns Count(); the abstraction lets generic walkers iterate
+// group-by-group regardless of variant.
+func (r LeafReader) RestartCount() int {
+	if !r.compressed {
+		return r.count
+	}
+	return r.rt.RestartCount()
+}
+
+// GroupEntryCount returns the number of entries in the i-th restart group.
+// For uncompressed leaves every group has exactly 1 entry.
+func (r LeafReader) GroupEntryCount(i int) int {
+	if !r.compressed {
+		return 1
+	}
+	return r.rt.GroupEntryCount(i)
+}
+
+// SearchLeaf performs a key lookup against the leaf. Returns the entry's
+// absolute index, the entry (with Key always nil — callers either had the
+// target already or don't need the key bytes back), and whether the key
+// was found. On miss, index is the insertion point (the index of the
+// smallest key strictly greater than target, or Count() if every entry is
+// less than target). Same robustness contract as the per-variant
+// decoders: total over input; errors flow through return-error variants
+// (TODO: chunk-4.6γ will wire an err-returning sibling).
+func (r LeafReader) SearchLeaf(target []byte) (index int, entry LeafEntry, found bool) {
+	if r.count == 0 {
+		return 0, LeafEntry{}, false
+	}
+	if !r.compressed {
+		return r.ucSearchLeaf(target)
+	}
+	return r.compressedSearchLeaf(target)
+}
+
+// SearchLeafIter is the cursor-friendly form of SearchLeaf: returns the
+// lookup result plus a LeafIter whose next Next() call returns the entry
+// immediately AFTER the returned found/successor entry (i.e. positioned
+// past the result, ready to stream forward). Carries delta-decode state
+// accumulated during the scan so the cursor's Seek/SeekGE avoid a second
+// group walk per page-formats.md §Leaf Lookup.
+//
+// keyBuf / bufKeys / bufEnts are caller-supplied scratch buffers reused by
+// the iter; pass the cursor's previously-returned KeyBuf/BufKeys/BufEnts
+// so allocation amortizes to zero across leaf transitions in the steady-
+// state cursor loop.
+func (r LeafReader) SearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []LeafEntry) (int, LeafEntry, bool, LeafIter) {
+	if r.count == 0 {
+		return 0, LeafEntry{}, false, LeafIter{
+			r:       r,
+			keyBuf:  keyBuf[:0],
+			bufKeys: bufKeys[:0],
+			bufEnts: bufEnts[:0],
 		}
-		if e.Flags&CellFlagOverflow != 0 && len(e.Value) != 0 {
-			return fmt.Errorf("page: EncodeLeaf entry %d: Overflow flag with non-empty Value", i)
+	}
+	if !r.compressed {
+		return r.ucSearchLeafIter(target, keyBuf, bufKeys, bufEnts)
+	}
+	return r.compressedSearchLeafIter(target, keyBuf, bufKeys, bufEnts)
+}
+
+// EntryAt decodes the entry at absolute index idx. For compressed leaves
+// this walks the entry's containing group from its restart point (O(K));
+// hot callers should use a LeafIter and call At through that to amortize
+// across multiple in-group hits. keyBuf is scratch storage for the
+// reconstructed key (compressed only); pass the cursor's keyBuf to avoid
+// per-call allocation. The returned entry's Key may alias keyBuf or the
+// page buffer.
+func (r LeafReader) EntryAt(idx int, keyBuf []byte) (LeafEntry, []byte) {
+	if idx < 0 || idx >= r.count {
+		panic(fmt.Sprintf("page: LeafReader.EntryAt %d out of range [0, %d)", idx, r.count))
+	}
+	if !r.compressed {
+		e, _ := r.ucDecodeEntry(r.ucOffset(idx))
+		return e, keyBuf
+	}
+	return r.compressedEntryAt(idx, keyBuf)
+}
+
+// LastKey returns the key of the last entry in the leaf, doing the
+// minimum decoding required (skip values; reconstruct deltas only for
+// the final group on compressed pages). Useful for the split-time
+// boundary-key reconstruction described in page-formats.md §Leaf Split.
+// keyBuf is scratch for delta-key reconstruction (compressed only); the
+// returned key may alias keyBuf or the page buffer.
+func (r LeafReader) LastKey(keyBuf []byte) ([]byte, []byte) {
+	if r.count == 0 {
+		return nil, keyBuf
+	}
+	if !r.compressed {
+		off := r.ucOffset(r.count - 1)
+		flags := r.buf[off]
+		off++
+		keyLen := int(le.Uint16(r.buf[off:]))
+		off += 2
+		if flags&CellFlagOverflow == 0 {
+			off += 4 // skip ValueLen uint32 — Key follows
 		}
-		// MultiValue/NestedTree cells land in chunk 6 (SetKeyspace);
-		// for chunk 4 we permit the bits but the encoder treats
-		// them as opaque inline values. EncodeLeaf neither knows
-		// nor cares about subpage internal structure.
+		return r.buf[off : off+keyLen], keyBuf
+	}
+	return r.compressedLastKey(keyBuf)
+}
+
+// FirstKey returns the key of the first entry. Both variants store the
+// first entry's full key inline (compressed: at the first restart point;
+// uncompressed: at offset 0 of the entry-data region), so this is a
+// constant-time slice into the page buffer regardless of variant.
+func (r LeafReader) FirstKey() []byte {
+	if r.count == 0 {
+		return nil
+	}
+	off := leafEntryStart
+	off++ // skip CellFlags
+	keyLen := int(le.Uint16(r.buf[off:]))
+	off += 2
+	if !r.compressed {
+		// uncompressed: [CellFlags][KeyLen][ValueLen][Key]...
+		// already advanced past CellFlags + KeyLen; skip ValueLen if
+		// inline, or skip nothing if overflow (overflow lays Key
+		// immediately after KeyLen, then OvflPage + TotalLen).
+		if r.buf[leafEntryStart]&CellFlagOverflow == 0 {
+			off += 4 // ValueLen uint32
+		}
+		return r.buf[off : off+keyLen]
+	}
+	// compressed: restart entry layout matches the uncompressed inline
+	// layout (CellFlags + KeyLen + ValueLen + Key + Value).
+	if r.buf[leafEntryStart]&CellFlagOverflow == 0 {
+		off += 4
+	}
+	return r.buf[off : off+keyLen]
+}
+
+// FreeSpace returns the byte count of unused space between the
+// entry-data tail and the lookup-table start. Used by the in-place
+// splice helpers to fit-check appends and inserts. Negative values are
+// not reachable from a well-formed page; the helpers gate their use on
+// the returned value being nonnegative.
+func (r LeafReader) FreeSpace() int {
+	if !r.compressed {
+		return r.cfg.ContentEnd() - r.dataEnd - r.count*ucOffsetEntrySize
+	}
+	return r.cfg.ContentEnd() - r.dataEnd - r.rt.RestartCount()*restartTableEntrySize
+}
+
+// Validate walks the page's structural surface and returns ErrCorrupted
+// (wrapped with context) on any spec invariant violation. Total over
+// its input: any byte sequence within `r.buf` either returns a clean
+// ErrCorrupted or nil — never panics on slice-out-of-range. This is
+// the load-bearing contract for the btree-level pager.Page boundary
+// and Check(), both of which feed arbitrary on-disk pages here.
+//
+// Checks performed:
+//
+//   - Compressed: restart-table fits within the content area; every
+//     restart-table entry has `Count >= 1` (per page-formats.md
+//     §Compressed Leaf — `Count == 0` leaves the next group's start
+//     ambiguous since variable-group reads sum counts to derive group
+//     ranges); the sum of group counts equals the page header's Count.
+//   - Both variants: per-entry walk with bounds-checked field reads;
+//     CellFlags has no bits outside cellFlagKnownMask (per
+//     file-layout.md §Reserved-byte policy — strict-reject for flag
+//     bits); declared lengths fit within the entry data region
+//     `[leafEntryStart, dataEnd)`.
+//
+// NewLeafReader is intentionally NOT a validation boundary: it
+// initializes per-variant metadata cheaply (O(1)) so cursor hot-path
+// re-construction doesn't pay a per-page walk. Callers that resolve a
+// page from disk for the first time (the btree's pager.Page boundary,
+// or Check()) should call Validate to surface corruption before
+// invoking the read paths (SearchLeaf, Iter, EntryAt), which assume
+// structural validity and either panic or decode garbage on malformed
+// input. The internal decoder helpers (decodeRestartEntry,
+// decodeDeltaEntry, ucDecodeEntry) are NOT bounds-checked because
+// they're on the hot lookup path; Validate's own walk uses checked
+// sibling helpers (validateRestartEntry, validateDeltaEntry,
+// validateUCEntry) defined below.
+func (r LeafReader) Validate() error {
+	contentEnd := r.cfg.ContentEnd()
+	if r.dataEnd < leafEntryStart || r.dataEnd > contentEnd {
+		return fmt.Errorf("%w: leaf DataEnd %d outside [%d, %d]", ErrCorrupted, r.dataEnd, leafEntryStart, contentEnd)
+	}
+	if r.compressed {
+		rc := r.rt.RestartCount()
+		// Restart table must fit between DataEnd and ContentEnd.
+		tableBytes := rc * restartTableEntrySize
+		if r.dataEnd+tableBytes > contentEnd {
+			return fmt.Errorf("%w: compressed leaf restart table (RestartCount=%d, %d bytes) overlaps DataEnd %d / ContentEnd %d",
+				ErrCorrupted, rc, tableBytes, r.dataEnd, contentEnd)
+		}
+		if rc == 0 && r.count > 0 {
+			return fmt.Errorf("%w: compressed leaf has %d entries but 0 restart groups", ErrCorrupted, r.count)
+		}
+		// Count == 0 forbidden; sum-of-Counts must equal r.count.
+		sum := 0
+		for g := range rc {
+			c := r.rt.GroupEntryCount(g)
+			if c == 0 {
+				return fmt.Errorf("%w: compressed leaf restart group %d has Count=0 (spec invariant)", ErrCorrupted, g)
+			}
+			sum += c
+			// Restart-table Offset must point within the entry-data
+			// region.
+			off := r.rt.Offset(g)
+			if off < leafEntryStart || off >= r.dataEnd {
+				return fmt.Errorf("%w: compressed leaf restart[%d] offset %d outside [%d, %d)", ErrCorrupted, g, off, leafEntryStart, r.dataEnd)
+			}
+		}
+		if sum != r.count {
+			return fmt.Errorf("%w: compressed leaf sum-of-group-counts %d != header Count %d", ErrCorrupted, sum, r.count)
+		}
+	} else {
+		// Uncompressed: offset table must fit; check below in the
+		// per-entry walk validates each offset is in-range.
+		tableBytes := r.count * ucOffsetEntrySize
+		if r.dataEnd+tableBytes > contentEnd {
+			return fmt.Errorf("%w: uncompressed leaf offset table (Count=%d, %d bytes) overlaps DataEnd %d / ContentEnd %d",
+				ErrCorrupted, r.count, tableBytes, r.dataEnd, contentEnd)
+		}
 	}
 
-	clear(buf)
-	WriteHeader(buf, TypeLeaf, uint16(len(entries)), 0)
-	le.PutUint16(buf[leafRestartIntervalOff:], interval)
-
-	// Phase 1: figure out per-entry sizes + which entries are
-	// restart points, then verify the encoded size fits before
-	// touching buf.
-	restartCount := uint16(0)
-	for i := range entries {
-		if uint16(i)%interval == 0 {
-			restartCount++
-		}
+	// Per-entry walks. Both branches use bounds-checked helpers and
+	// surface ErrCorrupted on any over-read.
+	if r.count == 0 {
+		return nil
 	}
-	totalEntryBytes := 0
-	for i, e := range entries {
-		isRestart := uint16(i)%interval == 0
-		var prev []byte
-		if !isRestart {
-			prev = entries[i-1].Key
+	if !r.compressed {
+		for i := range r.count {
+			off := r.ucOffset(i)
+			if off < leafEntryStart || off >= r.dataEnd {
+				return fmt.Errorf("%w: uncompressed leaf offset[%d]=%d outside [%d, %d)", ErrCorrupted, i, off, leafEntryStart, r.dataEnd)
+			}
+			if err := r.validateUCEntry(off); err != nil {
+				return fmt.Errorf("%w: uncompressed leaf entry %d: %w", ErrCorrupted, i, err)
+			}
 		}
-		totalEntryBytes += leafEntrySize(e, isRestart, prev)
+		return nil
 	}
-	need := leafHeaderEnd + totalEntryBytes + int(restartCount)*leafRestartTableEntrySize
-	if need > cfg.ContentEnd() {
-		return fmt.Errorf("page: EncodeLeaf %d entries need %d bytes, page content area is %d",
-			len(entries), need, cfg.ContentEnd())
-	}
-	le.PutUint16(buf[leafRestartCountOff:], restartCount)
-
-	// Phase 2: emit entries forward; record restart-point offsets.
-	pos := leafHeaderEnd
-	restartTable := make([]uint16, 0, restartCount)
-	for i, e := range entries {
-		isRestart := uint16(i)%interval == 0
-		var prev []byte
-		if !isRestart {
-			prev = entries[i-1].Key
+	// Compressed: walk by restart groups using validated decoders.
+	for g := range r.rt.RestartCount() {
+		gc := r.rt.GroupEntryCount(g)
+		off := r.rt.Offset(g)
+		for i := range gc {
+			if off > r.dataEnd {
+				return fmt.Errorf("%w: compressed leaf entry walk ran past DataEnd at group %d entry %d", ErrCorrupted, g, i)
+			}
+			var next int
+			var err error
+			if i == 0 {
+				next, err = r.validateRestartEntry(off)
+			} else {
+				next, err = r.validateDeltaEntry(off)
+			}
+			if err != nil {
+				return fmt.Errorf("%w: compressed leaf group %d entry %d: %w", ErrCorrupted, g, i, err)
+			}
+			off = next
 		}
-		if isRestart {
-			restartTable = append(restartTable, uint16(pos))
-		}
-		pos += writeLeafEntry(buf[pos:], e, isRestart, prev)
-	}
-	// Restart table: written at [ContentEnd - restartCount*2, ContentEnd).
-	tableStart := leafRestartTableStart(cfg, restartCount)
-	for i, off := range restartTable {
-		le.PutUint16(buf[tableStart+i*leafRestartTableEntrySize:], off)
 	}
 	return nil
 }
 
-// leafEntrySize computes the on-disk byte size of an entry. Pure
-// function for the fit-ahead pass.
-func leafEntrySize(e EncodedEntry, isRestart bool, prev []byte) int {
-	if isRestart {
-		if e.Flags&CellFlagOverflow != 0 {
-			// [Flags u8][KeyLen u16][Key][OvflPage u64][TotalLen u64]
-			return 1 + 2 + len(e.Key) + 8 + 8
-		}
-		// [Flags u8][KeyLen u16][ValueLen u32][Key][Value]
-		return 1 + 2 + 4 + len(e.Key) + len(e.Value)
+// validateRestartEntry checks a restart entry at off and returns the
+// offset of the next entry. Returns a non-nil error (without
+// ErrCorrupted wrap — the caller wraps with structural context) on any
+// bounds violation or unknown CellFlags.
+func (r LeafReader) validateRestartEntry(off int) (int, error) {
+	if err := r.ensureBytes(off, 1); err != nil {
+		return 0, err
 	}
-	shared := commonPrefixLen(prev, e.Key)
-	unshared := len(e.Key) - shared
-	if e.Flags&CellFlagOverflow != 0 {
-		// [Flags u8][SharedLen u16][UnsharedLen u16][UnsharedKey][OvflPage u64][TotalLen u64]
-		return 1 + 2 + 2 + unshared + 8 + 8
+	flags := r.buf[off]
+	if flags&^cellFlagKnownMask != 0 {
+		return 0, fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
 	}
-	// [Flags u8][SharedLen u16][UnsharedLen u16][ValueLen u32][UnsharedKey][Value]
-	return 1 + 2 + 2 + 4 + unshared + len(e.Value)
-}
-
-// writeLeafEntry writes one entry at dst[0:]. Returns the number of
-// bytes written. Must agree with leafEntrySize.
-func writeLeafEntry(dst []byte, e EncodedEntry, isRestart bool, prev []byte) int {
-	flags := e.Flags
-	if isRestart {
-		if flags&CellFlagOverflow != 0 {
-			dst[0] = flags
-			le.PutUint16(dst[1:], uint16(len(e.Key)))
-			copy(dst[3:], e.Key)
-			off := 3 + len(e.Key)
-			le.PutUint64(dst[off:], e.OverflowPage)
-			le.PutUint64(dst[off+8:], e.TotalLen)
-			return off + 16
-		}
-		dst[0] = flags
-		le.PutUint16(dst[1:], uint16(len(e.Key)))
-		le.PutUint32(dst[3:], uint32(len(e.Value)))
-		copy(dst[7:], e.Key)
-		off := 7 + len(e.Key)
-		copy(dst[off:], e.Value)
-		return off + len(e.Value)
+	off++
+	if err := r.ensureBytes(off, 2); err != nil {
+		return 0, err
 	}
-	shared := commonPrefixLen(prev, e.Key)
-	unshared := e.Key[shared:]
+	keyLen := int(le.Uint16(r.buf[off:]))
+	off += 2
 	if flags&CellFlagOverflow != 0 {
-		dst[0] = flags
-		le.PutUint16(dst[1:], uint16(shared))
-		le.PutUint16(dst[3:], uint16(len(unshared)))
-		copy(dst[5:], unshared)
-		off := 5 + len(unshared)
-		le.PutUint64(dst[off:], e.OverflowPage)
-		le.PutUint64(dst[off+8:], e.TotalLen)
-		return off + 16
+		// [Flags][KeyLen][Key][OvflPage u64][TotalLen u64]
+		if err := r.ensureBytes(off, keyLen+16); err != nil {
+			return 0, fmt.Errorf("restart overflow body: %w", err)
+		}
+		return off + keyLen + 16, nil
 	}
-	dst[0] = flags
-	le.PutUint16(dst[1:], uint16(shared))
-	le.PutUint16(dst[3:], uint16(len(unshared)))
-	le.PutUint32(dst[5:], uint32(len(e.Value)))
-	copy(dst[9:], unshared)
-	off := 9 + len(unshared)
-	copy(dst[off:], e.Value)
-	return off + len(e.Value)
+	// [Flags][KeyLen][ValueLen][Key][Value]
+	if err := r.ensureBytes(off, 4); err != nil {
+		return 0, err
+	}
+	valLen := int(le.Uint32(r.buf[off:]))
+	off += 4
+	if err := r.ensureBytes(off, keyLen+valLen); err != nil {
+		return 0, fmt.Errorf("restart inline body keyLen=%d valLen=%d: %w", keyLen, valLen, err)
+	}
+	return off + keyLen + valLen, nil
 }
 
-// LeafEncodedSize computes the byte size a leaf with the given
-// entries + interval would occupy. Used by the splitter / insert
-// hot path to decide when a leaf must split.
-func LeafEncodedSize(cfg Config, interval uint16, entries []EncodedEntry) int {
-	total := leafHeaderEnd
-	restartCount := 0
-	for i, e := range entries {
-		isRestart := uint16(i)%interval == 0
-		var prev []byte
-		if !isRestart {
-			prev = entries[i-1].Key
-		}
-		if isRestart {
-			restartCount++
-		}
-		total += leafEntrySize(e, isRestart, prev)
+// validateDeltaEntry mirrors validateRestartEntry for delta entries.
+func (r LeafReader) validateDeltaEntry(off int) (int, error) {
+	if err := r.ensureBytes(off, 1); err != nil {
+		return 0, err
 	}
-	return total + restartCount*leafRestartTableEntrySize
+	flags := r.buf[off]
+	if flags&^cellFlagKnownMask != 0 {
+		return 0, fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
+	}
+	off++
+	if err := r.ensureBytes(off, 4); err != nil {
+		return 0, err
+	}
+	// sharedLen at off, unsharedLen at off+2. We don't validate
+	// SharedLen against the previous key's actual length here (a
+	// separate semantic check); just bounds-check the unsharedLen
+	// region.
+	off += 2
+	unsharedLen := int(le.Uint16(r.buf[off:]))
+	off += 2
+	if flags&CellFlagOverflow != 0 {
+		// [Flags][SharedLen][UnsharedLen][UnsharedKey][OvflPage][TotalLen]
+		if err := r.ensureBytes(off, unsharedLen+16); err != nil {
+			return 0, fmt.Errorf("delta overflow body: %w", err)
+		}
+		return off + unsharedLen + 16, nil
+	}
+	// [Flags][SharedLen][UnsharedLen][ValueLen][UnsharedKey][Value]
+	if err := r.ensureBytes(off, 4); err != nil {
+		return 0, err
+	}
+	valLen := int(le.Uint32(r.buf[off:]))
+	off += 4
+	if err := r.ensureBytes(off, unsharedLen+valLen); err != nil {
+		return 0, fmt.Errorf("delta inline body unsharedLen=%d valLen=%d: %w", unsharedLen, valLen, err)
+	}
+	return off + unsharedLen + valLen, nil
 }
 
-// DecodeLeaf returns all entries from a leaf page with full keys
-// reconstructed. Used by tests + tree-walk consumers; hot-path
-// cursor uses incremental decode via the LeafCursor type (chunk
-// 4.6).
-//
-// For overflow references, the entry's Value is nil and
-// OverflowPage / TotalLen are populated.
-func DecodeLeaf(buf []byte, cfg Config) ([]LeafEntry, error) {
-	cfg.mustValidate()
-	if len(buf) != int(cfg.PageSize) {
-		return nil, fmt.Errorf("page: DecodeLeaf buf len %d != PageSize %d", len(buf), cfg.PageSize)
+// validateUCEntry checks an uncompressed entry at off. Returns nil on
+// success; non-nil error (without ErrCorrupted wrap) on any bounds
+// violation or unknown CellFlags.
+func (r LeafReader) validateUCEntry(off int) error {
+	if err := r.ensureBytes(off, 1); err != nil {
+		return err
 	}
-	n := LeafEntryCount(buf)
-	if n == 0 {
-		return nil, nil
+	flags := r.buf[off]
+	if flags&^cellFlagKnownMask != 0 {
+		return fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
 	}
-	interval := LeafRestartInterval(buf)
-	if interval == 0 {
-		return nil, fmt.Errorf("page: DecodeLeaf RestartInterval=0")
+	off++
+	if err := r.ensureBytes(off, 2); err != nil {
+		return err
 	}
-	// M3 cross-check (chunk-4.2 close-out): the per-page
-	// RestartCount field MUST equal ceil(n / interval). Spec
-	// invariant 3 — a forged RestartCount mislocates the restart
-	// table and lets LeafRestartOffset return offsets into the
-	// entries area, producing silently-wrong lookup results.
-	expectRC := uint16((uint32(n) + uint32(interval) - 1) / uint32(interval))
-	rc := LeafRestartCount(buf)
-	if rc != expectRC {
-		return nil, fmt.Errorf("page: DecodeLeaf RestartCount %d != ceil(%d/%d)=%d (corrupt header)",
-			rc, n, interval, expectRC)
-	}
-	// The restart table lives at [contentEnd - rc*2, contentEnd);
-	// no entry may extend past contentEnd - rc*2 or we'd overlap
-	// the table. Pass that as the per-entry upper bound to the
-	// decoder so a forged page that runs entries into the table
-	// surfaces as an error rather than wrong-data.
-	tableStart := leafRestartTableStart(cfg, rc)
-	out := make([]LeafEntry, 0, n)
-	pos := leafHeaderEnd
-	var prevKey []byte
-	for i := uint16(0); i < n; i++ {
-		isRestart := i%interval == 0
-		e, next, err := decodeLeafEntry(buf, pos, tableStart, isRestart, prevKey)
-		if err != nil {
-			return nil, fmt.Errorf("page: DecodeLeaf entry %d: %w", i, err)
-		}
-		out = append(out, e)
-		prevKey = e.Key
-		pos = next
-	}
-	return out, nil
-}
-
-// decodeLeafEntry decodes one entry starting at buf[off]. Returns
-// the decoded entry, the byte offset of the next entry, and an
-// error on malformed flags / out-of-range lengths.
-//
-// Decoder robustness contract (chunk-4.2 close-out): the decoder is
-// **total** over its input — for any byte sequence within `buf`,
-// decodeLeafEntry either returns a valid (LeafEntry, nextOff, nil)
-// or an error. It MUST NOT panic on slice-out-of-range. This is the
-// load-bearing property for Check() (chunk 11), which feeds
-// arbitrary on-disk pages through DecodeLeaf to enumerate
-// corruption findings.
-//
-// The returned entry's Key:
-//   - for an inline restart: borrows from buf (zero-copy).
-//   - for a delta with shared > 0: a fresh allocation
-//     (`shared || unshared` cannot alias both sources in one slice).
-//   - for an inline restart / delta with shared=0: borrows from buf.
-//
-// `contentEnd` is the upper bound on entry-area bytes — caller
-// passes cfg.ContentEnd() so the bounds checks see the same horizon
-// the restart table lives below.
-func decodeLeafEntry(buf []byte, off, contentEnd int, isRestart bool, prev []byte) (LeafEntry, int, error) {
-	// Per-section bound helper: ensures off+n <= contentEnd before
-	// the caller reads `n` bytes at off.
-	bound := func(o, n int) error {
-		if o < 0 || n < 0 || o+n > contentEnd {
-			return fmt.Errorf("length out of range: off=%d n=%d contentEnd=%d", o, n, contentEnd)
+	keyLen := int(le.Uint16(r.buf[off:]))
+	off += 2
+	if flags&CellFlagOverflow != 0 {
+		if err := r.ensureBytes(off, keyLen+16); err != nil {
+			return fmt.Errorf("uc overflow body: %w", err)
 		}
 		return nil
 	}
-	if err := bound(off, 1); err != nil {
-		return LeafEntry{}, 0, err
+	if err := r.ensureBytes(off, 4); err != nil {
+		return err
 	}
-	flags := buf[off]
-	if flags&^cellFlagKnownMask != 0 {
-		return LeafEntry{}, 0, fmt.Errorf("unknown flag bits 0x%x", flags&^cellFlagKnownMask)
+	valLen := int(le.Uint32(r.buf[off:]))
+	off += 4
+	if err := r.ensureBytes(off, keyLen+valLen); err != nil {
+		return fmt.Errorf("uc inline body keyLen=%d valLen=%d: %w", keyLen, valLen, err)
 	}
-	if isRestart {
-		if flags&CellFlagOverflow != 0 {
-			if err := bound(off+1, 2); err != nil {
-				return LeafEntry{}, 0, err
-			}
-			keyLen := int(le.Uint16(buf[off+1:]))
-			keyStart := off + 3
-			if err := bound(keyStart, keyLen+16); err != nil {
-				return LeafEntry{}, 0, err
-			}
-			ovflStart := keyStart + keyLen
-			return LeafEntry{
-				Flags:        flags,
-				Key:          buf[keyStart : keyStart+keyLen],
-				OverflowPage: le.Uint64(buf[ovflStart:]),
-				TotalLen:     le.Uint64(buf[ovflStart+8:]),
-			}, ovflStart + 16, nil
-		}
-		if err := bound(off+1, 6); err != nil {
-			return LeafEntry{}, 0, err
-		}
-		keyLen := int(le.Uint16(buf[off+1:]))
-		valLen := int(le.Uint32(buf[off+3:]))
-		keyStart := off + 7
-		if err := bound(keyStart, keyLen+valLen); err != nil {
-			return LeafEntry{}, 0, err
-		}
-		valStart := keyStart + keyLen
-		return LeafEntry{
-			Flags: flags,
-			Key:   buf[keyStart : keyStart+keyLen],
-			Value: buf[valStart : valStart+valLen],
-		}, valStart + valLen, nil
-	}
-	// Delta entry.
-	if err := bound(off+1, 4); err != nil {
-		return LeafEntry{}, 0, err
-	}
-	shared := int(le.Uint16(buf[off+1:]))
-	unsharedLen := int(le.Uint16(buf[off+3:]))
-	if shared > len(prev) {
-		return LeafEntry{}, 0, fmt.Errorf("SharedLen %d > previous key len %d", shared, len(prev))
-	}
-	if flags&CellFlagOverflow != 0 {
-		unsharedStart := off + 5
-		if err := bound(unsharedStart, unsharedLen+16); err != nil {
-			return LeafEntry{}, 0, err
-		}
-		ovflStart := unsharedStart + unsharedLen
-		var key []byte
-		if shared == 0 {
-			key = buf[unsharedStart : unsharedStart+unsharedLen]
-		} else {
-			key = make([]byte, shared+unsharedLen)
-			copy(key, prev[:shared])
-			copy(key[shared:], buf[unsharedStart:unsharedStart+unsharedLen])
-		}
-		return LeafEntry{
-			Flags:        flags,
-			Key:          key,
-			OverflowPage: le.Uint64(buf[ovflStart:]),
-			TotalLen:     le.Uint64(buf[ovflStart+8:]),
-		}, ovflStart + 16, nil
-	}
-	if err := bound(off+5, 4); err != nil {
-		return LeafEntry{}, 0, err
-	}
-	valLen := int(le.Uint32(buf[off+5:]))
-	unsharedStart := off + 9
-	if err := bound(unsharedStart, unsharedLen+valLen); err != nil {
-		return LeafEntry{}, 0, err
-	}
-	valStart := unsharedStart + unsharedLen
-	var key []byte
-	if shared == 0 {
-		key = buf[unsharedStart : unsharedStart+unsharedLen]
-	} else {
-		key = make([]byte, shared+unsharedLen)
-		copy(key, prev[:shared])
-		copy(key[shared:], buf[unsharedStart:unsharedStart+unsharedLen])
-	}
-	return LeafEntry{
-		Flags: flags,
-		Key:   key,
-		Value: buf[valStart : valStart+valLen],
-	}, valStart + valLen, nil
+	return nil
 }
 
-// LeafLookup performs the two-phase binary search from
-// page-formats.md §Leaf Lookup:
-//
-//  1. Binary search over restart points using the restart table —
-//     O(log R) where R = RestartCount.
-//  2. Linear scan within the restart group, decoding delta entries
-//     until the target is found or passed — O(K) where K =
-//     RestartInterval.
-//
-// Returns (entry, true, nil) on hit; (zero-value entry, false, nil)
-// on miss; error on malformed page (same robustness contract as
-// DecodeLeaf — total over its input, never panics on slice-OOR).
-//
-// Hot-path leaf lookup; the btree consumer (chunk 4.3) calls this
-// once per leaf descent.
-func LeafLookup(buf []byte, cfg Config, target []byte) (LeafEntry, bool, error) {
-	cfg.mustValidate()
-	if len(buf) != int(cfg.PageSize) {
-		return LeafEntry{}, false, fmt.Errorf("page: LeafLookup buf len %d != PageSize %d", len(buf), cfg.PageSize)
+// ensureBytes verifies r.buf[off : off+n] is within the entry-data
+// region [leafEntryStart, dataEnd). The bound is dataEnd, not
+// ContentEnd, so the per-entry validator catches entries that overrun
+// into the lookup table — even though raw r.buf has bytes past
+// dataEnd, the leaf-page invariant is that entry data ends at
+// dataEnd. Returns a context-free error; callers wrap with field
+// context.
+func (r LeafReader) ensureBytes(off, n int) error {
+	if off < leafEntryStart {
+		return fmt.Errorf("read at offset %d (n=%d) precedes entry-data start %d", off, n, leafEntryStart)
 	}
-	n := LeafEntryCount(buf)
-	if n == 0 {
-		return LeafEntry{}, false, nil
+	if n < 0 {
+		return fmt.Errorf("read length %d negative", n)
 	}
-	interval := LeafRestartInterval(buf)
-	if interval == 0 {
-		return LeafEntry{}, false, fmt.Errorf("page: LeafLookup RestartInterval=0")
+	if off+n > r.dataEnd {
+		return fmt.Errorf("read at offset %d (n=%d) exceeds DataEnd %d", off, n, r.dataEnd)
 	}
-	rc := LeafRestartCount(buf)
-	expectRC := uint16((uint32(n) + uint32(interval) - 1) / uint32(interval))
-	if rc != expectRC {
-		return LeafEntry{}, false, fmt.Errorf("page: LeafLookup RestartCount %d != ceil(%d/%d)=%d",
-			rc, n, interval, expectRC)
-	}
-	tableStart := leafRestartTableStart(cfg, rc)
-
-	// Phase 1: binary-search over restart points for the LARGEST
-	// i with restart[i].Key <= target. Equivalently: find the
-	// smallest i with restart[i].Key > target, then groupStart =
-	// i - 1. If groupStart < 0, target precedes every key in the
-	// leaf — not found.
-	lo, hi := 0, int(rc)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		off := int(LeafRestartOffset(buf, cfg, uint16(mid)))
-		key, err := leafRestartKey(buf, off, tableStart)
-		if err != nil {
-			return LeafEntry{}, false, fmt.Errorf("page: LeafLookup restart[%d]: %w", mid, err)
-		}
-		if bytes.Compare(key, target) <= 0 {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	groupStartIdx := lo - 1
-	if groupStartIdx < 0 {
-		return LeafEntry{}, false, nil
-	}
-
-	// Phase 2: linear scan from restart[groupStartIdx], decoding
-	// deltas until hit, pass, or end-of-group.
-	entryIdx := groupStartIdx * int(interval)
-	end := entryIdx + int(interval)
-	if end > int(n) {
-		end = int(n)
-	}
-	pos := int(LeafRestartOffset(buf, cfg, uint16(groupStartIdx)))
-	var prev []byte
-	for i := entryIdx; i < end; i++ {
-		isRestart := i == entryIdx
-		entry, next, err := decodeLeafEntry(buf, pos, tableStart, isRestart, prev)
-		if err != nil {
-			return LeafEntry{}, false, fmt.Errorf("page: LeafLookup entry %d: %w", i, err)
-		}
-		cmp := bytes.Compare(entry.Key, target)
-		if cmp == 0 {
-			return entry, true, nil
-		}
-		if cmp > 0 {
-			return LeafEntry{}, false, nil
-		}
-		prev = entry.Key
-		pos = next
-	}
-	return LeafEntry{}, false, nil
+	return nil
 }
 
-// leafRestartKey returns the Key bytes of the restart entry at
-// offset `off`. Avoids the full decodeLeafEntry call in the hot
-// binary-search phase of LeafLookup — only KeyLen + Key bytes are
-// needed per probe, not the value or overflow fields.
-//
-// The decoder's robustness contract applies: returns an error on
-// any length-out-of-range condition, never panics on slice OOR.
-func leafRestartKey(buf []byte, off, contentEnd int) ([]byte, error) {
-	if off < 0 || off+3 > contentEnd {
-		return nil, fmt.Errorf("restart entry header truncated at off=%d", off)
-	}
-	flags := buf[off]
-	if flags&^cellFlagKnownMask != 0 {
-		return nil, fmt.Errorf("unknown CellFlags 0x%x at off=%d", flags&^cellFlagKnownMask, off)
-	}
-	keyLen := int(le.Uint16(buf[off+1:]))
-	var keyStart int
-	if flags&CellFlagOverflow != 0 {
-		keyStart = off + 3
-	} else {
-		// Inline restart entry: skip ValueLen u32 between KeyLen
-		// and Key bytes.
-		if off+7 > contentEnd {
-			return nil, fmt.Errorf("restart entry inline-header truncated at off=%d", off)
-		}
-		keyStart = off + 7
-	}
-	if keyStart+keyLen > contentEnd {
-		return nil, fmt.Errorf("restart entry key out of bounds: off=%d keyLen=%d", off, keyLen)
-	}
-	return buf[keyStart : keyStart+keyLen], nil
-}
+// (commonPrefixLen alias removed — sharedPrefixLen in restart.go is the
+// canonical implementation; chunk-4.2's external callers have been
+// retired in the 4.6β rewrite.)
 
-// commonPrefixLen returns the length of the shared prefix between
-// a and b.
-func commonPrefixLen(a, b []byte) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	for i := range n {
-		if a[i] != b[i] {
-			return i
-		}
-	}
-	return n
-}
+var _ = bytes.Equal // keep bytes imported for future use
