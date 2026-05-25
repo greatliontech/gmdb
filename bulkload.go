@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"iter"
 
+	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -281,4 +283,183 @@ func (b *bulkBuilder) writeBranch(bl *bulkBranchLevel) (uint64, error) {
 // adding one cell with the given separator key.
 func (b *bulkBuilder) branchCellCost(sep []byte) int {
 	return page.BranchEncodedSize(b.cfg, []page.BranchCell{{Key: sep}}) - b.emptyBranchSize
+}
+
+// bulkOverflowWriter is the pager surface the streaming overflow-chain
+// writer needs: reserve a contiguous run of fresh page IDs and pwrite each
+// directly (slab bypass). *pager.Pager satisfies it.
+type bulkOverflowWriter interface {
+	AllocContiguous(n uint32) (uint64, error)
+	WriteDirect(id uint64, buf []byte) error
+}
+
+// writeBulkOverflowChain streams value into a fresh contiguous overflow
+// run, pwriting each page directly via WriteDirect (slab bypass) using a
+// single reused page buffer — O(pageSize) memory, never materializing the
+// whole run (the BulkLoad memory contract, bulkload.md §Slab Bypass).
+// Returns the run's first page ID; the leaf carries an overflow-reference
+// entry to it.
+//
+// The on-disk layout is byte-identical to page.EncodeOverflowRun (first
+// page: TypeOverflow header with AdditionalPages = runLen-1, then the
+// value prefix; followers: raw value bytes), so the engine's overflow
+// reader (page.AssembleOverflowValue) reassembles the value unchanged. The
+// per-page value capacities exclude the checksum footer (page.ContentEnd),
+// so WriteDirect's footer lands in the reserved tail without overwriting
+// value bytes.
+//
+// Atomicity: a mid-run WriteDirect failure leaves the already-pwritten
+// run pages as bounded leakage — they are at fresh IDs unreferenced by any
+// recoverable meta and are reclaimed by tx rollback (AbortTx) or, on a
+// committed-after-error orphan, by background maintenance — identical to
+// every other bulk write (bulkload.md §Atomicity). No FreeRun is issued:
+// the contract is that a BulkLoad error aborts the whole load.
+func writeBulkOverflowChain(pw bulkOverflowWriter, cfg page.Config, value []byte) (uint64, error) {
+	runLen := page.OverflowRunLength(cfg, uint64(len(value)))
+	firstID, err := pw.AllocContiguous(runLen)
+	if err != nil {
+		return 0, fmt.Errorf("gmdb: bulkload alloc overflow run (%d pages): %w", runLen, err)
+	}
+	buf := make([]byte, cfg.PageSize)
+
+	// First page: header + value prefix. buf is freshly zeroed, so the
+	// region past the copied prefix (for a value shorter than firstCap)
+	// is already zero-filled.
+	page.WriteHeader(buf, page.TypeOverflow, 0, runLen-1)
+	firstCap := page.OverflowFirstPageCapacity(cfg)
+	off := copy(buf[page.HeaderSize:page.HeaderSize+firstCap], value)
+	if err := pw.WriteDirect(firstID, buf); err != nil {
+		return 0, fmt.Errorf("gmdb: bulkload write overflow first page: %w", err)
+	}
+
+	// Follower pages: raw value bytes, no header. clear(buf) each
+	// iteration drops the previous page's content (incl. the footer
+	// WriteDirect wrote) and zero-fills the trailing slack of the final
+	// (partial) follower.
+	followerCap := page.OverflowFollowerCapacity(cfg)
+	for i := uint32(1); i < runLen; i++ {
+		clear(buf)
+		off += copy(buf[:followerCap], value[off:])
+		if err := pw.WriteDirect(firstID+uint64(i), buf); err != nil {
+			return 0, fmt.Errorf("gmdb: bulkload write overflow follower page %d: %w", i, err)
+		}
+	}
+	return firstID, nil
+}
+
+// BulkLoad replaces the contents of an empty keyspace with the sorted
+// key-value stream produced by rows. Input MUST be in strictly-ascending
+// lex key order; a non-ascending key returns ErrBulkLoadOutOfOrder. The
+// keyspace must be empty (Count == 0), else ErrBulkLoadNonEmpty —
+// clear with ks.DeleteRange(nil, nil) first if necessary. Returns the
+// number of pairs written. Per bulkload.md §API.
+//
+// BulkLoad bypasses the per-tx slab budget: pages are pwritten directly to
+// fresh page IDs as they are constructed, so memory is O(depth × pageSize)
+// independent of input size. Over-inline values are stored as overflow
+// chains streamed the same way (no MaxTxBufferBytes charge). The new tree
+// is published only at Tx.Commit via the meta swap; a mid-load crash or a
+// rollback leaves the keyspace at its pre-BulkLoad state (bounded leakage
+// reclaimed by background maintenance) per bulkload.md §Atomicity.
+//
+// Errors: ErrReadOnly (read-only tx or handle), ErrKeyspaceClosed (handle
+// invalidated by a same-tx DeleteKeyspace), ErrBulkLoadNonEmpty,
+// ErrBulkLoadOutOfOrder, ErrKeyEmpty (empty key in the stream), and the
+// btree key-size / I/O errors.
+func (ks *Keyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
+	if err := ks.tx.requireOpen(true); err != nil {
+		return 0, err
+	}
+	if ks.dead {
+		return 0, ErrKeyspaceClosed
+	}
+	if ks.readOnly {
+		return 0, ErrReadOnly
+	}
+	if ks.desc.Count != 0 {
+		return 0, ErrBulkLoadNonEmpty
+	}
+	if len(ks.indexes) > 0 {
+		// Indexed-keyspace BulkLoad (extractor + per-index sort/spill +
+		// unique detection) is wired in a later sub-chunk; until then
+		// it errors rather than silently building rows without indexes.
+		return ks.bulkLoadIndexed(rows)
+	}
+
+	cfg := ks.builderCfg()
+	b := newBulkBuilder(ks.tx.pgr, cfg)
+	var loopErr error
+	rows(func(key, value []byte) bool {
+		if len(key) == 0 {
+			loopErr = ErrKeyEmpty
+			return false
+		}
+		e, err := ks.bulkLeafEntry(cfg, key, value)
+		if err != nil {
+			loopErr = err
+			return false
+		}
+		if err := b.add(e); err != nil {
+			loopErr = err
+			return false
+		}
+		return true
+	})
+	if loopErr != nil {
+		return 0, loopErr
+	}
+	root, count, err := b.finish()
+	if err != nil {
+		return 0, err
+	}
+	// Retire any leftover root (a truly empty keyspace has Root == 0;
+	// this is defense for an empty-but-allocated root) before publishing
+	// the bulk-built tree. FreeSubtree(0) is a no-op.
+	if _, err := btree.FreeSubtree(ks.tx.pgr, cfg, ks.desc.Root); err != nil {
+		return 0, mapBtreeErr(err)
+	}
+	ks.desc.Root = root
+	ks.desc.Count = count
+	ks.markDirty()
+	ks.markCursorsStale()
+	return count, nil
+}
+
+// bulkLoadIndexed bulk-loads an indexed keyspace: it must build the row
+// tree AND every index's data tree (extractor over each row, external
+// sort with ScratchDir spill, unique-violation detection at the merge
+// output) so the committed state has consistent rows + index entries. That
+// path is implemented in a later sub-chunk; until then this returns an
+// error rather than silently producing rows without index entries (which
+// would leave the indexes permanently out of sync with the data).
+func (ks *Keyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
+	_ = rows
+	return 0, fmt.Errorf("gmdb: BulkLoad on an indexed keyspace requires the indexed bulk-load path (not yet wired)")
+}
+
+// bulkLeafEntry builds the leaf entry for one (key, value): an inline entry
+// when it fits an empty leaf, otherwise a streamed overflow chain plus an
+// overflow-reference entry. nil value is normalised to empty (the
+// nil-value-as-empty invariant). The inline/overflow boundary is btree's
+// (shared with Put) so a value Put would inline, BulkLoad inlines.
+func (ks *Keyspace) bulkLeafEntry(cfg page.Config, key, value []byte) (page.LeafEntry, error) {
+	if value == nil {
+		value = []byte{}
+	}
+	if !btree.NeedsOverflow(cfg, key, value) {
+		return page.LeafEntry{Key: key, Value: value}, nil
+	}
+	if !btree.OverflowRefFitsLeaf(cfg, key) {
+		return page.LeafEntry{}, btree.ErrKeyTooLarge
+	}
+	firstID, err := writeBulkOverflowChain(ks.tx.pgr, cfg, value)
+	if err != nil {
+		return page.LeafEntry{}, err
+	}
+	return page.LeafEntry{
+		Flags:        page.CellFlagOverflow,
+		Key:          key,
+		OverflowPage: firstID,
+		TotalLen:     uint64(len(value)),
+	}, nil
 }

@@ -70,6 +70,24 @@ func overflowRefFitsLeaf(cfg page.Config, key []byte) bool {
 	return refSize <= cfg.ContentEnd()-singleEntryPageOverhead
 }
 
+// NeedsOverflow exports needsOverflow for the bulk-load construction
+// path (package gmdb), which must make the SAME inline-vs-overflow
+// decision as the Put path so a value Put would inline, BulkLoad also
+// inlines, and a value Put would promote, BulkLoad also promotes — one
+// threshold, no drift. needsOverflow is conservative (over-estimates leaf
+// overhead), so anything it reports as inline definitely fits an
+// otherwise-empty leaf built by the same page.LeafBuilder.
+func NeedsOverflow(cfg page.Config, key, value []byte) bool {
+	return needsOverflow(cfg, key, value)
+}
+
+// OverflowRefFitsLeaf exports overflowRefFitsLeaf for the bulk-load path.
+// False ⇒ the key is too large even for the overflow-reference form
+// (the ErrKeyTooLarge surface).
+func OverflowRefFitsLeaf(cfg page.Config, key []byte) bool {
+	return overflowRefFitsLeaf(cfg, key)
+}
+
 // writeOverflowChain allocates a contiguous run of pages, encodes
 // `value` across them, and returns the new LeafEntry with overflow
 // fields set. On error any partial allocation is rolled back via
