@@ -518,9 +518,12 @@ func TestRegistryPersistsAcrossCommit(t *testing.T) {
 			t.Fatalf("Begin #2: %v", err)
 		}
 		defer tx.Rollback()
-		ks, err := tx.OpenKeyspace("users")
+		// Same backdoor as TestRegistryPutOnReopenedKeyspacePersists:
+		// registryPut wrote with ad-hoc SchemaHash; use the
+		// read-only path to skip chunk-7.5 fingerprint validation.
+		ks, err := tx.OpenKeyspaceReadOnly("users")
 		if err != nil {
-			t.Fatalf("OpenKeyspace: %v", err)
+			t.Fatalf("OpenKeyspaceReadOnly: %v", err)
 		}
 		if ks.desc.IndexRegistryRoot == 0 {
 			t.Fatalf("IndexRegistryRoot lost across Commit/Open")
@@ -618,9 +621,15 @@ func TestRegistryPutOnReopenedKeyspacePersists(t *testing.T) {
 			t.Fatalf("Begin #3: %v", err)
 		}
 		defer tx.Rollback()
-		ks, err := tx.OpenKeyspace("users")
+		// Use OpenKeyspaceReadOnly to bypass chunk-7.5's open-time
+		// IndexDecl validation. The test backdoor-wrote a registry
+		// entry via registryPut with ad-hoc SchemaHash that doesn't
+		// match any real IndexDecl; the public OpenKeyspace path
+		// would correctly reject this with ErrIndexExtractorRequired.
+		// We only need read-only access to verify persistence.
+		ks, err := tx.OpenKeyspaceReadOnly("users")
 		if err != nil {
-			t.Fatalf("OpenKeyspace #3: %v", err)
+			t.Fatalf("OpenKeyspaceReadOnly #3: %v", err)
 		}
 		if ks.desc.IndexRegistryRoot == 0 {
 			t.Fatalf("Tx 2 registryPut lost across Commit — H-1 regression")

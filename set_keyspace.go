@@ -79,6 +79,18 @@ type SetKeyspace struct {
 	// pattern as Keyspace.openCursors (chunk-5 markCursorsStale
 	// + SetRootID).
 	openSetCursors []*SetCursor
+
+	// indexes carries the pinned per-index state for this tx (kind-
+	// symmetric partner of Keyspace.indexes — see that godoc).
+	// Populated by OpenSetKeyspace / CreateSetKeyspace /
+	// CreateSetKeyspaceIfNotExists at chunk-7.5. SetKeyspace
+	// extractors run **per (key, value) set member** rather than
+	// per top-level key per indexing.md §Indexes on SetKeyspaces.
+	indexes map[string]*pinnedIndex
+
+	// readOnly is true when this handle was opened via
+	// OpenSetKeyspaceReadOnly. Same semantics as Keyspace.readOnly.
+	readOnly bool
 }
 
 // Name returns the keyspace's name.
@@ -138,35 +150,33 @@ func (ks *SetKeyspace) markSetCursorsStale() {
 
 
 // OpenSetKeyspace opens an existing Kind=1 keyspace (SetKeyspace) for
-// read+write. Returns ErrNotFound if the named keyspace does not
-// exist; ErrKeyspaceKindMismatch if the stored descriptor's Kind is 0
-// (Keyspace — use OpenKeyspace); ErrKeyspaceReserved if the name
-// resolves to an engine-internal keyspace (Kind=2); ErrCorrupted on
-// a malformed descriptor.
-//
-// Signature deferral: api-surface.md specifies
-// `OpenSetKeyspace(name string, indexes ...*IndexDecl)`. The
-// variadic IndexDecls land at chunk 7 alongside indexing
-// implementation; adding a variadic argument is a non-breaking Go-
-// language extension, so chunk-6.6 callers do not need source
-// changes when chunk 7 lands.
-func (tx *Tx) OpenSetKeyspace(name string) (*SetKeyspace, error) {
+// read+write with the supplied IndexDecls (chunk-7.5 indexing wiring).
+// Same shape as OpenKeyspace: validation against the stored registry
+// returns ErrIndexExtractorRequired / ErrIndexUnknown /
+// ErrIndexFingerprintMismatch as appropriate; same-tx re-open returns
+// the cached handle iff hashable inputs match (otherwise
+// ErrKeyspaceAlreadyOpen).
+func (tx *Tx) OpenSetKeyspace(name string, indexes ...*IndexDecl) (*SetKeyspace, error) {
 	if err := tx.requireOpen(true); err != nil {
 		return nil, err
 	}
 	if name == "" {
 		return nil, ErrKeyEmpty
 	}
+	pinned, err := buildPinnedIndexMap(indexes)
+	if err != nil {
+		return nil, err
+	}
 	handle := unique.Make(name)
 	if sks, ok := tx.openSetKeyspaces[handle]; ok {
+		if sks.readOnly {
+			return nil, ErrKeyspaceAlreadyOpen
+		}
+		if !indexesEqualByHashableInputs(sks.indexes, pinned) {
+			return nil, ErrKeyspaceAlreadyOpen
+		}
 		return sks, nil
 	}
-	// Reject if a Kind=0 *Keyspace handle is already cached for this
-	// name (a same-tx OpenKeyspace then OpenSetKeyspace on the same
-	// name violates Kind-immutability; the on-disk descriptor's
-	// Kind would surface the mismatch on a fresh resolve, but the
-	// cached *Keyspace path would otherwise short-circuit before
-	// hitting the descriptor check).
 	if _, ok := tx.openKeyspaces[handle]; ok {
 		return nil, ErrKeyspaceKindMismatch
 	}
@@ -183,21 +193,23 @@ func (tx *Tx) OpenSetKeyspace(name string) (*SetKeyspace, error) {
 	if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindSetKeyspace); err != nil {
 		return nil, err
 	}
+	// Defer dirtyDescriptors removal until validation succeeds —
+	// chunk-7.5 Round-1 M-2 fix.
+	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean)
+	if err := tx.validatePinnedAgainstRegistry(sks, name, pinned); err != nil {
+		delete(tx.openSetKeyspaces, handle)
+		return nil, err
+	}
 	delete(tx.dirtyDescriptors, name)
-	return tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean), nil
+	sks.indexes = pinned
+	return sks, nil
 }
 
-// OpenSetKeyspaceReadOnly opens an existing Kind=1 keyspace on a
-// read transaction (or on a write tx where the caller wants
-// read-only access). Same Kind / Reserved checks as
-// OpenSetKeyspace; the returned handle's mutating methods return
-// ErrReadOnly when invoked on a read tx (enforced by
-// requireOpen(true)).
-//
-// Chunk-6.6 caveat: the read-tx surface (gmdb.ReadTx) is the
-// chunk-3 *ReadTx type; this Tx-bound method is the write-tx
-// no-IndexDecls form. The read-tx surface lands as part of the
-// chunk-9 / chunk-11 read-tx wiring.
+// OpenSetKeyspaceReadOnly opens an existing Kind=1 keyspace for
+// reads only. No IndexDecls accepted/required (index lookups work
+// from stored entries directly per indexing.md §Open Semantics).
+// Same-tx-mixed Open* / OpenReadOnly on a single name returns
+// ErrKeyspaceAlreadyOpen.
 func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error) {
 	if err := tx.requireOpen(false); err != nil {
 		return nil, err
@@ -207,6 +219,9 @@ func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error) {
 	}
 	handle := unique.Make(name)
 	if sks, ok := tx.openSetKeyspaces[handle]; ok {
+		if !sks.readOnly {
+			return nil, ErrKeyspaceAlreadyOpen
+		}
 		return sks, nil
 	}
 	if _, ok := tx.openKeyspaces[handle]; ok {
@@ -225,8 +240,10 @@ func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error) {
 	if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindSetKeyspace); err != nil {
 		return nil, err
 	}
+	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean)
+	sks.readOnly = true
 	delete(tx.dirtyDescriptors, name)
-	return tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean), nil
+	return sks, nil
 }
 
 // CreateSetKeyspace creates a new Kind=1 keyspace with the supplied
@@ -246,7 +263,7 @@ func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error) {
 //
 // Chunk-6.6 caveat: opts == nil is treated as
 // SetKeyspaceOptions{FixedValueSize: 0} (variable-size values).
-func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions) (*SetKeyspace, error) {
+func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions, indexes ...*IndexDecl) (*SetKeyspace, error) {
 	if err := tx.requireOpen(true); err != nil {
 		return nil, err
 	}
@@ -254,6 +271,10 @@ func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions) (*SetKeys
 		return nil, ErrKeyEmpty
 	}
 	fvs, err := validateSetOpts(opts)
+	if err != nil {
+		return nil, err
+	}
+	pinned, err := buildPinnedIndexMap(indexes)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +300,21 @@ func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions) (*SetKeys
 		FixedValueSize: fvs,
 	}
 	tx.numKeyspaces++
-	return tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated), nil
+	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated)
+	if len(pinned) > 0 {
+		if err := tx.writeNewIndexRegistry(sks, pinned); err != nil {
+			// chunk-7.5 Round-1 M-1 fix: restore pendingDeletes
+			// state if we cleared it above.
+			delete(tx.openSetKeyspaces, handle)
+			tx.numKeyspaces--
+			if pendingDelete {
+				tx.pendingDeletes[name] = struct{}{}
+			}
+			return nil, err
+		}
+	}
+	sks.indexes = pinned
+	return sks, nil
 }
 
 // CreateSetKeyspaceIfNotExists opens the keyspace if it exists OR
@@ -291,7 +326,7 @@ func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions) (*SetKeys
 //
 // opts == nil is treated as FixedValueSize=0 — the same equality
 // check applies.
-func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions) (*SetKeyspace, error) {
+func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions, indexes ...*IndexDecl) (*SetKeyspace, error) {
 	if err := tx.requireOpen(true); err != nil {
 		return nil, err
 	}
@@ -302,13 +337,21 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 	if err != nil {
 		return nil, err
 	}
+	pinned, err := buildPinnedIndexMap(indexes)
+	if err != nil {
+		return nil, err
+	}
 	handle := unique.Make(name)
 	if sks, ok := tx.openSetKeyspaces[handle]; ok {
-		// Existing handle — Kind already matched at open time.
-		// Verify FixedValueSize parity.
+		if sks.readOnly {
+			return nil, ErrKeyspaceAlreadyOpen
+		}
 		if sks.desc.FixedValueSize != fvs {
 			return nil, fmt.Errorf("%w: existing FixedValueSize=%d, opts.FixedValueSize=%d",
 				ErrFixedValueSizeMismatch, sks.desc.FixedValueSize, fvs)
+		}
+		if !indexesEqualByHashableInputs(sks.indexes, pinned) {
+			return nil, ErrKeyspaceAlreadyOpen
 		}
 		return sks, nil
 	}
@@ -322,7 +365,18 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 			FixedValueSize: fvs,
 		}
 		tx.numKeyspaces++
-		return tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated), nil
+		sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated)
+		if len(pinned) > 0 {
+			if err := tx.writeNewIndexRegistry(sks, pinned); err != nil {
+				// Restore pending-delete (M-1 fix).
+				delete(tx.openSetKeyspaces, handle)
+				tx.numKeyspaces--
+				tx.pendingDeletes[name] = struct{}{}
+				return nil, err
+			}
+		}
+		sks.indexes = pinned
+		return sks, nil
 	}
 	desc, found, err := tx.lookupDescriptor(name)
 	if err != nil {
@@ -336,15 +390,30 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 			return nil, fmt.Errorf("%w: existing FixedValueSize=%d, opts.FixedValueSize=%d",
 				ErrFixedValueSizeMismatch, desc.FixedValueSize, fvs)
 		}
+		sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean)
+		if err := tx.validatePinnedAgainstRegistry(sks, name, pinned); err != nil {
+			delete(tx.openSetKeyspaces, handle)
+			return nil, err
+		}
 		delete(tx.dirtyDescriptors, name)
-		return tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean), nil
+		sks.indexes = pinned
+		return sks, nil
 	}
 	desc = page.KeyspaceDescriptor{
 		Kind:           page.KeyspaceKindSetKeyspace,
 		FixedValueSize: fvs,
 	}
 	tx.numKeyspaces++
-	return tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated), nil
+	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated)
+	if len(pinned) > 0 {
+		if err := tx.writeNewIndexRegistry(sks, pinned); err != nil {
+			delete(tx.openSetKeyspaces, handle)
+			tx.numKeyspaces--
+			return nil, err
+		}
+	}
+	sks.indexes = pinned
+	return sks, nil
 }
 
 // validateSetOpts normalises a *SetKeyspaceOptions into the uint16
@@ -527,6 +596,9 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 	if ks.dead {
 		return false, ErrKeyspaceClosed
 	}
+	if ks.readOnly {
+		return false, ErrReadOnly
+	}
 	if len(key) == 0 {
 		return false, ErrKeyEmpty
 	}
@@ -706,6 +778,9 @@ func (ks *SetKeyspace) Delete(key []byte) error {
 	if ks.dead {
 		return ErrKeyspaceClosed
 	}
+	if ks.readOnly {
+		return ErrReadOnly
+	}
 	if len(key) == 0 {
 		return ErrKeyEmpty
 	}
@@ -788,6 +863,9 @@ func (ks *SetKeyspace) DeleteValue(key, value []byte) error {
 	}
 	if ks.dead {
 		return ErrKeyspaceClosed
+	}
+	if ks.readOnly {
+		return ErrReadOnly
 	}
 	if len(key) == 0 {
 		return ErrKeyEmpty
@@ -930,6 +1008,9 @@ func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 	}
 	if ks.dead {
 		return 0, ErrKeyspaceClosed
+	}
+	if ks.readOnly {
+		return 0, ErrReadOnly
 	}
 	if start != nil && len(start) == 0 {
 		return 0, ErrKeyEmpty

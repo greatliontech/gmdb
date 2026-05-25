@@ -146,6 +146,10 @@ func (c *SetCursor) requireOpen(needsWrite bool) bool {
 		c.closeErr = ErrKeyspaceClosed
 		return false
 	}
+	if needsWrite && c.ks.readOnly {
+		c.closeErr = ErrReadOnly
+		return false
+	}
 	return true
 }
 

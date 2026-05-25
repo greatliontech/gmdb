@@ -90,6 +90,29 @@ type Keyspace struct {
 	// fields (see btree.Cursor.MarkStale) to avoid returning
 	// dangling references on a subsequent unguarded access.
 	openCursors []*Cursor
+
+	// indexes carries the pinned per-index state for this tx, keyed
+	// by IndexDecl.Name. Populated by OpenKeyspace / CreateKeyspace
+	// / CreateKeyspaceIfNotExists at chunk-7.5 with the validated
+	// supplied IndexDecls. First-Extract-wins per indexing.md
+	// §Re-opening: a same-tx second open with structurally identical
+	// hashable inputs but a different Extract function silently keeps
+	// the first call's Extract. Each pinnedIndex carries the user's
+	// IndexDecl (for the Extract function), the schema-hash (cached
+	// from chunk-7.2 schemaHash), and the index's data-tree
+	// root+count (populated from the on-disk registry on Open,
+	// initialized to 0 on Create, updated by chunk-7.6 atomic Put +
+	// chunk-7.8 RebuildIndex/DropIndex).
+	//
+	// nil for keyspaces with no declared indexes.
+	indexes map[string]*pinnedIndex
+
+	// readOnly is true when this handle was opened via
+	// OpenKeyspaceReadOnly. Used by the chunk-7.5 same-tx re-open
+	// idempotence check to surface ErrKeyspaceAlreadyOpen when a
+	// caller mixes OpenKeyspace and OpenKeyspaceReadOnly for the
+	// same name within one tx per indexing.md §Re-opening.
+	readOnly bool
 }
 
 // Name returns the keyspace's name (the unique-interned identity).
@@ -100,36 +123,53 @@ func (ks *Keyspace) Name() string { return ks.name.Value() }
 // OpenKeyspace opens an existing single-value keyspace (Kind=0) for
 // read+write. Returns ErrNotFound if the named keyspace does not
 // exist; ErrKeyspaceKindMismatch if the stored descriptor's Kind is 1
-// (SetKeyspace — use OpenSetKeyspace in chunk 6); ErrKeyspaceReserved
-// if the name resolves to an engine-internal keyspace (Kind=2);
-// ErrCorrupted (wrapping the codec validate error) if the descriptor
-// fails ValidateKeyspaceDescriptor (unknown Kind, FixedValueSize set
-// on Kind != 1, non-zero reserved bytes, RestartGroupTarget > 255).
+// (SetKeyspace — use OpenSetKeyspace); ErrKeyspaceReserved if the
+// name resolves to an engine-internal keyspace (Kind=2); ErrCorrupted
+// (wrapping the codec validate error) if the descriptor fails
+// ValidateKeyspaceDescriptor.
 //
-// Signature deferral: api-surface.md specifies
-// `OpenKeyspace(name string, indexes ...*IndexDecl)`. The variadic
-// IndexDecls land at chunk 7 alongside the indexing implementation;
-// adding a variadic argument is a non-breaking Go-language extension,
-// so chunk-5.4 callers do not need source changes when chunk 7 lands.
-func (tx *Tx) OpenKeyspace(name string) (*Keyspace, error) {
+// IndexDecl handling (chunk 7.5): every declared index on the
+// keyspace must be supplied with a matching IndexDecl. Missing
+// decls return ErrIndexExtractorRequired; extras return
+// ErrIndexUnknown; schema-hash or Version drift returns
+// ErrIndexFingerprintMismatch wrapped in *IndexFingerprintError
+// (indexing.md §Open Semantics + §Drift Guard).
+//
+// Same-tx re-open (indexing.md §Re-opening): a second OpenKeyspace
+// for the same name returns the cached handle iff every hashable
+// input matches the first call (names + Unique flags + schema
+// hashes + Versions). Otherwise returns ErrKeyspaceAlreadyOpen.
+// First-Extract-wins: structurally identical IndexDecls with
+// different Extract functions yield the cached handle (the first
+// call's Extract is pinned for the tx).
+//
+// Mixing OpenKeyspace and OpenKeyspaceReadOnly for the same name in
+// one tx also returns ErrKeyspaceAlreadyOpen.
+func (tx *Tx) OpenKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, error) {
 	if err := tx.requireOpen(true); err != nil {
 		return nil, err
 	}
 	if name == "" {
 		return nil, ErrKeyEmpty
 	}
+	pinned, err := buildPinnedIndexMap(indexes)
+	if err != nil {
+		return nil, err
+	}
 	handle := unique.Make(name)
 	if ks, ok := tx.openKeyspaces[handle]; ok {
-		// Cache hit. The cache only ever holds Kind=0 live handles
-		// (CreateKeyspace creates Kind=0 only at chunk-5; OpenKeyspace's
-		// successful path Kind-checks before caching), and dead handles
-		// live in tx.deadKeyspaces, not in this map.
+		// Cache hit. Same-tx re-open: compare hashable inputs.
+		if ks.readOnly {
+			return nil, ErrKeyspaceAlreadyOpen
+		}
+		if !indexesEqualByHashableInputs(ks.indexes, pinned) {
+			return nil, ErrKeyspaceAlreadyOpen
+		}
+		// First-Extract-wins: keep the pinned Extract from the
+		// original open call; discard the second call's pinned set.
 		return ks, nil
 	}
 	if _, deleted := tx.pendingDeletes[name]; deleted {
-		// Same-tx DeleteKeyspace removed this name from the keyspace
-		// B+tree (pending flush); a subsequent OpenKeyspace must not
-		// see the on-disk descriptor still present pre-flush.
 		return nil, ErrNotFound
 	}
 	desc, found, err := tx.lookupDescriptor(name)
@@ -142,73 +182,34 @@ func (tx *Tx) OpenKeyspace(name string) (*Keyspace, error) {
 	if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindKeyspace); err != nil {
 		return nil, err
 	}
-	// Promote out of dirtyDescriptors (if it was there) — the descriptor
-	// now rides on the *Keyspace handle, and the flush walk's step-3
-	// scan would double-emit otherwise.
-	delete(tx.dirtyDescriptors, name)
-	return tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean), nil
-}
-
-// CreateKeyspace creates a new single-value keyspace (Kind=0). Returns
-// ErrKeyExists if a keyspace with the supplied name already exists
-// (use CreateKeyspaceIfNotExists for the open-or-create shape).
-//
-// The keyspace descriptor is created in memory with state=Created and
-// persisted to the keyspace B+tree at Tx.Commit's flushKeyspaces walk
-// (chunk-5.6 deferred-flush refactor). numKeyspaces is incremented
-// eagerly so same-tx ListKeyspaces / NumKeyspaces reflect the new
-// entry immediately.
-//
-// Delete-then-Create in the same tx (where the name was previously
-// in pendingDeletes) is permitted: the pendingDeletes entry is
-// removed (the upcoming btree.Put at flush cleanly overwrites the
-// on-disk descriptor) and a fresh *Keyspace is returned. Any
-// previously-opened *Keyspace handle for the same name stays dead
-// (api-surface.md §Keyspace API DeleteKeyspace — re-creation does
-// NOT reactivate the old handle).
-//
-// Chunk 5.4 does not yet accept IndexDecls — that surface lands at
-// chunk 7.
-func (tx *Tx) CreateKeyspace(name string) (*Keyspace, error) {
-	if err := tx.requireOpen(true); err != nil {
+	// Cache the handle BEFORE validation so validatePinned* can
+	// resolve `ks.descriptor()`, but defer the dirtyDescriptors
+	// removal until validation succeeds — a fingerprint mismatch on
+	// open of a name that has an in-flight SetKeyspaceConfig
+	// mutation in dirtyDescriptors must not silently drop that
+	// mutation (chunk-7.5 Round-1 M-2 fix).
+	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean)
+	if err := tx.validatePinnedAgainstRegistry(ks, name, pinned); err != nil {
+		delete(tx.openKeyspaces, handle)
 		return nil, err
 	}
-	if name == "" {
-		return nil, ErrKeyEmpty
-	}
-	handle := unique.Make(name)
-	if _, ok := tx.openKeyspaces[handle]; ok {
-		return nil, ErrKeyExists
-	}
-	_, pendingDelete := tx.pendingDeletes[name]
-	if !pendingDelete {
-		// Not pending-delete: name must not already exist either
-		// in-memory (dirtyDescriptors) or on disk.
-		if _, found, err := tx.lookupDescriptor(name); err != nil {
-			return nil, err
-		} else if found {
-			return nil, ErrKeyExists
-		}
-	} else {
-		// Pending-delete: clear the pending-delete; the upcoming
-		// btree.Put at flush cleanly overwrites the on-disk
-		// descriptor. dirtyDescriptors cannot have an entry for this
-		// name (DeleteKeyspace removes it).
-		delete(tx.pendingDeletes, name)
-	}
-	desc := page.KeyspaceDescriptor{
-		Kind: page.KeyspaceKindKeyspace,
-	}
-	tx.numKeyspaces++
-	return tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated), nil
+	delete(tx.dirtyDescriptors, name)
+	ks.indexes = pinned
+	return ks, nil
 }
 
-// CreateKeyspaceIfNotExists opens the keyspace if it exists (with the
-// matching Kind=0 check) or creates it. The chunk-7 IndexDecl-matching
-// behaviour lands alongside indexing — this chunk-5.4 surface accepts
-// no index declarations.
-func (tx *Tx) CreateKeyspaceIfNotExists(name string) (*Keyspace, error) {
-	if err := tx.requireOpen(true); err != nil {
+// OpenKeyspaceReadOnly opens an existing Kind=0 keyspace for reads
+// only. No IndexDecls are accepted (and none are required) per
+// indexing.md §Open Semantics: index lookups still work on a
+// read-only handle by reading stored index entries directly,
+// without needing the extractor. Same-tx-mixed
+// OpenKeyspace+OpenKeyspaceReadOnly on a single name returns
+// ErrKeyspaceAlreadyOpen.
+//
+// The returned handle's mutating methods return ErrReadOnly when
+// invoked on a read tx.
+func (tx *Tx) OpenKeyspaceReadOnly(name string) (*Keyspace, error) {
+	if err := tx.requireOpen(false); err != nil {
 		return nil, err
 	}
 	if name == "" {
@@ -216,15 +217,139 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string) (*Keyspace, error) {
 	}
 	handle := unique.Make(name)
 	if ks, ok := tx.openKeyspaces[handle]; ok {
+		if !ks.readOnly {
+			return nil, ErrKeyspaceAlreadyOpen
+		}
 		return ks, nil
 	}
 	if _, deleted := tx.pendingDeletes[name]; deleted {
-		// The user just deleted this name in this tx and now wants to
-		// re-create it. Honor as a creation per chunk-5.6 semantics.
+		return nil, ErrNotFound
+	}
+	desc, found, err := tx.lookupDescriptor(name)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrNotFound
+	}
+	if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindKeyspace); err != nil {
+		return nil, err
+	}
+	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean)
+	ks.readOnly = true
+	delete(tx.dirtyDescriptors, name)
+	return ks, nil
+}
+
+// CreateKeyspace creates a new single-value keyspace (Kind=0) with
+// the supplied IndexDecls. Returns ErrKeyExists if a keyspace with
+// the supplied name already exists (use CreateKeyspaceIfNotExists
+// for the open-or-create shape).
+//
+// The keyspace descriptor is created in memory with state=Created
+// and persisted to the keyspace B+tree at Tx.Commit's flushKeyspaces
+// walk. numKeyspaces is incremented eagerly so same-tx
+// ListKeyspaces / NumKeyspaces reflect the new entry immediately.
+//
+// For each supplied IndexDecl, a fresh registry entry is written to
+// the new keyspace's index registry sub-tree (allocated lazily on
+// the first registryPut). Each entry starts with Root=0 (empty
+// index data tree) — chunk-7.6 atomic Put populates entries as
+// rows are written.
+//
+// Delete-then-Create in the same tx is permitted; any previously-
+// opened *Keyspace handle for the same name stays dead per
+// api-surface.md §Keyspace API DeleteKeyspace.
+func (tx *Tx) CreateKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, error) {
+	if err := tx.requireOpen(true); err != nil {
+		return nil, err
+	}
+	if name == "" {
+		return nil, ErrKeyEmpty
+	}
+	pinned, err := buildPinnedIndexMap(indexes)
+	if err != nil {
+		return nil, err
+	}
+	handle := unique.Make(name)
+	if _, ok := tx.openKeyspaces[handle]; ok {
+		return nil, ErrKeyExists
+	}
+	_, pendingDelete := tx.pendingDeletes[name]
+	if !pendingDelete {
+		if _, found, err := tx.lookupDescriptor(name); err != nil {
+			return nil, err
+		} else if found {
+			return nil, ErrKeyExists
+		}
+	} else {
+		delete(tx.pendingDeletes, name)
+	}
+	desc := page.KeyspaceDescriptor{
+		Kind: page.KeyspaceKindKeyspace,
+	}
+	tx.numKeyspaces++
+	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated)
+	if len(pinned) > 0 {
+		if err := tx.writeNewIndexRegistry(ks, pinned); err != nil {
+			// Roll back the in-memory cache insertion. The
+			// numKeyspaces++ was eager; symmetric decrement here.
+			// If we cleared a pending-delete entry above (pendingDelete
+			// was true), restore it so the original on-disk descriptor
+			// still gets removed at Commit (chunk-7.5 Round-1 M-1 fix).
+			delete(tx.openKeyspaces, handle)
+			tx.numKeyspaces--
+			if pendingDelete {
+				tx.pendingDeletes[name] = struct{}{}
+			}
+			return nil, err
+		}
+	}
+	ks.indexes = pinned
+	return ks, nil
+}
+
+// CreateKeyspaceIfNotExists opens the keyspace if it exists (Kind=0
+// check + supplied IndexDecls validated against the stored registry)
+// or creates it with the supplied IndexDecls. Same-tx re-open
+// idempotence applies on the open branch (indexing.md §Re-opening).
+func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Keyspace, error) {
+	if err := tx.requireOpen(true); err != nil {
+		return nil, err
+	}
+	if name == "" {
+		return nil, ErrKeyEmpty
+	}
+	pinned, err := buildPinnedIndexMap(indexes)
+	if err != nil {
+		return nil, err
+	}
+	handle := unique.Make(name)
+	if ks, ok := tx.openKeyspaces[handle]; ok {
+		if ks.readOnly {
+			return nil, ErrKeyspaceAlreadyOpen
+		}
+		if !indexesEqualByHashableInputs(ks.indexes, pinned) {
+			return nil, ErrKeyspaceAlreadyOpen
+		}
+		return ks, nil
+	}
+	if _, deleted := tx.pendingDeletes[name]; deleted {
 		delete(tx.pendingDeletes, name)
 		desc := page.KeyspaceDescriptor{Kind: page.KeyspaceKindKeyspace}
 		tx.numKeyspaces++
-		return tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated), nil
+		ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated)
+		if len(pinned) > 0 {
+			if err := tx.writeNewIndexRegistry(ks, pinned); err != nil {
+				// Restore pending-delete state (M-1 fix).
+				delete(tx.openKeyspaces, handle)
+				tx.numKeyspaces--
+				tx.pendingDeletes[name] = struct{}{}
+				return nil, err
+			}
+		}
+		ks.indexes = pinned
+		return ks, nil
 	}
 	desc, found, err := tx.lookupDescriptor(name)
 	if err != nil {
@@ -234,12 +359,27 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string) (*Keyspace, error) {
 		if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindKeyspace); err != nil {
 			return nil, err
 		}
+		ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean)
+		if err := tx.validatePinnedAgainstRegistry(ks, name, pinned); err != nil {
+			delete(tx.openKeyspaces, handle)
+			return nil, err
+		}
 		delete(tx.dirtyDescriptors, name)
-		return tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean), nil
+		ks.indexes = pinned
+		return ks, nil
 	}
 	desc = page.KeyspaceDescriptor{Kind: page.KeyspaceKindKeyspace}
 	tx.numKeyspaces++
-	return tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated), nil
+	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated)
+	if len(pinned) > 0 {
+		if err := tx.writeNewIndexRegistry(ks, pinned); err != nil {
+			delete(tx.openKeyspaces, handle)
+			tx.numKeyspaces--
+			return nil, err
+		}
+	}
+	ks.indexes = pinned
+	return ks, nil
 }
 
 // ListKeyspaces returns the names of all user keyspaces (Kind=0 or
@@ -488,6 +628,9 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	if ks.dead {
 		return ErrKeyspaceClosed
 	}
+	if ks.readOnly {
+		return ErrReadOnly
+	}
 	if len(key) == 0 {
 		return ErrKeyEmpty
 	}
@@ -534,6 +677,9 @@ func (ks *Keyspace) Delete(key []byte) error {
 	}
 	if ks.dead {
 		return ErrKeyspaceClosed
+	}
+	if ks.readOnly {
+		return ErrReadOnly
 	}
 	if len(key) == 0 {
 		return ErrKeyEmpty
@@ -614,6 +760,9 @@ func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 	}
 	if ks.dead {
 		return 0, ErrKeyspaceClosed
+	}
+	if ks.readOnly {
+		return 0, ErrReadOnly
 	}
 	// Reject empty-but-non-nil bounds per the chunk-5.1 user-locked
 	// empty-key policy + the chunk-5.7 spec-amend on DeleteRange
@@ -845,6 +994,10 @@ func (c *Cursor) requireOpen(needsWrite bool) bool {
 	}
 	if c.ks.dead {
 		c.closeErr = ErrKeyspaceClosed
+		return false
+	}
+	if needsWrite && c.ks.readOnly {
+		c.closeErr = ErrReadOnly
 		return false
 	}
 	return true

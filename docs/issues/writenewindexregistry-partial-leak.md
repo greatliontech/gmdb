@@ -1,0 +1,93 @@
+# `writeNewIndexRegistry` partial-write leaks pages on Commit-after-error
+
+**Lands:** when the engine's "rest-of-tx-continues after a per-op
+error" contract is canonicalized (chunk 11 free-space recovery, or
+whenever the loose-pages-on-error policy is reconsidered for write
+helpers that fail mid-loop). Or earlier if benchmarking shows the
+leakage is material at scale.
+
+## Problem
+
+Chunk-7.3's `writeNewIndexRegistry` (`index_open.go`) calls
+`registryPut` once per declared `IndexDecl`. Each call allocates
+pages via the pager and threads the new registry-tree root through
+`desc.IndexRegistryRoot`. If iteration `k` succeeds and iteration
+`k+1` fails (e.g. pager `ErrTxTooLarge` on a tight slab budget +
+many decls), the chunk-7.5 callers (`CreateKeyspace`,
+`CreateKeyspaceIfNotExists`, `CreateSetKeyspace`,
+`CreateSetKeyspaceIfNotExists`) roll back the in-memory cache:
+
+```go
+delete(tx.openKeyspaces, handle)
+tx.numKeyspaces--
+if pendingDelete { tx.pendingDeletes[name] = struct{}{} }
+return nil, err
+```
+
+The `k` pages allocated by iterations 0..k-1 are reachable through
+the no-longer-cached *Keyspace's `desc.IndexRegistryRoot`. With no
+cached handle, no flush walk visits those pages — they become loose
+pages.
+
+- On `Tx.Rollback()`: the pager's `AbortTx` reclaims everything via
+  the bitmap snapshot. Clean.
+- On `Tx.Commit()` (the "rest-of-tx-continues" contract acknowledged
+  by the caller's error handling — the caller catches `err`,
+  continues other work, then commits): the loose pages have no
+  referrer in any committed tree → orphaned for the lifetime of the
+  file until checkpoint / GC reclaims them.
+
+The chunk-7.3 godoc on the rollback path explicitly opts into
+"rest-of-tx-continues" semantics. Whether that's the right contract
+across the engine (vs. "all-or-nothing per write helper") is a
+design question outside chunk-7.5 scope.
+
+## Repro
+
+Tight `MaxTxBufferBytes`, many `IndexDecl`s, force the
+second-or-later `registryPut` to fail. Compare `tx.Stats().FreePages`
+pre-Begin vs post-Commit: should be unchanged on the
+all-or-nothing contract; will differ by `k * pages-per-registry-leaf`
+under current code.
+
+## Acceptance
+
+Either:
+
+1. **Make `writeNewIndexRegistry` atomic.** Build the full sub-tree
+   in memory (or against a savepoint), install the final root in
+   `desc.IndexRegistryRoot` via a single descriptor mutation; on
+   error, free the in-flight pages explicitly. Increases
+   implementation complexity but holds the "all in-flight
+   allocations land in committed tree OR returned to free space"
+   spec invariant uniformly.
+
+2. **Canonicalize the "rest-of-tx-continues" contract spec-side.**
+   Add a clause to `transactions.md` defining when a per-op error
+   may leave loose pages reachable only via uncommitted in-memory
+   state, and what `Tx.Commit` after such an error is expected to
+   do (silently commit with leaks reclaimable via maintenance? fail
+   loudly?). Then chunk-11 `Check()` audits + chunk-12 background
+   maintenance reclaims.
+
+The decision is upstream of chunk-7; chunk-7.5 takes the existing
+"rest-of-tx-continues" contract as given. This issue tracks the
+revisit.
+
+When this issue closes, the load-bearing rationale moves inline
+into `transactions.md` (the spec'd contract) or the
+`writeNewIndexRegistry` implementation (the atomic variant) and
+this file is deleted per the no-cite invariant.
+
+## Notes
+
+Surfaced by the chunk-7.5 Round-1 adversarial review (M-3). The
+chunk-7.3 H-1 fix (descriptorOwner interface) is unrelated — that
+fix closed the silent-data-loss on Clean-keyspace mutations. This
+issue is specifically about leak-on-error in the bulk-registry-
+write path that chunk-7.5 introduced.
+
+Adjacent: any future write helper that loops over multiple
+btree.Put calls inside one Tx will have the same shape (chunk-7.8
+RebuildIndex's cursor-walk-then-write loop is the natural next
+case).
