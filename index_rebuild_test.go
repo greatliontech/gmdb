@@ -344,14 +344,17 @@ func TestDropIndexMissingIndexNameReturnsErrIndexNotFound(t *testing.T) {
 	}
 }
 
-// --- Regression: Round-1 H-1 (SetKeyspace garbage path) ----------
+// --- Chunk 7.10: SetKeyspace Rebuild/Drop -------------------------
+//
+// These tests previously verified the chunk-7.8 H-1 gate that
+// rejected SetKeyspace Rebuild/Drop with ErrInvalidOptions. The
+// gate was removed at chunk-7.10; the tests now assert the
+// positive behavior (Rebuild/Drop succeed on SetKeyspace).
 
-// TestRebuildIndexOnSetKeyspaceReturnsErrInvalidOptions verifies
-// the chunk-7.8 Round-1 H-1 fix: RebuildIndex on a Kind=1
-// SetKeyspace is rejected (chunk 7.10 wires SetKeyspace-aware
-// rebuild). Without the gate, the row-cursor would feed subpage /
-// nested-tree bytes to decl.Extract, producing a garbage index.
-func TestRebuildIndexOnSetKeyspaceReturnsErrInvalidOptions(t *testing.T) {
+// TestRebuildIndexOnSetKeyspaceSucceeds verifies the chunk-7.10
+// SetKeyspace RebuildIndex path: per-(setKey, setValue) extractor
+// invocation via SetCursor; compound-PK index entry encoding.
+func TestRebuildIndexOnSetKeyspaceSucceeds(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	if err != nil {
@@ -360,19 +363,34 @@ func TestRebuildIndexOnSetKeyspaceReturnsErrInvalidOptions(t *testing.T) {
 	defer db.Close()
 	tx, _ := db.Begin(ctx, true)
 	defer tx.Rollback()
-	if _, err := tx.CreateSetKeyspace("subs", nil); err != nil {
+	v1 := testDecl("by_topic", "topic")
+	v1.Extract = setKeyspaceFirstByteExtract
+	v1.Version = "v1"
+	sks, err := tx.CreateSetKeyspace("subs", nil, v1)
+	if err != nil {
 		t.Fatalf("CreateSetKeyspace: %v", err)
 	}
-	decl := testDecl("by_topic", "topic")
-	decl.Extract = firstByteExtract
-	err = tx.RebuildIndex("subs", decl)
-	if !errors.Is(err, ErrInvalidOptions) {
-		t.Errorf("RebuildIndex on SetKeyspace: got %v want ErrInvalidOptions", err)
+	if _, err := sks.Put([]byte("u1"), []byte("alpha")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	// Rebuild with a fresh version.
+	v2 := testDecl("by_topic", "topic")
+	v2.Extract = setKeyspaceFirstByteExtract
+	v2.Version = "v2"
+	if err := tx.RebuildIndex("subs", v2); err != nil {
+		t.Fatalf("RebuildIndex SetKeyspace: %v", err)
+	}
+	if sks.indexes["by_topic"].count != 1 {
+		t.Errorf("post-rebuild count: got %d want 1", sks.indexes["by_topic"].count)
+	}
+	if sks.indexes["by_topic"].decl.Version != "v2" {
+		t.Errorf("decl.Version not updated: %q", sks.indexes["by_topic"].decl.Version)
 	}
 }
 
-// TestDropIndexOnSetKeyspaceReturnsErrInvalidOptions mirrors H-1.
-func TestDropIndexOnSetKeyspaceReturnsErrInvalidOptions(t *testing.T) {
+// TestDropIndexOnSetKeyspaceSucceeds verifies the chunk-7.10
+// SetKeyspace DropIndex path inherits the chunk-7.8 generic logic.
+func TestDropIndexOnSetKeyspaceSucceeds(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	if err != nil {
@@ -381,12 +399,24 @@ func TestDropIndexOnSetKeyspaceReturnsErrInvalidOptions(t *testing.T) {
 	defer db.Close()
 	tx, _ := db.Begin(ctx, true)
 	defer tx.Rollback()
-	if _, err := tx.CreateSetKeyspace("subs", nil); err != nil {
+	decl := testDecl("by_topic", "topic")
+	decl.Extract = setKeyspaceFirstByteExtract
+	sks, err := tx.CreateSetKeyspace("subs", nil, decl)
+	if err != nil {
 		t.Fatalf("CreateSetKeyspace: %v", err)
 	}
-	err = tx.DropIndex("subs", "by_topic")
-	if !errors.Is(err, ErrInvalidOptions) {
-		t.Errorf("DropIndex on SetKeyspace: got %v want ErrInvalidOptions", err)
+	if _, err := sks.Put([]byte("u1"), []byte("alpha")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := tx.DropIndex("subs", "by_topic"); err != nil {
+		t.Fatalf("DropIndex SetKeyspace: %v", err)
+	}
+	if _, ok := sks.indexes["by_topic"]; ok {
+		t.Errorf("pinned set still has by_topic after DropIndex")
+	}
+	if sks.desc.IndexRegistryRoot != 0 {
+		t.Errorf("IndexRegistryRoot after last DropIndex: got %d want 0",
+			sks.desc.IndexRegistryRoot)
 	}
 }
 

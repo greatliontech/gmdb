@@ -1,6 +1,7 @@
 package gmdb
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"unique"
@@ -50,15 +51,7 @@ func (tx *Tx) resolveKeyspaceForIndexOp(name string) (owner descriptorOwner, cac
 		return ks, ks, nil, ks.desc, nil
 	}
 	if sks, ok := tx.openSetKeyspaces[handle]; ok && !sks.dead {
-		// Chunk-7.8 Round-1 H-1: SetKeyspace RebuildIndex / DropIndex
-		// lands at chunk 7.10 (per-set-member extractor walk + compound-
-		// PK encoding). At chunk 7.8 the row-cursor used by RebuildIndex
-		// would feed the extractor with subpage / nested-tree bytes
-		// (Kind=1 storage layout), producing a garbage index. Reject
-		// here so the failure mode is loud, not silent.
-		return nil, nil, nil, page.KeyspaceDescriptor{}, fmt.Errorf(
-			"gmdb: index ops on SetKeyspace %q not yet implemented (lands with the SetKeyspace indexing chunk): %w",
-			name, ErrInvalidOptions)
+		return sks, nil, sks, sks.desc, nil
 	}
 	d, found, err := tx.lookupDescriptor(name)
 	if err != nil {
@@ -70,13 +63,9 @@ func (tx *Tx) resolveKeyspaceForIndexOp(name string) (owner descriptorOwner, cac
 	if d.Kind == page.KeyspaceKindIndexInternal {
 		return nil, nil, nil, page.KeyspaceDescriptor{}, ErrKeyspaceReserved
 	}
-	if d.Kind == page.KeyspaceKindSetKeyspace {
-		// Same H-1 gate for the not-cached path.
-		return nil, nil, nil, page.KeyspaceDescriptor{}, fmt.Errorf(
-			"gmdb: index ops on SetKeyspace %q not yet implemented (lands with the SetKeyspace indexing chunk): %w",
-			name, ErrInvalidOptions)
-	}
 	// Not-cached path: build an adapter the caller propagates.
+	// Chunk-7.10 removes the chunk-7.8 H-1 Kind=1 gate now that
+	// RebuildIndex's row-walk is kind-aware.
 	adapter := &descAdapterValue{desc: d}
 	return adapter, nil, nil, d, nil
 }
@@ -186,33 +175,34 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error {
 	}
 
 	mergeThreshold := tx.db.opts.MergeThreshold
-	rowCursor := btree.NewCursor(tx.pgr, cfg, desc.Root, mergeThreshold)
 	// Rebuild into a fresh tree (root=0; first btree.Put will
 	// allocate).
 	newRoot := uint64(0)
 	newCount := uint64(0)
 	hasCovering := len(decl.Covering) > 0
+	isSetKeyspace := desc.Kind == page.KeyspaceKindSetKeyspace
 
-	for rowKey, rowValue := rowCursor.First(); rowKey != nil; rowKey, rowValue = rowCursor.Next() {
-		// Copy key + value because cursor.Next() may invalidate.
-		keyCopy := make([]byte, len(rowKey))
-		copy(keyCopy, rowKey)
-		valCopy := make([]byte, len(rowValue))
-		copy(valCopy, rowValue)
-
-		entries := decl.Extract(keyCopy, valCopy)
+	// processPair builds and writes index entries for one extractor
+	// input. For Keyspace: k1=rowKey, k2=rowValue. For SetKeyspace
+	// (chunk-7.10): k1=setKey, k2=setValue — per-(setKey, setValue)
+	// extractor invocation per indexing.md §Indexes on SetKeyspaces.
+	processPair := func(k1, k2 []byte) error {
+		entries := decl.Extract(k1, k2)
 		if len(entries) == 0 {
-			continue
+			return nil
 		}
-		// Dedup within the candidate set; for unique, detect
-		// candidate-set collisions.
 		seen := make(map[string]IndexEntry, len(entries))
 		for _, e := range entries {
-			ik := string(indexEntryKey(e, keyCopy, decl.Unique))
+			var ik string
+			if isSetKeyspace {
+				ik = string(encodeSetKeyspaceIndexKey(e.Cols, k1, k2, decl.Unique))
+			} else {
+				ik = string(indexEntryKey(e, k1, decl.Unique))
+			}
 			if _, dup := seen[ik]; dup {
 				if decl.Unique {
 					return fmt.Errorf("%w: index %q during rebuild: candidate-set duplicate for row %x",
-						ErrIndexUniqueViolation, decl.Name, keyCopy)
+						ErrIndexUniqueViolation, decl.Name, k1)
 				}
 				continue
 			}
@@ -221,19 +211,22 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error {
 		for ik, entry := range seen {
 			ikBytes := []byte(ik)
 			if decl.Unique && newRoot != 0 {
-				// On-disk dedup against the in-progress rebuild
-				// tree (rebuild surfaces unique violations the
-				// new extractor introduces across DISTINCT rows).
 				_, found, err := btree.Get(tx.pgr, cfg, newRoot, ikBytes)
 				if err != nil {
 					return mapBtreeErr(err)
 				}
 				if found {
-					return fmt.Errorf("%w: index %q during rebuild: duplicate key for row %x (new extractor produces collision across rows)",
-						ErrIndexUniqueViolation, decl.Name, keyCopy)
+					return fmt.Errorf("%w: index %q during rebuild: duplicate key (new extractor produces collision across rows)",
+						ErrIndexUniqueViolation, decl.Name)
 				}
 			}
-			val := indexEntryValue(entry, keyCopy, decl.Unique, hasCovering)
+			var pkForValue []byte
+			if isSetKeyspace {
+				pkForValue = encodeSetKeyspaceCompoundPK(k1, k2)
+			} else {
+				pkForValue = k1
+			}
+			val := indexEntryValue(entry, pkForValue, decl.Unique, hasCovering)
 			updated, err := btree.Put(tx.pgr, cfg, newRoot, ikBytes, val)
 			if err != nil {
 				return fmt.Errorf("RebuildIndex %q.%q: btree.Put: %w", keyspace, decl.Name, mapBtreeErr(err))
@@ -241,9 +234,47 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error {
 			newRoot = updated
 			newCount++
 		}
+		return nil
 	}
-	if err := rowCursor.Err(); err != nil {
-		return fmt.Errorf("RebuildIndex %q.%q: row cursor: %w", keyspace, decl.Name, mapBtreeErr(err))
+
+	if isSetKeyspace {
+		// Use the cached *SetKeyspace if present; otherwise construct
+		// a transient handle for the SetCursor walk (read-only). The
+		// transient handle is NOT registered in tx.openSetKeyspaces
+		// so the spec's recovery-after-fingerprint-mismatch pattern
+		// (RebuildIndex on a not-cached keyspace) works unchanged.
+		// readOnly=true on the transient since we only read (chunk-
+		// 7.10 Round-1 L-1).
+		sks := cachedSKS
+		if sks == nil {
+			sks = &SetKeyspace{tx: tx, name: unique.Make(keyspace), desc: desc, readOnly: true}
+		}
+		// newInternalSetCursor bypasses openSetCursors registration
+		// so repeated RebuildIndex calls don't leak entries into the
+		// per-tx slice (chunk-7.10 Round-1 M-1 fix).
+		sc := newInternalSetCursor(sks)
+		for sk, sv := sc.First(); sk != nil; sk, sv = sc.Next() {
+			skCopy := bytes.Clone(sk)
+			svCopy := bytes.Clone(sv)
+			if err := processPair(skCopy, svCopy); err != nil {
+				return err
+			}
+		}
+		if err := sc.Err(); err != nil {
+			return fmt.Errorf("RebuildIndex %q.%q: set cursor: %w", keyspace, decl.Name, mapBtreeErr(err))
+		}
+	} else {
+		rowCursor := btree.NewCursor(tx.pgr, cfg, desc.Root, mergeThreshold)
+		for rowKey, rowValue := rowCursor.First(); rowKey != nil; rowKey, rowValue = rowCursor.Next() {
+			kCopy := bytes.Clone(rowKey)
+			vCopy := bytes.Clone(rowValue)
+			if err := processPair(kCopy, vCopy); err != nil {
+				return err
+			}
+		}
+		if err := rowCursor.Err(); err != nil {
+			return fmt.Errorf("RebuildIndex %q.%q: row cursor: %w", keyspace, decl.Name, mapBtreeErr(err))
+		}
 	}
 
 	// Publish-then-retire ordering (chunk-7.8 Round-1 H-2 fix):

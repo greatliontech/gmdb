@@ -165,13 +165,33 @@ retirement walk does not visit).
 Implementation: the engine iterates the range with a cursor, calling
 `Delete()` for each row. Cost is `O(entries × (indexes +
 extractor))`. The cursor must remain stable across the CoW +
-rebalance triggered by per-row deletes — `Cursor.Delete()` followed
-by `Cursor.Next()` is defined to correctly resume at the post-delete
-successor (see `transactions.md §Cursor State Machine` and
-`api-surface.md`).
+rebalance triggered by per-row deletes — `Cursor.Delete()` advances
+the cursor to the post-delete successor in-place, so the canonical
+drain pattern reads it via `Cursor.Current()` (NOT `Cursor.Next()`,
+which would skip the successor). See `transactions.md §Cursor State
+Machine` for the full pattern, and `§Cursor-Based Range Delete`
+below for the worked example.
 
 This is the same cost a SQL engine pays for `DELETE … WHERE … IN
 range` with secondary indexes. Predictable and correct.
+
+**Partial-progress on error (chunk-7.10 spec amendment).** Unlike
+non-indexed `Keyspace.DeleteRange` — whose underlying
+`btree.DeleteRange` is atomic and returns `(0, err)` with no
+visible state change on failure — the indexed-keyspace cursor-
+walk is per-row atomic, not per-call atomic. On a per-row failure
+at iteration `i`, iterations `0..i-1` have already completed: each
+of those rows is removed from the parent keyspace AND each of
+their index entries has been cleared via the chunk-7.6 atomic
+`Cursor.Delete` maintenance. `DeleteRange` returns
+`(deleted_so_far, err)` so the caller sees the real scope of
+state change. Each successful per-row delete satisfies the
+chunk-5.1 keyed-removal invariants and the chunk-7.1 atomic-Put/
+Delete invariant individually; the in-memory + on-disk state is
+consistent-but-partial. The only safe recovery is `Tx.Rollback()`
+(which restores via the pager bitmap snapshot per
+`pager-slab.md`). This matches the chunk-6.8
+`SetKeyspace.DeleteRange` partial-progress contract.
 
 Callers needing the O(pages) fast path on indexed data can:
 
@@ -187,10 +207,17 @@ For callers needing finer control:
 
 ```go
 c := ks.Cursor()
-for k, _ := c.SeekGE(start); k != nil && bytes.Compare(k, end) < 0; k, _ = c.Next() {
+for k, _ := c.SeekGE(start); k != nil && bytes.Compare(k, end) < 0; k, _ = c.Current() {
     c.Delete()
 }
 ```
+
+Note the use of `c.Current()` (not `c.Next()`) inside the loop:
+`Cursor.Delete()` already advances the cursor to the post-delete
+successor per `transactions.md §Cursor.Delete() post-delete state`,
+so `Current()` reads it directly. `Next()` would step PAST the
+successor and skip alternating entries. (Chunk-7.10 spec
+amendment — earlier revisions of this example used `Next()`.)
 
 One-at-a-time path. `DeleteRange` should be preferred for contiguous
 unconditional deletes.

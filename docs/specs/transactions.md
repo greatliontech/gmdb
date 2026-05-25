@@ -75,10 +75,14 @@ Invariant: kind=clause-explicit;
     inconsistent CoW state.
 
 Invariant: kind=entailed;
-  property=A `Cursor.Delete()` followed by `Cursor.Next()` resumes
-    iteration at the **post-delete successor** — the entry that
-    followed the deleted entry — regardless of mid-iteration CoW or
-    rebalance triggered by the delete;
+  property=A `Cursor.Delete()` positions the cursor ON the
+    **post-delete successor** — the entry that followed the deleted
+    entry — regardless of mid-iteration CoW or rebalance triggered
+    by the delete. The canonical drain-loop pattern is
+    `for k, _ := c.SeekGE(start); k != nil; k, _ = c.Current() {
+    c.Delete() }` — `Current()` reads the post-delete successor
+    in-place each iteration. `Next()` would advance PAST the
+    successor and skip alternating entries;
   from=entailed: cursor state machine (this spec) + cursor stack
     tolerance (`page-formats.md` §Cursor Iteration);
   violation=Cursor desync after delete causes the delete-range loop
@@ -350,8 +354,16 @@ Distinguishing end-of-iteration from unpositioned: end-of-iteration's
   transitions to End-of-iteration (subsequent `Next` returns
   `(nil, nil)`, `Err()` is nil).
 - The cursor stack tolerates CoW + rebalance triggered by the
-  delete: `Next()` after `Delete()` is the supported pattern and
-  always resumes correctly at the post-delete successor.
+  delete; the canonical iteration pattern is:
+  ```go
+  for k, _ := c.SeekGE(start); k != nil && bytes.Compare(k, end) < 0; k, _ = c.Current() {
+      c.Delete()
+  }
+  ```
+  `Current()` reads the post-delete successor in-place — `Next()`
+  would advance PAST the successor and skip alternating entries
+  (since `Delete()` already advanced the cursor). (Chunk-7.10
+  spec clarification.)
 - Possible errors: `ErrReadOnly` (cursor on a read-only txn or
   read-only keyspace), `ErrCursorUnpositioned`, `ErrTxClosed`.
 
@@ -366,10 +378,12 @@ Distinguishing end-of-iteration from unpositioned: end-of-iteration's
   advances to the first value of the next key. If there is no
   next key, transitions to End-of-iteration.
 - The cursor stack tolerates CoW + rebalance triggered by the
-  key-removal case — the same guarantee as `Cursor.Delete()` — so
-  `Next()` after `Delete()` always resumes correctly at the
-  post-delete successor, including across leaf splits and merges
-  caused by the parent-keyspace key removal.
+  key-removal case — the same guarantee as `Cursor.Delete()`. The
+  canonical drain pattern uses `Current()` after `Delete()`, NOT
+  `Next()`: `Delete()` already advanced the cursor to the
+  post-delete successor (next-value-in-key or first-of-next-key),
+  and `Next()` would advance PAST it (chunk-7.10 spec
+  clarification).
 - Same error set as `Cursor.Delete()`.
 
 ### Cursor invalidation by `DeleteKeyspace`

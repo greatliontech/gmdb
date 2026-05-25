@@ -544,10 +544,11 @@ walk does not visit).
 Implementation: the engine iterates the range with a cursor,
 calling `Delete()` for each row. Cost is
 `O(entries × (indexes + extractor))`. The cursor must remain
-stable across CoW + rebalance triggered by the per-row deletes
-— `Cursor.Delete()` followed by `Cursor.Next()` is defined to
-correctly resume at the post-delete successor (see
-`transactions.md §Cursor State Machine`).
+stable across CoW + rebalance triggered by the per-row deletes —
+the canonical drain loop reads the post-delete successor via
+`Cursor.Current()` (NOT `Cursor.Next()`, which would skip,
+since `Cursor.Delete()` already advances). See
+`transactions.md §Cursor State Machine` for the full pattern.
 
 This is the same cost a SQL engine pays for `DELETE … WHERE …
 IN range` with secondary indexes. Predictable and correct.

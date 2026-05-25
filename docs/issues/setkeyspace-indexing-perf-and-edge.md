@@ -1,8 +1,11 @@
 # SetKeyspace indexing: snapshot redundancy + zero-column edge
 
-**Lands:** when SetKeyspace indexing surfaces are next touched
-(chunk 7.10 SetKeyspace RebuildIndex/DropIndex; or whenever a
-profiling pass shows the snapshot allocations are hot).
+**Lands:** profiling-driven (items A + B are perf-only; remaining
+in scope at chunk 7.10's redefer).
+
+**Status:** Chunk 7.10 folded item C (zero-column IndexDecls now
+rejected at `validateIndexDecls`); items A + B remain open under
+the profiling-driven trigger above.
 
 ## Problems
 

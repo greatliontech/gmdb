@@ -236,6 +236,32 @@ func TestValidateIndexDeclsRejectsEmptyName(t *testing.T) {
 	}
 }
 
+// TestValidateIndexDeclsRejectsZeroColumns verifies the chunk-7.10
+// fold of setkeyspace-indexing-perf-and-edge.md item C: a zero-
+// column IndexDecl is rejected with ErrInvalidOptions at the
+// variadic-IndexDecl entry points. The non-unique decoder
+// (extractSetKeyspaceCompoundPKFromIndexKey + extractPKAndValue)
+// needs at least one column terminator to bound the PK component;
+// a zero-column index would surface errIndexKeyMalformed at decode
+// time. Rejecting at construction gives a clear sentinel.
+func TestValidateIndexDeclsRejectsZeroColumns(t *testing.T) {
+	decls := []*IndexDecl{
+		{Name: "by_nothing", Columns: nil},
+	}
+	err := validateIndexDecls(decls)
+	if !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("expected ErrInvalidOptions for zero-column IndexDecl, got %v", err)
+	}
+	// Empty-slice variant — same shape.
+	decls = []*IndexDecl{
+		{Name: "by_nothing", Columns: []IndexColumn{}},
+	}
+	err = validateIndexDecls(decls)
+	if !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("expected ErrInvalidOptions for empty-slice Columns, got %v", err)
+	}
+}
+
 // TestIndexFingerprintErrorSchemaHashFormat verifies the formatted
 // error message for the schema-hash discriminant. Per
 // api-surface.md §IndexFingerprintError + indexing.md §Drift Guard

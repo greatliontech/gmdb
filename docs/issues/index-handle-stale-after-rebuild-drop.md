@@ -1,8 +1,13 @@
 # `*Index` iterators / cursors not invalidated by same-tx RebuildIndex / DropIndex
 
-**Lands:** chunk 7.10 (SetKeyspace RebuildIndex / DropIndex
-wires the symmetric SetKeyspace path; both kinds get the
-invalidation contract together).
+**Lands:** when concurrent-iteration safety hardening lands
+(likely chunk 11 Check + repair, or earlier if a Check pass
+surfaces stale-page reads from this gap). Originally tracked
+for chunk 7.10 alongside SetKeyspace RebuildIndex / DropIndex;
+chunk-7.10 redeferred per Round-1 H-1 triage because the full
+markIndexHandlesStale wiring (Keyspace + SetKeyspace + Index
+handle + iterator-side cursor tracking) is its own substantial
+work bundle, not in scope of chunk 7.10's plan-doc roster.
 
 ## Problem
 

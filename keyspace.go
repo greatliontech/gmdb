@@ -1,6 +1,7 @@
 package gmdb
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -831,6 +832,16 @@ func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 	if ks.desc.Root == 0 {
 		return 0, nil
 	}
+	// Indexed-keyspace fallback per range-delete.md §Indexed-keyspace
+	// fallback (chunk-7.10): when the keyspace has declared indexes,
+	// the O(pages) subtree-retirement fast path is unsafe because
+	// the extractor needs each row's value to compute the prior
+	// index keys. Cursor-walk + Cursor.Delete per row instead. Cost
+	// is O(entries × (indexes + extractor)) — same as a SQL engine
+	// with secondary indexes.
+	if len(ks.indexes) > 0 {
+		return ks.deleteRangeIndexed(start, end)
+	}
 	cfg := ks.builderCfg()
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
 	count, newRoot, err := btree.DeleteRange(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, start, end)
@@ -854,6 +865,72 @@ func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 	ks.markDirty()
 	ks.markCursorsStale()
 	return count, nil
+}
+
+// deleteRangeIndexed is the chunk-7.10 indexed-keyspace fallback
+// for Keyspace.DeleteRange per range-delete.md §Indexed-keyspace
+// fallback. Walks the [start, end) range with a cursor, calling
+// Cursor.Delete per row. Each Cursor.Delete invokes the chunk-7.6
+// atomic index maintenance to clear the row's index entries
+// before removing the row, so post-condition: row + all its index
+// entries are gone, atomically per row.
+//
+// Returns (count_deleted, err). On a per-row delete error, the
+// loop stops and returns (count_so_far, err) — the chunk-6.8
+// SetKeyspace.DeleteRange partial-progress contract applies here
+// too: the chunk-5.7 atomic contract of Keyspace.DeleteRange is
+// replaced by per-row atomicity when indexes force the cursor
+// walker.
+func (ks *Keyspace) deleteRangeIndexed(start, end []byte) (uint64, error) {
+	// Internal cursor — bypass ks.Cursor() registration in
+	// ks.openCursors so repeated DeleteRange calls don't grow
+	// the slice unboundedly (chunk-7.10 Round-1 M-1 fix). The
+	// internal cursor is the sole mutator during this loop, so
+	// it self-recovers via btree.Cursor.Delete's internal SeekGE
+	// without needing the sibling-stale broadcast that
+	// ks.markCursorsStale relies on.
+	c := newInternalCursor(ks)
+	var k []byte
+	if start != nil {
+		k, _ = c.SeekGE(start)
+	} else {
+		k, _ = c.First()
+	}
+	var count uint64
+	for k != nil {
+		if end != nil && bytes.Compare(k, end) >= 0 {
+			break
+		}
+		if err := c.Delete(); err != nil {
+			return count, err
+		}
+		count++
+		// Cursor.Delete advanced the cursor to the next entry; read
+		// via Current (Next would skip).
+		k, _ = c.Current()
+	}
+	if err := c.Err(); err != nil {
+		return count, err
+	}
+	return count, nil
+}
+
+// newInternalCursor returns a *Cursor on this keyspace WITHOUT
+// registering in ks.openCursors. Used by chunk-7.10 internal
+// helpers (deleteRangeIndexed) where the cursor's lifetime is
+// scoped to a single helper call and registration would leak
+// entries into the per-tx openCursors slice. The non-registered
+// cursor doesn't receive markStale from sibling mutations — fine
+// when the cursor itself is the only mutator during its lifetime.
+func newInternalCursor(ks *Keyspace) *Cursor {
+	cfg := ks.builderCfg()
+	var inner *btree.Cursor
+	if ks.tx.writable {
+		inner = btree.NewCursor(ks.tx.pgr, cfg, ks.desc.Root, ks.tx.db.opts.MergeThreshold)
+	} else {
+		inner = btree.NewReadCursor(ks.tx.pgr, cfg, ks.desc.Root)
+	}
+	return &Cursor{inner: inner, tx: ks.tx, ks: ks}
 }
 
 // Cursor returns a new cursor for iterating over this keyspace's

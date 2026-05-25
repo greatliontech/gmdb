@@ -1078,9 +1078,15 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 //   - Every open SetCursor on this keyspace is MarkStale'd
 //     (each per-key Delete call invalidates them).
 //
-// Indexed-keyspace fallback (chunk 7) is not yet implemented;
-// chunk-6.8 operates on indexed-or-not Kind=1 keyspaces uniformly,
-// matching the chunk-5.7 Keyspace.DeleteRange deferral.
+// Indexed-keyspace fallback (chunk-7.10): the per-key Delete loop
+// transparently handles indexed Kind=1 keyspaces. The chunk-7.9
+// extension to SetKeyspace.Delete invokes
+// applyIndexMaintenanceOnBulkKeyDelete per call, which walks every
+// (setKey, setValue) pair in the key's set and clears index
+// entries via the extractor. Cost is O(K × M × (indexes +
+// extractor)) where K = keys in range, M = average set size per
+// key — same shape as Keyspace.DeleteRange's indexed fallback per
+// range-delete.md §Indexed-keyspace fallback.
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 	if err := ks.tx.requireOpen(true); err != nil {
 		return 0, err

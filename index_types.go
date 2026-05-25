@@ -213,6 +213,17 @@ func validateIndexDecls(decls []*IndexDecl) error {
 		if d.Name == "" {
 			return fmt.Errorf("gmdb: IndexDecl at position %d has empty Name: %w", i, ErrKeyEmpty)
 		}
+		// Zero-column IndexDecls are unsupported (chunk-7.10 fold
+		// of setkeyspace-indexing-perf-and-edge.md item C): the
+		// non-unique decoder (extractSetKeyspaceCompoundPKFromIndexKey
+		// + extractPKAndValue) needs at least one column terminator
+		// to bound the PK component; a zero-column index would
+		// surface errIndexKeyMalformed at decode time. Reject at
+		// construction with a clear sentinel.
+		if len(d.Columns) == 0 {
+			return fmt.Errorf("gmdb: IndexDecl %q has zero columns (index must declare at least one column): %w",
+				d.Name, ErrInvalidOptions)
+		}
 		if _, dup := seen[d.Name]; dup {
 			return fmt.Errorf("gmdb: duplicate IndexDecl name %q: %w", d.Name, ErrIndexExists)
 		}

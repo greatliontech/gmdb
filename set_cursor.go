@@ -104,6 +104,30 @@ type SetCursor struct {
 // DeleteValue / sibling SetCursor.Delete MarkStale every cursor
 // returned by this method that is still reachable; subsequent
 // non-repositioning ops surface ErrCursorStale until re-Seeked.
+// newInternalSetCursor returns a *SetCursor on this SetKeyspace
+// WITHOUT registering in ks.openSetCursors. Used by chunk-7.10
+// internal helpers (RebuildIndex's per-(setKey, setValue) walk
+// on the cached path) where the cursor's lifetime is scoped to a
+// single helper call. Registration would leak entries into the
+// per-tx openSetCursors slice across repeated calls. The non-
+// registered cursor doesn't receive markStale from sibling
+// mutations — fine when no concurrent ops fire during the
+// internal loop.
+func newInternalSetCursor(ks *SetKeyspace) *SetCursor {
+	cfg := ks.builderCfg()
+	var outer *btree.Cursor
+	if ks.tx.writable {
+		outer = btree.NewCursor(ks.tx.pgr, cfg, ks.desc.Root, ks.tx.db.opts.MergeThreshold)
+	} else {
+		outer = btree.NewReadCursor(ks.tx.pgr, cfg, ks.desc.Root)
+	}
+	return &SetCursor{
+		ks:          ks,
+		tx:          ks.tx,
+		outerCursor: outer,
+	}
+}
+
 func (ks *SetKeyspace) Cursor() *SetCursor {
 	cfg := ks.builderCfg()
 	var outer *btree.Cursor
