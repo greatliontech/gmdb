@@ -568,6 +568,15 @@ func (ks *Keyspace) markDirty() {
 	ks.state = keyspaceStateDirty
 }
 
+// descriptor returns the in-tx descriptor pointer. Used by the
+// chunk-7.3 registry-CRUD helpers (index_codec.go) to satisfy the
+// descriptorOwner interface — registryPut / registryDelete mutate
+// the descriptor in place AND call markDirty() so the chunk-5.6
+// flushKeyspaces walk persists the mutation. Unexported.
+func (ks *Keyspace) descriptor() *page.KeyspaceDescriptor {
+	return &ks.desc
+}
+
 // DeleteRange deletes every key k with start <= k < end from the
 // keyspace per range-delete.md §Algorithm. Returns the count of
 // entries deleted; empty range (start == end OR start > end) returns

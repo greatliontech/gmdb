@@ -111,6 +111,14 @@ func (ks *SetKeyspace) markDirty() {
 	ks.state = keyspaceStateDirty
 }
 
+// descriptor returns the in-tx descriptor pointer. Used by the
+// chunk-7.3 registry-CRUD helpers (index_codec.go) to satisfy the
+// descriptorOwner interface — see *Keyspace.descriptor godoc.
+// Unexported.
+func (ks *SetKeyspace) descriptor() *page.KeyspaceDescriptor {
+	return &ks.desc
+}
+
 // markSetCursorsStale invokes MarkStale on every SetCursor
 // registered on this keyspace AND refreshes their outer-cursor's
 // tracked rootID to the keyspace's current desc.Root. Also sets
