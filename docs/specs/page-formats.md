@@ -102,6 +102,28 @@ Invariant: kind=clause-explicit;
     accept a "duplicate" because the prefix tuple sorts adjacent.
 
 Invariant: kind=entailed;
+  property=At fixed column count, the encoder is tuple-prefix-free:
+    for any two distinct tuples `T1`, `T2` with `len(T1) == len(T2)`,
+    neither `encode(T1)` is a prefix of `encode(T2)` nor vice versa.
+    (Different-column-count tuples CAN prefix-collide — a 2-col
+    tuple's encoding is a prefix of a 3-col extension — which is by
+    design: an index has a fixed schema, so the decoder always
+    processes the same column count.);
+  from=entailed: the clause-explicit column-level prefix-freeness
+    above + the per-column `0x00 0x00` terminator together imply
+    that two same-length tuples differing at column k diverge at
+    column k's escaped bytes, with no terminator-induced prefix
+    confusion; no single clause states the tuple-level property
+    that index range queries actually depend on;
+  violation=An index range query at a fixed schema returns a
+    tuple whose encoded form prefix-matches a shorter-encoded
+    same-arity tuple — the cursor mis-classifies adjacency,
+    yielding wrong matches for `Range(start, end)` and false
+    duplicates for unique-index probes. (Chunk-7.4 spec amendment;
+    enforced by `TestEncodedTuplePrefixFreenessSameNColsProperty`
+    in `index_key_codec_test.go`.)
+
+Invariant: kind=entailed;
   property=A full key reconstructed from any leaf delta entry must
     fit within the maximum key size derived in `limits.md` from
     the branch-page budget;
@@ -581,9 +603,15 @@ concatenated into a single byte key — currently secondary indexes
 - Within each column's bytes, every `0x00` is escaped to `0x00 0xFF`.
 - After each column's escaped bytes, append a `0x00 0x00`
   terminator.
-- The full key is the concatenation of escaped columns + their
-  terminators, optionally followed (for non-unique indexes) by the
-  escaped primary key + a final `0x00 0x00`.
+- The full key shape is statically determined by `IndexDecl.Unique`
+  (per `indexing.md §Storage Layout`):
+  - **Unique indexes:** the key is `(escapedCol 0x00 0x00)+` — just
+    the concatenated escaped column tuple with terminators.
+  - **Non-unique indexes:** the key is extended with `escapedPK
+    0x00 0x00` — the escaped primary key plus a final terminator.
+    For SetKeyspace indexes the PK is the compound `escape(setKey)
+    || 0x00 0x01 || escape(setValue)` per `set-keyspace.md §Indexes
+    on SetKeyspaces`.
 
 The encoding is **prefix-free**: no escaped column is a prefix of
 another, and the column terminator `0x00 0x00` never appears inside
