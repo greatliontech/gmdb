@@ -1312,34 +1312,27 @@ func (tx *Tx) DeleteKeyspace(name string) error {
 	if desc.Kind == page.KeyspaceKindIndexInternal {
 		return ErrKeyspaceReserved
 	}
-	// Pre-flight assertion: chunk-5.6 implements only step 1 of the
-	// three-subtree retirement (api-surface.md §Keyspace API
-	// DeleteKeyspace). Index-keyspace + index-registry retire lands
-	// at chunk 7. No chunk-5 path produces a non-zero
-	// IndexRegistryRoot, so reaching this branch means a corrupted
-	// disk surface or a forged descriptor. Check BEFORE the
-	// FreeSubtree call so an error here does not leave the data
-	// subtree half-retired (caller's Rollback / AbortTx cleans up
-	// either way, but a Commit-after-ignoring-the-error path must
-	// not publish a partial state).
-	if desc.IndexRegistryRoot != 0 {
-		return fmt.Errorf("%w: DeleteKeyspace %q: IndexRegistryRoot=%d is non-zero; chunk 7 implements index-registry retirement, this should be unreachable at chunk 5",
-			ErrCorrupted, name, desc.IndexRegistryRoot)
+	cfg := tx.pgr.Config()
+
+	// Three-subtree retirement per api-surface.md §Keyspace API
+	// DeleteKeyspace (chunk-7.8 wires steps 2 + 3; step 1 already
+	// existed at chunk 5.6):
+	//
+	//   1. Data subtree FreeSubtree.
+	//   2. Per-index Kind=2 data tree FreeSubtree (walk registry).
+	//   3. Index registry sub-tree FreeSubtree.
+	//
+	// All three happen in the same write tx; on Commit the meta
+	// swap publishes the descriptor removal atomically.
+	if _, err := btree.FreeSubtree(tx.pgr, cfg, desc.Root); err != nil {
+		return fmt.Errorf("DeleteKeyspace %q: data subtree: %w", name, mapBtreeErr(err))
 	}
 
-	// Bulk-free the data subtree. The chunk-5.6 scope is the Kind=0
-	// case; the Kind=1 (SetKeyspace) nested-tree pages reachable via
-	// promoted-set leaf entries are NOT walked here (they don't exist
-	// in chunk 5 — the SetKeyspace surface lands at chunk 6 with its
-	// own bulk-free extension). For Kind=1 descriptors that reach
-	// here only via test-forging, the data subtree (if any) is a
-	// plain B+tree from the data-tree's perspective; FreeSubtree
-	// retires the top-level pages but cannot reach nested
-	// SetKeyspace promotions. This is acceptable because no
-	// non-forging path produces Kind=1 at chunk 5.
-	cfg := tx.pgr.Config()
-	if _, err := btree.FreeSubtree(tx.pgr, cfg, desc.Root); err != nil {
-		return fmt.Errorf("DeleteKeyspace %q: %w", name, mapBtreeErr(err))
+	// Steps 2 + 3: index retirement. Skip when no registry exists.
+	if desc.IndexRegistryRoot != 0 {
+		if err := tx.retireIndexRegistry(name, desc.IndexRegistryRoot); err != nil {
+			return err
+		}
 	}
 
 	// Invalidate the in-memory state.

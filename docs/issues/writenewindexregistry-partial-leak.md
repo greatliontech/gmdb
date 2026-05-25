@@ -113,3 +113,33 @@ shape-2 silent-drift path the chunk-7.6 Round-1 reviewer surfaced).
 When this issue resolves with the atomic variant, the chunk-7.6
 helpers benefit identically — the snapshot/revert layer can drop
 once the underlying contract guarantees all-or-nothing.
+
+## Chunk-7.8 extension: DeleteKeyspace three-subtree retirement +
+RebuildIndex / DropIndex mid-flight failures
+
+Chunk-7.8 adds three new partial-failure shapes under the same
+rest-of-tx-continues contract:
+
+1. `Keyspace.DeleteKeyspace` calls `btree.FreeSubtree(desc.Root)`
+   for the data tree, then `retireIndexRegistry` which walks the
+   registry sub-tree freeing each entry's Root, then frees the
+   registry root itself. A failure inside `retireIndexRegistry`
+   (e.g. `decodeRegistryEntry` on a corrupted entry) leaves the
+   data subtree already freed but the registry partially freed.
+   `Tx.Rollback` recovers via the bitmap snapshot; Commit-after-
+   error orphans the partial state.
+
+2. `Tx.RebuildIndex` builds the new index data tree via N
+   `btree.Put` calls. A failure mid-build leaks the partial new
+   tree. Publish-then-retire ordering (chunk-7.8 H-2 fix) ensures
+   the registry never points at freed pages, so Commit-after-error
+   leaks the partial new tree (no corruption).
+
+3. `Tx.DropIndex` does `registryDelete` then `FreeSubtree(root)`.
+   A failure between the two leaks the data tree but keeps the
+   registry consistent.
+
+All three shapes follow the same canonicalization path this issue
+tracks. When the rest-of-tx-continues contract is replaced by an
+all-or-nothing per-helper guarantee, all three benefit
+automatically.

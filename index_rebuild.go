@@ -1,0 +1,430 @@
+package gmdb
+
+import (
+	"errors"
+	"fmt"
+	"unique"
+
+	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/page"
+)
+
+// descAdapterValue implements descriptorOwner for code paths that
+// work directly on a *page.KeyspaceDescriptor without a *Keyspace /
+// *SetKeyspace handle (chunk-7.8 RebuildIndex / DropIndex on a
+// keyspace not currently cached in tx.openKeyspaces, per
+// indexing.md §Recovery pattern after ErrIndexFingerprintMismatch
+// where OpenKeyspace fails BEFORE caching). The dirty flag is
+// observed by the caller to decide whether to push the mutated
+// descriptor into tx.dirtyDescriptors at the end of the op.
+type descAdapterValue struct {
+	desc  page.KeyspaceDescriptor
+	dirty bool
+}
+
+func (a *descAdapterValue) descriptor() *page.KeyspaceDescriptor { return &a.desc }
+func (a *descAdapterValue) markDirty()                           { a.dirty = true }
+
+// resolveKeyspaceForIndexOp loads the keyspace's descriptor for a
+// RebuildIndex / DropIndex operation. Returns:
+//   - owner: a descriptorOwner the caller passes to registry CRUD
+//     helpers. For a currently-open Kind=0 keyspace, the cached
+//     *Keyspace handle. For a currently-open Kind=1 SetKeyspace
+//     (chunk 7.10 wires this), the cached *SetKeyspace. Otherwise,
+//     a descAdapterValue that the caller propagates to
+//     tx.dirtyDescriptors at the end of the op.
+//   - cachedKS / cachedSKS: non-nil when the keyspace is cached
+//     (used by RebuildIndex's cached-path which also updates
+//     ks.indexes[decl.Name]).
+//   - desc: the descriptor (for Kind check + Root + Count).
+//
+// Errors:
+//   - ErrNotFound if the keyspace does not exist on disk or in tx.
+//   - ErrKeyspaceReserved if the resolved descriptor is Kind=2.
+func (tx *Tx) resolveKeyspaceForIndexOp(name string) (owner descriptorOwner, cachedKS *Keyspace, cachedSKS *SetKeyspace, desc page.KeyspaceDescriptor, err error) {
+	if _, deleted := tx.pendingDeletes[name]; deleted {
+		return nil, nil, nil, page.KeyspaceDescriptor{}, ErrNotFound
+	}
+	handle := unique.Make(name)
+	if ks, ok := tx.openKeyspaces[handle]; ok && !ks.dead {
+		return ks, ks, nil, ks.desc, nil
+	}
+	if sks, ok := tx.openSetKeyspaces[handle]; ok && !sks.dead {
+		// Chunk-7.8 Round-1 H-1: SetKeyspace RebuildIndex / DropIndex
+		// lands at chunk 7.10 (per-set-member extractor walk + compound-
+		// PK encoding). At chunk 7.8 the row-cursor used by RebuildIndex
+		// would feed the extractor with subpage / nested-tree bytes
+		// (Kind=1 storage layout), producing a garbage index. Reject
+		// here so the failure mode is loud, not silent.
+		return nil, nil, nil, page.KeyspaceDescriptor{}, fmt.Errorf(
+			"gmdb: index ops on SetKeyspace %q not yet implemented (lands with the SetKeyspace indexing chunk): %w",
+			name, ErrInvalidOptions)
+	}
+	d, found, err := tx.lookupDescriptor(name)
+	if err != nil {
+		return nil, nil, nil, page.KeyspaceDescriptor{}, err
+	}
+	if !found {
+		return nil, nil, nil, page.KeyspaceDescriptor{}, ErrNotFound
+	}
+	if d.Kind == page.KeyspaceKindIndexInternal {
+		return nil, nil, nil, page.KeyspaceDescriptor{}, ErrKeyspaceReserved
+	}
+	if d.Kind == page.KeyspaceKindSetKeyspace {
+		// Same H-1 gate for the not-cached path.
+		return nil, nil, nil, page.KeyspaceDescriptor{}, fmt.Errorf(
+			"gmdb: index ops on SetKeyspace %q not yet implemented (lands with the SetKeyspace indexing chunk): %w",
+			name, ErrInvalidOptions)
+	}
+	// Not-cached path: build an adapter the caller propagates.
+	adapter := &descAdapterValue{desc: d}
+	return adapter, nil, nil, d, nil
+}
+
+// propagateNotCachedDescChange writes the adapter's mutated
+// descriptor back to tx.dirtyDescriptors when the adapter saw a
+// mark-dirty call. No-op for the cached path (cachedKS/cachedSKS
+// already carries the mutation in their .desc field).
+func (tx *Tx) propagateNotCachedDescChange(name string, owner descriptorOwner) {
+	a, ok := owner.(*descAdapterValue)
+	if !ok || !a.dirty {
+		return
+	}
+	if tx.dirtyDescriptors == nil {
+		tx.dirtyDescriptors = make(map[string]page.KeyspaceDescriptor)
+	}
+	tx.dirtyDescriptors[name] = a.desc
+}
+
+// RebuildIndex drops and re-populates the named index using the
+// supplied IndexDecl. Per indexing.md §Rebuild + §Recovery pattern
+// after ErrIndexFingerprintMismatch:
+//
+//   - The previous index is preserved until commit; a mid-rebuild
+//     failure leaves the old index intact.
+//   - decl.Name must match an existing registry entry's stored
+//     Name; mismatch returns ErrIndexNotFound.
+//   - decl.Extract must be non-nil (ErrIndexExtractorRequired).
+//   - On success the stored SchemaHash and Version are replaced
+//     by decl's values — this is the canonical recovery path after
+//     ErrIndexFingerprintMismatch (bypasses the open-time
+//     fingerprint check).
+//   - Existing rows are re-extracted via decl.Extract; for unique
+//     indexes a duplicate output aborts the rebuild with
+//     ErrIndexUniqueViolation and the existing registry entry is
+//     unchanged.
+//
+// Errors:
+//   - ErrKeyEmpty if keyspace or decl.Name is empty.
+//   - ErrIndexExtractorRequired if decl.Extract is nil.
+//   - ErrNotFound if the keyspace does not exist (chunk-7.1
+//     user-locked: keyspace-management dimension).
+//   - ErrIndexNotFound if the keyspace exists but decl.Name is
+//     not in its registry (chunk-7.1 user-locked: index-management
+//     dimension).
+//   - ErrKeyspaceReserved if the keyspace name resolves to Kind=2.
+//   - ErrIndexUniqueViolation on duplicate keys from the new
+//     extractor.
+//   - ErrReadOnly on a read-only transaction; ErrTxClosed on a
+//     closed transaction.
+func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error {
+	if err := tx.requireOpen(true); err != nil {
+		return err
+	}
+	if keyspace == "" {
+		return ErrKeyEmpty
+	}
+	if decl == nil {
+		return fmt.Errorf("gmdb: RebuildIndex: nil decl: %w", ErrInvalidOptions)
+	}
+	if decl.Name == "" {
+		return ErrKeyEmpty
+	}
+	if decl.Extract == nil {
+		return ErrIndexExtractorRequired
+	}
+	owner, cachedKS, cachedSKS, desc, err := tx.resolveKeyspaceForIndexOp(keyspace)
+	if err != nil {
+		return err
+	}
+	// Load the existing registry entry (must exist).
+	existing, err := tx.registryGet(owner, decl.Name)
+	if err != nil {
+		return err
+	}
+
+	// Open a row-cursor on the parent keyspace.
+	cfg := tx.pgr.Config()
+	if desc.Root == 0 {
+		// Empty parent → rebuilt index is empty. Publish-then-retire
+		// (H-2 ordering): write the registry entry first, then free
+		// the old data tree.
+		newEntry := &indexRegistryEntry{
+			SchemaHash:  schemaHash(decl),
+			Unique:      decl.Unique,
+			Root:        0,
+			Count:       0,
+			UserVersion: decl.Version,
+		}
+		for _, c := range decl.Columns {
+			newEntry.Columns = append(newEntry.Columns, c.Name)
+		}
+		for _, c := range decl.Covering {
+			newEntry.Covering = append(newEntry.Covering, c.Name)
+		}
+		if err := tx.registryPut(owner, decl.Name, newEntry); err != nil {
+			return err
+		}
+		if existing.Root != 0 {
+			if _, err := btree.FreeSubtree(tx.pgr, cfg, existing.Root); err != nil {
+				return fmt.Errorf("RebuildIndex %q.%q: free old subtree: %w", keyspace, decl.Name, mapBtreeErr(err))
+			}
+		}
+		tx.propagateNotCachedDescChange(keyspace, owner)
+		tx.syncRebuildToCachedPinned(cachedKS, cachedSKS, decl, 0, 0)
+		return nil
+	}
+
+	mergeThreshold := tx.db.opts.MergeThreshold
+	rowCursor := btree.NewCursor(tx.pgr, cfg, desc.Root, mergeThreshold)
+	// Rebuild into a fresh tree (root=0; first btree.Put will
+	// allocate).
+	newRoot := uint64(0)
+	newCount := uint64(0)
+	hasCovering := len(decl.Covering) > 0
+
+	for rowKey, rowValue := rowCursor.First(); rowKey != nil; rowKey, rowValue = rowCursor.Next() {
+		// Copy key + value because cursor.Next() may invalidate.
+		keyCopy := make([]byte, len(rowKey))
+		copy(keyCopy, rowKey)
+		valCopy := make([]byte, len(rowValue))
+		copy(valCopy, rowValue)
+
+		entries := decl.Extract(keyCopy, valCopy)
+		if len(entries) == 0 {
+			continue
+		}
+		// Dedup within the candidate set; for unique, detect
+		// candidate-set collisions.
+		seen := make(map[string]IndexEntry, len(entries))
+		for _, e := range entries {
+			ik := string(indexEntryKey(e, keyCopy, decl.Unique))
+			if _, dup := seen[ik]; dup {
+				if decl.Unique {
+					return fmt.Errorf("%w: index %q during rebuild: candidate-set duplicate for row %x",
+						ErrIndexUniqueViolation, decl.Name, keyCopy)
+				}
+				continue
+			}
+			seen[ik] = e
+		}
+		for ik, entry := range seen {
+			ikBytes := []byte(ik)
+			if decl.Unique && newRoot != 0 {
+				// On-disk dedup against the in-progress rebuild
+				// tree (rebuild surfaces unique violations the
+				// new extractor introduces across DISTINCT rows).
+				_, found, err := btree.Get(tx.pgr, cfg, newRoot, ikBytes)
+				if err != nil {
+					return mapBtreeErr(err)
+				}
+				if found {
+					return fmt.Errorf("%w: index %q during rebuild: duplicate key for row %x (new extractor produces collision across rows)",
+						ErrIndexUniqueViolation, decl.Name, keyCopy)
+				}
+			}
+			val := indexEntryValue(entry, keyCopy, decl.Unique, hasCovering)
+			updated, err := btree.Put(tx.pgr, cfg, newRoot, ikBytes, val)
+			if err != nil {
+				return fmt.Errorf("RebuildIndex %q.%q: btree.Put: %w", keyspace, decl.Name, mapBtreeErr(err))
+			}
+			newRoot = updated
+			newCount++
+		}
+	}
+	if err := rowCursor.Err(); err != nil {
+		return fmt.Errorf("RebuildIndex %q.%q: row cursor: %w", keyspace, decl.Name, mapBtreeErr(err))
+	}
+
+	// Publish-then-retire ordering (chunk-7.8 Round-1 H-2 fix):
+	// registryPut the new entry FIRST so a registryPut failure
+	// leaves the old data tree intact. Only after the registry
+	// points at the new root do we FreeSubtree the old root —
+	// a FreeSubtree failure after that point leaks the old tree
+	// (recoverable via Rollback) but cannot leave the registry
+	// pointing at freed pages.
+	newEntry := &indexRegistryEntry{
+		SchemaHash:  schemaHash(decl),
+		Unique:      decl.Unique,
+		Root:        newRoot,
+		Count:       newCount,
+		UserVersion: decl.Version,
+	}
+	for _, c := range decl.Columns {
+		newEntry.Columns = append(newEntry.Columns, c.Name)
+	}
+	for _, c := range decl.Covering {
+		newEntry.Covering = append(newEntry.Covering, c.Name)
+	}
+	if err := tx.registryPut(owner, decl.Name, newEntry); err != nil {
+		return err
+	}
+	// Free the OLD index data tree only after the registry has
+	// been atomically advanced.
+	if existing.Root != 0 {
+		if _, err := btree.FreeSubtree(tx.pgr, cfg, existing.Root); err != nil {
+			return fmt.Errorf("RebuildIndex %q.%q: free old subtree: %w", keyspace, decl.Name, mapBtreeErr(err))
+		}
+	}
+	tx.propagateNotCachedDescChange(keyspace, owner)
+	tx.syncRebuildToCachedPinned(cachedKS, cachedSKS, decl, newRoot, newCount)
+	return nil
+}
+
+// syncRebuildToCachedPinned updates ks.indexes / sks.indexes (when
+// the keyspace was already cached at RebuildIndex entry) with the
+// new decl + root + count + schemaHash. No-op on the not-cached
+// path. Required so a subsequent Lookup / Put within the same tx
+// observes the rebuilt index.
+func (tx *Tx) syncRebuildToCachedPinned(cachedKS *Keyspace, cachedSKS *SetKeyspace, decl *IndexDecl, newRoot, newCount uint64) {
+	if cachedKS == nil && cachedSKS == nil {
+		return
+	}
+	var pinnedMap map[string]*pinnedIndex
+	if cachedKS != nil {
+		pinnedMap = cachedKS.indexes
+	} else {
+		pinnedMap = cachedSKS.indexes
+	}
+	if pinnedMap == nil {
+		// The cached keyspace had no indexes in its pinned set
+		// (e.g. opened with no IndexDecls, then RebuildIndex
+		// supplied one). The rebuild updated the on-disk registry
+		// via registryPut, but the cached handle isn't aware. The
+		// caller's subsequent re-OpenKeyspace with the rebuilt
+		// IndexDecl will fail with ErrKeyspaceAlreadyOpen (cache
+		// hit + index-set mismatch). That's expected per the
+		// recovery loop pattern — the caller exits the loop after
+		// successful rebuild.
+		return
+	}
+	p, ok := pinnedMap[decl.Name]
+	if !ok {
+		// The cached pinnedIndex doesn't track decl.Name. The
+		// caller's prior OpenKeyspace must not have declared this
+		// index (otherwise it would be in pinnedMap). The on-disk
+		// registry is now in a state inconsistent with the cached
+		// handle's pinned set — subsequent ops via the cached
+		// handle don't know about the rebuilt index, which is
+		// acceptable (the caller will re-open).
+		return
+	}
+	p.root = newRoot
+	p.count = newCount
+	p.schemaHash = schemaHash(decl)
+	p.decl = decl
+}
+
+// retireIndexRegistry implements steps 2+3 of the three-subtree
+// retirement in Keyspace.DeleteKeyspace (api-surface.md §Keyspace
+// API DeleteKeyspace; chunk-7.8 wires this). For each index entry
+// in the registry sub-tree:
+//
+//   1. Decode the entry to read its Root (the index data tree).
+//   2. FreeSubtree the index data tree (when Root != 0; an
+//      empty index's data tree was never allocated).
+//   3. After all per-index data trees are retired, FreeSubtree
+//      the registry sub-tree itself.
+//
+// On a mid-walk failure: in-flight FreeSubtree calls have returned
+// pages to the loose pool, but the descriptor itself is still
+// reachable from the caller's tx state (DeleteKeyspace's removal
+// of the descriptor from the keyspace B+tree happens at the
+// chunk-5.6 flushKeyspaces Step 1, which runs at Commit). Tx
+// Rollback restores via AbortTx; Commit-after-error leaks (same
+// rest-of-tx-continues contract as chunk 7.5+7.6).
+func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) error {
+	cfg := tx.pgr.Config()
+	mergeThreshold := tx.db.opts.MergeThreshold
+	// Walk the registry sub-tree with a cursor; collect each
+	// entry's Root for FreeSubtree.
+	cur := btree.NewCursor(tx.pgr, cfg, registryRoot, mergeThreshold)
+	for k, v := cur.First(); k != nil; k, v = cur.Next() {
+		// Copy v because the next cursor op may invalidate.
+		valCopy := make([]byte, len(v))
+		copy(valCopy, v)
+		entry, err := decodeRegistryEntry(valCopy)
+		if err != nil {
+			return fmt.Errorf("%w: DeleteKeyspace %q: registry entry %q decode: %w",
+				ErrCorrupted, keyspaceName, string(k), err)
+		}
+		if entry.Root != 0 {
+			if _, err := btree.FreeSubtree(tx.pgr, cfg, entry.Root); err != nil {
+				return fmt.Errorf("DeleteKeyspace %q: free index %q data subtree: %w",
+					keyspaceName, string(k), mapBtreeErr(err))
+			}
+		}
+	}
+	if err := cur.Err(); err != nil {
+		return fmt.Errorf("DeleteKeyspace %q: registry walk: %w", keyspaceName, mapBtreeErr(err))
+	}
+	// Step 3: free the registry sub-tree itself.
+	if _, err := btree.FreeSubtree(tx.pgr, cfg, registryRoot); err != nil {
+		return fmt.Errorf("DeleteKeyspace %q: free registry subtree: %w", keyspaceName, mapBtreeErr(err))
+	}
+	return nil
+}
+
+// DropIndex removes the named index. Retires the index's Kind=2
+// data sub-tree pages (via btree.FreeSubtree) and removes the
+// registry entry. If the dropped index was the keyspace's last,
+// registryDelete's btree.Delete returns root=0, structurally
+// satisfying the chunk-7.1 indexing.md entailed invariant on
+// empty-registry canonical-at-zero.
+//
+// Errors mirror RebuildIndex: ErrKeyEmpty, ErrNotFound (keyspace),
+// ErrIndexNotFound (index name), ErrKeyspaceReserved (Kind=2),
+// ErrReadOnly / ErrTxClosed.
+func (tx *Tx) DropIndex(keyspace, indexName string) error {
+	if err := tx.requireOpen(true); err != nil {
+		return err
+	}
+	if keyspace == "" || indexName == "" {
+		return ErrKeyEmpty
+	}
+	owner, cachedKS, cachedSKS, _, err := tx.resolveKeyspaceForIndexOp(keyspace)
+	if err != nil {
+		return err
+	}
+	// Load the registry entry to capture its Root (the index data
+	// tree to retire).
+	existing, err := tx.registryGet(owner, indexName)
+	if err != nil {
+		return err
+	}
+	cfg := tx.pgr.Config()
+	// Publish-then-retire ordering (chunk-7.8 Round-1 H-2 fix):
+	// remove the registry entry FIRST so any failure leaves the
+	// data tree intact (and recoverable). Only after the registry
+	// is updated do we FreeSubtree the data tree pages.
+	if err := tx.registryDelete(owner, indexName); err != nil {
+		if errors.Is(err, ErrIndexNotFound) {
+			return err
+		}
+		return fmt.Errorf("DropIndex %q.%q: registry delete: %w", keyspace, indexName, err)
+	}
+	if existing.Root != 0 {
+		if _, err := btree.FreeSubtree(tx.pgr, cfg, existing.Root); err != nil {
+			return fmt.Errorf("DropIndex %q.%q: free data subtree: %w", keyspace, indexName, mapBtreeErr(err))
+		}
+	}
+	tx.propagateNotCachedDescChange(keyspace, owner)
+	// Drop the pinned entry from the cached keyspace, if any.
+	if cachedKS != nil {
+		delete(cachedKS.indexes, indexName)
+	}
+	if cachedSKS != nil {
+		delete(cachedSKS.indexes, indexName)
+	}
+	return nil
+}
