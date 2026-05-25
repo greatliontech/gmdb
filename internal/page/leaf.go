@@ -418,6 +418,37 @@ func (r LeafReader) Validate() error {
 	return nil
 }
 
+// validateCellFlagsCombo rejects flag combinations that have no defined
+// on-disk encoding (the cellFlagKnownMask check only catches unknown
+// bits, not illegal combinations of known bits):
+//
+//   - CellFlagOverflow | CellFlagMultiValue: `page-formats.md §Leaf
+//     Page (CellFlags bit layout)` declares these mutually exclusive
+//     in practice; no encoding exists for the combination.
+//   - CellFlagNestedTree without CellFlagMultiValue: the NestedTree
+//     bit is only meaningful when MultiValue is also set
+//     (see this file's `CellFlags bit layout` doc: NestedTree is
+//     defined as "only when Bit 1 set: 0 = subpage, 1 = nested
+//     B+tree"). NestedTree alone is structurally invalid.
+//
+// Caller wraps with the per-variant structural context. Centralised
+// here so all three Validate paths (restart / delta / uncompressed)
+// enforce the same combination contract, keeping `Validate` as the
+// trust boundary that `LeafBuilder.AddEntry` and downstream callers
+// rely on (`AddEntry` panics on these same combinations; without
+// this Validate gate, a corrupted on-disk page passing Validate
+// would panic-the-process mid-rebuild instead of returning
+// ErrCorrupted at the boundary).
+func validateCellFlagsCombo(flags uint8) error {
+	if flags&CellFlagOverflow != 0 && flags&CellFlagMultiValue != 0 {
+		return fmt.Errorf("CellFlags 0x%x sets both Overflow and MultiValue (mutually exclusive)", flags)
+	}
+	if flags&CellFlagNestedTree != 0 && flags&CellFlagMultiValue == 0 {
+		return fmt.Errorf("CellFlags 0x%x sets NestedTree without MultiValue (only valid when MultiValue is set)", flags)
+	}
+	return nil
+}
+
 // validateRestartEntry checks a restart entry at off and returns the
 // offset of the next entry. Returns a non-nil error (without
 // ErrCorrupted wrap — the caller wraps with structural context) on any
@@ -429,6 +460,9 @@ func (r LeafReader) validateRestartEntry(off int) (int, error) {
 	flags := r.buf[off]
 	if flags&^cellFlagKnownMask != 0 {
 		return 0, fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
+	}
+	if err := validateCellFlagsCombo(flags); err != nil {
+		return 0, err
 	}
 	off++
 	if err := r.ensureBytes(off, 2); err != nil {
@@ -463,6 +497,9 @@ func (r LeafReader) validateDeltaEntry(off int) (int, error) {
 	flags := r.buf[off]
 	if flags&^cellFlagKnownMask != 0 {
 		return 0, fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
+	}
+	if err := validateCellFlagsCombo(flags); err != nil {
+		return 0, err
 	}
 	off++
 	if err := r.ensureBytes(off, 4); err != nil {
@@ -504,6 +541,9 @@ func (r LeafReader) validateUCEntry(off int) error {
 	flags := r.buf[off]
 	if flags&^cellFlagKnownMask != 0 {
 		return fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
+	}
+	if err := validateCellFlagsCombo(flags); err != nil {
+		return err
 	}
 	off++
 	if err := r.ensureBytes(off, 2); err != nil {

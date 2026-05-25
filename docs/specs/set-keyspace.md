@@ -192,21 +192,32 @@ Two storage strategies based on value-set size:
 A subpage is stored in the leaf entry's value area.
 `CellFlags.MultiValue` is set and `CellFlags.NestedTree` is clear.
 The entry uses the standard restart/delta key encoding from
-`page-formats.md`; the subpage replaces the value portion.
+`page-formats.md`; the subpage occupies the inline value half —
+the `ValueLen u32` prefix from `page-formats.md §Leaf Page` is
+present and equals `4 + DataSize` (the subpage header + entry
+bytes). The leaf layer carries the subpage bytes opaque-through;
+the subpage's internal structure (Count / DataSize / entries) is
+decoded by the SetKeyspace layer, not by the leaf.
 
 ```
-SetKeyspace Subpage Entry (restart)
-+-----------+----------+-----------+-----------+
-| CellFlags | KeyLen   | Key bytes | Subpage   |
-| uint8     | uint16   |           |           |
-+-----------+----------+-----------+-----------+
-
-Subpage (embedded in cell value area):
+SetKeyspace Subpage Entry (restart)        Subpage size = ValueLen = 4 + DataSize
++-----------+----------+----------+-----------+-----------+
+| CellFlags | KeyLen   | ValueLen | Key bytes | Subpage   │
+| uint8     | uint16   | uint32   |           |           │
++-----------+----------+----------+-----------+-----------+
+                                                          │
+Subpage (embedded in cell value area) ←───────────────────┘
 +----------+----------+---------+---------+-----+
 | Count    | DataSize | Entry 0 | Entry 1 | ... |
 | uint16   | uint16   |         |         |     |
 +----------+----------+---------+---------+-----+
 ```
+
+The delta-entry form mirrors `page-formats.md §Leaf Page
+(Compressed Leaf) Delta entry` exactly:
+`[CellFlags][SharedLen][UnsharedLen][ValueLen u32][UnsharedKey][Subpage]`.
+Only the restart form is shown above; the delta form's `ValueLen`
+field has the same semantics.
 
 For **variable-size values**:
 

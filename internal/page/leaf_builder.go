@@ -74,10 +74,10 @@ func (b *LeafBuilder) Reset(buf []byte, cfg Config) {
 	}
 }
 
-// AddInline appends an inline (key, value) entry. Returns false if the
-// page is full (caller decides to split or finish + start a new page).
-// Panics on out-of-order key (debug assertion — pre-sorting is the
-// caller's responsibility).
+// AddInline appends an inline (key, value) entry (CellFlags = 0).
+// Returns false if the page is full (caller decides to split or
+// finish + start a new page). Panics on out-of-order key (debug
+// assertion — pre-sorting is the caller's responsibility).
 func (b *LeafBuilder) AddInline(key, value []byte) bool {
 	return b.addEntry(key, 0, value, 0, 0)
 }
@@ -89,14 +89,64 @@ func (b *LeafBuilder) AddOverflow(key []byte, ovflPage, totalLen uint64) bool {
 	return b.addEntry(key, CellFlagOverflow, nil, ovflPage, totalLen)
 }
 
-// AddEntry dispatches by cellFlags. Convenience for callers that already
-// hold a LeafEntry (e.g., the split-helper that copies entries between
-// pages).
+// AddSubpage appends a SetKeyspace subpage cell (CellFlagMultiValue
+// set, CellFlagNestedTree clear). The subpage parameter holds the
+// raw subpage bytes (header + entries, per set-keyspace.md §Subpage
+// Format) produced by internal/page.SubpageReader / EncodeSubpage /
+// Insert / Delete. The leaf carries the bytes opaque-through;
+// per-subpage validation lives at the SetKeyspace surface (chunk
+// 6.6) which has the keyspace's FixedValueSize.
+//
+// On-disk encoding is the same shape as AddInline (the cell flag is
+// the only byte that differs): [Flags][KeyLen][ValueLen][Key][Subpage].
+// Returns false on page-full.
+//
+// The subpage's 50%-of-leaf promotion threshold is the SetKeyspace
+// layer's responsibility (chunk 6.4) — this builder does not enforce
+// it and will happily build a leaf containing an over-threshold
+// subpage if asked.
+func (b *LeafBuilder) AddSubpage(key, subpage []byte) bool {
+	return b.addEntry(key, CellFlagMultiValue, subpage, 0, 0)
+}
+
+// AddEntry dispatches by e.Flags. Convenience for callers that
+// already hold a LeafEntry — e.g., the split / merge / rebuild
+// helpers in internal/btree that decode a leaf, mutate the entry
+// list, and re-encode. Preserves the cell flags through the
+// round-trip so SetKeyspace subpage cells survive every leaf
+// rebuild without silent demotion to a plain inline cell.
+//
+// Recognised dispatches:
+//   - CellFlagOverflow (alone) → AddOverflow (overflow reference
+//     value half).
+//   - CellFlagMultiValue && !CellFlagNestedTree → AddSubpage (subpage).
+//   - flags == 0 → AddInline (plain key → value).
+//
+// Panics on flag combinations the builder does not have an
+// encoding for:
+//   - CellFlagOverflow | CellFlagMultiValue: `page-formats.md
+//     §Leaf Page (CellFlags bit layout)` declares these mutually
+//     exclusive in practice; no encoding exists for the
+//     combination, so the caller has constructed an
+//     unrepresentable cell.
+//   - CellFlagNestedTree: the nested-B+tree reference cell uses
+//     a distinct value-half encoding (`[Root u64][Count u64]`,
+//     no ValueLen prefix) that lands when the chunk wiring the
+//     promotion-to-nested-tree behaviour also wires the encoder
+//     and decoder for this cell shape.
 func (b *LeafBuilder) AddEntry(e LeafEntry) bool {
-	if e.Flags&CellFlagOverflow != 0 {
+	switch {
+	case e.Flags&CellFlagOverflow != 0 && e.Flags&CellFlagMultiValue != 0:
+		panic(fmt.Sprintf("page: LeafBuilder.AddEntry on CellFlagOverflow|CellFlagMultiValue cell (flags=0x%x) — these bits are mutually exclusive per page-formats.md §Leaf Page (CellFlags bit layout)", e.Flags))
+	case e.Flags&CellFlagOverflow != 0:
 		return b.AddOverflow(e.Key, e.OverflowPage, e.TotalLen)
+	case e.Flags&CellFlagMultiValue != 0 && e.Flags&CellFlagNestedTree == 0:
+		return b.AddSubpage(e.Key, e.Value)
+	case e.Flags&CellFlagNestedTree != 0:
+		panic(fmt.Sprintf("page: LeafBuilder.AddEntry on CellFlagNestedTree cell (flags=0x%x) — nested-tree reference encoding not yet implemented in LeafBuilder", e.Flags))
+	default:
+		return b.AddInline(e.Key, e.Value)
 	}
-	return b.AddInline(e.Key, e.Value)
 }
 
 func (b *LeafBuilder) addEntry(key []byte, flags uint8, value []byte, ovflPage, totalLen uint64) bool {
