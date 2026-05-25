@@ -611,6 +611,42 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 	}
 	cfg := ks.builderCfg()
 
+	// Indexed-keyspace path (chunk 7.9): pre-probe the membership
+	// to determine if this Put is an add or a no-op. The spec at
+	// indexing.md §Write Path requires maintenance BEFORE the row
+	// write so a unique-probe failure aborts cleanly; for
+	// SetKeyspace there's no "old value to diff" — Put is either
+	// a no-op (pair already present) or an insert. The pre-probe
+	// duplicates the membership check the subsequent dispatch
+	// would perform; the redundancy is acceptable as the cost of
+	// the abort-before-mutation contract.
+	if len(ks.indexes) > 0 {
+		already, hvErr := ks.HasValue(key, value)
+		if hvErr != nil {
+			return false, hvErr
+		}
+		if already {
+			return false, nil // no-op; no maintenance fires
+		}
+		rowSnap := snapshotIndexes(ks.indexes)
+		if mErr := ks.applyIndexMaintenanceOnAddValue(key, value); mErr != nil {
+			return false, mErr
+		}
+		// Revert pinned state on any failure OR on the (currently
+		// unreachable in single-writer-tx) case where the dispatch
+		// returns added=false despite our pre-probe saying not-
+		// present. The contract per indexing.md is "row write
+		// happened" = (err==nil && added==true); any other outcome
+		// means our maintenance mutated pinned without a matching
+		// row mutation, and we must restore. (Chunk-7.9 Round-1
+		// M-1 fix.)
+		defer func() {
+			if err != nil || !added {
+				restoreIndexes(ks.indexes, rowSnap)
+			}
+		}()
+	}
+
 	if ks.desc.Root == 0 {
 		// Genesis: build a single-entry subpage + insert as the
 		// keyspace's root cell.
@@ -771,7 +807,7 @@ func (ks *SetKeyspace) putIntoNestedTree(cfg page.Config, key, value []byte, e p
 //
 // Errors: ErrKeyEmpty, ErrKeyspaceClosed, ErrNotFound (Delete-on-
 // miss), ErrCorrupted, pager allocation errors.
-func (ks *SetKeyspace) Delete(key []byte) error {
+func (ks *SetKeyspace) Delete(key []byte) (err error) {
 	if err := ks.tx.requireOpen(true); err != nil {
 		return err
 	}
@@ -794,6 +830,25 @@ func (ks *SetKeyspace) Delete(key []byte) error {
 	}
 	if !found {
 		return ErrNotFound
+	}
+
+	// Indexed-keyspace path (chunk 7.9 + indexing.md §Indexes on
+	// SetKeyspaces): bulk-key Delete on an indexed SetKeyspace
+	// cannot use the bulk-free fast path because each (key, value)
+	// pair must have its index entries removed via the extractor.
+	// Walk every set member, invoke applyIndexMaintenanceOnRemoveValue
+	// per pair, then drop the row's leaf cell.
+	if len(ks.indexes) > 0 {
+		rowSnap := snapshotIndexes(ks.indexes)
+		if err := ks.applyIndexMaintenanceOnBulkKeyDelete(cfg, key, e); err != nil {
+			restoreIndexes(ks.indexes, rowSnap)
+			return err
+		}
+		defer func() {
+			if err != nil {
+				restoreIndexes(ks.indexes, rowSnap)
+			}
+		}()
 	}
 
 	// Determine the value count contributed by this cell (for
@@ -857,7 +912,7 @@ func (ks *SetKeyspace) Delete(key []byte) error {
 // Errors: ErrKeyEmpty, ErrKeyspaceClosed, ErrValueSizeMismatch
 // (fixed-size keyspace wrong-length value), ErrNotFound (Delete-on-
 // miss), ErrCorrupted, pager allocation errors.
-func (ks *SetKeyspace) DeleteValue(key, value []byte) error {
+func (ks *SetKeyspace) DeleteValue(key, value []byte) (err error) {
 	if err := ks.tx.requireOpen(true); err != nil {
 		return err
 	}
@@ -878,6 +933,30 @@ func (ks *SetKeyspace) DeleteValue(key, value []byte) error {
 		return ErrNotFound
 	}
 	cfg := ks.builderCfg()
+
+	// Indexed-keyspace path (chunk 7.9): pre-probe that the
+	// (key, value) pair exists, then run index maintenance BEFORE
+	// the actual subpage / nested-tree delete. On any subsequent
+	// failure, restore pinned state.
+	if len(ks.indexes) > 0 {
+		present, hvErr := ks.HasValue(key, value)
+		if hvErr != nil {
+			return hvErr
+		}
+		if !present {
+			return ErrNotFound
+		}
+		rowSnap := snapshotIndexes(ks.indexes)
+		if mErr := ks.applyIndexMaintenanceOnRemoveValue(key, value); mErr != nil {
+			return mErr
+		}
+		defer func() {
+			if err != nil {
+				restoreIndexes(ks.indexes, rowSnap)
+			}
+		}()
+	}
+
 	e, found, err := btree.GetEntry(ks.tx.pgr, cfg, ks.desc.Root, key)
 	if err != nil {
 		return mapBtreeErr(err)

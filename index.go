@@ -127,12 +127,19 @@ func (idx *Index) rowTx() *Tx {
 // later chunk that wires covering-as-full-row coverage; chunk 7.7
 // always back-lookups for Lookup's value return).
 //
+// For a SetKeyspace index (idx.sks != nil), routes to the
+// SetKeyspace-aware path which yields (setKey, setValue) tuples
+// instead of (rowKey, rowValue) per chunk 7.9.
+//
 // Returns (nil, nil, true, nil) on a silent-skip case (back-
 // lookup failed to find the PK — corruption signal per
 // indexing.md §Lookup API §Intra-transaction consistency); the
 // caller treats this as a missed entry and continues iteration
 // without setting idx.err.
 func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []byte, skip bool, err error) {
+	if idx.sks != nil {
+		return idx.extractSetKeyspacePKAndValue(indexKey, indexValue)
+	}
 	if idx.pinned.decl.Unique {
 		extractedPK, _, decErr := decodeUniqueIndexValue(indexValue)
 		if decErr != nil {
@@ -284,6 +291,20 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
+		// Chunk-7.9 Round-1 H-1: LookupKeys on a SetKeyspace index
+		// has no well-defined iter.Seq[[]byte] surface — the "PK"
+		// is a compound (setKey, setValue) pair per set-keyspace.md
+		// §Indexes on SetKeyspaces. Returning the raw compound bytes
+		// would yield bytes the caller cannot interpret without
+		// out-of-band knowledge of the compound encoding; returning
+		// setKey-only or setValue-only would lose information. Use
+		// Lookup (iter.Seq2) instead — it yields (setKey, setValue)
+		// pairs cleanly.
+		if idx.sks != nil {
+			idx.err = fmt.Errorf("gmdb: index %q LookupKeys on SetKeyspace: use Lookup (iter.Seq2) for the compound (setKey, setValue) pair: %w",
+				idx.pinned.decl.Name, ErrInvalidOptions)
+			return
+		}
 		if got, want := len(cols), len(idx.pinned.decl.Columns); got != want {
 			idx.err = fmt.Errorf("gmdb: index %q LookupKeys: got %d cols, want %d (exact match): %w",
 				idx.pinned.decl.Name, got, want, ErrInvalidOptions)
@@ -465,3 +486,60 @@ func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error) {
 	return gotPK, rowValue, nil
 }
 
+// extractSetKeyspacePKAndValue decodes a SetKeyspace index entry
+// into the per-set-member (setKey, setValue) pair (chunk 7.9
+// SetKeyspace lookup contract; see api-surface.md §Index Lookup
+// API). For SetKeyspace indexes, the iter.Seq2 yields
+// (setKey, setValue) rather than (rowKey, rowValue): the
+// "primary key" of an index entry is the compound (setKey,
+// setValue) pair per set-keyspace.md §Indexes on SetKeyspaces.
+//
+// Decoding routes:
+//   - Unique: uvarint-prefixed compound PK in the index value;
+//     decodeUniqueIndexValue extracts the compound bytes, then
+//     decodeSetKeyspaceCompoundPK splits on the 0x00 0x01
+//     separator.
+//   - Non-unique: compound PK lives in the index key suffix after
+//     the column-tuple terminator; extractSetKeyspaceCompoundPKFromIndexKey
+//     walks the key counting real 0x00 0x00 terminators.
+//
+// Silent-skip applies per indexing.md §Lookup API: if the
+// (setKey, setValue) pair has been removed from the SetKeyspace
+// between index Put and Lookup (engine bug / external corruption),
+// the iterator skips the entry without setting idx.err.
+func (idx *Index) extractSetKeyspacePKAndValue(indexKey, indexValue []byte) (setKey, setValue []byte, skip bool, err error) {
+	var compoundPK []byte
+	if idx.pinned.decl.Unique {
+		pk, _, decErr := decodeUniqueIndexValue(indexValue)
+		if decErr != nil {
+			return nil, nil, false, fmt.Errorf("%w: %w", ErrCorrupted, decErr)
+		}
+		compoundPK = pk
+	} else {
+		extracted, extErr := extractSetKeyspaceCompoundPKFromIndexKey(indexKey, len(idx.pinned.decl.Columns))
+		if extErr != nil {
+			return nil, nil, false, fmt.Errorf("%w: index %q: %w", ErrCorrupted, idx.pinned.decl.Name, extErr)
+		}
+		compoundPK = extracted
+	}
+	sk, sv, decErr := decodeSetKeyspaceCompoundPK(compoundPK)
+	if decErr != nil {
+		return nil, nil, false, fmt.Errorf("%w: %w", ErrCorrupted, decErr)
+	}
+	// Back-lookup: verify the (setKey, setValue) pair still
+	// exists in the SetKeyspace. Silent-skip per spec on miss.
+	has, hvErr := idx.sks.HasValue(sk, sv)
+	if hvErr != nil {
+		return nil, nil, false, hvErr
+	}
+	if !has {
+		return nil, nil, true, nil
+	}
+	// Copy out — the caller may retain these slices past the
+	// next cursor op.
+	skCopy := make([]byte, len(sk))
+	copy(skCopy, sk)
+	svCopy := make([]byte, len(sv))
+	copy(svCopy, sv)
+	return skCopy, svCopy, false, nil
+}

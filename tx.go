@@ -545,12 +545,17 @@ func (tx *Tx) flushKeyspaces() error {
 	// Symmetric to 2a — the descriptor encoding is kind-agnostic
 	// (EncodeKeyspaceDescriptor writes the full struct including
 	// Kind + FixedValueSize), so the only difference is the source
-	// map and the *SetKeyspace handle type.
+	// map and the *SetKeyspace handle type. Sync the chunk-7.9
+	// SetKeyspace pinnedIndex root/count back to the registry
+	// sub-tree BEFORE encoding the descriptor, mirroring Step 2a.
 	if tx.hasDirtyOpenSetKeyspaces() {
 		names := dirtySetOpenNamesSorted(tx.openSetKeyspaces)
 		buf := make([]byte, page.KeyspaceDescriptorSize)
 		for _, name := range names {
 			sks := tx.openSetKeyspaces[unique.Make(name)]
+			if err := tx.flushIndexRegistry(sks, sks.indexes); err != nil {
+				return fmt.Errorf("flushKeyspaces: index registry sync %q (SetKeyspace): %w", name, err)
+			}
 			page.EncodeKeyspaceDescriptor(buf, sks.desc)
 			newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte(name), buf)
 			if err != nil {
