@@ -947,6 +947,86 @@ parts).
 
 Primary files: `subpage.go`, `btree.go`, `cursor.go`, `db.go`.
 
+Sub-chunk plan (9 sub-chunks; chunk-5 8-sub-chunk pattern + 1
+because subpage codec, leaf integration, and promotion are three
+structurally distinct pieces that need independent adversarial
+review):
+
+- **6.1 — chunk-start gate.** Triage (1 entry matches `Lands: 6`:
+  `setkeyspace-put-added-bool`, folded as user-locked at 6.1).
+  Project-invariants trigger fires for the new chunk-6 domain
+  concepts (subpage, promotion / demotion, per-key bulk-free,
+  intra-key cursor nav, empty-set ban); five clause-explicit
+  invariants already in `set-keyspace.md` to be enforced as tests,
+  plus four entailed invariants appended at 6.1 (nested-cell Count
+  equality, desc.Count accounting across promotion / bulk-free,
+  promotion/demotion atomicity, SetCursor NextValue key-boundary).
+  Spec-tier promotions chunk-6 owes per the chunk-5.1 schedule:
+  `keyspaces.md` #2 / #3 / #5 (Kind=1 parts) at 6.6 first
+  `CreateSetKeyspace`; Delete-on-miss for `SetKeyspace.Delete` /
+  `DeleteValue` at 6.6 first impl. User-locked at 6.1:
+  `SetKeyspace.Put(key, value []byte) (added bool, err error)` —
+  spec amendment landed at 6.1 in `api-surface.md` + the typed
+  mirror in `typed-keyspaces.md`; the issue file is resolved by
+  the close-out gate at 6.9 (load-bearing rationale moved inline
+  at 6.1; file deletion + `docs/issues/README.md` row removal at
+  6.9 per Issue-triage gate 2).
+- **6.2 — subpage codec.** New `internal/page/subpage.go` with
+  variable + fixed-size encode/decode/binary-search/insert/delete;
+  Count + DataSize fields; sorted-order invariant + (fixed)
+  uniform-stride invariant enforced by tests. Standalone unit-test
+  surface, no btree integration yet.
+- **6.3 — leaf integration.** Extend `LeafReader` / `LeafBuilder` /
+  `LeafIter` / `Validate` to surface `MultiValue && !NestedTree`
+  subpage cells as a distinct cell shape — chunk-4 leaf
+  split/merge/rebuild carries subpage cells through without
+  mangling.
+- **6.4 — nested-tree promotion.** 4-step atomic promotion
+  (alloc leaf → copy entries → replace cell → insert new value)
+  at the 50%-of-usable-leaf threshold. Operates on a single
+  SetKeyspace cell, no SetKeyspace surface yet — driven by an
+  `internal/btree` test fixture.
+- **6.5 — demotion + per-key bulk-free + FreeSubtree extension.**
+  Detect single-leaf-fits-as-subpage at delete → free leaf + repack
+  cell. Per-key bulk-free walks nested tree via subtree retirement.
+  Extends `FreeSubtree` to recognise SetKeyspace cells (closes the
+  inheritance chunk 5.6 left open re: SetKeyspace nested-tree
+  pages not walked).
+- **6.6 — SetKeyspace public surface.** `SetKeyspaceOptions`,
+  `Tx.OpenSetKeyspace` / `OpenSetKeyspaceReadOnly` /
+  `CreateSetKeyspace` / `CreateSetKeyspaceIfNotExists`; descriptor
+  flush integration (mirrors `Keyspace` state machine);
+  `Has` / `HasValue` / `Put` (added bool, err error) / `Delete` /
+  `DeleteValue` / `CountValues`. Spec-tier promotions land here:
+  `keyspaces.md` #2 / #3 / #5 (Kind=1 parts) at first
+  `CreateSetKeyspace`; Delete-on-miss for `SetKeyspace.Delete` /
+  `DeleteValue` at first impl (api-surface.md §Invariants).
+- **6.7 — `SetCursor`.** Core nav
+  (First/Last/Next/Prev/Seek/SeekGE/Current/Delete/Err) + intra-key
+  value nav
+  (FirstValue/LastValue/NextValue/PrevValue/SeekValue/NextKey/PrevKey/CountValues).
+  Enforces the entailed invariant: `NextValue` does NOT cross key
+  boundaries. Sibling-mutation MarkStale + SetRootID contract per
+  chunk-5 pattern.
+- **6.8 — `SetKeyspace.DeleteRange`.** Range walk via subpage-aware
+  leaf walker; per-key bulk-free for cells fully covered by the
+  range; partial-range fallback at boundaries. Reuses chunk-5.7
+  three-phase DeleteRange machinery where possible.
+- **6.9 — close-out.** Cite sweep — resolve
+  `setkeyspace-put-added-bool` by deleting the issue file (load-
+  bearing rationale already inline at 6.1). Spec-tier invariant
+  audit (verify every chunk-6 invariant is enforced by at least
+  one test). Full suite + `-race` green across all packages.
+  Plan-doc chunk-6 closeout entry.
+
+Chunk-5-precedent deferrals carried forward at chunk-6
+(no explicit issue doc filed; chunk-5 set the same precedent for
+`Keyspace`): `SetKeyspace.NextSequence`, `SetKeyspace.Stats`,
+`SetKeyspace.All / Range / Prefix` `iter.Seq2` helpers. (Lands:
+when corresponding `Keyspace.*` lands.) `SetKeyspace.Index` is
+chunk 7. `SetKeyspace.BulkLoad` is chunk 8 (covered in §Chunk 8
+scope alongside `Keyspace.BulkLoad`).
+
 ### Chunk 7 — Indexing
 
 **Scope.** `IndexDecl` validation + schema-hash, per-keyspace

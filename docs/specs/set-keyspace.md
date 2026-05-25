@@ -94,6 +94,89 @@ Invariant: kind=clause-explicit;
     return wrong primary keys at lookup, and the index registry's
     fingerprint guarantees do not catch it.
 
+Invariant: kind=entailed;
+  property=The nested-tree reference cell's `Count` field equals the
+    number of leaf entries reachable from `Root` for that key; every
+    `Put` / `DeleteValue` that mutates the nested tree maintains the
+    equality before returning to the caller;
+  from=entailed: §Nested B+tree Reference Cell describes `Count` as
+    "number of values in the set (O(1) access)" — but no single
+    clause states the per-op accounting that maintains equality
+    across promotion, in-place insert, in-place delete, and demotion;
+  violation=A `Put` or `DeleteValue` that mutates the nested tree
+    but skips the `Count` update returns wrong `CountValues(key)` —
+    the user reads "37 members" while iterating 42 of them, or vice
+    versa, with no clause stating they must match.
+
+Invariant: kind=entailed;
+  property=`desc.Count` for a SetKeyspace equals the sum over all
+    keys `k` of values stored under `k` (subpage-stored or
+    nested-tree-stored), maintained atomically with every Put /
+    Delete / DeleteValue / DeleteRange / bulk-free;
+  from=entailed: `keyspaces.md §Keyspace Descriptor` Count field
+    "For a SetKeyspace, total pairs across all value sets" — but no
+    single clause states the per-op accounting that maintains this
+    equality across subpage growth, promotion (a single Put can
+    increase Count by 1 and move N old members from subpage to
+    nested tree), per-key bulk-free (a single Delete can decrement
+    Count by N for the freed nested tree), and DeleteRange;
+  violation=`ks.Stats().Entries` diverges from the actual stored
+    pair count; iteration counts and `Stats()` disagree on the same
+    transaction snapshot, breaking audit, capacity planning, and the
+    `chunk-5.7 DeleteRange` defense-in-depth check that compares
+    returned-count vs desc.Count.
+
+Invariant: kind=entailed;
+  property=Promotion (subpage → nested tree) and demotion (nested
+    tree → subpage) are atomic within a single `SetKeyspace.Put` /
+    `DeleteValue` / `Cursor.Delete` / `DeleteRange` call —
+    observable only post-call; never mid-mutation. A failure inside
+    the multi-step sequence leaves the SetKeyspace observationally
+    unchanged within the same write transaction (any allocated
+    pages are retired into loose/retired pools, cell content is
+    restored); a subsequent `Has` / `HasValue` / `CountValues` /
+    cursor op in the same tx after the failed mutation must
+    observe the pre-call state. (Non-empty intermediate states
+    DURING the call sequence — e.g., between step 2's leaf
+    population and step 4's insert-new-value — are permitted; the
+    "no empty sets" clause-explicit invariant above is unaffected
+    because intermediate states carry the original `N` values,
+    never zero.);
+  from=entailed: §Subpage Promotion Threshold describes a 4-step
+    sequence (alloc leaf, copy entries, replace cell, insert new
+    value), and §Demotion describes the reverse — neither states
+    that an error mid-sequence must leave the SetKeyspace
+    observationally unchanged at the next same-tx read;
+  violation=A failure after step 3 of promotion leaves the parent
+    cell pointing at an allocated-but-unpopulated leaf —
+    subsequent same-tx `HasValue` reads decode garbage from an
+    empty leaf; the corresponding demotion failure mode leaves
+    the cell carrying valid subpage bytes while still flagged as
+    a nested-tree reference, with the nested root already freed —
+    every same-tx read decodes the freed page's stale content as
+    values.
+
+Invariant: kind=entailed;
+  property=`SetCursor.NextValue` from the last value in a key's set
+    transitions the cursor to "value-EOF for this key" (next
+    `NextValue` returns `nil`); only `Next` / `NextKey` advance
+    across keys. Symmetric for `PrevValue` / value-BOF / `Prev` /
+    `PrevKey`;
+  from=entailed: `api-surface.md §SetCursor` declares `NextValue`
+    and `NextKey` as separate methods, and `keyspaces.md
+    §Iteration Semantics` documents `Next` to "advance through
+    values within a key's set before moving to the next key" —
+    without the value-bounded `NextValue` contract, the two
+    methods (`Next` and `NextValue`) collapse to identical
+    behavior and `NextKey` becomes the only way to bound an
+    intra-key value iteration;
+  violation=`NextValue` silently crosses key boundaries — a caller
+    iterating one key's values via `NextValue` accidentally
+    consumes the next key's set with no signal, mis-routing pub/sub
+    deliveries to wrong subscribers, double-counting in
+    ref-counted indexes, or merging audit-log entries across
+    unrelated entities.
+
 ## Storage Strategy
 
 Two storage strategies based on value-set size:

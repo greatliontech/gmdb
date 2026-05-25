@@ -160,6 +160,7 @@ var (
     ErrKeyspaceKindMismatch    = errors.New("gmdb: keyspace kind does not match existing keyspace")
     ErrKeyspaceReserved        = errors.New("gmdb: keyspace name reserved for engine use")
     ErrValueSizeMismatch       = errors.New("gmdb: value size does not match fixed value size")
+    ErrFixedValueSizeMismatch  = errors.New("gmdb: keyspace exists with different FixedValueSize")
 
     // Indexing.
     ErrIndexExtractorRequired   = errors.New("gmdb: index extractor required for OpenKeyspace")
@@ -767,6 +768,19 @@ type SetKeyspaceOptions struct {
 func (tx *Tx) OpenSetKeyspace(name string, indexes ...*IndexDecl) (*SetKeyspace, error)
 func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error)
 func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions, indexes ...*IndexDecl) (*SetKeyspace, error)
+
+// CreateSetKeyspaceIfNotExists opens the keyspace if it exists (with
+// matching Kind=1 + matching FixedValueSize required) or creates it
+// with the supplied opts. Returns ErrKeyspaceKindMismatch if the
+// existing keyspace is a Kind=0 Keyspace. Returns
+// ErrFixedValueSizeMismatch if the existing keyspace's
+// FixedValueSize disagrees with opts.FixedValueSize — the
+// FixedValueSize is immutable after creation (keyspaces.md
+// invariant #5), so the API cannot silently coerce the caller's
+// opts to the existing value without misleading them about the
+// storage layout. A nil opts is treated as FixedValueSize=0
+// (variable values); the same equality check applies. Returns the
+// existing index-matching errors when indexes are supplied.
 func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions, indexes ...*IndexDecl) (*SetKeyspace, error)
 
 // DeleteKeyspace removes a keyspace and everything reachable from
@@ -899,13 +913,29 @@ func (c *Cursor) Current() (key, value []byte)
 func (c *Cursor) Delete() error
 
 func (c *Cursor) Err() error
+```
 
+### SetKeyspace API
+
+```go
 // SetKeyspace handle to a named set keyspace.
 type SetKeyspace struct { ... }
 
 func (ks *SetKeyspace) Has(key []byte) (bool, error)
 func (ks *SetKeyspace) HasValue(key, value []byte) (bool, error)
-func (ks *SetKeyspace) Put(key, value []byte) error
+
+// Put inserts value into the key's sorted set. added reports whether
+// the set actually grew (false iff (key, value) was already present —
+// the call is a no-op in that case). The membership probe is already
+// paid by the insert path (the B+tree / subpage layer must locate the
+// insertion point to detect the duplicate-no-op case), so surfacing
+// the bool is a no-cost API enhancement that collapses the
+// Put + HasValue pattern callers would otherwise need for pub/sub
+// broadcasts, ref-counted indexes, idempotent retries — all of which
+// need to know "did this call cause the set to grow" without the
+// TOCTOU window of HasValue-then-Put. (Chunk-6.1 user-locked decision;
+// the typed mirror TypedSetKS.Put propagates the bool.)
+func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error)
 
 // Delete returns ErrNotFound when the key does not exist (per
 // §Invariants — keyed-removal returns ErrNotFound on miss).

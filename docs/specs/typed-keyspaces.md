@@ -235,7 +235,14 @@ type TypedSetKS[K, V any] struct { /* ... */ }
 
 func (t *TypedSetKS[K, V]) Has(key K) (bool, error)
 func (t *TypedSetKS[K, V]) HasValue(key K, value V) (bool, error)
-func (t *TypedSetKS[K, V]) Put(key K, value V) error
+
+// Put inserts value into the key's sorted set. added reports whether
+// the set actually grew (false iff (key, value) was already present).
+// Mirrors SetKeyspace.Put — see api-surface.md §SetKeyspace API for
+// the load-bearing rationale (membership probe is already paid by
+// the insert path, surfacing the bool collapses Put + HasValue retry
+// patterns without a TOCTOU window). Chunk-6.1 user-locked decision.
+func (t *TypedSetKS[K, V]) Put(key K, value V) (added bool, err error)
 
 // Delete returns ErrNotFound when the key does not exist (per
 // api-surface.md §Invariants).
