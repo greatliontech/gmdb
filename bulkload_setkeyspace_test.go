@@ -321,25 +321,9 @@ func TestSetKeyspaceBulkLoadErrors(t *testing.T) {
 			t.Errorf("= %v, want ErrKeyEmpty", err)
 		}
 	})
-	t.Run("indexed", func(t *testing.T) {
-		db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
-		defer db.Close()
-		tx, err := db.Begin(ctx, true)
-		if err != nil {
-			t.Fatalf("Begin: %v", err)
-		}
-		defer tx.Rollback()
-		ks, err := tx.CreateSetKeyspace("sets", nil, testDecl("by_v", "v"))
-		if err != nil {
-			t.Fatalf("CreateSetKeyspace: %v", err)
-		}
-		if _, err := ks.BulkLoad(seqOf([]kv{{[]byte("k"), []byte("v")}})); err == nil {
-			t.Error("indexed SetKeyspace BulkLoad returned nil, want error")
-		}
-		if ks.desc.Count != 0 {
-			t.Errorf("indexed BulkLoad left Count=%d, want 0", ks.desc.Count)
-		}
-	})
+	// Indexed SetKeyspace.BulkLoad is covered in bulkload_indexed_test.go;
+	// the chunk-8.5 interim "indexed ⇒ error" stub asserted here was
+	// deliberately replaced by the real path in 8.6.
 }
 
 // TestSetKeyspaceBulkLoadMatchesPut cross-checks a BulkLoad-built SetKeyspace

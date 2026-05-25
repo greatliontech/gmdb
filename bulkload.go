@@ -374,10 +374,19 @@ func writeBulkOverflowChain(pw bulkOverflowWriter, cfg page.Config, value []byte
 // rollback leaves the keyspace at its pre-BulkLoad state (bounded leakage
 // reclaimed by background maintenance) per bulkload.md §Atomicity.
 //
+// On an indexed keyspace BulkLoad also builds every index's data tree: it
+// runs each index's extractor on every row, externally sorts the produced
+// entries (in memory, spilling to Options.ScratchDir when the aggregate
+// exceeds MaxTxBufferBytes), and bulk-builds each index tree from the
+// sorted stream — all published atomically with the row tree. A unique-index
+// duplicate aborts the whole load with ErrIndexUniqueViolation and publishes
+// nothing (see bulkload_indexed.go).
+//
 // Errors: ErrReadOnly (read-only tx or handle), ErrKeyspaceClosed (handle
 // invalidated by a same-tx DeleteKeyspace), ErrBulkLoadNonEmpty,
-// ErrBulkLoadOutOfOrder, ErrKeyEmpty (empty key in the stream), and the
-// btree key-size / I/O errors.
+// ErrBulkLoadOutOfOrder, ErrKeyEmpty (empty key in the stream),
+// ErrIndexUniqueViolation (duplicate key in a unique index), a wrapped I/O
+// error on a sort-spill failure, and the btree key-size / I/O errors.
 func (ks *Keyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
 	if err := ks.tx.requireOpen(true); err != nil {
 		return 0, err
@@ -392,33 +401,16 @@ func (ks *Keyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
 		return 0, ErrBulkLoadNonEmpty
 	}
 	if len(ks.indexes) > 0 {
-		// Indexed-keyspace BulkLoad (extractor + per-index sort/spill +
-		// unique detection) is wired in a later sub-chunk; until then
-		// it errors rather than silently building rows without indexes.
+		// Indexed keyspaces build the row tree AND every index data tree
+		// (extractor per row + per-index external sort/spill + unique
+		// detection at the merge output) atomically — see bulkload_indexed.go.
 		return ks.bulkLoadIndexed(rows)
 	}
 
 	cfg := ks.builderCfg()
 	b := newBulkBuilder(ks.tx.pgr, cfg)
-	var loopErr error
-	rows(func(key, value []byte) bool {
-		if len(key) == 0 {
-			loopErr = ErrKeyEmpty
-			return false
-		}
-		e, err := ks.bulkLeafEntry(cfg, key, value)
-		if err != nil {
-			loopErr = err
-			return false
-		}
-		if err := b.add(e); err != nil {
-			loopErr = err
-			return false
-		}
-		return true
-	})
-	if loopErr != nil {
-		return 0, loopErr
+	if err := ks.bulkLoadRows(rows, cfg, b, nil); err != nil {
+		return 0, err
 	}
 	root, count, err := b.finish()
 	if err != nil {
@@ -437,16 +429,38 @@ func (ks *Keyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
 	return count, nil
 }
 
-// bulkLoadIndexed bulk-loads an indexed keyspace: it must build the row
-// tree AND every index's data tree (extractor over each row, external
-// sort with ScratchDir spill, unique-violation detection at the merge
-// output) so the committed state has consistent rows + index entries. That
-// path is implemented in a later sub-chunk; until then this returns an
-// error rather than silently producing rows without index entries (which
-// would leave the indexes permanently out of sync with the data).
-func (ks *Keyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
-	_ = rows
-	return 0, fmt.Errorf("gmdb: BulkLoad on an indexed keyspace requires the indexed bulk-load path (not yet wired)")
+// bulkLoadRows drives the row stream into the bulk builder b, adding one
+// leaf entry per (key, value) pair, and — when onRow is non-nil — invoking
+// it after each row entry is added. The indexed path (bulkLoadIndexed)
+// uses onRow to feed per-index sorters from the same single pass over rows
+// (the iter.Seq2 input may be a one-shot generator, so the row tree and the
+// index entries must both be derived in one traversal). Returns the first
+// error encountered (input order, empty key, oversized entry, or I/O).
+func (ks *Keyspace) bulkLoadRows(rows iter.Seq2[[]byte, []byte], cfg page.Config, b *bulkBuilder, onRow func(key, value []byte) error) error {
+	var loopErr error
+	rows(func(key, value []byte) bool {
+		if len(key) == 0 {
+			loopErr = ErrKeyEmpty
+			return false
+		}
+		e, err := ks.bulkLeafEntry(cfg, key, value)
+		if err != nil {
+			loopErr = err
+			return false
+		}
+		if err := b.add(e); err != nil {
+			loopErr = err
+			return false
+		}
+		if onRow != nil {
+			if err := onRow(key, value); err != nil {
+				loopErr = err
+				return false
+			}
+		}
+		return true
+	})
+	return loopErr
 }
 
 // BulkLoad replaces the contents of an empty SetKeyspace with the sorted
@@ -470,9 +484,17 @@ func (ks *Keyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, err
 // materialised. Published only at Tx.Commit; a crash or rollback leaves
 // the keyspace at its pre-BulkLoad state (bulkload.md §Atomicity).
 //
+// On an indexed SetKeyspace BulkLoad also builds every index's data tree:
+// it runs each index's extractor per accepted (key, value) member, with the
+// same external sort + atomic all-or-nothing publish as the Keyspace path
+// (see bulkload_indexed.go). A unique-index duplicate aborts the whole load
+// with ErrIndexUniqueViolation.
+//
 // Errors: ErrReadOnly, ErrKeyspaceClosed, ErrBulkLoadNonEmpty,
 // ErrBulkLoadOutOfOrder, ErrKeyEmpty, ErrValueSizeMismatch (a value whose
-// length differs from a non-zero FixedValueSize), and btree/I-O errors.
+// length differs from a non-zero FixedValueSize), ErrIndexUniqueViolation
+// (duplicate key in a unique index), a wrapped I/O error on a sort-spill
+// failure, and btree/I-O errors.
 func (ks *SetKeyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
 	if err := ks.tx.requireOpen(true); err != nil {
 		return 0, err
@@ -491,15 +513,45 @@ func (ks *SetKeyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) 
 	}
 
 	cfg := ks.builderCfg()
-	fvs := ks.desc.FixedValueSize
 	sb := &setBulk{
 		top:       newBulkBuilder(ks.tx.pgr, cfg),
 		pw:        ks.tx.pgr,
 		cfg:       cfg,
-		fvs:       fvs,
+		fvs:       ks.desc.FixedValueSize,
 		threshold: page.SubpagePromotionThreshold(cfg),
 	}
+	if err := ks.bulkLoadStream(rows, sb, nil); err != nil {
+		return 0, err
+	}
+	if err := sb.flush(); err != nil {
+		return 0, err
+	}
+	root, _, err := sb.top.finish()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := btree.FreeSubtree(ks.tx.pgr, cfg, ks.desc.Root); err != nil {
+		return 0, mapBtreeErr(err)
+	}
+	ks.desc.Root = root
+	ks.desc.Count = sb.total
+	ks.markDirty()
+	ks.markSetCursorsStale()
+	return sb.total, nil
+}
 
+// bulkLoadStream drives the (key, value) stream into the setBulk
+// accumulator sb, applying the SetKeyspace input contract: keys strictly
+// ascending across groups, values strictly ascending within a key's group,
+// adjacent duplicate (key, value) pairs silently deduped, value-size matched
+// against a non-zero FixedValueSize, nil value normalised to empty. When
+// onMember is non-nil it fires once per accepted (non-duplicate) set member
+// AFTER the member is added to sb — the indexed path uses it to feed the
+// per-index sorters from the same single pass (the iter.Seq2 input may be a
+// one-shot generator). Returns the first error encountered. The caller still
+// performs the final sb.flush() + sb.top.finish().
+func (ks *SetKeyspace) bulkLoadStream(rows iter.Seq2[[]byte, []byte], sb *setBulk, onMember func(setKey, setValue []byte) error) error {
+	fvs := ks.desc.FixedValueSize
 	var loopErr error
 	rows(func(key, value []byte) bool {
 		if len(key) == 0 {
@@ -543,35 +595,18 @@ func (ks *SetKeyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) 
 			return false
 		}
 		sb.setLastValue(value)
+		if onMember != nil {
+			// The member is accepted: (key, value) is a fresh distinct set
+			// member. Index entries are derived from the same (setKey,
+			// setValue) the row side just stored.
+			if err := onMember(key, value); err != nil {
+				loopErr = err
+				return false
+			}
+		}
 		return true
 	})
-	if loopErr != nil {
-		return 0, loopErr
-	}
-	if err := sb.flush(); err != nil {
-		return 0, err
-	}
-	root, _, err := sb.top.finish()
-	if err != nil {
-		return 0, err
-	}
-	if _, err := btree.FreeSubtree(ks.tx.pgr, cfg, ks.desc.Root); err != nil {
-		return 0, mapBtreeErr(err)
-	}
-	ks.desc.Root = root
-	ks.desc.Count = sb.total
-	ks.markDirty()
-	ks.markSetCursorsStale()
-	return sb.total, nil
-}
-
-// bulkLoadIndexed is the SetKeyspace mirror of the Keyspace indexed-BulkLoad
-// gate: it must extract per (key, value) member and build the index data
-// trees alongside the row tree. Implemented in a later sub-chunk; until then
-// it errors rather than silently building members without index entries.
-func (ks *SetKeyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
-	_ = rows
-	return 0, fmt.Errorf("gmdb: BulkLoad on an indexed SetKeyspace requires the indexed bulk-load path (not yet wired)")
+	return loopErr
 }
 
 // setBulk accumulates one SetKeyspace key's value set during BulkLoad and

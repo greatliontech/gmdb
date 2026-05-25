@@ -129,12 +129,12 @@ func TestKeyspaceBulkLoadOverflowValues(t *testing.T) {
 			// Mix of inline and overflow-sized values (1, 2, 3-page runs)
 			// in sorted key order.
 			kvs := []kv{
-				{[]byte("k01"), bytes.Repeat([]byte("a"), 10)},      // inline
-				{[]byte("k02"), bytes.Repeat([]byte("B"), 5000)},    // 2-page overflow
-				{[]byte("k03"), []byte("small")},                    // inline
-				{[]byte("k04"), bytes.Repeat([]byte{0x7f}, 12000)},  // 3-page overflow
-				{[]byte("k05"), bytes.Repeat([]byte("z"), 4050)},    // ~1-page boundary
-				{[]byte("k06"), bytes.Repeat([]byte("Q"), 40000)},   // ~10-page overflow
+				{[]byte("k01"), bytes.Repeat([]byte("a"), 10)},     // inline
+				{[]byte("k02"), bytes.Repeat([]byte("B"), 5000)},   // 2-page overflow
+				{[]byte("k03"), []byte("small")},                   // inline
+				{[]byte("k04"), bytes.Repeat([]byte{0x7f}, 12000)}, // 3-page overflow
+				{[]byte("k05"), bytes.Repeat([]byte("z"), 4050)},   // ~1-page boundary
+				{[]byte("k06"), bytes.Repeat([]byte("Q"), 40000)},  // ~10-page overflow
 			}
 
 			db := openWith(t, ctx, path, opts)
@@ -351,30 +351,10 @@ func TestKeyspaceBulkLoadEmptyStream(t *testing.T) {
 	}
 }
 
-// TestKeyspaceBulkLoadIndexedReturnsError verifies an indexed keyspace
-// does not silently bulk-load rows without indexes (the indexed bulk path
-// lands in a later sub-chunk).
-func TestKeyspaceBulkLoadIndexedReturnsError(t *testing.T) {
-	ctx := context.Background()
-	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
-	defer db.Close()
-	tx, err := db.Begin(ctx, true)
-	if err != nil {
-		t.Fatalf("Begin: %v", err)
-	}
-	defer tx.Rollback()
-	ks, err := tx.CreateKeyspace("users", testDecl("by_owner", "owner"))
-	if err != nil {
-		t.Fatalf("CreateKeyspace: %v", err)
-	}
-	if _, err := ks.BulkLoad(seqOf([]kv{{[]byte("a"), []byte("1")}})); err == nil {
-		t.Error("BulkLoad on an indexed keyspace returned nil, want an error")
-	}
-	// The keyspace must remain empty (nothing partially written/published).
-	if ks.desc.Count != 0 {
-		t.Errorf("indexed BulkLoad left Count=%d, want 0", ks.desc.Count)
-	}
-}
+// Indexed Keyspace.BulkLoad is covered comprehensively in
+// bulkload_indexed_test.go (round-trip, Put-parity, unique-violation,
+// spill, abort-leaves-pre-state). The chunk-8.4 interim "indexed ⇒ error"
+// stub it asserted was deliberately replaced by the real path in 8.6.
 
 // TestKeyspaceBulkLoadReusedKeyBuffer verifies the iter.Seq2 contract: a
 // yield that reuses a single key (and value) buffer across iterations must
