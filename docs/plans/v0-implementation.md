@@ -1408,6 +1408,51 @@ Primary specs: `bulkload.md`, `indexing.md §Bulk Operations`.
 
 Primary files: `bulkload.go`, `index.go`, `db.go`.
 
+**Sub-chunk roster (as landed).**
+
+- **8.1** Triage + invariants (no separate commit; folded into
+  8.2). No `docs/issues/` entry resolved to chunk 8.
+- **8.2** `pager.WriteDirect` slab-bypass primitive (Inv-WD:
+  pendingAllocs-only, never in the slab, checksum parity,
+  reversed by `AbortTx`'s bitmap snapshot), `Options.ScratchDir`
+  (default `os.TempDir`), and the `ErrBulkLoadOutOfOrder` /
+  `ErrBulkLoadNonEmpty` sentinels. Files: `internal/pager/
+  pager.go`, `options.go`, `errors.go`.
+- **8.3** Bottom-up B+tree bulk builder (`bulkBuilder`): leaves →
+  branches → root over `WriteDirect`, O(depth × pageSize) memory,
+  prefix-truncated leaf separators, bubbled branch separators
+  (Inv-Builder routing contract). File: `bulkload.go`.
+- **8.4** `Keyspace.BulkLoad` (non-indexed) + streaming
+  slab-bypass overflow-chain writer (byte-identical to
+  `page.EncodeOverflowRun`, O(pageSize)); exported
+  `btree.NeedsOverflow` / `OverflowRefFitsLeaf` so the
+  inline/overflow boundary is shared with `Put`.
+- **8.5** `SetKeyspace.BulkLoad` (non-indexed): per-key subpage /
+  nested-tree storage matching `Put`'s shape via a streaming
+  incremental-promotion accumulator (no full-set buffering);
+  adjacent-dedup. Also fixed a latent `iter.Seq2` key-reuse bug
+  in the builder (the `page.LeafBuilder` order-assertion borrows
+  the caller's key slice).
+- **8.6** Indexed `BulkLoad` for both `Keyspace` and
+  `SetKeyspace` (`bulkload_indexed.go`): per-row/member extractor
+  → per-index external sort (`indexSorter`) with `ScratchDir`
+  disk-spill bounded by `MaxTxBufferBytes` (divided across
+  indexes), k-way `sortMerger`, unique-violation detection at the
+  sorted output, bottom-up index-tree build, all-or-nothing
+  in-process publish. Shared row-stream drivers `bulkLoadRows` /
+  `bulkLoadStream` factor the row side from the non-indexed
+  paths. Filed `bulkload-index-merge-run-fanin.md` (L-2:
+  single-pass merge fan-in; profiling-driven cascaded-merge fix).
+- **8.7** Close-out: cite sweep (no-cite invariant holds — no
+  production/spec cite of a tracking artifact); spec sync to
+  `bulkload.md` (aggregate sort-budget wording; the all-or-nothing
+  in-process publish recorded as the entailed invariant; the
+  bounded-leakage invariant refined to distinguish a clean
+  rollback (no leak, reusable) from commit-after-error / crash
+  (bounded leak)) and the `AbortTx` godoc (WriteDirect pages
+  revert to free on rollback). All `bulkload.md` §Invariants now
+  enforced by tests.
+
 ### Chunk 9 — Typed (generics) layer
 
 **Scope.** `Encoder[T]` interface, `FuncEncoder[T]`, engine-

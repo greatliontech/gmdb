@@ -303,10 +303,15 @@ func (p *Pager) BeginTx() {
 }
 
 // AbortTx restores the snapshotted state, releases slab buffers, and
-// resets tx-scoped freespace bookkeeping. The on-disk state is
-// unaffected (no pwrites have occurred — AbortTx is called on tx
-// rollback or on commit-pipeline failure, both of which guarantee no
-// data-page pwrites have completed).
+// resets tx-scoped freespace bookkeeping. The committed on-disk state is
+// unaffected: slab pages are pwritten only by the commit pipeline (so a
+// rollback before commit has none), and WriteDirect's slab-bypass pages
+// (BulkLoad) — which ARE pwritten mid-transaction — revert to free when
+// the bitmap snapshot is restored here. The on-disk bitmap is pwritten
+// only at commit, so it never recorded those allocations; their pwritten
+// bytes are harmless stale content in pages the allocator now sees as
+// free and will overwrite on reuse. A clean rollback therefore reclaims
+// every bulk-written page with no leak (no maintenance pass needed).
 //
 // After AbortTx returns, the pager is ready to start a fresh
 // transaction via BeginTx + SetCommitState.

@@ -60,15 +60,29 @@ Invariant: kind=clause-explicit;
     tree as the active state — corruption.
 
 Invariant: kind=entailed;
-  property=A mid-`BulkLoad` crash or unique-violation abort
-    leaves pwritten pages as bounded leakage: they are
-    unreferenced (no meta points to them) and are reclaimed by
-    background maintenance's bitmap-leak reclamation pass. The
-    on-disk state is consistent with the pre-`BulkLoad` meta;
+  property=A failed or aborted `BulkLoad` never publishes a
+    partial tree: `desc.Root`, `desc.Count`, and the index roots
+    advance only after the *entire* load succeeds, so the meta
+    the engine can recover to always references either the
+    complete new state or the pre-`BulkLoad` state — never a
+    partial one. Disposition of the already-pwritten pages then
+    depends on how the transaction ends: (a) a clean in-process
+    rollback (`Tx.Rollback` → `AbortTx`) restores the bitmap
+    snapshot, reverting every bulk-written page to free with NO
+    leak — immediately reusable, no maintenance pass needed;
+    (b) a commit-after-error (the caller ignores the `BulkLoad`
+    error and commits anyway, per the rest-of-tx-continues
+    contract) commits those allocated-but-unreferenced pages as
+    bounded leakage reclaimed by background maintenance's
+    bitmap-leak pass; (c) a crash before commit never recorded
+    the allocations on the on-disk bitmap (pwritten only at
+    commit), so the pages reopen as free — only any physical
+    file extension persists, reclaimed by `Compact()` / shrink;
   from=entailed: §Atomicity + `background-maintenance.md`;
-  violation=A mid-load abort that leaves pwritten pages
-    *reachable* breaks the "no partial writes visible" property
-    — the next opener sees a partial tree.
+  violation=Advancing any reachable meta (a root field) before
+    the whole load succeeds lets a crash or rollback expose the
+    partial tree as active state — the next opener sees a
+    partial tree (corruption).
 
 Invariant: kind=entailed;
   property=For an indexed keyspace, the engine runs the extractor
@@ -151,9 +165,13 @@ at 4 KB pages, 20 KB.
 Bulk-loaded pages are written to disk as they are completed, not
 held in the slab. The pwrite goes to a fresh page ID — invisible
 until the meta swap commits the new tree, so the partial write is
-safe (a crash before commit leaves the pages as unreferenced
-"leaked" pages in the bitmap, reclaimed by the next maintenance
-pass exactly like any other crash leakage).
+safe. A clean in-process rollback (`Tx.Rollback`) restores the
+bitmap snapshot, so every bulk-written page reverts to free and
+is immediately reusable with no leak. Only a commit-after-error
+or a crash leaves the pages as bounded leakage in the bitmap,
+reclaimed by the next maintenance pass exactly like any other
+crash leakage (see the §Invariants bounded-leakage invariant for
+the full disposition).
 
 This bypass keeps memory usage flat regardless of input size and
 makes `BulkLoad` the recommended path for inputs that would
@@ -165,9 +183,15 @@ For an indexed keyspace, the engine runs the extractor on every
 row and accumulates index entries per index. Each index's
 entries are **re-sorted** to lex order (the extractor may produce
 entries in arbitrary order even if rows are sorted by primary
-key) and bulk-loaded into a fresh index keyspace using the same
+key) and bulk-loaded into a fresh index data tree using the same
 algorithm. The sort is external (chunked sort with disk-spill if
-needed; chunk size bounded by `MaxTxBufferBytes`).
+needed). All indexes' sorters accumulate concurrently during the
+single pass over the input, so the budget is the **aggregate**:
+each index's in-memory chunk is bounded by `MaxTxBufferBytes /
+#indexes`, keeping the combined in-memory sort footprint bounded
+by `MaxTxBufferBytes` (not `MaxTxBufferBytes` per index, which
+would let N indexes peak at N× the budget and defeat the memory
+contract).
 
 When the sort fits in memory the indexes load in a single
 in-memory pass. When it does not, spill chunks are written to a
@@ -206,19 +230,27 @@ transaction's caller observes a clean error and can roll back;
 the on-disk state is consistent with the pre-`BulkLoad` meta.
 
 **Leakage scale warning.** "Bounded" here refers to crash-safety
-(no UB, no tree corruption), not magnitude. For a spilling-sort
-`BulkLoad` that aborts on a late index unique violation, the
-row corpus is *already on disk* as unreferenced pages — leakage
-is `O(input size)`, potentially gigabytes for a large migration
+(no UB, no tree corruption), not magnitude — and the magnitude
+matters *only* if the caller **commits the transaction after the
+`BulkLoad` returned an error** (the rest-of-tx-continues path).
+The normal recovery — `Tx.Rollback()` on the error — restores
+the bitmap snapshot and reclaims every bulk-written page
+immediately, with no leak (§Invariants disposition (a)). Callers
+should always roll back a failed `BulkLoad`.
+
+When a caller *does* commit-after-error, the consequence is
+material: for a spilling-sort `BulkLoad` that aborted on a late
+index unique violation, the row corpus is *already on disk* as
+allocated-but-unreferenced pages — committed leakage is
+`O(input size)`, potentially gigabytes for a large migration
 (e.g. gitfs SQLite → gmdb import). Background maintenance's
 bitmap-leak reclamation does reclaim it, but only on its next
-scheduled pass; in the meantime the leaked pages are invisible
-to the allocator (bits clear in the on-disk bitmap until the
-reclamation pass sets them), so subsequent write transactions
-cannot reuse the space. Callers performing large `BulkLoad`s
-that may fail should trigger
-`CheckWithOptions(&CheckOptions{Repair: true})` or wait for a
-maintenance pass before retrying.
+scheduled pass; in the meantime the leaked pages are in-use in
+the on-disk bitmap with no meta referencing them, so subsequent
+write transactions cannot reuse the space until the reclamation
+pass clears them. A caller that committed-after-error and cannot
+wait for a pass should trigger
+`CheckWithOptions(&CheckOptions{Repair: true})`.
 
 A two-pass (validate-then-load) mode that guarantees "no pwrite
 before violation detection" even for spilling sorts is
@@ -230,6 +262,17 @@ pass merge-output detection above is the shipped behaviour.
 `BulkLoad` is a transactional operation. It runs inside a write
 transaction and only takes effect on commit. Either the entire
 load (keyspace data + all index data + count updates) commits
-atomically, or none of it does. Mid-`BulkLoad` crash leaks
-pages exactly as a mid-commit crash does — bounded leakage
-reclaimed by background maintenance.
+atomically, or none of it does.
+
+The implementation enforces this with a stronger *in-process*
+guarantee than commit-time atomicity alone: it builds the row
+tree and every index data tree to completion first, and only
+then — in a single publish step reached exclusively on full
+success — advances `desc.Root`, `desc.Count`, and the in-memory
+index roots. A unique violation or I/O error during any index
+build returns before that step, so the descriptor and index
+roots are never even transiently advanced to a partial state.
+Combined with the bitmap snapshot, a clean `Tx.Rollback()` after
+an error reclaims all bulk-written pages with no leak; only a
+commit-after-error or a crash leaves bounded leakage, reclaimed
+by background maintenance (see the §Invariants disposition).
