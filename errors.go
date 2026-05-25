@@ -143,6 +143,78 @@ var (
 	// without misleading the caller about the storage layout. Per
 	// chunk-6.1 spec amendment.
 	ErrFixedValueSizeMismatch = errors.New("gmdb: keyspace exists with different FixedValueSize")
+
+	// ErrIndexExtractorRequired is returned by Tx.OpenKeyspace /
+	// Tx.OpenSetKeyspace when an IndexDecl is missing for an index
+	// already declared in the keyspace's registry (the caller passed
+	// fewer IndexDecls than the stored set), or by Tx.RebuildIndex
+	// when the supplied decl.Extract is nil. Per
+	// indexing.md §Open Semantics + §Rebuild.
+	ErrIndexExtractorRequired = errors.New("gmdb: index extractor required for OpenKeyspace")
+
+	// ErrIndexUnknown is returned by Tx.OpenKeyspace /
+	// Tx.OpenSetKeyspace when an IndexDecl is supplied for a name
+	// that is NOT registered on the keyspace (the caller passed an
+	// extra IndexDecl beyond the stored set). Per indexing.md §Open
+	// Semantics.
+	ErrIndexUnknown = errors.New("gmdb: IndexDecl supplied for index not declared in registry")
+
+	// ErrIndexFingerprintMismatch is returned wrapped in
+	// *IndexFingerprintError when an opened keyspace's stored
+	// schema-hash or Version tag differs from the supplied
+	// IndexDecl's. Caller's recovery path is Tx.RebuildIndex (per
+	// indexing.md §Drift Guard + §Rebuild).
+	ErrIndexFingerprintMismatch = errors.New("gmdb: index fingerprint mismatch — RebuildIndex required")
+
+	// ErrIndexUniqueViolation is returned by Put / Cursor.Delete on
+	// an indexed keyspace when a unique-index probe detects a
+	// duplicate index key — either against the existing on-disk
+	// index, or within the candidate-set produced by a single
+	// extractor invocation. Neither the row nor any index entries
+	// are written. Per indexing.md §Unique Indexes.
+	ErrIndexUniqueViolation = errors.New("gmdb: unique index violation")
+
+	// ErrIndexNotUnique is returned by Index.Get when called on a
+	// non-unique index. Get's contract (single (pk, value) result)
+	// is only well-defined for unique indexes. Per indexing.md
+	// §Lookup API.
+	ErrIndexNotUnique = errors.New("gmdb: Get called on non-unique index")
+
+	// ErrIndexExists is returned by Tx.OpenKeyspace /
+	// Tx.OpenSetKeyspace / Tx.CreateKeyspace when the supplied
+	// IndexDecl slice contains two entries with the same Name —
+	// duplicate names are rejected at validation time (the offending
+	// name is wrapped via fmt.Errorf("…: %w", ErrIndexExists)). Per
+	// indexing.md §Index Declaration.
+	ErrIndexExists = errors.New("gmdb: index already exists")
+
+	// ErrIndexNotFound is returned by Keyspace.Index /
+	// SetKeyspace.Index when no index with the supplied name is
+	// registered on the keyspace, and by Tx.DropIndex /
+	// Tx.RebuildIndex when the index name does not match any
+	// registry entry on the keyspace. Distinct from ErrNotFound to
+	// let callers dispatch between keyspace-missing
+	// (ErrNotFound — keyspace-management dimension) and
+	// index-name-missing (ErrIndexNotFound — index-management
+	// dimension) per chunk-7.1 user-locked.
+	ErrIndexNotFound = errors.New("gmdb: index not found")
+
+	// ErrIndexEncoderIDEmpty is returned by TypedIndex declaration
+	// when the supplied Encoder[T].ID() returns "" — encoder IDs
+	// must be unique non-empty strings for schema-hash
+	// determinism. Per typed-keyspaces.md (lands at chunk 9).
+	ErrIndexEncoderIDEmpty = errors.New("gmdb: typed index encoder returned empty ID() — encoder IDs must be unique non-empty strings")
+
+	// ErrKeyspaceAlreadyOpen is returned by Tx.OpenKeyspace /
+	// Tx.OpenSetKeyspace when a second open call for the same name
+	// within one transaction supplies an IndexDecl set that differs
+	// from the first call's set by any hashable input (names,
+	// Unique flags, schema hashes, Versions, and — for typed
+	// indexes — encoder IDs). Also returned when mixing
+	// OpenKeyspace and OpenKeyspaceReadOnly for the same name
+	// within one transaction. Per indexing.md §Re-opening a
+	// keyspace in the same transaction.
+	ErrKeyspaceAlreadyOpen = errors.New("gmdb: keyspace already opened in this transaction with a different index set")
 )
 
 var (

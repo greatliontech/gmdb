@@ -257,12 +257,31 @@ For each declared index, the engine computes a deterministic
 
 ```
 xxhash64(
-  index.Name ||
+  uvarint(len(index.Name)) || index.Name ||
   uvarint(len(Columns)) || for each col: uvarint(len(Name)) || Name ||
   uvarint(len(Covering)) || for each col: uvarint(len(Name)) || Name ||
   uint8(Unique)
 )
 ```
+
+Every string input — `index.Name`, column names, covering names —
+is uvarint-length-prefixed. Without a prefix on `index.Name`, the
+two distinct decls
+
+```
+A: Name="ab",     Columns=[{Name:""}], Covering=[{Name:""}], Unique=true
+B: Name="ab\x01", Columns=[],          Covering=[{Name:""}], Unique=true
+```
+
+both encode to the byte sequence `61 62 01 00 01 00 01` (7 bytes,
+verifiable by hand), so xxhash64 returns the same value for two
+structurally different indexes — a collision. The boundary between
+`Name` and `uvarint(len(Columns))` is undetectable when `Name`'s
+trailing bytes can mimic a uvarint length. Uniform uvarint-
+prefixing is the minimal injective encoding consistent with the
+§Drift Guard "exclusively `uvarint` length prefixes" clause-
+explicit invariant. (Chunk-7.2 spec amendment; the original
+grammar omitted the `Name` prefix.)
 
 The schema hash + the user-supplied `Version` string are stored
 on disk in the per-index registry entry. At Open, the engine
