@@ -29,9 +29,10 @@ type DB struct {
 	pool *pager.BufPool
 	opts Options
 
-	// logger captures Options.Logger at Open with the nil → discard
-	// fallback per the chunk-5.5 spec amend (slog-default-vs-spec.md
-	// resolution). Cleanup paths reference this via the cleanup-
+	// logger captures Options.Logger at Open with the chunk-5.5
+	// nil → discard-handler fallback (the spec-amend default: a nil
+	// Options.Logger discards diagnostic output rather than routing
+	// to slog.Default()). Cleanup paths reference this via cleanup-
 	// closure captures rather than slog.Default() so per-DB logging
 	// is honored even after the *DB is collected.
 	logger *slog.Logger
@@ -217,8 +218,9 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 		// caller needs to tune them.
 	})
 
-	// Capture Options.Logger with the spec-amend default (nil → discard
-	// handler). slog-default-vs-spec.md is resolved here.
+	// Capture Options.Logger with the chunk-5.5 spec-amend default
+	// (nil → discard handler) so per-DB logging routes to the
+	// caller's chosen sink — never to slog.Default().
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))

@@ -27,9 +27,11 @@ import (
 //          re-creating the same name does NOT reactivate the old
 //          handle.
 //
-// Plus the chunk-5.5 H1 fold (descriptor-drift): the deferred-flush
-// refactor removes the per-op storeDescriptor window, so a tx that
-// Put-then-Rolls-back leaves no orphan data pages on disk.
+// Plus the chunk-5.5 round-1 H1 fold (partial-mutation drift class):
+// the chunk-5.6 deferred-flush refactor removes the per-op
+// storeDescriptor window, so a tx that Put-then-Rolls-back leaves no
+// orphan data pages on disk. See Tx.Commit godoc for the contract;
+// TestDeferredFlushClosesDescriptorDrift below pins the symptom-class.
 
 func TestDeleteKeyspaceEmptyNameReturnsErrKeyEmpty(t *testing.T) {
 	ctx := context.Background()
@@ -591,12 +593,13 @@ func TestCursorErrReturnsKeyspaceClosedOnDeadHandle(t *testing.T) {
 	}
 }
 
-// TestDeferredFlushClosesDescriptorDrift folds chunk-5.5 H1
-// (docs/issues/descriptor-drift-on-partial-failure.md). Pre-refactor,
-// a Put that mutated the data B+tree before a failing storeDescriptor
-// could orphan pages on commit. Post-refactor, no per-op storeDescriptor
-// exists; the test verifies the symptom-class is gone by exercising
-// Put-then-Rollback and asserting no on-disk drift.
+// TestDeferredFlushClosesDescriptorDrift pins the chunk-5.5 round-1
+// H1 closure: pre-chunk-5.6, a Put that mutated the data B+tree
+// before a failing storeDescriptor could orphan pages on commit.
+// Post-chunk-5.6, no per-op storeDescriptor exists (see Tx.Commit
+// godoc for the deferred-flush contract); the test verifies the
+// symptom-class is gone by exercising Put-then-Rollback and
+// asserting no on-disk drift.
 func TestDeferredFlushClosesDescriptorDrift(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)

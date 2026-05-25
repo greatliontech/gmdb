@@ -85,8 +85,10 @@ type Keyspace struct {
 	// openCursors tracks every *Cursor returned by Keyspace.Cursor()
 	// in this tx so Put / Delete can MarkStale them — sibling
 	// mutations to the keyspace's B+tree invalidate cursor state
-	// (curKey / iter alias leaf-buffer slices that the mutation may
-	// CoW or free). Per cursor-markstale-clear-cur.md.
+	// because curKey / iter alias leaf-buffer slices that the
+	// mutation may CoW or free, so a stale cursor must clear those
+	// fields (see btree.Cursor.MarkStale) to avoid returning
+	// dangling references on a subsequent unguarded access.
 	openCursors []*Cursor
 }
 
@@ -687,11 +689,9 @@ type KeyspaceConfig struct {
 // keyspace. Kind-agnostic at the descriptor layer (the descriptor's
 // RestartGroupTarget field lives independently of Kind). Returns:
 //
-//   - ErrNotFound if the named keyspace does not exist (resolved
-//     per the chunk-5.4-filed
-//     docs/issues/tx-setkeyspaceconfig-missing-name-behavior.md —
-//     consistent with Tx.DeleteKeyspace and the Delete-on-miss
-//     invariant family).
+//   - ErrNotFound if the named keyspace does not exist (consistent
+//     with Tx.DeleteKeyspace and the chunk-5.1 Delete-on-miss
+//     invariant family per api-surface.md §Invariants).
 //   - ErrKeyEmpty for an empty name.
 //   - ErrInvalidOptions when cfg.RestartGroupTarget > 255.
 //

@@ -300,10 +300,12 @@ func (tx *Tx) Mutate(id uint64) ([]byte, error) {
 // path (bitmap snapshot restore, slab pool return, retired+loose
 // page clearance) and the on-disk state is unchanged — no new poison
 // machinery is needed because no on-disk write has yet been issued.
-// The folded-in chunk-5.5 H1 (descriptor-drift-on-partial-failure)
-// is closed by this design move: the two-write-no-atomicity window
-// per per-op storeDescriptor disappears in favour of a single
-// commit-time apply.
+// The chunk-5.5 round-1 H1 (a partial-mutation failure mode where a
+// per-op storeDescriptor write could fail AFTER a successful data-tree
+// mutation, producing on-disk orphan pages on a subsequent Commit) is
+// closed by this design move: the two-write-no-atomicity window per
+// per-op storeDescriptor disappears in favour of a single commit-time
+// apply.
 func (tx *Tx) Commit() error {
 	if err := tx.requireOpen(true); err != nil {
 		return err

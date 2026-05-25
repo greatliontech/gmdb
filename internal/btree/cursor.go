@@ -422,9 +422,7 @@ func (c *Cursor) Delete() error {
 // Delete). Also clears curKey / curValue / iter so a caller that
 // bypasses the gen check (e.g. a profiling hook or debug accessor
 // reading c.curKey directly) sees nil rather than dangling
-// references to potentially-freed leaf-buffer slices — per the
-// chunk-5.4-filed cursor-markstale-clear-cur.md (resolved here at
-// chunk 5.5).
+// references to potentially-freed leaf-buffer slices.
 func (c *Cursor) MarkStale() {
 	c.gen++
 	c.curKey, c.curValue = nil, nil

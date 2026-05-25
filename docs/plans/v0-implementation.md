@@ -204,9 +204,10 @@ commit.go` (SyncPolicy); `internal/pager/init.go` (checkpoint-
 preferring active-meta selector); `internal/page/meta.go`
 (ActiveMetaCheckpointPreferring).
 
-Filed: `docs/issues/lagging-reader-callback.md` (Lands: 5 —
-defer until `Keyspace.Put` is the first real `AllocPage`
-consumer).
+Filed: the LaggingReader-callback follow-up (deferred to chunk 5
+until `Keyspace.Put` becomes the first real `AllocPage` consumer
+that can trip the bound-blocked path). Resolved at chunk 5.5; see
+that chunk's entry for the landed surface.
 
 ### Chunk 4 — B+tree primitives + cursor
 
@@ -337,8 +338,11 @@ on a single keyspace.
     re-position. Three spec-tier invariants pinned by tests:
     Unpositioned-distinct-from-EOI; Delete-advances-to-successor;
     Delete-tolerates-CoW-cascade. Forward-compat scaffolding for
-    chunk-5 external-mutation invalidation filed:
-    `docs/issues/cursor-markstale-clear-cur.md`.
+    chunk-5 external-mutation invalidation filed as a follow-up
+    (cursor MarkStale should clear curKey / curValue / iter so a
+    caller bypassing the gen check sees nil rather than dangling
+    references to potentially-freed leaf-buffer slices). Resolved
+    at chunk 5.5.
 - **4.7** ✅ Overflow inline-value Put + Get + chain free on
   replace/Delete. Lifts the `ErrOverflowValueUnsupported`
   sentinel from 4.3; resolves the chunk-4.6γ-filed chain-orphan
@@ -402,15 +406,17 @@ the keyspace subtree atomically.
 - **5.1** ✅ Triage + invariant derivation + API decisions
   (docs-only).
   *Triage gate (chunk-start).* Two `Lands: 5` entries matched:
-  `keyspace-delete-missing-key.md` (folded into 5.1 then **closed**
-  — decision recorded in spec, rationale promoted, file deleted);
-  `lagging-reader-callback.md` (folded into 5.5 — chunk 5.5's
-  `Keyspace.Put` is the first real `pager.AllocPage` consumer).
-  Two condition-triggered entries resolved:
-  `cursor-markstale-clear-cur.md` (folded into 5.5 — keyspace
-  integration wires the first external `MarkStale` call-sites);
-  `slog-default-vs-spec.md` (**redeferred** — chunk 5 does not
-  introduce `Options.Logger`). `bitmap-rollback-undo-log.md`
+  the keyspace-Delete-on-miss policy follow-up (folded into 5.1
+  then **closed** — decision recorded in spec, rationale promoted,
+  file deleted); the LaggingReader-callback follow-up (folded into
+  5.5 — chunk 5.5's `Keyspace.Put` is the first real
+  `pager.AllocPage` consumer). Two condition-triggered entries
+  resolved: the cursor-MarkStale buffer-clear follow-up (folded
+  into 5.5 — keyspace integration wires the first external
+  `MarkStale` call-sites); the slog-default-vs-spec follow-up
+  (**redeferred** at 5.1 because chunk 5 originally did not
+  introduce `Options.Logger`; subsequently folded into 5.5 — see
+  that chunk's entry). The bitmap-rollback-undo-log entry
   (profiling-driven, no match).
   *API decision (user-locked).* Missing-key Delete semantics:
   `ErrNotFound` everywhere (LMDB-style) — applies to
@@ -540,7 +546,9 @@ the keyspace subtree atomically.
 - **5.5** ✅ Keyspace data ops + cursor surface +
   SetKeyspaceConfig + LaggingReader + Options.Logger. User
   re-confirmed the chunk-5.1 bundling at 5.5.1 and added
-  Options.Logger to the bundle (folded `slog-default-vs-spec.md`).
+  Options.Logger to the bundle (folded the slog-default-vs-spec
+  follow-up: pre-v1 clean-break to nil-default instead of
+  `slog.Default()`).
   Surface (in `keyspace.go`):
   `Keyspace.Get` / `Put` / `Delete` on Kind=0 wires chunk-4
   `btree.*` through `desc.Root` + `desc.Count` maintenance +
@@ -550,17 +558,18 @@ the keyspace subtree atomically.
   chunk-4 internal cursor; cursors register on the keyspace so
   Put/Delete `MarkStale`'s them. Internal MarkStale fix
   (`internal/btree/cursor.go`): nils `curKey` / `curValue` and
-  resets `iter` per `cursor-markstale-clear-cur.md` — a caller
-  bypassing the gen check now sees nil rather than dangling
-  references to potentially-freed leaf-buffer slices.
+  resets `iter` per the cursor-MarkStale buffer-clear follow-up
+  (chunk-4.6δ filed, chunk-5.5 resolved) — a caller bypassing the
+  gen check now sees nil rather than dangling references to
+  potentially-freed leaf-buffer slices.
   `Tx.SetKeyspaceConfig(name, KeyspaceConfig)`: Kind-agnostic
   at the descriptor layer; `cfg.RestartGroupTarget == 0` is
   "leave unchanged"; `[1, 255]` updates; `> 255` returns
   `ErrInvalidOptions`; missing name returns `ErrNotFound`
   (the user-locked decision recorded as a spec amend at
   `api-surface.md §Keyspace API SetKeyspaceConfig` godoc per
-  the chunk-5.4-filed `tx-setkeyspaceconfig-missing-name-
-  behavior.md`).
+  the chunk-5.4-filed SetKeyspaceConfig missing-name-behavior
+  follow-up).
   `Options.LaggingReader` callback + `LaggingReaderInfo` /
   `LaggingReaderAction` types added to the public surface.
   Pager-side: new `Pager.SetLaggingReaderCallback` /
@@ -574,16 +583,19 @@ the keyspace subtree atomically.
   nil → discard handler (clean-break vs the chunk-1
   `slog.Default()` default per pre-v1 policy). Cleanup paths in
   `tx.go` / `read_tx.go` / `db.go` use the captured logger via
-  cleanup-closure-captured `*slog.Logger` (resolves
-  `slog-default-vs-spec.md`).
+  cleanup-closure-captured `*slog.Logger` (resolves the
+  slog-default-vs-spec follow-up).
   `Options` additions: `MergeThreshold` (default 25),
   `RestartGroupTarget` (default 0 = engine default),
   `LaggingReader`, `Logger`. New sentinels:
   `ErrCursorUnpositioned`, `ErrCursorStale`.
-  Resolves: `docs/issues/cursor-markstale-clear-cur.md`,
-  `docs/issues/lagging-reader-callback.md`,
-  `docs/issues/slog-default-vs-spec.md`,
-  `docs/issues/tx-setkeyspaceconfig-missing-name-behavior.md`.
+  Resolves four chunk-4.x/5.x follow-ups (load-bearing rationale
+  promoted inline to the surfaces above; tracking-artifact
+  references deleted at 5.8 close-out per Issue-triage gate 2):
+  the cursor-MarkStale buffer-clear follow-up, the
+  LaggingReader-callback follow-up, the slog-default-vs-spec
+  follow-up, and the SetKeyspaceConfig missing-name-behavior
+  follow-up.
   Tests promote four chunk-5.5 invariants: Inv-A
   (Put/Get round-trip), Inv-B (descriptor CoW across commit +
   re-Open), Inv-C (Count tracks leaf entries; Put-replace does
@@ -597,12 +609,15 @@ the keyspace subtree atomically.
 - **5.6** ✅ `DeleteKeyspace` — single-keyspace subtree
   retirement + deferred descriptor flush refactor.
   *Triage gate (chunk-start).* One condition-triggered entry
-  resolved: `descriptor-drift-on-partial-failure.md` (chunk-5.5
-  H1) **folded** — the user picked option 4 (atomic-commit-time
-  descriptor flush) over option 1 (tx-poison) because the same
-  reshape closes both the chunk-5.5 H1 two-write-no-atomicity
-  shape and chunk-5.6 DeleteKeyspace's structurally-identical
-  failure surface in one design move. Other open entries: no
+  resolved: the chunk-5.5 round-1 H1 descriptor-drift class
+  (partial-mutation failure: a per-op storeDescriptor write
+  could fail AFTER a successful data-tree mutation, producing
+  on-disk orphan pages on a subsequent Commit) **folded** — the
+  user picked option 4 (atomic-commit-time descriptor flush) over
+  option 1 (tx-poison) because the same reshape closes both the
+  chunk-5.5 H1 two-write-no-atomicity shape and chunk-5.6
+  DeleteKeyspace's structurally-identical failure surface in one
+  design move. Other open entries: no
   fires at 5.6 (`pager-test-helper-export.md` may fire at 5.6
   test-time if a second cross-package writer-pager fixture
   materialises — opportunistically address; current plan keeps
@@ -673,10 +688,11 @@ the keyspace subtree atomically.
   5.6 implementation handles only step 1.
   *Promotes:* Inv-A/B/C/D as enforced tests in
   `keyspace_test.go` and `keyspace_dataops_test.go`.
-  *Resolves:* `docs/issues/descriptor-drift-on-partial-failure.md`
-  (cited rationale promoted inline to `api-surface.md §Keyspace
-  API` and to the deferred-flush godoc on `Tx.Commit`; issue
-  file deleted at 5.8 close-out per Issue-triage gate 2).
+  *Resolves:* chunk-5.5 round-1 H1 (descriptor-drift class);
+  load-bearing rationale promoted inline to
+  `api-surface.md §Database and Transaction API Tx.Commit` godoc
+  and to the `flushKeyspaces` godoc in `tx.go`. Tracking-artifact
+  reference deleted at 5.8 close-out per Issue-triage gate 2.
   *Adversarial review (round 1).* Fresh-eyes general-purpose
   reviewer surfaced 0 H, 2 introduced M, plus L1-L5 + N1-N3.
   Dispositions:
@@ -734,8 +750,8 @@ the keyspace subtree atomically.
   with rebalance + root collapse). Promotes `range-delete.md`
   #1/#2/#3.
   *Triage gate (chunk-start).* No `Lands:` entries resolved to
-  chunk 5.7 (the open `descriptor-drift-on-partial-failure.md`
-  was resolved at 5.6, awaiting cite-promote at 5.8;
+  chunk 5.7 (the chunk-5.5 round-1 H1 descriptor-drift class was
+  resolved at 5.6, awaiting cite-promote at 5.8;
   `btree-branch-page-validation.md` is opportunistic-deferred).
   *Project-invariants trigger.* `range-delete.md` already
   records four invariants; chunk 5.7 enforces #1/#2/#3 via tests
@@ -823,8 +839,92 @@ the keyspace subtree atomically.
   (chunk 7).
   Ship gate met: no introduced H/M unaddressed; every L/nit has
   a recorded disposition.
-- **5.8** ⏳ Close-out: cite sweep, spec-tier invariant audit,
+- **5.8** ✅ Close-out: cite sweep, spec-tier invariant audit,
   delete resolved issues.
+  *Cite sweep (Issue-triage gate 2).* Wrap-aware grep across
+  `docs/specs/*.md`, `docs/plans/*.md`, and every `*.go` for
+  references to chunk-3/4/5 resolved-and-deleted issue slugs +
+  paths. Surfaced 13 dangling cites accumulated from prior
+  close-outs that missed the cite-promote step (chunk 5.4's
+  cursor-MarkStale forward-compat filing, chunk 5.5's bundle of
+  four resolved issues, chunk 5.6's descriptor-drift resolution).
+  Promote-then-retarget pass:
+    - `tx.go` `Tx.Commit` godoc: descriptor-drift cite removed;
+      load-bearing rationale (two-write-no-atomicity → single
+      commit-time apply) kept inline.
+    - `keyspace.go` `*Keyspace.openCursors` godoc + Tx
+      SetKeyspaceConfig godoc: slug cites replaced with
+      descriptive prose (sibling-mutation CoW/free hazard;
+      Delete-on-miss invariant family attribution).
+    - `internal/btree/cursor.go` `MarkStale` godoc: slug cite
+      removed; rationale (buffer-clear safeguard for callers
+      bypassing the gen check) stays inline.
+    - `db.go` `DB.logger` + Open Options.Logger capture: slug
+      cites replaced with descriptive references to the chunk-5.5
+      spec-amend default (nil → discard handler).
+    - `delete_keyspace_test.go` two cites in the file header +
+      `TestDeferredFlushClosesDescriptorDrift`: slug-and-path
+      cites replaced with descriptive prose pointing at
+      Tx.Commit's deferred-flush godoc.
+    - `docs/plans/v0-implementation.md`: 9 dangling cites in
+      chunk-3.x, chunk-4.6δ, chunk-5.1, chunk-5.5, chunk-5.6, and
+      chunk-5.7 narrative entries replaced with descriptive
+      follow-up labels (e.g., "cursor-MarkStale buffer-clear
+      follow-up (chunk-4.6δ filed, chunk-5.5 resolved)").
+  *Delete.* `docs/issues/descriptor-drift-on-partial-failure.md`
+  + README entry deleted. Chunks 5.4 / 5.5 resolved issues were
+  already file-deleted in their respective commits (`fd0fe19`
+  and `eec7fc6`); only the dangling cites needed promoting at
+  this close-out.
+  *Spec-tier invariant audit.* Every chunk-5.1 enforcement-
+  schedule item verified landed:
+    - `keyspaces.md` #1 (40-byte descriptor) → 5.3
+      `TestKeyspaceDescriptorRoundTripAllFields` + per-field
+      offset assertions.
+    - `keyspaces.md` #2 (Kind enum / immutability, Kind=0
+      portion) → 5.4 forged-descriptor tests; Kind=1 / Kind=2
+      reachability deferred to chunks 6 / 7.
+    - `keyspaces.md` #3 (`ErrKeyspaceKindMismatch`, Kind=0
+      portion) → 5.4 `TestOpenKeyspaceRejectsForgedKindMismatch`.
+    - `keyspaces.md` #4 (`ErrKeyspaceReserved` on Kind=2 +
+      ListKeyspaces filter) → 5.4
+      `TestListKeyspacesFiltersKindIndexInternal` +
+      `TestOpenKeyspaceRejectsForgedKindReserved`. Kind=2
+      reachability via index registry deferred to chunk 7.
+    - `keyspaces.md` #5 (Kind=0 portion: FixedValueSize ≠ 0 on
+      Kind=0 rejected) → 5.4
+      `TestOpenKeyspaceRejectsForgedFixedValueSizeOnKind0`.
+      Full FixedValueSize immutability + Kind=1 meaningfulness
+      deferred to chunk 6.
+    - `keyspaces.md` #6 (SetKeyspaceConfig mutability semantics)
+      → 5.5 `TestSetKeyspaceConfigUpdatesRestartGroupTarget` +
+      `TestKeyspacePutHonorsPerKeyspaceRestartGroupTarget`.
+    - Delete-on-miss invariant (Kind=0 portion) → 5.5
+      `TestKeyspaceDeleteMissingReturnsErrNotFound`. SetKeyspace
+      enforcement deferred to chunk 6.
+    - `range-delete.md` #1 / #2 / #3 → 5.7 nine btree-layer
+      tests + ten public-surface tests. #4 (indexed per-row
+      parity) deferred to chunk 7.
+    - Chunk-5.6 Inv-A/B/C/D (DeleteKeyspace + handle
+      invalidation) → 5.6 `delete_keyspace_test.go` (12 tests).
+    - Chunk-5.7 adjacent fix (Cursor.SetRootID) regression test
+      → extended `TestCursorMarkStaleAfterSiblingPut`.
+  No spec-tier invariant whose `Lands:` resolved to a chunk-5
+  sub-chunk was left in spec-only form.
+  *Open issues post-chunk-5* (8 entries in `docs/issues/`):
+  `setkeyspace-put-added-bool` (Lands: 6),
+  `bitmap-rollback-undo-log` (profiling-driven),
+  `tx-rebuildindex-missing-name-behavior` (Lands: 7),
+  `pager-test-helper-export` (condition: 2nd cross-package
+  writer-pager fixture caller — chunk 5 added no second caller,
+  remains deferred),
+  `leaked-readtx-cleanup-race-flake` (condition),
+  `spec-numkeyspaces-semantics` (Lands: 7),
+  `btree-branch-page-validation` (opportunistic),
+  `btree-post-merge-underflow` (Lands: invariant #3 fill-ratio
+  enforcement test). None fire on chunk-6 entry; the chunk-6
+  chunk-start gate runs the next triage.
+  Chunk 5 complete; suite + `-race` green across all 6 packages.
 
 Primary specs: `keyspaces.md` (`Kind = 0` parts), `range-
 delete.md`.
