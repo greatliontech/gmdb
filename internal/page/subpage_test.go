@@ -593,6 +593,44 @@ func TestEncodeRejectsDataSizeOverflow(t *testing.T) {
 	}
 }
 
+// --- SubpagePromotionThreshold ---
+
+func TestSubpagePromotionThresholdValues(t *testing.T) {
+	// Pin: threshold = (ContentEnd - HeaderSize - 4 - 4) / 2 per
+	// set-keyspace.md §Subpage Promotion Threshold (conservative
+	// usable-space derivation). Hand-compute for the typical
+	// configurations exercised by chunk-6 tests so a future change to
+	// the threshold formula trips this guard.
+	cases := []struct {
+		name       string
+		cfg        Config
+		wantApprox int
+	}{
+		// 4 KB, no checksums: ContentEnd = 4096; usable = 4096 - 8 - 4 - 4 = 4080; threshold = 2040.
+		{"4096-nochecksum", Config{PageSize: 4096, RestartGroupTarget: 16}, 2040},
+		// 4 KB, with checksums: ContentEnd = 4088; usable = 4088 - 8 - 4 - 4 = 4072; threshold = 2036.
+		{"4096-checksum", Config{PageSize: 4096, RestartGroupTarget: 16, PageChecksum: true}, 2036},
+		// 8 KB, no checksums: ContentEnd = 8192; usable = 8192 - 8 - 4 - 4 = 8176; threshold = 4088.
+		{"8192-nochecksum", Config{PageSize: 8192, RestartGroupTarget: 16}, 4088},
+		// 16 KB, with checksums: ContentEnd = 16384 - 8 = 16376; threshold = (16376 - 16) / 2 = 8180.
+		{"16384-checksum", Config{PageSize: 16384, RestartGroupTarget: 16, PageChecksum: true}, 8180},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SubpagePromotionThreshold(tc.cfg)
+			if got != tc.wantApprox {
+				t.Errorf("SubpagePromotionThreshold = %d, want %d", got, tc.wantApprox)
+			}
+			// Sanity: threshold is well below ContentEnd (a subpage
+			// at threshold leaves room for the parent leaf's other
+			// cells and metadata).
+			if got >= tc.cfg.ContentEnd() {
+				t.Errorf("threshold %d >= ContentEnd %d", got, tc.cfg.ContentEnd())
+			}
+		})
+	}
+}
+
 // --- Insert ordering does not aliase the original buf ---
 
 func TestInsertProducesIndependentBuffer(t *testing.T) {

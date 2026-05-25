@@ -44,6 +44,18 @@ func (r LeafReader) decodeRestartEntry(off int) (LeafEntry, int) {
 		off += 8
 		return e, off
 	}
+	if e.IsNestedTree() {
+		// [Flags][KeyLen][Key][Root uint64][Count uint64] — same wire
+		// shape as overflow; different decoded-view fields. Per
+		// set-keyspace.md §Nested B+tree Reference Cell.
+		e.Key = r.buf[off : off+keyLen]
+		off += keyLen
+		e.NestedRoot = le.Uint64(r.buf[off:])
+		off += 8
+		e.NestedCount = le.Uint64(r.buf[off:])
+		off += 8
+		return e, off
+	}
 	// [Flags][KeyLen][ValueLen][Key][Value]
 	valLen := int(le.Uint32(r.buf[off:]))
 	off += 4
@@ -88,6 +100,19 @@ func (r LeafReader) decodeDeltaEntry(off int, prevKey, keyBuf []byte) (LeafEntry
 		e.OverflowPage = le.Uint64(r.buf[off:])
 		off += 8
 		e.TotalLen = le.Uint64(r.buf[off:])
+		off += 8
+		return e, off, keyBuf
+	}
+	if e.IsNestedTree() {
+		// NestedTree delta: UnsharedKey then Root + Count. Same wire
+		// shape as overflow delta; different decoded-view fields.
+		keyBuf = append(keyBuf[:0], prevKey[:sharedLen]...)
+		keyBuf = append(keyBuf, r.buf[off:off+unsharedLen]...)
+		e.Key = keyBuf
+		off += unsharedLen
+		e.NestedRoot = le.Uint64(r.buf[off:])
+		off += 8
+		e.NestedCount = le.Uint64(r.buf[off:])
 		off += 8
 		return e, off, keyBuf
 	}

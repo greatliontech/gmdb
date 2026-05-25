@@ -195,25 +195,136 @@ func TestLeafBuilderAddEntryPreservesMultiValue(t *testing.T) {
 	}
 }
 
-func TestLeafBuilderAddEntryPanicsOnNestedTree(t *testing.T) {
+// Chunk-6.3 had a TestLeafBuilderAddEntryPanicsOnNestedTree that
+// asserted AddEntry panicked on NestedTree cells; chunk 6.4 retires
+// the panic by wiring the actual encoding. The round-trip is now
+// covered by TestLeafBuilderAddNestedTreeRefRoundTrip below.
+
+func TestLeafBuilderAddNestedTreeRefRoundTripUncompressed(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	buf := make([]byte, cfg.PageSize)
+	b := NewLeafBuilder(buf, cfg)
+	if !b.AddNestedTreeRef([]byte("topic-1"), 42, 1000) {
+		t.Fatalf("AddNestedTreeRef returned false")
+	}
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+	if err := r.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	got, _ := r.EntryAt(0, nil)
+	if !got.IsNestedTree() {
+		t.Errorf("IsNestedTree=false; Flags=0x%x", got.Flags)
+	}
+	if got.NestedRoot != 42 {
+		t.Errorf("NestedRoot=%d, want 42", got.NestedRoot)
+	}
+	if got.NestedCount != 1000 {
+		t.Errorf("NestedCount=%d, want 1000", got.NestedCount)
+	}
+	if string(got.Key) != "topic-1" {
+		t.Errorf("Key=%q, want topic-1", got.Key)
+	}
+	if len(got.Value) != 0 {
+		t.Errorf("Value=%x, want empty (NestedTree cells have no inline value)", got.Value)
+	}
+}
+
+func TestLeafBuilderAddNestedTreeRefRoundTripCompressed(t *testing.T) {
 	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
 	buf := make([]byte, cfg.PageSize)
 	b := NewLeafBuilder(buf, cfg)
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Errorf("AddEntry on NestedTree cell did not panic")
-			return
+	if !b.AddNestedTreeRef([]byte("topic-1"), 100, 500) {
+		t.Fatalf("AddNestedTreeRef(topic-1): false")
+	}
+	if !b.AddNestedTreeRef([]byte("topic-2"), 200, 800) {
+		t.Fatalf("AddNestedTreeRef(topic-2): false")
+	}
+	b.Finish()
+
+	r := NewLeafReader(buf, cfg)
+	if err := r.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	got0, _ := r.EntryAt(0, nil)
+	got1, _ := r.EntryAt(1, nil)
+	if !got0.IsNestedTree() || !got1.IsNestedTree() {
+		t.Errorf("flags lost: got0=0x%x got1=0x%x", got0.Flags, got1.Flags)
+	}
+	if got0.NestedRoot != 100 || got0.NestedCount != 500 {
+		t.Errorf("entry 0 Root/Count = %d/%d, want 100/500", got0.NestedRoot, got0.NestedCount)
+	}
+	if got1.NestedRoot != 200 || got1.NestedCount != 800 {
+		t.Errorf("entry 1 Root/Count = %d/%d, want 200/800 (delta-encoded)", got1.NestedRoot, got1.NestedCount)
+	}
+	if string(got1.Key) != "topic-2" {
+		t.Errorf("entry 1 Key=%q, want topic-2 (delta reconstruction)", got1.Key)
+	}
+}
+
+func TestLeafBuilderAddEntryPreservesNestedTree(t *testing.T) {
+	// Decode → modify → re-encode via AddEntry must preserve the
+	// NestedTree flag + (NestedRoot, NestedCount) fields. Mirrors
+	// TestLeafBuilderAddEntryPreservesMultiValue but exercises the
+	// 16-byte-trailer write path.
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	src := make([]byte, cfg.PageSize)
+	b := NewLeafBuilder(src, cfg)
+	b.AddInline([]byte("aaa"), []byte("plain-a"))
+	b.AddNestedTreeRef([]byte("bbb"), 42, 100)
+	b.AddInline([]byte("ccc"), []byte("plain-c"))
+	b.Finish()
+
+	r := NewLeafReader(src, cfg)
+	it := r.IterForReuse(nil, nil, nil)
+	var entries []LeafEntry
+	for e, ok := it.Next(); ok; e, ok = it.Next() {
+		entries = append(entries, LeafEntry{
+			Flags:        e.Flags,
+			Key:          append([]byte(nil), e.Key...),
+			Value:        append([]byte(nil), e.Value...),
+			OverflowPage: e.OverflowPage,
+			TotalLen:     e.TotalLen,
+			NestedRoot:   e.NestedRoot,
+			NestedCount:  e.NestedCount,
+		})
+	}
+
+	dst := make([]byte, cfg.PageSize)
+	b2 := NewLeafBuilder(dst, cfg)
+	for _, e := range entries {
+		if !b2.AddEntry(e) {
+			t.Fatalf("AddEntry returned false during rebuild")
 		}
-		if !strings.Contains(fmt.Sprint(r), "NestedTree") {
-			t.Errorf("panic message missing 'NestedTree' marker: %v", r)
-		}
-	}()
-	b.AddEntry(LeafEntry{
-		Flags: CellFlagMultiValue | CellFlagNestedTree,
-		Key:   []byte("topic"),
-		Value: make([]byte, 16), // simulating [Root][Count]
-	})
+	}
+	b2.Finish()
+
+	r2 := NewLeafReader(dst, cfg)
+	if err := r2.Validate(); err != nil {
+		t.Fatalf("rebuilt Validate: %v", err)
+	}
+	got1, _ := r2.EntryAt(1, nil)
+	if !got1.IsNestedTree() {
+		t.Errorf("rebuilt entry 1 lost NestedTree: Flags=0x%x", got1.Flags)
+	}
+	if got1.NestedRoot != 42 || got1.NestedCount != 100 {
+		t.Errorf("rebuilt entry 1 (Root,Count)=(%d,%d), want (42,100)",
+			got1.NestedRoot, got1.NestedCount)
+	}
+}
+
+func TestLeafValidateAcceptsNestedTreeCells(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	buf := make([]byte, cfg.PageSize)
+	b := NewLeafBuilder(buf, cfg)
+	b.AddNestedTreeRef([]byte("k1"), 10, 20)
+	b.AddNestedTreeRef([]byte("k2"), 30, 40)
+	b.Finish()
+	r := NewLeafReader(buf, cfg)
+	if err := r.Validate(); err != nil {
+		t.Fatalf("Validate rejected a valid nested-tree-cell leaf: %v", err)
+	}
 }
 
 func TestLeafBuilderAddEntryPanicsOnOverflowMultiValue(t *testing.T) {

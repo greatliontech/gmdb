@@ -52,6 +52,18 @@ func (r LeafReader) ucDecodeEntry(off int) (LeafEntry, int) {
 		off += 8
 		return e, off
 	}
+	if e.IsNestedTree() {
+		// [Flags][KeyLen][Key][Root u64][Count u64] — same wire shape
+		// as overflow; different decoded-view fields. Per
+		// set-keyspace.md §Nested B+tree Reference Cell.
+		e.Key = r.buf[off : off+keyLen]
+		off += keyLen
+		e.NestedRoot = le.Uint64(r.buf[off:])
+		off += 8
+		e.NestedCount = le.Uint64(r.buf[off:])
+		off += 8
+		return e, off
+	}
 	// [Flags][KeyLen][ValueLen][Key][Value]
 	valLen := int(le.Uint32(r.buf[off:]))
 	off += 4

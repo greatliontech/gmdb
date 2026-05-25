@@ -488,6 +488,43 @@ func writeSubpageEntry(buf, value []byte, fixedValueSize uint16) {
 	copy(buf[2:], value)
 }
 
+// SubpagePromotionThreshold returns the byte size at which a subpage
+// must be promoted to a nested B+tree per set-keyspace.md §Subpage
+// Promotion Threshold ("50% of the leaf page's usable space").
+//
+// Usable space derivation (spec: PageSize minus header, per-page
+// metadata, restart-table overhead, optional checksum footer):
+//
+//	ContentEnd       = PageSize - footer_if_checksums (cfg.ContentEnd())
+//	per-page header  = HeaderSize (8 bytes)
+//	per-page metadata = 4 bytes (RestartCount+DataEnd for compressed
+//	                    OR DataEnd+Reserved for uncompressed)
+//	restart-table allowance = 4 bytes (one restart-table slot — the
+//	                          minimum a leaf carries; pages with more
+//	                          groups have slightly less usable space)
+//
+// The 4-byte restart-table allowance is conservative: pages with
+// multiple restart groups have a smaller true usable space, so the
+// returned threshold slightly OVER-estimates capacity and promotion
+// may fire one entry later than the strictest spec reading would.
+// The trade-off is determinism — the threshold is a function of cfg
+// only, not of the current leaf's group layout — which keeps the
+// SetKeyspace.Put fast-path (subpage vs promotion check) free of
+// per-page state inspection.
+//
+// Returned threshold is the maximum subpage byte size (header +
+// entries) that may remain inline; a subpage whose size would
+// exceed this value after a new insert must be promoted by the
+// caller per the 4-step algorithm in §Subpage Promotion Threshold.
+func SubpagePromotionThreshold(cfg Config) int {
+	cfg.mustValidate()
+	usable := cfg.ContentEnd() - HeaderSize - 4 - 4
+	if usable < 0 {
+		return 0
+	}
+	return usable / 2
+}
+
 // EncodeSubpage builds a subpage from the supplied sorted, deduped
 // values. Returns ErrSubpageCorrupted if values is out-of-order or
 // contains duplicates; ErrSubpageValueSize if any value's length

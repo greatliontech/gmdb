@@ -102,11 +102,30 @@ func (b *LeafBuilder) AddOverflow(key []byte, ovflPage, totalLen uint64) bool {
 // Returns false on page-full.
 //
 // The subpage's 50%-of-leaf promotion threshold is the SetKeyspace
-// layer's responsibility (chunk 6.4) — this builder does not enforce
-// it and will happily build a leaf containing an over-threshold
-// subpage if asked.
+// layer's responsibility — this builder does not enforce it and will
+// happily build a leaf containing an over-threshold subpage if asked.
 func (b *LeafBuilder) AddSubpage(key, subpage []byte) bool {
 	return b.addEntry(key, CellFlagMultiValue, subpage, 0, 0)
+}
+
+// AddNestedTreeRef appends a SetKeyspace nested-B+tree reference cell
+// (both CellFlagMultiValue and CellFlagNestedTree set). root is the
+// page ID of the nested B+tree's root; count is the cached member
+// count (the O(1) value surfaced by SetKeyspace.CountValues per
+// set-keyspace.md §Nested B+tree Reference Cell).
+//
+// On-disk encoding reuses the overflow wire form
+// (`[Flags][KeyLen][Key][u64][u64]` for restart/uncompressed;
+// `[Flags][SharedLen][UnsharedLen][UnsharedKey][u64][u64]` for delta)
+// — no `ValueLen` prefix; the two u64 fields hold (Root, Count)
+// instead of (OvflPage, TotalLen). Returns false on page-full.
+//
+// The keyspace's Count-equality contract (set-keyspace.md entailed
+// invariant E1: nested-cell Count equals the number of leaf entries
+// reachable from Root) is the SetKeyspace surface's responsibility;
+// the builder writes whatever (root, count) the caller supplies.
+func (b *LeafBuilder) AddNestedTreeRef(key []byte, root, count uint64) bool {
+	return b.addEntry(key, CellFlagMultiValue|CellFlagNestedTree, nil, root, count)
 }
 
 // AddEntry dispatches by e.Flags. Convenience for callers that
@@ -122,28 +141,21 @@ func (b *LeafBuilder) AddSubpage(key, subpage []byte) bool {
 //   - CellFlagMultiValue && !CellFlagNestedTree → AddSubpage (subpage).
 //   - flags == 0 → AddInline (plain key → value).
 //
-// Panics on flag combinations the builder does not have an
-// encoding for:
-//   - CellFlagOverflow | CellFlagMultiValue: `page-formats.md
-//     §Leaf Page (CellFlags bit layout)` declares these mutually
-//     exclusive in practice; no encoding exists for the
-//     combination, so the caller has constructed an
-//     unrepresentable cell.
-//   - CellFlagNestedTree: the nested-B+tree reference cell uses
-//     a distinct value-half encoding (`[Root u64][Count u64]`,
-//     no ValueLen prefix) that lands when the chunk wiring the
-//     promotion-to-nested-tree behaviour also wires the encoder
-//     and decoder for this cell shape.
+// Panics on `CellFlagOverflow | CellFlagMultiValue` — `page-formats.md
+// §Leaf Page (CellFlags bit layout)` declares these mutually exclusive
+// in practice; no encoding exists for the combination, so the caller
+// has constructed an unrepresentable cell. Validate enforces the same
+// rejection at the read-side trust boundary.
 func (b *LeafBuilder) AddEntry(e LeafEntry) bool {
 	switch {
 	case e.Flags&CellFlagOverflow != 0 && e.Flags&CellFlagMultiValue != 0:
 		panic(fmt.Sprintf("page: LeafBuilder.AddEntry on CellFlagOverflow|CellFlagMultiValue cell (flags=0x%x) — these bits are mutually exclusive per page-formats.md §Leaf Page (CellFlags bit layout)", e.Flags))
 	case e.Flags&CellFlagOverflow != 0:
 		return b.AddOverflow(e.Key, e.OverflowPage, e.TotalLen)
-	case e.Flags&CellFlagMultiValue != 0 && e.Flags&CellFlagNestedTree == 0:
+	case e.IsNestedTree():
+		return b.AddNestedTreeRef(e.Key, e.NestedRoot, e.NestedCount)
+	case e.IsSubpage():
 		return b.AddSubpage(e.Key, e.Value)
-	case e.Flags&CellFlagNestedTree != 0:
-		panic(fmt.Sprintf("page: LeafBuilder.AddEntry on CellFlagNestedTree cell (flags=0x%x) — nested-tree reference encoding not yet implemented in LeafBuilder", e.Flags))
 	default:
 		return b.AddInline(e.Key, e.Value)
 	}
@@ -184,7 +196,11 @@ func (b *LeafBuilder) addUCEntry(key []byte, flags uint8, value []byte, ovflPage
 	off++
 	le.PutUint16(b.buf[off:], uint16(len(key)))
 	off += 2
-	if flags&CellFlagOverflow != 0 {
+	if cellHasTrailerOnly(flags) {
+		// Overflow OR NestedTree — both lay [Key][u64][u64]. The
+		// caller passes the trailer u64s as (ovflPage, totalLen);
+		// AddNestedTreeRef threads (root, count) through these
+		// same parameters.
 		copy(b.buf[off:], key)
 		off += len(key)
 		le.PutUint64(b.buf[off:], ovflPage)
@@ -273,7 +289,7 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 	if isRestart {
 		le.PutUint16(b.buf[off:], uint16(len(key)))
 		off += 2
-		if flags&CellFlagOverflow != 0 {
+		if cellHasTrailerOnly(flags) {
 			copy(b.buf[off:], key)
 			off += len(key)
 			le.PutUint64(b.buf[off:], ovflPage)
@@ -293,7 +309,7 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 		off += 2
 		le.PutUint16(b.buf[off:], uint16(len(unsharedKey)))
 		off += 2
-		if flags&CellFlagOverflow != 0 {
+		if cellHasTrailerOnly(flags) {
 			copy(b.buf[off:], unsharedKey)
 			off += len(unsharedKey)
 			le.PutUint64(b.buf[off:], ovflPage)
@@ -365,9 +381,12 @@ func (b *LeafBuilder) FreeSpace() int {
 }
 
 // valuePartSize returns the on-page byte size of an entry's value half.
+// Both overflow references and nested-tree references use the 16-byte
+// trailer form (no ValueLen prefix) per page-formats.md §Leaf Page;
+// inline and subpage cells carry [ValueLen u32][bytes].
 func valuePartSize(flags uint8, value []byte) int {
-	if flags&CellFlagOverflow != 0 {
-		return 8 + 8 // OvflPage + TotalLen
+	if cellHasTrailerOnly(flags) {
+		return 8 + 8 // u64 + u64 (OvflPage|Root + TotalLen|Count)
 	}
 	return 4 + len(value) // ValueLen uint32 + value bytes
 }

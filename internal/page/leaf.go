@@ -70,19 +70,64 @@ var ErrCorrupted = errors.New("page: leaf structural corruption")
 //     iterator's keyBuf for compressed delta entries (since the full key
 //     must be reconstructed). Caller MUST NOT retain past the next
 //     iterator move or leaf transition.
-//   - Value: backed by the page buffer when Flags&Overflow == 0; nil for
-//     overflow entries (consult OverflowPage + TotalLen for the run).
+//   - Value: backed by the page buffer for inline (Flags == 0) entries
+//     and for subpage cells (Flags == CellFlagMultiValue, where Value
+//     holds the raw subpage bytes); nil for overflow and nested-tree
+//     reference entries (consult OverflowPage + TotalLen or
+//     NestedRoot + NestedCount respectively).
+//
+// On-disk vs in-memory: Overflow and NestedTree share the same wire
+// shape (`[Flags][KeyLen][Key][u64][u64]` for restart/uncompressed;
+// `[Flags][SharedLen][UnsharedLen][UnsharedKey][u64][u64]` for delta) —
+// the SetKeyspace nested-tree reference (`set-keyspace.md §Nested
+// B+tree Reference Cell`) intentionally reuses the overflow wire
+// format because both have a 16-byte trailer and no `ValueLen` prefix.
+// The decoded view splits the trailer into distinct field pairs by
+// CellFlags so callers reading e.OverflowPage on a NestedTree cell
+// (or vice versa) get a zero value rather than a silent
+// misinterpretation.
 type LeafEntry struct {
-	Flags        uint8
-	Key          []byte
-	Value        []byte
+	Flags uint8
+	Key   []byte
+	Value []byte
+
+	// Overflow-cell fields (valid iff Flags has CellFlagOverflow set
+	// and CellFlagMultiValue clear). For other flag combinations
+	// these are zero.
 	OverflowPage uint64
 	TotalLen     uint64
+
+	// NestedTree-cell fields (valid iff Flags has both
+	// CellFlagMultiValue and CellFlagNestedTree set). NestedRoot is
+	// the page ID of the nested B+tree's root; NestedCount is the
+	// number of values in the set (the O(1) Count surfaced by
+	// SetKeyspace.CountValues). For other flag combinations these
+	// are zero.
+	NestedRoot  uint64
+	NestedCount uint64
 }
 
 // IsOverflow reports whether the entry's value lives in an overflow run
-// rather than inline on the leaf.
+// rather than inline on the leaf. Mutually exclusive with IsSubpage
+// and IsNestedTree at the spec level (page-formats.md §Leaf Page
+// CellFlags bit layout); validateCellFlagsCombo enforces this at the
+// Validate boundary.
 func (e LeafEntry) IsOverflow() bool { return e.Flags&CellFlagOverflow != 0 }
+
+// IsSubpage reports whether the entry holds an inline SetKeyspace
+// subpage (CellFlagMultiValue set, CellFlagNestedTree clear). The
+// subpage bytes occupy e.Value.
+func (e LeafEntry) IsSubpage() bool {
+	return e.Flags&CellFlagMultiValue != 0 && e.Flags&CellFlagNestedTree == 0
+}
+
+// IsNestedTree reports whether the entry is a SetKeyspace nested-tree
+// reference (both CellFlagMultiValue and CellFlagNestedTree set).
+// The nested tree's root page ID is e.NestedRoot; the cached member
+// count is e.NestedCount.
+func (e LeafEntry) IsNestedTree() bool {
+	return e.Flags&CellFlagMultiValue != 0 && e.Flags&CellFlagNestedTree != 0
+}
 
 // LeafReader provides read access over both compressed and uncompressed
 // leaf pages. Constructed once per Page-resolution boundary in the btree
@@ -251,12 +296,21 @@ func (r LeafReader) LastKey(keyBuf []byte) ([]byte, []byte) {
 		off++
 		keyLen := int(le.Uint16(r.buf[off:]))
 		off += 2
-		if flags&CellFlagOverflow == 0 {
+		if !cellHasTrailerOnly(flags) {
 			off += 4 // skip ValueLen uint32 — Key follows
 		}
 		return r.buf[off : off+keyLen], keyBuf
 	}
 	return r.compressedLastKey(keyBuf)
+}
+
+// cellHasTrailerOnly reports whether the entry's value half is the
+// 16-byte trailer form (overflow run reference OR nested-tree
+// reference) — both shapes elide the `ValueLen u32` prefix. Centralised
+// here so FirstKey / LastKey and the splice helpers don't have to
+// re-derive the condition.
+func cellHasTrailerOnly(flags uint8) bool {
+	return flags&CellFlagOverflow != 0 || flags&CellFlagNestedTree != 0
 }
 
 // FirstKey returns the key of the first entry. Both variants store the
@@ -267,23 +321,16 @@ func (r LeafReader) FirstKey() []byte {
 	if r.count == 0 {
 		return nil
 	}
+	flags := r.buf[leafEntryStart]
 	off := leafEntryStart
 	off++ // skip CellFlags
 	keyLen := int(le.Uint16(r.buf[off:]))
 	off += 2
-	if !r.compressed {
-		// uncompressed: [CellFlags][KeyLen][ValueLen][Key]...
-		// already advanced past CellFlags + KeyLen; skip ValueLen if
-		// inline, or skip nothing if overflow (overflow lays Key
-		// immediately after KeyLen, then OvflPage + TotalLen).
-		if r.buf[leafEntryStart]&CellFlagOverflow == 0 {
-			off += 4 // ValueLen uint32
-		}
-		return r.buf[off : off+keyLen]
-	}
-	// compressed: restart entry layout matches the uncompressed inline
-	// layout (CellFlags + KeyLen + ValueLen + Key + Value).
-	if r.buf[leafEntryStart]&CellFlagOverflow == 0 {
+	// Trailer-only forms (overflow + nested-tree) elide the
+	// ValueLen u32 prefix and place the key immediately after KeyLen;
+	// inline cells (plain + subpage) carry ValueLen between KeyLen
+	// and Key.
+	if !cellHasTrailerOnly(flags) {
 		off += 4
 	}
 	return r.buf[off : off+keyLen]
@@ -470,10 +517,12 @@ func (r LeafReader) validateRestartEntry(off int) (int, error) {
 	}
 	keyLen := int(le.Uint16(r.buf[off:]))
 	off += 2
-	if flags&CellFlagOverflow != 0 {
-		// [Flags][KeyLen][Key][OvflPage u64][TotalLen u64]
+	if cellHasTrailerOnly(flags) {
+		// Overflow: [Flags][KeyLen][Key][OvflPage u64][TotalLen u64].
+		// NestedTree: [Flags][KeyLen][Key][Root u64][Count u64].
+		// Identical wire shape; the trailer is always 16 bytes.
 		if err := r.ensureBytes(off, keyLen+16); err != nil {
-			return 0, fmt.Errorf("restart overflow body: %w", err)
+			return 0, fmt.Errorf("restart trailer body: %w", err)
 		}
 		return off + keyLen + 16, nil
 	}
@@ -512,10 +561,12 @@ func (r LeafReader) validateDeltaEntry(off int) (int, error) {
 	off += 2
 	unsharedLen := int(le.Uint16(r.buf[off:]))
 	off += 2
-	if flags&CellFlagOverflow != 0 {
-		// [Flags][SharedLen][UnsharedLen][UnsharedKey][OvflPage][TotalLen]
+	if cellHasTrailerOnly(flags) {
+		// Overflow: [Flags][SharedLen][UnsharedLen][UnsharedKey][OvflPage][TotalLen].
+		// NestedTree: [Flags][SharedLen][UnsharedLen][UnsharedKey][Root][Count].
+		// Identical wire shape; trailer is always 16 bytes.
 		if err := r.ensureBytes(off, unsharedLen+16); err != nil {
-			return 0, fmt.Errorf("delta overflow body: %w", err)
+			return 0, fmt.Errorf("delta trailer body: %w", err)
 		}
 		return off + unsharedLen + 16, nil
 	}
@@ -551,9 +602,11 @@ func (r LeafReader) validateUCEntry(off int) error {
 	}
 	keyLen := int(le.Uint16(r.buf[off:]))
 	off += 2
-	if flags&CellFlagOverflow != 0 {
+	if cellHasTrailerOnly(flags) {
+		// Overflow OR NestedTree — both have a 16-byte trailer after
+		// the key, no ValueLen prefix.
 		if err := r.ensureBytes(off, keyLen+16); err != nil {
-			return fmt.Errorf("uc overflow body: %w", err)
+			return fmt.Errorf("uc trailer body: %w", err)
 		}
 		return nil
 	}
