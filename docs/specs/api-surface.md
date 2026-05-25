@@ -1056,11 +1056,16 @@ func (ks *SetKeyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte]
 ```go
 type Index struct { /* unexported */ }
 
-// Lookup returns (pk, value) pairs matching the exact column tuple.
-// value is read from the index's covering bytes when the index covers
-// the requested column set; otherwise via back-lookup to the row
-// keyspace. Iteration ends when no more matches; check Err() for
-// errors.
+// Lookup returns (pk, value) pairs matching the **exact** column
+// tuple. The number of supplied cols MUST equal the index's
+// declared column count; supplying fewer or more sets idx.Err()
+// to a wrapped ErrInvalidOptions and yields nothing — use Prefix
+// for partial-cols semantics (chunk-7.7 user-locked enforcement).
+//
+// value is read from the index's covering bytes when the index
+// covers the requested column set; otherwise via back-lookup to
+// the row keyspace. Iteration ends when no more matches; check
+// Err() for errors.
 //
 // Intra-transaction consistency: index cursor and back-lookup both
 // read the current transaction's dirty state. Row writes and index
@@ -1073,6 +1078,9 @@ func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
 
 // LookupKeys returns matching primary keys without back-lookup or
 // covering decode. Iteration cost is O(matches) leaf scans only.
+// The same exact-cols validation as Lookup applies (chunk-7.7
+// user-locked).
+//
 // Because LookupKeys never probes the row keyspace, it does not
 // observe missing-PK inconsistencies (the silent-skip case noted
 // on Lookup) — every index entry yields its raw PK, even if the
@@ -1082,9 +1090,35 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
 
 // Range returns matches in [start, end). Each tuple is a slice of
 // per-column byte slices; nil tuple = open-ended.
+//
+// Partial-tuple bounds are **prefix-bounds**: a start (or end) with
+// fewer columns than the index's declared count acts as the lex-
+// encoded prefix of that leading-cols group. Concretely, for a
+// 2-column index (color, size):
+//
+//   - Range([[0x42]], [[0x43])) matches every row whose first col
+//     == 0x42 (full tuple group bounded below by 0x42 inclusive,
+//     above by 0x43 exclusive).
+//   - Range([[0x42, 0x10]], [[0x42, 0x20])) matches rows with
+//     (0x42, 0x10) inclusive ... (0x42, 0x20) exclusive.
+//   - Range(nil, [[0x42])) matches every row whose first col < 0x42.
+//
+// The bound is the lex-encoded byte sequence, not a semantic
+// tuple comparison — Range works on the on-disk encoded form, so
+// shorter tuples naturally sort before longer ones sharing the
+// same lead bytes. Use Prefix for the equivalent "leading cols ==
+// X" query (single-bound shorthand).
+// (Chunk-7.7 spec amendment.)
 func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
 
-// Prefix returns matches whose leading columns match the prefix.
+// Prefix returns matches whose leading columns equal the prefix.
+// The number of leading columns must be ≤ the index's declared
+// column count — supplying more returns idx.Err() set to a wrapped
+// ErrInvalidOptions and yields nothing.
+//
+// Equivalent to Range(prefix, nextPrefix) where nextPrefix is the
+// smallest tuple strictly greater than the prefix; callers using
+// Prefix don't need to compute that upper bound themselves.
 func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
 
 // Get is shorthand for unique indexes: returns the single (pk, value)

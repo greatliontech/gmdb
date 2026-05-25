@@ -1,6 +1,7 @@
 package gmdb
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -14,13 +15,18 @@ import (
 //
 // On-disk index-entry shape per indexing.md §Storage Layout:
 //
-//	Unique index:     key = encodeIndexKey(cols);             value = pk_bytes
-//	Non-unique index: key = encodeIndexKey(cols || pk);       value = []byte{}
+//	Unique index:     key = encodeIndexKey(cols)
+//	                  value = uvarint(len(pk)) || pk_bytes || encoded_covering
+//	Non-unique index: key = encodeIndexKey(cols || pk)
+//	                  value = encoded_covering (empty if no Covering)
 //
-// Covering bytes are NOT yet written at chunk 7.6 — extractor's
-// IndexEntry.Cover is ignored. Lookup at chunk 7.7 will fall back
-// to row-keyspace back-lookup. The chunk-7.7 wiring extends the
-// value format to encode covering bytes.
+// encoded_covering = encodeIndexKey(coverColumns) when the
+// IndexDecl declares Covering; otherwise empty bytes.
+// The uvarint(len(pk)) length prefix on the unique value
+// delimits the PK from the optional covering blob — without it,
+// the decoder cannot distinguish where pk_bytes ends and
+// encoded_covering begins. Non-unique indexes carry the PK in the
+// key, so no length prefix is needed in the value.
 
 // indexEntryKey returns the on-disk index-tree key for a single
 // extractor-produced IndexEntry on a Keyspace row (the PK is the
@@ -38,17 +44,62 @@ func indexEntryKey(entry IndexEntry, pk []byte, unique bool) []byte {
 	return encodeIndexKey(withPK)
 }
 
-// indexEntryValue returns the on-disk index-tree value for the
-// entry. Unique → pk_bytes; non-unique → empty. (Covering deferred
-// to chunk 7.7.)
-func indexEntryValue(pk []byte, unique bool) []byte {
+// indexEntryValue returns the on-disk index-tree value for entry on
+// a row whose PK is pk. Per the value-format godoc above:
+//
+//	Unique:     uvarint(len(pk)) || pk_bytes || encoded_covering
+//	Non-unique: encoded_covering
+//
+// encoded_covering = encodeIndexKey(entry.Cover) when the IndexDecl
+// declares Covering and the extractor produced Cover bytes;
+// otherwise empty.
+func indexEntryValue(entry IndexEntry, pk []byte, unique bool, hasCovering bool) []byte {
+	var covering []byte
+	if hasCovering && len(entry.Cover) > 0 {
+		covering = encodeIndexKey(entry.Cover)
+	}
 	if unique {
-		out := make([]byte, len(pk))
-		copy(out, pk)
+		// uvarint(len(pk)) + pk + covering
+		var lenBuf [binary.MaxVarintLen64]byte
+		n := binary.PutUvarint(lenBuf[:], uint64(len(pk)))
+		out := make([]byte, 0, n+len(pk)+len(covering))
+		out = append(out, lenBuf[:n]...)
+		out = append(out, pk...)
+		out = append(out, covering...)
 		return out
 	}
-	return []byte{}
+	// Non-unique: just the covering (empty if none).
+	if covering == nil {
+		return []byte{}
+	}
+	return covering
 }
+
+// decodeUniqueIndexValue unpacks the unique-index entry value
+// produced by indexEntryValue (unique=true) into the row PK and
+// the encoded covering bytes (which may be empty).
+//
+// Returns errIndexValueShort wrapped in ErrCorrupted at the
+// caller's boundary on malformed input.
+func decodeUniqueIndexValue(value []byte) (pk, encodedCovering []byte, err error) {
+	pkLen, n := binary.Uvarint(value)
+	if n <= 0 {
+		return nil, nil, fmt.Errorf("%w: bad uvarint pk-length prefix", errIndexValueShort)
+	}
+	if uint64(len(value)-n) < pkLen {
+		return nil, nil, fmt.Errorf("%w: pk length %d exceeds remaining %d bytes",
+			errIndexValueShort, pkLen, len(value)-n)
+	}
+	pk = value[n : n+int(pkLen)]
+	encodedCovering = value[n+int(pkLen):]
+	return pk, encodedCovering, nil
+}
+
+// errIndexValueShort marks a malformed index entry value (truncated
+// uvarint, pk-length past end). Wrapped in ErrCorrupted at the
+// caller boundary; index entries are engine-internal so a
+// malformed value signals on-disk corruption.
+var errIndexValueShort = errors.New("index entry value malformed")
 
 // extractEntriesAsKeySet runs the extractor and returns a
 // map[string]IndexEntry keyed by the encoded index-tree key. The
@@ -226,8 +277,10 @@ func (ks *Keyspace) applyIndexMaintenanceOnPutInner(key, oldValue, newValue []by
 
 	// Step 5: apply inserts.
 	for _, pl := range plans {
-		val := indexEntryValue(key, pl.p.decl.Unique)
+		hasCovering := len(pl.p.decl.Covering) > 0
 		for _, k := range pl.ins {
+			entry := pl.news[k]
+			val := indexEntryValue(entry, key, pl.p.decl.Unique, hasCovering)
 			newRoot, err := btree.Put(ks.tx.pgr, cfg, pl.p.root, []byte(k), val)
 			if err != nil {
 				return mapBtreeErr(err)
