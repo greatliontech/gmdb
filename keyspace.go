@@ -297,6 +297,15 @@ func (tx *Tx) ListKeyspaces() ([]string, error) {
 		}
 		seen[ks.name.Value()] = struct{}{}
 	}
+	// Kind=1 partner: same-tx-created SetKeyspaces are also user-
+	// visible and must surface in ListKeyspaces.
+	for _, sks := range tx.openSetKeyspaces {
+		if sks.state != keyspaceStateCreated {
+			continue
+		}
+		// Kind=1 by construction; Kind=2 cannot reach this map.
+		seen[sks.name.Value()] = struct{}{}
+	}
 	if len(seen) == 0 {
 		return nil, nil
 	}
@@ -322,6 +331,14 @@ func (tx *Tx) lookupDescriptor(name string) (page.KeyspaceDescriptor, bool, erro
 	handle := unique.Make(name)
 	if ks, ok := tx.openKeyspaces[handle]; ok {
 		return ks.desc, true, nil
+	}
+	if sks, ok := tx.openSetKeyspaces[handle]; ok {
+		// Kind=1 partner: a same-tx-created SetKeyspace must
+		// surface its descriptor here so a subsequent OpenKeyspace
+		// on the same name observes Kind=1 and returns
+		// ErrKeyspaceKindMismatch (rather than ErrNotFound, which
+		// would suggest a never-seen name).
+		return sks.desc, true, nil
 	}
 	if desc, ok := tx.dirtyDescriptors[name]; ok {
 		return desc, true, nil
@@ -742,6 +759,24 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 		ks.markDirty()
 		return nil
 	}
+	// Kind=1 partner of the Kind=0 cached-handle branch above. Per
+	// keyspaces.md inv #6, RestartGroupTarget is kind-agnostic: the
+	// descriptor field is mutable for any Kind via SetKeyspaceConfig.
+	// Without this branch a same-tx CreateSetKeyspace +
+	// SetKeyspaceConfig silently returns ErrNotFound (the cached
+	// SetKeyspace's desc never gets updated, and the on-disk lookup
+	// misses because the descriptor was never persisted).
+	if sks, ok := tx.openSetKeyspaces[handle]; ok {
+		if sks.dead {
+			return ErrNotFound
+		}
+		if sks.desc.RestartGroupTarget == cfg.RestartGroupTarget {
+			return nil
+		}
+		sks.desc.RestartGroupTarget = cfg.RestartGroupTarget
+		sks.markDirty()
+		return nil
+	}
 	if desc, ok := tx.dirtyDescriptors[name]; ok {
 		if desc.RestartGroupTarget == cfg.RestartGroupTarget {
 			return nil
@@ -991,12 +1026,20 @@ func (tx *Tx) DeleteKeyspace(name string) error {
 	var (
 		desc             page.KeyspaceDescriptor
 		existingKS       *Keyspace
+		existingSKS      *SetKeyspace
 		needsBtreeDelete bool // true when an on-disk descriptor entry must be removed via btree.Delete at flush; false when the name lives only in-memory (state=Created)
 	)
 	if ks, ok := tx.openKeyspaces[handle]; ok && !ks.dead {
 		existingKS = ks
 		desc = ks.desc
 		needsBtreeDelete = ks.state != keyspaceStateCreated
+	} else if sks, ok := tx.openSetKeyspaces[handle]; ok && !sks.dead {
+		// Kind=1 partner of the Kind=0 cached-handle branch above.
+		// Same lifecycle: needsBtreeDelete iff the descriptor was
+		// already persisted (state != Created).
+		existingSKS = sks
+		desc = sks.desc
+		needsBtreeDelete = sks.state != keyspaceStateCreated
 	} else if d, ok := tx.dirtyDescriptors[name]; ok {
 		// dirtyDescriptors-only entries (from SetKeyspaceConfig on
 		// an uncached name) reflect an on-disk descriptor with a
@@ -1062,6 +1105,15 @@ func (tx *Tx) DeleteKeyspace(name string) error {
 		for _, c := range existingKS.openCursors {
 			c.inner.MarkStale()
 		}
+	}
+	if existingSKS != nil {
+		// Kind=1 partner: same dead-marking + cache eviction. No
+		// open-cursor invalidation here yet — SetCursor lands at
+		// chunk 6.7; that chunk wires the openSetCursors slice and
+		// the markStale loop.
+		delete(tx.openSetKeyspaces, handle)
+		existingSKS.dead = true
+		tx.deadSetKeyspaces = append(tx.deadSetKeyspaces, existingSKS)
 	}
 	delete(tx.dirtyDescriptors, name)
 

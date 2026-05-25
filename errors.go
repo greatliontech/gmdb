@@ -126,6 +126,23 @@ var (
 	// *Keyspace while the old handle stays dead until the caller
 	// drops it.
 	ErrKeyspaceClosed = errors.New("gmdb: keyspace closed by DeleteKeyspace")
+
+	// ErrValueSizeMismatch is returned by SetKeyspace.Put /
+	// SetKeyspace.DeleteValue when the value's length differs from
+	// the keyspace's declared FixedValueSize. Per api-surface.md
+	// §Sentinel errors + keyspaces.md invariant #5 (FixedValueSize
+	// immutable + uniform for Kind=1).
+	ErrValueSizeMismatch = errors.New("gmdb: value size does not match fixed value size")
+
+	// ErrFixedValueSizeMismatch is returned by
+	// Tx.CreateSetKeyspaceIfNotExists when the existing keyspace's
+	// FixedValueSize differs from the supplied
+	// opts.FixedValueSize. FixedValueSize is immutable after
+	// creation (keyspaces.md invariant #5), so the API cannot
+	// silently coerce the caller's opts to the existing value
+	// without misleading the caller about the storage layout. Per
+	// chunk-6.1 spec amendment.
+	ErrFixedValueSizeMismatch = errors.New("gmdb: keyspace exists with different FixedValueSize")
 )
 
 var (

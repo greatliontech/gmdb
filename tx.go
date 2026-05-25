@@ -60,6 +60,17 @@ type Tx struct {
 	// chunk-5.6 invariant Inv-D).
 	openKeyspaces map[uniqueNameHandle]*Keyspace
 
+	// openSetKeyspaces caches *SetKeyspace handles by interned name
+	// within this transaction — kind-symmetric partner of
+	// openKeyspaces for Kind=1 keyspaces. Same lifecycle: populated
+	// on successful OpenSetKeyspace / CreateSetKeyspace*;
+	// DeleteKeyspace removes the entry (and migrates the *SetKeyspace
+	// to deadKeyspaces with dead=true). A keyspace name is in at
+	// most one of {openKeyspaces, openSetKeyspaces} at any time
+	// (Kind-immutability + the Open Kind-mismatch check together
+	// ensure a name resolves to exactly one Kind per tx).
+	openSetKeyspaces map[uniqueNameHandle]*SetKeyspace
+
 	// dirtyDescriptors holds descriptor mutations on names that have
 	// no *Keyspace handle in openKeyspaces (today: SetKeyspaceConfig
 	// on an unopened name — kind-agnostic per the chunk-5.5 godoc on
@@ -93,6 +104,13 @@ type Tx struct {
 	// the tx is dropped and the dead handles become unreachable along
 	// with it.
 	deadKeyspaces []*Keyspace
+
+	// deadSetKeyspaces is the Kind=1 partner of deadKeyspaces:
+	// every *SetKeyspace handle invalidated by a same-tx
+	// DeleteKeyspace. Lifecycle and reachability semantics are
+	// identical (see deadKeyspaces godoc). A re-created keyspace in
+	// the same tx returns a fresh handle; the old stays dead.
+	deadSetKeyspaces []*SetKeyspace
 
 	// held tracks whether this Tx still owns the cross-process write
 	// grant. Begin sets it to true; Commit, Rollback, and the
@@ -473,7 +491,7 @@ func (tx *Tx) releaseGrant() {
 // yet (pager.Commit's step-1 runs after this), so AbortTx is
 // strictly sufficient to restore pre-flush state.
 func (tx *Tx) flushKeyspaces() error {
-	if len(tx.pendingDeletes) == 0 && len(tx.dirtyDescriptors) == 0 && !tx.hasDirtyOpenKeyspaces() {
+	if len(tx.pendingDeletes) == 0 && len(tx.dirtyDescriptors) == 0 && !tx.hasDirtyOpenKeyspaces() && !tx.hasDirtyOpenSetKeyspaces() {
 		return nil
 	}
 	cfg := tx.pgr.Config()
@@ -500,7 +518,7 @@ func (tx *Tx) flushKeyspaces() error {
 		}
 	}
 
-	// Step 2: open keyspaces with Created or Dirty state.
+	// Step 2a: Kind=0 open keyspaces with Created or Dirty state.
 	if tx.hasDirtyOpenKeyspaces() {
 		names := dirtyOpenNamesSorted(tx.openKeyspaces)
 		buf := make([]byte, page.KeyspaceDescriptorSize)
@@ -513,6 +531,26 @@ func (tx *Tx) flushKeyspaces() error {
 			}
 			tx.keyspaceRoot = newRoot
 			ks.state = keyspaceStateClean
+		}
+	}
+
+	// Step 2b: Kind=1 open set-keyspaces with Created or Dirty state.
+	// Symmetric to 2a — the descriptor encoding is kind-agnostic
+	// (EncodeKeyspaceDescriptor writes the full struct including
+	// Kind + FixedValueSize), so the only difference is the source
+	// map and the *SetKeyspace handle type.
+	if tx.hasDirtyOpenSetKeyspaces() {
+		names := dirtySetOpenNamesSorted(tx.openSetKeyspaces)
+		buf := make([]byte, page.KeyspaceDescriptorSize)
+		for _, name := range names {
+			sks := tx.openSetKeyspaces[unique.Make(name)]
+			page.EncodeKeyspaceDescriptor(buf, sks.desc)
+			newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte(name), buf)
+			if err != nil {
+				return fmt.Errorf("flushKeyspaces: btree.Put %q (SetKeyspace): %w", name, mapBtreeErr(err))
+			}
+			tx.keyspaceRoot = newRoot
+			sks.state = keyspaceStateClean
 		}
 	}
 
@@ -548,6 +586,18 @@ func (tx *Tx) hasDirtyOpenKeyspaces() bool {
 	return false
 }
 
+// hasDirtyOpenSetKeyspaces reports whether any open *SetKeyspace
+// handle has pending descriptor state. Kind=1 partner of
+// hasDirtyOpenKeyspaces.
+func (tx *Tx) hasDirtyOpenSetKeyspaces() bool {
+	for _, sks := range tx.openSetKeyspaces {
+		if sks.state != keyspaceStateClean {
+			return true
+		}
+	}
+	return false
+}
+
 // dirtyOpenNamesSorted returns the names of openKeyspaces entries
 // whose state is Created or Dirty, sorted for deterministic flush
 // ordering.
@@ -558,6 +608,20 @@ func dirtyOpenNamesSorted(m map[uniqueNameHandle]*Keyspace) []string {
 			continue
 		}
 		out = append(out, ks.name.Value())
+	}
+	sort.Strings(out)
+	return out
+}
+
+// dirtySetOpenNamesSorted is the Kind=1 partner of
+// dirtyOpenNamesSorted — same shape, different value type.
+func dirtySetOpenNamesSorted(m map[uniqueNameHandle]*SetKeyspace) []string {
+	out := make([]string, 0, len(m))
+	for _, sks := range m {
+		if sks.state == keyspaceStateClean {
+			continue
+		}
+		out = append(out, sks.name.Value())
 	}
 	sort.Strings(out)
 	return out
