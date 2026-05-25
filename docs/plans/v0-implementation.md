@@ -729,10 +729,100 @@ the keyspace subtree atomically.
       distinction.
   Ship gate met: no introduced H/M unaddressed; every L/nit has a
   recorded disposition.
-- **5.7** ⏳ `DeleteRange` — three-phase algorithm
+- **5.7** ✅ `DeleteRange` — three-phase algorithm
   (boundary paths + interior-subtree retire + boundary cleanup
   with rebalance + root collapse). Promotes `range-delete.md`
   #1/#2/#3.
+  *Triage gate (chunk-start).* No `Lands:` entries resolved to
+  chunk 5.7 (the open `descriptor-drift-on-partial-failure.md`
+  was resolved at 5.6, awaiting cite-promote at 5.8;
+  `btree-branch-page-validation.md` is opportunistic-deferred).
+  *Project-invariants trigger.* `range-delete.md` already
+  records four invariants; chunk 5.7 enforces #1/#2/#3 via tests
+  and defers #4 (indexed-keyspace per-row parity) to chunk 7
+  alongside the indexing surface.
+  *Surface.*
+    - New file: `internal/btree/range_delete.go` (~430 LOC).
+      `DeleteRange(pw, cfg, rootID, mergeThreshold, start, end)
+      → (count, newRoot, err)` runs a single recursive descent
+      that fuses phases 1+2 (boundary path identification +
+      interior-subtree retire via the chunk-5.6 `FreeSubtree`)
+      and handles phase 3 (boundary leaf rebuild + branch
+      rebalance via `mergeOrRedistribute*`) on the unwinding
+      path. Top-level root collapse iterates with a MaxTreeDepth
+      bound (L-4 fix from the chunk-5.7 review).
+    - `internal/btree/delete.go` refactor: factored
+      `deleteFromBranch`'s post-recursion body into a reusable
+      `patchBranchAfterChildDelete` helper so DeleteRange's
+      single-child case shares the existing case-A/B/C
+      merge/redistribute machinery. No behavior change for
+      chunk-4 callers.
+    - `internal/btree/subtree.go` refactor: `FreeSubtree`
+      signature changed from `error` → `(uint64, error)` to
+      count leaf entries retired. Chunk-5.6 `Tx.DeleteKeyspace`
+      caller discards the count.
+    - `keyspace.go`: `Keyspace.DeleteRange(start, end)` public
+      surface. ErrKeyspaceClosed guard, empty-tree short-circuit,
+      empty-but-non-nil boundary rejection (L-2 user-locked
+      decision: nil = open, `[]byte{}` = ErrKeyEmpty),
+      desc.Count underflow defense (L-3 fix: returns ErrCorrupted
+      if `count > desc.Count` rather than wrapping under uint64
+      arithmetic), in-memory descriptor update via the chunk-5.6
+      deferred-flush path, markCursorsStale on success.
+  *Adjacent fix (introduced-tests surface a chunk-5.5 latent
+  bug).* `Cursor.rootID` was captured at construction time and
+  never refreshed after a sibling mutation. Re-positioning via
+  `First/Last/Seek/SeekGE` descended from a `FreePage`'d
+  (now-retired) root whose mmap-resident bytes survive only
+  until the loose-pool reuses the id, producing stale or
+  corrupted reads. Fix: added `Cursor.SetRootID(rootID)` to
+  btree.Cursor, and `Keyspace.markCursorsStale` (plus
+  `Cursor.Delete`'s sibling-MarkStale loop) now refresh
+  `c.inner.SetRootID(ks.desc.Root)` alongside MarkStale.
+  Regression test extended in
+  `TestCursorMarkStaleAfterSiblingPut` to verify post-re-position
+  cursor sees sibling-Put'd entries. `class=adjacent` per the
+  chunk-5.7 diff arbiter (cause-line predates this change set in
+  chunk 5.5).
+  *Spec amends (user-locked).*
+    - `api-surface.md §Keyspace API DeleteRange` godoc: documented
+      `nil` open-boundary sentinel vs. `[]byte{}` rejection
+      semantic.
+    - `range-delete.md` invariant #1: extended to clarify the
+      `nil` vs. `[]byte{}` distinction in addition to the
+      original `[start, end)` boundary clause.
+  *Adversarial review (round 1).* Fresh-eyes general-purpose
+  reviewer surfaced 0 introduced H/M, 1 disputed M (M-1
+  post-merge underflow flag — pre-existing adjacent, filed),
+  L-1/L-3/L-4 + nit-1..4 with dispositions:
+    - **L-2** (empty-byte boundary policy): user-locked option (a)
+      → reject empty-non-nil with `ErrKeyEmpty`; **fixed
+      in-place** + spec amend applied.
+    - **L-3** (`desc.Count` underflow defense): user-locked
+      "fix both in-place" → ErrCorrupted return guard added.
+    - **L-4** (root-collapse loop MaxTreeDepth guard): user-locked
+      "fix both in-place" → bound added consistent with
+      `freeSubtreeAt`.
+    - **L-1** (DeleteRange's tx.requireOpen ordering): disputed by
+      reviewer on re-read.
+    - **M-1** (post-merge underflow flag forcibly cleared,
+      regardless of fill ratio): **filed** as
+      `docs/issues/btree-post-merge-underflow.md`,
+      `class=adjacent` — cause-line is chunk-4
+      `mergeOrRedistribute*` contract; `Lands: when invariant #3
+      fill-ratio enforcement test is added`.
+    - **nit-1** (`Cursor.SetRootID` exported without precondition
+      guard): documentation handles the future caller;
+      DeleteKeyspace's MarkStale path correctly skips SetRootID
+      because cursors hit `ks.dead` first.
+    - **nit-2** (`entries[:0]` aliasing): comment added.
+    - **nit-3** / **nit-4**: disputed.
+  *Promotes:* `range-delete.md` #1/#2/#3 as enforced tests in
+  `internal/btree/range_delete_test.go` (9 tests) and
+  `delete_range_test.go` (10 tests). Inv-#4 remains spec-tier
+  (chunk 7).
+  Ship gate met: no introduced H/M unaddressed; every L/nit has
+  a recorded disposition.
 - **5.8** ⏳ Close-out: cite sweep, spec-tier invariant audit,
   delete resolved issues.
 

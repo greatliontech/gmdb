@@ -851,8 +851,19 @@ func (ks *Keyspace) Put(key, value []byte) error
 // §Invariants — keyed-removal returns ErrNotFound on miss).
 func (ks *Keyspace) Delete(key []byte) error
 
-// DeleteRange returns (0, nil) for an empty range — bulk
-// operations report "rows affected", not membership.
+// DeleteRange deletes every key k with start <= k < end. Returns
+// the count of entries deleted; (0, nil) for an empty range
+// (start == end, start > end, or no matching keys) — bulk operations
+// report "rows affected", not membership.
+//
+// Boundary semantics:
+//   - nil = open-boundary sentinel. nil start = "from the beginning";
+//     nil end = "through the last key"; (nil, nil) = every key.
+//   - Non-nil zero-length ([]byte{}) is rejected with ErrKeyEmpty,
+//     consistent with every other name-taking API per api-surface.md
+//     §Invariants empty-key clause. The asymmetric semantic between
+//     nil and []byte{} is intentional: nil expresses "open"; the
+//     zero-length byte slice is an invalid key.
 func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error)
 func (ks *Keyspace) NextSequence() (uint64, error)
 func (ks *Keyspace) Cursor() *Cursor

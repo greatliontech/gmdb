@@ -22,7 +22,7 @@ func TestFreeSubtreeEmpty(t *testing.T) {
 	pw, _, f := setupPagerWriter(t, 16)
 	defer pw.Close()
 	defer f.Close()
-	if err := FreeSubtree(pw, pw.Config(), 0); err != nil {
+	if _, err := FreeSubtree(pw, pw.Config(), 0); err != nil {
 		t.Errorf("FreeSubtree(0): %v", err)
 	}
 	if len(pw.RetiredPages()) != 0 || len(pw.LoosePages()) != 0 {
@@ -46,7 +46,7 @@ func TestFreeSubtreeSingleLeaf(t *testing.T) {
 	if len(reachable) != 1 {
 		t.Fatalf("expected 1 reachable page, got %d", len(reachable))
 	}
-	if err := FreeSubtree(pw, cfg, root); err != nil {
+	if _, err := FreeSubtree(pw, cfg, root); err != nil {
 		t.Fatalf("FreeSubtree: %v", err)
 	}
 	for id := range reachable {
@@ -89,7 +89,7 @@ func TestFreeSubtreeMultiLeafBranch(t *testing.T) {
 		t.Fatal("test setup too small — no branch level produced")
 	}
 
-	if err := FreeSubtree(pw, cfg, root); err != nil {
+	if _, err := FreeSubtree(pw, cfg, root); err != nil {
 		t.Fatalf("FreeSubtree: %v", err)
 	}
 	loose := pw.LoosePages()
@@ -139,7 +139,7 @@ func TestFreeSubtreeWithOverflow(t *testing.T) {
 		t.Fatalf("expected ≥5 reachable pages (leaf + overflow chain), got %d", len(reachable))
 	}
 
-	if err := FreeSubtree(pw, cfg, root); err != nil {
+	if _, err := FreeSubtree(pw, cfg, root); err != nil {
 		t.Fatalf("FreeSubtree: %v", err)
 	}
 	loose := pw.LoosePages()

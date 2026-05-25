@@ -28,12 +28,19 @@ Invariant: kind=clause-explicit;
   property=`DeleteRange(start, end)` deletes every key `k` with
     `start <= k < end` from the keyspace and zero keys outside that
     interval; `end` itself is never deleted. Passing
-    `(nil, nil)` deletes every key in the keyspace;
-  from=this spec §Algorithm + API contract;
+    `(nil, nil)` deletes every key in the keyspace. `nil` is the
+    open-boundary sentinel: `nil` start = "from the beginning";
+    `nil` end = "through the last key". A non-nil zero-length
+    boundary (`[]byte{}`) is rejected with `ErrKeyEmpty` per
+    api-surface.md §Invariants empty-key clause — distinct from
+    the open-boundary `nil`;
+  from=this spec §Algorithm + API contract + api-surface.md
+    §Keyspace API DeleteRange;
   violation=Off-by-one in the boundary-leaf cleanup deletes `end`
     (inclusive bug) or leaves the first key `>= start` alive
     (exclusive bug) — silent data loss or silent retention of data
-    the caller said to delete.
+    the caller said to delete; OR coalescing `[]byte{}` with `nil`
+    silently accepts an invalid boundary the spec rejects.
 
 Invariant: kind=entailed;
   property=After `DeleteRange` commits, every overflow run referenced

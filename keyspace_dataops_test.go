@@ -198,10 +198,28 @@ func TestCursorMarkStaleAfterSiblingPut(t *testing.T) {
 	if !errors.Is(c.Err(), ErrCursorStale) {
 		t.Errorf("Err on stale cursor = %v, want ErrCursorStale", c.Err())
 	}
-	// Re-position recovers.
-	c.First()
+	// Re-position recovers — and observes the sibling-Put'd "c".
+	// Chunk-5.7 adjacent-fix: prior to the cursor.SetRootID +
+	// markCursorsStale-refresh pair, the re-position would have
+	// descended from the now-retired old root and silently read
+	// stale (or corrupted post-loose-pop) data.
+	k, _ = c.First()
+	if !bytes.Equal(k, []byte("a")) {
+		t.Errorf("Re-First after sibling Put = %q, want a", k)
+	}
 	if err := c.Err(); err != nil {
 		t.Errorf("Err after re-position = %v, want nil", err)
+	}
+	// Walk to confirm the Put'd "c" is visible.
+	saw := map[string]struct{}{}
+	for k != nil {
+		saw[string(k)] = struct{}{}
+		k, _ = c.Next()
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		if _, ok := saw[want]; !ok {
+			t.Errorf("cursor walk missing %q after sibling-Put + re-position", want)
+		}
 	}
 }
 

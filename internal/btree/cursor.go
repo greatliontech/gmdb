@@ -431,6 +431,23 @@ func (c *Cursor) MarkStale() {
 	c.iter = page.LeafIter{}
 }
 
+// SetRootID updates the cursor's tracked root after a sibling
+// mutation moved the keyspace's root via CoW. Called by the
+// chunk-5.5 Keyspace.markCursorsStale path immediately after
+// MarkStale so a caller re-positioning via First / Last / Seek /
+// SeekGE descends from the live root rather than the (now-retired)
+// pre-mutation root.
+//
+// Adjacent-fix from chunk-5.7 round 1: a pre-existing latent bug in
+// chunk 5.5 captured `rootID` at construction and never refreshed
+// it on sibling mutations. Re-positioning a stale cursor would
+// descend from a FreePage'd root whose mmap-resident bytes survive
+// only until the loose-pool reuses the id, producing either stale
+// or corrupted reads.
+func (c *Cursor) SetRootID(rootID uint64) {
+	c.rootID = rootID
+}
+
 // resetPath releases the active iter's scratch buffers back to
 // the cursor so the next leaf transition can re-thread them, then
 // clears the descent path.

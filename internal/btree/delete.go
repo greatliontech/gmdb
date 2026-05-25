@@ -232,7 +232,29 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 	if !found {
 		return pageID, false, false, nil
 	}
+	newID, underflow, err := patchBranchAfterChildDelete(pw, cfg, mergeThreshold, pageID, descentIdx, newChildID, childUnderflow)
+	if err != nil {
+		return 0, false, false, err
+	}
+	return newID, underflow, true, nil
+}
 
+// patchBranchAfterChildDelete CoWs the branch at pageID and applies
+// the single-child-replace result returned by a child's delete-side
+// recursion. Three cases per the original deleteFromBranch shape:
+//
+//   - Case A: newChildID == 0 (child subtree fully vanished). Remove
+//     the child-position and its associated cell from this branch.
+//     If the last child was removed, return newID=0 to cascade up.
+//   - Case B: newChildID != 0 && !childUnderflow. Patch the child
+//     pointer in place.
+//   - Case C: newChildID != 0 && childUnderflow. Merge with or
+//     redistribute against an adjacent sibling.
+//
+// Returns (newID, underflow, err). Used by both deleteFromBranch
+// (single-key delete) and deleteRangeFromBranch's single-child
+// overlap case (chunk-5.7 DeleteRange).
+func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, descentIdx uint16, newChildID uint64, childUnderflow bool) (uint64, bool, error) {
 	// CoW the parent for mutation and decode its (leftmost, cells)
 	// form. Deep-clone every cell Key — DecodeBranch returns Keys
 	// that borrow from parentBuf and EncodeBranch will clear that
@@ -240,11 +262,11 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 	// ascendWithSplit handles for Put.
 	newBranchID, err := pw.AllocPage()
 	if err != nil {
-		return 0, false, false, fmt.Errorf("btree: alloc CoW branch for delete: %w", err)
+		return 0, false, fmt.Errorf("btree: alloc CoW branch for delete: %w", err)
 	}
 	parentBuf, err := pw.CoW(pageID, newBranchID)
 	if err != nil {
-		return 0, false, false, fmt.Errorf("btree: CoW branch %d for delete: %w", pageID, err)
+		return 0, false, fmt.Errorf("btree: CoW branch %d for delete: %w", pageID, err)
 	}
 	leftmost, cells := page.DecodeBranch(parentBuf, cfg)
 	for i := range cells {
@@ -259,12 +281,12 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 				// This branch's only child vanished → branch is now
 				// fully empty; cascade newID=0 up.
 				if err := pw.FreePage(newBranchID); err != nil {
-					return 0, false, false, fmt.Errorf("btree: free empty branch CoW %d: %w", newBranchID, err)
+					return 0, false, fmt.Errorf("btree: free empty branch CoW %d: %w", newBranchID, err)
 				}
 				if err := pw.FreePage(pageID); err != nil {
-					return 0, false, false, fmt.Errorf("btree: free empty old branch %d: %w", pageID, err)
+					return 0, false, fmt.Errorf("btree: free empty old branch %d: %w", pageID, err)
 				}
-				return 0, false, true, nil
+				return 0, false, nil
 			}
 			leftmost = cells[0].Child
 			cells = cells[1:]
@@ -272,12 +294,12 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 			cells = append(cells[:descentIdx-1], cells[descentIdx:]...)
 		}
 		if err := page.EncodeBranch(parentBuf, cfg, leftmost, cells); err != nil {
-			return 0, false, false, fmt.Errorf("btree: encode branch after child-removal: %w", err)
+			return 0, false, fmt.Errorf("btree: encode branch after child-removal: %w", err)
 		}
 		if err := pw.FreePage(pageID); err != nil {
-			return 0, false, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
+			return 0, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
 		}
-		return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), true, nil
+		return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), nil
 	}
 
 	// Patch the child pointer at descentIdx in place. From here on
@@ -293,14 +315,14 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 	// merge/redistribute machinery.
 	if !childUnderflow {
 		if err := page.EncodeBranch(parentBuf, cfg, leftmost, cells); err != nil {
-			return 0, false, false, fmt.Errorf("btree: encode branch after child-pointer update: %w", err)
+			return 0, false, fmt.Errorf("btree: encode branch after child-pointer update: %w", err)
 		}
 		if err := pw.FreePage(pageID); err != nil {
-			return 0, false, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
+			return 0, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
 		}
 		// Pointer-only update can't shrink encoded size, but recompute
 		// for defense in depth against future encoders.
-		return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), true, nil
+		return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), nil
 	}
 
 	// Case C: child is underflowing → merge with or redistribute
@@ -310,12 +332,12 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 	// underflow upward instead of stalling.
 	if len(cells) == 0 {
 		if err := page.EncodeBranch(parentBuf, cfg, leftmost, cells); err != nil {
-			return 0, false, false, fmt.Errorf("btree: encode degenerate branch after underflow: %w", err)
+			return 0, false, fmt.Errorf("btree: encode degenerate branch after underflow: %w", err)
 		}
 		if err := pw.FreePage(pageID); err != nil {
-			return 0, false, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
+			return 0, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
 		}
-		return newBranchID, true, true, nil
+		return newBranchID, true, nil
 	}
 
 	// Pick a sibling. Left preferred when one exists, else right —
@@ -367,7 +389,7 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 	leftIsLeaf := page.IsLeafType(leftTyp)
 	rightIsLeaf := page.IsLeafType(rightTyp)
 	if leftIsLeaf != rightIsLeaf {
-		return 0, false, false, fmt.Errorf("%w: sibling page types differ left=%d right=%d", ErrCorrupted, leftTyp, rightTyp)
+		return 0, false, fmt.Errorf("%w: sibling page types differ left=%d right=%d", ErrCorrupted, leftTyp, rightTyp)
 	}
 
 	var (
@@ -383,10 +405,10 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 	case leftTyp == page.TypeBranch && rightTyp == page.TypeBranch:
 		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, leftPairID, rightPairID, separator)
 	default:
-		return 0, false, false, fmt.Errorf("%w: sibling page %d unexpected type %d", ErrCorrupted, leftPairID, leftTyp)
+		return 0, false, fmt.Errorf("%w: sibling page %d unexpected type %d", ErrCorrupted, leftPairID, leftTyp)
 	}
 	if err != nil {
-		return 0, false, false, err
+		return 0, false, err
 	}
 
 	// Project the helper's result back into the parent's child array.
@@ -415,12 +437,12 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 	}
 
 	if err := page.EncodeBranch(parentBuf, cfg, leftmost, cells); err != nil {
-		return 0, false, false, fmt.Errorf("btree: encode branch after merge/redistribute: %w", err)
+		return 0, false, fmt.Errorf("btree: encode branch after merge/redistribute: %w", err)
 	}
 	if err := pw.FreePage(pageID); err != nil {
-		return 0, false, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
+		return 0, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
 	}
-	return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), true, nil
+	return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), nil
 }
 
 // mergeOrRedistributeLeaves combines (or rebalances) two sibling

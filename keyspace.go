@@ -549,6 +549,83 @@ func (ks *Keyspace) markDirty() {
 	ks.state = keyspaceStateDirty
 }
 
+// DeleteRange deletes every key k with start <= k < end from the
+// keyspace per range-delete.md §Algorithm. Returns the count of
+// entries deleted; empty range (start == end OR start > end) returns
+// (0, nil) without mutating the tree per the chunk-5.1 user-locked
+// "bulk operations report rows-affected, not membership" decision.
+//
+// Boundary semantics (range-delete.md §Invariants #1):
+//   - nil start = open-left ("from the first key").
+//   - nil end = open-right ("through the last key").
+//   - (nil, nil) deletes every key.
+//
+// Errors:
+//   - ErrKeyspaceClosed if the handle was invalidated by a same-tx
+//     DeleteKeyspace.
+//   - ErrTxClosed / ErrReadOnly via Tx.requireOpen.
+//   - Pager errors (ErrTxTooLarge, ErrDBFull) pass through.
+//   - ErrCorrupted (wrapped) on a structural anomaly observed by the
+//     three-phase walk.
+//
+// Side effects on success (in-memory; persisted at Tx.Commit's
+// flushKeyspaces walk per chunk-5.6 deferred-flush refactor):
+//   - desc.Root reflects the new btree root (0 if the keyspace was
+//     emptied).
+//   - desc.Count decrements by the returned count.
+//   - state transitions to Dirty unless already Created.
+//   - Every open Cursor on this keyspace is MarkStale'd.
+//
+// Indexed-keyspace fallback (chunk 7) is not yet implemented;
+// DeleteRange operates on Kind=0 keyspaces only at chunk 5.7. The
+// chunk-7 surface will reroute indexed keyspaces through a per-row
+// cursor walk per range-delete.md §Indexed-keyspace fallback.
+func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
+	if err := ks.tx.requireOpen(true); err != nil {
+		return 0, err
+	}
+	if ks.dead {
+		return 0, ErrKeyspaceClosed
+	}
+	// Reject empty-but-non-nil bounds per the chunk-5.1 user-locked
+	// empty-key policy + the chunk-5.7 spec-amend on DeleteRange
+	// boundary semantics (nil = open, []byte{} = invalid). Treats
+	// both bounds independently so the caller's malformed shape
+	// surfaces at the originating arg.
+	if start != nil && len(start) == 0 {
+		return 0, ErrKeyEmpty
+	}
+	if end != nil && len(end) == 0 {
+		return 0, ErrKeyEmpty
+	}
+	if ks.desc.Root == 0 {
+		return 0, nil
+	}
+	cfg := ks.builderCfg()
+	mergeThreshold := ks.tx.db.opts.MergeThreshold
+	count, newRoot, err := btree.DeleteRange(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, start, end)
+	if err != nil {
+		return 0, mapBtreeErr(err)
+	}
+	if count == 0 {
+		// No-op — no Cursor invalidation, no state transition.
+		return 0, nil
+	}
+	// Defense-in-depth: a count > desc.Count return from btree.DeleteRange
+	// would indicate corruption (a divergence between the in-memory
+	// Count and the on-disk leaf-entry count). Surface as ErrCorrupted
+	// rather than wrapping desc.Count under uint64 arithmetic.
+	if count > ks.desc.Count {
+		return 0, fmt.Errorf("%w: DeleteRange count=%d exceeds desc.Count=%d for keyspace %q",
+			ErrCorrupted, count, ks.desc.Count, ks.name.Value())
+	}
+	ks.desc.Root = newRoot
+	ks.desc.Count -= count
+	ks.markDirty()
+	ks.markCursorsStale()
+	return count, nil
+}
+
 // Cursor returns a new cursor for iterating over this keyspace's
 // (key, value) pairs. The cursor starts Unpositioned — call First /
 // Last / Seek / SeekGE before reading. Per transactions.md §Cursor
@@ -579,13 +656,17 @@ func (ks *Keyspace) Cursor() *Cursor {
 }
 
 // markCursorsStale invokes MarkStale on every cursor registered on
-// this keyspace. Called by Put / Delete after a successful mutation.
-// Stale cursors are not unregistered — the caller may re-position
-// them via First/Last/Seek/SeekGE without needing a fresh
-// Keyspace.Cursor() call.
+// this keyspace AND refreshes their tracked rootID to the keyspace's
+// current desc.Root. Called by Put / Delete / DeleteRange after a
+// successful mutation. Stale cursors are not unregistered — the
+// caller may re-position them via First/Last/Seek/SeekGE without
+// needing a fresh Keyspace.Cursor() call; the rootID refresh
+// guarantees the re-position descends from the live tree, not the
+// pre-mutation (now-retired) root.
 func (ks *Keyspace) markCursorsStale() {
 	for _, c := range ks.openCursors {
 		c.inner.MarkStale()
+		c.inner.SetRootID(ks.desc.Root)
 	}
 }
 
@@ -815,10 +896,13 @@ func (c *Cursor) Delete() error {
 	c.ks.desc.Count--
 	c.ks.markDirty()
 	// Mark stale on every OTHER cursor (this cursor self-recovered
-	// via its internal SeekGE in btree.Cursor.Delete).
+	// via its internal SeekGE in btree.Cursor.Delete). Refresh
+	// rootID alongside the MarkStale so a caller re-positioning
+	// the sibling descends from the live tree.
 	for _, sibling := range c.ks.openCursors {
 		if sibling != c {
 			sibling.inner.MarkStale()
+			sibling.inner.SetRootID(c.ks.desc.Root)
 		}
 	}
 	return nil
@@ -960,7 +1044,7 @@ func (tx *Tx) DeleteKeyspace(name string) error {
 	// SetKeyspace promotions. This is acceptable because no
 	// non-forging path produces Kind=1 at chunk 5.
 	cfg := tx.pgr.Config()
-	if err := btree.FreeSubtree(tx.pgr, cfg, desc.Root); err != nil {
+	if _, err := btree.FreeSubtree(tx.pgr, cfg, desc.Root); err != nil {
 		return fmt.Errorf("DeleteKeyspace %q: %w", name, mapBtreeErr(err))
 	}
 
