@@ -952,72 +952,187 @@ because subpage codec, leaf integration, and promotion are three
 structurally distinct pieces that need independent adversarial
 review):
 
-- **6.1 — chunk-start gate.** Triage (1 entry matches `Lands: 6`:
-  `setkeyspace-put-added-bool`, folded as user-locked at 6.1).
-  Project-invariants trigger fires for the new chunk-6 domain
-  concepts (subpage, promotion / demotion, per-key bulk-free,
-  intra-key cursor nav, empty-set ban); five clause-explicit
-  invariants already in `set-keyspace.md` to be enforced as tests,
-  plus four entailed invariants appended at 6.1 (nested-cell Count
-  equality, desc.Count accounting across promotion / bulk-free,
-  promotion/demotion atomicity, SetCursor NextValue key-boundary).
-  Spec-tier promotions chunk-6 owes per the chunk-5.1 schedule:
-  `keyspaces.md` #2 / #3 / #5 (Kind=1 parts) at 6.6 first
-  `CreateSetKeyspace`; Delete-on-miss for `SetKeyspace.Delete` /
-  `DeleteValue` at 6.6 first impl. User-locked at 6.1:
-  `SetKeyspace.Put(key, value []byte) (added bool, err error)` —
-  spec amendment landed at 6.1 in `api-surface.md` + the typed
-  mirror in `typed-keyspaces.md`; the issue file is resolved by
-  the close-out gate at 6.9 (load-bearing rationale moved inline
-  at 6.1; file deletion + `docs/issues/README.md` row removal at
-  6.9 per Issue-triage gate 2).
-- **6.2 — subpage codec.** New `internal/page/subpage.go` with
-  variable + fixed-size encode/decode/binary-search/insert/delete;
-  Count + DataSize fields; sorted-order invariant + (fixed)
-  uniform-stride invariant enforced by tests. Standalone unit-test
-  surface, no btree integration yet.
-- **6.3 — leaf integration.** Extend `LeafReader` / `LeafBuilder` /
-  `LeafIter` / `Validate` to surface `MultiValue && !NestedTree`
-  subpage cells as a distinct cell shape — chunk-4 leaf
-  split/merge/rebuild carries subpage cells through without
-  mangling.
-- **6.4 — nested-tree promotion.** 4-step atomic promotion
-  (alloc leaf → copy entries → replace cell → insert new value)
-  at the 50%-of-usable-leaf threshold. Operates on a single
-  SetKeyspace cell, no SetKeyspace surface yet — driven by an
-  `internal/btree` test fixture.
-- **6.5 — demotion + per-key bulk-free + FreeSubtree extension.**
-  Detect single-leaf-fits-as-subpage at delete → free leaf + repack
-  cell. Per-key bulk-free walks nested tree via subtree retirement.
-  Extends `FreeSubtree` to recognise SetKeyspace cells (closes the
-  inheritance chunk 5.6 left open re: SetKeyspace nested-tree
-  pages not walked).
-- **6.6 — SetKeyspace public surface.** `SetKeyspaceOptions`,
+- **6.1** ✅ Chunk-start gate: triage (1 entry matched `Lands: 6`:
+  `setkeyspace-put-added-bool`, folded as user-locked). Project-
+  invariants trigger derived 4 entailed invariants for SetKeyspace
+  (nested-cell Count equality, desc.Count accounting,
+  promotion/demotion atomicity bounded to same-tx, SetCursor
+  NextValue key-boundary) appended to `set-keyspace.md §Invariants`.
+  User-locked `SetKeyspace.Put(key, value []byte) (added bool, err
+  error)` + spec amendments to `api-surface.md` (new
+  `### SetKeyspace API` sub-heading, new `ErrFixedValueSizeMismatch`
+  sentinel, `CreateSetKeyspaceIfNotExists` opts-conflict semantics)
+  + the typed mirror in `typed-keyspaces.md`. Adversarial review
+  2 rounds, 0H 1M (R1 cite error) → 0H 0M.
+- **6.2** ✅ Subpage codec: new `internal/page/subpage.go` (550
+  lines) — variable + fixed-size encode/decode/Insert/Delete/
+  Search with uint16 overflow guards; `EncodeSubpage` builder;
+  `SubpagePromotionThreshold` helper. 38 unit tests. Spec
+  amendment in `set-keyspace.md §Subpage Format` documenting the
+  fixed=binary / variable=linear search trade-off (density >
+  log-N for variable-size). Adversarial 2 rounds, severity
+  trending down (1M → 0M).
+- **6.3** ✅ Leaf integration: `LeafBuilder.AddSubpage` +
+  extended `AddEntry` dispatch on `CellFlagMultiValue && !NestedTree`;
+  retired the chunk-3 panic on MultiValue cells. `validateCellFlagsCombo`
+  helper centralises Validate's flag-pair rejection so the chunk-4
+  leaf-rebuild path now carries SetKeyspace subpage cells through
+  every split / merge / rebuild without silent demotion. 12
+  page-layer tests. `set-keyspace.md §Subpage Format` diagram
+  amended to show the standard inline `ValueLen u32` prefix
+  explicitly (pre-existing spec/code divergence surfaced by the
+  first writer of subpage cells). Adversarial 2 rounds, 1M
+  (Validate trust boundary) fixed in-place.
+- **6.4** ✅ Nested-tree promotion: `LeafEntry.NestedRoot` +
+  `NestedCount` fields + IsSubpage / IsNestedTree helpers;
+  decoder + encoder + validator branches share the 16-byte
+  trailer wire format with overflow but populate distinct
+  fields; `LeafBuilder.AddNestedTreeRef` retires chunk-6.3's
+  NestedTree panic. New `internal/btree/subpage_promotion.go`
+  with `PromoteSubpageToNestedTree` (4-step algorithm; caller
+  installs the new cell via `AddNestedTreeRef`). Atomicity
+  invariant E3 enforced by 3 fault-injection tests using a
+  `failingFakeWriter` wrapper. 10 page-layer + 10 btree-layer
+  tests. Adversarial 2 rounds, 1M (E3 unexercised) fixed.
+- **6.5** ✅ Demotion + per-key bulk-free + FreeSubtree
+  extension: `DemoteNestedTreeIfFits` (single-leaf-fits-as-
+  subpage detection + leaf retire); `FreeSubtree` extended to
+  recurse into NestedTree cells + add subpage Count to the
+  returned value (count semantic redefined to "user-visible
+  values freed"; Kind=0 trees unchanged). Closes the chunk-5.6
+  inheritance gap re: SetKeyspace nested-tree pages not walked
+  during DeleteKeyspace. 11 new tests. Adversarial 1 round,
+  0H 1M (ErrSubpageValueSize wrap as ErrCorrupted) fixed.
+- **6.6** ✅ SetKeyspace public surface: `SetKeyspaceOptions`,
   `Tx.OpenSetKeyspace` / `OpenSetKeyspaceReadOnly` /
-  `CreateSetKeyspace` / `CreateSetKeyspaceIfNotExists`; descriptor
-  flush integration (mirrors `Keyspace` state machine);
-  `Has` / `HasValue` / `Put` (added bool, err error) / `Delete` /
-  `DeleteValue` / `CountValues`. Spec-tier promotions land here:
-  `keyspaces.md` #2 / #3 / #5 (Kind=1 parts) at first
-  `CreateSetKeyspace`; Delete-on-miss for `SetKeyspace.Delete` /
-  `DeleteValue` at first impl (api-surface.md §Invariants).
-- **6.7 — `SetCursor`.** Core nav
-  (First/Last/Next/Prev/Seek/SeekGE/Current/Delete/Err) + intra-key
-  value nav
-  (FirstValue/LastValue/NextValue/PrevValue/SeekValue/NextKey/PrevKey/CountValues).
-  Enforces the entailed invariant: `NextValue` does NOT cross key
-  boundaries. Sibling-mutation MarkStale + SetRootID contract per
-  chunk-5 pattern.
-- **6.8 — `SetKeyspace.DeleteRange`.** Range walk via subpage-aware
-  leaf walker; per-key bulk-free for cells fully covered by the
-  range; partial-range fallback at boundaries. Reuses chunk-5.7
-  three-phase DeleteRange machinery where possible.
-- **6.9 — close-out.** Cite sweep — resolve
-  `setkeyspace-put-added-bool` by deleting the issue file (load-
-  bearing rationale already inline at 6.1). Spec-tier invariant
-  audit (verify every chunk-6 invariant is enforced by at least
-  one test). Full suite + `-race` green across all packages.
-  Plan-doc chunk-6 closeout entry.
+  `CreateSetKeyspace` / `CreateSetKeyspaceIfNotExists`; per-name
+  cache `openSetKeyspaces` + flush Step 2b in
+  `flushKeyspaces`; `Has` / `HasValue` / `Put` (added bool, err
+  error) / `Delete` / `DeleteValue` / `CountValues`. New btree
+  primitives `GetEntry` + `PutEntry` (return / install
+  arbitrary cell). DeleteKeyspace + lookupDescriptor +
+  ListKeyspaces + SetKeyspaceConfig extended to handle
+  Kind=1. Round-1 H finding: SetKeyspaceConfig silently no-op'd
+  on same-tx-created SetKeyspaces (keyspaces.md inv #6
+  violation) — fixed in-place with regression test. 32 tests.
+- **6.7** ✅ `SetCursor`: core nav + intra-key value nav with
+  E4 enforcement (NextValue / PrevValue do not cross key
+  boundaries). Materialization strategy (per-key transition
+  decodes the cell into a `values [][]byte` slice); two-tier
+  `requireOpen` / `requireFresh` permission gates separate
+  re-positioning ops from non-repositioning ops so the stale
+  flag clears via `clearPosition`. Wired
+  `markSetCursorsStale` into 5 SetKeyspace mutation paths
+  (3 nested-if-block sites that chunk-6.6's replace_all
+  missed). 25 tests. Adversarial 1 round, 0H 2M (1
+  introduced + fixed, 1 adjacent — filed
+  `cursor-err-unpositioned-state.md`).
+- **6.8** ✅ `SetKeyspace.DeleteRange`: snapshot-keys-in-range
+  via read cursor + per-key Delete loop. User-locked
+  partial-progress contract (chunk-6.8): returns
+  `(deleted_so_far, err)` on per-key error — unlike chunk-5.7
+  Keyspace.DeleteRange which is atomic — so caller sees real
+  scope of in-memory state change. Spec amendment in
+  `api-surface.md §SetKeyspace API DeleteRange` documents the
+  contract. 11 tests. Perf follow-up filed
+  (`setkeyspace-delete-range-bulk-walker.md`) — replace
+  O(K log N) loop with O(K + log N) adaptation of the
+  chunk-5.7 walker.
+- **6.9** ✅ Close-out: cite sweep, spec-tier invariant audit,
+  delete resolved issues.
+  *Cite sweep (Issue-triage gate 2).* Wrap-aware grep across
+  `docs/specs/*.md`, `docs/plans/*.md`, and every `*.go` for
+  references to `setkeyspace-put-added-bool` (chunk-6.1
+  user-locked, resolved at 6.1). The load-bearing rationale was
+  promoted inline at chunk 6.1 into `api-surface.md §SetKeyspace
+  API` (Put godoc carrying the "membership probe is already paid
+  by the insert" reasoning + the chunk-6.1 attribution) and
+  `typed-keyspaces.md §TypedSetKS API` (Put mirror godoc citing
+  api-surface.md for the rationale). No production-code or
+  authoritative-spec cites of the issue path remain — the only
+  remaining references are this plan-doc's own historical audit
+  trail (chunk-5.8 open-issues enumeration at line 915 and
+  this entry's 6.1 plan summary), which are not subject to the
+  no-cite invariant (plan-doc is the implementation roadmap,
+  not the authoritative spec).
+  *Delete.* `docs/issues/setkeyspace-put-added-bool.md` +
+  `docs/issues/README.md` row removed; git history preserved
+  via `git log --all -- docs/issues/setkeyspace-put-added-bool.md`.
+  *Spec-tier invariant audit.* Every chunk-6.1 enforcement-
+  schedule item verified landed:
+    - `keyspaces.md` #2 / #3 / #5 (Kind=1 parts) → 6.6
+      `TestOpenKeyspaceOnSetKeyspaceReturnsKindMismatch` +
+      `TestOpenSetKeyspaceOnKeyspaceReturnsKindMismatch` +
+      `TestCreateSetKeyspaceFixedValueSize` +
+      `TestCreateSetKeyspaceIfNotExistsMismatchedFixedValueSize` +
+      `TestSetKeyspacePutFixedValueSizeMismatch` +
+      `TestSetKeyspaceDeleteValueFixedValueSizeMismatch`.
+    - Delete-on-miss invariant (SetKeyspace portion) → 6.6
+      `TestSetKeyspaceDeleteMissingReturnsErrNotFound` +
+      `TestSetKeyspaceDeleteValueMissingKey` +
+      `TestSetKeyspaceDeleteValueMissingValueInSubpage`.
+    - `set-keyspace.md` Inv-1 (empty sets do not persist) → 6.6
+      `TestSetKeyspaceDeleteValueLastValueRemovesParentCell` +
+      6.7 `TestSetCursorDeleteLastValueAdvancesToNextKey` +
+      `TestSetKeyspaceDeleteValueNestedTreeDropsOnZeroCount`.
+    - `set-keyspace.md` Inv-2 (sorted-order subpage + nested) →
+      6.2 codec tests (`TestSearchVariableSizeMiss…`,
+      `TestSearchFixedSizeBinarySearch`,
+      `TestEncodeSubpageRejectsOutOfOrder`) + 6.4 promotion
+      preserves order tests.
+    - `set-keyspace.md` Inv-3 (FixedValueSize stride + no
+      per-value prefix) → 6.2 codec tests + 6.6 Put /
+      DeleteValue wrong-length rejection.
+    - `set-keyspace.md` Inv-4 (50% promotion threshold) → 6.2
+      `TestSubpagePromotionThresholdValues` + 6.6
+      `TestSetKeyspacePutTriggersPromotion`.
+    - `set-keyspace.md` Inv-5 (demotion to single
+      subpage-fitting leaf) → 6.5 `TestDemoteNestedTree*` (6
+      tests) + 6.6
+      `TestSetKeyspaceDeleteValueFromNestedTreeTriggersDemotion`.
+    - `set-keyspace.md` Inv-6 (compound-PK separator) — chunk-7
+      indexing scope, deferred (recorded but not enforced;
+      lands when first SetKeyspace index writer exists).
+    - `set-keyspace.md` E1 (nested-cell Count = leaf entries) →
+      6.4 `TestPromoteSubpageBasicVariableSize` +
+      `TestPromoteSubpageMatchesEncoderOutput` + 6.6 Delete
+      sanity-check (`freed != e.NestedCount → ErrCorrupted`)
+      + 6.6 `TestSetKeyspaceCommitReopenWithPromotedNestedTree`.
+    - `set-keyspace.md` E2 (desc.Count = sum of values) → 6.6
+      `TestSetKeyspaceDescCountAcrossMutations` + 6.8
+      `TestSetKeyspaceDeleteRangeMixedCellTypes`.
+    - `set-keyspace.md` E3 (promotion/demotion atomicity) → 6.4
+      `TestPromoteSubpageAtomicity*` (3 fault-injection tests
+      via `failingFakeWriter`); demotion side exercised
+      transitively via 6.6 DeleteValue tests (function-internal
+      step is atomic; multi-step caller atomicity documented in
+      `DemoteNestedTreeIfFits` godoc and SetKeyspace surface).
+    - `set-keyspace.md` E4 (SetCursor.NextValue does not cross
+      key boundaries) → 6.7 `TestSetCursorNextValueDoesNotCrossKeys`
+      + `TestSetCursorPrevValueDoesNotCrossKeys`.
+  No spec-tier invariant whose `Lands:` resolved to a chunk-6
+  sub-chunk was left in spec-only form.
+  *Open issues post-chunk-6* (10 entries in `docs/issues/`):
+  `bitmap-rollback-undo-log` (profiling-driven),
+  `tx-rebuildindex-missing-name-behavior` (Lands: 7),
+  `pager-test-helper-export` (condition; chunk 6 added no
+  cross-package writer-pager fixture caller, remains
+  deferred),
+  `leaked-readtx-cleanup-race-flake` (condition),
+  `spec-numkeyspaces-semantics` (Lands: 7),
+  `btree-branch-page-validation` (opportunistic),
+  `btree-post-merge-underflow` (Lands: when invariant #3
+  fill-ratio enforcement test is added),
+  `setkeyspace-put-redundant-membership-probe` (Lands:
+  opportunistic — chunk-6.6 surfaced the chunk-6.1
+  "no-cost" claim's gap on the nested-tree-cell path),
+  `cursor-err-unpositioned-state` (Lands: opportunistic —
+  chunk-6.7 surfaced a chunk-5 shared spec/impl divergence),
+  `setkeyspace-delete-range-bulk-walker` (Lands:
+  opportunistic — chunk-6.8 perf follow-up). None fire on
+  chunk-7 entry; the chunk-7 chunk-start gate runs the next
+  triage.
+  Chunk 6 complete; suite + `-race` green across all 6 packages.
 
 Chunk-5-precedent deferrals carried forward at chunk-6
 (no explicit issue doc filed; chunk-5 set the same precedent for
