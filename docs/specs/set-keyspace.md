@@ -231,8 +231,21 @@ Entry (fixed):
 of all entries.
 
 Values within the subpage are stored in sorted (lexicographic) order.
-Lookup is binary search. For fixed-size subpages, entries are a flat
-array — binary search is `O(log N)` with direct offset calculation.
+
+**Lookup.** Fixed-size subpages: `O(log N)` binary search via direct
+offset arithmetic (uniform stride). Variable-size subpages: `O(N)`
+linear scan — subpages are bounded by the 50% promotion threshold
+(N typically ≤ 200 for 4 KB pages at 8-byte values, fewer at larger
+sizes), and the absence of a per-entry offset table preserves
+subpage density: each offset would cost 2 bytes per entry, i.e.
+`2/(value_body + 4)` overhead per entry — ~17% at 8-byte values,
+~10% at 16-byte values, ~3% at 64-byte values — lowering the
+effective promotion threshold across the small/medium-value range
+and forcing earlier allocation of a 4 KB nested-tree leaf for sets
+that would otherwise fit inline. The on-disk subpage format carries
+no offset table; a future `SubpageReader` may build an in-memory
+offset cache transparently if profiling demonstrates lookup is hot
+— this is a non-format-breaking optimization.
 
 Subpage entries are **not prefix-compressed**. Subpages store
 *values* for a single key, which typically do not share prefixes by
