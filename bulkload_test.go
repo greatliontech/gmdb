@@ -1,0 +1,306 @@
+package gmdb
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"slices"
+	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/page"
+)
+
+// bulkTestTx opens a fresh DB, begins a write transaction, and returns the
+// tx plus a cleanup. The builder writes directly through tx.pgr; the test
+// reads its own writes back through the same pager (mmap coherence with
+// the WriteDirect pwrites) without committing.
+func bulkTestTx(t *testing.T) (*Tx, func()) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 16384})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("Begin: %v", err)
+	}
+	return tx, func() {
+		_ = tx.Rollback()
+		_ = db.Close()
+	}
+}
+
+type kv struct{ k, v []byte }
+
+// buildBulkTree drives the bottom-up builder over kvs (assumed sorted) and
+// returns (rootID, count). cfg selects the leaf encoding.
+func buildBulkTree(t *testing.T, pw bulkPageWriter, cfg page.Config, kvs []kv) (uint64, uint64) {
+	t.Helper()
+	b := newBulkBuilder(pw, cfg)
+	for _, e := range kvs {
+		if err := b.add(page.LeafEntry{Key: e.k, Value: e.v}); err != nil {
+			t.Fatalf("add(%q): %v", e.k, err)
+		}
+	}
+	root, count, err := b.finish()
+	if err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	return root, count
+}
+
+// verifyBulkTree checks every key resolves to its value via btree.Get and
+// that a full cursor scan reproduces kvs in order.
+func verifyBulkTree(t *testing.T, pr btree.PageReader, cfg page.Config, root uint64, kvs []kv) {
+	t.Helper()
+	for _, e := range kvs {
+		got, found, err := btree.Get(pr, cfg, root, e.k)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", e.k, err)
+		}
+		if !found {
+			t.Fatalf("Get(%q): not found", e.k)
+		}
+		if !bytes.Equal(got, e.v) {
+			t.Fatalf("Get(%q) = %q, want %q", e.k, got, e.v)
+		}
+	}
+	// Full ordered scan.
+	c := btree.NewReadCursor(pr, cfg, root)
+	i := 0
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if i >= len(kvs) {
+			t.Fatalf("cursor yielded more than %d entries", len(kvs))
+		}
+		if !bytes.Equal(k, kvs[i].k) {
+			t.Fatalf("scan[%d] key = %q, want %q", i, k, kvs[i].k)
+		}
+		if !bytes.Equal(v, kvs[i].v) {
+			t.Fatalf("scan[%d] value = %q, want %q", i, v, kvs[i].v)
+		}
+		i++
+	}
+	if err := c.Err(); err != nil {
+		t.Fatalf("cursor Err: %v", err)
+	}
+	if i != len(kvs) {
+		t.Fatalf("cursor yielded %d entries, want %d", i, len(kvs))
+	}
+}
+
+// genKVs produces n sorted unique entries with valueLen-byte values.
+func genKVs(n, valueLen int) []kv {
+	kvs := make([]kv, n)
+	for i := range n {
+		k := fmt.Appendf(nil, "key%08d", i)
+		v := bytes.Repeat([]byte{byte('a' + i%26)}, valueLen)
+		kvs[i] = kv{k, v}
+	}
+	return kvs
+}
+
+func TestBulkBuilderRoundTrip(t *testing.T) {
+	cases := []struct {
+		name     string
+		n        int
+		valueLen int
+		rgt      uint16 // 0 = engine default (compressed), 1 = uncompressed
+	}{
+		{"single-entry", 1, 8, 0},
+		{"single-leaf", 50, 8, 0},
+		{"multi-leaf-compressed", 500, 64, 0},
+		{"multi-leaf-uncompressed", 500, 64, 1},
+		{"deep-large-values", 4000, 400, 0},
+		{"deep-uncompressed", 4000, 400, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tx, cleanup := bulkTestTx(t)
+			defer cleanup()
+
+			cfg := tx.pgr.Config()
+			cfg.RestartGroupTarget = tc.rgt
+
+			kvs := genKVs(tc.n, tc.valueLen)
+			root, count := buildBulkTree(t, tx.pgr, cfg, kvs)
+
+			if count != uint64(tc.n) {
+				t.Errorf("count = %d, want %d", count, tc.n)
+			}
+			if root == 0 {
+				t.Fatal("root = 0 for non-empty input")
+			}
+			verifyBulkTree(t, tx.pgr, cfg, root, kvs)
+		})
+	}
+}
+
+// TestBulkBuilderEmpty verifies zero entries yield no tree.
+func TestBulkBuilderEmpty(t *testing.T) {
+	tx, cleanup := bulkTestTx(t)
+	defer cleanup()
+
+	cfg := tx.pgr.Config()
+	root, count := buildBulkTree(t, tx.pgr, cfg, nil)
+	if root != 0 || count != 0 {
+		t.Errorf("empty build = (root %d, count %d), want (0, 0)", root, count)
+	}
+}
+
+// TestBulkBuilderRootTypeProgression verifies the root is a leaf for a
+// single-leaf tree and a branch once the entries span multiple leaves —
+// confirming the builder actually constructs branch levels.
+func TestBulkBuilderRootTypeProgression(t *testing.T) {
+	tx, cleanup := bulkTestTx(t)
+	defer cleanup()
+	cfg := tx.pgr.Config()
+
+	// Few entries → single leaf root.
+	smallRoot, _ := buildBulkTree(t, tx.pgr, cfg, genKVs(10, 8))
+	typ, _, _, _ := page.ReadHeader(tx.pgr.Page(smallRoot))
+	if typ != page.TypeLeaf {
+		t.Errorf("small-tree root type = %d, want TypeLeaf(%d)", typ, page.TypeLeaf)
+	}
+
+	// Many large-valued entries → branch root (multiple leaves).
+	bigRoot, _ := buildBulkTree(t, tx.pgr, cfg, genKVs(2000, 400))
+	btyp, _, _, _ := page.ReadHeader(tx.pgr.Page(bigRoot))
+	if btyp != page.TypeBranch {
+		t.Errorf("big-tree root type = %d, want TypeBranch(%d)", btyp, page.TypeBranch)
+	}
+}
+
+// TestBulkBuilderOutOfOrder verifies a non-ascending key is rejected with
+// ErrBulkLoadOutOfOrder (not a LeafBuilder panic).
+func TestBulkBuilderOutOfOrder(t *testing.T) {
+	tx, cleanup := bulkTestTx(t)
+	defer cleanup()
+	cfg := tx.pgr.Config()
+
+	b := newBulkBuilder(tx.pgr, cfg)
+	if err := b.add(page.LeafEntry{Key: []byte("b"), Value: []byte("1")}); err != nil {
+		t.Fatalf("add b: %v", err)
+	}
+	// Equal key (not strictly greater) is out of order.
+	if err := b.add(page.LeafEntry{Key: []byte("b"), Value: []byte("2")}); !errors.Is(err, ErrBulkLoadOutOfOrder) {
+		t.Errorf("add equal key = %v, want ErrBulkLoadOutOfOrder", err)
+	}
+	// Smaller key is out of order.
+	if err := b.add(page.LeafEntry{Key: []byte("a"), Value: []byte("3")}); !errors.Is(err, ErrBulkLoadOutOfOrder) {
+		t.Errorf("add smaller key = %v, want ErrBulkLoadOutOfOrder", err)
+	}
+}
+
+// TestBulkBuilderRandomKeys builds from random variable-length unique keys
+// (sorted), exercising ShortestSeparator at diverse byte boundaries — a
+// stronger separator-correctness probe than the shared-prefix sequential
+// keys. Round-trips and cross-checks against the top-down tree.
+func TestBulkBuilderRandomKeys(t *testing.T) {
+	rng := rand.New(rand.NewPCG(0x9e3779b97f4a7c15, 0xb5))
+	seen := make(map[string]struct{}, 3000)
+	var kvs []kv
+	for len(kvs) < 3000 {
+		klen := 1 + rng.IntN(48)
+		k := make([]byte, klen)
+		for i := range k {
+			k[i] = byte(rng.IntN(256))
+		}
+		if _, dup := seen[string(k)]; dup {
+			continue
+		}
+		seen[string(k)] = struct{}{}
+		v := fmt.Appendf(nil, "v=%x", k)
+		kvs = append(kvs, kv{k, v})
+	}
+	slices.SortFunc(kvs, func(a, b kv) int { return bytes.Compare(a.k, b.k) })
+
+	tx, cleanup := bulkTestTx(t)
+	defer cleanup()
+	cfg := tx.pgr.Config()
+
+	root, count := buildBulkTree(t, tx.pgr, cfg, kvs)
+	if count != uint64(len(kvs)) {
+		t.Fatalf("count = %d, want %d", count, len(kvs))
+	}
+	verifyBulkTree(t, tx.pgr, cfg, root, kvs)
+
+	// Cross-check: a key NOT present must not be found (separator routing
+	// must not falsely land a miss on some leaf).
+	for range 200 {
+		probe := make([]byte, 1+rng.IntN(48))
+		for i := range probe {
+			probe[i] = byte(rng.IntN(256))
+		}
+		_, present := seen[string(probe)]
+		_, found, err := btree.Get(tx.pgr, cfg, root, probe)
+		if err != nil {
+			t.Fatalf("Get(probe %x): %v", probe, err)
+		}
+		if found != present {
+			t.Fatalf("Get(probe %x): found=%v, want %v", probe, found, present)
+		}
+	}
+}
+
+// TestBulkBuilderBranchSizeAccounting locks the incremental branch-size
+// tracking (bl.size += branchCellCost) against a full BranchEncodedSize
+// recompute, so a future change to the branch encoding's per-cell overhead
+// can't silently desync the fit check.
+func TestBulkBuilderBranchSizeAccounting(t *testing.T) {
+	cfg := page.Config{PageSize: 4096}
+	b := newBulkBuilder(nil, cfg) // pw unused: no page is written
+	var cells []page.BranchCell
+	size := b.emptyBranchSize
+	for i, seplen := range []int{1, 4, 13, 40, 100, 250} {
+		sep := bytes.Repeat([]byte{byte('a' + i)}, seplen)
+		size += b.branchCellCost(sep)
+		cells = append(cells, page.BranchCell{Key: sep, Child: uint64(i + 1)})
+		if got := page.BranchEncodedSize(cfg, cells); got != size {
+			t.Fatalf("incremental size %d != BranchEncodedSize %d after %d cells", size, got, i+1)
+		}
+	}
+}
+
+// TestBulkBuilderMatchesTopDownGet cross-checks the bulk-built tree against
+// an independent top-down btree.Put tree: every key Get-resolves to the
+// same value in both. Guards against a separator bug that routes Get to the
+// wrong leaf in a way a self-consistent scan might miss.
+func TestBulkBuilderMatchesTopDownGet(t *testing.T) {
+	tx, cleanup := bulkTestTx(t)
+	defer cleanup()
+	cfg := tx.pgr.Config()
+
+	kvs := genKVs(1500, 32)
+
+	// Bulk tree.
+	bulkRoot, _ := buildBulkTree(t, tx.pgr, cfg, kvs)
+
+	// Top-down tree built via btree.Put (the production insert path).
+	var topRoot uint64
+	for _, e := range kvs {
+		nr, err := btree.Put(tx.pgr, cfg, topRoot, e.k, e.v)
+		if err != nil {
+			t.Fatalf("btree.Put(%q): %v", e.k, err)
+		}
+		topRoot = nr
+	}
+
+	for _, e := range kvs {
+		bv, bfound, err := btree.Get(tx.pgr, cfg, bulkRoot, e.k)
+		if err != nil || !bfound {
+			t.Fatalf("bulk Get(%q): found=%v err=%v", e.k, bfound, err)
+		}
+		tv, tfound, err := btree.Get(tx.pgr, cfg, topRoot, e.k)
+		if err != nil || !tfound {
+			t.Fatalf("topdown Get(%q): found=%v err=%v", e.k, tfound, err)
+		}
+		if !bytes.Equal(bv, tv) {
+			t.Fatalf("Get(%q): bulk=%q topdown=%q", e.k, bv, tv)
+		}
+	}
+}
