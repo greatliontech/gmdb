@@ -947,7 +947,27 @@ func (ks *SetKeyspace) DeleteValue(key, value []byte) error
 
 func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
 
-// DeleteRange returns (0, nil) for an empty range.
+// DeleteRange deletes every (key, value) pair whose KEY falls in
+// [start, end) and returns the count of VALUES deleted (NOT keys
+// — Inv-2 entailed E2 accounting). Returns (0, nil) for an empty
+// range. Boundary semantics match Keyspace.DeleteRange: nil =
+// open-boundary; non-nil zero-length is rejected with
+// ErrKeyEmpty.
+//
+// **Partial-progress on error (chunk-6.1 user-locked).** Unlike
+// Keyspace.DeleteRange — whose underlying btree.DeleteRange is
+// atomic and returns (0, err) with descriptor state untouched —
+// SetKeyspace.DeleteRange's per-key loop is not atomic: on error
+// at iteration i, iterations 0..i-1 have already completed and
+// their effects (desc.Count delta, desc.Root advance, sibling-
+// cursor MarkStale, on-disk page retirements) ARE in-memory
+// visible. The function returns (deleted_so_far, err) so the
+// caller sees the actual scope of state change. Inv-1 / E1 / E2
+// hold for each successful per-key Delete; the in-memory state
+// is consistent-but-partial. The only safe recovery is
+// `Tx.Rollback()` (which restores via the pager bitmap
+// snapshot). A future O(K+log N) bulk-walker rewrite will honor
+// the same (deleted_so_far, err) contract.
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error)
 func (ks *SetKeyspace) NextSequence() (uint64, error)
 func (ks *SetKeyspace) Cursor() *SetCursor

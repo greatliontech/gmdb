@@ -1,6 +1,7 @@
 package gmdb
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"unique"
@@ -852,6 +853,149 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 	ks.markDirty()
 	ks.markSetCursorsStale()
 	return nil
+}
+
+// DeleteRange deletes every (key, value) pair whose KEY falls in
+// [start, end) from the SetKeyspace. Returns the count of VALUES
+// deleted (E2 accounting — desc.Count delta), NOT the count of keys.
+// Returns (0, nil) for an empty range (start == end, start > end,
+// nil/nil on an empty keyspace, or no keys matching).
+//
+// Boundary semantics (api-surface.md §SetKeyspace.DeleteRange):
+//   - nil = open-boundary sentinel. nil start = "from the
+//     beginning"; nil end = "through the last key"; (nil, nil) =
+//     every key.
+//   - Non-nil zero-length ([]byte{}) is rejected with ErrKeyEmpty.
+//
+// For a key with a nested-tree cell, bulk-frees the nested subtree
+// via SetKeyspace.Delete (which uses chunk-6.5's FreeSubtree
+// extension). For a key with a subpage cell, the cell + its
+// inline subpage are removed via btree.Delete on the parent tree.
+//
+// Implementation strategy (v1): snapshot keys in [start, end) via
+// a read cursor, then call SetKeyspace.Delete on each. Cost is
+// O(K log N) (K = keys in range, N = total parent-tree size).
+// The chunk-5.7 btree.DeleteRange three-phase algorithm is faster
+// but does not free nested-tree subtrees per cell — adapting it to
+// be SetKeyspace-aware is a perf-driven follow-up
+// (docs/issues/setkeyspace-delete-range-bulk-walker.md).
+//
+// **Partial-progress semantic (chunk-6.8 user-locked, distinct
+// from chunk-5.7 Keyspace.DeleteRange).** Chunk-5.7's atomic
+// btree.DeleteRange returns (0, err) on failure with descriptor
+// state untouched. Chunk-6.8's per-key Delete loop is NOT
+// atomic: on error at iteration i, iterations 0..i-1 have
+// already completed and their effects (desc.Count delta,
+// desc.Root advance, sibling-cursor MarkStale, on-disk page
+// retirements via the pager) ARE reflected in the in-memory
+// state. The function returns (deleted_so_far, err) so the
+// caller sees the actual scope of state change; Inv-1 / E1 / E2
+// hold for each successful per-key Delete (state is
+// consistent-but-partial). The only safe recovery is
+// Tx.Rollback() — which restores the pre-tx state via the
+// pager's bitmap snapshot. The future O(K+logN) bulk-walker
+// rewrite (filed follow-up) will honor the same
+// (deleted_so_far, err) contract.
+//
+// Errors:
+//   - ErrKeyspaceClosed (handle invalidated by same-tx
+//     DeleteKeyspace).
+//   - ErrTxClosed / ErrReadOnly via Tx.requireOpen.
+//   - ErrKeyEmpty for non-nil zero-length bounds.
+//   - Pager errors (ErrTxTooLarge, ErrDBFull) propagate.
+//   - ErrCorrupted (wrapped) on structural fault.
+//
+// Side effects on success (in-memory; persisted at Tx.Commit's
+// flushKeyspaces walk):
+//   - desc.Root reflects the post-delete root.
+//   - desc.Count decrements by the returned value count.
+//   - state transitions to Dirty unless already Created.
+//   - Every open SetCursor on this keyspace is MarkStale'd
+//     (each per-key Delete call invalidates them).
+//
+// Indexed-keyspace fallback (chunk 7) is not yet implemented;
+// chunk-6.8 operates on indexed-or-not Kind=1 keyspaces uniformly,
+// matching the chunk-5.7 Keyspace.DeleteRange deferral.
+func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
+	if err := ks.tx.requireOpen(true); err != nil {
+		return 0, err
+	}
+	if ks.dead {
+		return 0, ErrKeyspaceClosed
+	}
+	if start != nil && len(start) == 0 {
+		return 0, ErrKeyEmpty
+	}
+	if end != nil && len(end) == 0 {
+		return 0, ErrKeyEmpty
+	}
+	if ks.desc.Root == 0 {
+		return 0, nil
+	}
+	if start != nil && end != nil && bytes.Compare(start, end) >= 0 {
+		return 0, nil
+	}
+	cfg := ks.builderCfg()
+
+	// Phase 1: snapshot keys in [start, end) via a read cursor.
+	// Snapshot up front so the per-key Delete calls don't
+	// invalidate the iteration (each Delete mutates the parent
+	// tree's root, which would stale a cursor mid-walk).
+	keys, err := ks.snapshotKeysInRange(cfg, start, end)
+	if err != nil {
+		return 0, err
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+
+	// Phase 2: per-key Delete. Each call computes the cell's value
+	// count, bulk-frees the nested tree if applicable, removes the
+	// parent cell, and decrements desc.Count by the right value
+	// count. We accumulate the delta via the desc.Count snapshot
+	// so partial-progress on error surfaces honestly to the caller
+	// per the user-locked contract above.
+	before := ks.desc.Count
+	for _, k := range keys {
+		if err := ks.Delete(k); err != nil {
+			// Partial-progress error: iterations 0..i-1 have
+			// completed; their effects on desc.Count + desc.Root
+			// + sibling cursors + on-disk page retirements stand.
+			// Return (deleted_so_far, err) so the caller observes
+			// the real scope of state change. The only safe
+			// recovery is Tx.Rollback().
+			return before - ks.desc.Count, err
+		}
+	}
+	after := ks.desc.Count
+	// before - after is the total values freed across all per-key
+	// Delete calls (each decremented by the cell's value count).
+	return before - after, nil
+}
+
+// snapshotKeysInRange returns a sorted, deep-copied list of keys
+// in [start, end). Used by DeleteRange to materialize the
+// per-key-delete worklist before any mutation. Read-cursor only —
+// no MarkStale side effects, no descriptor mutation.
+func (ks *SetKeyspace) snapshotKeysInRange(cfg page.Config, start, end []byte) ([][]byte, error) {
+	cur := btree.NewReadCursor(ks.tx.pgr, cfg, ks.desc.Root)
+	var k []byte
+	if start == nil {
+		k, _ = cur.First()
+	} else {
+		k, _ = cur.SeekGE(start)
+	}
+	var keys [][]byte
+	for ; k != nil; k, _ = cur.Next() {
+		if end != nil && bytes.Compare(k, end) >= 0 {
+			break
+		}
+		keys = append(keys, bytes.Clone(k))
+	}
+	if err := cur.Err(); err != nil {
+		return nil, mapBtreeErr(err)
+	}
+	return keys, nil
 }
 
 // deleteValueFromNestedTree handles DeleteValue when the cell is a

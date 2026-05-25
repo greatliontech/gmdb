@@ -859,6 +859,320 @@ func TestSetKeyspaceConfigUpdatesSameTxCreatedSetKeyspace(t *testing.T) {
 	}
 }
 
+// --- DeleteRange ---
+
+func TestSetKeyspaceDeleteRangeEmptyKeyspace(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	n, err := sks.DeleteRange(nil, nil)
+	if err != nil || n != 0 {
+		t.Errorf("DeleteRange(nil,nil) empty=(%d,%v), want (0,nil)", n, err)
+	}
+}
+
+func TestSetKeyspaceDeleteRangeEmptyBoundsRejected(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	// Non-nil zero-length is invalid (matches chunk-5.7 keyspace.DeleteRange).
+	if _, err := sks.DeleteRange([]byte{}, nil); !errors.Is(err, ErrKeyEmpty) {
+		t.Errorf("DeleteRange([],nil): err=%v, want ErrKeyEmpty", err)
+	}
+	if _, err := sks.DeleteRange(nil, []byte{}); !errors.Is(err, ErrKeyEmpty) {
+		t.Errorf("DeleteRange(nil,[]): err=%v, want ErrKeyEmpty", err)
+	}
+}
+
+func TestSetKeyspaceDeleteRangeStartGEEndIsNoop(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	sks.Put([]byte("a"), []byte("1"))
+	// start == end (empty range) and start > end (empty range) both
+	// return (0, nil) per the api-surface contract.
+	for _, pair := range [][2]string{{"a", "a"}, {"z", "a"}, {"k1", "k0"}} {
+		n, err := sks.DeleteRange([]byte(pair[0]), []byte(pair[1]))
+		if err != nil || n != 0 {
+			t.Errorf("DeleteRange(%q,%q)=(%d,%v), want (0,nil)", pair[0], pair[1], n, err)
+		}
+	}
+	// Verify untouched.
+	count, _ := sks.CountValues([]byte("a"))
+	if count != 1 {
+		t.Errorf("CountValues post-noop=%d, want 1", count)
+	}
+}
+
+func TestSetKeyspaceDeleteRangeFullRangeDeletesAll(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	// 3 keys × 2 values = 6 values.
+	for _, k := range []string{"k1", "k2", "k3"} {
+		for _, v := range []string{"a", "b"} {
+			sks.Put([]byte(k), []byte(v))
+		}
+	}
+	n, err := sks.DeleteRange(nil, nil)
+	if err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	if n != 6 {
+		t.Errorf("DeleteRange count=%d, want 6 (values, not keys)", n)
+	}
+	if sks.desc.Count != 0 {
+		t.Errorf("desc.Count post-DeleteRange=%d, want 0", sks.desc.Count)
+	}
+	// Every key is gone.
+	for _, k := range []string{"k1", "k2", "k3"} {
+		has, _ := sks.Has([]byte(k))
+		if has {
+			t.Errorf("Has(%q) post-DeleteRange: want false", k)
+		}
+	}
+}
+
+func TestSetKeyspaceDeleteRangePartialBoundsHalfOpen(t *testing.T) {
+	// [start, end): start INCLUSIVE, end EXCLUSIVE.
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	for _, k := range []string{"k1", "k2", "k3", "k4", "k5"} {
+		sks.Put([]byte(k), []byte("v"))
+	}
+	// Delete [k2, k4) → removes k2 + k3 (NOT k4).
+	n, err := sks.DeleteRange([]byte("k2"), []byte("k4"))
+	if err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("count=%d, want 2", n)
+	}
+	for _, k := range []string{"k1", "k4", "k5"} {
+		has, _ := sks.Has([]byte(k))
+		if !has {
+			t.Errorf("Has(%q): want true (outside range)", k)
+		}
+	}
+	for _, k := range []string{"k2", "k3"} {
+		has, _ := sks.Has([]byte(k))
+		if has {
+			t.Errorf("Has(%q): want false (in range)", k)
+		}
+	}
+}
+
+func TestSetKeyspaceDeleteRangeLeftOpen(t *testing.T) {
+	// nil start = "from beginning".
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	for _, k := range []string{"a", "b", "c", "d"} {
+		sks.Put([]byte(k), []byte("v"))
+	}
+	n, _ := sks.DeleteRange(nil, []byte("c"))
+	if n != 2 {
+		t.Errorf("count=%d, want 2 (a,b)", n)
+	}
+	has, _ := sks.Has([]byte("c"))
+	if !has {
+		t.Errorf("c should still exist (exclusive end)")
+	}
+}
+
+func TestSetKeyspaceDeleteRangeRightOpen(t *testing.T) {
+	// nil end = "through last key".
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	for _, k := range []string{"a", "b", "c", "d"} {
+		sks.Put([]byte(k), []byte("v"))
+	}
+	n, _ := sks.DeleteRange([]byte("c"), nil)
+	if n != 2 {
+		t.Errorf("count=%d, want 2 (c,d)", n)
+	}
+	has, _ := sks.Has([]byte("a"))
+	if !has {
+		t.Errorf("a should still exist (before start)")
+	}
+}
+
+func TestSetKeyspaceDeleteRangeMixedCellTypes(t *testing.T) {
+	// Range covers some subpage-cell keys + one nested-tree-cell key.
+	// Verify count = total values across all (subpage Count + nested
+	// NestedCount) and nested-tree pages are freed.
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	// k1: 3 values (subpage).
+	for _, v := range []string{"a", "b", "c"} {
+		sks.Put([]byte("k1"), []byte(v))
+	}
+	// k2: 200 values (nested tree).
+	for i := range 200 {
+		v := make([]byte, 30)
+		v[0] = byte(i / 256)
+		v[1] = byte(i % 256)
+		sks.Put([]byte("k2"), v)
+	}
+	// k3: 2 values (subpage).
+	for _, v := range []string{"x", "y"} {
+		sks.Put([]byte("k3"), []byte(v))
+	}
+	// Sanity: desc.Count = 3 + 200 + 2 = 205.
+	if sks.desc.Count != 205 {
+		t.Fatalf("pre-DeleteRange desc.Count=%d, want 205", sks.desc.Count)
+	}
+	// Delete [k1, k3): k1 (3 values) + k2 (200 values) = 203 values.
+	n, err := sks.DeleteRange([]byte("k1"), []byte("k3"))
+	if err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	if n != 203 {
+		t.Errorf("count=%d, want 203 (3 + 200)", n)
+	}
+	if sks.desc.Count != 2 {
+		t.Errorf("post-DeleteRange desc.Count=%d, want 2 (k3's values)", sks.desc.Count)
+	}
+	// k3 still has its values.
+	count, _ := sks.CountValues([]byte("k3"))
+	if count != 2 {
+		t.Errorf("CountValues(k3)=%d, want 2", count)
+	}
+}
+
+func TestSetKeyspaceDeleteRangeMissingKeysAreNoop(t *testing.T) {
+	// Range with no keys → (0, nil).
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	sks.Put([]byte("a"), []byte("v"))
+	sks.Put([]byte("z"), []byte("v"))
+	// Range [m, q) has no keys.
+	n, err := sks.DeleteRange([]byte("m"), []byte("q"))
+	if err != nil || n != 0 {
+		t.Errorf("DeleteRange(m,q)=(%d,%v), want (0,nil)", n, err)
+	}
+	if sks.desc.Count != 2 {
+		t.Errorf("desc.Count post-noop=%d, want 2", sks.desc.Count)
+	}
+}
+
+// Note on read-only-tx rejection: chunk-5.7's
+// TestKeyspaceDeleteRangeReadOnlyTxReturnsErrReadOnly actually
+// pins "Begin(ctx, false) returns ErrReadOnly" — db.Begin rejects
+// non-writable callers before any Tx is constructed (db.go:468-470),
+// so a SetKeyspace.DeleteRange on a read-only tx is unreachable
+// via the current API surface. The defensive `requireOpen(true)`
+// gate at the top of DeleteRange remains for future read-tx
+// wiring (ReadTx.OpenSetKeyspace, not yet implemented).
+
+func TestSetKeyspaceDeleteRangeClosedHandle(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	sks.Put([]byte("a"), []byte("v"))
+	tx.DeleteKeyspace("k")
+	if _, err := sks.DeleteRange(nil, nil); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("DeleteRange on dead handle: err=%v, want ErrKeyspaceClosed", err)
+	}
+}
+
+func TestSetKeyspaceDeleteRangeCommitReopen(t *testing.T) {
+	// Pin: DeleteRange's effects survive commit + reopen, with
+	// nested-tree bulk-free correctly retiring pages.
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+
+	tx, _ := db.Begin(ctx, true)
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	// 5 keys, including one nested-tree.
+	for _, v := range []string{"a", "b"} {
+		sks.Put([]byte("k1"), []byte(v))
+	}
+	for i := range 200 {
+		v := make([]byte, 30)
+		v[0] = byte(i)
+		sks.Put([]byte("k2"), v)
+	}
+	for _, k := range []string{"k3", "k4", "k5"} {
+		sks.Put([]byte(k), []byte("z"))
+	}
+	// Delete [k2, k4): k2 + k3.
+	n, err := sks.DeleteRange([]byte("k2"), []byte("k4"))
+	if err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	if n != 201 {
+		t.Errorf("count=%d, want 201", n)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	db.Close()
+
+	db2, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db2.Close()
+	tx2, _ := db2.Begin(ctx, true)
+	defer tx2.Rollback()
+	sks2, _ := tx2.OpenSetKeyspace("k")
+	for _, k := range []string{"k1", "k4", "k5"} {
+		has, _ := sks2.Has([]byte(k))
+		if !has {
+			t.Errorf("Has(%q) post-reopen: want true", k)
+		}
+	}
+	for _, k := range []string{"k2", "k3"} {
+		has, _ := sks2.Has([]byte(k))
+		if has {
+			t.Errorf("Has(%q) post-reopen: want false", k)
+		}
+	}
+}
+
 // --- Empty-key rejection (all SetKeyspace ops) ---
 
 func TestSetKeyspaceEmptyKeyRejected(t *testing.T) {
