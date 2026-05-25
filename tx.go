@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
+	"unique"
 
+	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
@@ -51,10 +54,45 @@ type Tx struct {
 	// OpenKeyspace calls for the same name produce the same
 	// unique.Handle[string], so cache lookup is O(1) pointer compare
 	// (keyspaces.md §Keyspace Name Interning). Populated on
-	// successful Open / Create; the chunk-5.5 wiring will add
-	// invalidation on the same-tx data-op paths, and chunk-5.6's
-	// DeleteKeyspace will route through here to invalidate.
+	// successful Open / Create; DeleteKeyspace removes the entry
+	// (and migrates the *Keyspace to deadKeyspaces with dead=true so
+	// post-Delete handle ops return ErrKeyspaceClosed per the
+	// chunk-5.6 invariant Inv-D).
 	openKeyspaces map[uniqueNameHandle]*Keyspace
+
+	// dirtyDescriptors holds descriptor mutations on names that have
+	// no *Keyspace handle in openKeyspaces (today: SetKeyspaceConfig
+	// on an unopened name — kind-agnostic per the chunk-5.5 godoc on
+	// api-surface.md §Keyspace API SetKeyspaceConfig, so the
+	// mutation cannot be carried on a *Keyspace which is Kind=0
+	// only). These are flushed at Commit (the chunk-5.6 deferred-
+	// flush refactor) alongside openKeyspaces with state ∈
+	// {created, dirty}. Invariant: a name is in at most one of
+	// {openKeyspaces, dirtyDescriptors, pendingDeletes}.
+	dirtyDescriptors map[string]page.KeyspaceDescriptor
+
+	// pendingDeletes is the set of keyspace names whose persisted
+	// descriptor must be removed from the keyspace B+tree at Commit
+	// (via btree.Delete) — populated by DeleteKeyspace on a name
+	// that existed on disk pre-tx. A Created-this-tx-then-Deleted
+	// name is NOT added here (it was never persisted; the matching
+	// btree.Put never ran). A Delete-then-Create of the same name
+	// removes the name from pendingDeletes (the subsequent
+	// btree.Put at Commit cleanly overwrites the on-disk entry; no
+	// separate btree.Delete is needed).
+	pendingDeletes map[string]struct{}
+
+	// deadKeyspaces holds every *Keyspace handle invalidated by a
+	// same-tx DeleteKeyspace, including those whose name has since
+	// been re-created (spec: api-surface.md §Keyspace API
+	// DeleteKeyspace — re-creating the keyspace in the same tx does
+	// NOT reactivate the old handle). Each holds dead=true; their
+	// methods return ErrKeyspaceClosed. The slice keeps the *Keyspace
+	// reachable from the tx so future ops on the handle find their
+	// way back to the tx's closed-state checks; on Commit/Rollback
+	// the tx is dropped and the dead handles become unreachable along
+	// with it.
+	deadKeyspaces []*Keyspace
 
 	// held tracks whether this Tx still owns the cross-process write
 	// grant. Begin sets it to true; Commit, Rollback, and the
@@ -251,6 +289,21 @@ func (tx *Tx) Mutate(id uint64) ([]byte, error) {
 // Commit publishes the transaction's changes via the four-step commit
 // protocol (pager-slab.md §Commit Write Ordering). On success the DB's
 // active meta advances and the write-lock is released.
+//
+// Descriptor flush (chunk-5.6 deferred-flush refactor). All same-tx
+// descriptor mutations (Keyspace.Put / Delete / Cursor.Delete /
+// Tx.SetKeyspaceConfig / Tx.CreateKeyspace* / Tx.DeleteKeyspace) are
+// kept in memory on the *Keyspace handles, in tx.dirtyDescriptors,
+// and in tx.pendingDeletes. Commit walks these sets and applies the
+// final state to the keyspace B+tree before pager.Commit's four-step
+// protocol begins. A flush failure cleans up via the normal AbortTx
+// path (bitmap snapshot restore, slab pool return, retired+loose
+// page clearance) and the on-disk state is unchanged — no new poison
+// machinery is needed because no on-disk write has yet been issued.
+// The folded-in chunk-5.5 H1 (descriptor-drift-on-partial-failure)
+// is closed by this design move: the two-write-no-atomicity window
+// per per-op storeDescriptor disappears in favour of a single
+// commit-time apply.
 func (tx *Tx) Commit() error {
 	if err := tx.requireOpen(true); err != nil {
 		return err
@@ -263,6 +316,14 @@ func (tx *Tx) Commit() error {
 	defer tx.releaseGrant()
 	tx.closed = true
 	tx.pgr.SetCurrentTxnID(tx.newTxnID)
+	if err := tx.flushKeyspaces(); err != nil {
+		// Flush failed before pager.Commit ran — AbortTx is sufficient.
+		// No on-disk pwrite has happened yet (pager.Commit's step-1
+		// runs later), so no DB-wide poisoning. The caller can retry
+		// in a fresh tx.
+		tx.pgr.AbortTx()
+		return err
+	}
 	// Compose Flags + SyncPolicy per durability.md §Durability
 	// Modes. The PageChecksum bit is immutable across commits
 	// (carried forward from prev); the Checkpoint bit is computed
@@ -385,6 +446,130 @@ func (tx *Tx) releaseGrant() {
 			tx.grant.Release()
 		}
 	}
+}
+
+// flushKeyspaces applies the in-memory descriptor state to the
+// keyspace B+tree at Commit time. The walk:
+//
+//  1. For every name in pendingDeletes (alphabetical), issue
+//     btree.Delete on the keyspace B+tree.
+//  2. For every *Keyspace in openKeyspaces whose state is Created or
+//     Dirty (alphabetical by name), encode the descriptor and issue
+//     btree.Put.
+//  3. For every name in dirtyDescriptors not in openKeyspaces and not
+//     in pendingDeletes (alphabetical), encode and issue btree.Put.
+//
+// Ordering across the three steps doesn't affect the final on-disk
+// state because the three sets are disjoint by construction (see
+// invariants on the tx field godocs). Alphabetical-within-step is
+// for deterministic test behavior + reproducible CoW page chains.
+//
+// On failure the caller (Tx.Commit) calls pager.AbortTx — every
+// allocation done by this flush (CoW'd keyspace-B+tree pages,
+// loose-pool reuse, file-extension HWM bump) rolls back via the
+// bitmap snapshot taken at Begin. No on-disk pwrite has happened
+// yet (pager.Commit's step-1 runs after this), so AbortTx is
+// strictly sufficient to restore pre-flush state.
+func (tx *Tx) flushKeyspaces() error {
+	if len(tx.pendingDeletes) == 0 && len(tx.dirtyDescriptors) == 0 && !tx.hasDirtyOpenKeyspaces() {
+		return nil
+	}
+	cfg := tx.pgr.Config()
+	mergeThreshold := tx.db.opts.MergeThreshold
+
+	// Step 1: deletes.
+	if len(tx.pendingDeletes) > 0 {
+		names := sortedKeys(tx.pendingDeletes)
+		for _, name := range names {
+			newRoot, err := btree.Delete(tx.pgr, cfg, tx.keyspaceRoot, mergeThreshold, []byte(name))
+			if err != nil {
+				if errors.Is(err, btree.ErrNotFound) {
+					// Internal invariant violation: pendingDeletes only
+					// holds names that were present on-disk at the time
+					// of DeleteKeyspace. ErrNotFound here means the
+					// keyspace-B+tree drifted from our in-memory view —
+					// surface as ErrCorrupted.
+					return fmt.Errorf("%w: flushKeyspaces: keyspace %q in pendingDeletes missing from on-disk keyspace B+tree",
+						ErrCorrupted, name)
+				}
+				return fmt.Errorf("flushKeyspaces: btree.Delete %q: %w", name, mapBtreeErr(err))
+			}
+			tx.keyspaceRoot = newRoot
+		}
+	}
+
+	// Step 2: open keyspaces with Created or Dirty state.
+	if tx.hasDirtyOpenKeyspaces() {
+		names := dirtyOpenNamesSorted(tx.openKeyspaces)
+		buf := make([]byte, page.KeyspaceDescriptorSize)
+		for _, name := range names {
+			ks := tx.openKeyspaces[unique.Make(name)]
+			page.EncodeKeyspaceDescriptor(buf, ks.desc)
+			newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte(name), buf)
+			if err != nil {
+				return fmt.Errorf("flushKeyspaces: btree.Put %q: %w", name, mapBtreeErr(err))
+			}
+			tx.keyspaceRoot = newRoot
+			ks.state = keyspaceStateClean
+		}
+	}
+
+	// Step 3: dirty descriptors not owned by an open *Keyspace.
+	if len(tx.dirtyDescriptors) > 0 {
+		names := make([]string, 0, len(tx.dirtyDescriptors))
+		for name := range tx.dirtyDescriptors {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		buf := make([]byte, page.KeyspaceDescriptorSize)
+		for _, name := range names {
+			desc := tx.dirtyDescriptors[name]
+			page.EncodeKeyspaceDescriptor(buf, desc)
+			newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte(name), buf)
+			if err != nil {
+				return fmt.Errorf("flushKeyspaces: btree.Put (dirty descriptor) %q: %w", name, mapBtreeErr(err))
+			}
+			tx.keyspaceRoot = newRoot
+		}
+	}
+	return nil
+}
+
+// hasDirtyOpenKeyspaces reports whether any open *Keyspace handle has
+// pending descriptor state that the flush walk must persist.
+func (tx *Tx) hasDirtyOpenKeyspaces() bool {
+	for _, ks := range tx.openKeyspaces {
+		if ks.state != keyspaceStateClean {
+			return true
+		}
+	}
+	return false
+}
+
+// dirtyOpenNamesSorted returns the names of openKeyspaces entries
+// whose state is Created or Dirty, sorted for deterministic flush
+// ordering.
+func dirtyOpenNamesSorted(m map[uniqueNameHandle]*Keyspace) []string {
+	out := make([]string, 0, len(m))
+	for _, ks := range m {
+		if ks.state == keyspaceStateClean {
+			continue
+		}
+		out = append(out, ks.name.Value())
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sortedKeys returns the keys of m sorted. Used by the flush walk
+// for deterministic apply order across pendingDeletes.
+func sortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // mapPagerErr translates pager package sentinels to the root package's

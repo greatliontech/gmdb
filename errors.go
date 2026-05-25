@@ -115,6 +115,17 @@ var (
 	// invalidated the cursor. Per transactions.md §Cursor State
 	// Machine, the caller re-positions to recover.
 	ErrCursorStale = errors.New("gmdb: cursor invalidated by sibling mutation")
+
+	// ErrKeyspaceClosed is returned by Keyspace / SetKeyspace /
+	// Cursor / SetCursor operations against a handle whose parent
+	// keyspace was DeleteKeyspace'd within the same write
+	// transaction (api-surface.md §Keyspace API DeleteKeyspace).
+	// Invalidation is permanent for the handle's lifetime — even a
+	// CreateKeyspace re-creating the same name does NOT reactivate
+	// the old handle; the new CreateKeyspace returns a fresh
+	// *Keyspace while the old handle stays dead until the caller
+	// drops it.
+	ErrKeyspaceClosed = errors.New("gmdb: keyspace closed by DeleteKeyspace")
 )
 
 var (

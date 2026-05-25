@@ -684,6 +684,21 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error)
 // Tx is a write transaction.
 type Tx struct { ... }
 
+// Commit publishes the transaction's changes atomically via the meta
+// swap.
+//
+// Descriptor flush is deferred to Commit (chunk-5.6 design).
+// Same-tx Keyspace.Put / Keyspace.Delete / Cursor.Delete /
+// SetKeyspaceConfig / CreateKeyspace* / DeleteKeyspace mutate the
+// keyspace descriptors only in memory; the on-disk keyspace B+tree
+// is updated by Commit before pager-Commit's meta swap. Consequence
+// for the error surface: ErrTxTooLarge from a slab-budget exhaustion
+// caused by the keyspace-B+tree CoW path surfaces from Commit
+// itself, not from the originating per-op method. A Put / Delete
+// returning nil is a guarantee that the in-memory descriptor was
+// updated, NOT that the keyspace B+tree has been touched on disk;
+// the on-disk effect lands iff Commit returns nil. Rollback drops
+// the in-memory state and leaves no on-disk trace.
 func (tx *Tx) Commit() error
 func (tx *Tx) Rollback() error
 
@@ -777,7 +792,8 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 // For indexed keyspaces, no per-row extractor call is needed because
 // no index entries survive after step (2).
 //
-// Errors: ErrNotFound if the keyspace does not exist.
+// Errors: ErrKeyEmpty if name is nil or empty.
+// ErrNotFound if the keyspace does not exist.
 // ErrKeyspaceReserved if the supplied name is an engine-internal
 // index keyspace (Kind=2 — not enumerable, not user-deletable).
 //

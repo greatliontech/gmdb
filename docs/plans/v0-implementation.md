@@ -594,10 +594,141 @@ the keyspace subtree atomically.
   + Wait/Abort + nil-callback-falls-through-to-file-extension).
   Plus chunk-5.1 Kind=0 portion of Delete-on-miss invariant
   promoted at `Keyspace.Delete` (`ErrNotFound` on miss).
-- **5.6** ⏳ `DeleteKeyspace` — single-keyspace subtree
-  retirement (chunk 6 adds the SetKeyspace nested-tree
-  bulk-free path; chunk 7 adds the index-keyspace + registry
-  bulk-free).
+- **5.6** ✅ `DeleteKeyspace` — single-keyspace subtree
+  retirement + deferred descriptor flush refactor.
+  *Triage gate (chunk-start).* One condition-triggered entry
+  resolved: `descriptor-drift-on-partial-failure.md` (chunk-5.5
+  H1) **folded** — the user picked option 4 (atomic-commit-time
+  descriptor flush) over option 1 (tx-poison) because the same
+  reshape closes both the chunk-5.5 H1 two-write-no-atomicity
+  shape and chunk-5.6 DeleteKeyspace's structurally-identical
+  failure surface in one design move. Other open entries: no
+  fires at 5.6 (`pager-test-helper-export.md` may fire at 5.6
+  test-time if a second cross-package writer-pager fixture
+  materialises — opportunistically address; current plan keeps
+  5.6 tests inside the `gmdb` package against `tx.pgr`, so the
+  helper duplication does not grow).
+  *Project-invariants trigger (new domain concept: keyspace
+  retirement; new persistence boundary: `meta.KeyspaceRoot`
+  via deferred flush; new trust boundary: `ErrKeyspaceClosed`).*
+  Four chunk-5.6 invariants encoded as enforced tests:
+    - **Inv-A** (clause-explicit, `api-surface.md §Keyspace API
+      DeleteKeyspace`): `DeleteKeyspace(name)` followed by
+      `OpenKeyspace(name)` returns `ErrNotFound` (same tx and
+      post-commit re-Open).
+    - **Inv-B** (entailed; from "bulk subtree retirement"):
+      every page reachable from `desc.Root` pre-Delete enters
+      `loosePages` (same-tx allocations) or `retiredPages`
+      (prior-tx pages, RPL'd at commit). No page reachable
+      pre-Delete remains both bitmap-allocated AND unreachable
+      post-commit.
+    - **Inv-C** (entailed; from `file-layout.md §Meta Page`):
+      `tx.numKeyspaces` decrements on success; `meta.NumKeyspaces`
+      and `meta.KeyspaceRoot` reflect the post-Delete state
+      across commit + re-Open.
+    - **Inv-D** (clause-explicit, `api-surface.md §Keyspace API
+      DeleteKeyspace`): every `*Keyspace` / `*Cursor`
+      previously opened on `name` within the tx returns
+      `ErrKeyspaceClosed` on subsequent ops; re-creating the
+      same name via `CreateKeyspace` does NOT reactivate the
+      dead handle.
+  *Deferred descriptor flush refactor (folds chunk-5.5 H1).*
+  Removes per-op `tx.storeDescriptor` from `Keyspace.Put` /
+  `Delete` / `Cursor.Delete` / `SetKeyspaceConfig` /
+  `CreateKeyspace*`; in-memory `*Keyspace.desc` mutations only.
+  `Tx.Commit` runs a deterministic flush walk before
+  `pager.Commit`: for each name in `tx.pendingDeletes` →
+  `btree.Delete(keyspaceRoot, name)`; for each
+  `tx.openKeyspaces[name]` with `state ∈ {created, dirty}` →
+  `btree.Put(keyspaceRoot, name, EncodeKeyspaceDescriptor(desc))`.
+  Walk-failure path: `AbortTx` (restores bitmap snapshot, clears
+  loose + retired pages, releases slab buffers — no on-disk
+  state has been written yet, so no poisoning needed; failure
+  is a plain Commit error, the caller's Rollback equivalent is
+  the AbortTx that already ran). The two-set design
+  (`openKeyspaces` for live + dirty, `pendingDeletes` for
+  remove-from-disk) makes Create+Delete in same tx a no-op on
+  the keyspace-B+tree, and Delete+Create in same tx a single
+  `btree.Put` overwrite (the `Create` removes the
+  `pendingDeletes` entry).
+  *Surface.*
+    - New file: `internal/btree/subtree.go` (`FreeSubtree(pw,
+      cfg, rootID)` walks the tree, retiring every branch +
+      leaf + overflow-chain via `FreePage` / `FreeRun`).
+    - `keyspace.go`: `Tx.DeleteKeyspace(name)`; `*Keyspace.state`
+      enum; `*Keyspace.dead` invalidation flag; deferred-flush
+      paths through `Keyspace.Put` / `Delete` / `Cursor.Delete`.
+    - `tx.go`: `tx.pendingDeletes map[string]struct{}`;
+      `tx.deadKeyspaces []*Keyspace`; `tx.flushKeyspaces()`
+      Commit-time helper; flush invocation in `Tx.Commit` before
+      `pager.Commit`.
+    - `errors.go`: `ErrKeyspaceClosed` sentinel.
+  *Scope notes.* Chunk-5.6 bulk-free covers the single-keyspace
+  B+tree (Kind=0 data tree) only. Chunk 6 extends `FreeSubtree`
+  to walk SetKeyspace nested-tree promotions per
+  `set-keyspace.md`. Chunk 7 extends `DeleteKeyspace` to also
+  bulk-free each engine-internal index keyspace and the
+  per-keyspace index registry sub-tree per `indexing.md`. The
+  api-surface.md DeleteKeyspace godoc documents all three; the
+  5.6 implementation handles only step 1.
+  *Promotes:* Inv-A/B/C/D as enforced tests in
+  `keyspace_test.go` and `keyspace_dataops_test.go`.
+  *Resolves:* `docs/issues/descriptor-drift-on-partial-failure.md`
+  (cited rationale promoted inline to `api-surface.md §Keyspace
+  API` and to the deferred-flush godoc on `Tx.Commit`; issue
+  file deleted at 5.8 close-out per Issue-triage gate 2).
+  *Adversarial review (round 1).* Fresh-eyes general-purpose
+  reviewer surfaced 0 H, 2 introduced M, plus L1-L5 + N1-N3.
+  Dispositions:
+    - **M1** (`keyspace.go`, IndexRegistryRoot assertion fired
+      AFTER FreeSubtree): **fixed in-place** — reordered the
+      `IndexRegistryRoot != 0` check before the bulk-free call.
+    - **M2** (`Cursor.Err()` did not surface `ErrKeyspaceClosed`
+      when called directly on a dead handle without an intervening
+      nav op): **fixed in-place** — `Err()` now probes `c.ks.dead`
+      before consulting the underlying btree cursor's sticky
+      error; godoc updated; regression test
+      `TestCursorErrReturnsKeyspaceClosedOnDeadHandle` added.
+    - **L1** (defense-in-depth: `btree.Get`/`Has`/`Delete`/
+      `Cursor`/`FreeSubtree` validate leaf pages via
+      `LeafReader.Validate` but iterate branch children without an
+      equivalent `ValidateBranch`): **filed** as
+      `docs/issues/btree-branch-page-validation.md` —
+      `class=adjacent` (pre-existing surface shared by chunks 1-4
+      callers; chunk-5.6 inherited the pattern). Lands
+      opportunistically at chunk 11 (`Check()`) or fuzz repro.
+    - **L2** (variable name `wasOnDisk` confusing): **renamed** to
+      `needsBtreeDelete` — names the flush-time contract instead
+      of an ambiguous history fact.
+    - **L3** (missing test: SetKeyspaceConfig → dirtyDescriptors →
+      DeleteKeyspace round-trip): **added**
+      `TestDeleteKeyspaceAfterSetKeyspaceConfigClearsDirtyDescriptor`.
+    - **L4** (em-dash in error message): **disputed** — consistent
+      with the codebase's existing voice (chunk-1 through chunk-5
+      error messages and godocs all use em-dashes / Unicode).
+    - **L5** (flushKeyspaces ErrCorrupted message specificity):
+      **disputed** — message names the specific case
+      (pendingDeletes) and chains via fmt.Errorf so callers using
+      errors.Is satisfy gmdb.ErrCorrupted while logs show the
+      precise path.
+    - **N1** (Cursor() godoc on dead handle): **fixed** — godoc
+      now correctly describes the requireOpen + Err probe.
+    - **N2** (Cursor.Err godoc missing ErrKeyspaceClosed): **fixed**
+      by the M2 fix's godoc rewrite.
+    - **N3** (`mapBtreeErr` chunk-5.4 caveat): pre-existing on
+      `eec7fc6`; not in this change set's diff. No action.
+  Spec-amend candidates surfaced + user-locked:
+    - (1) `api-surface.md §Keyspace API DeleteKeyspace` godoc
+      missed `ErrKeyEmpty` in its error list: **amended** — added
+      `ErrKeyEmpty when name is empty.` to the error list.
+    - (3) Document that descriptor mutations are deferred to
+      Commit (failure-mode surface shifts ErrTxTooLarge to
+      Commit): **amended** — added a §Transactions clause on
+      `Tx.Commit`'s godoc capturing the deferred-flush contract +
+      the in-memory-success vs. on-disk-Commit-publishes
+      distinction.
+  Ship gate met: no introduced H/M unaddressed; every L/nit has a
+  recorded disposition.
 - **5.7** ⏳ `DeleteRange` — three-phase algorithm
   (boundary paths + interior-subtree retire + boundary cleanup
   with rebalance + root collapse). Promotes `range-delete.md`

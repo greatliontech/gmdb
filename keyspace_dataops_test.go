@@ -219,10 +219,14 @@ func TestSetKeyspaceConfigUpdatesRestartGroupTarget(t *testing.T) {
 	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{RestartGroupTarget: 32}); err != nil {
 		t.Fatalf("SetKeyspaceConfig: %v", err)
 	}
-	// Reload from B+tree.
-	desc, found, err := tx.loadDescriptor("ks")
+	// Lookup via the in-memory-aware path — the chunk-5.6 deferred-
+	// flush refactor moves descriptor persistence to Commit time, so
+	// loadDescriptor (disk-only) returns the pre-config state until
+	// the flush walk runs. lookupDescriptor consults openKeyspaces
+	// and dirtyDescriptors first per the chunk-5.6 contract.
+	desc, found, err := tx.lookupDescriptor("ks")
 	if err != nil || !found {
-		t.Fatalf("loadDescriptor: found=%v err=%v", found, err)
+		t.Fatalf("lookupDescriptor: found=%v err=%v", found, err)
 	}
 	if desc.RestartGroupTarget != 32 {
 		t.Errorf("descriptor RestartGroupTarget = %d, want 32", desc.RestartGroupTarget)
