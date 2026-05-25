@@ -141,6 +141,56 @@ Invariant: kind=entailed;
     every corruption signal; a `LookupKeys` that probes the
     row keyspace defeats its cost-sensitive contract.
 
+Invariant: kind=entailed;
+  property=Every engine-internal `Kind = 2` keyspace descriptor
+    is reachable via **exactly one** user-keyspace's index
+    registry sub-tree, never via the top-level keyspace B+tree
+    path used by `ListKeyspaces`, and never via two distinct
+    parent keyspaces. The Kind=2 descriptor's lifetime is
+    bounded by its parent keyspace's lifetime: parent
+    `DeleteKeyspace` retires the Kind=2 descriptor (per
+    `api-surface.md §Keyspace API DeleteKeyspace` three-subtree
+    retirement); `DropIndex` retires it standalone;
+  from=entailed: this spec §Storage Layout (registry-only
+    reachability) + `keyspaces.md` invariant #4
+    (`ErrKeyspaceReserved` + `ListKeyspaces` filter) — neither
+    states the one-parent uniqueness, but two-parent
+    reachability would make `DeleteKeyspace` of parent₁ retire
+    pages parent₂'s registry still references;
+  violation=A Kind=2 descriptor surfacing in `ListKeyspaces`,
+    addressable via the user `OpenKeyspace` surface, or
+    referenced by two parent keyspaces' registries lets
+    `DeleteKeyspace(parent₁)` retire pages a Kind=2 descriptor
+    still references from parent₂ — every subsequent `Lookup`
+    on parent₂'s indexes reads freed-and-reallocated pages,
+    yielding wrong rows or page-checksum failures.
+
+Invariant: kind=entailed;
+  property=`DropIndex` removing the last declared index on a
+    keyspace resets `desc.IndexRegistryRoot` to `0` and retires
+    the (now-empty) registry sub-tree pages in the same write
+    transaction. The registry sub-tree's leaf-entry count
+    equals the number of declared indexes — never a non-zero
+    root pointing at an empty leaf;
+  from=entailed: `keyspaces.md` invariant #7's biconditional
+    (`IndexRegistryRoot == 0` iff no indexes) already entails
+    the canonical-representation direction; what no clause
+    states is the **operational rule** that `DropIndex` of the
+    last index must both reset the root field AND retire the
+    sub-tree pages — a half-step (reset root, leak pages, or
+    retire pages, leave root non-zero) leaves #7's iff
+    momentarily false mid-transaction;
+  violation=`DropIndex` that resets the root without retiring
+    the sub-tree pages leaks every registry leaf page; the
+    reverse (retire pages, leave the root non-zero) leaves
+    `desc.IndexRegistryRoot` pointing at freed-and-
+    reallocatable pages — a subsequent `CreateKeyspace`-with-
+    indexes path checking `IndexRegistryRoot == 0` to decide
+    whether to allocate would write into a leaf the descriptor
+    still references, but later `OpenKeyspace` registry walks
+    see a non-zero root pointing at a now-stale page, yielding
+    wrong index lookups.
+
 ## Overview
 
 ```go

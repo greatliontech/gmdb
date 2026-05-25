@@ -127,6 +127,32 @@ Invariant: kind=entailed;
     indexes leaks every index entry (no registry → no
     lookup).
 
+Invariant: kind=clause-explicit;
+  property=The meta-page `NumKeyspaces` field equals the count
+    of leaf entries in the keyspace B+tree — **all leaves,
+    including engine-internal `Kind = 2` entries**. It is **not**
+    the user-visible keyspace count (which `ListKeyspaces` filters
+    out of `Kind = 2`). Every write that adds or removes a
+    descriptor from the keyspace B+tree adjusts `NumKeyspaces` by
+    ±1, regardless of `Kind`. Any user-facing surface that exposes
+    a keyspace count (e.g. a future `DBStats.NumKeyspaces`)
+    derives the user-visible count via a cursor walk over the
+    keyspace B+tree filtering `Kind == 2`, the same machinery
+    `ListKeyspaces` already uses — no separate persisted
+    counter is maintained;
+  from=this spec §Keyspace Descriptor + `file-layout.md
+    §Meta Page Layout` `NumKeyspaces` field;
+  violation=Diverging interpretations — "leaf count" in one code
+    path and "user-visible count" in another — make
+    `NumKeyspaces` non-canonical: an audit-mode integrity check
+    using one definition and a `DBStats` surface using the other
+    silently disagree when any `Kind = 2` keyspace exists,
+    leaking the divergence into operational dashboards and
+    `Check()` reports.
+
+(Chunk-7.1 user-locked decision; locks the chunk-5.4
+implementation as spec-correct.)
+
 ## Keyspace Descriptor
 
 ```

@@ -1159,7 +1159,137 @@ mismatch with field + names; rebuild loop completes.
 Primary specs: `indexing.md`, `set-keyspace.md §Indexes on
 SetKeyspaces`, `range-delete.md §Indexed-keyspace fallback`.
 
-Primary files: `index.go`, `db.go`, `btree.go`.
+Primary files: `index.go`, `index_types.go`, `index_codec.go`,
+`keyspace.go`, `set_keyspace.go`, `tx.go`, `errors.go`.
+
+**Sub-chunk roster.**
+
+- **7.1** Triage + invariants + spec amendments (no code).
+  Folds `tx-rebuildindex-missing-name-behavior.md` (locked:
+  `ErrNotFound` for keyspace-missing + `ErrIndexNotFound` for
+  decl.Name-missing) and `spec-numkeyspaces-semantics.md`
+  (locked: `NumKeyspaces` = keyspace-B+tree leaf count incl
+  `Kind = 2`; user-visible count via cursor walk). Records
+  amendments inline in `api-surface.md` (Tx.RebuildIndex /
+  Tx.DropIndex godoc), `keyspaces.md` (new clause-explicit
+  invariant), `file-layout.md` (meta-page NumKeyspaces field
+  comment), `indexing.md` (two new entailed invariants:
+  Kind=2 one-parent reachability uniqueness; empty-registry
+  representation canonical at IndexRegistryRoot=0). Deletes
+  both folded issue files + their README rows. Re-defers
+  conditional candidates: `pager-test-helper-export` (no 2nd
+  caller in chunk-7 scope), `setkeyspace-put-redundant-
+  membership-probe` (assess at 7.6), `setkeyspace-delete-
+  range-bulk-walker` (assess at 7.10).
+- **7.2** Public types + sentinels + schema-hash. `errors.go`
+  ErrIndex* sentinels (8 sentinels per `api-surface.md
+  §Sentinel errors`). New `index_types.go`: `IndexDecl`,
+  `IndexColumn`, `CoveringColumn`, `IndexEntry`,
+  `IndexExtractor`, `IndexFingerprintError` (with Error +
+  Unwrap). Schema-hash function (xxhash64 over uvarint-
+  prefixed byte sequences per `indexing.md §Drift Guard`).
+  Duplicate-Name validation in the variadic IndexDecl slice
+  → `ErrIndexExists`. No on-disk surface; no I/O. Tests
+  cover hash determinism + duplicate-name rejection.
+- **7.3** Index registry codec + sub-tree wiring. Internal
+  registry-entry struct + binary codec per `indexing.md
+  §Storage Layout`. Per-keyspace registry B+tree
+  (Kind=0-shaped) rooted at `desc.IndexRegistryRoot`:
+  allocate on first index, grow/shrink, dirty-flush via
+  existing `tx.dirtyDescriptors` machinery. CRUD helpers
+  (`registryGet`/`registryPut`/`registryDelete`/
+  `registryList`). No public surface yet; tests via
+  internal helpers.
+- **7.4** NUL-escape composite-key codec for index keys.
+  Encode/decode per `page-formats.md §NUL-escape encoding` +
+  `indexing.md §Column Encoding`. Property tests covering
+  prefix-freeness (clause-explicit invariant from
+  page-formats.md).
+- **7.5** Open/Create with IndexDecl + Kind=2 enforcement.
+  Variadic IndexDecl plumbed through `Tx.OpenKeyspace` /
+  `Tx.CreateKeyspace` / `Tx.CreateKeyspaceIfNotExists` + the
+  SetKeyspace mirrors. Open-time validation per `indexing.md
+  §Index Declaration`: name set match +
+  `ErrIndexExtractorRequired` (missing decl) /
+  `ErrIndexUnknown` (extra decl) /
+  `ErrIndexFingerprintMismatch` (drift, wrapped in
+  `IndexFingerprintError` naming Field + IndexName + Stored*
+  + Supplied*). Same-tx re-open idempotence per `indexing.md
+  §Re-opening`: chunk-6.6's `openKeyspaces` /
+  `openSetKeyspaces` caches extended; first-Extract-wins.
+  Kind=2 enforcement: existing `ErrKeyspaceReserved` from
+  chunks 5.4 / 6.6 verified against **real** registry-created
+  Kind=2 entries (not just forged ones) — extends the existing
+  chunk-5.4 `TestListKeyspacesFiltersKindIndexInternal`
+  forge-test coverage to the production code path. Spec-tier
+  promotion: the new `indexing.md §Invariants` entailed
+  invariant on Kind=2 one-parent-reachability uniqueness
+  (added at chunk-7.1) lands enforced here — tests verify a
+  registry-created Kind=2 root has exactly one parent
+  keyspace's registry pointing at it.
+- **7.6** Atomic Put/Delete + unique probes (Keyspace).
+  Wraps `Keyspace.Put` / `Delete` / `Cursor.Delete` with the
+  per-`indexing.md §Write Path: Atomic Index Maintenance`
+  sequence: read existing value → extract(old) →
+  extract(new) → diff → unique-probe candidate-set + index
+  → apply deletes → apply inserts → write row → bump
+  per-index Count in registry. IndexEntry collision
+  detection within a single extractor invocation (entailed
+  set-not-multiset semantics). All steps in one CoW tx.
+  `Keyspace.Index(name)` returns Index handle (Stats / Err
+  working; Lookup surface stubbed → 7.7). Assesses
+  `setkeyspace-put-redundant-membership-probe.md` for fold
+  if an atomic-Put primitive that fuses the existing-value
+  read with the row write materializes.
+- **7.7** Index lookup API (Keyspace). `Index.Lookup`
+  (`iter.Seq2` with back-lookup + covering decode).
+  `Index.LookupKeys` (`iter.Seq`, no back-lookup).
+  `Index.Range`, `Index.Prefix`. `Index.Get` (unique-only;
+  `ErrIndexNotUnique` on non-unique). Per-handle `Err`
+  state. `Index.Stats`. Silent-skip of missing-PK
+  back-lookups per `indexing.md §Lookup API`.
+- **7.8** `RebuildIndex` + `DropIndex` + three-subtree
+  retirement (Keyspace). `Tx.RebuildIndex`: allocate fresh
+  Kind=2 keyspace, cursor-walk parent, write fresh entries,
+  swap registry-entry Root+SchemaHash+Version, retire old
+  Kind=2 root via FreeSubtree. Honors `ErrNotFound`
+  (keyspace) / `ErrIndexNotFound` (name) per chunk-7.1.
+  `Tx.DropIndex`: retire Kind=2 root + remove registry
+  entry + reset `desc.IndexRegistryRoot = 0` if registry
+  becomes empty (retiring the registry sub-tree too). Three-
+  subtree retirement in `Keyspace.DeleteKeyspace`: replaces
+  the chunk-5.6 defensive `desc.IndexRegistryRoot != 0 →
+  ErrCorrupted` gate with the actual retirement sequence per
+  `api-surface.md §DeleteKeyspace`. Spec-tier promotion: the
+  new `indexing.md §Invariants` entailed invariant on
+  empty-registry-canonical-at-zero (added at chunk-7.1)
+  lands enforced here — tests verify that DropIndex of the
+  last index resets `IndexRegistryRoot` to 0 and retires
+  the registry sub-tree pages.
+- **7.9** SetKeyspace indexing. Compound-PK encoding
+  (`escape(setKey) 0x00 0x01 escape(setValue)`) per
+  `set-keyspace.md §Indexes on SetKeyspaces`. Atomic
+  per-`(key, value)` extractor invocation in
+  `SetKeyspace.Put` / `DeleteValue` / `SetCursor.Delete`;
+  bulk-key `Delete` walks every set member when indexes
+  present (per `indexing.md §Indexes on SetKeyspaces`).
+  `SetKeyspace.Index(name)` handle. Spec-tier promotion:
+  `set-keyspace.md` Inv-6 (compound-PK separator
+  prefix-freeness) lands enforced here.
+- **7.10** SetKeyspace retire+rebuild+drop + indexed
+  DeleteRange fallback. Three-subtree retirement in
+  `SetKeyspace.DeleteKeyspace` (mirror 7.8). `RebuildIndex`
+  + `DropIndex` on SetKeyspace. Indexed-keyspace
+  `DeleteRange` fallback (per-row walk per
+  `range-delete.md §Indexed-keyspace fallback`) for
+  Keyspace + SetKeyspace. Per-row Delete invokes the
+  atomic-Delete path from 7.6 / 7.9. Assesses
+  `setkeyspace-delete-range-bulk-walker.md` for fold if a
+  unified bulk walker materializes.
+- **7.11** Close-out. Cite sweep (wrap-aware grep) for
+  resolved issue paths. Spec-tier invariant audit (every
+  chunk-7 enforcement-schedule item verified landed). Delete
+  any chunk-7-resolved issue files + README rows.
 
 ### Chunk 8 — BulkLoad
 

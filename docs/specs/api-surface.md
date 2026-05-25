@@ -850,9 +850,47 @@ type KeyspaceConfig struct {
 // this is the recovery path after ErrIndexFingerprintMismatch.
 // Blocking — runs inside the current write transaction. See the
 // `indexing.md §Rebuild` section for the recovery pattern.
+//
+// Errors:
+//   - ErrKeyEmpty if keyspace is nil or empty, or decl.Name is empty.
+//   - ErrIndexExtractorRequired if decl.Extract is nil
+//     (`indexing.md §Rebuild`).
+//   - ErrNotFound if the keyspace does not exist (keyspace-management
+//     dimension; matches Tx.DeleteKeyspace and Tx.SetKeyspaceConfig).
+//   - ErrIndexNotFound if the keyspace exists but decl.Name does not
+//     match any registry entry on the keyspace (index-management
+//     dimension; matches Tx.DropIndex). Distinct sentinel from
+//     ErrNotFound so callers writing the recovery loop (see
+//     `indexing.md §Recovery pattern after ErrIndexFingerprintMismatch`)
+//     can dispatch between keyspace-missing and index-name-missing
+//     without inspecting Tx state.
+//   - ErrKeyspaceReserved if the supplied keyspace name resolves
+//     to an engine-internal Kind=2 entry.
+//   - ErrIndexUniqueViolation if the rebuild's extractor produces
+//     duplicate keys for a unique index.
+//   - ErrTxTooLarge if the rebuilt index exceeds MaxTxBufferBytes
+//     (caller should use BulkLoad or chunk the rebuild).
+//   - ErrReadOnly on a read-only transaction; ErrTxClosed on a
+//     closed transaction.
+//
+// (Chunk-7.1 user-locked: ErrNotFound for keyspace-missing +
+// ErrIndexNotFound for decl.Name-missing.)
 func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error
 
-// DropIndex removes the named index entirely.
+// DropIndex removes the named index entirely. Retires the index's
+// internal Kind=2 keyspace pages and the registry entry; if the
+// dropped index was the keyspace's last, resets
+// desc.IndexRegistryRoot to 0 and retires the registry sub-tree
+// (per `keyspaces.md` invariant #7 entailed).
+//
+// Errors:
+//   - ErrKeyEmpty if keyspace is nil or empty, or indexName is empty.
+//   - ErrNotFound if the keyspace does not exist.
+//   - ErrIndexNotFound if the keyspace exists but indexName does
+//     not match any registry entry.
+//   - ErrKeyspaceReserved if the keyspace name resolves to a
+//     Kind=2 entry.
+//   - ErrReadOnly / ErrTxClosed as for other write APIs.
 func (tx *Tx) DropIndex(keyspace, indexName string) error
 
 // Keyspace is a handle to a named single-value keyspace.

@@ -228,7 +228,7 @@ Meta Page
 | RPLEntryCount    | uint64 - total entries across all RPL segments
 | NumFreePages     | uint64 - total free pages (set bits in bitmap)
 | KeyspaceRoot     | uint64 - root page of keyspace B+tree
-| NumKeyspaces     | uint64 - number of keyspaces
+| NumKeyspaces     | uint64 - keyspace-B+tree leaf count (incl Kind=2; see keyspaces.md §Invariants)
 | TxnID            | uint64 - transaction ID that wrote this meta
 | Checksum         | uint64 - xxhash64 of all preceding bytes
 +------------------+
