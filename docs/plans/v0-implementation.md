@@ -1286,10 +1286,112 @@ Primary files: `index.go`, `index_types.go`, `index_codec.go`,
   atomic-Delete path from 7.6 / 7.9. Assesses
   `setkeyspace-delete-range-bulk-walker.md` for fold if a
   unified bulk walker materializes.
-- **7.11** Close-out. Cite sweep (wrap-aware grep) for
-  resolved issue paths. Spec-tier invariant audit (every
-  chunk-7 enforcement-schedule item verified landed). Delete
-  any chunk-7-resolved issue files + README rows.
+- **7.11** ✅ Close-out: cite sweep, spec-tier invariant audit,
+  no resolved issues remaining at close-out (the chunk-7.1 pair
+  was deleted at 7.1 itself; all other chunk-7-touched issues
+  are either filed-and-open with conditional `Lands:` triggers
+  or were partial-folded with sub-items remaining open).
+  *Cite sweep (Issue-triage gate 2).* Wrap-aware
+  `git grep -nE "docs/issues/" -- 'docs/specs/*.md' '*.go'`
+  excluding test files. Promoted inline + stripped 4 production-
+  code cites that violated the no-cite invariant: `index_maintain.go:162,420`
+  (writenewindexregistry-partial-leak refs → "engine's rest-of-tx-
+  continues contract"), `index_types.go:217` (zero-column
+  decoder rationale promoted inline), `set_keyspace.go:1046`
+  (setkeyspace-delete-range-bulk-walker ref → "perf-driven
+  follow-up"), `set_cursor.go:38` (setcursor-lazy-value-iteration
+  hypothetical ref → "perf-driven follow-up"). The single
+  remaining `docs/issues/` mention in production-doc-tier text
+  is `overview.md:26` ("follow-ups live under `docs/issues/`")
+  which is a project-organization meta-reference, not a
+  specific-issue cite; kept.
+  *Spec-tier invariant audit.* Every chunk-7 enforcement-schedule
+  item verified landed:
+    - `keyspaces.md` #4 (Kind=2 ErrKeyspaceReserved + ListKeyspaces
+      filter, real-registry path portion) → 7.5
+      `TestCreateKeyspaceWithIndexDoesNotPolluteListKeyspaces`
+      + chunk-5.4 forge test
+      `TestListKeyspacesFiltersKindIndexInternal` (verified
+      against real-registry-created Kind=2 — the entries don't
+      enter the top-level keyspace B+tree per the chunk-7.1
+      design clarification).
+    - `keyspaces.md` #7 entailed (IndexRegistryRoot=0 iff no
+      indexes) → 7.3 `TestRegistryDeleteLastResetsRootToZero`
+      + 7.8 `TestDropIndexLastResetsIndexRegistryRoot`
+      + 7.10 `TestDropIndexOnSetKeyspaceSucceeds`.
+    - `indexing.md` §Invariants (added at chunk 7.1) — Kind=2
+      one-parent-reachability uniqueness: structurally guaranteed
+      by per-keyspace IndexRegistryRoot allocation; "no top-level
+      pollution" direction tested at 7.5; "exactly one parent"
+      direction filed as `kind2-one-parent-reachability-test.md`
+      (Lands: 7.8 originally, redeferred to track with the
+      `index-handle-stale-after-rebuild-drop` Round at chunk 11).
+    - `indexing.md` §Invariants (added at chunk 7.1) — DropIndex
+      atomic empty-registry-canonical-at-zero: tested at 7.8 +
+      7.10 (see above).
+    - `indexing.md` schema-hash determinism (clause-explicit) →
+      7.2 `TestSchemaHash*` (10 sensitivity tests + length-prefix
+      disambiguation + Name-prefix-prevents-collision regression).
+    - `indexing.md` atomic Put/Delete (clause-explicit) → 7.6
+      `TestIndexedPut*` / `TestIndexedDelete*` / 7.9
+      `TestSetKeyspaceIndexedPut*` / `TestSetKeyspaceIndexedDelete*`
+      + chunk-7.6/7.9 snapshot-restore atomicity tests
+      (`TestIndexedPutPinnedStateRevertsOnCandidateCollision`).
+    - `indexing.md` unique-index uniqueness (clause-explicit) →
+      7.6 `TestIndexedPutUniqueViolationOnDiskConflict` +
+      `TestIndexedPutUniqueViolationOnCandidateSetCollision` +
+      7.9 `TestSetKeyspaceIndexedPutUniqueViolation` + 7.8
+      `TestRebuildIndexUniqueViolationFailsCleanly` + 7.10
+      `TestRebuildIndexOnSetKeyspaceUniqueViolation`.
+    - `indexing.md` ErrIndexFingerprintMismatch wrap discipline
+      (clause-explicit) → 7.5 `TestOpenKeyspaceSchemaHashMismatch`
+      + `TestOpenKeyspaceVersionMismatch` + 7.2 `TestIndexFingerprintError*`.
+    - `set-keyspace.md` Inv-6 (compound-PK separator
+      prefix-freeness) → 7.9
+      `TestSetKeyspaceCompoundPKSeparatorPrefixFree`.
+    - `page-formats.md` §Invariants clause-explicit (NUL-escape
+      prefix-freeness) + entailed (added at chunk-7.4 spec-amend:
+      fixed-column-count tuple-prefix-freeness) → 7.4
+      `TestEncodedColumnPrefixFreeness` + property test +
+      `TestEncodedTuplePrefixFreenessSameColumnCount` + property test.
+    - `keyspaces.md` NumKeyspaces clause-explicit (chunk-7.1
+      spec-amend) → no new enforcement needed; the amendment
+      locks chunk-5.4's existing implementation as spec-correct;
+      `TestListKeyspacesFiltersKindIndexInternal` continues to
+      verify the user-visible-count derivation works via cursor
+      walk + `Kind != 2` filter.
+  No spec-tier invariant whose `Lands:` resolved to a chunk-7
+  sub-chunk was left in spec-only form.
+  *Spec amendments landed across chunk 7.* `api-surface.md`
+  Tx.RebuildIndex / Tx.DropIndex godoc (ErrNotFound +
+  ErrIndexNotFound sentinels, chunk-7.1); `api-surface.md`
+  §Index Lookup API godoc (Range partial-tuple prefix-bound
+  semantics + Lookup/LookupKeys exact-cols requirement,
+  chunk-7.7); `keyspaces.md` NumKeyspaces invariant (chunk-7.1);
+  `indexing.md` schema-hash Name-prefix + 2 entailed invariants
+  (chunk-7.1/7.2); `set-keyspace.md` Inv-6 promotion (chunk 7.9);
+  `page-formats.md` tuple-prefix-freeness entailed (chunk 7.4);
+  `range-delete.md` §Indexed-keyspace fallback +
+  Cursor-Based Range Delete (Current vs Next correction +
+  partial-progress contract, chunk 7.10); `transactions.md`
+  §Cursor.Delete() post-delete state + the kind=entailed
+  invariant property= rewording (chunk 7.10 M-A).
+  *Open issues post-chunk-7* (13 entries in `docs/issues/`):
+  none new opened at 7.11; chunk-7 contributed 4 new files
+  (`index-handle-stale-after-rebuild-drop`,
+  `index-registry-decoder-bounds`,
+  `kind2-one-parent-reachability-test`,
+  `setkeyspace-indexing-perf-and-edge`,
+  `writenewindexregistry-partial-leak`) — all open with
+  conditional `Lands:` triggers (chunk 11 / profiling-driven /
+  concurrent-iteration safety hardening). Pre-chunk-7 carried
+  forward: `bitmap-rollback-undo-log`,
+  `pager-test-helper-export`, `leaked-readtx-cleanup-race-flake`,
+  `btree-branch-page-validation`, `btree-post-merge-underflow`,
+  `setkeyspace-put-redundant-membership-probe`,
+  `cursor-err-unpositioned-state`,
+  `setkeyspace-delete-range-bulk-walker`.
+  Chunk 7 complete; suite + `-race` green across all 6 packages.
 
 ### Chunk 8 — BulkLoad
 

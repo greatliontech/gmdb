@@ -1041,9 +1041,8 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 // a read cursor, then call SetKeyspace.Delete on each. Cost is
 // O(K log N) (K = keys in range, N = total parent-tree size).
 // The chunk-5.7 btree.DeleteRange three-phase algorithm is faster
-// but does not free nested-tree subtrees per cell — adapting it to
-// be SetKeyspace-aware is a perf-driven follow-up
-// (docs/issues/setkeyspace-delete-range-bulk-walker.md).
+// but does not free nested-tree subtrees per cell — a SetKeyspace-
+// aware adaptation is a perf-driven follow-up.
 //
 // **Partial-progress semantic (chunk-6.8 user-locked, distinct
 // from chunk-5.7 Keyspace.DeleteRange).** Chunk-5.7's atomic

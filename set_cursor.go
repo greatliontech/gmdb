@@ -34,9 +34,8 @@ import (
 // transition the cursor decodes the cell and materialises ALL
 // values for that key into a [][]byte. Cost is O(N) per key
 // transition; for very large nested-tree cells this allocates a
-// matching-size slice. Acceptable for v1 — see
-// `docs/issues/setcursor-lazy-value-iteration.md` (if/when filed
-// for the perf-driven follow-up).
+// matching-size slice. Acceptable for v1; a lazy-iteration
+// rewrite is a perf-driven follow-up.
 //
 // Sibling-mutation contract: SetKeyspace tracks every open
 // SetCursor in `openSetCursors`. SetKeyspace.Put / Delete /

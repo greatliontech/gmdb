@@ -159,8 +159,9 @@ func extractEntriesAsKeySet(decl *IndexDecl, key, value []byte) (map[string]Inde
 // Atomicity (chunk-7.6 Round-1 H-2 fix): on any failure during the
 // sequence, pinnedIndex.root / .count are restored to the pre-call
 // snapshot. The newly-allocated index data-tree pages still leak
-// per the chunk-7.5 writenewindexregistry-partial-leak rest-of-tx-
-// continues contract, BUT the registry stays consistent — at
+// per the engine's rest-of-tx-continues contract (Tx.Rollback
+// reclaims via the pager's bitmap snapshot; Commit-after-error
+// orphans the pages), BUT the registry stays consistent — at
 // Commit-after-error, flushIndexRegistry writes the pre-call
 // pinned state to disk, not a half-mutated state that would
 // silently misrepresent the index data tree.
@@ -416,9 +417,9 @@ func (tx *Tx) flushIndexRegistry(owner descriptorOwner, indexes map[string]*pinn
 // (root, count) consistent with the not-yet-written row, so
 // flushIndexRegistry at Commit-after-error never writes
 // partial-state pinned values to the on-disk registry. The
-// newly-allocated index data-tree pages still leak (chunk-7.5
-// writenewindexregistry-partial-leak issue scope — same rest-of-
-// tx-continues contract), but the registry stays consistent.
+// newly-allocated index data-tree pages still leak under the
+// engine's rest-of-tx-continues contract (Tx.Rollback reclaims;
+// Commit-after-error orphans), but the registry stays consistent.
 type indexSnapshot map[string]struct {
 	root  uint64
 	count uint64
