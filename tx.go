@@ -524,6 +524,13 @@ func (tx *Tx) flushKeyspaces() error {
 		buf := make([]byte, page.KeyspaceDescriptorSize)
 		for _, name := range names {
 			ks := tx.openKeyspaces[unique.Make(name)]
+			// Sync chunk-7.6 in-memory pinnedIndex root/count back
+			// to the registry sub-tree BEFORE encoding the
+			// descriptor — registryPut updates ks.desc.IndexRegistryRoot,
+			// and we want that final root in the flushed descriptor.
+			if err := tx.flushIndexRegistry(ks, ks.indexes); err != nil {
+				return fmt.Errorf("flushKeyspaces: index registry sync %q: %w", name, err)
+			}
 			page.EncodeKeyspaceDescriptor(buf, ks.desc)
 			newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte(name), buf)
 			if err != nil {

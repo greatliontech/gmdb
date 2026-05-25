@@ -1,0 +1,656 @@
+package gmdb
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"testing"
+)
+
+// Test extractor that splits a CSV value `a,b` into one IndexEntry
+// per column for a single-column index. Used by many chunk-7.6
+// tests to exercise the Put / Delete index-maintenance paths.
+func splitCSVExtract(_, value []byte) []IndexEntry {
+	if len(value) == 0 {
+		return nil
+	}
+	parts := bytes.Split(value, []byte(","))
+	out := make([]IndexEntry, 0, len(parts))
+	for _, p := range parts {
+		if len(p) == 0 {
+			continue
+		}
+		out = append(out, IndexEntry{Cols: [][]byte{p}})
+	}
+	return out
+}
+
+// firstByteExtract emits one IndexEntry whose column is the
+// value's first byte (or no entry if value is empty). Useful for
+// the unique-probe test (deterministic single-entry-per-row).
+func firstByteExtract(_, value []byte) []IndexEntry {
+	if len(value) == 0 {
+		return nil
+	}
+	return []IndexEntry{{Cols: [][]byte{{value[0]}}}}
+}
+
+// --- Atomic Put: basic happy path -------------------------------
+
+// TestIndexedPutWritesIndexEntries verifies that Put on an indexed
+// keyspace writes index entries reachable via the index data tree.
+// Probe the entries by computing the expected encoded index key
+// and walking the tree directly (chunk 7.7 will wire the Lookup
+// API; chunk 7.6 only writes).
+func TestIndexedPutWritesIndexEntries(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("alpha"), []byte{0x42, 'x'}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	p := ks.indexes["by_color"]
+	if p.count != 1 {
+		t.Errorf("pinnedIndex.count: got %d want 1", p.count)
+	}
+	if p.root == 0 {
+		t.Errorf("pinnedIndex.root: still 0 after Put — no index data tree allocated")
+	}
+}
+
+// TestIndexedPutOnEmptyValueWritesNoEntries verifies that a row
+// whose extractor returns no entries (partial-index semantics)
+// does NOT mutate the index data tree.
+func TestIndexedPutOnEmptyValueWritesNoEntries(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("alpha"), []byte{}); err != nil {
+		t.Fatalf("Put empty value: %v", err)
+	}
+	p := ks.indexes["by_color"]
+	if p.count != 0 {
+		t.Errorf("pinnedIndex.count after partial-index miss: got %d want 0", p.count)
+	}
+	if p.root != 0 {
+		t.Errorf("pinnedIndex.root: got %d want 0 (no index entries written)", p.root)
+	}
+}
+
+// TestIndexedPutMultipleRowsAllIndexed verifies that N row Puts
+// produce N index entries (non-unique index — no collision).
+func TestIndexedPutMultipleRowsAllIndexed(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for i, k := range []string{"a", "b", "c"} {
+		v := []byte{byte('R' + i), 'x'} // first byte = R, S, T
+		if err := ks.Put([]byte(k), v); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	if got := ks.indexes["by_color"].count; got != 3 {
+		t.Errorf("pinnedIndex.count: got %d want 3", got)
+	}
+}
+
+// --- Atomic Put: update path (diff) ------------------------------
+
+// TestIndexedPutUpdateRespectsOldNewDiff verifies the spec's
+// diff semantics: old → new with one entry in common and one
+// added results in count = previous + 1 (one delete, two inserts —
+// wait, no: one delete of the now-removed-from-new, two inserts
+// of news-not-in-olds. Net: count_new - count_common =
+// count_inserted. Net change: (new \ old) - (old \ new). Let me
+// be explicit: old=[A], new=[A,B] → del=[], ins=[B], net +1.
+func TestIndexedPutUpdateRespectsOldNewDiff(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_letter", "letter")
+	decl.Extract = splitCSVExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	// First Put: value "a,b" → 2 index entries.
+	if err := ks.Put([]byte("k"), []byte("a,b")); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+	if got := ks.indexes["by_letter"].count; got != 2 {
+		t.Fatalf("count after first Put: got %d want 2", got)
+	}
+	// Update: value "a,b,c" → old=[a,b], new=[a,b,c]; diff: del=[],
+	// ins=[c]. Net count: +1 → 3.
+	if err := ks.Put([]byte("k"), []byte("a,b,c")); err != nil {
+		t.Fatalf("update Put: %v", err)
+	}
+	if got := ks.indexes["by_letter"].count; got != 3 {
+		t.Errorf("count after update with one added: got %d want 3", got)
+	}
+	// Update: value "b,c" → old=[a,b,c], new=[b,c]; diff: del=[a],
+	// ins=[]. Net count: -1 → 2.
+	if err := ks.Put([]byte("k"), []byte("b,c")); err != nil {
+		t.Fatalf("shrinking update: %v", err)
+	}
+	if got := ks.indexes["by_letter"].count; got != 2 {
+		t.Errorf("count after shrinking update: got %d want 2", got)
+	}
+}
+
+// --- Atomic Put: unique-index probe ------------------------------
+
+// TestIndexedPutUniqueViolationOnDiskConflict verifies that a Put
+// whose extractor produces an index key already in the on-disk
+// unique index returns ErrIndexUniqueViolation. The row write does
+// not happen.
+func TestIndexedPutUniqueViolationOnDiskConflict(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	decl.Unique = true
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("k1"), []byte{0x42, 'x'}); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+	// k2 with same first-byte → unique collision against k1's entry.
+	err = ks.Put([]byte("k2"), []byte{0x42, 'y'})
+	if !errors.Is(err, ErrIndexUniqueViolation) {
+		t.Fatalf("expected ErrIndexUniqueViolation, got %v", err)
+	}
+	// Verify the row k2 was NOT written.
+	if _, err := ks.Get([]byte("k2")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("k2 row written despite unique violation: %v", err)
+	}
+	// Verify k1's index entry is still there (count=1, not 2).
+	if got := ks.indexes["by_color"].count; got != 1 {
+		t.Errorf("index count after rejected Put: got %d want 1", got)
+	}
+}
+
+// TestIndexedPutUniqueViolationOnCandidateSetCollision verifies
+// that an extractor returning two IndexEntry values with the same
+// encoded key on a unique index aborts with ErrIndexUniqueViolation
+// — detected against the candidate set, no need for an empty
+// index.
+func TestIndexedPutUniqueViolationOnCandidateSetCollision(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_color", "color")
+	decl.Unique = true
+	// Extractor returns TWO entries with the same column tuple
+	// from a single row — candidate-set collision.
+	decl.Extract = func(_, value []byte) []IndexEntry {
+		return []IndexEntry{
+			{Cols: [][]byte{{0x42}}},
+			{Cols: [][]byte{{0x42}}},
+		}
+	}
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	err = ks.Put([]byte("k"), []byte("anything"))
+	if !errors.Is(err, ErrIndexUniqueViolation) {
+		t.Fatalf("expected candidate-set ErrIndexUniqueViolation, got %v", err)
+	}
+}
+
+// TestIndexedPutNonUniqueAllowsSameColumn verifies that on a
+// NON-unique index, two rows with the same column tuple coexist
+// (the PK is appended to the index key, so the encoded keys
+// differ).
+func TestIndexedPutNonUniqueAllowsSameColumn(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	// Unique = false (default).
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("k1"), []byte{0x42}); err != nil {
+		t.Fatalf("Put k1: %v", err)
+	}
+	if err := ks.Put([]byte("k2"), []byte{0x42}); err != nil {
+		t.Fatalf("Put k2 (same color): %v", err)
+	}
+	if got := ks.indexes["by_color"].count; got != 2 {
+		t.Errorf("non-unique index count: got %d want 2", got)
+	}
+}
+
+// --- Atomic Delete: index entries cleared ------------------------
+
+// TestIndexedDeleteClearsIndexEntries verifies that Delete on an
+// indexed keyspace also deletes the row's index entries.
+func TestIndexedDeleteClearsIndexEntries(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for _, k := range []string{"a", "b"} {
+		if err := ks.Put([]byte(k), []byte{0x42, 'x'}); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	if got := ks.indexes["by_color"].count; got != 2 {
+		t.Fatalf("pre-delete count: got %d want 2", got)
+	}
+	if err := ks.Delete([]byte("a")); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got := ks.indexes["by_color"].count; got != 1 {
+		t.Errorf("post-delete count: got %d want 1", got)
+	}
+}
+
+// TestIndexedDeleteMissingReturnsErrNotFound verifies that Delete
+// on a key that doesn't exist returns ErrNotFound without
+// mutating any index (chunk-5.1 Delete-on-miss invariant + the
+// chunk-7.6 indexed-keyspace contract).
+func TestIndexedDeleteMissingReturnsErrNotFound(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Delete([]byte("missing")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("got %v want ErrNotFound", err)
+	}
+}
+
+// --- Cursor.Delete + index maintenance ---------------------------
+
+// TestIndexedCursorDeleteClearsIndexEntries verifies that
+// Cursor.Delete on an indexed keyspace deletes the row's index
+// entries too (the chunk-7.6 cursor-delete wire-in).
+func TestIndexedCursorDeleteClearsIndexEntries(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for i, k := range []string{"a", "b", "c"} {
+		if err := ks.Put([]byte(k), []byte{byte('R' + i)}); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	c := ks.Cursor()
+	if k, _ := c.First(); k == nil {
+		t.Fatalf("Cursor.First on populated keyspace returned nil")
+	}
+	if err := c.Delete(); err != nil {
+		t.Fatalf("Cursor.Delete: %v", err)
+	}
+	if got := ks.indexes["by_color"].count; got != 2 {
+		t.Errorf("post-CursorDelete count: got %d want 2", got)
+	}
+}
+
+// --- Regression: Round-1 H-1 (stale Cursor.Delete on indexed ks) -
+
+// TestIndexedCursorDeleteOnStaleCursorReturnsErrCursorStale is the
+// chunk-7.6 Round-1 H-1 regression: a stale indexed cursor must
+// return ErrCursorStale, not ErrCursorUnpositioned, matching the
+// non-indexed path and transactions.md §Cursor State Machine. The
+// indexed-path code translates Current() returning nil through
+// the inner cursor's Err() to distinguish stale from unpositioned.
+func TestIndexedCursorDeleteOnStaleCursorReturnsErrCursorStale(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("a"), []byte{0x42}); err != nil {
+		t.Fatalf("Put a: %v", err)
+	}
+	c := ks.Cursor()
+	if k, _ := c.First(); k == nil {
+		t.Fatalf("Cursor.First returned nil on populated keyspace")
+	}
+	// Sibling mutation invalidates the cursor.
+	if err := ks.Put([]byte("b"), []byte{0x43}); err != nil {
+		t.Fatalf("Put b: %v", err)
+	}
+	// Now c is stale. Delete must return ErrCursorStale, not
+	// ErrCursorUnpositioned (the Round-1 H-1 regression).
+	err = c.Delete()
+	if !errors.Is(err, ErrCursorStale) {
+		t.Errorf("stale Cursor.Delete on indexed ks: got %v want ErrCursorStale", err)
+	}
+}
+
+// --- Regression: Round-1 H-2 (atomicity snapshot/restore on failure)
+
+// TestIndexedPutPinnedStateRevertsOnCandidateCollision verifies the
+// chunk-7.6 H-2 atomicity fix: when applyIndexMaintenanceOnPut
+// fails on a candidate-set unique collision, the pinnedIndex
+// (root, count) is restored to the pre-call snapshot. Without
+// the fix, a later flushIndexRegistry would commit half-mutated
+// pinned state — but on the candidate-collision path no
+// btree.Put/Delete has yet happened, so the test verifies the
+// restore is a no-op on this specific path. The complementary
+// case (where mid-loop btree.Put fails after some prior btree.Put
+// succeeded) requires a failure injection seam not available at
+// chunk-7.6 — that fault-mode is in scope of the
+// writenewindexregistry-partial-leak deferral.
+func TestIndexedPutPinnedStateRevertsOnCandidateCollision(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Unique = true
+	// Extractor that collides for value=="bad" (candidate-set
+	// collision) but works fine for other values.
+	decl.Extract = func(_, value []byte) []IndexEntry {
+		if string(value) == "bad" {
+			return []IndexEntry{
+				{Cols: [][]byte{{0x42}}},
+				{Cols: [][]byte{{0x42}}}, // collision
+			}
+		}
+		if len(value) == 0 {
+			return nil
+		}
+		return []IndexEntry{{Cols: [][]byte{{value[0]}}}}
+	}
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	// Seed one row to set pinned.count=1.
+	if err := ks.Put([]byte("k1"), []byte{0x41}); err != nil {
+		t.Fatalf("Put k1: %v", err)
+	}
+	if got := ks.indexes["by_color"].count; got != 1 {
+		t.Fatalf("pre-collision count: got %d want 1", got)
+	}
+	prevRoot := ks.indexes["by_color"].root
+	// Trigger the candidate-set collision.
+	err = ks.Put([]byte("k2"), []byte("bad"))
+	if !errors.Is(err, ErrIndexUniqueViolation) {
+		t.Fatalf("expected ErrIndexUniqueViolation, got %v", err)
+	}
+	// H-2 fix: pinned state must equal the pre-call snapshot.
+	if got := ks.indexes["by_color"].count; got != 1 {
+		t.Errorf("post-failed-Put count: got %d want 1 — H-2 revert regression", got)
+	}
+	if got := ks.indexes["by_color"].root; got != prevRoot {
+		t.Errorf("post-failed-Put root: got %d want %d — H-2 revert regression", got, prevRoot)
+	}
+}
+
+// --- Persistence across Commit/Re-open --------------------------
+
+// TestIndexedPutCountPersistsAcrossCommit verifies that the
+// pinnedIndex.count + .root persist via the flushIndexRegistry sync
+// at Tx.Commit, and the next OpenKeyspace re-loads them.
+func TestIndexedPutCountPersistsAcrossCommit(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	{
+		db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		decl := testDecl("by_color", "color")
+		decl.Extract = firstByteExtract
+		ks, err := tx.CreateKeyspace("items", decl)
+		if err != nil {
+			t.Fatalf("CreateKeyspace: %v", err)
+		}
+		for i, k := range []string{"a", "b", "c"} {
+			if err := ks.Put([]byte(k), []byte{byte('R' + i)}); err != nil {
+				t.Fatalf("Put %q: %v", k, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		_ = db.Close()
+	}
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open #2: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin #2: %v", err)
+	}
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.OpenKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	p := ks.indexes["by_color"]
+	if p.count != 3 {
+		t.Errorf("post-reopen count: got %d want 3", p.count)
+	}
+	if p.root == 0 {
+		t.Errorf("post-reopen root: got 0 (registry sync lost?)")
+	}
+}
+
+// --- Keyspace.Index handle --------------------------------------
+
+// TestKeyspaceIndexHandleReturnsExisting verifies that
+// Keyspace.Index(name) returns a handle for a declared index.
+func TestKeyspaceIndexHandleReturnsExisting(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	st, err := idx.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Count != 0 {
+		t.Errorf("fresh index Stats.Count: got %d want 0", st.Count)
+	}
+	if err := ks.Put([]byte("k"), []byte{0x42}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	st, _ = idx.Stats()
+	if st.Count != 1 {
+		t.Errorf("post-Put Stats.Count: got %d want 1", st.Count)
+	}
+}
+
+// TestKeyspaceIndexHandleUnknownNameReturnsErrIndexNotFound
+// verifies that Index(name) for an unknown name returns
+// ErrIndexNotFound naming the missing index.
+func TestKeyspaceIndexHandleUnknownNameReturnsErrIndexNotFound(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	ks, err := tx.CreateKeyspace("items")
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	_, err = ks.Index("nonexistent")
+	if !errors.Is(err, ErrIndexNotFound) {
+		t.Errorf("got %v want ErrIndexNotFound", err)
+	}
+}

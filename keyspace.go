@@ -638,16 +638,46 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	if value == nil {
 		value = []byte{}
 	}
+	// Indexed-keyspace path (chunk 7.6): read the old value (if
+	// any), apply per-index maintenance BEFORE the row write so a
+	// unique-probe failure aborts cleanly without partial state.
+	var oldValue []byte
 	existed := false
 	if ks.desc.Root != 0 {
-		exists, err := btree.Has(ks.tx.pgr, cfg, ks.desc.Root, key)
-		if err != nil {
-			return mapBtreeErr(err)
+		if len(ks.indexes) > 0 {
+			v, found, err := btree.Get(ks.tx.pgr, cfg, ks.desc.Root, key)
+			if err != nil {
+				return mapBtreeErr(err)
+			}
+			existed = found
+			if found {
+				// Copy out of the (potentially mmap-borrowed) value
+				// slice so the extractor's view stays valid across
+				// subsequent btree mutations.
+				oldValue = make([]byte, len(v))
+				copy(oldValue, v)
+			}
+		} else {
+			exists, err := btree.Has(ks.tx.pgr, cfg, ks.desc.Root, key)
+			if err != nil {
+				return mapBtreeErr(err)
+			}
+			existed = exists
 		}
-		existed = exists
+	}
+	// Snapshot pinned state per chunk-7.6 H-2 fix: applyIndexMaintenance
+	// restores on its own internal failure, but a subsequent row
+	// btree.Put failure must also revert the (now-mutated) pinned
+	// state so flushIndexRegistry at Commit-after-error doesn't
+	// commit a partial-state index that points at a row that was
+	// never written.
+	rowSnap := snapshotIndexes(ks.indexes)
+	if err := ks.applyIndexMaintenanceOnPut(key, oldValue, value, existed); err != nil {
+		return err
 	}
 	newRoot, err := btree.Put(ks.tx.pgr, cfg, ks.desc.Root, key, value)
 	if err != nil {
+		restoreIndexes(ks.indexes, rowSnap)
 		return mapBtreeErr(err)
 	}
 	ks.desc.Root = newRoot
@@ -689,8 +719,31 @@ func (ks *Keyspace) Delete(key []byte) error {
 	}
 	cfg := ks.builderCfg()
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
+	// Indexed-keyspace path (chunk 7.6): fetch the old value first
+	// so the extractor can compute the index entries to delete;
+	// then apply index maintenance; then delete the row. Snapshot
+	// pinned state for the row-write-failure revert (H-2 atomicity
+	// fix); applyIndexMaintenanceOnDelete itself reverts on its
+	// internal failure.
+	var rowSnap indexSnapshot
+	if len(ks.indexes) > 0 {
+		v, found, err := btree.Get(ks.tx.pgr, cfg, ks.desc.Root, key)
+		if err != nil {
+			return mapBtreeErr(err)
+		}
+		if !found {
+			return ErrNotFound
+		}
+		oldValue := make([]byte, len(v))
+		copy(oldValue, v)
+		rowSnap = snapshotIndexes(ks.indexes)
+		if err := ks.applyIndexMaintenanceOnDelete(key, oldValue); err != nil {
+			return err
+		}
+	}
 	newRoot, err := btree.Delete(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, key)
 	if err != nil {
+		restoreIndexes(ks.indexes, rowSnap)
 		if errors.Is(err, btree.ErrNotFound) {
 			return ErrNotFound
 		}
@@ -1073,7 +1126,43 @@ func (c *Cursor) Delete() error {
 	if !c.requireOpen(true) {
 		return c.closeErr
 	}
+	// Indexed-keyspace path (chunk 7.6): apply per-index
+	// maintenance BEFORE the row delete, using the cursor's
+	// current (key, value). Copy out because c.inner.Delete may
+	// CoW or free the underlying mmap-borrowed slices.
+	var rowSnap indexSnapshot
+	if len(c.ks.indexes) > 0 {
+		curKey, curValue := c.inner.Current()
+		if curKey == nil {
+			// Distinguish stale-cursor from unpositioned per
+			// transactions.md §Cursor State Machine — the inner
+			// cursor's Err() reports ErrCursorStale when a sibling
+			// mutation invalidated state; nil-from-Current with
+			// no inner error is the Unpositioned state. Without
+			// this branch, chunk-7.6 would translate stale to
+			// ErrCursorUnpositioned, regressing the chunk-5/6
+			// state machine contract that the non-indexed path
+			// preserves via btree.ErrCursorStale at the
+			// inner.Delete error path below.
+			if errors.Is(c.inner.Err(), btree.ErrCursorStale) {
+				return ErrCursorStale
+			}
+			return ErrCursorUnpositioned
+		}
+		keyCopy := make([]byte, len(curKey))
+		copy(keyCopy, curKey)
+		valueCopy := make([]byte, len(curValue))
+		copy(valueCopy, curValue)
+		rowSnap = snapshotIndexes(c.ks.indexes)
+		if err := c.ks.applyIndexMaintenanceOnDelete(keyCopy, valueCopy); err != nil {
+			return err
+		}
+	}
 	if err := c.inner.Delete(); err != nil {
+		// chunk-7.6 H-2 atomicity: revert pinned state on row-write
+		// failure so flushIndexRegistry doesn't commit partial-
+		// state indexes pointing at a still-existing row.
+		restoreIndexes(c.ks.indexes, rowSnap)
 		if errors.Is(err, btree.ErrCursorUnpositioned) {
 			return ErrCursorUnpositioned
 		}

@@ -91,3 +91,25 @@ Adjacent: any future write helper that loops over multiple
 btree.Put calls inside one Tx will have the same shape (chunk-7.8
 RebuildIndex's cursor-walk-then-write loop is the natural next
 case).
+
+## Chunk-7.6 extension: per-row index maintenance
+
+Chunk-7.6's `applyIndexMaintenanceOnPut` /
+`applyIndexMaintenanceOnDelete` are per-row analogues. Each loops
+over declared indexes calling `btree.Put` / `btree.Delete` on the
+index data trees. The chunk-7.6 H-2 fix snapshots `pinnedIndex`
+(root, count) at the start and reverts on any failure — so the
+in-memory pinned state at flushIndexRegistry time always reflects
+either pre-call or post-success state, never partial. This keeps
+the registry consistent.
+
+The on-disk **pages** allocated by the partially-successful loop
+iterations are still loose under the same rest-of-tx-continues
+contract this issue tracks: on `Tx.Rollback` the pager's AbortTx
+reclaims; on `Tx.Commit` they orphan. Chunk-7.6 inherits the leak
+shape but does NOT add a new drift mode (the H-2 revert closes the
+shape-2 silent-drift path the chunk-7.6 Round-1 reviewer surfaced).
+
+When this issue resolves with the atomic variant, the chunk-7.6
+helpers benefit identically — the snapshot/revert layer can drop
+once the underlying contract guarantees all-or-nothing.
