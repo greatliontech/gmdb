@@ -68,6 +68,16 @@ type SetKeyspace struct {
 	// same name does NOT reactivate. Per api-surface.md §Keyspace
 	// API DeleteKeyspace.
 	dead bool
+
+	// openSetCursors tracks every *SetCursor returned by
+	// SetKeyspace.Cursor() in this tx so Put / Delete / DeleteValue
+	// can MarkStale them. Sibling mutations to the keyspace's
+	// B+tree (parent OR a cell's nested tree) invalidate cursor
+	// state because the cursor's outer btree.Cursor and inner
+	// materialized values may both be stale post-mutation. Same
+	// pattern as Keyspace.openCursors (chunk-5 markCursorsStale
+	// + SetRootID).
+	openSetCursors []*SetCursor
 }
 
 // Name returns the keyspace's name.
@@ -99,6 +109,24 @@ func (ks *SetKeyspace) markDirty() {
 	}
 	ks.state = keyspaceStateDirty
 }
+
+// markSetCursorsStale invokes MarkStale on every SetCursor
+// registered on this keyspace AND refreshes their outer-cursor's
+// tracked rootID to the keyspace's current desc.Root. Also sets
+// each SetCursor's own `stale` flag so the value-bounded ops
+// (NextValue / PrevValue / Current) surface stale even though
+// they short-circuit on the materialized values slice. Called by
+// Put / Delete / DeleteValue after a successful mutation. Stale
+// cursors are not unregistered — the caller may re-position via
+// First/Last/Seek/SeekGE (which clears the stale flag).
+func (ks *SetKeyspace) markSetCursorsStale() {
+	for _, c := range ks.openSetCursors {
+		c.outerCursor.MarkStale()
+		c.outerCursor.SetRootID(ks.desc.Root)
+		c.stale = true
+	}
+}
+
 
 // OpenSetKeyspace opens an existing Kind=1 keyspace (SetKeyspace) for
 // read+write. Returns ErrNotFound if the named keyspace does not
@@ -520,6 +548,7 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 		ks.desc.Root = newRoot
 		ks.desc.Count++
 		ks.markDirty()
+		ks.markSetCursorsStale()
 		return true, nil
 	}
 
@@ -544,6 +573,7 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 		ks.desc.Root = newRoot
 		ks.desc.Count++
 		ks.markDirty()
+		ks.markSetCursorsStale()
 		return true, nil
 	}
 
@@ -589,6 +619,7 @@ func (ks *SetKeyspace) putIntoSubpage(cfg page.Config, key, value []byte, e page
 		ks.desc.Root = newRoot
 		ks.desc.Count++
 		ks.markDirty()
+		ks.markSetCursorsStale()
 		return true, nil
 	}
 	// Promote: build the nested tree from the EXISTING subpage +
@@ -610,6 +641,7 @@ func (ks *SetKeyspace) putIntoSubpage(cfg page.Config, key, value []byte, e page
 	ks.desc.Root = newRoot
 	ks.desc.Count++
 	ks.markDirty()
+	ks.markSetCursorsStale()
 	return true, nil
 }
 
@@ -643,6 +675,7 @@ func (ks *SetKeyspace) putIntoNestedTree(cfg page.Config, key, value []byte, e p
 	ks.desc.Root = newRoot
 	ks.desc.Count++
 	ks.markDirty()
+	ks.markSetCursorsStale()
 	return true, nil
 }
 
@@ -720,6 +753,7 @@ func (ks *SetKeyspace) Delete(key []byte) error {
 	ks.desc.Root = newRoot
 	ks.desc.Count -= valuesFreed
 	ks.markDirty()
+	ks.markSetCursorsStale()
 	return nil
 }
 
@@ -801,6 +835,7 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 		ks.desc.Root = newRoot
 		ks.desc.Count--
 		ks.markDirty()
+		ks.markSetCursorsStale()
 		return nil
 	}
 	// Replace cell with shrunk subpage.
@@ -815,6 +850,7 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 	ks.desc.Root = newRoot
 	ks.desc.Count--
 	ks.markDirty()
+	ks.markSetCursorsStale()
 	return nil
 }
 
@@ -845,6 +881,7 @@ func (ks *SetKeyspace) deleteValueFromNestedTree(cfg page.Config, key, value []b
 		ks.desc.Root = newRoot
 		ks.desc.Count--
 		ks.markDirty()
+		ks.markSetCursorsStale()
 		return nil
 	}
 	// Try to demote.
@@ -874,5 +911,6 @@ func (ks *SetKeyspace) deleteValueFromNestedTree(cfg page.Config, key, value []b
 	ks.desc.Root = newRoot
 	ks.desc.Count--
 	ks.markDirty()
+	ks.markSetCursorsStale()
 	return nil
 }

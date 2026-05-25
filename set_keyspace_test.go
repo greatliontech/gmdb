@@ -1,9 +1,9 @@
 package gmdb
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"testing"
 
@@ -194,21 +194,9 @@ func TestListKeyspacesIncludesSetKeyspace(t *testing.T) {
 	got := append([]string(nil), names...)
 	sort.Strings(got)
 	want := []string{"kind0", "kind1"}
-	if !reflectEqualStrings(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("ListKeyspaces=%v, want %v", got, want)
 	}
-}
-
-func reflectEqualStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // --- Has / HasValue / CountValues (read-only) ---
@@ -902,7 +890,3 @@ func mustErr[T any](_ T, err error) error { return err }
 
 func mustErrPut(_ bool, err error) error { return err }
 
-// (`bytes` is used by mustErr/mustErrPut callers indirectly via
-// HasValue/Has bool returns; explicit use in `bytes.Equal` would
-// silence the unused-import warning if a future refactor drops it.)
-var _ = bytes.Equal
