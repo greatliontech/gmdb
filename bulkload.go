@@ -51,12 +51,11 @@ type bulkBuilder struct {
 	emptyBranchSize int // BranchEncodedSize of a cell-less branch page
 
 	// Leaf level (level 0).
-	leaf        *page.LeafBuilder
-	leafBuf     []byte
-	leafHave    bool   // an in-progress leaf page holds ≥1 entry
-	leafSep     []byte // separator routing to the in-progress leaf in level 0 (nil = first leaf)
-	leafLast    []byte // last key added overall, aliasing leafLastBuf
-	leafLastBuf []byte // reusable backing array for leafLast
+	leaf     *page.LeafBuilder
+	leafBuf  []byte
+	leafHave bool   // an in-progress leaf page holds ≥1 entry
+	leafSep  []byte // separator routing to the in-progress leaf in level 0 (nil = first leaf)
+	leafLast []byte // last key added overall; an owned clone (see add), valid until the next add
 
 	// Branch levels. levels[0] is the first branch level above the
 	// leaves; levels[i] feeds levels[i+1]. The deepest non-empty level
@@ -97,26 +96,38 @@ func (b *bulkBuilder) add(e page.LeafEntry) error {
 	if b.leafLast != nil && bytes.Compare(b.leafLast, e.Key) >= 0 {
 		return ErrBulkLoadOutOfOrder
 	}
+	// Clone the key once and use the clone everywhere. page.LeafBuilder
+	// retains the key by reference for its ascending-order assertion
+	// (lastAddedKey borrows the caller's slice, not the on-page copy —
+	// compressed leaves store only the unshared suffix, so the full key
+	// cannot be recovered from the page), and we retain it as leafLast
+	// for separator computation. The iter.Seq2 input contract lets the
+	// caller reuse the key buffer after yield returns, so borrowing e.Key
+	// would be a use-after-free. The clone is owned by the builder and
+	// released when the next add overwrites leafLast / the leaf's
+	// lastAddedKey.
+	k := bytes.Clone(e.Key)
+	e.Key = k
 	if !b.leafHave {
 		b.startLeaf()
 		b.leafSep = nil // first leaf is the leftmost child of level 0
 	}
 	if b.leaf.AddEntry(e) {
-		b.recordLeafKey(e.Key)
+		b.recordLeafKey(k)
 		return nil
 	}
 	// e did not fit the current leaf. The leaf must be non-empty —
 	// otherwise e is too large for any leaf.
 	if b.leaf.Count() == 0 {
-		return fmt.Errorf("%w (key %d bytes)", errBulkEntryTooLarge, len(e.Key))
+		return fmt.Errorf("%w (key %d bytes)", errBulkEntryTooLarge, len(k))
 	}
-	if err := b.closeLeaf(e.Key); err != nil {
+	if err := b.closeLeaf(k); err != nil {
 		return err
 	}
 	if !b.leaf.AddEntry(e) {
-		return fmt.Errorf("%w (key %d bytes)", errBulkEntryTooLarge, len(e.Key))
+		return fmt.Errorf("%w (key %d bytes)", errBulkEntryTooLarge, len(k))
 	}
-	b.recordLeafKey(e.Key)
+	b.recordLeafKey(k)
 	return nil
 }
 
@@ -168,11 +179,12 @@ func (b *bulkBuilder) startLeaf() {
 	b.leafHave = true
 }
 
-// recordLeafKey stashes key as the running last-key (cloned, since the
-// caller may reuse the slice) and bumps the entry count.
+// recordLeafKey stashes the owned key clone (from add) as the running
+// last-key and bumps the entry count. The clone survives until the next
+// add reassigns leafLast, covering both the separator computation and the
+// LeafBuilder's borrowed lastAddedKey assertion on the following add.
 func (b *bulkBuilder) recordLeafKey(key []byte) {
-	b.leafLastBuf = append(b.leafLastBuf[:0], key...)
-	b.leafLast = b.leafLastBuf
+	b.leafLast = key
 	b.count++
 }
 
@@ -435,6 +447,254 @@ func (ks *Keyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
 func (ks *Keyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
 	_ = rows
 	return 0, fmt.Errorf("gmdb: BulkLoad on an indexed keyspace requires the indexed bulk-load path (not yet wired)")
+}
+
+// BulkLoad replaces the contents of an empty SetKeyspace with the sorted
+// stream produced by rows. Input MUST be in strictly-ascending (key, value)
+// lex order — keys strictly ascending across groups, values strictly
+// ascending within a key's group; a non-ascending key OR value returns
+// ErrBulkLoadOutOfOrder. Duplicate (key, value) pairs are silently
+// deduplicated. The keyspace must be empty (Count == 0), else
+// ErrBulkLoadNonEmpty. Returns the number of distinct (key, value) members
+// written. Per bulkload.md §API.
+//
+// Each key's value set is stored exactly as the per-Put path would: a
+// subpage until adding a further value would push it past the 50%-of-leaf
+// promotion threshold (the first value always stays a subpage, matching
+// Put's genesis path), otherwise a nested B+tree (values as keys with
+// empty values). Both the
+// top-level tree and any nested value-trees are built bottom-up and
+// pwritten directly (slab bypass). Memory is O(depth × pageSize): a key's
+// values are buffered only up to the subpage threshold (≈ ½ page); a set
+// that exceeds it is streamed into a nested builder, never fully
+// materialised. Published only at Tx.Commit; a crash or rollback leaves
+// the keyspace at its pre-BulkLoad state (bulkload.md §Atomicity).
+//
+// Errors: ErrReadOnly, ErrKeyspaceClosed, ErrBulkLoadNonEmpty,
+// ErrBulkLoadOutOfOrder, ErrKeyEmpty, ErrValueSizeMismatch (a value whose
+// length differs from a non-zero FixedValueSize), and btree/I-O errors.
+func (ks *SetKeyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
+	if err := ks.tx.requireOpen(true); err != nil {
+		return 0, err
+	}
+	if ks.dead {
+		return 0, ErrKeyspaceClosed
+	}
+	if ks.readOnly {
+		return 0, ErrReadOnly
+	}
+	if ks.desc.Count != 0 {
+		return 0, ErrBulkLoadNonEmpty
+	}
+	if len(ks.indexes) > 0 {
+		return ks.bulkLoadIndexed(rows)
+	}
+
+	cfg := ks.builderCfg()
+	fvs := ks.desc.FixedValueSize
+	sb := &setBulk{
+		top:       newBulkBuilder(ks.tx.pgr, cfg),
+		pw:        ks.tx.pgr,
+		cfg:       cfg,
+		fvs:       fvs,
+		threshold: page.SubpagePromotionThreshold(cfg),
+	}
+
+	var loopErr error
+	rows(func(key, value []byte) bool {
+		if len(key) == 0 {
+			loopErr = ErrKeyEmpty
+			return false
+		}
+		if fvs != 0 && len(value) != int(fvs) {
+			loopErr = fmt.Errorf("%w: value len %d, keyspace FixedValueSize %d", ErrValueSizeMismatch, len(value), fvs)
+			return false
+		}
+		if value == nil {
+			value = []byte{}
+		}
+		// Key transition: flush the previous key's value set.
+		if !sb.haveKey || !bytes.Equal(key, sb.curKey) {
+			if sb.haveKey {
+				if bytes.Compare(key, sb.curKey) <= 0 {
+					loopErr = ErrBulkLoadOutOfOrder
+					return false
+				}
+				if err := sb.flush(); err != nil {
+					loopErr = err
+					return false
+				}
+			}
+			sb.startKey(key)
+		}
+		// Within the current key: dedup adjacent duplicates, enforce
+		// strictly-ascending values.
+		if sb.haveValue {
+			switch bytes.Compare(value, sb.lastValue) {
+			case 0:
+				return true // duplicate (key, value): silently deduped
+			case -1:
+				loopErr = ErrBulkLoadOutOfOrder
+				return false
+			}
+		}
+		if err := sb.addValue(value); err != nil {
+			loopErr = err
+			return false
+		}
+		sb.setLastValue(value)
+		return true
+	})
+	if loopErr != nil {
+		return 0, loopErr
+	}
+	if err := sb.flush(); err != nil {
+		return 0, err
+	}
+	root, _, err := sb.top.finish()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := btree.FreeSubtree(ks.tx.pgr, cfg, ks.desc.Root); err != nil {
+		return 0, mapBtreeErr(err)
+	}
+	ks.desc.Root = root
+	ks.desc.Count = sb.total
+	ks.markDirty()
+	ks.markSetCursorsStale()
+	return sb.total, nil
+}
+
+// bulkLoadIndexed is the SetKeyspace mirror of the Keyspace indexed-BulkLoad
+// gate: it must extract per (key, value) member and build the index data
+// trees alongside the row tree. Implemented in a later sub-chunk; until then
+// it errors rather than silently building members without index entries.
+func (ks *SetKeyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
+	_ = rows
+	return 0, fmt.Errorf("gmdb: BulkLoad on an indexed SetKeyspace requires the indexed bulk-load path (not yet wired)")
+}
+
+// setBulk accumulates one SetKeyspace key's value set during BulkLoad and
+// emits the per-key storage (subpage or nested B+tree) into the top-level
+// builder. Memory stays O(depth × pageSize): values are buffered only while
+// the set fits the subpage threshold; once exceeded, the buffer is drained
+// into a nested bulkBuilder and subsequent values stream straight through.
+type setBulk struct {
+	top       *bulkBuilder
+	pw        bulkPageWriter
+	cfg       page.Config
+	fvs       uint16
+	threshold int
+
+	haveKey   bool
+	curKey    []byte
+	curKeyBuf []byte
+
+	// Subpage-candidate buffer (used only until promotion).
+	buffered     [][]byte
+	bufferedSize int // SubpageHeaderSize + Σ entrySize
+
+	haveValue    bool
+	lastValue    []byte
+	lastValueBuf []byte
+
+	nested *bulkBuilder // non-nil once the set is promoted to a nested tree
+	total  uint64       // total members across all keys
+}
+
+// startKey begins accumulating a fresh key's value set.
+func (sb *setBulk) startKey(key []byte) {
+	sb.curKeyBuf = append(sb.curKeyBuf[:0], key...)
+	sb.curKey = sb.curKeyBuf
+	sb.haveKey = true
+	sb.buffered = sb.buffered[:0]
+	sb.bufferedSize = page.SubpageHeaderSize
+	sb.haveValue = false
+	sb.nested = nil
+}
+
+// setLastValue records the most recent value for dedup / order checks.
+func (sb *setBulk) setLastValue(v []byte) {
+	sb.lastValueBuf = append(sb.lastValueBuf[:0], v...)
+	sb.lastValue = sb.lastValueBuf
+	sb.haveValue = true
+}
+
+// entrySize is one value's contribution to the subpage's DataSize.
+func (sb *setBulk) entrySize(v []byte) int {
+	if sb.fvs != 0 {
+		return int(sb.fvs)
+	}
+	return 2 + len(v) // ValueLen uint16 + bytes
+}
+
+// addValue adds v to the current set (caller has validated size, dedup, and
+// order). Buffers it as a subpage entry, or — once the subpage would exceed
+// the promotion threshold — streams it into the nested builder.
+func (sb *setBulk) addValue(v []byte) error {
+	sb.total++
+	if sb.nested != nil {
+		return sb.nested.add(page.LeafEntry{Key: v})
+	}
+	newSize := sb.bufferedSize + sb.entrySize(v)
+	// Promote only when a SECOND-or-later value would push the subpage past
+	// the threshold. The first value of a key always stays a subpage —
+	// exactly as SetKeyspace.Put's genesis path, which never threshold-
+	// checks the first value (set_keyspace.go Put: a new key's single value
+	// is stored as a subpage regardless of size). This keeps the
+	// bulk-built storage shape identical to the per-Put shape.
+	if len(sb.buffered) > 0 && newSize > sb.threshold {
+		if err := sb.promote(); err != nil {
+			return err
+		}
+		return sb.nested.add(page.LeafEntry{Key: v})
+	}
+	sb.buffered = append(sb.buffered, bytes.Clone(v))
+	sb.bufferedSize = newSize
+	return nil
+}
+
+// promote switches the current key from subpage buffering to a nested
+// bulkBuilder, draining the already-buffered values into it.
+func (sb *setBulk) promote() error {
+	sb.nested = newBulkBuilder(sb.pw, sb.cfg)
+	for _, v := range sb.buffered {
+		if err := sb.nested.add(page.LeafEntry{Key: v}); err != nil {
+			return err
+		}
+	}
+	sb.buffered = sb.buffered[:0]
+	sb.bufferedSize = page.SubpageHeaderSize
+	return nil
+}
+
+// flush emits the current key's storage to the top-level builder: an
+// AddNestedTreeRef cell if promoted, else an AddSubpage cell.
+func (sb *setBulk) flush() error {
+	if !sb.haveKey {
+		return nil
+	}
+	if sb.nested != nil {
+		root, cnt, err := sb.nested.finish()
+		if err != nil {
+			return err
+		}
+		return sb.top.add(page.LeafEntry{
+			Flags:       page.CellFlagMultiValue | page.CellFlagNestedTree,
+			Key:         sb.curKey,
+			NestedRoot:  root,
+			NestedCount: cnt,
+		})
+	}
+	sub, err := page.EncodeSubpage(sb.buffered, sb.fvs)
+	if err != nil {
+		return fmt.Errorf("gmdb: bulkload encode subpage: %w", err)
+	}
+	return sb.top.add(page.LeafEntry{
+		Flags: page.CellFlagMultiValue,
+		Key:   sb.curKey,
+		Value: sub,
+	})
 }
 
 // bulkLeafEntry builds the leaf entry for one (key, value): an inline entry

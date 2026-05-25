@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"iter"
 	"testing"
 
@@ -372,6 +373,68 @@ func TestKeyspaceBulkLoadIndexedReturnsError(t *testing.T) {
 	// The keyspace must remain empty (nothing partially written/published).
 	if ks.desc.Count != 0 {
 		t.Errorf("indexed BulkLoad left Count=%d, want 0", ks.desc.Count)
+	}
+}
+
+// TestKeyspaceBulkLoadReusedKeyBuffer verifies the iter.Seq2 contract: a
+// yield that reuses a single key (and value) buffer across iterations must
+// still produce a correct tree (the builder clones what it retains).
+func TestKeyspaceBulkLoadReusedKeyBuffer(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	opts := Options{PageSize: 4096, MinSize: 16, MaxSize: 16384}
+
+	const n = 2000
+	db := openWith(t, ctx, path, opts)
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	ks, err := tx.CreateKeyspace("reuse")
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	// A single reused backing buffer for both key and value.
+	keyBuf := make([]byte, 0, 16)
+	valBuf := make([]byte, 0, 16)
+	reuse := func(yield func(k, v []byte) bool) {
+		for i := range n {
+			keyBuf = append(keyBuf[:0], fmt.Sprintf("rk%08d", i)...)
+			valBuf = append(valBuf[:0], fmt.Sprintf("v%d", i)...)
+			if !yield(keyBuf, valBuf) {
+				return
+			}
+		}
+	}
+	if _, err := ks.BulkLoad(reuse); err != nil {
+		t.Fatalf("BulkLoad: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	db.Close()
+
+	db2 := openWith(t, ctx, path, opts)
+	defer db2.Close()
+	tx2, err := db2.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("re-Begin: %v", err)
+	}
+	defer tx2.Rollback()
+	ks2, err := tx2.OpenKeyspace("reuse")
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	for i := range n {
+		k := fmt.Appendf(nil, "rk%08d", i)
+		want := fmt.Appendf(nil, "v%d", i)
+		got, err := ks2.Get(k)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", k, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("Get(%q) = %q, want %q", k, got, want)
+		}
 	}
 }
 
