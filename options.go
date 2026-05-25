@@ -11,6 +11,7 @@ import (
 	"cmp"
 	"crypto/rand"
 	"log/slog"
+	"os"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -171,6 +172,14 @@ type Options struct {
 	// slog.Default() to route to the process-wide handler, or to a
 	// custom *slog.Logger for structured per-DB logging.
 	Logger *slog.Logger
+
+	// ScratchDir is the directory used for BulkLoad sort spill on
+	// indexed keyspaces — the external merge-sort writes spill chunks
+	// here when the per-index entry set exceeds MaxTxBufferBytes. Must
+	// be on the same filesystem as the database file when Compact() is
+	// used (atomic rename requirement). Default: os.TempDir(). Per
+	// api-surface.md §Options + bulkload.md §Interaction with Indexes.
+	ScratchDir string
 }
 
 func (o Options) applyDefaults() Options {
@@ -182,6 +191,7 @@ func (o Options) applyDefaults() Options {
 	o.MaxTxBufferBytes = cmp.Or(o.MaxTxBufferBytes, 256<<20)
 	o.MaxReaders = cmp.Or(o.MaxReaders, lock.DefaultMaxReaders)
 	o.MergeThreshold = cmp.Or(o.MergeThreshold, defaultMergeThreshold)
+	o.ScratchDir = cmp.Or(o.ScratchDir, os.TempDir())
 	// RestartGroupTarget defaults to 0 (engine default at the leaf
 	// codec layer — currently 16 per page-formats.md §Compressed
 	// Leaf). 0 is the canonical "use engine default" sentinel.

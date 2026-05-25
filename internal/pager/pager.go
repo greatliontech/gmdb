@@ -538,6 +538,82 @@ func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
 	return out, nil
 }
 
+// WriteDirect pwrites a fully-formed page buffer to disk at id's file
+// offset, bypassing the slab entirely. It is the bulk-load escape hatch
+// from pager-slab.md §Slab Budget / bulkload.md §Slab Bypass: pages
+// constructed bottom-up are pwritten as they are completed so memory
+// stays O(depth × pageSize) regardless of input size, never charging the
+// MaxTxBufferBytes budget.
+//
+// Contract (the WriteDirect invariant, bulkload.md Inv-WD):
+//   - id MUST have been allocated in this transaction (present in
+//     pendingAllocs). This reserves id's bitmap bit (cleared = in-use)
+//     so no other allocation in the tx reuses it, and guarantees the
+//     file already covers id (AllocPage's file-extension path ftruncated
+//     up). Writing to a page not reserved by this tx could clobber a
+//     page reachable from the active meta — corruption.
+//   - id MUST NOT be in the slab (p.dirty). A slab buffer at the same id
+//     would be re-pwritten by commitStep1 over this direct content (map
+//     iteration order is undefined), so the committed tree could
+//     reference a page with the wrong bytes. The two write paths are
+//     mutually exclusive per page.
+//
+// On PageChecksum, WriteDirect writes the xxhash64 footer into the last
+// FooterSize bytes of buf in place — identical to commitStep1 — before
+// the pwrite, so a subsequent checksum-verified read of id succeeds.
+// The caller may reuse buf after WriteDirect returns.
+//
+// Durability: the direct pwrite lands in the OS page cache immediately.
+// It is made durable by the same step-2 fdatasync(fd) that the commit
+// protocol issues over the whole file before the meta swap — the direct
+// pages are flushed alongside the slab pages. Until the meta swap
+// publishes the new keyspace root, the direct pages are at fresh IDs
+// unreferenced by any recoverable meta (bulkload.md §Atomicity). On
+// abort, AbortTx restores the bitmap/HWM snapshot, so id reverts to free
+// on the in-memory bitmap and the on-disk bitmap (never pwritten
+// pre-commit) still marks it free — the direct content is harmless stale
+// bytes in a free page.
+//
+// Errors: ErrReadOnly on a read-only pager; ErrFreespaceUnconfigured if
+// the bitmap is unattached; a wrapped sentinel-free error for a buf whose
+// length is not exactly PageSize, an id not in pendingAllocs, or an id
+// already in the slab.
+func (p *Pager) WriteDirect(id uint64, buf []byte) error {
+	if p.readOnly {
+		return ErrReadOnly
+	}
+	if p.bitmap == nil {
+		return ErrFreespaceUnconfigured
+	}
+	if len(buf) != int(p.cfg.PageSize) {
+		return fmt.Errorf("pager: WriteDirect buf len %d != PageSize %d", len(buf), p.cfg.PageSize)
+	}
+	if _, ok := p.pendingAllocs[id]; !ok {
+		return fmt.Errorf("pager: WriteDirect page %d not allocated in this transaction", id)
+	}
+	if _, ok := p.dirty[id]; ok {
+		return fmt.Errorf("pager: WriteDirect page %d also in slab (dirty) — paths are mutually exclusive: %w", id, ErrCorrupted)
+	}
+	// Redundant safety assertion at the persistence boundary: the
+	// pendingAllocs guard above already guarantees the file covers id
+	// (every allocation path ftruncates up before returning the id, and
+	// HWM only advances through ensureFileCovers). ensureFileCovers
+	// short-circuits to a no-op when fileSize already covers id+1; it is
+	// kept so a future allocation path that forgets to extend cannot
+	// turn into a silent sparse-hole pwrite past EOF.
+	if err := p.ensureFileCovers(id + 1); err != nil {
+		return fmt.Errorf("pager: WriteDirect ensure file covers page %d: %w", id, err)
+	}
+	if p.cfg.PageChecksum {
+		page.WritePageFooter(buf, p.cfg.PageSize)
+	}
+	off := int64(id) * int64(p.cfg.PageSize)
+	if _, err := p.file.WriteAt(buf, off); err != nil {
+		return fmt.Errorf("pager: WriteDirect pwrite page %d: %w", id, err)
+	}
+	return nil
+}
+
 // Mutate returns the writable slab buffer at id. Returns ErrPageNotDirty
 // if id has not been CoW'd or AllocSlab'd in this transaction (the
 // caller must CoW first); ErrReadOnly on a read-only pager. The returned

@@ -205,6 +205,24 @@ var (
 	// determinism. Per typed-keyspaces.md (lands at chunk 9).
 	ErrIndexEncoderIDEmpty = errors.New("gmdb: typed index encoder returned empty ID() — encoder IDs must be unique non-empty strings")
 
+	// ErrBulkLoadOutOfOrder is returned by Keyspace.BulkLoad /
+	// SetKeyspace.BulkLoad when the input stream yields a key (or, for
+	// a SetKeyspace, a (key, value) pair) that is not strictly greater
+	// than its predecessor. BulkLoad's bottom-up construction relies on
+	// strictly-ascending input; a violation aborts the load before any
+	// page becomes reachable from a recoverable meta. Per bulkload.md
+	// §Invariants.
+	ErrBulkLoadOutOfOrder = errors.New("gmdb: BulkLoad input not in ascending key order")
+
+	// ErrBulkLoadNonEmpty is returned by Keyspace.BulkLoad /
+	// SetKeyspace.BulkLoad when the target keyspace is not empty
+	// (Count != 0). Bulk-loading into a non-empty keyspace would mix
+	// bottom-up-constructed leaves with pre-existing top-down ones;
+	// the load returns this sentinel without writing anything. Clear
+	// first with ks.DeleteRange(nil, nil) if necessary. Per
+	// bulkload.md §Invariants.
+	ErrBulkLoadNonEmpty = errors.New("gmdb: BulkLoad requires an empty keyspace")
+
 	// ErrKeyspaceAlreadyOpen is returned by Tx.OpenKeyspace /
 	// Tx.OpenSetKeyspace when a second open call for the same name
 	// within one transaction supplies an IndexDecl set that differs
