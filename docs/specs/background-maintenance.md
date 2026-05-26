@@ -163,8 +163,19 @@ stale-reader scan (see `cross-process.md §Reader Table`):
 same-namespace uses PID + StartTime, cross-namespace uses
 heartbeat timeout.
 
-No transaction needed — slot cleanup is an atomic store
-(`TxnID = 0`) on the shared mmap.
+No write *transaction* is needed — clearing a slot is a single
+atomic store (`TxnID = 0`) on the shared mmap, independent of the
+data file. But the scan still **acquires the write lock
+(`flock(LOCK_EX)`)** for its duration, the same exclusivity the
+writer's RPL-reclamation scan relies on. This is not an
+optimisation that can be dropped: the *decision* to clear must be
+serialised against every other clearer (a peer process's
+RPL-reclamation scan, stale-writer recovery). Two unsynchronised
+clearers could race the orphan-anchor CAS / clear stores and evict
+a slot a live reader just acquired (mid-publish, before its `PID`
+store), after which the writer's RPL reclamation advances its bound
+past that reader's snapshot and frees pages it is still reading. A
+lock-free scan is therefore unsafe by construction.
 
 **Why this matters.** The writer already clears stale slots
 during RPL reclamation, but only when it needs free pages.

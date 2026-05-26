@@ -126,3 +126,41 @@ func (c *Coord) OldestReaderTxnID() uint64 {
 	return c.f.OldestReaderTxnID(c.pidNS, c.clock(), staleTimeoutNanos())
 }
 
+// ReapStaleReaderSlots acquires the write lock and scans the reader
+// table, clearing slots owned by dead processes
+// (background-maintenance.md §Stale Reader Slot Cleanup). The
+// background-maintenance goroutine calls it every pass: a writer
+// already clears stale slots during RPL reclamation, but only when it
+// needs free pages, so a database with no active writer would let
+// stale slots from crashed peers pin RPL reclamation indefinitely.
+//
+// It performs the SAME namespace-aware classification + clear as
+// OldestReaderTxnID's documented side effect (the oldest-TxnID return
+// is irrelevant to cleanup and is discarded), but acquires LOCK_EX
+// *itself* via AcquireWriter rather than relying on a caller-held grant
+// — the maintenance goroutine runs it with no transaction in flight.
+//
+// Holding LOCK_EX is mandatory and is the entire reason this routes
+// through AcquireWriter: the clear stores and the HintEpoch
+// first-observer CAS race any other clearer (a peer process's
+// RPL-reclamation scan, or RecoverStaleWriter) without it. A phantom
+// eviction of a freshly-acquired slot would orphan a live reader's
+// snapshot and let RPL reclamation free pages it is still reading. A
+// lock-free scan is therefore unsafe by construction — see
+// OldestReaderTxnID's precondition.
+//
+// No write transaction is taken: clearing a slot is a single atomic
+// store on the lock-file mmap, independent of the data file. Returns
+// the AcquireWriter error (ctx cancellation / ErrClosed) unchanged so
+// the maintenance pass can skip silently on a closing handle; on
+// success the grant is always released before returning.
+func (c *Coord) ReapStaleReaderSlots(ctx context.Context) error {
+	g, err := c.AcquireWriter(ctx)
+	if err != nil {
+		return err
+	}
+	defer g.Release()
+	c.OldestReaderTxnID() // discard min; the in-place stale-clear is the goal
+	return nil
+}
+

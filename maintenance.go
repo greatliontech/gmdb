@@ -2,8 +2,10 @@ package gmdb
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -62,9 +64,27 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 	if !lockFile.TryClaimMaintenance(now, intervalNanos) {
 		return // a recent pass (this or another process) holds the interval
 	}
-	// Task 1 — bitmap leak reclamation. (Tasks 2/3/4 added in later
-	// sub-chunks.)
+	// Task 1 — bitmap leak reclamation.
 	db.maintReclaimLeaks(ctx)
+
+	// Task 2 — stale reader-slot cleanup (background-maintenance.md
+	// §Stale Reader Slot Cleanup). Acquire LOCK_EX (via the coord) and
+	// run the reader-table stale-clear scan. This is NOT lock-free: the
+	// clear races peer clearers (a writer's RPL-reclamation scan,
+	// stale-writer recovery) without LOCK_EX, which could evict a live
+	// reader's slot and let RPL reclamation free pages it is still
+	// reading. No write transaction is taken — clearing a slot is a
+	// lock-file mmap store, independent of the data file. Errors (ctx
+	// cancel on Close, coord closed) are benign: the next pass retries.
+	// (Tasks 3/4 added in later sub-chunks.)
+	if err := coord.ReapStaleReaderSlots(ctx); err != nil &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
+		!errors.Is(err, lock.ErrClosed) {
+		// Closing / cancelled handles are expected and silent; anything
+		// else (e.g. a raw flock() syscall failure) is abnormal — log it,
+		// matching Task 1's discipline. The next pass retries regardless.
+		db.logger.Warn("gmdb: maintenance stale-reader cleanup skipped", "err", err)
+	}
 }
 
 // maintReclaimLeaks reclaims bitmap-leaked pages — allocated in the bitmap

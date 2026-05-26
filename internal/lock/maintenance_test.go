@@ -1,9 +1,12 @@
 package lock
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestTryClaimMaintenance: the claim succeeds when no pass has run within
@@ -67,5 +70,85 @@ func TestTryClaimMaintenanceAtMostOneWinner(t *testing.T) {
 	wg.Wait()
 	if wins.Load() != 1 {
 		t.Errorf("concurrent claims: %d winners, want exactly 1", wins.Load())
+	}
+}
+
+// TestCoordReapStaleReaderSlotsClearsStaleKeepsLive (Task 2 — background-
+// maintenance.md §Stale Reader Slot Cleanup): a maintenance reap acquires
+// LOCK_EX itself and clears a dead-process slot while leaving a live one.
+// Cross-namespace heartbeat path (slot NS = 0) with an injected fixed
+// clock so "aged" vs "fresh" is deterministic — no dependence on the
+// CLOCK_BOOTTIME magnitude.
+func TestCoordReapStaleReaderSlotsClearsStaleKeepsLive(t *testing.T) {
+	root, base, _ := tmpLock(t)
+	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0x2A}, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	const now uint64 = 1_000_000_000_000 // 1000 s in ns; >> StaleTimeout
+	c := NewCoord(f, CoordOptions{
+		PID:           4242,
+		PIDNamespace:  99,
+		RetryInterval: 10 * time.Millisecond,
+		Clock:         func() uint64 { return now },
+	})
+	t.Cleanup(func() {
+		_ = c.Close()
+		_ = f.Close()
+	})
+
+	stale := staleTimeoutNanos()
+	// Slot 0: stale — cross-NS (NS=0 ⇒ heartbeat path), heartbeat aged
+	// past StaleTimeout. Raw stores: a deliberate manufactured pre-state.
+	s0 := f.Slot(0)
+	Store64(&s0.TxnID, 7)
+	Store64(&s0.PID, 9999)
+	Store64(&s0.Heartbeat, now-2*stale)
+	// Slot 1: live — cross-NS, fresh heartbeat.
+	s1 := f.Slot(1)
+	Store64(&s1.TxnID, 11)
+	Store64(&s1.PID, 8888)
+	Store64(&s1.Heartbeat, now)
+
+	if err := c.ReapStaleReaderSlots(context.Background()); err != nil {
+		t.Fatalf("ReapStaleReaderSlots: %v", err)
+	}
+	if got := Load64(&s0.TxnID); got != 0 {
+		t.Errorf("stale slot not cleared: TxnID = %d, want 0", got)
+	}
+	if got := Load64(&s1.TxnID); got != 11 {
+		t.Errorf("live slot cleared spuriously: TxnID = %d, want 11", got)
+	}
+	// The first reap did not leak its grant. (Not provable via flock
+	// itself: re-locking the same OFD is a kernel no-op success even
+	// with no intervening LOCK_UN.) The proof is the flock goroutine's
+	// in-process serialisation: it serves one writerRequest at a time
+	// off an unbuffered channel and cannot receive this second request
+	// until process() for the first has returned — which happens only
+	// after its step-4 release (clear-header + LOCK_UN) runs. A leaked
+	// grant would wedge the goroutine in its step-4 select, so this
+	// second AcquireWriter would hang (test timeout) instead of nil.
+	if err := c.ReapStaleReaderSlots(context.Background()); err != nil {
+		t.Fatalf("second reap (proves the first released its grant): %v", err)
+	}
+}
+
+// TestCoordReapStaleReaderSlotsCtxCancel: a cancelled ctx surfaces from
+// AcquireWriter and the reader table is left untouched — no clear ever
+// happens without the grant (the LOCK_EX precondition holds even on the
+// error path).
+func TestCoordReapStaleReaderSlotsCtxCancel(t *testing.T) {
+	c, f := newTestCoord(t, 10*time.Millisecond)
+	// Forge a stale-looking slot; it must survive a cancelled reap.
+	s := f.Slot(0)
+	Store64(&s.TxnID, 5)
+	Store64(&s.PID, 9999)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.ReapStaleReaderSlots(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("ReapStaleReaderSlots on cancelled ctx: got %v, want context.Canceled", err)
+	}
+	if got := Load64(&s.TxnID); got != 5 {
+		t.Errorf("reader table mutated despite no grant: TxnID = %d, want 5", got)
 	}
 }

@@ -1820,10 +1820,30 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
   field is inert until compaction). Review: 0 introduced H; M-1
   (this reorder note) + M-2 (option validation) + M-3 (off-Linux
   clock underflow guard) fixed; M-4 filed; SA-1/SA-2 applied.
-- **12.3** **Task 2** stale reader-slot cleanup — namespace-aware
-  scan clearing dead-process slots (atomic store, no tx); needs a
-  lock-free stale-scan in the lock package (the existing
-  `OldestReaderTxnID` requires LOCK_EX). *(pending)*
+- **12.3** ✅ **Task 2** stale reader-slot cleanup.
+  `Coord.ReapStaleReaderSlots` acquires the write lock (`AcquireWriter`)
+  and runs the existing LOCK_EX-preconditioned `OldestReaderTxnID` scan
+  for its in-place stale-clear side effect; wired into
+  `runMaintenancePass` after Task 1 (no write tx — clearing a slot is a
+  lock-file mmap store). **Amends 12.1's roster note** ("needs a
+  lock-free stale-scan"): a lock-free clear is *unsafe* — the clear
+  stores + the `HintEpoch` first-observer CAS race peer clearers (a
+  writer's RPL-reclamation scan, `RecoverStaleWriter`); a phantom
+  eviction of a mid-publish reader slot lets RPL reclamation free pages
+  a live reader still reads = corruption. Reusing the proven scan under
+  LOCK_EX is the smallest correct change. *Spec-amend:* §Stale Reader
+  Slot Cleanup now states the scan acquires `flock(LOCK_EX)` (the prior
+  "no transaction needed — atomic store" could be misread as "lock-free
+  OK"). Preserves the existing reader-table no-false-positive-clear
+  invariant *by construction* (the only maintenance clear path acquires
+  the grant first) — promotes no new Inv-M#. *Triage:* 0 README entries
+  match `Lands: 12.3`; condition-triggered
+  `leaked-readtx-cleanup-race-flake` walked (reader-slot lifecycle) →
+  redeferred (Task 2 clears cross-process *stale* slots under LOCK_EX;
+  it does not touch the in-process finalizer cleanup path the flaky test
+  exercises). Review: 0 introduced H/M (Rounds 1+2); R1 L (test-comment
+  mechanism) + nit (abnormal-error log) fixed, nit (clock re-read)
+  disputed-accepted; R2 clean.
 - **12.4** **Task 3** checksum scrubbing — `ScrubCursor` on DB,
   `ScrubBatchSize` pages/pass via a read-tx footer verify, wrapping
   at HighWaterMark; corruption logged as a `CheckWarning` with the
