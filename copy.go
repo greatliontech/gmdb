@@ -70,7 +70,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	// 2. Create the destination (must not exist) and size it to cover the
 	// snapshot's high-water mark (so original page ids fit), with the
 	// source's MinSize as a floor.
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("gmdb: CopyTo create %q: %w", path, err)
 	}
@@ -253,7 +253,7 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	pageSize := int64(meta.PageSize)
 	pr := rawPageReader{p: rtx.pgr}
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("gmdb: CopyTo create %q: %w", path, err)
 	}

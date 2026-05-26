@@ -187,6 +187,14 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 	if db.closeGate.IsClosed() {
 		return nil, ErrClosed
 	}
+	// A poisoned handle may map a stale, now-unlinked inode (a failed
+	// Compact reopen) — reads off it would observe pre-Compact data while
+	// the on-disk file is the new inode. Reject reads too (not just
+	// writes), so the only recovery is Close + re-Open. (api-surface.md
+	// §Compact reopen-failure contract.)
+	if db.poisoned.Load() {
+		return nil, ErrPoisoned
+	}
 	// Snapshot db.coord + db.file under db.mu (same race protection
 	// as the write-tx Begin path against a concurrent Close).
 	db.mu.Lock()

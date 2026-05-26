@@ -536,6 +536,20 @@ func (c *Coord) RegisterReaderSlot(i uint32) {
 	c.activeSlotsMu.Unlock()
 }
 
+// ActiveReaderSlots reports how many reader slots this handle (this
+// process's DB) currently holds — the in-process active read-transaction
+// count. Used by Compact to drain in-process readers before swapping the
+// file (cross-process readers occupy slots registered by *other* Coords
+// and are not counted here). The slot is registered on AcquireReader and
+// unregistered on ReleaseReader — whether via explicit Commit/Rollback or
+// the leak-detection cleanup — so this tracks live in-process readers
+// exactly.
+func (c *Coord) ActiveReaderSlots() int {
+	c.activeSlotsMu.Lock()
+	defer c.activeSlotsMu.Unlock()
+	return len(c.activeSlots)
+}
+
 // UnregisterReaderSlot removes slot index i from the active list.
 // MUST be called BEFORE the reader-side clears the slot's
 // PID/Heartbeat/etc. on release (cross-process.md §Heartbeat

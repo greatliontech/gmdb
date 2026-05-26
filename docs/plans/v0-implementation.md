@@ -1710,8 +1710,32 @@ Primary files: `db.go`.
   compact round-trip (indexed + nested-tree set + overflow,
   CheckIndexes clean), defragments (DeleteRange churn → smaller
   HWM than verbatim + zero free), empty, PageChecksum.
-- **11.6** `Compact()` — drain + flock + atomic rename +
-  reopen; `Options.CompactDrainTimeout`. *(pending)*
+- **11.6** ✅ `Compact()` — in-place defragment via compacting copy +
+  atomic rename + pager reopen (`compact.go`). Acquires the
+  cross-process write lock, drains in-process readers up to
+  `Options.CompactDrainTimeout` (new; default 30s) via
+  `coord.ActiveReaderSlots()` (new — counts this handle's reader
+  slots) → `ErrCompactReadersActive` (new sentinel) on timeout,
+  `copyCompact` to a 0600 temp preserving the UUID, atomic rename +
+  dir-fsync, then swaps `db.file`/`db.pgr` against the new inode
+  under `db.mu` (lock file + Coord + grant persist). `db.path`
+  field added for the temp/rename. Invariants: drain-before-swap
+  (clause-explicit), UUID-preserved + atomic-field-swap (entailed).
+  Adversarial review: **2 rounds**. Round 1 found 2 introduced H +
+  1 M — all fixed: **H1** (a writer that captured the pager then
+  blocked in `AcquireWriter` behind Compact's grant used the closed
+  old pager → panic; fixed by re-reading `db.pgr` under the
+  post-grant `db.mu`, pinned by `TestCompactConcurrentWriterNoCrash`
+  — confirmed to repanic when the fix is reverted), **H2** (Compact
+  widened the file mode 0600→0644; fixed: copies are 0600,
+  `TestCompactPreservesFileMode`), **M2** (reopen-failure
+  split-brain on the unlinked inode; fixed: poison the handle →
+  Close+reopen), **M1** (Compact-in-write-tx deadlock; documented).
+  Round 2 found 1 introduced M — **BeginRead didn't reject a
+  poisoned handle** (reads off the stale inode); fixed with a poison
+  gate in `BeginRead` (`TestPoisonedHandleRejectsReads`). Spec:
+  `api-surface.md §Compact` amended (dir-fsync, mode preservation,
+  reopen-failure poison contract, in-tx-Compact prohibition).
 - **11.7** Chunk close-out. *(pending)*
 
 ### Chunk 12 — Background maintenance goroutine

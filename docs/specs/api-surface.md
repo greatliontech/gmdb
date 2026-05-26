@@ -1427,9 +1427,13 @@ func (db *DB) CopyTo(path string, compact bool) error
 //     read-open attempts from other processes during this window
 //     succeed against the original inode (open() resolves before
 //     rename).
-//  4. fsync(tmpPath); atomic rename(tmpPath, originalPath); reopen
-//     the file descriptors and mmap; release the cross-process write
-//     lock.
+//  4. fsync(tmpPath); atomic rename(tmpPath, originalPath); fsync the
+//     containing directory (so the rename itself is durable across a
+//     crash); reopen this handle's data-file fd + writer mmap against
+//     the new inode (the lock file is not renamed — the Coord + write
+//     grant persist across the reopen); release the cross-process write
+//     lock. The temp file is created with the same mode as the source
+//     DB (0600) so the rename does not widen permissions.
 //
 // Cross-process readers post-rename: pre-rename readers' mmap still
 // references the original inode (rename unlinks the directory entry
@@ -1439,6 +1443,17 @@ func (db *DB) CopyTo(path string, compact bool) error
 // matches (Compact preserves UUID), so coordination continues
 // normally. There is no observable inconsistency window for
 // cross-process readers.
+//
+// Reopen failure: if the reopen in step 4 fails AFTER the rename
+// succeeded (the on-disk file is the new inode, but this handle could
+// not remap it), the handle is POISONED — every subsequent operation
+// returns ErrPoisoned — rather than left silently serving the stale,
+// now-unlinked inode (the split-brain the all-or-nothing invariant
+// forbids). Close + re-Open recovers against the renamed file.
+//
+// Compact MUST NOT be called from a goroutine holding an open write
+// transaction on this DB: it acquires the write lock and would block
+// forever behind the grant the caller already holds.
 //
 // Effects: reclaims leaked pages; defragments file; shrinks to
 // minimum size.

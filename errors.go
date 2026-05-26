@@ -54,16 +54,25 @@ var (
 	// format evolutions; never returned in v0.
 	ErrVersionMismatch = errors.New("gmdb: on-disk format version mismatch")
 
-	// ErrPoisoned is returned by Begin / Update after a previous
+	// ErrPoisoned is returned by Begin / BeginRead / Update / Compact
+	// after the handle is poisoned. Two causes: (a) a previous write
 	// transaction's commit failed in the publication phase (step-3
 	// pwrite or step-4 fdatasync), leaving the on-disk active meta
 	// potentially advanced while the in-memory pager state has been
-	// rolled back to pre-tx. The DB handle is in a state where it
-	// cannot safely allocate new pages (its in-memory bitmap /
-	// HighWaterMark / RPL chain disagree with disk); the caller must
-	// Close() and re-Open() to recover. Close() works normally on a
-	// poisoned handle.
+	// rolled back to pre-tx; (b) a Compact reopen failed after the
+	// rename, leaving the handle mapping the stale, now-unlinked inode.
+	// In case (b) even reads are unsafe (they would observe pre-Compact
+	// data), so BeginRead is rejected too. The caller must Close() and
+	// re-Open() to recover. Close() works normally on a poisoned handle.
 	ErrPoisoned = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
+
+	// ErrCompactReadersActive is returned by Compact when active
+	// in-process read transactions do not drain within
+	// Options.CompactDrainTimeout. Compact needs the in-process readers
+	// gone before swapping the file; if they persist, use
+	// CopyTo(path, compact=true) to produce an offline compacted copy
+	// instead (api-surface.md §Compact). No file swap occurred.
+	ErrCompactReadersActive = errors.New("gmdb: Compact drain timed out — in-process read transactions still active")
 
 	// ErrClosed is returned by operations against a DB handle whose
 	// Close has been called (or is concurrently in progress). Surfaces

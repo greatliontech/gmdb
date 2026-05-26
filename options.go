@@ -195,6 +195,13 @@ type Options struct {
 	// minimal waiting use a small delay or MaxBatchSize = 1.) Per
 	// transactions.md §Write Batching.
 	MaxBatchDelay time.Duration
+
+	// CompactDrainTimeout bounds how long Compact() waits for active
+	// in-process read transactions to commit/rollback before aborting
+	// with ErrCompactReadersActive. Default: 30s. Per api-surface.md
+	// §Compact. (Cross-process readers are not drained — they continue
+	// against the pre-Compact inode.)
+	CompactDrainTimeout time.Duration
 }
 
 func (o Options) applyDefaults() Options {
@@ -209,6 +216,7 @@ func (o Options) applyDefaults() Options {
 	o.ScratchDir = cmp.Or(o.ScratchDir, os.TempDir())
 	o.MaxBatchSize = cmp.Or(o.MaxBatchSize, defaultMaxBatchSize)
 	o.MaxBatchDelay = cmp.Or(o.MaxBatchDelay, defaultMaxBatchDelay)
+	o.CompactDrainTimeout = cmp.Or(o.CompactDrainTimeout, defaultCompactDrainTimeout)
 	// RestartGroupTarget defaults to 0 (engine default at the leaf
 	// codec layer — currently 16 per page-formats.md §Compressed
 	// Leaf). 0 is the canonical "use engine default" sentinel.
@@ -222,8 +230,9 @@ const defaultMergeThreshold uint8 = 25
 const maxMergeThreshold uint8 = 50
 
 const (
-	defaultMaxBatchSize  = 1000
-	defaultMaxBatchDelay = 10 * time.Millisecond
+	defaultMaxBatchSize        = 1000
+	defaultMaxBatchDelay       = 10 * time.Millisecond
+	defaultCompactDrainTimeout = 30 * time.Second
 )
 
 func (o Options) validate() error {

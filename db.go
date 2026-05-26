@@ -25,6 +25,7 @@ import (
 type DB struct {
 	file *os.File
 	root *os.Root // path-traversal guard from os.OpenRoot
+	path string   // the data-file path as passed to Open (for Compact's temp + rename)
 
 	pool *pager.BufPool
 	opts Options
@@ -241,6 +242,7 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 	db := &DB{
 		file:          file,
 		root:          root,
+		path:          path,
 		pool:          pool,
 		opts:          opts,
 		logger:        logger,
@@ -506,11 +508,14 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 		return nil, ErrPoisoned
 	}
 
-	// Snapshot db.coord + db.pgr under db.mu so the read is
-	// synchronized with Close (which nil's both under db.mu). The
-	// captured pointers are stable for this Tx's lifetime
-	// (independent of subsequent Close calls that nil the *DB
-	// fields).
+	// Snapshot db.coord under db.mu so the read is synchronized with
+	// Close (which nil's it under db.mu). coord is stable for this Tx's
+	// lifetime. db.pgr is read here only for the fast pre-grant closed
+	// check — it is RE-READ under the post-grant db.mu below, because
+	// Compact swaps db.pgr (closing the old pager) while holding the
+	// write grant: a writer that captured the old pager before blocking
+	// in AcquireWriter must use the post-Compact pager, never the
+	// munmap'd old one.
 	db.mu.Lock()
 	coord := db.coord
 	pgr := db.pgr
@@ -546,6 +551,15 @@ func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
 		return nil, ErrClosed
 	}
 
+	// Re-read pgr under the post-grant db.mu: we hold the write grant, so
+	// any Compact that swapped db.pgr has fully completed (it swaps under
+	// grant+db.mu and releases the grant only after). This is the pager
+	// the Tx must use — the pre-grant capture may be the closed old one.
+	pgr = db.pgr
+	if pgr == nil {
+		grant.Release()
+		return nil, ErrClosed
+	}
 	prevMeta := db.currentMeta
 	prevActive := db.activeMetaIdx
 
