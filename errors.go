@@ -15,6 +15,14 @@ var (
 	// ErrReadOnly is returned by mutating methods on a read transaction.
 	ErrReadOnly = errors.New("gmdb: read-only transaction")
 
+	// ErrChildActive is returned by every operation on a write
+	// transaction that has an unresolved child transaction open (created
+	// via Tx.BeginChild) — data ops, Commit, Rollback, and a second
+	// BeginChild. The parent, and transitively every ancestor, is frozen
+	// until the active child commits or rolls back. Per transactions.md
+	// §Nested Transactions (LMDB-style parent-freeze).
+	ErrChildActive = errors.New("gmdb: transaction is frozen by an active child transaction")
+
 	// ErrTxTooLarge is returned when the per-tx slab budget is
 	// exceeded.
 	ErrTxTooLarge = errors.New("gmdb: transaction buffer budget exceeded")

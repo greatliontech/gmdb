@@ -162,7 +162,13 @@ func (c *SetCursor) requireOpen(needsWrite bool) bool {
 		return false
 	}
 	if err := c.tx.requireOpen(needsWrite); err != nil {
-		c.closeErr = err
+		// ErrChildActive is transient — the parent-freeze lifts when the
+		// active child resolves (transactions.md §Nested Transactions).
+		// Do NOT stick it; terminal errors (ErrTxClosed / ErrReadOnly /
+		// ErrClosed) still stick.
+		if !errors.Is(err, ErrChildActive) {
+			c.closeErr = err
+		}
 		return false
 	}
 	if c.ks.dead {
@@ -599,6 +605,11 @@ func (c *SetCursor) Err() error {
 	}
 	if c.ks.dead {
 		return ErrKeyspaceClosed
+	}
+	// Transient: report the parent-freeze without sticking it, so Err
+	// clears once the active child resolves.
+	if c.ks.tx.activeChild != nil {
+		return ErrChildActive
 	}
 	if c.stale {
 		return ErrCursorStale

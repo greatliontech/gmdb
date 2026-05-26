@@ -105,6 +105,14 @@ type Pager struct {
 	// writable pagers.
 	currentTxnID uint64
 
+	// savepointDepth counts active (unresolved) child savepoints
+	// (transactions.md §Nested Transactions). While > 0, AllocPage
+	// suspends loose-page reuse so a child cannot hand out a page id
+	// whose slab buffer an ancestor's tree still references (Inv-N1).
+	// Managed by BeginSavepoint / RestoreSavepoint / ReleaseSavepoint;
+	// reset to 0 by AbortTx. See savepoint.go.
+	savepointDepth int
+
 	// bitmapSnapshot captures the bitmap's mutable state at the start
 	// of the in-progress write tx so AbortTx can restore it. Set by
 	// BeginTx, cleared by Commit success or by AbortTx. Nil between
@@ -333,6 +341,12 @@ func (p *Pager) AbortTx() {
 	clear(p.loosePages)
 	p.retiredPages = p.retiredPages[:0]
 	p.currentTxnID = 0
+	// A top-level abort supersedes any open child savepoints. The root
+	// package's parent-freeze rule prevents a top-level Rollback while a
+	// child is unresolved, so this is defense-in-depth — but resetting
+	// keeps AllocPage's loose-pop guard correct if a future caller path
+	// ever aborts with a dangling savepoint.
+	p.savepointDepth = 0
 }
 
 // discardTxSnapshot drops the snapshot without restoring (Commit

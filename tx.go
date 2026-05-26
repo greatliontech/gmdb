@@ -135,6 +135,31 @@ type Tx struct {
 	// the normal close path so the leak-detection warning doesn't fire
 	// for a tx the caller properly closed.
 	cleanup runtime.Cleanup
+
+	// parent is the enclosing transaction when this Tx is a child
+	// created via BeginChild; nil for a top-level write transaction. A
+	// child shares the parent's *Pager and (transitively) the top-level
+	// parent's cross-process write grant — only the top-level parent
+	// holds the lock and commits to disk (transactions.md §Nested
+	// Transactions). A child's prevMeta / newTxnID / pgr are copied from
+	// the parent; held and grant are nil (the child releases nothing).
+	parent *Tx
+
+	// activeChild is this tx's currently-open, unresolved child (from
+	// BeginChild), or nil. While non-nil this tx — and transitively
+	// every ancestor — is FROZEN: data ops, Commit, Rollback, and a
+	// second BeginChild all return ErrChildActive until the child
+	// commits or rolls back (parent-freeze / LMDB nested-txn model,
+	// transactions.md §Nested Transactions). Cleared by the child's
+	// commitChild / rollbackChild.
+	activeChild *Tx
+
+	// savepoint is the pager savepoint captured at BeginChild; nil for a
+	// top-level tx. The child's Commit releases it (page-level mutations
+	// merge into the shared pager, published at the top-level Commit);
+	// the child's Rollback restores it (mutations discarded). See
+	// internal/pager/savepoint.go.
+	savepoint *pager.Savepoint
 }
 
 // txCleanupInfo is the argument bundle for the AddCleanup callback.
@@ -328,6 +353,11 @@ func (tx *Tx) Commit() error {
 	if err := tx.requireOpen(true); err != nil {
 		return err
 	}
+	// A child transaction commits by merging into its parent (no disk
+	// write, no grant release) — see commitChild.
+	if tx.parent != nil {
+		return tx.commitChild()
+	}
 	// Cancel the leak-detection cleanup first — it must not fire if the
 	// caller is closing the tx explicitly. Safe to Stop even if the
 	// cleanup has already executed (Stop is idempotent per
@@ -421,6 +451,16 @@ func (tx *Tx) Rollback() error {
 	if tx.closed {
 		return ErrTxClosed
 	}
+	// Parent-freeze: a frozen parent cannot roll back until its child
+	// resolves (the user must Commit/Rollback the child first).
+	if tx.activeChild != nil {
+		return ErrChildActive
+	}
+	// A child transaction rolls back by restoring its pager savepoint
+	// and discarding its keyspace state — the parent is untouched.
+	if tx.parent != nil {
+		return tx.rollbackChild()
+	}
 	tx.cleanup.Stop()
 	defer tx.releaseGrant()
 	tx.closed = true
@@ -431,6 +471,15 @@ func (tx *Tx) Rollback() error {
 func (tx *Tx) requireOpen(needsWrite bool) error {
 	if tx.closed {
 		return ErrTxClosed
+	}
+	// Parent-freeze (transactions.md §Nested Transactions): a tx with an
+	// unresolved child is frozen — every operation, including a read,
+	// Commit, and Rollback, returns ErrChildActive until the child
+	// resolves. This guards both the public data-op surface and the
+	// top-level Commit path; Rollback checks activeChild separately
+	// because it does not route through requireOpen.
+	if tx.activeChild != nil {
+		return ErrChildActive
 	}
 	if needsWrite && !tx.writable {
 		return ErrReadOnly

@@ -39,8 +39,21 @@ func (p *Pager) AllocPage() (uint64, error) {
 		return 0, ErrFreespaceUnconfigured
 	}
 
-	// 1. Loose pages.
+	// 1. Loose pages — suspended while a child savepoint is active. A
+	// loose page is a same-tx page that was CoW'd then freed; reusing it
+	// detaches its slab buffer (see below) and lets a subsequent CoW
+	// install fresh content. If a descendant child is in progress, that
+	// freed page may be one the child freed but an ancestor's tree still
+	// references (the ancestor's saved root), so reusing it would
+	// overwrite a buffer the ancestor holds — violating the
+	// transactions.md §Invariants "child never mutates a parent's slab
+	// buffer in place" guarantee (Inv-N1). While savepointDepth > 0 the
+	// allocator skips straight to the bitmap; freed pages remain loose
+	// (not reusable) until every child resolves and the stack empties.
 	for id := range p.loosePages {
+		if p.savepointDepth > 0 {
+			break
+		}
 		delete(p.loosePages, id)
 		// Bookkeeping: the id was initially allocated (bitmap.Clear +
 		// pendingAllocs add), then FreePage moved it to loosePages.
