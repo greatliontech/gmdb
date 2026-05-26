@@ -272,12 +272,12 @@ func (t *TypedSetKS[K, V]) Prefix(prefix K) iter.Seq2[K, V]
 // TypedIndex declares a typed index on TypedKeyspace[K, V] with
 // extracted index key type IK.
 type TypedIndex[K, V, IK any] struct {
-    Name     string
-    IKEnc    Encoder[IK]            // produces lex-safe bytes from IK
-    Unique   bool
-    Version  string                 // bump on extractor logic changes
-    Extract  func(K, V) []IK        // empty slice ⇒ skip (partial index)
-    Covering []TypedCoveringColumn  // optional (currently parameterized by name + Encoder)
+    Name       string
+    IKEnc      Encoder[IK]      // produces lex-safe bytes from IK
+    Unique     bool
+    Version    string           // bump on extractor logic changes
+    Extract    func(K, V) []IK  // empty slice ⇒ skip (partial index)
+    CoverValue bool             // full-row covering (see §Covering)
 }
 
 // AnyTypedIndex is the type-erased interface satisfied by every
@@ -300,10 +300,16 @@ type TypedIndex[K, V, IK any] struct {
 // TypedIndex[K, V, IK] declaration. Wrapping at the IndexDecl level
 // is not supported and not needed.
 type AnyTypedIndex[K, V any] interface {
-    indexDecl() *IndexDecl
+    indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*IndexDecl, error)
 }
 
-func (t *TypedIndex[K, V, IK]) indexDecl() *IndexDecl { /* implements AnyTypedIndex */ }
+// indexDecl is unexported (the seal) and receives the owning keyspace's
+// K/V encoders so it can build the extractor closure (decode (key,value)
+// → run Extract → encode each IK) and validate encoder IDs; it returns
+// ErrIndexEncoderIDEmpty for an empty IKEnc (or, for a CoverValue index,
+// value-encoder) ID. The exact signature is an implementation detail of
+// the sealed method.
+func (t *TypedIndex[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*IndexDecl, error) { /* implements AnyTypedIndex */ }
 
 // TypedIndexHandle is the typed wrapper around Index for queries
 // where IK is known.
@@ -323,10 +329,41 @@ func (q *TypedIndexQuery[K, V, IK]) Get(ik IK) (K, V, error) // unique only
 func (q *TypedIndexQuery[K, V, IK]) Err() error
 ```
 
-The schema-hash inputs for a typed index include the encoder IDs
-of the index-key encoder and any covering encoders — so changing
-from `be-uint64` to `varint-zigzag` for the same column triggers
-`ErrIndexFingerprintMismatch` at Open.
+The schema-hash inputs for a typed index include the index-key
+encoder's ID (and, for a `CoverValue` index, the value encoder's
+ID) — so changing from `be-uint64` to `varint-zigzag` for the same
+column triggers `ErrIndexFingerprintMismatch` at Open. (The typed
+layer folds these IDs in by synthesizing the byte-`IndexDecl`'s
+column / covering-column **names** from the encoder IDs; the
+byte schema-hash already hashes column names.)
+
+### Covering: `CoverValue` (full-row covering)
+
+`CoverValue: true` makes the index a **full-row covering index**:
+the encoded row value is stored in each index entry, so
+`TypedIndexQuery` `Lookup` / `Range` / `Prefix` / `Get` return `V`
+directly from the index entry **without a back-lookup** against
+the row keyspace. It is a pure read optimization — identical
+`(K, V)` results, fewer reads.
+
+Mechanics: the extractor stores the row's stored value bytes
+(which are exactly `encode(V)`) as the entry's single covering
+column; the byte layer's covering-return path (gated, enabled only
+for an index the typed layer recognizes as full-row covering)
+returns that column instead of back-looking-up. The value
+encoder's `ID()` is folded into the fingerprint (an empty value
+encoder `ID()` is rejected with `ErrIndexEncoderIDEmpty`).
+
+`CoverValue` has effect only on a `TypedKeyspace`-backed index: a
+`TypedSetKeyspace` index's value (`setValue`) is already carried in
+its compound primary key, so there is no back-lookup to skip. This
+is the only covering shape the typed API exposes — arbitrary
+covering *projections* have no return surface here (every
+`TypedIndexQuery` method returns the row value `V`). The byte-
+oriented `IndexDecl` can *store* arbitrary covering projections,
+but its `Lookup`/`Get` covering-**return** is not yet wired (it
+back-looks-up the row value); see
+`docs/issues/byte-api-covering-return-unwired.md`.
 
 A typed extractor returning multiple `IK` values models composite
 indexes naturally (the `IK` type is itself a struct whose

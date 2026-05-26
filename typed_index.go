@@ -3,7 +3,28 @@ package gmdb
 import (
 	"fmt"
 	"iter"
+	"strings"
 )
+
+// typedCoverValuePrefix marks the synthesized covering column of a
+// full-row-covering typed index (TypedIndex.CoverValue). The column name
+// is typedCoverValuePrefix + valEnc.ID(), so the value encoder's
+// identity is folded into the schema-hash fingerprint (drift detection)
+// AND TypedKS.Index can recognize the index as full-row covering and
+// enable the byte-layer covering-return. This prefix is a reserved
+// covering-column namespace — a byte-API IndexDecl that names a covering
+// column with it would be (mis)treated as full-row covering on the typed
+// read path.
+const typedCoverValuePrefix = "gmdb/cover-value/"
+
+func typedCoverValueColumn(valEncID string) string { return typedCoverValuePrefix + valEncID }
+
+// isTypedCoverValueIndex reports whether decl is a typed full-row-
+// covering index (exactly one covering column with the cover-value
+// sentinel prefix).
+func isTypedCoverValueIndex(decl *IndexDecl) bool {
+	return len(decl.Covering) == 1 && strings.HasPrefix(decl.Covering[0].Name, typedCoverValuePrefix)
+}
 
 // Typed index layer (typed-keyspaces.md §Typed Indexes). A TypedIndex
 // declares a type-safe secondary index on a TypedKeyspace[K,V] with an
@@ -17,11 +38,6 @@ import (
 // are pure fingerprint inputs, never read at decode), swapping IKEnc for
 // one with a different ID changes the column name and therefore the
 // stored fingerprint — surfacing as ErrIndexFingerprintMismatch at Open.
-
-// Typed covering indexes (a covering-value extractor + the byte-layer
-// covering-return path) land in a later sub-chunk; TypedIndex has no
-// Covering field until that wiring is in place end-to-end, so callers
-// never declare covering that silently stores or returns nothing.
 
 // TypedIndex declares a typed index on a TypedKeyspace[K,V] with index-
 // key type IK.
@@ -39,12 +55,24 @@ import (
 // except an out-of-range BENanosEncoder value this never fires; use
 // infallible index-key encoders, or ensure Extract never yields an
 // unrepresentable value.
+//
+// CoverValue makes this a full-row covering index: the encoded row value
+// is stored in each index entry, so TypedIndexQuery Lookup/Range/Prefix/
+// Get return V directly from the index without a back-lookup against the
+// row keyspace (a read optimization — identical results, fewer reads).
+// The keyspace's value-encoder ID is folded into the schema-hash
+// fingerprint, so swapping the value encoder triggers
+// ErrIndexFingerprintMismatch; an empty value-encoder ID is rejected
+// with ErrIndexEncoderIDEmpty. CoverValue has effect only on a
+// TypedKeyspace (Keyspace-backed) index — a SetKeyspace index's value is
+// already carried in its compound PK, so there is no back-lookup to skip.
 type TypedIndex[K, V, IK any] struct {
-	Name    string
-	IKEnc   Encoder[IK]
-	Unique  bool
-	Version string
-	Extract func(K, V) []IK
+	Name       string
+	IKEnc      Encoder[IK]
+	Unique     bool
+	Version    string
+	Extract    func(K, V) []IK
+	CoverValue bool
 }
 
 // Compile-time proof that *TypedIndex implements the sealed
@@ -61,16 +89,25 @@ func (t *TypedIndex[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (
 	if ikID == "" {
 		return nil, fmt.Errorf("gmdb: typed index %q index-key encoder: %w", t.Name, ErrIndexEncoderIDEmpty)
 	}
-	extract := t.makeExtractor(keyEnc, valEnc)
-	return &IndexDecl{
+	decl := &IndexDecl{
 		Name: t.Name,
 		// One opaque column for the IK; its Name = IKEnc.ID() folds the
 		// encoder identity into the schema-hash fingerprint (Inv-T7).
 		Columns: []IndexColumn{{Name: ikID}},
 		Unique:  t.Unique,
 		Version: t.Version,
-		Extract: extract,
-	}, nil
+	}
+	if t.CoverValue {
+		valID := valEnc.ID()
+		if valID == "" {
+			return nil, fmt.Errorf("gmdb: typed index %q value encoder (CoverValue): %w", t.Name, ErrIndexEncoderIDEmpty)
+		}
+		// One covering column carrying the full encoded value; its name
+		// folds the value-encoder identity into the fingerprint.
+		decl.Covering = []CoveringColumn{{Name: typedCoverValueColumn(valID)}}
+	}
+	decl.Extract = t.makeExtractor(keyEnc, valEnc)
+	return decl, nil
 }
 
 // makeExtractor builds the byte-layer IndexExtractor closure: decode the
@@ -79,6 +116,7 @@ func (t *TypedIndex[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (
 // extractor contract is total, and silently dropping an entry would
 // diverge the index from the rows.
 func (t *TypedIndex[K, V, IK]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V]) IndexExtractor {
+	coverValue := t.CoverValue
 	return func(keyBytes, valueBytes []byte) []IndexEntry {
 		k, err := keyEnc.Decode(keyBytes)
 		if err != nil {
@@ -92,13 +130,23 @@ func (t *TypedIndex[K, V, IK]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V
 		if len(iks) == 0 {
 			return nil
 		}
+		// Full-row covering: each entry carries the stored value bytes
+		// (which ARE encode(V)) as its single covering column, so Lookup
+		// can return V without a back-lookup. Copied so the IndexEntry
+		// does not alias the caller's value buffer.
+		var cover [][]byte
+		if coverValue {
+			cb := make([]byte, len(valueBytes))
+			copy(cb, valueBytes)
+			cover = [][]byte{cb}
+		}
 		entries := make([]IndexEntry, 0, len(iks))
 		for _, ik := range iks {
 			ikb, err := t.IKEnc.AppendEncode(nil, ik)
 			if err != nil {
 				panic(fmt.Errorf("gmdb: typed index %q: encode index key: %w", t.Name, err))
 			}
-			entries = append(entries, IndexEntry{Cols: [][]byte{ikb}})
+			entries = append(entries, IndexEntry{Cols: [][]byte{ikb}, Cover: cover})
 		}
 		return entries
 	}
@@ -112,6 +160,12 @@ func (t *TypedKS[K, V]) Index(name string) (*TypedIndexHandle, error) {
 	idx, err := t.ks.Index(name)
 	if err != nil {
 		return nil, err
+	}
+	// Enable the byte-layer covering-return for a full-row-covering typed
+	// index, so Lookup/Range/Prefix/Get return V from the index entry
+	// without a back-lookup.
+	if isTypedCoverValueIndex(idx.pinned.decl) {
+		idx.coverValue = true
 	}
 	return &TypedIndexHandle{idx: idx, keyEnc: t.keyEnc, valEnc: t.valEnc}, nil
 }

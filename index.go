@@ -20,10 +20,20 @@ import (
 // same pinnedIndex — overlapping iterators on one handle race per
 // api-surface.md §Index Lookup API).
 type Index struct {
-	ks       *Keyspace
-	sks      *SetKeyspace // nil iff ks != nil
-	pinned   *pinnedIndex
-	err      error
+	ks     *Keyspace
+	sks    *SetKeyspace // nil iff ks != nil
+	pinned *pinnedIndex
+	err    error
+
+	// coverValue, when true, makes Lookup/Range/Prefix/Get return the
+	// row value from the index entry's covering blob instead of
+	// back-looking-up the row keyspace (typed full-row covering). Set
+	// only by the typed layer (TypedKS.Index) for indexes whose covering
+	// it recognizes as a full encoded-value column; default false ⇒
+	// back-lookup, the behavior for every byte-layer and non-covering
+	// index. Keyspace-only (a SetKeyspace index's value lives in its
+	// compound PK, so there is no back-lookup to skip).
+	coverValue bool
 }
 
 // IndexStats is the persistent count + tree statistics for an index.
@@ -140,15 +150,22 @@ func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []by
 	if idx.sks != nil {
 		return idx.extractSetKeyspacePKAndValue(indexKey, indexValue)
 	}
+	// encodedCovering holds the index entry's covering blob (the
+	// NUL-escaped covering tuple): the value suffix for a unique index,
+	// the whole value for a non-unique one. Used only by the
+	// covering-return path below.
+	var encodedCovering []byte
 	if idx.pinned.decl.Unique {
-		extractedPK, _, decErr := decodeUniqueIndexValue(indexValue)
+		extractedPK, encCov, decErr := decodeUniqueIndexValue(indexValue)
 		if decErr != nil {
 			return nil, nil, false, fmt.Errorf("%w: %w", ErrCorrupted, decErr)
 		}
 		pk = make([]byte, len(extractedPK))
 		copy(pk, extractedPK)
+		encodedCovering = encCov
 	} else {
-		// Non-unique: PK is the last component of the encoded key.
+		// Non-unique: PK is the last component of the encoded key; the
+		// entry value IS the covering blob.
 		cols, decErr := decodeIndexKey(indexKey)
 		if decErr != nil {
 			return nil, nil, false, fmt.Errorf("%w: index %q: %w", ErrCorrupted, idx.pinned.decl.Name, decErr)
@@ -157,6 +174,26 @@ func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []by
 			return nil, nil, false, fmt.Errorf("%w: index %q: non-unique key has zero columns", ErrCorrupted, idx.pinned.decl.Name)
 		}
 		pk = cols[len(cols)-1]
+		encodedCovering = indexValue
+	}
+	// Covering-return (typed full-row covering, indexing.md §Covering
+	// Indexes): the covering blob is a single NUL-escaped column holding
+	// the encoded row value, so the value is returned directly from the
+	// index entry — skipping the back-lookup against the row keyspace.
+	// Gated by idx.coverValue, set only by the typed layer for indexes it
+	// recognizes as full-row covering; default false ⇒ back-lookup
+	// (unchanged for every other index).
+	if idx.coverValue {
+		coverCols, decErr := decodeIndexKey(encodedCovering)
+		if decErr != nil {
+			return nil, nil, false, fmt.Errorf("%w: index %q covering: %w", ErrCorrupted, idx.pinned.decl.Name, decErr)
+		}
+		if len(coverCols) == 0 {
+			return nil, nil, false, fmt.Errorf("%w: index %q covering: zero columns", ErrCorrupted, idx.pinned.decl.Name)
+		}
+		value = make([]byte, len(coverCols[0]))
+		copy(value, coverCols[0])
+		return pk, value, false, nil
 	}
 	// Back-lookup against the row keyspace.
 	tx := idx.rowTx()
