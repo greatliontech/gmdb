@@ -1893,10 +1893,35 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
   was from 12.2). Spec §Incremental Compaction Trigger + §Options
   updated. Tested: `TestAllocContiguousFragmentationStats` (fragmented /
   contiguous / insufficient-free gate / n=1).
-- **12.5b** **Task 4** relocation mechanism + wiring — consume the rate,
-  gate on `CompactionThreshold`/`DisableCompaction`, per-pass batch CoW
-  relocation (cascade) bounded by `MaxTxBufferBytes` (never
-  `ErrTxTooLarge`). Promotes Inv-M4. *(pending)*
+- **12.5b** **Task 4** relocation mechanism + wiring. **Scope decision
+  (user): full coverage** — relocate B+tree nodes, overflow chains, and
+  RPL segment pages, so a region can actually be fully evacuated into a
+  contiguous free run (B+tree-only would leave overflow pages — the very
+  contiguous consumers whose alloc-failure is the trigger — stranded, a
+  functional gap). No reusable relocation primitive exists today (the
+  btree CoW cascade is only reachable via key-based Put/Delete;
+  `copyCompact` is a full rebuild), so built in phases, each reviewed
+  independently given the corruption risk:
+  - **12.5b-1** ✅ B+tree path-relocation primitive
+    (`internal/btree/relocate.go`): `RelocatePages` walks bottom-up,
+    CoW-relocating every page matching a predicate to a fresh id and
+    forcing the mandatory ancestor pointer-fix cascade; `maxMoves` bounds
+    *eligible* relocations (ancestor fixes uncounted ⇒ total CoWs ≤
+    maxMoves×(1+depth), the caller sizes vs `MaxTxBufferBytes` in
+    12.5b-3). Leaves relocate verbatim — their overflow refs point at
+    overflow pages this primitive does NOT relocate (those stay valid;
+    12.5b-2 relocates them). Tested: full round-trip (every page moved,
+    contents + page-count identical, all old ids retired, none reused),
+    budget bound, targeted predicate, overflow-leaf survival, single
+    leaf, empty. Review: 0 H/M (the dangling-pointer / aliasing /
+    stale-buffer classes traced clean against the pager's
+    CoW/Alloc/Free semantics); L (use CoW's return; structural-count
+    assertion; overflow-leaf test) fixed.
+  - **12.5b-2** overflow-chain relocation + RPL-segment relocation (the
+    non-tree referents). *(pending)*
+  - **12.5b-3** pass orchestration: consume the rate, gate on
+    `CompactionThreshold`/`DisableCompaction`, pick the evacuation
+    target, resumable cursor, wire as Task 4, promote Inv-M4. *(pending)*
 - **12.6** Chunk close-out. *(pending)*
 
 ## Cross-chunk concerns
