@@ -1640,11 +1640,33 @@ Primary files: `db.go`.
   `check-subpage-structural-validation` (adjacent: the STRUCTURAL
   walk does not validate subpage payloads though `api-surface.md
   §Check` claims it does — a spec-vs-code gap).
-- **11.4b** `CheckWithOptions(Repair)` — exclusive leaked-page
-  reclamation enforcing Inv-C5 (free ONLY allocated-but-
-  unreachable pages, under verified no-readers/no-writers
-  exclusivity; atomicity rides the commit pipeline). The
-  `CheckOptions.Repair` field lands here. *(pending)*
+- **11.4b** ✅ `CheckWithOptions(Repair)` — exclusive leaked-page
+  reclamation enforcing Inv-C5. `CheckOptions.Repair` opens a
+  WRITE tx (cross-process write lock ⇒ no concurrent writers) and
+  gates on `coord.OldestReaderTxnID()==noReader` (⇒ no concurrent
+  readers, else CheckError `Repair.ReadersActive`, frees nothing).
+  The `checker` was refactored from `rtx *ReadTx` to `pgr
+  *pager.Pager` so it runs against either a read or write tx.
+  Three Inv-C5 invariants promoted from spec-tier (recorded at
+  11.1) to enforced tests: **exclusivity** (clause-explicit),
+  **completeness gate** (entailed — `emit` latches `sawError` on
+  any CheckError/CheckFatal; Repair frees ONLY when the walk both
+  completed and stayed error-free, else reports `Repaired=false` +
+  `Repair.Skipped`; the gate prevents freeing live pages left
+  unvisited under a walk-aborting corrupt subtree), **atomicity**
+  (entailed, by construction — new `pager.FreeLeakedPage` dirties
+  only the in-memory bitmap; the sole persistence path is
+  `pgr.Commit`'s atomic meta-swap). Reclaimed pages report as
+  `BitmapLeak` with `Repaired=true`. Spec synced
+  (`api-surface.md §CheckOptions` Repair godoc expanded with the
+  refusal codes + conservative gate; `integrity.md §No partial
+  writes visible` points to Repair). Adversarial review: ship, 0
+  introduced H/M; dispositions — L-1 (no ctx param) disputed
+  (adjacent, matches the Check API family), nit-1 (sentinel
+  mirror) disputed, nit-2 (tighten corruption test) fixed,
+  coverage-gap L (untested Repair fatals) fixed for
+  `WriteTxUnavailable` + `CommitFailed` (`FreeFailed` is
+  unreachable-by-construction defensive code).
 - **11.5** `CopyTo(path, compact)`. *(pending)*
 - **11.6** `Compact()` — drain + flock + atomic rename +
   reopen; `Options.CompactDrainTimeout`. *(pending)*

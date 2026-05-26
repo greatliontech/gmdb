@@ -45,7 +45,10 @@ is intact until the meta-page swap. Bitmap leakage (pages that
 appear allocated but are unreferenced) is possible on crash
 between the bitmap pwrite and the meta pwrite, but tree
 integrity is always preserved. See `pager-slab.md §Commit Write
-Ordering`.
+Ordering`. Leaked pages are detected by `Check` (the BitmapLeak
+finding) and reclaimed offline, under exclusive access, by
+`CheckWithOptions` with `Repair` set — see `api-surface.md
+§CheckOptions`.
 
 ## Atomic commit
 

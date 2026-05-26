@@ -1301,9 +1301,33 @@ type CheckIssue struct {
 func (db *DB) Check() iter.Seq[CheckIssue]
 
 type CheckOptions struct {
-    // Repair enables offline repair: reclaims leaked pages in the
-    // bitmap. Requires exclusive access (no concurrent readers or
-    // writers).
+    // Repair enables offline repair: reclaims leaked pages (allocated in
+    // the bitmap, unreachable from every committed tree, absent from the
+    // RPL — the BitmapLeak class) by freeing them in the bitmap.
+    //
+    // Repair requires EXCLUSIVE access (no concurrent readers or
+    // writers). CheckWithOptions opens a WRITE transaction for the Repair
+    // mode (acquiring the cross-process write lock, so no other writer
+    // runs concurrently) and proceeds only when no read transaction is
+    // active in any process. With a reader active it frees nothing and
+    // emits a single CheckError "Repair.ReadersActive"; run Check without
+    // Repair for read-only diagnostics in that case.
+    //
+    // Repair is conservative: it frees a page ONLY when the structural
+    // walk both completed (the caller did not break) and emitted NO
+    // CheckError/CheckFatal. Any structural finding makes the reachable
+    // set unreliable — a page under a walk-aborting corrupt subtree would
+    // be misclassified as leaked — so a corrupt database reports its
+    // would-be leaks with Repaired=false plus a CheckWarning
+    // "Repair.Skipped" and reclaims nothing. Reclaimed pages are reported
+    // as the usual BitmapLeak CheckWarning with Repaired=true.
+    //
+    // The freed bitmap is published through the normal commit pipeline
+    // (atomic meta-swap), so a crash mid-repair leaves either the
+    // pre-repair bitmap or the fully-repaired one. The Repair mode may
+    // also emit, as CheckFatal, "Repair.WriteTxUnavailable" (the
+    // exclusive write tx could not be opened), "Repair.FreeFailed", or
+    // "Repair.CommitFailed" (nothing was reclaimed).
     Repair bool
 
     // CheckIndexes additionally verifies that stored index entries

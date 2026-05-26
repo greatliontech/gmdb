@@ -252,6 +252,41 @@ func (p *Pager) FreePage(id uint64) error {
 	return nil
 }
 
+// FreeLeakedPage frees a leaked page — one the caller has determined is
+// allocated in the bitmap yet unreachable from every committed tree and
+// absent from the RPL — by marking its bitmap bit free directly,
+// bypassing the RPL.
+//
+// This differs from FreePage's prior-tx path (which retires through the
+// RPL so a reader pinning an older snapshot keeps the page until it
+// drains). A genuinely leaked page is referenced by NO snapshot, so it
+// needs no reader-pinned deferral — but that is only true under verified
+// exclusive access (no concurrent readers or writers). The caller (the
+// exclusive Repair path; gmdb Inv-C5) is responsible for establishing
+// that precondition; this method does not and cannot check it.
+//
+// Atomicity: the freed bit is dirtied in the in-memory bitmap ONLY. It
+// reaches disk solely through the next Commit's atomic meta-swap (step-1
+// bitmap pwrite, then meta publication), so a crash mid-repair leaves
+// either the pre-repair bitmap or the fully-repaired one — never a
+// partial free. There is deliberately no incremental-flush path.
+func (p *Pager) FreeLeakedPage(id uint64) error {
+	if p.readOnly {
+		return ErrReadOnly
+	}
+	if p.bitmap == nil {
+		return ErrFreespaceUnconfigured
+	}
+	// A leaked page is ALLOCATED (bit clear); IsSet reports true for a
+	// FREE page. An already-free id means the caller's leak set is stale
+	// — refuse rather than double-count NumFreePages.
+	if p.bitmap.IsSet(id) {
+		return fmt.Errorf("pager: FreeLeakedPage %d: page is already free", id)
+	}
+	p.bitmap.Set(id) // mark free + dirty
+	return nil
+}
+
 // reclaimRPL walks the in-memory RPL segment list from tail (oldest) and
 // reclaims whole segments whose TxnID < reclamationBound. For each
 // reclaimed segment:

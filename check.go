@@ -48,10 +48,29 @@ type CheckIssue struct {
 }
 
 // CheckOptions configures CheckWithOptions. A nil *CheckOptions (or the
-// zero value) is plain structural Check. (Repair — exclusive leaked-page
-// reclamation — is wired in a following sub-chunk; this type carries only
-// the read-only options today.)
+// zero value) is plain structural Check.
 type CheckOptions struct {
+	// Repair enables offline leaked-page reclamation: pages that are
+	// allocated in the bitmap yet unreachable from every committed tree
+	// and absent from the RPL (BitmapLeak) are freed in the bitmap.
+	//
+	// Repair requires EXCLUSIVE access (api-surface.md §CheckOptions):
+	// it opens a WRITE transaction (acquiring the cross-process write
+	// lock, so no concurrent writers) and proceeds only when no read
+	// transaction is active in any process. With readers active it frees
+	// nothing and emits a single CheckError "Repair.ReadersActive" — run
+	// plain Check (no Repair) for read-only diagnostics in that case.
+	//
+	// Repair is conservative (gmdb Inv-C5): it frees a page ONLY when the
+	// structural walk completed without being stopped and emitted NO
+	// CheckError/CheckFatal. Any structural finding makes the reachable
+	// set unreliable, so a corrupt database reports its leaks with
+	// Repaired=false plus a CheckWarning "Repair.Skipped" and reclaims
+	// nothing. Reclaimed pages are reported as the usual BitmapLeak
+	// CheckWarning with Repaired=true. The freed bitmap is published
+	// through the normal commit pipeline (atomic meta-swap).
+	Repair bool
+
 	// CheckIndexes additionally verifies that each indexed keyspace's
 	// stored index entries match what the supplied extractors would
 	// produce — it re-runs every extractor over every row, O(rows ×
@@ -115,10 +134,18 @@ func (db *DB) Check() iter.Seq[CheckIssue] { return db.CheckWithOptions(nil) }
 // CheckWithOptions is Check with options (api-surface.md §Check). With
 // opts.CheckIndexes set it additionally verifies, for each supplied
 // IndexDecl, that the stored index entries match what the extractor
-// re-run over every live row would produce (extractor-equivalence). A
-// nil opts is identical to Check. The reader-slot lifetime and the
-// CheckFatal-is-last contract are unchanged from Check.
+// re-run over every live row would produce (extractor-equivalence). With
+// opts.Repair set it reclaims leaked pages under exclusive access (see
+// CheckOptions.Repair). A nil opts is identical to Check.
+//
+// The read-only modes (Repair unset) keep Check's reader-slot lifetime
+// and CheckFatal-is-last contract. The Repair mode instead opens a WRITE
+// transaction (exclusive access is required to free pages), but otherwise
+// preserves the lazy-open and CheckFatal-is-last semantics.
 func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue] {
+	if opts != nil && opts.Repair {
+		return db.checkRepair(opts)
+	}
 	return func(yield func(CheckIssue) bool) {
 		rtx, err := db.BeginRead(context.Background())
 		if err != nil {
@@ -132,7 +159,7 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue] {
 		defer rtx.Rollback()
 		meta := rtx.Meta()
 		c := &checker{
-			rtx:   rtx,
+			pgr:   rtx.pgr,
 			cfg:   page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)},
 			meta:  meta,
 			yield: yield,
@@ -142,12 +169,116 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue] {
 	}
 }
 
+// noReaderTxnID is coord.OldestReaderTxnID()'s "no live reader" sentinel
+// (math.MaxUint64). Mirrors the const in db.go's write-tx Begin path.
+const noReaderTxnID = ^uint64(0)
+
+// checkRepair is the exclusive Repair path (CheckOptions.Repair). It
+// opens a write transaction — acquiring the cross-process write lock, so
+// no other writer runs concurrently — verifies no read transaction is
+// active, runs the structural walk against the write tx's snapshot
+// collecting the BitmapLeak set, and (only when the walk completed
+// cleanly) frees exactly that set in the bitmap and commits. gmdb Inv-C5:
+// frees ONLY pages a COMPLETE, error-free walk proved unreachable, under
+// verified no-readers/no-writers exclusivity; atomicity rides the commit
+// pipeline.
+func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
+	return func(yield func(CheckIssue) bool) {
+		tx, err := db.Begin(context.Background(), true)
+		if err != nil {
+			yield(CheckIssue{
+				Severity: CheckFatal,
+				Code:     "Repair.WriteTxUnavailable",
+				Message:  fmt.Sprintf("Repair could not open an exclusive write transaction: %v", err),
+			})
+			return
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+
+		// Exclusivity gate (clause-explicit Inv-C5): we hold the write
+		// lock (no concurrent writers); require no live reader in any
+		// process. OldestReaderTxnID's LOCK_EX precondition is satisfied
+		// by the grant the write tx holds (same as db.Begin's bound
+		// computation). Snapshot coord under db.mu vs. Close.
+		db.mu.Lock()
+		coord := db.coord
+		db.mu.Unlock()
+		if coord == nil || coord.OldestReaderTxnID() != noReaderTxnID {
+			yield(CheckIssue{
+				Severity: CheckError,
+				Code:     "Repair.ReadersActive",
+				Message:  "Repair requires exclusive access but a read transaction is active; nothing reclaimed (run Check without Repair for read-only diagnostics)",
+			})
+			return
+		}
+
+		meta := tx.prevMeta
+		c := &checker{
+			pgr:    tx.pgr,
+			cfg:    page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)},
+			meta:   meta,
+			yield:  yield,
+			opts:   opts,
+			repair: true,
+		}
+		c.run()
+
+		// Inv-C5 completeness gate: free only when the walk ran to
+		// completion (caller did not break) and reported no structural
+		// error/fatal. Otherwise the reachable set is unreliable and a
+		// live page could be misclassified as leaked.
+		if c.stopped {
+			return // caller broke, or a CheckFatal already terminated the walk
+		}
+		if c.sawError {
+			// Corruption present: report the leaks we found, unrepaired,
+			// then a Skipped warning. Reclaim nothing.
+			for _, id := range c.leaked {
+				if !c.emitLeak(id, false) {
+					return
+				}
+			}
+			c.emit(CheckIssue{Severity: CheckWarning, Code: "Repair.Skipped",
+				Message: "structural corruption present; leaked pages reported but not reclaimed (reachable set unreliable)"})
+			return
+		}
+		if len(c.leaked) == 0 {
+			return // structurally clean, no leaks — nothing to commit
+		}
+
+		// Free exactly the leaked set in the bitmap and publish via commit.
+		for _, id := range c.leaked {
+			if err := tx.pgr.FreeLeakedPage(id); err != nil {
+				c.emit(CheckIssue{Severity: CheckFatal, Code: "Repair.FreeFailed", PageID: id,
+					Message: fmt.Sprintf("could not free leaked page %d: %v", id, err)})
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			c.emit(CheckIssue{Severity: CheckFatal, Code: "Repair.CommitFailed",
+				Message: fmt.Sprintf("repair commit failed; no pages reclaimed: %v", err)})
+			return
+		}
+		committed = true
+		for _, id := range c.leaked {
+			if !c.emitLeak(id, true) {
+				return
+			}
+		}
+	}
+}
+
 // errCheckStop is returned by a checker's visit callback to abort an
 // in-progress btree.Walk when the caller stopped iterating.
 var errCheckStop = errors.New("check: iteration stopped by caller")
 
 type checker struct {
-	rtx   *ReadTx
+	pgr   *pager.Pager
 	cfg   page.Config
 	meta  page.Meta
 	yield func(CheckIssue) bool
@@ -155,6 +286,18 @@ type checker struct {
 
 	stopped   bool
 	reachable bitset
+
+	// sawError latches true once any CheckError/CheckFatal is emitted —
+	// the Inv-C5 completeness gate keys Repair off it (a structurally
+	// dirty walk leaves the reachable set unreliable, so Repair frees
+	// nothing).
+	sawError bool
+
+	// repair, when set, makes accounting COLLECT the BitmapLeak set into
+	// leaked rather than emit it inline; checkRepair frees the set and
+	// emits each page (Repaired=true on success) after the walk.
+	repair bool
+	leaked []uint64
 
 	// inv is the per-keyspace inventory the structural walk records for
 	// the CheckIndexes pass — populated only when checkIndexesEnabled().
@@ -175,16 +318,30 @@ type ksInventory struct {
 func (c *checker) checkIndexesEnabled() bool { return c.opts != nil && c.opts.CheckIndexes }
 
 // emit yields one issue. Returns false (and latches stopped) when the
-// caller has asked to stop iterating.
+// caller has asked to stop iterating. A CheckError/CheckFatal latches
+// sawError (the Inv-C5 completeness gate).
 func (c *checker) emit(iss CheckIssue) bool {
 	if c.stopped {
 		return false
+	}
+	if iss.Severity >= CheckError {
+		c.sawError = true
 	}
 	if !c.yield(iss) {
 		c.stopped = true
 		return false
 	}
 	return true
+}
+
+// emitLeak yields a BitmapLeak finding for page id, with Repaired set per
+// whether the exclusive Repair path reclaimed it.
+func (c *checker) emitLeak(id uint64, repaired bool) bool {
+	msg := fmt.Sprintf("page %d is allocated but unreferenced (leaked)", id)
+	if repaired {
+		msg = fmt.Sprintf("page %d was allocated but unreferenced (leaked); reclaimed by Repair", id)
+	}
+	return c.emit(CheckIssue{Severity: CheckWarning, Code: "BitmapLeak", PageID: id, Repaired: repaired, Message: msg})
 }
 
 func (c *checker) run() {
@@ -196,7 +353,7 @@ func (c *checker) run() {
 	// bitset to a forged-huge HWM/MaxSize would OOM. ValidateMeta does
 	// not bound these, so clamp the walk to the real on-disk page count.
 	// (Inv-C1 no-crash.)
-	bound := min(uint64(c.rtx.pgr.FileSize())/uint64(c.cfg.PageSize), c.meta.MaxSize)
+	bound := min(uint64(c.pgr.FileSize())/uint64(c.cfg.PageSize), c.meta.MaxSize)
 	if hwm > bound {
 		c.emit(CheckIssue{Severity: CheckError, Code: "HighWaterMarkOutOfRange",
 			Message: fmt.Sprintf("meta HighWaterMark %d exceeds file/MaxSize bound %d; walk clamped", hwm, bound)})
@@ -251,7 +408,7 @@ func (c *checker) run() {
 // is unguarded and would panic/SIGBUS on a corrupt or forged tree —
 // Check must not crash on the corruption it exists to detect).
 func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
-	err := btree.WalkKV(rawPageReader{c.rtx.pgr}, c.cfg, c.meta.KeyspaceRoot, hwm, func(k, v []byte) error {
+	err := btree.WalkKV(rawPageReader{c.pgr}, c.cfg, c.meta.KeyspaceRoot, hwm, func(k, v []byte) error {
 		name := string(k)
 		if len(v) != page.KeyspaceDescriptorSize {
 			if !c.emit(CheckIssue{Severity: CheckError, Code: "KeyspaceDescriptorSize", Keyspace: name,
@@ -296,7 +453,7 @@ func (c *checker) walkRegistry(ks string, desc page.KeyspaceDescriptor, firstDat
 	if !c.walkTree(ks, "", desc.IndexRegistryRoot, firstData, hwm) {
 		return false
 	}
-	err := btree.WalkKV(rawPageReader{c.rtx.pgr}, c.cfg, desc.IndexRegistryRoot, hwm, func(k, v []byte) error {
+	err := btree.WalkKV(rawPageReader{c.pgr}, c.cfg, desc.IndexRegistryRoot, hwm, func(k, v []byte) error {
 		idxName := string(k)
 		entry, derr := decodeRegistryEntry(v)
 		if derr != nil {
@@ -365,7 +522,7 @@ func (c *checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 		}
 		c.reachable.set(id)
 		if c.cfg.PageChecksum {
-			if !page.VerifyPageFooter(c.rtx.pgr.PageRaw(id), c.cfg.PageSize) {
+			if !page.VerifyPageFooter(c.pgr.PageRaw(id), c.cfg.PageSize) {
 				if !c.emit(CheckIssue{Severity: CheckError, Code: "BadPageChecksum", PageID: id, Keyspace: ks, Index: idx,
 					Message: fmt.Sprintf("page %d checksum mismatch", id)}) {
 					return errCheckStop
@@ -374,7 +531,7 @@ func (c *checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 		}
 		return nil
 	}
-	err := btree.Walk(rawPageReader{c.rtx.pgr}, c.cfg, root, hwm, visit)
+	err := btree.Walk(rawPageReader{c.pgr}, c.cfg, root, hwm, visit)
 	if err == nil {
 		return true
 	}
@@ -415,7 +572,7 @@ func (c *checker) walkRPL(hwm uint64) (bitset, bool) {
 				Message: fmt.Sprintf("RPL chain exceeds entry-count bound %d (likely cycle)", maxSegs)})
 		}
 		visited[id] = struct{}{}
-		seg, ok := page.DecodeRPLSegment(c.rtx.pgr.PageRaw(id), c.cfg)
+		seg, ok := page.DecodeRPLSegment(c.pgr.PageRaw(id), c.cfg)
 		if !ok {
 			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentMalformed", PageID: id,
 				Message: fmt.Sprintf("RPL segment page %d malformed", id)})
@@ -468,8 +625,12 @@ func (c *checker) accounting(firstData, hwm uint64, rplPages bitset) {
 				return
 			}
 		case !reach && !free && !pending:
-			if !c.emit(CheckIssue{Severity: CheckWarning, Code: "BitmapLeak", PageID: id,
-				Message: fmt.Sprintf("page %d is allocated but unreferenced (leaked)", id)}) {
+			if c.repair {
+				// Defer emission: checkRepair frees these after the walk
+				// (Inv-C5 needs the COMPLETE reachable set first) and emits
+				// each with Repaired set per the outcome.
+				c.leaked = append(c.leaked, id)
+			} else if !c.emitLeak(id, false) {
 				return
 			}
 		}
@@ -579,7 +740,7 @@ func (c *checker) verifyIndexEquivalence(ks string, info *ksInventory, decl *Ind
 	}
 	// Stored entries: enumerate the index data tree.
 	stored := make(map[string]string)
-	serr := btree.WalkKV(rawPageReader{c.rtx.pgr}, c.cfg, idxRoot, hwm, func(k, v []byte) error {
+	serr := btree.WalkKV(rawPageReader{c.pgr}, c.cfg, idxRoot, hwm, func(k, v []byte) error {
 		stored[string(k)] = string(v)
 		return nil
 	})
@@ -600,7 +761,7 @@ func (c *checker) verifyIndexEquivalence(ks string, info *ksInventory, decl *Ind
 // the index should hold, using the Keyspace codec (row key as PK).
 func (c *checker) expectedKeyspaceIndex(decl *IndexDecl, dataRoot, hwm uint64, hasCovering bool) (expected map[string]string, extractErr, structErr error) {
 	expected = make(map[string]string)
-	werr := btree.WalkKV(rawPageReader{c.rtx.pgr}, c.cfg, dataRoot, hwm, func(k, v []byte) error {
+	werr := btree.WalkKV(rawPageReader{c.pgr}, c.cfg, dataRoot, hwm, func(k, v []byte) error {
 		entries, eerr := extractEntriesAsKeySet(decl, k, v)
 		if eerr != nil {
 			extractErr = eerr
@@ -629,7 +790,7 @@ func (c *checker) expectedKeyspaceIndex(decl *IndexDecl, dataRoot, hwm uint64, h
 // error, not a panic.
 func (c *checker) expectedSetKeyspaceIndex(decl *IndexDecl, dataRoot uint64, fvs uint16, hwm uint64, hasCovering bool) (expected map[string]string, extractErr, structErr error) {
 	expected = make(map[string]string)
-	pr := rawPageReader{c.rtx.pgr}
+	pr := rawPageReader{c.pgr}
 	addMember := func(setKey, member []byte) error {
 		entries, eerr := setKeyspaceExtractEntries(decl, setKey, member)
 		if eerr != nil {
@@ -721,7 +882,7 @@ func (c *checker) snapshotBitmap() (*bitmap.Bitmap, bool) {
 	ps := uint64(c.cfg.PageSize)
 	detail := make([]byte, uint64(c.meta.BitmapPages)*ps)
 	for i := uint64(0); i < uint64(c.meta.BitmapPages); i++ {
-		copy(detail[i*ps:(i+1)*ps], c.rtx.pgr.PageRaw(2+i))
+		copy(detail[i*ps:(i+1)*ps], c.pgr.PageRaw(2+i))
 	}
 	return bitmap.New(detail, c.cfg.PageSize, c.meta.BitmapPages, c.meta.MaxSize), true
 }
