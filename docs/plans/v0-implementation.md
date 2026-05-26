@@ -1688,9 +1688,28 @@ Primary files: `db.go`.
   (empty DB) + L-2 (PageChecksum) all fixed with added tests;
   SAC-1 (spec promotion) + SAC-2 (target-survives assertion)
   applied.
-- **11.5b** `CopyTo(path, compact=true)` — per-tree bottom-up
-  rebuild (defragment; reuses chunk-8 bulk-build retargeted to a
-  fresh file). *(pending)*
+- **11.5b** ✅ `CopyTo(path, compact=true)` — per-tree bottom-up
+  rebuild into a fresh file with sequential page ids (defragment).
+  Each B+tree is rebuilt structurally from its existing entries
+  (index trees included — extractors aren't on disk): Keyspace via
+  WalkKV → `bulkLeafEntry` → `bulkBuilder`; SetKeyspace via
+  WalkLeafEntries → `setBulk` (re-optimised subpage/nested per
+  threshold); index registry via WalkKV with each entry's Root
+  rewritten to the rebuilt index tree; then a fresh descriptor
+  tree. `freshFileWriter` (sequential alloc + WriteDirect) is the
+  shared `bulkPageWriter`/`bulkOverflowWriter`. **Approved reuse
+  shape (user decision):** decoupled `bulkLeafEntry` from
+  `*Keyspace` to a free function taking `bulkOverflowWriter` so
+  BulkLoad and compact-copy share ONE overflow encoder; `setBulk`
+  reused unchanged. Inv (entailed): rebuild preserves every
+  keyspace's logical contents + emits valid storage. Adversarial
+  review: ship, 0 introduced H/M; L-1 (registry/index trees now
+  use base cfg, matching runtime maintenance) + L-2 (compact
+  empty-DB + PageChecksum tests) fixed; SAC-1 (spec wording: ids
+  globally gap-free, not per-tree contiguous) applied. Tests:
+  compact round-trip (indexed + nested-tree set + overflow,
+  CheckIndexes clean), defragments (DeleteRange churn → smaller
+  HWM than verbatim + zero free), empty, PageChecksum.
 - **11.6** `Compact()` — drain + flock + atomic rename +
   reopen; `Options.CompactDrainTimeout`. *(pending)*
 - **11.7** Chunk close-out. *(pending)*

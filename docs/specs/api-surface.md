@@ -1382,8 +1382,15 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue]
 // read-tx snapshot — writers are not blocked (the snapshot's reader slot
 // pins its pages against RPL reclamation for the whole copy, so a
 // concurrent commit cannot reuse a page the copy reads). When compact is
-// true, the copy is compacted: free pages omitted, B+tree pages written
-// sequentially. Inherits source's PageSize, BitmapPages, MaxSize.
+// true, the copy is compacted: every B+tree is rebuilt bottom-up from its
+// existing entries with page ids assigned sequentially from the first data
+// page with NO gaps and free pages omitted, and the file shrinks to the
+// live size. Page ids are globally gap-free, NOT per-tree contiguous — the
+// data, index, registry, and descriptor trees and overflow runs draw from
+// one monotonic counter, so a single tree's pages form a monotone-
+// increasing but not necessarily adjacent id set. Index trees are rebuilt
+// structurally from their stored entries (the extractor closures are not on
+// disk). Inherits source's PageSize, BitmapPages, MaxSize.
 //
 // path must NOT already exist (CopyTo never clobbers an existing file).
 // The copy receives a FRESH UUID — it is a distinct database identity,

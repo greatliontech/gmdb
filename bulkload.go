@@ -443,7 +443,7 @@ func (ks *Keyspace) bulkLoadRows(rows iter.Seq2[[]byte, []byte], cfg page.Config
 			loopErr = ErrKeyEmpty
 			return false
 		}
-		e, err := ks.bulkLeafEntry(cfg, key, value)
+		e, err := bulkLeafEntry(ks.tx.pgr, cfg, key, value)
 		if err != nil {
 			loopErr = err
 			return false
@@ -737,7 +737,11 @@ func (sb *setBulk) flush() error {
 // overflow-reference entry. nil value is normalised to empty (the
 // nil-value-as-empty invariant). The inline/overflow boundary is btree's
 // (shared with Put) so a value Put would inline, BulkLoad inlines.
-func (ks *Keyspace) bulkLeafEntry(cfg page.Config, key, value []byte) (page.LeafEntry, error) {
+//
+// Decoupled from any *Keyspace: it takes the overflow writer (the live
+// pager for BulkLoad; a fresh-file writer for CopyTo's compacting rebuild)
+// so both bottom-up builders share one overflow encoder.
+func bulkLeafEntry(pw bulkOverflowWriter, cfg page.Config, key, value []byte) (page.LeafEntry, error) {
 	if value == nil {
 		value = []byte{}
 	}
@@ -747,7 +751,7 @@ func (ks *Keyspace) bulkLeafEntry(cfg page.Config, key, value []byte) (page.Leaf
 	if !btree.OverflowRefFitsLeaf(cfg, key) {
 		return page.LeafEntry{}, btree.ErrKeyTooLarge
 	}
-	firstID, err := writeBulkOverflowChain(ks.tx.pgr, cfg, value)
+	firstID, err := writeBulkOverflowChain(pw, cfg, value)
 	if err != nil {
 		return page.LeafEntry{}, err
 	}

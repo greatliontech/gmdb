@@ -3,11 +3,12 @@ package gmdb
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // firstByteDecl indexes rows on the first byte of their value — a small
@@ -459,17 +460,273 @@ func TestCopyToConcurrentWriter(t *testing.T) {
 	}
 }
 
-// TestCopyToCompactPending documents that compact=true is not yet wired
-// (plan 11.5b). Remove with that change set.
-func TestCopyToCompactPending(t *testing.T) {
+// metaOf opens path read-only-ish (a write tx, rolled back) and returns its
+// active meta — used to compare HighWaterMark / NumFreePages across copies.
+func metaOf(t *testing.T, path string) page.Meta {
+	t.Helper()
+	ctx := context.Background()
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("Open %q: %v", path, err)
+	}
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	return tx.prevMeta
+}
+
+// TestCopyToCompactRoundTrip: a compacting copy of a populated DB (indexed
+// keyspace + set keyspace with nested-tree promotion + overflow values)
+// reopens clean, every row/member/value survives, CheckIndexes reports no
+// drift (index trees rebuilt structurally), and the copy has zero free
+// pages.
+func TestCopyToCompactRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	dst := tmpPath(t)
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	const nItems, nHuge, nBig = 800, 400, 5
+	bigVal := bytes.Repeat([]byte("Z"), 6000)
+	tx, _ := db.Begin(ctx, true)
+	ks, err := tx.CreateKeyspace("items", firstByteDecl())
+	if err != nil {
+		t.Fatalf("CreateKeyspace items: %v", err)
+	}
+	for i := range nItems {
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "%c-val-%05d", byte('a'+i%26), i)); err != nil {
+			t.Fatalf("Put items %d: %v", i, err)
+		}
+	}
+	big, _ := tx.CreateKeyspace("big")
+	for i := range nBig {
+		if err := big.Put(fmt.Appendf(nil, "big%02d", i), bigVal); err != nil {
+			t.Fatalf("big Put: %v", err)
+		}
+	}
+	set, _ := tx.CreateSetKeyspace("set", nil)
+	for i := range nHuge {
+		if _, err := set.Put([]byte("huge"), fmt.Appendf(nil, "m%05d", i)); err != nil {
+			t.Fatalf("set huge Put: %v", err)
+		}
+	}
+	for i := range 50 { // a few small-set keys (subpage path)
+		if _, err := set.Put(fmt.Appendf(nil, "s%02d", i%5), fmt.Appendf(nil, "v%05d", i)); err != nil {
+			t.Fatalf("set small Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	if err := db.CopyTo(dst, true); err != nil {
+		t.Fatalf("CopyTo(compact): %v", err)
+	}
+	db.Close()
+
+	cp, err := Open(ctx, dst, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("Open compact copy: %v", err)
+	}
+	defer cp.Close()
+	for _, iss := range collectIssues(cp.CheckWithOptions(&CheckOptions{
+		CheckIndexes: true,
+		Indexes:      map[string][]*IndexDecl{"items": {firstByteDecl()}},
+	})) {
+		if iss.Severity != CheckWarning {
+			t.Errorf("compact copy Check error: code=%s ks=%s idx=%s page=%d msg=%s", iss.Code, iss.Keyspace, iss.Index, iss.PageID, iss.Message)
+		}
+		if iss.Code == "BitmapLeak" || iss.Code == "CheckIndexes.FingerprintDrift" {
+			t.Errorf("compact copy Check unexpected: code=%s page=%d idx=%s", iss.Code, iss.PageID, iss.Index)
+		}
+	}
+
+	rtx, _ := cp.Begin(ctx, true)
+	defer rtx.Rollback()
+	rks, err := rtx.OpenKeyspace("items", firstByteDecl())
+	if err != nil {
+		t.Fatalf("compact OpenKeyspace items: %v", err)
+	}
+	for i := range nItems {
+		got, err := rks.Get(fmt.Appendf(nil, "key%05d", i))
+		if err != nil {
+			t.Fatalf("compact Get items key%05d: %v", i, err)
+		}
+		if want := fmt.Sprintf("%c-val-%05d", byte('a'+i%26), i); string(got) != want {
+			t.Fatalf("compact items key%05d = %q, want %q", i, got, want)
+		}
+	}
+	rbig, _ := rtx.OpenKeyspace("big")
+	for i := range nBig {
+		got, err := rbig.Get(fmt.Appendf(nil, "big%02d", i))
+		if err != nil || !bytes.Equal(got, bigVal) {
+			t.Fatalf("compact big%02d mismatch (err=%v len=%d)", i, err, len(got))
+		}
+	}
+	rset, _ := rtx.OpenSetKeyspace("set")
+	if cnt, err := rset.CountValues([]byte("huge")); err != nil || cnt != nHuge {
+		t.Fatalf("compact CountValues(huge) = %d, %v; want %d", cnt, err, nHuge)
+	}
+	for i := range nHuge {
+		ok, err := rset.HasValue([]byte("huge"), fmt.Appendf(nil, "m%05d", i))
+		if err != nil || !ok {
+			t.Fatalf("compact set missing huge m%05d (ok=%v err=%v)", i, ok, err)
+		}
+	}
+
+	// A compacted copy has no free pages (read from the open copy's tx;
+	// re-Opening the same path here would deadlock on its lock file).
+	if nf := rtx.prevMeta.NumFreePages; nf != 0 {
+		t.Errorf("compact copy NumFreePages = %d, want 0", nf)
+	}
+}
+
+// TestCopyToCompactEmpty: a compacting copy of a DB with no keyspaces
+// opens clean and empty.
+func TestCopyToCompactEmpty(t *testing.T) {
 	ctx := context.Background()
 	dst := tmpPath(t)
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	if err := db.CopyTo(dst, true); err != nil {
+		t.Fatalf("CopyTo(compact): %v", err)
+	}
+	db.Close()
+	cp, err := Open(ctx, dst, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	if err != nil {
+		t.Fatalf("Open compact copy: %v", err)
+	}
+	defer cp.Close()
+	for _, iss := range collectIssues(cp.Check()) {
+		t.Errorf("empty compact copy Check issue: code=%s sev=%d msg=%s", iss.Code, iss.Severity, iss.Message)
+	}
+	vtx, _ := cp.Begin(ctx, true)
+	if names, _ := vtx.ListKeyspaces(); len(names) != 0 {
+		t.Errorf("empty compact copy has keyspaces: %v", names)
+	}
+	vtx.Rollback()
+}
+
+// TestCopyToCompactPageChecksum: a compacting copy with PageChecksum on
+// stamps fresh footers on every rebuilt page, so the copy verifies clean.
+func TestCopyToCompactPageChecksum(t *testing.T) {
+	ctx := context.Background()
+	dst := tmpPath(t)
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tx, _ := db.Begin(ctx, true)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range 400 {
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "val%05d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := db.CopyTo(dst, true); err != nil {
+		t.Fatalf("CopyTo(compact): %v", err)
+	}
+	db.Close()
+	cp, err := Open(ctx, dst, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("Open compact copy: %v", err)
+	}
+	defer cp.Close()
+	for _, iss := range collectIssues(cp.Check()) {
+		if iss.Code == "BadPageChecksum" {
+			t.Errorf("compact copy BadPageChecksum at page %d", iss.PageID)
+		}
+		if iss.Severity != CheckWarning {
+			t.Errorf("compact checksum copy Check error: code=%s msg=%s", iss.Code, iss.Message)
+		}
+	}
+	rtx, _ := cp.Begin(ctx, true)
+	defer rtx.Rollback()
+	rks, _ := rtx.OpenKeyspace("k")
+	for i := range 400 {
+		if _, err := rks.Get(fmt.Appendf(nil, "key%05d", i)); err != nil {
+			t.Fatalf("compact checksum Get key%05d: %v", i, err)
+		}
+	}
+}
+
+// TestCopyToCompactDefragments: a source with many freed pages (churned via
+// DeleteRange) yields a compact copy with a strictly smaller HighWaterMark
+// than a verbatim copy of the same snapshot — free pages are reclaimed.
+func TestCopyToCompactDefragments(t *testing.T) {
+	ctx := context.Background()
+	verbatimDst := tmpPath(t)
+	compactDst := tmpPath(t)
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
 	defer db.Close()
-	if err := db.CopyTo(dst, true); !errors.Is(err, errCompactCopyPending) {
-		t.Errorf("CopyTo(compact=true): got %v, want errCompactCopyPending", err)
+
+	// Build a large keyspace, then delete most of it — leaving many free
+	// pages below a high HighWaterMark (fragmentation).
+	tx, _ := db.Begin(ctx, true)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range 3000 {
+		if err := ks.Put(fmt.Appendf(nil, "key%06d", i), bytes.Repeat([]byte("v"), 200)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	tx2, _ := db.Begin(ctx, true)
+	ks2, _ := tx2.OpenKeyspace("k")
+	if _, err := ks2.DeleteRange(fmt.Appendf(nil, "key%06d", 100), fmt.Appendf(nil, "key%06d", 2900)); err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	if err := tx2.Commit(); err != nil {
+		t.Fatalf("Commit delete: %v", err)
+	}
+
+	if err := db.CopyTo(verbatimDst, false); err != nil {
+		t.Fatalf("CopyTo verbatim: %v", err)
+	}
+	if err := db.CopyTo(compactDst, true); err != nil {
+		t.Fatalf("CopyTo compact: %v", err)
+	}
+
+	vHWM := metaOf(t, verbatimDst).HighWaterMark
+	cMeta := metaOf(t, compactDst)
+	if cMeta.HighWaterMark >= vHWM {
+		t.Errorf("compact HighWaterMark %d not smaller than verbatim %d (no defragmentation)", cMeta.HighWaterMark, vHWM)
+	}
+	if cMeta.NumFreePages != 0 {
+		t.Errorf("compact copy NumFreePages = %d, want 0", cMeta.NumFreePages)
+	}
+
+	// Surviving keys round-trip in the compact copy.
+	cp, err := Open(ctx, compactDst, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("Open compact: %v", err)
+	}
+	defer cp.Close()
+	for _, iss := range collectIssues(cp.Check()) {
+		if iss.Severity != CheckWarning {
+			t.Errorf("compact copy Check error: code=%s msg=%s", iss.Code, iss.Message)
+		}
+	}
+	rtx, _ := cp.Begin(ctx, true)
+	defer rtx.Rollback()
+	rks, _ := rtx.OpenKeyspace("k")
+	for _, i := range []int{0, 50, 99, 2900, 2999} { // boundary survivors
+		if _, err := rks.Get(fmt.Appendf(nil, "key%06d", i)); err != nil {
+			t.Errorf("compact Get key%06d: %v", i, err)
+		}
+	}
+	if _, err := rks.Get(fmt.Appendf(nil, "key%06d", 1500)); err == nil {
+		t.Errorf("deleted key%06d present in compact copy", 1500)
 	}
 }
