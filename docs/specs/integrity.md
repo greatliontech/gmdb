@@ -14,6 +14,7 @@ Scope:
 - Stale reader / writer recovery.
 - Index consistency.
 - Silent bitrot detection.
+- Forged / structural corruption tolerance (read path).
 - Disk-full (ENOSPC) handling.
 
 ## Invariants
@@ -111,9 +112,25 @@ open the keyspace until `RebuildIndex` is called. See
 ## Silent bitrot detection
 
 When `PageChecksum` is enabled (the default), every data page
-read is verified against its xxhash64 footer. Corruption is
-detected at read time with `ErrBadPageChecksum` identifying the
-affected page. See `checksums.md`.
+read is verified against its xxhash64 footer on first access in a
+transaction (cached thereafter). Corruption is detected at read
+time with `ErrBadPageChecksum` identifying the affected page. See
+`checksums.md §Verification`.
+
+## Forged / structural corruption tolerance
+
+Checksum verification catches accidental bitrot but not a
+deliberately-forged page (recomputed footer) or a
+checksum-disabled database. The read path is independently
+hardened so a corrupt or forged on-disk surface yields an error
+rather than a crash: content-derived page ids are bounded against
+the file-resident extent before any mmap access (out-of-range ⇒
+`ErrCorrupted`, never a SIGBUS on the `MaxSize` reservation gap);
+allocations sized from on-disk length/count fields (overflow
+`TotalLen`, index-registry counts) are bounded before they are
+made (no OOM); and branch pages are structurally validated before
+their directory is iterated (no out-of-bounds panic). See
+`checksums.md §Structural and Allocation Bounds`.
 
 ## Disk full (ENOSPC)
 

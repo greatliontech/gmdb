@@ -368,6 +368,14 @@ func (tx *Tx) registryDelete(owner descriptorOwner, name string) error {
 // registryList returns the index names declared on the keyspace
 // owned by owner, in lex order. Returns nil for a keyspace with
 // no declared indexes (IndexRegistryRoot == 0). Read-only.
+//
+// On a corrupt registry tree the result is bounded by construction: the
+// cursor reads through the verifying pager.Page (Inv-RV3 file-resident
+// bound + branch validation), so it cannot yield more entries than the
+// finite registry tree holds, and cur.Err() surfaces ErrCorrupted /
+// ErrBadPageChecksum. No separate output cap is therefore needed — the
+// allocation is bounded by the file. (decodeRegistryEntry bounds the
+// per-entry count fields; see Inv-RV4 there.)
 func (tx *Tx) registryList(owner descriptorOwner) ([]string, error) {
 	desc := owner.descriptor()
 	if desc.IndexRegistryRoot == 0 {

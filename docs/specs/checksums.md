@@ -181,6 +181,43 @@ Pages CoW'd in the current transaction have their footers
 computed at commit time on the dirty slab buffer, before the
 pwrite.
 
+## Structural and Allocation Bounds (Read Path)
+
+Checksum verification catches accidental bitrot, but it does not
+cover a deliberately-forged page whose footer was recomputed, nor
+a checksum-disabled database. The read path is therefore hardened
+independently of the checksum so it never *crashes* on corrupt
+input — it returns an error instead:
+
+- **Page-id reachability bound.** Every content-derived page id
+  (a branch child pointer, an overflow-run page, a nested-subtree
+  root) is bounded against the file-resident page extent
+  (`fileSize / PageSize`) before any mmap access. An out-of-range
+  id yields `ErrCorrupted`, never a SIGBUS on the unbacked region
+  of the `MaxSize` mmap reservation (the reservation spans
+  `MaxSize` but only the first `fileSize` bytes are file-backed;
+  see `mmap-strategy.md`). The bound lives in the pager's
+  verifying page accessor (`pager-slab.md`).
+- **Allocation bound.** An allocation sized from an on-disk
+  length/count field — an overflow value's `TotalLen`, an index
+  registry entry's column/covering counts — is bounded before it
+  is made, so a forged field cannot drive an out-of-memory abort.
+  For overflow this means the run length is computed without
+  uint32 truncation and the run is read one page at a time so it
+  aborts at the file-resident bound before the value buffer is
+  allocated.
+- **Branch structure validation.** A branch page is validated
+  (`ValidateBranch`) before its cell directory is iterated — the
+  analogue of the per-leaf `LeafReader.Validate`, applied at the
+  first resolver of every branch on a descent. A forged directory
+  yields `ErrCorrupted`, not an out-of-bounds panic.
+
+These bounds are enforced by the btree / page / db corruption
+tests, not by a spec clause; they are the structural companions
+to the checksum verification above, and together they make
+`Check()` and ordinary reads tolerant of an arbitrarily-corrupt
+on-disk surface.
+
 ## Computation (Write Path)
 
 When checksums are enabled, the xxhash64 footer is computed on

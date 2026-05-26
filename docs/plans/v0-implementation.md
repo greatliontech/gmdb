@@ -1590,6 +1590,51 @@ Primary specs: `api-surface.md §Check, CopyTo, Compact`,
 
 Primary files: `db.go`.
 
+**Sub-chunk roster (as landed).**
+
+- **11.1** Triage + invariants. Folded `btree-branch-page-
+  validation` and `index-registry-decoder-bounds` (both
+  `Lands:` chunk 11) into the chunk plan; derived the Check
+  invariants Inv-C1..C5.
+- **11.2** `Check()` structural integrity walk — `iter.Seq[
+  CheckIssue]`, `btree.Walk`/`WalkKV`, `page.ValidateBranch`.
+  Commit `6cfc6ea`. Its round-3 fresh-eyes pass found a forged
+  overflow-`TotalLen` OOM (Inv-C1 class); folded into 11.3d.
+- **11.3** Read-path corruption tolerance. Mid-implementation
+  discovery: `checksums.md §Verification` (every page read
+  verified on first access ⇒ `ErrBadPageChecksum`, cached) was
+  a clause-explicit spec requirement that was entirely
+  unimplemented, and the read path dereferenced content-derived
+  page ids without a file-resident bound (SIGBUS on the
+  `[fileSize, MaxSize)` reservation gap). Surfaced to the user;
+  scoped as "full corruption tolerance now." Invariants
+  Inv-RV1..RV4 derived and enforced by tests.
+  - **11.3a+b** `PageReader.Page → ([]byte, error)` plumbing;
+    pager verifying+bounding `Page` (RV1/RV2 checksum verify +
+    per-tx cache, RV3 file-resident bound). Commit `c00bcf2`.
+  - **11.3c+d** `ValidateBranch` wired into every branch
+    first-read descent incl. the merge-sibling read (resolves
+    `btree-branch-page-validation`); `OverflowRunLength64` +
+    incremental `readOverflowValue` + run64 guards fix the 11.2
+    forged-`TotalLen` OOM; `decodeRegistryEntry` count
+    pre-checks (resolves `index-registry-decoder-bounds`).
+    Commit `cd9f445`.
+  - **11.3e** Close-out: promoted the two issues' rationale
+    inline (`validateBranchPage` / Inv-RV4 comments /
+    `registryList` no-cap note), deleted both issue docs +
+    README rows (`git log --all -- docs/issues/<f>.md`), synced
+    `checksums.md §Structural and Allocation Bounds` +
+    `integrity.md`, this roster. Spec-amend candidate relayed to
+    the user: Check's reader-slot release is deterministic
+    (defer-on-break), stronger than the spec's GC-via-AddCleanup
+    wording.
+- **11.4** `CheckWithOptions` — `CheckIndexes` extractor-
+  equivalence + `Repair` leaked-page reclamation. *(pending)*
+- **11.5** `CopyTo(path, compact)`. *(pending)*
+- **11.6** `Compact()` — drain + flock + atomic rename +
+  reopen; `Options.CompactDrainTimeout`. *(pending)*
+- **11.7** Chunk close-out. *(pending)*
+
 ### Chunk 12 — Background maintenance goroutine
 
 **Scope.** Maintenance loop (interval + `LastMaintenanceTime`
