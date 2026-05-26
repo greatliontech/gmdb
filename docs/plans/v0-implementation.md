@@ -1782,6 +1782,45 @@ Primary specs: `background-maintenance.md`.
 
 Primary files: `db.go`, `alloc.go`, `lock.go`.
 
+**Sub-chunk roster.**
+
+- **12.1** Triage + invariants (this gate). *Triage:* 0 entries match
+  `Lands: 12`; two condition-triggered entries walked as their task
+  lands — `leaked-readtx-cleanup-race-flake` (reader-slot lifecycle ↔
+  Task 2) and `writenewindexregistry-partial-leak` (Task 1 reclaims
+  such orphans like Repair; orphaning root unchanged ⇒ stays
+  deferred). *Lock layout:* `LastMaintenanceTime` already exists
+  (`internal/lock/format.go` + getter/setter; `cross-process.md`
+  documents it) — no layout change. *Invariants:* spec records
+  Inv-M1..M5; derived **Inv-M6** (entailed — the maintenance
+  goroutine drains before Close unmaps lock file / pager). Schedule:
+  M1+M6 → 12.2, M2 → 12.3, M3+M5 → 12.4, M4 → 12.5.
+- **12.2** `MaintenanceOptions` + `Options.Maintenance` + defaults;
+  the DB-level maintenance goroutine (start at Open, stop at Close —
+  batch-coordinator lifecycle pattern) with the interval ticker +
+  cross-process coordination via `LastMaintenanceTime` (skip if a
+  pass ran within Interval; stamp after). Includes **Task 2** (stale
+  reader-slot cleanup — atomic store, no tx) so the pass does real
+  work. Promotes Inv-M1 (≤1 pass/interval) + Inv-M6 (clean drain).
+  *(pending)*
+- **12.3** **Task 1** bitmap leak reclamation — detection read-tx
+  (reuse the Check leaked-set walk) + reclamation write-tx
+  (`FreeLeakedPage`), non-blocking (no exclusivity: a leaked page's
+  bit is clear so no allocator hands it out ⇒ it cannot become
+  un-leaked). Crash-recovery-at-Open schedules the first pass
+  immediately. Promotes Inv-M2. *(pending)*
+- **12.4** **Task 3** checksum scrubbing — `ScrubCursor` on DB,
+  `ScrubBatchSize` pages/pass via a read-tx footer verify, wrapping
+  at HighWaterMark; corruption logged as a `CheckWarning` with the
+  page ID, never repaired. Skipped when PageChecksum off. Promotes
+  Inv-M3 (report-only) + Inv-M5 (logged with page ID). *(pending)*
+- **12.5** **Task 4** incremental compaction — allocator
+  contiguous-allocation-failure-rate instrumentation (`alloc.go`),
+  threshold trigger, per-pass batch relocation (CoW cascade) bounded
+  by `MaxTxBufferBytes` (never `ErrTxTooLarge`). Promotes Inv-M4.
+  *(pending)*
+- **12.6** Chunk close-out. *(pending)*
+
 ## Cross-chunk concerns
 
 - **`SyncMode` plumbing** lands incrementally: `SyncDurable` in
