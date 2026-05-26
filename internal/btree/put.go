@@ -126,6 +126,9 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 		if typ != page.TypeBranch {
 			return 0, fmt.Errorf("%w: page %d has unexpected type %d during Put descent", ErrCorrupted, cur, typ)
 		}
+		if err := validateBranchPage(buf, cfg, cur); err != nil {
+			return 0, err
+		}
 		i := page.BranchSearch(buf, cfg, key)
 		next := page.BranchChildAt(buf, cfg, i)
 		if next == 0 {

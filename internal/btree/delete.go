@@ -85,6 +85,9 @@ func Delete(pw PageWriter, cfg page.Config, rootID uint64, mergeThreshold uint8,
 		if typ != page.TypeBranch || count != 0 {
 			break
 		}
+		if err := validateBranchPage(buf, cfg, newRootID); err != nil {
+			return 0, err
+		}
 		child := page.BranchLeftmostChild(buf)
 		if child == 0 {
 			return 0, fmt.Errorf("%w: empty root branch %d has null leftmost child", ErrCorrupted, newRootID)
@@ -118,6 +121,9 @@ func deleteFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uin
 	case page.IsLeafType(typ):
 		return deleteFromLeaf(pw, cfg, mergeThreshold, pageID, buf, key)
 	case typ == page.TypeBranch:
+		if err := validateBranchPage(buf, cfg, pageID); err != nil {
+			return 0, false, false, err
+		}
 		return deleteFromBranch(pw, cfg, mergeThreshold, pageID, buf, key)
 	default:
 		return 0, false, false, fmt.Errorf("%w: page %d unexpected type %d during Delete descent", ErrCorrupted, pageID, typ)
@@ -643,6 +649,17 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, leftID, rightID
 	}
 	rightSrc, err := pw.Page(rightID)
 	if err != nil {
+		return false, 0, 0, 0, nil, err
+	}
+	// Both siblings are read fresh here (NOT on the descent path that was
+	// validated on the way down), so validate their directories before
+	// DecodeBranch / BranchCellAt iterate them — mirrors the sibling-leaf
+	// Validate in mergeOrRedistributeLeaves, completing the branch-page-
+	// validation contract for the merge/redistribute path.
+	if err := validateBranchPage(leftSrc, cfg, leftID); err != nil {
+		return false, 0, 0, 0, nil, err
+	}
+	if err := validateBranchPage(rightSrc, cfg, rightID); err != nil {
 		return false, 0, 0, 0, nil, err
 	}
 	leftLeftmost, leftCells := page.DecodeBranch(leftSrc, cfg)

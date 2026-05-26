@@ -721,3 +721,42 @@ func stringSlicesEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// TestDecodeRegistryEntryRejectsForgedColumnCount (Inv-RV4): a forged
+// ColumnCount on a truncated on-disk registry entry is rejected as
+// errRegistryEntryShort without panicking or pre-allocating a
+// count-sized slice — decodeRegistryEntry bounds colCount*2 against the
+// remaining bytes before make([]string, colCount).
+func TestDecodeRegistryEntryRejectsForgedColumnCount(t *testing.T) {
+	data, err := encodeRegistryEntry(&indexRegistryEntry{
+		SchemaHash: 1, Root: 2, Count: 3, Columns: []string{"a"},
+	})
+	if err != nil {
+		t.Fatalf("encodeRegistryEntry: %v", err)
+	}
+	// ColumnCount is the u16 at offset 34 (32-byte fixed prefix + 2-byte
+	// empty UserVersionLen). Forge it to 0xFFFF; the entry stays the same
+	// (now-truncated) length.
+	binary.LittleEndian.PutUint16(data[34:], 0xFFFF)
+	if _, err := decodeRegistryEntry(data); !errors.Is(err, errRegistryEntryShort) {
+		t.Fatalf("decodeRegistryEntry(forged ColumnCount) = %v, want errRegistryEntryShort", err)
+	}
+}
+
+// TestDecodeRegistryEntryRejectsForgedCoveringCount (Inv-RV4): the
+// symmetric pre-check for CoveringCount — a forged CoveringCount on a
+// truncated entry is rejected before make([]string, covCount).
+func TestDecodeRegistryEntryRejectsForgedCoveringCount(t *testing.T) {
+	data, err := encodeRegistryEntry(&indexRegistryEntry{
+		SchemaHash: 1, Root: 2, Count: 3, Columns: []string{"a"},
+	})
+	if err != nil {
+		t.Fatalf("encodeRegistryEntry: %v", err)
+	}
+	// CoveringCount is the u16 immediately after the single 1-byte column
+	// "a": 32 prefix + 2 uvLen + 2 colCount + 2 nameLen + 1 name = offset 39.
+	binary.LittleEndian.PutUint16(data[39:], 0xFFFF)
+	if _, err := decodeRegistryEntry(data); !errors.Is(err, errRegistryEntryShort) {
+		t.Fatalf("decodeRegistryEntry(forged CoveringCount) = %v, want errRegistryEntryShort", err)
+	}
+}

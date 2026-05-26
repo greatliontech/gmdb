@@ -230,3 +230,97 @@ func TestCursorErrReportsBadPageChecksum(t *testing.T) {
 		t.Fatalf("Cursor.Err() over bitrotted keyspace = %v, want ErrBadPageChecksum", err)
 	}
 }
+
+// forgeBranchDirDB builds a checksums-OFF DB with a multi-level keyspace
+// "k", forges the data-tree root branch's first cell-directory entry
+// offset to 0xFFFF (past the page's content end), and returns the path
+// to the closed, corrupted file. Checksums are off so page.ValidateBranch
+// — not a footer mismatch — is what must catch the forged directory.
+func forgeBranchDirDB(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{PageSize: 4096, PageChecksum: false, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tx, _ := db.Begin(ctx, true)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range 800 { // multi-level tree → data-tree root is a branch
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "val%05d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	rtx, _ := db.Begin(ctx, true)
+	rks, _ := rtx.OpenKeyspace("k")
+	root := rks.desc.Root
+	rtx.Rollback()
+	if root == 0 {
+		t.Fatal("data-tree root is 0")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Offset 16 = branch cell-directory start (8-byte header + 8-byte
+	// leftmost-child pointer); 0xFFFF is far past content end, so
+	// BranchSearch/BranchCellAt would read out of the page — ValidateBranch
+	// must reject first.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	if _, err := f.WriteAt([]byte{0xFF, 0xFF}, int64(root)*4096+16); err != nil {
+		t.Fatalf("forge write: %v", err)
+	}
+	f.Close()
+	return path
+}
+
+// TestGetForgedBranchDirectoryNoPanic (G2 / btree-branch-page-validation):
+// a forged branch cell-directory on the production Get descent surfaces as
+// ErrCorrupted via validateBranchPage — never an out-of-bounds panic from
+// BranchSearch/BranchCellAt.
+func TestGetForgedBranchDirectoryNoPanic(t *testing.T) {
+	ctx := context.Background()
+	path := forgeBranchDirDB(t, ctx)
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	ks, err := tx.OpenKeyspace("k")
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	if _, err := ks.Get([]byte("key00000")); !errors.Is(err, ErrCorrupted) {
+		t.Fatalf("Get over forged branch directory = %v, want ErrCorrupted (no panic)", err)
+	}
+}
+
+// TestCursorForgedBranchDirectoryNoPanic (G2): the cursor descent
+// (descendLeftmost) hits the same validateBranchPage guard — a forged
+// branch directory surfaces through Cursor.Err() as ErrCorrupted, no panic.
+func TestCursorForgedBranchDirectoryNoPanic(t *testing.T) {
+	ctx := context.Background()
+	path := forgeBranchDirDB(t, ctx)
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	ks, err := tx.OpenKeyspace("k")
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	c := ks.Cursor()
+	c.First() // descendLeftmost reads the forged root branch
+	if err := c.Err(); !errors.Is(err, ErrCorrupted) {
+		t.Fatalf("Cursor.Err() over forged branch directory = %v, want ErrCorrupted (no panic)", err)
+	}
+}

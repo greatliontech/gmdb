@@ -79,6 +79,9 @@ func freeSubtreeAt(pw PageWriter, cfg page.Config, pageID uint64, depth int) (ui
 	typ, _, cellCount, _ := page.ReadHeader(buf)
 	switch {
 	case typ == page.TypeBranch:
+		if err := validateBranchPage(buf, cfg, pageID); err != nil {
+			return 0, err
+		}
 		// Recurse into the leftmost child + each cell's right child.
 		// page.BranchChildAt uses descent-index semantics: i=0 is the
 		// leftmost (Ptr[0]); i ∈ [1, cellCount] are the cell-pointed

@@ -185,6 +185,14 @@ func decodeRegistryEntry(data []byte) (*indexRegistryEntry, error) {
 	}
 	colCount := int(binary.LittleEndian.Uint16(data[off:]))
 	off += 2
+	// Inv-RV4: before allocating the slice, verify the remaining bytes can
+	// hold at least one 2-byte NameLen per column. A forged ColumnCount on
+	// a truncated on-disk entry would otherwise force a multi-MB make()
+	// before the per-iteration bounds check trips.
+	if colCount*2 > len(data)-off {
+		return nil, fmt.Errorf("%w: ColumnCount %d needs ≥%d bytes, %d remain at offset %d",
+			errRegistryEntryShort, colCount, colCount*2, len(data)-off, off)
+	}
 	if colCount > 0 {
 		e.Columns = make([]string, colCount)
 		for i := range colCount {
@@ -208,6 +216,11 @@ func decodeRegistryEntry(data []byte) (*indexRegistryEntry, error) {
 	}
 	covCount := int(binary.LittleEndian.Uint16(data[off:]))
 	off += 2
+	// Inv-RV4: same pre-allocation bound as ColumnCount above.
+	if covCount*2 > len(data)-off {
+		return nil, fmt.Errorf("%w: CoveringCount %d needs ≥%d bytes, %d remain at offset %d",
+			errRegistryEntryShort, covCount, covCount*2, len(data)-off, off)
+	}
 	if covCount > 0 {
 		e.Covering = make([]string, covCount)
 		for i := range covCount {

@@ -110,10 +110,13 @@ func walkKVAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, key
 			}
 			switch {
 			case e.IsOverflow():
-				runLen := page.OverflowRunLength(cfg, e.TotalLen)
-				if e.OverflowPage == 0 || e.OverflowPage+uint64(runLen) > hwm {
+				// Inv-RV4: uint64 run length — a forged TotalLen whose
+				// uint32 run truncates to a small value is caught here
+				// (run64 > hwm), before readOverflowValue allocates.
+				run64 := page.OverflowRunLength64(cfg, e.TotalLen)
+				if e.OverflowPage == 0 || e.OverflowPage >= hwm || e.OverflowPage+run64 > hwm {
 					return fmt.Errorf("%w: overflow run [%d,+%d) on leaf %d out of range (hwm=%d)",
-						ErrCorrupted, e.OverflowPage, runLen, pageID, hwm)
+						ErrCorrupted, e.OverflowPage, run64, pageID, hwm)
 				}
 				val, err := readOverflowValue(pr, cfg, e)
 				if err != nil {
@@ -189,13 +192,15 @@ func walkAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, visit
 			}
 			switch {
 			case e.IsOverflow():
-				runLen := page.OverflowRunLength(cfg, e.TotalLen)
-				if e.OverflowPage == 0 || e.OverflowPage+uint64(runLen) > hwm {
+				// Inv-RV4: uint64 run length (the visit loop is then
+				// bounded by hwm, never by a truncated forged run).
+				run64 := page.OverflowRunLength64(cfg, e.TotalLen)
+				if e.OverflowPage == 0 || e.OverflowPage >= hwm || e.OverflowPage+run64 > hwm {
 					return fmt.Errorf("%w: overflow run [%d,+%d) on leaf %d out of range (hwm=%d)",
-						ErrCorrupted, e.OverflowPage, runLen, pageID, hwm)
+						ErrCorrupted, e.OverflowPage, run64, pageID, hwm)
 				}
-				for j := range runLen {
-					if err := visit(e.OverflowPage+uint64(j), PageKindOverflow, depth+1); err != nil {
+				for j := range run64 {
+					if err := visit(e.OverflowPage+j, PageKindOverflow, depth+1); err != nil {
 						return err
 					}
 				}

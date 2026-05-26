@@ -549,6 +549,9 @@ func (c *Cursor) descendLeftmost(rootID uint64) error {
 		if typ != page.TypeBranch {
 			return fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
 		}
+		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
+			return err
+		}
 		child := page.BranchLeftmostChild(buf)
 		if child == 0 {
 			return fmt.Errorf("%w: null leftmost child in branch %d", ErrCorrupted, cur)
@@ -582,6 +585,9 @@ func (c *Cursor) descendRightmost(rootID uint64) error {
 		}
 		if typ != page.TypeBranch {
 			return fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
+		}
+		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
+			return err
 		}
 		n := page.BranchCellCount(buf)
 		var child uint64
@@ -626,6 +632,9 @@ func (c *Cursor) descendToKey(rootID uint64, target []byte) (idx int, entry page
 		}
 		if typ != page.TypeBranch {
 			return 0, page.LeafEntry{}, false, fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
+		}
+		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
+			return 0, page.LeafEntry{}, false, err
 		}
 		i := page.BranchSearch(buf, c.cfg, target)
 		child := page.BranchChildAt(buf, c.cfg, i)
@@ -707,6 +716,10 @@ func (c *Cursor) advanceToNextLeaf() bool {
 			c.err = err
 			return false
 		}
+		if err := validateBranchPage(buf, c.cfg, top.pageID); err != nil {
+			c.err = err
+			return false
+		}
 		n := page.BranchCellCount(buf)
 		if int(top.childIdx) < int(n) {
 			// Advance into the next sibling subtree at this
@@ -747,6 +760,10 @@ func (c *Cursor) advanceToPrevLeaf() bool {
 			c.err = err
 			return false
 		}
+		if err := validateBranchPage(buf, c.cfg, top.pageID); err != nil {
+			c.err = err
+			return false
+		}
 		child := page.BranchChildAt(buf, c.cfg, top.childIdx)
 		if child == 0 {
 			c.err = fmt.Errorf("%w: null sibling child in branch %d at idx %d", ErrCorrupted, top.pageID, top.childIdx)
@@ -784,6 +801,9 @@ func (c *Cursor) descendLeftmostFrom(cur uint64) error {
 		if typ != page.TypeBranch {
 			return fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
 		}
+		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
+			return err
+		}
 		child := page.BranchLeftmostChild(buf)
 		if child == 0 {
 			return fmt.Errorf("%w: null leftmost child in branch %d", ErrCorrupted, cur)
@@ -814,6 +834,9 @@ func (c *Cursor) descendRightmostFrom(cur uint64) error {
 		}
 		if typ != page.TypeBranch {
 			return fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
+		}
+		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
+			return err
 		}
 		n := page.BranchCellCount(buf)
 		var child uint64

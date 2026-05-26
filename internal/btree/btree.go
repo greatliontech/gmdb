@@ -49,6 +49,22 @@ var ErrCorrupted = errors.New("btree: structural corruption detected")
 // callers can errors.Is past either sentinel.
 var ErrTreeTooDeep = fmt.Errorf("%w: descent exceeded MaxTreeDepth (cycle or corrupt tree)", ErrCorrupted)
 
+// validateBranchPage validates a branch page's directory structure
+// before its separators/children are read — the chunk-4.6β "the first
+// resolver validates an arbitrary on-disk page" contract, extended from
+// leaves (LeafReader.Validate) to branches. A forged directory (count
+// past capacity, a cell offset outside the page) would otherwise make
+// BranchSearch / BranchCellAt / BranchChildAt read out of the page's
+// bounds; this turns that into a wrapped ErrCorrupted. Cheap (a
+// directory scan) and paid once per branch on its first read during a
+// descent, mirroring the per-leaf Validate already on the read path.
+func validateBranchPage(buf []byte, cfg page.Config, id uint64) error {
+	if err := page.ValidateBranch(buf, cfg); err != nil {
+		return fmt.Errorf("%w: branch %d: %w", ErrCorrupted, id, err)
+	}
+	return nil
+}
+
 // Get traverses the tree rooted at rootID looking for key. Returns
 // the value bytes on hit, (nil, false, nil) on miss, or an error
 // on structural corruption (bad page type, null child pointer,
@@ -91,6 +107,9 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch {
 		case typ == page.TypeBranch:
+			if err := validateBranchPage(buf, cfg, cur); err != nil {
+				return nil, false, err
+			}
 			i := page.BranchSearch(buf, cfg, key)
 			next := page.BranchChildAt(buf, cfg, i)
 			if next == 0 {
@@ -145,6 +164,9 @@ func Has(pr PageReader, cfg page.Config, rootID uint64, key []byte) (bool, error
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch {
 		case typ == page.TypeBranch:
+			if err := validateBranchPage(buf, cfg, cur); err != nil {
+				return false, err
+			}
 			i := page.BranchSearch(buf, cfg, key)
 			next := page.BranchChildAt(buf, cfg, i)
 			if next == 0 {

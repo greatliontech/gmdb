@@ -51,6 +51,26 @@ func OverflowRunLength(cfg Config, valLen uint64) uint32 {
 	return 1 + uint32((remaining+follower-1)/follower)
 }
 
+// OverflowRunLength64 is OverflowRunLength without the uint32 truncation:
+// it returns the page count as a uint64. The write path stores values
+// whose run length always fits a uint32, so OverflowRunLength suffices
+// there; the READ/validation path must use this form, because a forged
+// on-disk TotalLen can imply a run length that overflows uint32 and
+// truncates to a small value — making a naive run-vs-extent guard pass
+// while the TotalLen-sized allocation is enormous (Inv-RV4). Callers
+// bound the returned count against the file-resident extent before
+// trusting TotalLen for any allocation.
+func OverflowRunLength64(cfg Config, valLen uint64) uint64 {
+	cfg.mustValidate()
+	first := uint64(OverflowFirstPageCapacity(cfg))
+	if valLen <= first {
+		return 1
+	}
+	follower := uint64(OverflowFollowerCapacity(cfg))
+	remaining := valLen - first
+	return 1 + (remaining+follower-1)/follower
+}
+
 // EncodeOverflowRun writes value into a contiguous run of pages
 // starting at pages[0]. pages MUST have exactly OverflowRunLength
 // entries, each a page-sized buffer. The caller is responsible for

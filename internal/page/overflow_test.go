@@ -141,3 +141,35 @@ func TestOverflowFirstPageTypeIsOverflow(t *testing.T) {
 		t.Errorf("type = %d, want %d (TypeOverflow)", typ, TypeOverflow)
 	}
 }
+
+// TestOverflowRunLength64NoTruncation (Inv-RV4): the uint64 run length
+// must not truncate the way OverflowRunLength (uint32) does — a forged
+// on-disk TotalLen whose true run exceeds uint32 is exactly what made a
+// naive run-vs-extent guard pass while the value allocation was enormous.
+func TestOverflowRunLength64NoTruncation(t *testing.T) {
+	cfg := Config{PageSize: 4096}
+	// Small valid values: the two forms agree.
+	for _, v := range []uint64{0, 1, 100, 4088, 4089, 100000} {
+		if got, want := OverflowRunLength64(cfg, v), uint64(OverflowRunLength(cfg, v)); got != want {
+			t.Errorf("OverflowRunLength64(%d) = %d, OverflowRunLength = %d, want equal", v, got, want)
+		}
+	}
+	// A forged ~1 PB TotalLen: its run length exceeds uint32, so the
+	// uint32 form truncates while the uint64 form does not, and the uint64
+	// value equals ceil over the follower cap.
+	const forged = uint64(1) << 50
+	first := uint64(OverflowFirstPageCapacity(cfg))
+	follower := uint64(OverflowFollowerCapacity(cfg))
+	want := 1 + (forged-first+follower-1)/follower
+	got := OverflowRunLength64(cfg, forged)
+	if got != want {
+		t.Errorf("OverflowRunLength64(%d) = %d, want %d", forged, got, want)
+	}
+	if got <= uint64(^uint32(0)) {
+		t.Fatalf("premise broken: run %d fits uint32; cannot demonstrate truncation", got)
+	}
+	if uint64(OverflowRunLength(cfg, forged)) == got {
+		t.Errorf("OverflowRunLength did not truncate (got %d == %d); the uint64 variant would be redundant",
+			OverflowRunLength(cfg, forged), got)
+	}
+}

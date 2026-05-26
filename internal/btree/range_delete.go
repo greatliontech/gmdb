@@ -70,6 +70,9 @@ func DeleteRange(pw PageWriter, cfg page.Config, rootID uint64,
 		if typ != page.TypeBranch || c != 0 {
 			break
 		}
+		if err := validateBranchPage(buf, cfg, newID); err != nil {
+			return 0, 0, err
+		}
 		child := page.BranchLeftmostChild(buf)
 		if child == 0 {
 			return 0, 0, fmt.Errorf("%w: empty root branch %d has null leftmost child", ErrCorrupted, newID)
@@ -98,6 +101,9 @@ func deleteRangeFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	case page.IsLeafType(typ):
 		return deleteRangeFromLeaf(pw, cfg, mergeThreshold, pageID, buf, start, end)
 	case typ == page.TypeBranch:
+		if err := validateBranchPage(buf, cfg, pageID); err != nil {
+			return 0, 0, false, err
+		}
 		return deleteRangeFromBranch(pw, cfg, mergeThreshold, pageID, buf, start, end)
 	default:
 		return 0, 0, false, fmt.Errorf("%w: page %d unexpected type %d during DeleteRange descent",

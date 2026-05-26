@@ -60,6 +60,9 @@ func GetEntry(pr PageReader, cfg page.Config, rootID uint64, key []byte) (page.L
 		if typ != page.TypeBranch {
 			return page.LeafEntry{}, false, fmt.Errorf("%w: page %d has unexpected type %d during GetEntry descent", ErrCorrupted, cur, typ)
 		}
+		if err := validateBranchPage(buf, cfg, cur); err != nil {
+			return page.LeafEntry{}, false, err
+		}
 		i := page.BranchSearch(buf, cfg, key)
 		next := page.BranchChildAt(buf, cfg, i)
 		if next == 0 {
@@ -124,6 +127,9 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 		}
 		if typ != page.TypeBranch {
 			return 0, page.LeafEntry{}, fmt.Errorf("%w: page %d has unexpected type %d during PutEntry descent", ErrCorrupted, cur, typ)
+		}
+		if err := validateBranchPage(buf, cfg, cur); err != nil {
+			return 0, page.LeafEntry{}, err
 		}
 		i := page.BranchSearch(buf, cfg, e.Key)
 		next := page.BranchChildAt(buf, cfg, i)
@@ -267,4 +273,3 @@ func putEmptyEntry(pw PageWriter, cfg page.Config, e page.LeafEntry) (uint64, er
 func readLeafEntriesDeepCopyWithTrailers(buf []byte, cfg page.Config, pageID uint64) ([]page.LeafEntry, error) {
 	return readLeafEntriesDeepCopy(buf, cfg, pageID)
 }
-

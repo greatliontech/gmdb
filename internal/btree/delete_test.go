@@ -703,3 +703,35 @@ func checkSlabPartition(t *testing.T, pw *fakeWriter, cfg page.Config, root uint
 		}
 	}
 }
+
+// TestMergeBranchesForgedSiblingNoPanic (M-1, btree-branch-page-validation):
+// mergeOrRedistributeBranches reads BOTH siblings fresh — the merge sibling
+// is the adjacent slot, NOT on the descent path that was validated on the
+// way down. A forged sibling-branch directory must therefore surface as
+// ErrCorrupted via validateBranchPage, not a BranchCellAt out-of-bounds
+// panic. This mirrors the sibling-leaf validation in
+// mergeOrRedistributeLeaves (forged sibling leaf already yields
+// ErrCorrupted; this closes the same gap for branches).
+func TestMergeBranchesForgedSiblingNoPanic(t *testing.T) {
+	cfg := page.Config{PageSize: 4096}
+	pw := newFakeWriter(t, 4096)
+	// Left: a well-formed branch (two children).
+	left := make([]byte, 4096)
+	if err := page.EncodeBranch(left, cfg, 100, []page.BranchCell{{Key: []byte("m"), Child: 101}}); err != nil {
+		t.Fatalf("EncodeBranch(left): %v", err)
+	}
+	pw.pages[1] = left
+	// Right (the sibling): well-formed, then forge the first cell-directory
+	// entry offset to 0xFFFF (past content end) — BranchCellAt would panic.
+	right := make([]byte, 4096)
+	if err := page.EncodeBranch(right, cfg, 200, []page.BranchCell{{Key: []byte("t"), Child: 201}}); err != nil {
+		t.Fatalf("EncodeBranch(right): %v", err)
+	}
+	right[16], right[17] = 0xFF, 0xFF
+	pw.pages[2] = right
+
+	_, _, _, _, _, err := mergeOrRedistributeBranches(pw, cfg, 1, 2, []byte("sep"))
+	if !errors.Is(err, ErrCorrupted) {
+		t.Fatalf("mergeOrRedistributeBranches with forged sibling = %v, want ErrCorrupted (no panic)", err)
+	}
+}
