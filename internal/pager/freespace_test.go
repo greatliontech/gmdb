@@ -378,3 +378,78 @@ func TestAllocPageUnconfiguredErrors(t *testing.T) {
 		t.Errorf("TailRefund without bitmap: got %v, want ErrFreespaceUnconfigured", err)
 	}
 }
+
+// TestAllocContiguousFragmentationStats exercises the contiguous-allocation
+// failure-rate instrumentation that drives incremental compaction
+// (background-maintenance.md §Incremental Compaction Trigger). Each subtest
+// uses a fresh pager so counters don't bleed across cases.
+func TestAllocContiguousFragmentationStats(t *testing.T) {
+	// Non-adjacent free pages with sufficient total free ⇒ the first scan
+	// misses and a fragmentation failure is counted.
+	t.Run("fragmented", func(t *testing.T) {
+		p, bm, f := setupWriter(t, 32)
+		defer p.Close()
+		defer f.Close()
+		first := bm.FirstDataPage()
+		bm.Set(first + 5)
+		bm.Set(first + 10)
+		// First scan misses (no 2-run); the request is then satisfied via
+		// file extension (HWM=first, room to 32). The frag failure is still
+		// counted — the "counted regardless of later success" path.
+		if _, err := p.AllocContiguous(2); err != nil {
+			t.Fatalf("AllocContiguous(2): %v", err)
+		}
+		if a, frag := p.ConsumeContiguousAllocStats(); a != 1 || frag != 1 {
+			t.Errorf("attempts=%d fragFails=%d, want 1,1", a, frag)
+		}
+		// Consume reset the counters.
+		if a, frag := p.ConsumeContiguousAllocStats(); a != 0 || frag != 0 {
+			t.Errorf("consume did not reset: attempts=%d fragFails=%d", a, frag)
+		}
+	})
+	// An adjacent free run satisfies the first scan ⇒ an attempt, no
+	// fragmentation failure.
+	t.Run("contiguous", func(t *testing.T) {
+		p, bm, f := setupWriter(t, 32)
+		defer p.Close()
+		defer f.Close()
+		first := bm.FirstDataPage()
+		bm.Set(first + 6)
+		bm.Set(first + 7)
+		if _, err := p.AllocContiguous(2); err != nil {
+			t.Fatalf("AllocContiguous(2): %v", err)
+		}
+		if a, frag := p.ConsumeContiguousAllocStats(); a != 1 || frag != 0 {
+			t.Errorf("attempts=%d fragFails=%d, want 1,0", a, frag)
+		}
+	})
+	// Genuine fullness (total free < n) is NOT a fragmentation failure —
+	// the "despite sufficient total free pages" gate.
+	t.Run("insufficient_free", func(t *testing.T) {
+		p, bm, f := setupWriter(t, 32)
+		defer p.Close()
+		defer f.Close()
+		first := bm.FirstDataPage()
+		bm.Set(first + 8) // exactly one free page; request 2 ⇒ NumFree < n
+		if _, err := p.AllocContiguous(2); err != nil {
+			t.Fatalf("AllocContiguous(2): %v", err)
+		}
+		if a, frag := p.ConsumeContiguousAllocStats(); a != 1 || frag != 0 {
+			t.Errorf("attempts=%d fragFails=%d, want 1,0 (fullness, not fragmentation)", a, frag)
+		}
+	})
+	// n==1 routes through AllocPage and is not a contiguous attempt.
+	t.Run("n_eq_1", func(t *testing.T) {
+		p, bm, f := setupWriter(t, 32)
+		defer p.Close()
+		defer f.Close()
+		first := bm.FirstDataPage()
+		bm.Set(first + 9)
+		if _, err := p.AllocContiguous(1); err != nil {
+			t.Fatalf("AllocContiguous(1): %v", err)
+		}
+		if a, frag := p.ConsumeContiguousAllocStats(); a != 0 || frag != 0 {
+			t.Errorf("attempts=%d fragFails=%d, want 0,0", a, frag)
+		}
+	})
+}

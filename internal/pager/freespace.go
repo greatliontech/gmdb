@@ -463,10 +463,23 @@ func (p *Pager) AllocContiguous(n uint32) (uint64, error) {
 		return p.AllocPage()
 	}
 
+	// Instrument the contiguous-allocation failure rate (the incremental-
+	// compaction trigger, background-maintenance.md §Incremental
+	// Compaction). Every n>1 call is an attempt.
+	p.contigAttempts.Add(1)
+
 	// 1. Bitmap contiguous-run search.
 	if firstID, ok := p.bitmap.FindContiguous(int(n)); ok {
 		p.reserveBitmapRun(firstID, n)
 		return firstID, nil
+	}
+	// First bitmap scan found no contiguous run. If total free pages still
+	// cover the request, the failure is fragmentation (not fullness) — the
+	// signal incremental compaction exists to relieve. Counted on the first
+	// scan regardless of whether a later tier (RPL reclaim / lagging-reader
+	// wait / file extension) satisfies the request.
+	if p.bitmap.NumFree() >= uint64(n) {
+		p.contigFragFails.Add(1)
 	}
 
 	// 2. RPL reclamation + retry. Reclamation may set bits free in a
@@ -524,6 +537,22 @@ func (p *Pager) AllocContiguous(n uint32) (uint64, error) {
 		return 0, err
 	}
 	return firstID, nil
+}
+
+// ConsumeContiguousAllocStats atomically reads and resets the contiguous-
+// allocation counters accumulated since the last call: attempts =
+// multi-page (n>1) AllocContiguous calls; fragFails = those whose first
+// bitmap scan found no contiguous run despite sufficient total free pages
+// (fragmentation, not fullness). The background-maintenance compaction
+// trigger consumes these once per pass so the failure rate reflects recent
+// allocation behaviour and converges after compaction reduces fragmentation
+// (background-maintenance.md §Incremental Compaction).
+//
+// The two Swaps are not jointly atomic; a concurrent increment landing
+// between them shifts the next window's ratio by at most one sample —
+// acceptable for a scheduling heuristic.
+func (p *Pager) ConsumeContiguousAllocStats() (attempts, fragFails uint64) {
+	return p.contigAttempts.Swap(0), p.contigFragFails.Swap(0)
 }
 
 // reserveBitmapRun reserves [firstID, firstID+n) on the bitmap path:

@@ -1866,11 +1866,37 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
   unwritten page persists, reported truthfully) + honest best-effort
   spec/doc. R1 L (multi-pass cursor test) + nits fixed; R2 clean (one
   nit: bitmap gate is a frozen pass-start copy, not live — corrected).
-- **12.5** **Task 4** incremental compaction — allocator
-  contiguous-allocation-failure-rate instrumentation (`alloc.go`),
-  threshold trigger, per-pass batch relocation (CoW cascade) bounded
-  by `MaxTxBufferBytes` (never `ErrTxTooLarge`). Promotes Inv-M4.
-  *(pending)*
+- **Task 4 (incremental compaction) split into 12.5a/12.5b** — the
+  relocation mechanism (online CoW-cascade page relocation, resumable
+  across passes) is intricate and corruption-prone, so the well-defined
+  instrumentation + API lands first and is reviewed independently of the
+  relocation.
+- **12.5a** ✅ Allocator contiguous-allocation-failure-rate
+  instrumentation + the compaction-control API. `Pager` gains atomic
+  `contigAttempts`/`contigFragFails` counters incremented in
+  `AllocContiguous` (every `n>1` call is an attempt; a first-scan
+  `FindContiguous` miss with `bitmap.NumFree() >= n` is a fragmentation
+  failure — "despite sufficient total free pages"), consumed
+  (read-and-reset) via `ConsumeContiguousAllocStats` so the rate is
+  windowed and converges. **Folds `maintenance-compaction-threshold-disable`**
+  (Lands: 12.5): resolves the spec's broken "0.0 (disabled)" — `0.0` is
+  semantically the *most aggressive* setting, and `cmp.Or` makes it
+  unexpressible anyway, so `CompactionThreshold` is now a plain `[0,1]`
+  rate (0 aggressive … 1 ≈ never, default 0.5) and a new
+  `MaintenanceOptions.DisableCompaction bool` gives an exact
+  compaction-only off-switch (user-approved: the two concepts —
+  on/off vs aggressiveness — are orthogonal; compaction is the one task
+  that rewrites live data, so disabling it while keeping leak
+  reclamation/scrub/stale-reader is a real control). Instrumentation +
+  API only; the trigger/relocation that consumes the rate is 12.5b (the
+  counters are inert-but-tested until then, as `CompactionThreshold`
+  was from 12.2). Spec §Incremental Compaction Trigger + §Options
+  updated. Tested: `TestAllocContiguousFragmentationStats` (fragmented /
+  contiguous / insufficient-free gate / n=1).
+- **12.5b** **Task 4** relocation mechanism + wiring — consume the rate,
+  gate on `CompactionThreshold`/`DisableCompaction`, per-pass batch CoW
+  relocation (cascade) bounded by `MaxTxBufferBytes` (never
+  `ErrTxTooLarge`). Promotes Inv-M4. *(pending)*
 - **12.6** Chunk close-out. *(pending)*
 
 ## Cross-chunk concerns

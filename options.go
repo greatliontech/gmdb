@@ -226,14 +226,28 @@ type MaintenanceOptions struct {
 	// Default: 4096.
 	ScrubBatchSize int
 
-	// CompactionThreshold triggers incremental compaction when the
-	// contiguous-allocation failure rate exceeds this fraction. Range
-	// 0.0–1.0. Default: 0.5. (Disable all maintenance via Disable.)
+	// CompactionThreshold is the contiguous-allocation failure rate above
+	// which incremental compaction triggers — the fraction of multi-page
+	// allocations whose first bitmap scan finds no contiguous run despite
+	// sufficient total free pages. Range [0,1]: 0 is most aggressive
+	// (compact on any fragmentation), 1 is least (effectively never).
+	// Default: 0.5. To disable compaction specifically while keeping the
+	// other maintenance tasks, set DisableCompaction.
 	CompactionThreshold float64
 
 	// CompactionBatchSize is the number of pages relocated per
 	// incremental-compaction write transaction. Default: 1024.
 	CompactionBatchSize int
+
+	// DisableCompaction turns off incremental compaction (Task 4) only,
+	// leaving bitmap leak reclamation, stale-reader cleanup, and checksum
+	// scrubbing running. Compaction is the one maintenance task that
+	// rewrites live data (the CoW relocation cascade) and amplifies
+	// writes, so a write-amplification- or space-sensitive deployment may
+	// want it off while keeping the cheap, safety-relevant tasks (leak
+	// reclamation in particular). Default: false (compaction enabled).
+	// To disable ALL maintenance instead, use Disable.
+	DisableCompaction bool
 }
 
 func (o Options) applyDefaults() Options {

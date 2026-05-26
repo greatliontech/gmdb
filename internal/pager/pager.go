@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -170,6 +171,22 @@ type Pager struct {
 	// + the prev meta's TxnID. nil ⇒ no refresh attempted (the
 	// pager falls through to file extension after Wait).
 	refreshReclamationBound func() uint64
+
+	// contigAttempts / contigFragFails instrument the contiguous-
+	// allocation failure rate that drives incremental compaction
+	// (background-maintenance.md §Incremental Compaction Trigger).
+	// contigAttempts counts multi-page AllocContiguous calls (n > 1);
+	// contigFragFails counts those whose first bitmap scan found no
+	// contiguous run despite sufficient total free pages (fragmentation,
+	// not fullness). atomic.Uint64 because the writer increments them
+	// (single-threaded) while the maintenance goroutine reads+resets via
+	// ConsumeContiguousAllocStats. They survive across write txns on this
+	// (long-lived) writer pager — BeginTx does not reset them — and are
+	// naturally dropped when Compact swaps in a fresh pager (post-compact
+	// fragmentation is reduced, so a fresh window is correct). A miscount
+	// only mis-schedules compaction; it is never a correctness hazard.
+	contigAttempts  atomic.Uint64
+	contigFragFails atomic.Uint64
 }
 
 // LaggingReaderInfo is the pager-side mirror of gmdb.LaggingReaderInfo.

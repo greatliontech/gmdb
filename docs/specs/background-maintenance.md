@@ -259,11 +259,24 @@ restore contiguous free runs for overflow allocation. Online
 alternative to `Compact()`.
 
 **Trigger.** The allocator tracks the contiguous-allocation
-failure rate — the fraction of multi-page `pageAlloc(n)` calls
-(`n > 1`) that fail to find a contiguous run on the first
-bitmap scan despite sufficient total free pages. When this
-rate exceeds `CompactionThreshold` (default 0.5), the
-maintenance goroutine schedules compaction work.
+failure rate — the fraction of multi-page `AllocContiguous(n)`
+calls (`n > 1`) whose first bitmap scan finds no contiguous run
+despite sufficient total free pages (fragmentation, not
+fullness). The counters are consumed (read-and-reset) once per
+maintenance pass, so the rate reflects the most recent
+interval's allocations and falls as compaction relieves
+fragmentation. When the rate **exceeds** `CompactionThreshold`
+the maintenance goroutine schedules compaction work.
+
+`CompactionThreshold` is a rate in `[0,1]`: `0` is most
+aggressive (compact on any fragmentation), `1` is least
+(effectively never). Default `0.5`. The zero value defaults to
+`0.5` — `0.0` is not a magic "disabled" value (it would be the
+*most* aggressive setting). To disable compaction specifically
+while keeping the other three tasks running, set
+`DisableCompaction`; to disable all maintenance, set `Disable`.
+A pass with no multi-page allocations since the last (no
+signal) does not trigger.
 
 **Mechanism.** Each pass opens a write transaction and
 relocates up to `CompactionBatchSize` pages (default 1024):
@@ -310,15 +323,25 @@ type MaintenanceOptions struct {
     // Default: 4096.
     ScrubBatchSize int
 
-    // CompactionThreshold triggers incremental compaction when the
-    // contiguous-allocation failure rate exceeds this fraction.
-    // Range: 0.0 (disabled) to 1.0. Default: 0.5.
+    // CompactionThreshold is the contiguous-allocation failure rate
+    // above which incremental compaction triggers. Range [0,1]: 0 is
+    // most aggressive, 1 is least (effectively never). The zero value
+    // defaults to 0.5 (0.0 is NOT a "disabled" sentinel — that would be
+    // the most aggressive setting). Default: 0.5.
     CompactionThreshold float64
 
     // CompactionBatchSize is the number of pages relocated per write
     // transaction during incremental compaction.
     // Default: 1024.
     CompactionBatchSize int
+
+    // DisableCompaction turns off incremental compaction (Task 4) only,
+    // leaving leak reclamation, stale-reader cleanup, and checksum
+    // scrubbing running. Compaction is the one task that rewrites live
+    // data and amplifies writes, so disabling it specifically (vs all
+    // maintenance via Disable) is a distinct, supported control.
+    // Default: false (compaction enabled).
+    DisableCompaction bool
 }
 ```
 
