@@ -1667,7 +1667,30 @@ Primary files: `db.go`.
   coverage-gap L (untested Repair fatals) fixed for
   `WriteTxUnavailable` + `CommitFailed` (`FreeFailed` is
   unreachable-by-construction defensive code).
-- **11.5** `CopyTo(path, compact)`. *(pending)*
+- **11.5a** ✅ `CopyTo(path, compact=false)` — verbatim copy +
+  bitmap rebuild from a read snapshot (writers not blocked;
+  `copy.go`). Walks the snapshot's reachable set (keyspace tree +
+  each data tree incl. nested + overflow + index registry + index
+  trees) via the chunk-11.2 guarded `btree.Walk`/`WalkKV`, writes
+  each reachable page verbatim at its original id into a fresh
+  `O_EXCL` file, REBUILDS the bitmap from the reachable set (so the
+  copy's free list is consistent with its tree even under
+  concurrent commits, and source leaks are dropped), and writes a
+  fresh-UUID meta at TxnID 0 (the post-init tie-at-zero state).
+  Reader-slot pinning makes the snapshot's pages stable for the
+  copy's duration. Invariants: consistency (clause-explicit —
+  bitmap rebuilt, not copied) + standalone-validity (entailed).
+  Spec synced (`api-surface.md §CopyTo` godoc promotes fresh-UUID
+  / bitmap-rebuild / O_EXCL-no-clobber to contract). `compact=true`
+  returns `errCompactCopyPending` (11.5b). Adversarial review:
+  ship, 0 introduced H/M; M-1 (round-trip didn't hit nested-tree/
+  overflow recursion) + M-2 (concurrent-writer untested) + L-1
+  (empty DB) + L-2 (PageChecksum) all fixed with added tests;
+  SAC-1 (spec promotion) + SAC-2 (target-survives assertion)
+  applied.
+- **11.5b** `CopyTo(path, compact=true)` — per-tree bottom-up
+  rebuild (defragment; reuses chunk-8 bulk-build retargeted to a
+  fresh file). *(pending)*
 - **11.6** `Compact()` — drain + flock + atomic rename +
   reopen; `Options.CompactDrainTimeout`. *(pending)*
 - **11.7** Chunk close-out. *(pending)*

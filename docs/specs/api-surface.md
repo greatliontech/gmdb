@@ -1379,9 +1379,23 @@ type CheckOptions struct {
 func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue]
 
 // CopyTo creates a consistent copy at the given path. Taken from a
-// read-tx snapshot — writers are not blocked. When compact is true,
-// the copy is compacted: free pages omitted, B+tree pages written
+// read-tx snapshot — writers are not blocked (the snapshot's reader slot
+// pins its pages against RPL reclamation for the whole copy, so a
+// concurrent commit cannot reuse a page the copy reads). When compact is
+// true, the copy is compacted: free pages omitted, B+tree pages written
 // sequentially. Inherits source's PageSize, BitmapPages, MaxSize.
+//
+// path must NOT already exist (CopyTo never clobbers an existing file).
+// The copy receives a FRESH UUID — it is a distinct database identity,
+// not a clone of the source's. Its allocation bitmap is REBUILT from the
+// snapshot's reachable page set rather than copied from the source's
+// (in-place-mutated) bitmap region, so the copy's free list is always
+// consistent with its tree (leaked pages in the source are dropped, and a
+// writer committing mid-copy cannot make the copy's bitmap disagree with
+// its snapshot tree). The copy's RPL is empty: pages the source held
+// pending reader-pinned reclamation are unreferenced in the copy and
+// become free space.
+//
 // To change file format, re-open the copy and use SetFileFormat.
 func (db *DB) CopyTo(path string, compact bool) error
 
