@@ -15,6 +15,13 @@ var (
 	// ErrReadOnly is returned by mutating methods on a read transaction.
 	ErrReadOnly = errors.New("gmdb: read-only transaction")
 
+	// ErrBatchClosurePanic wraps a panic raised inside a DB.Batch
+	// closure. The coordinator recovers the panic, rolls back that
+	// closure's child transaction, and returns this (wrapping the panic
+	// value) to that one caller; sibling closures and the parent batch
+	// are unaffected. Per transactions.md §Write Batching.
+	ErrBatchClosurePanic = errors.New("gmdb: batch closure panicked")
+
 	// ErrChildActive is returned by every operation on a write
 	// transaction that has an unresolved child transaction open (created
 	// via Tx.BeginChild) — data ops, Commit, Rollback, and a second
@@ -252,4 +259,6 @@ var (
 	errSyncUnsafeRequiresOptIn   = errors.New("gmdb: SyncUnsafe requires AllowSyncUnsafe=true")
 	errInvalidMergeThreshold     = errors.New("gmdb: MergeThreshold must be in [1, 50]")
 	errInvalidRestartGroupTarget = errors.New("gmdb: RestartGroupTarget must be in [0, 255]")
+	errInvalidMaxBatchSize       = errors.New("gmdb: MaxBatchSize must be >= 1")
+	errInvalidMaxBatchDelay      = errors.New("gmdb: MaxBatchDelay must be >= 0")
 )

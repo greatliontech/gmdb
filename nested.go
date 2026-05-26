@@ -104,6 +104,32 @@ func (tx *Tx) commitChild() error {
 	return nil
 }
 
+// cascadeRollback rolls tx and every still-open descendant back, deepest
+// first (LIFO savepoint order), ignoring the parent-freeze. The batch
+// coordinator uses it to recover when a closure returns having left a
+// nested child (a grandchild of the batch tx) unresolved: an ordinary
+// tx.Rollback would itself be frozen by that open descendant
+// (ErrChildActive) and could not clear the freeze. After cascadeRollback
+// returns, tx and all its descendants are closed and tx.parent.activeChild
+// is cleared, so the enclosing transaction is no longer frozen.
+//
+// tx must be a child (tx.parent != nil); the coordinator only calls this
+// on a closure's child handle.
+func (tx *Tx) cascadeRollback() {
+	if tx.activeChild != nil {
+		tx.activeChild.cascadeRollback()
+	}
+	if tx.closed {
+		return
+	}
+	tx.closed = true
+	tx.pgr.RestoreSavepoint(tx.savepoint)
+	tx.savepoint = nil
+	if tx.parent != nil {
+		tx.parent.activeChild = nil
+	}
+}
+
 // rollbackChild discards the child's work: the pager savepoint is
 // restored (page-level mutations reverted, child slab buffers released)
 // and the child's keyspace clones are simply dropped — the parent's

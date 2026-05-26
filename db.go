@@ -86,6 +86,18 @@ type DB struct {
 	// by Close so a normal teardown doesn't fire the leak-warning
 	// path.
 	cleanup runtime.Cleanup
+
+	// Batch coordinator state (transactions.md §Write Batching). The
+	// coordinator goroutine is started lazily on the first DB.Batch call
+	// (ensureBatchCoordinator) and stopped by Close (stopBatchCoordinator).
+	// batchMu guards the start/stop lifecycle fields. See batch.go.
+	batchMu      sync.Mutex
+	batchCh      chan batchCall     // calls from Batch → coordinator
+	batchDone    chan struct{}      // closed when the coordinator exits
+	batchCtx     context.Context    // coordinator lifetime; its write tx uses it
+	batchCancel  context.CancelFunc // cancels batchCtx on Close
+	batchStarted bool               // coordinator goroutine launched
+	batchClosed  bool               // Close ran — refuse to (re)start
 }
 
 // Open opens the database at path. If the file does not exist, it is
@@ -367,6 +379,13 @@ func (db *DB) Close() error {
 	if !db.closeGate.CompareAndSwapClosed(false, true) {
 		return nil
 	}
+	// Step 1a′ — stop the batch coordinator (transactions.md §Write
+	// Batching coordinator lifecycle). Cancel its context (refusing new
+	// batches and unblocking any pending write-lock wait) and wait for it
+	// to exit. Done before the Coord / pager teardown below so the
+	// coordinator's in-flight write transaction unwinds and releases its
+	// grant first, and no coordinator goroutine outlives the unmap.
+	db.stopBatchCoordinator()
 	// Step 1b — drain in-flight Tx cleanups. Cleanups that observed
 	// closed=false BEFORE our store may still be mid-work touching
 	// the lock-file mmap (the read-tx slot-release path); we MUST

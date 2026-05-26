@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -180,6 +181,20 @@ type Options struct {
 	// used (atomic rename requirement). Default: os.TempDir(). Per
 	// api-surface.md §Options + bulkload.md §Interaction with Indexes.
 	ScratchDir string
+
+	// MaxBatchSize is the maximum number of DB.Batch calls the
+	// coordinator collects into one write transaction before executing.
+	// Default: 1000. Set to 1 to disable batching (each Batch call runs
+	// in its own transaction). Per transactions.md §Write Batching.
+	MaxBatchSize int
+
+	// MaxBatchDelay is the maximum time the coordinator waits for
+	// additional Batch calls after the first call in a batch before
+	// executing. Lower → lower latency; higher → higher throughput.
+	// Default: 10ms. (The zero value takes the default; to fire with
+	// minimal waiting use a small delay or MaxBatchSize = 1.) Per
+	// transactions.md §Write Batching.
+	MaxBatchDelay time.Duration
 }
 
 func (o Options) applyDefaults() Options {
@@ -192,6 +207,8 @@ func (o Options) applyDefaults() Options {
 	o.MaxReaders = cmp.Or(o.MaxReaders, lock.DefaultMaxReaders)
 	o.MergeThreshold = cmp.Or(o.MergeThreshold, defaultMergeThreshold)
 	o.ScratchDir = cmp.Or(o.ScratchDir, os.TempDir())
+	o.MaxBatchSize = cmp.Or(o.MaxBatchSize, defaultMaxBatchSize)
+	o.MaxBatchDelay = cmp.Or(o.MaxBatchDelay, defaultMaxBatchDelay)
 	// RestartGroupTarget defaults to 0 (engine default at the leaf
 	// codec layer — currently 16 per page-formats.md §Compressed
 	// Leaf). 0 is the canonical "use engine default" sentinel.
@@ -203,6 +220,11 @@ func (o Options) applyDefaults() Options {
 
 const defaultMergeThreshold uint8 = 25
 const maxMergeThreshold uint8 = 50
+
+const (
+	defaultMaxBatchSize  = 1000
+	defaultMaxBatchDelay = 10 * time.Millisecond
+)
 
 func (o Options) validate() error {
 	if !page.ValidPageSize(o.PageSize) {
@@ -237,6 +259,15 @@ func (o Options) validate() error {
 	}
 	if o.RestartGroupTarget > page.MaxRestartGroupTarget {
 		return errInvalidRestartGroupTarget
+	}
+	// Validated after applyDefaults: a zero MaxBatchSize/MaxBatchDelay has
+	// already been replaced by its default, so only an explicit negative
+	// (which cmp.Or leaves untouched) reaches here.
+	if o.MaxBatchSize < 1 {
+		return errInvalidMaxBatchSize
+	}
+	if o.MaxBatchDelay < 0 {
+		return errInvalidMaxBatchDelay
 	}
 	return nil
 }
