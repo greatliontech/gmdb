@@ -1794,21 +1794,36 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
   documents it) — no layout change. *Invariants:* spec records
   Inv-M1..M5; derived **Inv-M6** (entailed — the maintenance
   goroutine drains before Close unmaps lock file / pager). Schedule:
-  M1+M6 → 12.2, M2 → 12.3, M3+M5 → 12.4, M4 → 12.5.
-- **12.2** `MaintenanceOptions` + `Options.Maintenance` + defaults;
-  the DB-level maintenance goroutine (start at Open, stop at Close —
-  batch-coordinator lifecycle pattern) with the interval ticker +
-  cross-process coordination via `LastMaintenanceTime` (skip if a
-  pass ran within Interval; stamp after). Includes **Task 2** (stale
-  reader-slot cleanup — atomic store, no tx) so the pass does real
-  work. Promotes Inv-M1 (≤1 pass/interval) + Inv-M6 (clean drain).
-  *(pending)*
-- **12.3** **Task 1** bitmap leak reclamation — detection read-tx
-  (reuse the Check leaked-set walk) + reclamation write-tx
-  (`FreeLeakedPage`), non-blocking (no exclusivity: a leaked page's
-  bit is clear so no allocator hands it out ⇒ it cannot become
-  un-leaked). Crash-recovery-at-Open schedules the first pass
-  immediately. Promotes Inv-M2. *(pending)*
+  M1+M6+M2 → 12.2, M3+M5 → 12.4, M4 → 12.5. (Task-order amended at
+  12.2 — see below.)
+- **12.2** ✅ `MaintenanceOptions` + `Options.Maintenance` + defaults
+  (validated: negative Interval etc. → `ErrInvalidOptions`, else the
+  goroutine's `time.NewTicker` would panic); the DB-level maintenance
+  goroutine (start at Open, stop at Close — batch-coordinator
+  lifecycle pattern) with the interval ticker + cross-process
+  coordination via `lock.File.TryClaimMaintenance` (atomic CAS
+  claim-at-START of `LastMaintenanceTime`, the Inv-M1-correct shape —
+  see spec-amend below) + `coord.Clock()`. **Reorder (amends 12.1's
+  roster):** bundles **Task 1** (bitmap leak reclamation — detection
+  read-tx reusing the Check `checker` collect-leaks mode + reclamation
+  write-tx via `FreeLeakedPage`, non-blocking: a leaked page's bit is
+  clear so no allocator hands it out ⇒ it cannot become un-leaked,
+  Inv-M2; gated on a clean walk like Repair) instead of Task 2,
+  because Task 1 reuses already-reviewed pieces while Task 2 needs new
+  lock-package lock-free stale-scan work. Crash-recovery-at-Open
+  (`opened.NoCheckpoint`) schedules the first pass immediately.
+  Promotes Inv-M1, Inv-M2, Inv-M6. Spec-amends applied:
+  §Coordination claim-at-start (the literal "update after each pass"
+  has an Inv-M1 TOCTOU hole); §Trigger immediate-pass keyed on
+  `NoCheckpoint`. Filed `maintenance-compaction-threshold-disable`
+  (Lands: 12.5 — `CompactionThreshold=0.0`-disabled unreachable, the
+  field is inert until compaction). Review: 0 introduced H; M-1
+  (this reorder note) + M-2 (option validation) + M-3 (off-Linux
+  clock underflow guard) fixed; M-4 filed; SA-1/SA-2 applied.
+- **12.3** **Task 2** stale reader-slot cleanup — namespace-aware
+  scan clearing dead-process slots (atomic store, no tx); needs a
+  lock-free stale-scan in the lock package (the existing
+  `OldestReaderTxnID` requires LOCK_EX). *(pending)*
 - **12.4** **Task 3** checksum scrubbing — `ScrubCursor` on DB,
   `ScrubBatchSize` pages/pass via a read-tx footer verify, wrapping
   at HighWaterMark; corruption logged as a `CheckWarning` with the

@@ -15,6 +15,7 @@ cites are repointed at the new home, and the issue file is deleted.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
+| [maintenance-compaction-threshold-disable](maintenance-compaction-threshold-disable.md) | 12.5 (when incremental compaction consumes CompactionThreshold) | `MaintenanceOptions.CompactionThreshold = 0.0` (spec's "disabled") is unreachable — `cmp.Or` defaults the zero value to 0.5, so 0.0-disabled can't be expressed. Inert until 12.5 wires compaction. Resolve via a sentinel or a spec-amend. Surfaced by chunk-12.2 review (M-4). |
 | [bitmap-rollback-undo-log](bitmap-rollback-undo-log.md) | when profiling shows BeginTx allocation pressure is material | `Bitmap.Snapshot()` clones the full detail+summary per `Pager.BeginTx()` — 8 MB at 256 GB MaxSize. Replace with an undo log if profiling shows the per-tx allocation is hot. |
 | [pager-test-helper-export](pager-test-helper-export.md) | when chunk 5.3+ adds a second cross-package writer-pager fixture caller | `setupWriter` is duplicated into `internal/btree/pager_integration_test.go` as `setupPagerWriter` for the chunk-5.2 PageWriter parity test. Acceptable for one caller; factor when the second caller arrives. |
 | [leaked-readtx-cleanup-race-flake](leaked-readtx-cleanup-race-flake.md) | condition (when read-tx slot lifecycle is next touched, or opportunistically) | `TestLeakedReadTxReleasesSlotViaCleanup` is flaky under `-race` due to finalizer-scheduling latency. Pre-existing on HEAD cd34a40; surfaced by chunk-5.4 Round 2 adversarial review. |

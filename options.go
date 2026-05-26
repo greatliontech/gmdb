@@ -202,6 +202,38 @@ type Options struct {
 	// §Compact. (Cross-process readers are not drained — they continue
 	// against the pre-Compact inode.)
 	CompactDrainTimeout time.Duration
+
+	// Maintenance configures the background maintenance goroutine
+	// (background-maintenance.md). The zero value enables maintenance
+	// with all defaults.
+	Maintenance MaintenanceOptions
+}
+
+// MaintenanceOptions configures the background maintenance goroutine
+// (background-maintenance.md §Options).
+type MaintenanceOptions struct {
+	// Disable disables the background maintenance goroutine entirely.
+	// Default: false (maintenance enabled).
+	Disable bool
+
+	// Interval is the minimum time between maintenance passes,
+	// coordinated across processes via the lock file's
+	// LastMaintenanceTime. Default: 5m.
+	Interval time.Duration
+
+	// ScrubBatchSize is the number of pages verified per checksum-
+	// scrubbing pass (only meaningful when PageChecksum is enabled).
+	// Default: 4096.
+	ScrubBatchSize int
+
+	// CompactionThreshold triggers incremental compaction when the
+	// contiguous-allocation failure rate exceeds this fraction. Range
+	// 0.0–1.0. Default: 0.5. (Disable all maintenance via Disable.)
+	CompactionThreshold float64
+
+	// CompactionBatchSize is the number of pages relocated per
+	// incremental-compaction write transaction. Default: 1024.
+	CompactionBatchSize int
 }
 
 func (o Options) applyDefaults() Options {
@@ -217,6 +249,10 @@ func (o Options) applyDefaults() Options {
 	o.MaxBatchSize = cmp.Or(o.MaxBatchSize, defaultMaxBatchSize)
 	o.MaxBatchDelay = cmp.Or(o.MaxBatchDelay, defaultMaxBatchDelay)
 	o.CompactDrainTimeout = cmp.Or(o.CompactDrainTimeout, defaultCompactDrainTimeout)
+	o.Maintenance.Interval = cmp.Or(o.Maintenance.Interval, defaultMaintenanceInterval)
+	o.Maintenance.ScrubBatchSize = cmp.Or(o.Maintenance.ScrubBatchSize, defaultScrubBatchSize)
+	o.Maintenance.CompactionThreshold = cmp.Or(o.Maintenance.CompactionThreshold, defaultCompactionThreshold)
+	o.Maintenance.CompactionBatchSize = cmp.Or(o.Maintenance.CompactionBatchSize, defaultCompactionBatchSize)
 	// RestartGroupTarget defaults to 0 (engine default at the leaf
 	// codec layer — currently 16 per page-formats.md §Compressed
 	// Leaf). 0 is the canonical "use engine default" sentinel.
@@ -233,6 +269,10 @@ const (
 	defaultMaxBatchSize        = 1000
 	defaultMaxBatchDelay       = 10 * time.Millisecond
 	defaultCompactDrainTimeout = 30 * time.Second
+	defaultMaintenanceInterval = 5 * time.Minute
+	defaultScrubBatchSize      = 4096
+	defaultCompactionThreshold = 0.5
+	defaultCompactionBatchSize = 1024
 )
 
 func (o Options) validate() error {
@@ -277,6 +317,17 @@ func (o Options) validate() error {
 	}
 	if o.MaxBatchDelay < 0 {
 		return errInvalidMaxBatchDelay
+	}
+	// Maintenance: validated after applyDefaults (a zero Interval /
+	// ScrubBatchSize / CompactionBatchSize / CompactionThreshold is already
+	// the default), so only an explicit negative or out-of-range value
+	// reaches here. A negative Interval would panic time.NewTicker inside
+	// the maintenance goroutine (no recover) — reject at Open.
+	if o.Maintenance.Interval < 0 ||
+		o.Maintenance.ScrubBatchSize < 0 ||
+		o.Maintenance.CompactionBatchSize < 0 ||
+		o.Maintenance.CompactionThreshold < 0 || o.Maintenance.CompactionThreshold > 1 {
+		return errInvalidMaintenance
 	}
 	return nil
 }

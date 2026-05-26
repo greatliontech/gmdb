@@ -89,11 +89,24 @@ Invariant: kind=entailed;
 Multiple processes sharing the same database coordinate via a
 `LastMaintenanceTime` field in the lock-file header (see
 `cross-process.md §Lock File Layout`) — a `uint64` monotonic
-clock value (`CLOCK_BOOTTIME` on Linux) updated after each
-pass. Before starting a pass, the goroutine checks this
-timestamp. If a recent pass was completed by any process
-(within `MaintenanceOptions.Interval`), the goroutine skips.
-Ensures only one process runs maintenance per interval.
+clock value (`CLOCK_BOOTTIME` on Linux). Before a pass, the
+goroutine **atomically claims** the interval: if no pass has run
+within `MaintenanceOptions.Interval`, a single CAS stamps
+`LastMaintenanceTime` to the current time and the claimer runs;
+otherwise it skips. The claim is at pass *start* (not completion):
+a check-then-run-then-stamp-after design has a TOCTOU window where
+two processes both observe a stale timestamp, both pass the check,
+and both run — violating "one pass per interval". The atomic
+claim-at-start closes that window, so the CAS winner is the sole
+runner for the interval. (Consequence: a pass that runs longer than
+`Interval` measures the next interval from its start, becoming
+re-claimable as soon as it finishes — benign.)
+
+On Linux `CLOCK_BOOTTIME` is kernel-wide, so all processes sharing
+the file see one clock origin. On platforms with a per-process
+monotonic clock (darwin/freebsd) the claim degrades to best-effort
+(an occasional redundant pass) but never a double-reclaim — the CAS
+serialises any single instant and reclamation is leak-safe.
 
 ## Tasks
 
@@ -131,9 +144,16 @@ snapshot cannot become un-leaked by the time the write
 transaction runs.
 
 **Trigger.** Every maintenance pass. Additionally, if `Open()`
-detects crash recovery (selected a fallback meta), the first
-maintenance pass is scheduled immediately rather than waiting
-for the interval.
+recovered from an unclean prior shutdown — signalled by accepting
+a non-checkpoint-flagged meta (`pager.Open`'s `NoCheckpoint`, the
+available recovery signal) — the first maintenance pass runs
+immediately rather than waiting for the interval, to reclaim any
+crash-leaked pages promptly. (This is an approximation of "a
+fallback meta was selected": a clean reopen can also see
+`NoCheckpoint` for a never-checkpointed SyncLazy database — a
+harmless extra first pass — and some crashes that left a
+checkpoint-flagged meta durable do not trip it, in which case
+reclamation waits for the regular interval.)
 
 ### 2. Stale Reader Slot Cleanup
 

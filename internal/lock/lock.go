@@ -619,6 +619,36 @@ func (f *File) SetLastMaintenanceTime(v uint64) {
 	Store64(&f.header.LastMaintenanceTime, v)
 }
 
+// TryClaimMaintenance atomically claims the maintenance slot for the
+// current interval: if no pass has run within intervalNanos, it CAS-stamps
+// LastMaintenanceTime to nowNanos and returns true — the caller owns this
+// interval's pass. Otherwise (a recent pass, or a peer won the CAS) it
+// returns false and the caller skips. The CAS makes the check-and-claim
+// atomic across processes sharing the lock file, so at most one process per
+// interval runs maintenance (background-maintenance.md Inv-M1).
+//
+// On Linux nowNanos is CLOCK_BOOTTIME, which is kernel-wide, so all
+// processes share one clock origin and nowNanos >= LastMaintenanceTime
+// always holds; the skip test is exact. On platforms whose monotonic clock
+// is per-process (darwin/freebsd CLOCK_MONOTONIC) two processes have
+// unrelated origins, so a peer's stamp can exceed our nowNanos. The skip
+// test is gated on nowNanos >= last precisely so the subtraction never
+// wraps: when our clock is behind a peer's stamp we fall through and claim
+// (CAS), rather than skipping forever (which would stall maintenance after
+// a peer crash). Off-Linux the worst case is a redundant pass (wasted I/O)
+// — never a double-reclaim, since the CAS serialises any single instant and
+// reclamation is leak-safe (Inv-M2).
+func (f *File) TryClaimMaintenance(nowNanos, intervalNanos uint64) bool {
+	if f.header == nil {
+		panic("lock: TryClaimMaintenance on closed *File")
+	}
+	last := Load64(&f.header.LastMaintenanceTime)
+	if last != 0 && nowNanos >= last && nowNanos-last < intervalNanos {
+		return false // a pass ran within the interval
+	}
+	return CAS64(&f.header.LastMaintenanceTime, last, nowNanos)
+}
+
 // BaseFor returns the conventional lock-file base name for a data
 // file whose path is dataPath. The convention appends ".lock" to the
 // base name; callers compose with an os.Root over the data file's

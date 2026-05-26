@@ -99,6 +99,23 @@ type DB struct {
 	batchCancel  context.CancelFunc // cancels batchCtx on Close
 	batchStarted bool               // coordinator goroutine launched
 	batchClosed  bool               // Close ran — refuse to (re)start
+
+	// Background maintenance goroutine (background-maintenance.md).
+	// Started at Open unless Options.Maintenance.Disable; stopped by
+	// Close (stopMaintenance) BEFORE the Coord / pager teardown so the
+	// goroutine never touches a torn-down lock-file mmap or pager
+	// (Inv-M6). maintCancel cancels the goroutine's tx contexts so a
+	// pass blocked in AcquireWriter unwinds on Close. Single start (Open)
+	// + single stop (CAS-guarded Close) ⇒ no lifecycle mutex needed.
+	maintCtx     context.Context
+	maintCancel  context.CancelFunc
+	maintDone    chan struct{}
+	maintStarted bool
+
+	// scrubCursor is the next page id the checksum scrubber verifies,
+	// wrapping at HighWaterMark (Task 3 — background-maintenance.md
+	// §Checksum Scrubbing). Touched only by the maintenance goroutine.
+	scrubCursor uint64
 }
 
 // Open opens the database at path. If the file does not exist, it is
@@ -278,6 +295,18 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 		logger:    db.logger,
 		originPCs: captureOriginPCs(),
 	})
+
+	// Start the background maintenance goroutine (background-maintenance.md)
+	// unless disabled. A recovery that accepted a non-checkpoint meta
+	// (opened.NoCheckpoint — an unclean prior shutdown) schedules the first
+	// pass immediately rather than waiting a full interval, to reclaim any
+	// crash-leaked pages promptly.
+	if !opts.Maintenance.Disable {
+		db.maintCtx, db.maintCancel = context.WithCancel(context.Background())
+		db.maintDone = make(chan struct{})
+		db.maintStarted = true
+		go db.maintenanceLoop(db.maintCtx, opened.NoCheckpoint)
+	}
 	return db, nil
 }
 
@@ -388,6 +417,10 @@ func (db *DB) Close() error {
 	// coordinator's in-flight write transaction unwinds and releases its
 	// grant first, and no coordinator goroutine outlives the unmap.
 	db.stopBatchCoordinator()
+	// Step 1a″ — stop the maintenance goroutine and wait for it to exit.
+	// Done before the Coord / pager teardown so an in-flight pass's tx
+	// unwinds and the goroutine never touches a torn-down mmap (Inv-M6).
+	db.stopMaintenance()
 	// Step 1b — drain in-flight Tx cleanups. Cleanups that observed
 	// closed=false BEFORE our store may still be mid-work touching
 	// the lock-file mmap (the read-tx slot-release path); we MUST

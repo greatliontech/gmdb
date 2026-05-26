@@ -550,6 +550,13 @@ func (c *Coord) ActiveReaderSlots() int {
 	return len(c.activeSlots)
 }
 
+// Clock returns the coord's monotonic clock value in nanoseconds (the
+// shared CLOCK_BOOTTIME on Linux, or the test-injected clock). The
+// background-maintenance goroutine uses it both to compare against and to
+// stamp the lock file's LastMaintenanceTime, so the comparison and the
+// stamp share one clock source.
+func (c *Coord) Clock() uint64 { return c.clock() }
+
 // UnregisterReaderSlot removes slot index i from the active list.
 // MUST be called BEFORE the reader-side clears the slot's
 // PID/Heartbeat/etc. on release (cross-process.md §Heartbeat
