@@ -157,6 +157,7 @@ var (
     ErrPoisoned                = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
     ErrClosed                  = errors.New("gmdb: database is closed")
     ErrCursorUnpositioned      = errors.New("gmdb: cursor not positioned")
+    ErrChildActive             = errors.New("gmdb: transaction is frozen by an active child transaction")
     ErrKeyspaceKindMismatch    = errors.New("gmdb: keyspace kind does not match existing keyspace")
     ErrKeyspaceReserved        = errors.New("gmdb: keyspace name reserved for engine use")
     ErrValueSizeMismatch       = errors.New("gmdb: value size does not match fixed value size")
@@ -175,6 +176,9 @@ var (
     // Keyspace lifecycle.
     ErrKeyspaceAlreadyOpen      = errors.New("gmdb: keyspace already opened in this transaction with a different index set")
     ErrKeyspaceClosed           = errors.New("gmdb: keyspace handle is invalid (keyspace deleted in this transaction)")
+
+    // Write batching.
+    ErrBatchClosurePanic        = errors.New("gmdb: batch closure panicked")
 
     // Compact.
     ErrCompactReadersActive     = errors.New("gmdb: Compact drain timed out — in-process read transactions still active")
@@ -495,8 +499,9 @@ type Options struct {
     MaxBatchSize int
 
     // MaxBatchDelay is the maximum time to wait for additional
-    // Batch() calls before executing the current batch. Set to 0 to
-    // fire immediately. Default: 10ms.
+    // Batch() calls before executing the current batch. The zero value
+    // takes the 10ms default; for minimal coalescing set MaxBatchSize=1.
+    // Default: 10ms.
     MaxBatchDelay time.Duration
 
     // StaleTimeout for cross-PID-namespace stale detection via
@@ -646,11 +651,20 @@ func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
 // batch inclusion. Each closure runs in its own child transaction and
 // executes exactly once. See `transactions.md §Write Batching`.
 //
+// A closure that returns an error has its child rolled back and that
+// error returned to its caller; siblings are unaffected. A closure that
+// panics is recovered: its child is rolled back and the caller receives
+// ErrBatchClosurePanic wrapping the panic value, while sibling closures
+// still run. If the parent batch commit fails, every caller whose
+// closure succeeded receives the commit error.
+//
 // The closure MUST NOT call Commit() or Rollback() on the supplied
 // *Tx — the batch coordinator owns child-transaction lifecycle. A
 // closure that calls either causes the coordinator's subsequent
 // child-commit-or-rollback to error with ErrTxClosed, which
-// propagates to the caller as the closure's result.
+// propagates to the caller as the closure's result. (A closure may open
+// its own nested BeginChild, but must resolve it before returning, or
+// the caller receives ErrChildActive.)
 func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error
 
 // Begin starts a write transaction. The context governs the wait
@@ -727,7 +741,15 @@ func (rtx *ReadTx) Rollback() error
 
 // BeginChild creates a child transaction within the current write
 // transaction. Children can be committed (merged into parent) or
-// rolled back (discarded) independently. Only valid on a write txn.
+// rolled back (discarded) independently, and may nest to arbitrary
+// depth. Only valid on a write txn.
+//
+// While the child — or any descendant — is open, the parent and every
+// ancestor are FROZEN: any op on them (data ops, Commit, Rollback, a
+// second BeginChild) returns ErrChildActive until the child resolves.
+// Handles opened on the child are valid only for the child's lifetime
+// (ErrTxClosed after it resolves); continue through a parent handle.
+// See transactions.md §Nested Transactions.
 func (tx *Tx) BeginChild() (*Tx, error)
 
 // SetFileFormat updates the file format. MaxSize is immutable and

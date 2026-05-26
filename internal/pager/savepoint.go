@@ -23,9 +23,9 @@ import (
 //
 // The capture is by value/clone (not by reference into the live pager
 // maps) so the live maps can keep mutating while the savepoint is held.
-// Cost is dominated by the bitmap.Snapshot full clone, the same cost
-// BeginTx already pays per top-level transaction (see
-// docs/issues/bitmap-rollback-undo-log.md — an undo log would cut both).
+// Cost is dominated by the bitmap.Snapshot full clone — the same per-
+// transaction cost BeginTx already pays (see BeginTx); an undo-log
+// bitmap would reduce both.
 type Savepoint struct {
 	bitmap        *bitmap.Snapshot
 	highWaterMark uint64

@@ -74,6 +74,21 @@ Invariant: kind=clause-explicit;
     breaks and child rollback can leave the parent's pager in an
     inconsistent CoW state.
 
+Invariant: kind=clause-explicit;
+  property=A write transaction with an unresolved child (or any
+    descendant) is **frozen**: data ops, `Commit`, `Rollback`, and
+    a second `BeginChild` all return `ErrChildActive` until the
+    child resolves. Equivalently, the pager savepoint stack is empty
+    when the top-level transaction commits;
+  from=this spec §Nested Transactions (Parent freeze);
+  violation=Committing the parent while a child holds an open
+    savepoint publishes the child's *tentative* page allocations —
+    pages the child might still roll back — so a meta swap could
+    reference pages the bitmap will later mark free, corrupting the
+    on-disk tree. (The strongest counterexample: every per-page CoW
+    invariant still holds, yet the published tree references a page
+    a not-yet-resolved child allocated and would have freed.)
+
 Invariant: kind=entailed;
   property=A `Cursor.Delete()` positions the cursor ON the
     **post-delete successor** — the entry that followed the deleted
@@ -188,24 +203,35 @@ type batchCall struct {
    calls until either `Options.MaxBatchSize` calls have accumulated
    (default 1000) or `Options.MaxBatchDelay` has elapsed since the
    first call in the batch (default 10 ms). Lower delay → lower
-   latency; higher → higher throughput. Set 0 to fire as soon as
-   the coordinator runs.
-3. The coordinator opens a write transaction via `db.Begin(ctx,
-   true)` using `context.Background()` — caller contexts are
-   checked separately.
+   latency; higher → higher throughput. The zero `MaxBatchDelay`
+   takes the 10 ms default; for minimal coalescing set
+   `MaxBatchSize = 1` (each call runs in its own transaction).
+3. The coordinator opens a write transaction via `db.Begin` on a
+   **coordinator-lifetime context** (a cancellable context derived
+   from `context.Background()`, cancelled only by `DB.Close`) — a
+   single caller's context never aborts the shared batch transaction,
+   yet `Close` can unblock a pending write-lock acquire. Caller
+   contexts are checked separately (step 4).
 4. Each collected closure runs in its own **child transaction** (see
    Nested Transactions). Before executing, the caller's `ctx` is
    checked — if cancelled, the closure is skipped and the caller
    receives `context.Cause(ctx)`.
-5. If a closure returns an error, its child is **rolled back**. The
-   parent transaction is unaffected; other closures' children
-   remain intact. The failing caller receives the error.
+5. If a closure returns an error or **panics**, its child is
+   **rolled back** (a panic is recovered and surfaced to the caller
+   as `ErrBatchClosurePanic` wrapping the panic value). The parent
+   transaction is unaffected; other closures' children remain
+   intact. The failing caller receives the error. (A closure that
+   leaves a nested `BeginChild` unresolved is treated the same way —
+   its child is force-resolved and the caller receives
+   `ErrChildActive` — so one misbehaving closure cannot freeze the
+   batch.)
 6. If a closure succeeds, its child is **committed** (merged into
    the parent). The caller will receive `nil` when the parent
    commits.
 7. After all closures have run, the parent commits. All callers
-   whose closures succeeded receive `nil`. If commit fails, all
-   callers in the batch receive the commit error.
+   whose closures succeeded receive `nil`. If the parent commit
+   fails, every caller whose closure succeeded receives the commit
+   error.
 
 Each closure is invoked **exactly once** — there is no rollback-
 and-retry loop. This guarantee is about invocation count, NOT about
@@ -249,8 +275,13 @@ that queuing is not a bottleneck for the target N-daemon profiles.
 ### Coordinator lifecycle
 
 Started lazily on the first `Batch()` call. Stopped when
-`DB.Close()` is called: `db.batchCh` is closed, the coordinator
-drains pending calls (returning `ErrTxClosed` to each), then exits.
+`DB.Close()` is called: Close cancels the coordinator-lifetime
+context (rejecting new calls and unblocking any pending write-lock
+acquire) and joins the goroutine before tearing down the pager and
+lock coordinator. A call that was not yet accepted, or one rejected
+because Close has begun, receives `ErrClosed`. (Cancel-and-join,
+rather than closing `db.batchCh`, avoids a send-on-closed-channel
+panic from a caller still blocked on the unbuffered send.)
 
 ## Nested Transactions
 
@@ -270,19 +301,37 @@ if err := riskyOperation(child); err != nil {
 }
 ```
 
-**Child begin** — snapshot the parent's state:
+**Parent freeze (LMDB model).** While a child — or any of its
+descendants — is open and unresolved, the parent and every ancestor
+are **frozen**: every operation on a frozen transaction (data ops,
+`Commit`, `Rollback`, and a second `BeginChild`) returns
+`ErrChildActive` until the child commits or rolls back. This
+prevents the parent and child from racing on the shared
+copy-on-write pager state, and guarantees the savepoint stack is
+empty when the top-level transaction commits. A frozen cursor
+surfaces `ErrChildActive` transiently (the freeze lifts when the
+child resolves — it is not a terminal cursor error).
 
-- Snapshot `tx.pendingAllocs` length (or copy).
-- Snapshot `tx.pendingFrees` length.
-- Snapshot `tx.cowPages` (CoW'd page IDs).
-- Snapshot `tx.loosePages`.
-- Snapshot `tx.retiredPages` length.
-- Snapshot keyspace root page IDs and counts.
-- Snapshot the slab `dirty` map (which page IDs the parent has
-  dirtied) — for rollback comparison, not for state restoration.
-  The child does not get its own slab; it shares the parent's pager
-  but never modifies a page already in the parent's `dirty` set in
-  place.
+**Child begin** — capture a pager savepoint of the parent's
+tx-scoped state so the child can be rolled back independently:
+
+- Capture the allocation bitmap snapshot, `HighWaterMark`, and RPL
+  chain.
+- Capture `pendingAllocs`, `pendingFrees`, `loosePages`, the
+  `retiredPages` length, and the slab `dirty` page-ID set (so
+  rollback can release exactly the buffers the child added).
+- Inherit the parent's keyspace state — root page IDs, counts, and
+  the in-memory keyspace handles (the descriptor mutations the
+  deferred-flush model keeps on the handles, not yet on disk) — by
+  clone, so the child can mutate and roll them back without touching
+  the parent's handles.
+- The child does not get its own slab; it shares the parent's pager
+  but never modifies a page already reachable from an ancestor's
+  tree in place. The mechanism: while a savepoint is active the
+  allocator **suspends loose-page reuse**, so a freed page an
+  ancestor still references can never be handed back out and
+  overwritten. Freed pages remain loose (not reusable) until every
+  child resolves and the savepoint stack empties.
 
 **Child does work.** CoW always allocates a fresh page ID and a
 fresh slab buffer. If the page being CoW'd is already in the
@@ -290,27 +339,40 @@ parent's `dirty` set, the child copies the parent's buffer into a
 new buffer at a new page ID. The child never mutates a parent's
 slab buffer in place.
 
-**Child commit.** Discard the saved snapshots. The child's
+**Child commit.** Release (discard) the savepoint. The child's
 modifications (slab buffers, pending sets, retired list, root
-updates) remain in the parent's pager. No-op beyond freeing the
-snapshot memory.
+updates) remain in the parent's pager, to be published at the
+top-level Commit. The child's keyspace descriptor state is merged
+back into the parent by name: a parent handle for the same name is
+updated in place (so a caller still holding it observes the
+committed child work); a keyspace the child opened or created
+installs a fresh parent-owned handle; a keyspace the child deleted
+invalidates the parent's handle.
 
-**Child rollback.**
+**Child rollback.** Restore the pager savepoint:
 
 - Release child's slab buffers (those added since child begin) back
   to the pool; remove from the parent pager's `dirty` map.
-- Restore `pendingAllocs`, `pendingFrees`, `cowPages`,
-  `loosePages`, `retiredPages` from snapshots.
-- Restore keyspace roots to their pre-child state.
+- Restore the bitmap, `HighWaterMark`, RPL chain, `pendingAllocs`,
+  `pendingFrees`, `loosePages`, and `retiredPages` to the captured
+  state.
+- The parent's keyspace handles and roots were never touched — the
+  child's clones are simply dropped.
 - The child's CoW'd page IDs are returned to the allocator (they
   were pending allocations and never reached disk).
 - Done. No buffer-content restoration needed — every page the child
   touched lives at a fresh page ID, with a fresh slab buffer;
   dropping the buffer drops the modification.
 
+**Handle lifetime.** Keyspace / SetKeyspace / Cursor handles opened
+on a child are valid only for the child's lifetime — every child
+handle returns `ErrTxClosed` once the child commits or rolls back.
+After a child commits, a caller continues through a handle opened on
+the parent (re-opening by name if the parent never had it open).
+
 **Nesting depth.** Children can create their own children
-(arbitrary nesting). Each level snapshots its current state.
-Rollback at any level restores to that level's snapshot. Cost is
+(arbitrary nesting). Each level captures its own savepoint.
+Rollback at any level restores to that level's savepoint. Cost is
 proportional to pages modified at that level, not total database
 size.
 

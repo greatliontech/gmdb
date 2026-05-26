@@ -1523,7 +1523,55 @@ a final-commit failure surfaces uniformly.
 Primary specs: `transactions.md §Write Batching` and §Nested
 Transactions, `api-surface.md`.
 
-Primary files: `db.go`, `tx.go`.
+Primary files: `db.go`, `tx.go`, `nested.go`, `batch.go`,
+`internal/pager/savepoint.go`.
+
+**Sub-chunk roster (as landed).**
+
+- **10.1** Triage + invariants + design decisions (no separate
+  commit; folded into 10.2). Chunk-start gate: **0** `Lands: 10`
+  README entries; two condition-triggered entries redeferred —
+  `bitmap-rollback-undo-log` (chunk 10 *amplifies* it: each
+  BeginChild adds a bitmap snapshot, but the trigger is still
+  profiling) and `writenewindexregistry-partial-leak` (chunk 10
+  changes loose-page *reuse*, not error-recovery, policy).
+  User-locked decisions: (1) **parent-freeze** — a tx with an
+  unresolved child/descendant is frozen (`ErrChildActive`), LMDB
+  model; (2) a panicking `Batch` closure fails just that closure
+  (recover → rollback child → continue siblings). Invariants
+  N1–N5 derived (N1/N3/N5 clause-explicit, N2/N4 entailed),
+  encoded as tests at their introducing sub-chunk.
+- **10.2** Nested transactions. Pager savepoint primitive
+  (`internal/pager/savepoint.go`: BeginSavepoint / RestoreSavepoint
+  / ReleaseSavepoint, full freespace snapshot + loose-pop
+  suspension while a savepoint is active — Inv-N1). `Tx.BeginChild`
+  + child commit/rollback (`nested.go`): shared pager + grant,
+  keyspace-state clone at begin and merge-by-name at commit
+  (parent handles updated in place / fresh handles for child-
+  created / dead for child-deleted), parent-freeze in
+  `requireOpen` (Inv-N5), transient `ErrChildActive` in cursors.
+  Adversarial review (2 rounds): M-1 (child-handle lifecycle
+  asymmetry) fixed — child handles are tx-scoped, never promoted;
+  L-1 documented; L-2/L-3 indexed-child coverage added. Commit
+  `f440383`.
+- **10.3** `DB.Batch` coordinator (`batch.go`): channel-based, lazy
+  start, collect to MaxBatchSize / MaxBatchDelay, each closure in a
+  child tx (exactly-once), panic-recovery → `ErrBatchClosurePanic`,
+  per-caller ctx skip, parent commit → uniform result. Coordinator
+  lifecycle stopped by `Close` (cancel coordinator context + join).
+  `Options.MaxBatchSize`/`MaxBatchDelay` + validation. Adversarial
+  review (2 rounds): H-1 (a closure leaving a nested child open
+  froze the whole batch) fixed via `cascadeRollback`; M-1 (grant
+  leak on Close-race) fixed; L-1 (option validation) fixed; all
+  coverage gaps closed (size-cap + delay-coalescing via synctest,
+  parent-commit-failure via the step-4 hook). Commit `9c86d26`.
+- **10.4** Close-out: no-cite sweep (fixed a `savepoint.go` →
+  issue-doc cite introduced in 10.2), spec updates
+  (`transactions.md` §Nested Transactions parent-freeze +
+  savepoint mechanism + handle lifetime + Inv-N5; §Write Batching
+  panic/coordinator-context/lifecycle; `api-surface.md`
+  `ErrChildActive` + `ErrBatchClosurePanic` + BeginChild/Batch
+  godocs), plan roster. Invariants N1–N5 all enforced by tests.
 
 ### Chunk 11 — Check + CopyTo + Compact
 
