@@ -329,6 +329,43 @@ func ShortestSeparator(left, right []byte) []byte {
 	return sep
 }
 
+// ValidateBranch reports whether buf is a structurally well-formed
+// branch page: the header type is TypeBranch, the buffer covers the
+// page content region, the cell directory fits, and every cell's
+// (Offset, KeyLen) points within the content region with room for the
+// trailing 8-byte child pointer. It returns a non-nil error (wrapping
+// ErrCorrupted) on any violation and never panics — the chunk-4.2
+// "total over input, never panics on a forged page" decoder-robustness
+// contract extended to branch pages, so reachability walks (Check,
+// FreeSubtree) and the btree readers can call BranchChildAt /
+// BranchCellAt safely after Validate passes. Mirrors the per-cell
+// bounds BranchCellAt would otherwise panic on.
+func ValidateBranch(buf []byte, cfg Config) error {
+	contentEnd := cfg.ContentEnd()
+	if len(buf) < contentEnd {
+		return fmt.Errorf("%w: branch buffer len %d < content end %d", ErrCorrupted, len(buf), contentEnd)
+	}
+	typ, _, n, _ := ReadHeader(buf)
+	if typ != TypeBranch {
+		return fmt.Errorf("%w: branch page has type %d (want %d)", ErrCorrupted, typ, TypeBranch)
+	}
+	dirEnd := branchHeaderEnd + int(n)*branchDirEntrySize
+	if dirEnd > contentEnd {
+		return fmt.Errorf("%w: branch cell directory (%d cells) overruns content end %d", ErrCorrupted, n, contentEnd)
+	}
+	for i := 0; i < int(n); i++ {
+		dirOff := branchHeaderEnd + i*branchDirEntrySize
+		off := int(le.Uint16(buf[dirOff:]))
+		klen := int(le.Uint16(buf[dirOff+2:]))
+		end := off + klen + branchChildPtrSize
+		if off < dirEnd || end > contentEnd {
+			return fmt.Errorf("%w: branch cell %d offset/len out of range: off=%d klen=%d end=%d (dirEnd=%d contentEnd=%d)",
+				ErrCorrupted, i, off, klen, end, dirEnd, contentEnd)
+		}
+	}
+	return nil
+}
+
 // BranchChildAt returns the child pointer at descent index `i` from
 // BranchSearch:
 //   - i == 0 → leftmost (Ptr[0])
@@ -340,4 +377,3 @@ func BranchChildAt(buf []byte, cfg Config, i uint16) uint64 {
 	}
 	return BranchCellAt(buf, cfg, i-1).Child
 }
-
