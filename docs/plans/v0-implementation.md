@@ -1844,11 +1844,28 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
   exercises). Review: 0 introduced H/M (Rounds 1+2); R1 L (test-comment
   mechanism) + nit (abnormal-error log) fixed, nit (clock re-read)
   disputed-accepted; R2 clean.
-- **12.4** **Task 3** checksum scrubbing — `ScrubCursor` on DB,
-  `ScrubBatchSize` pages/pass via a read-tx footer verify, wrapping
-  at HighWaterMark; corruption logged as a `CheckWarning` with the
-  page ID, never repaired. Skipped when PageChecksum off. Promotes
-  Inv-M3 (report-only) + Inv-M5 (logged with page ID). *(pending)*
+- **12.4** ✅ **Task 3** checksum scrubbing. `maintScrubChecksums`
+  scans `ScrubBatchSize` page IDs/pass from the persistent
+  `db.scrubCursor`, wrapping at HighWaterMark, footer-verifying only
+  **allocated** pages (snapshot bitmap bit clear) in `[firstData, hwm)`
+  — meta/bitmap region carries no footer, free pages hold none. A
+  mismatch logs a `CheckWarning` with the page ID (Inv-M5), never
+  repairs (Inv-M3). Skipped when PageChecksum off. Promotes Inv-M3 +
+  Inv-M5 (spec-tier → enforced via tests) and adds + enforces an
+  entailed **footer-bearing-gate** invariant (free/meta pages excluded;
+  violation = non-full-db warning flood). *Triage:* 0 README entries
+  match `Lands: 12.4`; no condition-triggered entry relates. Review:
+  0 introduced H; R1 found 2 M sharing one root — *bitmap-allocated ≠
+  valid-stable-footer*: (M1) a newer concurrent writer's in-flight page
+  below the snapshot hwm can be observed torn, and (M2) a page allocated
+  via low-level `Tx.AllocPage` and committed unwritten carries no
+  footer. Both report-only. Fixed by removing a `torn-read-free`
+  overclaim **I introduced this round** (the scrubber was always
+  best-effort with `Check` as authority) + **re-verify-once** on
+  mismatch (transient torn read clears on re-read; genuine bitrot /
+  unwritten page persists, reported truthfully) + honest best-effort
+  spec/doc. R1 L (multi-pass cursor test) + nits fixed; R2 clean (one
+  nit: bitmap gate is a frozen pass-start copy, not live — corrected).
 - **12.5** **Task 4** incremental compaction — allocator
   contiguous-allocation-failure-rate instrumentation (`alloc.go`),
   threshold trigger, per-pass batch relocation (CoW cascade) bounded

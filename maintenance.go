@@ -76,7 +76,7 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 	// reading. No write transaction is taken — clearing a slot is a
 	// lock-file mmap store, independent of the data file. Errors (ctx
 	// cancel on Close, coord closed) are benign: the next pass retries.
-	// (Tasks 3/4 added in later sub-chunks.)
+	// (Task 4 added in a later sub-chunk.)
 	if err := coord.ReapStaleReaderSlots(ctx); err != nil &&
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
 		!errors.Is(err, lock.ErrClosed) {
@@ -85,6 +85,110 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 		// matching Task 1's discipline. The next pass retries regardless.
 		db.logger.Warn("gmdb: maintenance stale-reader cleanup skipped", "err", err)
 	}
+
+	// Task 3 — checksum scrubbing (background-maintenance.md §Checksum
+	// Scrubbing). Read-only; verifies a batch of page footers and reports
+	// (never repairs) any mismatch.
+	db.maintScrubChecksums(ctx)
+}
+
+// maintScrubChecksums verifies the xxhash64 footers of a bounded batch of
+// allocated data pages, advancing a persistent cursor across passes
+// (background-maintenance.md §Checksum Scrubbing). Its purpose is to catch
+// silent bitrot proactively — before a user transaction reads the page and
+// hits ErrBadPageChecksum.
+//
+// Read-only and report-only (Inv-M3): a mismatch is logged as a
+// CheckWarning carrying the page id (Inv-M5) and nothing is rewritten —
+// repair is the explicit CheckWithOptions(Repair) / CopyTo(compact=true)
+// path. Skipped entirely when PageChecksum is disabled.
+//
+// Footer-bearing gate: only pages the engine guarantees carry a footer are
+// verified — allocated pages (the snapshot bitmap's bit is clear) in
+// [firstData, hwm). The meta/bitmap region (< firstData) carries no
+// xxhash64 footer (checksums.md §Storage), and a free page holds no valid
+// footer; verifying either would emit a spurious BadPageChecksum per page
+// on any non-full database, flooding the log and burying real bitrot.
+//
+// The cursor scans the page-id space (free ids are advanced over, not
+// verified), wrapping at hwm; a full cycle covers the data region over
+// ceil((hwm-firstData)/ScrubBatchSize) passes.
+//
+// Best-effort: the allocated/free gate uses a bitmap snapshot copied once
+// at pass start (consistent for the whole pass), but page content is read
+// live through the read tx's mmap. Pages allocated in this reader's snapshot
+// are stable (reachable
+// ones are pinned by the read tx's slot; leaked ones are absent from the
+// RPL, so neither is reclaimed under the reader). A page a *newer*
+// concurrent writer allocates in a hole below the snapshot's hwm is not
+// pinned, so its in-flight pwrite can be observed torn; a mismatch is
+// therefore re-verified once (a transient torn read clears on re-read)
+// before warning. Genuine bitrot — or a page allocated via Tx.AllocPage and
+// committed unwritten, which carries no footer — persists across the
+// re-read and is reported truthfully. Check / CheckWithOptions(Repair) is
+// the authority for confirming and repairing.
+func (db *DB) maintScrubChecksums(ctx context.Context) {
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		return // closing / cancelled / poisoned — skip silently
+	}
+	defer rtx.Rollback()
+	meta := rtx.Meta()
+	if !meta.HasFlag(page.MetaFlagPageChecksum) {
+		return // checksums disabled — no footers to verify
+	}
+	pageSize := meta.PageSize
+	c := &checker{pgr: rtx.pgr, cfg: page.Config{PageSize: pageSize, PageChecksum: true}, meta: meta}
+	bm, ok := c.snapshotBitmap()
+	if !ok {
+		return // no bitmap pages — empty database
+	}
+	firstData := uint64(2) + uint64(meta.BitmapPages)
+	hwm := meta.HighWaterMark
+	// Clamp hwm to the file-resident extent (same defence as checker.run):
+	// a forged/over-large hwm must not drive PageRaw past the mapped file.
+	if bound := min(uint64(rtx.pgr.FileSize())/uint64(pageSize), meta.MaxSize); hwm > bound {
+		hwm = bound
+	}
+	if hwm <= firstData {
+		return // no data pages to scrub
+	}
+	// Clamp the persistent cursor into [firstData, hwm): the data region's
+	// bounds can move between passes (hwm grows, BitmapPages changes).
+	cursor := db.scrubCursor
+	if cursor < firstData || cursor >= hwm {
+		cursor = firstData
+	}
+	// Scan at most the whole data region once per pass — for a region
+	// smaller than the batch this avoids re-verifying the same pages
+	// repeatedly within one pass (one pass = one full cycle, per spec).
+	span := hwm - firstData
+	nScan := min(uint64(db.opts.Maintenance.ScrubBatchSize), span)
+	for range nScan {
+		if ctx.Err() != nil {
+			break // Close / cancel — persist progress and stop
+		}
+		id := cursor
+		cursor++
+		if cursor >= hwm {
+			cursor = firstData
+		}
+		if bm.IsSet(id) {
+			continue // free page (bit set) — no valid footer
+		}
+		if !page.VerifyPageFooter(rtx.pgr.PageRaw(id), pageSize) {
+			// Re-verify once: a newer concurrent writer's in-flight pwrite of
+			// a page it allocated below the snapshot's hwm can be observed
+			// torn through the live mmap. A transient torn read clears on
+			// re-read; genuine bitrot (or an unwritten allocated page, which
+			// has no footer) persists.
+			if !page.VerifyPageFooter(rtx.pgr.PageRaw(id), pageSize) {
+				// Inv-M3 report-only / Inv-M5 logged with page id.
+				db.logger.Warn("gmdb: scrub detected bad page checksum", "page", id)
+			}
+		}
+	}
+	db.scrubCursor = cursor
 }
 
 // maintReclaimLeaks reclaims bitmap-leaked pages — allocated in the bitmap

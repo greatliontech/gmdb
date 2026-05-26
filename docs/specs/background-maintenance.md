@@ -84,6 +84,25 @@ Invariant: kind=entailed;
     `ErrBadPageChecksum` on a user read — the proactive
     intent of the scrubber breaks.
 
+Invariant: kind=entailed;
+  property=The scrubber footer-verifies only pages it can
+    prove carry a footer: allocated pages (the snapshot
+    bitmap's bit is clear) in `[firstData, HighWaterMark)`.
+    The meta/bitmap region (`< firstData`) carries no
+    xxhash64 footer (`checksums.md §Storage`), and a free or
+    never-written page holds no valid footer — neither is
+    verified;
+  from=entailed: §Checksum Scrubbing says "verify data pages
+    sequentially" but does not state which pages carry a
+    footer; the gate is the assumption that makes that
+    sequential scan coherent;
+  violation=On any non-full database — free pages within
+    `[firstData, HighWaterMark)`, i.e. the common case — an
+    ungated sequential verify emits a spurious
+    `BadPageChecksum` `CheckWarning` for every free page,
+    flooding the log and burying real bitrot. The
+    proactive-detection intent inverts into noise.
+
 ## Coordination
 
 Multiple processes sharing the same database coordinate via a
@@ -191,12 +210,40 @@ performs a background read-only scan that verifies xxhash64
 footers on data pages proactively — before they are accessed
 by a user transaction. Catches silent bitrot early.
 
-Each pass verifies `ScrubBatchSize` pages (default 4096) in a
-read transaction, advancing through the file sequentially
-across passes. A `ScrubCursor` on the DB tracks the next page
-ID to verify, wrapping at `HighWaterMark`. A full scrub cycle
-covers the database over
-`ceil(HighWaterMark / ScrubBatchSize)` passes.
+Each pass scans up to `ScrubBatchSize` page IDs (default 4096)
+in a read transaction, advancing through the data region
+sequentially across passes. A `ScrubCursor` on the DB tracks
+the next page ID, wrapping at `HighWaterMark`. A full scrub
+cycle covers the data region over
+`ceil((HighWaterMark - firstData) / ScrubBatchSize)` passes.
+
+The scan footer-verifies only **allocated** pages (the
+snapshot bitmap's bit is clear) in `[firstData,
+HighWaterMark)` — data and RPL segment pages, both of which
+carry a footer (`pager-slab.md §Commit`). Free page IDs in
+that window are advanced over but not verified — a free page
+holds no valid footer. The meta/bitmap region (`< firstData`)
+is excluded entirely: those pages carry no xxhash64 footer
+(`checksums.md §Storage`).
+
+The scrubber is **best-effort and report-only**, not a
+substitute for `Check`. The allocated/free gate uses a bitmap
+snapshot copied once at pass start (consistent for the whole
+pass); page content is read live through the read
+transaction's mmap. Pages allocated in this reader's snapshot
+are stable — reachable ones are pinned
+by the read transaction's slot; leaked ones are absent from
+the RPL, so neither is reclaimed under the reader. But a page
+a *newer* concurrent writer allocates in a hole below the
+snapshot's `HighWaterMark` is not pinned, so the scan can
+momentarily observe its in-flight write as a torn page. A
+mismatch is therefore **re-verified once** (a transient torn
+read clears on re-read) before a warning is emitted. Genuine
+bitrot — or a page allocated via the low-level `Tx.AllocPage`
+and committed without ever being written, which carries no
+footer — persists across the re-read and is reported
+truthfully. `Check` / `CheckWithOptions(Repair)` remains the
+authority for confirming and repairing.
 
 Detected corruption is logged via `slog.Logger` as
 `CheckWarning` with the affected page ID. The scrubber does

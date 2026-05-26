@@ -4,12 +4,67 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
+	"github.com/thegrumpylion/gmdb/internal/page"
 )
+
+// captureHandler is a minimal slog.Handler that records every Record so a
+// test can assert what the maintenance goroutine logged. Safe for the
+// concurrent logging the maintenance goroutine could do (tests drive it
+// synchronously, but the mutex keeps -race clean regardless).
+type captureHandler struct {
+	mu   *sync.Mutex
+	recs *[]slog.Record
+}
+
+func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.recs = append(*h.recs, r.Clone())
+	return nil
+}
+func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// newCaptureLogger returns a *slog.Logger backed by a captureHandler plus
+// the slice it appends into and the mutex guarding it.
+func newCaptureLogger() (*slog.Logger, *[]slog.Record, *sync.Mutex) {
+	var mu sync.Mutex
+	recs := new([]slog.Record)
+	return slog.New(captureHandler{mu: &mu, recs: recs}), recs, &mu
+}
+
+const scrubBadChecksumMsg = "gmdb: scrub detected bad page checksum"
+
+// scrubWarnedPages returns the page ids reported by scrub-detected
+// bad-checksum warnings among the captured records.
+func scrubWarnedPages(t *testing.T, recs *[]slog.Record, mu *sync.Mutex) []uint64 {
+	t.Helper()
+	mu.Lock()
+	defer mu.Unlock()
+	var pages []uint64
+	for i := range *recs {
+		r := (*recs)[i]
+		if r.Message != scrubBadChecksumMsg {
+			continue
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "page" {
+				pages = append(pages, a.Value.Uint64())
+			}
+			return true
+		})
+	}
+	return pages
+}
 
 // makeLeak commits a keyspace "k" with n rows plus one leaked page
 // (allocated + committed, linked into no tree). Returns the leaked id.
@@ -260,6 +315,244 @@ func TestMaintenanceReapsStaleReaderSlot(t *testing.T) {
 	}
 	if got := lock.Load64(&s1.TxnID); got != 11 {
 		t.Errorf("live reader slot reaped spuriously: TxnID = %d, want 11", got)
+	}
+}
+
+// writeKeyspaceForScrub opens a checksummed db at path, creates keyspace
+// "k" with n rows, commits, and returns the active meta's KeyspaceRoot (an
+// allocated data page ≥ firstData) and the page size. The db is closed on
+// return so the caller can corrupt the file offline.
+func writeKeyspaceForScrub(t *testing.T, path string, n int) (root uint64, pageSize uint32) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tx, _ := db.Begin(ctx, true)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range n {
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	meta := rtx.Meta()
+	root, pageSize = meta.KeyspaceRoot, meta.PageSize
+	firstData := uint64(2) + uint64(meta.BitmapPages)
+	_ = rtx.Rollback()
+	if root < firstData {
+		t.Fatalf("KeyspaceRoot %d < firstData %d; not a corruptible data page", root, firstData)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return root, pageSize
+}
+
+// corruptPageByte flips one byte inside page pageID's checksummed region
+// (offset 16, well clear of the footer) directly on the file, breaking its
+// xxhash64 footer. The db must be closed (no live mmap).
+func corruptPageByte(t *testing.T, path string, pageID uint64, pageSize uint32) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for corrupt: %v", err)
+	}
+	defer f.Close()
+	off := int64(pageID)*int64(pageSize) + 16
+	b := make([]byte, 1)
+	if _, err := f.ReadAt(b, off); err != nil {
+		t.Fatalf("readat: %v", err)
+	}
+	b[0] ^= 0xFF
+	if _, err := f.WriteAt(b, off); err != nil {
+		t.Fatalf("writeat: %v", err)
+	}
+}
+
+// TestMaintenanceScrubDetectsAndReportsBadChecksum (Task 3 / Inv-M5 +
+// Inv-M3): scrub footer-verifies an allocated data page, reports a bitflip
+// as a CheckWarning carrying the page id, and does NOT repair it.
+func TestMaintenanceScrubDetectsAndReportsBadChecksum(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	root, pageSize := writeKeyspaceForScrub(t, path, 200)
+	corruptPageByte(t, path, root, pageSize)
+
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer db.Close()
+
+	db.maintScrubChecksums(ctx)
+
+	if pages := scrubWarnedPages(t, recs, mu); !slices.Contains(pages, root) {
+		t.Errorf("scrub did not report bad checksum for page %d; warned pages = %v", root, pages)
+	}
+	// Inv-M3 (report-only): the page is NOT repaired — it still fails.
+	rtx, _ := db.BeginRead(ctx)
+	defer rtx.Rollback()
+	if page.VerifyPageFooter(rtx.pgr.PageRaw(root), pageSize) {
+		t.Errorf("scrub repaired page %d (footer now valid); must be report-only", root)
+	}
+}
+
+// TestMaintenanceScrubWiredIntoPass: a full runMaintenancePass runs Task 3
+// (the scrub warning for a corrupted page appears among the pass's logs).
+func TestMaintenanceScrubWiredIntoPass(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	root, pageSize := writeKeyspaceForScrub(t, path, 200)
+	corruptPageByte(t, path, root, pageSize)
+
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer db.Close()
+
+	db.runMaintenancePass(ctx)
+
+	if pages := scrubWarnedPages(t, recs, mu); !slices.Contains(pages, root) {
+		t.Errorf("full maintenance pass did not scrub-warn page %d; warned = %v", root, pages)
+	}
+}
+
+// TestMaintenanceScrubCleanDBNoWarnings (footer-gate invariant): on a
+// healthy database scrub warns about nothing. This enforces the gate —
+// without it, the meta/bitmap region (< firstData, no footer) and any free
+// pages would each emit a spurious BadPageChecksum.
+func TestMaintenanceScrubCleanDBNoWarnings(t *testing.T) {
+	ctx := context.Background()
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range 300 {
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	db.maintScrubChecksums(ctx)
+
+	if pages := scrubWarnedPages(t, recs, mu); len(pages) != 0 {
+		t.Errorf("clean db: scrub warned on pages %v (gate must exclude meta/bitmap + free pages; all data footers valid)", pages)
+	}
+}
+
+// TestMaintenanceScrubCursorAdvancesAndWraps: the persistent ScrubCursor
+// advances by the batch size each pass and wraps at HighWaterMark, so a
+// full cycle covers the data region (no stuck cursor, no skipped region).
+// A small ScrubBatchSize forces many passes over the region.
+func TestMaintenanceScrubCursorAdvancesAndWraps(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true, ScrubBatchSize: 2}})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range 400 {
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	rtx, _ := db.BeginRead(ctx)
+	meta := rtx.Meta()
+	firstData := uint64(2) + uint64(meta.BitmapPages)
+	hwm := meta.HighWaterMark
+	if bound := min(uint64(rtx.pgr.FileSize())/uint64(meta.PageSize), meta.MaxSize); hwm > bound {
+		hwm = bound
+	}
+	_ = rtx.Rollback()
+	span := hwm - firstData
+	if span < 5 {
+		t.Skipf("data region too small (span=%d) to exercise multi-pass cursor", span)
+	}
+
+	if db.scrubCursor != 0 {
+		t.Fatalf("precondition: scrubCursor=%d, want 0", db.scrubCursor)
+	}
+	db.maintScrubChecksums(ctx)
+	if db.scrubCursor != firstData+2 { // start 0 → clamp firstData → +batch
+		t.Errorf("after pass 1: scrubCursor=%d, want %d (firstData=%d, hwm=%d)", db.scrubCursor, firstData+2, firstData, hwm)
+	}
+
+	// Run a full region's worth of passes; the cursor must stay in range
+	// every pass and wrap at least once (decrease) — proving coverage.
+	prev := db.scrubCursor
+	wrapped := false
+	for pass := range int(span) {
+		db.maintScrubChecksums(ctx)
+		cur := db.scrubCursor
+		if cur < firstData || cur >= hwm {
+			t.Fatalf("pass %d: cursor %d out of [%d,%d)", pass+2, cur, firstData, hwm)
+		}
+		if cur < prev {
+			wrapped = true
+		}
+		prev = cur
+	}
+	if !wrapped {
+		t.Errorf("cursor never wrapped over %d passes (span=%d, hwm=%d)", span, span, hwm)
+	}
+}
+
+// TestMaintenanceScrubSkippedWithoutChecksum: with PageChecksum disabled
+// scrub is a no-op (no footers exist, so verifying would flood spurious
+// warnings — the early skip prevents that).
+func TestMaintenanceScrubSkippedWithoutChecksum(t *testing.T) {
+	ctx := context.Background()
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		PageChecksum: false, Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range 100 {
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	db.maintScrubChecksums(ctx)
+
+	if pages := scrubWarnedPages(t, recs, mu); len(pages) != 0 {
+		t.Errorf("PageChecksum off: scrub should be a no-op, warned on %v", pages)
 	}
 }
 
