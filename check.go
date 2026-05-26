@@ -436,6 +436,17 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 		if !c.walkTree(name, "", desc.Root, firstData, hwm) {
 			return errCheckStop
 		}
+		// SetKeyspace subpage payloads are INLINE in the outer-tree leaf
+		// cells, not pages, so the page-level reachability walk above does
+		// not see them. Validate them here so the structural Check honours
+		// api-surface.md §Check's "verifies … set keyspace subpage …
+		// integrity" claim (nested-tree integrity IS covered by the
+		// reachability walk, which recurses nested subtrees).
+		if desc.Kind == page.KeyspaceKindSetKeyspace {
+			if !c.checkSetKeyspaceSubpages(name, desc.Root, desc.FixedValueSize, hwm) {
+				return errCheckStop
+			}
+		}
 		if desc.IndexRegistryRoot != 0 {
 			if !c.walkRegistry(name, desc, firstData, hwm) {
 				return errCheckStop
@@ -444,6 +455,51 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 		return nil
 	})
 	return c.dispositionEnumErr(err, "KeyspaceWalkFailed", "", "keyspace enumeration")
+}
+
+// checkSetKeyspaceSubpages validates every SetKeyspace subpage cell's
+// internal header (a forged Count / DataSize, or a value shorter than the
+// subpage header) — corruption the page-level reachability walk cannot
+// see, since subpages are inline in the outer-tree leaf cells. Enumerates
+// via the guarded WalkLeafEntries (never panics on a forged tree) and
+// constructs the reader with the keyspace's FixedValueSize so fixed- and
+// variable-width subpages are both validated faithfully. A bad subpage is
+// a SubpageCorrupt CheckError. A WalkLeafEntries structural failure is NOT
+// re-reported here — the reachability walkTree pass already ran and
+// reported the tree-structure corruption. Returns false only when the
+// caller stopped iterating.
+func (c *checker) checkSetKeyspaceSubpages(ks string, dataRoot uint64, fvs uint16, hwm uint64) bool {
+	if dataRoot == 0 {
+		return true
+	}
+	err := btree.WalkLeafEntries(rawPageReader{c.pgr}, c.cfg, dataRoot, hwm, func(e page.LeafEntry) error {
+		if !e.IsSubpage() {
+			return nil // nested-tree / other cells are covered by the reachability walk
+		}
+		// NewSubpageReader panics below SubpageHeaderSize and Validate is
+		// not total over a malformed header — bound the length first, the
+		// same guard the chunk-11.4a CheckIndexes path uses.
+		if len(e.Value) < page.SubpageHeaderSize {
+			if !c.emit(CheckIssue{Severity: CheckError, Code: "SubpageCorrupt", Keyspace: ks,
+				Message: fmt.Sprintf("set key %q subpage is %d bytes (< header %d)", e.Key, len(e.Value), page.SubpageHeaderSize)}) {
+				return errCheckStop
+			}
+			return nil
+		}
+		if verr := page.NewSubpageReader(e.Value, fvs).Validate(); verr != nil {
+			if !c.emit(CheckIssue{Severity: CheckError, Code: "SubpageCorrupt", Keyspace: ks,
+				Message: fmt.Sprintf("set key %q subpage invalid: %v", e.Key, verr)}) {
+				return errCheckStop
+			}
+		}
+		return nil
+	})
+	if err != nil && errors.Is(err, errCheckStop) {
+		return false
+	}
+	// A non-stop WalkLeafEntries error is tree-structure corruption already
+	// reported by the reachability walkTree pass — do not double-report.
+	return true
 }
 
 // walkRegistry walks a keyspace's index registry sub-tree (registry

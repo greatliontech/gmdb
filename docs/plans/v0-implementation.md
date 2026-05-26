@@ -1736,7 +1736,36 @@ Primary files: `db.go`.
   gate in `BeginRead` (`TestPoisonedHandleRejectsReads`). Spec:
   `api-surface.md §Compact` amended (dir-fsync, mode preservation,
   reopen-failure poison contract, in-tx-Compact prohibition).
-- **11.7** Chunk close-out. *(pending)*
+- **11.7** ✅ Chunk close-out.
+  - **11.7a** (fold) — `check-subpage-structural-validation` folded:
+    plain `Check`'s structural walk now validates SetKeyspace subpage
+    internals (`checkSetKeyspaceSubpages`: guarded `WalkLeafEntries`
+    + `SubpageReader.Validate` with the descriptor's FixedValueSize →
+    `SubpageCorrupt` CheckError), honouring `api-surface.md §Check`'s
+    subpage-integrity claim (previously a spec-vs-code gap — a forged
+    subpage passed plain Check silently). Pinned by
+    `TestCheckStructuralDetectsForgedSubpage` (teeth-verified: fails
+    pre-fix) + a fixed-value-size clean set in
+    `TestCheckCleanPopulatedDB`. Review: ship, 0 H/M/L.
+  - **Triage (close-out gate).** `check-subpage-structural-validation`
+    promoted-then-deleted (rationale now inline in the
+    `checkSetKeyspaceSubpages` godoc + the `§Check` spec claim + the
+    regression test — no tracking-artifact cite). Two redefers
+    (chunk-11 trigger spent without meeting the condition):
+    `writenewindexregistry-partial-leak` (Repair reclaims the orphans
+    but did not canonicalize the loose-pages-on-error contract) and
+    `index-handle-stale-after-rebuild-drop` (no concurrent-iteration
+    hardening landed). README `Lands:` reworded for both.
+  - **Cite sweep** (wrap-aware) of `docs/specs/**` + production `*.go`:
+    no tracking-artifact cites (the lone `overview.md` hit is a general
+    directory description, not a specific-artifact cite). The two
+    11.3e-deleted issues left no dangling pointers.
+  - **Spec-tier invariant audit.** All chunk-11 invariants enforced as
+    tests at their introducing sub-chunk: Inv-C1/C2 (11.2), Inv-RV1–4
+    (11.3), Inv-C5 (11.4b). None recorded-only; none pending promotion.
+
+Chunk 11 complete: Check (+ CheckIndexes, + Repair), CopyTo
+(verbatim + compacting), Compact — all landed, reviewed, green.
 
 ### Chunk 12 — Background maintenance goroutine
 

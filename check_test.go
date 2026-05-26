@@ -1,10 +1,13 @@
 package gmdb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 func collectIssues(seq func(func(CheckIssue) bool)) []CheckIssue {
@@ -72,6 +75,18 @@ func TestCheckCleanPopulatedDB(t *testing.T) {
 		key := fmt.Appendf(nil, "s%03d", i%10)
 		if _, err := set.Put(key, fmt.Appendf(nil, "member%05d", i)); err != nil {
 			t.Fatalf("set Put: %v", err)
+		}
+	}
+	// A fixed-value-size SetKeyspace exercises the FIXED-stride subpage
+	// Validate branch in the structural subpage check (vs the variable
+	// branch above) — a clean fixed set must not false-positive SubpageCorrupt.
+	fset, err := tx.CreateSetKeyspace("fset", &SetKeyspaceOptions{FixedValueSize: 8})
+	if err != nil {
+		t.Fatalf("CreateSetKeyspace fset: %v", err)
+	}
+	for i := range 60 {
+		if _, err := fset.Put(fmt.Appendf(nil, "f%02d", i%6), fmt.Appendf(nil, "%08d", i)); err != nil {
+			t.Fatalf("fset Put: %v", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -336,5 +351,87 @@ func TestCheckFatalIsLast(t *testing.T) {
 	}
 	if fatalIdx != len(issues)-1 {
 		t.Errorf("CheckFatal at index %d, not last (%d issues): %v", fatalIdx, len(issues), issuesByCode(issues))
+	}
+}
+
+// TestCheckStructuralDetectsForgedSubpage (chunk-11.7a): plain Check (no
+// CheckIndexes) must report a forged SetKeyspace subpage as SubpageCorrupt
+// — the structural walk now validates subpage internals, honouring
+// api-surface.md §Check's subpage-integrity claim. PageChecksum is off so
+// the only finding is the subpage corruption (no footer to also break).
+func TestCheckStructuralDetectsForgedSubpage(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tx, _ := db.Begin(ctx, true)
+	sks, err := tx.CreateSetKeyspace("subs", nil)
+	if err != nil {
+		t.Fatalf("CreateSetKeyspace: %v", err)
+	}
+	for _, m := range []string{"alpha", "beta", "gamma"} { // small set ⇒ subpage
+		if _, err := sks.Put([]byte("u1"), []byte(m)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	rtx, _ := db.Begin(ctx, true)
+	rsks, _ := rtx.OpenSetKeyspace("subs")
+	root := rsks.desc.Root
+	rtx.Rollback()
+	if root == 0 {
+		t.Fatal("set data-tree root is 0")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Forge the "u1" subpage's internal Count (first 2 bytes of its value)
+	// to 0xFFFF. The leaf stays structurally valid; only the subpage header
+	// is corrupt.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	pageBuf := make([]byte, 4096)
+	if _, err := f.ReadAt(pageBuf, int64(root)*4096); err != nil {
+		t.Fatalf("read root leaf: %v", err)
+	}
+	cfg := page.Config{PageSize: 4096}
+	it := page.NewLeafReader(pageBuf, cfg).IterForReuse(nil, nil, nil)
+	e, ok := it.Next()
+	if !ok || !e.IsSubpage() {
+		t.Fatalf("first data-tree entry is not a subpage (ok=%v flags=0x%x)", ok, e.Flags)
+	}
+	off := bytes.Index(pageBuf, e.Value)
+	if off < 0 {
+		t.Fatal("could not locate subpage value in the leaf page")
+	}
+	if _, err := f.WriteAt([]byte{0xFF, 0xFF}, int64(root)*4096+int64(off)); err != nil {
+		t.Fatalf("forge write: %v", err)
+	}
+	f.Close()
+
+	db2, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer db2.Close()
+	issues := collectIssues(db2.Check()) // plain Check, no CheckIndexes
+	var found bool
+	for _, iss := range issues {
+		if iss.Code == "SubpageCorrupt" && iss.Keyspace == "subs" {
+			found = true
+		}
+		if iss.Severity == CheckFatal {
+			t.Errorf("unexpected fatal: %s", iss.Message)
+		}
+	}
+	if !found {
+		t.Errorf("plain Check did not report SubpageCorrupt for the forged subpage; issues=%v", issuesByCode(issues))
 	}
 }
