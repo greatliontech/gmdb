@@ -1468,6 +1468,49 @@ Primary specs: `typed-keyspaces.md`.
 
 Primary files: `typed.go`.
 
+**Sub-chunk roster (as landed).**
+
+- **9.1** Triage + invariants (no separate commit; folded into
+  9.2). No `docs/issues/` entry resolved to chunk 9. Invariants
+  T1–T8 (encoder lex order, ID stability/uniqueness/immutability,
+  empty-ID rejection, sealing, round-trip, encoder-ID drift,
+  extractor wiring) derived and encoded as tests.
+- **9.2** `Encoder[T]` + `FuncEncoder[T]` + the canonical encoders
+  (string, bytes, be-uint64/32, be-int64/32 sign-bit-XOR,
+  be-time-nanos, uuid-v4/v7). Lex-order + round-trip + golden-ID
+  tests; BENanos rejects out-of-range times. File:
+  `typed_encoder.go`.
+- **9.3+9.4** `TypedKeyspace[K,V]` / `TypedKS[K,V]`
+  (Get/Put/Delete/DeleteRange) + `TypedCursor[K,V]` +
+  All/Range/Prefix iterators, delegating to the byte
+  Keyspace/Cursor through the encoders. `encodeBound` preserves
+  the open-vs-real-bound distinction. File: `typed.go`.
+- **9.5** `TypedSetKeyspace`/`TypedSetKS`/`TypedSetCursor`
+  (member-level cursor; value-level intra-key navigation
+  deliberately omitted — the key is an unambiguous end sentinel
+  where an empty-bytes set value would not be). File:
+  `typed_set.go`.
+- **9.6a** `TypedIndex[K,V,IK]` core + sealed `AnyTypedIndex`
+  (unexported `indexDecl`) + schema-hash IK-encoder-ID folding
+  (Inv-T7: column name = `IKEnc.ID()`) + `ErrIndexEncoderIDEmpty`
+  + `TypedIndexHandle`/`NewTypedIndexQuery`/`TypedIndexQuery`
+  (Lookup/LookupKeys/Range/Prefix/Get/Err). The extractor closure
+  panics on a decode/encode failure (the byte IndexExtractor is
+  infallible) — reviewer-verified to run before any pinned-index
+  mutation. File: `typed_index.go`.
+- **9.6b** Typed full-row covering (`TypedIndex.CoverValue`) +
+  byte-layer covering-return (gated `Index.coverValue`, enabled
+  only for the recognized typed sentinel; default unchanged
+  back-lookup). Value-encoder ID folded into the fingerprint.
+  Spec amended (`typed-keyspaces.md §Covering`). Filed
+  `byte-api-covering-return-unwired.md` (M-1, adjacent: byte-API
+  projection-covering-return unwired; spec-amend candidate).
+  Files: `index.go`, `typed_index.go`.
+- **9.7** Close-out: no-cite sweep (fixed a spec→issue-doc cite
+  introduced in 9.6b; invariant now holds), spec-tier invariant
+  audit (none pending), api-surface.md confirmed in sync, plan
+  roster. All typed-keyspaces.md §Invariants enforced by tests.
+
 ### Chunk 10 — Batch + nested transactions
 
 **Scope.** Channel-based batch coordinator, per-closure child

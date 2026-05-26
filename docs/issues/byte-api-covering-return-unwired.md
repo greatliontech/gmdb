@@ -61,6 +61,7 @@ correct for the common (no-covering / typed-full-row) cases.
 Surfaced by the chunk-9.6b Round-1 adversarial review (M-1 +
 spec-amend candidate). The typed-layer covering-return is fully wired
 and tested (chunk 9.6b); this issue is strictly about the byte-API
-projection-covering path. `typed-keyspaces.md §Covering` cross-
-references this issue so its "use the byte-oriented IndexDecl for
-projection covering" note does not over-promise.
+projection-covering path. `typed-keyspaces.md §Covering` documents the
+current byte-API behavior (stored, not returned) without over-promising
+— per the no-cite invariant the spec describes behavior and does not
+reference this tracking doc.

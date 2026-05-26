@@ -361,9 +361,10 @@ is the only covering shape the typed API exposes — arbitrary
 covering *projections* have no return surface here (every
 `TypedIndexQuery` method returns the row value `V`). The byte-
 oriented `IndexDecl` can *store* arbitrary covering projections,
-but its `Lookup`/`Get` covering-**return** is not yet wired (it
-back-looks-up the row value); see
-`docs/issues/byte-api-covering-return-unwired.md`.
+but its `Lookup`/`Get` covering-**return** is not yet wired: it
+back-looks-up the row value regardless (so declaring byte-API
+covering today changes only the schema fingerprint and on-disk
+storage, not what `Lookup` returns).
 
 A typed extractor returning multiple `IK` values models composite
 indexes naturally (the `IK` type is itself a struct whose
