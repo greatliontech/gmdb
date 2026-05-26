@@ -1289,12 +1289,15 @@ type CheckIssue struct {
 // Walk failures (I/O errors, unreadable pages) are reported as
 // CheckFatal severity and are always the last issue yielded.
 //
-// Check internally opens a read transaction. The transaction is
-// released when the iterator is exhausted OR when the caller
-// abandons iteration (a runtime.AddCleanup attached to the iter.Seq
-// closure releases the reader slot on GC). Callers iterating to
-// completion always see the slot released promptly; callers that
-// break early should not assume immediate release.
+// Check internally opens a read transaction, lazily, on the first
+// iteration (abandoning the Seq without ranging it opens nothing). The
+// reader slot is released DETERMINISTICALLY when the iterator is
+// exhausted OR when the caller breaks out of the range loop — the
+// range-over-func protocol runs the closure's deferred Rollback in both
+// cases, so an early break releases the slot promptly. A
+// runtime.AddCleanup on the read transaction is only the GC backstop
+// for a caller that abandons the Seq mid-iteration without completing
+// or breaking; only that path waits on GC.
 func (db *DB) Check() iter.Seq[CheckIssue]
 
 type CheckOptions struct {
