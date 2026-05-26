@@ -1624,12 +1624,27 @@ Primary files: `db.go`.
     `registryList` no-cap note), deleted both issue docs +
     README rows (`git log --all -- docs/issues/<f>.md`), synced
     `checksums.md §Structural and Allocation Bounds` +
-    `integrity.md`, this roster. Spec-amend candidate relayed to
-    the user: Check's reader-slot release is deterministic
-    (defer-on-break), stronger than the spec's GC-via-AddCleanup
-    wording.
-- **11.4** `CheckWithOptions` — `CheckIndexes` extractor-
-  equivalence + `Repair` leaked-page reclamation. *(pending)*
+    `integrity.md`, this roster. Spec-amend candidate (Check's
+    reader-slot release is deterministic — defer-on-break —
+    stronger than the spec's GC-via-AddCleanup wording) approved
+    by the user and applied: commit `9a90581`.
+- **11.4a** `CheckWithOptions(CheckIndexes)` — extractor-
+  equivalence for plain Keyspaces AND SetKeyspaces (full-entry
+  key+value comparison reproducing the exact stored entries; new
+  guarded `btree.WalkLeafEntries` for the SetKeyspace outer tree).
+  Commit `c51f85f`. 11.4.1 triage redeferred
+  `writenewindexregistry-partial-leak` (Check+Repair reclaim its
+  leak, but the orphaning root is unchanged) and
+  `index-handle-stale-after-rebuild-drop` (11.4 implements no
+  concurrent-iteration hardening). Round-2 review filed
+  `check-subpage-structural-validation` (adjacent: the STRUCTURAL
+  walk does not validate subpage payloads though `api-surface.md
+  §Check` claims it does — a spec-vs-code gap).
+- **11.4b** `CheckWithOptions(Repair)` — exclusive leaked-page
+  reclamation enforcing Inv-C5 (free ONLY allocated-but-
+  unreachable pages, under verified no-readers/no-writers
+  exclusivity; atomicity rides the commit pipeline). The
+  `CheckOptions.Repair` field lands here. *(pending)*
 - **11.5** `CopyTo(path, compact)`. *(pending)*
 - **11.6** `Compact()` — drain + flock + atomic rename +
   reopen; `Options.CompactDrainTimeout`. *(pending)*
