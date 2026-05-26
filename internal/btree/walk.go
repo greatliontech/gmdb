@@ -67,6 +67,77 @@ func WalkKV(pr PageReader, cfg page.Config, root, hwm uint64, fn func(key, value
 	return walkKVAt(pr, cfg, root, hwm, 0, keyBuf, fn)
 }
 
+// WalkLeafEntries walks the B+tree rooted at root in ascending key order
+// and calls fn for every leaf ENTRY — including the multi-value cells
+// (subpage, nested-tree) that WalkKV rejects. It descends with the same
+// hwm + ValidateBranch + LeafReader.Validate guards as Walk / WalkKV, so
+// it never panics on a forged page. fn receives the raw page.LeafEntry:
+// its Key / Value slices are borrowed and valid only for the duration of
+// the call (copy anything retained), overflow values are NOT assembled
+// (fn sees the overflow reference), and nested-tree roots are NOT
+// recursed (fn sees the nested-tree cell). This is the guarded enumerator
+// Check uses for a SetKeyspace's outer tree, whose entries map a set key
+// to a subpage or nested-tree of members.
+func WalkLeafEntries(pr PageReader, cfg page.Config, root, hwm uint64, fn func(e page.LeafEntry) error) error {
+	if root == 0 {
+		return nil
+	}
+	keyBuf := make([]byte, 0, 256)
+	return walkLeafEntriesAt(pr, cfg, root, hwm, 0, keyBuf, fn)
+}
+
+func walkLeafEntriesAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, keyBuf []byte, fn func(e page.LeafEntry) error) error {
+	if depth > MaxTreeDepth {
+		return ErrTreeTooDeep
+	}
+	if pageID >= hwm {
+		return fmt.Errorf("%w: page id %d >= HighWaterMark %d at depth %d", ErrCorrupted, pageID, hwm, depth)
+	}
+	buf, err := pr.Page(pageID)
+	if err != nil {
+		return err
+	}
+	typ, _, cellCount, _ := page.ReadHeader(buf)
+	switch {
+	case typ == page.TypeBranch:
+		if err := page.ValidateBranch(buf, cfg); err != nil {
+			return fmt.Errorf("%w: branch %d at depth %d: %w", ErrCorrupted, pageID, depth, err)
+		}
+		children := make([]uint64, 0, int(cellCount)+1)
+		for i := uint16(0); i <= cellCount; i++ {
+			c := page.BranchChildAt(buf, cfg, i)
+			if c == 0 {
+				return fmt.Errorf("%w: null child pointer in branch %d index %d at depth %d", ErrCorrupted, pageID, i, depth)
+			}
+			children = append(children, c)
+		}
+		for _, c := range children {
+			if err := walkLeafEntriesAt(pr, cfg, c, hwm, depth+1, keyBuf, fn); err != nil {
+				return err
+			}
+		}
+	case page.IsLeafType(typ):
+		r := page.NewLeafReader(buf, cfg)
+		if err := r.Validate(); err != nil {
+			return fmt.Errorf("%w: leaf %d at depth %d: %w", ErrCorrupted, pageID, depth, err)
+		}
+		it := r.IterForReuse(keyBuf, nil, nil)
+		for {
+			e, ok := it.Next()
+			if !ok {
+				break
+			}
+			if err := fn(e); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("%w: page %d unexpected type %d at depth %d (want branch=%d or leaf=%d/%d)",
+			ErrCorrupted, pageID, typ, depth, page.TypeBranch, page.TypeLeaf, page.TypeLeafUncompressed)
+	}
+	return nil
+}
+
 func walkKVAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, keyBuf []byte, fn func(key, value []byte) error) error {
 	if depth > MaxTreeDepth {
 		return ErrTreeTooDeep

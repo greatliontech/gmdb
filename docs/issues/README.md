@@ -15,6 +15,7 @@ cites are repointed at the new home, and the issue file is deleted.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
+| [check-subpage-structural-validation](check-subpage-structural-validation.md) | chunk 11 subpage-structural-validation hardening (or fuzz repro) | `Check`'s structural walk (`btree.walkAt`) never validates SetKeyspace subpage payloads, though `api-surface.md §Check` claims it verifies subpage integrity — a forged subpage passes structurally with no CheckIssue. Distinct from the 11.4a CheckIndexes panic (fixed). Adjacent; surfaced by chunk-11.4a Round-3 review. |
 | [bitmap-rollback-undo-log](bitmap-rollback-undo-log.md) | when profiling shows BeginTx allocation pressure is material | `Bitmap.Snapshot()` clones the full detail+summary per `Pager.BeginTx()` — 8 MB at 256 GB MaxSize. Replace with an undo log if profiling shows the per-tx allocation is hot. |
 | [pager-test-helper-export](pager-test-helper-export.md) | when chunk 5.3+ adds a second cross-package writer-pager fixture caller | `setupWriter` is duplicated into `internal/btree/pager_integration_test.go` as `setupPagerWriter` for the chunk-5.2 PageWriter parity test. Acceptable for one caller; factor when the second caller arrives. |
 | [leaked-readtx-cleanup-race-flake](leaked-readtx-cleanup-race-flake.md) | condition (when read-tx slot lifecycle is next touched, or opportunistically) | `TestLeakedReadTxReleasesSlotViaCleanup` is flaky under `-race` due to finalizer-scheduling latency. Pre-existing on HEAD cd34a40; surfaced by chunk-5.4 Round 2 adversarial review. |

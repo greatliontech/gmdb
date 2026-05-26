@@ -143,3 +143,16 @@ All three shapes follow the same canonicalization path this issue
 tracks. When the rest-of-tx-continues contract is replaced by an
 all-or-nothing per-helper guarantee, all three benefit
 automatically.
+
+## Chunk-11.4 triage update (redefer, not resolved)
+
+Chunk 11 makes the *consequence* recoverable without fixing the
+*root*: `Check()` reports the orphaned pages as `BitmapLeak`
+(11.2) and `CheckWithOptions(Repair)` reclaims them under
+exclusive access (11.4). So a partial-failure leak is now both
+detectable and offline-reclaimable. The root — the
+rest-of-tx-continues contract that lets `Tx.Commit` keep the
+orphaned pages in the first place — is unchanged. Redeferred to
+the original trigger (error-contract canonicalization /
+loose-pages-on-error policy); the Repair path is the interim
+recovery, not the fix.

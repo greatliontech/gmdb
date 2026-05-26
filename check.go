@@ -47,6 +47,48 @@ type CheckIssue struct {
 	Repaired bool
 }
 
+// CheckOptions configures CheckWithOptions. A nil *CheckOptions (or the
+// zero value) is plain structural Check. (Repair — exclusive leaked-page
+// reclamation — is wired in a following sub-chunk; this type carries only
+// the read-only options today.)
+type CheckOptions struct {
+	// CheckIndexes additionally verifies that each indexed keyspace's
+	// stored index entries match what the supplied extractors would
+	// produce — it re-runs every extractor over every row, O(rows ×
+	// indexes). Off by default.
+	//
+	// When true, Indexes MUST carry an IndexDecl set for each indexed
+	// keyspace to verify. An indexed keyspace absent from Indexes is
+	// reported as a CheckWarning "CheckIndexes.KeyspaceNotSupplied" (its
+	// structure is still checked). A drifted index is a CheckError
+	// "CheckIndexes.FingerprintDrift" and does NOT abort the walk or
+	// trigger a rebuild.
+	CheckIndexes bool
+
+	// Indexes supplies extractors for CheckIndexes, keyed by keyspace
+	// name. Ignored when CheckIndexes is false. A keyspace name not in
+	// the database is reported as "CheckIndexes.KeyspaceNotFound"; an
+	// IndexDecl.Name not registered on an existing keyspace as
+	// "CheckIndexes.IndexNotInRegistry".
+	//
+	// The supplied IndexDecl's Unique and Covering must match the
+	// registered index's: the equivalence check reproduces the on-disk
+	// (key, value) using the SUPPLIED decl, so a mismatched Unique or
+	// Covering produces a FingerprintDrift (correctly — the supplied
+	// decl does not describe the stored index). Both Keyspace and
+	// SetKeyspace indexes are verified, each with its own codec.
+	//
+	// Beyond the four codes above, the pass may emit these diagnostic
+	// codes (CheckError unless noted), all stable and prefixed
+	// "CheckIndexes.": ExtractorMissing (supplied decl has a nil
+	// Extract), ExtractorError (the extractor failed re-running, e.g. a
+	// unique candidate-set collision), RowsUnreadable / IndexUnreadable
+	// (CheckWarning — a corrupt tree blocked enumeration; the structural
+	// pass already reported it), and KeyspaceKindUnsupported (CheckWarning
+	// — a keyspace kind the pass cannot verify).
+	Indexes map[string][]*IndexDecl
+}
+
 // Check performs a structural integrity walk over a read snapshot and
 // returns the findings as an iter.Seq[CheckIssue]. It verifies the
 // active meta, every reachable B+tree page's checksum (when
@@ -68,7 +110,15 @@ type CheckIssue struct {
 // writer allocated looks unreferenced against the older snapshot's
 // tree). Run Check on a quiescent database, or use the exclusive Repair
 // path, for authoritative accounting.
-func (db *DB) Check() iter.Seq[CheckIssue] {
+func (db *DB) Check() iter.Seq[CheckIssue] { return db.CheckWithOptions(nil) }
+
+// CheckWithOptions is Check with options (api-surface.md §Check). With
+// opts.CheckIndexes set it additionally verifies, for each supplied
+// IndexDecl, that the stored index entries match what the extractor
+// re-run over every live row would produce (extractor-equivalence). A
+// nil opts is identical to Check. The reader-slot lifetime and the
+// CheckFatal-is-last contract are unchanged from Check.
+func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue] {
 	return func(yield func(CheckIssue) bool) {
 		rtx, err := db.BeginRead(context.Background())
 		if err != nil {
@@ -86,6 +136,7 @@ func (db *DB) Check() iter.Seq[CheckIssue] {
 			cfg:   page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)},
 			meta:  meta,
 			yield: yield,
+			opts:  opts,
 		}
 		c.run()
 	}
@@ -100,10 +151,28 @@ type checker struct {
 	cfg   page.Config
 	meta  page.Meta
 	yield func(CheckIssue) bool
+	opts  *CheckOptions
 
 	stopped   bool
 	reachable bitset
+
+	// inv is the per-keyspace inventory the structural walk records for
+	// the CheckIndexes pass — populated only when checkIndexesEnabled().
+	inv map[string]*ksInventory
 }
+
+// ksInventory records, for the CheckIndexes pass, a keyspace's kind,
+// data-tree root, the fixed value size (SetKeyspaces only), and the
+// data-tree root of each registered index — gathered during the
+// structural walk so the index pass needs no second descriptor read.
+type ksInventory struct {
+	kind           uint8  // page.KeyspaceKind* — selects the index codec
+	fixedValueSize uint16 // SetKeyspace subpage member width (0 ⇒ variable)
+	dataRoot       uint64
+	indexRoots     map[string]uint64 // index name → index data-tree root
+}
+
+func (c *checker) checkIndexesEnabled() bool { return c.opts != nil && c.opts.CheckIndexes }
 
 // emit yields one issue. Returns false (and latches stopped) when the
 // caller has asked to stop iterating.
@@ -135,6 +204,9 @@ func (c *checker) run() {
 	}
 	firstData := uint64(2) + uint64(c.meta.BitmapPages)
 	c.reachable = newBitset(hwm)
+	if c.checkIndexesEnabled() {
+		c.inv = make(map[string]*ksInventory)
+	}
 
 	if err := page.ValidateMeta(c.meta); err != nil {
 		if !c.emit(CheckIssue{Severity: CheckError, Code: "MetaInvalid",
@@ -161,6 +233,15 @@ func (c *checker) run() {
 	}
 
 	c.accounting(firstData, hwm, rplPages)
+
+	// Extractor-equivalence verification (opt-in). Runs after the
+	// structural walk so the inventory is complete and the
+	// CheckFatal-is-last contract holds (the structural/accounting passes
+	// have already returned on any fatal; checkIndexes emits only
+	// warnings + FingerprintDrift errors, never fatals).
+	if c.checkIndexesEnabled() && !c.stopped {
+		c.checkIndexes(hwm)
+	}
 }
 
 // walkKeyspaces enumerates keyspaces from the snapshot's KeyspaceRoot,
@@ -186,6 +267,14 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 				return errCheckStop
 			}
 			return nil
+		}
+		if c.checkIndexesEnabled() {
+			c.inv[name] = &ksInventory{
+				kind:           desc.Kind,
+				fixedValueSize: desc.FixedValueSize,
+				dataRoot:       desc.Root,
+				indexRoots:     make(map[string]uint64),
+			}
 		}
 		if !c.walkTree(name, "", desc.Root, firstData, hwm) {
 			return errCheckStop
@@ -216,6 +305,11 @@ func (c *checker) walkRegistry(ks string, desc page.KeyspaceDescriptor, firstDat
 				return errCheckStop
 			}
 			return nil
+		}
+		if c.checkIndexesEnabled() {
+			if info := c.inv[ks]; info != nil {
+				info.indexRoots[idxName] = entry.Root
+			}
 		}
 		if !c.walkTree(ks, idxName, entry.Root, firstData, hwm) {
 			return errCheckStop
@@ -385,6 +479,235 @@ func (c *checker) accounting(firstData, hwm uint64, rplPages bitset) {
 		c.emit(CheckIssue{Severity: CheckWarning, Code: "FreeCountMismatch",
 			Message: fmt.Sprintf("bitmap free-page count %d != meta NumFreePages %d", got, c.meta.NumFreePages)})
 	}
+}
+
+// checkIndexes runs the extractor-equivalence pass (CheckOptions.
+// CheckIndexes). For each indexed keyspace not covered by opts.Indexes it
+// emits KeyspaceNotSupplied; for each supplied (keyspace, IndexDecl) it
+// flags KeyspaceNotFound / IndexNotInRegistry on misconfiguration, else
+// verifies the stored index equals what the extractor re-run over every
+// row produces. Read-only; emits only warnings + FingerprintDrift errors,
+// never CheckFatal, so the CheckFatal-is-last contract is preserved. Map
+// iteration order is unspecified, but findings are a set so order is
+// immaterial.
+func (c *checker) checkIndexes(hwm uint64) {
+	// Indexed keyspaces the caller supplied no extractors for.
+	for ksName, info := range c.inv {
+		if len(info.indexRoots) == 0 {
+			continue // not an indexed keyspace
+		}
+		if _, ok := c.opts.Indexes[ksName]; ok {
+			continue
+		}
+		if !c.emit(CheckIssue{Severity: CheckWarning, Code: "CheckIndexes.KeyspaceNotSupplied", Keyspace: ksName,
+			Message: fmt.Sprintf("indexed keyspace %q has no IndexDecls supplied; extractor-equivalence skipped (structure still checked)", ksName)}) {
+			return
+		}
+	}
+	// Supplied extractors → verify, or flag misconfiguration.
+	for ksName, decls := range c.opts.Indexes {
+		info, ok := c.inv[ksName]
+		if !ok {
+			if !c.emit(CheckIssue{Severity: CheckWarning, Code: "CheckIndexes.KeyspaceNotFound", Keyspace: ksName,
+				Message: fmt.Sprintf("supplied keyspace %q does not exist in the database", ksName)}) {
+				return
+			}
+			continue
+		}
+		for _, decl := range decls {
+			if decl == nil {
+				continue
+			}
+			idxRoot, ok := info.indexRoots[decl.Name]
+			if !ok {
+				if !c.emit(CheckIssue{Severity: CheckWarning, Code: "CheckIndexes.IndexNotInRegistry", Keyspace: ksName, Index: decl.Name,
+					Message: fmt.Sprintf("supplied index %q is not registered on keyspace %q", decl.Name, ksName)}) {
+					return
+				}
+				continue
+			}
+			if !c.verifyIndexEquivalence(ksName, info, decl, idxRoot, hwm) {
+				return
+			}
+		}
+	}
+}
+
+// verifyIndexEquivalence re-runs decl.Extract over every row of the
+// keyspace data tree, accumulates the encoded index keys the extractor
+// would produce, and compares that set against the keys stored in the
+// index data tree. A discrepancy is a FingerprintDrift CheckError (the
+// index does not match the supplied extractor — typically an extractor
+// changed without a Version bump, indexing.md §Drift Guard). Both walks
+// use the guarded WalkKV (no panic on a forged tree). Returns false only
+// when the caller stopped iterating.
+func (c *checker) verifyIndexEquivalence(ks string, info *ksInventory, decl *IndexDecl, idxRoot, hwm uint64) bool {
+	if decl.Extract == nil {
+		return c.emit(CheckIssue{Severity: CheckError, Code: "CheckIndexes.ExtractorMissing", Keyspace: ks, Index: decl.Name,
+			Message: fmt.Sprintf("supplied IndexDecl %q has a nil Extract", decl.Name)})
+	}
+	hasCovering := len(decl.Covering) > 0
+	// Build the (encoded key → encoded value) set the index SHOULD contain
+	// by re-running the extractor over the live rows/members, reproducing
+	// the exact on-disk (key, value) the write path stores — using the
+	// codec for this keyspace kind. extractErr = the extractor itself
+	// failed; structErr = enumerating rows/members hit a corrupt page
+	// (already reported by the structural pass).
+	var (
+		expected   map[string]string
+		extractErr error
+		structErr  error
+	)
+	switch info.kind {
+	case page.KeyspaceKindKeyspace:
+		expected, extractErr, structErr = c.expectedKeyspaceIndex(decl, info.dataRoot, hwm, hasCovering)
+	case page.KeyspaceKindSetKeyspace:
+		expected, extractErr, structErr = c.expectedSetKeyspaceIndex(decl, info.dataRoot, info.fixedValueSize, hwm, hasCovering)
+	default:
+		return c.emit(CheckIssue{Severity: CheckWarning, Code: "CheckIndexes.KeyspaceKindUnsupported", Keyspace: ks, Index: decl.Name,
+			Message: fmt.Sprintf("keyspace %q has kind %d, which CheckIndexes cannot verify", ks, info.kind)})
+	}
+	if extractErr != nil {
+		return c.emit(CheckIssue{Severity: CheckError, Code: "CheckIndexes.ExtractorError", Keyspace: ks, Index: decl.Name,
+			Message: fmt.Sprintf("re-running extractor failed: %v", extractErr)})
+	}
+	if structErr != nil {
+		// Structural failure enumerating rows/members (already reported by
+		// the structural pass); skip equivalence for this index.
+		return c.emit(CheckIssue{Severity: CheckWarning, Code: "CheckIndexes.RowsUnreadable", Keyspace: ks, Index: decl.Name,
+			Message: fmt.Sprintf("could not enumerate rows/members for index verification: %v", structErr)})
+	}
+	// Stored entries: enumerate the index data tree.
+	stored := make(map[string]string)
+	serr := btree.WalkKV(rawPageReader{c.rtx.pgr}, c.cfg, idxRoot, hwm, func(k, v []byte) error {
+		stored[string(k)] = string(v)
+		return nil
+	})
+	if serr != nil {
+		return c.emit(CheckIssue{Severity: CheckWarning, Code: "CheckIndexes.IndexUnreadable", Keyspace: ks, Index: decl.Name,
+			Message: fmt.Sprintf("could not enumerate stored index entries: %v", serr)})
+	}
+	if missing, extra, mism := diffEntrySets(expected, stored); missing > 0 || extra > 0 || mism > 0 {
+		return c.emit(CheckIssue{Severity: CheckError, Code: "CheckIndexes.FingerprintDrift", Keyspace: ks, Index: decl.Name,
+			Message: fmt.Sprintf("index %q drift: %d expected entries missing from the index, %d stored entries the extractor did not produce, %d value mismatches",
+				decl.Name, missing, extra, mism)})
+	}
+	return true
+}
+
+// expectedKeyspaceIndex re-runs decl.Extract over every row of a plain
+// Keyspace's data tree and returns the (encoded key → encoded value) set
+// the index should hold, using the Keyspace codec (row key as PK).
+func (c *checker) expectedKeyspaceIndex(decl *IndexDecl, dataRoot, hwm uint64, hasCovering bool) (expected map[string]string, extractErr, structErr error) {
+	expected = make(map[string]string)
+	werr := btree.WalkKV(rawPageReader{c.rtx.pgr}, c.cfg, dataRoot, hwm, func(k, v []byte) error {
+		entries, eerr := extractEntriesAsKeySet(decl, k, v)
+		if eerr != nil {
+			extractErr = eerr
+			return errCheckStop
+		}
+		for ek, entry := range entries {
+			expected[ek] = string(indexEntryValue(entry, k, decl.Unique, hasCovering))
+		}
+		return nil
+	})
+	if extractErr != nil {
+		return nil, extractErr, nil
+	}
+	if werr != nil {
+		return nil, nil, werr
+	}
+	return expected, nil, nil
+}
+
+// expectedSetKeyspaceIndex re-runs decl.Extract over every (setKey,
+// member) pair of a SetKeyspace and returns the expected (encoded key →
+// encoded value) set, using the SetKeyspace codec (encodeSetKeyspaceIndexKey
+// + the compound (setKey,member) PK). Members live in a subpage (small
+// sets) or a nested B+tree keyed by the set key in the outer tree; both
+// are enumerated through the guarded walkers so a forged tree yields an
+// error, not a panic.
+func (c *checker) expectedSetKeyspaceIndex(decl *IndexDecl, dataRoot uint64, fvs uint16, hwm uint64, hasCovering bool) (expected map[string]string, extractErr, structErr error) {
+	expected = make(map[string]string)
+	pr := rawPageReader{c.rtx.pgr}
+	addMember := func(setKey, member []byte) error {
+		entries, eerr := setKeyspaceExtractEntries(decl, setKey, member)
+		if eerr != nil {
+			extractErr = eerr
+			return errCheckStop
+		}
+		compoundPK := encodeSetKeyspaceCompoundPK(setKey, member)
+		for ek, entry := range entries {
+			expected[ek] = string(indexEntryValue(entry, compoundPK, decl.Unique, hasCovering))
+		}
+		return nil
+	}
+	werr := btree.WalkLeafEntries(pr, c.cfg, dataRoot, hwm, func(e page.LeafEntry) error {
+		switch {
+		case e.IsSubpage():
+			// Guard the raw on-disk subpage before decoding it — a forged
+			// subpage (too short, or a bad internal Count/DataSize) must
+			// surface as ErrCorrupted (→ a RowsUnreadable warning), never
+			// a panic: NewSubpageReader panics below SubpageHeaderSize and
+			// AllValues is not total over a malformed header. This upholds
+			// the chunk-11 "Check never panics on a forged page" contract.
+			if len(e.Value) < page.SubpageHeaderSize {
+				return fmt.Errorf("%w: SetKeyspace subpage for key %q is %d bytes (< header %d)",
+					btree.ErrCorrupted, e.Key, len(e.Value), page.SubpageHeaderSize)
+			}
+			sp := page.NewSubpageReader(e.Value, fvs)
+			if err := sp.Validate(); err != nil {
+				return fmt.Errorf("%w: SetKeyspace subpage for key %q: %w", btree.ErrCorrupted, e.Key, err)
+			}
+			var inErr error
+			sp.AllValues(func(member []byte) bool {
+				if err := addMember(e.Key, member); err != nil {
+					inErr = err
+					return false
+				}
+				return true
+			})
+			return inErr
+		case e.IsNestedTree():
+			// Members are the KEYS of the nested tree (empty values), per
+			// set-keyspace.md §Storage Strategy.
+			return btree.WalkKV(pr, c.cfg, e.NestedRoot, hwm, func(member, _ []byte) error {
+				return addMember(e.Key, member)
+			})
+		default:
+			return fmt.Errorf("%w: SetKeyspace entry for key %q is neither subpage nor nested-tree (flags 0x%x)",
+				btree.ErrCorrupted, e.Key, e.Flags)
+		}
+	})
+	if extractErr != nil {
+		return nil, extractErr, nil
+	}
+	if werr != nil {
+		return nil, nil, werr
+	}
+	return expected, nil, nil
+}
+
+// diffEntrySets compares two (encoded key → encoded value) maps: missing
+// = a key in expected but absent from stored; extra = a key in stored but
+// absent from expected; mismatch = a key in both whose values differ.
+func diffEntrySets(expected, stored map[string]string) (missing, extra, mismatch int) {
+	for k, ev := range expected {
+		sv, ok := stored[k]
+		if !ok {
+			missing++
+			continue
+		}
+		if sv != ev {
+			mismatch++
+		}
+	}
+	for k := range stored {
+		if _, ok := expected[k]; !ok {
+			extra++
+		}
+	}
+	return missing, extra, mismatch
 }
 
 // snapshotBitmap reconstructs the allocation bitmap from the snapshot's

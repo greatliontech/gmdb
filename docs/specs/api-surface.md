@@ -1333,6 +1333,22 @@ type CheckOptions struct {
     // Code = "CheckIndexes.IndexNotInRegistry". Both surface common
     // misconfiguration (typos, out-of-date callers) instead of
     // silently skipping.
+    //
+    // The supplied IndexDecl's Unique and Covering must match the
+    // registered index: the check reproduces the on-disk (key, value)
+    // from the SUPPLIED decl, so a mismatched Unique/Covering yields a
+    // FingerprintDrift (correctly — the supplied decl does not describe
+    // the stored index). Both Keyspace and SetKeyspace indexes are
+    // verified, each with its own on-disk codec (a SetKeyspace's
+    // extractor is re-run over every (set key, member) pair).
+    //
+    // The pass may also emit these stable "CheckIndexes."-prefixed
+    // diagnostic codes: ExtractorMissing / ExtractorError (CheckError —
+    // the supplied Extract is nil, or failed/violated uniqueness when
+    // re-run); RowsUnreadable / IndexUnreadable (CheckWarning — a corrupt
+    // tree blocked enumeration, already reported structurally);
+    // KeyspaceKindUnsupported (CheckWarning — a keyspace kind the pass
+    // cannot verify).
     Indexes map[string][]*IndexDecl
 }
 
