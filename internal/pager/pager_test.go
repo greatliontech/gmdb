@@ -57,7 +57,7 @@ func TestReaderResolvesFromMmap(t *testing.T) {
 	defer p.Close()
 
 	for i := range 4 {
-		got := p.Page(uint64(i))
+		got := p.pageRaw(uint64(i))
 		want := expectedPageBytes(i)
 		if !bytes.Equal(got, want) {
 			t.Errorf("page %d mismatch", i)
@@ -121,7 +121,7 @@ func TestWriterCoWAndMutate(t *testing.T) {
 	}
 
 	// Page(5) now resolves to the slab buffer.
-	got := p.Page(5)
+	got := p.pageRaw(5)
 	if !bytes.Equal(got, want) {
 		t.Fatal("Page(5) does not match CoW buffer")
 	}
@@ -135,12 +135,12 @@ func TestWriterCoWAndMutate(t *testing.T) {
 		t.Fatalf("Mutate: %v", err)
 	}
 	buf[0] = 0xAB
-	if p.Page(5)[0] != 0xAB {
+	if p.pageRaw(5)[0] != 0xAB {
 		t.Fatal("mutation not visible via Page()")
 	}
 
 	// Page(2) still resolves via mmap, unchanged.
-	got = p.Page(2)
+	got = p.pageRaw(2)
 	if !bytes.Equal(got, expectedPageBytes(2)) {
 		t.Fatal("Page(2) mutated despite CoW going to id 5")
 	}
@@ -332,7 +332,7 @@ func TestPageOutOfRangePanics(t *testing.T) {
 			t.Fatal("expected panic")
 		}
 	}()
-	_ = p.Page(100)
+	_ = p.pageRaw(100)
 }
 
 func TestNewReaderRejectsInvalidConfig(t *testing.T) {

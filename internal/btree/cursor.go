@@ -532,7 +532,10 @@ func (c *Cursor) descendLeftmost(rootID uint64) error {
 	c.resetPath()
 	cur := rootID
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := c.pr.Page(cur)
+		buf, err := c.pr.Page(cur)
+		if err != nil {
+			return err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
 			r := page.NewLeafReader(buf, c.cfg)
@@ -563,7 +566,10 @@ func (c *Cursor) descendRightmost(rootID uint64) error {
 	c.resetPath()
 	cur := rootID
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := c.pr.Page(cur)
+		buf, err := c.pr.Page(cur)
+		if err != nil {
+			return err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
 			r := page.NewLeafReader(buf, c.cfg)
@@ -604,7 +610,10 @@ func (c *Cursor) descendToKey(rootID uint64, target []byte) (idx int, entry page
 	c.resetPath()
 	cur := rootID
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := c.pr.Page(cur)
+		buf, err := c.pr.Page(cur)
+		if err != nil {
+			return 0, page.LeafEntry{}, false, err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
 			r := page.NewLeafReader(buf, c.cfg)
@@ -693,7 +702,11 @@ func (c *Cursor) advanceToNextLeaf() bool {
 	c.path = c.path[:len(c.path)-1]
 	for len(c.path) > 0 {
 		top := &c.path[len(c.path)-1]
-		buf := c.pr.Page(top.pageID)
+		buf, err := c.pr.Page(top.pageID)
+		if err != nil {
+			c.err = err
+			return false
+		}
 		n := page.BranchCellCount(buf)
 		if int(top.childIdx) < int(n) {
 			// Advance into the next sibling subtree at this
@@ -729,7 +742,11 @@ func (c *Cursor) advanceToPrevLeaf() bool {
 			continue
 		}
 		top.childIdx--
-		buf := c.pr.Page(top.pageID)
+		buf, err := c.pr.Page(top.pageID)
+		if err != nil {
+			c.err = err
+			return false
+		}
 		child := page.BranchChildAt(buf, c.cfg, top.childIdx)
 		if child == 0 {
 			c.err = fmt.Errorf("%w: null sibling child in branch %d at idx %d", ErrCorrupted, top.pageID, top.childIdx)
@@ -750,7 +767,10 @@ func (c *Cursor) advanceToPrevLeaf() bool {
 // reset the existing path frames above the descent root.
 func (c *Cursor) descendLeftmostFrom(cur uint64) error {
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := c.pr.Page(cur)
+		buf, err := c.pr.Page(cur)
+		if err != nil {
+			return err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
 			r := page.NewLeafReader(buf, c.cfg)
@@ -778,7 +798,10 @@ func (c *Cursor) descendLeftmostFrom(cur uint64) error {
 // advanceToPrevLeaf.
 func (c *Cursor) descendRightmostFrom(cur uint64) error {
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := c.pr.Page(cur)
+		buf, err := c.pr.Page(cur)
+		if err != nil {
+			return err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
 			r := page.NewLeafReader(buf, c.cfg)

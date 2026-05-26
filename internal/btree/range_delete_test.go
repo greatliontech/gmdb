@@ -214,7 +214,8 @@ func TestBtreeDeleteRangeMultiLevelInteriorRetire(t *testing.T) {
 		}
 	}
 	// Sanity: tree should have at least one branch level.
-	rootTyp, _, _, _ := page.ReadHeader(pw.Page(root))
+	rootBuf, _ := pw.Page(root)
+	rootTyp, _, _, _ := page.ReadHeader(rootBuf)
 	if rootTyp != page.TypeBranch {
 		t.Fatalf("test setup too small — root is leaf, not branch")
 	}

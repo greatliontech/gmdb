@@ -618,10 +618,11 @@ func (c *SetCursor) Err() error {
 		if errors.Is(err, btree.ErrCursorStale) {
 			return ErrCursorStale
 		}
-		if errors.Is(err, btree.ErrCorrupted) {
-			return fmt.Errorf("%w: %v", ErrCorrupted, err)
-		}
-		return err
+		// mapBtreeErr covers btree.ErrCorrupted AND the pager sentinels
+		// (ErrBadPageChecksum / ErrCorrupted) now reachable through a
+		// cursor read via the verifying Page (Inv-RV1/RV3); other errors
+		// pass through unwrapped, preserving the prior behaviour.
+		return mapBtreeErr(err)
 	}
 	return nil
 }

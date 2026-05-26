@@ -300,7 +300,7 @@ func (rtx *ReadTx) Page(id uint64) ([]byte, error) {
 	if rtx.db.closeGate.IsClosed() {
 		return nil, ErrClosed
 	}
-	return rtx.pgr.Page(id), nil
+	return rtx.pgr.Page(id)
 }
 
 // Meta returns a copy of the snapshot meta. Useful for tests +

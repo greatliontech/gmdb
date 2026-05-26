@@ -62,7 +62,10 @@ func DeleteRange(pw PageWriter, cfg page.Config, rootID uint64,
 		if depth > MaxTreeDepth {
 			return 0, 0, ErrTreeTooDeep
 		}
-		buf := pw.Page(newID)
+		buf, err := pw.Page(newID)
+		if err != nil {
+			return 0, 0, err
+		}
 		typ, _, c, _ := page.ReadHeader(buf)
 		if typ != page.TypeBranch || c != 0 {
 			break
@@ -86,7 +89,10 @@ func DeleteRange(pw PageWriter, cfg page.Config, rootID uint64,
 // subtree fell into [start, end)).
 func deleteRangeFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	pageID uint64, start, end []byte) (uint64, uint64, bool, error) {
-	buf := pw.Page(pageID)
+	buf, err := pw.Page(pageID)
+	if err != nil {
+		return 0, 0, false, err
+	}
 	typ, _, _, _ := page.ReadHeader(buf)
 	switch {
 	case page.IsLeafType(typ):
@@ -441,8 +447,14 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, origCellKeys [][]byte, s
 		separator := origCellKeys[sepKeyIdx]
 
 		// Dispatch to leaves or branches.
-		leftBuf := pw.Page(leftPairID)
-		rightBuf := pw.Page(rightPairID)
+		leftBuf, err := pw.Page(leftPairID)
+		if err != nil {
+			return err
+		}
+		rightBuf, err := pw.Page(rightPairID)
+		if err != nil {
+			return err
+		}
 		leftTyp, _, _, _ := page.ReadHeader(leftBuf)
 		rightTyp, _, _, _ := page.ReadHeader(rightBuf)
 		leftIsLeaf := page.IsLeafType(leftTyp)
@@ -458,7 +470,6 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, origCellKeys [][]byte, s
 			newLeftID    uint64
 			newRightID   uint64
 			newSeparator []byte
-			err          error
 		)
 		if leftIsLeaf {
 			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID)

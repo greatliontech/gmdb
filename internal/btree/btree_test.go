@@ -23,9 +23,9 @@ func newFakeReader(t *testing.T, pageSize uint32) *fakeReader {
 	return &fakeReader{pageSize: pageSize, pages: make(map[uint64][]byte)}
 }
 
-func (f *fakeReader) Page(id uint64) []byte {
+func (f *fakeReader) Page(id uint64) ([]byte, error) {
 	if buf, ok := f.pages[id]; ok {
-		return buf
+		return buf, nil
 	}
 	panic(fmt.Sprintf("fakeReader: page %d not registered", id))
 }

@@ -272,7 +272,7 @@ func (p *Pager) reclaimRPL() int {
 	var lastReclaimed uint64
 	for len(p.rplSegments) > 0 && p.rplSegments[0].TxnID < p.reclamationBound {
 		seg := p.rplSegments[0]
-		buf := p.Page(seg.PageID)
+		buf := p.pageRaw(seg.PageID)
 		decoded, ok := page.DecodeRPLSegment(buf, p.cfg)
 		if !ok {
 			// Corrupt RPL segment — surface via the integrity-check

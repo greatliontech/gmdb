@@ -170,7 +170,7 @@ func TestDemoteNestedTreeMultiLeafReturnsFalse(t *testing.T) {
 		root = newRoot
 	}
 	// Verify the tree has a branch root.
-	buf := pw.Page(root)
+	buf, _ := pw.Page(root)
 	typ, _, _, _ := page.ReadHeader(buf)
 	if typ != page.TypeBranch {
 		t.Fatalf("root type=%d, want branch (test premise: multi-leaf tree)", typ)
@@ -227,7 +227,7 @@ func TestDemoteNestedTreeSingleLeafTooLargeReturnsFalse(t *testing.T) {
 		root = nr
 	}
 	// Confirm the tree is a single leaf (test premise).
-	buf := fake.Page(root)
+	buf, _ := fake.Page(root)
 	typ, _, _, _ := page.ReadHeader(buf)
 	if !page.IsLeafType(typ) {
 		t.Fatalf("tree is not single-leaf (type=%d); test fixture invalid — try fewer entries", typ)

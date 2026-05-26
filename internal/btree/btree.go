@@ -12,14 +12,21 @@ import (
 // for writers, mmap-only for readers).
 //
 // Callers MUST supply a reader whose Page(id) returns a slice of
-// length cfg.PageSize. The btree does not validate the size at
-// every call — the pager's Page method panics on out-of-reservation
-// access, which is the boundary at which size mismatches surface.
+// length cfg.PageSize. The btree does not re-validate the size — the
+// pager's verifying Page enforces the file-resident bound and the
+// per-page checksum, and is the boundary at which an out-of-range id
+// (Inv-RV3) or a bitrotted page (Inv-RV1) surfaces as an error.
 type PageReader interface {
-	// Page returns the page bytes at id. The returned slice is
-	// valid for the duration of the caller's enclosing tx (per
-	// the pager-slab.md byte-slice ownership invariant).
-	Page(id uint64) []byte
+	// Page returns the page bytes at id, or an error. The pager's
+	// implementation bounds id against the file-resident extent
+	// before any mmap access (so a forged/out-of-range id yields
+	// ErrCorrupted, never a SIGBUS) and, when checksums are
+	// enabled, verifies the xxhash64 footer on first access in the
+	// transaction (mismatch yields ErrBadPageChecksum). The
+	// returned slice is valid for the duration of the caller's
+	// enclosing tx (per the pager-slab.md byte-slice ownership
+	// invariant).
+	Page(id uint64) ([]byte, error)
 }
 
 // MaxTreeDepth caps the descent loop to catch malformed cyclic
@@ -77,7 +84,10 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 	}
 	cur := rootID
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := pr.Page(cur)
+		buf, err := pr.Page(cur)
+		if err != nil {
+			return nil, false, err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch {
 		case typ == page.TypeBranch:
@@ -128,7 +138,10 @@ func Has(pr PageReader, cfg page.Config, rootID uint64, key []byte) (bool, error
 	}
 	cur := rootID
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := pr.Page(cur)
+		buf, err := pr.Page(cur)
+		if err != nil {
+			return false, err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch {
 		case typ == page.TypeBranch:

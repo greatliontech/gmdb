@@ -72,7 +72,10 @@ func freeSubtreeAt(pw PageWriter, cfg page.Config, pageID uint64, depth int) (ui
 		return 0, ErrTreeTooDeep
 	}
 	var count uint64
-	buf := pw.Page(pageID)
+	buf, err := pw.Page(pageID)
+	if err != nil {
+		return 0, err
+	}
 	typ, _, cellCount, _ := page.ReadHeader(buf)
 	switch {
 	case typ == page.TypeBranch:

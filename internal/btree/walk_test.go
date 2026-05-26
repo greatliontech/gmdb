@@ -22,7 +22,8 @@ func TestWalkVisitsEveryReachablePageOnce(t *testing.T) {
 	hwm := pw.nextID
 
 	// Root must be a branch for this test to mean anything.
-	if typ, _, _, _ := page.ReadHeader(pw.Page(root)); typ != page.TypeBranch {
+	rootBuf, _ := pw.Page(root)
+	if typ, _, _, _ := page.ReadHeader(rootBuf); typ != page.TypeBranch {
 		t.Fatalf("root type = %d, want branch (need a multi-level tree)", typ)
 	}
 
@@ -86,7 +87,8 @@ func TestWalkRejectsOutOfRangeChild(t *testing.T) {
 	root, pw := buildTree(t, cfg, pairs)
 	hwm := pw.nextID
 	// Forge the root branch's leftmost child to point past HWM.
-	page.SetBranchLeftmostChild(pw.Page(root), hwm+9999)
+	rootBuf, _ := pw.Page(root)
+	page.SetBranchLeftmostChild(rootBuf, hwm+9999)
 
 	err := Walk(pw, cfg, root, hwm, func(uint64, PageKind, int) error { return nil })
 	if !errors.Is(err, ErrCorrupted) {
@@ -105,7 +107,7 @@ func TestWalkRejectsForgedBranchDirectory(t *testing.T) {
 	}
 	root, pw := buildTree(t, cfg, pairs)
 	hwm := pw.nextID
-	buf := pw.Page(root)
+	buf, _ := pw.Page(root)
 	if typ, _, n, _ := page.ReadHeader(buf); typ != page.TypeBranch || n == 0 {
 		t.Fatalf("root not a non-empty branch")
 	}
@@ -170,7 +172,8 @@ func TestWalkKVEmptyAndForged(t *testing.T) {
 	}
 	root, pw := buildTree(t, cfg, pairs)
 	hwm := pw.nextID
-	page.SetBranchLeftmostChild(pw.Page(root), hwm+5)
+	rootBuf, _ := pw.Page(root)
+	page.SetBranchLeftmostChild(rootBuf, hwm+5)
 	err := WalkKV(pw, cfg, root, hwm, func([]byte, []byte) error { return nil })
 	if !errors.Is(err, ErrCorrupted) {
 		t.Errorf("WalkKV forged child = %v, want ErrCorrupted", err)

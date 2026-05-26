@@ -148,7 +148,11 @@ func readOverflowValue(pr PageReader, cfg page.Config, entry page.LeafEntry) ([]
 	runLen := page.OverflowRunLength(cfg, entry.TotalLen)
 	pages := make([][]byte, runLen)
 	for i := range runLen {
-		pages[i] = pr.Page(entry.OverflowPage + uint64(i))
+		buf, err := pr.Page(entry.OverflowPage + uint64(i))
+		if err != nil {
+			return nil, err
+		}
+		pages[i] = buf
 	}
 	dst := make([]byte, entry.TotalLen)
 	n, err := page.AssembleOverflowValue(pages, cfg, dst)

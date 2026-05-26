@@ -272,7 +272,7 @@ func TestWriteDirectSurvivesCommit(t *testing.T) {
 			}
 			defer db2.Pager.Close()
 
-			got := db2.Pager.Page(id)
+			got := db2.Pager.pageRaw(id)
 			if !bytes.HasPrefix(got[page.HeaderSize:], []byte("direct-write payload")) {
 				t.Error("directly-written payload not durable after commit")
 			}

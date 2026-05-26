@@ -115,7 +115,10 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 	path := make([]pathFrame, 0, 8)
 	cur := rootID
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := pw.Page(cur)
+		buf, err := pw.Page(cur)
+		if err != nil {
+			return 0, err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
 			break

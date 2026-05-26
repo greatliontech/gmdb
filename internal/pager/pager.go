@@ -48,6 +48,14 @@ var (
 	// api-surface.md sentinel; the descriptive message is preserved
 	// in the wrapped chain.
 	ErrCorrupted = errors.New("pager: structural corruption detected")
+
+	// ErrBadPageChecksum is returned by Page when a data page's xxhash64
+	// footer does not match its content (checksums.md §Verification,
+	// Inv-RV1). Distinct from ErrCorrupted: a checksum mismatch is silent
+	// bitrot on a structurally-plausible page, whereas ErrCorrupted is a
+	// structural-layout violation. mapPagerErr translates this into
+	// gmdb.ErrBadPageChecksum, the public api-surface.md sentinel.
+	ErrBadPageChecksum = errors.New("pager: page checksum mismatch")
 )
 
 // Pager resolves page bytes for one transaction. Read transactions get a
@@ -112,6 +120,16 @@ type Pager struct {
 	// Managed by BeginSavepoint / RestoreSavepoint / ReleaseSavepoint;
 	// reset to 0 by AbortTx. See savepoint.go.
 	savepointDepth int
+
+	// verified is the per-transaction checksum-verification cache
+	// (checksums.md §Verification, Inv-RV2): a mmap page whose xxhash64
+	// footer has been verified once in this tx is recorded here and not
+	// re-verified on subsequent accesses within the tx. A compact
+	// []uint64 bitset indexed by page id, lazily allocated on the first
+	// verified read and reset per write tx (BeginTx / AbortTx); a read
+	// pager builds it fresh per ReadTx and discards it at close. Nil when
+	// PageChecksum is disabled or before the first verified read.
+	verified []uint64
 
 	// bitmapSnapshot captures the bitmap's mutable state at the start
 	// of the in-progress write tx so AbortTx can restore it. Set by
@@ -301,6 +319,11 @@ func (p *Pager) RPLChain() []RPLSegmentRef { return p.rplSegments }
 // snapshot (used by tests; production callers don't re-Begin without
 // Commit/Rollback).
 func (p *Pager) BeginTx() {
+	// Reset the checksum-verification cache at every write-tx boundary:
+	// the previous commit may have rewritten mmap pages, so verifications
+	// from the prior tx no longer hold (Inv-RV2). Done before the early
+	// return so it runs regardless of bitmap-attachment ordering.
+	p.resetVerified()
 	if p.readOnly || p.bitmap == nil {
 		return
 	}
@@ -424,7 +447,8 @@ func (p *Pager) MaxBytes() int { return p.maxBytes }
 // IsReadOnly reports whether mutating operations are rejected.
 func (p *Pager) IsReadOnly() bool { return p.readOnly }
 
-// Page returns a borrowed byte slice for the page at id. Resolution
+// pageRaw returns a borrowed byte slice for the page at id WITHOUT
+// file-resident bounds-checking or checksum verification. Resolution
 // order: dirty[id] (write txn only) then mmap.
 //
 // The returned slice has length cfg.PageSize and is valid as long as the
@@ -433,9 +457,14 @@ func (p *Pager) IsReadOnly() bool { return p.readOnly }
 // invariant in pager-slab.md). For mmap-backed reads the slice is
 // valid until the mmap is unmapped (i.e. Close()).
 //
-// Panics if id*PageSize would exceed the mmap reservation. Callers must
-// gate access by HighWaterMark from the active meta.
-func (p *Pager) Page(id uint64) []byte {
+// Panics if id*PageSize would exceed the mmap reservation. This is the
+// low-level accessor: callers that read content-derived ids from a
+// possibly-corrupt tree MUST go through the verifying Page (which
+// bounds against the file-resident extent before any mmap access);
+// pageRaw is for callers that have already bounded id (the btree Walk /
+// WalkKV hwm gate, Open-time scans bounded by their own cycle caps,
+// and Check's deliberately-unverified reporting reads).
+func (p *Pager) pageRaw(id uint64) []byte {
 	if !p.readOnly {
 		if buf, ok := p.dirty[id]; ok {
 			return *buf
@@ -444,10 +473,95 @@ func (p *Pager) Page(id uint64) []byte {
 	off := id * uint64(p.cfg.PageSize)
 	end := off + uint64(p.cfg.PageSize)
 	if end > uint64(len(p.mmap)) {
-		panic(fmt.Sprintf("pager: Page(%d) past mmap reservation [%d, %d]", id, off, end))
+		panic(fmt.Sprintf("pager: pageRaw(%d) past mmap reservation [%d, %d]", id, off, end))
 	}
 	return p.mmap[off:end]
 }
+
+// PageRaw exposes pageRaw to other packages that have already bounded
+// id and deliberately want unverified bytes (the gmdb Check path, which
+// reports corruption as issues rather than aborting on it). It panics
+// past the mmap reservation exactly like pageRaw.
+func (p *Pager) PageRaw(id uint64) []byte { return p.pageRaw(id) }
+
+// Page resolves the page at id for the btree read/write paths, returning
+// an error rather than panicking or returning unverified bytes. It is
+// the boundary that enforces the read-path corruption-tolerance
+// invariants (checksums.md §Verification):
+//
+//   - Inv-RV3: a content-derived id is bounded against the file-resident
+//     extent before any mmap access, so a forged/out-of-range id yields
+//     ErrCorrupted instead of a SIGBUS on the unbacked MaxSize
+//     reservation. (A dirty slab buffer lives in process memory and is
+//     this-tx content, so it is returned without bound or verification.)
+//   - Inv-RV1/RV2: when checksums are enabled, the xxhash64 footer is
+//     verified on the page's first mmap access within the transaction
+//     and the id recorded in p.verified so subsequent accesses skip the
+//     re-hash; a mismatch yields ErrBadPageChecksum.
+func (p *Pager) Page(id uint64) ([]byte, error) {
+	if !p.readOnly {
+		if buf, ok := p.dirty[id]; ok {
+			return *buf, nil
+		}
+	}
+	// Inv-RV3: bound id against the file-resident page count BEFORE any
+	// mmap access. The mmap spans the whole MaxSize reservation, but only
+	// the first p.fileSize bytes are file-backed — reading the gap
+	// SIGBUSes. Comparing page counts (not byte offsets) keeps id*PageSize
+	// from overflowing uint64 for a forged-huge id.
+	backedPages := uint64(p.fileSize) / uint64(p.cfg.PageSize)
+	if id >= backedPages {
+		return nil, fmt.Errorf("%w: page id %d beyond file-resident extent (%d pages)",
+			ErrCorrupted, id, backedPages)
+	}
+	off := id * uint64(p.cfg.PageSize)
+	buf := p.mmap[off : off+uint64(p.cfg.PageSize)]
+	// Inv-RV1/RV2: verify the footer on first access this tx, then cache.
+	if p.cfg.PageChecksum && !p.isVerified(id) {
+		if !page.VerifyPageFooter(buf, p.cfg.PageSize) {
+			return nil, fmt.Errorf("%w: page %d", ErrBadPageChecksum, id)
+		}
+		p.markVerified(id, backedPages)
+	}
+	return buf, nil
+}
+
+// isVerified reports whether page id's footer has already been verified
+// in this transaction (Inv-RV2). Out-of-range ids (never cached) return
+// false; the file-resident bound in Page rejects them before this is
+// reached, so the guard is purely defensive.
+func (p *Pager) isVerified(id uint64) bool {
+	w := id >> 6
+	if w >= uint64(len(p.verified)) {
+		return false
+	}
+	return p.verified[w]&(1<<(id&63)) != 0
+}
+
+// markVerified records page id as verified for the rest of this tx. The
+// bitset is lazily sized to cover the file-resident extent on first use;
+// a page id is always < backedPages here (Page bounds it first).
+func (p *Pager) markVerified(id, backedPages uint64) {
+	if p.verified == nil {
+		p.verified = make([]uint64, (backedPages+63)>>6)
+	}
+	w := id >> 6
+	if w >= uint64(len(p.verified)) {
+		// File grew since the bitset was sized (write tx extension).
+		// Grow to cover id; the freshly-zeroed words mark nothing
+		// verified, which is correct (those pages were never read yet).
+		grown := make([]uint64, w+1)
+		copy(grown, p.verified)
+		p.verified = grown
+	}
+	p.verified[w] |= 1 << (id & 63)
+}
+
+// resetVerified clears the per-tx checksum-verification cache. Called at
+// each write-tx boundary because committed mmap content can change
+// across transactions (a page rewritten by the previous commit must be
+// re-verified). Read pagers never reuse, so they never call this.
+func (p *Pager) resetVerified() { p.verified = nil }
 
 // CoW installs a fresh slab buffer at dstID populated from the current
 // content of srcID. dstID is supplied by the caller's allocator (see
@@ -475,7 +589,7 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 	if p.dirtyBytes+int(p.cfg.PageSize) > p.maxBytes {
 		return nil, ErrTxTooLarge
 	}
-	src := p.Page(srcID)
+	src := p.pageRaw(srcID)
 	buf := p.bufPool.Get()
 	copy(*buf, src)
 	p.dirty[dstID] = buf

@@ -380,7 +380,7 @@ func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
 			return nil, fmt.Errorf("pager: RPL chain exceeds bound %d (likely cycle): %w", maxSegs, ErrCorrupted)
 		}
 		visited[id] = struct{}{}
-		buf := p.Page(id)
+		buf := p.pageRaw(id)
 		seg, ok := page.DecodeRPLSegment(buf, p.cfg)
 		if !ok {
 			return nil, fmt.Errorf("pager: RPL segment at page %d malformed: %w", id, ErrCorrupted)

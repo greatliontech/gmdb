@@ -36,7 +36,10 @@ func GetEntry(pr PageReader, cfg page.Config, rootID uint64, key []byte) (page.L
 	}
 	cur := rootID
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := pr.Page(cur)
+		buf, err := pr.Page(cur)
+		if err != nil {
+			return page.LeafEntry{}, false, err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
 			r := page.NewLeafReader(buf, cfg)
@@ -111,7 +114,10 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 	path := make([]pathFrame, 0, 8)
 	cur := rootID
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf := pw.Page(cur)
+		buf, err := pw.Page(cur)
+		if err != nil {
+			return 0, page.LeafEntry{}, err
+		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
 			break

@@ -130,7 +130,7 @@ func TestCommitRoundTrip(t *testing.T) {
 			if db2.ActiveMetaIdx != 1 {
 				t.Errorf("re-opened active = %d, want 1", db2.ActiveMetaIdx)
 			}
-			gotPage := db2.Pager.Page(id)
+			gotPage := db2.Pager.pageRaw(id)
 			typ, _, count, _ := page.ReadHeader(gotPage)
 			if typ != page.TypeLeaf || count != 1 {
 				t.Errorf("re-opened page header: typ=%d count=%d", typ, count)

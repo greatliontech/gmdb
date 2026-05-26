@@ -28,7 +28,7 @@ func collectNestedTreeValues(t *testing.T, pw PageWriter, cfg page.Config, rootI
 	var out [][]byte
 	var walk func(pageID uint64)
 	walk = func(pageID uint64) {
-		buf := pw.Page(pageID)
+		buf, _ := pw.Page(pageID)
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch {
 		case page.IsLeafType(typ):

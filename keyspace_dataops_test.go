@@ -412,7 +412,7 @@ func TestKeyspacePutHonorsPerKeyspaceRestartGroupTarget(t *testing.T) {
 
 	// Default RGT=0 (engine default = 16 = compressed leaf).
 	_ = ks.Put([]byte("a"), []byte("v"))
-	leafBuf := tx.pgr.Page(ks.desc.Root)
+	leafBuf := tx.pgr.PageRaw(ks.desc.Root)
 	if !page.IsLeafType(leafBuf[0]) {
 		t.Fatalf("root is not a leaf: type=%d", leafBuf[0])
 	}
@@ -428,7 +428,7 @@ func TestKeyspacePutHonorsPerKeyspaceRestartGroupTarget(t *testing.T) {
 	// Write enough to force a split or rewrite — Put on an existing
 	// leaf CoWs it and re-encodes with the new builder cfg.
 	_ = ks.Put([]byte("b"), []byte("v"))
-	leafBuf = tx.pgr.Page(ks.desc.Root)
+	leafBuf = tx.pgr.PageRaw(ks.desc.Root)
 	if leafBuf[0] != page.TypeLeafUncompressed {
 		t.Errorf("after SetKeyspaceConfig(RGT=1): leaf type = %d, "+
 			"want %d (TypeLeafUncompressed) — per-keyspace RGT not "+

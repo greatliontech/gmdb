@@ -34,9 +34,9 @@ func newFakeWriter(t *testing.T, pageSize uint32) *fakeWriter {
 	}
 }
 
-func (f *fakeWriter) Page(id uint64) []byte {
+func (f *fakeWriter) Page(id uint64) ([]byte, error) {
 	if buf, ok := f.pages[id]; ok {
-		return buf
+		return buf, nil
 	}
 	panic(fmt.Sprintf("fakeWriter: page %d not allocated", id))
 }
@@ -262,7 +262,7 @@ func countLeaves(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64) int
 	n := 0
 	var walk func(id uint64)
 	walk = func(id uint64) {
-		buf := pw.Page(id)
+		buf, _ := pw.Page(id)
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch {
 		case page.IsLeafType(typ):
@@ -291,7 +291,7 @@ func walkLeavesUC(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64) {
 	}
 	var walk func(id uint64)
 	walk = func(id uint64) {
-		buf := pw.Page(id)
+		buf, _ := pw.Page(id)
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch typ {
 		case page.TypeLeafUncompressed:
@@ -351,7 +351,8 @@ func TestPutForcesLeafSplitAndRootGrows(t *testing.T) {
 		root = newRoot
 	}
 	// Root should now be a branch (depth > 0).
-	typ, _, _, _ := page.ReadHeader(pw.Page(root))
+	rootBuf, _ := pw.Page(root)
+	typ, _, _, _ := page.ReadHeader(rootBuf)
 	if typ != page.TypeBranch {
 		t.Errorf("root type = %d after %d puts, want TypeBranch=%d", typ, N, page.TypeBranch)
 	}
@@ -459,7 +460,8 @@ func treeDepth(t *testing.T, pw *fakeWriter, root uint64) int {
 	depth := 0
 	cur := root
 	for {
-		typ, _, _, _ := page.ReadHeader(pw.Page(cur))
+		curBuf, _ := pw.Page(cur)
+		typ, _, _, _ := page.ReadHeader(curBuf)
 		if page.IsLeafType(typ) {
 			return depth
 		}
@@ -467,7 +469,7 @@ func treeDepth(t *testing.T, pw *fakeWriter, root uint64) int {
 			t.Fatalf("treeDepth: page %d type %d", cur, typ)
 		}
 		depth++
-		cur = page.BranchLeftmostChild(pw.Page(cur))
+		cur = page.BranchLeftmostChild(curBuf)
 	}
 }
 
@@ -708,7 +710,8 @@ func collectReachable(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, 
 		return
 	}
 	out[id] = struct{}{}
-	typ, _, _, _ := page.ReadHeader(pw.Page(id))
+	buf, _ := pw.Page(id)
+	typ, _, _, _ := page.ReadHeader(buf)
 	if page.IsLeafType(typ) {
 		// Walk overflow chains owned by any overflow leaf entries:
 		// each chain page is reachable via the leaf entry's
@@ -720,7 +723,7 @@ func collectReachable(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, 
 		// references it; pinned by
 		// TestPutOverflowReplaceFreesOldChain +
 		// TestDeleteOverflowEntryFreesChain).
-		r := page.NewLeafReader(pw.Page(id), cfg)
+		r := page.NewLeafReader(buf, cfg)
 		it := r.IterForReuse(nil, nil, nil)
 		for {
 			e, ok := it.Next()
@@ -746,7 +749,7 @@ func collectReachable(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, 
 		t.Errorf("collectReachable: page %d type %d unexpected", id, typ)
 		return
 	}
-	lm, cells := page.DecodeBranch(pw.Page(id), cfg)
+	lm, cells := page.DecodeBranch(buf, cfg)
 	collectReachable(t, pw, cfg, lm, out)
 	for _, c := range cells {
 		collectReachable(t, pw, cfg, c.Child, out)

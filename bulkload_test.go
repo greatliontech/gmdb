@@ -162,14 +162,14 @@ func TestBulkBuilderRootTypeProgression(t *testing.T) {
 
 	// Few entries → single leaf root.
 	smallRoot, _ := buildBulkTree(t, tx.pgr, cfg, genKVs(10, 8))
-	typ, _, _, _ := page.ReadHeader(tx.pgr.Page(smallRoot))
+	typ, _, _, _ := page.ReadHeader(tx.pgr.PageRaw(smallRoot))
 	if typ != page.TypeLeaf {
 		t.Errorf("small-tree root type = %d, want TypeLeaf(%d)", typ, page.TypeLeaf)
 	}
 
 	// Many large-valued entries → branch root (multiple leaves).
 	bigRoot, _ := buildBulkTree(t, tx.pgr, cfg, genKVs(2000, 400))
-	btyp, _, _, _ := page.ReadHeader(tx.pgr.Page(bigRoot))
+	btyp, _, _, _ := page.ReadHeader(tx.pgr.PageRaw(bigRoot))
 	if btyp != page.TypeBranch {
 		t.Errorf("big-tree root type = %d, want TypeBranch(%d)", btyp, page.TypeBranch)
 	}

@@ -241,7 +241,7 @@ func collectReachablePages(t *testing.T, pr btree.PageReader, cfg page.Config, r
 			t.Fatalf("collectReachablePages: page %d visited twice (cycle?)", id)
 		}
 		out[id] = struct{}{}
-		buf := pr.Page(id)
+		buf, _ := pr.Page(id)
 		typ, _, count, _ := page.ReadHeader(buf)
 		switch {
 		case typ == page.TypeBranch:

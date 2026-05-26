@@ -124,7 +124,8 @@ func TestDeleteCausesRootCollapseAfterLeafMerge(t *testing.T) {
 		root = nr
 	}
 	// Confirm initial topology: root is a branch.
-	typ, _, _, _ := page.ReadHeader(pw.Page(root))
+	rootBuf, _ := pw.Page(root)
+	typ, _, _, _ := page.ReadHeader(rootBuf)
 	if typ != page.TypeBranch {
 		t.Fatalf("setup: root type = %d, want TypeBranch", typ)
 	}
@@ -143,7 +144,8 @@ func TestDeleteCausesRootCollapseAfterLeafMerge(t *testing.T) {
 	}
 
 	// Root should now be a single leaf (collapse fired).
-	typ, _, _, _ = page.ReadHeader(pw.Page(root))
+	rootBuf, _ = pw.Page(root)
+	typ, _, _, _ = page.ReadHeader(rootBuf)
 	if !page.IsLeafType(typ) {
 		t.Errorf("after merge+collapse: root type = %d, want leaf variant (root branch should have collapsed)", typ)
 	}
@@ -615,12 +617,13 @@ func checkBalance(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64) {
 	leafDepths := make(map[int]int)
 	var walk func(id uint64, depth int)
 	walk = func(id uint64, depth int) {
-		typ, _, _, _ := page.ReadHeader(pw.Page(id))
+		buf, _ := pw.Page(id)
+		typ, _, _, _ := page.ReadHeader(buf)
 		switch {
 		case page.IsLeafType(typ):
 			leafDepths[depth]++
 		case typ == page.TypeBranch:
-			lm, cells := page.DecodeBranch(pw.Page(id), cfg)
+			lm, cells := page.DecodeBranch(buf, cfg)
 			walk(lm, depth+1)
 			for _, c := range cells {
 				walk(c.Child, depth+1)
@@ -645,7 +648,7 @@ func checkUnderflowInvariant(t *testing.T, pw *fakeWriter, cfg page.Config, root
 	}
 	var walk func(id uint64, isRoot bool)
 	walk = func(id uint64, isRoot bool) {
-		buf := pw.Page(id)
+		buf, _ := pw.Page(id)
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch typ {
 		case page.TypeLeaf, page.TypeLeafUncompressed:

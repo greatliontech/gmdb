@@ -77,7 +77,10 @@ func Delete(pw PageWriter, cfg page.Config, rootID uint64, mergeThreshold uint8,
 	// iteration. The freed id is never re-read; subsequent pw.Page
 	// calls target the new root from the previous iteration.
 	for {
-		buf := pw.Page(newRootID)
+		buf, err := pw.Page(newRootID)
+		if err != nil {
+			return 0, err
+		}
 		typ, _, count, _ := page.ReadHeader(buf)
 		if typ != page.TypeBranch || count != 0 {
 			break
@@ -106,7 +109,10 @@ func Delete(pw PageWriter, cfg page.Config, rootID uint64, mergeThreshold uint8,
 //     siblings).
 //   - found: key was present and deleted.
 func deleteFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, key []byte) (newID uint64, underflow, found bool, err error) {
-	buf := pw.Page(pageID)
+	buf, err := pw.Page(pageID)
+	if err != nil {
+		return 0, false, false, err
+	}
 	typ, _, _, _ := page.ReadHeader(buf)
 	switch {
 	case page.IsLeafType(typ):
@@ -382,8 +388,14 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	// uncompressed variant on either side (the chunk-4.6β leaf
 	// format permits per-leaf variant choice — merge/redistribute
 	// just rebuilds via cfg.RestartGroupTarget).
-	leftSrc := pw.Page(leftPairID)
-	rightSrc := pw.Page(rightPairID)
+	leftSrc, err := pw.Page(leftPairID)
+	if err != nil {
+		return 0, false, err
+	}
+	rightSrc, err := pw.Page(rightPairID)
+	if err != nil {
+		return 0, false, err
+	}
 	leftTyp, _, _, _ := page.ReadHeader(leftSrc)
 	rightTyp, _, _, _ := page.ReadHeader(rightSrc)
 	leftIsLeaf := page.IsLeafType(leftTyp)
@@ -469,8 +481,14 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 // redistribute homogenizes toward the keyspace-level target. No
 // spec clause requires variant preservation across merge.
 func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID uint64) (bool, uint64, uint64, uint64, []byte, error) {
-	leftSrc := pw.Page(leftID)
-	rightSrc := pw.Page(rightID)
+	leftSrc, err := pw.Page(leftID)
+	if err != nil {
+		return false, 0, 0, 0, nil, err
+	}
+	rightSrc, err := pw.Page(rightID)
+	if err != nil {
+		return false, 0, 0, 0, nil, err
+	}
 	leftEntries, err := readLeafEntriesDeepCopy(leftSrc, cfg, leftID)
 	if err != nil {
 		return false, 0, 0, 0, nil, err
@@ -619,8 +637,14 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, leftID, rightID
 	if len(separator) == 0 {
 		return false, 0, 0, 0, nil, fmt.Errorf("%w: branch siblings %d/%d separated by empty key", ErrCorrupted, leftID, rightID)
 	}
-	leftSrc := pw.Page(leftID)
-	rightSrc := pw.Page(rightID)
+	leftSrc, err := pw.Page(leftID)
+	if err != nil {
+		return false, 0, 0, 0, nil, err
+	}
+	rightSrc, err := pw.Page(rightID)
+	if err != nil {
+		return false, 0, 0, 0, nil, err
+	}
 	leftLeftmost, leftCells := page.DecodeBranch(leftSrc, cfg)
 	rightLeftmost, rightCells := page.DecodeBranch(rightSrc, cfg)
 	// Deep-clone Keys: leftCells / rightCells borrow from leftSrc /

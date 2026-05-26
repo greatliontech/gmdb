@@ -78,7 +78,7 @@ func TestFreeSubtreeMultiLeafBranch(t *testing.T) {
 	// Quick structural check: at least one branch page exists.
 	branchSeen := false
 	for id := range reachable {
-		buf := pw.Page(id)
+		buf, _ := pw.Page(id)
 		typ, _, _, _ := page.ReadHeader(buf)
 		if typ == page.TypeBranch {
 			branchSeen = true
@@ -176,7 +176,7 @@ func collectSubtreePages(t *testing.T, pr PageReader, cfg page.Config, rootID ui
 			t.Fatalf("collectSubtreePages: page %d visited twice (cycle?)", id)
 		}
 		out[id] = struct{}{}
-		buf := pr.Page(id)
+		buf, _ := pr.Page(id)
 		typ, _, count, _ := page.ReadHeader(buf)
 		switch {
 		case typ == page.TypeBranch:

@@ -74,7 +74,10 @@ func walkKVAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, key
 	if pageID >= hwm {
 		return fmt.Errorf("%w: page id %d >= HighWaterMark %d at depth %d", ErrCorrupted, pageID, hwm, depth)
 	}
-	buf := pr.Page(pageID)
+	buf, err := pr.Page(pageID)
+	if err != nil {
+		return err
+	}
 	typ, _, cellCount, _ := page.ReadHeader(buf)
 	switch {
 	case typ == page.TypeBranch:
@@ -141,7 +144,10 @@ func walkAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, visit
 	if pageID >= hwm {
 		return fmt.Errorf("%w: page id %d >= HighWaterMark %d at depth %d", ErrCorrupted, pageID, hwm, depth)
 	}
-	buf := pr.Page(pageID)
+	buf, err := pr.Page(pageID)
+	if err != nil {
+		return err
+	}
 	typ, _, cellCount, _ := page.ReadHeader(buf)
 	switch {
 	case typ == page.TypeBranch:

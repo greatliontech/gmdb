@@ -9,6 +9,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
 // uniqueNameHandle is the interned form of a keyspace name. unique.Make
@@ -1307,10 +1308,11 @@ func (c *Cursor) Err() error {
 		if errors.Is(err, btree.ErrCursorStale) {
 			return ErrCursorStale
 		}
-		if errors.Is(err, btree.ErrCorrupted) {
-			return fmt.Errorf("%w: %v", ErrCorrupted, err)
-		}
-		return err
+		// mapBtreeErr covers btree.ErrCorrupted AND the pager sentinels
+		// (ErrBadPageChecksum / ErrCorrupted) now reachable through a
+		// cursor read via the verifying Page (Inv-RV1/RV3); other errors
+		// pass through unwrapped, preserving the prior behaviour.
+		return mapBtreeErr(err)
 	}
 	return nil
 }
@@ -1464,6 +1466,12 @@ func (tx *Tx) DeleteKeyspace(name string) error {
 // sentinels. btree.ErrCorrupted → ErrCorrupted; other btree errors
 // pass through unwrapped.
 //
+// The btree read path resolves pages through pager.Page (the verifying
+// accessor), so a read can now surface pager.ErrBadPageChecksum (a
+// bitrotted footer, Inv-RV1) or pager.ErrCorrupted (a content-derived id
+// past the file-resident extent, Inv-RV3). Both are mapped to their
+// public gmdb sentinels here so callers' errors.Is checks work.
+//
 // Chunk-5.4 caveat: btree.ErrKeyTooLarge is reachable through
 // storeDescriptor if a future caller supplies a pathologically long
 // keyspace name. Chunk 5.4 does not impose a name-length cap (api-
@@ -1474,7 +1482,10 @@ func mapBtreeErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, btree.ErrCorrupted) {
+	switch {
+	case errors.Is(err, pager.ErrBadPageChecksum):
+		return fmt.Errorf("%w: %v", ErrBadPageChecksum, err)
+	case errors.Is(err, btree.ErrCorrupted), errors.Is(err, pager.ErrCorrupted):
 		return fmt.Errorf("%w: %v", ErrCorrupted, err)
 	}
 	return err

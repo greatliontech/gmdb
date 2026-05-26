@@ -9,7 +9,15 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 )
+
+// rawPageReader feeds btree.Walk/WalkKV unverified bytes: Check reports
+// corruption as CheckIssues rather than aborting the walk on it. The
+// hwm bound inside Walk/WalkKV still prevents out-of-range reads.
+type rawPageReader struct{ p *pager.Pager }
+
+func (r rawPageReader) Page(id uint64) ([]byte, error) { return r.p.PageRaw(id), nil }
 
 // CheckSeverity grades a CheckIssue.
 type CheckSeverity int
@@ -162,7 +170,7 @@ func (c *checker) run() {
 // is unguarded and would panic/SIGBUS on a corrupt or forged tree —
 // Check must not crash on the corruption it exists to detect).
 func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
-	err := btree.WalkKV(c.rtx.pgr, c.cfg, c.meta.KeyspaceRoot, hwm, func(k, v []byte) error {
+	err := btree.WalkKV(rawPageReader{c.rtx.pgr}, c.cfg, c.meta.KeyspaceRoot, hwm, func(k, v []byte) error {
 		name := string(k)
 		if len(v) != page.KeyspaceDescriptorSize {
 			if !c.emit(CheckIssue{Severity: CheckError, Code: "KeyspaceDescriptorSize", Keyspace: name,
@@ -199,7 +207,7 @@ func (c *checker) walkRegistry(ks string, desc page.KeyspaceDescriptor, firstDat
 	if !c.walkTree(ks, "", desc.IndexRegistryRoot, firstData, hwm) {
 		return false
 	}
-	err := btree.WalkKV(c.rtx.pgr, c.cfg, desc.IndexRegistryRoot, hwm, func(k, v []byte) error {
+	err := btree.WalkKV(rawPageReader{c.rtx.pgr}, c.cfg, desc.IndexRegistryRoot, hwm, func(k, v []byte) error {
 		idxName := string(k)
 		entry, derr := decodeRegistryEntry(v)
 		if derr != nil {
@@ -263,7 +271,7 @@ func (c *checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 		}
 		c.reachable.set(id)
 		if c.cfg.PageChecksum {
-			if !page.VerifyPageFooter(c.rtx.pgr.Page(id), c.cfg.PageSize) {
+			if !page.VerifyPageFooter(c.rtx.pgr.PageRaw(id), c.cfg.PageSize) {
 				if !c.emit(CheckIssue{Severity: CheckError, Code: "BadPageChecksum", PageID: id, Keyspace: ks, Index: idx,
 					Message: fmt.Sprintf("page %d checksum mismatch", id)}) {
 					return errCheckStop
@@ -272,7 +280,7 @@ func (c *checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 		}
 		return nil
 	}
-	err := btree.Walk(c.rtx.pgr, c.cfg, root, hwm, visit)
+	err := btree.Walk(rawPageReader{c.rtx.pgr}, c.cfg, root, hwm, visit)
 	if err == nil {
 		return true
 	}
@@ -313,7 +321,7 @@ func (c *checker) walkRPL(hwm uint64) (bitset, bool) {
 				Message: fmt.Sprintf("RPL chain exceeds entry-count bound %d (likely cycle)", maxSegs)})
 		}
 		visited[id] = struct{}{}
-		seg, ok := page.DecodeRPLSegment(c.rtx.pgr.Page(id), c.cfg)
+		seg, ok := page.DecodeRPLSegment(c.rtx.pgr.PageRaw(id), c.cfg)
 		if !ok {
 			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentMalformed", PageID: id,
 				Message: fmt.Sprintf("RPL segment page %d malformed", id)})
@@ -390,7 +398,7 @@ func (c *checker) snapshotBitmap() (*bitmap.Bitmap, bool) {
 	ps := uint64(c.cfg.PageSize)
 	detail := make([]byte, uint64(c.meta.BitmapPages)*ps)
 	for i := uint64(0); i < uint64(c.meta.BitmapPages); i++ {
-		copy(detail[i*ps:(i+1)*ps], c.rtx.pgr.Page(2+i))
+		copy(detail[i*ps:(i+1)*ps], c.rtx.pgr.PageRaw(2+i))
 	}
 	return bitmap.New(detail, c.cfg.PageSize, c.meta.BitmapPages, c.meta.MaxSize), true
 }

@@ -293,7 +293,7 @@ func (tx *Tx) Page(id uint64) ([]byte, error) {
 	if err := tx.requireOpen(false); err != nil {
 		return nil, err
 	}
-	return tx.pgr.Page(id), nil
+	return tx.pgr.Page(id)
 }
 
 // CoW copies the content of srcID into a fresh slab buffer keyed at
@@ -716,6 +716,8 @@ func mapPagerErr(err error) error {
 		return ErrTxTooLarge
 	case errors.Is(err, pager.ErrDBFull):
 		return ErrDBFull
+	case errors.Is(err, pager.ErrBadPageChecksum):
+		return fmt.Errorf("%w: %w", ErrBadPageChecksum, err)
 	case errors.Is(err, pager.ErrCorrupted):
 		return fmt.Errorf("%w: %w", ErrCorrupted, err)
 	default:

@@ -69,7 +69,10 @@ func DemoteNestedTreeIfFits(
 		return nil, false, fmt.Errorf("%w: DemoteNestedTreeIfFits called with rootID=0", ErrCorrupted)
 	}
 
-	buf := pw.Page(rootID)
+	buf, err := pw.Page(rootID)
+	if err != nil {
+		return nil, false, err
+	}
 	typ, _, _, _ := page.ReadHeader(buf)
 	if !page.IsLeafType(typ) {
 		// Multi-leaf nested tree (root is a branch) — never a
