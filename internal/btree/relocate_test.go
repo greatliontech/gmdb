@@ -126,15 +126,36 @@ func TestRelocatePagesPreservesOverflowLeaf(t *testing.T) {
 		root = nr
 	}
 
-	newRoot, moved, err := RelocatePages(pw, cfg, root, func(uint64) bool { return true }, 1<<30)
+	// Relocate every tree page EXCEPT the overflow chain (exclude its first
+	// page from the predicate). The leaf owning the chain is thus relocated
+	// *verbatim*, and its unchanged overflow ref must still resolve the
+	// un-relocated chain — the verbatim-leaf-keeps-its-ref path.
+	chainFirst := map[uint64]struct{}{}
+	if err := WalkLeafEntries(pw, cfg, root, ^uint64(0), func(e page.LeafEntry) error {
+		if e.IsOverflow() {
+			chainFirst[e.OverflowPage] = struct{}{}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkLeafEntries: %v", err)
+	}
+	newRoot, moved, err := RelocatePages(pw, cfg, root, func(id uint64) bool {
+		_, isChain := chainFirst[id]
+		return !isChain
+	}, 1<<30)
 	if err != nil {
 		t.Fatalf("RelocatePages: %v", err)
 	}
 	if moved == 0 {
 		t.Fatal("nothing relocated")
 	}
-	// The relocated leaf's overflow ref still points at the (un-relocated)
-	// chain, so the large value round-trips.
+	// The chain was NOT relocated (excluded by the predicate)...
+	for cp := range chainFirst {
+		if _, freed := pw.freed[cp]; freed {
+			t.Errorf("chain first page %d was relocated despite the predicate excluding it", cp)
+		}
+	}
+	// ...yet the verbatim-relocated leaf's ref still resolves it.
 	got, found, err := Get(pw, cfg, newRoot, bigKey)
 	if err != nil || !found || !bytes.Equal(got, bigVal) {
 		t.Errorf("big value after relocation: found=%v err=%v len(got)=%d want %d", found, err, len(got), len(bigVal))
@@ -225,6 +246,84 @@ func TestRelocatePagesTargeted(t *testing.T) {
 		if _, old := before[id]; old && id > threshold {
 			t.Errorf("targeted old page %d still referenced by the new tree", id)
 		}
+	}
+}
+
+// TestRelocatePagesRelocatesOverflowChains: a predicate matching only the
+// overflow-chain first pages relocates each chain to a fresh run, rewrites
+// the owning leaf entry (re-encoding the leaf), retires the old run, and
+// preserves every value. Tree-node ids are excluded by the predicate, so
+// the only counted moves are chain pages (the forced leaf re-encodes +
+// ancestor fixes are uncounted overhead).
+func TestRelocatePagesRelocatesOverflowChains(t *testing.T) {
+	cfg := page.Config{PageSize: 4096}
+	pw := newFakeWriter(t, 4096)
+	root := uint64(0)
+	want := map[string]string{}
+	// Overflow values (6000 B > page) interleaved with small keys so the
+	// tree has branches too.
+	const nOvf = 12
+	for i := range nOvf {
+		key := fmt.Appendf(nil, "ovf-%03d", i)
+		val := bytes.Repeat([]byte{byte('A' + i%26)}, 6000)
+		nr, err := Put(pw, cfg, root, key, val)
+		if err != nil {
+			t.Fatalf("Put overflow %d: %v", i, err)
+		}
+		root = nr
+		want[string(key)] = string(val)
+		nr, err = Put(pw, cfg, root, fmt.Appendf(nil, "small-%03d", i), []byte("v"))
+		if err != nil {
+			t.Fatalf("Put small %d: %v", i, err)
+		}
+		root = nr
+		want[fmt.Sprintf("small-%03d", i)] = "v"
+	}
+
+	// First pages of every overflow chain, and the expected moved count
+	// (sum of run lengths).
+	chainFirst := map[uint64]struct{}{}
+	wantMoved := 0
+	if err := WalkLeafEntries(pw, cfg, root, ^uint64(0), func(e page.LeafEntry) error {
+		if e.IsOverflow() {
+			chainFirst[e.OverflowPage] = struct{}{}
+			wantMoved += int(page.OverflowRunLength(cfg, e.TotalLen))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkLeafEntries: %v", err)
+	}
+	if len(chainFirst) != nOvf {
+		t.Fatalf("built %d overflow chains, want %d", len(chainFirst), nOvf)
+	}
+
+	newRoot, moved, err := RelocatePages(pw, cfg, root, func(id uint64) bool {
+		_, isChain := chainFirst[id]
+		return isChain
+	}, 1<<30)
+	if err != nil {
+		t.Fatalf("RelocatePages: %v", err)
+	}
+	if moved != wantMoved {
+		t.Errorf("moved=%d, want %d (sum of chain run lengths)", moved, wantMoved)
+	}
+	// Every value round-trips (overflow refs rewritten correctly).
+	assertSameKV(t, want, collectKVForRelocate(t, pw, cfg, newRoot))
+	// Old chain first pages retired; the new tree references none of them.
+	for cp := range chainFirst {
+		if _, freed := pw.freed[cp]; !freed {
+			t.Errorf("old chain first page %d not retired", cp)
+		}
+	}
+	if err := WalkLeafEntries(pw, cfg, newRoot, ^uint64(0), func(e page.LeafEntry) error {
+		if e.IsOverflow() {
+			if _, old := chainFirst[e.OverflowPage]; old {
+				t.Errorf("new tree still references old chain first page %d", e.OverflowPage)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkLeafEntries(new): %v", err)
 	}
 }
 

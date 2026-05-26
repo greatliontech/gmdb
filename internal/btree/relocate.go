@@ -22,13 +22,26 @@ import (
 // dangling pointer to a freed page). Old pages are retired via
 // pw.FreePage (→ RPL for prior-tx pages, loose within this tx).
 //
-// Bounding: at most maxMoves *eligible* pages are relocated per call.
-// Mandatory ancestor pointer-fix CoWs are not counted against maxMoves —
-// once a descendant moves, its ancestors must be re-pointed regardless.
-// The total CoW count is therefore bounded by maxMoves×(1+depth); the
-// caller sizes maxMoves so that fits MaxTxBufferBytes (Inv-M4). A CoW that
-// nonetheless overruns the slab budget surfaces ErrTxTooLarge, which the
-// caller rolls back — never on-disk corruption.
+// Overflow chains owned by a leaf are also relocated when their first page
+// is eligible: the runLen-page chain is copied to a fresh contiguous run
+// and the owning leaf entry's ref rewritten (which re-encodes the leaf —
+// keys unchanged, so still one page). RPL segment pages are deliberately
+// NOT relocated by this primitive — they are managed (allocated, chained,
+// reclaimed) by the commit pipeline, and rewriting them out-of-band would
+// race that machinery; RPL pages instead drain via reclamation and new
+// segments self-place via the allocator. The caller's predicate should
+// exclude them.
+//
+// Bounding: at most maxMoves *eligible* pages are relocated per call
+// (a chain counts runLen — and is an indivisible quantum: a single eligible
+// chain relocates its whole run even if runLen overshoots the remaining
+// budget). Mandatory ancestor pointer-fix CoWs and the leaf
+// re-encode forced by a chain relocation are not counted against maxMoves —
+// once a descendant/chain moves, the parent/leaf must be rewritten
+// regardless. The total CoW count is therefore bounded by ~maxMoves×(1+depth);
+// the caller sizes maxMoves so that fits MaxTxBufferBytes (Inv-M4). A CoW or
+// slab alloc that nonetheless overruns the budget surfaces ErrTxTooLarge,
+// which the caller rolls back — never on-disk corruption.
 //
 // Convergence: because relocated pages are handed low(er) ids by a
 // consolidating allocator, a page moved out of the evacuation region stops
@@ -62,19 +75,7 @@ func relocateNode(pw PageWriter, cfg page.Config, id uint64, shouldRelocate func
 	typ, _, _, _ := page.ReadHeader(buf)
 
 	if page.IsLeafType(typ) {
-		// A leaf has no in-page child pointers to fix. Its overflow refs
-		// point to overflow pages, which this primitive does not relocate
-		// — they remain valid. So relocation is a verbatim CoW.
-		if shouldRelocate(id) && *budget > 0 {
-			nid, _, err := relocateVerbatim(pw, id)
-			if err != nil {
-				return 0, false, err
-			}
-			*budget--
-			*moved++
-			return nid, true, nil
-		}
-		return id, false, nil
+		return relocateLeaf(pw, cfg, id, buf, shouldRelocate, budget, moved)
 	}
 	if typ != page.TypeBranch {
 		return 0, false, fmt.Errorf("%w: page %d has unexpected type %d during relocation", ErrCorrupted, id, typ)
@@ -129,6 +130,98 @@ func relocateNode(pw PageWriter, cfg page.Config, id uint64, shouldRelocate func
 		*moved++
 	}
 	return nid, true, nil
+}
+
+// relocateLeaf relocates a leaf and any of its overflow chains selected by
+// shouldRelocate. A chain whose first page is eligible is copied to a fresh
+// contiguous run and the owning entry's overflow ref rewritten; because the
+// leaf's keys are unchanged the re-encoded leaf still fits one page (no
+// split). The leaf is also relocated if the leaf page itself is eligible.
+// Chain pages are counted against budget/moved (runLen each); a leaf
+// re-encoded solely to carry updated refs is mandatory overhead, counted
+// only when the leaf itself is eligible.
+func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldRelocate func(uint64) bool, budget, moved *int) (uint64, bool, error) {
+	entries, err := readLeafEntriesDeepCopy(buf, cfg, id)
+	if err != nil {
+		return 0, false, err
+	}
+	chainsMoved := false
+	for k := range entries {
+		e := &entries[k]
+		if !e.IsOverflow() || !shouldRelocate(e.OverflowPage) || *budget <= 0 {
+			continue
+		}
+		runLen := page.OverflowRunLength(cfg, e.TotalLen)
+		nf, err := relocateOverflowChain(pw, e.OverflowPage, runLen)
+		if err != nil {
+			return 0, false, err
+		}
+		e.OverflowPage = nf
+		*budget -= int(runLen)
+		*moved += int(runLen)
+		chainsMoved = true
+	}
+
+	leafEligible := shouldRelocate(id) && *budget > 0
+	if !chainsMoved && !leafEligible {
+		return id, false, nil
+	}
+	nid, err := pw.AllocPage()
+	if err != nil {
+		return 0, false, err
+	}
+	if chainsMoved {
+		// Re-encode with the updated overflow refs (keys unchanged ⇒ fits
+		// the same page, no split).
+		nbuf, err := pw.AllocSlab(nid)
+		if err != nil {
+			return 0, false, err
+		}
+		b := page.NewLeafBuilder(nbuf, cfg)
+		for i := range entries {
+			if !b.AddEntry(entries[i]) {
+				return 0, false, fmt.Errorf("%w: leaf %d overflowed its page when re-encoded during relocation", ErrCorrupted, id)
+			}
+		}
+		b.Finish()
+	} else if _, err := pw.CoW(id, nid); err != nil {
+		return 0, false, err
+	}
+	if err := pw.FreePage(id); err != nil {
+		return 0, false, err
+	}
+	if leafEligible {
+		*budget--
+		*moved++
+	}
+	return nid, true, nil
+}
+
+// relocateOverflowChain copies the runLen-page overflow chain at oldFirst to
+// a fresh contiguous run, retires the old run, and returns the new first id.
+// The copy is byte-for-byte (the stored footer comes along; commit
+// recomputes it). pw.Page verifies each source page's footer, so a bitrotted
+// chain page aborts relocation (rolled back) rather than propagating.
+func relocateOverflowChain(pw PageWriter, oldFirst uint64, runLen uint32) (uint64, error) {
+	newFirst, err := pw.AllocContiguous(runLen)
+	if err != nil {
+		return 0, err
+	}
+	dst, err := pw.AllocSlabRun(newFirst, runLen)
+	if err != nil {
+		return 0, err
+	}
+	for i := range runLen {
+		src, err := pw.Page(oldFirst + uint64(i))
+		if err != nil {
+			return 0, err
+		}
+		copy(dst[i], src)
+	}
+	if err := pw.FreeRun(oldFirst, runLen); err != nil {
+		return 0, err
+	}
+	return newFirst, nil
 }
 
 // relocateVerbatim allocates a fresh id, CoW-copies id's content into it,

@@ -1917,11 +1917,44 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
     stale-buffer classes traced clean against the pager's
     CoW/Alloc/Free semantics); L (use CoW's return; structural-count
     assertion; overflow-leaf test) fixed.
-  - **12.5b-2** overflow-chain relocation + RPL-segment relocation (the
-    non-tree referents). *(pending)*
+  - **12.5b-2** ✅ overflow-chain relocation, folded into
+    `RelocatePages`. A leaf's overflow chain whose first page is eligible
+    is copied to a fresh contiguous run (`relocateOverflowChain`), the
+    owning entry's ref rewritten, and the leaf re-encoded 1:1 via
+    `LeafBuilder` (keys unchanged ⇒ no split); `pw.Page` footer-verifies
+    each source chain page so bitrot aborts (rolls back) rather than
+    propagating. **RPL-segment relocation deferred** (user-approved,
+    discovered mid-impl): RPL pages are owned by the commit pipeline
+    (`appendRPL`/`reclaimRPL` alloc/chain/reclaim them) so out-of-band
+    relocation races that machinery for low value — they're transient
+    (drain via reclamation; new ones self-place low). Filed
+    `rpl-segment-relocation` (condition); 12.5b-3's predicate excludes
+    them. Tested: chain relocation (values round-trip, old runs retired,
+    new refs disjoint, moved == Σ run lengths). Review: 0 H/M (re-encode
+    fidelity across all cell types, follower copy, free-after-copy
+    ordering, rollback all correct-by-construction); nits fixed
+    (verbatim-leaf-keeps-ref test tightened, indivisible-chain-quantum
+    doc); 2 L coverage gaps deferred to their natural homes — re-encode
+    over nested/subpage/multivalue cells → 12.5b-2b, follower
+    footer-verify on a corrupt chain (real pager) → 12.5b-3.
+  - **12.5b-2b** nested-tree subtree relocation — **discovered mid-12.5b-2,
+    not in the original "full coverage" enumeration**: SetKeyspace promotes
+    large sets into nested B+trees rooted at a leaf cell's `NestedRoot`;
+    `RelocatePages` does not recurse into them, so those pages aren't
+    relocated (currently left correctly intact — a coverage gap, not
+    corruption). High-value for set-heavy workloads; reuses the recursion +
+    leaf-re-encode machinery (recurse `relocateNode(NestedRoot)`, rewrite
+    the `NestedRoot` ref like an overflow ref). Must also add the 12.5b-2
+    review's deferred coverage: a re-encode test over a leaf holding
+    nested/subpage/multivalue cells alongside an overflow ref (fidelity is
+    correct-by-construction but unasserted at the relocate layer).
+    *(pending — surfaced to user)*
   - **12.5b-3** pass orchestration: consume the rate, gate on
     `CompactionThreshold`/`DisableCompaction`, pick the evacuation
-    target, resumable cursor, wire as Task 4, promote Inv-M4. *(pending)*
+    target, resumable cursor, wire as Task 4, promote Inv-M4. Must add the
+    12.5b-2 review's deferred real-pager integration test: relocate a
+    committed overflow chain with `PageChecksum` on, corrupt a follower,
+    assert `ErrBadPageChecksum` (not silent propagation). *(pending)*
 - **12.6** Chunk close-out. *(pending)*
 
 ## Cross-chunk concerns
