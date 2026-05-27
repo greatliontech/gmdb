@@ -74,6 +74,25 @@ Invariant: kind=clause-explicit;
     goroutine respects, not a user-facing trigger.
 
 Invariant: kind=entailed;
+  property=When an incremental-compaction pass commits, every
+    relocated tree root is re-pointed at its holder — a moved
+    keyspace data or index-registry root in that keyspace's
+    descriptor, a moved index data-tree root in its registry
+    entry, and a moved keyspace descriptor tree in
+    `meta.KeyspaceRoot` — so the whole forest stays reachable.
+    The descriptor tree is relocated last, after the per-keyspace
+    descriptors are staged, so the staged re-puts land on the
+    relocated tree;
+  from=entailed: §Incremental Compaction step 2 says pages are
+    "re-pointed" but no clause states the cascade must be
+    complete across all four root-holder kinds;
+  violation=A relocated root whose holder keeps the stale id is
+    a dangling root: the subtree's old pages are retired to the
+    RPL yet still referenced, so a later reclamation hands a
+    live-referenced page back to the allocator — aliasing /
+    data loss — while every other invariant still holds.
+
+Invariant: kind=entailed;
   property=`CheckWarning` produced by the scrubber identifies
     the affected page ID and is logged via `slog.Logger`;
     no scrub-detected corruption is silently dropped;
@@ -279,19 +298,37 @@ A pass with no multi-page allocations since the last (no
 signal) does not trigger.
 
 **Mechanism.** Each pass opens a write transaction and
-relocates up to `CompactionBatchSize` pages (default 1024):
+relocates up to `CompactionBatchSize` pages (default 1024) by
+**high-watermark evacuation**:
 
-1. Identify fragmented regions — pages that interrupt
-   potential contiguous runs.
-2. For each, CoW it to a new location (allocated from a
-   region with more free neighbours).
+1. Choose an evacuation floor near the high-water mark, sized
+   so the band `[floor, HighWaterMark)` holds roughly
+   `CompactionBatchSize` allocated pages (estimated from the
+   free-page density). Walk every B+tree in the forest: the
+   keyspace descriptor tree, each keyspace's data tree, its
+   index registry sub-tree and index data trees, and any
+   set-keyspace nested trees. RPL segment pages are **excluded**
+   from relocation — they are owned by the commit pipeline
+   (allocated, chained, and reclaimed there), drain on their own
+   as reclamation advances, and new segments self-place low via
+   the allocator, so relocating them out-of-band would race that
+   machinery for no benefit.
+2. Relocate each allocated page at or above the floor: it is
+   CoW'd to a fresh id, which the consolidating allocator draws
+   from a low free hole; every owning parent, descriptor, and
+   `KeyspaceRoot` is re-pointed so the relocated subtree stays
+   reachable (the same bottom-up CoW cascade a normal write
+   uses).
 3. The old page goes to the RPL and is reclaimed in a future
    txn.
 4. Commit.
 
-Over multiple passes, scattered pages consolidate and
-contiguous free runs emerge. Converges when the failure rate
-drops below the threshold.
+Over multiple passes the top band drains into a contiguous free
+run, the live set consolidates toward low ids, and the file can
+shrink. Converges because a relocated page receives a low id and
+so stops matching the evacuation floor — successive passes make
+monotone progress until the failure rate drops below the
+threshold.
 
 **Cost per pass.** Each moved leaf forces a CoW cascade up the
 tree (every ancestor branch needs CoW + new child pointer),

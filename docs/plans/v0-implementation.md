@@ -1958,12 +1958,72 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
     entails covering nested-tree subtree pages (an un-relocatable type pins
     its region); per-type handling is documented in `relocate.go`. RPL
     remains the sole excluded type (`rpl-segment-relocation`).
-  - **12.5b-3** pass orchestration: consume the rate, gate on
-    `CompactionThreshold`/`DisableCompaction`, pick the evacuation
-    target, resumable cursor, wire as Task 4, promote Inv-M4. Must add the
-    12.5b-2 review's deferred real-pager integration test: relocate a
-    committed overflow chain with `PageChecksum` on, corrupt a follower,
-    assert `ErrBadPageChecksum` (not silent propagation). *(pending)*
+  - **Evacuation strategy (user decision, 12.5b-3):** **high-watermark
+    evacuation** (over the spec-literal "fragmentation-region" approach).
+    Predicate `shouldRelocate(id) = id >= evacFloor && id ∉ RPLsegments`;
+    `evacFloor` is sized near `HighWaterMark` so the top band holds ~budget
+    allocated pages (estimated from free-page density). Relocated pages get
+    low ids from the consolidating allocator, the top band drains into a
+    contiguous run, the file shrinks; monotone-convergent (moved pages stop
+    matching the floor). Spec-amend applied: `background-maintenance.md
+    §Incremental Compaction (Mechanism)` reworded from fragmented-region to
+    high-watermark. Chosen as the smallest correct change that serves the
+    trigger + enables shrink, reusing `RelocatePages`' budget/cursor as-is.
+  - **12.5b-3a** forest-relocation engine `(tx).compactForest(pred, budget)`:
+    walk the forest from `tx.keyspaceRoot` (keyspace descriptor tree → each
+    keyspace's data tree + index registry sub-tree → each index's data tree;
+    nested trees handled transitively by `RelocatePages`), calling
+    `RelocatePages` per root with a shared descending budget. Re-root the
+    cascade via the **existing** persistence machinery: index `entry.Root`
+    rewritten by `btree.Put` into the (relocated) registry tree; the
+    keyspace's `desc.Root`/`desc.IndexRegistryRoot` staged in
+    `tx.dirtyDescriptors[name]` (re-`Put` at `flushKeyspaces`); the keyspace
+    tree itself relocated last and assigned to `tx.keyspaceRoot` (→
+    `meta.KeyspaceRoot` at commit). cfg discipline mirrors `copyCompact`:
+    data tree uses the keyspace-overridden cfg, registry + index trees use
+    base cfg. **RPL exclusion is inherent, not a predicate check:**
+    `RelocatePages` only offers `shouldRelocate` the pages it reaches via
+    the tree structure (branch/leaf ids, overflow first-page ids, nested
+    roots); RPL segment pages hang off `meta.RPLHeadPage` on a separate
+    chain the forest walk never visits, so they are never relocated without
+    any `id ∉ RPL` term (a `Pager.IsRPLSegmentPage` query would be dead
+    code). Predicate is simply `id >= evacFloor`. New entailed invariant
+    (re-rooting referential integrity across all four root-holder kinds)
+    recorded in the spec + enforced by the round-trip/Check-clean test.
+    ✅ Tests: forest round-trip (plain + indexed + tiny + set keyspaces,
+    overflow values, fragmented; all KV survives, index `LookupKeys`
+    unchanged, SetKeyspace `CountValues`/`HasValue` intact incl. a
+    nested-tree-promoted set, `KeyspaceRoot` changes, Check clean,
+    moved>0), budget bound, empty/zero-budget. Review: 0 introduced H/M
+    (re-rooting completeness, borrow-after-free, RPL exclusion, multi-pass
+    convergence all verified — reviewer ran 8 passes Check-clean); L1
+    (unmapped re-encode error) fixed, L2 (bare TxTooLarge sentinel — matches
+    `mapPagerErr` convention) + nit (dead budget decrement) disputed; SA1
+    (re-rooting invariant → spec), SA2 (no-open-keyspaces precondition →
+    godoc) applied.
+  - **12.5b-3b** orchestration + Inv-M4 + wiring: trigger eval
+    (`ConsumeContiguousAllocStats` → rate vs `CompactionThreshold`; skip on
+    `DisableCompaction` / no-signal `attempts==0`), `evacFloor` from density,
+    resumable keyspace cursor (`db.compactCursor` — resume forest walk after
+    the last keyspace whose budget exhausted, for fairness), wire as **Task
+    4** in `runMaintenancePass`. **Inv-M4 promotion** (spec-tier →
+    enforced): maintenance catches `ErrTxTooLarge` from the compaction tx,
+    rolls back, logs non-fatally, and reduces the effective budget /
+    reschedules — it never *surfaces* `ErrTxTooLarge` (the invariant's
+    "reduces `CompactionBatchSize` or aborts and re-schedules"). Test:
+    tiny `MaxTxBufferBytes` + large `CompactionBatchSize` + fragmented DB →
+    pass returns nil, DB stays consistent, no user-visible error. Plus the
+    12.5b-2 review's deferred real-pager test: relocate a committed overflow
+    chain with `PageChecksum` on, corrupt a follower, assert
+    `ErrBadPageChecksum` (not silent propagation). **Shrink verification
+    (12.5b-3a review SA3/C1):** the spec's "the file can shrink" benefit is
+    delivered only when `evacFloor` is sized *near* `HighWaterMark` — a
+    midpoint floor consolidates but grows HWM for a pass (relocated-from
+    pages are same-tx-unreclaimable RPL; fresh allocations extend the file)
+    then plateaus. The density-based `evacFloor` must target the trailing
+    band so commit's tail-refund/shrink truncates; 3b's test MUST assert
+    `HighWaterMark` strictly *decreases* across passes (with intervening
+    RPL drain), else the headline benefit ships unverified. *(pending)*
 - **12.6** Chunk close-out. *(pending)*
 
 ## Cross-chunk concerns
