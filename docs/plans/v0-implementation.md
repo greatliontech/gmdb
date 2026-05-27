@@ -2038,7 +2038,27 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
       publication-phase only). Required for Inv-M4's halving to recover rather
       than brick the handle; also fixes a latent over-poison for a large
       single-tx delete near the buffer limit.
-- **12.6** Chunk close-out. *(pending)*
+- **12.6** ✅ Chunk close-out. **Triage close-out gate:** 0 `docs/issues`
+  entries resolved by chunk-12 work (the chunk-start-deferred
+  `leaked-readtx-cleanup-race-flake` / `writenewindexregistry-partial-leak`
+  remain deferred — Task 2 reused the proven reader-slot scan without
+  touching the flake's finalizer race, and no compaction/maintenance work
+  touched the index-registry orphaning root). `maintenance-compaction-threshold-disable`
+  was promote-then-deleted at 12.5a. Three new follow-ups filed this chunk:
+  `rpl-segment-relocation` (12.5b-2), `rpl-rebuild-panic-on-wild-pointer`
+  + `compaction-full-forest-walk-per-pass` (12.5b-3b). **No-cite sweep
+  (wrap-aware):** authoritative spec + production `.go` cite only
+  kept-current artifacts — every `.md` reference points at a spec section,
+  and the RPL-relocation deferral in `compaction.go` is described inline
+  with a `git history` pointer, never an issue doc; clean. **Spec-tier
+  invariant audit:** Inv-M1/M2/M6 enforced at 12.2, Inv-M3/M5 at 12.4,
+  **Inv-M4 at 12.5b-3b** (`TestRunCompactionNeverSurfacesTxTooLarge` +
+  `TestCompactionPassReturnsTxTooLargeAndRollsBack` — reviewer-verified
+  load-bearing) — all six maintenance invariants now test-enforced, none
+  spec-tier-only. **Prereq fix landed:** `a98ad6f` (RPL chain walk bounded
+  by `RPLTailPage`) — a pre-existing data-loss bug (DB unopenable after
+  churn) surfaced by compaction's page reuse, fixed as its own reviewed
+  commit before completing 12.5b-3b. Full suite green under `-race`.
 
 ## Cross-chunk concerns
 
