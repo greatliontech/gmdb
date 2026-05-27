@@ -25,23 +25,34 @@ import (
 // Overflow chains owned by a leaf are also relocated when their first page
 // is eligible: the runLen-page chain is copied to a fresh contiguous run
 // and the owning leaf entry's ref rewritten (which re-encodes the leaf —
-// keys unchanged, so still one page). RPL segment pages are deliberately
-// NOT relocated by this primitive — they are managed (allocated, chained,
-// reclaimed) by the commit pipeline, and rewriting them out-of-band would
-// race that machinery; RPL pages instead drain via reclamation and new
-// segments self-place via the allocator. The caller's predicate should
-// exclude them.
+// keys unchanged, so still one page). Nested-tree subtrees (a SetKeyspace
+// member set promoted to its own B+tree, rooted at a leaf cell's
+// NestedRoot — set-keyspace.md §Nested B+tree Reference Cell) are
+// relocated recursively: the primitive descends into NestedRoot exactly
+// as into any other tree, and rewrites the owning leaf entry's NestedRoot
+// when the nested root's id changes (re-encoding the leaf — the NestedRoot
+// trailer is a fixed 8-byte field, so the cell keeps its size and the leaf
+// still fits one page). NestedCount rides through the re-encode unchanged,
+// preserving the keyspace Count-equality contract (set-keyspace.md E1).
+// RPL segment pages are deliberately NOT relocated by this primitive —
+// they are managed (allocated, chained, reclaimed) by the commit pipeline,
+// and rewriting them out-of-band would race that machinery; RPL pages
+// instead drain via reclamation and new segments self-place via the
+// allocator. The caller's predicate should exclude them.
 //
 // Bounding: at most maxMoves *eligible* pages are relocated per call
 // (a chain counts runLen — and is an indivisible quantum: a single eligible
 // chain relocates its whole run even if runLen overshoots the remaining
-// budget). Mandatory ancestor pointer-fix CoWs and the leaf
-// re-encode forced by a chain relocation are not counted against maxMoves —
-// once a descendant/chain moves, the parent/leaf must be rewritten
-// regardless. The total CoW count is therefore bounded by ~maxMoves×(1+depth);
-// the caller sizes maxMoves so that fits MaxTxBufferBytes (Inv-M4). A CoW or
-// slab alloc that nonetheless overruns the budget surfaces ErrTxTooLarge,
-// which the caller rolls back — never on-disk corruption.
+// budget; a nested-tree subtree is relocated page-by-page like any tree, so
+// it consumes budget incrementally and a pass may relocate it only
+// partially). Mandatory ancestor pointer-fix CoWs and the leaf
+// re-encode forced by a chain or nested-root relocation are not counted
+// against maxMoves — once a descendant/chain/nested-root moves, the
+// parent/leaf must be rewritten regardless. The total CoW count is
+// therefore bounded by ~maxMoves×(1+depth), and the caller sizes maxMoves
+// so that fits MaxTxBufferBytes (Inv-M4). A CoW or slab alloc that
+// nonetheless overruns the budget surfaces ErrTxTooLarge, which the caller
+// rolls back — never on-disk corruption.
 //
 // Convergence: because relocated pages are handed low(er) ids by a
 // consolidating allocator, a page moved out of the evacuation region stops
@@ -75,7 +86,7 @@ func relocateNode(pw PageWriter, cfg page.Config, id uint64, shouldRelocate func
 	typ, _, _, _ := page.ReadHeader(buf)
 
 	if page.IsLeafType(typ) {
-		return relocateLeaf(pw, cfg, id, buf, shouldRelocate, budget, moved)
+		return relocateLeaf(pw, cfg, id, buf, shouldRelocate, budget, moved, depth)
 	}
 	if typ != page.TypeBranch {
 		return 0, false, fmt.Errorf("%w: page %d has unexpected type %d during relocation", ErrCorrupted, id, typ)
@@ -132,47 +143,81 @@ func relocateNode(pw PageWriter, cfg page.Config, id uint64, shouldRelocate func
 	return nid, true, nil
 }
 
-// relocateLeaf relocates a leaf and any of its overflow chains selected by
-// shouldRelocate. A chain whose first page is eligible is copied to a fresh
-// contiguous run and the owning entry's overflow ref rewritten; because the
-// leaf's keys are unchanged the re-encoded leaf still fits one page (no
-// split). The leaf is also relocated if the leaf page itself is eligible.
-// Chain pages are counted against budget/moved (runLen each); a leaf
-// re-encoded solely to carry updated refs is mandatory overhead, counted
-// only when the leaf itself is eligible.
-func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldRelocate func(uint64) bool, budget, moved *int) (uint64, bool, error) {
+// relocateLeaf relocates a leaf together with any of its off-leaf referents
+// selected by shouldRelocate: overflow chains and nested-tree subtrees.
+//   - An overflow chain whose first page is eligible is copied to a fresh
+//     contiguous run and the owning entry's OverflowPage rewritten.
+//   - A nested-tree cell's subtree is relocated recursively (relocateNode on
+//     NestedRoot — it handles the nested tree's own branches, leaves,
+//     overflow chains, and any further nesting); if the nested root's id
+//     changes the owning entry's NestedRoot is rewritten. NestedCount is
+//     carried through untouched, preserving set-keyspace.md E1.
+//
+// Either rewrite re-encodes the leaf. Because every rewritten field
+// (OverflowPage, NestedRoot) is a fixed 8-byte trailer and all keys are
+// unchanged, the re-encoded leaf is byte-for-byte the same size and still
+// fits one page (no split). The leaf is also relocated if the leaf page
+// itself is eligible. Chain pages (runLen each) and nested-subtree pages
+// are counted against budget/moved as they move; a leaf re-encoded solely
+// to carry updated refs is mandatory overhead, counted only when the leaf
+// itself is eligible. depth bounds the descent across the nesting boundary
+// (continued, not reset — matches freeSubtreeAt).
+func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldRelocate func(uint64) bool, budget, moved *int, depth int) (uint64, bool, error) {
 	entries, err := readLeafEntriesDeepCopy(buf, cfg, id)
 	if err != nil {
 		return 0, false, err
 	}
-	chainsMoved := false
+	refsRewritten := false
 	for k := range entries {
 		e := &entries[k]
-		if !e.IsOverflow() || !shouldRelocate(e.OverflowPage) || *budget <= 0 {
-			continue
+		switch {
+		case e.IsOverflow():
+			if !shouldRelocate(e.OverflowPage) || *budget <= 0 {
+				continue
+			}
+			runLen := page.OverflowRunLength(cfg, e.TotalLen)
+			nf, err := relocateOverflowChain(pw, e.OverflowPage, runLen)
+			if err != nil {
+				return 0, false, err
+			}
+			e.OverflowPage = nf
+			*budget -= int(runLen)
+			*moved += int(runLen)
+			refsRewritten = true
+		case e.IsNestedTree():
+			// A nested-tree cell must carry a non-zero root (same
+			// corruption contract enforced by freeSubtreeAt and the
+			// Walk* readers). Validate unconditionally — even when the
+			// budget can't fund the descent — so a corrupt cell never
+			// slips past relocation silently.
+			if e.NestedRoot == 0 {
+				return 0, false, fmt.Errorf("%w: nested-tree cell on leaf %d has NestedRoot=0", ErrCorrupted, id)
+			}
+			if *budget <= 0 {
+				continue
+			}
+			nr, nestedMoved, err := relocateNode(pw, cfg, e.NestedRoot, shouldRelocate, budget, moved, depth+1)
+			if err != nil {
+				return 0, false, err
+			}
+			if nestedMoved {
+				e.NestedRoot = nr
+				refsRewritten = true
+			}
 		}
-		runLen := page.OverflowRunLength(cfg, e.TotalLen)
-		nf, err := relocateOverflowChain(pw, e.OverflowPage, runLen)
-		if err != nil {
-			return 0, false, err
-		}
-		e.OverflowPage = nf
-		*budget -= int(runLen)
-		*moved += int(runLen)
-		chainsMoved = true
 	}
 
 	leafEligible := shouldRelocate(id) && *budget > 0
-	if !chainsMoved && !leafEligible {
+	if !refsRewritten && !leafEligible {
 		return id, false, nil
 	}
 	nid, err := pw.AllocPage()
 	if err != nil {
 		return 0, false, err
 	}
-	if chainsMoved {
-		// Re-encode with the updated overflow refs (keys unchanged ⇒ fits
-		// the same page, no split).
+	if refsRewritten {
+		// Re-encode with the updated overflow / nested-tree refs (keys and
+		// every other field unchanged ⇒ fits the same page, no split).
 		nbuf, err := pw.AllocSlab(nid)
 		if err != nil {
 			return 0, false, err

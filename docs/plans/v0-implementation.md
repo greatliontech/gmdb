@@ -1937,18 +1937,27 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
     doc); 2 L coverage gaps deferred to their natural homes — re-encode
     over nested/subpage/multivalue cells → 12.5b-2b, follower
     footer-verify on a corrupt chain (real pager) → 12.5b-3.
-  - **12.5b-2b** nested-tree subtree relocation — **discovered mid-12.5b-2,
+  - **12.5b-2b** ✅ nested-tree subtree relocation — **discovered mid-12.5b-2,
     not in the original "full coverage" enumeration**: SetKeyspace promotes
-    large sets into nested B+trees rooted at a leaf cell's `NestedRoot`;
-    `RelocatePages` does not recurse into them, so those pages aren't
-    relocated (currently left correctly intact — a coverage gap, not
-    corruption). High-value for set-heavy workloads; reuses the recursion +
-    leaf-re-encode machinery (recurse `relocateNode(NestedRoot)`, rewrite
-    the `NestedRoot` ref like an overflow ref). Must also add the 12.5b-2
-    review's deferred coverage: a re-encode test over a leaf holding
-    nested/subpage/multivalue cells alongside an overflow ref (fidelity is
-    correct-by-construction but unasserted at the relocate layer).
-    *(pending — surfaced to user)*
+    large sets into nested B+trees rooted at a leaf cell's `NestedRoot`.
+    `relocateLeaf` now recurses `relocateNode(NestedRoot, depth+1)` (the
+    nested tree's own branches/leaves/overflow chains/further nesting all
+    handled by the same machinery) and rewrites the owning entry's
+    `NestedRoot` like an overflow ref when the nested root's id changes;
+    `NestedCount` rides through the re-encode untouched (set-keyspace.md E1).
+    Depth is continued (not reset) across the nesting boundary, matching
+    `freeSubtreeAt`. A nested cell with `NestedRoot==0` aborts as
+    `ErrCorrupted` (matching `freeSubtreeAt` / the `Walk*` readers) — checked
+    unconditionally, even when the budget can't fund the descent. Encodes the
+    12.5b-2b entailed invariant (referential integrity across the nesting
+    boundary + `NestedCount` preservation) as a regression test. Also lands
+    the 12.5b-2 review's deferred coverage: a re-encode test over a leaf
+    holding inline/overflow/subpage/nested cells, asserting every cell type
+    round-trips verbatim through the relocation re-encode. No spec change —
+    the spec's generic "relocate pages to restore contiguous runs" already
+    entails covering nested-tree subtree pages (an un-relocatable type pins
+    its region); per-type handling is documented in `relocate.go`. RPL
+    remains the sole excluded type (`rpl-segment-relocation`).
   - **12.5b-3** pass orchestration: consume the rate, gate on
     `CompactionThreshold`/`DisableCompaction`, pick the evacuation
     target, resumable cursor, wire as Task 4, promote Inv-M4. Must add the
