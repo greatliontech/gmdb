@@ -618,6 +618,17 @@ func (c *SetCursor) Err() error {
 		if errors.Is(err, btree.ErrCursorStale) {
 			return ErrCursorStale
 		}
+		// Translate the internal Unpositioned sentinel to the public one
+		// (same reason ErrCursorStale is translated just above). The source
+		// of truth is outerCursor.Err(), NOT the SetCursor.positioned bool:
+		// positioned is false for BOTH Unpositioned and End-of-iteration, so
+		// it cannot make the distinction transactions.md §Cursor State
+		// Machine requires — but outerCursor's 3-state machine returns
+		// btree.ErrCursorUnpositioned only when Unpositioned and nil at
+		// End-of-iteration, so EOI correctly stays nil here.
+		if errors.Is(err, btree.ErrCursorUnpositioned) {
+			return ErrCursorUnpositioned
+		}
 		// mapBtreeErr covers btree.ErrCorrupted AND the pager sentinels
 		// (ErrBadPageChecksum / ErrCorrupted) now reachable through a
 		// cursor read via the verifying Page (Inv-RV1/RV3); other errors

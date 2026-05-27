@@ -1308,6 +1308,17 @@ func (c *Cursor) Err() error {
 		if errors.Is(err, btree.ErrCursorStale) {
 			return ErrCursorStale
 		}
+		// Translate the internal Unpositioned sentinel to the public one:
+		// the btree 3-state machine returns btree.ErrCursorUnpositioned for
+		// the Unpositioned state (and nil at End-of-iteration), which is the
+		// discriminator transactions.md §Cursor State Machine requires — but
+		// callers errors.Is against gmdb.ErrCursorUnpositioned, so the
+		// internal sentinel must not leak across the public boundary (same
+		// reason ErrCursorStale is translated just above). End-of-iteration
+		// stays nil because Err() only sees a non-nil value here.
+		if errors.Is(err, btree.ErrCursorUnpositioned) {
+			return ErrCursorUnpositioned
+		}
 		// mapBtreeErr covers btree.ErrCorrupted AND the pager sentinels
 		// (ErrBadPageChecksum / ErrCorrupted) now reachable through a
 		// cursor read via the verifying Page (Inv-RV1/RV3); other errors
