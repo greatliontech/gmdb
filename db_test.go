@@ -503,6 +503,116 @@ func TestCorruptionSentinelOnOpen(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsOutOfRangeRPLHeadWithoutPanic(t *testing.T) {
+	// Regression: rebuildRPLChain (internal/pager/init.go) walks the RPL
+	// chain at Open by calling pageRaw(id) per segment. pageRaw panics on an
+	// id past the mmap reservation (MaxSize pages) and would SIGBUS in the
+	// [fileSize, reservation) gap. A corrupt meta whose RPLHeadPage (or a
+	// followed OlderSegment) is out of range must surface as ErrCorrupted,
+	// NOT crash. The walk bounds each id against min(fileSize/PageSize,
+	// MaxSize) — the file-resident extent — exactly like checker.walkRPL
+	// (check.go) and Pager.Page's Inv-RV3.
+	//
+	// Companion to TestCorruptionSentinelOnOpen (malformed-segment path: an
+	// in-range pointer at bad bytes). Two out-of-range shapes are covered:
+	//   wild_far_past_reservation — id far beyond any reservation.
+	//   past_maxsize_inflated_hwm — id just past MaxSize with HighWaterMark
+	//     forged > MaxSize. HighWaterMark is NOT a safe bound here (the file
+	//     is shorter than MaxSize and ValidateMeta does not enforce
+	//     HighWaterMark <= MaxSize), so bounding against HighWaterMark alone
+	//     would let this id through to a pageRaw panic.
+	const maxSizePages = 128
+	for _, tc := range []struct {
+		name            string
+		head, hwmIfNonZ uint64
+	}{
+		{name: "wild_far_past_reservation", head: 1 << 40},
+		{name: "past_maxsize_inflated_hwm", head: maxSizePages + 10, hwmIfNonZ: maxSizePages + 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := tmpPath(t)
+			db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: maxSizePages})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			// Commit 1: allocate + materialize a page; Commit 2: free it so it
+			// lands in the RPL (RPLHeadPage / RPLTailPage become non-zero). The
+			// corruption below must get past rebuildRPLChain's tail==0 guard to
+			// reach the pageRaw walk, so a real chain is required.
+			var idA uint64
+			if err := db.Update(ctx, func(tx *Tx) error {
+				id, e := tx.AllocPage()
+				if e != nil {
+					return e
+				}
+				idA = id
+				_, e = tx.AllocSlab(id)
+				return e
+			}); err != nil {
+				t.Fatalf("commit 1: %v", err)
+			}
+			if err := db.Update(ctx, func(tx *Tx) error { return tx.FreePage(idA) }); err != nil {
+				t.Fatalf("commit 2: %v", err)
+			}
+			if db.Meta().RPLHeadPage == 0 {
+				t.Fatalf("RPLHeadPage = 0 after retiring page; nothing to corrupt")
+			}
+			pageSize := int64(db.Meta().PageSize)
+			activeOff := int64(db.activeMetaIdx) * pageSize
+			db.Close()
+
+			// Rewrite the active meta with an out-of-range RPLHeadPage /
+			// RPLTailPage (and optionally an inflated HighWaterMark),
+			// recomputing the checksum (EncodeMeta) so the meta VERIFIES —
+			// otherwise Open falls back to the sibling meta and never reaches
+			// the corrupt RPL walk.
+			f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatalf("open for corrupt: %v", err)
+			}
+			buf := make([]byte, pageSize)
+			if _, err := f.ReadAt(buf, activeOff); err != nil {
+				t.Fatalf("read active meta: %v", err)
+			}
+			m := page.DecodeMeta(buf)
+			m.RPLHeadPage = tc.head
+			m.RPLTailPage = tc.head
+			if tc.hwmIfNonZ != 0 {
+				m.HighWaterMark = tc.hwmIfNonZ
+			}
+			page.EncodeMeta(buf, &m)
+			if _, err := f.WriteAt(buf, activeOff); err != nil {
+				t.Fatalf("write corrupted meta: %v", err)
+			}
+			f.Close()
+
+			// Re-open must return ErrCorrupted, never panic. The recover
+			// converts a pre-fix panic into a clean failure instead of
+			// crashing the test binary.
+			var reErr error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("Open panicked on out-of-range RPLHeadPage (want ErrCorrupted): %v", r)
+					}
+				}()
+				db2, e := Open(ctx, path, Options{PageSize: 4096})
+				reErr = e
+				if db2 != nil {
+					db2.Close()
+				}
+			}()
+			if reErr == nil {
+				t.Fatal("re-Open accepted out-of-range RPLHeadPage")
+			}
+			if !errors.Is(reErr, ErrCorrupted) {
+				t.Errorf("Open error does not satisfy errors.Is(ErrCorrupted): %v", reErr)
+			}
+		})
+	}
+}
+
 func TestCommitFailurePoisonsHandle(t *testing.T) {
 	// Publication-phase failure contract (pager-slab.md §Commit Write
 	// Ordering + api-surface.md §Sentinel Errors). A step-3 pwrite

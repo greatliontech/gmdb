@@ -383,8 +383,25 @@ func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
 	maxSegs := m.RPLEntryCount + 1
 	visited := make(map[uint64]struct{}, maxSegs)
 	var headFirst []RPLSegmentRef
+	// Trustworthy ceiling for every segment page id, computed BEFORE the
+	// walk so it bounds head, every followed OlderSegment, and the tail.
+	// pageRaw panics past the mmap reservation (MaxSize pages) and would
+	// SIGBUS in the [fileSize, reservation) gap, so a corrupt meta whose
+	// RPLHeadPage / OlderSegment is out of range must surface as
+	// ErrCorrupted at Open, not crash. The bound is the file-resident
+	// extent capped by MaxSize — NOT meta.HighWaterMark (ValidateMeta does
+	// not enforce HighWaterMark <= MaxSize, so a forged meta can inflate it
+	// past the reservation) and NOT MaxSize alone (the file may be shorter
+	// than the reservation). This is Pager.Page's Inv-RV3 bound, identical
+	// to checker.walkRPL's min(fileSize/PageSize, MaxSize) (the root gmdb
+	// package's check.go); the two sibling RPL walkers must agree a wild
+	// pointer is structured corruption, not a crash.
+	backedPages := min(uint64(p.fileSize)/uint64(p.cfg.PageSize), m.MaxSize)
 	id := m.RPLHeadPage
 	for {
+		if id >= backedPages {
+			return nil, fmt.Errorf("pager: RPL segment page %d beyond file-resident extent %d pages: %w", id, backedPages, ErrCorrupted)
+		}
 		if _, seen := visited[id]; seen {
 			return nil, fmt.Errorf("pager: RPL chain cycle at page %d: %w", id, ErrCorrupted)
 		}
