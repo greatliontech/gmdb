@@ -297,9 +297,12 @@ while keeping the other three tasks running, set
 A pass with no multi-page allocations since the last (no
 signal) does not trigger.
 
-**Mechanism.** Each pass opens a write transaction and
-relocates up to `CompactionBatchSize` pages (default 1024) by
-**high-watermark evacuation**:
+**Mechanism.** Each pass opens a write transaction, **eagerly
+reclaims the RPL** (refreshes the reclamation bound and returns every
+now-reader-safe retired page to the bitmap *before* relocating, rather
+than waiting for the lazy on-allocation reclaim), and relocates up to
+`CompactionBatchSize` pages (default 1024) by **high-watermark
+evacuation**:
 
 1. Choose an evacuation floor near the high-water mark, sized
    so the band `[floor, HighWaterMark)` holds roughly
@@ -324,11 +327,31 @@ relocates up to `CompactionBatchSize` pages (default 1024) by
 4. Commit.
 
 Over multiple passes the top band drains into a contiguous free
-run, the live set consolidates toward low ids, and the file can
-shrink. Converges because a relocated page receives a low id and
+run, the live set consolidates toward low ids, and the file
+shrinks. Converges because a relocated page receives a low id and
 so stops matching the evacuation floor — successive passes make
 monotone progress until the failure rate drops below the
 threshold.
+
+**Shrink is lazy but monotone (MVCC).** A relocated-from page goes
+to the RPL (a concurrent reader may still hold the pre-relocation
+snapshot), so it cannot be freed — and the tail cannot refund past
+it — until the reclamation bound advances beyond this pass's commit,
+i.e. one pass later. The eager reclaim at each pass start drains the
+*previous* pass's relocated-from pages, so the trailing band frees up
+and `HighWaterMark` falls steadily across passes; with reader-safe
+freed space available, a pass never extends the file. The one
+exception is a pass that runs immediately after large frees not yet
+reader-safe (the reclamation bound has not advanced past them, e.g.
+compacting in the same instant as a bulk delete with no intervening
+commit): with no reclaimable space to relocate into, that pass extends
+the file by up to one batch. This is bounded, recovered within a pass
+or two as the bound advances, and *necessary* — the extending commit
+is what advances the bound; suppressing it (refusing to relocate
+without free space) would stall a quiescent database. Online
+compaction therefore shrinks amortised over passes, not instantly;
+`Compact()` remains the instant-shrink path (it rebuilds into a fresh,
+RPL-less file).
 
 **Cost per pass.** Each moved leaf forces a CoW cascade up the
 tree (every ancestor branch needs CoW + new child pointer),

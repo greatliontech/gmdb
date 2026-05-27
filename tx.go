@@ -406,25 +406,29 @@ func (tx *Tx) Commit() error {
 		Sync:         syncPolicy,
 	}, tx.prevMeta, tx.prevActive)
 	if err != nil {
-		// pager.Commit failure modes all leave the handle in a state
-		// where in-memory disagrees with disk:
-		//   - Step 1 succeeded → data / bitmap / RPL pages have been
-		//     pwritten before the error; kernel cache may not have
-		//     flushed (step 2 fdatasync state is uncertain on EIO).
-		//   - Step 3 succeeded → the new meta is on disk; ActiveMeta
-		//     selection on a fresh Open picks the new tree even though
-		//     the in-process tx.Commit returned an error.
-		// AbortTx has rolled the pager's in-memory bitmap /
-		// HighWaterMark / RPL chain to pre-tx; the in-memory snapshot
-		// no longer reflects what step 1's pwrites put on disk. The
-		// handle cannot safely allocate further (the bitmap divergence
-		// would leak pages or — when combined with a since-advanced
-		// on-disk meta — write through pages the on-disk active tree
-		// references). Poison; the caller's recovery is the same
-		// machinery cross-process Open uses after a writer crash:
-		// Close, re-Open, the new handle reads everything from disk
-		// and is internally consistent.
-		tx.db.poisoned.Store(true)
+		// A commit can fail in the no-syscall ASSEMBLY phase (step 0:
+		// tail-refund, loose migration, RPL segment slab allocation /
+		// file extension) or in the PUBLICATION phase (step 1+: data /
+		// bitmap / RPL pwrites, fsync, meta pwrite). pager.Commit runs
+		// AbortTx on either, restoring the in-memory bitmap / HighWaterMark
+		// / RPL chain to the pre-tx snapshot.
+		//
+		// Publication-phase failures leave in-memory disagreeing with disk
+		// (step-1 pwrites already hit the file; step-3 may have published a
+		// new meta) — the handle cannot safely continue and must be poisoned;
+		// recovery is Close + re-Open, exactly as after a writer crash.
+		//
+		// Assembly-phase failures are fully reversible: nothing was pwritten,
+		// and AbortTx restored consistency, so the handle stays usable (the
+		// caller may retry in a fresh, smaller tx). The only errors that can
+		// originate in step 0 are ErrTxTooLarge (RPL-segment slab exceeds
+		// MaxTxBufferBytes) and ErrDBFull (file extension hits MaxSize) —
+		// step 1+ performs no allocation. Poisoning those would brick a
+		// recoverable handle (e.g. a single large delete whose RPL append
+		// overruns the budget, or background compaction's Inv-M4 retry).
+		if !errors.Is(err, pager.ErrTxTooLarge) && !errors.Is(err, pager.ErrDBFull) {
+			tx.db.poisoned.Store(true)
+		}
 		return mapPagerErr(err)
 	}
 	tx.db.mu.Lock()

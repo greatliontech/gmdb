@@ -2,6 +2,7 @@ package gmdb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 
@@ -220,6 +221,153 @@ func (tx *Tx) compactIndexRegistry(regRoot uint64, shouldRelocate func(uint64) b
 	}
 
 	return curReg, moved, nil
+}
+
+// maintCompact runs Task 4 of a maintenance pass: incremental compaction
+// (background-maintenance.md §Incremental Compaction). It consumes the
+// contiguous-allocation fragmentation rate the allocator has tracked since the
+// last pass and, when that rate exceeds CompactionThreshold (and compaction is
+// enabled), runs a budgeted high-watermark relocation batch to consolidate
+// free space and let the file shrink.
+//
+// Inv-M4: the pass never surfaces ErrTxTooLarge. runCompaction halves the
+// batch and retries when a relocation would exceed MaxTxBufferBytes, and gives
+// up (logs) if not even one page's cascade fits — the user never sees a
+// maintenance-induced ErrTxTooLarge.
+func (db *DB) maintCompact(ctx context.Context) {
+	if db.opts.Maintenance.DisableCompaction {
+		return
+	}
+	db.mu.Lock()
+	pgr := db.pgr
+	db.mu.Unlock()
+	if pgr == nil {
+		return // closing
+	}
+	// Consume (read-and-reset) the fragmentation counters. Doing this even
+	// when the trigger does not fire keeps the rate scoped to the most recent
+	// interval (spec §Incremental Compaction Trigger).
+	attempts, fragFails := pgr.ConsumeContiguousAllocStats()
+	if !compactionTriggered(attempts, fragFails, db.opts.Maintenance.CompactionThreshold) {
+		return
+	}
+	db.runCompaction(ctx)
+}
+
+// compactionTriggered reports whether the contiguous-allocation failure rate
+// (fragFails/attempts) over the last interval exceeds threshold. A pass with no
+// multi-page allocations (attempts == 0) has no signal and never triggers.
+func compactionTriggered(attempts, fragFails uint64, threshold float64) bool {
+	if attempts == 0 {
+		return false
+	}
+	return float64(fragFails)/float64(attempts) > threshold
+}
+
+// runCompaction runs compaction batches until one succeeds (or there is
+// nothing to do), halving the budget on ErrTxTooLarge so a too-large batch is
+// reduced rather than surfaced (Inv-M4). Benign tx-open failures (closing /
+// cancelled / poisoned) are silent; other errors are logged. Each successful
+// batch is one committed transaction.
+func (db *DB) runCompaction(ctx context.Context) {
+	budget := db.opts.Maintenance.CompactionBatchSize
+	for budget >= 1 {
+		moved, err := db.compactionPass(ctx, budget)
+		switch {
+		case errors.Is(err, ErrTxTooLarge):
+			budget /= 2 // batch too large for MaxTxBufferBytes — halve and retry
+			continue
+		case err != nil:
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
+				!errors.Is(err, ErrClosed) && !errors.Is(err, ErrPoisoned) {
+				db.logger.Warn("gmdb: maintenance compaction skipped", "err", err)
+			}
+			return
+		default:
+			if moved > 0 {
+				db.logger.Info("gmdb: maintenance compacted pages", "count", moved)
+			}
+			return
+		}
+	}
+	db.logger.Warn("gmdb: maintenance compaction could not fit a single page relocation in MaxTxBufferBytes")
+}
+
+// compactionPass runs one compaction transaction: derive the high-watermark
+// evacuation floor from the snapshot meta, relocate up to budget pages at or
+// above it across the forest, and commit. Returns the count of pages
+// relocated. On ErrTxTooLarge (or any error) the tx is rolled back and the
+// error returned; the caller retries with a smaller budget or aborts.
+func (db *DB) compactionPass(ctx context.Context, budget int) (int, error) {
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		return 0, err // closing / cancelled / poisoned
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Eagerly reclaim the RPL before relocating: returns already-eligible
+	// freed pages to the bitmap so relocations consolidate into them (rather
+	// than extending the file), and so the previous pass's relocated-from
+	// pages — now committed below the reclamation bound — are freed and a
+	// trailing run of them tail-refunds at this commit. This is what makes
+	// the file shrink monotonically across passes (background-maintenance.md
+	// §Incremental Compaction); without it reclamation is lazy and the file
+	// shrinks only stepwise after bitmap exhaustion.
+	tx.pgr.ReclaimFreeSpace()
+
+	// Size the evacuation band against the post-reclaim free count + the
+	// current high-water mark (reclamation frees pages but does not lower the
+	// HWM — that happens via tail refund at commit).
+	firstData := uint64(2) + uint64(tx.prevMeta.BitmapPages)
+	floor, ok := evacuationFloor(firstData, tx.pgr.HighWaterMark(), tx.pgr.NumFreePages(), budget)
+	if !ok {
+		return 0, nil // no data region / nothing allocated — defer rolls back
+	}
+	moved, err := tx.compactForest(func(id uint64) bool { return id >= floor }, budget)
+	if err != nil {
+		return 0, err
+	}
+	if moved == 0 {
+		return 0, nil // nothing above the floor moved — defer rolls back
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	committed = true
+	return moved, nil
+}
+
+// evacuationFloor computes the high-watermark evacuation floor: the lowest page
+// id such that the trailing band [floor, hwm) holds roughly budget allocated
+// pages, estimated from the free-page density. Relocating that band lets it
+// drain into a contiguous free run so the file can shrink. Returns ok=false
+// when there is no data region or nothing allocated to relocate.
+//
+// Sizing the band to ~budget allocated pages (rather than fixing it at the very
+// top) keeps each pass's relocation count near the budget regardless of how
+// sparse the region is: a near-full region uses a thin band, a sparse one a
+// wider band.
+func evacuationFloor(firstData, hwm, numFreePages uint64, budget int) (uint64, bool) {
+	if budget <= 0 || hwm <= firstData {
+		return 0, false
+	}
+	dataSpan := hwm - firstData
+	freeInData := min(numFreePages, dataSpan)
+	allocInData := dataSpan - freeInData
+	if allocInData == 0 {
+		return 0, false // region is entirely free — nothing to relocate
+	}
+	density := float64(allocInData) / float64(dataSpan) // in (0, 1]
+	bandSpan := uint64(float64(budget) / density)
+	if bandSpan >= dataSpan {
+		return firstData, true // budget covers the whole region
+	}
+	return hwm - bandSpan, true
 }
 
 // mapCompactErr maps the btree + pager error surfaces that the relocation

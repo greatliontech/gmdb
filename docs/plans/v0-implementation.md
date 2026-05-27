@@ -2001,29 +2001,43 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
     `mapPagerErr` convention) + nit (dead budget decrement) disputed; SA1
     (re-rooting invariant → spec), SA2 (no-open-keyspaces precondition →
     godoc) applied.
-  - **12.5b-3b** orchestration + Inv-M4 + wiring: trigger eval
-    (`ConsumeContiguousAllocStats` → rate vs `CompactionThreshold`; skip on
-    `DisableCompaction` / no-signal `attempts==0`), `evacFloor` from density,
-    resumable keyspace cursor (`db.compactCursor` — resume forest walk after
-    the last keyspace whose budget exhausted, for fairness), wire as **Task
-    4** in `runMaintenancePass`. **Inv-M4 promotion** (spec-tier →
-    enforced): maintenance catches `ErrTxTooLarge` from the compaction tx,
-    rolls back, logs non-fatally, and reduces the effective budget /
-    reschedules — it never *surfaces* `ErrTxTooLarge` (the invariant's
-    "reduces `CompactionBatchSize` or aborts and re-schedules"). Test:
-    tiny `MaxTxBufferBytes` + large `CompactionBatchSize` + fragmented DB →
-    pass returns nil, DB stays consistent, no user-visible error. Plus the
-    12.5b-2 review's deferred real-pager test: relocate a committed overflow
-    chain with `PageChecksum` on, corrupt a follower, assert
-    `ErrBadPageChecksum` (not silent propagation). **Shrink verification
-    (12.5b-3a review SA3/C1):** the spec's "the file can shrink" benefit is
-    delivered only when `evacFloor` is sized *near* `HighWaterMark` — a
-    midpoint floor consolidates but grows HWM for a pass (relocated-from
-    pages are same-tx-unreclaimable RPL; fresh allocations extend the file)
-    then plateaus. The density-based `evacFloor` must target the trailing
-    band so commit's tail-refund/shrink truncates; 3b's test MUST assert
-    `HighWaterMark` strictly *decreases* across passes (with intervening
-    RPL drain), else the headline benefit ships unverified. *(pending)*
+  - **12.5b-3b** ✅ orchestration + Inv-M4 + wiring + **two pre-existing
+    bugs the work surfaced**. `maintCompact` (Task 4 in `runMaintenancePass`):
+    consume `ConsumeContiguousAllocStats`, gate via pure `compactionTriggered`
+    (rate > `CompactionThreshold`; skip on `DisableCompaction` / no-signal
+    `attempts==0`), then `runCompaction`. `compactionPass`: **eager
+    `Pager.ReclaimFreeSpace`** (refresh bound + drain RPL) before relocating,
+    pure `evacuationFloor` from post-reclaim free density, `compactForest`,
+    commit. **Inv-M4** (spec-tier → enforced): `runCompaction` halves the
+    budget on `ErrTxTooLarge` and retries; gives up (logs) if not even one
+    page fits — never surfaces `ErrTxTooLarge`. **Eager reclaim** was the
+    first-principles fix to the SA3 shrink concern: it drains the prior
+    pass's relocated-from pages so the tail refunds promptly → `HighWaterMark`
+    falls **monotonically** (73→50 over passes in the churn test, no growth);
+    the residual bounded bootstrap-growth (compacting at the exact instant of
+    a bulk delete, frees not yet reader-safe) is *necessary* — the commit
+    advances the reclamation bound; suppressing it would stall a quiescent DB.
+    Spec §Mechanism + a new "shrink is lazy but monotone (MVCC)" paragraph
+    capture this honestly; `Compact()` stays the instant-shrink path.
+    Tests: `compactionTriggered` + `evacuationFloor` units; **shrink
+    monotonicity** (churn + intervening commit → HWM non-increasing per pass
+    AND net-decreasing, data intact, Check clean); Inv-M4 (oversize forest →
+    `compactionPass` returns `ErrTxTooLarge`+rolls back; `runCompaction`
+    halves to success, no poison, data intact); the 12.5b-2 deferred
+    corrupt-follower checksum test (`compactForest` over a bitrotted overflow
+    follower → `ErrBadPageChecksum`); disable gate.
+    - **Prereq bug A (RPL chain walk) — fixed in `a98ad6f`** (own commit +
+      review): `rebuildRPLChain`/`walkRPL` bounded by `RPLTailPage` not
+      `OlderSegment==0`; without it, churn made the DB unopenable. Surfaced
+      by compaction's heavy page reuse; reproduced with no compaction.
+    - **Prereq bug B (commit over-poison) — folded here** (its only clean
+      repro is the Inv-M4 compaction test): `tx.Commit` poisoned the handle
+      on *any* `pager.Commit` error, including the fully-reversible
+      assembly-phase `ErrTxTooLarge`/`ErrDBFull` (no pwrite, `AbortTx`
+      restores). Fix conforms code to `api-surface.md §ErrPoisoned` (poison is
+      publication-phase only). Required for Inv-M4's halving to recover rather
+      than brick the handle; also fixes a latent over-poison for a large
+      single-tx delete near the buffer limit.
 - **12.6** Chunk close-out. *(pending)*
 
 ## Cross-chunk concerns

@@ -400,6 +400,17 @@ func (p *Pager) discardTxSnapshot() {
 // HighWaterMark returns the current write-tx HighWaterMark snapshot.
 func (p *Pager) HighWaterMark() uint64 { return p.highWaterMark }
 
+// NumFreePages returns the current count of bitmap-free data pages (pages
+// available to AllocPage without reclamation or file extension). Used by
+// incremental compaction to size its evacuation band against the free space
+// actually reachable this transaction (after ReclaimFreeSpace).
+func (p *Pager) NumFreePages() uint64 {
+	if p.bitmap == nil {
+		return 0
+	}
+	return p.bitmap.NumFree()
+}
+
 // PendingAllocs / PendingFrees / RetiredPages expose the tx-scoped
 // bookkeeping for the commit-step-0 caller (chunk 1.8). Returned
 // slices/maps are owned by the pager — callers must not mutate.
@@ -448,6 +459,30 @@ func (p *Pager) SetLaggingReaderCallback(cb func(LaggingReaderInfo) LaggingReade
 // that recomputes min(coord.OldestReaderTxnID(), prevMeta.TxnID).
 func (p *Pager) SetReclamationBoundRefresh(refresh func() uint64) {
 	p.refreshReclamationBound = refresh
+}
+
+// ReclaimFreeSpace eagerly reclaims every RPL segment now below the
+// reclamation bound, returning their pages to the allocation bitmap, and
+// returns the number of pages reclaimed. It first refreshes the bound IF a
+// refresh hook is wired (SetReclamationBoundRefresh — only with a LaggingReader
+// configured); otherwise it uses the bound seeded at BeginTx
+// (min(oldestReader, prevMeta.TxnID)), the same gate AllocPage's lazy reclaim
+// uses. Normally reclamation is lazy —
+// AllocPage triggers it only when the bitmap is exhausted. Incremental
+// compaction calls this at the start of its transaction so that (a) already-
+// reclaimable free space is available to relocate *into* before the first
+// AllocPage (avoiding a needless file extension), and (b) the previous pass's
+// relocated-from pages — now committed under an older TxnID than the bound —
+// are returned to the bitmap promptly, so a trailing run of them tail-refunds
+// at this commit rather than waiting for a future bitmap-exhaustion. It is
+// reader-safe: reclaimRPL only frees segments strictly below the bound, the
+// same gate AllocPage uses. Must be called on the writer pager within a
+// transaction (after BeginTx).
+func (p *Pager) ReclaimFreeSpace() int {
+	if p.refreshReclamationBound != nil {
+		p.reclamationBound = p.refreshReclamationBound()
+	}
+	return p.reclaimRPL()
 }
 
 // FileSize returns the file size observed at Open. Used to bound reads

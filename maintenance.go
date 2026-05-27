@@ -90,6 +90,12 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 	// Scrubbing). Read-only; verifies a batch of page footers and reports
 	// (never repairs) any mismatch.
 	db.maintScrubChecksums(ctx)
+
+	// Task 4 — incremental compaction (background-maintenance.md §Incremental
+	// Compaction). When the contiguous-allocation fragmentation rate exceeds
+	// CompactionThreshold, relocates a budgeted batch of high-watermark pages
+	// to consolidate free space (Inv-M4: never surfaces ErrTxTooLarge).
+	db.maintCompact(ctx)
 }
 
 // maintScrubChecksums verifies the xxhash64 footers of a bounded batch of

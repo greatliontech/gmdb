@@ -229,9 +229,23 @@ func (e *IndexFingerprintError) Unwrap() error { return ErrIndexFingerprintMisma
 
 `ErrPoisoned` is returned by `Begin` (and therefore `Update`) after
 a previous write transaction's commit failed in the publication
-phase: step-3 pwrite of the new meta page, or step-4 fdatasync of
-the meta. See `pager-slab.md §Commit Write Ordering` for the
-four-step protocol; the publication boundary is step 3.
+phase: step-1 data/bitmap/RPL pwrites onward — through step-3 pwrite
+of the new meta page and step-4 fdatasync. See `pager-slab.md §Commit
+Write Ordering` for the four-step protocol; the publication boundary
+is the first pwrite (step 1).
+
+A failure in the **assembly phase** (step 0: tail refund, loose
+migration, RPL-segment slab allocation and file extension) does NOT
+poison: no pwrite has occurred, `AbortTx` fully restores the pre-tx
+in-memory state, and the handle stays usable. The only commit errors
+that can originate in assembly are `ErrTxTooLarge` (RPL-segment slab
+exceeds `MaxTxBufferBytes`) and `ErrDBFull` (file extension hits
+`MaxSize`) — step 1+ performs no allocation — so `Commit` returning
+either leaves the handle recoverable and retryable (a fresh, smaller
+transaction), never poisoned. This is what lets background
+compaction's Inv-M4 budget-halving retry an over-large batch, and a
+single large delete whose RPL append overruns the budget recover
+cleanly.
 
 After such a failure, the on-disk active meta may have advanced
 to the new tree (step-3 success + step-4 EIO leaves the new meta
