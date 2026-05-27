@@ -5,6 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // Convenience IndexDecl factory for tests.
@@ -1070,5 +1073,105 @@ func TestCreateKeyspaceWithIndexDoesNotPolluteListKeyspaces(t *testing.T) {
 	}
 	if len(names) != 1 || names[0] != "users" {
 		t.Errorf("ListKeyspaces: got %v want [users]", names)
+	}
+}
+
+// TestKind2DescriptorsHaveDistinctIndexRegistryRoots enforces the
+// "exactly one parent" half of the chunk-7.1 indexing.md entailed
+// invariant: every engine-internal Kind=2 keyspace descriptor is
+// reachable via exactly one user keyspace's index-registry sub-tree —
+// never via two distinct parents. Per-keyspace IndexRegistryRoot
+// allocation makes this structurally true (each CreateKeyspace /
+// CreateSetKeyspace allocates its own registry sub-tree root), so the
+// uniqueness of non-zero IndexRegistryRoot page IDs across all
+// top-level descriptors is the observable proxy: two parents sharing
+// a root would mean a Kind=2 descriptor reachable via both.
+//
+// This fixture exercises the Create path (CreateKeyspace /
+// CreateSetKeyspace with indexes); it pins root uniqueness at
+// allocation. A bad descriptor copy in a later refactor that mutates
+// IndexRegistryRoot copies (DeleteKeyspace's three-subtree retirement,
+// RebuildIndex/DropIndex's registry-root rewrites) would violate the
+// same proxy — caught here once a fixture exercises those ops, and
+// across all on-disk descriptors by the chunk-11 Check(CheckIndexes)
+// full walk.
+//
+// The companion TestCreateKeyspaceWithIndexDoesNotPolluteListKeyspaces
+// + the forge test TestListKeyspacesFiltersKindIndexInternal cover the
+// other half ("never via the top-level keyspace B+tree"). This walks
+// the persisted keyspace B+tree (not the cached handles) so a
+// descriptor mutated on disk but not in-cache is still caught.
+func TestKind2DescriptorsHaveDistinctIndexRegistryRoots(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	// Three indexed parents of both kinds + one index-free keyspace
+	// (IndexRegistryRoot == 0, must not register as a "duplicate").
+	if _, err := tx.CreateKeyspace("users", testDecl("by_owner", "owner"), testDecl("by_repo", "repo")); err != nil {
+		t.Fatalf("CreateKeyspace users: %v", err)
+	}
+	if _, err := tx.CreateKeyspace("repos", testDecl("by_org", "org")); err != nil {
+		t.Fatalf("CreateKeyspace repos: %v", err)
+	}
+	if _, err := tx.CreateSetKeyspace("subs", nil, testDecl("by_tag", "tag")); err != nil {
+		t.Fatalf("CreateSetKeyspace subs: %v", err)
+	}
+	if _, err := tx.CreateKeyspace("plain"); err != nil {
+		t.Fatalf("CreateKeyspace plain: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Walk the persisted top-level keyspace B+tree, collecting every
+	// descriptor's IndexRegistryRoot. The top-level tree holds only the
+	// Kind=0/1 parents (Kind=2 internals live in the registry sub-trees),
+	// so this is exactly the set of "parents" whose roots must be unique.
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	defer rtx.Rollback()
+	cfg := rtx.pgr.Config()
+	meta := rtx.meta
+
+	seen := map[uint64]string{} // IndexRegistryRoot -> first keyspace seen
+	var indexed, total int
+	walkErr := btree.WalkKV(rtx.pgr, cfg, meta.KeyspaceRoot, meta.HighWaterMark, func(k, v []byte) error {
+		total++
+		name := string(k)
+		d := page.DecodeKeyspaceDescriptor(v)
+		if d.IndexRegistryRoot == 0 {
+			return nil
+		}
+		indexed++
+		if prev, dup := seen[d.IndexRegistryRoot]; dup {
+			t.Errorf("keyspaces %q and %q share IndexRegistryRoot %d — Kind=2 one-parent-reachability violated",
+				prev, name, d.IndexRegistryRoot)
+		}
+		seen[d.IndexRegistryRoot] = name
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("WalkKV: %v", walkErr)
+	}
+	// Guard against a vacuous pass: the three indexed parents must each
+	// have contributed a distinct non-zero root, and the walk must have
+	// seen all four top-level keyspaces (no Kind=2 pollution).
+	if indexed != 3 {
+		t.Errorf("indexed parents with non-zero IndexRegistryRoot = %d, want 3", indexed)
+	}
+	if total != 4 {
+		t.Errorf("top-level descriptors walked = %d, want 4 (Kind=2 internals must not appear here)", total)
+	}
+	if len(seen) != 3 {
+		t.Errorf("distinct non-zero IndexRegistryRoots = %d, want 3", len(seen))
 	}
 }
