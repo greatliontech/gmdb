@@ -610,11 +610,25 @@ func (c *checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 // Returns ok=false only when the caller stopped iterating.
 func (c *checker) walkRPL(hwm uint64) (bitset, bool) {
 	pending := newBitset(hwm)
-	id := c.meta.RPLHeadPage
+	head := c.meta.RPLHeadPage
+	if head == 0 {
+		return pending, true
+	}
+	// Bound the walk by the authoritative RPLTailPage, NOT by OlderSegment==0:
+	// reclaimRPL drains tail segments without rewriting the new tail's
+	// OlderSegment, which then dangles at a reclaimed/reused page. RPLTailPage
+	// is recomputed on every commit, so it is the correct terminator; a head
+	// with a zero tail is corrupt meta.
+	tail := c.meta.RPLTailPage
+	if tail == 0 {
+		return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLTailMissing", PageID: head,
+			Message: fmt.Sprintf("RPL head %d set but tail page is 0", head)})
+	}
 	maxSegs := c.meta.RPLEntryCount + 1
 	visited := make(map[uint64]struct{})
 	var segs uint64
-	for id != 0 {
+	id := head
+	for {
 		if id >= hwm {
 			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentOutOfRange", PageID: id,
 				Message: fmt.Sprintf("RPL segment page %d >= HighWaterMark %d", id, hwm)})
@@ -638,7 +652,15 @@ func (c *checker) walkRPL(hwm uint64) (bitset, bool) {
 			pending.setIfInRange(pid)
 		}
 		segs++
-		id = seg.OlderSegment
+		if id == tail {
+			break // authoritative tail — do not follow the (possibly dangling) OlderSegment
+		}
+		next := seg.OlderSegment
+		if next == 0 {
+			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLChainEndedBeforeTail", PageID: id,
+				Message: fmt.Sprintf("RPL chain from head %d ended before tail %d", head, tail)})
+		}
+		id = next
 	}
 	return pending, true
 }

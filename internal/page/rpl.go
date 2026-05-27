@@ -8,7 +8,9 @@ import "fmt"
 //
 //	  0..7:   Common 8-byte page header (Type = TypeRPLSegment, Count = N entries)
 //	  8..15:  TxnID         uint64  — transaction that retired these pages
-//	 16..23:  OlderSegment  uint64  — page ID of the next older segment (0 = tail)
+//	 16..23:  OlderSegment  uint64  — page ID of the next older segment (0 only
+//	          on a never-reclaimed original tail; the authoritative tail is
+//	          meta.RPLTailPage — see free-space.md §Retired Page Log)
 //	 24..24+8N: PageID array (N uint64 entries)
 //
 // Total per-segment overhead: 24 bytes. The page-header Count field

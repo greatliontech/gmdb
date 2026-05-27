@@ -368,11 +368,23 @@ func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
 	// stale RPLHeadPage from a partial pwrite would be one excess
 	// segment); cycles are caught by the visited-set, so the count
 	// bound is a belt-and-suspenders second line of defense.
+	// The chain is bounded by the authoritative tail pointer, NOT by
+	// OlderSegment == 0: reclaimRPL drains whole segments from the tail
+	// (oldest) without rewriting the new tail's on-disk OlderSegment, so that
+	// pointer dangles at a reclaimed (and possibly reused) page. Walking it
+	// would read a non-segment page as a segment. RPLTailPage is recomputed on
+	// every commit (buildNewMeta) from the surviving chain, so it is the
+	// correct terminator. head and tail are both zero or both non-zero
+	// (buildNewMeta); a head with no tail is corrupt meta.
+	tail := m.RPLTailPage
+	if tail == 0 {
+		return nil, fmt.Errorf("pager: RPL head %d set but tail is 0: %w", m.RPLHeadPage, ErrCorrupted)
+	}
 	maxSegs := m.RPLEntryCount + 1
 	visited := make(map[uint64]struct{}, maxSegs)
 	var headFirst []RPLSegmentRef
 	id := m.RPLHeadPage
-	for id != 0 {
+	for {
 		if _, seen := visited[id]; seen {
 			return nil, fmt.Errorf("pager: RPL chain cycle at page %d: %w", id, ErrCorrupted)
 		}
@@ -385,15 +397,22 @@ func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
 		if !ok {
 			return nil, fmt.Errorf("pager: RPL segment at page %d malformed: %w", id, ErrCorrupted)
 		}
-		if seg.OlderSegment == id {
-			return nil, fmt.Errorf("pager: RPL segment at page %d is self-referential: %w", id, ErrCorrupted)
-		}
 		headFirst = append(headFirst, RPLSegmentRef{
 			PageID: id,
 			TxnID:  seg.TxnID,
 			Count:  uint32(len(seg.PageIDs)),
 		})
-		id = seg.OlderSegment
+		if id == tail {
+			break // authoritative tail — do not follow the (possibly dangling) OlderSegment
+		}
+		next := seg.OlderSegment
+		if next == 0 {
+			return nil, fmt.Errorf("pager: RPL chain from head %d ended before tail %d: %w", m.RPLHeadPage, tail, ErrCorrupted)
+		}
+		if next == id {
+			return nil, fmt.Errorf("pager: RPL segment at page %d is self-referential: %w", id, ErrCorrupted)
+		}
+		id = next
 	}
 	// Reverse: head-first → tail-first.
 	for i, j := 0, len(headFirst)-1; i < j; i, j = i+1, j-1 {

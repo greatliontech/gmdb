@@ -99,6 +99,23 @@ Invariant: kind=clause-explicit;
     observe a segment whose entries no longer match its `TxnID`,
     misclassifying still-pinned pages as reclaimable.
 
+Invariant: kind=entailed;
+  property=Every walk of the persisted RPL chain (the in-memory
+    rebuild at Open, `Check`'s RPL validator) traverses exactly the
+    live segments `RPLHeadPage … RPLTailPage` and terminates *at*
+    `RPLTailPage` — never following the tail segment's `OlderSegment`,
+    which dangles at a reclaimed page once any tail segment has been
+    reclaimed. `OlderSegment == 0` is not the terminator;
+  from=entailed: §RPL Reclamation advances `RPLTailPage` and leaves the
+    new tail's `OlderSegment` unrewritten, but no clause states the
+    walk terminator is `RPLTailPage` rather than `OlderSegment == 0`;
+  violation=After any tail segment is reclaimed, the new tail's
+    `OlderSegment` points at a freed page; once that page is reused
+    (any bitmap-exhausting workload — delete-heavy churn, or background
+    compaction), an `OlderSegment == 0`-terminated walk reads it as a
+    segment → `ErrCorrupted` at Open (the database becomes UNOPENABLE)
+    / `RPLSegmentMalformed` at Check, with every other invariant intact.
+
 Invariant: kind=clause-explicit;
   property=A **loose** page (CoW'd then freed within the same
     transaction) is reusable within that transaction only and
@@ -222,7 +239,7 @@ RPL Segment Page
 | Page Header (8 bytes)    |  Count = N (number of PageID entries)
 +--------------------------+
 | TxnID          | uint64  |  transaction that retired these pages
-| OlderSegment   | uint64  |  page ID of the next older segment (0 = tail)
+| OlderSegment   | uint64  |  page ID of the next older segment (0 only on the original tail; see below)
 +--------------------------+
 | PageID 0       | uint64  |
 | PageID 1       | uint64  |
@@ -244,6 +261,19 @@ Meta stores `RPLHeadPage` (newest) and `RPLTailPage` (oldest).
 Segments are singly linked head → tail via `OlderSegment`. The
 tail-toward-head direction is maintained as an in-memory segment
 list rebuilt at Open.
+
+**`RPLTailPage` is the authoritative tail boundary, NOT `OlderSegment
+== 0`.** Reclamation drains whole segments from the tail and advances
+`RPLTailPage`, but does *not* rewrite the surviving new tail's on-disk
+`OlderSegment` (that would mean CoW-ing an immutable prior-snapshot
+segment page on every reclaim). So once any tail segment has been
+reclaimed, the new tail's `OlderSegment` points at a now-reclaimed —
+and possibly reused — page; it is stale and MUST NOT be followed. Every
+consumer that walks the chain (the in-memory rebuild at Open, `Check`'s
+RPL validator) walks `RPLHeadPage → … → RPLTailPage` and stops *at*
+`RPLTailPage`, never following the tail's `OlderSegment`. `OlderSegment
+== 0` holds only for a chain whose original tail has never been
+reclaimed; it is not a safe walk terminator.
 
 ### RPL append (at commit time)
 
@@ -279,7 +309,10 @@ At the start of a write transaction (or lazily on first
 3. For each segment with `TxnID < reclamationBound`: set bitmap
    bits for all PageIDs in the segment.
 4. When a segment is fully reclaimed, free the segment page itself,
-   remove it from the in-memory list, advance `RPLTailPage`.
+   remove it from the in-memory list, advance `RPLTailPage` to the new
+   oldest segment. The new tail's on-disk `OlderSegment` is left as-is
+   (it now dangles at the reclaimed page) — `RPLTailPage` is the
+   authoritative boundary, so the dangling link is never followed.
 5. Update `RPLEntryCount` and `NumFreePages`.
 
 Reclamation is oldest-first so the RPL shrinks from the tail.
@@ -332,8 +365,12 @@ head. To avoid full-chain traversal, the writer maintains an
 in-memory `[]uint64` of segment page IDs ordered tail (index 0) to
 head (last).
 
-Rebuilt at `Open()` by walking the on-disk chain head → tail then
-reversing. O(RPL segments) — typically tens to low hundreds.
+Rebuilt at `Open()` by walking the on-disk chain `RPLHeadPage → … →
+RPLTailPage` (following `OlderSegment`, stopping *at* `RPLTailPage` —
+never following the tail's possibly-dangling link) then reversing.
+O(RPL segments) — typically tens to low hundreds. A chain that reaches
+`OlderSegment == 0` before hitting `RPLTailPage`, or exceeds the
+`RPLEntryCount` bound, is corrupt meta and aborts the Open.
 
 Maintained incrementally:
 
