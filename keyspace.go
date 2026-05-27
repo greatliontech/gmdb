@@ -645,28 +645,30 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	// unique-probe failure aborts cleanly without partial state.
 	var oldValue []byte
 	existed := false
-	if ks.desc.Root != 0 {
-		if len(ks.indexes) > 0 {
-			v, found, err := btree.Get(ks.tx.pgr, cfg, ks.desc.Root, key)
-			if err != nil {
-				return mapBtreeErr(err)
-			}
-			existed = found
-			if found {
-				// Copy out of the (potentially mmap-borrowed) value
-				// slice so the extractor's view stays valid across
-				// subsequent btree mutations.
-				oldValue = make([]byte, len(v))
-				copy(oldValue, v)
-			}
-		} else {
-			exists, err := btree.Has(ks.tx.pgr, cfg, ks.desc.Root, key)
-			if err != nil {
-				return mapBtreeErr(err)
-			}
-			existed = exists
+	indexed := len(ks.indexes) > 0
+	if ks.desc.Root != 0 && indexed {
+		// Indexed keyspaces need the OLD value (not just existence) to
+		// diff index entries, so they read it via btree.Get; existence
+		// falls out of that read.
+		v, found, err := btree.Get(ks.tx.pgr, cfg, ks.desc.Root, key)
+		if err != nil {
+			return mapBtreeErr(err)
+		}
+		existed = found
+		if found {
+			// Copy out of the (potentially mmap-borrowed) value
+			// slice so the extractor's view stays valid across
+			// subsequent btree mutations.
+			oldValue = make([]byte, len(v))
+			copy(oldValue, v)
 		}
 	}
+	// For an un-indexed keyspace `existed` is not known yet — the single
+	// btree.PutReportExisting descent below reports it, collapsing the
+	// chunk-7 redundant btree.Has probe + btree.Put into one descent.
+	// Index maintenance is a no-op with no indexes, so invoking it with
+	// the provisional existed=false on that path is harmless.
+	//
 	// Snapshot pinned state per chunk-7.6 H-2 fix: applyIndexMaintenance
 	// restores on its own internal failure, but a subsequent row
 	// btree.Put failure must also revert the (now-mutated) pinned
@@ -677,7 +679,13 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	if err := ks.applyIndexMaintenanceOnPut(key, oldValue, value, existed); err != nil {
 		return err
 	}
-	newRoot, err := btree.Put(ks.tx.pgr, cfg, ks.desc.Root, key, value)
+	var newRoot uint64
+	var err error
+	if indexed {
+		newRoot, err = btree.Put(ks.tx.pgr, cfg, ks.desc.Root, key, value)
+	} else {
+		newRoot, existed, err = btree.PutReportExisting(ks.tx.pgr, cfg, ks.desc.Root, key, value)
+	}
 	if err != nil {
 		restoreIndexes(ks.indexes, rowSnap)
 		return mapBtreeErr(err)

@@ -384,6 +384,65 @@ func TestSetKeyspacePutTriggersPromotion(t *testing.T) {
 	}
 }
 
+// TestSetKeyspacePutDuplicateIntoNestedTreeIsNoOp pins the rewired
+// nested-tree Put path (putIntoNestedTree now uses btree.InsertIfAbsent
+// instead of Has-then-Put). A re-Put of an existing member after
+// promotion must report added=false, leave CountValues unchanged, AND
+// not churn the tree: the SetKeyspace data-tree Root is unchanged. A
+// CoW (which the issue's discarded always-write PutReportExisting sketch
+// would have done) would change Root and orphan the rewritten
+// nested-tree pages — the exact leak this rewire avoids.
+func TestSetKeyspacePutDuplicateIntoNestedTreeIsNoOp(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	const N = 200 // forces promotion to a nested tree (subpage threshold ~64)
+	mkVal := func(i int) []byte {
+		v := make([]byte, 30)
+		v[0] = byte(i / 256)
+		v[1] = byte(i % 256)
+		return v
+	}
+	for i := range N {
+		added, err := sks.Put([]byte("topic"), mkVal(i))
+		if err != nil || !added {
+			t.Fatalf("Put %d: added=%v err=%v", i, added, err)
+		}
+	}
+	if e, found, err := getEntryForTest(sks, sks.builderCfg()); err != nil || !found || !e.IsNestedTree() {
+		t.Fatalf("precondition: set not promoted to nested tree (found=%v err=%v)", found, err)
+	}
+
+	rootBefore := sks.desc.Root
+	// Re-Put an existing member (index 100): no-op on the nested tree.
+	added, err := sks.Put([]byte("topic"), mkVal(100))
+	if err != nil {
+		t.Fatalf("duplicate Put: %v", err)
+	}
+	if added {
+		t.Errorf("duplicate Put into nested tree: added=true, want false")
+	}
+	if sks.desc.Root != rootBefore {
+		t.Errorf("duplicate Put churned the tree (Root %d -> %d); nested-tree duplicate must be a no-op", rootBefore, sks.desc.Root)
+	}
+	if count, _ := sks.CountValues([]byte("topic")); count != uint64(N) {
+		t.Errorf("CountValues after duplicate=%d, want %d", count, N)
+	}
+
+	// A genuinely new member is still added and grows the count.
+	added, err = sks.Put([]byte("topic"), mkVal(N))
+	if err != nil || !added {
+		t.Fatalf("new-member Put: added=%v err=%v", added, err)
+	}
+	if count, _ := sks.CountValues([]byte("topic")); count != uint64(N+1) {
+		t.Errorf("CountValues after new member=%d, want %d", count, N+1)
+	}
+}
+
 // Test helper: read the cell for sks's only key via btree.GetEntry.
 func getEntryForTest(sks *SetKeyspace, cfg page.Config) (page.LeafEntry, bool, error) {
 	return getEntryForTestKey(sks, cfg, []byte("topic"))

@@ -107,55 +107,106 @@ type pathFrame struct {
 // heuristics + table layout; btree treats leaves as opaque past
 // the LeafReader / LeafBuilder interface.
 func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint64, error) {
+	newRoot, _, err := putReportCore(pw, cfg, rootID, key, value, false)
+	return newRoot, err
+}
+
+// PutReportExisting is Put that additionally reports whether key was
+// already present (a replace) rather than newly inserted — determined
+// during the same single descent, so a caller that would otherwise do
+// Has-then-Put collapses two descents into one with no TOCTOU window.
+// The value is always written (replacing any existing value), exactly
+// like Put.
+func PutReportExisting(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (newRoot uint64, existed bool, err error) {
+	return putReportCore(pw, cfg, rootID, key, value, false)
+}
+
+// InsertIfAbsent inserts key=value only when key is absent and reports
+// whether the insert happened (added). When key is already present it
+// is a no-op: no page is allocated or written and the original rootID
+// is returned with added=false. Single descent. This is the
+// set-membership primitive — re-writing an existing member would
+// needlessly CoW-churn pages, so unlike PutReportExisting it does not
+// write on present (which would also orphan the rewritten pages if the
+// caller discards the new root).
+func InsertIfAbsent(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (newRoot uint64, added bool, err error) {
+	newRoot, existed, err := putReportCore(pw, cfg, rootID, key, value, true)
+	return newRoot, !existed, err
+}
+
+// putReportCore is the shared single-descent implementation behind Put,
+// PutReportExisting, and InsertIfAbsent. It returns the new rootID and
+// whether key already existed. When insertOnly is true and key is
+// present it returns (rootID, true, nil) WITHOUT allocating or writing
+// any page (the InsertIfAbsent no-op-on-present contract); otherwise it
+// performs the standard replace-or-insert.
+func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte, insertOnly bool) (newRoot uint64, existed bool, err error) {
 	if rootID == 0 {
-		return putEmpty(pw, cfg, key, value)
+		nr, e := putEmpty(pw, cfg, key, value)
+		return nr, false, e
 	}
 
-	// Phase 1: descend, recording the path.
+	// Phase 1: descend, recording the path. Retain the leaf buffer for
+	// the insertOnly existence peek below.
 	path := make([]pathFrame, 0, 8)
+	var leafBuf []byte
 	cur := rootID
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf, err := pw.Page(cur)
-		if err != nil {
-			return 0, err
+		buf, e := pw.Page(cur)
+		if e != nil {
+			return 0, false, e
 		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
+			leafBuf = buf
 			break
 		}
 		if typ != page.TypeBranch {
-			return 0, fmt.Errorf("%w: page %d has unexpected type %d during Put descent", ErrCorrupted, cur, typ)
+			return 0, false, fmt.Errorf("%w: page %d has unexpected type %d during Put descent", ErrCorrupted, cur, typ)
 		}
-		if err := validateBranchPage(buf, cfg, cur); err != nil {
-			return 0, err
+		if e := validateBranchPage(buf, cfg, cur); e != nil {
+			return 0, false, e
 		}
 		i := page.BranchSearch(buf, cfg, key)
 		next := page.BranchChildAt(buf, cfg, i)
 		if next == 0 {
-			return 0, fmt.Errorf("%w: null child pointer in branch %d during Put descent", ErrCorrupted, cur)
+			return 0, false, fmt.Errorf("%w: null child pointer in branch %d during Put descent", ErrCorrupted, cur)
 		}
 		path = append(path, pathFrame{pageID: cur, descentIdx: i})
 		cur = next
 	}
 	if len(path) > MaxTreeDepth {
-		return 0, ErrTreeTooDeep
+		return 0, false, ErrTreeTooDeep
 	}
 	leafID := cur
+
+	// insertOnly fast path: when key is already present, skip the write
+	// entirely (no CoW, no alloc) — InsertIfAbsent's no-op-on-present
+	// contract. Checked on the original leaf before any mutation.
+	if insertOnly {
+		r := page.NewLeafReader(leafBuf, cfg)
+		if e := r.Validate(); e != nil {
+			return 0, false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, leafID, e)
+		}
+		if _, _, found := r.SearchLeaf(key); found {
+			return rootID, true, nil
+		}
+	}
 
 	// Phase 2: leaf mutation. CoW the leaf, decode entries (deep-
 	// copy), apply insert/replace, re-build into the CoW
 	// destination (or split into two).
 	leftID, err := pw.AllocPage()
 	if err != nil {
-		return 0, fmt.Errorf("btree: alloc CoW leaf: %w", err)
+		return 0, false, fmt.Errorf("btree: alloc CoW leaf: %w", err)
 	}
 	leftBuf, err := pw.CoW(leafID, leftID)
 	if err != nil {
-		return 0, fmt.Errorf("btree: CoW leaf: %w", err)
+		return 0, false, fmt.Errorf("btree: CoW leaf: %w", err)
 	}
 	entries, err := readLeafEntriesDeepCopy(leftBuf, cfg, leafID)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	// Determine if the new value needs overflow promotion.
@@ -165,14 +216,15 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 	newEntry, err := buildPutEntry(pw, cfg, key, value)
 	if err != nil {
 		_ = pw.FreePage(leftID)
-		return 0, err
+		return 0, false, err
 	}
 
 	// insertOrReplaceLeaf returns the displaced entry (zero-valued
-	// on insert) so we can free its overflow chain after the new
-	// leaf is committed.
+	// on insert) and whether the key existed (replace vs insert), so we
+	// can free its overflow chain after the new leaf is committed and
+	// report existence to PutReportExisting / InsertIfAbsent.
 	var displaced page.LeafEntry
-	entries, displaced = insertOrReplaceLeaf(entries, newEntry)
+	entries, displaced, existed = insertOrReplaceLeaf(entries, newEntry)
 
 	// Helper: rollback the freshly-allocated new chain (if any) on
 	// failure paths below. Mirrors the AllocPage→CoW→mutate→FreePage
@@ -210,14 +262,18 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 		if err := freeOverflowChainIfPresent(pw, cfg, displaced); err != nil {
 			_ = pw.FreePage(leftID)
 			rollbackNewChain()
-			return 0, err
+			return 0, false, err
 		}
 		if err := pw.FreePage(leafID); err != nil {
 			_ = pw.FreePage(leftID)
 			rollbackNewChain()
-			return 0, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
+			return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
 		}
-		return ascendNoSplit(pw, cfg, path, leftID)
+		nr, e := ascendNoSplit(pw, cfg, path, leftID)
+		if e != nil {
+			return 0, false, e
+		}
+		return nr, existed, nil
 	}
 
 	// Split required. Since the new entry has been promoted to
@@ -232,7 +288,7 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 	if len(entries) < 2 {
 		_ = pw.FreePage(leftID)
 		rollbackNewChain()
-		return 0, ErrKeyTooLarge
+		return 0, false, ErrKeyTooLarge
 	}
 	mid := len(entries) / 2
 
@@ -246,7 +302,7 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 		if !b.AddEntry(e) {
 			_ = pw.FreePage(leftID)
 			rollbackNewChain()
-			return 0, ErrKeyTooLarge
+			return 0, false, ErrKeyTooLarge
 		}
 	}
 	b.Finish()
@@ -256,14 +312,14 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 	if err != nil {
 		_ = pw.FreePage(leftID)
 		rollbackNewChain()
-		return 0, fmt.Errorf("btree: alloc split-right leaf: %w", err)
+		return 0, false, fmt.Errorf("btree: alloc split-right leaf: %w", err)
 	}
 	rightBuf, err := pw.AllocSlab(rightID)
 	if err != nil {
 		_ = pw.FreePage(leftID)
 		_ = pw.FreePage(rightID)
 		rollbackNewChain()
-		return 0, fmt.Errorf("btree: alloc split-right buf: %w", err)
+		return 0, false, fmt.Errorf("btree: alloc split-right buf: %w", err)
 	}
 	rb := page.NewLeafBuilder(rightBuf, cfg)
 	for _, e := range entries[mid:] {
@@ -271,7 +327,7 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 			_ = pw.FreePage(leftID)
 			_ = pw.FreePage(rightID)
 			rollbackNewChain()
-			return 0, ErrKeyTooLarge
+			return 0, false, ErrKeyTooLarge
 		}
 	}
 	rb.Finish()
@@ -284,18 +340,22 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 		_ = pw.FreePage(leftID)
 		_ = pw.FreePage(rightID)
 		rollbackNewChain()
-		return 0, err
+		return 0, false, err
 	}
 	if err := pw.FreePage(leafID); err != nil {
 		_ = pw.FreePage(leftID)
 		_ = pw.FreePage(rightID)
 		rollbackNewChain()
-		return 0, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
+		return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
 	}
 
 	// Separator: shortest S with leftLast < S <= rightFirst.
 	sep := page.ShortestSeparator(entries[mid-1].Key, entries[mid].Key)
-	return ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
+	nr, e := ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
+	if e != nil {
+		return 0, false, e
+	}
+	return nr, existed, nil
 }
 
 // buildPutEntry constructs the LeafEntry for a Put: an inline entry
@@ -403,7 +463,7 @@ func readLeafEntriesDeepCopy(buf []byte, cfg page.Config, pageID uint64) ([]page
 // stale Flags / OverflowPage / TotalLen from the old entry doesn't
 // survive into the rebuilt leaf; the displaced entry is returned
 // separately so the chain-free path runs on the OLD overflow info.
-func insertOrReplaceLeaf(entries []page.LeafEntry, newEntry page.LeafEntry) ([]page.LeafEntry, page.LeafEntry) {
+func insertOrReplaceLeaf(entries []page.LeafEntry, newEntry page.LeafEntry) ([]page.LeafEntry, page.LeafEntry, bool) {
 	lo, hi := 0, len(entries)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -416,13 +476,13 @@ func insertOrReplaceLeaf(entries []page.LeafEntry, newEntry page.LeafEntry) ([]p
 		default:
 			displaced := entries[mid]
 			entries[mid] = newEntry
-			return entries, displaced
+			return entries, displaced, true
 		}
 	}
 	entries = append(entries, page.LeafEntry{})
 	copy(entries[lo+1:], entries[lo:])
 	entries[lo] = newEntry
-	return entries, page.LeafEntry{}
+	return entries, page.LeafEntry{}, false
 }
 
 // ascendNoSplit walks the path in reverse, CoWing each branch and

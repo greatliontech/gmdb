@@ -575,7 +575,8 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error) {
 // the result exceeds SubpagePromotionThreshold, promotes to a
 // nested B+tree (chunk 6.4 PromoteSubpageToNestedTree).
 // On an existing key with nested-tree cell: inserts into the nested
-// tree via btree.Put; updates the parent cell's NestedCount.
+// tree via btree.InsertIfAbsent (one descent, a no-op if the value is
+// already a member); on insert, updates the parent cell's NestedCount.
 //
 // Fixed-size SetKeyspace: a wrong-length value returns
 // ErrValueSizeMismatch BEFORE any tree mutation.
@@ -763,21 +764,22 @@ func (ks *SetKeyspace) putIntoSubpage(cfg page.Config, key, value []byte, e page
 }
 
 // putIntoNestedTree handles Put when the cell is a nested-tree-ref.
-// Inserts the value into the nested tree via btree.Put; on
+// Inserts the value into the nested tree via btree.InsertIfAbsent (a
+// single descent that is a true no-op on an existing member); on
 // duplicate returns (false, nil) without mutation. On success,
 // updates the parent cell's NestedRoot + NestedCount.
 func (ks *SetKeyspace) putIntoNestedTree(cfg page.Config, key, value []byte, e page.LeafEntry) (bool, error) {
-	// Duplicate check via btree.Has BEFORE the Put.
-	exists, err := btree.Has(ks.tx.pgr, cfg, e.NestedRoot, value)
+	// Single-descent insert-if-absent: btree.InsertIfAbsent reports
+	// whether the value was newly added and, when already present, is a
+	// true no-op (no CoW, no alloc) — so a duplicate set-insert neither
+	// pays a second descent (the old btree.Has + btree.Put) nor orphans
+	// rewritten pages.
+	newNestedRoot, added, err := btree.InsertIfAbsent(ks.tx.pgr, cfg, e.NestedRoot, value, nil)
 	if err != nil {
 		return false, mapBtreeErr(err)
 	}
-	if exists {
+	if !added {
 		return false, nil
-	}
-	newNestedRoot, err := btree.Put(ks.tx.pgr, cfg, e.NestedRoot, value, nil)
-	if err != nil {
-		return false, mapBtreeErr(err)
 	}
 	newCell := page.LeafEntry{
 		Flags:       page.CellFlagMultiValue | page.CellFlagNestedTree,

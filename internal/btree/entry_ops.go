@@ -159,7 +159,7 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 		return 0, page.LeafEntry{}, err
 	}
 
-	entries, displaced = insertOrReplaceLeaf(entries, e)
+	entries, displaced, _ = insertOrReplaceLeaf(entries, e)
 
 	// Attempt single-page build.
 	b := page.NewLeafBuilder(leftBuf, cfg)
