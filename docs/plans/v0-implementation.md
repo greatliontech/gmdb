@@ -3,6 +3,19 @@
 Implementation roadmap for bringing the gmdb design (`docs/specs/`)
 to a working v0.
 
+## Status: chunk roadmap COMPLETE (chunks 1–12)
+
+All twelve implementation chunks have landed and passed the adversarial
+review loop; the full module is green under `-race`. Chunk 12
+(background maintenance) was the last. The remaining v0 work is **issue
+burn-down** — the tracked follow-ups in `docs/issues/`, worked
+proactively now that the chunk-start triage gates no longer fire (no
+chunks left to gate on). Each follow-up is resolved as its own
+change set: diagnose → fix → regression test → adversarial review →
+promote-then-delete the issue per the close-out gate in
+`~/.claude/CLAUDE.md` (Issue triage). `.semrel.yaml` remains
+`development: true` (pre-v1; clean breaks still the default).
+
 Derived from every spec in `docs/specs/`. Chunks listed in
 dependency order; sub-chunks `N.1` (planning/triage) and the
 final close-out are fixed anchors per chunk, intermediate sub-

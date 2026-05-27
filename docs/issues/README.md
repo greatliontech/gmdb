@@ -2,9 +2,18 @@
 
 Tracked follow-ups for gmdb. Each entry is a `docs/issues/<slug>.md`
 file with a `Lands:` trigger (a chunk number or a condition). Per
-the workflow in `~/.claude/CLAUDE.md` (Issue triage), this index is
-walked at every chunk-start gate (`N.1`) — entries whose `Lands:`
-resolves to the current chunk are folded, redeferred, or closed.
+the workflow in `~/.claude/CLAUDE.md` (Issue triage), this index was
+walked at every chunk-start gate (`N.1`) during the chunk roadmap —
+entries whose `Lands:` resolved to the current chunk were folded,
+redeferred, or closed.
+
+**The v0 chunk roadmap is now complete** (see
+`docs/plans/v0-implementation.md`), so the chunk-start gates no longer
+fire. This index is now the **active v0 backlog**, worked as a
+proactive burn-down: each follow-up is pulled when chosen (its `Lands:`
+trigger records the original deferral rationale, not a blocker), and
+resolved as its own change set — diagnose → fix → regression test →
+adversarial review → promote-then-delete.
 
 When an issue is resolved, the load-bearing rationale moves inline
 into the spec / code where it belongs (kept-current artifact), all
