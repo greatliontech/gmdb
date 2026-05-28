@@ -430,6 +430,35 @@ column names in declaration order, so adding / removing /
 reordering covering columns triggers
 `ErrIndexFingerprintMismatch`.
 
+**Byte-API return contract.** For the byte-oriented `*Index`
+surface, the bytes `Lookup` / `Range` / `Prefix` / `Get` yield
+as the `value` ARE the encoded covering tuple stored by the
+engine — the NUL-escape multi-column blob produced from
+`IndexEntry.Cover`. The caller recovers the per-column
+`[][]byte` via `DecodeCoveringTuple(value)`. This is symmetric
+with the storage encoder (`encodeIndexKey`) reused for covering
+bytes per the grammar above. An index whose `Covering` is empty
+continues to back-lookup the row keyspace and returns the row's
+stored bytes — the contract switches on whether the
+`IndexDecl.Covering` slice is non-empty, not on any runtime
+flag.
+
+A covering tuple with zero entries (extractor returned
+`Cover=nil` despite a non-empty `Covering` declaration) is
+stored as empty bytes and `Lookup` returns an empty `value`;
+the engine permits this case to keep the storage / read paths
+total. The extractor contract is "one `Cover[i]` per declared
+`CoveringColumn`" — producing fewer is a caller-side contract
+violation, not an engine error.
+
+The typed full-row covering helper (`TypedIndex.CoverValue`,
+see `typed-keyspaces.md §Covering`) is the typed-layer
+specialization: its extractor stores `encode(V)` as the single
+covering column, and `TypedKS.Index` enables an internal
+single-column unwrap so `TypedIndexQuery.Lookup` returns `V`
+without forcing the caller to call `DecodeCoveringTuple`
+themselves.
+
 **Names are semantic anchors, not positional labels.** Covering
 and indexed column names are inputs to the schema hash
 specifically to catch *structural* changes. They do not catch
@@ -489,8 +518,13 @@ and index updates happen atomically in the same `Put` / `Delete`
 finds the row. If a back-lookup ever fails to find its PK
 (engine bug or external corruption), the entry is silently
 skipped from `Lookup`'s iteration and the inconsistency is
-reportable via `Check()`. `LookupKeys` does not probe and
-therefore does not observe the silent-skip case.
+reportable via `Check()`. Two surfaces do **not** probe the row
+keyspace and therefore do **not** observe the silent-skip case:
+`LookupKeys` (raw PK only) and covering-`Lookup` / `Range` /
+`Prefix` / `Get` on an index declaring `Covering` (the value
+comes from the index entry itself — see §Byte-API return
+contract above). On those surfaces an index-versus-row
+inconsistency surfaces only via `Check()`.
 
 ## Write Path: Atomic Index Maintenance
 

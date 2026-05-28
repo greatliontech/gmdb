@@ -172,6 +172,7 @@ var (
     ErrIndexExists              = errors.New("gmdb: index already exists")
     ErrIndexNotFound            = errors.New("gmdb: index not found")
     ErrIndexEncoderIDEmpty      = errors.New("gmdb: typed index encoder returned empty ID() — encoder IDs must be unique non-empty strings")
+    ErrCoveringTupleMalformed   = errors.New("gmdb: covering tuple malformed")
 
     // Keyspace lifecycle.
     ErrKeyspaceAlreadyOpen      = errors.New("gmdb: keyspace already opened in this transaction with a different index set")
@@ -1107,10 +1108,12 @@ type Index struct { /* unexported */ }
 // to a wrapped ErrInvalidOptions and yields nothing — use Prefix
 // for partial-cols semantics (chunk-7.7 user-locked enforcement).
 //
-// value is read from the index's covering bytes when the index
-// covers the requested column set; otherwise via back-lookup to
-// the row keyspace. Iteration ends when no more matches; check
-// Err() for errors.
+// value is the on-disk encoded covering tuple when the index
+// declares Covering — decode via DecodeCoveringTuple to recover
+// the extractor's per-column Cover bytes. When the index has no
+// Covering declaration, value is fetched via back-lookup against
+// the row keyspace and is the row's stored bytes verbatim.
+// Iteration ends when no more matches; check Err() for errors.
 //
 // Intra-transaction consistency: index cursor and back-lookup both
 // read the current transaction's dirty state. Row writes and index
@@ -1134,7 +1137,10 @@ func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
 func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
 
 // Range returns matches in [start, end). Each tuple is a slice of
-// per-column byte slices; nil tuple = open-ended.
+// per-column byte slices; nil tuple = open-ended. Same value
+// semantics as Lookup: covering tuple (decode via
+// DecodeCoveringTuple) when IndexDecl.Covering is non-empty, row
+// bytes via back-lookup otherwise.
 //
 // Partial-tuple bounds are **prefix-bounds**: a start (or end) with
 // fewer columns than the index's declared count acts as the lex-
@@ -1163,12 +1169,15 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
 //
 // Equivalent to Range(prefix, nextPrefix) where nextPrefix is the
 // smallest tuple strictly greater than the prefix; callers using
-// Prefix don't need to compute that upper bound themselves.
+// Prefix don't need to compute that upper bound themselves. Same
+// value semantics as Lookup.
 func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
 
 // Get is shorthand for unique indexes: returns the single (pk, value)
 // or ErrNotFound. Returns ErrIndexNotUnique when called on a
-// non-unique index.
+// non-unique index. Same value semantics as Lookup: covering tuple
+// (decode via DecodeCoveringTuple) when IndexDecl.Covering is
+// non-empty, row bytes via back-lookup otherwise.
 func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error)
 
 // Err returns the first error encountered during the last sequence
@@ -1183,6 +1192,20 @@ func (idx *Index) Err() error
 
 // Stats returns the index's persistent count + tree statistics.
 func (idx *Index) Stats() (IndexStats, error)
+
+// DecodeCoveringTuple decodes the byte slice returned by Lookup /
+// Get / Range / Prefix on an index whose IndexDecl.Covering is
+// non-empty (the byte-API covering return contract — see
+// indexing.md §Covering Indexes). The returned [][]byte has one
+// entry per declared CoveringColumn in declaration order, each
+// carrying the extractor's IndexEntry.Cover[i] bytes verbatim.
+//
+// Returns an error wrapping ErrCoveringTupleMalformed (declared
+// in §Sentinel errors above) if the input does not parse as a
+// NUL-escape column tuple. The wrap is neutral by design: an
+// on-disk-corruption diagnosis goes through Check(), not this
+// decoder's error class.
+func DecodeCoveringTuple(value []byte) ([][]byte, error)
 ```
 
 ## Statistics

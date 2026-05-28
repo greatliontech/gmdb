@@ -661,6 +661,503 @@ func TestIndexedPutWritesCoveringBytes(t *testing.T) {
 	}
 }
 
+// --- Byte-API covering return (indexing.md §Covering Indexes) ---
+
+// TestByteAPIUniqueCoveringLookupReturnsCovering verifies the spec
+// promise (indexing.md §Covering Indexes): for a byte-API index
+// declaring Covering, Lookup returns the encoded covering blob —
+// NOT the row value via back-lookup. The row value and the
+// covering content are deliberately distinct, so a regression
+// reverting to back-lookup would yield the row value and fail
+// this assertion.
+func TestByteAPIUniqueCoveringLookupReturnsCovering(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := &IndexDecl{
+		Name:     "by_color",
+		Columns:  []IndexColumn{{Name: "color"}},
+		Covering: []CoveringColumn{{Name: "size"}},
+		Unique:   true,
+		Extract: func(_, value []byte) []IndexEntry {
+			if len(value) < 2 {
+				return nil
+			}
+			// Cover = [value[1]]; deliberately distinct from row
+			// value (which is value[0..]) so back-lookup vs covering
+			// return are observably different.
+			return []IndexEntry{{
+				Cols:  [][]byte{{value[0]}},
+				Cover: [][]byte{{value[1]}},
+			}}
+		},
+	}
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	rowValue := []byte{0x42, 0xAB, 0xCD, 0xEF}
+	if err := ks.Put([]byte("k1"), rowValue); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	var gotPK, gotVal []byte
+	count := 0
+	for pk, v := range idx.Lookup([]byte{0x42}) {
+		gotPK = append([]byte(nil), pk...)
+		gotVal = append([]byte(nil), v...)
+		count++
+	}
+	if err := idx.Err(); err != nil {
+		t.Fatalf("Lookup Err: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("Lookup count: got %d want 1", count)
+	}
+	if !bytes.Equal(gotPK, []byte("k1")) {
+		t.Errorf("pk: got %q want k1", gotPK)
+	}
+	// The byte-API contract: returned value is the encoded covering
+	// tuple. Cover=[[0xAB]] ⇒ encodeIndexKey([[0xAB]]) = 0xAB 0x00 0x00.
+	wantEncoded := []byte{0xAB, 0x00, 0x00}
+	if !bytes.Equal(gotVal, wantEncoded) {
+		t.Errorf("Lookup value: got %x want %x (expected encoded covering tuple; got the row value via back-lookup?)",
+			gotVal, wantEncoded)
+	}
+	// And DecodeCoveringTuple round-trips to the extractor's Cover.
+	decoded, err := DecodeCoveringTuple(gotVal)
+	if err != nil {
+		t.Fatalf("DecodeCoveringTuple: %v", err)
+	}
+	if len(decoded) != 1 || !bytes.Equal(decoded[0], []byte{0xAB}) {
+		t.Errorf("decoded covering: got %x want [[0xAB]]", decoded)
+	}
+	// Sanity: the returned value is NOT the row value (would imply
+	// back-lookup regression).
+	if bytes.Equal(gotVal, rowValue) {
+		t.Errorf("Lookup returned row value %x; expected covering tuple, not back-lookup", gotVal)
+	}
+}
+
+// TestByteAPIUniqueCoveringMultiColumnRoundTrip stresses the
+// NUL-escape codec on the byte-API covering return path: two
+// covering columns with embedded 0x00 bytes round-trip through
+// DecodeCoveringTuple.
+func TestByteAPIUniqueCoveringMultiColumnRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	// Cover columns deliberately include 0x00 bytes to stress NUL
+	// escaping; deliberately distinct from the row value bytes.
+	want := [][]byte{
+		{0xCC, 0x00, 0xDD},
+		{0x00, 0xEE},
+	}
+	decl := &IndexDecl{
+		Name:     "by_lead",
+		Columns:  []IndexColumn{{Name: "lead"}},
+		Covering: []CoveringColumn{{Name: "a"}, {Name: "b"}},
+		Unique:   true,
+		Extract: func(_, value []byte) []IndexEntry {
+			if len(value) < 1 {
+				return nil
+			}
+			return []IndexEntry{{
+				Cols:  [][]byte{{value[0]}},
+				Cover: want,
+			}}
+		},
+	}
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("k1"), []byte{0x42, 0xFF, 0xFF}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := ks.Index("by_lead")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	var gotVal []byte
+	for _, v := range idx.Lookup([]byte{0x42}) {
+		gotVal = append([]byte(nil), v...)
+	}
+	if err := idx.Err(); err != nil {
+		t.Fatalf("Lookup Err: %v", err)
+	}
+	if len(gotVal) == 0 {
+		t.Fatal("Lookup yielded no rows")
+	}
+	// Belt-and-suspenders: assert the raw blob equals
+	// encodeIndexKey(want) before decoding. A hypothetical bug
+	// returning wrong bytes that happen to decode correctly would
+	// pass the per-column assertion below but fail this one.
+	expectedBlob := encodeIndexKey(want)
+	if !bytes.Equal(gotVal, expectedBlob) {
+		t.Errorf("raw covering blob: got %x want %x", gotVal, expectedBlob)
+	}
+	decoded, err := DecodeCoveringTuple(gotVal)
+	if err != nil {
+		t.Fatalf("DecodeCoveringTuple: %v", err)
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("decoded covering columns: got %d want 2", len(decoded))
+	}
+	for i, w := range want {
+		if !bytes.Equal(decoded[i], w) {
+			t.Errorf("col %d: got %x want %x", i, decoded[i], w)
+		}
+	}
+}
+
+// TestByteAPINonUniqueCoveringLookupReturnsCovering verifies the
+// non-unique path also returns covering bytes — the entry value
+// for a non-unique index IS the covering blob (no PK prefix), and
+// the byte-API return contract applies identically.
+func TestByteAPINonUniqueCoveringLookupReturnsCovering(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := &IndexDecl{
+		Name:     "by_color",
+		Columns:  []IndexColumn{{Name: "color"}},
+		Covering: []CoveringColumn{{Name: "size"}},
+		Unique:   false,
+		Extract: func(_, value []byte) []IndexEntry {
+			if len(value) < 2 {
+				return nil
+			}
+			return []IndexEntry{{
+				Cols:  [][]byte{{value[0]}},
+				Cover: [][]byte{{value[1]}},
+			}}
+		},
+	}
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	// Two rows sharing the same indexed color — non-unique.
+	if err := ks.Put([]byte("k1"), []byte{0x42, 0xAB}); err != nil {
+		t.Fatalf("Put k1: %v", err)
+	}
+	if err := ks.Put([]byte("k2"), []byte{0x42, 0xCD}); err != nil {
+		t.Fatalf("Put k2: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	got := map[string][]byte{}
+	for pk, v := range idx.Lookup([]byte{0x42}) {
+		got[string(pk)] = append([]byte(nil), v...)
+	}
+	if err := idx.Err(); err != nil {
+		t.Fatalf("Lookup Err: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Lookup count: got %d want 2", len(got))
+	}
+	// Per-row covering tuple should match the extractor's Cover bytes.
+	if !bytes.Equal(got["k1"], []byte{0xAB, 0x00, 0x00}) {
+		t.Errorf("k1 covering: got %x want [AB 00 00]", got["k1"])
+	}
+	if !bytes.Equal(got["k2"], []byte{0xCD, 0x00, 0x00}) {
+		t.Errorf("k2 covering: got %x want [CD 00 00]", got["k2"])
+	}
+}
+
+// TestByteAPICoveringGetReturnsCovering verifies Get() (unique-
+// shorthand) goes through the same byte-API covering path as
+// Lookup.
+func TestByteAPICoveringGetReturnsCovering(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := &IndexDecl{
+		Name:     "by_color",
+		Columns:  []IndexColumn{{Name: "color"}},
+		Covering: []CoveringColumn{{Name: "size"}},
+		Unique:   true,
+		Extract: func(_, value []byte) []IndexEntry {
+			if len(value) < 2 {
+				return nil
+			}
+			return []IndexEntry{{
+				Cols:  [][]byte{{value[0]}},
+				Cover: [][]byte{{value[1]}},
+			}}
+		},
+	}
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("k1"), []byte{0x42, 0xAB, 0xCD}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	gotPK, gotVal, err := idx.Get([]byte{0x42})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(gotPK, []byte("k1")) {
+		t.Errorf("pk: got %q want k1", gotPK)
+	}
+	if !bytes.Equal(gotVal, []byte{0xAB, 0x00, 0x00}) {
+		t.Errorf("Get covering: got %x want [AB 00 00] (back-lookup regression?)", gotVal)
+	}
+}
+
+// TestByteAPICoveringRangeReturnsCovering verifies Range() goes
+// through the same byte-API covering path (single extractPKAndValue
+// call site is shared, but the cursor walk vs single-Get probe
+// is a distinct code path).
+func TestByteAPICoveringRangeReturnsCovering(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := &IndexDecl{
+		Name:     "by_color",
+		Columns:  []IndexColumn{{Name: "color"}},
+		Covering: []CoveringColumn{{Name: "size"}},
+		Unique:   true,
+		Extract: func(_, value []byte) []IndexEntry {
+			if len(value) < 2 {
+				return nil
+			}
+			return []IndexEntry{{
+				Cols:  [][]byte{{value[0]}},
+				Cover: [][]byte{{value[1]}},
+			}}
+		},
+	}
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("k1"), []byte{0x10, 0xAA}); err != nil {
+		t.Fatalf("Put k1: %v", err)
+	}
+	if err := ks.Put([]byte("k2"), []byte{0x20, 0xBB}); err != nil {
+		t.Fatalf("Put k2: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	got := map[string][]byte{}
+	for pk, v := range idx.Range([][]byte{{0x10}}, [][]byte{{0x30}}) {
+		got[string(pk)] = append([]byte(nil), v...)
+	}
+	if err := idx.Err(); err != nil {
+		t.Fatalf("Range Err: %v", err)
+	}
+	if !bytes.Equal(got["k1"], []byte{0xAA, 0x00, 0x00}) {
+		t.Errorf("k1 covering: got %x want [AA 00 00]", got["k1"])
+	}
+	if !bytes.Equal(got["k2"], []byte{0xBB, 0x00, 0x00}) {
+		t.Errorf("k2 covering: got %x want [BB 00 00]", got["k2"])
+	}
+}
+
+// TestNonCoveringLookupStillBackLookupsRowValue is the negative
+// control: an index without Covering must continue to back-lookup
+// the row value. Guards against an over-broad fix that
+// accidentally short-circuits the back-lookup for non-covering
+// indexes.
+func TestNonCoveringLookupStillBackLookupsRowValue(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Unique = true
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	rowValue := []byte{0x42, 0xAB, 0xCD, 0xEF}
+	if err := ks.Put([]byte("k1"), rowValue); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	gotPK, gotVal, err := idx.Get([]byte{0x42})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(gotPK, []byte("k1")) {
+		t.Errorf("pk: got %q want k1", gotPK)
+	}
+	if !bytes.Equal(gotVal, rowValue) {
+		t.Errorf("non-covering Get value: got %x want %x (back-lookup regression)", gotVal, rowValue)
+	}
+}
+
+// TestDecodeCoveringTupleRejectsMalformed verifies the public
+// decoder wraps malformed-input errors in
+// ErrCoveringTupleMalformed — a neutral sentinel distinct from
+// ErrCorrupted, since at the byte-stream level the decoder cannot
+// distinguish on-disk corruption from caller misuse (applying it
+// to non-covering Lookup bytes). Authoritative corruption
+// diagnosis is via Check().
+func TestDecodeCoveringTupleRejectsMalformed(t *testing.T) {
+	// Lone 0x00 at end: no terminator, no escape byte.
+	_, err := DecodeCoveringTuple([]byte{0xAA, 0x00})
+	if err == nil {
+		t.Fatal("expected error for malformed input, got nil")
+	}
+	if !errors.Is(err, ErrCoveringTupleMalformed) {
+		t.Errorf("error: got %v, want wrapping ErrCoveringTupleMalformed", err)
+	}
+	// And NOT wrapping ErrCorrupted — the neutral-sentinel
+	// invariant: ErrCorrupted is the engine's "I found corruption"
+	// signal, not the public decoder's malformed-input class.
+	if errors.Is(err, ErrCorrupted) {
+		t.Errorf("error: %v wraps ErrCorrupted; neutral sentinel was the design choice", err)
+	}
+}
+
+// TestDecodeCoveringTupleAcceptsEmpty verifies an empty input
+// (the engine stores empty covering for an extractor producing
+// no Cover bytes) decodes to nil without error.
+func TestDecodeCoveringTupleAcceptsEmpty(t *testing.T) {
+	cols, err := DecodeCoveringTuple(nil)
+	if err != nil {
+		t.Fatalf("DecodeCoveringTuple(nil): %v", err)
+	}
+	if cols != nil {
+		t.Errorf("cols: got %v want nil", cols)
+	}
+}
+
+// TestByteAPICoveringNilCoverReturnsEmpty verifies the spec
+// statement (indexing.md §Covering Indexes): when the extractor
+// returns Cover=nil despite the IndexDecl declaring Covering,
+// Lookup yields an empty value. Engine round-trip, not just a
+// decoder-level check.
+func TestByteAPICoveringNilCoverReturnsEmpty(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := &IndexDecl{
+		Name:     "by_color",
+		Columns:  []IndexColumn{{Name: "color"}},
+		Covering: []CoveringColumn{{Name: "size"}}, // declared, but...
+		Unique:   true,
+		Extract: func(_, value []byte) []IndexEntry {
+			if len(value) < 1 {
+				return nil
+			}
+			// ... extractor returns nil Cover despite Covering being
+			// declared (programmer error per the IndexEntry contract,
+			// but the spec specifies the read shape: empty value).
+			return []IndexEntry{{
+				Cols:  [][]byte{{value[0]}},
+				Cover: nil,
+			}}
+		},
+	}
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	rowValue := []byte{0x42, 0xAB, 0xCD}
+	if err := ks.Put([]byte("k1"), rowValue); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	gotPK, gotVal, err := idx.Get([]byte{0x42})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(gotPK, []byte("k1")) {
+		t.Errorf("pk: got %q want k1", gotPK)
+	}
+	// Spec: "stored as empty bytes and Lookup returns an empty value"
+	if len(gotVal) != 0 {
+		t.Errorf("Get value: got %x (len %d) want empty (len 0); back-lookup regression?",
+			gotVal, len(gotVal))
+	}
+	// Sanity: empty bytes decode to nil cols via DecodeCoveringTuple.
+	cols, decErr := DecodeCoveringTuple(gotVal)
+	if decErr != nil {
+		t.Errorf("DecodeCoveringTuple(empty): %v", decErr)
+	}
+	if cols != nil {
+		t.Errorf("decoded: got %v want nil (zero-tuple)", cols)
+	}
+}
+
 // --- Regression: Round-1 M-4 (decodeUniqueIndexValue errors) -----
 
 // TestDecodeUniqueIndexValueRejectsEmpty verifies the malformed-

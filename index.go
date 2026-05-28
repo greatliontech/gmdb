@@ -130,16 +130,28 @@ func (idx *Index) rowTx() *Tx {
 // optional covering; for a non-unique index, the PK is in the
 // key suffix and the value carries only covering bytes.
 //
-// row_value is the user-facing value: the row's stored bytes,
-// fetched via back-lookup against the parent keyspace's row tree
-// (idx.rowRoot()), OR — when the IndexDecl's Covering matches the
-// full row representation — decoded covering bytes (deferred to a
-// later chunk that wires covering-as-full-row coverage; chunk 7.7
-// always back-lookups for Lookup's value return).
+// row_value is the user-facing value, selected by index shape:
+//
+//   - Typed full-row covering (idx.coverValue=true, set by
+//     TypedKS.Index for an index whose covering is the typed full-row
+//     sentinel column): the covering blob's single column is decoded
+//     and returned as the encoded V — the typed wrapper then runs
+//     valEnc.Decode on it.
+//   - Byte-API covering (len(decl.Covering) > 0, coverValue=false):
+//     the raw encoded covering blob (NUL-escape multi-column tuple)
+//     is returned verbatim. The caller decodes via the exported
+//     DecodeCoveringTuple — per indexing.md §Covering Indexes /
+//     api-surface.md §Index Lookup API "byte-API covering return".
+//   - No covering: back-lookup against the parent keyspace's row
+//     tree (idx.rowRoot()).
 //
 // For a SetKeyspace index (idx.sks != nil), routes to the
 // SetKeyspace-aware path which yields (setKey, setValue) tuples
-// instead of (rowKey, rowValue) per chunk 7.9.
+// instead of (rowKey, rowValue) per chunk 7.9. Covering is not
+// returned for SetKeyspace indexes — set-keyspace.md §Indexes
+// makes the (setKey, setValue) pair the natural query result
+// (no back-lookup to save), and the byte-layer covering-return
+// contract is Keyspace-only.
 //
 // Returns (nil, nil, true, nil) on a silent-skip case (back-
 // lookup failed to find the PK — corruption signal per
@@ -152,8 +164,10 @@ func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []by
 	}
 	// encodedCovering holds the index entry's covering blob (the
 	// NUL-escaped covering tuple): the value suffix for a unique index,
-	// the whole value for a non-unique one. Used only by the
-	// covering-return path below.
+	// the whole value for a non-unique one. Used by both covering-return
+	// branches below; empty for an index whose IndexDecl declares no
+	// Covering (the engine still stores it as empty per
+	// indexEntryValue).
 	var encodedCovering []byte
 	if idx.pinned.decl.Unique {
 		extractedPK, encCov, decErr := decodeUniqueIndexValue(indexValue)
@@ -176,13 +190,18 @@ func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []by
 		pk = cols[len(cols)-1]
 		encodedCovering = indexValue
 	}
-	// Covering-return (typed full-row covering, indexing.md §Covering
-	// Indexes): the covering blob is a single NUL-escaped column holding
-	// the encoded row value, so the value is returned directly from the
-	// index entry — skipping the back-lookup against the row keyspace.
-	// Gated by idx.coverValue, set only by the typed layer for indexes it
-	// recognizes as full-row covering; default false ⇒ back-lookup
-	// (unchanged for every other index).
+	// Typed full-row covering (indexing.md §Covering Indexes,
+	// typed-keyspaces.md §Covering). The covering blob is a single
+	// NUL-escaped column holding the encoded row value, so the value
+	// is returned directly from the index entry — skipping the
+	// back-lookup against the row keyspace. The TypedIndexQuery
+	// wrapper then runs valEnc.Decode on the returned bytes.
+	//
+	// Gated by idx.coverValue, set only by the typed layer for indexes
+	// it recognizes as full-row covering (isTypedCoverValueIndex —
+	// exactly one covering column with the typedCoverValuePrefix
+	// sentinel). The byte-API path below handles arbitrary covering
+	// projections; default (no Covering declared) is back-lookup.
 	if idx.coverValue {
 		coverCols, decErr := decodeIndexKey(encodedCovering)
 		if decErr != nil {
@@ -193,6 +212,23 @@ func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []by
 		}
 		value = make([]byte, len(coverCols[0]))
 		copy(value, coverCols[0])
+		return pk, value, false, nil
+	}
+	// Byte-API covering return (indexing.md §Covering Indexes,
+	// api-surface.md §Index Lookup API). For any index whose
+	// IndexDecl.Covering is non-empty (and which is not a typed
+	// full-row sentinel — that branch is above), Lookup returns the
+	// encoded covering blob verbatim. The caller decodes via the
+	// exported DecodeCoveringTuple to recover the extractor's
+	// IndexEntry.Cover slice in declaration order. Skips the
+	// back-lookup against the row keyspace per spec.
+	//
+	// Copy the slice — encodedCovering may alias the value buffer the
+	// cursor will reuse (decodeUniqueIndexValue returns slices into
+	// indexValue; non-unique sets encodedCovering = indexValue).
+	if len(idx.pinned.decl.Covering) > 0 {
+		value = make([]byte, len(encodedCovering))
+		copy(value, encodedCovering)
 		return pk, value, false, nil
 	}
 	// Back-lookup against the row keyspace.
@@ -227,11 +263,20 @@ func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []by
 // index, yields every row whose extractor produced the matching
 // column tuple.
 //
+// Value semantics (indexing.md §Covering Indexes):
+//   - When the index's IndexDecl.Covering is non-empty, value is
+//     the on-disk encoded covering tuple — decode via
+//     DecodeCoveringTuple to recover per-column Cover bytes.
+//   - When IndexDecl.Covering is empty, value is the row's stored
+//     bytes via back-lookup against the row keyspace.
+//
 // Per indexing.md §Lookup API §Intra-transaction consistency:
 // entries whose back-lookup against the row keyspace fails to
 // find the PK are silently skipped (corruption signal — surfaced
 // later via Check()). The caller observes the skip as "this
-// entry didn't yield" without any error on idx.Err().
+// entry didn't yield" without any error on idx.Err(). The
+// covering-return path skips the back-lookup entirely so the
+// silent-skip case does not apply.
 //
 // idx.Err() is reset at the start of each call (per api-surface.md
 // §Index Lookup API "first error encountered during the **last**
@@ -407,6 +452,11 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 // (start inclusive, end exclusive). A nil start = open lower
 // bound; a nil end = open upper bound. Each tuple is a slice of
 // per-column byte slices.
+//
+// Value semantics are the same as Lookup: the yielded value is
+// the encoded covering tuple (decode via DecodeCoveringTuple)
+// when IndexDecl.Covering is non-empty, otherwise the row's
+// stored bytes via back-lookup. See indexing.md §Covering Indexes.
 func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
@@ -459,7 +509,9 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 
 // Prefix returns matches whose leading columns equal the prefix.
 // Equivalent to `Range(prefix, nextPrefix)` but the caller doesn't
-// have to compute the upper bound.
+// have to compute the upper bound. Same value semantics as Lookup
+// — covering tuple when IndexDecl.Covering is non-empty, row
+// bytes via back-lookup otherwise.
 func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
@@ -481,7 +533,10 @@ func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] {
 
 // Get is shorthand for unique indexes: returns the single (pk,
 // value) tuple matching cols, or ErrNotFound if no match. Returns
-// ErrIndexNotUnique when called on a non-unique index.
+// ErrIndexNotUnique when called on a non-unique index. Same value
+// semantics as Lookup — covering tuple when IndexDecl.Covering is
+// non-empty (decode via DecodeCoveringTuple), row bytes via
+// back-lookup otherwise.
 func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error) {
 	// Per-sequence Err reset (M-2 fix; Get isn't strictly a sequence,
 	// but the handle's Err() is shared and a stale prior error

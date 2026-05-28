@@ -358,13 +358,13 @@ encoder `ID()` is rejected with `ErrIndexEncoderIDEmpty`).
 `TypedSetKeyspace` index's value (`setValue`) is already carried in
 its compound primary key, so there is no back-lookup to skip. This
 is the only covering shape the typed API exposes — arbitrary
-covering *projections* have no return surface here (every
-`TypedIndexQuery` method returns the row value `V`). The byte-
-oriented `IndexDecl` can *store* arbitrary covering projections,
-but its `Lookup`/`Get` covering-**return** is not yet wired: it
-back-looks-up the row value regardless (so declaring byte-API
-covering today changes only the schema fingerprint and on-disk
-storage, not what `Lookup` returns).
+covering *projections* have no typed return surface (every
+`TypedIndexQuery` method returns the row value `V`). For arbitrary
+covering projections, use the byte-oriented `IndexDecl` API: its
+`Lookup` / `Range` / `Prefix` / `Get` return the encoded covering
+tuple, decoded by the caller via `DecodeCoveringTuple` (see
+`indexing.md §Covering Indexes` and `api-surface.md §Index Lookup
+API`).
 
 A typed extractor returning multiple `IK` values models composite
 indexes naturally (the `IK` type is itself a struct whose
