@@ -200,12 +200,21 @@ input — it returns an error instead:
   verifying page accessor (`pager-slab.md`).
 - **Allocation bound.** An allocation sized from an on-disk
   length/count field — an overflow value's `TotalLen`, an index
-  registry entry's column/covering counts — is bounded before it
-  is made, so a forged field cannot drive an out-of-memory abort.
-  For overflow this means the run length is computed without
-  uint32 truncation and the run is read one page at a time so it
-  aborts at the file-resident bound before the value buffer is
-  allocated.
+  registry entry's column/covering counts, the meta-page
+  `BitmapPages` driving Open's bitmap rebuild — is bounded before
+  it is made, so a forged field cannot drive an out-of-memory
+  abort. For overflow this means the run length is computed
+  without uint32 truncation and the run is read one page at a time
+  so it aborts at the file-resident bound before the value buffer
+  is allocated. For Open's bitmap rebuild this means BitmapPages
+  is bounded against `min(fileSize/PageSize, MaxSize)` (the
+  file-resident extent, same pattern as the Page-id reachability
+  bound above) AND against the MaxSize-derived capacity
+  (`BitmapPages * PageSize * 8` bits must be ≥ MaxSize pages) so
+  `bitmap.New` cannot panic with totalPages-exceeds-capacity. An
+  unrecoverable runtime OOM throw from `make` is the strongest
+  failure shape in this class — `recover()` does not catch
+  `runtime.throw`, so the bound MUST precede the `make`.
 - **Branch structure validation.** A branch page is validated
   (`ValidateBranch`) before its cell directory is iterated — the
   analogue of the per-leaf `LeafReader.Validate`, applied at the

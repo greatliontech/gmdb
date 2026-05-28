@@ -247,6 +247,20 @@ is mutable — set/cleared per commit depending on whether the
 commit's data pages have been confirmed on stable storage (see
 `durability.md`).
 
+`ValidateMeta` enforces only format identity — `Magic`, `Version`,
+`PageSize`, and `Flags` (unknown bits rejected per above). The
+size/offset fields (`BitmapPages`, `MaxSize`, `HighWaterMark`,
+`RPLHeadPage`, `RPLTailPage`, `KeyspaceRoot`) are deliberately NOT
+enforced here: a strict cross-field validator would reject
+recoverable databases whose meta is consistent-but-unusual (a
+larger `MaxSize` than the file extent during partial growth, etc.).
+Instead, every consumer of these fields applies a **walk-site
+bound** before use — `min(fileSize/PageSize, MaxSize)` for page-id
+reachability, `BitmapPages * PageSize * 8 ≥ MaxSize` for the bitmap
+capacity check at Open, etc. — so a forged-meta input surfaces as
+`ErrCorrupted` rather than a crash. See `checksums.md §Structural
+and Allocation Bounds` for the canonical pattern.
+
 The file-format fields (`MinSize`, `MaxSize`, `GrowStep`,
 `ShrinkThreshold`) persist across opens.
 

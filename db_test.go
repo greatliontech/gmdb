@@ -613,6 +613,97 @@ func TestOpenRejectsOutOfRangeRPLHeadWithoutPanic(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsCorruptBitmapPagesWithoutPanic(t *testing.T) {
+	// Regression: Open rebuilds the in-memory bitmap by reading the
+	// on-disk bitmap region into a make-allocated buffer sized from
+	// m.BitmapPages (internal/pager/init.go), and passes (BitmapPages,
+	// MaxSize) to bitmap.New. ValidateMeta validates Magic / Version /
+	// PageSize / Flags only, so a checksum-passing meta with a forged
+	// BitmapPages bypasses every existing guard.
+	//
+	// Two reachable in-spec corrupt-meta inputs that, pre-fix, crash
+	// the process instead of surfacing as ErrCorrupted:
+	//
+	//   wild_high — BitmapPages = 1<<30 forges bitmapBytes far beyond
+	//     the mmap reservation; either `make([]byte, bitmapBytes)`
+	//     hits "runtime error: makeslice: cap out of range" or the
+	//     subsequent `p.mmap[2*pageSize : 2*pageSize+bitmapBytes]`
+	//     slice expression panics with "slice bounds out of range".
+	//
+	//   zero — BitmapPages = 0 produces an empty detail buffer paired
+	//     with a non-zero totalPages (m.MaxSize); bitmap.New panics
+	//     with "totalPages N exceeds bitmap capacity 0".
+	//
+	// Sibling to TestOpenRejectsOutOfRangeRPLHeadWithoutPanic; same
+	// fault class (corrupt meta → must yield ErrCorrupted, not crash),
+	// distinct proximate line. checksums.md §Structural and Allocation
+	// Bounds and integrity.md §Forged / structural corruption tolerance
+	// are the clause-explicit no-crash invariants.
+	const maxSizePages = 128
+	for _, tc := range []struct {
+		name        string
+		bitmapPages uint32
+	}{
+		{name: "wild_high", bitmapPages: 1 << 30},
+		{name: "zero", bitmapPages: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := tmpPath(t)
+			db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: maxSizePages})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			pageSize := int64(db.Meta().PageSize)
+			activeOff := int64(db.activeMetaIdx) * pageSize
+			db.Close()
+
+			// Rewrite the active meta with a forged BitmapPages, recomputing
+			// the checksum (EncodeMeta) so the meta VERIFIES — otherwise
+			// Open falls back to the sibling meta and never reaches the
+			// bitmap-rebuild walk.
+			f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+			if err != nil {
+				t.Fatalf("open for corrupt: %v", err)
+			}
+			buf := make([]byte, pageSize)
+			if _, err := f.ReadAt(buf, activeOff); err != nil {
+				t.Fatalf("read active meta: %v", err)
+			}
+			m := page.DecodeMeta(buf)
+			m.BitmapPages = tc.bitmapPages
+			page.EncodeMeta(buf, &m)
+			if _, err := f.WriteAt(buf, activeOff); err != nil {
+				t.Fatalf("write corrupted meta: %v", err)
+			}
+			f.Close()
+
+			// Re-open must return ErrCorrupted, never panic. The recover
+			// converts a pre-fix panic into a clean failure instead of
+			// crashing the test binary.
+			var reErr error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("Open panicked on forged BitmapPages (want ErrCorrupted): %v", r)
+					}
+				}()
+				db2, e := Open(ctx, path, Options{PageSize: 4096})
+				reErr = e
+				if db2 != nil {
+					db2.Close()
+				}
+			}()
+			if reErr == nil {
+				t.Fatal("re-Open accepted forged BitmapPages")
+			}
+			if !errors.Is(reErr, ErrCorrupted) {
+				t.Errorf("Open error does not satisfy errors.Is(ErrCorrupted): %v", reErr)
+			}
+		})
+	}
+}
+
 func TestCommitFailurePoisonsHandle(t *testing.T) {
 	// Publication-phase failure contract (pager-slab.md §Commit Write
 	// Ordering + api-surface.md §Sentinel Errors). A step-3 pwrite

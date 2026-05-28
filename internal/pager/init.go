@@ -235,6 +235,48 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 	// 4) Build the in-memory bitmap by reading the on-disk bitmap region
 	// from the mmap (which sees the just-written data through the
 	// unified page cache).
+	//
+	// ValidateMeta does not bound BitmapPages, so a checksum-passing
+	// meta with a forged BitmapPages bypasses every existing guard. Two
+	// reachable in-spec corruption shapes that must surface as
+	// ErrCorrupted, not crash the process — checksums.md §Structural
+	// and Allocation Bounds and integrity.md §Forged / structural
+	// corruption tolerance ("the read path... never crashes on corrupt
+	// input — it returns an error instead"):
+	//
+	//   (a) wild-high BitmapPages → `make([]byte, BitmapPages*PageSize)`
+	//       hits runtime OOM via `runtime.throw` (unrecoverable —
+	//       `recover()` does NOT catch this; the test binary dies), or
+	//       at a smaller-but-still-too-big size the subsequent slice
+	//       expression `p.mmap[2*pageSize : 2*pageSize+bitmapBytes]`
+	//       panics with slice-bounds-out-of-range (this one IS
+	//       recoverable, but the wild_high regression case exercises
+	//       the runtime.throw path — a stronger no-crash assertion).
+	//   (b) BitmapPages too small to cover MaxSize (incl. zero) →
+	//       `bitmap.New` panics with "totalPages N exceeds bitmap
+	//       capacity M bits" (entered with empty/under-sized detail).
+	//
+	// File-extent bound (a): the bitmap region lives in pages
+	// [2, firstDataPage) where firstDataPage = 2 + BitmapPages
+	// (Init.go); the metas occupy 0 and 1, so firstDataPage must lie
+	// within the file-resident extent. Use
+	// `min(fileSize/PageSize, MaxSize)` exactly like rebuildRPLChain
+	// (Inv-RV3) and checker.walkRPL (Inv-C1) — established walk-site
+	// pattern; ValidateMeta deliberately does not enforce these per
+	// check.go (avoid rejecting recoverable databases). Capacity bound
+	// (b): BitmapPages*PageSize*8 (bits the detail can address) must be
+	// >= MaxSize (pages the bitmap must represent).
+	backedPages := min(uint64(p.fileSize)/uint64(pageSize), m.MaxSize)
+	firstDataPage := uint64(m.BitmapPages) + 2
+	if firstDataPage > backedPages {
+		_ = p.Close()
+		return nil, fmt.Errorf("pager: meta firstDataPage %d (BitmapPages %d + 2 metas) exceeds backed extent %d pages: %w", firstDataPage, m.BitmapPages, backedPages, ErrCorrupted)
+	}
+	bitmapCapacityBits := uint64(m.BitmapPages) * uint64(pageSize) * 8
+	if bitmapCapacityBits < m.MaxSize {
+		_ = p.Close()
+		return nil, fmt.Errorf("pager: meta BitmapPages %d gives bitmap capacity %d bits, < MaxSize %d pages: %w", m.BitmapPages, bitmapCapacityBits, m.MaxSize, ErrCorrupted)
+	}
 	bitmapBytes := uint64(m.BitmapPages) * uint64(pageSize)
 	detail := make([]byte, bitmapBytes)
 	copy(detail, p.mmap[2*uint64(pageSize):2*uint64(pageSize)+bitmapBytes])
