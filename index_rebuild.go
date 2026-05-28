@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"unique"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
@@ -116,7 +117,7 @@ func (tx *Tx) propagateNotCachedDescChange(name string, owner descriptorOwner) {
 //     extractor.
 //   - ErrReadOnly on a read-only transaction; ErrTxClosed on a
 //     closed transaction.
-func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error {
+func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	if err := tx.requireOpen(true); err != nil {
 		return err
 	}
@@ -141,6 +142,33 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error {
 	if err != nil {
 		return err
 	}
+
+	// Atomicity wrap (transactions.md §Write-helper error contract):
+	// the rebuild allocates pages for the new index data tree
+	// (processPair's btree.Put loop), advances the registry to point
+	// at the new root (registryPut), then frees the old data tree
+	// (FreeSubtree). A mid-build btree.Put failure leaves the partial
+	// new tree allocated; a FreeSubtree failure after the publish-
+	// then-retire registryPut leaves the partially-freed OLD tree
+	// allocated and unreferenced — either shape orphans pages on
+	// Tx.Commit (the rest-of-tx-continues path). Bracket the body in
+	// a nested savepoint so any error after this point reverts every
+	// page allocation/free AND restores the descriptor's pre-call
+	// IndexRegistryRoot (the savepoint owns pager state, not caller-
+	// descriptor fields). Nested kind (not shallow) is correct here:
+	// RebuildIndex is one-shot per call, not per-row, so suspending
+	// loose-page reuse for the duration is not a cost concern.
+	ownerDesc := owner.descriptor()
+	prevRegRoot := ownerDesc.IndexRegistryRoot
+	sp := tx.pgr.BeginSavepoint()
+	defer func() {
+		if retErr != nil {
+			tx.pgr.RestoreSavepoint(sp)
+			ownerDesc.IndexRegistryRoot = prevRegRoot
+			return
+		}
+		tx.pgr.ReleaseSavepoint(sp)
+	}()
 
 	// Open a row-cursor on the parent keyspace.
 	cfg := tx.pgr.Config()
@@ -300,6 +328,15 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error {
 	if err := tx.registryPut(owner, decl.Name, newEntry); err != nil {
 		return err
 	}
+	// Test-only failure-injection seam: simulates a FreeSubtree
+	// failure after the publish-then-retire registryPut succeeded.
+	// Exercises the savepoint-backed restore that must revert both
+	// pager state and the descriptor's IndexRegistryRoot.
+	if hook := rebuildIndexFailHookForTest.Load(); hook != nil {
+		if err := (*hook)(); err != nil {
+			return err
+		}
+	}
 	// Free the OLD index data tree only after the registry has
 	// been atomically advanced.
 	if existing.Root != 0 {
@@ -380,6 +417,7 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 	// Walk the registry sub-tree with a cursor; collect each
 	// entry's Root for FreeSubtree.
 	cur := btree.NewCursor(tx.pgr, cfg, registryRoot, mergeThreshold)
+	i := 0
 	for k, v := cur.First(); k != nil; k, v = cur.Next() {
 		// Copy v because the next cursor op may invalidate.
 		valCopy := make([]byte, len(v))
@@ -395,6 +433,17 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 					keyspaceName, string(k), mapBtreeErr(err))
 			}
 		}
+		// Test-only failure-injection seam: simulates a partial-walk
+		// failure (e.g. decode of a later entry, or a FreeSubtree
+		// error). Exercises the savepoint-backed restore in
+		// Keyspace.DeleteKeyspace that covers both this walk and the
+		// preceding step-1 data-subtree FreeSubtree.
+		if hook := retireIndexRegistryFailHookForTest.Load(); hook != nil {
+			if err := (*hook)(i); err != nil {
+				return err
+			}
+		}
+		i++
 	}
 	if err := cur.Err(); err != nil {
 		return fmt.Errorf("DeleteKeyspace %q: registry walk: %w", keyspaceName, mapBtreeErr(err))
@@ -416,7 +465,7 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 // Errors mirror RebuildIndex: ErrKeyEmpty, ErrNotFound (keyspace),
 // ErrIndexNotFound (index name), ErrKeyspaceReserved (Kind=2),
 // ErrReadOnly / ErrTxClosed.
-func (tx *Tx) DropIndex(keyspace, indexName string) error {
+func (tx *Tx) DropIndex(keyspace, indexName string) (retErr error) {
 	if err := tx.requireOpen(true); err != nil {
 		return err
 	}
@@ -434,6 +483,29 @@ func (tx *Tx) DropIndex(keyspace, indexName string) error {
 		return err
 	}
 	cfg := tx.pgr.Config()
+
+	// Atomicity wrap (transactions.md §Write-helper error contract):
+	// the drop advances the registry off the entry (registryDelete,
+	// which CoWs the registry tree) and then frees the OLD data tree
+	// (FreeSubtree). A FreeSubtree mid-walk failure after the publish-
+	// then-retire registryDelete orphans the partially-freed data
+	// tree (the registry no longer references it) on Tx.Commit (the
+	// rest-of-tx-continues path). Bracket the body in a nested
+	// savepoint so any error after this point reverts the page
+	// allocations/frees AND restores the descriptor's pre-call
+	// IndexRegistryRoot.
+	ownerDesc := owner.descriptor()
+	prevRegRoot := ownerDesc.IndexRegistryRoot
+	sp := tx.pgr.BeginSavepoint()
+	defer func() {
+		if retErr != nil {
+			tx.pgr.RestoreSavepoint(sp)
+			ownerDesc.IndexRegistryRoot = prevRegRoot
+			return
+		}
+		tx.pgr.ReleaseSavepoint(sp)
+	}()
+
 	// Publish-then-retire ordering (chunk-7.8 Round-1 H-2 fix):
 	// remove the registry entry FIRST so any failure leaves the
 	// data tree intact (and recoverable). Only after the registry
@@ -443,6 +515,14 @@ func (tx *Tx) DropIndex(keyspace, indexName string) error {
 			return err
 		}
 		return fmt.Errorf("DropIndex %q.%q: registry delete: %w", keyspace, indexName, err)
+	}
+	// Test-only failure-injection seam: simulates a FreeSubtree
+	// failure after the publish-then-retire registryDelete advanced
+	// the registry. Exercises the savepoint-backed restore.
+	if hook := dropIndexFailHookForTest.Load(); hook != nil {
+		if err := (*hook)(); err != nil {
+			return err
+		}
 	}
 	if existing.Root != 0 {
 		if _, err := btree.FreeSubtree(tx.pgr, cfg, existing.Root); err != nil {
@@ -458,4 +538,53 @@ func (tx *Tx) DropIndex(keyspace, indexName string) error {
 		delete(cachedSKS.indexes, indexName)
 	}
 	return nil
+}
+
+// rebuildIndexFailHookForTest, when set, is invoked once inside
+// Tx.RebuildIndex after the publish-then-retire registryPut succeeded
+// but before FreeSubtree of the OLD index data tree runs. A non-nil
+// return injects a failure that exercises the savepoint-backed restore
+// (revert pager state + restore IndexRegistryRoot). Test-only;
+// installed via setRebuildIndexFailHookForTest and cleared via
+// t.Cleanup. The hook is global state — tests that set it must NOT
+// call t.Parallel(). Same caveat for dropIndexFailHookForTest and
+// retireIndexRegistryFailHookForTest below.
+var rebuildIndexFailHookForTest atomic.Pointer[func() error]
+
+func setRebuildIndexFailHookForTest(hook func() error) {
+	if hook == nil {
+		rebuildIndexFailHookForTest.Store(nil)
+		return
+	}
+	rebuildIndexFailHookForTest.Store(&hook)
+}
+
+// dropIndexFailHookForTest, when set, is invoked once inside
+// Tx.DropIndex after the publish-then-retire registryDelete succeeded
+// but before FreeSubtree of the OLD data tree runs. Test-only.
+var dropIndexFailHookForTest atomic.Pointer[func() error]
+
+func setDropIndexFailHookForTest(hook func() error) {
+	if hook == nil {
+		dropIndexFailHookForTest.Store(nil)
+		return
+	}
+	dropIndexFailHookForTest.Store(&hook)
+}
+
+// retireIndexRegistryFailHookForTest, when set, is invoked after each
+// registry entry's processing inside retireIndexRegistry's walk (the
+// per-entry FreeSubtree runs only when entry.Root != 0; the hook
+// still fires for an empty-Root entry). A non-nil return injects a
+// partial-walk failure that exercises the savepoint-backed restore in
+// Keyspace.DeleteKeyspace (which covers both step-1 data-subtree
+// FreeSubtree and the registry retirement). Test-only.
+var retireIndexRegistryFailHookForTest atomic.Pointer[func(i int) error]
+
+func setRetireIndexRegistryFailHookForTest(hook func(i int) error) {
+	if hook == nil {
+		retireIndexRegistryFailHookForTest.Store(nil)
+		return
+	}
+	retireIndexRegistryFailHookForTest.Store(&hook)
 }

@@ -70,10 +70,11 @@ clause's wording suggests.
 
 ## Notes
 
-Surfaced by the writenewindexregistry-partial-leak per-row resolution
-session's Round 2 adversarial review (L-3). The user explicitly chose
-"Build shallow-savepoint now" knowing the clone-cost trade-off; this
-issue tracks the next-level resolution path (undo-log conversion).
+Surfaced by the chunk-7.6 / 7.9 per-row indexed-maintenance resolution
+session's Round 2 adversarial review (L-3); the resolution introduced
+`Pager.BeginShallowSavepoint` (commit `15f9b70`). The user explicitly
+chose "Build shallow-savepoint now" knowing the clone-cost trade-off;
+this issue tracks the next-level resolution path (undo-log conversion).
 
 The 6 per-row callers of `BeginShallowSavepoint` are leak-free and
 correct under the current clone-based shape. This issue is a perf /

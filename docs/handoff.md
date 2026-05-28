@@ -112,8 +112,8 @@ before designing the fix. The proof is in the receipts:
   boundaries). The pager DID need to change. Two wrong claims in one
   issue.
 
-- **`writenewindexregistry-partial-leak` per-row case** (this
-  session, `15f9b70`): the **handoff's own framing was wrong**.
+- **`writenewindexregistry-partial-leak` per-row case** (`15f9b70`):
+  the **handoff's own framing was wrong**.
   Prior handoff said "per-row wrapping is correct-by-design now that
   Snapshot is O(window-flips)". That claim was about the bitmap
   snapshot only — it missed that `Pager.BeginSavepoint` ALSO
@@ -135,6 +135,51 @@ before designing the fix. The proof is in the receipts:
   (`TestShallowSavepointRestoreReversesLoosePop`'s 0xAA / 0xCC
   marker assertion).
 
+- **`writenewindexregistry-partial-leak` DDL siblings** (this
+  session, the close-out commit): two surprises beyond the
+  "mechanical" framing.
+
+  **First**, the *test detection shape was non-uniform*. Under
+  neuter, `RebuildIndex` produces `BitmapLeak` (cached-path:
+  `flushIndexRegistry(ks, ks.indexes)` re-writes the registry from
+  the still-pinned map, ORPHANING the newly-built newRoot tree
+  pages); but `DropIndex` under the cached-path is MASKED by the
+  same `flushIndexRegistry` rewrite (the still-pinned entry is
+  re-published, so the data tree gets re-referenced and Check
+  shows zero leak — a false-negative on the neuter). The
+  cached-path test was passing for the WRONG reason. Fix: use the
+  not-cached path for DropIndex (no `OpenKeyspace` in tx 2), where
+  the corruption surfaces as `ReachableInRPL` because
+  `propagateNotCachedDescChange` is success-only and the on-disk
+  descriptor stays pointing at the bitmap-freed registry root.
+  Generalized this into a shared `assertNoBitmapCorruption(t, db,
+  site)` helper that checks all four corruption codes
+  (`BitmapLeak`, `ReachableButFree`, `ReachableInRPL`,
+  `FreeAndPending`) — a single-code assertion would silently miss
+  the actual failure mode.
+
+  **Second**, `Tx.DeleteKeyspace`'s partial failure was framed in
+  the issue doc as "leak-only" but is actually *corruption*: the
+  retirement frees data-tree pages via the bitmap, but the
+  in-memory invalidation (cache eviction, dead-mark,
+  `pendingDeletes`) runs AFTER the retirement returns — on
+  rest-of-tx-continues, the still-cached descriptor (which
+  flushKeyspaces skips, because its state is Clean) keeps
+  pointing at the freed pages; a future tx that re-allocates them
+  overwrites still-referenced data. Severity is the same as
+  RebuildIndex/DropIndex post-publish leaks (overwrite hazard on
+  re-alloc), not a milder pure leak. Updated the inline comment to
+  drop the "leak-only" framing per Round 1 nit-1.
+
+  **Trap pattern:** *a test that passes against neutered code can
+  be passing for the WRONG reason* — the cached-path's
+  `flushIndexRegistry` rebuild from `ks.indexes` masks DropIndex's
+  leak shape. Verify neuter actually exposes the demonstrated fault
+  on the chosen test path; switch paths if the rewrite-from-cache
+  hides it. (Same trap class: a test gating on `BitmapLeak` only,
+  not on the broader corruption code set, would miss the
+  `ReachableInRPL` shape entirely.)
+
 **Trap pattern to watch for:** the issue cites a "well-known"
 invariant or rationale that the actual spec doesn't state, OR proposes
 a one-line fix that introduces a new bug (same class as the one it's
@@ -142,7 +187,11 @@ fixing), OR understates the work because the safe version of the
 proposed mechanism converges on bigger infrastructure, OR **the
 handoff's own framing of the unblocked-prerequisites is incomplete**
 — a "now-unblocked" claim may only cover one of several cost
-mechanisms the prior fix surfaced.
+mechanisms the prior fix surfaced, OR **a regression test passes for
+the wrong reason** — verify the neutered fix actually exposes the
+demonstrated fault on the chosen test path (the cached-path
+`flushIndexRegistry` rebuild can mask leak shapes that surface on
+not-cached paths).
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -195,9 +244,14 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-7 commits resolved 5 issues + 1 partial in prior sessions; this
-session converted that partial into a per-row close (3 cold-path
-DDL siblings remain):
+8 commits resolved 6 issues + 1 partial in prior sessions; this
+session closed the DDL-siblings partial via the
+nested-savepoint pattern AND promoted-then-deleted the originating
+`writenewindexregistry-partial-leak` issue file (with its
+load-bearing rationale promoted into a new
+`transactions.md §Write-helper error contract` section that serves
+all 4 sibling sites: writeNewIndexRegistry, the 6 per-row maintenance
+sites, and the 3 DDL siblings):
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -205,28 +259,16 @@ DDL siblings remain):
 | `ddb3831` | rpl-rebuild-panic-on-wild-pointer | Closed (Inv-RV3 bound) + filed adjacent `open-corrupt-meta-size-fields-panic` |
 | `ab2d239` | kind2-one-parent-reachability-test | Closed (enforced test) |
 | `e40cbdc` | setkeyspace-put-redundant-membership-probe | Closed (2 single-descent btree primitives) |
-| `c1effd2` | writenewindexregistry-partial-leak | **Partial** — `writeNewIndexRegistry` site done via nested savepoint; 4 siblings remained |
+| `c1effd2` | writenewindexregistry-partial-leak | Partial — `writeNewIndexRegistry` site done via nested savepoint; 4 siblings remained |
 | `0893be5` | bitmap-rollback-undo-log | Closed (undo-log substrate + spec amend in transactions.md §Nested Transactions + new `Discard` API) |
-| `15f9b70` | writenewindexregistry-partial-leak per-row case | **Partial→Partial** — 6 per-row sites done via new `Pager.BeginShallowSavepoint` substrate; 3 cold-path DDL siblings remain. Filed `shallow-savepoint-clone-cost.md` (residual per-Begin clone cost). |
+| `15f9b70` | writenewindexregistry-partial-leak per-row case | Partial — 6 per-row sites done via new `Pager.BeginShallowSavepoint` substrate; 3 cold-path DDL siblings remain. Filed `shallow-savepoint-clone-cost.md` (residual per-Begin clone cost). |
+| `402c066` | writenewindexregistry-partial-leak DDL siblings | **Closed** — `Tx.RebuildIndex`, `Tx.DropIndex`, `Keyspace.DeleteKeyspace` retirement wrapped in nested savepoint via defer-named-return; new `transactions.md §Write-helper error contract` spec section codifies the all-or-nothing contract for all 4 sibling-set sites; `assertNoBitmapCorruption` test helper checks BitmapLeak / ReachableButFree / ReachableInRPL / FreeAndPending union; promote-then-delete completed (issue file removed, all test/spec cites repointed at the new spec section). |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
 the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
-
-- **`writenewindexregistry-partial-leak`** — 3 cold-path DDL
-  siblings remain (the per-row hot-path closed this session). Apply
-  `c1effd2`'s nested-savepoint pattern (NOT the new shallow kind —
-  these are one-shot per DDL op, not per-row, so loose-pop
-  suspension is not a cost concern). Each needs a failure-injection
-  test. Subtle: savepoint restores pager state but NOT caller-
-  descriptor fields — explicitly restore any descriptor / pinned-
-  index field the helper mutates (precedent in `c1effd2`: explicit
-  `desc.IndexRegistryRoot = prevRegRoot`).
-  - `Tx.RebuildIndex` (`index_rebuild.go:119`)
-  - `Tx.DropIndex` (`index_rebuild.go:419`)
-  - `retireIndexRegistry` (`index_rebuild.go:377`)
 
 - **`btree-post-merge-underflow`** — user elected to **tighten the
   contract** despite first-principles finding that the cited
@@ -288,23 +330,18 @@ Pick **one** issue from `docs/issues/README.md`. Confirm the pick with
 the user at session start (offer your recommendation + rationale; the
 user may override). Default order, given prior decisions:
 
-1. **The 3 DDL savepoint siblings** of
-   `writenewindexregistry-partial-leak` — apply `c1effd2`'s nested-
-   savepoint pattern (NOT shallow — DDL ops are one-shot per tx, no
-   per-row cost concern). Three failure-injection tests. Could be
-   one increment. Adjacent to recently-closed (the substrate is
-   fresh); finishes the partial-close.
-2. **`btree-post-merge-underflow`** — spec amend + recursive
+1. **`btree-post-merge-underflow`** — spec amend + recursive
    rebalance + enforced test. User pre-decided to tighten the
    contract; frame as `Rationale:` (intended new behavior), not
-   `Diagnosis:`. Design-heavy; suits fresh context.
-3. **`byte-api-covering-return-unwired`** — byte-level return
+   `Diagnosis:`. Design-heavy; suits fresh context. (Promoted to
+   #1 now that the DDL siblings closed this session.)
+2. **`byte-api-covering-return-unwired`** — byte-level return
    contract; touches `extractPKAndValue` + byte-API `Lookup`/`Get`
    semantics. Don't break existing covering tests.
-4. **`open-corrupt-meta-size-fields-panic`** — adjacent to a closed
+3. **`open-corrupt-meta-size-fields-panic`** — adjacent to a closed
    issue; same Inv-RV3 bound pattern. Smaller; suits later resets
    with tighter context budgets.
-5. **`index-handle-stale-after-rebuild-drop`** — undecided / needs
+4. **`index-handle-stale-after-rebuild-drop`** — undecided / needs
    analysis. Substantial bundle; consider deciding before pulling.
 
 Then resolve it via the full protocol above. **One issue per session

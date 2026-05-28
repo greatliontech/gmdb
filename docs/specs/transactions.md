@@ -410,6 +410,112 @@ fails, its child is rolled back — sibling closures' children are
 unaffected. Closures execute exactly once and do not need to be
 idempotent.
 
+## Write-helper error contract
+
+A **write-helper** is an internal API on `*Tx` (or on a `*Keyspace` /
+`*SetKeyspace` rooted in a `*Tx`) that mutates more than one page
+inside a single user-visible operation — the DDL surface
+(`CreateKeyspace` with indexes, `Tx.RebuildIndex`, `Tx.DropIndex`,
+`tx.DeleteKeyspace`'s three-subtree retirement), the per-row indexed
+maintenance path (`Keyspace.Put`/`Delete`, `Cursor.Delete`,
+`SetKeyspace.Put`/`Delete`/`DeleteValue`), and any future helper
+following the same shape.
+
+**Rest-of-tx-continues contract.** A per-op error returned by such a
+helper does NOT auto-rollback the tx — `Tx.Commit` is a separate
+caller decision, and `Tx.Rollback` is recovery-of-last-resort. After
+a helper returns an error the caller may legitimately `Commit` to
+publish the work done before the failure (a use case the atomicity
+comment in `writeNewIndexRegistry`'s body — chunk-7.3 — explicitly
+opts into).
+
+**Atomicity guarantee.** Every write-helper is **all-or-nothing in the
+bitmap** for every in-spec return (named errors, including caller-
+canceled context): at the end of a returning call — success or error
+— the set of pages that the bitmap considers allocated, the set the
+meta's trees reach, and the set the RPL holds for reclamation together
+satisfy free-space.md's bitmap-consistency invariant (every reachable
+page has its bit clear; every RPL page has its bit clear; every other
+page below `HighWaterMark` has its bit set). A helper that returns an
+error leaves the bitmap exactly as it was at entry, modulo whatever
+work the helper successfully completed *before* the failure point
+that the caller is then free to keep at `Commit` time — bookkeeping
+state, never partially-freed or partially-allocated pages. A panic
+from internal corruption (e.g. a guarded-walk assertion in btree)
+is out-of-spec and unrecoverable; the panic propagates through the
+defer (which sees `retErr == nil` and takes the `ReleaseSavepoint`
+branch, merging the savepoint's pager state into the parent tx) —
+only `Tx.Rollback()` (or process exit) reverts that merged state via
+the whole-tx `AbortTx` snapshot.
+
+**Scope.** This contract governs helpers whose implementation builds
+on the pager's per-tx incremental allocator/RPL substrate (every site
+enumerated above). `Keyspace.BulkLoad` and `SetKeyspace.BulkLoad` are
+*outside* this contract: they bypass the slab via `pwriteAlloc` for
+durability-after-meta-swap semantics and carry the distinct atomicity
+model documented in `bulkload.md §Atomicity` ("bounded leakage
+reclaimed by background maintenance"). A future helper whose
+implementation also bypasses the slab is similarly out of scope and
+must declare its own atomicity model.
+
+**Implementation.** Internal write-helpers achieve all-or-nothing
+through one of two pager substrates, chosen per the helper's calling
+shape:
+
+- **Nested savepoint** (`Pager.BeginSavepoint` / `RestoreSavepoint(on
+  error)` / `ReleaseSavepoint(on success)`) for one-shot DDL helpers
+  (`writeNewIndexRegistry`, `Tx.RebuildIndex`, `Tx.DropIndex`,
+  `tx.DeleteKeyspace`'s retirement). Nested kind suspends loose-page
+  reuse for the duration — acceptable here because each helper runs
+  at most once per tx and the suspension window does not multiply.
+
+- **Shallow savepoint** (`Pager.BeginShallowSavepoint`) for per-row
+  indexed maintenance — `Keyspace.Put`/`Delete`, `Cursor.Delete`,
+  `SetKeyspace.Put`/`Delete`/`DeleteValue`. Shallow preserves
+  loose-pop across the savepoint window so an N-row indexed-Put
+  workload stays bounded in file growth (the nested kind's
+  loose-pop suspension would multiply to O(N·depth) and exhaust
+  `MaxSize` for moderate batches). See §Nested Transactions for
+  the substrate semantics.
+
+A savepoint owns *pager* state (bitmap, `pendingAllocs`/`Frees`,
+`loosePages`, `dirtyKeys`, `retiredPages`, slab buffers added during
+the window). It does NOT own *caller* state — descriptor fields the
+helper mutates (`KeyspaceDescriptor.IndexRegistryRoot`, in particular,
+which `registryPut` / `registryDelete` advance in place), pinned-index
+entries on the cached handle, or the handle's flush state. A helper
+that mutates such caller fields **and has any error-returning step
+following the mutation within the savepoint window** must capture
+the pre-call value explicitly and restore it on the error path beside
+the `RestoreSavepoint`. Caller-field mutations that strictly follow
+the last error-returning step in the window — DeleteKeyspace's
+in-memory invalidation block (cache eviction, dead-marking,
+`pendingDeletes`), RebuildIndex's `propagateNotCachedDescChange` +
+`syncRebuildToCachedPinned`, DropIndex's `delete(cachedKS.indexes,
+…)` — need no restore: they cannot be reached on a `retErr != nil`
+exit, so the defer's `RestoreSavepoint` branch cannot observe them
+half-applied. Missing the restore where it IS required re-opens the
+atomicity gap the savepoint was added to close: the bitmap rolls
+back, the descriptor stays at the would-be-published value, and a
+later op following the descriptor reads from pages the bitmap now
+considers free → `ReachableButFree` / `ReachableInRPL` corruption on
+the next `Check()`.
+
+A future contributor adding a fallible step BELOW the existing
+caller-field mutations must restructure the helper (explicit
+`ReleaseSavepoint` before the new step + a fresh savepoint if more
+atomic work follows) or extend the explicit capture-and-restore to
+the field whose mutation now precedes a fallible step.
+
+**Failure-injection seam.** Write-helpers expose a test-only
+`atomic.Pointer[func(...) error]` hook (one per helper, in the
+helper's source file) so regression tests can deterministically
+exercise the partial-failure path without depending on fragile
+`MaxTxBufferBytes` calibration. Each helper has a regression test
+that asserts `db.Check()` reports no `BitmapLeak` /
+`ReachableButFree` / `ReachableInRPL` / `FreeAndPending` after a
+mid-helper error followed by `Tx.Commit`.
+
 ## Cursor State Machine
 
 Every cursor (`Cursor`, `SetCursor`, `TypedCursor`) is at any

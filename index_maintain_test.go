@@ -473,9 +473,10 @@ func TestIndexedCursorDeleteOnStaleCursorReturnsErrCursorStale(t *testing.T) {
 // btree.Put/Delete has yet happened, so the test verifies the
 // restore is a no-op on this specific path. The complementary
 // case (where mid-loop btree.Put fails after some prior btree.Put
-// succeeded) requires a failure injection seam not available at
-// chunk-7.6 — that fault-mode is in scope of the
-// writenewindexregistry-partial-leak deferral.
+// succeeded) is covered by the per-row failure-injection tests
+// below, which exercise the transactions.md §Write-helper error
+// contract via Pager.BeginShallowSavepoint at every per-row caller
+// site.
 func TestIndexedPutPinnedStateRevertsOnCandidateCollision(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -655,13 +656,15 @@ func TestKeyspaceIndexHandleUnknownNameReturnsErrIndexNotFound(t *testing.T) {
 	}
 }
 
-// --- writenewindexregistry-partial-leak per-row case ------------
+// --- per-row index-maintenance atomicity ------------------------
 //
 // These four regression tests pin the caller-site
 // Pager.BeginShallowSavepoint / RestoreSavepoint(on error) /
-// ReleaseSavepoint(on success) wrap that closes the per-row case of
-// writenewindexregistry-partial-leak (the chunk-7.6 / 7.9 extension
-// the original chunk-7.5 fix deferred). Each:
+// ReleaseSavepoint(on success) wrap that satisfies the per-row
+// portion of transactions.md §Write-helper error contract (the
+// chunk-7.6 / 7.9 sites; the chunk-7.5 sibling writeNewIndexRegistry
+// and the chunk-7.8 cold-path DDL siblings use the nested-kind
+// savepoint per the same contract). Each:
 //
 //   1. Creates an indexed Keyspace / SetKeyspace with ≥2 indexes
 //      that the row mutation will touch.

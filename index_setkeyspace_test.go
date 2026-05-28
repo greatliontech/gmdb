@@ -651,12 +651,13 @@ func TestSetKeyspaceIndexedPersistsAcrossCommit(t *testing.T) {
 	}
 }
 
-// --- writenewindexregistry-partial-leak per-row case (SetKeyspace)
+// --- per-row index-maintenance atomicity (SetKeyspace) ----------
 //
 // SetKeyspace counterparts of the Keyspace.Put / Delete /
-// Cursor.Delete tests in index_maintain_test.go. Same contract:
-// after a per-op error followed by Tx.Commit, db.Check() reports
-// zero BitmapLeak — the caller-site savepoint Restore reverts the
+// Cursor.Delete tests in index_maintain_test.go. Same contract
+// (transactions.md §Write-helper error contract): after a per-op
+// error followed by Tx.Commit, db.Check() reports zero BitmapLeak
+// — the caller-site savepoint Restore reverts the
 // partial allocations the helper made before the injection.
 
 // setKeyspaceTwoIndexDecls returns two decls with distinct

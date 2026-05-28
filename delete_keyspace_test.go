@@ -640,3 +640,103 @@ func TestDeferredFlushClosesDescriptorDrift(t *testing.T) {
 		t.Errorf("Get post-rollback: got err=%v, want ErrNotFound (no orphan write)", err)
 	}
 }
+
+// TestDeleteKeyspaceAtomicOnPartialRetirement pins the DDL atomicity
+// contract for the three-subtree retirement (transactions.md §Write-
+// helper error contract). A failure mid-walk of retireIndexRegistry —
+// after step-1 FreeSubtree(desc.Root) has already returned the
+// keyspace's data tree pages to the loose pool, and after one index
+// data tree has been freed — leaves the bitmap with the keyspace's
+// data tree partially-freed yet the cached *Keyspace's descriptor
+// still pointing at desc.Root. Without the savepoint wrap around the
+// whole retirement, Tx.Commit (the rest-of-tx-continues path)
+// publishes that bitmap, and a future tx that re-allocates the freed
+// pages overwrites still-referenced data — corruption, not just a
+// leak. Check() must report zero BitmapLeak after Commit AND the
+// keyspace must still read correctly (no overwrites since the
+// savepoint reverted everything).
+func TestDeleteKeyspaceAtomicOnPartialRetirement(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Setup tx: create a keyspace with TWO indexes so the registry
+	// walk has multiple iterations; populate it so step-1 and the
+	// per-index FreeSubtree have real subtrees to retire.
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	idx1 := testDecl("by_color", "color")
+	idx1.Extract = firstByteExtract
+	idx2 := testDecl("by_size", "size")
+	idx2.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", idx1, idx2)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		if err := ks.Put([]byte(k), []byte{0x42, 'x'}); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit setup: %v", err)
+	}
+
+	// Failure-injection: fail after the first registry entry's
+	// per-index FreeSubtree (i==0) — step 1's data-subtree free has
+	// already run, plus one index's data tree, but the other index
+	// and the registry-root free have not.
+	injected := errors.New("injected retire failure")
+	setRetireIndexRegistryFailHookForTest(func(i int) error {
+		if i == 0 {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setRetireIndexRegistryFailHookForTest(nil) })
+
+	tx, err = db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin 2: %v", err)
+	}
+	if err := tx.DeleteKeyspace("items"); !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("DeleteKeyspace err = %v, want injected failure", err)
+	}
+	// Rest-of-tx-continues: commit despite the per-op error.
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	assertNoBitmapCorruption(t, db, "DeleteKeyspace")
+
+	// Stronger check: the keyspace must still read correctly after a
+	// re-open — the savepoint reverted every FreeSubtree, so the
+	// data tree is intact. (Without the wrap, the bitmap shows the
+	// pages free; even if Check shows zero leak this tx, a future
+	// re-allocation of those pages would corrupt the still-live
+	// data tree.)
+	tx, err = db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin 3: %v", err)
+	}
+	defer tx.Rollback()
+	ks2, err := tx.OpenKeyspace("items", idx1, idx2)
+	if err != nil {
+		t.Fatalf("OpenKeyspace after failed delete: %v", err)
+	}
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		v, err := ks2.Get([]byte(k))
+		if err != nil {
+			t.Errorf("Get %q after failed delete: %v", k, err)
+		}
+		if len(v) != 2 || v[0] != 0x42 || v[1] != 'x' {
+			t.Errorf("Get %q: got %x, want {0x42, 'x'}", k, v)
+		}
+	}
+}

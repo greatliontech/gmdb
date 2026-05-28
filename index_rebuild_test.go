@@ -749,3 +749,172 @@ func TestDeleteKeyspacePersistsAcrossCommit(t *testing.T) {
 		}
 	}
 }
+
+// assertNoBitmapCorruption fails the test if db.Check() reports any
+// issue that signals page-level inconsistency between the committed
+// reachable set and the bitmap — BitmapLeak (allocated-but-unreferenced),
+// ReachableButFree (referenced-but-marked-free), ReachableInRPL
+// (referenced-but-pending-reclamation), or FreeAndPending (free AND in
+// RPL: future double-allocation hazard). Different partial-failure
+// shapes (cached vs not-cached descriptor path) produce different
+// corruption codes — all four indicate the write-helper's atomicity
+// contract has been violated.
+func assertNoBitmapCorruption(t *testing.T, db *DB, site string) {
+	t.Helper()
+	bad := map[string]bool{
+		"BitmapLeak":       true,
+		"ReachableButFree": true,
+		"ReachableInRPL":   true,
+		"FreeAndPending":   true,
+	}
+	var problems []CheckIssue
+	for _, iss := range collectIssues(db.Check()) {
+		if bad[iss.Code] {
+			problems = append(problems, iss)
+		}
+	}
+	if len(problems) != 0 {
+		t.Errorf("%s violated atomicity contract — %d Check issue(s): %v",
+			site, len(problems), problems)
+	}
+}
+
+// TestRebuildIndexAtomicOnPartialFailure pins the chunk-7.8 DDL
+// write-helper atomicity contract (transactions.md §Write-helper error
+// contract): a mid-rebuild failure must not orphan any pages on
+// Tx.Commit (the rest-of-tx-continues path). The failure is injected
+// after the publish-then-retire registryPut succeeded (the registry
+// now points at the freshly-built newRoot) but before the OLD index
+// data tree is freed — the H-2 ordering's worst-case window, where
+// without the savepoint wrap newRoot's pages would be orphaned (the
+// restored descriptor must NOT keep pointing at them) and the OLD
+// tree would remain partially live. Check() must report no bitmap-
+// to-tree inconsistency after Commit.
+func TestRebuildIndexAtomicOnPartialFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// First tx: create + populate so the rebuild has a real OLD tree.
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	v1 := testDecl("by_color", "color")
+	v1.Extract = firstByteExtract
+	v1.Version = "v1"
+	ks, err := tx.CreateKeyspace("items", v1)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		if err := ks.Put([]byte(k), []byte{0x42, 'x'}); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit setup: %v", err)
+	}
+
+	// Second tx: inject the failure during RebuildIndex.
+	injected := errors.New("injected rebuild failure")
+	setRebuildIndexFailHookForTest(func() error { return injected })
+	t.Cleanup(func() { setRebuildIndexFailHookForTest(nil) })
+
+	tx, err = db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin 2: %v", err)
+	}
+	// Cache the keyspace handle so registryPut mutates ks.desc
+	// directly (uniform cached-path: ks.markDirty + flushKeyspaces
+	// publishes the new descriptor at Commit, surfacing the orphans
+	// as BitmapLeak under neuter).
+	v1Open := testDecl("by_color", "color")
+	v1Open.Extract = firstByteExtract
+	v1Open.Version = "v1"
+	if _, err := tx.OpenKeyspace("items", v1Open); err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	v2 := testDecl("by_color", "color")
+	v2.Extract = firstByteExtract
+	v2.Version = "v2"
+	if err := tx.RebuildIndex("items", v2); !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("RebuildIndex err = %v, want injected failure", err)
+	}
+	// Rest-of-tx-continues: commit despite the per-op error.
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	assertNoBitmapCorruption(t, db, "RebuildIndex")
+}
+
+// TestDropIndexAtomicOnPartialFailure pins the DDL atomicity contract
+// for Tx.DropIndex: a failure between the publish-then-retire
+// registryDelete (which advances the registry off the entry) and the
+// FreeSubtree of the OLD data tree must not orphan the data tree on
+// Tx.Commit. Without the savepoint wrap, registryDelete already
+// updated desc.IndexRegistryRoot — the data tree pages are still
+// allocated yet unreferenced. Check() must report zero BitmapLeak.
+func TestDropIndexAtomicOnPartialFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Setup tx: create + populate so DropIndex has a non-trivial data
+	// tree to retire.
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		if err := ks.Put([]byte(k), []byte{0x42, 'x'}); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit setup: %v", err)
+	}
+
+	injected := errors.New("injected drop failure")
+	setDropIndexFailHookForTest(func() error { return injected })
+	t.Cleanup(func() { setDropIndexFailHookForTest(nil) })
+
+	tx, err = db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin 2: %v", err)
+	}
+	// Not-cached path (no OpenKeyspace in this tx): on error,
+	// propagateNotCachedDescChange does NOT run, so the on-disk
+	// descriptor stays pointing at the OLD IndexRegistryRoot — which
+	// registryDelete has already mutated in the bitmap (the registry
+	// shrank to empty, freeing the old leaf into retired/RPL).
+	// Under neuter the bitmap and the descriptor disagree →
+	// ReachableInRPL on the old registry leaf. The cached-path
+	// alternative is masked by flushKeyspaces's flushIndexRegistry
+	// rebuild, which re-writes the registry from ks.indexes (still
+	// pinned) so the leak vanishes from the committed state — a
+	// faulty test, not a safe outcome.
+	if err := tx.DropIndex("items", "by_color"); !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("DropIndex err = %v, want injected failure", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	assertNoBitmapCorruption(t, db, "DropIndex")
+}

@@ -1440,7 +1440,7 @@ func (c *Cursor) Err() error {
 // name allocates a fresh *Keyspace; the old handle stays dead per
 // Inv-D (api-surface.md §Keyspace API DeleteKeyspace permanent-
 // invalidation clause).
-func (tx *Tx) DeleteKeyspace(name string) error {
+func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 	if err := tx.requireOpen(true); err != nil {
 		return err
 	}
@@ -1503,6 +1503,39 @@ func (tx *Tx) DeleteKeyspace(name string) error {
 	//
 	// All three happen in the same write tx; on Commit the meta
 	// swap publishes the descriptor removal atomically.
+	//
+	// Atomicity wrap (transactions.md §Write-helper error contract):
+	// any of the three FreeSubtree calls (step 1's data subtree, the
+	// per-index data trees in step 2, or step 3's registry root) can
+	// fail mid-walk, leaving the bitmap with some pages of the
+	// keyspace's structures freed and others still allocated. The
+	// cached *Keyspace's descriptor still points at the partially-
+	// freed structures, and the in-memory invalidation (eviction +
+	// pendingDeletes + numKeyspaces--) happens AFTER the retirement
+	// returns successfully — so a Tx.Commit on the rest-of-tx-continues
+	// path would publish a bitmap that contradicts a still-live
+	// descriptor, violating free-space.md's bitmap-consistency
+	// invariant (structurally similar to RebuildIndex / DropIndex's
+	// partial-failure shapes; the consequence — a future tx that
+	// re-allocates the bitmap-freed pages overwrites still-referenced
+	// data — is the same overwrite hazard each of the four DDL sites
+	// must avoid). Bracket the whole retirement in a nested savepoint
+	// so a mid-walk failure restores every FreeSubtree, leaving the
+	// keyspace structurally intact. No descriptor-field restore is
+	// needed here: the local `desc` is a value-copy of the cached
+	// descriptor, and the retirement does not mutate the cached
+	// descriptor's fields. Defer-based dispatch (Restore on retErr !=
+	// nil, Release on success) mirrors RebuildIndex / DropIndex and
+	// is robust to future additions of early-return paths inside the
+	// retirement window.
+	sp := tx.pgr.BeginSavepoint()
+	defer func() {
+		if retErr != nil {
+			tx.pgr.RestoreSavepoint(sp)
+			return
+		}
+		tx.pgr.ReleaseSavepoint(sp)
+	}()
 	if _, err := btree.FreeSubtree(tx.pgr, cfg, desc.Root); err != nil {
 		return fmt.Errorf("DeleteKeyspace %q: data subtree: %w", name, mapBtreeErr(err))
 	}

@@ -293,10 +293,11 @@ func TestSavepointNesting(t *testing.T) {
 
 // TestShallowSavepointPreservesLoosePop verifies that a SHALLOW
 // savepoint does NOT suspend loose-pop the way nested savepoints do
-// (the writenewindexregistry-partial-leak per-row case's correctness
-// + cost contract). A child Loose-pop within the shallow window is
-// allowed; the existing nested-savepoint Inv-N1 mechanic (suspension
-// while savepointDepth > 0) stays unchanged.
+// (the per-row index-maintenance correctness + cost contract from
+// transactions.md §Write-helper error contract). A child Loose-pop
+// within the shallow window is allowed; the existing nested-
+// savepoint Inv-N1 mechanic (suspension while savepointDepth > 0)
+// stays unchanged.
 func TestShallowSavepointPreservesLoosePop(t *testing.T) {
 	p, bm, f := setupWriter(t, 64)
 	defer p.Close()
