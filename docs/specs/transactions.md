@@ -373,8 +373,9 @@ the parent (re-opening by name if the parent never had it open).
 **Nesting depth.** Children can create their own children
 (arbitrary nesting). Each level captures its own savepoint.
 Rollback at any level restores to that level's savepoint. Cost is
-proportional to pages modified at that level, not total database
-size.
+proportional to pages modified since the outermost open savepoint,
+plus O(bitmap-pages currently dirty) for the bitmap-dirty-set
+clone, not total database size.
 
 ### Why this is cheap
 
@@ -384,6 +385,23 @@ means releasing the buffer (back to a `sync.Pool`) and clearing
 the page ID from bookkeeping sets — no buffer-content restoration,
 no parent-state reconstruction. The slab analogue of the fresh-
 mmap-position CoW model.
+
+The allocation bitmap is the one piece of cross-level state whose
+naive snapshot would scale with `MaxSize`. Its rollback substrate
+is a three-method, strict-LIFO lifecycle: **Snapshot** opens a
+marker at the current bitmap state; subsequent `Set`/`Clear`
+operations append undo entries to a shared per-bitmap log while
+at least one Snapshot is open; **Restore** replays the log in
+reverse from the marker (reverting bit flips) and reinstalls
+captured scalars (`hint`, `numFree`) plus the dirty-set clone;
+**Discard** releases a marker without replaying (child commit /
+top-level Commit success). Markers must be released in LIFO
+order — the parent-freeze rule (Inv-N3) and the BeginTx/Commit
+pairing already guarantee this; an out-of-order Restore or Discard
+panics rather than silently corrupt state. Memory per open marker
+is `O(bit flips since the marker)` + `O(bitmap-pages dirty at
+marker capture)`, both bounded by mutation count and bitmap
+geometry, not by `MaxSize`.
 
 ### Interaction with write batching
 

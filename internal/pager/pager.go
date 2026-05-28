@@ -332,9 +332,13 @@ func (p *Pager) RPLChain() []RPLSegmentRef { return p.rplSegments }
 
 // BeginTx snapshots the pager's mutable state (bitmap, HighWaterMark,
 // RPL chain) so AbortTx can restore it. Called at the start of every
-// write transaction. Idempotent: a second call clobbers the first
-// snapshot (used by tests; production callers don't re-Begin without
-// Commit/Rollback).
+// write transaction. Idempotent: a second call discards the first
+// snapshot via bitmap.Discard before clobbering it (used by tests;
+// production callers don't re-Begin without Commit/Rollback). The
+// Discard is required because the bitmap now tracks open Snapshots
+// internally — silently overwriting bitmapSnapshot without releasing
+// it would leak the prior Snapshot into openSnapshots and grow the
+// undo log unbounded.
 func (p *Pager) BeginTx() {
 	// Reset the checksum-verification cache at every write-tx boundary:
 	// the previous commit may have rewritten mmap pages, so verifications
@@ -343,6 +347,9 @@ func (p *Pager) BeginTx() {
 	p.resetVerified()
 	if p.readOnly || p.bitmap == nil {
 		return
+	}
+	if p.haveTxSnapshot {
+		p.bitmap.Discard(p.bitmapSnapshot)
 	}
 	p.bitmapSnapshot = p.bitmap.Snapshot()
 	p.hwmSnapshot = p.highWaterMark
@@ -390,8 +397,15 @@ func (p *Pager) AbortTx() {
 }
 
 // discardTxSnapshot drops the snapshot without restoring (Commit
-// success path).
+// success path). Releases the bitmap's per-Snapshot undo-log tracking
+// via bitmap.Discard: with no Snapshot left open the bitmap truncates
+// its undo log to length 0, so the log never survives across a tx
+// boundary. Guard mirrors AbortTx's haveTxSnapshot && bitmap != nil
+// pattern.
 func (p *Pager) discardTxSnapshot() {
+	if p.haveTxSnapshot && p.bitmap != nil {
+		p.bitmap.Discard(p.bitmapSnapshot)
+	}
 	p.bitmapSnapshot = nil
 	p.rplChainSnapshot = nil
 	p.haveTxSnapshot = false

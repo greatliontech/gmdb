@@ -568,6 +568,259 @@ func TestClearOnAlreadyClearIsNoOp(t *testing.T) {
 	}
 }
 
+// TestSnapshotNestedLIFORoundTrip exercises the entailed-invariant
+// "Restore(s) is observationally equivalent to undoing every flip
+// since Snapshot returned s" for nested Snapshots (the pager's
+// BeginTx + BeginSavepoint usage; see transactions.md §Why this is
+// cheap). The undo-log substrate shares one flip log across all open
+// Snapshots; a bug in the cascade-on-restore or in indexOfSnapshot
+// would surface here as either a stale flip persisting past an outer
+// Restore, or an inner Restore disturbing the outer's view.
+func TestSnapshotNestedLIFORoundTrip(t *testing.T) {
+	b := newBitmap(t, 4096)
+	first := b.FirstDataPage()
+
+	// Initial state captured for the outer Snapshot.
+	initialNumFree := b.NumFree()
+	initialDirty := b.DirtyPages()
+
+	outer := b.Snapshot()
+
+	// Outer-window mutations.
+	b.Set(first + 1)
+	b.Set(first + 100)
+	b.Clear(first + 1) // re-clear: a same-bit toggle within the outer window
+	b.Set(first + 200)
+	afterOuterMutations := b.NumFree()
+	if afterOuterMutations == initialNumFree {
+		t.Fatal("test setup: outer mutations did not change NumFree")
+	}
+
+	inner := b.Snapshot()
+	// Capture inner's begin state to assert nested-restore returns there.
+	innerBeginNumFree := b.NumFree()
+
+	// Inner-window mutations.
+	b.Set(first + 300)
+	b.Clear(first + 100) // touch a page set in outer window
+	b.Set(first + 400)
+
+	b.Restore(inner)
+
+	// After inner restore: state == inner-begin state. The outer's
+	// flips (first+100 set, first+200 set, first+1 toggled clear) must
+	// remain; the inner's flips (first+300, first+400 set; first+100
+	// cleared) must be reverted.
+	if b.NumFree() != innerBeginNumFree {
+		t.Errorf("post-inner-restore NumFree = %d, want %d (inner-begin)",
+			b.NumFree(), innerBeginNumFree)
+	}
+	if !b.IsSet(first + 100) {
+		t.Error("post-inner-restore: outer-window Set(first+100) not preserved")
+	}
+	if !b.IsSet(first + 200) {
+		t.Error("post-inner-restore: outer-window Set(first+200) not preserved")
+	}
+	if b.IsSet(first + 1) {
+		t.Error("post-inner-restore: outer-window toggle to clear not preserved")
+	}
+	if b.IsSet(first + 300) {
+		t.Error("post-inner-restore: inner-window Set(first+300) not reverted")
+	}
+	if b.IsSet(first + 400) {
+		t.Error("post-inner-restore: inner-window Set(first+400) not reverted")
+	}
+
+	// After-inner mutations land in the outer's revert window.
+	b.Set(first + 500)
+	b.Clear(first + 100) // re-clear inside outer revert window
+
+	b.Restore(outer)
+
+	// After outer restore: state == initial.
+	if b.NumFree() != initialNumFree {
+		t.Errorf("post-outer-restore NumFree = %d, want %d (initial)",
+			b.NumFree(), initialNumFree)
+	}
+	for _, p := range []uint64{first + 1, first + 100, first + 200, first + 300, first + 400, first + 500} {
+		if b.IsSet(p) {
+			t.Errorf("post-outer-restore: page %d still set, want clear", p)
+		}
+	}
+	got := b.DirtyPages()
+	if !equalUint32(got, initialDirty) {
+		t.Errorf("post-outer-restore DirtyPages = %v, want %v", got, initialDirty)
+	}
+}
+
+// TestSnapshotRestoreCrossBitmapPageDirtySet pins the wholesale-dirty-
+// restore path across distinct bitmap pages. The single-bitmap-page
+// round-trip tests (4096-totalPages newBitmap) leave b.dirty at most
+// {0} — they don't exercise the case where a post-Snapshot mutation
+// dirties a new bitmap page that the captured-at-Snapshot dirty set
+// must NOT contain after Restore. A regression that aliased b.dirty to
+// the live set (rather than capturing a clone at Snapshot time) would
+// pass the single-page tests and fail here.
+func TestSnapshotRestoreCrossBitmapPageDirtySet(t *testing.T) {
+	// pageSize=4096 → bitsPerPage=32768. 1<<20 totalPages → 32 bitmap pages.
+	const totalPages = uint64(1) << 20
+	b := newBitmap(t, totalPages)
+	first := b.FirstDataPage()
+
+	// Pre-Snapshot: mutate a data page in bitmap-page 0.
+	pageInBM0 := first + 1
+	b.Set(pageInBM0)
+	preDirty := b.DirtyPages()
+	// Sanity-check: pre-state lives only in bitmap-page 0.
+	if len(preDirty) != 1 || preDirty[0] != 0 {
+		t.Fatalf("test setup: preDirty = %v, want [0]", preDirty)
+	}
+
+	snap := b.Snapshot()
+
+	// Post-Snapshot: mutate a data page in bitmap-page 5 — markDirty
+	// will index = page / (pageSize*8) = page / 32768.
+	pageInBM5 := uint64(5*32768 + 100)
+	if pageInBM5 >= totalPages {
+		t.Fatalf("test setup: pageInBM5 %d out of range", pageInBM5)
+	}
+	b.Set(pageInBM5)
+	postDirty := b.DirtyPages()
+	if len(postDirty) != 2 {
+		t.Fatalf("test setup: postDirty = %v, want 2 entries (BM-page 0 and 5)", postDirty)
+	}
+
+	b.Restore(snap)
+
+	// After Restore: pageInBM5 bit reverted; bitmap-page 5 dropped from
+	// dirty (it was added only during this Snapshot's window).
+	if b.IsSet(pageInBM5) {
+		t.Error("post-Restore: pageInBM5 bit not reverted")
+	}
+	got := b.DirtyPages()
+	if !equalUint32(got, preDirty) {
+		t.Errorf("post-Restore DirtyPages = %v, want %v (bitmap-page 5 should have been dropped)",
+			got, preDirty)
+	}
+}
+
+// TestSnapshotDiscardIsObservableNoOp pins the entailed invariant
+// "Discard(s) releases per-Snapshot tracking without changing
+// observable Bitmap state": after a Snapshot is Discarded (the
+// ReleaseSavepoint / commit-success path), every IsSet/NumFree/Hint/
+// DirtyPages reading matches the pre-Discard value. A regression that
+// (e.g.) accidentally re-applied undo entries on Discard would surface
+// here.
+func TestSnapshotDiscardIsObservableNoOp(t *testing.T) {
+	b := newBitmap(t, 4096)
+	first := b.FirstDataPage()
+
+	b.Set(first + 1)
+	b.Set(first + 7)
+	b.SetHint(first + 5)
+
+	snap := b.Snapshot()
+	b.Set(first + 50)
+	b.Clear(first + 7)
+	b.SetHint(first + 50)
+
+	preDiscardNumFree := b.NumFree()
+	preDiscardHint := b.Hint()
+	preDiscardDirty := b.DirtyPages()
+	preDiscardSet1 := b.IsSet(first + 1)
+	preDiscardSet7 := b.IsSet(first + 7)
+	preDiscardSet50 := b.IsSet(first + 50)
+
+	b.Discard(snap)
+
+	if b.NumFree() != preDiscardNumFree {
+		t.Errorf("Discard changed NumFree: %d → %d", preDiscardNumFree, b.NumFree())
+	}
+	if b.Hint() != preDiscardHint {
+		t.Errorf("Discard changed Hint: %d → %d", preDiscardHint, b.Hint())
+	}
+	if !equalUint32(b.DirtyPages(), preDiscardDirty) {
+		t.Errorf("Discard changed DirtyPages: %v → %v", preDiscardDirty, b.DirtyPages())
+	}
+	if b.IsSet(first+1) != preDiscardSet1 {
+		t.Error("Discard changed IsSet(first+1)")
+	}
+	if b.IsSet(first+7) != preDiscardSet7 {
+		t.Error("Discard changed IsSet(first+7)")
+	}
+	if b.IsSet(first+50) != preDiscardSet50 {
+		t.Error("Discard changed IsSet(first+50)")
+	}
+}
+
+// TestDiscardReleasesUndoLogTracking asserts that after a Discard of
+// the last open Snapshot, the bitmap's undo-log tracking is fully
+// released — a subsequent Set on the same page must NOT be recorded
+// (no Snapshot exists to replay it). Validated indirectly by opening
+// a fresh Snapshot and verifying Restore from that Snapshot does not
+// revert pre-Snapshot mutations.
+func TestDiscardReleasesUndoLogTracking(t *testing.T) {
+	b := newBitmap(t, 4096)
+	first := b.FirstDataPage()
+
+	// Pre-snapshot baseline mutations.
+	b.Set(first + 1)
+
+	// Open + Discard a snapshot to exercise the "log truncates on last
+	// Discard" path.
+	snap := b.Snapshot()
+	b.Set(first + 2)
+	b.Discard(snap)
+
+	// At this point the undo log should be released (len == 0).
+	// Subsequent mutations with NO snapshot open should not be tracked.
+	b.Set(first + 3)
+
+	// Now open a fresh snapshot, do nothing, restore. The fresh restore
+	// must not revert first+1, first+2, or first+3 — none of those were
+	// inside an open snapshot's window.
+	snap2 := b.Snapshot()
+	b.Restore(snap2)
+
+	for _, p := range []uint64{first + 1, first + 2, first + 3} {
+		if !b.IsSet(p) {
+			t.Errorf("page %d lost after Snapshot/Restore of an empty window — undo log was not properly released by Discard", p)
+		}
+	}
+}
+
+// TestRestoreOnNonOpenSnapshotPanics pins the strict-LIFO contract:
+// calling Restore on a Snapshot that has already been Restored or
+// Discarded (or never returned by this Bitmap's Snapshot()) panics.
+// Surfacing the misuse loudly is safer than silently producing wrong
+// state when openSnapshots tracking is bypassed.
+func TestRestoreOnNonOpenSnapshotPanics(t *testing.T) {
+	b := newBitmap(t, 4096)
+	snap := b.Snapshot()
+	b.Discard(snap)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Restore on a discarded Snapshot did not panic")
+		}
+	}()
+	b.Restore(snap)
+}
+
+// TestDiscardOnNonOpenSnapshotPanics mirrors the above for Discard.
+func TestDiscardOnNonOpenSnapshotPanics(t *testing.T) {
+	b := newBitmap(t, 4096)
+	snap := b.Snapshot()
+	b.Restore(snap)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Discard on a restored Snapshot did not panic")
+		}
+	}()
+	b.Discard(snap)
+}
+
 func equalUint32(a, b []uint32) bool {
 	if len(a) != len(b) {
 		return false

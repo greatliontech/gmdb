@@ -94,6 +94,24 @@ before designing the fix. The proof is in the receipts:
   already its own deferred issue (`bitmap-rollback-undo-log`). One
   build resolves both.
 
+- **`bitmap-rollback-undo-log`** (this session, `97fba4b`):
+  the issue framed the work as profile-driven (`Lands:` "when
+  profiling shows BeginTx allocation pressure is material"). First-
+  principles re-derivation found `transactions.md §Nested Transactions`
+  carries a **clause-explicit cost invariant** — *"Cost is
+  proportional to pages modified at that level, not total database
+  size"* — that `Bitmap.Snapshot()`'s `slices.Clone(detail) +
+  slices.Clone(summary)` was **violating** (8 MB at 256 GB MaxSize,
+  independent of mutation count). So it's a defect closing a
+  spec→code divergence, not a perf optimisation; pulling it required
+  no profiling justification. Second surprise: the issue claimed
+  *"the API surface stays the same so the pager doesn't change"* — a
+  new `Discard(s)` method was required so the bitmap could release
+  per-Snapshot tracking on the commit-success path (without it the
+  `openSnapshots` slice and `undoLog` would leak across tx
+  boundaries). The pager DID need to change. Two wrong claims in one
+  issue.
+
 **Trap pattern to watch for:** the issue cites a "well-known"
 invariant or rationale that the actual spec doesn't state, OR proposes
 a one-line fix that introduces a new bug (same class as the one it's
@@ -151,7 +169,7 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-5 commits resolved 4 issues + 1 partial in prior sessions:
+6 commits resolved 5 issues + 1 partial in prior sessions:
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -160,6 +178,7 @@ close-out.
 | `ab2d239` | kind2-one-parent-reachability-test | Closed (enforced test) |
 | `e40cbdc` | setkeyspace-put-redundant-membership-probe | Closed (2 single-descent btree primitives) |
 | `c1effd2` | writenewindexregistry-partial-leak | **Partial** — `writeNewIndexRegistry` site done via savepoint; 4 siblings remain |
+| `97fba4b` | bitmap-rollback-undo-log | Closed (undo-log substrate + spec amend in transactions.md §Nested Transactions + new `Discard` API) |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -167,25 +186,26 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-- **`writenewindexregistry-partial-leak`** — 4 sites remain.
-  - 3 cold-path DDL siblings (`Tx.RebuildIndex` index_rebuild.go:119,
-    `Tx.DropIndex` :419, `retireIndexRegistry` :377). Apply the same
-    `BeginSavepoint` / `RestoreSavepoint(on error)` /
-    `ReleaseSavepoint(on success)` pattern as `writeNewIndexRegistry`
-    (`c1effd2`). Each needs a failure-injection test using the
-    `atomic.Pointer[func()]` seam idiom (precedent:
-    `createInitHookForTest` in `internal/lock/lock.go:339`; first
-    instance in production: `writeRegistryFailHookForTest` in
-    `index_open.go`). Subtle: savepoint restores pager state but NOT
-    caller-descriptor fields — explicitly restore any descriptor /
-    pinned-index field the helper mutates.
+- **`writenewindexregistry-partial-leak`** — 4 sites remain. The
+  bitmap-undo-log infrastructure is now in place (this session),
+  unblocking the hot-path site.
   - `applyIndexMaintenanceOnPut/Delete` (index_maintain.go:168) —
-    **needs the bitmap-undo-log build**. Per-row savepoint is a perf
-    catastrophe (8 MB bitmap clone at 256 GB MaxSize per row).
-    Bespoke rollback must un-retire old pages so the chunk-7.6 H-2
-    `pinned.root` revert can't dangle → converges on
-    `bitmap-rollback-undo-log`. One infrastructure build resolves
-    both.
+    **now unblocked.** Wrap each helper in
+    `BeginSavepoint`/`RestoreSavepoint(on error)`/`ReleaseSavepoint(on
+    success)`. The savepoint's `bitmap.Snapshot` is now an
+    O(this-window-flips) marker, so per-row wrapping is correct-by-
+    design. Existing `snapshotIndexes`/`restoreIndexes` covers the
+    in-memory `pinnedIndex.{root,count}` revert; the savepoint adds
+    the missing on-disk index B-tree page reclaim. Failure-injection
+    test using the `atomic.Pointer[func()]` seam idiom (precedent in
+    `index_open.go writeRegistryFailHookForTest`).
+  - 3 cold-path DDL siblings (`Tx.RebuildIndex` index_rebuild.go:119,
+    `Tx.DropIndex` :419, `retireIndexRegistry` :377). Same
+    savepoint pattern as `writeNewIndexRegistry` (`c1effd2`). Each
+    needs a failure-injection test. Subtle: savepoint restores pager
+    state but NOT caller-descriptor fields — explicitly restore any
+    descriptor / pinned-index field the helper mutates (precedent in
+    `c1effd2`: explicit `desc.IndexRegistryRoot = prevRegRoot`).
 
 - **`btree-post-merge-underflow`** — user elected to **tighten the
   contract** despite first-principles finding that the cited
@@ -213,9 +233,6 @@ the README as ground truth, this as a hint.
   tuple). Don't break existing byte covering tests
   (`TestIndexedPutWritesCoveringBytes` asserts stored bytes, not the
   Lookup return).
-
-- **`bitmap-rollback-undo-log`** — couples with `applyIndexMaintenance`
-  above. One build resolves both.
 
 ### Undecided / needs analysis
 
@@ -249,17 +266,28 @@ Pick **one** issue from `docs/issues/README.md`. Confirm the pick with
 the user at session start (offer your recommendation + rationale; the
 user may override). Default order, given prior decisions:
 
-1. **The bitmap-undo-log build** — resolves
-   `bitmap-rollback-undo-log` + unblocks `applyIndexMaintenance`. The
-   largest piece, infrastructural; tackle when context is fresh.
+1. **`applyIndexMaintenance` per-row savepoint wiring** (last open
+   site of `writenewindexregistry-partial-leak`) — now **unblocked**
+   by the bitmap-undo-log build (this prior session). Adjacent to
+   recently-closed; the substrate is fresh in committed code. Per-row
+   `BeginSavepoint`/`Restore`/`Release` is correct-by-design now that
+   `Snapshot` is O(window-flips), not O(MaxSize). Closes one of the
+   two open sub-issues of the partial commit.
 2. **The 3 DDL savepoint siblings** of
-   `writenewindexregistry-partial-leak` — mechanical pattern, three
-   failure-injection tests; could be one increment.
-3. **`btree-post-merge-underflow`** — spec amend + recursive rebalance.
+   `writenewindexregistry-partial-leak` — mechanical pattern (apply
+   `c1effd2`'s `BeginSavepoint`/`RestoreSavepoint(on error)`/
+   `ReleaseSavepoint(on success)` shape), three failure-injection
+   tests; could be one increment.
+3. **`btree-post-merge-underflow`** — spec amend + recursive
+   rebalance + enforced test. User pre-decided to tighten the
+   contract; frame as `Rationale:` (intended new behavior), not
+   `Diagnosis:`. Design-heavy; suits fresh context.
 4. **`byte-api-covering-return-unwired`** — byte-level return
-   contract.
+   contract; touches `extractPKAndValue` + byte-API `Lookup`/`Get`
+   semantics. Don't break existing covering tests.
 5. **`open-corrupt-meta-size-fields-panic`** — adjacent to a closed
-   issue; same Inv-RV3 bound pattern.
+   issue; same Inv-RV3 bound pattern. Smaller; suits later resets
+   with tighter context budgets.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**

@@ -23,9 +23,15 @@ import (
 //
 // The capture is by value/clone (not by reference into the live pager
 // maps) so the live maps can keep mutating while the savepoint is held.
-// Cost is dominated by the bitmap.Snapshot full clone — the same per-
-// transaction cost BeginTx already pays (see BeginTx); an undo-log
-// bitmap would reduce both.
+//
+// Cost contract (transactions.md §Nested Transactions "Cost is
+// proportional to pages modified at that level, not total database
+// size"): every field is O(this-level changes) — bitmap.Snapshot is an
+// undo-log marker (O(flips since BeginSavepoint), not O(MaxSize));
+// pendingAllocs/Frees/loosePages/dirtyKeys are clones of maps whose
+// cardinality is bounded by this-tx mutations; rplSegments is the chain
+// inherited from the active meta (bounded). No field scales with
+// MaxSize.
 type Savepoint struct {
 	bitmap        *bitmap.Snapshot
 	highWaterMark uint64
@@ -144,9 +150,17 @@ func (p *Pager) RestoreSavepoint(sp *Savepoint) {
 // child's allocations, frees, and slab buffers remain in the parent's
 // pager state, to be published at the top-level Commit. Popping the
 // nesting level re-enables loose-page reuse once the stack empties.
+//
+// Also releases the bitmap's per-Snapshot undo-log tracking for sp:
+// any flips appended during the child window stay in the parent's
+// (still-open) outer Snapshot's revert range, so an outer Restore
+// (top-level AbortTx) still undoes them.
 func (p *Pager) ReleaseSavepoint(sp *Savepoint) {
 	if p.readOnly || sp == nil {
 		return
+	}
+	if sp.bitmap != nil && p.bitmap != nil {
+		p.bitmap.Discard(sp.bitmap)
 	}
 	if p.savepointDepth > 0 {
 		p.savepointDepth--
