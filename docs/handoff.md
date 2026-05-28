@@ -19,6 +19,29 @@ reset picks up cleanly.
 
 ---
 
+## Session start (you are here after `/reset`)
+
+You were just invoked after a fresh context reset. Your first actions:
+
+1. **Read this entire file**, top to bottom. The "RECURRING LESSON"
+   section is non-skippable.
+2. **Re-read** `~/.claude/CLAUDE.md` (authoritative workflow). It
+   overrides any conflicting habit.
+3. **Check `docs/issues/README.md`** for the live backlog — that is
+   ground truth; this file's snapshot may be a session behind.
+4. **Propose** the top candidate from "This session's task" with a
+   one-line rationale derived from the Ordering criteria, then
+   **wait for the user to confirm or override**.
+5. **Resolve the chosen issue** via the protocol in "THE RECURRING
+   LESSON" (re-validate → diagnose → fix + regression test →
+   adversarial review → close-out → commit). One issue per session;
+   do not start a second.
+6. **Before exiting** — for any reason: success, partial, or
+   context-budget halt — follow the "End-of-session protocol" to
+   rewrite this file so the next `/reset` picks up cleanly.
+
+---
+
 ## THE RECURRING LESSON — re-derive every issue from first principles
 
 **The issue docs' framing and proposed remediations are often wrong or
@@ -241,23 +264,64 @@ user may override). Default order, given prior decisions:
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
 
+### Ordering criteria (apply when reordering candidates at end of session)
+
+1. **Decided > undecided** — don't burn a session re-deciding when
+   executable work exists. Items in "Decided, in-flight or queued"
+   precede items in "Undecided / needs analysis".
+2. **Infrastructural / unblocks others > standalone** — items whose
+   completion unblocks other queued work (e.g. bitmap-undo-log
+   unblocks `applyIndexMaintenance`) come earlier.
+3. **Fresh-context-required > mechanical** — the largest, riskiest,
+   or most-design-heavy items go first while context is freshest.
+   Smaller / mechanical work suits later resets that may have less
+   budget left if the user chains them.
+4. **Adjacent to recently-closed > unrelated** — shared mental
+   context is a real discount; e.g. an Inv-RV3-bound issue right
+   after another Inv-RV3-bound issue.
+5. **Correctness > perf** — profiling-driven items stay last and
+   must be re-validated (the gap may have closed) before being
+   pulled.
+
+When the live backlog changes, re-rank by these in order — earlier
+criteria dominate later ones.
+
 ---
 
 ## End-of-session protocol
 
-Before exiting this session, rewrite this file (`docs/handoff.md`) so
-the next reset picks up cleanly. Specifically:
+Before exiting this session — **whether the issue closed cleanly, made
+partial progress, or you halted on context** — rewrite this file
+(`docs/handoff.md`) so the next `/reset` picks up cleanly:
 
-1. **Preserve the RECURRING LESSON section** — keep all prior receipts.
-   Append any *new* trap pattern or finding this session uncovered.
-2. **Update Backlog state** — add this session's commit to the table,
-   update the in-flight / queued / undecided sections with new
-   decisions, removed entries (if an issue was fully closed), or
-   findings (e.g., "tried X, discovered Y converges on Z").
-3. **Update This session's task** — re-order or reword the candidates
-   based on what's now live.
-4. **Keep this End-of-session protocol section unchanged** so the
-   chain continues.
+1. **Preserve the RECURRING LESSON section** in full — keep every
+   prior receipt. Append a *new* receipt if this session uncovered a
+   new trap pattern (one bullet, citing the commit hash; describe the
+   surprise plainly so future you doesn't fall into it).
+2. **Update Backlog state**:
+   - Add this session's commit(s) to the table. Mark the Outcome as
+     `Closed (<one-line summary>)` if fully resolved + promote-then-
+     deleted, or `Partial — <what's done, what remains>` if the
+     issue still has open scope.
+   - Update the "Decided, in-flight or queued" and "Undecided / needs
+     analysis" sections: remove closed entries; add or amend entries
+     with new findings (e.g. "tried X, discovered Y converges on Z");
+     record any new user decisions verbatim.
+3. **Update "This session's task"** — re-order or reword the
+   candidates by applying the **Ordering criteria** above. State each
+   candidate's one-line rationale next to it so the next agent
+   inherits the reasoning.
+4. **If the session halted on context mid-fix** (uncommitted work in
+   the tree): add a short "Carry-over" subsection under "This
+   session's task" describing exactly what's staged / unstaged / done /
+   pending and what the next agent should do to either finish or
+   safely revert it. Do not commit broken or unreviewed code to
+   resume; either complete the protocol or revert and re-queue.
+5. **Keep the Session start, Ordering criteria, and End-of-session
+   protocol sections themselves unchanged** so the chain continues.
 
-Commit the handoff file with the session's work (or as a small
-follow-up commit) so it's never out of sync with the repo state.
+Commit the handoff file in the session's commit (when it's a small
+docs touch) or as a separate `docs:` follow-up commit so the file is
+never out of sync with the repo state. The handoff being committed is
+the persistence boundary — anything not in the committed file is lost
+to the next reset.
