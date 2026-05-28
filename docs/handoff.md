@@ -94,7 +94,7 @@ before designing the fix. The proof is in the receipts:
   already its own deferred issue (`bitmap-rollback-undo-log`). One
   build resolves both.
 
-- **`bitmap-rollback-undo-log`** (this session, `97fba4b`):
+- **`bitmap-rollback-undo-log`** (this session, `0893be5`):
   the issue framed the work as profile-driven (`Lands:` "when
   profiling shows BeginTx allocation pressure is material"). First-
   principles re-derivation found `transactions.md §Nested Transactions`
@@ -178,7 +178,7 @@ close-out.
 | `ab2d239` | kind2-one-parent-reachability-test | Closed (enforced test) |
 | `e40cbdc` | setkeyspace-put-redundant-membership-probe | Closed (2 single-descent btree primitives) |
 | `c1effd2` | writenewindexregistry-partial-leak | **Partial** — `writeNewIndexRegistry` site done via savepoint; 4 siblings remain |
-| `97fba4b` | bitmap-rollback-undo-log | Closed (undo-log substrate + spec amend in transactions.md §Nested Transactions + new `Discard` API) |
+| `0893be5` | bitmap-rollback-undo-log | Closed (undo-log substrate + spec amend in transactions.md §Nested Transactions + new `Discard` API) |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
