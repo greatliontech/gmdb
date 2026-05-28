@@ -194,6 +194,55 @@ before designing the fix. The proof is in the receipts:
   not on the broader corruption code set, would miss the
   `ReachableInRPL` shape entirely.)
 
+- **`byte-api-covering-return-unwired`** (`682fa70`): two surprises
+  beyond the user's pre-decided wiring shape.
+
+  **First**, the issue's first-sentence framing ("Make
+  `extractPKAndValue` return the **decoded** covering tuple for any
+  covering index") was wrong; the parenthetical that *immediately
+  followed* ("Defines a byte-level (NUL-escape) return contract …
+  caller decodes the NUL-escape tuple") was the actual contract.
+  Returning per-column `[][]byte` from `extractPKAndValue` is
+  incompatible with the byte-API `Lookup`'s `iter.Seq2[[]byte,
+  []byte]` signature — the value MUST be a single `[]byte`. The
+  parenthetical's "caller decodes" reading is the only coherent one.
+  Lesson: when an issue's headline and parenthetical disagree, the
+  parenthetical's specificity wins; sanity-check the headline by
+  pattern-matching against the existing API shape it would have to
+  fit.
+
+  **Second**, the neutral-sentinel pattern for public decoder
+  surfaces. I argued for `ErrCorrupted` wrap on `DecodeCoveringTuple`
+  malformed-input as "matches engine convention for decoded-bytes-
+  from-disk failures." User pushed back, escalated as introduced L-2,
+  required a new sentinel (`ErrCoveringTupleMalformed`). The deeper
+  principle: **a public surface should not wrap in a meaning-laden
+  sentinel when it cannot prove the meaning.** At the byte-stream
+  level, `DecodeCoveringTuple` cannot distinguish on-disk corruption
+  from caller misuse (mis-applying it to non-covering Lookup bytes).
+  Engine-internal decoders sit at the corruption boundary by
+  construction — they're called only on bytes from the engine.
+  *Exported* decoders can be called on arbitrary inputs. So the
+  internal `errIndexKeyMalformed` wraps in `ErrCorrupted` (correct
+  for engine context); the exported `DecodeCoveringTuple` wraps in
+  neutral `ErrCoveringTupleMalformed`. Lesson: when designing a
+  public error class for a decoder, ask "what context CAN this
+  function prove about the input?" — if it can't prove corruption,
+  the sentinel must not imply corruption.
+
+  **Third (process-level, Round 2 finding L-2 receipt)**, when
+  adding a new branch to a spec-defined behavior class (here:
+  "Lookup paths that DO NOT probe row keyspace"), the **authoritative
+  enumeration paragraph elsewhere in the spec** needs the same edit.
+  I added §Byte-API return contract and Lookup-godoc claim "covering-
+  return skips silent-skip", but missed extending the authoritative
+  §Intra-transaction consistency paragraph that enumerates the
+  silent-skip exceptions (`LookupKeys` was the only one listed). The
+  fresh-eyes reviewer caught it. Lesson: a spec edit that adds a new
+  member to a behavior class needs to walk the enumeration sites
+  (typically "X does/does-not Y" paragraphs), not just the §-where-
+  the-feature-lives section.
+
 **Trap pattern to watch for:** the issue cites a "well-known"
 invariant or rationale that the actual spec doesn't state, OR proposes
 a one-line fix that introduces a new bug (same class as the one it's
@@ -212,7 +261,18 @@ and the real fix is a 5-line rule, not a 200-line patch
 accumulation (the `btree-post-merge-underflow` cousin-cascade gap is
 the canonical instance: 3 rounds of H/M findings collapsed to one
 force-underflow rule once I asked "what's the invariant being
-violated?" instead of "how do I patch the latest finding?").
+violated?" instead of "how do I patch the latest finding?"), OR **an
+issue's headline framing disagrees with its parenthetical
+clarification** — the parenthetical's specificity usually wins; if
+the headline-shape would not fit the existing API surface, the
+parenthetical is the real contract, OR **a public decoder error
+class implies corruption it cannot prove** — at the byte-stream
+level, `DecodeCoveringTuple` cannot distinguish on-disk corruption
+from caller misuse; wrap in a neutral sentinel, not `ErrCorrupted`,
+OR **a new behavior-class member needs the authoritative
+enumeration paragraph extended elsewhere in the spec** — not just
+the section you edited (the silent-skip enumeration in indexing.md
+§Intra-transaction consistency is the canonical instance).
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -268,13 +328,16 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `btree-post-merge-underflow` via a unifying
-architectural rule (force `parentUnderflow=true` while a deep is in
-flight, so case-C fires and the cousin pass heals via the merge's
-new siblings) plus a top-level final-heal pass at `Delete()` /
-`DeleteRange()`. The journey through 3 rounds of adversarial review
-+ a complexity spiral + root-cause analysis is its own RECURRING
-LESSON receipt.
+This session closed `byte-api-covering-return-unwired` (user pre-
+decided in prior session). Fix: add a byte-API branch to
+`extractPKAndValue` returning the encoded covering blob verbatim
+when `len(decl.Covering) > 0`; export `DecodeCoveringTuple` for
+callers to decode the NUL-escape tuple; add `ErrCoveringTupleMalformed`
+as a neutral sentinel (NOT wrapped in `ErrCorrupted` — the byte-stream
+decoder cannot distinguish on-disk corruption from caller misuse).
+Adversarial-review loop converged in 2 rounds (no Round 3); user
+escalation on L-2 (ErrCorrupted conflation) — user required the new
+sentinel rather than accepting the dispute.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -286,7 +349,8 @@ LESSON receipt.
 | `0893be5` | bitmap-rollback-undo-log | Closed (undo-log substrate + spec amend in transactions.md §Nested Transactions + new `Discard` API) |
 | `15f9b70` | writenewindexregistry-partial-leak per-row case | Partial — 6 per-row sites done via new `Pager.BeginShallowSavepoint` substrate; 3 cold-path DDL siblings remain. Filed `shallow-savepoint-clone-cost.md` (residual per-Begin clone cost). |
 | `27361ac` | writenewindexregistry-partial-leak DDL siblings | Closed — `Tx.RebuildIndex`, `Tx.DropIndex`, `Keyspace.DeleteKeyspace` retirement wrapped in nested savepoint via defer-named-return |
-| THIS SESSION | btree-post-merge-underflow | **Closed** — strict fill-floor invariant added to `range-delete.md §Invariants`; mechanism: (a) `mergeOrRedistribute*` callers (`rebalanceSurvivors`, `patchBranchAfterChildDelete`) do post-merge re-rebalance + cousin propagation; (b) **architectural force-underflow rule** — a level returning `deepUnderflowChild != 0` reports `underflow=true` regardless of encoded fill (forces next level into case-C, which gives the deep new siblings via the merge); (c) top-level final-heal pass at `Delete()` / `DeleteRange()` runs one final cousin at the new root. Three adversarial-review rounds + root-cause analysis collapsed a 1400-LOC complexity accumulation to a single 5-line architectural rule. New regression tests: `TestBtreeDeleteRangePreservesFillFloor`, `TestBtreeDeleteRangePreservesFillFloorUseLeftCousin`, `TestDeleteSingleKeyPreservesFillFloor`. Promote-then-delete: issue file removed, README row removed, load-bearing rationale promoted to spec §Invariants + §Algorithm Phase 3 + `MergeThreshold` godoc reconciled across `options.go` + `api-surface.md`. |
+| `f1d9ad7` | btree-post-merge-underflow | Closed — strict fill-floor invariant added to `range-delete.md §Invariants`; mechanism: (a) `mergeOrRedistribute*` callers do post-merge re-rebalance + cousin propagation; (b) architectural force-underflow rule — a level returning `deepUnderflowChild != 0` reports `underflow=true` regardless of encoded fill; (c) top-level final-heal pass. Three rounds + root-cause analysis collapsed a 1400-LOC complexity accumulation to a 5-line rule. |
+| THIS SESSION (`682fa70`) | byte-api-covering-return-unwired | **Closed** — byte-API branch added to `extractPKAndValue` returning the encoded covering blob verbatim when `len(decl.Covering) > 0` (typed full-row path unchanged). New public `DecodeCoveringTuple` + `ErrCoveringTupleMalformed` — sentinel deliberately NOT wrapped in `ErrCorrupted` (at the byte-stream level the decoder cannot distinguish on-disk corruption from caller misuse; `Check()` is the authoritative diagnostic). Spec promoted into `indexing.md §Covering Indexes` (new §Byte-API return contract + `Cover=nil` clarification + silent-skip exception extended in §Intra-transaction consistency). `typed-keyspaces.md §Covering` retargeted at the new byte-API contract. `api-surface.md` adds DecodeCoveringTuple/ErrCoveringTupleMalformed + value-semantics clauses on Lookup/Range/Prefix/Get. 8 new regression tests (`TestByteAPI*`, `TestNonCoveringLookupStillBackLookupsRowValue`, `TestDecodeCoveringTuple*`) with 5 neuter-verified to fail under back-lookup regression; negative control proves narrow targeting. R1=0H/2M/3L/2nit, R2=0H/0M/2L/2nit; user escalated L-2 (ErrCorrupted conflation) → required new neutral sentinel. |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -294,15 +358,8 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-- **`byte-api-covering-return-unwired`** — user elected (prior
-  session) to **wire** the byte-API projection-covering return. Make
-  `extractPKAndValue` (`index.go`) return the decoded covering tuple
-  for any covering index. Defines a byte-level (NUL-escape) return
-  contract that changes byte `Lookup`'s value semantics for covering
-  indexes (currently the row value via back-lookup; will become the
-  covering tuple). Don't break existing byte covering tests
-  (`TestIndexedPutWritesCoveringBytes` asserts stored bytes, not the
-  Lookup return).
+*(none — the prior decided item `byte-api-covering-return-unwired`
+landed this session in `682fa70`.)*
 
 ### Undecided / needs analysis
 
@@ -318,7 +375,8 @@ the README as ground truth, this as a hint.
   `bitmapBytes = MaxSize * pageSize` exceeding `len(p.mmap)`). Apply
   the Inv-RV3 bound pattern (use the file-resident extent
   `fileSize/PageSize` clamped by `MaxSize`); maybe extend
-  `ValidateMeta`.
+  `ValidateMeta`. Mostly mechanical — appropriate for tighter context
+  budgets.
 
 ### Profiling-driven / condition-triggered (re-validate before pulling)
 
@@ -335,18 +393,25 @@ obsolete.
 
 Pick **one** issue from `docs/issues/README.md`. Confirm the pick with
 the user at session start (offer your recommendation + rationale; the
-user may override). Default order, given prior decisions:
+user may override). Default order, applying the Ordering criteria
+(decided > undecided is moot now that the decided slot is empty; rank
+on fresh-context / adjacent-to-recently-closed / correctness > perf):
 
-1. **`byte-api-covering-return-unwired`** — user pre-decided to wire
-   the byte-API projection-covering return. Defines a byte-level
-   (NUL-escape) return contract for `extractPKAndValue`. Don't break
-   existing byte covering tests. Suitable for fresh context: design-
-   touching across `index.go` + byte-API surface.
-2. **`open-corrupt-meta-size-fields-panic`** — adjacent to the closed
-   `rpl-rebuild-panic-on-wild-pointer`; same Inv-RV3 bound pattern;
-   mechanical fit for tighter context budgets.
-3. **`index-handle-stale-after-rebuild-drop`** — undecided / needs
-   analysis. Substantial bundle; consider deciding before pulling.
+1. **`open-corrupt-meta-size-fields-panic`** — adjacent to the closed
+   `rpl-rebuild-panic-on-wild-pointer` (Inv-RV3 bound pattern); shared
+   mental context discount per Ordering criterion 4. Largely
+   mechanical: clamp `MaxSize`/`BitmapPages` by the file-resident
+   extent (`fileSize/PageSize`); optionally extend `ValidateMeta`.
+   Correctness-class (Open-time panic on a corrupt-meta input). Good
+   fit for any context budget.
+2. **`index-handle-stale-after-rebuild-drop`** — undecided / needs
+   analysis. Substantial `markIndexHandlesStale` bundle: Keyspace +
+   SetKeyspace + Index handle + iterator-side cursor tracking; sub-
+   choice on `ErrCursorStale` vs new `ErrIndexHandleStale` sentinel.
+   Decide the sub-choice before pulling; fresh-context-required per
+   Ordering criterion 3.
+3. Anything in the profiling-driven set, after re-validation. Re-
+   derive live — some may now be obsolete.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
