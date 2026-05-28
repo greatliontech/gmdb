@@ -629,8 +629,19 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 		if already {
 			return false, nil // no-op; no maintenance fires
 		}
+		// Two atomicity layers cover the indexed Put against a per-op
+		// error followed by Tx.Commit (see Keyspace.Put godoc for the
+		// full rationale): rowSnap + restoreIndexes covers in-memory
+		// pinnedIndex; psp (pager savepoint) covers on-disk page
+		// allocations that applyIndexMaintenanceOnAddValue and the
+		// subsequent dispatched btree mutation (genesis subpage,
+		// putIntoSubpage, putIntoNestedTree) made — so a per-op error
+		// followed by Tx.Commit does not orphan the in-flight
+		// allocations.
+		psp := ks.tx.pgr.BeginShallowSavepoint()
 		rowSnap := snapshotIndexes(ks.indexes)
 		if mErr := ks.applyIndexMaintenanceOnAddValue(key, value); mErr != nil {
+			ks.tx.pgr.RestoreSavepoint(psp)
 			return false, mErr
 		}
 		// Revert pinned state on any failure OR on the (currently
@@ -644,6 +655,9 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 		defer func() {
 			if err != nil || !added {
 				restoreIndexes(ks.indexes, rowSnap)
+				ks.tx.pgr.RestoreSavepoint(psp)
+			} else {
+				ks.tx.pgr.ReleaseSavepoint(psp)
 			}
 		}()
 	}
@@ -840,15 +854,28 @@ func (ks *SetKeyspace) Delete(key []byte) (err error) {
 	// pair must have its index entries removed via the extractor.
 	// Walk every set member, invoke applyIndexMaintenanceOnRemoveValue
 	// per pair, then drop the row's leaf cell.
+	//
+	// Two atomicity layers cover the indexed bulk-key Delete against
+	// a per-op error followed by Tx.Commit (see Keyspace.Put godoc):
+	// rowSnap + restoreIndexes covers in-memory pinnedIndex; psp
+	// (pager savepoint) covers on-disk page allocations the bulk
+	// per-member maintenance walk AND the subsequent FreeSubtree /
+	// btree.Delete row drop made — so a per-op error followed by
+	// Tx.Commit does not orphan the in-flight allocations.
 	if len(ks.indexes) > 0 {
+		psp := ks.tx.pgr.BeginShallowSavepoint()
 		rowSnap := snapshotIndexes(ks.indexes)
 		if err := ks.applyIndexMaintenanceOnBulkKeyDelete(cfg, key, e); err != nil {
 			restoreIndexes(ks.indexes, rowSnap)
+			ks.tx.pgr.RestoreSavepoint(psp)
 			return err
 		}
 		defer func() {
 			if err != nil {
 				restoreIndexes(ks.indexes, rowSnap)
+				ks.tx.pgr.RestoreSavepoint(psp)
+			} else {
+				ks.tx.pgr.ReleaseSavepoint(psp)
 			}
 		}()
 	}
@@ -940,6 +967,14 @@ func (ks *SetKeyspace) DeleteValue(key, value []byte) (err error) {
 	// (key, value) pair exists, then run index maintenance BEFORE
 	// the actual subpage / nested-tree delete. On any subsequent
 	// failure, restore pinned state.
+	//
+	// Two atomicity layers cover the indexed DeleteValue against a
+	// per-op error followed by Tx.Commit (see Keyspace.Put godoc):
+	// rowSnap + restoreIndexes covers in-memory pinnedIndex; psp
+	// (pager savepoint) covers on-disk page allocations
+	// applyIndexMaintenanceOnRemoveValue and the subsequent
+	// subpage / nested-tree delete made — so a per-op error followed
+	// by Tx.Commit does not orphan the in-flight allocations.
 	if len(ks.indexes) > 0 {
 		present, hvErr := ks.HasValue(key, value)
 		if hvErr != nil {
@@ -948,13 +983,18 @@ func (ks *SetKeyspace) DeleteValue(key, value []byte) (err error) {
 		if !present {
 			return ErrNotFound
 		}
+		psp := ks.tx.pgr.BeginShallowSavepoint()
 		rowSnap := snapshotIndexes(ks.indexes)
 		if mErr := ks.applyIndexMaintenanceOnRemoveValue(key, value); mErr != nil {
+			ks.tx.pgr.RestoreSavepoint(psp)
 			return mErr
 		}
 		defer func() {
 			if err != nil {
 				restoreIndexes(ks.indexes, rowSnap)
+				ks.tx.pgr.RestoreSavepoint(psp)
+			} else {
+				ks.tx.pgr.ReleaseSavepoint(psp)
 			}
 		}()
 	}

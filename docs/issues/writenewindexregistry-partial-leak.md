@@ -1,10 +1,18 @@
 # `writeNewIndexRegistry` partial-write leaks pages on Commit-after-error
 
-**Lands:** when the engine's "rest-of-tx-continues after a per-op
-error" contract is canonicalized (chunk 11 free-space recovery, or
-whenever the loose-pages-on-error policy is reconsidered for write
-helpers that fail mid-loop). Or earlier if benchmarking shows the
-leakage is material at scale.
+**Status:** chunk-7.5 (`writeNewIndexRegistry`) **closed** by commit
+`c1effd2`; chunk-7.6 / 7.9 per-row indexed maintenance **closed**
+this session (`Pager.BeginShallowSavepoint` substrate). Remaining:
+the 3 cold-path DDL siblings — `Tx.RebuildIndex`, `Tx.DropIndex`,
+`retireIndexRegistry`.
+
+**Lands:** the 3 DDL siblings remain. Apply the c1effd2
+`BeginSavepoint` / `RestoreSavepoint(on error)` /
+`ReleaseSavepoint(on success)` pattern at each cold-path DDL site
+(nested savepoint kind is fine for these — they're one-shot per DDL
+op, not per-row, so loose-pop suspension is not a concern). Each
+needs a failure-injection regression test using the
+`atomic.Pointer[func()]` seam idiom.
 
 ## Problem
 
@@ -92,27 +100,49 @@ btree.Put calls inside one Tx will have the same shape (chunk-7.8
 RebuildIndex's cursor-walk-then-write loop is the natural next
 case).
 
-## Chunk-7.6 extension: per-row index maintenance
+## Chunk-7.6 / 7.9 extension: per-row index maintenance — RESOLVED
 
-Chunk-7.6's `applyIndexMaintenanceOnPut` /
-`applyIndexMaintenanceOnDelete` are per-row analogues. Each loops
-over declared indexes calling `btree.Put` / `btree.Delete` on the
-index data trees. The chunk-7.6 H-2 fix snapshots `pinnedIndex`
-(root, count) at the start and reverts on any failure — so the
-in-memory pinned state at flushIndexRegistry time always reflects
-either pre-call or post-success state, never partial. This keeps
-the registry consistent.
+The per-row case is closed by the `Pager.BeginShallowSavepoint`
+substrate. Resolution shape:
 
-The on-disk **pages** allocated by the partially-successful loop
-iterations are still loose under the same rest-of-tx-continues
-contract this issue tracks: on `Tx.Rollback` the pager's AbortTx
-reclaims; on `Tx.Commit` they orphan. Chunk-7.6 inherits the leak
-shape but does NOT add a new drift mode (the H-2 revert closes the
-shape-2 silent-drift path the chunk-7.6 Round-1 reviewer surfaced).
+1. `Pager.BeginShallowSavepoint` (internal/pager/savepoint.go) is a
+   new savepoint kind that, unlike nested savepoints, does NOT
+   suspend loose-page reuse — so wrapping each indexed Put/Delete
+   per-row preserves the across-Put loose-page recycling the file
+   needs to stay bounded under bulk indexed workloads.
+2. The 6 caller sites — Keyspace.Put / Delete / Cursor.Delete and
+   SetKeyspace.Put / Delete (bulk-key) / DeleteValue — bracket the
+   `applyIndexMaintenanceOn*` call AND the subsequent row btree
+   mutation in `BeginShallowSavepoint` / `ReleaseSavepoint(success)`
+   / `RestoreSavepoint(error)` pairs.
+3. Each loose-pop AllocPage performs during a shallow savepoint
+   window appends a `(id, original-buffer)` entry to the
+   savepoint's loose-pop log; `RestoreSavepoint` replays the log to
+   re-attach the original buffer to `p.dirty[id]`, faithfully
+   reversing the detach.
 
-When this issue resolves with the atomic variant, the chunk-7.6
-helpers benefit identically — the snapshot/revert layer can drop
-once the underlying contract guarantees all-or-nothing.
+Regression coverage:
+
+- `internal/pager/savepoint_test.go`:
+  `TestShallowSavepointPreservesLoosePop`,
+  `TestShallowSavepointRestoreReversesLoosePop`,
+  `TestShallowSavepointReleaseKeepsLoosePop`,
+  `TestShallowSavepointDoesNotSuspendNestedInv`,
+  `TestShallowSavepointOutOfOrderPanics`.
+- gmdb-level: `TestApplyIndexMaintenanceAtomicOn{Keyspace,SetKeyspace}-
+  {Put,Delete,CursorDelete,DeleteValue,BulkKeyDelete}` in
+  `index_maintain_test.go` / `index_setkeyspace_test.go`.
+
+Cost trade-off: the residual per-savepoint clone of
+`pendingAllocs`/`Frees`/`loosePages`/`dirtyKeys` is O(this-tx-state-
+at-Begin), N²-in-#mutations across N per-row savepoints in one tx.
+Benign for OLTP-N (≤ 100); profiling-driven follow-up tracked as
+`shallow-savepoint-clone-cost.md`.
+
+The chunk-7.6 H-2 in-memory `pinnedIndex` snapshot/restore stays —
+it covers the `flushIndexRegistry` registry-consistency layer; the
+new shallow savepoint covers the on-disk page-allocation layer.
+Both layers are required.
 
 ## Chunk-7.8 extension: DeleteKeyspace three-subtree retirement +
 RebuildIndex / DropIndex mid-flight failures

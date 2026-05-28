@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 )
@@ -156,15 +157,34 @@ func extractEntriesAsKeySet(decl *IndexDecl, key, value []byte) (map[string]Inde
 //
 // Caller writes the row AFTER this function returns nil.
 //
-// Atomicity (chunk-7.6 Round-1 H-2 fix): on any failure during the
-// sequence, pinnedIndex.root / .count are restored to the pre-call
-// snapshot. The newly-allocated index data-tree pages still leak
-// per the engine's rest-of-tx-continues contract (Tx.Rollback
-// reclaims via the pager's bitmap snapshot; Commit-after-error
-// orphans the pages), BUT the registry stays consistent — at
-// Commit-after-error, flushIndexRegistry writes the pre-call
-// pinned state to disk, not a half-mutated state that would
-// silently misrepresent the index data tree.
+// Atomicity. Two layers cooperate to keep the helper + the subsequent
+// row write all-or-nothing across Tx.Commit:
+//
+//   - In-memory pinned state (chunk-7.6 Round-1 H-2 fix): on any
+//     failure during the sequence, pinnedIndex.root / .count are
+//     restored to the pre-call snapshot so flushIndexRegistry at
+//     Commit-after-error never writes half-mutated pinned values
+//     to the on-disk registry.
+//
+//   - On-disk page allocations: the caller (Keyspace.Put / Delete /
+//     Cursor.Delete) brackets the maintenance call AND its subsequent
+//     row btree write in a Pager.BeginShallowSavepoint /
+//     ReleaseSavepoint(success) / RestoreSavepoint(error) pair. The
+//     savepoint's bitmap.Snapshot is an undo-log marker (free-space.md
+//     / transactions.md §Nested Transactions cost contract —
+//     O(this-window-flips), not O(MaxSize)), and the SHALLOW kind
+//     preserves intra-tx loose-page recycling so per-row wrapping is
+//     correct-by-design without growing the file O(N·depth) across
+//     an indexed bulk workload: a mid-loop failure (or a row-btree-
+//     mutation failure after the helper returned nil) frees every
+//     in-flight index-data-tree page allocation regardless of
+//     whether the caller eventually commits or rolls back.
+//
+// Together the two layers close free-space.md's entailed
+// bitmap-consistency invariant ("every page below HighWaterMark
+// with bit clear is reachable from the active meta, in the RPL,
+// or is a meta/bitmap page") against the per-op-error path that
+// the engine's rest-of-tx-continues contract allows.
 func (ks *Keyspace) applyIndexMaintenanceOnPut(key, oldValue, newValue []byte, existedBefore bool) error {
 	snap := snapshotIndexes(ks.indexes)
 	if err := ks.applyIndexMaintenanceOnPutInner(key, oldValue, newValue, existedBefore); err != nil {
@@ -247,6 +267,13 @@ func (ks *Keyspace) applyIndexMaintenanceOnPutInner(key, oldValue, newValue []by
 		}
 	}
 
+	// Steps 4-5 mutate index data trees. The opIdx counter is the
+	// per-call monotonic index of successful btree.Put/Delete
+	// operations exposed to indexMaintenanceFailHookForTest so
+	// regression tests can deterministically inject a mid-loop
+	// failure that exercises the caller's savepoint rollback.
+	opIdx := 0
+
 	// Step 4: apply deletes.
 	for _, pl := range plans {
 		for _, k := range pl.dels {
@@ -273,6 +300,10 @@ func (ks *Keyspace) applyIndexMaintenanceOnPutInner(key, oldValue, newValue []by
 			}
 			pl.p.root = newRoot
 			pl.p.count--
+			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
+				return err
+			}
+			opIdx++
 		}
 	}
 
@@ -288,6 +319,10 @@ func (ks *Keyspace) applyIndexMaintenanceOnPutInner(key, oldValue, newValue []by
 			}
 			pl.p.root = newRoot
 			pl.p.count++
+			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
+				return err
+			}
+			opIdx++
 		}
 	}
 
@@ -325,6 +360,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnDeleteInner(key, oldValue []byte) err
 	cfg := ks.tx.pgr.Config()
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
 
+	opIdx := 0
 	for _, name := range names {
 		p := ks.indexes[name]
 		olds, err := extractEntriesAsKeySet(p.decl, key, oldValue)
@@ -354,6 +390,10 @@ func (ks *Keyspace) applyIndexMaintenanceOnDeleteInner(key, oldValue []byte) err
 			}
 			p.root = newRoot
 			p.count--
+			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
+				return err
+			}
+			opIdx++
 		}
 	}
 	return nil
@@ -449,5 +489,39 @@ func restoreIndexes(indexes map[string]*pinnedIndex, snap indexSnapshot) {
 			p.count = s.count
 		}
 	}
+}
+
+// indexMaintenanceFailHookForTest, when set, is invoked after each
+// successful btree.Put / btree.Delete on an index data tree inside
+// applyIndexMaintenanceOn{Put,Delete} (Keyspace) and
+// applyIndexMaintenanceOn{AddValue,RemoveValue} (SetKeyspace), with
+// a monotonic per-call iteration index. A non-nil return aborts the
+// loop with that error so a regression test can deterministically
+// exercise the caller-site savepoint-backed rollback (the per-row
+// case of the page-orphan-on-Commit-after-error contract). The hook
+// signature mirrors writeRegistryFailHookForTest (chunk-7.5 sibling
+// in index_open.go). Test-only; installed via
+// setIndexMaintenanceFailHookForTest and cleared via t.Cleanup.
+var indexMaintenanceFailHookForTest atomic.Pointer[func(i int) error]
+
+func setIndexMaintenanceFailHookForTest(hook func(i int) error) {
+	if hook == nil {
+		indexMaintenanceFailHookForTest.Store(nil)
+		return
+	}
+	indexMaintenanceFailHookForTest.Store(&hook)
+}
+
+// fireIndexMaintenanceFailHookForTest dispatches the hook (if
+// installed) with the just-completed op index. Returns nil when no
+// hook is set or the hook returns nil; otherwise the hook's error
+// flows through the helper's failure path so the caller-site
+// savepoint reverts the partial allocations.
+func fireIndexMaintenanceFailHookForTest(i int) error {
+	hook := indexMaintenanceFailHookForTest.Load()
+	if hook == nil {
+		return nil
+	}
+	return (*hook)(i)
 }
 

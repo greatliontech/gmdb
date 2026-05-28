@@ -654,3 +654,259 @@ func TestKeyspaceIndexHandleUnknownNameReturnsErrIndexNotFound(t *testing.T) {
 		t.Errorf("got %v want ErrIndexNotFound", err)
 	}
 }
+
+// --- writenewindexregistry-partial-leak per-row case ------------
+//
+// These four regression tests pin the caller-site
+// Pager.BeginShallowSavepoint / RestoreSavepoint(on error) /
+// ReleaseSavepoint(on success) wrap that closes the per-row case of
+// writenewindexregistry-partial-leak (the chunk-7.6 / 7.9 extension
+// the original chunk-7.5 fix deferred). Each:
+//
+//   1. Creates an indexed Keyspace / SetKeyspace with ≥2 indexes
+//      that the row mutation will touch.
+//   2. Commits the setup (so subsequent allocations come from a
+//      fresh tx whose Check leak count is isolated).
+//   3. Begins a new write tx.
+//   4. Installs indexMaintenanceFailHookForTest to fail after the
+//      1st successful btree.Put / btree.Delete on an index data
+//      tree, demonstrating the partial-success path.
+//   5. Invokes the user op; expects the injected error.
+//   6. Commits despite the per-op error (rest-of-tx-continues).
+//   7. db.Check() reports zero BitmapLeak — i.e. the savepoint
+//      Restore reverted the 1st btree op's pager allocations and
+//      no orphaned pages reached disk.
+//
+// Without the caller-site savepoint, step 6's Commit publishes the
+// pages the 1st btree mutation allocated, free-space.md's entailed
+// bitmap-consistency invariant breaks ("every page below
+// HighWaterMark with bit clear is reachable from the active meta,
+// in the RPL, or is a meta/bitmap page"), and Check reports them
+// as BitmapLeak. The tests were empirically verified to fail in
+// that mode (stash the savepoint hunks, rerun → "BitmapLeak page
+// …" reported; restore → clean).
+
+func TestApplyIndexMaintenanceAtomicOnKeyspacePut(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Setup: create an indexed keyspace with 2 indexes both
+	// producing one entry per row (firstByteExtract on the value).
+	{
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin setup: %v", err)
+		}
+		da := testDecl("idx_a", "a")
+		da.Extract = firstByteExtract
+		db2 := testDecl("idx_b", "b")
+		db2.Extract = firstByteExtract
+		if _, err := tx.CreateKeyspace("items", da, db2); err != nil {
+			tx.Rollback()
+			t.Fatalf("CreateKeyspace: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit setup: %v", err)
+		}
+	}
+
+	injected := errors.New("injected index-maintenance failure (Put)")
+	setIndexMaintenanceFailHookForTest(func(i int) error {
+		if i >= 0 { // fail after the 1st successful btree.Put
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	ks, err := tx.OpenKeyspace("items", keyspaceTestDeclsForOpen()...)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	err = ks.Put([]byte("k1"), []byte{0x42, 'x'})
+	if !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("Put err = %v, want injected", err)
+	}
+	// Rest-of-tx-continues: commit despite the per-op error.
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	assertNoBitmapLeak(t, db)
+}
+
+func TestApplyIndexMaintenanceAtomicOnKeyspaceDelete(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Setup: indexed keyspace + 2 rows so Delete has index entries
+	// to remove on both indexes.
+	{
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin setup: %v", err)
+		}
+		da := testDecl("idx_a", "a")
+		da.Extract = firstByteExtract
+		db2 := testDecl("idx_b", "b")
+		db2.Extract = firstByteExtract
+		ks, err := tx.CreateKeyspace("items", da, db2)
+		if err != nil {
+			tx.Rollback()
+			t.Fatalf("CreateKeyspace: %v", err)
+		}
+		if err := ks.Put([]byte("k1"), []byte{0x42, 'x'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put k1: %v", err)
+		}
+		if err := ks.Put([]byte("k2"), []byte{0x43, 'y'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put k2: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit setup: %v", err)
+		}
+	}
+
+	injected := errors.New("injected index-maintenance failure (Delete)")
+	setIndexMaintenanceFailHookForTest(func(i int) error {
+		if i >= 0 {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	ks, err := tx.OpenKeyspace("items", keyspaceTestDeclsForOpen()...)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	err = ks.Delete([]byte("k1"))
+	if !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("Delete err = %v, want injected", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	assertNoBitmapLeak(t, db)
+}
+
+func TestApplyIndexMaintenanceAtomicOnCursorDelete(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	{
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin setup: %v", err)
+		}
+		da := testDecl("idx_a", "a")
+		da.Extract = firstByteExtract
+		db2 := testDecl("idx_b", "b")
+		db2.Extract = firstByteExtract
+		ks, err := tx.CreateKeyspace("items", da, db2)
+		if err != nil {
+			tx.Rollback()
+			t.Fatalf("CreateKeyspace: %v", err)
+		}
+		if err := ks.Put([]byte("k1"), []byte{0x42, 'x'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put k1: %v", err)
+		}
+		if err := ks.Put([]byte("k2"), []byte{0x43, 'y'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put k2: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit setup: %v", err)
+		}
+	}
+
+	injected := errors.New("injected index-maintenance failure (Cursor.Delete)")
+	setIndexMaintenanceFailHookForTest(func(i int) error {
+		if i >= 0 {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	ks, err := tx.OpenKeyspace("items", keyspaceTestDeclsForOpen()...)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	c := ks.Cursor()
+	if k, _ := c.First(); k == nil {
+		tx.Rollback()
+		t.Fatalf("Cursor.First returned nil on a seeded keyspace")
+	}
+	err = c.Delete()
+	if !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("Cursor.Delete err = %v, want injected", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	assertNoBitmapLeak(t, db)
+}
+
+// keyspaceTestDeclsForOpen returns the same two IndexDecls used in
+// the Keyspace setup blocks above — needed at OpenKeyspace time per
+// indexing.md §Open Semantics (handed back at every reopen with the
+// declared extractor and schema).
+func keyspaceTestDeclsForOpen() []*IndexDecl {
+	da := testDecl("idx_a", "a")
+	da.Extract = firstByteExtract
+	db2 := testDecl("idx_b", "b")
+	db2.Extract = firstByteExtract
+	return []*IndexDecl{da, db2}
+}
+
+// assertNoBitmapLeak walks db.Check() and fails if any BitmapLeak
+// issue is reported. The savepoint-correctness probe used by every
+// applyIndexMaintenance per-row atomicity regression test.
+func assertNoBitmapLeak(t *testing.T, db *DB) {
+	t.Helper()
+	var leaks []CheckIssue
+	for _, iss := range collectIssues(db.Check()) {
+		if iss.Code == "BitmapLeak" {
+			leaks = append(leaks, iss)
+		}
+	}
+	if len(leaks) != 0 {
+		t.Errorf("applyIndexMaintenance orphaned %d page(s) on Commit-after-error (want 0): %v",
+			len(leaks), leaks)
+	}
+}

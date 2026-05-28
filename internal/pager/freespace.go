@@ -39,17 +39,27 @@ func (p *Pager) AllocPage() (uint64, error) {
 		return 0, ErrFreespaceUnconfigured
 	}
 
-	// 1. Loose pages — suspended while a child savepoint is active. A
-	// loose page is a same-tx page that was CoW'd then freed; reusing it
-	// detaches its slab buffer (see below) and lets a subsequent CoW
-	// install fresh content. If a descendant child is in progress, that
-	// freed page may be one the child freed but an ancestor's tree still
-	// references (the ancestor's saved root), so reusing it would
-	// overwrite a buffer the ancestor holds — violating the
-	// transactions.md §Invariants "child never mutates a parent's slab
-	// buffer in place" guarantee (Inv-N1). While savepointDepth > 0 the
-	// allocator skips straight to the bitmap; freed pages remain loose
-	// (not reusable) until every child resolves and the stack empties.
+	// 1. Loose pages — suspended while a NESTED-kind child savepoint
+	// is active. A loose page is a same-tx page that was CoW'd then
+	// freed; reusing it detaches its slab buffer (see below) and lets
+	// a subsequent CoW install fresh content. If a NESTED descendant
+	// is in progress, that freed page may be one the child freed but
+	// an ancestor's tree still references (the ancestor's saved
+	// root), so reusing it would overwrite a buffer the ancestor
+	// holds — violating the transactions.md §Invariants "child never
+	// mutates a parent's slab buffer in place" guarantee (Inv-N1).
+	// While savepointDepth > 0 the allocator skips straight to the
+	// bitmap; freed pages remain loose (not reusable) until every
+	// nested child resolves and the stack empties.
+	//
+	// SHALLOW savepoints (BeginShallowSavepoint, used by per-row
+	// indexed maintenance) do NOT increment savepointDepth so loose-
+	// pop stays enabled — internal-helper atomicity does not require
+	// suspension because there is no concurrent parent tree pinning a
+	// stale root. Every loose-pop event during a shallow savepoint
+	// window is recorded in each active shallow savepoint's
+	// loosePopLog so RestoreSavepoint can re-attach the detached
+	// buffer (savepoint.go).
 	for id := range p.loosePages {
 		if p.savepointDepth > 0 {
 			break
@@ -94,6 +104,17 @@ func (p *Pager) AllocPage() (uint64, error) {
 		if buf, ok := p.dirty[id]; ok {
 			p.detachedBufs = append(p.detachedBufs, buf)
 			delete(p.dirty, id)
+			// Record the loose-pop in every active SHALLOW savepoint
+			// so a subsequent RestoreSavepoint can re-attach buf to
+			// p.dirty[id] and re-add id to loosePages. (No-op when
+			// no shallow savepoint is active — len==0.) The same buf
+			// pointer appears in p.detachedBufs[detachedLen + …] for
+			// the savepoint window; RestoreSavepoint's shallow path
+			// truncates without pool-Put because the entries have
+			// been re-attached via this log.
+			for _, sp := range p.activeShallowSavepoints {
+				sp.loosePopLog = append(sp.loosePopLog, loosePopEntry{id: id, buf: buf})
+			}
 		}
 		p.pendingAllocs[id] = struct{}{}
 		// Defensive symmetry with the bitmap-path branch below. The

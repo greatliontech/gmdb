@@ -650,3 +650,220 @@ func TestSetKeyspaceIndexedPersistsAcrossCommit(t *testing.T) {
 		t.Errorf("Lookup post-reopen: got %d want 1", n)
 	}
 }
+
+// --- writenewindexregistry-partial-leak per-row case (SetKeyspace)
+//
+// SetKeyspace counterparts of the Keyspace.Put / Delete /
+// Cursor.Delete tests in index_maintain_test.go. Same contract:
+// after a per-op error followed by Tx.Commit, db.Check() reports
+// zero BitmapLeak — the caller-site savepoint Restore reverts the
+// partial allocations the helper made before the injection.
+
+// setKeyspaceTwoIndexDecls returns two decls with distinct
+// extractor outputs so each Put/RemoveValue runs ≥2 btree
+// mutations on index data trees, letting the fail hook fire on
+// the second after the first allocated pages.
+func setKeyspaceTwoIndexDecls() (*IndexDecl, *IndexDecl) {
+	da := testDecl("by_a", "a")
+	da.Extract = setKeyspaceFirstByteExtract
+	db := testDecl("by_b", "b")
+	// Distinct extractor so b's index data tree is non-empty and a
+	// btree.Put on it allocates separately from a's tree.
+	db.Extract = func(_, setValue []byte) []IndexEntry {
+		if len(setValue) < 2 {
+			return nil
+		}
+		return []IndexEntry{{Cols: [][]byte{{setValue[1]}}}}
+	}
+	return da, db
+}
+
+func TestApplyIndexMaintenanceAtomicOnSetKeyspacePut(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	{
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin setup: %v", err)
+		}
+		da, db2 := setKeyspaceTwoIndexDecls()
+		// Seed one pair so the index data trees are non-empty;
+		// a Put of a new pair then exercises btree.Put on both.
+		sks, err := tx.CreateSetKeyspace("subs", nil, da, db2)
+		if err != nil {
+			tx.Rollback()
+			t.Fatalf("CreateSetKeyspace: %v", err)
+		}
+		if _, err := sks.Put([]byte("u1"), []byte{'x', 'y'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put seed: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit setup: %v", err)
+		}
+	}
+
+	injected := errors.New("injected index-maintenance failure (SetKeyspace Put)")
+	setIndexMaintenanceFailHookForTest(func(i int) error {
+		if i >= 0 {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	da, db2 := setKeyspaceTwoIndexDecls()
+	sks, err := tx.OpenSetKeyspace("subs", da, db2)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("OpenSetKeyspace: %v", err)
+	}
+	_, err = sks.Put([]byte("u2"), []byte{'p', 'q'})
+	if !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("Put err = %v, want injected", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	assertNoBitmapLeak(t, db)
+}
+
+func TestApplyIndexMaintenanceAtomicOnSetKeyspaceDeleteValue(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	{
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin setup: %v", err)
+		}
+		da, db2 := setKeyspaceTwoIndexDecls()
+		sks, err := tx.CreateSetKeyspace("subs", nil, da, db2)
+		if err != nil {
+			tx.Rollback()
+			t.Fatalf("CreateSetKeyspace: %v", err)
+		}
+		if _, err := sks.Put([]byte("u1"), []byte{'x', 'y'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put seed1: %v", err)
+		}
+		if _, err := sks.Put([]byte("u1"), []byte{'p', 'q'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put seed2: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit setup: %v", err)
+		}
+	}
+
+	injected := errors.New("injected index-maintenance failure (SetKeyspace DeleteValue)")
+	setIndexMaintenanceFailHookForTest(func(i int) error {
+		if i >= 0 {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	da, db2 := setKeyspaceTwoIndexDecls()
+	sks, err := tx.OpenSetKeyspace("subs", da, db2)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("OpenSetKeyspace: %v", err)
+	}
+	err = sks.DeleteValue([]byte("u1"), []byte{'x', 'y'})
+	if !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("DeleteValue err = %v, want injected", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	assertNoBitmapLeak(t, db)
+}
+
+func TestApplyIndexMaintenanceAtomicOnSetKeyspaceBulkKeyDelete(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	{
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin setup: %v", err)
+		}
+		da, db2 := setKeyspaceTwoIndexDecls()
+		sks, err := tx.CreateSetKeyspace("subs", nil, da, db2)
+		if err != nil {
+			tx.Rollback()
+			t.Fatalf("CreateSetKeyspace: %v", err)
+		}
+		// Seed two values under the same key so SetKeyspace.Delete
+		// walks both via applyIndexMaintenanceOnBulkKeyDelete →
+		// applyIndexMaintenanceOnRemoveValue per member.
+		if _, err := sks.Put([]byte("u1"), []byte{'x', 'y'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put seed1: %v", err)
+		}
+		if _, err := sks.Put([]byte("u1"), []byte{'p', 'q'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put seed2: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit setup: %v", err)
+		}
+	}
+
+	injected := errors.New("injected index-maintenance failure (SetKeyspace Delete bulk-key)")
+	setIndexMaintenanceFailHookForTest(func(i int) error {
+		if i >= 0 {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	da, db2 := setKeyspaceTwoIndexDecls()
+	sks, err := tx.OpenSetKeyspace("subs", da, db2)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("OpenSetKeyspace: %v", err)
+	}
+	err = sks.Delete([]byte("u1"))
+	if !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("Delete err = %v, want injected", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	assertNoBitmapLeak(t, db)
+}

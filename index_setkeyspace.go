@@ -273,8 +273,11 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnAddValueInner(setKey, setValue []b
 		}
 	}
 
-	// Step 2: inserts.
+	// Step 2: inserts. opIdx exposes per-btree.Put progress to
+	// indexMaintenanceFailHookForTest for the regression test that
+	// pins the caller-site savepoint rollback.
 	compoundPK := encodeSetKeyspaceCompoundPK(setKey, setValue)
+	opIdx := 0
 	for _, pl := range plans {
 		hasCovering := len(pl.p.decl.Covering) > 0
 		for _, k := range pl.ins {
@@ -286,6 +289,10 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnAddValueInner(setKey, setValue []b
 			}
 			pl.p.root = newRoot
 			pl.p.count++
+			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
+				return err
+			}
+			opIdx++
 		}
 	}
 	return nil
@@ -362,6 +369,7 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnRemoveValueInner(setKey, setValue 
 	cfg := ks.tx.pgr.Config()
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
 
+	opIdx := 0
 	for _, name := range names {
 		p := ks.indexes[name]
 		olds, err := setKeyspaceExtractEntries(p.decl, setKey, setValue)
@@ -391,6 +399,10 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnRemoveValueInner(setKey, setValue 
 			}
 			p.root = newRoot
 			p.count--
+			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
+				return err
+			}
+			opIdx++
 		}
 	}
 	return nil

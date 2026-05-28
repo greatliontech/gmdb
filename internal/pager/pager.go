@@ -114,13 +114,30 @@ type Pager struct {
 	// writable pagers.
 	currentTxnID uint64
 
-	// savepointDepth counts active (unresolved) child savepoints
+	// savepointDepth counts active (unresolved) NESTED-kind savepoints
 	// (transactions.md §Nested Transactions). While > 0, AllocPage
 	// suspends loose-page reuse so a child cannot hand out a page id
 	// whose slab buffer an ancestor's tree still references (Inv-N1).
 	// Managed by BeginSavepoint / RestoreSavepoint / ReleaseSavepoint;
 	// reset to 0 by AbortTx. See savepoint.go.
+	//
+	// SHALLOW-kind savepoints (BeginShallowSavepoint) do NOT increment
+	// this depth — they exist for internal-helper atomicity (per-row
+	// indexed Put/Delete maintenance, see indexing.md §Write Path) and
+	// must allow loose-pop to remain enabled so across-Put loose-page
+	// recycling stays bounded. Shallow savepoints track loose-pop
+	// events explicitly in Savepoint.loosePopLog so Restore can
+	// re-attach the detached buffer rather than relying on the
+	// suspended-loose-pop invariant.
 	savepointDepth int
+
+	// activeShallowSavepoints is the LIFO stack of unresolved
+	// SHALLOW-kind savepoints. AllocPage's loose-pop branch appends a
+	// (id, original-buffer) entry to each one's loosePopLog so any
+	// outstanding shallow Restore can faithfully undo the loose-pop.
+	// Nil/empty between savepoints; reset on AbortTx alongside
+	// savepointDepth.
+	activeShallowSavepoints []*Savepoint
 
 	// verified is the per-transaction checksum-verification cache
 	// (checksums.md §Verification, Inv-RV2): a mmap page whose xxhash64
@@ -394,6 +411,7 @@ func (p *Pager) AbortTx() {
 	// keeps AllocPage's loose-pop guard correct if a future caller path
 	// ever aborts with a dangling savepoint.
 	p.savepointDepth = 0
+	p.activeShallowSavepoints = p.activeShallowSavepoints[:0]
 }
 
 // discardTxSnapshot drops the snapshot without restoring (Commit
@@ -409,6 +427,14 @@ func (p *Pager) discardTxSnapshot() {
 	p.bitmapSnapshot = nil
 	p.rplChainSnapshot = nil
 	p.haveTxSnapshot = false
+	// Defense-in-depth, symmetric with AbortTx: a leaked (un-Released,
+	// un-Restored) shallow savepoint would otherwise survive past the
+	// commit boundary, and a subsequent loose-pop in the next tx would
+	// append to its stale loosePopLog. All six current callers (the
+	// per-row indexed maintenance helpers) are leak-free by
+	// construction, so this is belt-and-braces — but matches AbortTx's
+	// savepointDepth = 0 reset pattern (pager.go:savepointDepth reset).
+	p.activeShallowSavepoints = p.activeShallowSavepoints[:0]
 }
 
 // HighWaterMark returns the current write-tx HighWaterMark snapshot.
