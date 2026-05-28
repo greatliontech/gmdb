@@ -1076,6 +1076,61 @@ func TestCreateKeyspaceWithIndexDoesNotPolluteListKeyspaces(t *testing.T) {
 	}
 }
 
+// TestWriteNewIndexRegistryAtomicOnPartialFailure pins the write-helper
+// atomicity contract: a mid-loop failure in writeNewIndexRegistry must
+// not orphan the registry-tree pages allocated by the iterations that
+// already succeeded. The savepoint wrap frees them and restores the
+// descriptor's registry root; without it, Tx.Commit (the
+// rest-of-tx-continues path) would commit those pages as a BitmapLeak.
+// A deterministic failure is injected after the 2nd registryPut via the
+// test hook; Check() must then report zero BitmapLeak pages.
+func TestWriteNewIndexRegistryAtomicOnPartialFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	injected := errors.New("injected registry-write failure")
+	setWriteRegistryFailHookForTest(func(i int) error {
+		if i >= 1 { // iterations 0 and 1 succeed, then fail
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setWriteRegistryFailHookForTest(nil) })
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	_, err = tx.CreateKeyspace("ks",
+		testDecl("idx_a", "a"),
+		testDecl("idx_b", "b"),
+		testDecl("idx_c", "c"),
+	)
+	if !errors.Is(err, injected) {
+		tx.Rollback()
+		t.Fatalf("CreateKeyspace err = %v, want injected failure", err)
+	}
+	// Rest-of-tx-continues: commit despite the per-op error (the path
+	// that would orphan the partial allocation without the savepoint).
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after injected failure: %v", err)
+	}
+
+	var leaks []CheckIssue
+	for _, iss := range collectIssues(db.Check()) {
+		if iss.Code == "BitmapLeak" {
+			leaks = append(leaks, iss)
+		}
+	}
+	if len(leaks) != 0 {
+		t.Errorf("writeNewIndexRegistry orphaned %d page(s) on partial failure (want 0): %v", len(leaks), leaks)
+	}
+}
+
 // TestKind2DescriptorsHaveDistinctIndexRegistryRoots enforces the
 // "exactly one parent" half of the chunk-7.1 indexing.md entailed
 // invariant: every engine-internal Kind=2 keyspace descriptor is

@@ -3,6 +3,7 @@ package gmdb
 import (
 	"fmt"
 	"sort"
+	"sync/atomic"
 )
 
 // pinnedIndex carries the per-index state that survives the open-time
@@ -206,7 +207,23 @@ func (tx *Tx) writeNewIndexRegistry(
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	for _, name := range names {
+
+	// Atomicity (transactions.md §Write-helper error contract): each
+	// registryPut allocates pages and threads the new registry-tree root
+	// through desc.IndexRegistryRoot. If iteration k+1 fails after 0..k
+	// succeeded, iterations 0..k's pages are reachable only via the
+	// descriptor the failing caller is about to drop from the open-
+	// keyspace cache — Tx.Rollback's bitmap snapshot reclaims them, but
+	// Tx.Commit (the rest-of-tx-continues path) would orphan them as a
+	// bitmap leak. Bracket the loop in a savepoint so a mid-loop failure
+	// frees every in-flight page and restores the descriptor's pre-loop
+	// registry root: the helper is all-or-nothing regardless of whether
+	// the caller commits or rolls back.
+	desc := owner.descriptor()
+	prevRegRoot := desc.IndexRegistryRoot
+	sp := tx.pgr.BeginSavepoint()
+	var loopErr error
+	for i, name := range names {
 		p := pinned[name]
 		entry := &indexRegistryEntry{
 			SchemaHash:  p.schemaHash,
@@ -221,10 +238,36 @@ func (tx *Tx) writeNewIndexRegistry(
 		for _, c := range p.decl.Covering {
 			entry.Covering = append(entry.Covering, c.Name)
 		}
-		if err := tx.registryPut(owner, name, entry); err != nil {
-			return err
+		if loopErr = tx.registryPut(owner, name, entry); loopErr != nil {
+			break
+		}
+		if hook := writeRegistryFailHookForTest.Load(); hook != nil {
+			if loopErr = (*hook)(i); loopErr != nil {
+				break
+			}
 		}
 	}
+	if loopErr != nil {
+		tx.pgr.RestoreSavepoint(sp)
+		desc.IndexRegistryRoot = prevRegRoot
+		return loopErr
+	}
+	tx.pgr.ReleaseSavepoint(sp)
 	return nil
+}
+
+// writeRegistryFailHookForTest, when set, is invoked after each
+// successful registryPut in writeNewIndexRegistry with the iteration
+// index; a non-nil return injects a failure that exercises the
+// savepoint-backed rollback above. Test-only; installed via
+// setWriteRegistryFailHookForTest and cleared via t.Cleanup.
+var writeRegistryFailHookForTest atomic.Pointer[func(i int) error]
+
+func setWriteRegistryFailHookForTest(hook func(i int) error) {
+	if hook == nil {
+		writeRegistryFailHookForTest.Store(nil)
+		return
+	}
+	writeRegistryFailHookForTest.Store(&hook)
 }
 
