@@ -151,11 +151,27 @@ type Options struct {
 	// is uint8. Default: 16.
 	RestartGroupTarget uint16
 
-	// MergeThreshold is the B+tree page fill percentage below which
-	// a page is merged with a sibling after deletion. Range: 1-50.
-	// Default: 25 (DefaultMergeThreshold). Above 50% redistribute
-	// thrash becomes pathological — two siblings each hovering just
-	// below 50% would never have room to merge.
+	// MergeThreshold is the B+tree page fill percentage that doubles
+	// as the post-deletion merge **trigger** AND the maintained
+	// non-root fill **floor**. Range: 1-50. Default: 25
+	// (DefaultMergeThreshold).
+	//
+	// Trigger: after a `Delete` or `DeleteRange` mutation drops a
+	// page below MergeThreshold% of its `ContentEnd`, the page is
+	// merged with (or redistributed against) an adjacent sibling.
+	//
+	// Floor: after a successful `Delete` or `DeleteRange` returns,
+	// every non-root page reachable from the new root has encoded
+	// fill `>= MergeThreshold%` of `ContentEnd` — see
+	// `range-delete.md §Invariants` for the full fill-floor clause
+	// (including the post-merge re-rebalance loop and the
+	// cousin-cascade thread that close the 2-survivor edge case).
+	// The root is exempt: a partially-emptied tree's root may be
+	// arbitrarily small or root-collapse to empty.
+	//
+	// Above 50% redistribute thrash becomes pathological — two
+	// siblings each hovering just below 50% would never have room
+	// to merge, and each Delete would force a redistribute.
 	MergeThreshold uint8
 
 	// LaggingReader is called by pager.AllocPage when bitmap +

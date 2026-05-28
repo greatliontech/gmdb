@@ -43,6 +43,18 @@ const DefaultMergeThreshold uint8 = 25
 //     that child; if the only leaf entry was the deleted key the
 //     tree becomes empty (returned rootID = 0).
 //
+// Maintains range-delete.md §Invariants fill-floor clause: after a
+// successful return, every non-root page reachable from the new root
+// has fill ≥ MergeThreshold% of ContentEnd. See `deleteFrom`'s
+// `deepUnderflowChild` return + the cousin-cascade thread in
+// `patchBranchAfterChildDelete` for the mechanism — at the top level
+// here, a residual `deepUnderflowChild` (a sub-MT page that no
+// intermediate level could heal because every level along the cascade
+// was degenerate) ends up exactly at `newRootID` after root collapse,
+// which makes it the root (exempt). The trivial top-level handling
+// reflects that: any non-zero `deepUnderflowChild` at this level
+// has been promoted to root by the collapse loop below.
+//
 // On error: any pages already allocated are freed via FreePage (they
 // become loose pages for re-use within this tx). The returned rootID
 // is meaningful only when err is nil OR err is ErrNotFound; on
@@ -55,7 +67,7 @@ func Delete(pw PageWriter, cfg page.Config, rootID uint64, mergeThreshold uint8,
 	if rootID == 0 {
 		return 0, ErrNotFound
 	}
-	newRootID, _, found, err := deleteFrom(pw, cfg, mergeThreshold, rootID, key)
+	newRootID, _, found, topDeep, err := deleteFrom(pw, cfg, mergeThreshold, rootID, key)
 	if err != nil {
 		return 0, err
 	}
@@ -64,6 +76,23 @@ func Delete(pw PageWriter, cfg page.Config, rootID uint64, mergeThreshold uint8,
 	}
 	if newRootID == 0 {
 		return 0, nil
+	}
+	// Top-level final-heal pass: if the cascade left a sub-MT direct
+	// child at the new root (the rare case where every cascade level
+	// exhausted siblings AND the new root is not itself the residual),
+	// run one last cousin pass at root. cousinRebalanceBranch finds
+	// the deep at the root's direct-child level (per the wrapper-
+	// propagation contract); the rebalance against root's other
+	// children heals it, or the root-collapse loop below promotes
+	// the residual to root (exempt from the floor). Without this,
+	// the deep persists as a sub-MT non-root direct child of root
+	// — a fill-floor violation on the root's children.
+	if topDeep != 0 {
+		nr, _, _, herr := cousinRebalanceBranch(pw, cfg, newRootID, topDeep, mergeThreshold)
+		if herr != nil {
+			return 0, herr
+		}
+		newRootID = nr
 	}
 	// Root collapse: a 0-cell root branch is a degenerate passthrough
 	// (1 child, 0 separators) — its sole leftmost child becomes the
@@ -111,22 +140,30 @@ func Delete(pw PageWriter, cfg page.Config, rootID uint64, mergeThreshold uint8,
 //     on this; the top-level Delete ignores it (root has no
 //     siblings).
 //   - found: key was present and deleted.
-func deleteFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, key []byte) (newID uint64, underflow, found bool, err error) {
+//   - deepUnderflowChild: non-zero iff this level's local rebalance
+//     reduced a branch to a single child still below MT (the
+//     "cousin-cascade" case from range-delete.md §Invariants fill-floor
+//     clause). The caller threads this upward; the level whose own
+//     case-C merge produces a sibling-rich branch containing the deep
+//     child runs `cousinRebalanceBranch` to heal it. At leaves this
+//     return is always 0.
+func deleteFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, key []byte) (newID uint64, underflow, found bool, deepUnderflowChild uint64, err error) {
 	buf, err := pw.Page(pageID)
 	if err != nil {
-		return 0, false, false, err
+		return 0, false, false, 0, err
 	}
 	typ, _, _, _ := page.ReadHeader(buf)
 	switch {
 	case page.IsLeafType(typ):
-		return deleteFromLeaf(pw, cfg, mergeThreshold, pageID, buf, key)
+		newID, underflow, found, err = deleteFromLeaf(pw, cfg, mergeThreshold, pageID, buf, key)
+		return newID, underflow, found, 0, err
 	case typ == page.TypeBranch:
 		if err := validateBranchPage(buf, cfg, pageID); err != nil {
-			return 0, false, false, err
+			return 0, false, false, 0, err
 		}
 		return deleteFromBranch(pw, cfg, mergeThreshold, pageID, buf, key)
 	default:
-		return 0, false, false, fmt.Errorf("%w: page %d unexpected type %d during Delete descent", ErrCorrupted, pageID, typ)
+		return 0, false, false, 0, fmt.Errorf("%w: page %d unexpected type %d during Delete descent", ErrCorrupted, pageID, typ)
 	}
 }
 
@@ -231,24 +268,46 @@ func branchUnderflow(cfg page.Config, cells []page.BranchCell, mergeThreshold ui
 	return size*100 < int(mergeThreshold)*cfg.ContentEnd()
 }
 
-func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, srcBuf []byte, key []byte) (uint64, bool, bool, error) {
+// pageUnderflow dispatches to leafUnderflow or branchUnderflow based
+// on the page type at id. Used by the redistribute path in
+// rebalanceSurvivors and other fill-floor re-check sites that need a
+// type-agnostic check after the page may have been mutated by a
+// downstream cousin step.
+func pageUnderflow(pw PageReader, cfg page.Config, id uint64, mergeThreshold uint8) (bool, error) {
+	buf, err := pw.Page(id)
+	if err != nil {
+		return false, err
+	}
+	typ, _, _, _ := page.ReadHeader(buf)
+	switch {
+	case page.IsLeafType(typ):
+		return leafUnderflow(buf, cfg, mergeThreshold), nil
+	case typ == page.TypeBranch:
+		_, cells := page.DecodeBranch(buf, cfg)
+		return branchUnderflow(cfg, cells, mergeThreshold), nil
+	default:
+		return false, fmt.Errorf("%w: page %d unexpected type %d in pageUnderflow", ErrCorrupted, id, typ)
+	}
+}
+
+func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, srcBuf []byte, key []byte) (uint64, bool, bool, uint64, error) {
 	descentIdx := page.BranchSearch(srcBuf, cfg, key)
 	childID := page.BranchChildAt(srcBuf, cfg, descentIdx)
 	if childID == 0 {
-		return 0, false, false, fmt.Errorf("%w: null child in branch %d at descent %d", ErrCorrupted, pageID, descentIdx)
+		return 0, false, false, 0, fmt.Errorf("%w: null child in branch %d at descent %d", ErrCorrupted, pageID, descentIdx)
 	}
-	newChildID, childUnderflow, found, err := deleteFrom(pw, cfg, mergeThreshold, childID, key)
+	newChildID, childUnderflow, found, childDeepUnderflow, err := deleteFrom(pw, cfg, mergeThreshold, childID, key)
 	if err != nil {
-		return 0, false, false, err
+		return 0, false, false, 0, err
 	}
 	if !found {
-		return pageID, false, false, nil
+		return pageID, false, false, 0, nil
 	}
-	newID, underflow, err := patchBranchAfterChildDelete(pw, cfg, mergeThreshold, pageID, descentIdx, newChildID, childUnderflow)
+	newID, underflow, deepUnderflowChild, err := patchBranchAfterChildDelete(pw, cfg, mergeThreshold, pageID, descentIdx, newChildID, childUnderflow, childDeepUnderflow)
 	if err != nil {
-		return 0, false, false, err
+		return 0, false, false, 0, err
 	}
-	return newID, underflow, true, nil
+	return newID, underflow, true, deepUnderflowChild, nil
 }
 
 // patchBranchAfterChildDelete CoWs the branch at pageID and applies
@@ -261,12 +320,20 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 //   - Case B: newChildID != 0 && !childUnderflow. Patch the child
 //     pointer in place.
 //   - Case C: newChildID != 0 && childUnderflow. Merge with or
-//     redistribute against an adjacent sibling.
+//     redistribute against an adjacent sibling, then run the
+//     post-merge re-rebalance loop and (if the recursion handed up
+//     a deepUnderflowChildIn) cousin-rebalance the merged result.
+//     These two extra steps maintain the range-delete.md §Invariants
+//     fill-floor clause — see those functions for the algorithm.
 //
-// Returns (newID, underflow, err). Used by both deleteFromBranch
-// (single-key delete) and deleteRangeFromBranch's single-child
-// overlap case (chunk-5.7 DeleteRange).
-func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, descentIdx uint16, newChildID uint64, childUnderflow bool) (uint64, bool, error) {
+// Returns (newID, underflow, deepUnderflowChildOut, err). deepUnderflowChildIn
+// is the sub-MT descendant the recursion at the child level could not
+// heal locally (0 if none); deepUnderflowChildOut is the corresponding
+// signal this level propagates upward (0 if fully healed here).
+// Used by both deleteFromBranch (single-key delete) and
+// deleteRangeFromBranch's single-child overlap case (chunk-5.7
+// DeleteRange).
+func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, descentIdx uint16, newChildID uint64, childUnderflow bool, deepUnderflowChildIn uint64) (uint64, bool, uint64, error) {
 	// CoW the parent for mutation and decode its (leftmost, cells)
 	// form. Deep-clone every cell Key — DecodeBranch returns Keys
 	// that borrow from parentBuf and EncodeBranch will clear that
@@ -274,11 +341,11 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	// ascendWithSplit handles for Put.
 	newBranchID, err := pw.AllocPage()
 	if err != nil {
-		return 0, false, fmt.Errorf("btree: alloc CoW branch for delete: %w", err)
+		return 0, false, 0, fmt.Errorf("btree: alloc CoW branch for delete: %w", err)
 	}
 	parentBuf, err := pw.CoW(pageID, newBranchID)
 	if err != nil {
-		return 0, false, fmt.Errorf("btree: CoW branch %d for delete: %w", pageID, err)
+		return 0, false, 0, fmt.Errorf("btree: CoW branch %d for delete: %w", pageID, err)
 	}
 	leftmost, cells := page.DecodeBranch(parentBuf, cfg)
 	for i := range cells {
@@ -293,12 +360,12 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 				// This branch's only child vanished → branch is now
 				// fully empty; cascade newID=0 up.
 				if err := pw.FreePage(newBranchID); err != nil {
-					return 0, false, fmt.Errorf("btree: free empty branch CoW %d: %w", newBranchID, err)
+					return 0, false, 0, fmt.Errorf("btree: free empty branch CoW %d: %w", newBranchID, err)
 				}
 				if err := pw.FreePage(pageID); err != nil {
-					return 0, false, fmt.Errorf("btree: free empty old branch %d: %w", pageID, err)
+					return 0, false, 0, fmt.Errorf("btree: free empty old branch %d: %w", pageID, err)
 				}
-				return 0, false, nil
+				return 0, false, 0, nil
 			}
 			leftmost = cells[0].Child
 			cells = cells[1:]
@@ -306,12 +373,15 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 			cells = append(cells[:descentIdx-1], cells[descentIdx:]...)
 		}
 		if err := page.EncodeBranch(parentBuf, cfg, leftmost, cells); err != nil {
-			return 0, false, fmt.Errorf("btree: encode branch after child-removal: %w", err)
+			return 0, false, 0, fmt.Errorf("btree: encode branch after child-removal: %w", err)
 		}
 		if err := pw.FreePage(pageID); err != nil {
-			return 0, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
+			return 0, false, 0, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
 		}
-		return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), nil
+		// Case A vanishes the recursed-into subtree entirely, so any
+		// deepUnderflowChildIn was inside that vanished subtree —
+		// nothing to thread upward.
+		return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), 0, nil
 	}
 
 	// Patch the child pointer at descentIdx in place. From here on
@@ -327,29 +397,37 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	// merge/redistribute machinery.
 	if !childUnderflow {
 		if err := page.EncodeBranch(parentBuf, cfg, leftmost, cells); err != nil {
-			return 0, false, fmt.Errorf("btree: encode branch after child-pointer update: %w", err)
+			return 0, false, 0, fmt.Errorf("btree: encode branch after child-pointer update: %w", err)
 		}
 		if err := pw.FreePage(pageID); err != nil {
-			return 0, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
+			return 0, false, 0, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
 		}
 		// Pointer-only update can't shrink encoded size, but recompute
-		// for defense in depth against future encoders.
-		return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), nil
+		// for defense in depth against future encoders. Case B
+		// cannot receive a non-zero deepUnderflowChildIn from a
+		// well-formed recursion (deep underflow is set only when the
+		// recursion's branch went degenerate, which makes
+		// childUnderflow=true) — but if a future caller passes one,
+		// thread it through rather than silently dropping the signal.
+		return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), deepUnderflowChildIn, nil
 	}
 
 	// Case C: child is underflowing → merge with or redistribute
 	// against a sibling. A non-root branch always carries ≥1 cell
 	// (≥2 children); the guard below handles the transient
 	// degenerate state a deeper cascade can produce, by propagating
-	// underflow upward instead of stalling.
+	// underflow upward instead of stalling. If deepUnderflowChildIn
+	// was set, it lives somewhere in newChildID's subtree — we
+	// cannot heal it at this level if we have no sibling here, so
+	// thread it upward unchanged for the next level to handle.
 	if len(cells) == 0 {
 		if err := page.EncodeBranch(parentBuf, cfg, leftmost, cells); err != nil {
-			return 0, false, fmt.Errorf("btree: encode degenerate branch after underflow: %w", err)
+			return 0, false, 0, fmt.Errorf("btree: encode degenerate branch after underflow: %w", err)
 		}
 		if err := pw.FreePage(pageID); err != nil {
-			return 0, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
+			return 0, false, 0, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
 		}
-		return newBranchID, true, nil
+		return newBranchID, true, deepUnderflowChildIn, nil
 	}
 
 	// Pick a sibling. Left preferred when one exists, else right —
@@ -396,18 +474,18 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	// just rebuilds via cfg.RestartGroupTarget).
 	leftSrc, err := pw.Page(leftPairID)
 	if err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 	rightSrc, err := pw.Page(rightPairID)
 	if err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 	leftTyp, _, _, _ := page.ReadHeader(leftSrc)
 	rightTyp, _, _, _ := page.ReadHeader(rightSrc)
 	leftIsLeaf := page.IsLeafType(leftTyp)
 	rightIsLeaf := page.IsLeafType(rightTyp)
 	if leftIsLeaf != rightIsLeaf {
-		return 0, false, fmt.Errorf("%w: sibling page types differ left=%d right=%d", ErrCorrupted, leftTyp, rightTyp)
+		return 0, false, 0, fmt.Errorf("%w: sibling page types differ left=%d right=%d", ErrCorrupted, leftTyp, rightTyp)
 	}
 
 	var (
@@ -423,10 +501,10 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	case leftTyp == page.TypeBranch && rightTyp == page.TypeBranch:
 		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, leftPairID, rightPairID, separator)
 	default:
-		return 0, false, fmt.Errorf("%w: sibling page %d unexpected type %d", ErrCorrupted, leftPairID, leftTyp)
+		return 0, false, 0, fmt.Errorf("%w: sibling page %d unexpected type %d", ErrCorrupted, leftPairID, leftTyp)
 	}
 	if err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 
 	// Project the helper's result back into the parent's child array.
@@ -434,6 +512,8 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	if useLeft {
 		posLeftPair, posRightPair = siblingPos, int(descentIdx)
 	}
+	var insertedPos int
+	var insertedID uint64
 	if isMerge {
 		// posLeftPair's slot becomes the merged page; posRightPair's
 		// cell (the separator + child pointer) is removed.
@@ -443,6 +523,8 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 			cells[posLeftPair-1].Child = mergedID
 		}
 		cells = append(cells[:separatorIdx], cells[separatorIdx+1:]...)
+		insertedPos = posLeftPair
+		insertedID = mergedID
 	} else {
 		if posLeftPair == 0 {
 			leftmost = newLeftID
@@ -452,15 +534,467 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		// posRightPair is always ≥ 1 since posRightPair = posLeftPair + 1.
 		cells[posRightPair-1].Child = newRightID
 		cells[separatorIdx].Key = newSeparator
+		// Redistribute leaves two new pages in the parent. Either could
+		// be below MT under pathological size skew; the post-merge
+		// re-rebalance loop below will attempt to heal the one on the
+		// side that received the recursed-into child (= descentIdx).
+		// The other half came from the previously-healthy sibling and
+		// inherits the sibling's half of the entries, which the
+		// count-balanced split keeps above MT under non-pathological
+		// entry sizes.
+		insertedPos = int(descentIdx)
+		if useLeft {
+			insertedID = newRightID
+		} else {
+			insertedID = newLeftID
+		}
+	}
+	_ = posRightPair
+
+	// Cousin-rebalance step. When the recursion at the child level
+	// could not heal a sub-MT descendant (deepUnderflowChildIn != 0)
+	// AND the local case-C merge produced a branch result containing
+	// that descendant as a child, run cousinRebalanceBranch on the
+	// merged result. Same `(newID, branchUnderflow, residualDeepID)`
+	// contract as rebalanceChildAtPos but operating on an already-
+	// encoded branch (the helper handles the re-CoW + free).
+	//
+	// Reachability: the only producer of deepUnderflowChildIn is a
+	// recursion that reduced its own branch to a single sub-MT child
+	// (rebalanceChildAtPos's "no siblings" exit). That means
+	// childUnderflow is also true (the degenerate branch's own
+	// encoded fill is ~0). So this branch path only fires when the
+	// case-C merge is branch-level — leaf-merge would imply the
+	// recursion was a leaf, which cannot produce deepUnderflowChildIn.
+	deepUnderflowChildOut := uint64(0)
+	if deepUnderflowChildIn != 0 && isMerge && !leftIsLeaf {
+		newMergedID, _, residual, err := cousinRebalanceBranch(pw, cfg, mergedID, deepUnderflowChildIn, mergeThreshold)
+		if err != nil {
+			return 0, false, 0, err
+		}
+		// Update parent's slot to point at the (possibly re-encoded)
+		// merged page.
+		if posLeftPair == 0 {
+			leftmost = newMergedID
+		} else {
+			cells[posLeftPair-1].Child = newMergedID
+		}
+		mergedID = newMergedID
+		insertedID = newMergedID
+		if residual != 0 {
+			// Propagate the wrapper (newMergedID — a direct child of
+			// THIS parent CoW) rather than the buried `residual`. At
+			// the next level above, this parent merges with sibling
+			// into merge_GP; newMergedID stays at a direct-child
+			// position of merge_GP (mergedID.leftmost or
+			// cells[posLeftPair-1].Child by the case-C merge geometry),
+			// so the receiving cousinRebalanceBranch finds it as a
+			// direct child. Propagating `residual` directly would
+			// leave it buried under newMergedID at merge_GP — outside
+			// cousinRebalanceBranch's direct-child search range
+			// (review Round 2 H-1).
+			deepUnderflowChildOut = newMergedID
+		}
+	}
+
+	// Post-merge re-rebalance loop. If the merged/redistributed result
+	// at insertedPos is itself below MT AND this parent has more cells
+	// to merge against, run rebalanceChildAtPos to walk the inserted
+	// child rightward/leftward through adjacent siblings until it
+	// reaches the fill floor or only one child remains in this parent.
+	if len(cells) > 0 {
+		finalPos, finalID, finalUnderflow, err := rebalanceChildAtPos(pw, cfg, mergeThreshold, &leftmost, &cells, insertedPos, insertedID)
+		if err != nil {
+			return 0, false, 0, err
+		}
+		_ = finalPos
+		// If the loop exited with the inserted child still below MT,
+		// propagate finalID as deepUnderflowChildOut. finalID is a
+		// direct child of this branch's CoW (at *leftmost when the
+		// loop fully consumed cells, or at cells[finalPos-1].Child
+		// when triedRedistPos exhaustion broke the loop early with
+		// cells > 0 still). Either way the wrapper-propagation
+		// invariant holds: at the next level above, finalID stays at
+		// a direct-child position of merge_GP by the case-C merge
+		// geometry. The earlier `&& len(cells) == 0` gate silently
+		// dropped the cells>0 exit (review Round 3 M-1).
+		//
+		// When BOTH this step's finalID AND the cousin step's
+		// newMergedID would propagate, last-non-zero wins: the next
+		// level's cousinRebalanceBranch scan (delete.go all-children
+		// scan) will find the other surviving sub-MT direct child of
+		// merge_GP when it walks merge_GP's children.
+		if finalUnderflow {
+			deepUnderflowChildOut = finalID
+		}
 	}
 
 	if err := page.EncodeBranch(parentBuf, cfg, leftmost, cells); err != nil {
-		return 0, false, fmt.Errorf("btree: encode branch after merge/redistribute: %w", err)
+		return 0, false, 0, fmt.Errorf("btree: encode branch after merge/redistribute: %w", err)
 	}
 	if err := pw.FreePage(pageID); err != nil {
-		return 0, false, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
+		return 0, false, 0, fmt.Errorf("btree: free old branch %d: %w", pageID, err)
 	}
-	return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), nil
+	// Force parentUnderflow when a deepUnderflowChild is in flight.
+	// The signal-receiving level's case-B path (childUnderflow=false)
+	// does NOT invoke the cousin pass — it only threads the signal
+	// upward, so the deep never finds new siblings and the cascade
+	// reaches the top exempt-root unhealed (silent fill-floor
+	// violation). Tagging this branch as semantically-underflow even
+	// when its encoded fill is fine forces the next level to run
+	// case-C (merge with sibling), which gives the deep the new
+	// siblings it needs via the merge result + cousinRebalanceBranch.
+	// (Root cause of the iterative review-round corner-case spiral —
+	// addresses Round 3 M-1 + the producer-1 cells>0 reachability
+	// the round-2 wrapper propagation didn't close.)
+	parentUnderflow := branchUnderflow(cfg, cells, mergeThreshold)
+	if deepUnderflowChildOut != 0 {
+		parentUnderflow = true
+	}
+	return newBranchID, parentUnderflow, deepUnderflowChildOut, nil
+}
+
+// rebalanceChildAtPos runs the post-merge re-rebalance loop inside a
+// parent's in-memory branch state. The parent's encoded form has not
+// yet been written (the caller will EncodeBranch the resulting
+// `*leftmost`/`*cells` after this returns) — this helper mutates
+// those in place plus the underlying pager state via
+// mergeOrRedistribute*.
+//
+// Starting position (startPos, startID): startPos==0 means the child
+// at *leftmost; startPos==k means cells[k-1].Child. The loop checks
+// the current child's fill; if below MergeThreshold AND ≥1 cell
+// remains in the parent, picks an adjacent sibling (left-preferred,
+// per the existing mergeOrRedistribute* contract in
+// patchBranchAfterChildDelete), runs mergeOrRedistribute*, and
+// re-walks. Exits when either the current child reaches the floor or
+// `len(*cells) == 0` (no more siblings here).
+//
+// Returns (finalPos, finalID, finalUnderflow, err):
+//   - finalUnderflow=true ⇒ len(*cells)==0 AND the lone surviving
+//     child finalID==*leftmost is still below MergeThreshold. The
+//     caller propagates finalID upward as deepUnderflowChild so a
+//     higher level can heal it via cousinRebalanceBranch after its
+//     own cascade-merge.
+//   - finalUnderflow=false ⇒ the current child reached the floor;
+//     the parent's (leftmost, cells) is the heal-converged state.
+func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, leftmost *uint64, cells *[]page.BranchCell, startPos int, startID uint64) (int, uint64, bool, error) {
+	curPos := startPos
+	curID := startID
+	// triedRedistPos: the sibling position last paired via a
+	// redistribute that did not heal the child's underflow. A second
+	// pairing with the same sibling would re-run the same
+	// count-balanced split with identical inputs and identical outputs
+	// — infinite loop. Skip that position on subsequent picks; if
+	// every remaining adjacent slot has already been tried this way,
+	// exit with finalUnderflow=true so the caller threads the residual
+	// upward via deepUnderflowChild. Reset to -1 on merge (cells
+	// layout changed, so adjacency is different now).
+	triedRedistPos := -1
+	for {
+		// Read current child to compute fill.
+		buf, err := pw.Page(curID)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		typ, _, _, _ := page.ReadHeader(buf)
+		var underflow bool
+		switch {
+		case page.IsLeafType(typ):
+			underflow = leafUnderflow(buf, cfg, mergeThreshold)
+		case typ == page.TypeBranch:
+			_, childCells := page.DecodeBranch(buf, cfg)
+			underflow = branchUnderflow(cfg, childCells, mergeThreshold)
+		default:
+			return 0, 0, false, fmt.Errorf("%w: page %d unexpected type %d during rebalanceChildAtPos", ErrCorrupted, curID, typ)
+		}
+		if !underflow {
+			return curPos, curID, false, nil
+		}
+		if len(*cells) == 0 {
+			// Parent has no more siblings to absorb this child.
+			// Caller threads curID upward as deepUnderflowChild.
+			return curPos, curID, true, nil
+		}
+		// Pick adjacent sibling: left-preferred if curPos>0, else right,
+		// skipping any position last paired via a redistribute that did
+		// not heal (see triedRedistPos commentary above the loop).
+		var siblingPos, separatorIdx int
+		switch {
+		case curPos > 0 && curPos-1 != triedRedistPos:
+			siblingPos = curPos - 1
+			separatorIdx = curPos - 1
+		case curPos+1 <= len(*cells) && curPos+1 != triedRedistPos:
+			siblingPos = curPos + 1
+			separatorIdx = curPos
+		default:
+			// Both adjacent slots either don't exist or were already
+			// tried; another iteration cannot make progress at this
+			// level. Propagate the residual underflow upward.
+			return curPos, curID, true, nil
+		}
+		var siblingID uint64
+		if siblingPos == 0 {
+			siblingID = *leftmost
+		} else {
+			siblingID = (*cells)[siblingPos-1].Child
+		}
+		// Order the pair so leftPair holds smaller keys.
+		var leftPairID, rightPairID uint64
+		var posLeftPair, posRightPair int
+		if siblingPos < curPos {
+			leftPairID, rightPairID = siblingID, curID
+			posLeftPair, posRightPair = siblingPos, curPos
+		} else {
+			leftPairID, rightPairID = curID, siblingID
+			posLeftPair, posRightPair = curPos, siblingPos
+		}
+		separator := (*cells)[separatorIdx].Key
+		// Dispatch by type.
+		leftSrc, err := pw.Page(leftPairID)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		leftTyp, _, _, _ := page.ReadHeader(leftSrc)
+		leftIsLeaf := page.IsLeafType(leftTyp)
+		var (
+			isMerge      bool
+			mergedID     uint64
+			newLeftID    uint64
+			newRightID   uint64
+			newSeparator []byte
+		)
+		if leftIsLeaf {
+			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID)
+		} else {
+			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, leftPairID, rightPairID, separator)
+		}
+		if err != nil {
+			return 0, 0, false, err
+		}
+		if isMerge {
+			if posLeftPair == 0 {
+				*leftmost = mergedID
+			} else {
+				(*cells)[posLeftPair-1].Child = mergedID
+			}
+			*cells = append((*cells)[:separatorIdx], (*cells)[separatorIdx+1:]...)
+			curPos = posLeftPair
+			curID = mergedID
+			// Cells layout changed — old triedRedistPos no longer
+			// references the same slot relative to curPos.
+			triedRedistPos = -1
+		} else {
+			if posLeftPair == 0 {
+				*leftmost = newLeftID
+			} else {
+				(*cells)[posLeftPair-1].Child = newLeftID
+			}
+			(*cells)[posRightPair-1].Child = newRightID
+			(*cells)[separatorIdx].Key = bytes.Clone(newSeparator)
+			// Track the side curID was on so the next iteration
+			// re-checks the right output.
+			if siblingPos < curPos {
+				curPos = posRightPair
+				curID = newRightID
+			} else {
+				curPos = posLeftPair
+				curID = newLeftID
+			}
+			// Mark this sibling slot as tried via redistribute. Cells
+			// layout is unchanged (redistribute preserves cell count
+			// and positions), so siblingPos remains a valid index
+			// relative to the unchanged curPos.
+			triedRedistPos = siblingPos
+		}
+		// Loop re-checks underflow on curID.
+	}
+}
+
+// cousinRebalanceBranch heals a sub-MT descendant `deepID` that lives
+// inside an already-encoded branch `branchID`. The deep descendant
+// arrived here from a recursion that exhausted siblings at its own
+// level and threaded `deepID` upward via deepUnderflowChild; the
+// caller's local case-C merge then produced `branchID` as a
+// sibling-rich result whose children include `deepID` (as either
+// `leftmost` or some `cells[i].Child`).
+//
+// Algorithm: decode branchID's state, locate deepID's position, run
+// rebalanceChildAtPos starting there, encode the resulting layout
+// into a fresh branch page (freeing the original branchID's slab).
+//
+// Returns (newBranchID, branchUnderflow, residualDeepID, err):
+//   - newBranchID is the re-CoW'd branch reflecting the cousin merge
+//     (or the same branchID if no mutation was needed — but the
+//     helper always reallocates for clarity).
+//   - residualDeepID is non-zero iff the cousin rebalance reduced
+//     this branch to a single sub-MT child; the caller threads it
+//     one more level up. 0 means fully healed at this level.
+func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deepID uint64, mergeThreshold uint8) (uint64, bool, uint64, error) {
+	buf, err := pw.Page(branchID)
+	if err != nil {
+		return 0, false, 0, err
+	}
+	if err := validateBranchPage(buf, cfg, branchID); err != nil {
+		return 0, false, 0, err
+	}
+	leftmost, cells := page.DecodeBranch(buf, cfg)
+	for i := range cells {
+		cells[i].Key = bytes.Clone(cells[i].Key)
+	}
+	// Find deepID's position. It must be a direct child of branchID
+	// (the cousin-cascade thread always lands here at the merge that
+	// promoted the deep child to a direct-child slot — see
+	// patchBranchAfterChildDelete's case-C cousin step for the
+	// argument).
+	deepPos := -1
+	if leftmost == deepID {
+		deepPos = 0
+	} else {
+		for i, c := range cells {
+			if c.Child == deepID {
+				deepPos = i + 1
+				break
+			}
+		}
+	}
+	if deepPos == -1 {
+		return 0, false, 0, fmt.Errorf("%w: cousinRebalanceBranch: deep underflow child %d not found in branch %d", ErrCorrupted, deepID, branchID)
+	}
+	// Snapshot pre-rebalance to detect no-op pass (caller's defensive
+	// pre-check found the deep child was actually already healthy in
+	// this branch). A no-op returns branchID unchanged, avoiding
+	// AllocPage + AllocSlab + FreePage churn that would otherwise
+	// inflate the pager's pending alloc/free lists with no semantic
+	// effect (review M-1).
+	prevLen := len(cells)
+	prevLeftmost := leftmost
+	finalPos, finalID, finalUnderflow, err := rebalanceChildAtPos(pw, cfg, mergeThreshold, &leftmost, &cells, deepPos, deepID)
+	if err != nil {
+		return 0, false, 0, err
+	}
+	if len(cells) == prevLen && leftmost == prevLeftmost && !finalUnderflow {
+		return branchID, branchUnderflow(cfg, cells, mergeThreshold), 0, nil
+	}
+	// Cascade-absorption spine walk (review H-3). When the
+	// rebalanceChildAtPos pass merged a degenerate wrapper branch
+	// (carrying a sub-MT descendant as its sole child) into a
+	// healthy sibling-rich result, the merge result's leftmost is
+	// now that descendant — still sub-MT, but at a different
+	// nesting depth than the rebalance loop tracks (the loop only
+	// checks `curID`'s own fill, not its leftmost descendant's).
+	// Walk down finalID's leftmost spine; for each non-root level
+	// whose leftmost is sub-MT, recursively cousin-rebalance.
+	// Termination is bounded by tree depth: each recursion strictly
+	// descends. If a recursive call exhausts siblings at its level,
+	// the residual cascades back here as `recResidual` and the
+	// caller's own cascade continues unchanged.
+	residual := uint64(0)
+	if finalUnderflow && len(cells) == 0 {
+		residual = finalID
+	} else {
+		// Post-rebalance descendant scan (Round 2 review H-1 + H-3).
+		// The rebalance may have absorbed a wrapper-branch into a
+		// merge result whose sub-MT descendant ended up at a
+		// non-leftmost position (e.g. when the in-rebalance merge
+		// picked a LEFT sibling, the absorbed wrapper's leftmost
+		// lands at mergedID.cells[len(leftSibling.cells)].Child, NOT
+		// at leftmost). A leftmost-only spine walk missed this.
+		// Instead, scan ALL of finalID's direct children for sub-MT;
+		// for each, recursively cousin-heal. Bounded by tree depth
+		// × per-branch fanout × cousin recursion depth (= tree depth)
+		// in the worst case; for the common (heal-at-first-merge)
+		// case this terminates in a single iteration.
+		curScan := finalID
+		for {
+			scanBuf, perr := pw.Page(curScan)
+			if perr != nil {
+				return 0, false, 0, perr
+			}
+			scanTyp, _, _, _ := page.ReadHeader(scanBuf)
+			if scanTyp != page.TypeBranch {
+				break
+			}
+			scanLeftmost, scanCells := page.DecodeBranch(scanBuf, cfg)
+			if len(scanCells) == 0 {
+				break
+			}
+			// Find the first sub-MT direct child: leftmost first, then cells.
+			candidates := make([]uint64, 0, 1+len(scanCells))
+			candidates = append(candidates, scanLeftmost)
+			for _, c := range scanCells {
+				candidates = append(candidates, c.Child)
+			}
+			subID, sfind := uint64(0), false
+			for _, candidate := range candidates {
+				cbuf, ferr := pw.Page(candidate)
+				if ferr != nil {
+					return 0, false, 0, ferr
+				}
+				ctyp, _, _, _ := page.ReadHeader(cbuf)
+				var cuf bool
+				switch {
+				case page.IsLeafType(ctyp):
+					cuf = leafUnderflow(cbuf, cfg, mergeThreshold)
+				case ctyp == page.TypeBranch:
+					_, cc := page.DecodeBranch(cbuf, cfg)
+					cuf = branchUnderflow(cfg, cc, mergeThreshold)
+				default:
+					return 0, false, 0, fmt.Errorf("%w: page %d unexpected type %d during cousin descendant scan", ErrCorrupted, candidate, ctyp)
+				}
+				if cuf {
+					subID = candidate
+					sfind = true
+					break
+				}
+			}
+			if !sfind {
+				break
+			}
+			newScan, _, recResidual, rerr := cousinRebalanceBranch(pw, cfg, curScan, subID, mergeThreshold)
+			if rerr != nil {
+				return 0, false, 0, rerr
+			}
+			// Update OUR branch's slot pointing at finalID.
+			if finalPos == 0 {
+				leftmost = newScan
+			} else {
+				cells[finalPos-1].Child = newScan
+			}
+			curScan = newScan
+			finalID = newScan
+			if recResidual != 0 {
+				// The recursive call exhausted: newScan is a degenerate
+				// wrapping branch that holds recResidual transitively.
+				// Propagate newScan (the wrapper — a direct child of
+				// OUR returned branch) so the caller's cousin at the
+				// next level above finds it as a direct child of the
+				// next-level merge result. (Review Round 2 H-1.)
+				residual = newScan
+				break
+			}
+			// Else: loop in case the rebalance introduced a new sub-MT
+			// descendant a level deeper.
+		}
+	}
+	// Allocate a fresh branch page for the re-encoded layout. Same
+	// re-CoW idiom Put uses for split children — the helper owns the
+	// freed slot reuse via the pager's loose-page pool.
+	newBranchID, err := pw.AllocPage()
+	if err != nil {
+		return 0, false, 0, fmt.Errorf("btree: cousinRebalanceBranch alloc: %w", err)
+	}
+	newBuf, err := pw.AllocSlab(newBranchID)
+	if err != nil {
+		return 0, false, 0, fmt.Errorf("btree: cousinRebalanceBranch alloc slab: %w", err)
+	}
+	if err := page.EncodeBranch(newBuf, cfg, leftmost, cells); err != nil {
+		return 0, false, 0, fmt.Errorf("btree: cousinRebalanceBranch encode: %w", err)
+	}
+	if err := pw.FreePage(branchID); err != nil {
+		return 0, false, 0, fmt.Errorf("btree: cousinRebalanceBranch free old %d: %w", branchID, err)
+	}
+	return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), residual, nil
 }
 
 // mergeOrRedistributeLeaves combines (or rebalances) two sibling

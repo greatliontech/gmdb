@@ -80,6 +80,37 @@ Invariant: kind=entailed;
     — the index returns stale primary keys that point at deleted
     rows.
 
+Invariant: kind=clause-explicit;
+  property=After a successful `DeleteRange` returns, every non-root
+    page reachable from the new root has encoded fill
+    `>= MergeThreshold%` of the page's `ContentEnd`. The root is
+    exempt — a partially-emptied tree's root may shrink arbitrarily
+    (and may root-collapse to a leaf or to 0 / empty). The same
+    floor holds for single-key `Delete` and applies inductively:
+    a `Put`-only build maintains it (splits balance roughly at 50%,
+    above MergeThreshold's [1, 50] range); the post-mutation pass
+    must preserve it. Maintained by tightening the merge/redistribute
+    contract: when a local merge produces a still-below-MT page,
+    `rebalanceSurvivors` re-attempts merge with the next adjacent
+    survivor; when the 2-survivor cousin-cascade case
+    (`leftIdx=0 ∧ rightIdx=cellCount` at the parent of two below-MT
+    survivors) leaves the parent degenerate, the still-below-MT
+    page is threaded upward as `deepUnderflowChild` and rebalanced
+    against its cousins after the parent's own cascade-merge
+    produces a sibling-rich branch — see §Algorithm Phase 3
+    Rebalance below;
+  from=this spec §Algorithm Phase 3 rebalance + `api-surface.md`
+    Options.MergeThreshold godoc (the percentage doubles as the
+    merge **trigger** AND the post-mutation **floor**);
+  violation=A `DeleteRange` whose 2-survivor cascade leaves a leaf
+    at e.g. 8% fill as a non-root child of the merged grandparent —
+    the page-fill invariant the rest of the engine (compaction
+    pacing, leak-detection page-utilization heuristics, splitting
+    fairness across concurrent writers) reasons against drifts
+    silently, and the soft "eventual-convergence" rationale (that
+    subsequent mutations heal it) becomes a forced load-bearing
+    assumption with no localized enforcement.
+
 ## Algorithm (un-indexed keyspaces)
 
 Three phases.
@@ -121,6 +152,51 @@ subtree)`.
 - Rebalance: check fill ratios on modified branches and leaves. Merge
   or redistribute per `MergeThreshold` (see Options in
   `api-surface.md`).
+- **Post-merge re-rebalance.** A single merge of two below-MT
+  siblings can leave the merged page itself below MT. The local
+  rebalance loop checks the merge result's encoded fill against
+  `MergeThreshold` and, when the result is still below the floor,
+  re-attempts merge with the next adjacent survivor in the same
+  parent. The loop converges in `O(survivors)` iterations.
+- **Cousin-cascade rebalance.** When the recursed-into branch's
+  survivor list reduces to a single still-below-MT child (the
+  `leftIdx=0 ∧ rightIdx=cellCount` boundary case where both
+  surviving children come back below MT and no third survivor
+  remains at that level), the branch is degenerate. The
+  still-below-MT child is threaded upward as a `deepUnderflowChild`
+  signal alongside the `(newID, count, underflow)` return tuple. At
+  the level above, after the local cascade-merge produces a
+  sibling-rich branch that now holds the deep child as a direct
+  child, the local code finds that child's position in the new
+  branch and runs the same local-rebalance loop against its
+  cousins. The loop terminates when either the deep child reaches
+  the floor or the level above ALSO collapses to a single child —
+  in which case the signal threads one more level up. Termination:
+  bounded by tree depth.
+- **Semantic-underflow rule for deepUnderflowChild propagation.**
+  A branch returning `deepUnderflowChild != 0` is reported as
+  underflow=true regardless of its encoded fill. Rationale: the
+  level above runs the cousin pass only on the case-C (merge) path
+  — case-B (child healthy, no merge) would thread the deep signal
+  upward without giving the deep new siblings, and the cascade
+  would reach the top with the deep buried unhealed. Tagging the
+  branch as semantically-underflow forces the level above into
+  case-C, where mergeOrRedistribute*-then-cousinRebalanceBranch
+  exposes the deep as a child of a sibling-rich merge result that
+  the cousin pass can heal.
+- **Top-level final-heal pass.** After the top-level recursion
+  returns `(newRootID, …, deepUnderflowChild)`, if the
+  deepUnderflowChild is non-zero AND newRootID is non-zero, run
+  one cousin pass at newRootID. The root collapse loop that
+  follows promotes any residual to root (where it becomes exempt
+  from the floor). Without this final pass, a cascade that
+  exhausted every intermediate level's siblings would leave the
+  deep as a sub-MT direct child of the new root — a non-root
+  fill-floor violation.
+
+This §Phase 3 covers both `Delete` and `DeleteRange` post-mutation
+rebalance — the merge/redistribute primitives are shared, and the
+fill-floor invariant applies to both call sites.
 
 **Root collapse.** If rebalance reduces the keyspace's root to a
 single child (a branch with one child pointer and no separators),

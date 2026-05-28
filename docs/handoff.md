@@ -77,14 +77,28 @@ before designing the fix. The proof is in the receipts:
   core — `PutReportExisting` (replace+report) for `Keyspace.Put`,
   `InsertIfAbsent` (no-op-on-present) for `putIntoNestedTree`.
 
-- **`btree-post-merge-underflow`** (decided, not yet executed):
-  re-derivation found the spec's §Invariants in `docs/specs/
-  range-delete.md` has **no** `fill >= MergeThreshold` invariant. The
-  issue's "invariant #3" is invented. `MergeThreshold`'s godoc:
-  *"the fill percentage **below which a page is merged**"* — a merge
-  **trigger**, not a maintained floor. The user nonetheless elected
-  to add the guarantee; framed as `Rationale:` (intended new behavior),
-  not `Diagnosis:` of a current defect.
+- **`btree-post-merge-underflow`** (this session): the issue's
+  "~10 LOC" framing was structurally insufficient. The user picked
+  "Strong invariant + cousin rebalance" expecting ~100-200 LOC,
+  but Rounds 1-3 of adversarial review surfaced a complexity spiral
+  (each fix exposed another corner). **The actual root cause was an
+  architectural gap I didn't diagnose until pressed**: the
+  `deepUnderflowChild` propagation contract only gets healed in
+  case-C (merge). Case-B (child healthy, no merge) just threads the
+  signal upward without healing — once any code path produced
+  `deepUnderflowChild != 0` while the carrying branch's encoded fill
+  was ≥ MT, the deep cascaded to the top and got discarded. **The
+  unifying fix** is a 5-line architectural rule: when a level returns
+  `deepUnderflowChild != 0`, force `parentUnderflow=true` regardless
+  of encoded fill, so the next level's case-C fires and gives the
+  deep new siblings via the merge result. Plus a top-level
+  final-heal pass at `Delete()` / `DeleteRange()` for cases where
+  the cascade reaches root. This unifies every corner case Rounds
+  1-3 surfaced. **Lesson**: when reviewers surface a sequence of
+  surface-similar findings, stop pattern-matching at the symptom
+  level and ask "what's the architectural invariant being violated?"
+  — the answer is usually a 5-line rule, not a 200-line accumulation
+  of patches.
 
 - **`writenewindexregistry-partial-leak`** (partial, `c1effd2`): the
   "bespoke lightweight page-tracking rollback" chosen for the hot-path
@@ -135,8 +149,8 @@ before designing the fix. The proof is in the receipts:
   (`TestShallowSavepointRestoreReversesLoosePop`'s 0xAA / 0xCC
   marker assertion).
 
-- **`writenewindexregistry-partial-leak` DDL siblings** (this
-  session, the close-out commit): two surprises beyond the
+- **`writenewindexregistry-partial-leak` DDL siblings** (the
+  close-out commit): two surprises beyond the
   "mechanical" framing.
 
   **First**, the *test detection shape was non-uniform*. Under
@@ -191,7 +205,14 @@ mechanisms the prior fix surfaced, OR **a regression test passes for
 the wrong reason** — verify the neutered fix actually exposes the
 demonstrated fault on the chosen test path (the cached-path
 `flushIndexRegistry` rebuild can mask leak shapes that surface on
-not-cached paths).
+not-cached paths), OR **when adversarial review surfaces an
+iterating sequence of surface-similar findings, the symptoms are not
+the bug** — there is a single architectural invariant being violated
+and the real fix is a 5-line rule, not a 200-line patch
+accumulation (the `btree-post-merge-underflow` cousin-cascade gap is
+the canonical instance: 3 rounds of H/M findings collapsed to one
+force-underflow rule once I asked "what's the invariant being
+violated?" instead of "how do I patch the latest finding?").
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -222,6 +243,9 @@ not-cached paths).
    reasons, spec coverage). Disposition every finding (fixed | filed |
    disputed, with `class=introduced|adjacent` decided by the diff
    arbiter, not by judgment). Re-review on any introduced H/M.
+   **When the review surfaces a sequence of similar findings,
+   stop and ask: "is there a single architectural invariant being
+   violated?" — if yes, fix the invariant, not the symptoms.**
 6. **Close-out (promote-then-delete)** per §Issue triage. Wrap-aware
    cite search of authoritative spec (`docs/specs/*.md`) and production
    `.go`. Promote load-bearing rationale inline into kept-current
@@ -244,14 +268,13 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-8 commits resolved 6 issues + 1 partial in prior sessions; this
-session closed the DDL-siblings partial via the
-nested-savepoint pattern AND promoted-then-deleted the originating
-`writenewindexregistry-partial-leak` issue file (with its
-load-bearing rationale promoted into a new
-`transactions.md §Write-helper error contract` section that serves
-all 4 sibling sites: writeNewIndexRegistry, the 6 per-row maintenance
-sites, and the 3 DDL siblings):
+This session closed `btree-post-merge-underflow` via a unifying
+architectural rule (force `parentUnderflow=true` while a deep is in
+flight, so case-C fires and the cousin pass heals via the merge's
+new siblings) plus a top-level final-heal pass at `Delete()` /
+`DeleteRange()`. The journey through 3 rounds of adversarial review
++ a complexity spiral + root-cause analysis is its own RECURRING
+LESSON receipt.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -262,7 +285,8 @@ sites, and the 3 DDL siblings):
 | `c1effd2` | writenewindexregistry-partial-leak | Partial — `writeNewIndexRegistry` site done via nested savepoint; 4 siblings remained |
 | `0893be5` | bitmap-rollback-undo-log | Closed (undo-log substrate + spec amend in transactions.md §Nested Transactions + new `Discard` API) |
 | `15f9b70` | writenewindexregistry-partial-leak per-row case | Partial — 6 per-row sites done via new `Pager.BeginShallowSavepoint` substrate; 3 cold-path DDL siblings remain. Filed `shallow-savepoint-clone-cost.md` (residual per-Begin clone cost). |
-| `27361ac` | writenewindexregistry-partial-leak DDL siblings | **Closed** — `Tx.RebuildIndex`, `Tx.DropIndex`, `Keyspace.DeleteKeyspace` retirement wrapped in nested savepoint via defer-named-return; new `transactions.md §Write-helper error contract` spec section codifies the all-or-nothing contract for all 4 sibling-set sites; `assertNoBitmapCorruption` test helper checks BitmapLeak / ReachableButFree / ReachableInRPL / FreeAndPending union; promote-then-delete completed (issue file removed, all test/spec cites repointed at the new spec section). |
+| `27361ac` | writenewindexregistry-partial-leak DDL siblings | Closed — `Tx.RebuildIndex`, `Tx.DropIndex`, `Keyspace.DeleteKeyspace` retirement wrapped in nested savepoint via defer-named-return |
+| THIS SESSION | btree-post-merge-underflow | **Closed** — strict fill-floor invariant added to `range-delete.md §Invariants`; mechanism: (a) `mergeOrRedistribute*` callers (`rebalanceSurvivors`, `patchBranchAfterChildDelete`) do post-merge re-rebalance + cousin propagation; (b) **architectural force-underflow rule** — a level returning `deepUnderflowChild != 0` reports `underflow=true` regardless of encoded fill (forces next level into case-C, which gives the deep new siblings via the merge); (c) top-level final-heal pass at `Delete()` / `DeleteRange()` runs one final cousin at the new root. Three adversarial-review rounds + root-cause analysis collapsed a 1400-LOC complexity accumulation to a single 5-line architectural rule. New regression tests: `TestBtreeDeleteRangePreservesFillFloor`, `TestBtreeDeleteRangePreservesFillFloorUseLeftCousin`, `TestDeleteSingleKeyPreservesFillFloor`. Promote-then-delete: issue file removed, README row removed, load-bearing rationale promoted to spec §Invariants + §Algorithm Phase 3 + `MergeThreshold` godoc reconciled across `options.go` + `api-surface.md`. |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -270,30 +294,13 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-- **`btree-post-merge-underflow`** — user elected to **tighten the
-  contract** despite first-principles finding that the cited
-  "invariant #3" doesn't exist in the spec. This is a hardening, not
-  a defect fix. Frame as `Rationale:` (intended new behavior +
-  invariant it must preserve + why this shape), not `Diagnosis:`.
-  Work:
-  1. Amend `docs/specs/range-delete.md §Invariants` to add
-     `fill >= MergeThreshold` as a clause-explicit invariant (a new
-     guarantee). Reconcile with `MergeThreshold`'s Options godoc
-     (currently described as a merge **trigger**, not a floor).
-  2. Implement: `mergeOrRedistributeLeaves` / `mergeOrRedistribute-
-     Branches` return the real post-merge underflow state; callers
-     (`internal/btree/delete.go` `patchBranchAfterChildDelete`
-     case-C, `internal/btree/range_delete.go` `rebalanceSurvivors`)
-     propagate it for a second-pass recursive rebalance.
-  3. Enforced test for the post-merge fill-floor invariant.
-
-- **`byte-api-covering-return-unwired`** — user elected to **wire**
-  the byte-API projection-covering return. Make `extractPKAndValue`
-  (`index.go`) return the decoded covering tuple for any covering
-  index. Defines a byte-level (NUL-escape) return contract that
-  changes byte `Lookup`'s value semantics for covering indexes
-  (currently the row value via back-lookup; will become the covering
-  tuple). Don't break existing byte covering tests
+- **`byte-api-covering-return-unwired`** — user elected (prior
+  session) to **wire** the byte-API projection-covering return. Make
+  `extractPKAndValue` (`index.go`) return the decoded covering tuple
+  for any covering index. Defines a byte-level (NUL-escape) return
+  contract that changes byte `Lookup`'s value semantics for covering
+  indexes (currently the row value via back-lookup; will become the
+  covering tuple). Don't break existing byte covering tests
   (`TestIndexedPutWritesCoveringBytes` asserts stored bytes, not the
   Lookup return).
 
@@ -319,8 +326,8 @@ the README as ground truth, this as a hint.
 `pager-test-helper-export`, `leaked-readtx-cleanup-race-flake`,
 `setkeyspace-delete-range-bulk-walker`, `bulkload-index-merge-run-
 fanin`, `setkeyspace-indexing-perf-and-edge`, `shallow-savepoint-
-clone-cost` (NEW — filed this session). Re-validate live before
-acting; some may now be obsolete.
+clone-cost`. Re-validate live before acting; some may now be
+obsolete.
 
 ---
 
@@ -330,18 +337,15 @@ Pick **one** issue from `docs/issues/README.md`. Confirm the pick with
 the user at session start (offer your recommendation + rationale; the
 user may override). Default order, given prior decisions:
 
-1. **`btree-post-merge-underflow`** — spec amend + recursive
-   rebalance + enforced test. User pre-decided to tighten the
-   contract; frame as `Rationale:` (intended new behavior), not
-   `Diagnosis:`. Design-heavy; suits fresh context. (Promoted to
-   #1 now that the DDL siblings closed this session.)
-2. **`byte-api-covering-return-unwired`** — byte-level return
-   contract; touches `extractPKAndValue` + byte-API `Lookup`/`Get`
-   semantics. Don't break existing covering tests.
-3. **`open-corrupt-meta-size-fields-panic`** — adjacent to a closed
-   issue; same Inv-RV3 bound pattern. Smaller; suits later resets
-   with tighter context budgets.
-4. **`index-handle-stale-after-rebuild-drop`** — undecided / needs
+1. **`byte-api-covering-return-unwired`** — user pre-decided to wire
+   the byte-API projection-covering return. Defines a byte-level
+   (NUL-escape) return contract for `extractPKAndValue`. Don't break
+   existing byte covering tests. Suitable for fresh context: design-
+   touching across `index.go` + byte-API surface.
+2. **`open-corrupt-meta-size-fields-panic`** — adjacent to the closed
+   `rpl-rebuild-panic-on-wild-pointer`; same Inv-RV3 bound pattern;
+   mechanical fit for tighter context budgets.
+3. **`index-handle-stale-after-rebuild-drop`** — undecided / needs
    analysis. Substantial bundle; consider deciding before pulling.
 
 Then resolve it via the full protocol above. **One issue per session

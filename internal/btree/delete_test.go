@@ -712,6 +712,157 @@ func checkSlabPartition(t *testing.T, pw *fakeWriter, cfg page.Config, root uint
 // panic. This mirrors the sibling-leaf validation in
 // mergeOrRedistributeLeaves (forged sibling leaf already yields
 // ErrCorrupted; this closes the same gap for branches).
+// TestDeleteSingleKeyPreservesFillFloor pins range-delete.md
+// §Invariants fill-floor clause's "the same floor holds for
+// single-key `Delete`" sub-clause. The cousin-cascade case is
+// **structurally unreachable** from a valid pre-state for
+// single-key Delete (the inductive maintenance argument: each
+// merge has one input >= MT — the untouched sibling — so combined
+// >= MT and the merged result is >= MT; redistribute can only
+// happen when combined > ContentEnd, which means combined > 2*MT
+// for any MT <= 50, so per-half count split is >= MT). What
+// SHOULD be true even so: every successful single-key Delete
+// leaves every non-root page >= MergeThreshold% of ContentEnd.
+//
+// This is a per-Delete progression smoke test: a hand-built
+// depth-2 tree where every non-root page is just above MT,
+// every key is deleted one at a time in a deterministic order,
+// and the floor is asserted after each delete. A regression
+// that broke the inductive maintenance — including any future
+// merge/redistribute change that allowed an under-floor
+// non-root page — fires here.
+func TestDeleteSingleKeyPreservesFillFloor(t *testing.T) {
+	cfg := page.Config{PageSize: 4096}
+	pw := newFakeWriter(t, 4096)
+
+	// Same hand-built shape as the DeleteRange test but with the
+	// invariant pinned at mt=10 across a sequence of single-key
+	// Deletes. ROOT -> [P, Q, R]; each intermediate -> 6 leaves;
+	// each leaf -> 3 entries.
+	const mt uint8 = 10
+
+	pw.nextID = 23
+
+	padKey := func(s string) []byte {
+		out := make([]byte, 100)
+		copy(out, []byte(s))
+		return out
+	}
+	val := bytes.Repeat([]byte{0xAB}, 50)
+
+	buildLeaf := func(id uint64, keys []string) {
+		t.Helper()
+		buf, err := pw.AllocSlab(id)
+		if err != nil {
+			t.Fatalf("AllocSlab(%d): %v", id, err)
+		}
+		b := page.NewLeafBuilder(buf, cfg)
+		for _, k := range keys {
+			if !b.AddEntry(page.LeafEntry{Key: padKey(k), Value: val}) {
+				t.Fatalf("leaf %d: AddEntry(%q) overflow", id, k)
+			}
+		}
+		b.Finish()
+	}
+
+	leafKeys := map[uint64][]string{
+		5:  {"a01", "a02", "a03"},
+		6:  {"b01", "b02", "b03"},
+		7:  {"c01", "c02", "c03"},
+		8:  {"d01", "d02", "d03"},
+		9:  {"e01", "e02", "e03"},
+		10: {"f01", "f02", "f03"},
+	}
+	for id, keys := range leafKeys {
+		buildLeaf(id, keys)
+	}
+	for q := range 6 {
+		qid := uint64(11 + q)
+		qkeys := []string{
+			fmt.Sprintf("q%c01", 'a'+q),
+			fmt.Sprintf("q%c02", 'a'+q),
+			fmt.Sprintf("q%c03", 'a'+q),
+		}
+		buildLeaf(qid, qkeys)
+		leafKeys[qid] = qkeys
+		rid := uint64(17 + q)
+		rkeys := []string{
+			fmt.Sprintf("r%c01", 'a'+q),
+			fmt.Sprintf("r%c02", 'a'+q),
+			fmt.Sprintf("r%c03", 'a'+q),
+		}
+		buildLeaf(rid, rkeys)
+		leafKeys[rid] = rkeys
+	}
+
+	buildBranch := func(id uint64, leftmost uint64, cells []page.BranchCell) {
+		t.Helper()
+		buf, err := pw.AllocSlab(id)
+		if err != nil {
+			t.Fatalf("AllocSlab(%d): %v", id, err)
+		}
+		if err := page.EncodeBranch(buf, cfg, leftmost, cells); err != nil {
+			t.Fatalf("EncodeBranch(%d): %v", id, err)
+		}
+	}
+
+	buildBranch(2, 5, []page.BranchCell{
+		{Key: padKey("b01"), Child: 6},
+		{Key: padKey("c01"), Child: 7},
+		{Key: padKey("d01"), Child: 8},
+		{Key: padKey("e01"), Child: 9},
+		{Key: padKey("f01"), Child: 10},
+	})
+	buildBranch(3, 11, []page.BranchCell{
+		{Key: padKey("qb01"), Child: 12},
+		{Key: padKey("qc01"), Child: 13},
+		{Key: padKey("qd01"), Child: 14},
+		{Key: padKey("qe01"), Child: 15},
+		{Key: padKey("qf01"), Child: 16},
+	})
+	buildBranch(4, 17, []page.BranchCell{
+		{Key: padKey("rb01"), Child: 18},
+		{Key: padKey("rc01"), Child: 19},
+		{Key: padKey("rd01"), Child: 20},
+		{Key: padKey("re01"), Child: 21},
+		{Key: padKey("rf01"), Child: 22},
+	})
+	buildBranch(1, 2, []page.BranchCell{
+		{Key: padKey("qa01"), Child: 3},
+		{Key: padKey("ra01"), Child: 4},
+	})
+
+	checkUnderflowInvariant(t, pw, cfg, 1, mt)
+
+	// Collect every key and delete in a deterministic order. After
+	// each delete, the floor must hold.
+	var allKeys []string
+	for _, ks := range leafKeys {
+		allKeys = append(allKeys, ks...)
+	}
+	// Deterministic order: lexical.
+	for i := 0; i < len(allKeys); i++ {
+		for j := i + 1; j < len(allKeys); j++ {
+			if allKeys[i] > allKeys[j] {
+				allKeys[i], allKeys[j] = allKeys[j], allKeys[i]
+			}
+		}
+	}
+
+	root := uint64(1)
+	for _, k := range allKeys {
+		nr, err := Delete(pw, cfg, root, mt, padKey(k))
+		if err != nil {
+			t.Fatalf("Delete(%q): %v", k, err)
+		}
+		root = nr
+		checkUnderflowInvariant(t, pw, cfg, root, mt)
+		if root == 0 {
+			break
+		}
+	}
+}
+
 func TestMergeBranchesForgedSiblingNoPanic(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)

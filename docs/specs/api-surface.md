@@ -498,9 +498,18 @@ type Options struct {
     // Default: 16.
     RestartGroupTarget int
 
-    // MergeThreshold is the B+tree page fill percentage below which a
-    // page is merged with a sibling after deletion. Range: 1-50.
-    // Default: 25.
+    // MergeThreshold is the B+tree page fill percentage that doubles
+    // as the post-deletion merge trigger AND the maintained non-root
+    // fill floor. Range: 1-50. Default: 25.
+    //
+    // Trigger: a page that drops below this percentage of ContentEnd
+    // after Delete / DeleteRange is merged with (or redistributed
+    // against) an adjacent sibling. Floor: after Delete / DeleteRange
+    // returns successfully, every non-root page reachable from the
+    // new root has fill >= MergeThreshold% of ContentEnd — see
+    // range-delete.md §Invariants for the post-merge re-rebalance
+    // loop and the cousin-cascade thread that maintain the floor.
+    // The root is exempt.
     MergeThreshold int
 
     // LaggingReader is called when a long-lived reader is blocking
