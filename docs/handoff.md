@@ -194,6 +194,64 @@ before designing the fix. The proof is in the receipts:
   not on the broader corruption code set, would miss the
   `ReachableInRPL` shape entirely.)
 
+- **`open-corrupt-meta-size-fields-panic`** (`5750827`): two
+  surprises beyond the issue's "two-shape fix sketch" framing.
+
+  **First**, *the demonstrated fault is worse than the issue
+  framed it.* The issue said "panics with slice-bounds-out-of-
+  range (or the make OOMs first)." Reading "OOMs first" as "the
+  OS process gets OOM-killed" implied a recoverable error path; in
+  practice `make([]byte, BitmapPages*PageSize)` for wild-high
+  BitmapPages triggers Go's `runtime: out of memory` via
+  `runtime.throw` — which is NOT a catchable panic.
+  **`recover()` does not catch `runtime.throw`; the test binary
+  dies mid-run.** Confirmed by running the regression test against
+  HEAD before the fix: the test process was killed in
+  `runtime.mallocgc → runtime.sysMapOS` with no opportunity for
+  the deferred recover to fire. Implication for the fix: **the
+  bound MUST precede the `make`**, because by the time the
+  `make` is called the unrecoverable throw is the failure mode, not
+  the recoverable slice-bounds-out-of-range panic that fires at the
+  `copy(... p.mmap[...:...])` site for the smaller-but-still-too-
+  big intermediate case. A bound placed only inside or after the
+  make (e.g. checking `len(detail)` post-allocation) would be
+  unreachable for the high-end case. Lesson: when an issue cites
+  "make OOMs first" as a parenthetical, ASSUME it's the
+  unrecoverable `runtime.throw` shape and bound the size field
+  BEFORE the allocation — not via `recover()`-then-translate.
+
+  **Second**, the escalation rule's second-fault test fired
+  cleanly and the result was the structurally-minimal two-bound
+  fix. The naive "file-extent bound only" (the issue's option 1
+  literal sketch) would catch wild-high but leave `BitmapPages=0`
+  failing with the unrelated `bitmap.New` "totalPages exceeds
+  capacity 0" panic — a second demonstrated fault on the same
+  fault class. Per the escalation rule that authorizes widening
+  only when a second demonstrated same-fault case the narrower fix
+  leaves failing exists, the second bound (`BitmapPages*PageSize*8
+  >= MaxSize`) was added — covers Fault-(ii) and the structurally-
+  larger-but-simpler shape (two parallel bounds vs. one
+  consistency check) was correct because the two bounds catch
+  different fault mechanisms (file-extent SIGBUS / make-OOM vs.
+  bitmap-capacity-check panic). The escalation rule is *exactly*
+  the right tool for this case — the second bound is not "wider
+  scope" in the smallest-correct-change sense; it's a co-equal
+  fix for a co-equal demonstrated fault.
+
+  **Trap pattern:** *"runtime OOM" in an issue doc may mean
+  unrecoverable `runtime.throw`, not OS-level OOM-kill.* The two
+  fail very differently — `runtime.throw` aborts the process from
+  Go's runtime with no signal handler entry, while OS OOM-kill
+  delivers SIGKILL after pressure builds. The Go-runtime variant
+  is what `make([]byte, hugeN)` triggers when the requested size
+  exceeds the runtime's max allocation; `recover()` cannot catch
+  it because it's `runtime.throw`, not `panic()`. Bound size
+  fields BEFORE the make, not via post-allocation checks. (Same
+  no-crash spec invariant — `checksums.md §Structural and
+  Allocation Bounds` and `integrity.md §Forged / structural
+  corruption tolerance` — but with the implementation constraint
+  that the bound CAN'T be after the make.)
+
 - **`byte-api-covering-return-unwired`** (`682fa70`): two surprises
   beyond the user's pre-decided wiring shape.
 
@@ -272,7 +330,14 @@ from caller misuse; wrap in a neutral sentinel, not `ErrCorrupted`,
 OR **a new behavior-class member needs the authoritative
 enumeration paragraph extended elsewhere in the spec** — not just
 the section you edited (the silent-skip enumeration in indexing.md
-§Intra-transaction consistency is the canonical instance).
+§Intra-transaction consistency is the canonical instance), OR **an
+issue's "make OOMs" parenthetical may mean Go-runtime
+`runtime.throw` not OS-level OOM-kill** — `recover()` cannot catch
+`runtime.throw`, so the size-field bound MUST precede the `make`,
+not wrap it via recover (the `open-corrupt-meta-size-fields-panic`
+BitmapPages bound is the canonical instance: `make([]byte, hugeN)`
+aborts the process from Go's runtime before any deferred recover
+gets a chance to fire).
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -328,16 +393,26 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `byte-api-covering-return-unwired` (user pre-
-decided in prior session). Fix: add a byte-API branch to
-`extractPKAndValue` returning the encoded covering blob verbatim
-when `len(decl.Covering) > 0`; export `DecodeCoveringTuple` for
-callers to decode the NUL-escape tuple; add `ErrCoveringTupleMalformed`
-as a neutral sentinel (NOT wrapped in `ErrCorrupted` — the byte-stream
-decoder cannot distinguish on-disk corruption from caller misuse).
-Adversarial-review loop converged in 2 rounds (no Round 3); user
-escalation on L-2 (ErrCorrupted conflation) — user required the new
-sentinel rather than accepting the dispute.
+This session closed `open-corrupt-meta-size-fields-panic` (top
+candidate from prior handoff; adjacent to the closed
+`rpl-rebuild-panic-on-wild-pointer`, shared Inv-RV3 bound mental
+context). Fix: two walk-site bounds in `internal/pager/init.go` step 4
+(bitmap rebuild) — file-extent bound (firstDataPage = BitmapPages+2 ≤
+min(fileSize/PageSize, MaxSize)) catches wild-high BitmapPages before
+the `make` triggers Go-runtime OOM throw, capacity bound
+(BitmapPages*PageSize*8 ≥ MaxSize) catches under-sized BitmapPages
+before `bitmap.New`'s totalPages-exceeds-capacity panic. The escalation
+rule fired cleanly — Fault-(ii) is a second demonstrated case of the
+same class that the file-extent-only bound leaves failing. Spec
+promotions: `checksums.md §Structural and Allocation Bounds`
+enumeration extended with BitmapPages (third instance of the on-disk
+length/count field class); `file-layout.md §Meta Page` documents
+which fields ValidateMeta covers vs. which are walk-site-bounded
+elsewhere. 1-round adversarial review (3 L/nit, no H/M); all L/nit
+fixed in-place (message domain mismatch clarified, off-by-one
+arithmetic refactored as firstDataPage-explicit, catchability split
+noted in comment). Issue file unconditionally deleted per no-cite
+invariant (zero spec / production-code cites).
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -350,7 +425,8 @@ sentinel rather than accepting the dispute.
 | `15f9b70` | writenewindexregistry-partial-leak per-row case | Partial — 6 per-row sites done via new `Pager.BeginShallowSavepoint` substrate; 3 cold-path DDL siblings remain. Filed `shallow-savepoint-clone-cost.md` (residual per-Begin clone cost). |
 | `27361ac` | writenewindexregistry-partial-leak DDL siblings | Closed — `Tx.RebuildIndex`, `Tx.DropIndex`, `Keyspace.DeleteKeyspace` retirement wrapped in nested savepoint via defer-named-return |
 | `f1d9ad7` | btree-post-merge-underflow | Closed — strict fill-floor invariant added to `range-delete.md §Invariants`; mechanism: (a) `mergeOrRedistribute*` callers do post-merge re-rebalance + cousin propagation; (b) architectural force-underflow rule — a level returning `deepUnderflowChild != 0` reports `underflow=true` regardless of encoded fill; (c) top-level final-heal pass. Three rounds + root-cause analysis collapsed a 1400-LOC complexity accumulation to a 5-line rule. |
-| THIS SESSION (`682fa70`) | byte-api-covering-return-unwired | **Closed** — byte-API branch added to `extractPKAndValue` returning the encoded covering blob verbatim when `len(decl.Covering) > 0` (typed full-row path unchanged). New public `DecodeCoveringTuple` + `ErrCoveringTupleMalformed` — sentinel deliberately NOT wrapped in `ErrCorrupted` (at the byte-stream level the decoder cannot distinguish on-disk corruption from caller misuse; `Check()` is the authoritative diagnostic). Spec promoted into `indexing.md §Covering Indexes` (new §Byte-API return contract + `Cover=nil` clarification + silent-skip exception extended in §Intra-transaction consistency). `typed-keyspaces.md §Covering` retargeted at the new byte-API contract. `api-surface.md` adds DecodeCoveringTuple/ErrCoveringTupleMalformed + value-semantics clauses on Lookup/Range/Prefix/Get. 8 new regression tests (`TestByteAPI*`, `TestNonCoveringLookupStillBackLookupsRowValue`, `TestDecodeCoveringTuple*`) with 5 neuter-verified to fail under back-lookup regression; negative control proves narrow targeting. R1=0H/2M/3L/2nit, R2=0H/0M/2L/2nit; user escalated L-2 (ErrCorrupted conflation) → required new neutral sentinel. |
+| `682fa70` | byte-api-covering-return-unwired | Closed — byte-API branch added to `extractPKAndValue` returning encoded covering blob verbatim when `len(decl.Covering) > 0`. New public `DecodeCoveringTuple` + `ErrCoveringTupleMalformed` (NOT wrapped in `ErrCorrupted` — neutral sentinel). Spec promoted into `indexing.md §Covering Indexes` + `typed-keyspaces.md §Covering` + `api-surface.md`. 8 regression tests. |
+| THIS SESSION (`5750827`) | open-corrupt-meta-size-fields-panic | **Closed** — two walk-site bounds in `internal/pager/init.go` step 4 (bitmap rebuild): (1) firstDataPage = BitmapPages+2 ≤ min(fileSize/PageSize, MaxSize) catches wild-high BitmapPages before `make` triggers Go-runtime OOM throw; (2) BitmapPages*PageSize*8 ≥ MaxSize catches under-sized BitmapPages before `bitmap.New`'s totalPages-exceeds-capacity panic. Two-bound shape derives from escalation rule (Fault-ii is second demonstrated same-fault case Fault-i bound leaves failing). Sibling MaxSize/HighWaterMark/KeyspaceRoot/RPLHeadPage already walk-site-bounded by their consumers — no remaining reachable in-spec panic in this class. Spec: `checksums.md §Structural and Allocation Bounds` enumeration extended with BitmapPages; `file-layout.md §Meta Page` documents ValidateMeta scope vs. walk-site bounds. R1=0H/0M/3L/nit; all L/nit fixed in-place. New regression test `TestOpenRejectsCorruptBitmapPagesWithoutPanic` (wild_high + zero subtests) mirroring `TestOpenRejectsOutOfRangeRPLHeadWithoutPanic`. |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -358,8 +434,9 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-*(none — the prior decided item `byte-api-covering-return-unwired`
-landed this session in `682fa70`.)*
+*(none — the prior session's top candidate
+`open-corrupt-meta-size-fields-panic` landed this session in
+`5750827`.)*
 
 ### Undecided / needs analysis
 
@@ -367,16 +444,10 @@ landed this session in `682fa70`.)*
   `markIndexHandlesStale` bundle (Keyspace + SetKeyspace + Index
   handle + iterator-side cursor tracking). Mirror the chunk-5.6
   `markCursorsStale` pattern. Sub-choice: `ErrCursorStale` vs new
-  `ErrIndexHandleStale` sentinel.
-
-- **`open-corrupt-meta-size-fields-panic`** — adjacent same-class to
-  the resolved rpl-rebuild. Corrupt `BitmapPages`/`MaxSize` panics
-  Open at `init.go:238-240` (slice-out-of-range from
-  `bitmapBytes = MaxSize * pageSize` exceeding `len(p.mmap)`). Apply
-  the Inv-RV3 bound pattern (use the file-resident extent
-  `fileSize/PageSize` clamped by `MaxSize`); maybe extend
-  `ValidateMeta`. Mostly mechanical — appropriate for tighter context
-  budgets.
+  `ErrIndexHandleStale` sentinel. Now the *only* undecided
+  correctness-class entry in the backlog (everything else is
+  profiling-driven). Fresh-context-required per Ordering
+  criterion 3.
 
 ### Profiling-driven / condition-triggered (re-validate before pulling)
 
@@ -394,24 +465,24 @@ obsolete.
 Pick **one** issue from `docs/issues/README.md`. Confirm the pick with
 the user at session start (offer your recommendation + rationale; the
 user may override). Default order, applying the Ordering criteria
-(decided > undecided is moot now that the decided slot is empty; rank
-on fresh-context / adjacent-to-recently-closed / correctness > perf):
+(decided > undecided is moot — decided slot empty; rank on
+fresh-context / adjacent-to-recently-closed / correctness > perf):
 
-1. **`open-corrupt-meta-size-fields-panic`** — adjacent to the closed
-   `rpl-rebuild-panic-on-wild-pointer` (Inv-RV3 bound pattern); shared
-   mental context discount per Ordering criterion 4. Largely
-   mechanical: clamp `MaxSize`/`BitmapPages` by the file-resident
-   extent (`fileSize/PageSize`); optionally extend `ValidateMeta`.
-   Correctness-class (Open-time panic on a corrupt-meta input). Good
-   fit for any context budget.
-2. **`index-handle-stale-after-rebuild-drop`** — undecided / needs
-   analysis. Substantial `markIndexHandlesStale` bundle: Keyspace +
-   SetKeyspace + Index handle + iterator-side cursor tracking; sub-
-   choice on `ErrCursorStale` vs new `ErrIndexHandleStale` sentinel.
-   Decide the sub-choice before pulling; fresh-context-required per
-   Ordering criterion 3.
-3. Anything in the profiling-driven set, after re-validation. Re-
-   derive live — some may now be obsolete.
+1. **`index-handle-stale-after-rebuild-drop`** — the only remaining
+   correctness-class entry in the backlog (everything else is
+   profiling-driven / condition-triggered). Undecided / needs
+   analysis: substantial `markIndexHandlesStale` bundle (Keyspace +
+   SetKeyspace + Index handle + iterator-side cursor tracking),
+   mirroring the chunk-5.6 `markCursorsStale` pattern. Sub-choice
+   on `ErrCursorStale` vs new `ErrIndexHandleStale` sentinel —
+   decide before pulling. Fresh-context-required per Ordering
+   criterion 3.
+2. Anything in the profiling-driven set, after re-validation. Re-
+   derive live — some may now be obsolete (e.g. the
+   `shallow-savepoint-clone-cost` was filed at the end of a
+   bitmap-undo-log close-out and a subsequent fix may have already
+   reduced the per-Begin clone surface). Correctness > perf per
+   Ordering criterion 5 — these stay last.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
