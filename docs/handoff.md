@@ -361,7 +361,80 @@ before designing the fix. The proof is in the receipts:
   (typically "X does/does-not Y" paragraphs), not just the §-where-
   the-feature-lives section.
 
-- **`index-handle-stale-after-deletekeyspace`** (this session): two
+- **`shallow-savepoint-clone-cost`** (this session, `43ac8df`): three
+  surprises beyond the issue's "profile-driven, fix later" framing.
+
+  **First (re-derivation finds clause-explicit violation, not
+  profile-driven optimization).** The issue framed the work as
+  profiling-driven (`Lands:` "when overhead is measurably material").
+  First-principles re-derivation against the spec found
+  `transactions.md §Nested Transactions`'s cost clause — "Cost is
+  proportional to pages modified since the outermost open savepoint,
+  plus O(bitmap-pages currently dirty) for the bitmap-dirty-set clone,
+  not total database size" (as amended in `0893be5`) — was being
+  violated. `captureSavepointState`'s 4× `maps.Clone` + dirtyKeys-set
+  build paid O(this-tx-cumulative-state-at-Begin), not O(per-window
+  mutations). For N indexed Puts in one tx, total cost was
+  Σₖ O(k) = **O(N²)**. The "outermost open savepoint" reading the
+  issue used (lenient: implicitly extends to tx-start) was textually
+  defensible but the spec amend's specific wording — naming the
+  bitmap-dirty-set as the ONE exception — made the strict reading
+  (per-window mutations only) the intended one. **Same pattern as
+  `bitmap-rollback-undo-log` (`0893be5`): profile-driven framing
+  hides a clause-explicit defect.** Lesson: when an issue framing is
+  "profile-driven for a perf concern," check the spec for a cost
+  clause that the issue's mechanism may be violating — if found,
+  the work is correctness, not perf.
+
+  **Second (Round-1 adversarial review: scope completion).** The
+  fix instrumented mutation sites at AllocPage's bitmap-hit branch,
+  RPL-reclaim retry branch, FreePage's three branches,
+  AllocContiguous, reserveBitmapRun, TailRefund, and the three slab
+  installers (CoW / AllocSlab / AllocSlabRun). **Round-1 reviewer
+  caught H-1: AllocPage's LaggingReaderWait → refreshReclamationBound
+  → reclaimRPL > 0 → bitmap.FindFirst → success path was structurally
+  identical to the bitmap-hit branch but uninstrumented.** Reachable
+  via per-row indexed maintenance with `LaggingReader=Wait` under
+  bitmap exhaustion. Fix: instrument the branch identically (~4
+  lines). Lesson: when a fix instruments N mutation sites
+  structurally identical to one another, **enumerate them by
+  pattern match**, not by walking the original instrumentation list
+  — a fast-path branch buried in a switch case is easy to miss.
+
+  **Third (Round-1 H-2 + Round-2 M-1 — loose-pop interaction with
+  in-window dirty additions).** The Round-1 reviewer surfaced H-2:
+  the pre-fix `Restore`'s wholesale "iterate `dirty`, drop any id
+  not in pre-window `dirtyKeys` set" cleanup handled BOTH (a) the
+  in-window-CoW + loose-pop interleave (case for the
+  savepointUndoLog-first replay order) AND (b) the in-window-alloc
+  + loose-pop case where pre-window dirty[id] was absent.
+  Post-fix's savepointUndoLog (fieldDirty, id, false) replay handles
+  (a) cleanly, but the loose-pop replay then unconditionally re-
+  attached entry.buf to dirty[id] — leaking the in-window-installed
+  buffer into post-Restore dirty (Inv-N2 violation, dirtyBytes
+  accounting desync). **Fix: add `wasPreWindow bool` to
+  loosePopEntry, captured at loose-pop time by scanning
+  sp.undoLogPos..end for a prior (fieldDirty, id, false) entry. The
+  replay branches: true → re-attach; false → pool-Put and do NOT
+  install.** Round-2 reviewer then found M-1 (adjacent, pre-
+  existing): nested SHALLOW savepoints double-reference the same
+  buf pointer across outer + inner loosePopLogs; outer Restore's
+  wasPreWindow=true branch pool-Puts the buffer the inner Restore
+  just re-installed → buffer in both pool and dirty[id]. Unreachable
+  in production (6 per-row callers each open-and-resolve one
+  shallow per call); filed as
+  `nested-shallow-loose-pop-buffer-alias.md`. Lesson: **the pre-
+  fix wholesale-dirty-cleanup loop was a single broad mechanism
+  that silently covered two distinct cases (in-window-CoW vs
+  in-window-alloc); replacing it with per-mutation undo entries
+  requires explicitly handling each case the broad mechanism
+  covered** — the in-window-alloc case is not subsumed by the
+  savepointUndoLog's fieldDirty entries because the loose-pop's
+  dirty-detach (handled by loosePopLog, not savepointUndoLog)
+  occurs AFTER the in-window add, and the buffer pointer is only
+  known to loosePopLog. The wasPreWindow flag is the bridge.
+
+- **`index-handle-stale-after-deletekeyspace`** (prior session): two
   surprises beyond the issue's "single-line guards" framing.
 
   **First (Round-2 H-1, scope-widening regression introduced by the
@@ -516,7 +589,41 @@ canonical instance: the spec recorded "drop-then-delete reports
 ErrKeyspaceClosed (broader truth)" but no test pinned the
 entry-method guard ordering — a refactor swapping
 `idx.dead`-first / `keyspaceDead`-first would pass the suite
-while violating the spec).
+while violating the spec), OR
+**a "profile-driven" issue framing may hide a clause-explicit
+spec defect** — the `shallow-savepoint-clone-cost` issue was
+filed as profile-driven ("when overhead is measurably material")
+but re-derivation against `transactions.md §Nested Transactions`
+found the cost clause being violated; same pattern as
+`bitmap-rollback-undo-log` (`0893be5`). Lesson: when an issue
+frames work as "perf concern, defer until measured," check the
+spec for a cost/timing clause the mechanism may be violating —
+if found, the work is correctness, not perf, OR
+**a fix that instruments N structurally-identical mutation sites
+must enumerate them by pattern match, not by walking the original
+instrumentation list** — the `shallow-savepoint-clone-cost`
+Round-1 H-1 was AllocPage's LaggingReaderWait branch buried in a
+switch case, structurally identical to the bitmap-hit branch but
+missed by linear enumeration. A fast-path branch in a switch is
+easy to miss unless you grep for the pattern that defines a
+mutation site, OR
+**replacing a broad cleanup mechanism with per-mutation undo
+entries requires explicitly handling every case the broad
+mechanism covered** — the `shallow-savepoint-clone-cost` Round-1
+H-2 surfaced this: the pre-fix `dirtyKeys`-set + iterate-and-drop
+loop in Restore silently covered TWO cases (in-window-CoW where
+loose-pop's original buf must be re-attached; in-window-alloc
+where loose-pop's buf was the in-window install itself and
+must NOT be re-attached). The per-savepointUndoLog undo entries
+handled case 1 but not case 2 — the loose-pop's dirty-detach is
+in loosePopLog, not savepointUndoLog, so the buffer pointer
+identity (which decides "pre-window vs in-window") is only
+known at loose-pop time. Fix: `wasPreWindow bool` on
+loosePopEntry, captured by scanning sp's window slice of
+savepointUndoLog for a prior `(fieldDirty, id, false)` entry.
+Lesson: when a single broad mechanism is being replaced by
+per-mutation undo, enumerate the cases the broad mechanism
+covered separately and verify each is closed.
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -572,55 +679,52 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `index-handle-stale-after-deletekeyspace`
-(the only remaining correctness-class entry in the prior backlog;
-all others were profiling-driven). Fix: extends the chunk-5.6 /
-chunk-7.6 *Index handle-invalidation infrastructure to enforce
-the pre-existing `transactions.md §Cursor invalidation by
-DeleteKeyspace` clause for `*Index` (the impl honored it for
-`*Cursor`/`*SetCursor` but never for `*Index`). Six entry-method
-guards (`keyspaceDead()` probing `idx.ks.dead` / `idx.sks.dead`)
-on Stats / Lookup / LookupKeys / Range / Prefix / Get; entry-time
-ordering is `keyspaceDead → idx.dead` (parent-dead wins over
-per-handle dead, so drop-then-delete reports the broader
-`ErrKeyspaceClosed`). `Tx.DeleteKeyspace`'s in-memory invalidation
-block now walks `openIndexHandles` via `markIndexHandlesStale` on
-both branches (KS + SKS). The chunk-7.6 `mapIndexCursorErr`
-helper became a method `(idx *Index).mapCursorErr` translating
-`btree.ErrCursorStale → ErrKeyspaceClosed` when `keyspaceDead()`
-(the "broader-truth-wins" rule on the iter cursor path). Bare
-`idx.Err()` reordered to `keyspaceDead → idx.err → idx.dead`:
-closes the Inv-IHS3 Err-vs-Stats asymmetry the Round-2 reviewer
-surfaced while preserving the chunk-7.6 mid-iter Drop
-ErrCursorStale contract (Drop alone leaves keyspaceDead=false, so
-the sticky idx.err check fires next). Stale comment fixed on the
-SetKeyspace branch of `Tx.DeleteKeyspace` (the "chunk-6.7 lands
-openSetCursors" forward-reference was outdated; chunk 6.7 wired
-entry-time `c.ks.dead` checks via `requireOpen`, not a walk-and-
-MarkStale loop). New sentinel: NONE — `ErrKeyspaceClosed`
-existed for `*Cursor`/`*SetCursor`; this fix extends its
-applicability to `*Index`. Spec promotions: `indexing.md §Handle
-Invalidation` extended with Inv-IHS3 + preamble clarification
-("Three distinct invalidation conditions, each with its
-canonical sentinel"); `api-surface.md` Lookup/LookupKeys/Range/
-Prefix/Get/Err/Stats godoc updates. 11 new regression tests:
-8 deterministic-fail-on-HEAD demonstrating the fault on Stats/
-Lookup/LookupKeys/Range/Prefix/Get/Stats/mid-iter (row+SKS); 3
-locking the new invariants (`TestStatsPreservesInFlightStaleSignal`
-pinning Stats-doesn't-touch-idx.err, `TestErrSymmetricWithStatsAfterDeleteKeyspace`
-pinning the Inv-IHS3 Err symmetry, `TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed`
-pinning the broader-truth ordering). R1=0H/1M/3L/2nit; R2=1H/2M/3L/1nit
-(introduced H-1 = Stats sticky-err reset regression, scope-widening
-caught by the loop); R3=0H/1M/2nit (introduced M-1 = drop-then-
-delete ordering encoded-but-not-enforced); R4=0H/0M/0L (Round-3 M
-fixed by adding the missing regression test + 2 nit trims). The
-reviewer correctly identified the chunk-7.7 M-2 per-sequence reset
-pattern's adjacency hazard: copying to a single-shot like Stats
-silently destroyed the chunk-7.6 Inv-IHS1 sticky-stale signal.
-Narrower fix (reorder check sequence to keyspaceDead-first;
-remove reset) closes Round-1 L-1 by structure, and Round-3
-test pins the entry-method guard ordering against future
-refactors.
+This session closed `shallow-savepoint-clone-cost` — re-derived as
+a clause-explicit cost-clause violation (not the profile-driven
+perf concern the issue framed). Fix: per-pager `savepointUndoLog`
++ per-Savepoint `undoLogPos int` marker, mirroring the bitmap
+layer's `0893be5` per-Snapshot undo log. `captureSavepointState`
+becomes O(1) for the four pending-set/dirty fields (the rplSegments
+clone is still bounded-by-RPL-chain; filed as separate issue).
+Every state-changing mutation site (AllocPage's 4 branches
+including the previously-missed LaggingReaderWait retry; FreePage's
+3 branches; AllocContiguous's bitmap-hit + file-extension;
+reserveBitmapRun; TailRefund; CoW; AllocSlab; AllocSlabRun)
+appends a `(field, key, wasPresent)` entry when at least one
+savepoint is open. `RestoreSavepoint` replays the log from
+`sp.undoLogPos` in reverse FIRST, then runs the Shallow loose-pop
+replay; this ordering closes the in-window-CoW + loose-pop case.
+`ReleaseSavepoint` truncates the log to 0 only when the active
+stack empties. `loosePopEntry` gains `wasPreWindow bool` captured
+at loose-pop time by scanning `sp.undoLogPos..end` for a prior
+`(fieldDirty, id, false)` entry: true → re-attach buf; false →
+pool-Put and do NOT install (closes the in-window-alloc + loose-
+pop leak that the pre-fix `dirtyKeys`-set cleanup silently
+handled). Unifies `activeShallowSavepoints` → `activeSavepoints`
+(both kinds); strict-LIFO panic now uniform. Spec promotions:
+`transactions.md §Why this is cheap` extended with two paragraphs
+spelling out the pager savepoint-undo-log substrate, the dirty-add
+tracking, and the wasPreWindow branch. 4 new regression tests
+(`TestShallowSavepointBeginCostConstantInTxState` pinning the cost
+invariant via alloc-count assertion; `TestShallowSavepointLoosePopReCoWRestore`
+pinning the savepointUndoLog-first replay order;
+`TestShallowSavepointInWindowAllocLoosePopRestoreDoesNotLeak`
+pinning the wasPreWindow=false branch; `TestSavepointUndoLogTruncatesOnLastRelease`
++ `TestSavepointRestoreOuterRevertsInnerReleasedWork` pinning log
+lifecycle). R1=2H/0M/2L/1nit (introduced H-1 LaggingReaderWait
+uninstrumented + H-2 in-window-alloc loose-pop buffer leak, both
+fixed in-place + neuter-verified); R2=0H/0M (introduced)/1M
+(adjacent, filed)/2L (doc cross-refs fixed inline)/1nit (dropped).
+Two issues filed: `docs/issues/rplsegments-clone-cost.md` (residual
+RPL chain clone in captureSavepointState, profile-driven trigger);
+`docs/issues/nested-shallow-loose-pop-buffer-alias.md` (pre-existing
+buffer-pointer aliasing in nested-SHALLOW Restore — outer's
+wasPreWindow=true pool-Puts the buffer the inner Restore just re-
+installed; unreachable in production since the 6 per-row callers
+each open-and-resolve one shallow per call).
+
+Prior session closed `index-handle-stale-after-deletekeyspace` —
+see commit `3eb3488` for that change set's details.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -637,6 +741,7 @@ refactors.
 | `5750827` | open-corrupt-meta-size-fields-panic | Closed — two walk-site bounds in `internal/pager/init.go` step 4 (bitmap rebuild): (1) firstDataPage = BitmapPages+2 ≤ min(fileSize/PageSize, MaxSize) catches wild-high BitmapPages before `make` triggers Go-runtime OOM throw; (2) BitmapPages*PageSize*8 ≥ MaxSize catches under-sized BitmapPages before `bitmap.New`'s totalPages-exceeds-capacity panic. Two-bound shape derives from escalation rule (Fault-ii is second demonstrated same-fault case Fault-i bound leaves failing). |
 | `a114172` | index-handle-stale-after-rebuild-drop | **Closed** — mirrors chunk-5.6 markCursorsStale pattern for `*Index`. New fields: `Index.{openCursors,dead}` + `Keyspace.openIndexHandles` + `SetKeyspace.openIndexHandles`. New helpers per keyspace: `markIndexHandlesStale` (mark-all, called by Put/Delete/etc via markCursorsStale consolidation), `markIndexHandleStaleByName` (RebuildIndex), `markIndexHandleDead` (DropIndex). Iter closures (iteratePrefix / Range / LookupKeys non-unique) register/unregister via defer. Dead-handle check at Stats/Lookup/LookupKeys/Range/Prefix/Get entry. `mapIndexCursorErr` translates btree.ErrCursorStale → gmdb.ErrCursorStale (same sentinel-leak class as 24ec951). Sentinels: ErrCursorStale (mid-iter) + ErrIndexNotFound (post-Drop) — NO new sentinel. Spec promotions: `indexing.md §Handle Invalidation` (new) + `api-surface.md` Lookup/RebuildIndex/DropIndex godoc updates. R1=0H/1M/3L/1nit; R2=0H/0M/0L (reviewer neuter-verified the two new tests fail deterministically when calls removed). 12 regression tests. Filed adjacent `index-handle-stale-after-deletekeyspace` (pre-existing spec-impl gap, different cause-line). |
 | `3eb3488` | index-handle-stale-after-deletekeyspace | **Closed** — extends chunk-7.6 `*Index` handle infrastructure to enforce the pre-existing `transactions.md §Cursor invalidation by DeleteKeyspace` clause. New `(idx *Index).keyspaceDead()` helper; entry-time `keyspaceDead`-first guards on Stats/Lookup/LookupKeys/Range/Prefix/Get (parent-dead wins over per-handle dead → drop-then-delete reports broader `ErrKeyspaceClosed`). `mapIndexCursorErr` made a method `(idx *Index).mapCursorErr` translating `btree.ErrCursorStale → ErrKeyspaceClosed` when `keyspaceDead()` (mid-iter broader-truth wins on iter cursor path). `Tx.DeleteKeyspace`'s in-memory invalidation block walks `openIndexHandles` via `markIndexHandlesStale` on both branches. `Err()` reordered to `keyspaceDead → idx.err → idx.dead`: closes Inv-IHS3 Err-vs-Stats asymmetry while preserving chunk-7.6 mid-iter Drop ErrCursorStale contract. Stale "chunk-6.7" comment on SetKeyspace branch fixed. NO new sentinel. Spec promotions: `indexing.md §Handle Invalidation` extended with Inv-IHS3 + "Three distinct invalidation conditions" preamble; `api-surface.md` 6 method godocs updated. 11 regression tests (8 deterministic-fail-on-HEAD + 3 invariant-pinning: `TestStatsPreservesInFlightStaleSignal`, `TestErrSymmetricWithStatsAfterDeleteKeyspace`, `TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed`). R1=0H/1M/3L/2nit; R2=1H/2M/3L/1nit (introduced H-1 = Stats sticky-err reset regression caught by the loop, fixed Round-3); R3=0H/1M/2nit (introduced M-1 = drop-then-delete ordering encoded-but-not-enforced); R4=0H/0M/0L. |
+| `43ac8df` | shallow-savepoint-clone-cost | **Closed** — re-derived as a `transactions.md §Nested Transactions` cost-clause violation (not the profile-driven perf concern the issue framed). Per-pager `savepointUndoLog []savepointUndoEntry` + per-Savepoint `undoLogPos int` marker replaces the 4 cloned maps (`pendingAllocs`/`pendingFrees`/`loosePages`/`dirtyKeys`); mirrors bitmap layer's `0893be5`. `captureSavepointState` becomes O(1) for those fields. 10 mutation sites instrumented (AllocPage's 4 branches incl. previously-missed LaggingReaderWait; FreePage's 3; AllocContiguous; reserveBitmapRun; TailRefund; CoW; AllocSlab; AllocSlabRun). `RestoreSavepoint` order: savepointUndoLog replay FIRST, then Shallow loose-pop replay. `loosePopEntry.wasPreWindow` captured at loose-pop time by scanning `sp.undoLogPos..end` for prior `(fieldDirty, id, false)` entry — true→re-attach, false→pool-Put-no-install (closes in-window-alloc + loose-pop leak the pre-fix `dirtyKeys`-cleanup silently handled). Unifies `activeShallowSavepoints`→`activeSavepoints`. `ReleaseSavepoint` truncates log on empty active stack. Spec amend: `transactions.md §Why this is cheap` extended with two paragraphs on pager substrate + wasPreWindow. 4 new tests (`TestShallowSavepointBeginCostConstantInTxState` alloc-count assertion; `TestShallowSavepointLoosePopReCoWRestore`; `TestShallowSavepointInWindowAllocLoosePopRestoreDoesNotLeak`; `TestSavepointUndoLogTruncatesOnLastRelease`; `TestSavepointRestoreOuterRevertsInnerReleasedWork`). R1=2H/0M/2L/1nit (introduced H-1 LaggingReaderWait uninstrumented + H-2 in-window-alloc loose-pop buffer leak — both fixed in-place + neuter-verified); R2=0H/1M (adjacent, filed)/2L (doc cross-refs)/1nit (dropped). 2 issues filed: `rplsegments-clone-cost.md` (residual RPL chain clone), `nested-shallow-loose-pop-buffer-alias.md` (pre-existing nested-shallow pointer alias, unreachable in production). |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -644,9 +749,11 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-*(none — this session's top candidate
-`index-handle-stale-after-deletekeyspace` landed; no
-correctness-class entries remain in the backlog.)*
+*(none — this session's top candidate `shallow-savepoint-clone-cost`
+landed; no correctness-class entries remain in the backlog. The
+two new filed issues — `rplsegments-clone-cost` and
+`nested-shallow-loose-pop-buffer-alias` — are condition-/profile-
+driven, not currently reachable in-spec.)*
 
 ### Undecided / needs analysis
 
@@ -658,9 +765,14 @@ or condition-triggered.)*
 `rpl-segment-relocation`, `compaction-full-forest-walk-per-pass`,
 `pager-test-helper-export`, `leaked-readtx-cleanup-race-flake`,
 `setkeyspace-delete-range-bulk-walker`, `bulkload-index-merge-run-
-fanin`, `setkeyspace-indexing-perf-and-edge`, `shallow-savepoint-
-clone-cost`. Re-validate live before acting; some may now be
-obsolete.
+fanin`, `setkeyspace-indexing-perf-and-edge`, `rplsegments-clone-cost`
+(new this session — residual rplSegments clone in
+`captureSavepointState`, bound by RPL chain length),
+`nested-shallow-loose-pop-buffer-alias` (new this session — pre-
+existing nested-shallow buffer-pointer alias; unreachable in
+production today, fires only if nested SHALLOW becomes in-spec or
+gets a panic guard). Re-validate live before acting; some may now
+be obsolete.
 
 ---
 
@@ -672,29 +784,56 @@ rationale; the user may override). Default order, applying the
 Ordering criteria (every remaining entry is profiling-driven /
 condition-triggered; correctness-class slot is empty):
 
-1. **Re-validate the profiling-driven set first.** Some entries
-   were filed in the middle of prior multi-step refactors and may
-   already be obsolete — e.g. `shallow-savepoint-clone-cost` was
-   filed at the end of a bitmap-undo-log close-out and a
-   subsequent fix may have reduced the per-Begin clone surface;
-   `pager-test-helper-export` would close opportunistically as
-   soon as a second cross-package caller appears. Re-derive each
-   from first principles before pulling — the recurring lesson
-   says issue framings often go stale, and *especially* so for
-   profiling-driven items where the cost surface depends on
-   adjacent code that has shifted under the issue.
+1. **Re-validate the profiling-driven set first** — the recurring
+   lesson says issue framings often go stale, *especially* for
+   profiling-driven items. This session's `shallow-savepoint-clone-
+   cost` proved the lesson again: filed as "profile-driven, defer
+   until material," re-derivation found a clause-explicit cost
+   violation. So re-derive each candidate against the spec before
+   accepting the issue's framing. Specifically check whether the
+   spec carries a clause-explicit cost/timing invariant the issue's
+   mechanism may be violating.
+
 2. **Among re-validated live items, prefer ones that unblock
-   others** (Ordering criterion 2). Of the current set,
-   `shallow-savepoint-clone-cost` is the only one whose
-   resolution touches infrastructure shared across other
-   indexed-OLTP code paths (the per-Put `BeginShallowSavepoint`
-   path). The others are more localized.
+   others** (Ordering criterion 2). The remaining set is fairly
+   localized:
+   - `rplsegments-clone-cost` (new) — touches the same
+     `captureSavepointState` path the just-closed session edited;
+     fresh adjacent context. Profile-driven trigger condition
+     stated in the issue.
+   - `nested-shallow-loose-pop-buffer-alias` (new) — condition-
+     triggered (unreachable until nested-SHALLOW becomes in-spec
+     or a panic guard lands); narrow scope (loosePopLog handling
+     + possibly a guard at BeginShallowSavepoint). Picking this
+     should be accompanied by a user decision on Option 1
+     (panic guard + spec amend, narrowest fix per the issue's
+     analysis) vs Options 2/3.
+   - Others (`rpl-segment-relocation`, `compaction-full-forest-
+     walk-per-pass`, `pager-test-helper-export`,
+     `leaked-readtx-cleanup-race-flake`,
+     `setkeyspace-delete-range-bulk-walker`,
+     `bulkload-index-merge-run-fanin`,
+     `setkeyspace-indexing-perf-and-edge`) — more localized; no
+     shared-infra unblock.
+
 3. **Then by fresh-context-required vs. mechanical** (Ordering
-   criterion 3). Profiling-driven work usually requires
-   benchmark setup + interpretation; do these while context is
-   fresh. Mechanical leftovers (e.g.
-   `pager-test-helper-export`'s "factor when the second caller
-   arrives") suit later resets.
+   criterion 3). Profiling-driven work usually requires benchmark
+   setup + interpretation; do these while context is fresh.
+   Mechanical leftovers (e.g. `pager-test-helper-export`'s
+   "factor when the second caller arrives") suit later resets.
+
+4. **Adjacent to recently-closed > unrelated** (Ordering criterion
+   4). Both `rplsegments-clone-cost` and
+   `nested-shallow-loose-pop-buffer-alias` are direct adjacents to
+   the just-closed `shallow-savepoint-clone-cost` work; the next
+   session inherits the savepoint-substrate mental model. Either
+   is a natural follow-on.
+
+**Recommended next candidate:** `nested-shallow-loose-pop-buffer-
+alias` if the user is willing to lock in the spec amend
+("BeginShallowSavepoint is single-active per tx") that makes the
+narrowest fix (Option 1 = panic guard) viable. Otherwise pick
+`rplsegments-clone-cost` (profile-driven; requires benchmark setup).
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
