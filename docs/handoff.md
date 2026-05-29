@@ -569,7 +569,91 @@ before designing the fix. The proof is in the receipts:
   any unenforced spec-tier claim that the code-stage could enforce
   IS a defect.
 
-- **`rplsegments-clone-cost`** (this session, `b83846c`): three
+- **`rplchain-head-tail-terminology-conflict`** (this session,
+  `9d060ba`): three surprises beyond the issue's "4 comment-site
+  edits" framing.
+
+  **First (an issue's enumeration of fix-sites is a first-pass
+  finding, not a complete set).** The issue listed 5 sites (4 in
+  freespace.go + 1 in transactions.md). A wide grep audit
+  (`grep -rn "chain head\|chain tail\|head trim\|tail trim\|head
+  segments\|tail segments\|head slot" internal/pager/ docs/specs/`)
+  found 3 more sites the issue missed: `commit.go:235` (pre-existing
+  appendRPL phase-1 comment using the slice-front idiom);
+  `savepoint.go:189` (the `b83846c` amendment text inherited the
+  misnomer); `transactions.md:472` (second instance of "drain head
+  segments" in the same paragraph as the issue's enumerated site).
+  User pre-approved fixing all per "full scope" authorization at the
+  audit reveal. The pre-pick advisory's blast-radius check catches
+  the function rename's call sites but not the broader textual
+  misnomer in adjacent text or in spec amendments that landed after
+  the issue was filed. Lesson: when an issue enumerates fix-sites,
+  run the wide grep audit BEFORE committing to scope — the issue's
+  list is the original reporter's first-pass finding, not the
+  complete set of convention violations.
+
+  **Second (a "pure docs/naming, no correctness" diff can carry a
+  project-invariant promotion opportunity that the diff's own
+  framing hides).** The issue framed the work as "pure docs/naming
+  cleanup; no correctness implication." Round-1 fresh-eyes reviewer
+  surfaced a spec-amend candidate: the chain-orientation invariant
+  (`pager.go:369-370` SetRPLChain godoc + free-space.md §RPL
+  in-memory segment list) is recorded-only — no test exercises
+  multi-segment drain ordering. Existing single-segment fixtures
+  (`TestReclaimRPL`, `TestReclaimRPLRespectsBound`, the
+  lagging-reader tests) all seed one RPLSegmentRef and cannot
+  distinguish tail-first from head-first drain. Per CLAUDE.md
+  Project invariants, the violation= is "a future maintainer writes
+  new chain-mutating code under the wrong orientation assumption,
+  producing wrong-result reclamation or commit-encoding logic" — a
+  reachable in-spec state→wrong-result violation, not a preference.
+  User picked option (b) "add test now" over (a) "file as new
+  issue" and (c) "keep godoc-only." `TestRPLChainOrientationMulti
+  Segment` (3-segment chain, partial reclamation bound between mid
+  and head TxnIDs, identity-tested survivor) promotes the invariant
+  to enforced-by-test (neuter-verified: reversing `headPageID()` to
+  read `rplSegments[0]` produces deterministic failure with
+  `headPageID() = 10, want 12 (last index per chain convention)`).
+  Lesson: when a docs-only diff touches a domain concept, audit
+  whether the underlying invariant is enforced — the spec-amend-
+  candidates channel surfaces the promotion opportunity without
+  widening the diff's intent. Per CLAUDE.md Project invariants,
+  recorded-only is weaker than enforced when stronger is available;
+  the strongest reachable encoding for a code-stage project is a
+  regression test.
+
+  **Third (rewording an existing comment without auditing the
+  underlying claim's accuracy preserves the wrong framing —
+  Round-1 L-1 receipt).** The original `freespace.go:440-441`
+  inline comment said "copy-trim to free the head slot for GC
+  rather than a head-retaining reslice." My initial reword fixed
+  the "head"/"tail" misnomer but preserved the GC-eligibility
+  rationale: "copy-trim so the slice's first element is GC-
+  eligible." Round-1 reviewer L-1: for `RPLSegmentRef` (a pure
+  value type `{PageID uint64; TxnID uint64; Count uint32}`), there
+  is no per-element GC concern — the backing array is one
+  allocation, kept alive as long as any slice references it. The
+  actual benefit of copy-trim over `s = s[1:]` is **capacity
+  preservation**: `s[1:]` shrinks `cap` by 1 (Go slice cap is
+  measured from the data pointer), forcing earlier reallocation as
+  the chain re-grows; copy-trim preserves trailing slice capacity
+  so the next `appendRPL` reuses the same backing array. Round-2
+  fix used the capacity framing. Classified as adjacent (cause-
+  line predates the diff: the original comment shipped with the
+  GC-eligibility framing) — and the protocol-compliant disposition
+  for an adjacent finding is filing OR fixing in-place under the
+  smallest-correct-change structural-size rule. Fixing in-place
+  was correct here because I was already inside the comment doing
+  the rename reword — leaving misleading text I just edited would
+  be poor stewardship even though the misframing predated me.
+  Lesson: when rewording an existing comment, audit the underlying
+  claim's accuracy, not just the surface language; a reword that
+  preserves a wrong rationale is still wrong. The adversarial
+  reviewer is the safety net here — the lesson is to slow down at
+  the reword step and ask "is the existing claim even right?"
+  rather than "does my reword change the surface meaning?".
+
+- **`rplsegments-clone-cost`** (prior session, `b83846c`): three
   surprises beyond the issue's "profiling-driven, fix later"
   framing.
 
@@ -850,7 +934,73 @@ for an adjacent M is filing, not in-place fix. Lesson: when a
 spec amend carries over a phrase verbatim, verify the phrase
 aligns with the local spec's other naming conventions; if not,
 the adversarial reviewer may surface the conflict and the right
-disposition is filing-and-proceed, not widening the change set.
+disposition is filing-and-proceed, not widening the change set, OR
+**an issue's enumeration of fix-sites is a first-pass finding, not
+a complete set — run the wide grep audit BEFORE committing to
+scope.** The `rplchain-head-tail-terminology-conflict` issue
+(`9d060ba`) listed 5 sites (4 in freespace.go + 1 in
+transactions.md); a wide grep audit added 3 more (commit.go:235
+pre-existing comment using slice-front idiom; savepoint.go:189
+inherited from `b83846c` amendment; transactions.md:472 second
+instance of "drain head segments" in the same paragraph as the
+issue's enumerated site). The pre-pick advisory's blast-radius
+check catches the function rename's call sites but misses the
+broader textual misnomer in adjacent text and in spec amendments
+that landed after the issue was filed. Lesson: when an issue
+enumerates fix-sites, treat the list as the original reporter's
+first-pass finding and run a wide grep audit (the same
+greps you'd use during scope completion review) BEFORE estimating
+scope to the user — discovering audit-found additions mid-fix
+forces a re-confirmation under the Honest scope estimation rule
+when a pre-fix sweep would have presented the full scope upfront,
+OR
+**a "pure docs/naming, no correctness" diff can carry a project-
+invariant promotion opportunity that the diff's own framing
+hides** — the `rplchain-head-tail-terminology-conflict` (`9d060ba`)
+was framed as "pure docs/naming cleanup; no correctness
+implication," but Round-1 reviewer surfaced spec-amend candidate:
+the chain-orientation invariant (`pager.go:369-370`) is
+recorded-only — godoc + free-space.md spec text — with no
+multi-segment ordering test. Existing single-segment fixtures
+cannot distinguish tail-first from head-first drain. Per CLAUDE.md
+Project invariants, recorded-only is weaker than enforced when
+stronger is available; the strongest reachable encoding for a
+code-stage project is a regression test. User picked
+"add-test-now" over "file-as-new-issue"; the
+`TestRPLChainOrientationMultiSegment` test (3 segments, partial
+reclamation bound, identity-tested survivor) promotes the
+invariant to enforced-by-test, neuter-verified. Lesson: when a
+docs-only diff touches a domain concept, audit whether the
+underlying invariant is enforced — the spec-amend-candidates
+channel surfaces the promotion opportunity without widening the
+diff's intent. The trigger to check: a diff that touches a
+domain concept (the Project-invariants trigger fires); ask "is
+the relevant invariant recorded-only, or enforced?" before
+shipping, OR
+**rewording an existing comment without auditing the underlying
+claim's accuracy preserves the wrong framing** — the
+`rplchain-head-tail-terminology-conflict` Round-1 L-1 was the
+original `freespace.go:440-441` "copy-trim to free the head slot
+for GC" rationale being wrong for value-type slices.
+`RPLSegmentRef` is `{PageID uint64; TxnID uint64; Count uint32}`,
+no pointers — there is no per-element GC concern; the backing
+array is one allocation kept alive as long as any slice
+references it. My initial reword fixed the "head"/"tail" misnomer
+but inherited the GC-eligibility framing. The actual benefit of
+copy-trim over `s = s[1:]` is **capacity preservation**: `s[1:]`
+shrinks `cap` by 1 (Go slice cap is measured from the data
+pointer), forcing earlier reallocation as the chain re-grows;
+copy-trim preserves trailing slice capacity so the next
+`appendRPL` reuses the same backing array. Classified as adjacent
+(cause-line predates the diff) but fixed in-place under the
+smallest-correct-change structural-size rule (already inside the
+comment doing the rename reword, leaving misleading text I just
+edited would be poor stewardship). Lesson: when rewording an
+existing comment, audit the underlying claim's accuracy, not just
+the surface language. The reword step is the natural place to ask
+"is the existing claim even right?" before pressing on — the
+adversarial reviewer is the safety net, but the cheaper defense is
+to slow down at the reword and audit first.
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -906,49 +1056,52 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `rplsegments-clone-cost` — the adjacent issue
-filed at the prior-prior session's `shallow-savepoint-clone-cost`
-close-out. User picked Option A (spec amend + close, no code
-change) over Option B (implement undo-log substrate) and Option C
-(defer per profile-driven Lands trigger), justified by
-first-principles re-derivation: the strict cost clause "Cost is
-proportional to pages modified since the outermost open savepoint,
-plus O(bitmap-pages currently dirty), not total database size" is
-**satisfied** by the rplSegments clone (chain length is independent
-of `MaxSize`, growing with retired-pages-pending-reclamation count
-not page count). Only the auxiliary "small constant in practice"
-claim in §Why this is cheap can be falsified by a lagging-reader
-workload, but slow ≠ wrong/unsafe — per CLAUDE.md Project
-invariants, "an invariant with no statable violation= is a
-preference — do not record it." Different fault class from the
-prior two profile-driven closes (`bitmap-rollback-undo-log`
-`0893be5`, `shallow-savepoint-clone-cost` `43ac8df`) which both
-re-derived as clause-explicit MaxSize-scaling violations. Fix:
-drop the preference from `transactions.md §Why this is cheap`;
-replace with honest workload-dependent prose (lagging reader pins
-`reclamationBound` → chain accumulates across writer commits;
-structural ceiling at `MaxSize`/`PageSize` is the only
-workload-independent bound). §Nested Transactions §Nesting depth
-extended to name the chain-clone as an explicit cost term with
-cross-ref to §Why this is cheap. Code godoc alignment in
-`internal/pager/savepoint.go` (Savepoint struct cost-contract
-citation + captureSavepointState godoc) — disambiguates the
-"across-writer-commits scaling" (orthogonal to within-tx 43ac8df
-work). Promote-then-delete: rationale folded inline; issue file
-deleted; README row removed. NO code semantic change; NO new tests
-(spec no longer asserts a constant the test would need to
-enforce). R1=1H/1M/2L/1nit (introduced H-1 `finalizeRPLChain`
-phantom symbol cite → fixed in-place to `appendRPL`; adjacent M-1
-`trimRPLChainHead` vs `pager.go:370` chain-orientation convention
-conflict → filed as `rplchain-head-tail-terminology-conflict.md`;
-introduced L-1 cross-tx-vs-within-tx ambiguity → fixed in-place
-with explicit 43ac8df cross-ref; adjacent L-2 existing alloc-count
-test → disputed; introduced L-3 per-tx `MaxTxBufferBytes` mention
-→ disputed); R2=0H/0M/0L/1nit (disposition-narrative mis-citation
-of `MaxTxBufferBytes` location, no landed artifact affected; ship).
+This session closed `rplchain-head-tail-terminology-conflict` —
+the adjacent issue filed at the prior session's
+`rplsegments-clone-cost` close-out (Round-1 reviewer M-1). User
+picked Option 1 (rename + comment/spec align) at the session-start
+proposal. Issue's enumeration listed 5 sites (4 in freespace.go +
+1 in transactions.md); wide grep audit before first cut added 3
+more (`commit.go:235` pre-existing comment using slice-front
+idiom; `savepoint.go:189` inherited from `b83846c` amendment;
+`transactions.md:472` second instance of "drain head segments" in
+the same paragraph). User authorized full scope at the audit
+reveal. Fix: rename `trimRPLChainHead` → `trimRPLChainTail` with
+godoc cross-ref to SetRPLChain; reword reclaimRPL inline comment
+to **capacity-preservation framing** (the prior "free the head
+slot for GC" rationale was incorrect for RPLSegmentRef value-type
+slices — the real benefit of copy-trim over `s = s[1:]` is
+preserving slice cap so the next appendRPL reuses the same
+backing array); tighten appendRPL phase-1 comment in
+`commit.go:235`; fix savepoint.go captureSavepointState godoc and
+the two transactions.md sites; fix free-space.md:378-379
+"removed from the front" → "removed from the tail (slice index
+0)". Round-1 adversarial reviewer additionally surfaced a
+**spec-amend candidate** (chain-orientation invariant
+recorded-only with a real violation= per Project invariants);
+user picked option (b) "add test now" — `TestRPLChain
+OrientationMultiSegment` (3 segments, partial reclamation bound
+between mid and head TxnIDs, identity-tested survivor) promotes
+the invariant to enforced-by-test (neuter-verified: reversing
+`headPageID()` to read `rplSegments[0]` produces deterministic
+failure). Promote-then-delete: rationale folded inline into
+`trimRPLChainTail` godoc, `appendRPL` phase-1 comment, the new
+regression test, and the corrected spec text; issue file deleted;
+README row removed. NO code semantic change (rename + comment
+reword only); behavior preserved. R1=0H/1M/2L/2nit (introduced
+M-1 close-out incomplete → fixed in-place; adjacent L-1 GC-
+eligibility framing wrong for value-type slice → fixed in-place
+with capacity-preservation framing; introduced L-2 "in the limit
+including the prior head" reads as non-degenerate → fixed
+in-place per reviewer's suggested phrasing; nit-1 SetRPLChain
+cross-ref load-bearing → recorded; adjacent nit-2/spec-amend
+candidate #2 free-space.md slice-front idiom → fixed in-place
+under the user's full-scope authorization; spec-amend candidate
+#1 chain-orientation invariant recorded-only → user picked option
+(b) and the test landed). R2=0H/0M/0L/0nit (converged, ship).
 
-Prior session closed `nested-shallow-loose-pop-buffer-alias` — see
-commit `d9ea7d4` for that change set's details.
+Prior session closed `rplsegments-clone-cost` — see commit
+`b83846c` for that change set's details.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -968,6 +1121,7 @@ commit `d9ea7d4` for that change set's details.
 | `43ac8df` | shallow-savepoint-clone-cost | **Closed** — re-derived as a `transactions.md §Nested Transactions` cost-clause violation (not the profile-driven perf concern the issue framed). Per-pager `savepointUndoLog []savepointUndoEntry` + per-Savepoint `undoLogPos int` marker replaces the 4 cloned maps (`pendingAllocs`/`pendingFrees`/`loosePages`/`dirtyKeys`); mirrors bitmap layer's `0893be5`. `captureSavepointState` becomes O(1) for those fields. 10 mutation sites instrumented (AllocPage's 4 branches incl. previously-missed LaggingReaderWait; FreePage's 3; AllocContiguous; reserveBitmapRun; TailRefund; CoW; AllocSlab; AllocSlabRun). `RestoreSavepoint` order: savepointUndoLog replay FIRST, then Shallow loose-pop replay. `loosePopEntry.wasPreWindow` captured at loose-pop time by scanning `sp.undoLogPos..end` for prior `(fieldDirty, id, false)` entry — true→re-attach, false→pool-Put-no-install (closes in-window-alloc + loose-pop leak the pre-fix `dirtyKeys`-cleanup silently handled). Unifies `activeShallowSavepoints`→`activeSavepoints`. `ReleaseSavepoint` truncates log on empty active stack. Spec amend: `transactions.md §Why this is cheap` extended with two paragraphs on pager substrate + wasPreWindow. 4 new tests (`TestShallowSavepointBeginCostConstantInTxState` alloc-count assertion; `TestShallowSavepointLoosePopReCoWRestore`; `TestShallowSavepointInWindowAllocLoosePopRestoreDoesNotLeak`; `TestSavepointUndoLogTruncatesOnLastRelease`; `TestSavepointRestoreOuterRevertsInnerReleasedWork`). R1=2H/0M/2L/1nit (introduced H-1 LaggingReaderWait uninstrumented + H-2 in-window-alloc loose-pop buffer leak — both fixed in-place + neuter-verified); R2=0H/1M (adjacent, filed)/2L (doc cross-refs)/1nit (dropped). 2 issues filed: `rplsegments-clone-cost.md` (residual RPL chain clone), `nested-shallow-loose-pop-buffer-alias.md` (pre-existing nested-shallow pointer alias, unreachable in production). |
 | `d9ea7d4` | nested-shallow-loose-pop-buffer-alias | **Closed** — Option 1 (panic guard + spec amend) per user pick; justified by production-caller audit (the 6 per-row indexed-maintenance helpers each open-and-resolve one SHALLOW per call, never nest). `Pager.BeginShallowSavepoint` scans `p.activeSavepoints` for any `SavepointShallow` entry and panics on hit with message "shallow savepoint already active (single-active per pager)". Check runs BEFORE `captureSavepointState` so panic leaves no `bitmap.Snapshot` leaked into `openSnapshots` and no partial mutation of `activeSavepoints`. Full-stack scan (not topmost) so [SHALLOW, NESTED, attempt SHALLOW] still panics — topmost-only would defeat itself once inner NESTED resolves. SHALLOW-inside-NESTED and NESTED-inside-SHALLOW remain allowed (NESTED's `savepointDepth > 0` suspends loose-pop inside the nested window). Spec promotions: `transactions.md §Why this is cheap` extended with a paragraph on the `loosePopLog` single-owner contract on `*[]byte`, the buf-alias mechanism, and the structural enforcement; §Write-helper error contract §Implementation Shallow bullet states the single-active rule with cross-reference. `savepoint.go` `RestoreSavepoint` step-4 godoc retargeted from the issue-doc citation to the inline spec amend. 2 new tests (`TestShallowSavepointPanicsOnNestedShallow` + `TestNestedInsideShallowSavepointAllowed`); 2 existing tests retargeted from shallow-inside-shallow to NESTED-inside-NESTED (`TestSavepointOutOfOrderPanics` for kind-agnostic LIFO discipline; `TestSavepointRestoreOuterRevertsInnerReleasedWork` for kind-agnostic per-pager log shared-by-outer semantic). R1=0H/0M/2L/2nit (all introduced; all fixed in-place + neuter-verified — L-1 hardened panic identity, L-2 new cross-kind positive test, nit-1 godoc wording, nit-2 panic message aligned to spec). R2=0H/0M/0L/0nit (converged). |
 | `b83846c` | rplsegments-clone-cost | **Closed** — Option A (spec amend + close, no code change) per user pick; justified by first-principles re-derivation finding the strict `transactions.md §Nested Transactions` cost clause "not total database size" is SATISFIED (chain length grows with retired-pages-pending-reclamation count, not page count → not MaxSize-scaling, distinguishing from `0893be5` and `43ac8df`). The auxiliary "small constant in practice" claim in §Why this is cheap is a preference with no statable violation= (slow ≠ wrong/unsafe) — per CLAUDE.md Project invariants, do not record. Spec promotions: §Nesting depth cost clause amended to name `O(rplSegments chain length)` explicitly with cross-ref; §Why this is cheap replaced with honest workload-dependent prose (lagging reader → chain accumulates across writer commits; structural ceiling `MaxSize/PageSize` is the only workload-independent bound). `internal/pager/savepoint.go` godoc alignment (Savepoint struct + captureSavepointState). NO code semantic change; NO new tests. R1=1H/1M/2L/1nit (introduced H-1 `finalizeRPLChain` phantom-symbol cite → fixed in-place to `appendRPL`; adjacent M-1 `trimRPLChainHead` vs `pager.go:370` chain-orientation conflict → filed `rplchain-head-tail-terminology-conflict.md`; introduced L-1 cross-tx-vs-within-tx ambiguity → fixed in-place with explicit 43ac8df cross-ref; adjacent L-2 alloc-count test empty-chain precondition → disputed; introduced L-3 `MaxTxBufferBytes` mention → disputed); R2=0H/0M/0L/1nit (disposition-narrative mis-citation of `MaxTxBufferBytes` location, no landed artifact; ship). |
+| `9d060ba` | rplchain-head-tail-terminology-conflict | **Closed** — Option 1 (rename + comment/spec align) per user pick. Issue enumerated 5 sites; wide grep audit added 3 more (`commit.go:235` pre-existing comment using slice-front idiom; `savepoint.go:189` inherited from `b83846c` amendment; `transactions.md:472` second instance of "drain head segments"). 8 sites fixed for full convention conformance (rename `trimRPLChainHead` → `trimRPLChainTail` with godoc cross-ref to SetRPLChain; capacity-preservation framing on the reclaimRPL inline comment + `trimRPLChainTail` godoc, replacing the wrong "GC the head slot" framing that pre-dated this diff; tightened appendRPL phase-1 comment; fixed `savepoint.go:189` + the two transactions.md sites + free-space.md:378-379). Spec-amend candidate #1 (chain-orientation invariant recorded-only with violation= per Project invariants) → user picked add-test-now, `TestRPLChainOrientationMultiSegment` added at `internal/pager/freespace_test.go:340-460` (3-segment chain, partial reclamation bound, identity-tested survivor) — neuter-verified by reversing `headPageID()` to read `rplSegments[0]`. Existing single-segment fixtures cannot distinguish tail-first from head-first drain; this new test is the strongest available encoding per Project invariants. R1=0H/1M/2L/2nit (introduced M-1 close-out incomplete → fixed; adjacent L-1 GC-eligibility framing wrong for value-type slice → fixed in-place with capacity-preservation framing; introduced L-2 "in the limit including head" phrasing → fixed in-place; nit-1 cross-ref disposition recorded; adjacent nit-2/spec-amend candidate #2 free-space.md slice-front idiom → fixed in-place under user's full-scope authorization; spec-amend candidate #1 chain-orientation invariant → user picked add-test, landed). R2=0H/0M/0L/0nit (converged, ship). |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -975,12 +1129,9 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-*(none — this session's `rplsegments-clone-cost` closed via
-spec-amend-only; no correctness-class entries remain in the
-backlog. The adjacent issue filed this session —
-`rplchain-head-tail-terminology-conflict` — is pure docs/naming
-cleanup with no correctness implication, condition-triggered when
-the RPL chain area is next touched.)*
+*(none — this session's `rplchain-head-tail-terminology-conflict`
+closed via rename + spec align + new regression test; no
+correctness-class or docs/naming entries remain in the backlog.)*
 
 ### Undecided / needs analysis
 
@@ -992,13 +1143,8 @@ or condition-triggered.)*
 `rpl-segment-relocation`, `compaction-full-forest-walk-per-pass`,
 `pager-test-helper-export`, `leaked-readtx-cleanup-race-flake`,
 `setkeyspace-delete-range-bulk-walker`, `bulkload-index-merge-run-
-fanin`, `setkeyspace-indexing-perf-and-edge`,
-`rplchain-head-tail-terminology-conflict` (this session's filed
-adjacent — pure docs/naming cleanup: `trimRPLChainHead` is a
-misnomer per `pager.go:369-370`'s chain-orientation convention;
-`Lands:` triggers when the RPL chain area is next touched, or
-opportunistically). Re-validate live before acting; some may now
-be obsolete.
+fanin`, `setkeyspace-indexing-perf-and-edge`. Re-validate live
+before acting; some may now be obsolete.
 
 ---
 
@@ -1008,12 +1154,16 @@ Pick **one** issue from `docs/issues/README.md`. Confirm the pick
 with the user at session start (offer your recommendation +
 rationale; the user may override). Default order, applying the
 Ordering criteria (every remaining entry is profiling-driven /
-condition-triggered; correctness-class slot is empty):
+condition-triggered; correctness-class slot is empty; the
+adjacent-docs cleanup that the last three sessions held in queue
+is also empty now that `rplchain-head-tail-terminology-conflict`
+closed):
 
 1. **Re-validate the profiling-driven set first** — the recurring
    lesson says issue framings often go stale, *especially* for
-   profiling-driven items. The last three sessions proved the
-   lesson three times (with a 2:1 split on disposition):
+   profiling-driven items. The last four sessions proved the
+   lesson four times (with a 3:1 split on perf disposition vs.
+   docs-only):
    `shallow-savepoint-clone-cost` (filed profile-driven →
    first-principles found a clause-explicit cost-clause violation,
    fixed via undo-log substrate);
@@ -1023,30 +1173,31 @@ condition-triggered; correctness-class slot is empty):
    `rplsegments-clone-cost` (filed profile-driven → first-principles
    found the strict cost clause is SATISFIED and only an auxiliary
    "small constant" *preference* could be falsified → spec amend
-   only, no code change). The disposition is NOT predictable from
-   the "profile-driven" framing alone: re-derive each candidate
-   against the spec, asking "does the unenumerated cost term scale
-   with `MaxSize` (clause violation, fix) or with workload history
-   the spec already permits (preference, drop from spec)?"
+   only, no code change);
+   `rplchain-head-tail-terminology-conflict` (filed as "pure
+   docs/naming, no correctness" → first-principles surfaced a
+   project-invariant promotion opportunity, user added the
+   regression test inline). The disposition is NOT predictable
+   from the issue's framing alone: re-derive each candidate
+   against the spec, asking both "does the unenumerated cost term
+   scale with `MaxSize` (clause violation, fix) or with workload
+   history the spec already permits (preference, drop from spec)?"
+   AND "does the diff touch a domain concept whose invariant is
+   recorded-only? if yes, audit promotion opportunity."
 
 2. **Among re-validated live items, prefer ones with active
    triggers and concrete acceptance** (Ordering criteria 2 + 3).
    - `pager-test-helper-export` is **blocked on its trigger**
      ("when a second cross-package writer-pager fixture caller
      arrives"); the count is still 1, so it is not pickable now.
-   - `rplchain-head-tail-terminology-conflict` (this session's
-     filed adjacent) has an **opportunistic** Lands trigger —
-     pickable any time. Pure docs/naming cleanup, narrow
-     well-defined fix shape (rename `trimRPLChainHead` →
-     `trimRPLChainTail` + 4 comment-site edits + spec amend).
-     Inherits fresh adjacent context from this session.
    - `leaked-readtx-cleanup-race-flake` has a real engineering
      value (CI noise elimination); pre-existing flake on HEAD,
      reproduces 1-in-2-3 under `go test -race`. Concrete
      acceptance options sketched in the issue (deterministic
      hook on closeGate / cleanup pipeline; race-cost-proportional
      wait bound; skip-under-race as last resort). Independent of
-     savepoint area — fresh context, not adjacent.
+     the RPL/savepoint area this session worked in — fresh
+     context, not adjacent.
    - Others (`rpl-segment-relocation`,
      `compaction-full-forest-walk-per-pass`,
      `setkeyspace-delete-range-bulk-walker`,
@@ -1057,33 +1208,52 @@ condition-triggered; correctness-class slot is empty):
      heavier sessions.
 
 3. **Adjacent to recently-closed > unrelated** (Ordering criterion
-   4). `rplchain-head-tail-terminology-conflict` is the direct
-   adjacent to this session's `rplsegments-clone-cost` close-out
-   (same RPL/savepoint area; the conflict was surfaced by the
-   adversarial reviewer); the next session inherits the
-   `pager.go:369-370` chain-convention mental model.
+   4). This session worked the RPL chain / savepoint area
+   (rename + comment alignment + new chain-orientation regression
+   test). No remaining open issue is in the same direct
+   neighborhood — the closest *positional* adjacents are the
+   profile-driven `rpl-segment-relocation` and
+   `compaction-full-forest-walk-per-pass`, but both need profile
+   data to disambiguate disposition. With no clear adjacent on an
+   active trigger, criterion 3 (fresh-context-required ≥
+   mechanical) breaks the tie in favor of meatier work while
+   context is fresh.
 
-**Recommended next candidate:** `rplchain-head-tail-terminology-conflict`.
-Combines criteria 2 + 3 + 4 favorably: adjacent-to-just-closed (fresh
-context); active opportunistic trigger; concrete acceptance options
-(rename + 4 comment edits + spec amend; ~30 LOC docs commit);
-pre-existing pure cleanup (no correctness implication, low
-adversarial-review surface). **Pre-pick advisory:** verify the
-rename's blast radius by `grep -rn "trimRPLChainHead\|head trim"
-internal/ docs/` before committing to the shape — if the function
-name is referenced in tests or other comments beyond the 4 sites
-this issue enumerates, the fix may be larger than "mechanical
-rename" and warrants user re-confirmation per the Honest scope
-estimation rule.
+**Recommended next candidate:** `leaked-readtx-cleanup-race-flake`.
+Combines criteria 2 + 3 favorably: real CI value (race-flake on
+HEAD that pre-existed since `cd34a40`); concrete acceptance options
+(deterministic hook on `closeGate` / cleanup pipeline mirroring the
+existing `commitStep4HookForTest` shape; race-cost-proportional
+wait bound; skip-under-race as last resort); fresh context
+(separate area from this session's RPL/savepoint work). Trade-off:
+Option 1 (deterministic-finalizer-hook) is the right fix but
+requires designing a test-only hook on the closeGate / cleanup
+pipeline — a small new test surface that needs adversarial review
+for ownership / lifecycle correctness. Heavier session; well-
+suited to fresh context. **Pre-pick advisory:** verify the flake
+still reproduces on current HEAD before committing to the fix
+shape — `go test -race -count=10 -run TestLeakedReadTxReleasesSlot
+ViaCleanup ./...` should fail 2-4 of 10 iterations per the issue's
+empirical observation; if the flake has self-resolved (e.g. via
+Go runtime updates to finalizer scheduling), close the issue as
+no-longer-reproducing. Also apply the recurring-lesson check: this
+diff touches the read-tx slot lifecycle (a domain concept); audit
+the underlying invariants for recorded-only-but-violation-able
+gaps the way `TestRPLChainOrientationMultiSegment` was discovered.
 
-**Alternative candidate** (if user prefers meatier work):
-`leaked-readtx-cleanup-race-flake`. Real CI value, fresh context
-(separate area from this session's savepoint work), concrete
-acceptance options. Trade-off: the deterministic-finalizer-hook
-shape (Option 1) is the right fix but requires designing a test-
-only hook on the closeGate / cleanup pipeline — a small new test
-surface that needs adversarial review for ownership / lifecycle
-correctness. Heavier session than the rename.
+**Alternative candidate** (if user prefers lighter work or wants
+to push a profile-driven item to first-principles re-derivation):
+any one of the remaining profile-driven entries
+(`rpl-segment-relocation`,
+`compaction-full-forest-walk-per-pass`,
+`setkeyspace-delete-range-bulk-walker`,
+`bulkload-index-merge-run-fanin`,
+`setkeyspace-indexing-perf-and-edge`). Trade-off: the 3:1 split
+across the last four profile-driven re-derivations shows ~75%
+chance the right disposition is "fix" (clause-explicit violation
+or invariant-promotion opportunity) and ~25% chance it's "drop
+preference from spec, no code change." Either way the re-
+derivation is informative.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
