@@ -375,7 +375,9 @@ the parent (re-opening by name if the parent never had it open).
 Rollback at any level restores to that level's savepoint. Cost is
 proportional to pages modified since the outermost open savepoint,
 plus O(bitmap-pages currently dirty) for the bitmap-dirty-set
-clone, not total database size.
+clone, plus O(`rplSegments` chain length) for the chain clone
+(workload-dependent at cross-tx granularity, see §Why this is
+cheap), not total database size.
 
 ### Why this is cheap
 
@@ -461,11 +463,22 @@ window and no alias can form regardless of which kind is at the
 top of the stack.
 
 Per-tx-body mid-tx mutations to `rplSegments` (only `reclaimRPL`'s
-head trim) are not undo-logged; the savepoint clones the chain
-slice at capture instead. The chain length is bounded by in-memory
-RPL state — independent of `MaxSize` and of per-tx mutation count
-— so the clone cost is itself bounded by a small constant in
-practice.
+head trim, which monotonically shrinks the chain — `appendRPL`'s
+commit-time append runs after every savepoint has resolved, never
+inside a window) are not undo-logged; the savepoint clones the chain
+slice at capture instead. The clone is O(chain length), independent
+of `MaxSize` and of per-tx mutation count, but **workload-dependent
+at cross-tx granularity**: each commit that retires pages appends one
+or more segments, and `reclaimRPL` can only drain head segments whose
+`TxnID < reclamationBound`, so a lagging reader pinning an old
+`TxnID` blocks reclamation across writer commits and lets the chain
+accumulate proportionally to retired-pages-pending-reclamation until
+the reader releases. Under healthy OLTP the chain stays in the
+10s–100s of segments; under stuck reclamation it grows until the
+reader releases. The structural ceiling (chain entries ≤
+`MaxSize`/`PageSize`, since each segment occupies one on-disk page
+below `HighWaterMark`) is the only workload-independent bound; there
+is no tighter constant-bound on the per-savepoint clone.
 
 ### Interaction with write batching
 

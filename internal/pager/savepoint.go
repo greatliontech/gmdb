@@ -118,18 +118,24 @@ type savepointUndoEntry struct {
 // the savepoint analogue of AbortTx (top-level rollback) and
 // discardTxSnapshot (top-level commit).
 //
-// Cost contract (transactions.md §Nested Transactions "Cost is
-// proportional to pages modified since the outermost open savepoint,
-// plus O(bitmap-pages currently dirty) ..."): every field is O(per-
-// window mutations) — bitmap.Snapshot is an undo-log marker
-// (O(flips since this Snapshot opened) + O(bitmap-pages-dirty ≤ ~2048
-// = ~16 KiB)); pendingAllocs/Frees/loosePages/dirty additions are
-// tracked via the per-pager Pager.savepointUndoLog with a per-Savepoint
-// marker (undoLogPos), so Begin is O(1) and Restore replays only this
+// Cost contract (transactions.md §Nested Transactions §Nesting depth
+// "Cost is proportional to pages modified since the outermost open
+// savepoint, plus O(bitmap-pages currently dirty) ... plus
+// O(rplSegments chain length) ..."): every field is O(per-window
+// mutations) — bitmap.Snapshot is an undo-log marker (O(flips since
+// this Snapshot opened) + O(bitmap-pages-dirty ≤ ~2048 = ~16 KiB));
+// pendingAllocs/Frees/loosePages/dirty additions are tracked via the
+// per-pager Pager.savepointUndoLog with a per-Savepoint marker
+// (undoLogPos), so Begin is O(1) and Restore replays only this
 // savepoint's window-mutations; rplSegments is the chain inherited
-// from the active meta (bounded by per-tx reclamation activity). No
-// field scales with MaxSize, and no field scales with cumulative
-// pre-window tx state.
+// from the active meta and clone-captured at Begin — O(chain length),
+// workload-dependent at cross-tx granularity (a stuck reclamation
+// bound from a lagging reader lets the chain accumulate across
+// commits; see transactions.md §Why this is cheap). No field scales
+// with MaxSize; the within-tx cumulative-state scaling closed by
+// 43ac8df is gone for all four undo-logged fields; only rplSegments
+// retains an across-writer-commits scaling that is orthogonal to the
+// within-tx case.
 //
 // Kind=SavepointShallow additionally carries loosePopLog: a per-event
 // record of every loose-pop AllocPage performed during the savepoint
@@ -180,10 +186,14 @@ type Savepoint struct {
 // (undoLogPos = len(p.savepointUndoLog)) and the bitmap.Snapshot
 // (which itself is an undo-log marker post-0893be5). The rplSegments
 // slice is still clone-captured because mid-tx mutations to it are
-// rare (only reclaimRPL head-trim) and the clone cost is bounded by
-// the in-memory RPL chain length — independent of MaxSize and of
-// per-tx mutation count. Scalars (highWaterMark, retiredLen,
-// detachedLen, dirtyBytes) are straight value copies.
+// rare (only reclaimRPL head-trim, which monotonically shrinks the
+// chain). The clone is O(chain length) — independent of MaxSize and
+// of per-tx mutation count, but workload-dependent at cross-tx
+// granularity (a stuck reclamationBound from a lagging reader lets
+// the chain accumulate across commits; see transactions.md §Why this
+// is cheap for the chain-length workload profile). Scalars
+// (highWaterMark, retiredLen, detachedLen, dirtyBytes) are straight
+// value copies.
 func (p *Pager) captureSavepointState() *Savepoint {
 	sp := &Savepoint{
 		highWaterMark: p.highWaterMark,
