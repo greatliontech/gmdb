@@ -131,13 +131,43 @@ type Pager struct {
 	// suspended-loose-pop invariant.
 	savepointDepth int
 
-	// activeShallowSavepoints is the LIFO stack of unresolved
-	// SHALLOW-kind savepoints. AllocPage's loose-pop branch appends a
-	// (id, original-buffer) entry to each one's loosePopLog so any
-	// outstanding shallow Restore can faithfully undo the loose-pop.
+	// activeSavepoints is the LIFO stack of unresolved savepoints of
+	// BOTH kinds (Nested and Shallow). Pushed by Begin{,Shallow}
+	// Savepoint and popped by Restore/Release in strict-LIFO order.
+	//
+	// Two uses:
+	//
+	//  1. recordSavepointUndo's fast-path skips appending to
+	//     savepointUndoLog when this stack is empty — mirroring
+	//     bitmap.recordFlip's openSnapshots == 0 guard.
+	//
+	//  2. AllocPage's loose-pop branch appends an (id, original-buffer)
+	//     entry to the loosePopLog of each Shallow-kind entry on this
+	//     stack (filtered by kind == SavepointShallow). Loose-pop is
+	//     suspended during Nested windows (savepointDepth > 0), so a
+	//     Nested-only stack does not see loose-pop events.
+	//
 	// Nil/empty between savepoints; reset on AbortTx alongside
 	// savepointDepth.
-	activeShallowSavepoints []*Savepoint
+	activeSavepoints []*Savepoint
+
+	// savepointUndoLog is the shared per-tx undo log into which every
+	// state-changing mutation of the tx-scoped pending sets and dirty
+	// additions appends an entry while at least one savepoint is open
+	// (see recordSavepointUndo + savepointUndoEntry). Each Savepoint
+	// records its capture-time position (Savepoint.undoLogPos);
+	// RestoreSavepoint replays log[sp.undoLogPos:end] in reverse and
+	// then truncates to sp.undoLogPos.
+	//
+	// Cost contract (transactions.md §Nested Transactions): the log
+	// grows by O(1) per actual mutation observed while any savepoint is
+	// open, never with cumulative tx state or MaxSize. Truncates to
+	// length 0 in ReleaseSavepoint when the last open savepoint is
+	// released, in AbortTx (top-level rollback), and in
+	// discardTxSnapshot (commit success) — so it never survives a tx
+	// boundary. The bitmap layer's per-Snapshot undo log (0893be5) is
+	// the structural parent of this design.
+	savepointUndoLog []savepointUndoEntry
 
 	// verified is the per-transaction checksum-verification cache
 	// (checksums.md §Verification, Inv-RV2): a mmap page whose xxhash64
@@ -409,9 +439,13 @@ func (p *Pager) AbortTx() {
 	// package's parent-freeze rule prevents a top-level Rollback while a
 	// child is unresolved, so this is defense-in-depth — but resetting
 	// keeps AllocPage's loose-pop guard correct if a future caller path
-	// ever aborts with a dangling savepoint.
+	// ever aborts with a dangling savepoint. The savepointUndoLog reset
+	// is required for the same reason: any leaked entries would
+	// otherwise survive the tx boundary and a later Begin's undoLogPos
+	// would index past stale entries.
 	p.savepointDepth = 0
-	p.activeShallowSavepoints = p.activeShallowSavepoints[:0]
+	p.activeSavepoints = p.activeSavepoints[:0]
+	p.savepointUndoLog = p.savepointUndoLog[:0]
 }
 
 // discardTxSnapshot drops the snapshot without restoring (Commit
@@ -428,13 +462,15 @@ func (p *Pager) discardTxSnapshot() {
 	p.rplChainSnapshot = nil
 	p.haveTxSnapshot = false
 	// Defense-in-depth, symmetric with AbortTx: a leaked (un-Released,
-	// un-Restored) shallow savepoint would otherwise survive past the
-	// commit boundary, and a subsequent loose-pop in the next tx would
-	// append to its stale loosePopLog. All six current callers (the
-	// per-row indexed maintenance helpers) are leak-free by
-	// construction, so this is belt-and-braces — but matches AbortTx's
-	// savepointDepth = 0 reset pattern (pager.go:savepointDepth reset).
-	p.activeShallowSavepoints = p.activeShallowSavepoints[:0]
+	// un-Restored) savepoint of either kind would otherwise survive past
+	// the commit boundary, and a subsequent loose-pop in the next tx
+	// would append to its stale loosePopLog (Shallow) or its dangling
+	// undoLogPos would index against the next tx's log entries. All
+	// production callers (the per-row indexed maintenance helpers and
+	// the DDL nested-savepoint sites) are leak-free by construction,
+	// so this is belt-and-braces — but matches AbortTx's reset pattern.
+	p.activeSavepoints = p.activeSavepoints[:0]
+	p.savepointUndoLog = p.savepointUndoLog[:0]
 }
 
 // HighWaterMark returns the current write-tx HighWaterMark snapshot.
@@ -686,6 +722,11 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 	copy(*buf, src)
 	p.dirty[dstID] = buf
 	p.dirtyBytes += int(p.cfg.PageSize)
+	// Reaching this branch means dirty[dstID] was absent (the
+	// idempotent shortcut above returned otherwise), so the dirty-add
+	// undo entry has wasPresent=false. RestoreSavepoint deletes
+	// dirty[dstID] and pool-Puts the buffer.
+	p.recordSavepointUndo(fieldDirty, dstID, false)
 	return *buf, nil
 }
 
@@ -710,6 +751,7 @@ func (p *Pager) AllocSlab(id uint64) ([]byte, error) {
 	buf := p.bufPool.Get()
 	p.dirty[id] = buf
 	p.dirtyBytes += int(p.cfg.PageSize)
+	p.recordSavepointUndo(fieldDirty, id, false)
 	return *buf, nil
 }
 
@@ -758,6 +800,7 @@ func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
 		buf := p.bufPool.Get()
 		p.dirty[id] = buf
 		p.dirtyBytes += int(p.cfg.PageSize)
+		p.recordSavepointUndo(fieldDirty, id, false)
 		out[i] = *buf
 	}
 	return out, nil

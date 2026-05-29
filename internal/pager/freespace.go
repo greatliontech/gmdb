@@ -65,6 +65,10 @@ func (p *Pager) AllocPage() (uint64, error) {
 			break
 		}
 		delete(p.loosePages, id)
+		// loosePages[id] WAS present (we just iterated it) — record
+		// the delete in the savepoint undo log when any savepoint is
+		// open so an outstanding Restore can re-add the entry.
+		p.recordSavepointUndo(fieldLoosePages, id, true)
 		// Bookkeeping: the id was initially allocated (bitmap.Clear +
 		// pendingAllocs add), then FreePage moved it to loosePages.
 		// Re-allocating it now:
@@ -106,17 +110,48 @@ func (p *Pager) AllocPage() (uint64, error) {
 			delete(p.dirty, id)
 			// Record the loose-pop in every active SHALLOW savepoint
 			// so a subsequent RestoreSavepoint can re-attach buf to
-			// p.dirty[id] and re-add id to loosePages. (No-op when
-			// no shallow savepoint is active — len==0.) The same buf
-			// pointer appears in p.detachedBufs[detachedLen + …] for
-			// the savepoint window; RestoreSavepoint's shallow path
-			// truncates without pool-Put because the entries have
-			// been re-attached via this log.
-			for _, sp := range p.activeShallowSavepoints {
-				sp.loosePopLog = append(sp.loosePopLog, loosePopEntry{id: id, buf: buf})
+			// p.dirty[id]. (No-op when no shallow savepoint is active.)
+			// The dirty-delete here is NOT recorded in the
+			// savepointUndoLog — loosePopLog owns the buffer-pointer
+			// pairing and the dirty re-attach happens in the
+			// loose-pop replay phase of Restore. Filtered by kind ==
+			// SavepointShallow because Nested savepoints suspend
+			// loose-pop via savepointDepth > 0 (checked above), so
+			// they can never observe this branch.
+			//
+			// wasPreWindow per Savepoint: was dirty[id] in p.dirty at
+			// this savepoint's Begin time, or did the in-window add it
+			// (via CoW / AllocSlab / AllocSlabRun)? Scan sp's window
+			// slice of savepointUndoLog for a prior (fieldDirty, id,
+			// false) entry — present iff dirty[id] was added inside
+			// this window. Critical for Restore correctness: an in-
+			// window add followed by a loose-pop within the same
+			// window means buf is in-window content; replay must drop
+			// it, not re-install it (re-installing would leak the
+			// in-window buffer into the parent tx's dirty map post-
+			// Restore — Inv-N2 violation). See loosePopEntry godoc.
+			for _, sp := range p.activeSavepoints {
+				if sp.kind != SavepointShallow {
+					continue
+				}
+				wasPreWindow := true
+				for i := sp.undoLogPos; i < len(p.savepointUndoLog); i++ {
+					e := p.savepointUndoLog[i]
+					if e.field == fieldDirty && e.key == id && !e.wasPresent {
+						wasPreWindow = false
+						break
+					}
+				}
+				sp.loosePopLog = append(sp.loosePopLog, loosePopEntry{
+					id: id, buf: buf, wasPreWindow: wasPreWindow,
+				})
 			}
 		}
+		_, wasInPendingAllocs := p.pendingAllocs[id]
 		p.pendingAllocs[id] = struct{}{}
+		if !wasInPendingAllocs {
+			p.recordSavepointUndo(fieldPendingAllocs, id, false)
+		}
 		// Defensive symmetry with the bitmap-path branch below. The
 		// commit pipeline is the only writer of pendingFrees and runs
 		// strictly after all tx-body AllocPage calls, so this delete
@@ -124,7 +159,11 @@ func (p *Pager) AllocPage() (uint64, error) {
 		// 5.2 FreePage contract (allocation removes a pending-free
 		// scheduling) and to make a future commit-step rearrangement
 		// safe by construction.
+		_, wasInPendingFrees := p.pendingFrees[id]
 		delete(p.pendingFrees, id)
+		if wasInPendingFrees {
+			p.recordSavepointUndo(fieldPendingFrees, id, true)
+		}
 		return id, nil
 	}
 
@@ -132,12 +171,20 @@ func (p *Pager) AllocPage() (uint64, error) {
 	if id, ok := p.bitmap.FindFirst(); ok {
 		p.bitmap.Clear(id)
 		p.bitmap.SetHint(id)
+		_, wasInPendingAllocs := p.pendingAllocs[id]
 		p.pendingAllocs[id] = struct{}{}
+		if !wasInPendingAllocs {
+			p.recordSavepointUndo(fieldPendingAllocs, id, false)
+		}
 		// If id was in pendingFrees from earlier in this tx (a loose
 		// page that was already scheduled to be marked free), undo:
 		// the bitmap bit goes from set→clear (commit-time) but the
 		// page is now in active use again.
+		_, wasInPendingFrees := p.pendingFrees[id]
 		delete(p.pendingFrees, id)
+		if wasInPendingFrees {
+			p.recordSavepointUndo(fieldPendingFrees, id, true)
+		}
 		return id, nil
 	}
 
@@ -148,8 +195,16 @@ func (p *Pager) AllocPage() (uint64, error) {
 		if id, ok := p.bitmap.FindFirst(); ok {
 			p.bitmap.Clear(id)
 			p.bitmap.SetHint(id)
+			_, wasInPendingAllocs := p.pendingAllocs[id]
 			p.pendingAllocs[id] = struct{}{}
+			if !wasInPendingAllocs {
+				p.recordSavepointUndo(fieldPendingAllocs, id, false)
+			}
+			_, wasInPendingFrees := p.pendingFrees[id]
 			delete(p.pendingFrees, id)
+			if wasInPendingFrees {
+				p.recordSavepointUndo(fieldPendingFrees, id, true)
+			}
 			return id, nil
 		}
 	}
@@ -172,8 +227,16 @@ func (p *Pager) AllocPage() (uint64, error) {
 					if id, ok := p.bitmap.FindFirst(); ok {
 						p.bitmap.Clear(id)
 						p.bitmap.SetHint(id)
+						_, wasInPendingAllocs := p.pendingAllocs[id]
 						p.pendingAllocs[id] = struct{}{}
+						if !wasInPendingAllocs {
+							p.recordSavepointUndo(fieldPendingAllocs, id, false)
+						}
+						_, wasInPendingFrees := p.pendingFrees[id]
 						delete(p.pendingFrees, id)
+						if wasInPendingFrees {
+							p.recordSavepointUndo(fieldPendingFrees, id, true)
+						}
 						return id, nil
 					}
 				}
@@ -194,11 +257,28 @@ func (p *Pager) AllocPage() (uint64, error) {
 	}
 	id := p.highWaterMark
 	p.highWaterMark++
+	// File-extension ids are necessarily fresh (id == prior HWM, which
+	// was an unallocated page), so pendingAllocs[id] cannot have been
+	// previously present. Record unconditionally — the only path that
+	// might disagree is the ftruncate-error rollback below, which
+	// undoes both the delete and the undo entry by the truncate-with-
+	// erase pattern (the trailing undo entry's wasPresent=false
+	// matches the rollback's delete(pendingAllocs, id)).
 	p.pendingAllocs[id] = struct{}{}
+	p.recordSavepointUndo(fieldPendingAllocs, id, false)
 	if err := p.ensureFileCovers(p.highWaterMark); err != nil {
-		// Roll back the HWM bump on truncate failure.
+		// Roll back the HWM bump on truncate failure. The
+		// savepointUndoLog entry just appended for id is also
+		// reverted by trimming the log back one position, so a
+		// later Restore does not undo a never-completed allocation.
 		p.highWaterMark--
 		delete(p.pendingAllocs, id)
+		if n := len(p.savepointUndoLog); n > 0 && len(p.activeSavepoints) > 0 {
+			last := p.savepointUndoLog[n-1]
+			if last.field == fieldPendingAllocs && last.key == id && !last.wasPresent {
+				p.savepointUndoLog = p.savepointUndoLog[:n-1]
+			}
+		}
 		return 0, err
 	}
 	return id, nil
@@ -252,8 +332,16 @@ func (p *Pager) FreePage(id uint64) error {
 		// (byte-slice ownership invariant). pendingAllocs entry is
 		// cleared because the page no longer needs its bitmap bit
 		// cleared at commit — it was never published as in-use.
+		_, wasInLoose := p.loosePages[id]
 		p.loosePages[id] = struct{}{}
+		if !wasInLoose {
+			p.recordSavepointUndo(fieldLoosePages, id, false)
+		}
+		_, wasInPendingAllocs := p.pendingAllocs[id]
 		delete(p.pendingAllocs, id)
+		if wasInPendingAllocs {
+			p.recordSavepointUndo(fieldPendingAllocs, id, true)
+		}
 		return nil
 	}
 	if _, justAllocated := p.pendingAllocs[id]; justAllocated {
@@ -266,9 +354,13 @@ func (p *Pager) FreePage(id uint64) error {
 		// AllocContiguous already cleared the bitmap bits.
 		p.bitmap.Set(id)
 		delete(p.pendingAllocs, id)
+		// justAllocated => wasPresent=true at delete time.
+		p.recordSavepointUndo(fieldPendingAllocs, id, true)
 		return nil
 	}
-	// Prior-tx page: retire via RPL.
+	// Prior-tx page: retire via RPL. retiredPages length is captured
+	// at savepoint Begin and truncated on Restore, so the append needs
+	// no per-entry undo log.
 	p.retiredPages = append(p.retiredPages, id)
 	return nil
 }
@@ -397,12 +489,17 @@ func (p *Pager) TailRefund() error {
 			// matches "page outside the file" — no pendingFrees
 			// update needed (the bit transitions free→clear before
 			// HWM transitions to exclude the page).
+			_, wasInPendingFrees := p.pendingFrees[tail]
 			delete(p.pendingFrees, tail)
+			if wasInPendingFrees {
+				p.recordSavepointUndo(fieldPendingFrees, tail, true)
+			}
 			p.highWaterMark--
 			continue
 		}
 		if _, loose := p.loosePages[tail]; loose {
 			delete(p.loosePages, tail)
+			p.recordSavepointUndo(fieldLoosePages, tail, true)
 			// The loose page's slab buffer stays alive in p.dirty
 			// (byte-slice ownership). It will be released at
 			// Commit / Rollback via ReleaseAll.
@@ -544,15 +641,25 @@ func (p *Pager) AllocContiguous(n uint32) (uint64, error) {
 	}
 	firstID := p.highWaterMark
 	newHWM := p.highWaterMark + uint64(n)
+	// File-extension ids are necessarily fresh, so each wasPresent is
+	// false. Append n undo entries unconditionally — the rollback
+	// branch below trims them when ensureFileCovers fails.
+	undoBaseLen := len(p.savepointUndoLog)
 	for id := firstID; id < newHWM; id++ {
 		p.pendingAllocs[id] = struct{}{}
+		p.recordSavepointUndo(fieldPendingAllocs, id, false)
 	}
 	p.highWaterMark = newHWM
 	if err := p.ensureFileCovers(p.highWaterMark); err != nil {
 		// Roll back the HWM bump + pendingAllocs entries on truncate
-		// failure. Atomicity per the chunk-5.2 Inv-1 contract.
+		// failure. Atomicity per the chunk-5.2 Inv-1 contract. Trim
+		// the savepointUndoLog entries appended for this run so a
+		// later Restore does not undo a never-completed allocation.
 		for id := firstID; id < newHWM; id++ {
 			delete(p.pendingAllocs, id)
+		}
+		if len(p.savepointUndoLog) > undoBaseLen {
+			p.savepointUndoLog = p.savepointUndoLog[:undoBaseLen]
 		}
 		p.highWaterMark = firstID
 		return 0, err
@@ -584,8 +691,16 @@ func (p *Pager) reserveBitmapRun(firstID uint64, n uint32) {
 	end := firstID + uint64(n)
 	for id := firstID; id < end; id++ {
 		p.bitmap.Clear(id)
+		_, wasInPendingAllocs := p.pendingAllocs[id]
 		p.pendingAllocs[id] = struct{}{}
+		if !wasInPendingAllocs {
+			p.recordSavepointUndo(fieldPendingAllocs, id, false)
+		}
+		_, wasInPendingFrees := p.pendingFrees[id]
 		delete(p.pendingFrees, id)
+		if wasInPendingFrees {
+			p.recordSavepointUndo(fieldPendingFrees, id, true)
+		}
 	}
 	p.bitmap.SetHint(end - 1)
 }

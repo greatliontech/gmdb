@@ -531,3 +531,374 @@ func TestShallowSavepointDoesNotSuspendNestedInv(t *testing.T) {
 	p.ReleaseSavepoint(shallow)
 	p.ReleaseSavepoint(nested)
 }
+
+// TestShallowSavepointBeginCostConstantInTxState pins the
+// transactions.md §Nested Transactions cost contract: BeginShallowSavepoint
+// must run in O(1) time and allocations regardless of cumulative tx
+// state at Begin time — proportional to per-window mutations only
+// (which is 0 at the moment of Begin).
+//
+// The pre-fix implementation cloned pendingAllocs / pendingFrees /
+// loosePages and built a dirtyKeys set per call (4 map operations each
+// proportional to current tx state). For an OLTP workload that opens
+// many shallow savepoints in one tx (the canonical per-row indexed
+// maintenance loop fires one per Put), the per-Begin cost summed to
+// O(N²·depth) clone work across N indexed Puts — a clause-explicit
+// violation of "Cost is proportional to pages modified since the
+// outermost open savepoint, plus O(bitmap-pages currently dirty) for
+// the bitmap-dirty-set clone, not total database size."
+//
+// The post-fix design captures only an undo-log marker (undoLogPos)
+// plus the bitmap.Snapshot marker, both O(1) per Begin. Per-mutation
+// undo entries appended during the window absorb the work; Restore
+// replays only the per-window entries. Total cost across N savepoints
+// becomes O(per-window mutations) = O(N), not O(N²).
+//
+// Test demonstrates the fault by measuring per-Begin allocation count:
+// pre-fix grows with prior tx state (maps.Clone of 100-entry maps);
+// post-fix stays at the small constant set (Savepoint struct + bitmap
+// Snapshot's small clones).
+func TestShallowSavepointBeginCostConstantInTxState(t *testing.T) {
+	p, bm, f := setupWriter(t, 16384)
+	defer p.Close()
+	defer f.Close()
+	first := bm.FirstDataPage()
+	markFree(bm, first, 1024)
+
+	// Accumulate cumulative tx state so the pre-fix map clones would
+	// have meaningful size. 100 alloc+CoW cycles populate
+	// pendingAllocs and dirty with 100 entries each.
+	for i := range 100 {
+		id, err := p.AllocPage()
+		if err != nil {
+			t.Fatalf("AllocPage %d: %v", i, err)
+		}
+		if _, err := p.AllocSlab(id); err != nil {
+			t.Fatalf("AllocSlab %d: %v", i, err)
+		}
+	}
+
+	allocs := testing.AllocsPerRun(20, func() {
+		sp := p.BeginShallowSavepoint()
+		p.ReleaseSavepoint(sp)
+	})
+
+	// Post-fix per Begin+Release cycle:
+	//   - Savepoint struct: 1 alloc.
+	//   - slices.Clone(rplSegments): 0 (chain empty at startup).
+	//   - bitmap.Snapshot: Snapshot struct + maps.Clone(b.dirty,
+	//     small constant ≤ 2048 entries): 2 allocs.
+	//   - activeSavepoints append: amortised 0 after the first grow.
+	// Total: ~3-4 allocations per cycle.
+	//
+	// Pre-fix added 4 cloned maps (pendingAllocs/Frees/loosePages +
+	// dirtyKeys), each maps.Clone or make() = ~2 allocs each = ~8
+	// extra. Pre-fix total: ~11-12 per cycle.
+	//
+	// Threshold 6 is generous post-fix (4 actual + 2 slack) and
+	// detects the pre-fix shape cleanly.
+	if allocs > 6 {
+		t.Errorf("BeginShallowSavepoint+Release allocates %.1f per cycle with 100-op prior tx state; want ≤ 6 (the per-Begin O(1) cost invariant — pendingAllocs/Frees/loosePages/dirtyKeys map clones would push this to ~12+)", allocs)
+	}
+}
+
+// TestShallowSavepointLoosePopReCoWRestore pins the Restore ordering
+// for the worst interleave the unified per-pager undo-log design must
+// handle: pre-window dirty[id] = bufA; in window FreePage(id) →
+// loose; AllocPage loose-pop detaches bufA; CoW(srcID, id) installs
+// bufB; Restore.
+//
+// Pre-fix the clone-based restore handled this by capturing dirtyKeys
+// at Begin and dropping any post-Begin additions to p.dirty at
+// Restore. Post-fix the savepointUndoLog records (fieldDirty, id, false)
+// for the second CoW; Restore replays this BEFORE the loosePopLog
+// replay, deleting bufB and leaving dirty[id] absent — exactly the
+// pre-loose-pop-replay state — so the loose-pop replay can cleanly
+// re-install bufA without double-Put on the same id.
+//
+// Without the "savepointUndoLog first, then loosePopLog" order in
+// RestoreSavepoint (savepoint.go), this test fails: dirty[id] ends
+// up absent (the savepointUndoLog replay pool-Puts the just-re-
+// attached bufA after loose-pop's replay), or holds bufB (if the
+// fieldDirty entry never fires), or double-Puts bufA (corrupting the
+// pool).
+func TestShallowSavepointLoosePopReCoWRestore(t *testing.T) {
+	p, bm, f := setupWriter(t, 64)
+	defer p.Close()
+	defer f.Close()
+	first := bm.FirstDataPage()
+	markFree(bm, first, 32)
+
+	// Pre-window: allocate id and CoW (dirty[id] = bufA marker 0xAA).
+	id, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage: %v", err)
+	}
+	bufA, err := p.AllocSlab(id)
+	if err != nil {
+		t.Fatalf("AllocSlab: %v", err)
+	}
+	bufA[0] = 0xAA
+
+	// Open shallow window.
+	sp := p.BeginShallowSavepoint()
+
+	// In window step 1: FreePage(id) — same-tx path → loose.
+	if err := p.FreePage(id); err != nil {
+		t.Fatalf("FreePage in window: %v", err)
+	}
+	if _, ok := p.loosePages[id]; !ok {
+		t.Fatalf("page %d not in loosePages after in-window FreePage (test precondition)", id)
+	}
+
+	// In window step 2: AllocPage loose-pops id (detaches bufA).
+	popped, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage in window: %v", err)
+	}
+	if popped != id {
+		t.Fatalf("AllocPage = %d, want loose-pop %d (test precondition)", popped, id)
+	}
+	if _, ok := p.dirty[id]; ok {
+		t.Fatalf("dirty[%d] still present after loose-pop (test precondition)", id)
+	}
+
+	// In window step 3: re-CoW the same id (installs bufB).
+	bufB, err := p.AllocSlab(id)
+	if err != nil {
+		t.Fatalf("AllocSlab post-loose-pop: %v", err)
+	}
+	bufB[0] = 0xBB
+
+	// Restore.
+	p.RestoreSavepoint(sp)
+
+	// Pre-window state must be recovered: dirty[id] holds bufA
+	// (0xAA marker); id is back in pendingAllocs (from the pre-
+	// window AllocPage); loosePages does not hold id.
+	got, ok := p.dirty[id]
+	if !ok {
+		t.Fatalf("dirty[%d] missing after Restore (loose-pop replay regressed)", id)
+	}
+	if (*got)[0] != 0xAA {
+		t.Errorf("dirty[%d][0] = %#x after Restore, want 0xAA (pre-window bufA marker)", id, (*got)[0])
+	}
+	if _, ok := p.pendingAllocs[id]; !ok {
+		t.Errorf("page %d not in pendingAllocs after Restore", id)
+	}
+	if _, ok := p.loosePages[id]; ok {
+		t.Errorf("page %d in loosePages after Restore (in-window FreePage not reverted)", id)
+	}
+}
+
+// TestSavepointUndoLogTruncatesOnLastRelease verifies the bitmap-
+// undo-log-style truncation: log entries persist while any savepoint
+// is open, but a Release that empties the activeSavepoints stack
+// truncates the log to 0 so per-tx memory does not accumulate
+// across savepoint windows.
+//
+// Mirrors bitmap.Discard's "if openSnapshots becomes empty, truncate
+// undoLog" pattern from 0893be5 — and is required for the same
+// reason: without it, indexed-OLTP workloads opening N shallow
+// savepoints would leak each window's mutation log into the next
+// window's log indexing.
+func TestSavepointUndoLogTruncatesOnLastRelease(t *testing.T) {
+	p, bm, f := setupWriter(t, 64)
+	defer p.Close()
+	defer f.Close()
+	first := bm.FirstDataPage()
+	markFree(bm, first, 16)
+
+	if got := len(p.savepointUndoLog); got != 0 {
+		t.Fatalf("log non-empty at fixture init: %d", got)
+	}
+
+	sp := p.BeginShallowSavepoint()
+
+	// In-window mutations populate the log.
+	for range 5 {
+		if _, err := p.AllocPage(); err != nil {
+			t.Fatalf("AllocPage: %v", err)
+		}
+	}
+
+	if got := len(p.savepointUndoLog); got == 0 {
+		t.Fatalf("log empty after in-window mutations; expected entries")
+	}
+
+	p.ReleaseSavepoint(sp)
+
+	if got := len(p.savepointUndoLog); got != 0 {
+		t.Errorf("savepointUndoLog len = %d after last Release; want 0 (truncate-on-empty contract)", got)
+	}
+}
+
+// TestShallowSavepointInWindowAllocLoosePopRestoreDoesNotLeak pins
+// the loose-pop replay's wasPreWindow branching: a Shallow window
+// that ALLOCATES a fresh page, installs a slab buffer (CoW or
+// AllocSlab), then frees that page (same-tx → loose), then re-
+// allocates the same id via loose-pop, then Restores — the in-
+// window-installed buffer MUST NOT survive into the post-Restore
+// dirty map. Pre-window dirty[id] was absent; post-Restore dirty[id]
+// must be absent too (Inv-N2: post-Restore state matches pre-Begin).
+//
+// Without the wasPreWindow flag in loosePopEntry (i.e., the loose-
+// pop replay unconditionally re-attaches entry.buf to dirty[id]),
+// the in-window AllocSlab buffer leaks into post-Restore dirty —
+// breaking Inv-N2 and the dirtyBytes accounting (pre-window
+// dirtyBytes was 0; post-Restore dirty[id] holds PageSize bytes of
+// in-window content, yet dirtyBytes is restored to 0 from
+// sp.dirtyBytes). A subsequent ReleaseAll iterates dirty and pool-
+// Puts the buffer — but a same-tx caller that observes dirty mid-
+// tx (commit step 1's DirtyIDs iteration) would see and pwrite an
+// in-window-only page.
+//
+// The wasPreWindow flag distinguishes this case from the pre-
+// existing test TestShallowSavepointRestoreReversesLoosePop, which
+// covers the inverse: pre-window dirty[id] = bufA, in-window
+// loose-pop detaches bufA, in-window CoW installs bufB. There the
+// flag is true and the replay re-attaches bufA correctly.
+func TestShallowSavepointInWindowAllocLoosePopRestoreDoesNotLeak(t *testing.T) {
+	p, bm, f := setupWriter(t, 64)
+	defer p.Close()
+	defer f.Close()
+	first := bm.FirstDataPage()
+	markFree(bm, first, 32)
+
+	preDirty := len(p.dirty)
+	preDirtyBytes := p.dirtyBytes
+	prePendingAllocs := len(p.pendingAllocs)
+	preLoose := len(p.loosePages)
+
+	sp := p.BeginShallowSavepoint()
+
+	// In window: AllocPage (bitmap-hit) + AllocSlab — pre-window
+	// dirty[id] was absent; in-window install adds it.
+	id, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage in window: %v", err)
+	}
+	if _, err := p.AllocSlab(id); err != nil {
+		t.Fatalf("AllocSlab in window: %v", err)
+	}
+
+	// In window: FreePage(id) → same-tx loose.
+	if err := p.FreePage(id); err != nil {
+		t.Fatalf("FreePage: %v", err)
+	}
+	if _, ok := p.loosePages[id]; !ok {
+		t.Fatalf("page %d not loose (test precondition)", id)
+	}
+
+	// In window: AllocPage loose-pops id — detaches the in-window
+	// buffer to detachedBufs; loosePopLog appends (id, bufA,
+	// wasPreWindow=false).
+	popped, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage loose-pop: %v", err)
+	}
+	if popped != id {
+		t.Fatalf("AllocPage = %d, want loose-pop %d", popped, id)
+	}
+	if _, ok := p.dirty[id]; ok {
+		t.Fatalf("dirty[%d] still present after loose-pop (test precondition)", id)
+	}
+
+	// Restore.
+	p.RestoreSavepoint(sp)
+
+	// Pre-window state must be recovered exactly. The in-window
+	// buffer that was detached by the loose-pop MUST NOT be re-
+	// installed (wasPreWindow=false). dirtyBytes must match pre-
+	// window (0).
+	if got, ok := p.dirty[id]; ok {
+		t.Errorf("dirty[%d] present after Restore = %p; want absent (pre-window state had no dirty for this id — in-window-allocated buffer must not leak via loose-pop replay)", id, got)
+	}
+	if got := len(p.dirty); got != preDirty {
+		t.Errorf("len(p.dirty) = %d after Restore, want %d (pre-window)", got, preDirty)
+	}
+	if got := p.dirtyBytes; got != preDirtyBytes {
+		t.Errorf("dirtyBytes = %d after Restore, want %d (pre-window)", got, preDirtyBytes)
+	}
+	if got := len(p.pendingAllocs); got != prePendingAllocs {
+		t.Errorf("len(p.pendingAllocs) = %d after Restore, want %d (pre-window)", got, prePendingAllocs)
+	}
+	if got := len(p.loosePages); got != preLoose {
+		t.Errorf("len(p.loosePages) = %d after Restore, want %d (pre-window)", got, preLoose)
+	}
+}
+
+// TestSavepointRestoreOuterRevertsInnerReleasedWork pins the per-pager
+// log shared-by-outer semantic: when an inner savepoint Releases
+// (commits) work that the outer later Restores (rolls back), the
+// outer's Restore MUST undo the inner's committed work because that
+// work became part of the outer's post-Begin state.
+//
+// The unified per-pager savepointUndoLog naturally encodes this: the
+// inner's log entries (between inner.undoLogPos and inner-end) stay
+// in the log past inner Release because outer remains active. When
+// outer Restores, it replays log[outer.undoLogPos:end-after-inner-
+// release] in reverse — which includes the inner-window entries.
+//
+// Pre-fix this worked because outer's captured clone of pendingAllocs
+// at Begin time was wholesale-restored, naturally including pre-inner
+// state. Post-fix the equivalent guarantee comes from the log
+// retention rule in ReleaseSavepoint (truncate only when activeSavepoints
+// becomes empty).
+func TestSavepointRestoreOuterRevertsInnerReleasedWork(t *testing.T) {
+	p, bm, f := setupWriter(t, 64)
+	defer p.Close()
+	defer f.Close()
+	first := bm.FirstDataPage()
+	markFree(bm, first, 32)
+
+	preAllocs := len(p.pendingAllocs)
+	preDirty := len(p.dirty)
+
+	outer := p.BeginShallowSavepoint()
+
+	// Outer-window does some work.
+	outerID, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("outer AllocPage: %v", err)
+	}
+	if _, err := p.AllocSlab(outerID); err != nil {
+		t.Fatalf("outer AllocSlab: %v", err)
+	}
+
+	inner := p.BeginShallowSavepoint()
+
+	// Inner-window does more work.
+	innerID, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("inner AllocPage: %v", err)
+	}
+	if _, err := p.AllocSlab(innerID); err != nil {
+		t.Fatalf("inner AllocSlab: %v", err)
+	}
+
+	// Inner commits — its mutations stay in the parent's pager state
+	// pending the outer's resolution.
+	p.ReleaseSavepoint(inner)
+
+	if _, ok := p.pendingAllocs[innerID]; !ok {
+		t.Fatalf("inner page %d dropped from pendingAllocs by inner Release (committed work lost)", innerID)
+	}
+
+	// Outer rolls back — must revert BOTH outer's and inner-committed
+	// work, returning to pre-outer state.
+	p.RestoreSavepoint(outer)
+
+	if _, ok := p.pendingAllocs[innerID]; ok {
+		t.Errorf("inner page %d still in pendingAllocs after outer Restore (inner-released work not reverted)", innerID)
+	}
+	if _, ok := p.pendingAllocs[outerID]; ok {
+		t.Errorf("outer page %d still in pendingAllocs after outer Restore", outerID)
+	}
+	if got := len(p.pendingAllocs); got != preAllocs {
+		t.Errorf("len(pendingAllocs) = %d after outer Restore, want %d", got, preAllocs)
+	}
+	if got := len(p.dirty); got != preDirty {
+		t.Errorf("len(dirty) = %d after outer Restore, want %d", got, preDirty)
+	}
+}

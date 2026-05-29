@@ -403,6 +403,48 @@ is `O(bit flips since the marker)` + `O(bitmap-pages dirty at
 marker capture)`, both bounded by mutation count and bitmap
 geometry, not by `MaxSize`.
 
+The pager's tx-scoped pending sets — `pendingAllocs`, `pendingFrees`,
+`loosePages`, and additions to the slab's `dirty` map — use the same
+substrate, distinct only in that their log is per-pager (not per-
+bitmap). At `BeginSavepoint`/`BeginShallowSavepoint` the savepoint
+records `undoLogPos = len(savepointUndoLog)` (an `int`), then every
+state-changing mutation of those four fields while at least one
+savepoint is open appends an `(field, key, wasPresent)` entry.
+`RestoreSavepoint` replays `log[sp.undoLogPos:end]` in reverse —
+for the three set-valued fields, setting `map[key] = wasPresent`
+(delete to remove, struct{} to add); for `dirty` adds, deleting
+`dirty[key]` and pool-`Put`'ing the buffer. `ReleaseSavepoint`
+pops the savepoint and, when the active stack becomes empty,
+truncates the log to length 0 (mirroring `bitmap.Discard`'s
+no-open-Snapshot truncation). Per-Savepoint memory is therefore
+`O(state-changing mutations observed during this savepoint's
+window)`, never `O(cumulative tx state at Begin time)` — which is
+what makes per-row `BeginShallowSavepoint` (one per indexed
+`Keyspace.Put`/`Delete`/`Cursor.Delete`, `SetKeyspace.Put`/
+`Delete`/`DeleteValue`) safe to invoke N times in a single tx:
+total clone work across the tx is `O(N)`, not `O(N²)`.
+
+The slab's `dirty` map specifically is tracked via append-only
+log entries on `CoW`/`AllocSlab`/`AllocSlabRun` (the idempotent
+shortcut on `dirty[id]` already-present skips both the install
+and the log append). Loose-pop's `dirty[id]` detach is recorded
+in a separate per-Savepoint `loosePopLog` (with the original
+buffer pointer) because the (key, wasPresent) shape of the shared
+log cannot carry the buffer reference; the loose-pop replay
+branches on `wasPreWindow` (captured at loose-pop time by scanning
+sp's window slice of `savepointUndoLog` for a prior
+`(fieldDirty, id, false)` entry) to decide whether to re-attach
+the original buffer (pre-window dirty) or pool-`Put` it (in-
+window-installed buffer that was loose-popped within the same
+window — re-attaching would leak it post-Restore).
+
+Per-tx-body mid-tx mutations to `rplSegments` (only `reclaimRPL`'s
+head trim) are not undo-logged; the savepoint clones the chain
+slice at capture instead. The chain length is bounded by in-memory
+RPL state — independent of `MaxSize` and of per-tx mutation count
+— so the clone cost is itself bounded by a small constant in
+practice.
+
 ### Interaction with write batching
 
 Each `Batch()` closure runs in a child transaction. If a closure
