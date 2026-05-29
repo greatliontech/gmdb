@@ -569,6 +569,81 @@ before designing the fix. The proof is in the receipts:
   any unenforced spec-tier claim that the code-stage could enforce
   IS a defect.
 
+- **`rplsegments-clone-cost`** (this session, `b83846c`): three
+  surprises beyond the issue's "profiling-driven, fix later"
+  framing.
+
+  **First (re-derivation distinguishes from the prior two
+  profile-driven closes by *which* cost dimension scales).** The
+  last two profile-driven closes (`bitmap-rollback-undo-log`
+  `0893be5`, `shallow-savepoint-clone-cost` `43ac8df`) both
+  re-derived as clause-explicit cost-clause violations because
+  their unenumerated cost term scaled with **MaxSize** (bitmap
+  clone: 8 MB at 256 GB MaxSize; per-tx map clones: O(N²) within
+  one tx). The rplSegments case looked surface-similar (a
+  profile-driven framing on the same `captureSavepointState`
+  path) but re-derivation found the strict cost clause is
+  **SATISFIED**: chain length is independent of `MaxSize` (chain
+  grows with retired-pages-pending-reclamation count, not page
+  count). Only the auxiliary "small constant in practice" claim in
+  §Why this is cheap can be falsified (lagging-reader scenario
+  accumulates the chain across writer commits). Per CLAUDE.md
+  Project invariants, "an invariant with no statable violation= is
+  a preference — do not record it" — slow ≠ wrong/unsafe, no
+  demonstrated fault, so the claim is a preference not an
+  invariant. Smallest correct change per Quality bar: **drop the
+  preference from the spec**, not implement the substrate. **The
+  distinguishing test**: does the unenumerated cost term scale
+  with `MaxSize` (clause violation, must fix structurally) or with
+  workload history the spec already permits (preference, drop from
+  spec)? The 2:1 split (0893be5 fix, 43ac8df fix, b83846c drop)
+  shows the right disposition is not predictable from the
+  "profile-driven" framing alone — re-derivation must distinguish
+  case-by-case.
+
+  **Second (Round-1 H-1 self-introduced symbol cite of a phantom
+  function).** My spec amend cited `finalizeRPLChain` as the
+  commit-time RPL appender, but the actual function name is
+  `appendRPL` (`internal/pager/commit.go:238`). I had read the
+  function body earlier without scrolling to the signature line,
+  inferred the name from memory + context, and wrote the wrong
+  symbol into the authoritative spec. Round-1 reviewer caught it
+  with a `grep finalizeRPLChain → 0 hits` mechanical check.
+  **Lesson**: when citing a code symbol in spec text, verify the
+  symbol exists *by signature* (`grep -n "^func.*<symbol>"`) not
+  by recall — a phantom cite into the authoritative spec is a fault
+  even if the surrounding claim is correct, because future readers
+  / tooling will follow the cite to a missing symbol. The fault
+  class here is "incidental name-recall error in authoritative
+  prose"; the cheap defense is the explicit signature-grep before
+  the spec edit lands.
+
+  **Third (Round-1 M-1 surfaced a pre-existing terminology
+  conflict that the prior spec text inherited unchanged).** The
+  spec phrase "`reclaimRPL`'s head trim" is pre-existing wording,
+  but the chain orientation defined at `pager.go:369-370`
+  ("tail (index 0, oldest) → head (last, newest)") makes
+  `trimRPLChainHead` actually trim the chain *tail* — the function
+  name uses "head" to mean "front of the backing slice" while the
+  documented chain convention uses "head" to mean "newest entry".
+  The pre-existing function name conflicts with the pre-existing
+  convention; the spec text inherits the function's naming. My
+  diff did not introduce the conflict but propagated it. **Filed
+  as adjacent** (`rplchain-head-tail-terminology-conflict.md`)
+  because the cause-line predates this change set; the cleanest
+  fix is a rename refactor (`trimRPLChainHead` →
+  `trimRPLChainTail` + 4 comment-site edits) on a future session
+  that touches the area. Adjacent classification per the diff
+  arbiter: cause-line outside the delta; not widened by the
+  diff. **Lesson**: when a spec amend inherits pre-existing
+  wording, verify the inherited wording aligns with the local
+  spec's other conventions (here, the chain-orientation
+  convention defined elsewhere in the same package). The
+  inherited phrase is "not introduced" by the diff arbiter, but
+  the adversarial reviewer may still flag it as a co-located M
+  worth filing — and filing-and-proceed is the protocol-compliant
+  disposition.
+
 **Trap pattern to watch for:** the issue cites a "well-known"
 invariant or rationale that the actual spec doesn't state, OR proposes
 a one-line fix that introduces a new bug (same class as the one it's
@@ -732,7 +807,50 @@ tests that exercised the removed path. The distinguishing
 question is "if the substrate had been correct, would this
 test have still been worth running?" — if yes, retarget to a
 surviving kind; if no, delete. Don't reflexively delete tests
-that started failing on the new guard.
+that started failing on the new guard, OR
+**a "profile-driven" issue may converge on EITHER a clause-explicit
+cost-clause violation OR a preference-disguised-as-invariant —
+distinguish by *which* cost dimension scales.** Same-shape framing
+as `bitmap-rollback-undo-log` (`0893be5`) and `shallow-savepoint-
+clone-cost` (`43ac8df`) — both re-derived as clause-explicit fixes
+because their unenumerated cost terms scaled with `MaxSize`. The
+`rplsegments-clone-cost` case looked surface-similar but the chain
+length is workload-history-dependent (lagging reader pins
+`reclamationBound` → chain grows across commits), NOT `MaxSize`-
+scaling. Strict cost clause "not total database size" is satisfied;
+only the auxiliary "small constant in practice" hand-wave can be
+falsified — slow ≠ wrong/unsafe, no demonstrated fault, the claim
+is a preference not an invariant per Project invariants. Smallest
+correct change: drop the preference from the spec (no code change),
+NOT implement the substrate (over-engineering). 2:1 split across
+three profile-driven closes shows the right disposition is not
+predictable from the "profile-driven" framing alone, OR
+**citing a code symbol in authoritative spec text requires a
+signature-grep, not recall** — the `rplsegments-clone-cost` spec
+amend (`b83846c`) cited `finalizeRPLChain` from memory after
+reading the function body but not the signature line; the actual
+function is `appendRPL` (`commit.go:238`). Round-1 reviewer caught
+it with a mechanical `grep -n "^func.*finalizeRPLChain"` → 0 hits.
+A phantom symbol cite into authoritative spec is a fault even when
+the surrounding claim is correct: future readers / tooling will
+follow the cite to a missing symbol. Cheap defense: explicit
+signature-grep before the spec edit lands, OR
+**a spec amend that inherits pre-existing wording may inherit a
+co-located naming conflict the local spec defines elsewhere** —
+the `rplsegments-clone-cost` close-out's spec phrase "`reclaimRPL`'s
+head trim" was carried over from prior spec text. The chain
+orientation defined at `pager.go:369-370` ("tail (index 0, oldest)
+→ head (last, newest)") makes the existing `trimRPLChainHead`
+function name a misnomer — it trims the chain's tail per the
+local convention while its name says "head". Filed-as-adjacent
+(`rplchain-head-tail-terminology-conflict.md`) because the
+cause-line predates the change set; the diff arbiter classifies it
+adjacent (not introduced), and the protocol-compliant disposition
+for an adjacent M is filing, not in-place fix. Lesson: when a
+spec amend carries over a phrase verbatim, verify the phrase
+aligns with the local spec's other naming conventions; if not,
+the adversarial reviewer may surface the conflict and the right
+disposition is filing-and-proceed, not widening the change set.
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -788,50 +906,49 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `nested-shallow-loose-pop-buffer-alias` — the
-adjacent issue filed at the prior session's `shallow-savepoint-
-clone-cost` close-out. User picked Option 1 (panic guard + spec
-amend stating shallow savepoints are single-active per pager) over
-Options 2/3 (keep nested-shallow in-spec via bookkeeping), justified
-by the production-caller audit: the 6 per-row indexed-maintenance
-helpers (`Keyspace.Put`/`Delete`, `Cursor.Delete`, `SetKeyspace.Put`/
-`Delete`/`DeleteValue`) each open-and-resolve exactly one shallow
-per call, never nest. Options 2/3 would carry runtime bookkeeping
-cost for a hypothetical caller that does not exist (Quality bar
-over-engineering). Fix: `BeginShallowSavepoint` scans
-`p.activeSavepoints` for any prior `SavepointShallow` entry and
-panics on hit ("shallow savepoint already active (single-active
-per pager)"). Check runs BEFORE `captureSavepointState` so the
-panic leaves no `bitmap.Snapshot` leaked into `openSnapshots` and
-no partial mutation of `activeSavepoints`. Full-stack scan (not
-just topmost): [SHALLOW, NESTED, attempt SHALLOW] must still
-panic because the inner NESTED's eventual resolution would
-re-expose the [SHALLOW, SHALLOW] alias configuration — topmost-
-only would defeat itself. SHALLOW-inside-NESTED and NESTED-inside-
-SHALLOW remain allowed (NESTED suspends loose-pop via
-`savepointDepth > 0`, so no loose-pop fires inside the NESTED
-window and no `loosePopLog` alias can form). Spec promotions:
-`transactions.md §Why this is cheap` extended with a paragraph
-documenting the `loosePopLog` single-owner contract on `*[]byte`,
-the alias mechanism, and the structural enforcement; §Write-helper
-error contract §Implementation Shallow bullet states the
-single-active rule with cross-reference. Existing
-`RestoreSavepoint` step-4 godoc retargeted from the issue-doc
-citation to the inline spec amend. 2 new tests
-(`TestShallowSavepointPanicsOnNestedShallow` pinning the panic
-identity via `strings.Contains`; `TestNestedInsideShallowSavepointAllowed`
-pinning the cross-kind allowance with suspension + loosePopLog
-emptiness assertions). 2 existing tests retargeted from
-shallow-inside-shallow to NESTED-inside-NESTED
-(`TestSavepointOutOfOrderPanics` for kind-agnostic LIFO discipline;
-`TestSavepointRestoreOuterRevertsInnerReleasedWork` for kind-
-agnostic per-pager log shared-by-outer semantic). R1=0H/0M/2L/2nit
-(all introduced; all fixed in-place + neuter-verified — L-1 panic
-identity check, L-2 new positive test, nit-1 godoc wording, nit-2
-panic message aligned to spec). R2=0H/0M/0L/0nit (converged).
+This session closed `rplsegments-clone-cost` — the adjacent issue
+filed at the prior-prior session's `shallow-savepoint-clone-cost`
+close-out. User picked Option A (spec amend + close, no code
+change) over Option B (implement undo-log substrate) and Option C
+(defer per profile-driven Lands trigger), justified by
+first-principles re-derivation: the strict cost clause "Cost is
+proportional to pages modified since the outermost open savepoint,
+plus O(bitmap-pages currently dirty), not total database size" is
+**satisfied** by the rplSegments clone (chain length is independent
+of `MaxSize`, growing with retired-pages-pending-reclamation count
+not page count). Only the auxiliary "small constant in practice"
+claim in §Why this is cheap can be falsified by a lagging-reader
+workload, but slow ≠ wrong/unsafe — per CLAUDE.md Project
+invariants, "an invariant with no statable violation= is a
+preference — do not record it." Different fault class from the
+prior two profile-driven closes (`bitmap-rollback-undo-log`
+`0893be5`, `shallow-savepoint-clone-cost` `43ac8df`) which both
+re-derived as clause-explicit MaxSize-scaling violations. Fix:
+drop the preference from `transactions.md §Why this is cheap`;
+replace with honest workload-dependent prose (lagging reader pins
+`reclamationBound` → chain accumulates across writer commits;
+structural ceiling at `MaxSize`/`PageSize` is the only
+workload-independent bound). §Nested Transactions §Nesting depth
+extended to name the chain-clone as an explicit cost term with
+cross-ref to §Why this is cheap. Code godoc alignment in
+`internal/pager/savepoint.go` (Savepoint struct cost-contract
+citation + captureSavepointState godoc) — disambiguates the
+"across-writer-commits scaling" (orthogonal to within-tx 43ac8df
+work). Promote-then-delete: rationale folded inline; issue file
+deleted; README row removed. NO code semantic change; NO new tests
+(spec no longer asserts a constant the test would need to
+enforce). R1=1H/1M/2L/1nit (introduced H-1 `finalizeRPLChain`
+phantom symbol cite → fixed in-place to `appendRPL`; adjacent M-1
+`trimRPLChainHead` vs `pager.go:370` chain-orientation convention
+conflict → filed as `rplchain-head-tail-terminology-conflict.md`;
+introduced L-1 cross-tx-vs-within-tx ambiguity → fixed in-place
+with explicit 43ac8df cross-ref; adjacent L-2 existing alloc-count
+test → disputed; introduced L-3 per-tx `MaxTxBufferBytes` mention
+→ disputed); R2=0H/0M/0L/1nit (disposition-narrative mis-citation
+of `MaxTxBufferBytes` location, no landed artifact affected; ship).
 
-Prior session closed `shallow-savepoint-clone-cost` — see commit
-`43ac8df` for that change set's details.
+Prior session closed `nested-shallow-loose-pop-buffer-alias` — see
+commit `d9ea7d4` for that change set's details.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -850,6 +967,7 @@ Prior session closed `shallow-savepoint-clone-cost` — see commit
 | `3eb3488` | index-handle-stale-after-deletekeyspace | **Closed** — extends chunk-7.6 `*Index` handle infrastructure to enforce the pre-existing `transactions.md §Cursor invalidation by DeleteKeyspace` clause. New `(idx *Index).keyspaceDead()` helper; entry-time `keyspaceDead`-first guards on Stats/Lookup/LookupKeys/Range/Prefix/Get (parent-dead wins over per-handle dead → drop-then-delete reports broader `ErrKeyspaceClosed`). `mapIndexCursorErr` made a method `(idx *Index).mapCursorErr` translating `btree.ErrCursorStale → ErrKeyspaceClosed` when `keyspaceDead()` (mid-iter broader-truth wins on iter cursor path). `Tx.DeleteKeyspace`'s in-memory invalidation block walks `openIndexHandles` via `markIndexHandlesStale` on both branches. `Err()` reordered to `keyspaceDead → idx.err → idx.dead`: closes Inv-IHS3 Err-vs-Stats asymmetry while preserving chunk-7.6 mid-iter Drop ErrCursorStale contract. Stale "chunk-6.7" comment on SetKeyspace branch fixed. NO new sentinel. Spec promotions: `indexing.md §Handle Invalidation` extended with Inv-IHS3 + "Three distinct invalidation conditions" preamble; `api-surface.md` 6 method godocs updated. 11 regression tests (8 deterministic-fail-on-HEAD + 3 invariant-pinning: `TestStatsPreservesInFlightStaleSignal`, `TestErrSymmetricWithStatsAfterDeleteKeyspace`, `TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed`). R1=0H/1M/3L/2nit; R2=1H/2M/3L/1nit (introduced H-1 = Stats sticky-err reset regression caught by the loop, fixed Round-3); R3=0H/1M/2nit (introduced M-1 = drop-then-delete ordering encoded-but-not-enforced); R4=0H/0M/0L. |
 | `43ac8df` | shallow-savepoint-clone-cost | **Closed** — re-derived as a `transactions.md §Nested Transactions` cost-clause violation (not the profile-driven perf concern the issue framed). Per-pager `savepointUndoLog []savepointUndoEntry` + per-Savepoint `undoLogPos int` marker replaces the 4 cloned maps (`pendingAllocs`/`pendingFrees`/`loosePages`/`dirtyKeys`); mirrors bitmap layer's `0893be5`. `captureSavepointState` becomes O(1) for those fields. 10 mutation sites instrumented (AllocPage's 4 branches incl. previously-missed LaggingReaderWait; FreePage's 3; AllocContiguous; reserveBitmapRun; TailRefund; CoW; AllocSlab; AllocSlabRun). `RestoreSavepoint` order: savepointUndoLog replay FIRST, then Shallow loose-pop replay. `loosePopEntry.wasPreWindow` captured at loose-pop time by scanning `sp.undoLogPos..end` for prior `(fieldDirty, id, false)` entry — true→re-attach, false→pool-Put-no-install (closes in-window-alloc + loose-pop leak the pre-fix `dirtyKeys`-cleanup silently handled). Unifies `activeShallowSavepoints`→`activeSavepoints`. `ReleaseSavepoint` truncates log on empty active stack. Spec amend: `transactions.md §Why this is cheap` extended with two paragraphs on pager substrate + wasPreWindow. 4 new tests (`TestShallowSavepointBeginCostConstantInTxState` alloc-count assertion; `TestShallowSavepointLoosePopReCoWRestore`; `TestShallowSavepointInWindowAllocLoosePopRestoreDoesNotLeak`; `TestSavepointUndoLogTruncatesOnLastRelease`; `TestSavepointRestoreOuterRevertsInnerReleasedWork`). R1=2H/0M/2L/1nit (introduced H-1 LaggingReaderWait uninstrumented + H-2 in-window-alloc loose-pop buffer leak — both fixed in-place + neuter-verified); R2=0H/1M (adjacent, filed)/2L (doc cross-refs)/1nit (dropped). 2 issues filed: `rplsegments-clone-cost.md` (residual RPL chain clone), `nested-shallow-loose-pop-buffer-alias.md` (pre-existing nested-shallow pointer alias, unreachable in production). |
 | `d9ea7d4` | nested-shallow-loose-pop-buffer-alias | **Closed** — Option 1 (panic guard + spec amend) per user pick; justified by production-caller audit (the 6 per-row indexed-maintenance helpers each open-and-resolve one SHALLOW per call, never nest). `Pager.BeginShallowSavepoint` scans `p.activeSavepoints` for any `SavepointShallow` entry and panics on hit with message "shallow savepoint already active (single-active per pager)". Check runs BEFORE `captureSavepointState` so panic leaves no `bitmap.Snapshot` leaked into `openSnapshots` and no partial mutation of `activeSavepoints`. Full-stack scan (not topmost) so [SHALLOW, NESTED, attempt SHALLOW] still panics — topmost-only would defeat itself once inner NESTED resolves. SHALLOW-inside-NESTED and NESTED-inside-SHALLOW remain allowed (NESTED's `savepointDepth > 0` suspends loose-pop inside the nested window). Spec promotions: `transactions.md §Why this is cheap` extended with a paragraph on the `loosePopLog` single-owner contract on `*[]byte`, the buf-alias mechanism, and the structural enforcement; §Write-helper error contract §Implementation Shallow bullet states the single-active rule with cross-reference. `savepoint.go` `RestoreSavepoint` step-4 godoc retargeted from the issue-doc citation to the inline spec amend. 2 new tests (`TestShallowSavepointPanicsOnNestedShallow` + `TestNestedInsideShallowSavepointAllowed`); 2 existing tests retargeted from shallow-inside-shallow to NESTED-inside-NESTED (`TestSavepointOutOfOrderPanics` for kind-agnostic LIFO discipline; `TestSavepointRestoreOuterRevertsInnerReleasedWork` for kind-agnostic per-pager log shared-by-outer semantic). R1=0H/0M/2L/2nit (all introduced; all fixed in-place + neuter-verified — L-1 hardened panic identity, L-2 new cross-kind positive test, nit-1 godoc wording, nit-2 panic message aligned to spec). R2=0H/0M/0L/0nit (converged). |
+| `b83846c` | rplsegments-clone-cost | **Closed** — Option A (spec amend + close, no code change) per user pick; justified by first-principles re-derivation finding the strict `transactions.md §Nested Transactions` cost clause "not total database size" is SATISFIED (chain length grows with retired-pages-pending-reclamation count, not page count → not MaxSize-scaling, distinguishing from `0893be5` and `43ac8df`). The auxiliary "small constant in practice" claim in §Why this is cheap is a preference with no statable violation= (slow ≠ wrong/unsafe) — per CLAUDE.md Project invariants, do not record. Spec promotions: §Nesting depth cost clause amended to name `O(rplSegments chain length)` explicitly with cross-ref; §Why this is cheap replaced with honest workload-dependent prose (lagging reader → chain accumulates across writer commits; structural ceiling `MaxSize/PageSize` is the only workload-independent bound). `internal/pager/savepoint.go` godoc alignment (Savepoint struct + captureSavepointState). NO code semantic change; NO new tests. R1=1H/1M/2L/1nit (introduced H-1 `finalizeRPLChain` phantom-symbol cite → fixed in-place to `appendRPL`; adjacent M-1 `trimRPLChainHead` vs `pager.go:370` chain-orientation conflict → filed `rplchain-head-tail-terminology-conflict.md`; introduced L-1 cross-tx-vs-within-tx ambiguity → fixed in-place with explicit 43ac8df cross-ref; adjacent L-2 alloc-count test empty-chain precondition → disputed; introduced L-3 `MaxTxBufferBytes` mention → disputed); R2=0H/0M/0L/1nit (disposition-narrative mis-citation of `MaxTxBufferBytes` location, no landed artifact; ship). |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -857,11 +975,12 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-*(none — this session's `nested-shallow-loose-pop-buffer-alias`
-closed; no correctness-class entries remain in the backlog. The
-sole adjacent issue still on the list — `rplsegments-clone-cost`
-— is profile-driven and bounded-by-RPL-chain-length, not currently
-reachable in-spec.)*
+*(none — this session's `rplsegments-clone-cost` closed via
+spec-amend-only; no correctness-class entries remain in the
+backlog. The adjacent issue filed this session —
+`rplchain-head-tail-terminology-conflict` — is pure docs/naming
+cleanup with no correctness implication, condition-triggered when
+the RPL chain area is next touched.)*
 
 ### Undecided / needs analysis
 
@@ -873,10 +992,13 @@ or condition-triggered.)*
 `rpl-segment-relocation`, `compaction-full-forest-walk-per-pass`,
 `pager-test-helper-export`, `leaked-readtx-cleanup-race-flake`,
 `setkeyspace-delete-range-bulk-walker`, `bulkload-index-merge-run-
-fanin`, `setkeyspace-indexing-perf-and-edge`, `rplsegments-clone-cost`
-(residual rplSegments clone in `captureSavepointState`, bound by
-RPL chain length — closest adjacent to recently-closed savepoint
-work). Re-validate live before acting; some may now be obsolete.
+fanin`, `setkeyspace-indexing-perf-and-edge`,
+`rplchain-head-tail-terminology-conflict` (this session's filed
+adjacent — pure docs/naming cleanup: `trimRPLChainHead` is a
+misnomer per `pager.go:369-370`'s chain-orientation convention;
+`Lands:` triggers when the RPL chain area is next touched, or
+opportunistically). Re-validate live before acting; some may now
+be obsolete.
 
 ---
 
@@ -890,61 +1012,78 @@ condition-triggered; correctness-class slot is empty):
 
 1. **Re-validate the profiling-driven set first** — the recurring
    lesson says issue framings often go stale, *especially* for
-   profiling-driven items. The last two sessions proved the lesson
-   twice: `shallow-savepoint-clone-cost` (filed profile-driven →
-   first-principles found a clause-explicit cost-clause violation);
+   profiling-driven items. The last three sessions proved the
+   lesson three times (with a 2:1 split on disposition):
+   `shallow-savepoint-clone-cost` (filed profile-driven →
+   first-principles found a clause-explicit cost-clause violation,
+   fixed via undo-log substrate);
    `nested-shallow-loose-pop-buffer-alias` (filed as a binary
-   "user-choice A vs B/C" → production-caller audit collapsed it to
-   Option 1 by construction). So re-derive each candidate against
-   the spec before accepting the issue's framing. Specifically
-   check whether the spec carries a clause-explicit cost/timing
-   invariant the issue's mechanism may be violating.
+   "user-choice A vs B/C" → production-caller audit collapsed it
+   to Option 1 by construction);
+   `rplsegments-clone-cost` (filed profile-driven → first-principles
+   found the strict cost clause is SATISFIED and only an auxiliary
+   "small constant" *preference* could be falsified → spec amend
+   only, no code change). The disposition is NOT predictable from
+   the "profile-driven" framing alone: re-derive each candidate
+   against the spec, asking "does the unenumerated cost term scale
+   with `MaxSize` (clause violation, fix) or with workload history
+   the spec already permits (preference, drop from spec)?"
 
-2. **Among re-validated live items, prefer ones that unblock
-   others** (Ordering criterion 2). The remaining set is fairly
-   localized:
-   - `rplsegments-clone-cost` — touches the same
-     `captureSavepointState` path the last two sessions edited;
-     fresh adjacent context. Profile-driven trigger condition
-     stated in the issue. **First-principles re-derivation
-     hint**: the issue's "in practice bounded by small constant"
-     claim is itself a recorded-but-unenforced spec-tier
-     assertion (`transactions.md §Why this is cheap`). Check
-     whether a real workload can violate it (the issue cites
-     a stuck-reclamation-bound scenario). If the bound CAN be
-     violated, the work is correctness (enforcement gap), not
-     perf — same pattern as the last two sessions.
-   - Others (`rpl-segment-relocation`, `compaction-full-forest-
-     walk-per-pass`, `pager-test-helper-export`,
-     `leaked-readtx-cleanup-race-flake`,
+2. **Among re-validated live items, prefer ones with active
+   triggers and concrete acceptance** (Ordering criteria 2 + 3).
+   - `pager-test-helper-export` is **blocked on its trigger**
+     ("when a second cross-package writer-pager fixture caller
+     arrives"); the count is still 1, so it is not pickable now.
+   - `rplchain-head-tail-terminology-conflict` (this session's
+     filed adjacent) has an **opportunistic** Lands trigger —
+     pickable any time. Pure docs/naming cleanup, narrow
+     well-defined fix shape (rename `trimRPLChainHead` →
+     `trimRPLChainTail` + 4 comment-site edits + spec amend).
+     Inherits fresh adjacent context from this session.
+   - `leaked-readtx-cleanup-race-flake` has a real engineering
+     value (CI noise elimination); pre-existing flake on HEAD,
+     reproduces 1-in-2-3 under `go test -race`. Concrete
+     acceptance options sketched in the issue (deterministic
+     hook on closeGate / cleanup pipeline; race-cost-proportional
+     wait bound; skip-under-race as last resort). Independent of
+     savepoint area — fresh context, not adjacent.
+   - Others (`rpl-segment-relocation`,
+     `compaction-full-forest-walk-per-pass`,
      `setkeyspace-delete-range-bulk-walker`,
      `bulkload-index-merge-run-fanin`,
-     `setkeyspace-indexing-perf-and-edge`) — more localized; no
-     shared-infra unblock.
+     `setkeyspace-indexing-perf-and-edge`) — bounded by needing a
+     measured workload that hasn't been produced. Profile work +
+     spec re-derivation per the recurring lesson; potentially
+     heavier sessions.
 
-3. **Then by fresh-context-required vs. mechanical** (Ordering
-   criterion 3). Profiling-driven work usually requires benchmark
-   setup + interpretation; do these while context is fresh.
-   Mechanical leftovers (e.g. `pager-test-helper-export`'s
-   "factor when the second caller arrives") suit later resets.
+3. **Adjacent to recently-closed > unrelated** (Ordering criterion
+   4). `rplchain-head-tail-terminology-conflict` is the direct
+   adjacent to this session's `rplsegments-clone-cost` close-out
+   (same RPL/savepoint area; the conflict was surfaced by the
+   adversarial reviewer); the next session inherits the
+   `pager.go:369-370` chain-convention mental model.
 
-4. **Adjacent to recently-closed > unrelated** (Ordering criterion
-   4). `rplsegments-clone-cost` is the direct adjacent to the
-   last two sessions' savepoint-substrate work (`43ac8df` and
-   `d9ea7d4`); the next session inherits the substrate mental
-   model. Strongest fit for the next pick.
+**Recommended next candidate:** `rplchain-head-tail-terminology-conflict`.
+Combines criteria 2 + 3 + 4 favorably: adjacent-to-just-closed (fresh
+context); active opportunistic trigger; concrete acceptance options
+(rename + 4 comment edits + spec amend; ~30 LOC docs commit);
+pre-existing pure cleanup (no correctness implication, low
+adversarial-review surface). **Pre-pick advisory:** verify the
+rename's blast radius by `grep -rn "trimRPLChainHead\|head trim"
+internal/ docs/` before committing to the shape — if the function
+name is referenced in tests or other comments beyond the 4 sites
+this issue enumerates, the fix may be larger than "mechanical
+rename" and warrants user re-confirmation per the Honest scope
+estimation rule.
 
-**Recommended next candidate:** `rplsegments-clone-cost`. Combines
-all four criteria favorably: adjacent-to-just-closed savepoint
-substrate (fresh context); plausible clause-explicit cost claim
-to re-derive (per the pattern from the last two sessions); narrow
-scope (one path in `captureSavepointState`); option set already
-sketched (extend `savepointUndoLog` to `rplSegments`; add
-runtime assertion; tighten spec bound). Pre-pick advisory: if
-re-derivation surfaces no demonstrable bound violation under any
-in-spec workload, treat as a true spec-tier-only enforcement
-question (Option 3 = tighten the bound claim, no code change) and
-flag to user for explicit defer.
+**Alternative candidate** (if user prefers meatier work):
+`leaked-readtx-cleanup-race-flake`. Real CI value, fresh context
+(separate area from this session's savepoint work), concrete
+acceptance options. Trade-off: the deterministic-finalizer-hook
+shape (Option 1) is the right fix but requires designing a test-
+only hook on the closeGate / cleanup pipeline — a small new test
+surface that needs adversarial review for ownership / lifecycle
+correctness. Heavier session than the rename.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
