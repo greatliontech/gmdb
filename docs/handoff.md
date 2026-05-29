@@ -809,6 +809,71 @@ before designing the fix. The proof is in the receipts:
   no-cite invariant is static — it fires regardless of whether
   the cite would be stale-on-merge.
 
+- **`compaction-full-forest-walk-per-pass`** (this session,
+  `91a268a`): two surprises beyond the issue's three-option
+  resolution sketch.
+
+  **First (the strict cost clause quantifies WRITE cost only —
+  "I/O budget" framing in §Cost per pass does NOT cover reads
+  even though the clause uses the unqualified word "I/O").** The
+  issue framed the work as "O(total live pages) in reads vs only
+  `CompactionBatchSize` relocated — wasteful." First-principles
+  re-derivation against `background-maintenance.md §Cost per
+  pass` found the clause-explicit "worst-case I/O is
+  `CompactionBatchSize × (1 + depth) × PageSize`" is followed
+  immediately by "the slab must hold the whole cascade" — the
+  slab is the in-memory CoW write buffer pwritten at commit. The
+  clause is exclusively about pwrite I/O. Read cost is documented
+  in §Mechanism step 1 ("Walk every B+tree in the forest") but
+  NOT bounded in the cost clause. So the strict clause is
+  SATISFIED for writes; the issue's read-cost concern is an
+  unenumerated cost dimension, not a clause violation. The
+  MaxSize-scaling test (`shallow-savepoint-clone-cost` `43ac8df`
+  / `bitmap-rollback-undo-log` `0893be5` → MaxSize-scaling → fix;
+  `rplsegments-clone-cost` `b83846c` / this session → workload-
+  history-dependent → preference, drop from spec) confirms the
+  disposition: read cost scales with live B+tree node pages
+  (workload state), structural ceiling `MaxSize`/`PageSize` for a
+  fully-allocated database — same shape as `b83846c`'s
+  rplSegments chain. **Lesson**: when a cost clause says "worst-
+  case I/O is X," check whether X is a write-side or
+  comprehensive expression — "the slab must hold the cascade" is
+  the diagnostic signal that only writes are quantified, and the
+  read-cost dimension may be separately unbounded. Don't conflate
+  the clause's coverage with the clause's apparent breadth. The
+  3:3 split now reinforces: three profile-driven concerns were
+  clause violations needing fix (`0893be5`, `43ac8df`, `5800299`);
+  three were preferences needing spec amend only (`b83846c`,
+  `9d060ba`, `91a268a`). The disposition is not predictable from
+  "profile-driven" framing alone — the cost-dimension audit must
+  be explicit.
+
+  **Second (an issue's "Related" sub-concern can flip independently
+  from the main concern — re-derive each separately).** The
+  issue bundled a "Related: compaction self-signals fragmentation
+  trigger" sub-concern (`relocateOverflowChain`'s
+  `AllocContiguous` bumps the same `contigAttempts` /
+  `contigFragFails` counters consumed by the trigger). The issue
+  itself characterized this as "self-limiting … arguably
+  desirable … not a correctness defect" — explicitly a preference
+  shape. First-principles re-derivation agreed (no statable
+  `violation=` per CLAUDE.md Project invariants), so both the
+  main concern and the Related sub-concern were preferences this
+  session. But they could have gone the other way independently
+  — if the spec had a clause about trigger-metric-purity, the
+  Related concern alone might have been a clause violation while
+  the main concern remained a preference. **Lesson**: an issue's
+  "Related" or "Adjacent" sub-section is an independent piece of
+  work requiring its own clause-explicit / entailed invariant
+  check. Do not assume a sub-concern shares the main concern's
+  disposition. Treat each as its own first-principles re-
+  derivation: read the relevant spec section, derive the invariant
+  with statable `violation=`, and disposition independently. The
+  sub-concern's spec promotion can be folded into the same
+  close-out commit (this session: brief §Trigger note that the
+  inclusive count is self-limiting and intentional), but the
+  derivation must be separate.
+
 **Trap pattern to watch for:** the issue cites a "well-known"
 invariant or rationale that the actual spec doesn't state, OR proposes
 a one-line fix that introduces a new bug (same class as the one it's
@@ -1132,7 +1197,49 @@ new production godoc that references a fix's rationale, default
 to "cite the test name + `git log` mechanism"; the no-cite
 invariant is static — it fires regardless of whether the cite
 would be stale-on-merge or not. Promote-then-delete makes the
-cite acceptable only AFTER retarget, not by intent to delete.
+cite acceptable only AFTER retarget, not by intent to delete, OR
+**a cost clause's "worst-case I/O is X" may quantify only ONE
+cost dimension (e.g. writes) — the unqualified word "I/O" does
+not imply comprehensive coverage** — the `compaction-full-forest-
+walk-per-pass` (`91a268a`) `§Cost per pass` said "worst-case I/O
+is `CompactionBatchSize × (1 + depth) × PageSize`" but was
+immediately followed by "the slab must hold the whole cascade"
+— the slab is the in-memory CoW write buffer, so the clause
+is exclusively about pwrite I/O. The read cost ("Walk every
+B+tree in the forest" per §Mechanism step 1) was documented but
+NOT bounded in the cost clause. Strict clause SATISFIED for
+writes; read cost is a separately-unenumerated dimension. The
+diagnostic signal is the clause's adjacent context ("the slab,"
+"the buffer," "the cascade") — these are write-side anchors.
+Lesson: when a cost clause says "worst-case I/O is X," audit
+which DIMENSION X quantifies; do not read coverage as broader
+than the expression. The dimension-aware MaxSize-scaling test:
+write cost is bounded by clause; check read cost separately —
+if it's MaxSize-scaling it's a fix, if workload-history-
+dependent it's a preference. The 3:3 split across profile-driven
+closes (0893be5 / 43ac8df / 5800299 → fix; b83846c / 9d060ba /
+91a268a → preference) is independent of which cost dimension is
+being asked about, OR
+**an issue's "Related" or "Adjacent" sub-concern is an
+independent piece of work — re-derive each separately, do NOT
+assume it shares the main concern's disposition** — the
+`compaction-full-forest-walk-per-pass` (`91a268a`) bundled a
+"Related: compaction self-signals fragmentation trigger" sub-
+concern (relocateOverflowChain's AllocContiguous bumps the same
+contigAttempts / contigFragFails the trigger reads). The issue's
+own framing characterized it as "self-limiting … arguably
+desirable … not a correctness defect" — preference shape. First-
+principles re-derivation agreed: both main and Related were
+preferences this session. But they could have gone differently
+— if the spec had a clause about trigger-metric-purity, the
+Related alone might have been a clause violation while the main
+remained a preference. Lesson: an issue's "Related" / "Adjacent"
+sub-section is its own clause-explicit / entailed invariant
+check (read the relevant spec section; derive the invariant with
+statable violation=; disposition independently). The sub-
+concern's spec promotion can be folded into the same close-out
+commit (this session: brief §Trigger note on intentional
+inclusive count), but the derivation MUST be separate.
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -1188,48 +1295,59 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `leaked-readtx-cleanup-race-flake` — picked
-opportunistically per the issue's condition trigger ("when read-tx
-slot lifecycle is next touched, or opportunistically") and the
-prior session handoff's recommendation. Re-validated the flake on
-current HEAD `7fae978` (2/10 iterations fail under `-race`,
-matching the issue's empirical 2-4/10). First-principles diagnosis
-surfaced a deeper root cause than the issue framed: `BeginRead`
-with no-deadline `ctx` returns `ErrReadersFull` IMMEDIATELY
-(`internal/lock/coord_reader.go:75-77`) — it does NOT block. The
-test's goroutine + 5s wall-clock timer assumed `BeginRead` blocks
-(the write-path counterpart `TestLeakedTxReleasesWriteLock` DOES
-block on the writer-flock channel and is NOT flaky, 20/20 under
-`-race` — the asymmetry was the diagnostic signal). No
-"race-cost-proportional wait bound" or extra `runtime.GC()` cycles
-would have fixed the flake — the wait shape was wrong by
-construction. Fix: deterministic test-only synchronization hook
-fired at the tail of `readTxCleanupFn`'s active-release path,
-after `info.coord.ReleaseReader(info.slot)`. Package-level
-`atomic.Pointer[func()]` mirroring existing
-`writeRegistryFailHookForTest` /
-`indexMaintenanceFailHookForTest` pattern; production cleanup
-contract UNCHANGED (hook is test-only observability; nil-load is
-a single atomic op). Test refactored to install hook (buffered
-cap=1 channel + select-default send), leak rtx, GC, wait on
-signal, then synchronously call BeginRead — 100/100 pass under
-`-race` post-fix; neuter-verified (both removing `ReleaseReader`
-and removing the hook fire produce deterministic failures).
-Promote-then-delete: rationale already inline at the hook's
-godoc + the test's godoc + the close-out commit message; issue
-file deleted; README row removed. R1=0H/1M/1L/3nit (introduced
-M-1 production-code cite to
-`docs/issues/leaked-readtx-cleanup-race-flake.md` violated
-CLAUDE.md Issue-triage no-cite invariant → fixed in-place by
-retargeting cite to test name +
-`git log --all -S readTxCleanupHookForTest` mechanism; introduced
-L-1 godoc panic clause missing → fixed in-place; nit-1
-EnterCleanup-window framing folded into inline comment; nit-2
-disputed (line numbers rot); nit-3 disputed (matches local
-convention)). R2=0H/0M/0L/0nit (converged, ship).
+This session closed `compaction-full-forest-walk-per-pass` —
+picked per the user's session-start override of the recommended
+`setkeyspace-indexing-perf-and-edge` candidate. Re-validated on
+current HEAD `6434155`: `compactForest` → `btree.RelocatePages`
+→ `relocateNode` does read every page in every tree
+(`internal/btree/relocate.go:78-144`), matching the issue's
+description; existing tests green. First-principles re-derivation
+against `background-maintenance.md §Cost per pass` found the
+clause-explicit "worst-case I/O is `CompactionBatchSize × (1 +
+depth) × PageSize`" plus "the slab must hold the whole cascade"
+quantifies pwrite I/O only — the slab is the in-memory CoW write
+buffer pwritten at commit. The clause is exclusively about
+writes. Read cost is documented at §Mechanism step 1 ("Walk
+every B+tree in the forest") but NOT bounded in the cost clause.
+So the strict clause is SATISFIED for writes; the issue's read-
+cost concern is an unenumerated cost dimension that scales with
+live B+tree node pages (workload-history-dependent — same shape
+as `rplsegments-clone-cost` `b83846c`, NOT MaxSize-scaling like
+`0893be5` or `43ac8df`). No demonstrated fault — slow on a large
+cold database is not wrong/unsafe. Per CLAUDE.md Project
+invariants ("an invariant with no statable violation= is a
+preference — do not record it"), the implicit "small read cost"
+expectation is a preference, not an invariant. The issue's
+"Related: compaction self-signals fragmentation trigger" sub-
+concern (`relocateOverflowChain`'s `AllocContiguous` bumps the
+same `contigAttempts` / `contigFragFails` counters the trigger
+consumes) was independently re-derived and also a preference
+(the issue itself framed it as "self-limiting … arguably
+desirable … not a correctness defect"). Disposition: **Option 3
+(close as obsolete) + spec amend** (no code change, no new
+tests). `background-maintenance.md §Cost per pass` rewritten
+into "Two cost dimensions, separately bounded" — Write cost
+(existing material) + new Read cost paragraph naming O(live
+B+tree node pages) workload-dependent with `MaxSize/PageSize`
+structural ceiling; cites `relocateNode`'s read-then-predicate
+order on B+tree nodes and `relocateLeaf`'s predicate-then-
+relocate on overflow chains (precise: nested-tree subtree pages
+are nodes and counted, overflow chain pages are not). §Trigger
+gains a paragraph documenting the inclusive-count is intentional
+(self-limiting: once eager reclaim consolidates,
+`FindContiguous` succeeds and the rate falls); per-tx "don't
+count" flag explicitly rejected. R1=0H/0M/3L (L-1 introduced
+overflow-chain ordering imprecision in §Read cost → fixed in-
+place; L-2/L-3 adjacent file-only `v0-implementation.md` /
+`handoff.md` cites of the closed slug — narrative records,
+disputed-as-historical / fixed-via-end-of-session-protocol)/1nit
+(no defect); R2=0H/0M/0L/0nit (converged, ship). 3:3 split now
+across six profile-driven closes: `0893be5` / `43ac8df` /
+`5800299` → fix; `b83846c` / `9d060ba` / `91a268a` → preference,
+spec amend only.
 
-Prior session closed `rplchain-head-tail-terminology-conflict` —
-see commit `9d060ba` for that change set's details.
+Prior session closed `leaked-readtx-cleanup-race-flake` —
+see commit `5800299` for that change set's details.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -1251,6 +1369,7 @@ see commit `9d060ba` for that change set's details.
 | `b83846c` | rplsegments-clone-cost | **Closed** — Option A (spec amend + close, no code change) per user pick; justified by first-principles re-derivation finding the strict `transactions.md §Nested Transactions` cost clause "not total database size" is SATISFIED (chain length grows with retired-pages-pending-reclamation count, not page count → not MaxSize-scaling, distinguishing from `0893be5` and `43ac8df`). The auxiliary "small constant in practice" claim in §Why this is cheap is a preference with no statable violation= (slow ≠ wrong/unsafe) — per CLAUDE.md Project invariants, do not record. Spec promotions: §Nesting depth cost clause amended to name `O(rplSegments chain length)` explicitly with cross-ref; §Why this is cheap replaced with honest workload-dependent prose (lagging reader → chain accumulates across writer commits; structural ceiling `MaxSize/PageSize` is the only workload-independent bound). `internal/pager/savepoint.go` godoc alignment (Savepoint struct + captureSavepointState). NO code semantic change; NO new tests. R1=1H/1M/2L/1nit (introduced H-1 `finalizeRPLChain` phantom-symbol cite → fixed in-place to `appendRPL`; adjacent M-1 `trimRPLChainHead` vs `pager.go:370` chain-orientation conflict → filed `rplchain-head-tail-terminology-conflict.md`; introduced L-1 cross-tx-vs-within-tx ambiguity → fixed in-place with explicit 43ac8df cross-ref; adjacent L-2 alloc-count test empty-chain precondition → disputed; introduced L-3 `MaxTxBufferBytes` mention → disputed); R2=0H/0M/0L/1nit (disposition-narrative mis-citation of `MaxTxBufferBytes` location, no landed artifact; ship). |
 | `9d060ba` | rplchain-head-tail-terminology-conflict | **Closed** — Option 1 (rename + comment/spec align) per user pick. Issue enumerated 5 sites; wide grep audit added 3 more (`commit.go:235` pre-existing comment using slice-front idiom; `savepoint.go:189` inherited from `b83846c` amendment; `transactions.md:472` second instance of "drain head segments"). 8 sites fixed for full convention conformance (rename `trimRPLChainHead` → `trimRPLChainTail` with godoc cross-ref to SetRPLChain; capacity-preservation framing on the reclaimRPL inline comment + `trimRPLChainTail` godoc, replacing the wrong "GC the head slot" framing that pre-dated this diff; tightened appendRPL phase-1 comment; fixed `savepoint.go:189` + the two transactions.md sites + free-space.md:378-379). Spec-amend candidate #1 (chain-orientation invariant recorded-only with violation= per Project invariants) → user picked add-test-now, `TestRPLChainOrientationMultiSegment` added at `internal/pager/freespace_test.go:340-460` (3-segment chain, partial reclamation bound, identity-tested survivor) — neuter-verified by reversing `headPageID()` to read `rplSegments[0]`. Existing single-segment fixtures cannot distinguish tail-first from head-first drain; this new test is the strongest available encoding per Project invariants. R1=0H/1M/2L/2nit (introduced M-1 close-out incomplete → fixed; adjacent L-1 GC-eligibility framing wrong for value-type slice → fixed in-place with capacity-preservation framing; introduced L-2 "in the limit including head" phrasing → fixed in-place; nit-1 cross-ref disposition recorded; adjacent nit-2/spec-amend candidate #2 free-space.md slice-front idiom → fixed in-place under user's full-scope authorization; spec-amend candidate #1 chain-orientation invariant → user picked add-test, landed). R2=0H/0M/0L/0nit (converged, ship). |
 | `5800299` | leaked-readtx-cleanup-race-flake | **Closed** — first-principles re-derivation found the deeper root cause is `BeginRead` returning `ErrReadersFull` immediately (no-deadline `ctx` does NOT block on slot — `internal/lock/coord_reader.go:75-77`); the test's goroutine + 5s wall-clock timer assumed blocking. No "longer wait" Option 2 would have closed the flake — the wait shape was structurally wrong. Fix: deterministic test-only synchronization hook fired at the tail of `readTxCleanupFn`'s active-release path (after `info.coord.ReleaseReader(info.slot)`). New `readTxCleanupHookForTest atomic.Pointer[func()]` + `setReadTxCleanupHookForTest` setter in `read_tx.go`, mirroring `writeRegistryFailHookForTest` / `indexMaintenanceFailHookForTest` pattern. Hook fires INSIDE the EnterCleanup/ExitCleanup window — `closeGate.BeginClose`'s drain naturally waits for it; non-blocking constraint inherited per `leak-detection.md §Cleanup Behavior`. `TestLeakedReadTxReleasesSlotViaCleanup` refactored: installs hook (buffered cap=1 channel + select-default send), leaks rtx, GCs ×2, waits on hook signal (5s fatal), then synchronously calls BeginRead + Rollback. Pre-fix flake re-validated on HEAD `7fae978` (2/10 fail under -race); post-fix 100/100 pass. Neuter-verified: removing ReleaseReader fails 3/3 with `no reader slots available`; removing hook fire fails 3/3 with 5s timeout. Production cleanup contract UNCHANGED. R1=0H/1M/1L/3nit (introduced M-1 production cite to `docs/issues/leaked-readtx-cleanup-race-flake.md` violated CLAUDE.md Issue-triage no-cite invariant → fixed in-place by retargeting to test name + `git log --all -S` mechanism; introduced L-1 godoc panic clause missing → fixed in-place; nit-1 EnterCleanup-window framing folded into inline comment; nit-2 line numbers rot → disputed; nit-3 nil-branch pattern matches local convention → disputed). R2=0H/0M/0L/0nit (converged, ship). |
+| `91a268a` | compaction-full-forest-walk-per-pass | **Closed** — Option 3 (close as obsolete + spec amend, no code change) per first-principles re-derivation finding the strict `background-maintenance.md §Cost per pass` clause "worst-case I/O is `CompactionBatchSize × (1 + depth) × PageSize` … the slab must hold the whole cascade" is SATISFIED for pwrite I/O (slab = in-memory CoW write buffer). Read cost is unenumerated, scales with live B+tree node pages (workload-history-dependent — matches `rplsegments-clone-cost` `b83846c` shape, NOT MaxSize-scaling like `0893be5` / `43ac8df`); structural ceiling `MaxSize`/`PageSize` for a fully-allocated database. No demonstrated fault — slow is not wrong/unsafe; per CLAUDE.md Project invariants the implicit "small read cost" expectation is a preference. The issue's "Related: compaction self-signals fragmentation trigger" sub-concern independently re-derived as preference (the issue itself framed it "self-limiting … arguably desirable … not a correctness defect"). Spec promotions: `background-maintenance.md §Cost per pass` rewritten into "Two cost dimensions, separately bounded" — Write cost (existing material kept, with "Bounded by `CompactionBatchSize` and depth, independent of total database size" sharpening) + new Read cost paragraph naming O(live B+tree node pages) workload-dependent with `MaxSize/PageSize` structural ceiling, citing `relocateNode`'s read-then-predicate on B+tree nodes and `relocateLeaf`'s predicate-then-relocate on overflow chains (so the O() expression precisely includes nested-tree subtree pages via the recursive `relocateNode` at `relocate.go:199`, excludes overflow chain pages which are not walked); `§Trigger` gains a paragraph documenting inclusive-count is intentional self-limiting, per-tx "don't count" flag explicitly rejected. NO code change; NO new tests. R1=0H/0M/3L/1nit (introduced L-1 §Cost-per-pass §Read-cost "page" vs "B+tree node" precision: original wording was precise for B+tree node descent but imprecise for overflow-chain case at `relocate.go:175` where predicate gates the chain read → fixed in-place: tightened to "on B+tree nodes shouldRelocate(id) runs only after the page is read … overflow chains are gated the other way, predicate-then-relocate, with no walk-time read of their pages" + "page" → "node" in 3 spots; adjacent L-2 `v0-implementation.md:2062` chunk-12.6 narrative cite of the closed slug — disputed as past-tense historical fact per close-out protocol; adjacent L-3 `handoff.md` candidate-list cites — fixed via end-of-session protocol rewrite). R2=0H/0M/0L/0nit (converged, ship). |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -1258,10 +1377,9 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-*(none — this session's `leaked-readtx-cleanup-race-flake`
-closed via test-only synchronization hook + test refactor; no
-correctness-class or condition-triggered-now entries remain in
-the backlog.)*
+*(none — this session's `compaction-full-forest-walk-per-pass`
+closed via spec amend + close as obsolete; no correctness-class
+or condition-triggered-now entries remain in the backlog.)*
 
 ### Undecided / needs analysis
 
@@ -1270,8 +1388,7 @@ or condition-triggered.)*
 
 ### Profiling-driven / condition-triggered (re-validate before pulling)
 
-`rpl-segment-relocation`, `compaction-full-forest-walk-per-pass`,
-`pager-test-helper-export`,
+`rpl-segment-relocation`, `pager-test-helper-export`,
 `setkeyspace-delete-range-bulk-walker`,
 `bulkload-index-merge-run-fanin`,
 `setkeyspace-indexing-perf-and-edge`. Re-validate live before
@@ -1290,14 +1407,13 @@ condition-triggered; the one condition-triggered entry —
 
 1. **Re-validate the profiling-driven set first** — the recurring
    lesson says issue framings often go stale, *especially* for
-   profiling-driven items. The last five sessions proved this
-   five times, with a 4:1 split on disposition:
-   `shallow-savepoint-clone-cost` `43ac8df` →
-   clause-explicit cost-clause violation, fix via undo-log
-   substrate;
+   profiling-driven items. The last six sessions proved this six
+   times, with a 3:3 split on disposition (fix vs spec-only):
+   `shallow-savepoint-clone-cost` `43ac8df` → clause-explicit
+   cost-clause violation, fix via undo-log substrate;
    `nested-shallow-loose-pop-buffer-alias` `d9ea7d4` → binary
-   "user-choice A vs B/C" → production-caller audit collapsed to
-   Option 1 by construction;
+   "user-choice A vs B/C" → production-caller audit collapsed
+   to Option 1 by construction;
    `rplsegments-clone-cost` `b83846c` → strict cost clause
    SATISFIED, only an auxiliary "small constant" *preference*
    could be falsified → spec amend only, no code change;
@@ -1305,12 +1421,20 @@ condition-triggered; the one condition-triggered entry —
    as "pure docs/naming, no correctness" → first-principles
    surfaced a project-invariant promotion opportunity, user
    added the regression test inline;
-   `leaked-readtx-cleanup-race-flake` `5800299` (this session)
-   → filed as "GC timing variant," first-principles surfaced
-   the deeper root cause is the test's wait shape not matching
-   `BeginRead`'s wait semantics (returns ErrReadersFull
-   IMMEDIATELY with no-deadline ctx, does NOT block) — fixed
-   via deterministic test-only hook.
+   `leaked-readtx-cleanup-race-flake` `5800299` → filed as "GC
+   timing variant," first-principles surfaced the deeper root
+   cause is the test's wait shape not matching `BeginRead`'s
+   wait semantics (returns ErrReadersFull IMMEDIATELY with
+   no-deadline ctx, does NOT block) — fixed via deterministic
+   test-only hook;
+   `compaction-full-forest-walk-per-pass` `91a268a` (this
+   session) → filed as "O(live pages) per pass, wasteful";
+   first-principles re-derivation found the §Cost per pass
+   clause quantifies WRITE I/O only ("the slab must hold the
+   whole cascade" — slab = CoW write buffer); read cost is
+   workload-history-dependent, no clause violated → spec amend
+   only, two-dimensions Cost-per-pass + §Trigger inclusive-
+   count rationale.
    The disposition is NOT predictable from issue framing alone:
    re-derive each candidate against the spec, asking
    (i) does the unenumerated cost term scale with `MaxSize`
@@ -1321,10 +1445,21 @@ condition-triggered; the one condition-triggered entry —
        is recorded-only? if yes, audit promotion opportunity;
    (iii) does the test under inspection wait on a signal whose
        SEMANTICS match the function-under-test's actual
-       behavior? (this-session lesson: a goroutine +
-       wall-clock timer assumes the function blocks; if it
-       returns immediately with an error, the wait is wrong
-       by construction).
+       behavior?
+   (iv) **new this session**: when the cost clause says
+       "worst-case I/O is X," check whether X is a WRITE-side
+       or COMPREHENSIVE expression — "the slab must hold the
+       cascade" / "the buffer must hold" / "the cascade" are
+       diagnostic signals that only writes are quantified;
+       read cost may be separately unbounded. Distinguish the
+       DIMENSION, not just the magnitude;
+   (v) **new this session**: an issue's "Related" / "Adjacent"
+       sub-concern is its OWN clause-explicit / entailed
+       invariant check — do not assume it shares the main
+       concern's disposition. Treat each as an independent
+       first-principles re-derivation; promote its spec
+       conclusion into the same close-out commit but DERIVE
+       it separately.
 
 2. **Among re-validated live items, prefer ones whose framing
    could be wrong in instructive ways** (Ordering criterion 3 —
@@ -1339,17 +1474,16 @@ condition-triggered; the one condition-triggered entry —
      indexing spec + transactions.md §Nested Transactions cost
      clause to verify). If subsumed, the disposition is
      close-as-obsolete; if not, two close-outs in one session.
-   - `compaction-full-forest-walk-per-pass` — per-pass O(live
-     pages) re-walk has a clause-explicit-cost-clause shape;
-     the spec's compaction cost clause (if any) is the test.
-     Focused re-derivation.
-   - `rpl-segment-relocation` — adjacent to last two sessions'
-     RPL/savepoint area positionally; design-heavy
-     (immovability assumption may need to change).
    - `setkeyspace-delete-range-bulk-walker` — uses
      snapshot-then-Delete loop O(K log N) instead of the
      three-phase walker O(K + log N). The spec's DeleteRange
-     cost clause is the test.
+     cost clause (`range-delete.md`) is the test; adjacent to
+     this session's compaction-walk cost-dimension work, so
+     the cost-clause-dimension lesson (iv above) applies
+     freshly here.
+   - `rpl-segment-relocation` — adjacent to recent RPL/savepoint
+     area positionally; design-heavy (immovability assumption
+     may need to change).
    - `bulkload-index-merge-run-fanin` — single-pass merge opens
      O(#runs) FDs; pathological tiny buffer + huge input could
      hit EMFILE. Unreachable at default `MaxTxBufferBytes`.
@@ -1376,20 +1510,27 @@ concept); audit underlying invariants for recorded-only-but-
 violation-able gaps the way the
 `TestRPLChainOrientationMultiSegment` (chunk-orientation) and
 the `TestLeakedReadTxReleasesSlotViaCleanup` (slot-lifecycle)
-promotions were discovered. Additional this-session check: if
-the issue's framing is "user observes high allocation count
-under workload X," verify the test or benchmark exists and
-actually exercises the workload — a framing without a workload
-fixture is itself a recorded-only invariant requiring a
+promotions were discovered. Apply this session's cost-dimension
+audit: if the framing names an "allocation count" cost, identify
+whether it's a write-side (CoW / undo-log / map clone) or
+read-side (walk / probe) expression — the spec's cost clause may
+quantify only one side. If the issue has a "Related" sub-
+concern, re-derive it independently per check (v) above.
+Additional check: if the issue's framing is "user observes high
+allocation count under workload X," verify the test or benchmark
+exists and actually exercises the workload — a framing without a
+workload fixture is itself a recorded-only invariant requiring a
 fixture before measurement.
 
 **Alternative candidate** (if user prefers a focused single-item
-session): any one of `compaction-full-forest-walk-per-pass`,
-`setkeyspace-delete-range-bulk-walker`,
-`bulkload-index-merge-run-fanin`, `rpl-segment-relocation`. The
-4:1+ "fix or surface a structural insight" split across the last
-five profile-driven re-derivations holds high probability of an
-instructive outcome per candidate.
+session): `setkeyspace-delete-range-bulk-walker` (adjacent to
+this session's cost-dimension work, single sub-item),
+`bulkload-index-merge-run-fanin` (extrinsic-bound shape — most
+likely a drop-preference outcome), or `rpl-segment-relocation`
+(design-heavy, immovability assumption). The 3:3+ "fix or surface
+a structural insight" split across the last six profile-driven
+re-derivations holds high probability of an instructive outcome
+per candidate.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
