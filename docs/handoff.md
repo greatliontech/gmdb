@@ -874,6 +874,94 @@ before designing the fix. The proof is in the receipts:
   inclusive count is self-limiting and intentional), but the
   derivation must be separate.
 
+- **`setkeyspace-indexing-perf-and-edge`** (this session, `de9e7c1`):
+  three surprises beyond the issue's "items A+B perf-only,
+  fix shape obvious" framing.
+
+  **First (the third disposition class — "fix" outside the
+  MaxSize-clause-violation / preference-drop binary).** Six prior
+  profile-driven closes split 3:3 between clause-explicit cost
+  violations (fix via substrate) and preferences (drop from spec). This
+  one fit NEITHER bucket: no spec clause was being violated (the bulk-
+  op cost clause `O(entries × (indexes + extractor))` already permits
+  the 2× constant factor); but the redundancy ALSO wasn't a
+  preference-to-drop (no spec text recorded the implicit "one
+  snapshot per op" expectation). Per first-principles re-derivation
+  it's a *third class*: a constant-factor inefficiency where the
+  CLEANUP is structurally small and correct-preserving. The wrappers
+  had two layers (chunk-7.6 H-2 wrapper-internal snap + chunk-7.9
+  caller rowSnap) that were *historically* both load-bearing, but
+  after chunk-7.9 the caller layer subsumed the wrapper's contract
+  entirely. Consolidation deletes the wrapper layer and moves the
+  responsibility cleanly. Disposition: **fix** (not preference-drop),
+  because the cleanup is small and "smallest correct change" applies
+  to code shape even when the bigger O isn't violated. The 3:3:1 split
+  across seven profile-driven closes now: `0893be5` / `43ac8df` /
+  `5800299` → clause violation → fix; `b83846c` / `9d060ba` /
+  `91a268a` → preference → spec-amend only; THIS session → neither →
+  fix via cleanup. Lesson: don't pre-decide between "fix" and
+  "preference-drop" by which profile-driven bucket the issue fits;
+  re-derive whether a structurally-simple consolidation eliminates
+  the redundancy (third bucket: cleanup-fix) before assuming the
+  only options are "MaxSize-scaling fix" or "preference-drop."
+
+  **Second (Round-1 M-2: test-coverage encoding density — every
+  caller-site bearing an invariant deserves its own test, not "one
+  test per distinct mechanism").** I initially encoded the
+  consolidated atomicity invariant with 3 tests covering 3 mechanisms
+  (Put helper / Delete helper / Bulk-loop), reasoning that the
+  remaining 3 caller sites (Cursor.Delete + SetKeyspace.Put +
+  SetKeyspace.DeleteValue) "share mechanism with the encoded sites"
+  and don't need individual tests. Per Project invariants' "record
+  the fewest invariants that pin the spec's correctness; a
+  speculative catalogue is over-encoding." Round-1 reviewer
+  empirically neuter-verified that removing the new caller-side
+  `restoreIndexes(...)` at `set_keyspace.go:726` (SetKeyspace.Put)
+  caused ZERO existing test failures — the encoding gap was real,
+  not speculative. The mechanism-sharing argument is plausible by
+  inspection but exactly the kind of claim regression tests exist
+  to encode at the line level, not just the mechanism level. Per
+  Project invariants' "encode each invariant in the strongest
+  artifact the project stage affords" — for code-stage that's a
+  test per neuter-able line. Added 3 more tests for the 3 uncovered
+  caller sites; all 6 now neuter-verified individually. **Lesson**:
+  "smallest correct change" governs PRODUCTION code; for TESTS, the
+  rule is "every caller-site line that bears an encoded invariant
+  deserves a test whose removal regresses the line." Empirical
+  neuter-verify is the gate: if removing the line passes the suite,
+  the encoding has a gap. The "speculative catalogue" prohibition
+  applies to recording NEW invariants, not to test coverage of
+  caller-sites that already bear one. The boundary: same invariant
+  + same mechanism + different cause-line = different neuter target
+  = different test.
+
+  **Third (Round-1 M-1: no-cite invariant fires on TEST files,
+  including during the same change set that closes the issue —
+  same trap class as `5800299`'s godoc cite).** I cited
+  `setkeyspace-indexing-perf-and-edge` in the new
+  `TestSetKeyspaceBulkDeletePinnedStateRevertsAfterMidLoopFailure`
+  godoc as "originally tracked as item B of <slug>". Per CLAUDE.md
+  Issue triage gate 2's no-cite invariant: "Authoritative Spec and
+  production code cite only a kept-current artifact or a `git log`
+  mechanism — NEVER a tracking artifact." Test files are
+  kept-current artifacts; the cite is no different from a code
+  comment cite. The cite is dangling-on-merge once the issue file is
+  deleted, even during the same change set. Same trap pattern the
+  `leaked-readtx-cleanup-race-flake` `5800299` Round-1 M-1
+  surfaced for production godoc; this session's lesson is that the
+  pattern extends to test godoc as well. **Adjacent in-place fix**:
+  `index_types_test.go:240`'s pre-existing cite of the same slug for
+  the closed item-C reference — same anti-pattern, pre-existing
+  cause-line, classified adjacent per the diff arbiter; fixed
+  in-place under smallest-correct-change because we were already
+  doing a wide grep-and-fix on the slug for close-out. Lesson:
+  default to citing chunk numbers (kept-current via `git log
+  --grep="chunk-N"`) + the test's own neuter clause when describing
+  a test's rationale; reach for an issue-path cite ONLY when no
+  durable anchor exists, which for a closing fix is never (the
+  chunk evolution chain plus the test's neuter assertion are always
+  available).
+
 **Trap pattern to watch for:** the issue cites a "well-known"
 invariant or rationale that the actual spec doesn't state, OR proposes
 a one-line fix that introduces a new bug (same class as the one it's
@@ -1239,7 +1327,69 @@ check (read the relevant spec section; derive the invariant with
 statable violation=; disposition independently). The sub-
 concern's spec promotion can be folded into the same close-out
 commit (this session: brief §Trigger note on intentional
-inclusive count), but the derivation MUST be separate.
+inclusive count), but the derivation MUST be separate, OR
+**a profile-driven issue may resolve to a "fix" outside the
+MaxSize-clause-violation / preference-drop binary — re-derive
+whether a structurally-simple consolidation eliminates the
+redundancy.** The `setkeyspace-indexing-perf-and-edge` close (this
+session) fit NEITHER bucket: no spec clause was being violated
+(bulk-op cost clause already permits the 2× constant factor); but
+the redundancy ALSO wasn't a preference-to-drop (no spec text
+recorded the implicit "one snapshot per op" expectation). Third
+class: a constant-factor inefficiency where the cleanup is
+structurally small and correct-preserving. The two layers were
+*historically* both load-bearing (chunk-7.6 H-2 wrapper-internal
+snap + chunk-7.9 caller rowSnap) but after chunk-7.9 the caller
+layer subsumed the wrapper's contract entirely. Disposition: fix
+(not preference-drop), because the cleanup is small and
+"smallest correct change" applies to code shape even when the
+bigger O isn't violated. Lesson: the 3:3 profile-driven split
+shouldn't pre-decide between fix and preference-drop — re-derive
+whether a structurally-simple consolidation eliminates the
+redundancy (third bucket: cleanup-fix) before assuming the only
+options are "MaxSize-scaling fix" or "preference-drop", OR
+**every caller-site bearing an encoded invariant deserves its own
+test, not "one test per distinct mechanism" — empirical neuter-
+verify is the gate, not mechanism-sharing arguments by
+inspection.** The `setkeyspace-indexing-perf-and-edge` Round-1 M-2
+finding: I initially encoded the consolidated atomicity invariant
+with 3 tests covering 3 mechanisms (Put helper / Delete helper /
+Bulk-loop), reasoning that the remaining 3 caller sites
+(Cursor.Delete + SetKeyspace.Put + SetKeyspace.DeleteValue)
+"share mechanism with the encoded sites" and don't need individual
+tests. Reviewer empirically neuter-verified that removing the new
+caller-side `restoreIndexes(...)` at `set_keyspace.go:726`
+(SetKeyspace.Put) caused ZERO existing test failures — the
+encoding gap was real, not speculative. "Smallest correct change"
+governs PRODUCTION code; for TESTS, the rule is "every caller-site
+line that bears an encoded invariant deserves a test whose removal
+regresses the line." The "speculative catalogue" prohibition
+applies to recording NEW invariants, not to test coverage of
+caller-sites that already bear one. The boundary: same invariant
++ same mechanism + different cause-line = different neuter target
+= different test. Added 3 more tests for the 3 uncovered caller
+sites; all 6 now neuter-verified individually, OR
+**the no-cite invariant fires on TEST files too, including during
+the same change set that closes the issue — same trap class as
+`5800299`'s production godoc cite.** The
+`setkeyspace-indexing-perf-and-edge` Round-1 M-1: I cited the
+issue slug in the new
+`TestSetKeyspaceBulkDeletePinnedStateRevertsAfterMidLoopFailure`
+godoc as "originally tracked as item B of <slug>". Test files are
+kept-current artifacts; the cite is no different from a code
+comment cite and is dangling-on-merge once the issue file is
+deleted. Same trap pattern surfaced by `5800299` for production
+godoc; this session shows it extends to test godoc. Adjacent
+in-place fix: `index_types_test.go:240`'s pre-existing cite of
+the same slug for the closed item-C reference — same anti-
+pattern, classified adjacent per the diff arbiter; fixed in-place
+under smallest-correct-change because we were already doing a
+wide grep-and-fix for close-out. Lesson: default to citing chunk
+numbers (kept-current via `git log --grep="chunk-N"`) + the
+test's own neuter clause when describing a test's rationale; reach
+for an issue-path cite ONLY when no durable anchor exists, which
+for a closing fix is never (the chunk evolution chain plus the
+test's neuter assertion are always available).
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -1295,59 +1445,85 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `compaction-full-forest-walk-per-pass` —
-picked per the user's session-start override of the recommended
-`setkeyspace-indexing-perf-and-edge` candidate. Re-validated on
-current HEAD `6434155`: `compactForest` → `btree.RelocatePages`
-→ `relocateNode` does read every page in every tree
-(`internal/btree/relocate.go:78-144`), matching the issue's
-description; existing tests green. First-principles re-derivation
-against `background-maintenance.md §Cost per pass` found the
-clause-explicit "worst-case I/O is `CompactionBatchSize × (1 +
-depth) × PageSize`" plus "the slab must hold the whole cascade"
-quantifies pwrite I/O only — the slab is the in-memory CoW write
-buffer pwritten at commit. The clause is exclusively about
-writes. Read cost is documented at §Mechanism step 1 ("Walk
-every B+tree in the forest") but NOT bounded in the cost clause.
-So the strict clause is SATISFIED for writes; the issue's read-
-cost concern is an unenumerated cost dimension that scales with
-live B+tree node pages (workload-history-dependent — same shape
-as `rplsegments-clone-cost` `b83846c`, NOT MaxSize-scaling like
-`0893be5` or `43ac8df`). No demonstrated fault — slow on a large
-cold database is not wrong/unsafe. Per CLAUDE.md Project
-invariants ("an invariant with no statable violation= is a
-preference — do not record it"), the implicit "small read cost"
-expectation is a preference, not an invariant. The issue's
-"Related: compaction self-signals fragmentation trigger" sub-
-concern (`relocateOverflowChain`'s `AllocContiguous` bumps the
-same `contigAttempts` / `contigFragFails` counters the trigger
-consumes) was independently re-derived and also a preference
-(the issue itself framed it as "self-limiting … arguably
-desirable … not a correctness defect"). Disposition: **Option 3
-(close as obsolete) + spec amend** (no code change, no new
-tests). `background-maintenance.md §Cost per pass` rewritten
-into "Two cost dimensions, separately bounded" — Write cost
-(existing material) + new Read cost paragraph naming O(live
-B+tree node pages) workload-dependent with `MaxSize/PageSize`
-structural ceiling; cites `relocateNode`'s read-then-predicate
-order on B+tree nodes and `relocateLeaf`'s predicate-then-
-relocate on overflow chains (precise: nested-tree subtree pages
-are nodes and counted, overflow chain pages are not). §Trigger
-gains a paragraph documenting the inclusive-count is intentional
-(self-limiting: once eager reclaim consolidates,
-`FindContiguous` succeeds and the rate falls); per-tx "don't
-count" flag explicitly rejected. R1=0H/0M/3L (L-1 introduced
-overflow-chain ordering imprecision in §Read cost → fixed in-
-place; L-2/L-3 adjacent file-only `v0-implementation.md` /
-`handoff.md` cites of the closed slug — narrative records,
-disputed-as-historical / fixed-via-end-of-session-protocol)/1nit
-(no defect); R2=0H/0M/0L/0nit (converged, ship). 3:3 split now
-across six profile-driven closes: `0893be5` / `43ac8df` /
-`5800299` → fix; `b83846c` / `9d060ba` / `91a268a` → preference,
-spec amend only.
+This session closed `setkeyspace-indexing-perf-and-edge` —
+picked per the user's confirmation of the recommendation at
+session-start. Re-validated on HEAD `22492c9`: the issue's
+items A (double snapshot in indexed `SetKeyspace.Put` /
+`DeleteValue`) and B (per-value snapshot in indexed bulk-key
+`Delete` loops over N members allocating N maps) reproduce
+exactly as described in `index_setkeyspace.go` and
+`set_keyspace.go`; existing tests green. First-principles
+re-derivation found the consolidation fix sits OUTSIDE the
+prior 3:3 profile-driven split: no spec clause was being
+violated (the bulk-op cost clause
+`O(entries × (indexes + extractor))` already permits the 2×
+constant factor), but the redundancy ALSO wasn't a preference-
+to-drop (no spec text recorded an "O(I) snapshot per op"
+expectation). Re-derived as a *third class*: a constant-factor
+inefficiency where the cleanup is structurally small and
+correct-preserving. The two layers (chunk-7.6 H-2 wrapper-
+internal snap + chunk-7.9 caller `rowSnap`) were historically
+both load-bearing; after chunk-7.9 added the caller layer, it
+subsumed the wrapper's contract entirely. Folded the chunk-7.6
+Keyspace symmetric sites (`Keyspace.Put` / `Delete` /
+`Cursor.Delete`) under Quality bar's "structurally-larger-but-
+simpler" exception — one consistent mechanism across Keyspace
++ SetKeyspace.
 
-Prior session closed `leaked-readtx-cleanup-race-flake` —
-see commit `5800299` for that change set's details.
+Disposition: **fix** (not preference-drop). Deleted four
+wrapper functions and renamed each `*Inner` → public name
+(`Keyspace.applyIndexMaintenanceOn{Put,Delete}`,
+`SetKeyspace.applyIndexMaintenanceOn{AddValue,RemoveValue}`).
+Added 5 caller-side `restoreIndexes(ks.indexes, rowSnap)` lines
+to the helper-error branches (`Keyspace.Put` / `Delete` /
+`Cursor.Delete` and `SetKeyspace.Put` / `DeleteValue`);
+`SetKeyspace.Delete` bulk branch already restored. Spec
+promotions: chunk-7.6 H-2 → chunk-7.9 evolution chain moved
+inline into the (renamed) `applyIndexMaintenanceOnPut` godoc +
+the `indexSnapshot` type godoc (new 3-bullet Capture / Restore
+/ Purpose contract); each caller site's helper-error branch
+comment documents "the helper does not snapshot pinned state —
+see its godoc."
+
+6 new regression tests (one per caller site, each neuter-
+verified individually — removing the named line produces
+deterministic failure with the first processed index's pinned
+mutated):
+- `TestIndexedPutPinnedStateRevertsAfterMidLoopFailure`
+- `TestIndexedDeletePinnedStateRevertsAfterMidLoopFailure`
+- `TestCursorDeletePinnedStateRevertsAfterMidLoopFailure`
+- `TestSetKeyspacePutPinnedStateRevertsAfterMidLoopFailure`
+- `TestSetKeyspaceDeleteValuePinnedStateRevertsAfterMidLoopFailure`
+- `TestSetKeyspaceBulkDeletePinnedStateRevertsAfterMidLoopFailure`
+
+R1=0H/2M/2L/1nit (introduced M-1 = no-cite invariant violation
+in new test godoc citing `setkeyspace-indexing-perf-and-edge`
+slug → fixed in-place by retargeting to chunk-7.6 → chunk-7.9
+evolution chain + test's own neuter clause as kept-current
+anchor; ADJACENT pre-existing same-class cite in
+`index_types_test.go:240` → fixed in-place under smallest-
+correct-change because already doing wide grep-and-fix for
+close-out; introduced M-2 = test-coverage encoding gap — only
+3 mechanisms had tests but 6 caller sites bear the encoded
+invariant individually; reviewer neuter-verified the
+SetKeyspace.Put line could be removed with zero suite failures
+→ fixed by adding 3 more tests; L-1/L-2 = bulk-test godoc
+phrasing implied differential coverage of the consolidation
+→ fixed by plain "Pins the invariant" framing + clarifying
+neuter targets a pre-existing line; nit-1 = `indexSnapshot`
+godoc style → restructured to lead with current 3-bullet
+contract).
+R2=0H/0M/0L/0nit (converged, ship).
+
+3:3:1 split now across seven profile-driven closes:
+`0893be5` / `43ac8df` / `5800299` → clause-explicit violation
+→ fix via substrate; `b83846c` / `9d060ba` / `91a268a` →
+preference → spec-amend only; THIS session → neither (no
+clause violated, no preference to drop) → fix via constant-
+factor cleanup (delete-redundant-wrapper consolidation).
+
+Prior session closed `compaction-full-forest-walk-per-pass` —
+see commit `91a268a` for that change set's details.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -1370,6 +1546,7 @@ see commit `5800299` for that change set's details.
 | `9d060ba` | rplchain-head-tail-terminology-conflict | **Closed** — Option 1 (rename + comment/spec align) per user pick. Issue enumerated 5 sites; wide grep audit added 3 more (`commit.go:235` pre-existing comment using slice-front idiom; `savepoint.go:189` inherited from `b83846c` amendment; `transactions.md:472` second instance of "drain head segments"). 8 sites fixed for full convention conformance (rename `trimRPLChainHead` → `trimRPLChainTail` with godoc cross-ref to SetRPLChain; capacity-preservation framing on the reclaimRPL inline comment + `trimRPLChainTail` godoc, replacing the wrong "GC the head slot" framing that pre-dated this diff; tightened appendRPL phase-1 comment; fixed `savepoint.go:189` + the two transactions.md sites + free-space.md:378-379). Spec-amend candidate #1 (chain-orientation invariant recorded-only with violation= per Project invariants) → user picked add-test-now, `TestRPLChainOrientationMultiSegment` added at `internal/pager/freespace_test.go:340-460` (3-segment chain, partial reclamation bound, identity-tested survivor) — neuter-verified by reversing `headPageID()` to read `rplSegments[0]`. Existing single-segment fixtures cannot distinguish tail-first from head-first drain; this new test is the strongest available encoding per Project invariants. R1=0H/1M/2L/2nit (introduced M-1 close-out incomplete → fixed; adjacent L-1 GC-eligibility framing wrong for value-type slice → fixed in-place with capacity-preservation framing; introduced L-2 "in the limit including head" phrasing → fixed in-place; nit-1 cross-ref disposition recorded; adjacent nit-2/spec-amend candidate #2 free-space.md slice-front idiom → fixed in-place under user's full-scope authorization; spec-amend candidate #1 chain-orientation invariant → user picked add-test, landed). R2=0H/0M/0L/0nit (converged, ship). |
 | `5800299` | leaked-readtx-cleanup-race-flake | **Closed** — first-principles re-derivation found the deeper root cause is `BeginRead` returning `ErrReadersFull` immediately (no-deadline `ctx` does NOT block on slot — `internal/lock/coord_reader.go:75-77`); the test's goroutine + 5s wall-clock timer assumed blocking. No "longer wait" Option 2 would have closed the flake — the wait shape was structurally wrong. Fix: deterministic test-only synchronization hook fired at the tail of `readTxCleanupFn`'s active-release path (after `info.coord.ReleaseReader(info.slot)`). New `readTxCleanupHookForTest atomic.Pointer[func()]` + `setReadTxCleanupHookForTest` setter in `read_tx.go`, mirroring `writeRegistryFailHookForTest` / `indexMaintenanceFailHookForTest` pattern. Hook fires INSIDE the EnterCleanup/ExitCleanup window — `closeGate.BeginClose`'s drain naturally waits for it; non-blocking constraint inherited per `leak-detection.md §Cleanup Behavior`. `TestLeakedReadTxReleasesSlotViaCleanup` refactored: installs hook (buffered cap=1 channel + select-default send), leaks rtx, GCs ×2, waits on hook signal (5s fatal), then synchronously calls BeginRead + Rollback. Pre-fix flake re-validated on HEAD `7fae978` (2/10 fail under -race); post-fix 100/100 pass. Neuter-verified: removing ReleaseReader fails 3/3 with `no reader slots available`; removing hook fire fails 3/3 with 5s timeout. Production cleanup contract UNCHANGED. R1=0H/1M/1L/3nit (introduced M-1 production cite to `docs/issues/leaked-readtx-cleanup-race-flake.md` violated CLAUDE.md Issue-triage no-cite invariant → fixed in-place by retargeting to test name + `git log --all -S` mechanism; introduced L-1 godoc panic clause missing → fixed in-place; nit-1 EnterCleanup-window framing folded into inline comment; nit-2 line numbers rot → disputed; nit-3 nil-branch pattern matches local convention → disputed). R2=0H/0M/0L/0nit (converged, ship). |
 | `91a268a` | compaction-full-forest-walk-per-pass | **Closed** — Option 3 (close as obsolete + spec amend, no code change) per first-principles re-derivation finding the strict `background-maintenance.md §Cost per pass` clause "worst-case I/O is `CompactionBatchSize × (1 + depth) × PageSize` … the slab must hold the whole cascade" is SATISFIED for pwrite I/O (slab = in-memory CoW write buffer). Read cost is unenumerated, scales with live B+tree node pages (workload-history-dependent — matches `rplsegments-clone-cost` `b83846c` shape, NOT MaxSize-scaling like `0893be5` / `43ac8df`); structural ceiling `MaxSize`/`PageSize` for a fully-allocated database. No demonstrated fault — slow is not wrong/unsafe; per CLAUDE.md Project invariants the implicit "small read cost" expectation is a preference. The issue's "Related: compaction self-signals fragmentation trigger" sub-concern independently re-derived as preference (the issue itself framed it "self-limiting … arguably desirable … not a correctness defect"). Spec promotions: `background-maintenance.md §Cost per pass` rewritten into "Two cost dimensions, separately bounded" — Write cost (existing material kept, with "Bounded by `CompactionBatchSize` and depth, independent of total database size" sharpening) + new Read cost paragraph naming O(live B+tree node pages) workload-dependent with `MaxSize/PageSize` structural ceiling, citing `relocateNode`'s read-then-predicate on B+tree nodes and `relocateLeaf`'s predicate-then-relocate on overflow chains (so the O() expression precisely includes nested-tree subtree pages via the recursive `relocateNode` at `relocate.go:199`, excludes overflow chain pages which are not walked); `§Trigger` gains a paragraph documenting inclusive-count is intentional self-limiting, per-tx "don't count" flag explicitly rejected. NO code change; NO new tests. R1=0H/0M/3L/1nit (introduced L-1 §Cost-per-pass §Read-cost "page" vs "B+tree node" precision: original wording was precise for B+tree node descent but imprecise for overflow-chain case at `relocate.go:175` where predicate gates the chain read → fixed in-place: tightened to "on B+tree nodes shouldRelocate(id) runs only after the page is read … overflow chains are gated the other way, predicate-then-relocate, with no walk-time read of their pages" + "page" → "node" in 3 spots; adjacent L-2 `v0-implementation.md:2062` chunk-12.6 narrative cite of the closed slug — disputed as past-tense historical fact per close-out protocol; adjacent L-3 `handoff.md` candidate-list cites — fixed via end-of-session protocol rewrite). R2=0H/0M/0L/0nit (converged, ship). |
+| `de9e7c1` | setkeyspace-indexing-perf-and-edge | **Closed** — consolidated two-layer atomicity (chunk-7.6 H-2 wrapper-internal snap + chunk-7.9 caller `rowSnap`) to caller-only by deleting the four `applyIndexMaintenanceOn{Put,Delete}` wrappers (Keyspace + SetKeyspace mirrors) and renaming each `*Inner` to the public name. Folded chunk-7.6 Keyspace symmetric sites (`Keyspace.Put` / `Delete` / `Cursor.Delete`) under "structurally-larger-but-simpler" exception. Added 5 caller-side `restoreIndexes(ks.indexes, rowSnap)` lines on the helper-error branches; `SetKeyspace.Delete` bulk branch already restored. Disposition is **third class** outside the prior 3:3 split: no spec clause violated, but NOT a preference-drop either — a constant-factor inefficiency where the cleanup is structurally small and correct-preserving (so 3:3:1 split). Spec promotions: chunk-7.6 H-2 → chunk-7.9 evolution chain moved inline into renamed `applyIndexMaintenanceOnPut` godoc + restructured `indexSnapshot` type godoc (3-bullet Capture/Restore/Purpose contract); each caller's helper-error branch comment documents the snapshot-less helper contract. 6 new regression tests (one per caller site, each neuter-verified individually — produces deterministic pinned-mutated failure on line removal). R1=0H/2M/2L/1nit (introduced M-1 = no-cite invariant violation in new test godoc citing the slug → fixed in-place by retargeting to chunk-7.6 → chunk-7.9 evolution chain + git log mechanism; ADJACENT same-class pre-existing cite at `index_types_test.go:240` → fixed in-place; introduced M-2 = test coverage gap, only 3 mechanisms had tests but 6 caller sites bear the encoded invariant individually, reviewer empirically neuter-verified the SetKeyspace.Put line could be removed with zero suite failures → fixed by adding 3 more tests; L-1/L-2 = bulk-test godoc phrasing → fixed; nit-1 = indexSnapshot godoc structure → restructured to lead with current 3-bullet contract). R2=0H/0M/0L/0nit (converged, ship). |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -1377,8 +1554,8 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-*(none — this session's `compaction-full-forest-walk-per-pass`
-closed via spec amend + close as obsolete; no correctness-class
+*(none — this session's `setkeyspace-indexing-perf-and-edge`
+closed via consolidation fix + spec promote; no correctness-class
 or condition-triggered-now entries remain in the backlog.)*
 
 ### Undecided / needs analysis
@@ -1390,8 +1567,7 @@ or condition-triggered.)*
 
 `rpl-segment-relocation`, `pager-test-helper-export`,
 `setkeyspace-delete-range-bulk-walker`,
-`bulkload-index-merge-run-fanin`,
-`setkeyspace-indexing-perf-and-edge`. Re-validate live before
+`bulkload-index-merge-run-fanin`. Re-validate live before
 acting; some may now be obsolete.
 
 ---
@@ -1407,8 +1583,9 @@ condition-triggered; the one condition-triggered entry —
 
 1. **Re-validate the profiling-driven set first** — the recurring
    lesson says issue framings often go stale, *especially* for
-   profiling-driven items. The last six sessions proved this six
-   times, with a 3:3 split on disposition (fix vs spec-only):
+   profiling-driven items. The last seven sessions proved this
+   seven times, with a 3:3:1 split on disposition (fix via
+   substrate / spec-only / fix via cleanup):
    `shallow-savepoint-clone-cost` `43ac8df` → clause-explicit
    cost-clause violation, fix via undo-log substrate;
    `nested-shallow-loose-pop-buffer-alias` `d9ea7d4` → binary
@@ -1427,63 +1604,76 @@ condition-triggered; the one condition-triggered entry —
    wait semantics (returns ErrReadersFull IMMEDIATELY with
    no-deadline ctx, does NOT block) — fixed via deterministic
    test-only hook;
-   `compaction-full-forest-walk-per-pass` `91a268a` (this
-   session) → filed as "O(live pages) per pass, wasteful";
-   first-principles re-derivation found the §Cost per pass
-   clause quantifies WRITE I/O only ("the slab must hold the
-   whole cascade" — slab = CoW write buffer); read cost is
-   workload-history-dependent, no clause violated → spec amend
-   only, two-dimensions Cost-per-pass + §Trigger inclusive-
-   count rationale.
+   `compaction-full-forest-walk-per-pass` `91a268a` → filed as
+   "O(live pages) per pass, wasteful"; first-principles re-
+   derivation found the §Cost per pass clause quantifies WRITE
+   I/O only ("the slab must hold the whole cascade" — slab =
+   CoW write buffer); read cost is workload-history-dependent,
+   no clause violated → spec amend only, two-dimensions
+   Cost-per-pass + §Trigger inclusive-count rationale;
+   `setkeyspace-indexing-perf-and-edge` `de9e7c1` (this session) →
+   filed as "perf-only items A+B (double / per-
+   value snapshot)"; first-principles found NO clause violated
+   AND NO preference to drop — third-bucket cleanup-fix: the
+   two-layer atomicity scheme (chunk-7.6 H-2 wrapper + chunk-7.9
+   caller `rowSnap`) had its wrapper-internal snap subsumed by
+   the caller layer at chunk-7.9; consolidating to caller-only
+   is structurally small and correct-preserving. Folded the
+   chunk-7.6 Keyspace symmetric sites under structurally-larger-
+   but-simpler exception.
    The disposition is NOT predictable from issue framing alone:
    re-derive each candidate against the spec, asking
    (i) does the unenumerated cost term scale with `MaxSize`
-       (clause-explicit violation → fix) or with workload
-       history the spec already permits (preference → drop
-       from spec)?
+       (clause-explicit violation → fix via substrate) or with
+       workload history the spec already permits (preference →
+       drop from spec)?
    (ii) does the diff touch a domain concept whose invariant
        is recorded-only? if yes, audit promotion opportunity;
    (iii) does the test under inspection wait on a signal whose
        SEMANTICS match the function-under-test's actual
        behavior?
-   (iv) **new this session**: when the cost clause says
-       "worst-case I/O is X," check whether X is a WRITE-side
-       or COMPREHENSIVE expression — "the slab must hold the
-       cascade" / "the buffer must hold" / "the cascade" are
-       diagnostic signals that only writes are quantified;
-       read cost may be separately unbounded. Distinguish the
-       DIMENSION, not just the magnitude;
-   (v) **new this session**: an issue's "Related" / "Adjacent"
-       sub-concern is its OWN clause-explicit / entailed
-       invariant check — do not assume it shares the main
-       concern's disposition. Treat each as an independent
-       first-principles re-derivation; promote its spec
-       conclusion into the same close-out commit but DERIVE
-       it separately.
+   (iv) when the cost clause says "worst-case I/O is X," check
+       whether X is a WRITE-side or COMPREHENSIVE expression
+       — "the slab must hold the cascade" / "the buffer must
+       hold" / "the cascade" are diagnostic signals that only
+       writes are quantified; read cost may be separately
+       unbounded. Distinguish the DIMENSION, not just the
+       magnitude;
+   (v) an issue's "Related" / "Adjacent" sub-concern is its OWN
+       clause-explicit / entailed invariant check — do not
+       assume it shares the main concern's disposition. Treat
+       each as an independent first-principles re-derivation;
+       promote its spec conclusion into the same close-out
+       commit but DERIVE it separately;
+   (vi) **new this session**: if neither (i) clause violation
+       nor (ii) preference-drop applies, check whether a
+       structurally-simple consolidation eliminates the
+       redundancy. This is the third bucket: cleanup-fix
+       (smallest correct change applies to code shape even when
+       no bigger-O bound is violated). The signal is "the
+       redundant work was historically load-bearing but a later
+       layer subsumed its contract" — the wrapper-snap +
+       rowSnap consolidation is the canonical instance. Before
+       inferring "preference, drop from spec," check whether
+       the wasted work can simply be deleted under a structural-
+       simpler exception.
 
 2. **Among re-validated live items, prefer ones whose framing
    could be wrong in instructive ways** (Ordering criterion 3 —
    fresh-context-required > mechanical):
-   - `setkeyspace-indexing-perf-and-edge` has TWO distinct
-     sub-items (A: double snapshot in indexed Put/DeleteValue;
-     B: per-value snapshot in indexed bulk-key Delete loops
-     allocating N maps). Surface similarity to
-     `bitmap-rollback-undo-log` (`0893be5`) which already made
-     `bitmap.Snapshot` O(window-flips) — items A+B may now be
-     subsumed by that substrate (re-derive against the
-     indexing spec + transactions.md §Nested Transactions cost
-     clause to verify). If subsumed, the disposition is
-     close-as-obsolete; if not, two close-outs in one session.
    - `setkeyspace-delete-range-bulk-walker` — uses
      snapshot-then-Delete loop O(K log N) instead of the
      three-phase walker O(K + log N). The spec's DeleteRange
      cost clause (`range-delete.md`) is the test; adjacent to
-     this session's compaction-walk cost-dimension work, so
-     the cost-clause-dimension lesson (iv above) applies
-     freshly here.
+     the `91a268a` compaction-walk cost-dimension work, so the
+     cost-clause-dimension lesson (iv above) applies freshly.
+     Single sub-item, clean session shape.
    - `rpl-segment-relocation` — adjacent to recent RPL/savepoint
      area positionally; design-heavy (immovability assumption
-     may need to change).
+     may need to change). The condition trigger says "when RPL
+     pages are shown to block consolidation, or when RPL
+     relocation folds into the commit pipeline" — re-validate
+     whether either has been demonstrated.
    - `bulkload-index-merge-run-fanin` — single-pass merge opens
      O(#runs) FDs; pathological tiny buffer + huge input could
      hit EMFILE. Unreachable at default `MaxTxBufferBytes`.
@@ -1495,32 +1685,36 @@ condition-triggered; the one condition-triggered entry —
    caller arrives"); the count is still 1. Not pickable.
 
 **Recommended next candidate:**
-`setkeyspace-indexing-perf-and-edge`. Combines criteria 2 + 3
-favorably: two sub-items (A + B) share the indexing spec
-re-derivation context; high probability that the
-`bitmap-rollback-undo-log` (`0893be5`) work already subsumed one
-or both — if subsumed, close-as-obsolete is the cleanest
-disposition; if not, two close-outs in one session.
-**Pre-pick advisory:** re-derive A+B against `indexing.md` +
-`transactions.md §Nested Transactions` cost clauses; check
-whether `bitmap.Snapshot`'s O(window-flips) behavior post-0893be5
-closes the original framing. Apply the recurring-lesson check:
-this diff touches indexed Put/DeleteValue/DeleteRange (a domain
-concept); audit underlying invariants for recorded-only-but-
-violation-able gaps the way the
-`TestRPLChainOrientationMultiSegment` (chunk-orientation) and
-the `TestLeakedReadTxReleasesSlotViaCleanup` (slot-lifecycle)
-promotions were discovered. Apply this session's cost-dimension
-audit: if the framing names an "allocation count" cost, identify
-whether it's a write-side (CoW / undo-log / map clone) or
-read-side (walk / probe) expression — the spec's cost clause may
-quantify only one side. If the issue has a "Related" sub-
-concern, re-derive it independently per check (v) above.
-Additional check: if the issue's framing is "user observes high
-allocation count under workload X," verify the test or benchmark
-exists and actually exercises the workload — a framing without a
-workload fixture is itself a recorded-only invariant requiring a
-fixture before measurement.
+`setkeyspace-delete-range-bulk-walker`. Combines criterion 4
+(adjacent-to-recently-closed cost-clause work from `91a268a`
+and structurally-similar atomicity-on-the-write-path concerns
+from this session) with criterion 3 (single sub-item,
+fresh-context-required to re-derive against `range-delete.md`'s
+cost clause). The issue's "O(K log N) per-key descents vs
+O(K + log N) three-phase walker" framing pre-dates the cost-
+clause-dimension work; first-principles re-derivation should
+ask check (i) — does the cost clause name `O(K + log N)` or
+`O(K log N)` as the bound? — and check (iv) — does any cost
+text quantify writes only? **Pre-pick advisory:** read
+`range-delete.md` top-down before designing any mechanism;
+identify the canonical DeleteRange cost contract; verify
+whether the chunk-6.8 v1 implementation violates it (fix via
+walker substrate) or merely uses a structurally-different
+correct implementation that the spec already permits
+(preference-drop). The cleanup-fix third bucket from this
+session also applies: check whether the v1 implementation has
+a structurally-simple consolidation toward the walker shape
+that's not gated on bigger-O improvement.
+
+**Alternative candidate** (if user prefers a focused single-
+item session with possibly low surprise yield):
+`bulkload-index-merge-run-fanin` (extrinsic-bound shape — most
+likely a drop-preference outcome, or a "make this a documented
+caller-knob" close), or `rpl-segment-relocation` (design-heavy,
+immovability assumption). The 3:3:1+ "fix or surface a
+structural insight" split across the last seven profile-driven
+re-derivations holds high probability of an instructive outcome
+per candidate.
 
 **Alternative candidate** (if user prefers a focused single-item
 session): `setkeyspace-delete-range-bulk-walker` (adjacent to
