@@ -962,6 +962,143 @@ before designing the fix. The proof is in the receipts:
   chunk evolution chain plus the test's neuter assertion are always
   available).
 
+- **`setkeyspace-delete-range-bulk-walker`** (this session,
+  `400c95d`): three surprises beyond the issue's "perf-driven
+  walker rewrite" framing.
+
+  **First (spec internal inconsistency as the gating trap).**
+  The issue framed the work as profile-driven ("Lands:
+  opportunistic — when profiling shows DeleteRange-heavy workloads
+  bottlenecked"). First-principles re-derivation against three
+  spec files surfaced an INCONSISTENCY:
+  - `set-keyspace.md` line 17 said "Range delete on SetKeyspaces
+    uses the bulk-free mechanism described here PLUS the
+    range-delete walk of `range-delete.md`" — walker-normative.
+  - `range-delete.md §Indexed-keyspace fallback` chunk-7.10
+    amendment said "This matches the chunk-6.8
+    `SetKeyspace.DeleteRange` partial-progress contract" —
+    explicitly endorses v1 per-row-atomic.
+  - `set_keyspace.go:1191-1193` inline + `api-surface.md`
+    `SetKeyspace.DeleteRange` godoc both promised "The future
+    O(K+logN) bulk-walker rewrite will honor the same
+    (deleted_so_far, err) contract" — STRUCTURALLY IMPOSSIBLE.
+    A walker is naturally all-or-nothing OR per-leaf atomic; the
+    per-row contract requires per-row sub-savepoints OR
+    structural rework of the walker's branch-rebuild atomicity.
+
+  Three normative sources, two contradictions. The 3:3:1 + 1
+  profile-driven split now reads: this session's disposition is
+  a **fourth bucket** — spec internal inconsistency close +
+  clause-explicit re-alignment via clean-break atomicity.
+  Lesson: when an issue is filed as "perf-driven follow-up,"
+  walk THREE artifacts (the canonical spec, the chunk-N
+  amendments since filing, and the api-surface godoc) — they
+  may contain contradictory normative claims that the
+  re-derivation must surface BEFORE picking a mechanism. A
+  "future X will honor same contract" claim is the diagnostic
+  signal — verify the contract is structurally compatible with
+  the proposed mechanism; if not, the claim is itself a defect
+  the close-out must address (drop the claim and re-align the
+  inconsistency).
+
+  **Second (mechanism-space discussion + honest scope
+  estimation forced a re-pick mid-decision).** The issue's
+  proposed remediation was a single mechanism (PerCellFreeFn
+  callback). The user's pushback on my binary framing surfaced
+  a richer space: (a) v1 stays + spec-only, (b) walker
+  all-or-nothing (issue's original) + clean break, (c) streaming
+  cursor with new `SetCursor.DeleteKey()` primitive — preserves
+  per-row, no CPU win without cached-path infrastructure, (d)
+  hybrid walker-interior + per-key-boundary — mixed atomicity,
+  CPU + memory win, structurally more complex, (e)
+  configurable knob. I initially described (d) as "glue over
+  existing walker"; reading `deleteRangeFromBranch`'s recursion
+  more carefully revealed (d) needs leaf-level classification
+  ("fully in range" vs "boundary") to handle the
+  walker's-position-vs-actual-content asymmetry. **Honest scope
+  estimate surfaced mid-design**: (d) ~420 LOC; (b) ~225 LOC.
+  Per Quality bar smallest-correct-change + "Honest scope
+  estimation: if a chosen approach turns out larger or riskier
+  than the issue framed it, surface and re-confirm" — I
+  surfaced the size delta to the user, they re-picked (b)
+  walker-all-or-nothing. **Lesson**: when reviewing mechanism
+  options, do the STRUCTURAL-FIT audit (read the recursion
+  shape, identify the boundary classification logic) BEFORE
+  comparing CPU/memory/atomicity trade-offs. If the
+  structural-fit reveals a "glue over existing" claim is
+  optimistic, surface the honest size estimate and let the user
+  re-pick. Don't lock in on a non-Pareto-optimal mechanism just
+  because you've over-described it.
+
+  **Third (dispatch-direction invariants need hook-based
+  test-pinning — generalizing the `readTxCleanupHookForTest`
+  pattern).** The chunk-7.10 indexed-vs-un-indexed dispatch in
+  `SetKeyspace.DeleteRange` determines the user-facing atomicity
+  contract (atomic for un-indexed; per-row for indexed). R2 M-1
+  flagged that the un-indexed dispatch direction was not
+  test-pinned — a future refactor could silently route un-indexed
+  traffic through `deleteRangePerKey` (correct counts, correct
+  on-disk state, no leak — but per-row partial-progress contract
+  instead of atomic). All existing tests would still pass.
+  Mechanism: new btree-level `SetDeleteRangeCalledHookForTest
+  atomic.Pointer[func()]` + setter, fired once per `DeleteRange`
+  invocation at function entry. Tests install hook + run
+  workload + assert hook fired (un-indexed) or NOT fired
+  (indexed). Mirrors the `readTxCleanupHookForTest` from
+  `5800299` (deterministic-synchronization hook). The pattern
+  generalizes: when a dispatch direction determines a
+  user-facing contract, the dispatch ITSELF needs a hook +
+  positive-and-negative test to pin the contract differential.
+  Without it, a future refactor preserving the dispatch GATE
+  but changing its SEMANTIC (e.g., swapping the helper called)
+  would silently violate the contract. **Lesson**: identify
+  invariants where a dispatch-DIRECTION determines a
+  contract-DIFFERENTIAL (atomicity, cost class, error shape).
+  Spec-tier text alone is recorded-only per Project invariants;
+  test-tier hook-based pinning makes the invariant enforced.
+  Cost is ~20 LOC of hook infrastructure per dispatch.
+
+  **Fourth (test workload sizing matters for "interior path"
+  claims).** R1 M-1: my `Test...NoLeakInteriorSubtreeRetire`
+  workload (80 keys + 1 nested-tree key) docstring claimed to
+  "pin the interior-subtree retire path through FreeSubtree (the
+  chunk-5.7 walker's Phase 2)" but the resulting tree was a
+  single-level structure where Phase 2 (called at branch level
+  for entirely-in-range children) never fired —
+  `leftIdx+1 < rightIdx` empty loop. Scaling to 500 keys × 60
+  bytes forced a multi-leaf parent tree with cellCount >= 2
+  branches; added a probe assertion (`if cellCount < 2: Fatal`)
+  to make the workload-size constraint impossible to silently
+  shrink in future edits. Lesson: when a test docstring claims
+  to "pin path X via mechanism Y," verify the test workload's
+  STRUCTURAL SHAPE actually exercises mechanism Y. The probe
+  pattern (in-test assertion that the workload reached the
+  expected shape) is the defense against silent shrinkage —
+  add it whenever the test's coverage depends on a particular
+  tree depth, cellCount, or descent-path topology.
+
+  **Fifth (spec-tier `violation=` clauses must describe
+  reachable runtime input/state, not "future refactor"
+  scenarios).** R3 M-1: my first cut of the new entailed
+  dispatch invariant's `violation=` clause read "A future
+  refactor routes un-indexed through the per-row path. ... A
+  caller relying on the atomicity contract sees their assumed
+  contract silently broken." This describes a code-MODIFICATION
+  scenario, not a reachable input/state per CLAUDE.md Project
+  invariants: "violation= must be a reachable in-spec
+  input/state → wrong/unsafe result." Re-wrote to describe the
+  reachable runtime failure: "A caller invokes DeleteRange on
+  an un-indexed Kind=1 keyspace; the operation hits a pager
+  error mid-walk; the caller's subsequent same-tx read sees N
+  rows already gone — partial mutation contradicts the
+  documented atomic contract." Lesson: when writing entailed-
+  invariant `violation=` clauses for dispatch-direction or
+  contract-shape invariants, frame the violation as a
+  reachable user-input + user-observable wrong/unsafe result.
+  "A future refactor" framings violate the reachability
+  requirement and become recorded-only encoding nits per R3
+  audit.
+
 **Trap pattern to watch for:** the issue cites a "well-known"
 invariant or rationale that the actual spec doesn't state, OR proposes
 a one-line fix that introduces a new bug (same class as the one it's
@@ -1445,85 +1582,109 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `setkeyspace-indexing-perf-and-edge` —
-picked per the user's confirmation of the recommendation at
-session-start. Re-validated on HEAD `22492c9`: the issue's
-items A (double snapshot in indexed `SetKeyspace.Put` /
-`DeleteValue`) and B (per-value snapshot in indexed bulk-key
-`Delete` loops over N members allocating N maps) reproduce
-exactly as described in `index_setkeyspace.go` and
-`set_keyspace.go`; existing tests green. First-principles
-re-derivation found the consolidation fix sits OUTSIDE the
-prior 3:3 profile-driven split: no spec clause was being
-violated (the bulk-op cost clause
-`O(entries × (indexes + extractor))` already permits the 2×
-constant factor), but the redundancy ALSO wasn't a preference-
-to-drop (no spec text recorded an "O(I) snapshot per op"
-expectation). Re-derived as a *third class*: a constant-factor
-inefficiency where the cleanup is structurally small and
-correct-preserving. The two layers (chunk-7.6 H-2 wrapper-
-internal snap + chunk-7.9 caller `rowSnap`) were historically
-both load-bearing; after chunk-7.9 added the caller layer, it
-subsumed the wrapper's contract entirely. Folded the chunk-7.6
-Keyspace symmetric sites (`Keyspace.Put` / `Delete` /
-`Cursor.Delete`) under Quality bar's "structurally-larger-but-
-simpler" exception — one consistent mechanism across Keyspace
-+ SetKeyspace.
+This session closed `setkeyspace-delete-range-bulk-walker` (commit
+`400c95d`) — picked per the user's confirmation of the
+recommendation at session-start. Re-validated on HEAD `aa9cfd7`:
+the v1 SetKeyspace.DeleteRange's snapshot-then-Delete loop in
+`set_keyspace.go:1220-1278` reproduced as described
+(`O(K log N)` per-key descents + `O(K × keysize)` snapshot
+allocation upfront). First-principles re-derivation surfaced a
+spec internal inconsistency: `set-keyspace.md` line 17 said
+"Range delete on SetKeyspaces uses … the range-delete walk of
+range-delete.md" (sounds walker-normative), but the chunk-6.8
+user-locked partial-progress contract + chunk-7.10 "matches the
+chunk-6.8 SetKeyspace.DeleteRange partial-progress contract"
+amendment locked the v1 per-row-atomic behavior; the
+api-surface.md godoc promised "future O(K+log N) bulk-walker
+rewrite will honor the same (deleted_so_far, err) contract" —
+structurally impossible (a walker is naturally all-or-nothing OR
+per-leaf, not per-row without per-row sub-savepoints).
 
-Disposition: **fix** (not preference-drop). Deleted four
-wrapper functions and renamed each `*Inner` → public name
-(`Keyspace.applyIndexMaintenanceOn{Put,Delete}`,
-`SetKeyspace.applyIndexMaintenanceOn{AddValue,RemoveValue}`).
-Added 5 caller-side `restoreIndexes(ks.indexes, rowSnap)` lines
-to the helper-error branches (`Keyspace.Put` / `Delete` /
-`Cursor.Delete` and `SetKeyspace.Put` / `DeleteValue`);
-`SetKeyspace.Delete` bulk branch already restored. Spec
-promotions: chunk-7.6 H-2 → chunk-7.9 evolution chain moved
-inline into the (renamed) `applyIndexMaintenanceOnPut` godoc +
-the `indexSnapshot` type godoc (new 3-bullet Capture / Restore
-/ Purpose contract); each caller site's helper-error branch
-comment documents "the helper does not snapshot pinned state —
-see its godoc."
+User-picked mechanism after a 4-round discussion exploring the
+mechanism space (v1 stay, walker-all-or-nothing, streaming
+cursor, hybrid mixed-atomicity, configurable knob): **walker
+all-or-nothing** for un-indexed (Option B), preserving per-row
+atomic for indexed via dispatch (matches Keyspace.DeleteRange's
+chunk-7.10 split). Honest scope estimate surfaced mid-discussion:
+hybrid (d) was ~2× larger code (~420 LOC) for ~0 practical-
+failure-mode benefit; user re-confirmed clean-break atomic walker
+shape (~225 LOC).
 
-6 new regression tests (one per caller site, each neuter-
-verified individually — removing the named line produces
-deterministic failure with the first processed index's pinned
-mutated):
-- `TestIndexedPutPinnedStateRevertsAfterMidLoopFailure`
-- `TestIndexedDeletePinnedStateRevertsAfterMidLoopFailure`
-- `TestCursorDeletePinnedStateRevertsAfterMidLoopFailure`
-- `TestSetKeyspacePutPinnedStateRevertsAfterMidLoopFailure`
-- `TestSetKeyspaceDeleteValuePinnedStateRevertsAfterMidLoopFailure`
-- `TestSetKeyspaceBulkDeletePinnedStateRevertsAfterMidLoopFailure`
+Disposition: **fix** (clause-explicit close — set-keyspace.md
+line 17 + spec internal inconsistency + the actual perf benefit
+all align under one mechanism). New
+`btree.PerCellFreeFn` type + threaded through
+`deleteRangeFrom*`; new `keyspaceCellFree` (Kind=0: overflow +
+count=1) + `setKeyspaceCellFree` (Kind=1: subpage Count /
+NestedCount via `FreeSubtree` / overflow + count=1) callbacks.
+`SetKeyspace.DeleteRange` dispatches by `len(ks.indexes) > 0`:
+indexed → lifted `deleteRangePerKey` (wrap-immune accumulator
+per R2 L-2); un-indexed → `btree.DeleteRange` with
+`setKeyspaceCellFree`. `Keyspace.DeleteRange` updated to pass
+`keyspaceCellFree`.
 
-R1=0H/2M/2L/1nit (introduced M-1 = no-cite invariant violation
-in new test godoc citing `setkeyspace-indexing-perf-and-edge`
-slug → fixed in-place by retargeting to chunk-7.6 → chunk-7.9
-evolution chain + test's own neuter clause as kept-current
-anchor; ADJACENT pre-existing same-class cite in
-`index_types_test.go:240` → fixed in-place under smallest-
-correct-change because already doing wide grep-and-fix for
-close-out; introduced M-2 = test-coverage encoding gap — only
-3 mechanisms had tests but 6 caller sites bear the encoded
-invariant individually; reviewer neuter-verified the
-SetKeyspace.Put line could be removed with zero suite failures
-→ fixed by adding 3 more tests; L-1/L-2 = bulk-test godoc
-phrasing implied differential coverage of the consolidation
-→ fixed by plain "Pins the invariant" framing + clarifying
-neuter targets a pre-existing line; nit-1 = `indexSnapshot`
-godoc style → restructured to lead with current 3-bullet
-contract).
-R2=0H/0M/0L/0nit (converged, ship).
+Spec promotions: `range-delete.md` gains new `§Set Keyspace
+Range Delete` section describing dispatch + atomicity contracts
+(atomic un-indexed + per-row indexed); `set-keyspace.md` line 17
+narrative aligned (drops walker-shape over-claim); `set-keyspace.md`
+§Invariants gains new entailed dispatch-direction invariant
+recording the contract differential and citing the
+`SetDeleteRangeCalledHookForTest` instrumentation hook (R2 M-1);
+`api-surface.md` `Keyspace.DeleteRange` godoc gains atomicity-
+contract spell-out matching `SetKeyspace.DeleteRange`'s godoc
+(spec-amend 1).
 
-3:3:1 split now across seven profile-driven closes:
-`0893be5` / `43ac8df` / `5800299` → clause-explicit violation
-→ fix via substrate; `b83846c` / `9d060ba` / `91a268a` →
-preference → spec-amend only; THIS session → neither (no
-clause violated, no preference to drop) → fix via constant-
-factor cleanup (delete-redundant-wrapper consolidation).
+5 new regression tests (each neuter-verified individually):
+- `TestSetKeyspaceDeleteRangeUnindexedNoLeakWithNestedTreeAtBoundary`
+- `TestSetKeyspaceDeleteRangeUnindexedNoLeakInteriorSubtreeRetire`
+  (workload scaled to 500 keys × 60-byte keys to force a multi-
+  leaf parent tree so Phase 2 `FreeSubtree` actually fires per
+  R1 M-1 fix; probe assertion fails the test if root is not a
+  TypeBranch with cellCount >= 2)
+- `TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance`
+- `TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker` (R2 M-1
+  hook-based dispatch pinning)
+- `TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker`
 
-Prior session closed `compaction-full-forest-walk-per-pass` —
-see commit `91a268a` for that change set's details.
+R1=0H/3M/2L/2nit (M-1 test interior-path workload too small +
+M-2 docstring over-claims + M-3 spec atomic-on-error wording
+missing in-memory pre-call state sentence — all fixed in-place;
+L-1 NestedRoot==0 strictness disputed; L-2 error-wrap depth
+divergence disputed; nit-1/2 godoc rewords fixed).
+R2=0H/1M/2L/0nit (introduced M-1 un-indexed dispatch not
+test-pinned → user picked fix-in-place via new
+`SetDeleteRangeCalledHookForTest` hook + 2 dispatch tests;
+introduced L-1 NestedCount sanity check absent in
+`setKeyspaceCellFree` → user picked fix-in-place mirroring
+`SetKeyspace.Delete`'s defense; introduced L-2 `deleteRangePerKey`
+before/after subtraction → user picked fix-in-place via wrap-
+immune per-iteration accumulator; spec-amend 1 → user picked
+mirror to Keyspace; spec-amend 2 → user picked add entailed
+invariant).
+R3=0H/2M/4L/1nit (introduced M-1 violation= clause reachability
+mis-framed → fixed in-place rewriting to "caller invokes
+DeleteRange + pager error mid-walk" reachable user-visible
+fault; introduced M-2 dispatch tests asserted only hook, no
+count → fixed in-place adding `n != 2` assertions; introduced L-3
+comment phrasing "Mirrors Keyspace.deleteRangeIndexed's
+wrap-immune shape" inaccurate → fixed in-place; introduced L-4
+entailed from= claim now clause-explicit → fixed in-place
+re-framing; L-1 Begin error nil-deref pervasive pattern
+adjacent; L-2 interior-path NestedCount asymmetry adjacent — pre-
+existing freeSubtreeAt; loop converged).
+
+3:3:2 split now across eight profile-driven closes:
+`0893be5` / `43ac8df` / `5800299` → clause-explicit violation →
+fix via substrate; `b83846c` / `9d060ba` / `91a268a` →
+preference → spec-amend only; `de9e7c1` → third-class cleanup-
+fix (no clause violated, no preference to drop, structural
+redundancy consolidation); THIS session → spec internal
+inconsistency + clause-explicit close (set-keyspace.md line 17
+walker promise + spec ↔ impl gap + clean-break atomicity
+realignment).
+
+Prior session closed `setkeyspace-indexing-perf-and-edge` — see
+commit `de9e7c1` for that change set's details.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -1547,6 +1708,7 @@ see commit `91a268a` for that change set's details.
 | `5800299` | leaked-readtx-cleanup-race-flake | **Closed** — first-principles re-derivation found the deeper root cause is `BeginRead` returning `ErrReadersFull` immediately (no-deadline `ctx` does NOT block on slot — `internal/lock/coord_reader.go:75-77`); the test's goroutine + 5s wall-clock timer assumed blocking. No "longer wait" Option 2 would have closed the flake — the wait shape was structurally wrong. Fix: deterministic test-only synchronization hook fired at the tail of `readTxCleanupFn`'s active-release path (after `info.coord.ReleaseReader(info.slot)`). New `readTxCleanupHookForTest atomic.Pointer[func()]` + `setReadTxCleanupHookForTest` setter in `read_tx.go`, mirroring `writeRegistryFailHookForTest` / `indexMaintenanceFailHookForTest` pattern. Hook fires INSIDE the EnterCleanup/ExitCleanup window — `closeGate.BeginClose`'s drain naturally waits for it; non-blocking constraint inherited per `leak-detection.md §Cleanup Behavior`. `TestLeakedReadTxReleasesSlotViaCleanup` refactored: installs hook (buffered cap=1 channel + select-default send), leaks rtx, GCs ×2, waits on hook signal (5s fatal), then synchronously calls BeginRead + Rollback. Pre-fix flake re-validated on HEAD `7fae978` (2/10 fail under -race); post-fix 100/100 pass. Neuter-verified: removing ReleaseReader fails 3/3 with `no reader slots available`; removing hook fire fails 3/3 with 5s timeout. Production cleanup contract UNCHANGED. R1=0H/1M/1L/3nit (introduced M-1 production cite to `docs/issues/leaked-readtx-cleanup-race-flake.md` violated CLAUDE.md Issue-triage no-cite invariant → fixed in-place by retargeting to test name + `git log --all -S` mechanism; introduced L-1 godoc panic clause missing → fixed in-place; nit-1 EnterCleanup-window framing folded into inline comment; nit-2 line numbers rot → disputed; nit-3 nil-branch pattern matches local convention → disputed). R2=0H/0M/0L/0nit (converged, ship). |
 | `91a268a` | compaction-full-forest-walk-per-pass | **Closed** — Option 3 (close as obsolete + spec amend, no code change) per first-principles re-derivation finding the strict `background-maintenance.md §Cost per pass` clause "worst-case I/O is `CompactionBatchSize × (1 + depth) × PageSize` … the slab must hold the whole cascade" is SATISFIED for pwrite I/O (slab = in-memory CoW write buffer). Read cost is unenumerated, scales with live B+tree node pages (workload-history-dependent — matches `rplsegments-clone-cost` `b83846c` shape, NOT MaxSize-scaling like `0893be5` / `43ac8df`); structural ceiling `MaxSize`/`PageSize` for a fully-allocated database. No demonstrated fault — slow is not wrong/unsafe; per CLAUDE.md Project invariants the implicit "small read cost" expectation is a preference. The issue's "Related: compaction self-signals fragmentation trigger" sub-concern independently re-derived as preference (the issue itself framed it "self-limiting … arguably desirable … not a correctness defect"). Spec promotions: `background-maintenance.md §Cost per pass` rewritten into "Two cost dimensions, separately bounded" — Write cost (existing material kept, with "Bounded by `CompactionBatchSize` and depth, independent of total database size" sharpening) + new Read cost paragraph naming O(live B+tree node pages) workload-dependent with `MaxSize/PageSize` structural ceiling, citing `relocateNode`'s read-then-predicate on B+tree nodes and `relocateLeaf`'s predicate-then-relocate on overflow chains (so the O() expression precisely includes nested-tree subtree pages via the recursive `relocateNode` at `relocate.go:199`, excludes overflow chain pages which are not walked); `§Trigger` gains a paragraph documenting inclusive-count is intentional self-limiting, per-tx "don't count" flag explicitly rejected. NO code change; NO new tests. R1=0H/0M/3L/1nit (introduced L-1 §Cost-per-pass §Read-cost "page" vs "B+tree node" precision: original wording was precise for B+tree node descent but imprecise for overflow-chain case at `relocate.go:175` where predicate gates the chain read → fixed in-place: tightened to "on B+tree nodes shouldRelocate(id) runs only after the page is read … overflow chains are gated the other way, predicate-then-relocate, with no walk-time read of their pages" + "page" → "node" in 3 spots; adjacent L-2 `v0-implementation.md:2062` chunk-12.6 narrative cite of the closed slug — disputed as past-tense historical fact per close-out protocol; adjacent L-3 `handoff.md` candidate-list cites — fixed via end-of-session protocol rewrite). R2=0H/0M/0L/0nit (converged, ship). |
 | `de9e7c1` | setkeyspace-indexing-perf-and-edge | **Closed** — consolidated two-layer atomicity (chunk-7.6 H-2 wrapper-internal snap + chunk-7.9 caller `rowSnap`) to caller-only by deleting the four `applyIndexMaintenanceOn{Put,Delete}` wrappers (Keyspace + SetKeyspace mirrors) and renaming each `*Inner` to the public name. Folded chunk-7.6 Keyspace symmetric sites (`Keyspace.Put` / `Delete` / `Cursor.Delete`) under "structurally-larger-but-simpler" exception. Added 5 caller-side `restoreIndexes(ks.indexes, rowSnap)` lines on the helper-error branches; `SetKeyspace.Delete` bulk branch already restored. Disposition is **third class** outside the prior 3:3 split: no spec clause violated, but NOT a preference-drop either — a constant-factor inefficiency where the cleanup is structurally small and correct-preserving (so 3:3:1 split). Spec promotions: chunk-7.6 H-2 → chunk-7.9 evolution chain moved inline into renamed `applyIndexMaintenanceOnPut` godoc + restructured `indexSnapshot` type godoc (3-bullet Capture/Restore/Purpose contract); each caller's helper-error branch comment documents the snapshot-less helper contract. 6 new regression tests (one per caller site, each neuter-verified individually — produces deterministic pinned-mutated failure on line removal). R1=0H/2M/2L/1nit (introduced M-1 = no-cite invariant violation in new test godoc citing the slug → fixed in-place by retargeting to chunk-7.6 → chunk-7.9 evolution chain + git log mechanism; ADJACENT same-class pre-existing cite at `index_types_test.go:240` → fixed in-place; introduced M-2 = test coverage gap, only 3 mechanisms had tests but 6 caller sites bear the encoded invariant individually, reviewer empirically neuter-verified the SetKeyspace.Put line could be removed with zero suite failures → fixed by adding 3 more tests; L-1/L-2 = bulk-test godoc phrasing → fixed; nit-1 = indexSnapshot godoc structure → restructured to lead with current 3-bullet contract). R2=0H/0M/0L/0nit (converged, ship). |
+| `400c95d` | setkeyspace-delete-range-bulk-walker | **Closed** — un-indexed `SetKeyspace.DeleteRange` migrated from chunk-6.8 v1 snapshot-then-Delete loop (`O(K log N)` per-key descents + `O(K × keysize)` upfront snapshot) to the chunk-5.7 atomic three-phase walker via new `btree.PerCellFreeFn` callback abstraction. Indexed path preserved per-row via lifted `deleteRangePerKey` (chunk-7.10 contract retained). Atomicity change for un-indexed: per-row → atomic (`(0, err)` on failure), clean break of chunk-6.8 user-lock per pre-v1 default. `keyspaceCellFree` (overflow + count=1) + `setKeyspaceCellFree` (subpage Count / NestedCount via `FreeSubtree` with NestedCount sanity check / overflow + count=1) callbacks; the walker stays SetKeyspace-agnostic. Spec promotions: `range-delete.md §Set Keyspace Range Delete` (new section), `set-keyspace.md` §17 narrative align + §Invariants new entailed dispatch-direction invariant, `api-surface.md` symmetric atomicity-contract godoc on both `SetKeyspace.DeleteRange` (new spell-out) and `Keyspace.DeleteRange` (R2 spec-amend 1 — mirrored from SetKeyspace). New `SetDeleteRangeCalledHookForTest` instrumentation hook in `internal/btree/range_delete.go` (mirrors `readTxCleanupHookForTest` pattern from `5800299`) pins the dispatch-direction invariant via 2 dispatch-direction tests. 5 new regression tests: `TestSetKeyspaceDeleteRangeUnindexedNoLeakWithNestedTreeAtBoundary`, `TestSetKeyspaceDeleteRangeUnindexedNoLeakInteriorSubtreeRetire` (workload scaled per R1 M-1 + probe asserts cellCount >= 2), `TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance`, `TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker`, `TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker` — all neuter-verified individually. R1=0H/3M/2L/2nit (introduced M-1 interior-path workload too small + M-2 docstring over-claims + M-3 spec atomic-on-error wording missing in-memory pre-call state sentence; all fixed in-place; L-1/L-2 disputed; nit-1/2 fixed). R2=0H/1M/2L/0nit (introduced M-1 un-indexed dispatch not test-pinned → user picked fix-in-place via hook + 2 tests; introduced L-1 NestedCount sanity check absent → fixed in-place mirroring SetKeyspace.Delete; introduced L-2 `deleteRangePerKey` before/after subtraction → fixed in-place via wrap-immune per-iteration accumulator; spec-amend 1 → Keyspace.DeleteRange godoc parity; spec-amend 2 → entailed dispatch invariant added). R3=0H/2M/4L/1nit (introduced M-1 violation= reachability mis-framed → fixed in-place; M-2 dispatch tests missed count assertion → fixed by adding `n != 2`; introduced L-3 comment phrasing inaccurate + L-4 from= clause encoding nit → fixed in-place; L-1/L-2 adjacent; loop converged). |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -1566,9 +1728,8 @@ or condition-triggered.)*
 ### Profiling-driven / condition-triggered (re-validate before pulling)
 
 `rpl-segment-relocation`, `pager-test-helper-export`,
-`setkeyspace-delete-range-bulk-walker`,
-`bulkload-index-merge-run-fanin`. Re-validate live before
-acting; some may now be obsolete.
+`bulkload-index-merge-run-fanin`. Re-validate live before acting;
+some may now be obsolete.
 
 ---
 
@@ -1611,7 +1772,7 @@ condition-triggered; the one condition-triggered entry —
    CoW write buffer); read cost is workload-history-dependent,
    no clause violated → spec amend only, two-dimensions
    Cost-per-pass + §Trigger inclusive-count rationale;
-   `setkeyspace-indexing-perf-and-edge` `de9e7c1` (this session) →
+   `setkeyspace-indexing-perf-and-edge` `de9e7c1` →
    filed as "perf-only items A+B (double / per-
    value snapshot)"; first-principles found NO clause violated
    AND NO preference to drop — third-bucket cleanup-fix: the
@@ -1621,6 +1782,23 @@ condition-triggered; the one condition-triggered entry —
    is structurally small and correct-preserving. Folded the
    chunk-7.6 Keyspace symmetric sites under structurally-larger-
    but-simpler exception.
+   `setkeyspace-delete-range-bulk-walker` `400c95d` (this session) →
+   filed as "v1 snapshot-then-Delete is O(K log N), the chunk-5.7
+   walker is O(K + log N) — perf-driven follow-up"; first-principles
+   re-derivation surfaced a spec internal inconsistency: `set-
+   keyspace.md` line 17 said "Range delete on SetKeyspaces uses …
+   the range-delete walk of range-delete.md" (walker-normative) but
+   chunk-6.8 user-lock + chunk-7.10 amendment + api-surface.md godoc
+   together preserved the v1 per-row-atomic contract while promising
+   a "future walker that honors the same (deleted_so_far, err)
+   contract" — structurally impossible (a walker is naturally all-
+   or-nothing or per-leaf, not per-row). User picked clean-break
+   atomic walker for un-indexed (Option B) over hybrid mixed-atomicity
+   (Option D, ~2× larger) after honest-scope reveal mid-decision.
+   Disposition fits a new bucket: **spec internal inconsistency
+   close + clause-explicit re-alignment + clean-break atomicity to
+   stronger contract**. Filed-and-closed via the chunk-5.7 walker
+   substrate; chunk-7.10 indexed dispatch preserved.
    The disposition is NOT predictable from issue framing alone:
    re-derive each candidate against the spec, asking
    (i) does the unenumerated cost term scale with `MaxSize`
@@ -1661,70 +1839,43 @@ condition-triggered; the one condition-triggered entry —
 2. **Among re-validated live items, prefer ones whose framing
    could be wrong in instructive ways** (Ordering criterion 3 —
    fresh-context-required > mechanical):
-   - `setkeyspace-delete-range-bulk-walker` — uses
-     snapshot-then-Delete loop O(K log N) instead of the
-     three-phase walker O(K + log N). The spec's DeleteRange
-     cost clause (`range-delete.md`) is the test; adjacent to
-     the `91a268a` compaction-walk cost-dimension work, so the
-     cost-clause-dimension lesson (iv above) applies freshly.
-     Single sub-item, clean session shape.
+   - `bulkload-index-merge-run-fanin` — single-pass merge opens
+     O(#runs) FDs; pathological tiny buffer + huge input could
+     hit EMFILE. Unreachable at default `MaxTxBufferBytes`.
+     EXTRINSIC bound shape (FD limit) — possibly
+     drop-preference not fix.
    - `rpl-segment-relocation` — adjacent to recent RPL/savepoint
      area positionally; design-heavy (immovability assumption
      may need to change). The condition trigger says "when RPL
      pages are shown to block consolidation, or when RPL
      relocation folds into the commit pipeline" — re-validate
      whether either has been demonstrated.
-   - `bulkload-index-merge-run-fanin` — single-pass merge opens
-     O(#runs) FDs; pathological tiny buffer + huge input could
-     hit EMFILE. Unreachable at default `MaxTxBufferBytes`.
-     EXTRINSIC bound shape (FD limit) — possibly
-     drop-preference not fix.
 
 3. **`pager-test-helper-export`** remains blocked on its
    trigger ("when a second cross-package writer-pager fixture
    caller arrives"); the count is still 1. Not pickable.
 
 **Recommended next candidate:**
-`setkeyspace-delete-range-bulk-walker`. Combines criterion 4
-(adjacent-to-recently-closed cost-clause work from `91a268a`
-and structurally-similar atomicity-on-the-write-path concerns
-from this session) with criterion 3 (single sub-item,
-fresh-context-required to re-derive against `range-delete.md`'s
-cost clause). The issue's "O(K log N) per-key descents vs
-O(K + log N) three-phase walker" framing pre-dates the cost-
-clause-dimension work; first-principles re-derivation should
-ask check (i) — does the cost clause name `O(K + log N)` or
-`O(K log N)` as the bound? — and check (iv) — does any cost
-text quantify writes only? **Pre-pick advisory:** read
-`range-delete.md` top-down before designing any mechanism;
-identify the canonical DeleteRange cost contract; verify
-whether the chunk-6.8 v1 implementation violates it (fix via
-walker substrate) or merely uses a structurally-different
-correct implementation that the spec already permits
-(preference-drop). The cleanup-fix third bucket from this
-session also applies: check whether the v1 implementation has
-a structurally-simple consolidation toward the walker shape
-that's not gated on bigger-O improvement.
+`bulkload-index-merge-run-fanin`. Single sub-item, clean session
+shape. Pre-pick advisory: read `bulkload.md` top-down + the
+chunk-8.6 indexed-bulkload sort-spill mechanism. The issue says
+"unreachable at default `MaxTxBufferBytes`" — verify by computing
+the EMFILE threshold (typical ulimit -n 1024 / 4096 / 8192) against
+the worst-case run-fan-in at min `MaxTxBufferBytes`. If genuinely
+unreachable in practice → preference-drop with spec note. If
+reachable at small enough `MaxTxBufferBytes` → fix via cascaded
+multi-pass merge OR caller-knob exposure. Apply the seven-prior-
+session checks (i) — does the cost clause name O(#runs) FD usage?
+— (iii) — is the failure mode a graceful abort vs corruption? —
+and check whether this session's spec internal inconsistency
+pattern applies (does the bulkload.md spec describe a different
+shape than chunk-8.6 implements?).
 
-**Alternative candidate** (if user prefers a focused single-
-item session with possibly low surprise yield):
-`bulkload-index-merge-run-fanin` (extrinsic-bound shape — most
-likely a drop-preference outcome, or a "make this a documented
-caller-knob" close), or `rpl-segment-relocation` (design-heavy,
-immovability assumption). The 3:3:1+ "fix or surface a
-structural insight" split across the last seven profile-driven
-re-derivations holds high probability of an instructive outcome
-per candidate.
-
-**Alternative candidate** (if user prefers a focused single-item
-session): `setkeyspace-delete-range-bulk-walker` (adjacent to
-this session's cost-dimension work, single sub-item),
-`bulkload-index-merge-run-fanin` (extrinsic-bound shape — most
-likely a drop-preference outcome), or `rpl-segment-relocation`
-(design-heavy, immovability assumption). The 3:3+ "fix or surface
-a structural insight" split across the last six profile-driven
-re-derivations holds high probability of an instructive outcome
-per candidate.
+**Alternative candidate** (if user prefers design-heavy work):
+`rpl-segment-relocation` (immovability assumption may need to
+change; design-heavy). The 3:3:2 "fix or surface a structural
+insight" split across the last eight profile-driven re-derivations
+holds high probability of an instructive outcome per candidate.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
