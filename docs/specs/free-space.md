@@ -376,7 +376,7 @@ Maintained incrementally:
 
 - **Append** (commit with retired pages): new segment IDs appended.
 - **Reclaim** (tail consumption): consumed segment IDs removed
-  from the front.
+  from the tail (slice index 0).
 
 Stored on the `DB` struct; access guarded by the write lock.
 

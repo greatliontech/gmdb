@@ -463,13 +463,13 @@ window and no alias can form regardless of which kind is at the
 top of the stack.
 
 Per-tx-body mid-tx mutations to `rplSegments` (only `reclaimRPL`'s
-head trim, which monotonically shrinks the chain — `appendRPL`'s
+tail trim, which monotonically shrinks the chain — `appendRPL`'s
 commit-time append runs after every savepoint has resolved, never
 inside a window) are not undo-logged; the savepoint clones the chain
 slice at capture instead. The clone is O(chain length), independent
 of `MaxSize` and of per-tx mutation count, but **workload-dependent
 at cross-tx granularity**: each commit that retires pages appends one
-or more segments, and `reclaimRPL` can only drain head segments whose
+or more segments, and `reclaimRPL` can only drain tail segments whose
 `TxnID < reclamationBound`, so a lagging reader pinning an old
 `TxnID` blocks reclamation across writer commits and lets the chain
 accumulate proportionally to retired-pages-pending-reclamation until

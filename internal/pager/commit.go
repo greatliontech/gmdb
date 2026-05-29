@@ -231,10 +231,13 @@ func (p *Pager) commitStep0() error {
 //
 // Allocation and encoding are split into two phases to close the
 // self-reference race the round-1 review caught: phase 1 reserves all
-// segment page IDs (allocator may trigger RPL reclamation, which can
-// pop the existing chain head); phase 2 captures `prevHead` from the
-// post-reservation chain state, then encodes segments with
-// `OlderSegment` links that never point to a page reclaimed in phase 1.
+// segment page IDs (allocator may trigger RPL reclamation, which
+// drains oldest segments from the chain tail per the SetRPLChain
+// convention and in the full-drain limit empties the chain, after
+// which headPageID() returns 0); phase 2 captures `prevHead` from
+// the post-reservation chain state, then encodes segments with
+// `OlderSegment` links that never point to a page reclaimed in
+// phase 1.
 func (p *Pager) appendRPL() error {
 	capPerSeg := page.RPLEntriesPerSegment(p.cfg)
 	if capPerSeg <= 0 {

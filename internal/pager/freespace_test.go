@@ -339,6 +339,121 @@ func TestReclaimRPLRespectsBound(t *testing.T) {
 	}
 }
 
+// TestRPLChainOrientationMultiSegment pins the chain-orientation
+// invariant defined at SetRPLChain (internal/pager/pager.go) and
+// free-space.md §RPL in-memory segment list: tail = index 0 = oldest
+// TxnID, head = last index = newest TxnID. A future refactor that
+// reverses the ordering — by repurposing head/tail to mean the slice's
+// other end — would silently produce wrong-result reclamation (e.g.
+// draining the newest segments first, leaving older ones unreachable
+// to readers that need them) and break OlderSegment encoding in
+// appendRPL. Single-segment fixtures (TestReclaimRPL,
+// TestReclaimRPLRespectsBound, the lagging-reader tests) cannot
+// distinguish tail-first from head-first drain; this test uses three
+// segments with a partial reclamation bound so the surviving segment's
+// identity is the discriminator.
+func TestRPLChainOrientationMultiSegment(t *testing.T) {
+	p, _, f := setupWriter(t, 32)
+	defer p.Close()
+	defer f.Close()
+
+	cfg := page.Config{PageSize: testPageSize}
+
+	// Encode three RPL segments on disk so reclaimRPL's
+	// DecodeRPLSegment succeeds for each. PageIDs ascend with TxnIDs
+	// purely as a convention-neutral test layout — what matters is
+	// (TxnID, expected drain order) and which slice index a given
+	// segment lives at after SetRPLChain.
+	const (
+		tailPageID  = 10  // ordered tail per convention: index 0, oldest
+		midPageID   = 11  // middle: index 1
+		headPageID  = 12  // ordered head per convention: last index, newest
+		tailPayload = 20
+		midPayload  = 21
+		headPayload = 22
+		tailTxnID   = 100
+		midTxnID    = 200
+		headTxnID   = 300
+	)
+	segments := []struct {
+		pageID, payload uint64
+		txnID           uint64
+	}{
+		{tailPageID, tailPayload, tailTxnID},
+		{midPageID, midPayload, midTxnID},
+		{headPageID, headPayload, headTxnID},
+	}
+	for _, seg := range segments {
+		buf := make([]byte, testPageSize)
+		page.EncodeRPLSegment(buf, cfg, seg.txnID, 0, []uint64{seg.payload})
+		if _, err := f.WriteAt(buf, int64(seg.pageID)*int64(testPageSize)); err != nil {
+			t.Fatalf("write seg page %d: %v", seg.pageID, err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// Re-open so the mmap picks up the on-disk segments. Re-seed the
+	// chain tail-first per the SetRPLChain convention.
+	p.Close()
+	pool := NewBufPool(testPageSize)
+	p, err := NewWriter(f, cfg, 32*testPageSize, pool, 16<<20)
+	if err != nil {
+		t.Fatalf("re-open: %v", err)
+	}
+	bm := bitmap.New(make([]byte, testPageSize), testPageSize, 1, 32)
+	p.AttachBitmap(bm)
+	p.SetRPLChain([]RPLSegmentRef{
+		{PageID: tailPageID, TxnID: tailTxnID, Count: 1},
+		{PageID: midPageID, TxnID: midTxnID, Count: 1},
+		{PageID: headPageID, TxnID: headTxnID, Count: 1},
+	})
+
+	// Property 1: head = last index per the convention.
+	// headPageID() must return the newest segment's PageID, which is
+	// the last index of the seeded slice. A refactor that swapped to
+	// rplSegments[0].PageID would return tailPageID and fail here.
+	if got := p.headPageID(); got != headPageID {
+		t.Errorf("headPageID() = %d, want %d (last index per chain convention)", got, headPageID)
+	}
+
+	// Property 2: reclaimRPL drains the tail first.
+	// Set the bound between midTxnID and headTxnID so the tail
+	// (TxnID=100) and middle (TxnID=200) drain; the head (TxnID=300)
+	// survives. If the implementation drained head-first instead,
+	// the surviving entry would be the tail (TxnID=100), and the
+	// count would still be 4 (same number of segments below bound),
+	// so the survivor's identity is what distinguishes orientations.
+	p.SetCommitState(bm.FirstDataPage(), 32, 250)
+
+	count := p.reclaimRPL()
+	// Expected: 2 payload pages (tailPayload, midPayload) + 2 segment
+	// pages (tailPageID, midPageID) = 4 bits set.
+	if count != 4 {
+		t.Errorf("reclaimRPL count = %d, want 4 (2 payloads + 2 segment pages)", count)
+	}
+	chain := p.RPLChain()
+	if len(chain) != 1 {
+		t.Fatalf("post-reclaim chain length = %d, want 1 (head survives)", len(chain))
+	}
+	// The surviving entry is the original head — index 0 of the
+	// post-reclaim slice, but identity-tested via its PageID/TxnID so
+	// a reversed-orientation refactor that left a different segment
+	// at index 0 would fail loudly.
+	if chain[0].PageID != headPageID {
+		t.Errorf("surviving segment PageID = %d, want %d (head per convention)", chain[0].PageID, headPageID)
+	}
+	if chain[0].TxnID != headTxnID {
+		t.Errorf("surviving segment TxnID = %d, want %d (head per convention)", chain[0].TxnID, headTxnID)
+	}
+	// Property 1 again on the reduced chain: headPageID() still
+	// returns the (now sole) head; this is also the last index.
+	if got := p.headPageID(); got != headPageID {
+		t.Errorf("post-reclaim headPageID() = %d, want %d", got, headPageID)
+	}
+}
+
 func TestResetFreespace(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
 	defer p.Close()

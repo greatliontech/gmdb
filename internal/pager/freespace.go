@@ -437,9 +437,11 @@ func (p *Pager) reclaimRPL() int {
 		p.bitmap.Set(seg.PageID)
 		count++
 		lastReclaimed = seg.PageID
-		// Pop from the in-memory list (copy-trim to free the head
-		// slot for GC rather than a head-retaining reslice).
-		p.trimRPLChainHead(1)
+		// Pop from the in-memory list. copy-trim preserves trailing
+		// slice capacity so the next appendRPL reuses the same
+		// backing array; `s = s[1:]` would shrink cap by 1 and force
+		// earlier reallocation as the chain re-grows.
+		p.trimRPLChainTail(1)
 	}
 	if count > 0 {
 		// Bias the next allocation toward the most-recently-reclaimed
@@ -449,11 +451,13 @@ func (p *Pager) reclaimRPL() int {
 	return count
 }
 
-// trimRPLChainHead removes the consumed head entries from the in-memory
-// chain so the backing array can be GC'd as the chain shrinks. Cheaper
-// than `p.rplSegments = p.rplSegments[1:]` which retains the backing
-// array.
-func (p *Pager) trimRPLChainHead(n int) {
+// trimRPLChainTail removes the n oldest entries (chain tail per
+// SetRPLChain: tail = index 0 = oldest TxnID, head = last = newest)
+// from the in-memory chain. Copies surviving entries down and
+// reslices so the next append reuses the full backing array;
+// `p.rplSegments = p.rplSegments[n:]` would shrink cap by n and force
+// earlier reallocation as the chain re-grows on subsequent commits.
+func (p *Pager) trimRPLChainTail(n int) {
 	if n <= 0 || n > len(p.rplSegments) {
 		return
 	}

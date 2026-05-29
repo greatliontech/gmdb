@@ -186,7 +186,7 @@ type Savepoint struct {
 // (undoLogPos = len(p.savepointUndoLog)) and the bitmap.Snapshot
 // (which itself is an undo-log marker post-0893be5). The rplSegments
 // slice is still clone-captured because mid-tx mutations to it are
-// rare (only reclaimRPL head-trim, which monotonically shrinks the
+// rare (only reclaimRPL tail-trim, which monotonically shrinks the
 // chain). The clone is O(chain length) — independent of MaxSize and
 // of per-tx mutation count, but workload-dependent at cross-tx
 // granularity (a stuck reclamationBound from a lagging reader lets
