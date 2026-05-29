@@ -434,6 +434,67 @@ before designing the fix. The proof is in the receipts:
   occurs AFTER the in-window add, and the buffer pointer is only
   known to loosePopLog. The wasPreWindow flag is the bridge.
 
+- **`nested-shallow-loose-pop-buffer-alias`** (this session, `d9ea7d4`):
+  three surprises beyond the issue's "user choice on resolution
+  candidates" framing.
+
+  **First (the right scope decision is determined by the production-
+  caller audit, not by the resolution candidates' formal symmetry).**
+  The issue offered Option 1 (panic guard + spec amend) vs Options
+  2/3 (keep nested-shallow in-spec, add bookkeeping). The candidates
+  looked formally symmetric — both close the bug, just at different
+  scope. But the smallest-correct-change reading depends on whether
+  any production caller exercises the case: if no production caller
+  nests SHALLOWs (which a grep of the 6 per-row callers confirmed),
+  Option 1 is the smallest correct change (illegal-state-unrepresentable
+  at API surface, no ongoing bookkeeping cost), and Options 2/3 are
+  *over-engineering for a non-existent caller* — a Quality-bar
+  defect, not diligence. **Lesson**: when an issue's resolution
+  candidates are "A = panic + spec amend that removes the case from
+  spec" vs "B/C = keep the case in-spec via bookkeeping," run the
+  production-caller audit BEFORE picking. If no production caller
+  exercises the case, A is the smallest correct change by
+  construction; B/C carry runtime cost for hypothetical callers and
+  should be rejected per the Quality bar's over-engineering clause.
+
+  **Second (full-stack scan vs topmost-only — narrowest is not
+  always topmost).** The Round-1 reviewer questioned whether the
+  guard's full-stack scan was widening (vs a topmost-only check).
+  The answer: full-stack is NOT widening. A topmost-only check
+  would permit [SHALLOW outer, NESTED middle, attempt SHALLOW
+  inner] because the topmost entry is NESTED. But once the inner
+  NESTED resolves, the [SHALLOW outer, SHALLOW inner] alias
+  configuration is restored and a loose-pop in the inner SHALLOW's
+  remaining window still produces the buf alias. The narrowest
+  correct check is full-stack-scan-for-kind. **Lesson**: "narrowest
+  check" in panic guards is sometimes a structural rather than
+  positional choice. A topmost-only check can defeat itself by
+  letting an inner sub-window resolve and re-expose the forbidden
+  configuration. Verify the guard's reachability set covers ALL
+  paths back to the forbidden state, not just the immediate
+  begin.
+
+  **Third (test conversion when removing a code path from spec —
+  retarget, don't delete).** Two existing tests
+  (`TestShallowSavepointOutOfOrderPanics`,
+  `TestSavepointRestoreOuterRevertsInnerReleasedWork`) exercised
+  shallow-inside-shallow to test KIND-AGNOSTIC substrate
+  properties: the LIFO panic discipline and the per-pager log
+  shared-by-outer semantic. When the spec amend removed
+  shallow-inside-shallow, these tests started panicking on the new
+  guard, but their underlying invariants survive in the NESTED
+  substrate (both kinds share `RestoreSavepoint`'s LIFO check and
+  the per-pager `savepointUndoLog` lifecycle). Retargeting to
+  `BeginSavepoint` (NESTED) kept the coverage without deleting it.
+  **Lesson**: when a fix narrows a primitive's spec by removing a
+  buggy code path, audit existing tests that exercised the removed
+  path. Tests pinning the REMOVED behavior should be deleted;
+  tests pinning a KIND-AGNOSTIC substrate property that the
+  removed path happened to be a vehicle for should be RETARGETED
+  to a surviving kind. The distinguishing question: "if the
+  substrate had been correct, would this test have still been
+  worth running?" If yes, retarget; if no, delete.
+
 - **`index-handle-stale-after-deletekeyspace`** (prior session): two
   surprises beyond the issue's "single-line guards" framing.
 
@@ -623,7 +684,55 @@ loosePopEntry, captured by scanning sp's window slice of
 savepointUndoLog for a prior `(fieldDirty, id, false)` entry.
 Lesson: when a single broad mechanism is being replaced by
 per-mutation undo, enumerate the cases the broad mechanism
-covered separately and verify each is closed.
+covered separately and verify each is closed, OR
+**an issue's "user choice between Option A (panic guard + spec
+amend) vs Options B/C (keep case in-spec, add bookkeeping)" may
+look formally symmetric but the smallest-correct-change reading
+depends on the production-caller audit** — the `nested-shallow-
+loose-pop-buffer-alias` issue framed both shapes as user-decision
+candidates; first-principles audit found NO production caller
+exercised nested-shallow (the 6 per-row helpers each open-and-
+resolve one shallow per call, no nesting), making Option A the
+smallest correct change by construction and Options B/C
+over-engineering for a non-existent caller (Quality bar defect,
+not diligence). Lesson: when an issue's candidates are
+"A = panic + spec amend removing the case from spec" vs "B/C =
+keep case in-spec via bookkeeping," run the production-caller
+audit BEFORE picking. If no production caller nests, A is the
+smallest correct change; B/C carry ongoing cost for hypothetical
+callers and should be rejected, OR
+**a panic guard's "narrowest check" is sometimes structural
+rather than positional — full-stack scan can be narrower than
+topmost-only** when an inner sub-window's resolution restores
+the forbidden configuration. The `nested-shallow-loose-pop-
+buffer-alias` Round-1 reviewer initially questioned whether
+the full-stack scan was widening vs a topmost-only check; it
+isn't. A topmost-only check would permit [SHALLOW, NESTED,
+attempt SHALLOW] because the topmost entry is NESTED, but once
+the inner NESTED resolves the [SHALLOW, SHALLOW] alias
+configuration is back and a loose-pop in the inner SHALLOW's
+remaining window produces the buf alias. Lesson: verify a guard's
+reachability set covers ALL paths back to the forbidden state,
+not just the immediate begin — sometimes that requires a
+full-stack scan, OR
+**when a fix narrows a primitive's spec by removing a buggy
+code path, existing tests that exercised the path may pin
+KIND-AGNOSTIC substrate properties worth keeping** — the
+`nested-shallow-loose-pop-buffer-alias` close-out's two
+existing tests (`TestShallowSavepointOutOfOrderPanics` for the
+LIFO panic; `TestSavepointRestoreOuterRevertsInnerReleasedWork`
+for the per-pager log shared-by-outer semantic) exercised
+shallow-inside-shallow but tested kind-agnostic substrate
+properties that survive in the NESTED-inside-NESTED case
+(same code paths through `RestoreSavepoint`/`ReleaseSavepoint`,
+same `savepointUndoLog` lifecycle). Retargeting them to
+`BeginSavepoint` preserved the coverage without deletion.
+Lesson: when narrowing a primitive's spec, audit existing
+tests that exercised the removed path. The distinguishing
+question is "if the substrate had been correct, would this
+test have still been worth running?" — if yes, retarget to a
+surviving kind; if no, delete. Don't reflexively delete tests
+that started failing on the new guard.
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -679,52 +788,50 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `shallow-savepoint-clone-cost` — re-derived as
-a clause-explicit cost-clause violation (not the profile-driven
-perf concern the issue framed). Fix: per-pager `savepointUndoLog`
-+ per-Savepoint `undoLogPos int` marker, mirroring the bitmap
-layer's `0893be5` per-Snapshot undo log. `captureSavepointState`
-becomes O(1) for the four pending-set/dirty fields (the rplSegments
-clone is still bounded-by-RPL-chain; filed as separate issue).
-Every state-changing mutation site (AllocPage's 4 branches
-including the previously-missed LaggingReaderWait retry; FreePage's
-3 branches; AllocContiguous's bitmap-hit + file-extension;
-reserveBitmapRun; TailRefund; CoW; AllocSlab; AllocSlabRun)
-appends a `(field, key, wasPresent)` entry when at least one
-savepoint is open. `RestoreSavepoint` replays the log from
-`sp.undoLogPos` in reverse FIRST, then runs the Shallow loose-pop
-replay; this ordering closes the in-window-CoW + loose-pop case.
-`ReleaseSavepoint` truncates the log to 0 only when the active
-stack empties. `loosePopEntry` gains `wasPreWindow bool` captured
-at loose-pop time by scanning `sp.undoLogPos..end` for a prior
-`(fieldDirty, id, false)` entry: true → re-attach buf; false →
-pool-Put and do NOT install (closes the in-window-alloc + loose-
-pop leak that the pre-fix `dirtyKeys`-set cleanup silently
-handled). Unifies `activeShallowSavepoints` → `activeSavepoints`
-(both kinds); strict-LIFO panic now uniform. Spec promotions:
-`transactions.md §Why this is cheap` extended with two paragraphs
-spelling out the pager savepoint-undo-log substrate, the dirty-add
-tracking, and the wasPreWindow branch. 4 new regression tests
-(`TestShallowSavepointBeginCostConstantInTxState` pinning the cost
-invariant via alloc-count assertion; `TestShallowSavepointLoosePopReCoWRestore`
-pinning the savepointUndoLog-first replay order;
-`TestShallowSavepointInWindowAllocLoosePopRestoreDoesNotLeak`
-pinning the wasPreWindow=false branch; `TestSavepointUndoLogTruncatesOnLastRelease`
-+ `TestSavepointRestoreOuterRevertsInnerReleasedWork` pinning log
-lifecycle). R1=2H/0M/2L/1nit (introduced H-1 LaggingReaderWait
-uninstrumented + H-2 in-window-alloc loose-pop buffer leak, both
-fixed in-place + neuter-verified); R2=0H/0M (introduced)/1M
-(adjacent, filed)/2L (doc cross-refs fixed inline)/1nit (dropped).
-Two issues filed: `docs/issues/rplsegments-clone-cost.md` (residual
-RPL chain clone in captureSavepointState, profile-driven trigger);
-`docs/issues/nested-shallow-loose-pop-buffer-alias.md` (pre-existing
-buffer-pointer aliasing in nested-SHALLOW Restore — outer's
-wasPreWindow=true pool-Puts the buffer the inner Restore just re-
-installed; unreachable in production since the 6 per-row callers
-each open-and-resolve one shallow per call).
+This session closed `nested-shallow-loose-pop-buffer-alias` — the
+adjacent issue filed at the prior session's `shallow-savepoint-
+clone-cost` close-out. User picked Option 1 (panic guard + spec
+amend stating shallow savepoints are single-active per pager) over
+Options 2/3 (keep nested-shallow in-spec via bookkeeping), justified
+by the production-caller audit: the 6 per-row indexed-maintenance
+helpers (`Keyspace.Put`/`Delete`, `Cursor.Delete`, `SetKeyspace.Put`/
+`Delete`/`DeleteValue`) each open-and-resolve exactly one shallow
+per call, never nest. Options 2/3 would carry runtime bookkeeping
+cost for a hypothetical caller that does not exist (Quality bar
+over-engineering). Fix: `BeginShallowSavepoint` scans
+`p.activeSavepoints` for any prior `SavepointShallow` entry and
+panics on hit ("shallow savepoint already active (single-active
+per pager)"). Check runs BEFORE `captureSavepointState` so the
+panic leaves no `bitmap.Snapshot` leaked into `openSnapshots` and
+no partial mutation of `activeSavepoints`. Full-stack scan (not
+just topmost): [SHALLOW, NESTED, attempt SHALLOW] must still
+panic because the inner NESTED's eventual resolution would
+re-expose the [SHALLOW, SHALLOW] alias configuration — topmost-
+only would defeat itself. SHALLOW-inside-NESTED and NESTED-inside-
+SHALLOW remain allowed (NESTED suspends loose-pop via
+`savepointDepth > 0`, so no loose-pop fires inside the NESTED
+window and no `loosePopLog` alias can form). Spec promotions:
+`transactions.md §Why this is cheap` extended with a paragraph
+documenting the `loosePopLog` single-owner contract on `*[]byte`,
+the alias mechanism, and the structural enforcement; §Write-helper
+error contract §Implementation Shallow bullet states the
+single-active rule with cross-reference. Existing
+`RestoreSavepoint` step-4 godoc retargeted from the issue-doc
+citation to the inline spec amend. 2 new tests
+(`TestShallowSavepointPanicsOnNestedShallow` pinning the panic
+identity via `strings.Contains`; `TestNestedInsideShallowSavepointAllowed`
+pinning the cross-kind allowance with suspension + loosePopLog
+emptiness assertions). 2 existing tests retargeted from
+shallow-inside-shallow to NESTED-inside-NESTED
+(`TestSavepointOutOfOrderPanics` for kind-agnostic LIFO discipline;
+`TestSavepointRestoreOuterRevertsInnerReleasedWork` for kind-
+agnostic per-pager log shared-by-outer semantic). R1=0H/0M/2L/2nit
+(all introduced; all fixed in-place + neuter-verified — L-1 panic
+identity check, L-2 new positive test, nit-1 godoc wording, nit-2
+panic message aligned to spec). R2=0H/0M/0L/0nit (converged).
 
-Prior session closed `index-handle-stale-after-deletekeyspace` —
-see commit `3eb3488` for that change set's details.
+Prior session closed `shallow-savepoint-clone-cost` — see commit
+`43ac8df` for that change set's details.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -742,6 +849,7 @@ see commit `3eb3488` for that change set's details.
 | `a114172` | index-handle-stale-after-rebuild-drop | **Closed** — mirrors chunk-5.6 markCursorsStale pattern for `*Index`. New fields: `Index.{openCursors,dead}` + `Keyspace.openIndexHandles` + `SetKeyspace.openIndexHandles`. New helpers per keyspace: `markIndexHandlesStale` (mark-all, called by Put/Delete/etc via markCursorsStale consolidation), `markIndexHandleStaleByName` (RebuildIndex), `markIndexHandleDead` (DropIndex). Iter closures (iteratePrefix / Range / LookupKeys non-unique) register/unregister via defer. Dead-handle check at Stats/Lookup/LookupKeys/Range/Prefix/Get entry. `mapIndexCursorErr` translates btree.ErrCursorStale → gmdb.ErrCursorStale (same sentinel-leak class as 24ec951). Sentinels: ErrCursorStale (mid-iter) + ErrIndexNotFound (post-Drop) — NO new sentinel. Spec promotions: `indexing.md §Handle Invalidation` (new) + `api-surface.md` Lookup/RebuildIndex/DropIndex godoc updates. R1=0H/1M/3L/1nit; R2=0H/0M/0L (reviewer neuter-verified the two new tests fail deterministically when calls removed). 12 regression tests. Filed adjacent `index-handle-stale-after-deletekeyspace` (pre-existing spec-impl gap, different cause-line). |
 | `3eb3488` | index-handle-stale-after-deletekeyspace | **Closed** — extends chunk-7.6 `*Index` handle infrastructure to enforce the pre-existing `transactions.md §Cursor invalidation by DeleteKeyspace` clause. New `(idx *Index).keyspaceDead()` helper; entry-time `keyspaceDead`-first guards on Stats/Lookup/LookupKeys/Range/Prefix/Get (parent-dead wins over per-handle dead → drop-then-delete reports broader `ErrKeyspaceClosed`). `mapIndexCursorErr` made a method `(idx *Index).mapCursorErr` translating `btree.ErrCursorStale → ErrKeyspaceClosed` when `keyspaceDead()` (mid-iter broader-truth wins on iter cursor path). `Tx.DeleteKeyspace`'s in-memory invalidation block walks `openIndexHandles` via `markIndexHandlesStale` on both branches. `Err()` reordered to `keyspaceDead → idx.err → idx.dead`: closes Inv-IHS3 Err-vs-Stats asymmetry while preserving chunk-7.6 mid-iter Drop ErrCursorStale contract. Stale "chunk-6.7" comment on SetKeyspace branch fixed. NO new sentinel. Spec promotions: `indexing.md §Handle Invalidation` extended with Inv-IHS3 + "Three distinct invalidation conditions" preamble; `api-surface.md` 6 method godocs updated. 11 regression tests (8 deterministic-fail-on-HEAD + 3 invariant-pinning: `TestStatsPreservesInFlightStaleSignal`, `TestErrSymmetricWithStatsAfterDeleteKeyspace`, `TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed`). R1=0H/1M/3L/2nit; R2=1H/2M/3L/1nit (introduced H-1 = Stats sticky-err reset regression caught by the loop, fixed Round-3); R3=0H/1M/2nit (introduced M-1 = drop-then-delete ordering encoded-but-not-enforced); R4=0H/0M/0L. |
 | `43ac8df` | shallow-savepoint-clone-cost | **Closed** — re-derived as a `transactions.md §Nested Transactions` cost-clause violation (not the profile-driven perf concern the issue framed). Per-pager `savepointUndoLog []savepointUndoEntry` + per-Savepoint `undoLogPos int` marker replaces the 4 cloned maps (`pendingAllocs`/`pendingFrees`/`loosePages`/`dirtyKeys`); mirrors bitmap layer's `0893be5`. `captureSavepointState` becomes O(1) for those fields. 10 mutation sites instrumented (AllocPage's 4 branches incl. previously-missed LaggingReaderWait; FreePage's 3; AllocContiguous; reserveBitmapRun; TailRefund; CoW; AllocSlab; AllocSlabRun). `RestoreSavepoint` order: savepointUndoLog replay FIRST, then Shallow loose-pop replay. `loosePopEntry.wasPreWindow` captured at loose-pop time by scanning `sp.undoLogPos..end` for prior `(fieldDirty, id, false)` entry — true→re-attach, false→pool-Put-no-install (closes in-window-alloc + loose-pop leak the pre-fix `dirtyKeys`-cleanup silently handled). Unifies `activeShallowSavepoints`→`activeSavepoints`. `ReleaseSavepoint` truncates log on empty active stack. Spec amend: `transactions.md §Why this is cheap` extended with two paragraphs on pager substrate + wasPreWindow. 4 new tests (`TestShallowSavepointBeginCostConstantInTxState` alloc-count assertion; `TestShallowSavepointLoosePopReCoWRestore`; `TestShallowSavepointInWindowAllocLoosePopRestoreDoesNotLeak`; `TestSavepointUndoLogTruncatesOnLastRelease`; `TestSavepointRestoreOuterRevertsInnerReleasedWork`). R1=2H/0M/2L/1nit (introduced H-1 LaggingReaderWait uninstrumented + H-2 in-window-alloc loose-pop buffer leak — both fixed in-place + neuter-verified); R2=0H/1M (adjacent, filed)/2L (doc cross-refs)/1nit (dropped). 2 issues filed: `rplsegments-clone-cost.md` (residual RPL chain clone), `nested-shallow-loose-pop-buffer-alias.md` (pre-existing nested-shallow pointer alias, unreachable in production). |
+| `d9ea7d4` | nested-shallow-loose-pop-buffer-alias | **Closed** — Option 1 (panic guard + spec amend) per user pick; justified by production-caller audit (the 6 per-row indexed-maintenance helpers each open-and-resolve one SHALLOW per call, never nest). `Pager.BeginShallowSavepoint` scans `p.activeSavepoints` for any `SavepointShallow` entry and panics on hit with message "shallow savepoint already active (single-active per pager)". Check runs BEFORE `captureSavepointState` so panic leaves no `bitmap.Snapshot` leaked into `openSnapshots` and no partial mutation of `activeSavepoints`. Full-stack scan (not topmost) so [SHALLOW, NESTED, attempt SHALLOW] still panics — topmost-only would defeat itself once inner NESTED resolves. SHALLOW-inside-NESTED and NESTED-inside-SHALLOW remain allowed (NESTED's `savepointDepth > 0` suspends loose-pop inside the nested window). Spec promotions: `transactions.md §Why this is cheap` extended with a paragraph on the `loosePopLog` single-owner contract on `*[]byte`, the buf-alias mechanism, and the structural enforcement; §Write-helper error contract §Implementation Shallow bullet states the single-active rule with cross-reference. `savepoint.go` `RestoreSavepoint` step-4 godoc retargeted from the issue-doc citation to the inline spec amend. 2 new tests (`TestShallowSavepointPanicsOnNestedShallow` + `TestNestedInsideShallowSavepointAllowed`); 2 existing tests retargeted from shallow-inside-shallow to NESTED-inside-NESTED (`TestSavepointOutOfOrderPanics` for kind-agnostic LIFO discipline; `TestSavepointRestoreOuterRevertsInnerReleasedWork` for kind-agnostic per-pager log shared-by-outer semantic). R1=0H/0M/2L/2nit (all introduced; all fixed in-place + neuter-verified — L-1 hardened panic identity, L-2 new cross-kind positive test, nit-1 godoc wording, nit-2 panic message aligned to spec). R2=0H/0M/0L/0nit (converged). |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -749,11 +857,11 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-*(none — this session's top candidate `shallow-savepoint-clone-cost`
-landed; no correctness-class entries remain in the backlog. The
-two new filed issues — `rplsegments-clone-cost` and
-`nested-shallow-loose-pop-buffer-alias` — are condition-/profile-
-driven, not currently reachable in-spec.)*
+*(none — this session's `nested-shallow-loose-pop-buffer-alias`
+closed; no correctness-class entries remain in the backlog. The
+sole adjacent issue still on the list — `rplsegments-clone-cost`
+— is profile-driven and bounded-by-RPL-chain-length, not currently
+reachable in-spec.)*
 
 ### Undecided / needs analysis
 
@@ -766,13 +874,9 @@ or condition-triggered.)*
 `pager-test-helper-export`, `leaked-readtx-cleanup-race-flake`,
 `setkeyspace-delete-range-bulk-walker`, `bulkload-index-merge-run-
 fanin`, `setkeyspace-indexing-perf-and-edge`, `rplsegments-clone-cost`
-(new this session — residual rplSegments clone in
-`captureSavepointState`, bound by RPL chain length),
-`nested-shallow-loose-pop-buffer-alias` (new this session — pre-
-existing nested-shallow buffer-pointer alias; unreachable in
-production today, fires only if nested SHALLOW becomes in-spec or
-gets a panic guard). Re-validate live before acting; some may now
-be obsolete.
+(residual rplSegments clone in `captureSavepointState`, bound by
+RPL chain length — closest adjacent to recently-closed savepoint
+work). Re-validate live before acting; some may now be obsolete.
 
 ---
 
@@ -786,28 +890,30 @@ condition-triggered; correctness-class slot is empty):
 
 1. **Re-validate the profiling-driven set first** — the recurring
    lesson says issue framings often go stale, *especially* for
-   profiling-driven items. This session's `shallow-savepoint-clone-
-   cost` proved the lesson again: filed as "profile-driven, defer
-   until material," re-derivation found a clause-explicit cost
-   violation. So re-derive each candidate against the spec before
-   accepting the issue's framing. Specifically check whether the
-   spec carries a clause-explicit cost/timing invariant the issue's
-   mechanism may be violating.
+   profiling-driven items. The last two sessions proved the lesson
+   twice: `shallow-savepoint-clone-cost` (filed profile-driven →
+   first-principles found a clause-explicit cost-clause violation);
+   `nested-shallow-loose-pop-buffer-alias` (filed as a binary
+   "user-choice A vs B/C" → production-caller audit collapsed it to
+   Option 1 by construction). So re-derive each candidate against
+   the spec before accepting the issue's framing. Specifically
+   check whether the spec carries a clause-explicit cost/timing
+   invariant the issue's mechanism may be violating.
 
 2. **Among re-validated live items, prefer ones that unblock
    others** (Ordering criterion 2). The remaining set is fairly
    localized:
-   - `rplsegments-clone-cost` (new) — touches the same
-     `captureSavepointState` path the just-closed session edited;
+   - `rplsegments-clone-cost` — touches the same
+     `captureSavepointState` path the last two sessions edited;
      fresh adjacent context. Profile-driven trigger condition
-     stated in the issue.
-   - `nested-shallow-loose-pop-buffer-alias` (new) — condition-
-     triggered (unreachable until nested-SHALLOW becomes in-spec
-     or a panic guard lands); narrow scope (loosePopLog handling
-     + possibly a guard at BeginShallowSavepoint). Picking this
-     should be accompanied by a user decision on Option 1
-     (panic guard + spec amend, narrowest fix per the issue's
-     analysis) vs Options 2/3.
+     stated in the issue. **First-principles re-derivation
+     hint**: the issue's "in practice bounded by small constant"
+     claim is itself a recorded-but-unenforced spec-tier
+     assertion (`transactions.md §Why this is cheap`). Check
+     whether a real workload can violate it (the issue cites
+     a stuck-reclamation-bound scenario). If the bound CAN be
+     violated, the work is correctness (enforcement gap), not
+     perf — same pattern as the last two sessions.
    - Others (`rpl-segment-relocation`, `compaction-full-forest-
      walk-per-pass`, `pager-test-helper-export`,
      `leaked-readtx-cleanup-race-flake`,
@@ -823,17 +929,22 @@ condition-triggered; correctness-class slot is empty):
    "factor when the second caller arrives") suit later resets.
 
 4. **Adjacent to recently-closed > unrelated** (Ordering criterion
-   4). Both `rplsegments-clone-cost` and
-   `nested-shallow-loose-pop-buffer-alias` are direct adjacents to
-   the just-closed `shallow-savepoint-clone-cost` work; the next
-   session inherits the savepoint-substrate mental model. Either
-   is a natural follow-on.
+   4). `rplsegments-clone-cost` is the direct adjacent to the
+   last two sessions' savepoint-substrate work (`43ac8df` and
+   `d9ea7d4`); the next session inherits the substrate mental
+   model. Strongest fit for the next pick.
 
-**Recommended next candidate:** `nested-shallow-loose-pop-buffer-
-alias` if the user is willing to lock in the spec amend
-("BeginShallowSavepoint is single-active per tx") that makes the
-narrowest fix (Option 1 = panic guard) viable. Otherwise pick
-`rplsegments-clone-cost` (profile-driven; requires benchmark setup).
+**Recommended next candidate:** `rplsegments-clone-cost`. Combines
+all four criteria favorably: adjacent-to-just-closed savepoint
+substrate (fresh context); plausible clause-explicit cost claim
+to re-derive (per the pattern from the last two sessions); narrow
+scope (one path in `captureSavepointState`); option set already
+sketched (extend `savepointUndoLog` to `rplSegments`; add
+runtime assertion; tighten spec bound). Pre-pick advisory: if
+re-derivation surfaces no demonstrable bound violation under any
+in-spec workload, treat as a true spec-tier-only enforcement
+question (Option 3 = tighten the bound claim, no code change) and
+flag to user for explicit defer.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
