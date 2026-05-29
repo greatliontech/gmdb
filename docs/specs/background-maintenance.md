@@ -297,6 +297,19 @@ while keeping the other three tasks running, set
 A pass with no multi-page allocations since the last (no
 signal) does not trigger.
 
+The counters include *both* user-driven and maintenance-internal
+allocations — `relocateOverflowChain`'s `AllocContiguous(runLen)`
+during compaction bumps the same `contigAttempts` /
+`contigFragFails`. This is intentional rather than a metric
+defect: a fragmented forest typically needs more than one pass
+to consolidate, and the maintenance-internal allocs landing in
+the next pass's window keep the rate elevated until consolidation
+succeeds — self-limiting, since once eager reclaim has
+consolidated, `FindContiguous` succeeds and the rate falls below
+the threshold. A per-tx "don't count" flag to exclude
+maintenance-internal allocs would suppress that self-driving
+behaviour for no correctness gain.
+
 **Mechanism.** Each pass opens a write transaction, **eagerly
 reclaims the RPL** (refreshes the reclamation bound and returns every
 now-reader-safe retired page to the bitmap *before* relocating, rather
@@ -353,17 +366,39 @@ compaction therefore shrinks amortised over passes, not instantly;
 `Compact()` remains the instant-shrink path (it rebuilds into a fresh,
 RPL-less file).
 
-**Cost per pass.** Each moved leaf forces a CoW cascade up the
-tree (every ancestor branch needs CoW + new child pointer),
-so worst-case I/O is `CompactionBatchSize × (1 + depth) ×
+**Cost per pass.** Two cost dimensions, separately bounded.
+
+*Write cost.* Each moved leaf forces a CoW cascade up the tree
+(every ancestor branch needs CoW + new child pointer), so
+worst-case pwrite I/O is `CompactionBatchSize × (1 + depth) ×
 PageSize` plus `CompactionBatchSize × (1 + depth)` RPL entries
-for the retired originals. At 1024 pages, depth 5, 4 KB
-pages: ~24 MB of pwrite I/O per pass, ~6 K RPL entries (~12
-segment pages at 508 entries/segment). Size
-`CompactionBatchSize` against `MaxTxBufferBytes` accordingly
-— the slab must hold the whole cascade plus assembly buffers
-in step 0 of the commit. Bounded and amortised across the
-maintenance interval.
+for the retired originals. At 1024 pages, depth 5, 4 KB pages:
+~24 MB of pwrite I/O per pass, ~6 K RPL entries (~12 segment
+pages at 508 entries/segment). Size `CompactionBatchSize`
+against `MaxTxBufferBytes` accordingly — the slab must hold the
+whole cascade plus assembly buffers in step 0 of the commit.
+Bounded by `CompactionBatchSize` and depth, independent of total
+database size.
+
+*Read cost.* Step 1's high-watermark scan walks every B+tree in
+the forest to evaluate the floor predicate on each node (the
+page format carries no per-branch min/max child-id metadata that
+would let a subtree be pruned without descending, and on B+tree
+nodes `shouldRelocate(id)` runs only after the page is read —
+see `internal/btree/relocate.go`'s `relocateNode`; overflow
+chains are gated the other way, predicate-then-relocate, with no
+walk-time read of their pages). Cost is O(live B+tree node
+pages), **workload-dependent**: a forest with more data has more
+live nodes. Reads go through the mmap, so OS
+page-fault latency dominates for cold pages; warm pages are
+near-free. The structural ceiling (`MaxSize`/`PageSize`, a
+fully-allocated database) is the only workload-independent
+bound; there is no tighter constant-bound on the per-pass walk
+because the page format does not support id-range pruning, and
+bitmap-driven targeting would change the high-watermark strategy
+itself.
+
+Both dimensions are amortised across the maintenance interval.
 
 ## Options
 
