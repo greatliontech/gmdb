@@ -13,9 +13,16 @@ Scope:
 - Indexes-on-SetKeyspaces PK encoding.
 
 The user-facing API split between `Keyspace` and `SetKeyspace` lives
-in `keyspaces.md` and `api-surface.md`. Range delete on
-SetKeyspaces uses the bulk-free mechanism described here plus the
-range-delete walk of `range-delete.md`. Indexing semantics for
+in `keyspaces.md` and `api-surface.md`. Range delete on un-indexed
+SetKeyspaces dispatches to the same three-phase walker as
+`Keyspace.DeleteRange` (per `range-delete.md §Algorithm`) — interior
+subtrees are retired via `FreeSubtree` (which handles SetKeyspace
+cell types via the recursive `freeSubtreeAt` per the §Bulk Free
+mechanism below), and boundary leaves invoke a per-cell free
+callback that runs the same bulk-free per nested-tree cell. Range
+delete on INDEXED SetKeyspaces falls back to the per-row cursor walk
+(`range-delete.md §Indexed-keyspace fallback`), same shape as
+`Keyspace.DeleteRange`'s indexed dispatch. Indexing semantics for
 SetKeyspaces live in `indexing.md`.
 
 SetKeyspaces are a general-purpose data primitive for set-shaped
@@ -176,6 +183,47 @@ Invariant: kind=entailed;
     deliveries to wrong subscribers, double-counting in
     ref-counted indexes, or merging audit-log entries across
     unrelated entities.
+
+Invariant: kind=entailed;
+  property=`SetKeyspace.DeleteRange` honors the atomicity-contract
+    differential `range-delete.md §Set Keyspace Range Delete`
+    declares: un-indexed call paths return `(0, err)` on failure
+    with NO observable in-memory mutation (atomic; matches the
+    `Keyspace.DeleteRange` un-indexed contract documented in
+    `api-surface.md`); indexed call paths return
+    `(deleted_so_far, err)` with iterations `0..i-1` committed in-
+    memory (per-row atomic). The two contracts are user-facing,
+    not implementation-internal — callers reason about post-error
+    state via the documented contract;
+  from=entailed: `range-delete.md §Set Keyspace Range Delete`
+    declares the dispatch direction by index presence (clause-
+    explicit at the algorithm level), and `api-surface.md
+    SetKeyspace.DeleteRange` godoc names the resulting atomicity
+    contracts — but no single clause states the dispatch is the
+    SOLE mechanism producing the named contracts, so an impl that
+    routes by index presence but produces the wrong contract on
+    that path (e.g., un-indexed routed through a per-row helper
+    that returns `(deleted_so_far, err)`) would honor the
+    dispatch-direction declaration while silently violating the
+    contract differential;
+  violation=A caller invokes `SetKeyspace.DeleteRange(start, end)`
+    on an un-indexed Kind=1 keyspace; the operation hits a pager
+    error mid-walk (e.g., `ErrTxTooLarge` after `n` rows have
+    been mutated). The api-surface.md godoc promises `(0, err)`
+    with no observable mutation. The caller's subsequent same-tx
+    read sees `n` rows already gone — partial mutation contradicts
+    the documented atomic contract; the caller's recovery
+    assumption ("I can retry the whole call after re-checking
+    state") is silently wrong, producing a double-delete or an
+    inconsistent index-vs-row state if the caller proceeds.
+    Pinned by
+    `TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker` /
+    `TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker` via
+    the `SetDeleteRangeCalledHookForTest` instrumentation hook in
+    `internal/btree/range_delete.go` — the dispatch direction is
+    the necessary pre-condition for the contract differential to
+    hold; testing the dispatch is the strongest enforcement
+    available without fault-injection infrastructure.
 
 ## Storage Strategy
 

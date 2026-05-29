@@ -892,6 +892,25 @@ func (ks *Keyspace) descriptor() *page.KeyspaceDescriptor {
 // DeleteRange operates on Kind=0 keyspaces only at chunk 5.7. The
 // chunk-7 surface will reroute indexed keyspaces through a per-row
 // cursor walk per range-delete.md §Indexed-keyspace fallback.
+// keyspaceCellFree is the per-cell free callback Keyspace.DeleteRange
+// passes to btree.DeleteRange. Per range-delete.md §Algorithm, Kind=0
+// (plain key→value) cells carry at most one overflow chain and
+// contribute exactly 1 to the values count — no subpage or nested-
+// tree cases. Mirrors the prior chunk-5.7 in-place
+// freeOverflowChainIfPresent + uint64(len(deleted)) shape; the count
+// semantics are preserved exactly (count of cells == count of values
+// for Kind=0).
+func keyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry) (uint64, error) {
+	if e.IsOverflow() {
+		runLen := page.OverflowRunLength(cfg, e.TotalLen)
+		if err := pw.FreeRun(e.OverflowPage, runLen); err != nil {
+			return 0, fmt.Errorf("btree: keyspace DeleteRange free overflow chain at %d (run=%d): %w",
+				e.OverflowPage, runLen, err)
+		}
+	}
+	return 1, nil
+}
+
 func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 	if err := ks.tx.requireOpen(true); err != nil {
 		return 0, err
@@ -928,7 +947,7 @@ func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 	}
 	cfg := ks.builderCfg()
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
-	count, newRoot, err := btree.DeleteRange(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, start, end)
+	count, newRoot, err := btree.DeleteRange(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, start, end, keyspaceCellFree)
 	if err != nil {
 		return 0, mapBtreeErr(err)
 	}

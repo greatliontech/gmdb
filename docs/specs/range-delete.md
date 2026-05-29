@@ -230,6 +230,47 @@ If the SetKeyspace has indexes declared, this falls back to a
 per-member walk — same reasoning as `DeleteRange` on indexed
 keyspaces.
 
+## Set Keyspace Range Delete
+
+`SetKeyspace.DeleteRange(start, end)` dispatches by index
+presence, mirroring `Keyspace.DeleteRange`'s chunk-7.10 split:
+
+- **Un-indexed (Kind=1, no declared indexes)**: dispatches to
+  `btree.DeleteRange` (the §Algorithm three-phase walker) with a
+  SetKeyspace-aware per-cell free callback. Interior subtrees are
+  retired by the walker's Phase 2 via `FreeSubtree` — the existing
+  cell-type-aware retire that handles subpage (counts
+  `subpage.Count`), nested-tree (recurses + counts `NestedCount`),
+  and plain/overflow (counts 1) cells. Boundary leaves' Phase 3
+  cleanup invokes the same callback per deleted entry, retiring
+  the per-cell resources and contributing the per-cell values
+  count. Returned count is total VALUES deleted (sum across
+  subpages + nested-tree NestedCounts + plain cells) per the
+  `set-keyspace.md` `desc.Count` entailed E2 accounting.
+  **Atomic on error**: returns `(0, err)` with no observable
+  mutations — `desc.Root`, `desc.Count`, and the
+  dirty/cursor-stale state are touched only on the success return,
+  so successive same-tx reads after a failed call observe the
+  pre-call state; tx-level `Rollback` restores the on-disk pager
+  bitmap to the pre-call state per `pager-slab.md`. Same
+  all-or-nothing contract as `Keyspace.DeleteRange`. Cost:
+  O(P + depth²) per §Complexity.
+
+- **Indexed (Kind=1 with declared indexes)**: per-row cursor walk
+  + `SetKeyspace.Delete(k)`, where each call invokes chunk-7.9's
+  `applyIndexMaintenanceOnBulkKeyDelete` to clear index entries
+  per (setKey, setValue) pair via the extractor. Cost is
+  `O(K × M × (indexes + extractor))` where K = keys in range, M =
+  average set size per key. **Per-row atomic on error**: same
+  partial-progress contract as the §Indexed-keyspace fallback
+  below — returns `(deleted_so_far, err)` with the first i-1
+  successful per-row deletes committed in-memory.
+
+Both paths use the §Set Keyspace Bulk Free mechanism for
+nested-tree cells (the un-indexed path via `FreeSubtree` at both
+interior subtrees and boundary leaves; the indexed path via
+`SetKeyspace.Delete`'s nested-tree branch per call).
+
 ## Indexed-keyspace fallback
 
 `DeleteRange` on an indexed keyspace does NOT use the O(pages)
@@ -266,8 +307,11 @@ chunk-5.1 keyed-removal invariants and the chunk-7.1 atomic-Put/
 Delete invariant individually; the in-memory + on-disk state is
 consistent-but-partial. The only safe recovery is `Tx.Rollback()`
 (which restores via the pager bitmap snapshot per
-`pager-slab.md`). This matches the chunk-6.8
-`SetKeyspace.DeleteRange` partial-progress contract.
+`pager-slab.md`). The same per-row partial-progress contract
+applies to the indexed `SetKeyspace.DeleteRange` dispatch — see
+§Set Keyspace Range Delete above. The un-indexed
+`SetKeyspace.DeleteRange` dispatch, like un-indexed
+`Keyspace.DeleteRange`, is atomic via `btree.DeleteRange`.
 
 Callers needing the O(pages) fast path on indexed data can:
 

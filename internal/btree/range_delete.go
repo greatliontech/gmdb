@@ -3,14 +3,81 @@ package btree
 import (
 	"bytes"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
+// deleteRangeCalledHookForTest is fired once per DeleteRange
+// invocation, at the function-entry point after argument validation.
+// Tests that need to verify which dispatch path took the walker (vs
+// a higher-level per-key loop) install via
+// SetDeleteRangeCalledHookForTest. Production callers must never
+// install a hook. Mirrors the readTxCleanupHookForTest pattern
+// (`read_tx.go`) used to test deterministic-synchronization points;
+// non-blocking is the inherited constraint (the hook fires inside
+// DeleteRange's normal call path, no quiescence guarantee).
+//
+// The lifetime contract: the hook fires AFTER mergeThreshold /
+// perCellFree / rootID / start>=end validation but BEFORE any
+// page mutation, so a test installing the hook on a workload that
+// would have been a no-op (rootID==0, empty range) still gets the
+// signal. Caller asserts via the hook whether SetKeyspace's
+// un-indexed dispatch reached btree.DeleteRange.
+var deleteRangeCalledHookForTest atomic.Pointer[func()]
+
+// SetDeleteRangeCalledHookForTest installs (or clears, if hook is
+// nil) the test-only hook fired at DeleteRange entry. Returns the
+// prior hook so callers can restore it via defer. The hook is
+// process-global; tests using it must not run concurrently with
+// other tests that share the hook.
+//
+// Cite: TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker /
+// TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker pin the
+// dispatch-direction invariant in `range-delete.md §Set Keyspace
+// Range Delete`. `git log --all -S deleteRangeCalledHookForTest`
+// preserves the rationale chain.
+func SetDeleteRangeCalledHookForTest(hook *func()) *func() {
+	return deleteRangeCalledHookForTest.Swap(hook)
+}
+
+// PerCellFreeFn is the per-leaf-entry callback DeleteRange's
+// boundary-leaf cleanup invokes for each entry to be removed.
+// Per range-delete.md §Algorithm, it carries two responsibilities:
+//
+//  1. Retire any per-cell resources the entry references — for
+//     Kind=0 cells the overflow chain (when CellFlagOverflow is
+//     set); for Kind=1 cells additionally the nested-tree subtree
+//     (CellFlagMultiValue|CellFlagNestedTree) or the inline
+//     subpage (CellFlagMultiValue alone — the subpage's value
+//     count is tallied but no extra page is freed; the subpage
+//     bytes live in the leaf entry itself).
+//  2. Return the count of user-visible VALUES this entry
+//     contributes to DeleteRange's total. For Kind=0 every entry
+//     contributes 1 (one key→value pair); for Kind=1 a subpage
+//     contributes the subpage's Count, a nested-tree contributes
+//     its NestedCount (returned from FreeSubtree), a plain
+//     overflow-only or no-flag cell contributes 1.
+//
+// Interior subtrees fully in [start, end) are retired via the
+// existing FreeSubtree which itself walks each leaf and counts
+// cell-type-aware values (see subtree.go) — the callback is
+// invoked ONLY at the boundary-leaf positions where the walker
+// rebuilds with keep entries.
+//
+// On error the walker aborts the operation; the caller's
+// tx-level Rollback restores via the pager bitmap snapshot per
+// pager-slab.md. No partial retirement is observable post-
+// Rollback.
+type PerCellFreeFn func(pw PageWriter, cfg page.Config, e page.LeafEntry) (uint64, error)
+
 // DeleteRange deletes every key k with start <= k < end from the
 // tree rooted at rootID, per range-delete.md §Algorithm. Returns
-// the count of leaf entries deleted and the new rootID (0 for an
-// emptied tree).
+// the count of user-visible VALUES deleted (1 per Kind=0 entry;
+// the sum of subpage Counts + nested-tree NestedCounts + 1 per
+// plain cell for Kind=1) and the new rootID (0 for an emptied
+// tree). The values-vs-entries distinction is driven entirely
+// by the caller's perCellFree callback — see PerCellFreeFn.
 //
 // Boundary semantics (range-delete.md invariant #1):
 //   - start == nil: open-left, "from the beginning"; deletes every
@@ -26,17 +93,31 @@ import (
 // rebalance) on the unwinding path. Root collapse runs at the top
 // level after the descent returns.
 //
+// perCellFree must be non-nil — DeleteRange has no implicit
+// default cell-free behavior. Callers operating on Kind=0
+// keyspaces typically pass a callback that calls FreeRun on
+// overflow chains and returns 1; callers on Kind=1 SetKeyspaces
+// pass one that additionally calls FreeSubtree on nested-tree
+// cells and tallies the subpage / NestedCount.
+//
 // Errors: btree.ErrCorrupted on structural anomaly; pager errors
-// (ErrTxTooLarge, alloc failures) pass through.
+// (ErrTxTooLarge, alloc failures) pass through; any error
+// returned by perCellFree propagates verbatim.
 //
 // On error: pages allocated during this DeleteRange may have been
 // retired; the caller's tx-level pager.AbortTx restores from the
 // bitmap snapshot. The returned (count, rootID) are meaningful only
 // when err == nil.
 func DeleteRange(pw PageWriter, cfg page.Config, rootID uint64,
-	mergeThreshold uint8, start, end []byte) (uint64, uint64, error) {
+	mergeThreshold uint8, start, end []byte, perCellFree PerCellFreeFn) (uint64, uint64, error) {
 	if mergeThreshold == 0 || mergeThreshold > MaxMergeThreshold {
 		return 0, 0, fmt.Errorf("btree: DeleteRange MergeThreshold %d outside (0, %d]", mergeThreshold, MaxMergeThreshold)
+	}
+	if perCellFree == nil {
+		return 0, 0, fmt.Errorf("btree: DeleteRange perCellFree callback is required")
+	}
+	if hook := deleteRangeCalledHookForTest.Load(); hook != nil {
+		(*hook)()
 	}
 	if rootID == 0 {
 		return 0, 0, nil
@@ -45,7 +126,7 @@ func DeleteRange(pw PageWriter, cfg page.Config, rootID uint64,
 		return 0, rootID, nil
 	}
 
-	newID, count, _, topDeep, err := deleteRangeFrom(pw, cfg, mergeThreshold, rootID, start, end)
+	newID, count, _, topDeep, err := deleteRangeFrom(pw, cfg, mergeThreshold, rootID, start, end, perCellFree)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -115,7 +196,7 @@ func DeleteRange(pw PageWriter, cfg page.Config, rootID uint64,
 // the leaf level itself). See `patchBranchAfterChildDelete` and
 // `cousinRebalanceBranch` for the mechanism.
 func deleteRangeFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8,
-	pageID uint64, start, end []byte) (uint64, uint64, bool, uint64, error) {
+	pageID uint64, start, end []byte, perCellFree PerCellFreeFn) (uint64, uint64, bool, uint64, error) {
 	buf, err := pw.Page(pageID)
 	if err != nil {
 		return 0, 0, false, 0, err
@@ -123,13 +204,13 @@ func deleteRangeFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	typ, _, _, _ := page.ReadHeader(buf)
 	switch {
 	case page.IsLeafType(typ):
-		newID, count, underflow, err := deleteRangeFromLeaf(pw, cfg, mergeThreshold, pageID, buf, start, end)
+		newID, count, underflow, err := deleteRangeFromLeaf(pw, cfg, mergeThreshold, pageID, buf, start, end, perCellFree)
 		return newID, count, underflow, 0, err
 	case typ == page.TypeBranch:
 		if err := validateBranchPage(buf, cfg, pageID); err != nil {
 			return 0, 0, false, 0, err
 		}
-		return deleteRangeFromBranch(pw, cfg, mergeThreshold, pageID, buf, start, end)
+		return deleteRangeFromBranch(pw, cfg, mergeThreshold, pageID, buf, start, end, perCellFree)
 	default:
 		return 0, 0, false, 0, fmt.Errorf("%w: page %d unexpected type %d during DeleteRange descent",
 			ErrCorrupted, pageID, typ)
@@ -137,11 +218,15 @@ func deleteRangeFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 }
 
 // deleteRangeFromLeaf rebuilds the leaf with entries whose keys lie
-// outside [start, end), retires overflow chains for in-range entries.
-// Returns newID=0 if the leaf becomes empty; pageID unchanged with
-// count=0 if no entry fell in range (no allocation).
+// outside [start, end), invoking perCellFree on each in-range entry
+// to retire its per-cell resources and tally its values
+// contribution. Returns newID=0 if the leaf becomes empty; pageID
+// unchanged with count=0 if no entry fell in range (no allocation).
+// The returned count is the SUM of perCellFree returns (not
+// uint64(len(deleted))) so SetKeyspace cells with multi-value
+// subpage or nested-tree contributions are accounted correctly.
 func deleteRangeFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8,
-	pageID uint64, srcBuf []byte, start, end []byte) (uint64, uint64, bool, error) {
+	pageID uint64, srcBuf []byte, start, end []byte, perCellFree PerCellFreeFn) (uint64, uint64, bool, error) {
 	entries, err := readLeafEntriesDeepCopy(srcBuf, cfg, pageID)
 	if err != nil {
 		return 0, 0, false, err
@@ -165,19 +250,22 @@ func deleteRangeFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 		return pageID, 0, false, nil
 	}
 	if len(keep) == 0 {
-		// Whole leaf in range — retire it (and every overflow chain).
-		// Order: chain-free first (still reachable via the
+		// Whole leaf in range — retire it (and every per-cell resource).
+		// Order: per-cell-free first (still reachable via the
 		// not-yet-retired leaf), then leaf-free. Mirrors the
 		// rebuildLeafAfterDelete empty-result path.
+		var totalCount uint64
 		for _, e := range deleted {
-			if err := freeOverflowChainIfPresent(pw, cfg, e); err != nil {
+			n, err := perCellFree(pw, cfg, e)
+			if err != nil {
 				return 0, 0, false, err
 			}
+			totalCount += n
 		}
 		if err := pw.FreePage(pageID); err != nil {
 			return 0, 0, false, fmt.Errorf("btree: free emptied leaf %d: %w", pageID, err)
 		}
-		return 0, uint64(len(deleted)), true, nil
+		return 0, totalCount, true, nil
 	}
 
 	// Partial: rebuild leaf with keep entries.
@@ -201,17 +289,20 @@ func deleteRangeFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 		}
 	}
 	b.Finish()
+	var totalCount uint64
 	for _, e := range deleted {
-		if err := freeOverflowChainIfPresent(pw, cfg, e); err != nil {
+		n, err := perCellFree(pw, cfg, e)
+		if err != nil {
 			_ = pw.FreePage(newID)
 			return 0, 0, false, err
 		}
+		totalCount += n
 	}
 	if err := pw.FreePage(pageID); err != nil {
 		_ = pw.FreePage(newID)
 		return 0, 0, false, fmt.Errorf("btree: free old leaf %d: %w", pageID, err)
 	}
-	return newID, uint64(len(deleted)), leafUnderflow(newBuf, cfg, mergeThreshold), nil
+	return newID, totalCount, leafUnderflow(newBuf, cfg, mergeThreshold), nil
 }
 
 // keyInRange reports whether key k lies in [start, end). nil start =
@@ -236,7 +327,7 @@ func keyInRange(k, start, end []byte) bool {
 // any underflowing boundary children are merged or redistributed
 // with their nearest siblings in the new layout.
 func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
-	pageID uint64, srcBuf []byte, start, end []byte) (uint64, uint64, bool, uint64, error) {
+	pageID uint64, srcBuf []byte, start, end []byte, perCellFree PerCellFreeFn) (uint64, uint64, bool, uint64, error) {
 	cellCount := page.BranchCellCount(srcBuf)
 
 	leftIdx := uint16(0)
@@ -259,7 +350,7 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 			return 0, 0, false, 0, fmt.Errorf("%w: null child in branch %d at descent %d",
 				ErrCorrupted, pageID, leftIdx)
 		}
-		newChildID, count, childUnderflow, childDeepUnderflow, err := deleteRangeFrom(pw, cfg, mergeThreshold, childID, start, end)
+		newChildID, count, childUnderflow, childDeepUnderflow, err := deleteRangeFrom(pw, cfg, mergeThreshold, childID, start, end, perCellFree)
 		if err != nil {
 			return 0, 0, false, 0, err
 		}
@@ -300,7 +391,7 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 		return 0, 0, false, 0, fmt.Errorf("%w: null left-boundary child in branch %d at descent %d",
 			ErrCorrupted, pageID, leftIdx)
 	}
-	newLeftID, leftCount, leftUnderflow, leftDeepUnderflow, err := deleteRangeFrom(pw, cfg, mergeThreshold, leftChildID, start, nil)
+	newLeftID, leftCount, leftUnderflow, leftDeepUnderflow, err := deleteRangeFrom(pw, cfg, mergeThreshold, leftChildID, start, nil, perCellFree)
 	if err != nil {
 		return 0, 0, false, 0, err
 	}
@@ -313,7 +404,7 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 		return 0, 0, false, 0, fmt.Errorf("%w: null right-boundary child in branch %d at descent %d",
 			ErrCorrupted, pageID, rightIdx)
 	}
-	newRightID, rightCount, rightUnderflow, rightDeepUnderflow, err := deleteRangeFrom(pw, cfg, mergeThreshold, rightChildID, nil, end)
+	newRightID, rightCount, rightUnderflow, rightDeepUnderflow, err := deleteRangeFrom(pw, cfg, mergeThreshold, rightChildID, nil, end, perCellFree)
 	if err != nil {
 		return 0, 0, false, 0, err
 	}

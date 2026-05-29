@@ -975,6 +975,28 @@ func (ks *Keyspace) Delete(key []byte) error
 //     §Invariants empty-key clause. The asymmetric semantic between
 //     nil and []byte{} is intentional: nil expresses "open"; the
 //     zero-length byte slice is an invalid key.
+//
+// **Atomicity contract.** Dispatches by index presence (chunk-7.10
+// indexed-keyspace fallback per range-delete.md §Indexed-keyspace
+// fallback):
+//   - **Un-indexed**: btree.DeleteRange (the chunk-5.7 atomic
+//     three-phase walker). **Atomic on error**: returns (0, err)
+//     with no observable mutations — desc.Root, desc.Count, and
+//     the dirty/cursor-stale state are touched only on the
+//     success return, so successive same-tx reads after a failed
+//     call observe the pre-call state; tx-level Rollback restores
+//     the on-disk pager bitmap per pager-slab.md.
+//   - **Indexed**: per-row cursor walk + Cursor.Delete per row
+//     (chunk-7.6 atomic index maintenance clears index entries
+//     before removing the row). **Per-row atomic on error**:
+//     returns (deleted_so_far, err); iterations 0..i-1 have
+//     completed and are in-memory visible; the failing iteration
+//     and remainder are untouched. Each successful per-row delete
+//     satisfies chunk-5.1's keyed-removal invariants and
+//     chunk-7.1's atomic-Put/Delete invariant individually; the
+//     in-memory + on-disk state is consistent-but-partial. The
+//     only safe recovery is Tx.Rollback() (which restores via
+//     the pager bitmap snapshot).
 func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error)
 func (ks *Keyspace) NextSequence() (uint64, error)
 func (ks *Keyspace) Cursor() *Cursor
@@ -1051,20 +1073,25 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
 // open-boundary; non-nil zero-length is rejected with
 // ErrKeyEmpty.
 //
-// **Partial-progress on error (chunk-6.1 user-locked).** Unlike
-// Keyspace.DeleteRange — whose underlying btree.DeleteRange is
-// atomic and returns (0, err) with descriptor state untouched —
-// SetKeyspace.DeleteRange's per-key loop is not atomic: on error
-// at iteration i, iterations 0..i-1 have already completed and
-// their effects (desc.Count delta, desc.Root advance, sibling-
-// cursor MarkStale, on-disk page retirements) ARE in-memory
-// visible. The function returns (deleted_so_far, err) so the
-// caller sees the actual scope of state change. Inv-1 / E1 / E2
-// hold for each successful per-key Delete; the in-memory state
-// is consistent-but-partial. The only safe recovery is
-// `Tx.Rollback()` (which restores via the pager bitmap
-// snapshot). A future O(K+log N) bulk-walker rewrite will honor
-// the same (deleted_so_far, err) contract.
+// **Atomicity contract (mirrors Keyspace.DeleteRange's chunk-7.10
+// indexed/un-indexed split).** Dispatches by index presence:
+//   - **Un-indexed**: btree.DeleteRange (the chunk-5.7 atomic
+//     three-phase walker) with a SetKeyspace-aware per-cell free
+//     callback that handles subpage / nested-tree / overflow
+//     cells. **Atomic on error**: returns (0, err) with no
+//     observable mutations — tx-level Rollback restores via the
+//     pager bitmap snapshot per pager-slab.md.
+//   - **Indexed**: per-row cursor walk + ks.Delete(k) per row
+//     (chunk-7.9's per-(setKey, setValue) index maintenance
+//     clears index entries via the extractor). **Per-row atomic
+//     on error**: returns
+//     (deleted_so_far, err); iterations 0..i-1 have completed
+//     and are in-memory visible; the failing iteration and
+//     remainder are untouched. Each successful per-row delete
+//     satisfies Inv-1 / E1 / E2; the in-memory + on-disk state
+//     is consistent-but-partial. The only safe recovery is
+//     Tx.Rollback() (which restores via the pager bitmap
+//     snapshot).
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error)
 func (ks *SetKeyspace) NextSequence() (uint64, error)
 func (ks *SetKeyspace) Cursor() *SetCursor

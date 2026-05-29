@@ -1151,11 +1151,87 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 	return nil
 }
 
+// setKeyspaceCellFree is the per-cell free callback
+// SetKeyspace.DeleteRange (un-indexed path) passes to
+// btree.DeleteRange. SetKeyspace cells split three ways per
+// set-keyspace.md §Storage Strategy + §Nested B+tree Reference Cell:
+//
+//   - Nested-tree cell (CellFlagMultiValue|CellFlagNestedTree):
+//     recursively retires the nested B+tree via btree.FreeSubtree;
+//     contributes NestedCount values (per set-keyspace.md Inv-2
+//     entailed: the cell's Count field equals the number of leaf
+//     entries reachable from Root). FreeSubtree's returned count
+//     IS that NestedCount by construction — it walks the nested
+//     tree and tallies entries; an on-disk mismatch surfaces as
+//     ErrCorrupted on the next sanity check.
+//   - Subpage cell (CellFlagMultiValue, no NestedTree): the
+//     inline subpage bytes go away with the parent leaf entry; no
+//     extra page retire. Contributes Subpage.Count values
+//     (decoded from the 2-byte Count header at offset 0 of
+//     e.Value; matches btree.FreeSubtree's subpage handling for
+//     consistency).
+//   - Plain cell (no MultiValue flag): contributes 1 value. If
+//     CellFlagOverflow is set, the overflow chain is retired via
+//     pw.FreeRun. Reachable for SetKeyspace only when the user
+//     stores a single inline value above the subpage promotion
+//     threshold (rare but in-spec).
+//
+// Mirrors the cell-type-aware retire + count logic in
+// btree.freeSubtreeAt (subtree.go §Count semantics) used for
+// interior subtrees in the same DeleteRange call. The two paths
+// must agree on count semantics so the (interior + boundary)
+// total returned by DeleteRange equals desc.Count's per-cell
+// accounting (set-keyspace.md Inv-2 entailed + Inv entailed E2).
+func setKeyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry) (uint64, error) {
+	switch {
+	case e.IsNestedTree():
+		if e.NestedRoot == 0 {
+			return 0, fmt.Errorf("%w: SetKeyspace DeleteRange: nested-tree cell has NestedRoot=0", btree.ErrCorrupted)
+		}
+		freed, err := btree.FreeSubtree(pw, cfg, e.NestedRoot)
+		if err != nil {
+			return 0, err
+		}
+		// Defense-in-depth (mirrors SetKeyspace.Delete's bulk-free
+		// path at set_keyspace.go's deleteFromNestedTree branch): the
+		// cell's NestedCount field MUST equal the walked-leaf tally
+		// per set-keyspace.md §Invariants Inv-2 entailed ("the
+		// nested-tree reference cell's Count field equals the number
+		// of leaf entries reachable from Root"). A divergence is
+		// on-disk corruption — surface as ErrCorrupted rather than
+		// silently letting desc.Count drift (the parent-level
+		// `count > ks.desc.Count` defense at DeleteRange's tail can't
+		// catch an undercount; only an overcount).
+		if freed != uint64(e.NestedCount) {
+			return 0, fmt.Errorf("%w: SetKeyspace DeleteRange: FreeSubtree freed %d values, cell NestedCount=%d",
+				btree.ErrCorrupted, freed, e.NestedCount)
+		}
+		return freed, nil
+	case e.IsSubpage():
+		// Inline subpage — no extra page retire; Count semantic
+		// matches freeSubtreeAt: read the 2-byte Count header
+		// directly via SubpageReader with fixedValueSize=0
+		// (Count is independent of variable/fixed mode).
+		sp := page.NewSubpageReader(e.Value, 0)
+		return uint64(sp.Count()), nil
+	case e.IsOverflow():
+		runLen := page.OverflowRunLength(cfg, e.TotalLen)
+		if err := pw.FreeRun(e.OverflowPage, runLen); err != nil {
+			return 0, fmt.Errorf("btree: SetKeyspace DeleteRange free overflow chain at %d (run=%d): %w",
+				e.OverflowPage, runLen, err)
+		}
+		return 1, nil
+	default:
+		return 1, nil
+	}
+}
+
 // DeleteRange deletes every (key, value) pair whose KEY falls in
 // [start, end) from the SetKeyspace. Returns the count of VALUES
-// deleted (E2 accounting — desc.Count delta), NOT the count of keys.
-// Returns (0, nil) for an empty range (start == end, start > end,
-// nil/nil on an empty keyspace, or no keys matching).
+// deleted (entailed E2 accounting — desc.Count delta), NOT the
+// count of keys. Returns (0, nil) for an empty range (start ==
+// end, start > end, nil/nil on an empty keyspace, or no keys
+// matching).
 //
 // Boundary semantics (api-surface.md §SetKeyspace.DeleteRange):
 //   - nil = open-boundary sentinel. nil start = "from the
@@ -1163,34 +1239,40 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 //     every key.
 //   - Non-nil zero-length ([]byte{}) is rejected with ErrKeyEmpty.
 //
-// For a key with a nested-tree cell, bulk-frees the nested subtree
-// via SetKeyspace.Delete (which uses chunk-6.5's FreeSubtree
-// extension). For a key with a subpage cell, the cell + its
-// inline subpage are removed via btree.Delete on the parent tree.
+// Mechanism splits on whether the SetKeyspace has secondary
+// indexes declared (per range-delete.md §Indexed-keyspace
+// fallback chunk-7.10 amendment — the same dispatch shape
+// Keyspace.DeleteRange uses):
 //
-// Implementation strategy (v1): snapshot keys in [start, end) via
-// a read cursor, then call SetKeyspace.Delete on each. Cost is
-// O(K log N) (K = keys in range, N = total parent-tree size).
-// The chunk-5.7 btree.DeleteRange three-phase algorithm is faster
-// but does not free nested-tree subtrees per cell — a SetKeyspace-
-// aware adaptation is a perf-driven follow-up.
+//   - **Un-indexed (len(ks.indexes) == 0)**: dispatches to
+//     btree.DeleteRange with setKeyspaceCellFree. The walker
+//     descends once, retires interior subtrees via FreeSubtree
+//     (which handles SetKeyspace cell types — subpage / nested-
+//     tree / overflow — and tallies values), and at boundary
+//     leaves invokes setKeyspaceCellFree per deleted entry.
+//     Cost: O(P + depth²) walker descent (range-delete.md
+//     §Complexity worked example) — single tree walk vs. v1's
+//     O(K log N) per-key descents. **Atomic on error**: returns
+//     (0, err) with no observable mutations (tx-level Rollback
+//     restores via pager bitmap snapshot per pager-slab.md), the
+//     same all-or-nothing contract as Keyspace.DeleteRange. The
+//     chunk-6.8 per-row partial-progress contract no longer
+//     applies on this path; an error means nothing was deleted.
 //
-// **Partial-progress semantic (chunk-6.8 user-locked, distinct
-// from chunk-5.7 Keyspace.DeleteRange).** Chunk-5.7's atomic
-// btree.DeleteRange returns (0, err) on failure with descriptor
-// state untouched. Chunk-6.8's per-key Delete loop is NOT
-// atomic: on error at iteration i, iterations 0..i-1 have
-// already completed and their effects (desc.Count delta,
-// desc.Root advance, sibling-cursor MarkStale, on-disk page
-// retirements via the pager) ARE reflected in the in-memory
-// state. The function returns (deleted_so_far, err) so the
-// caller sees the actual scope of state change; Inv-1 / E1 / E2
-// hold for each successful per-key Delete (state is
-// consistent-but-partial). The only safe recovery is
-// Tx.Rollback() — which restores the pre-tx state via the
-// pager's bitmap snapshot. The future O(K+logN) bulk-walker
-// rewrite (filed follow-up) will honor the same
-// (deleted_so_far, err) contract.
+//   - **Indexed (len(ks.indexes) > 0)**: dispatches to the per-
+//     key Delete loop helper (deleteRangePerKey). Each
+//     SetKeyspace.Delete invokes chunk-7.9's
+//     applyIndexMaintenanceOnBulkKeyDelete, walking every
+//     (setKey, setValue) pair and clearing index entries via the
+//     extractor. **Per-row atomic on error**: returns
+//     (deleted_so_far, err) — iterations 0..i-1 are committed
+//     in-memory; the failing iteration and remainder are
+//     untouched. Cost: O(K × M × (indexes + extractor)) where K
+//     = keys in range, M = average set size per key.
+//
+// The atomicity-contract split between the two paths mirrors
+// Keyspace.DeleteRange's chunk-7.10 split (atomic walker for
+// Kind=0 un-indexed; per-row cursor walk for Kind=0 indexed).
 //
 // Errors:
 //   - ErrKeyspaceClosed (handle invalidated by same-tx
@@ -1205,18 +1287,7 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 //   - desc.Root reflects the post-delete root.
 //   - desc.Count decrements by the returned value count.
 //   - state transitions to Dirty unless already Created.
-//   - Every open SetCursor on this keyspace is MarkStale'd
-//     (each per-key Delete call invalidates them).
-//
-// Indexed-keyspace fallback (chunk-7.10): the per-key Delete loop
-// transparently handles indexed Kind=1 keyspaces. The chunk-7.9
-// extension to SetKeyspace.Delete invokes
-// applyIndexMaintenanceOnBulkKeyDelete per call, which walks every
-// (setKey, setValue) pair in the key's set and clears index
-// entries via the extractor. Cost is O(K × M × (indexes +
-// extractor)) where K = keys in range, M = average set size per
-// key — same shape as Keyspace.DeleteRange's indexed fallback per
-// range-delete.md §Indexed-keyspace fallback.
+//   - Every open SetCursor on this keyspace is MarkStale'd.
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 	if err := ks.tx.requireOpen(true); err != nil {
 		return 0, err
@@ -1241,7 +1312,67 @@ func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 	}
 	cfg := ks.builderCfg()
 
-	// Phase 1: snapshot keys in [start, end) via a read cursor.
+	if len(ks.indexes) > 0 {
+		// Indexed path: per-key Delete loop preserves chunk-7.9's
+		// applyIndexMaintenanceOnBulkKeyDelete per-row contract +
+		// chunk-6.8 per-row-atomic partial-progress semantic.
+		return ks.deleteRangePerKey(cfg, start, end)
+	}
+
+	// Un-indexed path: walker (atomic). One descent retires
+	// interior subtrees + rebuilds boundary leaves. setKeyspaceCellFree
+	// at boundary handles subpage / nested-tree / overflow cells +
+	// tallies values; FreeSubtree at interior does the same via its
+	// recursive freeSubtreeAt. Total count is values-correct across
+	// both phases (set-keyspace.md Inv-2 entailed + Inv entailed E2).
+	mergeThreshold := ks.tx.db.opts.MergeThreshold
+	count, newRoot, err := btree.DeleteRange(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, start, end, setKeyspaceCellFree)
+	if err != nil {
+		return 0, mapBtreeErr(err)
+	}
+	if count == 0 {
+		// No-op (no entry in range, or empty subtree) — no
+		// descriptor or cursor invalidation, no state transition.
+		return 0, nil
+	}
+	// Defense-in-depth: a count > desc.Count return from
+	// btree.DeleteRange would indicate corruption (the parent-tree
+	// cell-count accounting diverged from desc.Count). Surface as
+	// ErrCorrupted rather than wrapping desc.Count under uint64
+	// arithmetic. Mirrors Keyspace.DeleteRange's defense-in-depth.
+	if count > ks.desc.Count {
+		return 0, fmt.Errorf("%w: SetKeyspace DeleteRange count=%d exceeds desc.Count=%d for keyspace %q",
+			ErrCorrupted, count, ks.desc.Count, ks.name.Value())
+	}
+	ks.desc.Root = newRoot
+	ks.desc.Count -= count
+	ks.markDirty()
+	ks.markSetCursorsStale()
+	return count, nil
+}
+
+// deleteRangePerKey is the indexed-SetKeyspace path for DeleteRange.
+// Snapshots keys in [start, end) and calls ks.Delete(k) per row.
+// Per-row atomic via SetKeyspace.Delete's existing per-row index
+// maintenance contract; returns (deleted_so_far, err) on a per-row
+// error. The walker shape (btree.DeleteRange) is unsafe here
+// because the extractor needs each (setKey, setValue) pair's value
+// to compute the prior index keys, which subtree retirement does
+// not visit.
+//
+// Count accumulation uses a per-iteration wrap-immune shape:
+// capture desc.Count BEFORE each Delete, verify it did not
+// INCREASE (a corruption signal — set-keyspace.md §Invariants
+// entailed E2 has desc.Count strictly decrease per successful
+// Delete on a non-empty cell), and accumulate the per-row delta.
+// Compared to the chunk-6.8 v1 pattern (`before - ks.desc.Count`
+// once at end) the per-iteration shape is wrap-immune even under
+// a corrupt on-disk state where Delete might leave desc.Count
+// above its pre-call value. Cannot use Keyspace.deleteRangeIndexed's
+// `count++` per-row pattern because SetKeyspace cells may carry
+// N>1 values (subpage Count, nested-tree NestedCount); the delta
+// must be computed from desc.Count, not assumed to be 1.
+func (ks *SetKeyspace) deleteRangePerKey(cfg page.Config, start, end []byte) (uint64, error) {
 	// Snapshot up front so the per-key Delete calls don't
 	// invalidate the iteration (each Delete mutates the parent
 	// tree's root, which would stale a cursor mid-walk).
@@ -1252,29 +1383,32 @@ func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
-
-	// Phase 2: per-key Delete. Each call computes the cell's value
-	// count, bulk-frees the nested tree if applicable, removes the
-	// parent cell, and decrements desc.Count by the right value
-	// count. We accumulate the delta via the desc.Count snapshot
-	// so partial-progress on error surfaces honestly to the caller
-	// per the user-locked contract above.
-	before := ks.desc.Count
+	var count uint64
 	for _, k := range keys {
+		before := ks.desc.Count
 		if err := ks.Delete(k); err != nil {
 			// Partial-progress error: iterations 0..i-1 have
-			// completed; their effects on desc.Count + desc.Root
-			// + sibling cursors + on-disk page retirements stand.
-			// Return (deleted_so_far, err) so the caller observes
-			// the real scope of state change. The only safe
-			// recovery is Tx.Rollback().
-			return before - ks.desc.Count, err
+			// completed; their effects on desc.Count + desc.Root +
+			// sibling cursors + on-disk page retirements stand.
+			// Return (deleted_so_far, err); the only safe recovery
+			// is Tx.Rollback (pager bitmap snapshot per
+			// pager-slab.md).
+			return count, err
 		}
+		if ks.desc.Count > before {
+			// Defense-in-depth (mirrors the un-indexed walker's
+			// `count > ks.desc.Count` check at the parent
+			// DeleteRange tail): a successful Delete must not
+			// INCREASE desc.Count; an increase is on-disk
+			// corruption (set-keyspace.md §Invariants entailed E2
+			// — desc.Count equals the sum of stored values; Delete
+			// decrements by the cell's value count).
+			return count, fmt.Errorf("%w: SetKeyspace.Delete(%q) raised desc.Count from %d to %d",
+				ErrCorrupted, k, before, ks.desc.Count)
+		}
+		count += before - ks.desc.Count
 	}
-	after := ks.desc.Count
-	// before - after is the total values freed across all per-key
-	// Delete calls (each decremented by the cell's value count).
-	return before - after, nil
+	return count, nil
 }
 
 // snapshotKeysInRange returns a sorted, deep-copied list of keys

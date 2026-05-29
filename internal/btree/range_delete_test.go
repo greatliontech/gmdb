@@ -13,6 +13,20 @@ import (
 // against the deferred-flush descriptor machinery; these tests pin
 // the btree-layer invariants directly against an in-memory pager.
 
+// plainCellFreeForTest is the per-cell free callback DeleteRange
+// expects: retire the overflow chain when CellFlagOverflow is set
+// and contribute 1 per entry to the values count. Matches the
+// shape Keyspace.DeleteRange uses in production (plain key→value
+// cells, no subpage or nested-tree). All btree-layer tests pass
+// this — the SetKeyspace shape (subpage / nested-tree handling)
+// is covered by the higher-level gmdb-package tests.
+func plainCellFreeForTest(pw PageWriter, cfg page.Config, e page.LeafEntry) (uint64, error) {
+	if err := freeOverflowChainIfPresent(pw, cfg, e); err != nil {
+		return 0, err
+	}
+	return 1, nil
+}
+
 // TestBtreeDeleteRangeEmptyTree promotes the rootID == 0 edge case:
 // DeleteRange on an empty tree returns (0, 0, nil) and does not
 // allocate or free pages.
@@ -20,7 +34,7 @@ func TestBtreeDeleteRangeEmptyTree(t *testing.T) {
 	pw, _, f := setupPagerWriter(t, 16)
 	defer pw.Close()
 	defer f.Close()
-	count, newRoot, err := DeleteRange(pw, pw.Config(), 0, DefaultMergeThreshold, []byte("a"), []byte("z"))
+	count, newRoot, err := DeleteRange(pw, pw.Config(), 0, DefaultMergeThreshold, []byte("a"), []byte("z"), plainCellFreeForTest)
 	if err != nil {
 		t.Fatalf("DeleteRange(empty): %v", err)
 	}
@@ -45,7 +59,7 @@ func TestBtreeDeleteRangeEmptyRange(t *testing.T) {
 		{[]byte("a"), []byte("a")},
 		{[]byte("z"), []byte("a")},
 	} {
-		count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, pair.s, pair.e)
+		count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, pair.s, pair.e, plainCellFreeForTest)
 		if err != nil {
 			t.Fatalf("DeleteRange(%q, %q): %v", pair.s, pair.e, err)
 		}
@@ -76,7 +90,7 @@ func TestBtreeDeleteRangeBoundaryInclusion(t *testing.T) {
 		}
 	}
 	// Delete [b, d): expect b and c gone, a/d/e present.
-	count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, []byte("b"), []byte("d"))
+	count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, []byte("b"), []byte("d"), plainCellFreeForTest)
 	if err != nil {
 		t.Fatalf("DeleteRange: %v", err)
 	}
@@ -131,7 +145,7 @@ func TestBtreeDeleteRangeOpenBoundaries(t *testing.T) {
 					t.Fatalf("Put %q: %v", k, err)
 				}
 			}
-			count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, tc.start, tc.end)
+			count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, tc.start, tc.end, plainCellFreeForTest)
 			if err != nil {
 				t.Fatalf("DeleteRange: %v", err)
 			}
@@ -177,7 +191,7 @@ func TestBtreeDeleteRangeAllKeys(t *testing.T) {
 			t.Fatalf("Put #%d: %v", i, err)
 		}
 	}
-	count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, nil, nil)
+	count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, nil, nil, plainCellFreeForTest)
 	if err != nil {
 		t.Fatalf("DeleteRange: %v", err)
 	}
@@ -222,7 +236,7 @@ func TestBtreeDeleteRangeMultiLevelInteriorRetire(t *testing.T) {
 	// Delete the middle 600 keys [k00300, k00900).
 	startK := []byte("k00300")
 	endK := []byte("k00900")
-	count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, startK, endK)
+	count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, startK, endK, plainCellFreeForTest)
 	if err != nil {
 		t.Fatalf("DeleteRange: %v", err)
 	}
@@ -294,7 +308,7 @@ func TestBtreeDeleteRangeOverflowChainRetire(t *testing.T) {
 		// 1 leaf + 3 × ~4-page overflow chains = ≥13 pages.
 		t.Fatalf("expected ≥13 reachable pages (leaf + 3 overflow chains), got %d", len(reachable))
 	}
-	count, _, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, []byte("a"), []byte("d"))
+	count, _, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, []byte("a"), []byte("d"), plainCellFreeForTest)
 	if err != nil {
 		t.Fatalf("DeleteRange: %v", err)
 	}
@@ -336,7 +350,7 @@ func TestBtreeDeleteRangeMissOnRange(t *testing.T) {
 	// Range (a, c) — exclusive of both — touches the gap between
 	// existing keys. Wait: spec is [start, end). [b, c) → no hit
 	// because b doesn't exist. count should be 0.
-	count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, []byte("b"), []byte("c"))
+	count, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, []byte("b"), []byte("c"), plainCellFreeForTest)
 	if err != nil {
 		t.Fatalf("DeleteRange: %v", err)
 	}
@@ -379,7 +393,7 @@ func TestBtreeDeleteRangeWellFormedAfter(t *testing.T) {
 		}
 	}
 	// Delete a slice from the middle.
-	_, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, []byte("k00050"), []byte("k00150"))
+	_, newRoot, err := DeleteRange(pw, cfg, root, DefaultMergeThreshold, []byte("k00050"), []byte("k00150"), plainCellFreeForTest)
 	if err != nil {
 		t.Fatalf("DeleteRange: %v", err)
 	}
@@ -580,7 +594,7 @@ func TestBtreeDeleteRangePreservesFillFloor(t *testing.T) {
 	// with the sub-MT leaf as M.leftmost. R survives so ROOT does
 	// NOT root-collapse — M is a non-root branch of ROOT, and its
 	// leftmost is a non-root sub-MT leaf.
-	count, newRoot, err := DeleteRange(pw, cfg, rootID, mt, padKey("a02"), padKey("f03"))
+	count, newRoot, err := DeleteRange(pw, cfg, rootID, mt, padKey("a02"), padKey("f03"), plainCellFreeForTest)
 	if err != nil {
 		t.Fatalf("DeleteRange: %v", err)
 	}
@@ -711,7 +725,7 @@ func TestBtreeDeleteRangePreservesFillFloorUseLeftCousin(t *testing.T) {
 	// Branches(Q, R_degenerate) lands the deep leaf at the LAST cell of
 	// mergedID — exactly the non-leftmost geometry the all-children
 	// scan was added to catch.
-	count, newRoot, err := DeleteRange(pw, cfg, 1, mt, padKey("ra02"), padKey("rf03"))
+	count, newRoot, err := DeleteRange(pw, cfg, 1, mt, padKey("ra02"), padKey("rf03"), plainCellFreeForTest)
 	if err != nil {
 		t.Fatalf("DeleteRange: %v", err)
 	}
