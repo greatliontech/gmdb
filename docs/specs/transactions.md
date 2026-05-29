@@ -438,6 +438,28 @@ the original buffer (pre-window dirty) or pool-`Put` it (in-
 window-installed buffer that was loose-popped within the same
 window — re-attaching would leak it post-Restore).
 
+The `loosePopLog`'s record of one (id, original-buffer) entry
+per loose-pop event carries an implicit **single-owner contract**
+on the detached `*[]byte`: `RestoreSavepoint`'s step-4 acts on
+each entry as if it were uniquely owned (unconditional
+`pool.Put(cur)` of the present `dirty[id]` followed by re-install
+of `entry.buf`, with no refcount). The loose-pop branch
+(`freespace.go`) appends the SAME `buf` pointer to every active
+SHALLOW savepoint's `loosePopLog`, so the single-owner contract
+holds only when at most one SHALLOW is active at the time of any
+loose-pop event. To make the contract structural (illegal-state-
+unrepresentable rather than caller-discipline), `Pager.
+BeginShallowSavepoint` **panics if another SHALLOW savepoint is
+already unresolved on the pager** — at most one SHALLOW is
+active per pager at any moment. The 6 per-row indexed-maintenance
+helpers (the only legitimate callers) each open-and-resolve
+exactly one SHALLOW per call and do not nest, so the rule is
+free in practice. SHALLOW-inside-NESTED and NESTED-inside-
+SHALLOW remain allowed: NESTED suspends loose-pop via
+`savepointDepth > 0`, so no loose-pop fires inside the nested
+window and no alias can form regardless of which kind is at the
+top of the stack.
+
 Per-tx-body mid-tx mutations to `rplSegments` (only `reclaimRPL`'s
 head trim) are not undo-logged; the savepoint clones the chain
 slice at capture instead. The chain length is bounded by in-memory
@@ -517,8 +539,18 @@ shape:
   loose-pop across the savepoint window so an N-row indexed-Put
   workload stays bounded in file growth (the nested kind's
   loose-pop suspension would multiply to O(N·depth) and exhaust
-  `MaxSize` for moderate batches). See §Nested Transactions for
-  the substrate semantics.
+  `MaxSize` for moderate batches). **At most one SHALLOW
+  savepoint may be active on the pager at any moment**:
+  `BeginShallowSavepoint` panics if another SHALLOW is already
+  unresolved, because two simultaneously-active SHALLOWs would
+  alias the same loose-popped `*[]byte` across their
+  `loosePopLog`s and corrupt the pool/`dirty` invariant on
+  Restore (see §Nested Transactions §Why this is cheap for the
+  alias mechanism and the single-owner contract). The six callers
+  listed above each open-and-resolve exactly one SHALLOW per
+  call and do not nest, so the rule is free in practice.
+  SHALLOW-inside-NESTED and NESTED-inside-SHALLOW remain
+  allowed. See §Nested Transactions for the substrate semantics.
 
 A savepoint owns *pager* state (bitmap, `pendingAllocs`/`Frees`,
 `loosePages`, `dirtyKeys`, `retiredPages`, slab buffers added during

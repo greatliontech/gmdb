@@ -267,9 +267,45 @@ func (p *Pager) BeginSavepoint() *Savepoint {
 // engine's rest-of-tx-continues contract) does not orphan the
 // in-flight allocations — see free-space.md's entailed bitmap-
 // consistency invariant.
+//
+// Single-active per pager. At most one SHALLOW savepoint may be
+// active on the pager at any moment (transactions.md §Nested
+// Transactions / §Write-helper error contract). A second concurrent
+// SHALLOW would alias the same loose-popped *[]byte across both
+// savepoints' loosePopLogs (freespace.go's loose-pop branch walks
+// every active SHALLOW and appends the SAME buf pointer to each),
+// so on Restore the outer would pool-Put the buffer the inner just
+// re-installed — leaving the buf simultaneously in the pool free
+// list and in p.dirty[id], a use-after-free in user-visible page
+// data on the next bufPool.Get(). The 6 per-row indexed-maintenance
+// production callers (the only legitimate users of this primitive)
+// each open-and-resolve exactly one shallow per call and do not
+// nest; the panic surfaces a programming-discipline violation at
+// the API surface rather than allowing the buffer alias to form.
+//
+// SHALLOW-inside-NESTED is allowed (NESTED suspends loose-pop via
+// savepointDepth > 0, so no loose-pop event fires inside the
+// SHALLOW window → no alias can form). Likewise NESTED-inside-
+// SHALLOW: NESTED's Begin establishes the suspension (depth 0 →
+// 1) for its own window, so no new loose-pop fires during it; the
+// outer SHALLOW's pre-NESTED loosePopLog entries (if any) are not
+// aliased because there is still only one SHALLOW on the stack.
 func (p *Pager) BeginShallowSavepoint() *Savepoint {
 	if p.readOnly {
 		return nil
+	}
+	// Single-active SHALLOW guard. Check BEFORE captureSavepointState
+	// so a panic leaves no bitmap.Snapshot leaked into openSnapshots
+	// and no partial mutation of activeSavepoints. Scan the full stack
+	// (not just the topmost) so the rule holds regardless of NESTED
+	// interleaving below: [SHALLOW, NESTED, … attempt SHALLOW] must
+	// still panic — two SHALLOWs could still alias on a loose-pop
+	// fired after the inner NESTED resolves but before the outer
+	// SHALLOW does.
+	for _, sp := range p.activeSavepoints {
+		if sp.kind == SavepointShallow {
+			panic("pager: BeginShallowSavepoint: shallow savepoint already active (single-active per pager)")
+		}
 	}
 	sp := p.captureSavepointState()
 	sp.kind = SavepointShallow
@@ -403,14 +439,15 @@ func (p *Pager) RestoreSavepoint(sp *Savepoint) {
 	//     Restore re-attaches it. Any subsequent in-window CoW that
 	//     re-installed at id appended a (fieldDirty, id, false) undo
 	//     entry; the step-3 replay above already deleted it, so
-	//     dirty[entry.id] is absent here in the common case. A
-	//     defensive pool-Put covers any future code path that mutates
-	//     dirty without going through the recorded installers — and
-	//     today is also the reachable path under nested-SHALLOW
-	//     resolution (an unsupported topology per Issue triage; see
-	//     docs/issues/nested-shallow-loose-pop-buffer-alias.md for
-	//     the buffer-pointer aliasing the defensive pool-Put currently
-	//     mishandles).
+	//     dirty[entry.id] is absent here in the common case. The
+	//     defensive pool-Put on a non-absent dirty[entry.id] covers any
+	//     future code path that mutates dirty without going through
+	//     the recorded installers. The single-active SHALLOW invariant
+	//     (BeginShallowSavepoint's panic guard; transactions.md §Nested
+	//     Transactions §Why this is cheap "single-owner contract")
+	//     guarantees buf is owned by exactly one loosePopLog entry, so
+	//     the pool-Put never aliases another savepoint's still-live
+	//     entry.buf at re-install time.
 	//
 	//   - wasPreWindow=false: dirty[entry.id] was added in-window
 	//     (CoW/AllocSlab/AllocSlabRun) and then loose-popped, also

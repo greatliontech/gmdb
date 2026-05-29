@@ -1,6 +1,9 @@
 package pager
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // markFree marks pages [first, first+n) free in the bitmap so AllocPage
 // has somewhere to allocate from.
@@ -464,23 +467,31 @@ func TestShallowSavepointReleaseKeepsLoosePop(t *testing.T) {
 	}
 }
 
-// TestShallowSavepointOutOfOrderPanics pins the strict-LIFO guard on
-// shallow savepoint resolution (transactions.md §Nested Transactions:
+// TestSavepointOutOfOrderPanics pins the strict-LIFO guard on
+// savepoint resolution (transactions.md §Nested Transactions:
 // "out-of-order Restore or Discard panics rather than silently
-// corrupt state"). Without the guard, Restoring the outer first
-// would silently no-op the pop, leave the inner dangling in
-// activeShallowSavepoints, and surface as a delayed bitmap-snapshot
-// panic at the inner's eventual resolution. Pre-emptive panic
-// matches bitmap.go's openSnapshots LIFO behaviour.
-func TestShallowSavepointOutOfOrderPanics(t *testing.T) {
+// corrupt state"). The guard is kind-agnostic — it lives in
+// RestoreSavepoint / ReleaseSavepoint and fires before any
+// kind-specific work. NESTED is used here because two SHALLOWs can
+// no longer coexist (TestShallowSavepointPanicsOnNestedShallow
+// pins the single-active SHALLOW rule); the LIFO contract under
+// either kind goes through the same shared check.
+//
+// Without the guard, Restoring the outer first would silently no-op
+// the pop, leave the inner dangling in activeSavepoints with a
+// stale bitmap snapshot in openSnapshots, and surface as a delayed
+// bitmap-snapshot panic at the inner's eventual resolution.
+// Pre-emptive panic matches bitmap.go's openSnapshots LIFO
+// behaviour.
+func TestSavepointOutOfOrderPanics(t *testing.T) {
 	p, bm, f := setupWriter(t, 64)
 	defer p.Close()
 	defer f.Close()
 	first := bm.FirstDataPage()
 	markFree(bm, first, 16)
 
-	outer := p.BeginShallowSavepoint()
-	inner := p.BeginShallowSavepoint()
+	outer := p.BeginSavepoint()
+	inner := p.BeginSavepoint()
 	_ = inner
 
 	defer func() {
@@ -845,6 +856,16 @@ func TestShallowSavepointInWindowAllocLoosePopRestoreDoesNotLeak(t *testing.T) {
 // state. Post-fix the equivalent guarantee comes from the log
 // retention rule in ReleaseSavepoint (truncate only when activeSavepoints
 // becomes empty).
+//
+// Uses NESTED savepoints because two SHALLOWs can no longer coexist
+// (TestShallowSavepointPanicsOnNestedShallow pins the single-active
+// SHALLOW rule). The savepointUndoLog substrate is shared across
+// kinds — per-Savepoint marker, per-pager log, replay on Restore —
+// so the invariant tested here applies equally to either kind. Under
+// NESTED, AllocPage takes the bitmap.FindFirst branch (loose-pop
+// suspended via savepointDepth > 0) which records the same
+// (fieldPendingAllocs, id, false) undo entries the SHALLOW path
+// would have under loose-pop-disabled state.
 func TestSavepointRestoreOuterRevertsInnerReleasedWork(t *testing.T) {
 	p, bm, f := setupWriter(t, 64)
 	defer p.Close()
@@ -855,7 +876,7 @@ func TestSavepointRestoreOuterRevertsInnerReleasedWork(t *testing.T) {
 	preAllocs := len(p.pendingAllocs)
 	preDirty := len(p.dirty)
 
-	outer := p.BeginShallowSavepoint()
+	outer := p.BeginSavepoint()
 
 	// Outer-window does some work.
 	outerID, err := p.AllocPage()
@@ -866,7 +887,7 @@ func TestSavepointRestoreOuterRevertsInnerReleasedWork(t *testing.T) {
 		t.Fatalf("outer AllocSlab: %v", err)
 	}
 
-	inner := p.BeginShallowSavepoint()
+	inner := p.BeginSavepoint()
 
 	// Inner-window does more work.
 	innerID, err := p.AllocPage()
@@ -901,4 +922,170 @@ func TestSavepointRestoreOuterRevertsInnerReleasedWork(t *testing.T) {
 	if got := len(p.dirty); got != preDirty {
 		t.Errorf("len(dirty) = %d after outer Restore, want %d", got, preDirty)
 	}
+}
+
+// TestShallowSavepointPanicsOnNestedShallow pins the single-active
+// SHALLOW invariant (transactions.md §Nested Transactions /
+// §Write-helper error contract): at most one SHALLOW savepoint may be
+// active on the pager at any moment. BeginShallowSavepoint panics if
+// another shallow savepoint is already unresolved on
+// p.activeSavepoints.
+//
+// Why it's a panic, not an error. Two simultaneously-active SHALLOW
+// savepoints both record the SAME loose-popped *[]byte pointer in
+// their loosePopLogs — freespace.go's loose-pop branch walks every
+// active SHALLOW savepoint and appends a loosePopEntry with the buf
+// pointer it just detached, with no per-savepoint cloning of the
+// underlying []byte (the buf IS the original slab buffer being
+// transferred). Both entries get wasPreWindow=true because the
+// pre-window scan of sp.undoLogPos..end finds no (fieldDirty, id,
+// false) entry for either. On Restore (inner-first, LIFO):
+//
+//   - Inner Restore step-4: dirty[id] is absent (loose-pop deleted
+//     it); cur,ok := p.dirty[id]; !ok → no pool-Put; p.dirty[id] =
+//     entry.buf re-attaches the original buffer.
+//   - Outer Restore step-4: dirty[id] = buf (the same pointer the
+//     inner just re-installed); cur,ok := p.dirty[id]; ok →
+//     p.bufPool.Put(buf); p.dirty[id] = entry.buf RE-INSTALLS the
+//     same pointer.
+//
+// End state: buf is simultaneously in bufPool's free list AND in
+// p.dirty[id]. A subsequent bufPool.Get() returns buf to a new
+// caller, who writes to it, silently corrupting the page content at
+// p.dirty[id]. This is a use-after-free in user-visible page data,
+// fired by a programming-discipline violation at the API surface;
+// panic is the conventional response (same posture as bitmap.go's
+// openSnapshots LIFO discipline and RestoreSavepoint's out-of-order
+// guard — see TestNestedSavepointOutOfOrderPanics).
+//
+// SHALLOW-inside-NESTED is the legitimate cross-kind combination
+// (allowed): NESTED suspends loose-pop via savepointDepth > 0, so
+// no loose-pop events fire inside the SHALLOW window and no alias
+// can form. Pinned by TestShallowSavepointDoesNotSuspendNestedInv.
+func TestShallowSavepointPanicsOnNestedShallow(t *testing.T) {
+	p, _, f := setupWriter(t, 64)
+	defer p.Close()
+	defer f.Close()
+
+	outer := p.BeginShallowSavepoint()
+	if outer == nil {
+		t.Fatalf("BeginShallowSavepoint on writable pager returned nil")
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Errorf("BeginShallowSavepoint with another shallow already active did not panic")
+		} else if msg, ok := r.(string); !ok || !strings.Contains(msg, "shallow savepoint already active") {
+			// Pin the panic identity: future maintenance could move the
+			// panic to a different site (e.g. captureSavepointState
+			// itself) and a bare r != nil check would still pass while
+			// no longer asserting THIS guard fired. The message text is
+			// the contract surface — it appears in user-facing stack
+			// traces — and is grep-anchored by the spec amend
+			// (transactions.md §Write-helper error contract).
+			t.Errorf("panic = %v, want message containing %q", r, "shallow savepoint already active")
+		}
+		// Clean up the outer so the test ends in a consistent state.
+		// The panic fires BEFORE captureSavepointState / append, so
+		// activeSavepoints is unchanged; outer remains the top entry.
+		// A second defer swallows any unexpected panic from Release
+		// so it surfaces as a test failure, not a goroutine kill.
+		defer func() {
+			if rr := recover(); rr != nil {
+				t.Errorf("ReleaseSavepoint(outer) panicked: %v", rr)
+			}
+		}()
+		p.ReleaseSavepoint(outer)
+	}()
+
+	_ = p.BeginShallowSavepoint()
+}
+
+// TestNestedInsideShallowSavepointAllowed pins the cross-kind
+// allowance documented in transactions.md §Nested Transactions §Why
+// this is cheap and BeginShallowSavepoint godoc: a NESTED savepoint
+// may open inside an active SHALLOW savepoint without panic. The
+// safety argument: the NESTED's Begin establishes loose-pop
+// suspension (savepointDepth 0 → 1) for its window, so no new
+// loose-pop event fires during the NESTED window — the outer
+// SHALLOW's loosePopLog cannot grow inside the NESTED window, and
+// the NESTED's resolution leaves the SHALLOW's existing
+// loosePopLog entries (if any) intact.
+//
+// Asserts:
+//   - Both Begin calls succeed (no panic from the single-active
+//     SHALLOW guard; NESTED is a different kind so the guard skips).
+//   - During the NESTED window, an AllocPage takes the bitmap branch
+//     (loose-pop suspended); the result is NOT a previously freed
+//     loose page.
+//   - The outer SHALLOW resolves cleanly after the inner NESTED
+//     resolves (no LIFO violation, no leftover loosePopLog alias).
+func TestNestedInsideShallowSavepointAllowed(t *testing.T) {
+	p, bm, f := setupWriter(t, 64)
+	defer p.Close()
+	defer f.Close()
+	first := bm.FirstDataPage()
+	markFree(bm, first, 32)
+
+	// Pre-stage a loose page so we can verify loose-pop is suspended
+	// under the NESTED window. Without the SHALLOW open, this loose
+	// page would be the next AllocPage result.
+	loose, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("loose AllocPage: %v", err)
+	}
+	if _, err := p.AllocSlab(loose); err != nil {
+		t.Fatalf("loose AllocSlab: %v", err)
+	}
+	if err := p.FreePage(loose); err != nil {
+		t.Fatalf("loose FreePage: %v", err)
+	}
+
+	shallow := p.BeginShallowSavepoint()
+	if shallow == nil {
+		t.Fatalf("BeginShallowSavepoint on writable pager returned nil")
+	}
+
+	// Open NESTED inside the SHALLOW window. This must NOT panic —
+	// the single-active SHALLOW guard checks kind == SavepointShallow
+	// and skips NESTED entries.
+	nested := p.BeginSavepoint()
+	if nested == nil {
+		t.Fatalf("BeginSavepoint on writable pager returned nil")
+	}
+	if got := p.SavepointDepth(); got != 1 {
+		t.Errorf("SavepointDepth = %d under NESTED-inside-SHALLOW, want 1", got)
+	}
+
+	// Loose-pop must be suspended inside the NESTED window
+	// regardless of the outer SHALLOW. If suspension fails, AllocPage
+	// returns the previously-loose page, aliasing the outer
+	// SHALLOW's would-be loosePopLog.
+	got, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage inside NESTED-inside-SHALLOW: %v", err)
+	}
+	if got == loose {
+		t.Errorf("AllocPage = %d = loose-popped under nested savepoint (loose-pop not suspended)", loose)
+	}
+	if _, err := p.AllocSlab(got); err != nil {
+		t.Fatalf("AllocSlab inside NESTED-inside-SHALLOW: %v", err)
+	}
+
+	// The outer SHALLOW's loosePopLog must remain empty — no
+	// loose-pop fired inside the NESTED window.
+	if n := len(shallow.loosePopLog); n != 0 {
+		t.Errorf("shallow.loosePopLog len = %d after NESTED window, want 0", n)
+	}
+
+	// Inner NESTED commits (Release). Its mutations stay in the
+	// pager. The outer SHALLOW must still be resolvable (LIFO holds).
+	p.ReleaseSavepoint(nested)
+	if got := p.SavepointDepth(); got != 0 {
+		t.Errorf("SavepointDepth = %d after NESTED release, want 0", got)
+	}
+
+	// Outer SHALLOW commits. Must not panic; mutations persist.
+	p.ReleaseSavepoint(shallow)
 }
