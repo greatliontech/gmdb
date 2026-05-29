@@ -156,6 +156,53 @@ func readTxCleanupFn(info readTxCleanupInfo) {
 	}
 	defer info.gate.ExitCleanup()
 	info.coord.ReleaseReader(info.slot)
+	// Test-only synchronization point. Fires AFTER ReleaseReader so a
+	// waiting test observes the slot already cleared (TxnID=0 stored)
+	// when the signal arrives — the prior wall-clock-poll shape in
+	// TestLeakedReadTxReleasesSlotViaCleanup flaked under -race because
+	// finalizer scheduling latency outran the test's bounded wait. The
+	// hook is loaded via atomic.Pointer (single non-blocking op) and
+	// the installed callback MUST itself be non-blocking per
+	// leak-detection.md §Cleanup Behavior — atomic ops, non-blocking
+	// channel sends, no Lock/RLock/spin, no blocking I/O, no panic;
+	// the test pattern is `select { case ch <- struct{}{}: default: }`.
+	// The hook runs INSIDE the EnterCleanup/ExitCleanup window —
+	// closeGate.BeginClose's drain (closegate.go) waits for it; the
+	// non-blocking constraint bounds that wait to the cost of one
+	// atomic-pointer load plus the installed callback's own duration.
+	if hook := readTxCleanupHookForTest.Load(); hook != nil {
+		(*hook)()
+	}
+}
+
+// readTxCleanupHookForTest, when set, is invoked at the tail of
+// readTxCleanupFn's active-release path (after info.coord.ReleaseReader
+// returns) — fires only on the gate-open branch where the slot was
+// actually released, NOT on the closed-observed skip path. Used by
+// TestLeakedReadTxReleasesSlotViaCleanup to wait deterministically for
+// cleanup to fire instead of polling the slot table on a finalizer-
+// scheduling timer (which flaked under -race; see the test's godoc and
+// `git log --all -S readTxCleanupHookForTest` for the rationale
+// history). Test-only; installed via setReadTxCleanupHookForTest and
+// cleared via t.Cleanup.
+//
+// Concurrency: the cleanup callback runs on a GC background goroutine
+// and MUST stay non-blocking (leak-detection.md §Cleanup Behavior). The
+// installed hook callback inherits that constraint — atomic ops and
+// non-blocking channel sends only; no Lock/RLock/spin, no blocking
+// I/O, no panic. A panicking callback propagates through the GC
+// goroutine and crashes the process.
+var readTxCleanupHookForTest atomic.Pointer[func()]
+
+// setReadTxCleanupHookForTest installs (or clears, when hook==nil) the
+// test-only post-release synchronization hook described on
+// readTxCleanupHookForTest. Test-only.
+func setReadTxCleanupHookForTest(hook func()) {
+	if hook == nil {
+		readTxCleanupHookForTest.Store(nil)
+		return
+	}
+	readTxCleanupHookForTest.Store(&hook)
 }
 
 // BeginRead opens a snapshot read transaction. The returned ReadTx

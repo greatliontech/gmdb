@@ -327,8 +327,19 @@ func TestLeakedReadTxReleasesSlotViaCleanup(t *testing.T) {
 	// must not pin its reader slot forever — runtime.AddCleanup
 	// fires after GC, the cleanup CAS's the held flag and releases
 	// the slot. We pin the contract by leaking a ReadTx, forcing
-	// GC, and asserting the next BeginRead on a max-1-slots table
-	// succeeds.
+	// GC, waiting on the readTxCleanupHookForTest signal (fires at
+	// the tail of the active-release path), and asserting the next
+	// BeginRead on a max-1-slots table succeeds.
+	//
+	// Why the hook: BeginRead with a no-deadline context returns
+	// ErrReadersFull IMMEDIATELY (internal/lock/coord_reader.go) if
+	// the slot is busy — it does NOT wait. The prior "spawn a
+	// BeginRead goroutine and wait on a 5s timer" shape polled a
+	// wall-clock timer against the asynchronous finalizer-scheduling
+	// signal and flaked under -race when scheduling latency outran
+	// the goroutine's race-to-BeginRead-after-GC. The hook fires
+	// AFTER info.coord.ReleaseReader returns, so a hook-signalled
+	// BeginRead succeeds deterministically.
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 64, MaxReaders: 1,
@@ -337,27 +348,37 @@ func TestLeakedReadTxReleasesSlotViaCleanup(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
+	// Buffered cap=1 + select-default in the callback so concurrent
+	// cleanups (none expected here — single leak — but the hook
+	// contract requires non-blocking) cannot block the GC goroutine.
+	cleanupDone := make(chan struct{}, 1)
+	setReadTxCleanupHookForTest(func() {
+		select {
+		case cleanupDone <- struct{}{}:
+		default:
+		}
+	})
+	t.Cleanup(func() { setReadTxCleanupHookForTest(nil) })
+
 	leakReadTx(t, db, ctx)
+	// Two GC cycles drain the cleanup queue: the first marks the
+	// *ReadTx unreachable; the second flushes the cleanup function
+	// onto its runtime goroutine. The hook signal proves the
+	// callback completed, not merely that it was enqueued.
 	runtime.GC()
 	runtime.GC()
-	// Cleanup runs on a separate goroutine; wait via a channel for
-	// the slot to free. If cleanup fires within the timeout,
-	// BeginRead unblocks immediately.
-	done := make(chan error, 1)
-	go func() {
-		rtx, err := db.BeginRead(ctx)
-		if err == nil {
-			_ = rtx.Rollback()
-		}
-		done <- err
-	}()
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("BeginRead after GC of leaked ReadTx: %v", err)
-		}
+	case <-cleanupDone:
+		// Cleanup callback ran to completion; slot is released.
 	case <-time.After(5 * time.Second):
-		t.Fatal("BeginRead blocked — leaked ReadTx did not release slot via GC cleanup")
+		t.Fatal("ReadTx cleanup did not fire within 5s after GC — leak-detection.md §Cleanup Behavior step 2 violated")
+	}
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead after cleanup signalled: %v", err)
+	}
+	if err := rtx.Rollback(); err != nil {
+		t.Errorf("Rollback: %v", err)
 	}
 }
 
