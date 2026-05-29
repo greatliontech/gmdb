@@ -1147,13 +1147,19 @@ type Index struct { /* unexported */ }
 // post-mutation pinned.root. After Tx.DropIndex on this name the
 // handle becomes dead — subsequent Lookup/LookupKeys/Range/
 // Prefix/Get/Stats return ErrIndexNotFound (the same sentinel
-// ks.Index(name) returns for a now-missing index).
+// ks.Index(name) returns for a now-missing index). After
+// Tx.DeleteKeyspace on the parent keyspace the same calls return
+// ErrKeyspaceClosed — the whole keyspace is gone, not just this
+// index; the parent-dead sentinel wins over the per-handle dead
+// sentinel (mirroring Cursor.Err's dead-check ordering).
 func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
 
 // LookupKeys returns matching primary keys without back-lookup or
 // covering decode. Iteration cost is O(matches) leaf scans only.
 // The same exact-cols validation as Lookup applies (chunk-7.7
-// user-locked).
+// user-locked). Same Inv-IHS3 / Inv-IHS2 dead-handle contract as
+// Lookup: post-DeleteKeyspace → idx.Err() = ErrKeyspaceClosed;
+// post-DropIndex → idx.Err() = ErrIndexNotFound wrap.
 //
 // Because LookupKeys never probes the row keyspace, it does not
 // observe missing-PK inconsistencies (the silent-skip case noted
@@ -1166,7 +1172,10 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
 // per-column byte slices; nil tuple = open-ended. Same value
 // semantics as Lookup: covering tuple (decode via
 // DecodeCoveringTuple) when IndexDecl.Covering is non-empty, row
-// bytes via back-lookup otherwise.
+// bytes via back-lookup otherwise. Same Inv-IHS3 / Inv-IHS2
+// dead-handle contract as Lookup: post-DeleteKeyspace →
+// idx.Err() = ErrKeyspaceClosed; post-DropIndex → idx.Err() =
+// ErrIndexNotFound wrap.
 //
 // Partial-tuple bounds are **prefix-bounds**: a start (or end) with
 // fewer columns than the index's declared count acts as the lex-
@@ -1196,18 +1205,29 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
 // Equivalent to Range(prefix, nextPrefix) where nextPrefix is the
 // smallest tuple strictly greater than the prefix; callers using
 // Prefix don't need to compute that upper bound themselves. Same
-// value semantics as Lookup.
+// value semantics and Inv-IHS3 / Inv-IHS2 dead-handle contract as
+// Lookup.
 func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
 
 // Get is shorthand for unique indexes: returns the single (pk, value)
 // or ErrNotFound. Returns ErrIndexNotUnique when called on a
-// non-unique index. Same value semantics as Lookup: covering tuple
-// (decode via DecodeCoveringTuple) when IndexDecl.Covering is
-// non-empty, row bytes via back-lookup otherwise.
+// non-unique index. Returns ErrKeyspaceClosed (Inv-IHS3) when the
+// parent keyspace was DeleteKeyspace'd in this tx, and
+// ErrIndexNotFound (Inv-IHS2 wrap) when this index was Drop'd —
+// both checked at entry before any descent. Same value semantics
+// as Lookup: covering tuple (decode via DecodeCoveringTuple) when
+// IndexDecl.Covering is non-empty, row bytes via back-lookup
+// otherwise.
 func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error)
 
-// Err returns the first error encountered during the last sequence
-// returned by Lookup / Range / Prefix.
+// Err returns the broader handle-invalid sentinel if the parent
+// keyspace was DeleteKeyspace'd (Inv-IHS3 → ErrKeyspaceClosed,
+// wins over the sticky iter cause because re-position-to-recover
+// is impossible when the parent is gone), otherwise the first
+// error encountered during the last sequence returned by Lookup /
+// Range / Prefix / LookupKeys (Inv-IHS1 sticky), otherwise the
+// post-Drop dead-handle sentinel (Inv-IHS2 → wrapped
+// ErrIndexNotFound), otherwise nil.
 //
 // Index handles are not safe for concurrent use by multiple
 // goroutines. The Err state is per-handle, so two overlapping
@@ -1216,7 +1236,12 @@ func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error)
 // for concurrent index queries.
 func (idx *Index) Err() error
 
-// Stats returns the index's persistent count + tree statistics.
+// Stats returns the index's persistent count + tree statistics, or
+// ErrKeyspaceClosed (Inv-IHS3) when the parent keyspace was
+// DeleteKeyspace'd in this tx, or ErrIndexNotFound (Inv-IHS2
+// wrap) when this index was Drop'd. Stats does NOT clear the
+// sticky iter cause on idx.err (Inv-IHS1) — the cause remains
+// observable via idx.Err() until a fresh iter resets it.
 func (idx *Index) Stats() (IndexStats, error)
 
 // DecodeCoveringTuple decodes the byte slice returned by Lookup /

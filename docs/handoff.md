@@ -361,6 +361,80 @@ before designing the fix. The proof is in the receipts:
   (typically "X does/does-not Y" paragraphs), not just the §-where-
   the-feature-lives section.
 
+- **`index-handle-stale-after-deletekeyspace`** (this session): two
+  surprises beyond the issue's "single-line guards" framing.
+
+  **First (Round-2 H-1, scope-widening regression introduced by the
+  fix itself).** The issue's resolution was framed as "add `idx.ks.dead`
+  / `idx.sks.dead` guards at every `*Index` entry method" — a clean
+  symmetric extension. Round-1 reviewer found a closely-related L-1:
+  Stats with a sticky `idx.err` from a prior bad-cols Lookup would
+  mask post-DeleteKeyspace ErrKeyspaceClosed. The reviewer's
+  recommended L-1 fix had two options: tighten the doc, OR reset
+  `idx.err = nil` at Stats entry (matching the iter closures'
+  chunk-7.7 M-2 per-sequence reset). I went wider — added the reset.
+  **This was scope-widening per CLAUDE.md Root-cause discipline's
+  escalation rule** (the narrower fix — Stats's keyspaceDead-first
+  ordering already closes L-1 because Stats now never reads
+  `idx.err`). Round-2 fresh-eyes reviewer surfaced the consequence:
+  Stats silently destroys the chunk-7.6 Inv-IHS1 sticky-stale
+  signal. A user observing `idx.Err() = ErrCursorStale` after a
+  mid-iter sibling-Put, then calling `idx.Stats()` for an unrelated
+  count read, sees `idx.Err() = nil` because Stats wiped the
+  sentinel. **Lesson**: when a fix's mechanism (entry-method
+  guard ordering) already closes the reported fault by structure,
+  do NOT also add belt-and-suspenders reset code "to match the
+  existing pattern" — that pattern existed for a reason (sequence
+  semantics on iter closures vs. single-shot Stats) and copying it
+  without that reason regresses an adjacent invariant. The
+  escalation rule's "second demonstrated same-fault failing case"
+  test is the gate: if no test fails with the narrower fix, don't
+  widen.
+
+  **Second (Round-2 M-1 + Round-3 fix, Err-vs-Stats sentinel
+  asymmetry).** Round-1's M-1 said bare `idx.Err()` doesn't fire
+  post-DeleteKeyspace. I fixed via "Option B": idx.err FIRST, then
+  fall back to keyspaceDead / idx.dead. This preserved the
+  chunk-7.6 mid-iter Drop ErrCursorStale contract pinned by
+  `TestIndexHandleInFlightDropSurfacesCursorStaleAndDead`. Round-2
+  surfaced the cost: (bad-cols Lookup → DeleteKeyspace → bare Err)
+  returns `ErrInvalidOptions` wrap while `idx.Stats()` returns
+  `ErrKeyspaceClosed` — same handle state, different sentinel.
+  Round-3 fix: keyspaceDead-first ordering (Option 1). Closes the
+  Inv-IHS3 asymmetry on the DeleteKeyspace side while preserving
+  the chunk-7.6 mid-iter Drop ErrCursorStale contract on the
+  Drop-only side (because on a live ks, keyspaceDead is false and
+  the idx.err check fires next). The dial that closes the asymmetry
+  *without* breaking the chunk-7.6 contract is precisely this
+  ordering: parent-state-first, sticky-iter-cause-second,
+  per-handle-state-third. **Lesson**: when the existing contract
+  pins a specific sentinel for a mid-iter case, "fix the bare-Err
+  symmetry by putting dead-checks first" breaks the contract.
+  Instead, identify the broader-truth that holds and put THAT
+  check first; the inner sticky-cause still wins on the narrower
+  case where the broader truth doesn't hold.
+
+  **Third (Round-3 M-1, spec-tier invariant encoded-but-not-
+  enforced).** The Round-3 keyspaceDead-first ordering encoded a
+  new explicit claim in the spec: "a handle whose index was
+  dropped AND whose keyspace was then deleted in the same tx
+  reports `ErrKeyspaceClosed` (the broader truth) rather than
+  `ErrIndexNotFound`." Reviewer noted the implementation is
+  correct but **no test pins the drop-then-delete ordering** —
+  every existing test exercises either Drop alone or
+  DeleteKeyspace alone. A future refactor swapping the entry-method
+  guard order ("idx.dead first as a perceived field-read
+  micro-opt") would pass the suite while silently violating the
+  spec. Added `TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed`
+  pinning Stats/Err/Lookup/Get for the (Drop → DeleteKeyspace)
+  sequence. **Lesson**: per CLAUDE.md Project invariants, every
+  invariant encoded in the spec needs the *strongest artifact
+  the project stage affords* — for code-stage, that's a
+  regression test. Spec-tier alone is recorded-but-not-enforced.
+  Walk the new spec claims with a "which test pins this?" question;
+  any unenforced spec-tier claim that the code-stage could enforce
+  IS a defect.
+
 **Trap pattern to watch for:** the issue cites a "well-known"
 invariant or rationale that the actual spec doesn't state, OR proposes
 a one-line fix that introduces a new bug (same class as the one it's
@@ -410,7 +484,39 @@ cause-lines** — the existing transactions.md §Cursor invalidation
 by DeleteKeyspace clause already names `*Index` handles, but the
 impl has never enforced it; same-fault-class adjacent gap to file,
 not to fold in (the escalation rule's "same reported fault" means
-the cause-lines named in the issue, not the fault class).
+the cause-lines named in the issue, not the fault class), OR
+**copying a "matching existing pattern" reset can regress an
+adjacent invariant** — the chunk-7.7 M-2 per-sequence `idx.err = nil`
+reset exists on iter closures for sequence semantics; copying it
+to a single-shot like Stats "to match" silently destroys the
+chunk-7.6 Inv-IHS1 sticky-stale signal across unrelated Stats
+calls (the `index-handle-stale-after-deletekeyspace` Round-2 H-1
+is the canonical instance). The escalation rule's "second
+demonstrated same-fault failing case" test catches this: if the
+narrower fix (e.g. reordering check sequence) already closes the
+reported fault by structure, do NOT also add belt-and-suspenders
+code — that adjacent code is widening without justification and
+will regress adjacent invariants, OR
+**closing a sentinel asymmetry via "put dead-checks first
+everywhere" can break a deliberate prior contract** — the
+chunk-7.6 mid-iter Drop ErrCursorStale contract pins
+`idx.Err() = ErrCursorStale` even though `idx.dead = true`,
+because the iter cause is the user-actionable signal at that
+moment; reordering `Err()` to put `idx.dead` first regresses it
+(the `index-handle-stale-after-deletekeyspace` Round-2 M-1
+disposition picked the narrowest viable shape: keyspaceDead first
+to close the Inv-IHS3 case, then sticky idx.err to preserve the
+chunk-7.6 Inv-IHS2 mid-iter case, then idx.dead last), OR
+**a spec-tier invariant claim encoded in the spec needs a
+regression test when code exists** — per CLAUDE.md Project
+invariants the *strongest artifact the project stage affords*
+governs; code-stage means a test, not just spec prose (the
+`index-handle-stale-after-deletekeyspace` Round-3 M-1 is the
+canonical instance: the spec recorded "drop-then-delete reports
+ErrKeyspaceClosed (broader truth)" but no test pinned the
+entry-method guard ordering — a refactor swapping
+`idx.dead`-first / `keyspaceDead`-first would pass the suite
+while violating the spec).
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -466,40 +572,55 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `index-handle-stale-after-rebuild-drop` (the
-only remaining correctness-class entry in the prior backlog; all
-others were profiling-driven). Fix: mirrors chunk-5.6
-`markCursorsStale` pattern for `*Index` — `openIndexHandles` slice
-on Keyspace/SetKeyspace, `openCursors`+`dead` on `*Index`, three
-helpers (`markIndexHandlesStale` mark-all, `markIndexHandleStaleByName`
-for RebuildIndex, `markIndexHandleDead` for DropIndex). Consolidated
-the mark-all helper into existing `markCursorsStale`/
-`markSetCursorsStale` bodies — structurally-larger-but-simpler
-shape that avoids 11+ surgical edits at every post-mutation site
-and is justified by the tight semantic coupling ("a successful
-mutation invalidates all in-flight observer state"). Cursor.Delete
-gets an explicit open-coded call (it doesn't go through
-markCursorsStale because of the self-recovery exemption).
-Sentinel: NO new sentinel — `ErrCursorStale` for mid-iter cursor
-invalidation, `ErrIndexNotFound` for post-Drop dead-handle. New
-`mapIndexCursorErr` translates `btree.ErrCursorStale` →
-`gmdb.ErrCursorStale` at the public boundary (closes the same
-sentinel-identity-leak class as `cursor-err-unpositioned-state`
-commit 24ec951). Spec promotions: `indexing.md §Handle
-Invalidation` (new section, records Inv-IHS1 + Inv-IHS2);
-`api-surface.md` Lookup/RebuildIndex/DropIndex godoc updates. R1
-findings: 0H/1M/3L/1nit — M-1 fix added 2 missing regression
-tests (Cursor.Delete + SetCursor.Delete), L-1/L-2/L-3 fixed
-in-place (spec wording, cite retarget, shape-change recovery
-note). R2 converged: 0H/0M/0L; reviewer verified the fix by
-neutering — both new tests fail deterministically when the calls
-are removed. Filed adjacent
-`index-handle-stale-after-deletekeyspace.md` (pre-existing
-gap: `transactions.md §Cursor invalidation by DeleteKeyspace`
-spec says `*Index` handles return ErrKeyspaceClosed post-
-DeleteKeyspace, but the iter methods don't check `idx.ks.dead`
-— same fault class, different cause-line; per escalation rule
-out of scope for this fix).
+This session closed `index-handle-stale-after-deletekeyspace`
+(the only remaining correctness-class entry in the prior backlog;
+all others were profiling-driven). Fix: extends the chunk-5.6 /
+chunk-7.6 *Index handle-invalidation infrastructure to enforce
+the pre-existing `transactions.md §Cursor invalidation by
+DeleteKeyspace` clause for `*Index` (the impl honored it for
+`*Cursor`/`*SetCursor` but never for `*Index`). Six entry-method
+guards (`keyspaceDead()` probing `idx.ks.dead` / `idx.sks.dead`)
+on Stats / Lookup / LookupKeys / Range / Prefix / Get; entry-time
+ordering is `keyspaceDead → idx.dead` (parent-dead wins over
+per-handle dead, so drop-then-delete reports the broader
+`ErrKeyspaceClosed`). `Tx.DeleteKeyspace`'s in-memory invalidation
+block now walks `openIndexHandles` via `markIndexHandlesStale` on
+both branches (KS + SKS). The chunk-7.6 `mapIndexCursorErr`
+helper became a method `(idx *Index).mapCursorErr` translating
+`btree.ErrCursorStale → ErrKeyspaceClosed` when `keyspaceDead()`
+(the "broader-truth-wins" rule on the iter cursor path). Bare
+`idx.Err()` reordered to `keyspaceDead → idx.err → idx.dead`:
+closes the Inv-IHS3 Err-vs-Stats asymmetry the Round-2 reviewer
+surfaced while preserving the chunk-7.6 mid-iter Drop
+ErrCursorStale contract (Drop alone leaves keyspaceDead=false, so
+the sticky idx.err check fires next). Stale comment fixed on the
+SetKeyspace branch of `Tx.DeleteKeyspace` (the "chunk-6.7 lands
+openSetCursors" forward-reference was outdated; chunk 6.7 wired
+entry-time `c.ks.dead` checks via `requireOpen`, not a walk-and-
+MarkStale loop). New sentinel: NONE — `ErrKeyspaceClosed`
+existed for `*Cursor`/`*SetCursor`; this fix extends its
+applicability to `*Index`. Spec promotions: `indexing.md §Handle
+Invalidation` extended with Inv-IHS3 + preamble clarification
+("Three distinct invalidation conditions, each with its
+canonical sentinel"); `api-surface.md` Lookup/LookupKeys/Range/
+Prefix/Get/Err/Stats godoc updates. 11 new regression tests:
+8 deterministic-fail-on-HEAD demonstrating the fault on Stats/
+Lookup/LookupKeys/Range/Prefix/Get/Stats/mid-iter (row+SKS); 3
+locking the new invariants (`TestStatsPreservesInFlightStaleSignal`
+pinning Stats-doesn't-touch-idx.err, `TestErrSymmetricWithStatsAfterDeleteKeyspace`
+pinning the Inv-IHS3 Err symmetry, `TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed`
+pinning the broader-truth ordering). R1=0H/1M/3L/2nit; R2=1H/2M/3L/1nit
+(introduced H-1 = Stats sticky-err reset regression, scope-widening
+caught by the loop); R3=0H/1M/2nit (introduced M-1 = drop-then-
+delete ordering encoded-but-not-enforced); R4=0H/0M/0L (Round-3 M
+fixed by adding the missing regression test + 2 nit trims). The
+reviewer correctly identified the chunk-7.7 M-2 per-sequence reset
+pattern's adjacency hazard: copying to a single-shot like Stats
+silently destroyed the chunk-7.6 Inv-IHS1 sticky-stale signal.
+Narrower fix (reorder check sequence to keyspaceDead-first;
+remove reset) closes Round-1 L-1 by structure, and Round-3
+test pins the entry-method guard ordering against future
+refactors.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -515,6 +636,7 @@ out of scope for this fix).
 | `682fa70` | byte-api-covering-return-unwired | Closed — byte-API branch added to `extractPKAndValue` returning encoded covering blob verbatim when `len(decl.Covering) > 0`. New public `DecodeCoveringTuple` + `ErrCoveringTupleMalformed` (NOT wrapped in `ErrCorrupted` — neutral sentinel). Spec promoted into `indexing.md §Covering Indexes` + `typed-keyspaces.md §Covering` + `api-surface.md`. 8 regression tests. |
 | `5750827` | open-corrupt-meta-size-fields-panic | Closed — two walk-site bounds in `internal/pager/init.go` step 4 (bitmap rebuild): (1) firstDataPage = BitmapPages+2 ≤ min(fileSize/PageSize, MaxSize) catches wild-high BitmapPages before `make` triggers Go-runtime OOM throw; (2) BitmapPages*PageSize*8 ≥ MaxSize catches under-sized BitmapPages before `bitmap.New`'s totalPages-exceeds-capacity panic. Two-bound shape derives from escalation rule (Fault-ii is second demonstrated same-fault case Fault-i bound leaves failing). |
 | `a114172` | index-handle-stale-after-rebuild-drop | **Closed** — mirrors chunk-5.6 markCursorsStale pattern for `*Index`. New fields: `Index.{openCursors,dead}` + `Keyspace.openIndexHandles` + `SetKeyspace.openIndexHandles`. New helpers per keyspace: `markIndexHandlesStale` (mark-all, called by Put/Delete/etc via markCursorsStale consolidation), `markIndexHandleStaleByName` (RebuildIndex), `markIndexHandleDead` (DropIndex). Iter closures (iteratePrefix / Range / LookupKeys non-unique) register/unregister via defer. Dead-handle check at Stats/Lookup/LookupKeys/Range/Prefix/Get entry. `mapIndexCursorErr` translates btree.ErrCursorStale → gmdb.ErrCursorStale (same sentinel-leak class as 24ec951). Sentinels: ErrCursorStale (mid-iter) + ErrIndexNotFound (post-Drop) — NO new sentinel. Spec promotions: `indexing.md §Handle Invalidation` (new) + `api-surface.md` Lookup/RebuildIndex/DropIndex godoc updates. R1=0H/1M/3L/1nit; R2=0H/0M/0L (reviewer neuter-verified the two new tests fail deterministically when calls removed). 12 regression tests. Filed adjacent `index-handle-stale-after-deletekeyspace` (pre-existing spec-impl gap, different cause-line). |
+| _this session_ | index-handle-stale-after-deletekeyspace | **Closed** — extends chunk-7.6 `*Index` handle infrastructure to enforce the pre-existing `transactions.md §Cursor invalidation by DeleteKeyspace` clause. New `(idx *Index).keyspaceDead()` helper; entry-time `keyspaceDead`-first guards on Stats/Lookup/LookupKeys/Range/Prefix/Get (parent-dead wins over per-handle dead → drop-then-delete reports broader `ErrKeyspaceClosed`). `mapIndexCursorErr` made a method `(idx *Index).mapCursorErr` translating `btree.ErrCursorStale → ErrKeyspaceClosed` when `keyspaceDead()` (mid-iter broader-truth wins on iter cursor path). `Tx.DeleteKeyspace`'s in-memory invalidation block walks `openIndexHandles` via `markIndexHandlesStale` on both branches. `Err()` reordered to `keyspaceDead → idx.err → idx.dead`: closes Inv-IHS3 Err-vs-Stats asymmetry while preserving chunk-7.6 mid-iter Drop ErrCursorStale contract. Stale "chunk-6.7" comment on SetKeyspace branch fixed. NO new sentinel. Spec promotions: `indexing.md §Handle Invalidation` extended with Inv-IHS3 + "Three distinct invalidation conditions" preamble; `api-surface.md` 6 method godocs updated. 11 regression tests (8 deterministic-fail-on-HEAD + 3 invariant-pinning: `TestStatsPreservesInFlightStaleSignal`, `TestErrSymmetricWithStatsAfterDeleteKeyspace`, `TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed`). R1=0H/1M/3L/2nit; R2=1H/2M/3L/1nit (introduced H-1 = Stats sticky-err reset regression caught by the loop, fixed Round-3); R3=0H/1M/2nit (introduced M-1 = drop-then-delete ordering encoded-but-not-enforced); R4=0H/0M/0L. |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -522,24 +644,14 @@ the README as ground truth, this as a hint.
 
 ### Decided, in-flight or queued
 
-*(none — the prior session's top candidate
-`index-handle-stale-after-rebuild-drop` landed this session.)*
+*(none — this session's top candidate
+`index-handle-stale-after-deletekeyspace` landed; no
+correctness-class entries remain in the backlog.)*
 
 ### Undecided / needs analysis
 
-- **`index-handle-stale-after-deletekeyspace`** — adjacent gap
-  filed at this session's close-out. Pre-existing spec-impl gap:
-  `transactions.md §Cursor invalidation by DeleteKeyspace` says
-  `*Index` handles return ErrKeyspaceClosed post-DeleteKeyspace,
-  but the iter methods (Lookup / LookupKeys / Range / Prefix /
-  Get / Stats) don't check `idx.ks.dead`. Same fault class as the
-  closed `index-handle-stale-after-rebuild-drop` (in-flight Index
-  reads freed pages), different cause-line. Resolution: single-
-  line guards mirroring the existing `idx.dead` checks. Smaller
-  than the just-closed bundle (no new tracking infrastructure
-  required — the openIndexHandles slice already exists; just add
-  the `idx.ks.dead` / `idx.sks.dead` guards alongside `idx.dead`).
-  Adjacent-to-recently-closed per Ordering criterion 4.
+*(none — every remaining `docs/issues/` entry is profiling-driven
+or condition-triggered.)*
 
 ### Profiling-driven / condition-triggered (re-validate before pulling)
 
@@ -554,33 +666,35 @@ obsolete.
 
 ## This session's task
 
-Pick **one** issue from `docs/issues/README.md`. Confirm the pick with
-the user at session start (offer your recommendation + rationale; the
-user may override). Default order, applying the Ordering criteria
-(decided > undecided is moot — decided slot empty; rank on
-fresh-context / adjacent-to-recently-closed / correctness > perf):
+Pick **one** issue from `docs/issues/README.md`. Confirm the pick
+with the user at session start (offer your recommendation +
+rationale; the user may override). Default order, applying the
+Ordering criteria (every remaining entry is profiling-driven /
+condition-triggered; correctness-class slot is empty):
 
-1. **`index-handle-stale-after-deletekeyspace`** — the only
-   remaining correctness-class entry in the backlog (everything
-   else is profiling-driven / condition-triggered). Adjacent-to-
-   recently-closed: same fault class as the just-closed
-   `index-handle-stale-after-rebuild-drop`, different cause-line.
-   The infrastructure (openIndexHandles slice + Index.dead/
-   openCursors + markIndexHandles* helpers) is already in place
-   from this session — the resolution is single-line `idx.ks.dead`
-   / `idx.sks.dead` guards at each `*Index` entry method
-   (mirroring the existing `idx.dead` checks) returning
-   `ErrKeyspaceClosed` (per the existing transactions.md spec).
-   Plus 4–6 regression tests mirroring the existing dead-handle
-   suite. Smaller and more mechanical than the prior issue. Per
-   Ordering criteria 4 (adjacent-to-recently-closed > unrelated):
-   the shared mental context discount is real.
-2. Anything in the profiling-driven set, after re-validation. Re-
-   derive live — some may now be obsolete (e.g. the
-   `shallow-savepoint-clone-cost` was filed at the end of a
-   bitmap-undo-log close-out and a subsequent fix may have already
-   reduced the per-Begin clone surface). Correctness > perf per
-   Ordering criterion 5 — these stay last.
+1. **Re-validate the profiling-driven set first.** Some entries
+   were filed in the middle of prior multi-step refactors and may
+   already be obsolete — e.g. `shallow-savepoint-clone-cost` was
+   filed at the end of a bitmap-undo-log close-out and a
+   subsequent fix may have reduced the per-Begin clone surface;
+   `pager-test-helper-export` would close opportunistically as
+   soon as a second cross-package caller appears. Re-derive each
+   from first principles before pulling — the recurring lesson
+   says issue framings often go stale, and *especially* so for
+   profiling-driven items where the cost surface depends on
+   adjacent code that has shifted under the issue.
+2. **Among re-validated live items, prefer ones that unblock
+   others** (Ordering criterion 2). Of the current set,
+   `shallow-savepoint-clone-cost` is the only one whose
+   resolution touches infrastructure shared across other
+   indexed-OLTP code paths (the per-Put `BeginShallowSavepoint`
+   path). The others are more localized.
+3. **Then by fresh-context-required vs. mechanical** (Ordering
+   criterion 3). Profiling-driven work usually requires
+   benchmark setup + interpretation; do these while context is
+   fresh. Mechanical leftovers (e.g.
+   `pager-test-helper-export`'s "factor when the second caller
+   arrives") suit later resets.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**

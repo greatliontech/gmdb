@@ -21,20 +21,29 @@ import (
 // same pinnedIndex — overlapping iterators on one handle race per
 // api-surface.md §Index Lookup API).
 //
-// Invalidation contract (Inv-IHS1, Inv-IHS2 — see indexing.md
-// §Handle Invalidation): mutations that replace or free the index
-// data tree's pages within the same tx (Tx.RebuildIndex on this
-// name; Tx.DropIndex on this name; Keyspace.Put / Delete /
-// Cursor.Delete on the parent indexed keyspace; the SetKeyspace
-// analogues) MarkStale every in-flight *btree.Cursor opened by
-// this handle's iter closures. A stale cursor surfaces as
-// ErrCursorStale on the iter's Err() and terminates iteration; a
-// fresh iter call re-opens on the current pinned.root. After
-// Tx.DropIndex on this index's name the handle additionally
-// transitions to "dead": every subsequent Lookup / LookupKeys /
-// Range / Prefix / Get / Stats returns ErrIndexNotFound (matching
-// the sentinel ks.Index(name) returns post-Drop — the index is
-// gone, not "stale").
+// Invalidation contract (Inv-IHS1, Inv-IHS2, Inv-IHS3 — see
+// indexing.md §Handle Invalidation): mutations that replace or
+// free the index data tree's pages within the same tx
+// (Tx.RebuildIndex on this name; Tx.DropIndex on this name;
+// Keyspace.Put / Delete / Cursor.Delete on the parent indexed
+// keyspace; the SetKeyspace analogues) MarkStale every in-flight
+// *btree.Cursor opened by this handle's iter closures. A stale
+// cursor surfaces as ErrCursorStale on the iter's Err() and
+// terminates iteration; a fresh iter call re-opens on the current
+// pinned.root. After Tx.DropIndex on this index's name the handle
+// additionally transitions to "dead": every subsequent Lookup /
+// LookupKeys / Range / Prefix / Get / Stats returns
+// ErrIndexNotFound (matching the sentinel ks.Index(name) returns
+// post-Drop — the index is gone, not "stale"). After
+// Tx.DeleteKeyspace on the parent keyspace's name the same calls
+// return ErrKeyspaceClosed instead — the WHOLE keyspace is gone,
+// not just this index; the parent-dead sentinel wins over the
+// per-handle dead sentinel (mirroring Cursor.Err's dead-check
+// ordering). A mid-iter DeleteKeyspace MarkStales the in-flight
+// cursor and the closure's err translation maps the resulting
+// btree.ErrCursorStale to ErrKeyspaceClosed (not ErrCursorStale —
+// the "re-position to recover" semantic does not apply when the
+// parent is gone).
 type Index struct {
 	ks     *Keyspace
 	sks    *SetKeyspace // nil iff ks != nil
@@ -89,14 +98,27 @@ type IndexStats struct {
 
 // Stats returns the index's persistent count + B+tree statistics.
 // Chunk-7.6 surface: Count is populated; TreeDepth is zero
-// (deferred to chunk 7.7). Returns ErrIndexNotFound (with the
+// (deferred to chunk 7.7).
+//
+// Returns ErrKeyspaceClosed when the parent keyspace was
+// Tx.DeleteKeyspace'd (Inv-IHS3) and ErrIndexNotFound (with the
 // keyspace/index name in the wrap) when the handle has been
-// invalidated by a same-tx Tx.DropIndex (Inv-IHS2) — without this
-// check Stats would return the pre-Drop count from the still-pinned
-// in-memory state.
+// invalidated by a same-tx Tx.DropIndex (Inv-IHS2). Without these
+// guards Stats would return the pre-Delete/pre-Drop count from the
+// still-pinned in-memory state, because idx.pinned.count is
+// in-memory and survives both Drop and DeleteKeyspace even after
+// the on-disk tree has been FreeSubtree'd.
+//
+// Sentinel ordering (mirroring Cursor.Err's dead-check-wins): the
+// parent ks/sks dead check fires before the idx.dead check, so a
+// drop-then-delete sequence reports ErrKeyspaceClosed (the broader
+// truth) rather than ErrIndexNotFound. Stats does NOT touch
+// idx.err — the iter-side sticky cause (Inv-IHS1, e.g. mid-iter
+// ErrCursorStale) survives across Stats calls and remains
+// observable via idx.Err() until a fresh iter resets it.
 func (idx *Index) Stats() (IndexStats, error) {
-	if idx.err != nil {
-		return IndexStats{}, idx.err
+	if idx.keyspaceDead() {
+		return IndexStats{}, ErrKeyspaceClosed
 	}
 	if idx.dead {
 		return IndexStats{}, idx.indexNotFoundError()
@@ -106,11 +128,63 @@ func (idx *Index) Stats() (IndexStats, error) {
 	}, nil
 }
 
-// Err returns the first error encountered during the last sequence
-// returned by Lookup / Range / Prefix. Chunk-7.6 surface: only
-// returns the handle-construction error (e.g. ErrIndexNotFound)
-// since the lookup API is not yet wired.
-func (idx *Index) Err() error { return idx.err }
+// keyspaceDead reports whether the parent Keyspace or SetKeyspace
+// has been Tx.DeleteKeyspace'd in this tx. Exactly one of idx.ks /
+// idx.sks is non-nil (set at handle construction in ks.Index /
+// sks.Index); the nil-aware probe avoids a panic on whichever is
+// not set. Centralized so the entry-method guards (Stats, Lookup,
+// LookupKeys, Range, Prefix, Get) and mapCursorErr's mid-iter
+// translation share one statement of Inv-IHS3's dead-check.
+func (idx *Index) keyspaceDead() bool {
+	if idx.ks != nil && idx.ks.dead {
+		return true
+	}
+	if idx.sks != nil && idx.sks.dead {
+		return true
+	}
+	return false
+}
+
+// Err returns the broader handle-invalid sentinel if the parent
+// keyspace was DeleteKeyspace'd (Inv-IHS3 — ErrKeyspaceClosed wins
+// over the sticky iter cause because re-position-to-recover is
+// impossible when the parent is gone), otherwise the first error
+// encountered during the last sequence returned by Lookup / Range
+// / Prefix / LookupKeys (Inv-IHS1 sticky cause), otherwise the
+// post-Drop dead-handle sentinel (Inv-IHS2 wrap), otherwise nil.
+//
+// Ordering:
+//
+//   1. keyspaceDead → ErrKeyspaceClosed. Symmetric with Stats /
+//      Lookup / LookupKeys / Range / Prefix / Get: the user
+//      polling Err() to ask "is the handle still usable?" sees the
+//      broadest truth, not a stale Inv-IHS1 cause from a prior
+//      bad-cols Lookup.
+//   2. idx.err sticky (chunk-7.6 / 5.6 Inv-IHS1 contract). On a
+//      live keyspace, a mid-iter Drop or sibling-mutation stamps
+//      idx.err = ErrCursorStale via mapCursorErr; Err() reports
+//      that ErrCursorStale until the next iter call resets it.
+//   3. idx.dead → wrapped ErrIndexNotFound. Bare-Err on a Dropped
+//      handle (no intervening iter) reports the dead-handle
+//      sentinel even with no sticky idx.err.
+//
+// Inv-IHS2 (Drop) keeps a residual Err-vs-Stats asymmetry on a
+// (bad-cols Lookup → Drop → bare Err) sequence: Err reports the
+// sticky ErrInvalidOptions wrap, Stats reports ErrIndexNotFound.
+// This is the prior chunk-7.6 contract and out of scope for the
+// Inv-IHS3 fix (different cause-line from DeleteKeyspace).
+func (idx *Index) Err() error {
+	if idx.keyspaceDead() {
+		return ErrKeyspaceClosed
+	}
+	if idx.err != nil {
+		return idx.err
+	}
+	if idx.dead {
+		return idx.indexNotFoundError()
+	}
+	return nil
+}
 
 // Index returns a query handle for the named index on this
 // Keyspace. Returns ErrIndexNotFound if no index with that name is
@@ -383,6 +457,17 @@ func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (chunk-7.7 Round-1 M-2 fix).
 		idx.err = nil
+		// Dead-keyspace check (Inv-IHS3): Tx.DeleteKeyspace on the
+		// parent ks/sks freed the index data tree via
+		// retireIndexRegistry; idx.pinned.root points at FreeSubtree'd
+		// pages. Wins over the dead-handle check below — the whole
+		// keyspace is gone, so the canonical sentinel is
+		// ErrKeyspaceClosed (per transactions.md §Cursor invalidation
+		// by DeleteKeyspace), not ErrIndexNotFound.
+		if idx.keyspaceDead() {
+			idx.err = ErrKeyspaceClosed
+			return
+		}
 		// Dead-handle check (Inv-IHS2): Tx.DropIndex on this name
 		// poisoned the handle; pinned.root points at FreeSubtree'd
 		// pages. Set ErrIndexNotFound and yield nothing.
@@ -470,23 +555,45 @@ func (idx *Index) iteratePrefix(prefix []byte, yield func([]byte, []byte) bool) 
 		}
 	}
 	if err := c.Err(); err != nil {
-		idx.err = mapIndexCursorErr(err)
+		idx.err = idx.mapCursorErr(err)
 	}
 }
 
-// mapIndexCursorErr translates a *btree.Cursor.Err() into the
-// gmdb-public surface. btree.ErrCursorStale is the sentinel set by
-// MarkStale (Inv-IHS1); translate to gmdb.ErrCursorStale so callers
-// can errors.Is against the gmdb sentinel, mirroring the row-cursor
-// translation pattern in keyspace.go Cursor.Delete /
-// translateCursorErr. Other errors flow through mapBtreeErr.
+// mapCursorErr translates a *btree.Cursor.Err() into the gmdb-public
+// surface. btree.ErrCursorStale is the sentinel set by MarkStale
+// (Inv-IHS1); translate to gmdb.ErrCursorStale so callers can
+// errors.Is against the gmdb sentinel, mirroring the row-cursor
+// translation pattern in keyspace.go Cursor.Delete / Cursor.Err.
+// Other errors flow through mapBtreeErr.
+//
+// Inv-IHS3 dead-check-wins ordering: when the parent ks/sks was
+// Tx.DeleteKeyspace'd while the cursor was in flight, the stale was
+// raised by Tx.DeleteKeyspace's markIndexHandlesStale call AND the
+// parent is dead at translation time. The user-facing sentinel is
+// ErrKeyspaceClosed, not ErrCursorStale — the "re-position to
+// recover" semantic of ErrCursorStale does not apply when the
+// parent is gone. This mirrors Cursor.Err's dead-check-wins
+// ordering specifically for the stale case; Cursor.Err's
+// keyspace.go:1487-1489 check translates EVERY non-nil inner err
+// to ErrKeyspaceClosed under ks.dead, while mapCursorErr restricts
+// the override to ErrCursorStale because the iter closures only
+// invoke it after a c.Next() loop terminates — non-stale errs
+// from c.Err() (e.g. ErrCorrupted from a freed-page CRC) flow
+// through mapBtreeErr unchanged, which is correct for a live ks
+// and unreachable under single-goroutine semantics for a dead ks
+// (DeleteKeyspace and c.Next() cannot interleave within one
+// goroutine).
 //
 // Without this translation, idx.Err() after a MarkStale leaks the
 // internal btree.ErrCursorStale across the public boundary — the
 // same defect class as the cursor-err-unpositioned-state issue
-// (commit 24ec951).
-func mapIndexCursorErr(err error) error {
+// (commit 24ec951). Made a method on *Index so it can probe the
+// parent ks/sks dead state for the Inv-IHS3 case.
+func (idx *Index) mapCursorErr(err error) error {
 	if errors.Is(err, btree.ErrCursorStale) {
+		if idx.keyspaceDead() {
+			return ErrKeyspaceClosed
+		}
 		return ErrCursorStale
 	}
 	return mapBtreeErr(err)
@@ -502,6 +609,11 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
+		// Dead-keyspace check (Inv-IHS3) — see Lookup for rationale.
+		if idx.keyspaceDead() {
+			idx.err = ErrKeyspaceClosed
+			return
+		}
 		// Dead-handle check (Inv-IHS2).
 		if idx.dead {
 			idx.err = idx.indexNotFoundError()
@@ -580,7 +692,7 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 			}
 		}
 		if err := c.Err(); err != nil {
-			idx.err = mapIndexCursorErr(err)
+			idx.err = idx.mapCursorErr(err)
 		}
 	}
 }
@@ -598,6 +710,11 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
+		// Dead-keyspace check (Inv-IHS3) — see Lookup for rationale.
+		if idx.keyspaceDead() {
+			idx.err = ErrKeyspaceClosed
+			return
+		}
 		// Dead-handle check (Inv-IHS2).
 		if idx.dead {
 			idx.err = idx.indexNotFoundError()
@@ -646,7 +763,7 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 			}
 		}
 		if err := c.Err(); err != nil {
-			idx.err = mapIndexCursorErr(err)
+			idx.err = idx.mapCursorErr(err)
 		}
 	}
 }
@@ -660,6 +777,11 @@ func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
+		// Dead-keyspace check (Inv-IHS3) — see Lookup for rationale.
+		if idx.keyspaceDead() {
+			idx.err = ErrKeyspaceClosed
+			return
+		}
 		// Dead-handle check (Inv-IHS2).
 		if idx.dead {
 			idx.err = idx.indexNotFoundError()
@@ -691,6 +813,10 @@ func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error) {
 	// but the handle's Err() is shared and a stale prior error
 	// should not surface to a fresh Get).
 	idx.err = nil
+	// Dead-keyspace check (Inv-IHS3) — see Lookup for rationale.
+	if idx.keyspaceDead() {
+		return nil, nil, ErrKeyspaceClosed
+	}
 	// Dead-handle check (Inv-IHS2): Get is single-shot, no cursor,
 	// so it returns the error directly rather than via idx.err.
 	if idx.dead {

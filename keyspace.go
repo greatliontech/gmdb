@@ -1072,6 +1072,18 @@ func (ks *Keyspace) markCursorsStale() {
 // in-flight iter cursors → those cursors must MarkStale or the next
 // c.Next() reads CoW'd-then-released leaf pages (Inv-IHS1).
 //
+// Also called by Tx.DeleteKeyspace (Inv-IHS3). Caveat: in that path,
+// idx.pinned.root has already been FreeSubtree'd by
+// retireIndexRegistry, so SetRootID stores a FREED pageID into
+// every stale cursor's tracked-root. This is safe under the current
+// API because every *Index entry method (Stats / Lookup / LookupKeys
+// / Range / Prefix / Get / Err) short-circuits via keyspaceDead()
+// before issuing a fresh descent, so the freed-root is never
+// dereferenced. If a future API exposes the underlying *btree.Cursor
+// or weakens the entry-method short-circuit, this SetRootID(freed)
+// store on the DeleteKeyspace path becomes a use-after-free hazard
+// and the caller must skip the SetRootID under ks.dead.
+//
 // Conservative-mark-all (mirrors markCursorsStale): an extractor
 // may emit entries for any subset of declared indexes per Put, and
 // the cheapest correct policy is to stale every in-flight index
@@ -1672,15 +1684,33 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 		for _, c := range existingKS.openCursors {
 			c.inner.MarkStale()
 		}
+		// Inv-IHS3 (indexing.md §Handle Invalidation): MarkStale every
+		// in-flight *btree.Cursor opened by an *Index iter closure on
+		// this keyspace's handles. retireIndexRegistry above
+		// FreeSubtree'd every declared index's data tree, so any
+		// cursor still iterating idx.pinned.root would walk loose
+		// (now-reusable) pages. The closure's mapCursorErr translates
+		// the resulting btree.ErrCursorStale to ErrKeyspaceClosed
+		// because keyspaceDead() is now true.
+		existingKS.markIndexHandlesStale()
 	}
 	if existingSKS != nil {
 		// Kind=1 partner: same dead-marking + cache eviction. No
-		// open-cursor invalidation here yet — SetCursor lands at
-		// chunk 6.7; that chunk wires the openSetCursors slice and
-		// the markStale loop.
+		// openSetCursors walk is needed here: SetCursor's
+		// requireOpen probes c.ks.dead at every entry and sticks
+		// closeErr = ErrKeyspaceClosed before touching outerCursor,
+		// so a freed-leaf dereference is impossible (set_cursor.go
+		// requireOpen, chunk 6.7).
 		delete(tx.openSetKeyspaces, handle)
 		existingSKS.dead = true
 		tx.deadSetKeyspaces = append(tx.deadSetKeyspaces, existingSKS)
+		// Inv-IHS3 mirror on Kind=1: stale every in-flight *Index
+		// iter cursor opened from sks-side handles, same rationale
+		// as the Keyspace branch above. SetCursor's per-method
+		// dead-check is insufficient here — the iter closure runs
+		// btree.Cursor.Next directly without an outer ks.dead
+		// probe, so the MarkStale is the canonical mechanism.
+		existingSKS.markIndexHandlesStale()
 	}
 	delete(tx.dirtyDescriptors, name)
 

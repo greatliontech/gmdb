@@ -574,3 +574,572 @@ func TestSetKeyspaceIndexHandleInFlightSiblingPutSurfacesCursorStale(t *testing.
 		t.Errorf("idx.Err() = %v, want ErrCursorStale", idx.Err())
 	}
 }
+
+// --- *Index handle invalidation by tx.DeleteKeyspace --------------------
+//
+// These pin Inv-IHS3 (post-DeleteKeyspace handle closed — indexing.md
+// §Handle Invalidation): once tx.DeleteKeyspace succeeds on the parent
+// keyspace, every subsequent call on every previously-handed-out
+// *Index for that keyspace returns ErrKeyspaceClosed, and any in-
+// flight *btree.Cursor opened by an idx iter closure is MarkStale'd
+// before the FreeSubtree returns. The mid-iter case translates
+// btree.ErrCursorStale to ErrKeyspaceClosed (not ErrCursorStale)
+// at the public boundary — the "re-position to recover" semantic of
+// ErrCursorStale does not apply when the parent keyspace is gone
+// (mirroring row Cursor.Err's dead-check-wins ordering).
+
+// TestIndexHandleBareErrAfterDeleteKeyspaceReturnsErrKeyspaceClosed
+// pins the bare-Err() path: a user who opens an *Index, calls
+// tx.DeleteKeyspace, then probes idx.Err() WITHOUT an intervening
+// iter call must see ErrKeyspaceClosed. The entry-method guards on
+// Lookup/Stats/etc. set idx.err on the iter path, but a user
+// polling Err() directly never goes through those — so Err()
+// itself probes keyspaceDead/idx.dead before returning the sticky
+// idx.err (mirroring Cursor.Err's keyspace.go:1483-1489 ordering).
+// Without this Err()-side guard, the bare path returns nil and the
+// transactions.md §Cursor invalidation by DeleteKeyspace clause
+// ("subsequent use ... returns ErrKeyspaceClosed") is silently
+// violated.
+func TestIndexHandleBareErrAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("a"), []byte{0x42}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if err := tx.DeleteKeyspace("items"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+	// Bare Err() — no iter call between Index() and Err().
+	if err := idx.Err(); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("bare Err() after DeleteKeyspace: %v, want ErrKeyspaceClosed", err)
+	}
+}
+
+// TestStatsPreservesInFlightStaleSignal pins Round-3 H-1's
+// regression boundary: Stats must NOT clear idx.err. A user who
+// observes a mid-iter sibling-mutation sentinel via idx.Err()
+// must continue observing it across an unrelated Stats() call —
+// the Inv-IHS1 sticky-cause contract from chunk-7.6 / 5.6 says
+// the iter cause survives until a fresh iter call resets it. A
+// prior Round-2 cut reset idx.err at Stats entry to close Round-1
+// L-1; that overshot the fix (Stats's keyspaceDead-first ordering
+// already closes L-1 without the reset) and silently destroyed
+// the stale signal on every Stats call. This test pins the fix.
+func TestStatsPreservesInFlightStaleSignal(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for _, k := range []string{"a", "b"} {
+		if err := ks.Put([]byte(k), []byte{0x42}); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	// Mid-iter sibling Put → cursor MarkStale'd → idx.err =
+	// ErrCursorStale via mapCursorErr.
+	yielded := 0
+	for range idx.Lookup([]byte{0x42}) {
+		yielded++
+		if yielded == 1 {
+			if err := ks.Put([]byte("c"), []byte{0x42}); err != nil {
+				t.Fatalf("sibling Put: %v", err)
+			}
+		}
+	}
+	if !errors.Is(idx.Err(), ErrCursorStale) {
+		t.Fatalf("pre-Stats idx.Err() = %v, want ErrCursorStale (setup)", idx.Err())
+	}
+	// Unrelated Stats call on a live keyspace. Inv-IHS1's contract:
+	// the stale signal survives. Round-2 H-1 violated this.
+	stats, statsErr := idx.Stats()
+	if statsErr != nil {
+		t.Errorf("Stats on live ks: err = %v, want nil", statsErr)
+	}
+	if stats.Count != 3 {
+		t.Errorf("Stats.Count = %d, want 3 (a,b + the sibling Put 'c')", stats.Count)
+	}
+	if !errors.Is(idx.Err(), ErrCursorStale) {
+		t.Errorf("post-Stats idx.Err() = %v, want ErrCursorStale (Stats must not destroy the sticky stale signal)", idx.Err())
+	}
+}
+
+// TestErrSymmetricWithStatsAfterDeleteKeyspace pins Round-3 M-1:
+// the (bad-cols Lookup → DeleteKeyspace → bare Err) sequence must
+// report ErrKeyspaceClosed on idx.Err() — symmetric with what
+// idx.Stats() reports for the same state. Round-2's idx.err-first
+// ordering would have returned the sticky ErrInvalidOptions wrap
+// from the bad-cols Lookup, contradicting Stats. Round-3's
+// keyspaceDead-first ordering closes the asymmetry on the
+// Inv-IHS3 side while preserving Inv-IHS2's mid-iter Drop
+// ErrCursorStale contract (verified by the pre-existing
+// TestIndexHandleInFlightDropSurfacesCursorStaleAndDead which
+// continues to pass).
+func TestErrSymmetricWithStatsAfterDeleteKeyspace(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("a"), []byte{0x42}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	// Bad-cols Lookup (0 supplied, 1 declared) sets idx.err =
+	// ErrInvalidOptions wrap.
+	for range idx.Lookup() {
+	}
+	if !errors.Is(idx.Err(), ErrInvalidOptions) {
+		t.Fatalf("setup: idx.Err() = %v, want ErrInvalidOptions wrap", idx.Err())
+	}
+	// DeleteKeyspace.
+	if err := tx.DeleteKeyspace("items"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+	// Stats reports the broader truth: ErrKeyspaceClosed.
+	if _, err := idx.Stats(); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("Stats after bad Lookup + DeleteKeyspace: err = %v, want ErrKeyspaceClosed", err)
+	}
+	// Err must report the same broader truth (Round-3 M-1 fix:
+	// keyspaceDead-first ordering).
+	if err := idx.Err(); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("Err after bad Lookup + DeleteKeyspace: %v, want ErrKeyspaceClosed (symmetric with Stats)", err)
+	}
+}
+
+// TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed pins the
+// "broader truth wins" ordering of the entry-method guards: when
+// both Inv-IHS2 (idx.dead, set by tx.DropIndex) and Inv-IHS3
+// (idx.ks.dead, set by tx.DeleteKeyspace) hold for the same
+// handle, every entry method reports ErrKeyspaceClosed (the
+// broader sentinel) — NOT ErrIndexNotFound (the narrower one).
+// indexing.md §Handle Invalidation explicitly records this:
+//
+//   "a handle whose index was dropped AND whose keyspace was then
+//    deleted in the same tx reports `ErrKeyspaceClosed` (the
+//    broader truth) rather than `ErrIndexNotFound`."
+//
+// Without this test, a future refactor swapping the entry-method
+// guard order ("idx.dead first" looks like a micro-optimization
+// because it's a field read vs. a method+pointer-check) would
+// silently violate the spec while still passing every other
+// existing test — none of which exercise both Drop + DeleteKeyspace
+// on the same handle. Pinned across Stats / Err / Lookup / Get
+// to defend the ordering invariant on all entry surfaces.
+func TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("a"), []byte{0x42}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	// Drop first → idx.dead = true.
+	if err := tx.DropIndex("items", "by_color"); err != nil {
+		t.Fatalf("DropIndex: %v", err)
+	}
+	// DeleteKeyspace second → ks.dead = true. Both dead-flags now hold.
+	if err := tx.DeleteKeyspace("items"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+	if _, err := idx.Stats(); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("Stats: %v, want ErrKeyspaceClosed (broader truth wins over ErrIndexNotFound)", err)
+	}
+	if err := idx.Err(); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("Err: %v, want ErrKeyspaceClosed", err)
+	}
+	yielded := 0
+	for range idx.Lookup([]byte{0x42}) {
+		yielded++
+	}
+	if yielded != 0 {
+		t.Errorf("Lookup yielded %d, want 0", yielded)
+	}
+	if !errors.Is(idx.Err(), ErrKeyspaceClosed) {
+		t.Errorf("Lookup idx.Err(): %v, want ErrKeyspaceClosed", idx.Err())
+	}
+	if _, _, err := idx.Get([]byte{0x42}); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("Get: %v, want ErrKeyspaceClosed", err)
+	}
+}
+
+// TestIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed is
+// the deterministic Inv-IHS3 regression on the Stats path (no cursor,
+// no back-lookup). On HEAD, Stats returns IndexStats{Count: pre-delete
+// count}, nil because the cached idx.pinned.count is read without
+// consulting idx.ks.dead. With the fix, the ks.dead-check-wins guard
+// at Stats entry returns ErrKeyspaceClosed.
+func TestIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for _, k := range []string{"a", "b", "c"} {
+		if err := ks.Put([]byte(k), []byte{0x42}); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if err := tx.DeleteKeyspace("items"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+	stats, err := idx.Stats()
+	if !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("Stats after DeleteKeyspace: err = %v, want ErrKeyspaceClosed", err)
+	}
+	if stats.Count != 0 {
+		t.Errorf("Stats after DeleteKeyspace: Count = %d, want 0 (handle is closed)", stats.Count)
+	}
+}
+
+// TestIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed
+// exercises every cached-handle iter path post-DeleteKeyspace. The
+// row Keyspace path is canonical: without the entry-time ks.dead
+// guard, the closure descends from idx.pinned.root which
+// retireIndexRegistry just FreeSubtree'd — yields the pre-delete
+// entries (the freed pages are still readable until a subsequent
+// allocation re-issues them), with idx.Err() = nil. The fix's
+// entry-time guard returns ErrKeyspaceClosed before any descent.
+func TestIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for _, k := range []string{"a", "b"} {
+		if err := ks.Put([]byte(k), []byte{0x42}); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if err := tx.DeleteKeyspace("items"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+	// Lookup (non-unique iter path).
+	yielded := 0
+	for range idx.Lookup([]byte{0x42}) {
+		yielded++
+	}
+	if yielded != 0 {
+		t.Errorf("Lookup after DeleteKeyspace yielded %d entries, want 0", yielded)
+	}
+	if !errors.Is(idx.Err(), ErrKeyspaceClosed) {
+		t.Errorf("Lookup after DeleteKeyspace: idx.Err() = %v, want ErrKeyspaceClosed", idx.Err())
+	}
+	// Range.
+	yielded = 0
+	for range idx.Range(nil, nil) {
+		yielded++
+	}
+	if yielded != 0 {
+		t.Errorf("Range after DeleteKeyspace yielded %d entries, want 0", yielded)
+	}
+	if !errors.Is(idx.Err(), ErrKeyspaceClosed) {
+		t.Errorf("Range after DeleteKeyspace: idx.Err() = %v, want ErrKeyspaceClosed", idx.Err())
+	}
+	// Prefix.
+	yielded = 0
+	for range idx.Prefix() {
+		yielded++
+	}
+	if yielded != 0 {
+		t.Errorf("Prefix after DeleteKeyspace yielded %d entries, want 0", yielded)
+	}
+	if !errors.Is(idx.Err(), ErrKeyspaceClosed) {
+		t.Errorf("Prefix after DeleteKeyspace: idx.Err() = %v, want ErrKeyspaceClosed", idx.Err())
+	}
+	// LookupKeys.
+	yielded = 0
+	for range idx.LookupKeys([]byte{0x42}) {
+		yielded++
+	}
+	if yielded != 0 {
+		t.Errorf("LookupKeys after DeleteKeyspace yielded %d entries, want 0", yielded)
+	}
+	if !errors.Is(idx.Err(), ErrKeyspaceClosed) {
+		t.Errorf("LookupKeys after DeleteKeyspace: idx.Err() = %v, want ErrKeyspaceClosed", idx.Err())
+	}
+}
+
+// TestIndexHandleGetAfterDeleteKeyspaceReturnsErrKeyspaceClosed
+// exercises the unique-Get path (btree.Get on idx.pinned.root with no
+// cursor — the closest analogue of Stats since it short-circuits before
+// any extractPKAndValue back-lookup when the entry doesn't exist).
+// Without the entry-time ks.dead guard, btree.Get descends the freed
+// root → either yields stale data or panics.
+func TestIndexHandleGetAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Unique = true
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("a"), []byte{0x42}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if err := tx.DeleteKeyspace("items"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+	_, _, err = idx.Get([]byte{0x42})
+	if !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("Get after DeleteKeyspace: err = %v, want ErrKeyspaceClosed", err)
+	}
+}
+
+// TestIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed
+// exercises Inv-IHS3's in-flight branch: a mid-iter tx.DeleteKeyspace
+// must MarkStale every in-flight *btree.Cursor opened by an idx iter
+// closure before the FreeSubtree returns, AND the closure's err
+// translation must report ErrKeyspaceClosed (not ErrCursorStale) when
+// the parent ks is dead at translation time — matching row Cursor.Err's
+// dead-check-wins ordering. On HEAD, Tx.DeleteKeyspace does NOT walk
+// openIndexHandles to MarkStale, so the next c.Next() walks the just-
+// FreeSubtree'd pages with no MarkStale signal.
+func TestIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for _, k := range []string{"a", "b", "c"} {
+		if err := ks.Put([]byte(k), []byte{0x42}); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	idx, err := ks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	yielded := 0
+	for range idx.Lookup([]byte{0x42}) {
+		yielded++
+		if yielded == 1 {
+			if err := tx.DeleteKeyspace("items"); err != nil {
+				t.Fatalf("mid-iter DeleteKeyspace: %v", err)
+			}
+		}
+	}
+	if yielded != 1 {
+		t.Errorf("yielded = %d, want 1 (mid-iter DeleteKeyspace stales the cursor)", yielded)
+	}
+	if !errors.Is(idx.Err(), ErrKeyspaceClosed) {
+		t.Errorf("after mid-iter DeleteKeyspace: idx.Err() = %v, want ErrKeyspaceClosed", idx.Err())
+	}
+	// A subsequent iter call hits the entry-time ks.dead guard.
+	yielded = 0
+	for range idx.Lookup([]byte{0x42}) {
+		yielded++
+	}
+	if yielded != 0 {
+		t.Errorf("second iter after DeleteKeyspace yielded %d, want 0", yielded)
+	}
+	if !errors.Is(idx.Err(), ErrKeyspaceClosed) {
+		t.Errorf("second iter after DeleteKeyspace: idx.Err() = %v, want ErrKeyspaceClosed", idx.Err())
+	}
+}
+
+// --- SetKeyspace mirror -------------------------------------------------
+
+// TestSetKeyspaceIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed:
+// Inv-IHS3 on a SetKeyspace-anchored *Index, Stats path. Stats reads
+// idx.pinned.count without any keyspace probe, so the entry-time
+// sks.dead guard is the only mechanism — no accidental enforcement
+// via extractSetKeyspacePKAndValue's HasValue back-lookup.
+func TestSetKeyspaceIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	sks, err := tx.CreateSetKeyspace("members", nil, decl)
+	if err != nil {
+		t.Fatalf("CreateSetKeyspace: %v", err)
+	}
+	if _, err := sks.Put([]byte("a"), []byte{0x42}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := sks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if err := tx.DeleteKeyspace("members"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+	stats, err := idx.Stats()
+	if !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("SetKeyspace Stats after DeleteKeyspace: err = %v, want ErrKeyspaceClosed", err)
+	}
+	if stats.Count != 0 {
+		t.Errorf("SetKeyspace Stats after DeleteKeyspace: Count = %d, want 0", stats.Count)
+	}
+}
+
+// TestSetKeyspaceIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed:
+// Inv-IHS3 on the SetKeyspace iter path. Note: on HEAD this path
+// surfaces ErrKeyspaceClosed accidentally via the back-lookup
+// (extractSetKeyspacePKAndValue → sks.HasValue → sks.dead → err), so
+// this test pins the entry-time guard's behavior rather than uniquely
+// detecting the regression. Removing the entry-time guard AND
+// HasValue's sks.dead check would surface this test as the wrong-yield
+// shape; today the entry-time guard catches it cleanly without
+// descending into any freed-page read.
+func TestSetKeyspaceIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	sks, err := tx.CreateSetKeyspace("members", nil, decl)
+	if err != nil {
+		t.Fatalf("CreateSetKeyspace: %v", err)
+	}
+	for _, pair := range [][2]string{{"a", "X"}, {"b", "Y"}} {
+		val := []byte{0x42, pair[1][0]}
+		if _, err := sks.Put([]byte(pair[0]), val); err != nil {
+			t.Fatalf("Put %q.%q: %v", pair[0], pair[1], err)
+		}
+	}
+	idx, err := sks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if err := tx.DeleteKeyspace("members"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+	yielded := 0
+	for range idx.Lookup([]byte{0x42}) {
+		yielded++
+	}
+	if yielded != 0 {
+		t.Errorf("SetKeyspace Lookup after DeleteKeyspace yielded %d entries, want 0", yielded)
+	}
+	if !errors.Is(idx.Err(), ErrKeyspaceClosed) {
+		t.Errorf("SetKeyspace Lookup after DeleteKeyspace: idx.Err() = %v, want ErrKeyspaceClosed", idx.Err())
+	}
+}
+
+// TestSetKeyspaceIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed:
+// Inv-IHS3 in-flight branch, SetKeyspace. Mirrors the row-Keyspace
+// mid-iter test. On HEAD, Tx.DeleteKeyspace's SetKeyspace branch does
+// NOT walk openIndexHandles → in-flight cursor is not MarkStale'd
+// → next c.Next() walks FreeSubtree'd pages.
+func TestSetKeyspaceIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+	decl := testDecl("by_color", "color")
+	decl.Extract = firstByteExtract
+	sks, err := tx.CreateSetKeyspace("members", nil, decl)
+	if err != nil {
+		t.Fatalf("CreateSetKeyspace: %v", err)
+	}
+	for _, pair := range [][2]string{{"a", "X"}, {"b", "Y"}, {"c", "Z"}} {
+		val := []byte{0x42, pair[1][0]}
+		if _, err := sks.Put([]byte(pair[0]), val); err != nil {
+			t.Fatalf("Put %q.%q: %v", pair[0], pair[1], err)
+		}
+	}
+	idx, err := sks.Index("by_color")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	yielded := 0
+	for range idx.Lookup([]byte{0x42}) {
+		yielded++
+		if yielded == 1 {
+			if err := tx.DeleteKeyspace("members"); err != nil {
+				t.Fatalf("mid-iter DeleteKeyspace: %v", err)
+			}
+		}
+	}
+	if yielded != 1 {
+		t.Errorf("yielded = %d, want 1 (mid-iter DeleteKeyspace stales the cursor)", yielded)
+	}
+	if !errors.Is(idx.Err(), ErrKeyspaceClosed) {
+		t.Errorf("after mid-iter SetKeyspace DeleteKeyspace: idx.Err() = %v, want ErrKeyspaceClosed", idx.Err())
+	}
+}

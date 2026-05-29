@@ -532,8 +532,8 @@ An `*Index` handle returned by `ks.Index(name)` is bound to the
 parent keyspace for the lifetime of the transaction. Mutations
 that replace or free the index's data tree pages within the same
 transaction invalidate in-flight observers tied to that handle.
-Two distinct conditions are surfaced as two distinct sentinels —
-identical to the row-cursor contract that
+Three distinct invalidation conditions, each with its canonical
+sentinel — identical to the row-cursor contract that
 `transactions.md §Cursor State Machine` defines:
 
 - **`ErrCursorStale` (mid-iter cursor invalidation).** Triggered by
@@ -571,7 +571,36 @@ identical to the row-cursor contract that
   permanent within the transaction; a re-`Index(name)` after the
   drop returns `ErrIndexNotFound` for the same reason.
 
-Two invariants pin this contract:
+- **`ErrKeyspaceClosed` (post-DeleteKeyspace handle closed).**
+  Triggered by `tx.DeleteKeyspace(ks.Name())` on the handle's
+  parent keyspace. `retireIndexRegistry` walks every declared
+  index's `Root` and `FreeSubtree`s the data tree, and the cached
+  handle's `idx.pinned.root` is now a freed page. Every subsequent
+  `Lookup` / `LookupKeys` / `Range` / `Prefix` / `Get` / `Stats`
+  call sets `idx.Err()` (or returns directly, for `Get` / `Stats`)
+  to `ErrKeyspaceClosed` — distinct from the post-Drop dead-handle
+  sentinel because the WHOLE keyspace is gone, not just this
+  index. Closes the
+  `transactions.md §Cursor invalidation by DeleteKeyspace` clause
+  for `*Index` handles (the clause names them but the row-cursor
+  fix that landed at chunk 5.6 did not enforce it on the iter
+  surface). Dead-check ordering is "parent first":
+  `Stats` / `Lookup` / etc. probe the parent ks/sks `dead` flag
+  before the handle's own `dead`, so a handle whose index was
+  dropped AND whose keyspace was then deleted in the same tx
+  reports `ErrKeyspaceClosed` (the broader truth) rather than
+  `ErrIndexNotFound` (the narrower one) — matching `Cursor.Err`'s
+  dead-check-wins ordering. The mid-iter case (a
+  `tx.DeleteKeyspace` call from inside a user `for-range` over
+  `idx.Lookup`) MarkStales the in-flight `*btree.Cursor` via
+  `markIndexHandlesStale` during `tx.DeleteKeyspace`'s in-memory
+  invalidation block, and the closure's err translation maps the
+  resulting `btree.ErrCursorStale` to `ErrKeyspaceClosed`
+  (`mapCursorErr` checks `keyspaceDead()` before returning
+  `ErrCursorStale` — the "re-position to recover" semantic of
+  `ErrCursorStale` does not apply when the parent is gone).
+
+Three invariants pin this contract:
 
 - **Inv-IHS1 (cursor-on-stale-tree).** A `*btree.Cursor` opened by
   an `*Index` iter closure is `MarkStale`'d (and its tracked rootID
@@ -588,14 +617,44 @@ Two invariants pin this contract:
   with `ErrIndexNotFound`. Violation: `idx.Stats()` returns the
   pre-Drop `Count` and `idx.Lookup()` walks freed root pages.
 
+- **Inv-IHS3 (post-DeleteKeyspace handle closed).** After
+  `tx.DeleteKeyspace(ks.Name())` succeeds, every previously-
+  handed-out `*Index` handle whose parent is `ks` rejects
+  subsequent `Lookup` / `LookupKeys` / `Range` / `Prefix` / `Get`
+  / `Stats` / `Err` with `ErrKeyspaceClosed` — checked BEFORE the
+  Inv-IHS2 `idx.dead` check, so the broader sentinel wins on a
+  drop-then-delete sequence. `Err()`'s `keyspaceDead`-first
+  ordering keeps the bare-`Err()` poll observation symmetric with
+  `Stats` / `Lookup` / etc. — a user polling `Err()` after
+  `tx.DeleteKeyspace` (regardless of any prior bad-cols Lookup or
+  mid-iter sibling-mutation stale that may have left a sticky
+  `idx.err`) observes `ErrKeyspaceClosed`, matching what
+  `Stats()` / `Lookup()` report for the same state. The iter-side
+  sticky `idx.err` (Inv-IHS1) remains observable only on a live
+  keyspace; on a dead keyspace, the broader truth supersedes it.
+  Any `*btree.Cursor` opened by an
+  in-flight `idx` iter closure is `MarkStale`'d before the
+  surrounding `tx.DeleteKeyspace` call returns (via
+  `markIndexHandlesStale` in the in-memory invalidation block),
+  and the closure's `idx.mapCursorErr` translates the resulting
+  `btree.ErrCursorStale` to `ErrKeyspaceClosed` because
+  `keyspaceDead()` is now true. Violation: `idx.Stats()` returns
+  the pre-Delete `Count`, `idx.Lookup()` walks the freed root, or
+  a mid-iter `tx.DeleteKeyspace` from inside a user `for-range`
+  yields stale entries from the just-`FreeSubtree`'d pages with
+  no MarkStale signal. Closes the
+  `transactions.md §Cursor invalidation by DeleteKeyspace` clause
+  for `*Index` handles (the clause names them but the row-cursor
+  fix that landed at chunk 5.6 did not enforce it on the iter
+  surface).
+
 Per the chunk-5.6 row-cursor invalidation pattern these
 invariants are spec-tier *and* enforced (regression tests
-`TestIndexHandleStatsAfterDropReturnsErrIndexNotFound` et al. on
-the package, plus the markup of the contract on this section).
-Out of scope of these invariants: `tx.DeleteKeyspace(name)` on
-the parent of the index handle — covered separately by
-`transactions.md §Cursor invalidation by DeleteKeyspace`, which
-specifies `ErrKeyspaceClosed`.
+`TestIndexHandleStatsAfterDropReturnsErrIndexNotFound`,
+`TestIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed`,
+`TestIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed`
+et al. on the package, plus the markup of the contract on this
+section).
 
 ## Write Path: Atomic Index Maintenance
 

@@ -171,14 +171,17 @@ func (ks *SetKeyspace) markSetCursorsStale() {
 
 // markIndexHandlesStale / markIndexHandleStaleByName /
 // markIndexHandleDead are the SetKeyspace mirrors of the
-// Keyspace-side helpers (see keyspace.go for the contract). They
-// close Inv-IHS1 / Inv-IHS2 on the Kind=1 side: SetKeyspace.Put /
-// Delete / DeleteValue / SetCursor.Delete run
+// Keyspace-side helpers (see keyspace.go for the full contract,
+// including the Inv-IHS3 freed-root caveat for the
+// Tx.DeleteKeyspace caller). They close Inv-IHS1 / Inv-IHS2 /
+// Inv-IHS3 on the Kind=1 side: SetKeyspace.Put / Delete /
+// DeleteValue / SetCursor.Delete run
 // applyIndexMaintenanceOn{AddValue,RemoveValue} which CoWs each
 // declared index's data tree; Tx.RebuildIndex / Tx.DropIndex on a
-// SetKeyspace mutate or free wholesale. Either shape stales
-// in-flight cursors opened by *Index iter closures from this
-// SetKeyspace.
+// SetKeyspace mutate or free wholesale; Tx.DeleteKeyspace on a
+// SetKeyspace FreeSubtree's the per-index data trees via
+// retireIndexRegistry. Either shape stales in-flight cursors
+// opened by *Index iter closures from this SetKeyspace.
 func (ks *SetKeyspace) markIndexHandlesStale() {
 	for _, idx := range ks.openIndexHandles {
 		if idx.pinned == nil || idx.dead {
