@@ -719,6 +719,11 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 		psp := ks.tx.pgr.BeginShallowSavepoint()
 		rowSnap := snapshotIndexes(ks.indexes)
 		if mErr := ks.applyIndexMaintenanceOnAddValue(key, value); mErr != nil {
+			// The helper does not snapshot pinned state — see its godoc.
+			// rowSnap is the sole atomicity-rollback for in-memory
+			// pinned state, covering both this helper's failure and
+			// the dispatched btree.Put failure further below.
+			restoreIndexes(ks.indexes, rowSnap)
 			ks.tx.pgr.RestoreSavepoint(psp)
 			return false, mErr
 		}
@@ -1064,6 +1069,12 @@ func (ks *SetKeyspace) DeleteValue(key, value []byte) (err error) {
 		psp := ks.tx.pgr.BeginShallowSavepoint()
 		rowSnap := snapshotIndexes(ks.indexes)
 		if mErr := ks.applyIndexMaintenanceOnRemoveValue(key, value); mErr != nil {
+			// The helper does not snapshot pinned state — see its godoc.
+			// rowSnap is the sole atomicity-rollback for in-memory
+			// pinned state, covering both this helper's failure and
+			// the dispatched subpage / nested-tree delete failure
+			// further below.
+			restoreIndexes(ks.indexes, rowSnap)
 			ks.tx.pgr.RestoreSavepoint(psp)
 			return mErr
 		}

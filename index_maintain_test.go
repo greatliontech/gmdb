@@ -885,6 +885,289 @@ func TestApplyIndexMaintenanceAtomicOnCursorDelete(t *testing.T) {
 	assertNoBitmapLeak(t, db)
 }
 
+// --- Mid-loop pinned-state restore (caller-owned rowSnap) -------
+
+// TestIndexedPutPinnedStateRevertsAfterMidLoopFailure verifies the
+// caller-owned `rowSnap` atomicity contract: when
+// applyIndexMaintenanceOnPut fails AFTER mutating pinned for some
+// indexes (the helper itself is snapshot-less; see its godoc),
+// `Keyspace.Put`'s restoreIndexes(rowSnap) call on the helper-error
+// branch returns pinned.{root, count} to the pre-call state.
+//
+// Pins the chunk-7.6 H-2 atomicity invariant across the consolidation
+// from helper-layer-snapshot to caller-layer-only. Sister to
+// TestIndexedPutPinnedStateRevertsOnCandidateCollision, which
+// exercises only the no-mutation path (candidate-set collision before
+// any btree op runs).
+//
+// Neuter: remove `restoreIndexes(ks.indexes, rowSnap)` from
+// Keyspace.Put's helper-error branch. This test fails with non-zero
+// `idx_a` mutation: count=2 (the seeded k1 plus k2's pre-failure
+// mutation) and a root mutated by the first successful btree.Put on
+// idx_a's data tree.
+func TestIndexedPutPinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Setup: indexed keyspace with 2 indexes, both producing 1 entry
+	// per row. Seed 1 row so both index data trees are non-empty
+	// (pinned.root != 0, pinned.count == 1) and a subsequent Put runs
+	// btree.Put on BOTH trees in sequence — the fail hook fires after
+	// the first.
+	{
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin setup: %v", err)
+		}
+		da := testDecl("idx_a", "a")
+		da.Extract = firstByteExtract
+		db2 := testDecl("idx_b", "b")
+		db2.Extract = firstByteExtract
+		ks, err := tx.CreateKeyspace("items", da, db2)
+		if err != nil {
+			tx.Rollback()
+			t.Fatalf("CreateKeyspace: %v", err)
+		}
+		if err := ks.Put([]byte("k1"), []byte{0x42, 'x'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put k1: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit setup: %v", err)
+		}
+	}
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	ks, err := tx.OpenKeyspace("items", keyspaceTestDeclsForOpen()...)
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+
+	// Capture pre-Put pinned state.
+	type pinnedSnapshot struct{ root, count uint64 }
+	pre := map[string]pinnedSnapshot{}
+	for name, p := range ks.indexes {
+		pre[name] = pinnedSnapshot{root: p.root, count: p.count}
+	}
+
+	injected := errors.New("injected index-maintenance failure (mid-loop)")
+	// Fail after the FIRST successful btree.Put on an index data
+	// tree — so pinned for that first index is mutated but pinned
+	// for the second index is not yet touched. Tests that the
+	// caller-side restoreIndexes covers the first index's mutation.
+	setIndexMaintenanceFailHookForTest(func(i int) error {
+		if i >= 0 {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
+
+	err = ks.Put([]byte("k2"), []byte{0x43, 'y'})
+	if !errors.Is(err, injected) {
+		t.Fatalf("Put err = %v, want injected", err)
+	}
+
+	// Post-failure pinned state must equal pre-Put.
+	for name, p := range ks.indexes {
+		want := pre[name]
+		if p.root != want.root {
+			t.Errorf("post-failure pinned[%q].root: got %d want %d — caller rowSnap restore regression",
+				name, p.root, want.root)
+		}
+		if p.count != want.count {
+			t.Errorf("post-failure pinned[%q].count: got %d want %d — caller rowSnap restore regression",
+				name, p.count, want.count)
+		}
+	}
+}
+
+// TestIndexedDeletePinnedStateRevertsAfterMidLoopFailure is the
+// Delete-path counterpart of
+// TestIndexedPutPinnedStateRevertsAfterMidLoopFailure.
+//
+// Neuter: remove `restoreIndexes(ks.indexes, rowSnap)` from
+// Keyspace.Delete's helper-error branch. Fails with idx_a's pinned
+// count decremented below the pre-Delete value.
+func TestIndexedDeletePinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	{
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin setup: %v", err)
+		}
+		da := testDecl("idx_a", "a")
+		da.Extract = firstByteExtract
+		db2 := testDecl("idx_b", "b")
+		db2.Extract = firstByteExtract
+		ks, err := tx.CreateKeyspace("items", da, db2)
+		if err != nil {
+			tx.Rollback()
+			t.Fatalf("CreateKeyspace: %v", err)
+		}
+		if err := ks.Put([]byte("k1"), []byte{0x42, 'x'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put k1: %v", err)
+		}
+		if err := ks.Put([]byte("k2"), []byte{0x43, 'y'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put k2: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit setup: %v", err)
+		}
+	}
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	ks, err := tx.OpenKeyspace("items", keyspaceTestDeclsForOpen()...)
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+
+	type pinnedSnapshot struct{ root, count uint64 }
+	pre := map[string]pinnedSnapshot{}
+	for name, p := range ks.indexes {
+		pre[name] = pinnedSnapshot{root: p.root, count: p.count}
+	}
+
+	injected := errors.New("injected index-maintenance failure (Delete mid-loop)")
+	setIndexMaintenanceFailHookForTest(func(i int) error {
+		if i >= 0 {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
+
+	err = ks.Delete([]byte("k1"))
+	if !errors.Is(err, injected) {
+		t.Fatalf("Delete err = %v, want injected", err)
+	}
+
+	for name, p := range ks.indexes {
+		want := pre[name]
+		if p.root != want.root {
+			t.Errorf("post-failure pinned[%q].root: got %d want %d — caller rowSnap restore regression",
+				name, p.root, want.root)
+		}
+		if p.count != want.count {
+			t.Errorf("post-failure pinned[%q].count: got %d want %d — caller rowSnap restore regression",
+				name, p.count, want.count)
+		}
+	}
+}
+
+// TestCursorDeletePinnedStateRevertsAfterMidLoopFailure is the
+// Cursor.Delete counterpart of
+// TestIndexedDeletePinnedStateRevertsAfterMidLoopFailure. Pins the
+// invariant that Cursor.Delete's added rowSnap-restore on the
+// helper-error branch is the sole atomicity-rollback for in-memory
+// pinned state.
+//
+// Neuter: remove `restoreIndexes(c.ks.indexes, rowSnap)` from
+// Cursor.Delete's helper-error branch. Test fails with the first
+// processed index's pinned count decremented below the pre-Delete
+// value.
+func TestCursorDeletePinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	{
+		tx, err := db.Begin(ctx, true)
+		if err != nil {
+			t.Fatalf("Begin setup: %v", err)
+		}
+		da := testDecl("idx_a", "a")
+		da.Extract = firstByteExtract
+		db2 := testDecl("idx_b", "b")
+		db2.Extract = firstByteExtract
+		ks, err := tx.CreateKeyspace("items", da, db2)
+		if err != nil {
+			tx.Rollback()
+			t.Fatalf("CreateKeyspace: %v", err)
+		}
+		if err := ks.Put([]byte("k1"), []byte{0x42, 'x'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put k1: %v", err)
+		}
+		if err := ks.Put([]byte("k2"), []byte{0x43, 'y'}); err != nil {
+			tx.Rollback()
+			t.Fatalf("Put k2: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit setup: %v", err)
+		}
+	}
+
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	ks, err := tx.OpenKeyspace("items", keyspaceTestDeclsForOpen()...)
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+
+	type pinnedSnapshot struct{ root, count uint64 }
+	pre := map[string]pinnedSnapshot{}
+	for name, p := range ks.indexes {
+		pre[name] = pinnedSnapshot{root: p.root, count: p.count}
+	}
+
+	injected := errors.New("injected index-maintenance failure (Cursor.Delete mid-loop)")
+	setIndexMaintenanceFailHookForTest(func(i int) error {
+		if i >= 0 {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
+
+	c := ks.Cursor()
+	if k, _ := c.First(); k == nil {
+		t.Fatalf("Cursor.First returned nil on seeded keyspace")
+	}
+	err = c.Delete()
+	if !errors.Is(err, injected) {
+		t.Fatalf("Cursor.Delete err = %v, want injected", err)
+	}
+
+	for name, p := range ks.indexes {
+		want := pre[name]
+		if p.root != want.root {
+			t.Errorf("post-failure pinned[%q].root: got %d want %d — caller rowSnap restore regression",
+				name, p.root, want.root)
+		}
+		if p.count != want.count {
+			t.Errorf("post-failure pinned[%q].count: got %d want %d — caller rowSnap restore regression",
+				name, p.count, want.count)
+		}
+	}
+}
+
 // keyspaceTestDeclsForOpen returns the same two IndexDecls used in
 // the Keyspace setup blocks above — needed at OpenKeyspace time per
 // indexing.md §Open Semantics (handed back at every reopen with the

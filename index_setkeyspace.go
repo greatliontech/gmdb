@@ -208,23 +208,20 @@ func setKeyspaceExtractEntries(decl *IndexDecl, setKey, setValue []byte) (map[st
 }
 
 // applyIndexMaintenanceOnAddValue is the SetKeyspace analogue of
-// chunk-7.6's Keyspace.applyIndexMaintenanceOnPut. Called BEFORE
-// the actual btree.Put when a NEW set member is being added (Put
-// where (setKey, setValue) was not already in the set). Atomicity:
-// snapshot/restore on any internal failure.
+// Keyspace.applyIndexMaintenanceOnPut. Called BEFORE the actual
+// btree.Put when a NEW set member is being added (Put where
+// (setKey, setValue) was not already in the set).
+//
+// Atomicity: the caller owns `rowSnap` and the pager savepoint — see
+// applyIndexMaintenanceOnPut godoc for the full two-layer contract.
+// This helper does NOT snapshot pinned state itself; a single caller-
+// side `rowSnap` covers both this helper's error path and the
+// subsequent dispatched btree mutation (genesis subpage, putIntoSubpage,
+// putIntoNestedTree) failing.
 func (ks *SetKeyspace) applyIndexMaintenanceOnAddValue(setKey, setValue []byte) error {
 	if len(ks.indexes) == 0 {
 		return nil
 	}
-	snap := snapshotIndexes(ks.indexes)
-	if err := ks.applyIndexMaintenanceOnAddValueInner(setKey, setValue); err != nil {
-		restoreIndexes(ks.indexes, snap)
-		return err
-	}
-	return nil
-}
-
-func (ks *SetKeyspace) applyIndexMaintenanceOnAddValueInner(setKey, setValue []byte) error {
 	names := sortedIndexNames(ks.indexes)
 	cfg := ks.tx.pgr.Config()
 
@@ -298,22 +295,6 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnAddValueInner(setKey, setValue []b
 	return nil
 }
 
-// applyIndexMaintenanceOnRemoveValue is the SetKeyspace analogue
-// of Keyspace.applyIndexMaintenanceOnDelete. Called BEFORE the
-// actual btree.Delete (or value-specific removal) for the given
-// (setKey, setValue) pair.
-func (ks *SetKeyspace) applyIndexMaintenanceOnRemoveValue(setKey, setValue []byte) error {
-	if len(ks.indexes) == 0 {
-		return nil
-	}
-	snap := snapshotIndexes(ks.indexes)
-	if err := ks.applyIndexMaintenanceOnRemoveValueInner(setKey, setValue); err != nil {
-		restoreIndexes(ks.indexes, snap)
-		return err
-	}
-	return nil
-}
-
 // applyIndexMaintenanceOnBulkKeyDelete iterates every value in the
 // key's set (subpage or nested-tree storage) and applies index
 // maintenance per (setKey, setValue) pair. Used by
@@ -323,6 +304,12 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnRemoveValue(setKey, setValue []byt
 // on SetKeyspaces: "Bulk-free of a key's nested B+tree (via
 // Delete(key)) reverts to a per-member walk when the SetKeyspace
 // has indexes."
+//
+// Atomicity: this routine threads errors out of
+// applyIndexMaintenanceOnRemoveValue per member; the outer
+// SetKeyspace.Delete caller's `rowSnap` covers a mid-loop failure
+// by restoring to pre-loop state (the per-member helper is
+// snapshot-less by design — see its godoc).
 func (ks *SetKeyspace) applyIndexMaintenanceOnBulkKeyDelete(cfg page.Config, key []byte, e page.LeafEntry) error {
 	fvs := ks.desc.FixedValueSize
 	switch {
@@ -364,7 +351,24 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnBulkKeyDelete(cfg page.Config, key
 	}
 }
 
-func (ks *SetKeyspace) applyIndexMaintenanceOnRemoveValueInner(setKey, setValue []byte) error {
+// applyIndexMaintenanceOnRemoveValue is the SetKeyspace analogue of
+// Keyspace.applyIndexMaintenanceOnDelete. Called BEFORE the actual
+// btree.Delete (or value-specific removal) for the given
+// (setKey, setValue) pair.
+//
+// Atomicity: the caller owns `rowSnap` and the pager savepoint — see
+// applyIndexMaintenanceOnPut godoc for the full two-layer contract.
+// This helper does NOT snapshot pinned state itself; a single caller-
+// side `rowSnap` covers both this helper's error path and the
+// subsequent dispatched btree mutation failing. In the bulk-key
+// delete case (applyIndexMaintenanceOnBulkKeyDelete loop), one outer
+// `rowSnap` at SetKeyspace.Delete covers EVERY per-member call: a
+// failure on member k leaves the caller to restore to pre-loop state,
+// not per-iteration intermediate state.
+func (ks *SetKeyspace) applyIndexMaintenanceOnRemoveValue(setKey, setValue []byte) error {
+	if len(ks.indexes) == 0 {
+		return nil
+	}
 	names := sortedIndexNames(ks.indexes)
 	cfg := ks.tx.pgr.Config()
 	mergeThreshold := ks.tx.db.opts.MergeThreshold

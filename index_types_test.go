@@ -237,13 +237,13 @@ func TestValidateIndexDeclsRejectsEmptyName(t *testing.T) {
 }
 
 // TestValidateIndexDeclsRejectsZeroColumns verifies the chunk-7.10
-// fold of setkeyspace-indexing-perf-and-edge.md item C: a zero-
-// column IndexDecl is rejected with ErrInvalidOptions at the
-// variadic-IndexDecl entry points. The non-unique decoder
-// (extractSetKeyspaceCompoundPKFromIndexKey + extractPKAndValue)
-// needs at least one column terminator to bound the PK component;
-// a zero-column index would surface errIndexKeyMalformed at decode
-// time. Rejecting at construction gives a clear sentinel.
+// rejection rule: a zero-column IndexDecl is rejected with
+// ErrInvalidOptions at the variadic-IndexDecl entry points. The
+// non-unique decoder (extractSetKeyspaceCompoundPKFromIndexKey +
+// extractPKAndValue) needs at least one column terminator to bound
+// the PK component; a zero-column index would surface
+// errIndexKeyMalformed at decode time. Rejecting at construction
+// gives a clear sentinel.
 func TestValidateIndexDeclsRejectsZeroColumns(t *testing.T) {
 	decls := []*IndexDecl{
 		{Name: "by_nothing", Columns: nil},

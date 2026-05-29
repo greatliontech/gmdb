@@ -141,9 +141,9 @@ func extractEntriesAsKeySet(decl *IndexDecl, key, value []byte) (map[string]Inde
 	return out, nil
 }
 
-// applyIndexMaintenanceOnPut wraps the per-index pre-Put/post-Put
-// work for an indexed Keyspace. Caller has already validated the
-// keyspace handle (not dead, not readOnly) and the key (non-empty).
+// applyIndexMaintenanceOnPut runs the per-index pre-Put/post-Put work
+// for an indexed Keyspace. Caller has already validated the keyspace
+// handle (not dead, not readOnly) and the key (non-empty).
 //
 // Sequence per indexing.md §Write Path:
 //  1. For each index: extract(key, oldValue) → old entry set.
@@ -160,11 +160,20 @@ func extractEntriesAsKeySet(decl *IndexDecl, key, value []byte) (map[string]Inde
 // Atomicity. Two layers cooperate to keep the helper + the subsequent
 // row write all-or-nothing across Tx.Commit:
 //
-//   - In-memory pinned state (chunk-7.6 Round-1 H-2 fix): on any
-//     failure during the sequence, pinnedIndex.root / .count are
-//     restored to the pre-call snapshot so flushIndexRegistry at
-//     Commit-after-error never writes half-mutated pinned values
-//     to the on-disk registry.
+//   - In-memory pinned state: the CALLER takes
+//     `rowSnap := snapshotIndexes(ks.indexes)` BEFORE invoking this
+//     helper and calls `restoreIndexes(ks.indexes, rowSnap)` on ANY
+//     failure path — this helper returning an error, or the
+//     subsequent row btree.Put failing. This helper does NOT snapshot
+//     pinned state itself: a single caller-side snapshot covers both
+//     failure modes (chunk-7.6 H-2 originally took the snapshot at
+//     the helper layer; consolidated to caller-only when chunk-7.9
+//     made every caller already hold rowSnap for the post-helper
+//     failure case — the helper-layer snapshot became a redundant
+//     allocation paying O(indexes) per indexed write). Without the
+//     caller-side restore on the helper-error branch,
+//     flushIndexRegistry at Commit-after-error would publish partial-
+//     mutated pinned values to the on-disk registry.
 //
 //   - On-disk page allocations: the caller (Keyspace.Put / Delete /
 //     Cursor.Delete) brackets the maintenance call AND its subsequent
@@ -186,15 +195,6 @@ func extractEntriesAsKeySet(decl *IndexDecl, key, value []byte) (map[string]Inde
 // or is a meta/bitmap page") against the per-op-error path that
 // the engine's rest-of-tx-continues contract allows.
 func (ks *Keyspace) applyIndexMaintenanceOnPut(key, oldValue, newValue []byte, existedBefore bool) error {
-	snap := snapshotIndexes(ks.indexes)
-	if err := ks.applyIndexMaintenanceOnPutInner(key, oldValue, newValue, existedBefore); err != nil {
-		restoreIndexes(ks.indexes, snap)
-		return err
-	}
-	return nil
-}
-
-func (ks *Keyspace) applyIndexMaintenanceOnPutInner(key, oldValue, newValue []byte, existedBefore bool) error {
 	if len(ks.indexes) == 0 {
 		return nil
 	}
@@ -329,7 +329,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnPutInner(key, oldValue, newValue []by
 	return nil
 }
 
-// applyIndexMaintenanceOnDelete wraps the per-index work for an
+// applyIndexMaintenanceOnDelete runs the per-index work for an
 // indexed Keyspace.Delete or Cursor.Delete. Caller has the existing
 // row's (key, value) and has validated the handle.
 //
@@ -340,19 +340,12 @@ func (ks *Keyspace) applyIndexMaintenanceOnPutInner(key, oldValue, newValue []by
 //
 // The row delete itself happens AFTER this function returns nil.
 //
-// Atomicity (chunk-7.6 Round-1 H-2 / M-1 fix): on any failure,
-// pinnedIndex state is restored from the pre-call snapshot — see
-// applyIndexMaintenanceOnPut godoc.
+// Atomicity: the caller owns `rowSnap` and the pager savepoint — see
+// applyIndexMaintenanceOnPut godoc for the full two-layer contract.
+// This helper does NOT snapshot pinned state itself; a single caller-
+// side `rowSnap` covers both this helper's error path and the
+// subsequent row btree.Delete failing.
 func (ks *Keyspace) applyIndexMaintenanceOnDelete(key, oldValue []byte) error {
-	snap := snapshotIndexes(ks.indexes)
-	if err := ks.applyIndexMaintenanceOnDeleteInner(key, oldValue); err != nil {
-		restoreIndexes(ks.indexes, snap)
-		return err
-	}
-	return nil
-}
-
-func (ks *Keyspace) applyIndexMaintenanceOnDeleteInner(key, oldValue []byte) error {
 	if len(ks.indexes) == 0 {
 		return nil
 	}
@@ -448,18 +441,30 @@ func (tx *Tx) flushIndexRegistry(owner descriptorOwner, indexes map[string]*pinn
 	return nil
 }
 
-// indexSnapshot is a per-index (root, count) pair captured before
-// a mutation, used by the chunk-7.6 atomicity-rollback path
-// (Round-1 H-2 fix). On any failure during the
-// applyIndexMaintenanceOn{Put,Delete} sequence — including a
-// failure of the row btree.Put/Delete that runs AFTER maintenance
-// — the caller restores the snapshot to keep pinnedIndex's
-// (root, count) consistent with the not-yet-written row, so
-// flushIndexRegistry at Commit-after-error never writes
-// partial-state pinned values to the on-disk registry. The
-// newly-allocated index data-tree pages still leak under the
-// engine's rest-of-tx-continues contract (Tx.Rollback reclaims;
-// Commit-after-error orphans), but the registry stays consistent.
+// indexSnapshot is a per-index (root, count) pair used by the
+// indexed-path atomicity-rollback contract. The contract:
+//
+//   - Capture: the caller of every indexed mutation
+//     (Keyspace.Put / Delete / Cursor.Delete and SetKeyspace.Put /
+//     Delete / DeleteValue) takes
+//     `rowSnap := snapshotIndexes(ks.indexes)` BEFORE the per-index
+//     maintenance helper runs.
+//   - Restore: the caller calls `restoreIndexes(ks.indexes, rowSnap)`
+//     on EVERY failure path — failure of the maintenance helper
+//     itself, OR failure of the row btree.Put / btree.Delete that
+//     runs AFTER maintenance returns nil.
+//   - Purpose: keep pinnedIndex's (root, count) consistent with the
+//     not-yet-written row so flushIndexRegistry at Commit-after-error
+//     never writes partial-state pinned values to the on-disk
+//     registry.
+//
+// The helper itself does NOT snapshot pinned state — atomicity is
+// single-layered on the caller side. See applyIndexMaintenanceOnPut
+// godoc for the full two-layer contract that bundles the rowSnap
+// in-memory layer with the per-row pager savepoint on-disk layer.
+// Newly-allocated index data-tree pages still leak under the engine's
+// rest-of-tx-continues contract (Tx.Rollback reclaims; Commit-after-
+// error orphans); the registry stays consistent regardless.
 type indexSnapshot map[string]struct {
 	root  uint64
 	count uint64
