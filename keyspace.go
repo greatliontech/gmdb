@@ -93,6 +93,21 @@ type Keyspace struct {
 	// dangling references on a subsequent unguarded access.
 	openCursors []*Cursor
 
+	// openIndexHandles tracks every *Index returned by
+	// Keyspace.Index(name) in this tx. The chunk-7.6 atomic
+	// Put/Delete/Cursor.Delete path mutates index trees
+	// (applyIndexMaintenanceOn{Put,Delete}); Tx.RebuildIndex /
+	// Tx.DropIndex replace or free the per-index data tree
+	// wholesale. Each of these mutations CoWs or frees pages reached
+	// by in-flight *btree.Cursor instances opened from these
+	// handles' iter closures (Lookup / Range / LookupKeys
+	// non-unique). markIndexHandlesStale (and the by-name /
+	// dead variants) walk this slice to MarkStale every such
+	// cursor, closing Inv-IHS1. Mirrors openCursors structurally
+	// (the chunk-5.6 markCursorsStale pattern); see indexing.md
+	// §Handle Invalidation for the contract.
+	openIndexHandles []*Index
+
 	// indexes carries the pinned per-index state for this tx, keyed
 	// by IndexDecl.Name. Populated by OpenKeyspace / CreateKeyspace
 	// / CreateKeyspaceIfNotExists at chunk-7.5 with the validated
@@ -1029,10 +1044,99 @@ func (ks *Keyspace) Cursor() *Cursor {
 // needing a fresh Keyspace.Cursor() call; the rootID refresh
 // guarantees the re-position descends from the live tree, not the
 // pre-mutation (now-retired) root.
+//
+// Also delegates to markIndexHandlesStale (Inv-IHS1): every site
+// that stales row cursors here is post-mutation and, on the indexed
+// path, has just CoW'd index trees via applyIndexMaintenanceOn{Put,
+// Delete}; the in-flight *Index iter cursors must MarkStale or read
+// CoW'd-then-released leaf pages. Centralized here so every existing
+// markCursorsStale caller (Put / Delete / DeleteRange non-indexed
+// fast path) gets the index-handle invalidation for free without
+// re-touching each site. No-op on non-indexed keyspaces
+// (openIndexHandles stays empty — Keyspace.Index rejects).
 func (ks *Keyspace) markCursorsStale() {
 	for _, c := range ks.openCursors {
 		c.inner.MarkStale()
 		c.inner.SetRootID(ks.desc.Root)
+	}
+	ks.markIndexHandlesStale()
+}
+
+// markIndexHandlesStale invokes MarkStale on every in-flight
+// *btree.Cursor opened by an *Index handle from this keyspace, and
+// refreshes the cursor's tracked rootID to the (possibly mutated)
+// pinnedIndex.root. Called by Keyspace.Put / Delete / Cursor.Delete
+// after the atomic-maintenance step that mutates index trees:
+// applyIndexMaintenanceOn{Put,Delete} runs btree.Put / btree.Delete
+// on each declared index's data tree → CoWs pages reachable from
+// in-flight iter cursors → those cursors must MarkStale or the next
+// c.Next() reads CoW'd-then-released leaf pages (Inv-IHS1).
+//
+// Conservative-mark-all (mirrors markCursorsStale): an extractor
+// may emit entries for any subset of declared indexes per Put, and
+// the cheapest correct policy is to stale every in-flight index
+// cursor on any successful row mutation. Dead handles are skipped
+// (their cursors have already been staled by markIndexHandleDead).
+func (ks *Keyspace) markIndexHandlesStale() {
+	for _, idx := range ks.openIndexHandles {
+		if idx.pinned == nil || idx.dead {
+			continue
+		}
+		newRoot := idx.pinned.root
+		for _, c := range idx.openCursors {
+			c.MarkStale()
+			c.SetRootID(newRoot)
+		}
+	}
+}
+
+// markIndexHandleStaleByName invokes MarkStale on in-flight cursors
+// for the named index only. Called by Tx.RebuildIndex after
+// syncRebuildToCachedPinned: only the rebuilt index's tree was
+// replaced (FreeSubtree of the old root + new root published into
+// pinned.root); other indexes' handles must NOT be invalidated.
+// Refreshes the cursor's tracked rootID so a re-position descends
+// from the new root.
+func (ks *Keyspace) markIndexHandleStaleByName(name string) {
+	for _, idx := range ks.openIndexHandles {
+		if idx.pinned == nil || idx.dead {
+			continue
+		}
+		if idx.pinned.decl.Name != name {
+			continue
+		}
+		newRoot := idx.pinned.root
+		for _, c := range idx.openCursors {
+			c.MarkStale()
+			c.SetRootID(newRoot)
+		}
+	}
+}
+
+// markIndexHandleDead marks every *Index handle for the named index
+// as dead (Inv-IHS2): subsequent Lookup / LookupKeys / Range /
+// Prefix / Get / Stats on the cached handle return ErrIndexNotFound.
+// Also MarkStale's in-flight cursors so any iter mid-loop terminates
+// (ErrCursorStale on Err()) instead of walking the FreeSubtree'd
+// data tree pages.
+//
+// Called by Tx.DropIndex after registryDelete + FreeSubtree
+// succeed: the on-disk registry no longer references this index and
+// the data tree pages have been returned to the loose-page pool, so
+// any cached handle pointing at the stale pinnedIndex must reject
+// further use.
+func (ks *Keyspace) markIndexHandleDead(name string) {
+	for _, idx := range ks.openIndexHandles {
+		if idx.pinned == nil || idx.dead {
+			continue
+		}
+		if idx.pinned.decl.Name != name {
+			continue
+		}
+		idx.dead = true
+		for _, c := range idx.openCursors {
+			c.MarkStale()
+		}
 	}
 }
 
@@ -1353,6 +1457,13 @@ func (c *Cursor) Delete() error {
 			sibling.inner.SetRootID(c.ks.desc.Root)
 		}
 	}
+	// Inv-IHS1: indexed Cursor.Delete ran applyIndexMaintenanceOnDelete
+	// which CoW'd index trees. Stale every in-flight *Index iter cursor
+	// on this keyspace. (Open-coded here rather than via the
+	// markCursorsStale helper because Cursor.Delete sibling-stales only
+	// OTHER row cursors — not all — so the row-cursor stale loop is
+	// above; the index-handle path has no analogous self-recovery.)
+	c.ks.markIndexHandlesStale()
 	return nil
 }
 

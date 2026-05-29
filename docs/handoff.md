@@ -194,6 +194,66 @@ before designing the fix. The proof is in the receipts:
   not on the broader corruption code set, would miss the
   `ReachableInRPL` shape entirely.)
 
+- **`index-handle-stale-after-rebuild-drop`** (this session): two
+  surprises beyond the issue's "user choice on sentinel" framing.
+
+  **First**, *the spec's existing transactions.md §Cursor invalidation
+  by DeleteKeyspace clause already enumerated `*Index` handles as
+  things that get invalidated by DeleteKeyspace and return
+  `ErrKeyspaceClosed`* — but the implementation has NEVER enforced
+  this on the iter surface (no `idx.ks.dead` check in Lookup / Range
+  / etc.). This is a same-fault-class adjacent gap, distinct from
+  the issue's reported RebuildIndex / DropIndex / atomic-Put cases.
+  The Escalation Rule says widening requires a second demonstrated
+  same-fault case the narrower fix leaves failing — the
+  DeleteKeyspace case IS a second demonstrated same-fault case (an
+  `*Index` reads freed pages from a tx mutation), but it has a
+  *different cause-line* and was filed as adjacent rather than
+  folded in. The judgment call: "same reported fault" in the
+  escalation rule means the specific cause-lines named in the
+  issue, not the fault class. Filing-and-proceeding here matches
+  the chunk-close adjacent-issue contract; widening to cover
+  DeleteKeyspace would have been a scope violation. Lesson: when a
+  fix touches a known spec clause that the impl doesn't honor,
+  CHECK whether the impl actually honors it for the issue's
+  reported triggers vs. other adjacent triggers — finding the
+  honored-vs-unhonored split early is the difference between a
+  same-scope fix and an over-scoped one.
+
+  **Second**, the sentinel-choice analysis revealed the issue's
+  framing ("ErrCursorStale vs new ErrIndexHandleStale — user
+  choice") was incomplete. The post-Drop case is semantically
+  "the index is gone," NOT "stale, re-iterate works" — and the
+  correct sentinel is `ErrIndexNotFound` (matching what
+  `ks.Index(name)` returns post-Drop). The mid-iter cursor case is
+  ErrCursorStale (matching row-cursor sibling-mutation). Two
+  *existing* sentinels for two distinct conditions, NO new
+  sentinel. The "user choice" framing in the issue obscured this
+  distinction — both proposed options would have conflated the
+  two. Lesson: when an issue offers a binary "choose A or new B"
+  on a sentinel question, the right answer is often "neither —
+  decompose the cases and use distinct existing sentinels per
+  case." First-principles re-derivation of the user-facing
+  contract surfaces the decomposition.
+
+  **Third (consolidation refactor)**, instead of adding a 1-line
+  `ks.markIndexHandlesStale()` at each of 11+ post-mutation sites
+  in set_keyspace.go (Put/Delete/DeleteValue genesis-/subpage-/
+  nested-tree- branches), the cleaner shape is to make
+  `markCursorsStale` / `markSetCursorsStale` internally call
+  `markIndexHandlesStale`. The semantic justification: both are
+  "stale all in-flight observers of this keyspace's
+  post-mutation state" — they're tightly coupled by design. The
+  Quality Bar's "smallest correct change" allows
+  structurally-larger-but-simpler shapes, and this is one of
+  them: 1 line in 2 functions instead of 11+ surgical site
+  edits. Cost is zero for non-indexed keyspaces (empty
+  openIndexHandles slice). The fresh-eyes Round-2 reviewer
+  verified by neutering BOTH the consolidated call and the
+  open-coded Cursor.Delete call → tests fail deterministically →
+  the consolidation correctly covers every former markSetCursorsStale
+  call site without missing one.
+
 - **`open-corrupt-meta-size-fields-panic`** (`5750827`): two
   surprises beyond the issue's "two-shape fix sketch" framing.
 
@@ -337,7 +397,20 @@ issue's "make OOMs" parenthetical may mean Go-runtime
 not wrap it via recover (the `open-corrupt-meta-size-fields-panic`
 BitmapPages bound is the canonical instance: `make([]byte, hugeN)`
 aborts the process from Go's runtime before any deferred recover
-gets a chance to fire).
+gets a chance to fire), OR **an issue's binary "sentinel A vs new
+sentinel B — user choice" obscures a decomposable case** — the
+right answer is often "neither — decompose into distinct conditions
+and use distinct existing sentinels per case" (the `index-handle-
+stale-after-rebuild-drop` close-out is the canonical instance: mid-
+iter cursor invalidation deserves `ErrCursorStale` while post-Drop
+dead-handle deserves `ErrIndexNotFound`; both proposed options in
+the issue would have conflated them), OR **a fix that touches a
+known spec clause may discover the impl never honored it for OTHER
+cause-lines** — the existing transactions.md §Cursor invalidation
+by DeleteKeyspace clause already names `*Index` handles, but the
+impl has never enforced it; same-fault-class adjacent gap to file,
+not to fold in (the escalation rule's "same reported fault" means
+the cause-lines named in the issue, not the fault class).
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -393,26 +466,40 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `open-corrupt-meta-size-fields-panic` (top
-candidate from prior handoff; adjacent to the closed
-`rpl-rebuild-panic-on-wild-pointer`, shared Inv-RV3 bound mental
-context). Fix: two walk-site bounds in `internal/pager/init.go` step 4
-(bitmap rebuild) — file-extent bound (firstDataPage = BitmapPages+2 ≤
-min(fileSize/PageSize, MaxSize)) catches wild-high BitmapPages before
-the `make` triggers Go-runtime OOM throw, capacity bound
-(BitmapPages*PageSize*8 ≥ MaxSize) catches under-sized BitmapPages
-before `bitmap.New`'s totalPages-exceeds-capacity panic. The escalation
-rule fired cleanly — Fault-(ii) is a second demonstrated case of the
-same class that the file-extent-only bound leaves failing. Spec
-promotions: `checksums.md §Structural and Allocation Bounds`
-enumeration extended with BitmapPages (third instance of the on-disk
-length/count field class); `file-layout.md §Meta Page` documents
-which fields ValidateMeta covers vs. which are walk-site-bounded
-elsewhere. 1-round adversarial review (3 L/nit, no H/M); all L/nit
-fixed in-place (message domain mismatch clarified, off-by-one
-arithmetic refactored as firstDataPage-explicit, catchability split
-noted in comment). Issue file unconditionally deleted per no-cite
-invariant (zero spec / production-code cites).
+This session closed `index-handle-stale-after-rebuild-drop` (the
+only remaining correctness-class entry in the prior backlog; all
+others were profiling-driven). Fix: mirrors chunk-5.6
+`markCursorsStale` pattern for `*Index` — `openIndexHandles` slice
+on Keyspace/SetKeyspace, `openCursors`+`dead` on `*Index`, three
+helpers (`markIndexHandlesStale` mark-all, `markIndexHandleStaleByName`
+for RebuildIndex, `markIndexHandleDead` for DropIndex). Consolidated
+the mark-all helper into existing `markCursorsStale`/
+`markSetCursorsStale` bodies — structurally-larger-but-simpler
+shape that avoids 11+ surgical edits at every post-mutation site
+and is justified by the tight semantic coupling ("a successful
+mutation invalidates all in-flight observer state"). Cursor.Delete
+gets an explicit open-coded call (it doesn't go through
+markCursorsStale because of the self-recovery exemption).
+Sentinel: NO new sentinel — `ErrCursorStale` for mid-iter cursor
+invalidation, `ErrIndexNotFound` for post-Drop dead-handle. New
+`mapIndexCursorErr` translates `btree.ErrCursorStale` →
+`gmdb.ErrCursorStale` at the public boundary (closes the same
+sentinel-identity-leak class as `cursor-err-unpositioned-state`
+commit 24ec951). Spec promotions: `indexing.md §Handle
+Invalidation` (new section, records Inv-IHS1 + Inv-IHS2);
+`api-surface.md` Lookup/RebuildIndex/DropIndex godoc updates. R1
+findings: 0H/1M/3L/1nit — M-1 fix added 2 missing regression
+tests (Cursor.Delete + SetCursor.Delete), L-1/L-2/L-3 fixed
+in-place (spec wording, cite retarget, shape-change recovery
+note). R2 converged: 0H/0M/0L; reviewer verified the fix by
+neutering — both new tests fail deterministically when the calls
+are removed. Filed adjacent
+`index-handle-stale-after-deletekeyspace.md` (pre-existing
+gap: `transactions.md §Cursor invalidation by DeleteKeyspace`
+spec says `*Index` handles return ErrKeyspaceClosed post-
+DeleteKeyspace, but the iter methods don't check `idx.ks.dead`
+— same fault class, different cause-line; per escalation rule
+out of scope for this fix).
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -426,7 +513,8 @@ invariant (zero spec / production-code cites).
 | `27361ac` | writenewindexregistry-partial-leak DDL siblings | Closed — `Tx.RebuildIndex`, `Tx.DropIndex`, `Keyspace.DeleteKeyspace` retirement wrapped in nested savepoint via defer-named-return |
 | `f1d9ad7` | btree-post-merge-underflow | Closed — strict fill-floor invariant added to `range-delete.md §Invariants`; mechanism: (a) `mergeOrRedistribute*` callers do post-merge re-rebalance + cousin propagation; (b) architectural force-underflow rule — a level returning `deepUnderflowChild != 0` reports `underflow=true` regardless of encoded fill; (c) top-level final-heal pass. Three rounds + root-cause analysis collapsed a 1400-LOC complexity accumulation to a 5-line rule. |
 | `682fa70` | byte-api-covering-return-unwired | Closed — byte-API branch added to `extractPKAndValue` returning encoded covering blob verbatim when `len(decl.Covering) > 0`. New public `DecodeCoveringTuple` + `ErrCoveringTupleMalformed` (NOT wrapped in `ErrCorrupted` — neutral sentinel). Spec promoted into `indexing.md §Covering Indexes` + `typed-keyspaces.md §Covering` + `api-surface.md`. 8 regression tests. |
-| THIS SESSION (`5750827`) | open-corrupt-meta-size-fields-panic | **Closed** — two walk-site bounds in `internal/pager/init.go` step 4 (bitmap rebuild): (1) firstDataPage = BitmapPages+2 ≤ min(fileSize/PageSize, MaxSize) catches wild-high BitmapPages before `make` triggers Go-runtime OOM throw; (2) BitmapPages*PageSize*8 ≥ MaxSize catches under-sized BitmapPages before `bitmap.New`'s totalPages-exceeds-capacity panic. Two-bound shape derives from escalation rule (Fault-ii is second demonstrated same-fault case Fault-i bound leaves failing). Sibling MaxSize/HighWaterMark/KeyspaceRoot/RPLHeadPage already walk-site-bounded by their consumers — no remaining reachable in-spec panic in this class. Spec: `checksums.md §Structural and Allocation Bounds` enumeration extended with BitmapPages; `file-layout.md §Meta Page` documents ValidateMeta scope vs. walk-site bounds. R1=0H/0M/3L/nit; all L/nit fixed in-place. New regression test `TestOpenRejectsCorruptBitmapPagesWithoutPanic` (wild_high + zero subtests) mirroring `TestOpenRejectsOutOfRangeRPLHeadWithoutPanic`. |
+| `5750827` | open-corrupt-meta-size-fields-panic | Closed — two walk-site bounds in `internal/pager/init.go` step 4 (bitmap rebuild): (1) firstDataPage = BitmapPages+2 ≤ min(fileSize/PageSize, MaxSize) catches wild-high BitmapPages before `make` triggers Go-runtime OOM throw; (2) BitmapPages*PageSize*8 ≥ MaxSize catches under-sized BitmapPages before `bitmap.New`'s totalPages-exceeds-capacity panic. Two-bound shape derives from escalation rule (Fault-ii is second demonstrated same-fault case Fault-i bound leaves failing). |
+| THIS SESSION | index-handle-stale-after-rebuild-drop | **Closed** — mirrors chunk-5.6 markCursorsStale pattern for `*Index`. New fields: `Index.{openCursors,dead}` + `Keyspace.openIndexHandles` + `SetKeyspace.openIndexHandles`. New helpers per keyspace: `markIndexHandlesStale` (mark-all, called by Put/Delete/etc via markCursorsStale consolidation), `markIndexHandleStaleByName` (RebuildIndex), `markIndexHandleDead` (DropIndex). Iter closures (iteratePrefix / Range / LookupKeys non-unique) register/unregister via defer. Dead-handle check at Stats/Lookup/LookupKeys/Range/Prefix/Get entry. `mapIndexCursorErr` translates btree.ErrCursorStale → gmdb.ErrCursorStale (same sentinel-leak class as 24ec951). Sentinels: ErrCursorStale (mid-iter) + ErrIndexNotFound (post-Drop) — NO new sentinel. Spec promotions: `indexing.md §Handle Invalidation` (new) + `api-surface.md` Lookup/RebuildIndex/DropIndex godoc updates. R1=0H/1M/3L/1nit; R2=0H/0M/0L (reviewer neuter-verified the two new tests fail deterministically when calls removed). 12 regression tests. Filed adjacent `index-handle-stale-after-deletekeyspace` (pre-existing spec-impl gap, different cause-line). |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -435,19 +523,23 @@ the README as ground truth, this as a hint.
 ### Decided, in-flight or queued
 
 *(none — the prior session's top candidate
-`open-corrupt-meta-size-fields-panic` landed this session in
-`5750827`.)*
+`index-handle-stale-after-rebuild-drop` landed this session.)*
 
 ### Undecided / needs analysis
 
-- **`index-handle-stale-after-rebuild-drop`** — substantial
-  `markIndexHandlesStale` bundle (Keyspace + SetKeyspace + Index
-  handle + iterator-side cursor tracking). Mirror the chunk-5.6
-  `markCursorsStale` pattern. Sub-choice: `ErrCursorStale` vs new
-  `ErrIndexHandleStale` sentinel. Now the *only* undecided
-  correctness-class entry in the backlog (everything else is
-  profiling-driven). Fresh-context-required per Ordering
-  criterion 3.
+- **`index-handle-stale-after-deletekeyspace`** — adjacent gap
+  filed at this session's close-out. Pre-existing spec-impl gap:
+  `transactions.md §Cursor invalidation by DeleteKeyspace` says
+  `*Index` handles return ErrKeyspaceClosed post-DeleteKeyspace,
+  but the iter methods (Lookup / LookupKeys / Range / Prefix /
+  Get / Stats) don't check `idx.ks.dead`. Same fault class as the
+  closed `index-handle-stale-after-rebuild-drop` (in-flight Index
+  reads freed pages), different cause-line. Resolution: single-
+  line guards mirroring the existing `idx.dead` checks. Smaller
+  than the just-closed bundle (no new tracking infrastructure
+  required — the openIndexHandles slice already exists; just add
+  the `idx.ks.dead` / `idx.sks.dead` guards alongside `idx.dead`).
+  Adjacent-to-recently-closed per Ordering criterion 4.
 
 ### Profiling-driven / condition-triggered (re-validate before pulling)
 
@@ -468,15 +560,21 @@ user may override). Default order, applying the Ordering criteria
 (decided > undecided is moot — decided slot empty; rank on
 fresh-context / adjacent-to-recently-closed / correctness > perf):
 
-1. **`index-handle-stale-after-rebuild-drop`** — the only remaining
-   correctness-class entry in the backlog (everything else is
-   profiling-driven / condition-triggered). Undecided / needs
-   analysis: substantial `markIndexHandlesStale` bundle (Keyspace +
-   SetKeyspace + Index handle + iterator-side cursor tracking),
-   mirroring the chunk-5.6 `markCursorsStale` pattern. Sub-choice
-   on `ErrCursorStale` vs new `ErrIndexHandleStale` sentinel —
-   decide before pulling. Fresh-context-required per Ordering
-   criterion 3.
+1. **`index-handle-stale-after-deletekeyspace`** — the only
+   remaining correctness-class entry in the backlog (everything
+   else is profiling-driven / condition-triggered). Adjacent-to-
+   recently-closed: same fault class as the just-closed
+   `index-handle-stale-after-rebuild-drop`, different cause-line.
+   The infrastructure (openIndexHandles slice + Index.dead/
+   openCursors + markIndexHandles* helpers) is already in place
+   from this session — the resolution is single-line `idx.ks.dead`
+   / `idx.sks.dead` guards at each `*Index` entry method
+   (mirroring the existing `idx.dead` checks) returning
+   `ErrKeyspaceClosed` (per the existing transactions.md spec).
+   Plus 4–6 regression tests mirroring the existing dead-handle
+   suite. Smaller and more mechanical than the prior issue. Per
+   Ordering criteria 4 (adjacent-to-recently-closed > unrelated):
+   the shared mental context discount is real.
 2. Anything in the profiling-driven set, after re-validation. Re-
    derive live — some may now be obsolete (e.g. the
    `shallow-savepoint-clone-cost` was filed at the end of a

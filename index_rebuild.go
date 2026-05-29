@@ -199,6 +199,18 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		}
 		tx.propagateNotCachedDescChange(keyspace, owner)
 		tx.syncRebuildToCachedPinned(cachedKS, cachedSKS, decl, 0, 0)
+		// Inv-IHS1: any in-flight *Index iter on this name walks the
+		// just-FreeSubtree'd old root. MarkStale every such cursor
+		// (by-name — other declared indexes were not touched) and
+		// refresh the cursor's tracked rootID to the new (0, empty)
+		// root so a re-position yields nothing rather than reading
+		// freed pages.
+		if cachedKS != nil {
+			cachedKS.markIndexHandleStaleByName(decl.Name)
+		}
+		if cachedSKS != nil {
+			cachedSKS.markIndexHandleStaleByName(decl.Name)
+		}
 		return nil
 	}
 
@@ -346,6 +358,17 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	}
 	tx.propagateNotCachedDescChange(keyspace, owner)
 	tx.syncRebuildToCachedPinned(cachedKS, cachedSKS, decl, newRoot, newCount)
+	// Inv-IHS1: see the empty-parent branch above. The pinned root
+	// was just swapped to newRoot and the OLD tree FreeSubtree'd —
+	// any in-flight *Index iter cursor on this name is now walking
+	// freed pages. MarkStale by-name (only this index, not siblings)
+	// and refresh the cursor's rootID to newRoot.
+	if cachedKS != nil {
+		cachedKS.markIndexHandleStaleByName(decl.Name)
+	}
+	if cachedSKS != nil {
+		cachedSKS.markIndexHandleStaleByName(decl.Name)
+	}
 	return nil
 }
 
@@ -536,6 +559,21 @@ func (tx *Tx) DropIndex(keyspace, indexName string) (retErr error) {
 	}
 	if cachedSKS != nil {
 		delete(cachedSKS.indexes, indexName)
+	}
+	// Inv-IHS2 + Inv-IHS1: any cached *Index handle whose pinned
+	// matches this (ks, name) pair must now reject further use —
+	// the on-disk registry entry is gone and the data tree pages
+	// have been FreeSubtree'd. markIndexHandleDead poisons the
+	// handle (dead=true → ErrIndexNotFound on subsequent
+	// Lookup / LookupKeys / Range / Prefix / Get / Stats) AND
+	// MarkStales every in-flight cursor so any iter mid-loop
+	// terminates with ErrCursorStale instead of walking freed
+	// leaves.
+	if cachedKS != nil {
+		cachedKS.markIndexHandleDead(indexName)
+	}
+	if cachedSKS != nil {
+		cachedSKS.markIndexHandleDead(indexName)
 	}
 	return nil
 }

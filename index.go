@@ -2,6 +2,7 @@ package gmdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"iter"
 
@@ -19,6 +20,21 @@ import (
 // (or, for chunk-7.6 implementations, the same handle bound to the
 // same pinnedIndex — overlapping iterators on one handle race per
 // api-surface.md §Index Lookup API).
+//
+// Invalidation contract (Inv-IHS1, Inv-IHS2 — see indexing.md
+// §Handle Invalidation): mutations that replace or free the index
+// data tree's pages within the same tx (Tx.RebuildIndex on this
+// name; Tx.DropIndex on this name; Keyspace.Put / Delete /
+// Cursor.Delete on the parent indexed keyspace; the SetKeyspace
+// analogues) MarkStale every in-flight *btree.Cursor opened by
+// this handle's iter closures. A stale cursor surfaces as
+// ErrCursorStale on the iter's Err() and terminates iteration; a
+// fresh iter call re-opens on the current pinned.root. After
+// Tx.DropIndex on this index's name the handle additionally
+// transitions to "dead": every subsequent Lookup / LookupKeys /
+// Range / Prefix / Get / Stats returns ErrIndexNotFound (matching
+// the sentinel ks.Index(name) returns post-Drop — the index is
+// gone, not "stale").
 type Index struct {
 	ks     *Keyspace
 	sks    *SetKeyspace // nil iff ks != nil
@@ -34,6 +50,25 @@ type Index struct {
 	// index. Keyspace-only (a SetKeyspace index's value lives in its
 	// compound PK, so there is no back-lookup to skip).
 	coverValue bool
+
+	// dead is set by Tx.DropIndex on the parent keyspace via
+	// markIndexHandleDead when this index's name is dropped. Once
+	// dead, every iter / Get / Stats call surfaces ErrIndexNotFound
+	// (Inv-IHS2). Distinct from idx.pinned == nil: a dead handle
+	// still carries pinned for the name+ks check, but the on-disk
+	// index registry entry is gone and pinned.root points at freed
+	// pages (FreeSubtree'd by DropIndex).
+	dead bool
+
+	// openCursors tracks every *btree.Cursor handed out by this
+	// handle's iter closures (iteratePrefix, Range, LookupKeys
+	// non-unique). Registered on closure entry, unregistered on
+	// closure exit (defer). The parent keyspace's mutators
+	// (markIndexHandlesStale / markIndexHandleStaleByName /
+	// markIndexHandleDead) walk this slice to MarkStale every
+	// in-flight cursor when index pages are CoW'd or freed —
+	// closes Inv-IHS1.
+	openCursors []*btree.Cursor
 }
 
 // IndexStats is the persistent count + tree statistics for an index.
@@ -54,10 +89,17 @@ type IndexStats struct {
 
 // Stats returns the index's persistent count + B+tree statistics.
 // Chunk-7.6 surface: Count is populated; TreeDepth is zero
-// (deferred to chunk 7.7).
+// (deferred to chunk 7.7). Returns ErrIndexNotFound (with the
+// keyspace/index name in the wrap) when the handle has been
+// invalidated by a same-tx Tx.DropIndex (Inv-IHS2) — without this
+// check Stats would return the pre-Drop count from the still-pinned
+// in-memory state.
 func (idx *Index) Stats() (IndexStats, error) {
 	if idx.err != nil {
 		return IndexStats{}, idx.err
+	}
+	if idx.dead {
+		return IndexStats{}, idx.indexNotFoundError()
 	}
 	return IndexStats{
 		Count: idx.pinned.count,
@@ -87,7 +129,13 @@ func (ks *Keyspace) Index(name string) (*Index, error) {
 		return nil, fmt.Errorf("gmdb: index %q on keyspace %q: %w",
 			name, ks.name.Value(), ErrIndexNotFound)
 	}
-	return &Index{ks: ks, pinned: p}, nil
+	idx := &Index{ks: ks, pinned: p}
+	// Register so the parent keyspace's mutators (Put / Delete /
+	// Cursor.Delete / Tx.RebuildIndex / Tx.DropIndex) can find and
+	// MarkStale every in-flight cursor on this handle and mark the
+	// handle dead on Drop — Inv-IHS1 / Inv-IHS2.
+	ks.openIndexHandles = append(ks.openIndexHandles, idx)
+	return idx, nil
 }
 
 // Index returns a query handle for the named index on this
@@ -104,7 +152,54 @@ func (sks *SetKeyspace) Index(name string) (*Index, error) {
 		return nil, fmt.Errorf("gmdb: index %q on keyspace %q: %w",
 			name, sks.name.Value(), ErrIndexNotFound)
 	}
-	return &Index{sks: sks, pinned: p}, nil
+	idx := &Index{sks: sks, pinned: p}
+	sks.openIndexHandles = append(sks.openIndexHandles, idx)
+	return idx, nil
+}
+
+// indexNotFoundError builds the standard ErrIndexNotFound wrap used
+// by every dead-handle entry check (Inv-IHS2). Shape matches
+// Keyspace.Index / SetKeyspace.Index's miss path so a caller that
+// uses errors.Is(err, ErrIndexNotFound) handles cached-dead-handle
+// and fresh-lookup-miss symmetrically.
+func (idx *Index) indexNotFoundError() error {
+	name := ""
+	if idx.pinned != nil && idx.pinned.decl != nil {
+		name = idx.pinned.decl.Name
+	}
+	ksName := ""
+	if idx.ks != nil {
+		ksName = idx.ks.name.Value()
+	} else if idx.sks != nil {
+		ksName = idx.sks.name.Value()
+	}
+	return fmt.Errorf("gmdb: index %q on keyspace %q: %w", name, ksName, ErrIndexNotFound)
+}
+
+// registerCursor records c on idx.openCursors so the parent's
+// markIndexHandlesStale / markIndexHandleStaleByName /
+// markIndexHandleDead helpers can MarkStale it before they free or
+// CoW the underlying index data tree pages (Inv-IHS1). Always paired
+// with a defer'd unregisterCursor at the iter closure's exit so the
+// slice does not grow unboundedly across iterations on the same
+// handle.
+func (idx *Index) registerCursor(c *btree.Cursor) {
+	idx.openCursors = append(idx.openCursors, c)
+}
+
+// unregisterCursor removes c from idx.openCursors. Swap-and-truncate
+// — the slice has no ordering requirement (mark operations walk
+// every entry). Single-goroutine per spec, so no mutex needed.
+func (idx *Index) unregisterCursor(c *btree.Cursor) {
+	for i, x := range idx.openCursors {
+		if x == c {
+			last := len(idx.openCursors) - 1
+			idx.openCursors[i] = idx.openCursors[last]
+			idx.openCursors[last] = nil
+			idx.openCursors = idx.openCursors[:last]
+			return
+		}
+	}
 }
 
 // rowRoot returns the row keyspace's current B+tree root (the
@@ -288,6 +383,13 @@ func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (chunk-7.7 Round-1 M-2 fix).
 		idx.err = nil
+		// Dead-handle check (Inv-IHS2): Tx.DropIndex on this name
+		// poisoned the handle; pinned.root points at FreeSubtree'd
+		// pages. Set ErrIndexNotFound and yield nothing.
+		if idx.dead {
+			idx.err = idx.indexNotFoundError()
+			return
+		}
 		if got, want := len(cols), len(idx.pinned.decl.Columns); got != want {
 			idx.err = fmt.Errorf("gmdb: index %q Lookup: got %d cols, want %d (exact match on all declared columns): %w",
 				idx.pinned.decl.Name, got, want, ErrInvalidOptions)
@@ -332,11 +434,20 @@ func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 // with the supplied prefix, yielding (pk, value) for each entry
 // whose key starts with prefix. Stops at the first key without
 // the prefix. Used by Lookup (non-unique) and Prefix.
+//
+// The cursor is registered on idx.openCursors for the closure's
+// lifetime so the parent keyspace's mutators (Put / Delete /
+// Cursor.Delete / Tx.RebuildIndex / Tx.DropIndex) can MarkStale it
+// when index pages are CoW'd or freed (Inv-IHS1). The defer'd
+// unregister keeps the slice bounded across long-running tx with
+// many iter calls on the same handle.
 func (idx *Index) iteratePrefix(prefix []byte, yield func([]byte, []byte) bool) {
 	tx := idx.rowTx()
 	cfg := tx.pgr.Config()
 	mergeThreshold := tx.db.opts.MergeThreshold
 	c := btree.NewCursor(tx.pgr, cfg, idx.pinned.root, mergeThreshold)
+	idx.registerCursor(c)
+	defer idx.unregisterCursor(c)
 	for k, v := c.SeekGE(prefix); k != nil; k, v = c.Next() {
 		if !bytes.HasPrefix(k, prefix) {
 			break
@@ -359,8 +470,26 @@ func (idx *Index) iteratePrefix(prefix []byte, yield func([]byte, []byte) bool) 
 		}
 	}
 	if err := c.Err(); err != nil {
-		idx.err = mapBtreeErr(err)
+		idx.err = mapIndexCursorErr(err)
 	}
+}
+
+// mapIndexCursorErr translates a *btree.Cursor.Err() into the
+// gmdb-public surface. btree.ErrCursorStale is the sentinel set by
+// MarkStale (Inv-IHS1); translate to gmdb.ErrCursorStale so callers
+// can errors.Is against the gmdb sentinel, mirroring the row-cursor
+// translation pattern in keyspace.go Cursor.Delete /
+// translateCursorErr. Other errors flow through mapBtreeErr.
+//
+// Without this translation, idx.Err() after a MarkStale leaks the
+// internal btree.ErrCursorStale across the public boundary — the
+// same defect class as the cursor-err-unpositioned-state issue
+// (commit 24ec951).
+func mapIndexCursorErr(err error) error {
+	if errors.Is(err, btree.ErrCursorStale) {
+		return ErrCursorStale
+	}
+	return mapBtreeErr(err)
 }
 
 // LookupKeys returns matching primary keys without back-lookup or
@@ -373,6 +502,11 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
+		// Dead-handle check (Inv-IHS2).
+		if idx.dead {
+			idx.err = idx.indexNotFoundError()
+			return
+		}
 		// Chunk-7.9 Round-1 H-1: LookupKeys on a SetKeyspace index
 		// has no well-defined iter.Seq[[]byte] surface — the "PK"
 		// is a compound (setKey, setValue) pair per set-keyspace.md
@@ -421,7 +555,10 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 			return
 		}
 		// Non-unique: cursor-walk prefix, extract PK from key suffix.
+		// Register so sibling mutations MarkStale us (Inv-IHS1).
 		c := btree.NewCursor(tx.pgr, cfg, idx.pinned.root, mergeThreshold)
+		idx.registerCursor(c)
+		defer idx.unregisterCursor(c)
 		for k, _ := c.SeekGE(encoded); k != nil; k, _ = c.Next() {
 			if !bytes.HasPrefix(k, encoded) {
 				break
@@ -443,7 +580,7 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 			}
 		}
 		if err := c.Err(); err != nil {
-			idx.err = mapBtreeErr(err)
+			idx.err = mapIndexCursorErr(err)
 		}
 	}
 }
@@ -461,6 +598,11 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
+		// Dead-handle check (Inv-IHS2).
+		if idx.dead {
+			idx.err = idx.indexNotFoundError()
+			return
+		}
 		if idx.pinned.root == 0 {
 			return
 		}
@@ -475,6 +617,8 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 		cfg := tx.pgr.Config()
 		mergeThreshold := tx.db.opts.MergeThreshold
 		c := btree.NewCursor(tx.pgr, cfg, idx.pinned.root, mergeThreshold)
+		idx.registerCursor(c)
+		defer idx.unregisterCursor(c)
 		var k, v []byte
 		if startKey != nil {
 			k, v = c.SeekGE(startKey)
@@ -502,7 +646,7 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 			}
 		}
 		if err := c.Err(); err != nil {
-			idx.err = mapBtreeErr(err)
+			idx.err = mapIndexCursorErr(err)
 		}
 	}
 }
@@ -516,6 +660,11 @@ func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
+		// Dead-handle check (Inv-IHS2).
+		if idx.dead {
+			idx.err = idx.indexNotFoundError()
+			return
+		}
 		if got, want := len(leadingCols), len(idx.pinned.decl.Columns); got > want {
 			idx.err = fmt.Errorf("gmdb: index %q Prefix: got %d cols, want <= %d (leading-cols prefix): %w",
 				idx.pinned.decl.Name, got, want, ErrInvalidOptions)
@@ -542,6 +691,11 @@ func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error) {
 	// but the handle's Err() is shared and a stale prior error
 	// should not surface to a fresh Get).
 	idx.err = nil
+	// Dead-handle check (Inv-IHS2): Get is single-shot, no cursor,
+	// so it returns the error directly rather than via idx.err.
+	if idx.dead {
+		return nil, nil, idx.indexNotFoundError()
+	}
 	if !idx.pinned.decl.Unique {
 		return nil, nil, ErrIndexNotUnique
 	}

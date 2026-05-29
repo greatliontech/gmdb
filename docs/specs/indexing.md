@@ -526,6 +526,77 @@ comes from the index entry itself — see §Byte-API return
 contract above). On those surfaces an index-versus-row
 inconsistency surfaces only via `Check()`.
 
+### Handle Invalidation
+
+An `*Index` handle returned by `ks.Index(name)` is bound to the
+parent keyspace for the lifetime of the transaction. Mutations
+that replace or free the index's data tree pages within the same
+transaction invalidate in-flight observers tied to that handle.
+Two distinct conditions are surfaced as two distinct sentinels —
+identical to the row-cursor contract that
+`transactions.md §Cursor State Machine` defines:
+
+- **`ErrCursorStale` (mid-iter cursor invalidation).** Triggered by
+  `tx.RebuildIndex(ks, decl)` for the named index, `tx.DropIndex`
+  for the named index, or any successful mutation of the parent
+  indexed keyspace that runs the atomic index-maintenance step:
+  Keyspace `Put` / `Delete` / `DeleteRange` (indexed-fallback —
+  routes through per-row `Cursor.Delete`) / `Cursor.Delete`; and
+  the SetKeyspace mutators `Put` / `Delete` / `DeleteValue` /
+  `DeleteRange` (cursor-walk) / `SetCursor.Delete` (which delegates
+  to `DeleteValue`). The next `c.Next()` inside a `Lookup` /
+  `LookupKeys` / `Range` / `Prefix` iter closure surfaces
+  `ErrCursorStale` (via the in-iter `*btree.Cursor.MarkStale`
+  machinery); iteration terminates and `idx.Err()` reports
+  `ErrCursorStale`. The caller's recovery is to re-iterate via a
+  fresh `idx.Lookup` / `idx.Range` / `idx.Prefix` — the new iter
+  opens a fresh cursor on the current `idx.pinned.root`, descending
+  from the live (post-mutation) tree. If `RebuildIndex` changed the
+  index's column shape (a different `IndexDecl.Columns` slice), the
+  cached handle's re-`Lookup` with the OLD shape returns
+  `ErrInvalidOptions` (`got N cols, want M`); full recovery from a
+  shape-changing rebuild is to re-`OpenKeyspace` with the new
+  `IndexDecl` and obtain a fresh `*Index` via `ks.Index(name)`.
+  `BulkLoad` is invalidation-irrelevant here: its precondition
+  (`Count == 0`) makes any in-flight iter cursor unreachable (the
+  iter closures early-return at `pinned.root == 0`).
+
+- **`ErrIndexNotFound` (post-Drop dead-handle).** Triggered by
+  `tx.DropIndex(ks, name)` on the handle's index. The handle
+  transitions to "dead": every subsequent
+  `Lookup` / `LookupKeys` / `Range` / `Prefix` / `Get` / `Stats`
+  call sets `idx.Err()` (or returns directly, for `Get` / `Stats`)
+  to a wrapped `ErrIndexNotFound` — the same sentinel
+  `ks.Index(name)` returns for a name that does not exist. Dead is
+  permanent within the transaction; a re-`Index(name)` after the
+  drop returns `ErrIndexNotFound` for the same reason.
+
+Two invariants pin this contract:
+
+- **Inv-IHS1 (cursor-on-stale-tree).** A `*btree.Cursor` opened by
+  an `*Index` iter closure is `MarkStale`'d (and its tracked rootID
+  refreshed to `idx.pinned.root`) before any same-tx code path
+  completes that frees or replaces the index data tree pages it
+  walks. Violation: an iter's `c.Next()` reads CoW'd-then-released
+  or `FreeSubtree`'d-then-reallocated leaf pages → wrong-key
+  yields or layout-decode panics.
+
+- **Inv-IHS2 (post-drop handle dead).** After `tx.DropIndex(ks,
+  name)` succeeds, every previously-handed-out `*Index` handle for
+  the `(ks, name)` pair rejects subsequent
+  `Lookup` / `LookupKeys` / `Range` / `Prefix` / `Get` / `Stats`
+  with `ErrIndexNotFound`. Violation: `idx.Stats()` returns the
+  pre-Drop `Count` and `idx.Lookup()` walks freed root pages.
+
+Per the chunk-5.6 row-cursor invalidation pattern these
+invariants are spec-tier *and* enforced (regression tests
+`TestIndexHandleStatsAfterDropReturnsErrIndexNotFound` et al. on
+the package, plus the markup of the contract on this section).
+Out of scope of these invariants: `tx.DeleteKeyspace(name)` on
+the parent of the index handle — covered separately by
+`transactions.md §Cursor invalidation by DeleteKeyspace`, which
+specifies `ErrKeyspaceClosed`.
+
 ## Write Path: Atomic Index Maintenance
 
 For an indexed keyspace, every `Put`, `Delete`, and

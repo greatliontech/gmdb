@@ -897,6 +897,11 @@ type KeyspaceConfig struct {
 // Blocking — runs inside the current write transaction. See the
 // `indexing.md §Rebuild` section for the recovery pattern.
 //
+// Handle invalidation (indexing.md §Handle Invalidation): every
+// in-flight *Index iter on this name surfaces ErrCursorStale on
+// the next yield. The handle stays usable — a re-iterate after
+// the rebuild opens a fresh cursor on the new pinned.root.
+//
 // Errors:
 //   - ErrKeyEmpty if keyspace is nil or empty, or decl.Name is empty.
 //   - ErrIndexExtractorRequired if decl.Extract is nil
@@ -928,6 +933,14 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error
 // dropped index was the keyspace's last, resets
 // desc.IndexRegistryRoot to 0 and retires the registry sub-tree
 // (per `keyspaces.md` invariant #7 entailed).
+//
+// Handle invalidation (indexing.md §Handle Invalidation): every
+// previously-handed-out *Index handle for this (keyspace, name)
+// pair becomes dead — subsequent Lookup/LookupKeys/Range/Prefix/
+// Get/Stats return ErrIndexNotFound. An in-flight iter at the
+// moment of the drop surfaces ErrCursorStale on the next yield,
+// after which the handle stays permanently dead within the
+// transaction.
 //
 // Errors:
 //   - ErrKeyEmpty if keyspace is nil or empty, or indexName is empty.
@@ -1122,6 +1135,19 @@ type Index struct { /* unexported */ }
 // back-lookup ever fails to find its PK (engine bug or external
 // corruption), the entry is silently skipped from iteration and the
 // inconsistency is reportable via Check().
+//
+// Handle invalidation (indexing.md §Handle Invalidation): a
+// mid-iter mutation that CoWs or frees this index's data tree
+// pages (Tx.RebuildIndex for this name; Tx.DropIndex for this
+// name; Put / Delete / Cursor.Delete on the parent indexed
+// keyspace; the SetKeyspace mutator analogues) MarkStale's the
+// iter's cursor — the next yield surfaces nothing and idx.Err()
+// reports ErrCursorStale. The caller's recovery is to re-iterate
+// on a fresh idx.Lookup, which opens a new cursor on the current
+// post-mutation pinned.root. After Tx.DropIndex on this name the
+// handle becomes dead — subsequent Lookup/LookupKeys/Range/
+// Prefix/Get/Stats return ErrIndexNotFound (the same sentinel
+// ks.Index(name) returns for a now-missing index).
 func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
 
 // LookupKeys returns matching primary keys without back-lookup or

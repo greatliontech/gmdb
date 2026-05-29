@@ -80,6 +80,15 @@ type SetKeyspace struct {
 	// + SetRootID).
 	openSetCursors []*SetCursor
 
+	// openIndexHandles tracks every *Index returned by
+	// SetKeyspace.Index(name) in this tx. Mirror of
+	// Keyspace.openIndexHandles (see that field's godoc for the
+	// invalidation contract); the SetKeyspace mutators
+	// (Put / Delete / DeleteValue / SetCursor.Delete) call
+	// markIndexHandlesStale after applyIndexMaintenanceOn{AddValue,
+	// RemoveValue} to close Inv-IHS1 on the kind-1 side.
+	openIndexHandles []*Index
+
 	// indexes carries the pinned per-index state for this tx (kind-
 	// symmetric partner of Keyspace.indexes — see that godoc).
 	// Populated by OpenSetKeyspace / CreateSetKeyspace /
@@ -140,11 +149,77 @@ func (ks *SetKeyspace) descriptor() *page.KeyspaceDescriptor {
 // Put / Delete / DeleteValue after a successful mutation. Stale
 // cursors are not unregistered — the caller may re-position via
 // First/Last/Seek/SeekGE (which clears the stale flag).
+//
+// Also delegates to markIndexHandlesStale (Inv-IHS1): every existing
+// caller (Put / Delete / DeleteValue / SetCursor.Delete / BulkLoad
+// success paths) post-dates the mutation and, on the indexed path,
+// has just CoW'd index trees via applyIndexMaintenanceOn{AddValue,
+// RemoveValue} or finalizeIndexBuild. The in-flight *Index iter
+// cursors must MarkStale or read CoW'd/freed leaves. Centralized
+// here so every existing call site gets index-handle invalidation
+// for free; no-op when openIndexHandles is empty (no
+// SetKeyspace.Index(name) call has been made — or the keyspace has
+// no declared indexes).
 func (ks *SetKeyspace) markSetCursorsStale() {
 	for _, c := range ks.openSetCursors {
 		c.outerCursor.MarkStale()
 		c.outerCursor.SetRootID(ks.desc.Root)
 		c.stale = true
+	}
+	ks.markIndexHandlesStale()
+}
+
+// markIndexHandlesStale / markIndexHandleStaleByName /
+// markIndexHandleDead are the SetKeyspace mirrors of the
+// Keyspace-side helpers (see keyspace.go for the contract). They
+// close Inv-IHS1 / Inv-IHS2 on the Kind=1 side: SetKeyspace.Put /
+// Delete / DeleteValue / SetCursor.Delete run
+// applyIndexMaintenanceOn{AddValue,RemoveValue} which CoWs each
+// declared index's data tree; Tx.RebuildIndex / Tx.DropIndex on a
+// SetKeyspace mutate or free wholesale. Either shape stales
+// in-flight cursors opened by *Index iter closures from this
+// SetKeyspace.
+func (ks *SetKeyspace) markIndexHandlesStale() {
+	for _, idx := range ks.openIndexHandles {
+		if idx.pinned == nil || idx.dead {
+			continue
+		}
+		newRoot := idx.pinned.root
+		for _, c := range idx.openCursors {
+			c.MarkStale()
+			c.SetRootID(newRoot)
+		}
+	}
+}
+
+func (ks *SetKeyspace) markIndexHandleStaleByName(name string) {
+	for _, idx := range ks.openIndexHandles {
+		if idx.pinned == nil || idx.dead {
+			continue
+		}
+		if idx.pinned.decl.Name != name {
+			continue
+		}
+		newRoot := idx.pinned.root
+		for _, c := range idx.openCursors {
+			c.MarkStale()
+			c.SetRootID(newRoot)
+		}
+	}
+}
+
+func (ks *SetKeyspace) markIndexHandleDead(name string) {
+	for _, idx := range ks.openIndexHandles {
+		if idx.pinned == nil || idx.dead {
+			continue
+		}
+		if idx.pinned.decl.Name != name {
+			continue
+		}
+		idx.dead = true
+		for _, c := range idx.openCursors {
+			c.MarkStale()
+		}
 	}
 }
 
