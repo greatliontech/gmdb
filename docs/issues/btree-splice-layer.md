@@ -1,8 +1,9 @@
 # Build the in-place leaf splice layer (no-decode insert/delete/split)
 
 **Lands:** proactive — a specced-but-unbuilt performance optimization;
-multi-session feature, port from grove. Decide the format-alignment fork
-(below) first.
+multi-session feature, port from grove. The format decision is **settled**
+(keep gmdb's format — see DECISION 1, RESOLVED). Resume by porting
+`TryAppend` first.
 
 **Severity:** [perf] — not a correctness defect; a measured throughput +
 allocation optimization. The current decode/re-encode path is correct.
@@ -87,7 +88,48 @@ write. The restart-table updates, byte-shift logic, overflow handling,
 and I-B/I-C/I-D insert structure port as-is. Adaptation is contained, not
 pervasive.
 
-## Port plan (after Decision 1)
+## Resume — read these first, in order (open the code; don't infer)
+
+**gmdb format** (the target byte layout the splice must produce):
+- `internal/page/leaf_compressed.go`: `decodeRestartEntry:31`,
+  `decodeDeltaEntry:86` — exact entry byte layout incl. gmdb's
+  `ValueLen`-before-key order (the only thing that differs from grove).
+- `internal/page/leaf_builder.go`: `LeafBuilder.addEntry` +
+  `valuePartSize` — how gmdb encodes a single entry; **reuse this** for
+  the splice's new/displaced-entry write, don't hand-roll bytes.
+- `internal/page/leaf.go:32-38` (`leafEntryStart=12`,
+  `leafOffRestartCount=8`, `leafOffDataEnd=10`); `restart.go`
+  (restart-table accessors); `leaf_uncompressed.go` (uncompressed form +
+  the already-present `ucSkipEntry:167` scaffolding built for this).
+
+**grove algorithm**: read the matching helper before porting it (paths in
+the Reference section above). Don't infer from names/commits — open it.
+
+**gmdb wiring anchors** (where the fast-path goes):
+- Insert: `internal/btree/put.go:143` `putReportCore` — after the leaf is
+  found + CoW'd, try the splice; on `false` fall through to the existing
+  `readLeafEntriesDeepCopy` (~put.go:207) decode path. (A's change folded
+  fit/split/promote into one loop; the splice goes *before* that decode,
+  leaving the loop as the fallback.)
+- Delete: the single-key leaf-mutation site in `internal/btree/delete.go`
+  (gmdb analog of grove's `del.go:140`).
+
+## Determinism test recipe (the safety net for every helper)
+
+The spliced page MUST be byte-identical to a decode-re-encode of the same
+logical entries (page-formats.md determinism invariant, :566-579):
+1. Build the original leaf via `LeafBuilder` from entries E.
+2. `expected` = decode E → apply the op to the entry slice → re-encode
+   via `LeafBuilder` (the proven slow path).
+3. `actual` = copy the original page bytes → apply the splice helper.
+4. Assert the helper returned true AND `bytes.Equal(actual, expected)`.
+5. Also exercise the false-return cases (page full, group boundary) — the
+   helper declines and the fallback handles it.
+
+Add a `Fuzz*` target in `internal/page` (random sorted entries + random
+op) asserting the same equality; `task fuzz` already runs that package.
+
+## Port plan
 
 Incremental, **fast-path + fallback**: each helper returns false on any
 case it can't handle (page full → split, tricky boundary) and the
@@ -109,5 +151,5 @@ bench` for before/after.
 
 `page-formats.md §Insert and Delete` (:531-538) already describes the
 splice helpers as if they exist — a spec-vs-code gap. Implementing this
-closes it; if Decision 1 picks (b), update the §Compressed Leaf entry
-layout too.
+closes it (no §Compressed Leaf layout change — gmdb's format is kept per
+DECISION 1).
