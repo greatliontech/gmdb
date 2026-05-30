@@ -340,6 +340,52 @@ func TestDeleteKeyspaceInvalidatesCursor(t *testing.T) {
 	}
 }
 
+// TestKeyspaceCursorOnDeadHandleDoesNotRegister asserts Cursor() on a
+// DeleteKeyspace'd handle does NOT register the cursor in openCursors —
+// a pathological `for { ks.Cursor() }` after Delete must not grow the
+// slice unbounded (mirrors SetKeyspace.Cursor's `if !ks.dead` guard).
+// Regression for keyspace-cursor-dead-append-guard.
+func TestKeyspaceCursorOnDeadHandleDoesNotRegister(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx, true)
+	defer tx.Rollback()
+
+	ks, _ := tx.CreateKeyspace("ks")
+	_ = ks.Put([]byte("a"), []byte("1"))
+
+	// A live handle registers its cursors (the guard must not break the
+	// normal path).
+	_ = ks.Cursor()
+	if got := len(ks.openCursors); got != 1 {
+		t.Fatalf("live-handle Cursor() registered count = %d, want 1", got)
+	}
+
+	if err := tx.DeleteKeyspace("ks"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+
+	// After Delete the handle is dead; repeated Cursor() must not grow
+	// openCursors.
+	before := len(ks.openCursors)
+	for range 100 {
+		_ = ks.Cursor()
+	}
+	if got := len(ks.openCursors); got != before {
+		t.Errorf("openCursors grew on dead handle: %d -> %d after 100 Cursor() calls, want stable at %d", before, got, before)
+	}
+
+	// A cursor from a dead handle is inert.
+	c := ks.Cursor()
+	if k, _ := c.First(); k != nil {
+		t.Errorf("First on dead-handle cursor = %q, want nil", k)
+	}
+	if err := c.Err(); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Errorf("dead-handle cursor Err = %v, want ErrKeyspaceClosed", err)
+	}
+}
+
 // TestDeleteKeyspaceRecreateLeavesOldHandleDead promotes Inv-D
 // (permanent-invalidation portion): a same-tx CreateKeyspace re-
 // creating the deleted name returns a fresh *Keyspace; the old

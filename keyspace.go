@@ -894,7 +894,15 @@ func newInternalCursor(ks *Keyspace) *Cursor {
 // SeekGE and continues.
 func (ks *Keyspace) Cursor() *Cursor {
 	c := &Cursor{inner: ks.newRootCursor(), tx: ks.tx, ks: ks}
-	ks.openCursors = append(ks.openCursors, c)
+	// Only register cursors on live handles. A dead keyspace's cursors
+	// are rejected by requireOpen anyway (ErrKeyspaceClosed); appending
+	// them would let a pathological caller (`for { ks.Cursor() }` after
+	// DeleteKeyspace) grow openCursors unboundedly, since
+	// markCursorsStale walks every entry on every sibling mutation.
+	// Mirrors SetKeyspace.Cursor.
+	if !ks.dead {
+		ks.openCursors = append(ks.openCursors, c)
+	}
 	return c
 }
 
