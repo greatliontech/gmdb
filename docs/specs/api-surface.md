@@ -293,7 +293,15 @@ same file is unaffected by another process's poisoned handle.
 // multiple processes call Open() simultaneously on a non-existent
 // path. If exclusive create fails with EEXIST, Open() retries as a
 // normal open. The lock file uses the same pattern.
-func Open(path string, opts *Options) (*DB, error)
+//
+// The context governs cancellation: an already-cancelled / expired ctx
+// fails fast before any filesystem work, and cancellation during the
+// EEXIST-retry wait aborts promptly (context.Cause(ctx)). ctx does not
+// yet abort a syscall already in flight; it is retained on the
+// signature so future tracing / timeout / cancellation can be wired
+// without a breaking change. opts is passed by value (no nil-pointer
+// ambiguity; the zero value applies all defaults).
+func Open(ctx context.Context, path string, opts Options) (*DB, error)
 ```
 
 ## Byte Slice Ownership

@@ -228,6 +228,17 @@ func TestOpenRejectsDifferentFormatVersion(t *testing.T) {
 	}
 }
 
+// TestOpenHonorsCancelledContext pins that Open fails fast on an
+// already-cancelled context before doing filesystem work — the ctx is
+// honored, not ignored.
+func TestOpenHonorsCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Open(ctx, tmpPath(t), Options{PageSize: 4096}); !errors.Is(err, context.Canceled) {
+		t.Errorf("Open with cancelled ctx: got %v, want context.Canceled", err)
+	}
+}
+
 func TestInvalidOptions(t *testing.T) {
 	ctx := context.Background()
 	bad := []Options{

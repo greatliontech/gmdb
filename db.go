@@ -107,7 +107,19 @@ type DB struct {
 // canonicalised; a caller that passes `/foo/../etc/passwd` resolves
 // `dir = /etc` and opens `passwd` there. The guard prevents
 // symlink-escape from `dir`, not directory-traversal in the input.
-func Open(_ context.Context, path string, opts Options) (*DB, error) {
+//
+// The context governs cancellation: an already-cancelled or expired
+// ctx fails fast before any filesystem work, and cancellation during
+// the partial-init retry wait aborts promptly. ctx is kept on the
+// signature for future tracing / timeout / cancellation wiring — it
+// does not yet abort a syscall already in flight (a stuck fdatasync /
+// mmap completes before the next ctx check).
+func Open(ctx context.Context, path string, opts Options) (*DB, error) {
+	// Check ctx first so an already-cancelled / expired context fails
+	// fast before any filesystem work (matches Begin / BeginRead).
+	if err := ctx.Err(); err != nil {
+		return nil, context.Cause(ctx)
+	}
 	opts = opts.applyDefaults()
 	if err := opts.validate(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidOptions, err)
@@ -166,7 +178,7 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 	// "PageSize invalid" error. Chunk 2's lock file resolves the
 	// race structurally; until then this is a chunk-1 defensive
 	// measure.
-	persistedPageSize, err := readPersistedPageSize(file, !created)
+	persistedPageSize, err := readPersistedPageSize(ctx, file, !created)
 	if err != nil {
 		_ = file.Close()
 		_ = root.Close()
@@ -663,7 +675,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 // DiscoverPageSize after the final attempt. Chunk-2's lock file
 // resolves the race window structurally; the retry remains here as a
 // chunk-1 defensive measure.
-func readPersistedPageSize(file *os.File, raceWindow bool) (uint32, error) {
+func readPersistedPageSize(ctx context.Context, file *os.File, raceWindow bool) (uint32, error) {
 	const (
 		maxAttempts = 50
 		backoff     = 2 * time.Millisecond
@@ -685,7 +697,13 @@ func readPersistedPageSize(file *os.File, raceWindow bool) (uint32, error) {
 			break
 		}
 		if i+1 < attempts {
-			time.Sleep(backoff)
+			// ctx-aware backoff: a cancelled / timed-out context aborts
+			// the partial-init retry promptly instead of sleeping it out.
+			select {
+			case <-ctx.Done():
+				return 0, context.Cause(ctx)
+			case <-time.After(backoff):
+			}
 		}
 	}
 	return 0, mapPagerErr(lastErr)
