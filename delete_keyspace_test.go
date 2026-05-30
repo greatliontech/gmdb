@@ -344,7 +344,6 @@ func TestDeleteKeyspaceInvalidatesCursor(t *testing.T) {
 // DeleteKeyspace'd handle does NOT register the cursor in openCursors —
 // a pathological `for { ks.Cursor() }` after Delete must not grow the
 // slice unbounded (mirrors SetKeyspace.Cursor's `if !ks.dead` guard).
-// Regression for keyspace-cursor-dead-append-guard.
 func TestKeyspaceCursorOnDeadHandleDoesNotRegister(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
