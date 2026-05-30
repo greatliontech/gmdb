@@ -1099,6 +1099,113 @@ before designing the fix. The proof is in the receipts:
   requirement and become recorded-only encoding nits per R3
   audit.
 
+- **`bulkload-index-merge-run-fanin`** (this session, `ac4af82`):
+  three surprises beyond the issue's "profile-driven, cascaded-merge
+  is the fix" framing.
+
+  **First (the user's pushback "is this matching b83846c/91a268a a
+  rationalization?" caught the lazy pattern-match — and the prior
+  two cases were correctly disposed of even though THIS one wasn't
+  a preference).** I opened with "this fits preference-drop +
+  spec-amend, mirrors `b83846c` (`rplsegments-clone-cost`) and
+  `91a268a` (`compaction-full-forest-walk-per-pass`)" — a clean
+  surface-level pattern-match: all three are profile-driven framings
+  on cost-clause dimensions where the unenumerated term is
+  workload-history-dependent. User pushed back. Re-examination with
+  rigor found three concrete dimensions that distinguish:
+  (i) **foreground vs background**: bulkload runs in the user's
+  write tx; b83846c's clone is per-Begin-savepoint CPU under
+  degraded state; 91a268a is the maintenance goroutine. Foreground
+  tx work hitting bounds is materially different from background
+  goroutine work going slow.
+  (ii) **OS-hard-limit vs CPU-only**: bulkload's `EMFILE` is a
+  per-process FD limit (typical Linux 1024, macOS default 256).
+  b83846c is CPU + heap allocation, bounded only by available
+  memory. 91a268a is read I/O, bounded only by disk bandwidth.
+  Hitting an OS-enforced hard limit fails the operation; slow CPU /
+  slow I/O degrades performance but doesn't fail.
+  (iii) **user-bound-exceeded vs intrinsic**: bulkload's merger
+  read buffers (64 KiB × #runs ≈ 256 MiB at 4000 runs) exceed the
+  user-configured `MaxTxBufferBytes=256MiB` by ~2× — silently. A
+  user budgeting in-tx memory for a cgroup limit sees their bound
+  silently violated. b83846c's savepoint clone has no formal
+  user-configured bound (MaxTxBufferBytes is slab-scoped, not
+  savepoint-scoped). 91a268a's background reads have no user-
+  configured bound on maintenance pass cost.
+  Verdict: b83846c and 91a268a are defensible preferences — they
+  pass all three dimension checks. Bulkload fails all three. My
+  pattern-match was lazy because I conflated the framing similarity
+  with disposition similarity. **Lesson**: when applying the
+  established prior-session re-derivation pattern (the 3:3:2 split
+  across 8 profile-driven closes), check each candidate against
+  the THREE dimensions (foreground/background, OS-hard-limit/CPU,
+  user-bound-exceeded/intrinsic) before assigning a bucket. Surface-
+  framing similarity (profile-driven, unenumerated cost term,
+  workload-dependent) does not entail disposition similarity. The
+  prior preference-drops were correctly identified; the trap is
+  inferring "this case too" without re-running the dimension audit
+  per CLAUDE.md "Analyze, don't rationalize" + "no editorializing
+  the user's call."
+
+  **Second (the spec's "appears comprehensive" phrasing is broad-
+  reading authoritative even when the implementation interprets
+  narrowly).** The spec phrase
+  "keeping the combined in-memory sort footprint bounded by
+  MaxTxBufferBytes" (`bulkload.md §Interaction with Indexes`) has
+  two readings: (narrow) "in-memory sort footprint" = phase-1
+  sorter accumulator chunk only, matching impl comment at
+  `bulkload_indexed.go:59`; (broad) "in-memory sort footprint" =
+  entire sort's in-memory state, including the merge phase's
+  read buffers. A user reading the spec naturally takes the broad
+  reading — a memory bound described as "sort footprint" should
+  bound the entire sort. The impl's narrow reading silently lets
+  the merger allocate 256 MiB of additional read-buffer memory
+  outside the user-configured 256 MiB budget. Per CLAUDE.md the
+  spec is authoritative; the impl conforms to spec, not the
+  reverse. So the broad-reading clause violation is real. This
+  parallels the chunk-7.6 / chunk-7.9 patterns where spec
+  phrasing turned out to bind implementation more tightly than
+  the impl's narrow self-interpretation. **Lesson**: when an
+  impl comment narrows a spec phrase's scope ("X = phase-1 only"
+  when spec says "X" without qualifier), the impl's narrow
+  reading is the BUG, not the spec's "appearing comprehensive"
+  wording. The spec wins. Re-derivation that finds the impl is
+  silently exceeding a user-configured bound is a clause violation
+  even when the impl-comment "fits" the impl's behavior.
+
+  **Third (Round-1 L-2 surfaced an adjacent gap where a new
+  invariant inherits a pre-existing imprecision — fix in-place via
+  spec disambiguation rather than file as adjacent).** My first
+  cut of the new clause-explicit invariant claimed merger memory
+  bounded at `O(maxMergeFanIn × 64 KiB)`. Round-1 reviewer L-2
+  caught that this is the bufio READ-BUFFER bound; the merge
+  heap's per-slot key+value bytes (one `make([]byte, n)` per
+  `readRunField` call, lifetime = one merge step) are a separate
+  `O(maxMergeFanIn × max-record-size)` term inherited unchanged
+  from the pre-existing `sortMerger`. The new invariant inherited
+  the imprecision — claiming a total memory bound when only
+  read-buffer memory is bounded. **Classified adjacent** (the heap-
+  memory gap is pre-existing in `sortMerger`, cause-line predates
+  this diff). **Fixed in-place** under smallest-correct-change +
+  spec-amend-candidate (~10-char tightening) rather than filing as
+  adjacent: while I was authoring the new invariant text, leaving
+  the imprecision in the diff would be a recently-touched gap that
+  future readers attribute to me. The protocol-compliant
+  disposition for an adjacent finding is filing OR fixing in-place
+  under smallest-correct-change structural-simpler exception — and
+  the spec disambiguation is structurally trivial. Round-2 also
+  caught a self-introduced L-1 (cap=4 typo in the docstring after
+  my Round-1 cap=2 rewrite — left-over from the test's prior
+  workload sizing). One-char fix. **Lesson**: when adding a new
+  invariant that touches a pre-existing imprecisely-stated
+  property, the invariant inherits the imprecision; a Round-1 L
+  surfaces this even when the underlying impl is correct. The
+  smallest correct change is in-place spec disambiguation (cheap
+  text edit), not filing as adjacent (which would leave the new
+  invariant misleading). Same trap class as `rplchain-head-tail-
+  terminology-conflict` Round-1 L-1 — rewording a comment without
+  auditing the underlying claim's accuracy preserves wrong framing.
+
 **Trap pattern to watch for:** the issue cites a "well-known"
 invariant or rationale that the actual spec doesn't state, OR proposes
 a one-line fix that introduces a new bug (same class as the one it's
@@ -1526,7 +1633,82 @@ numbers (kept-current via `git log --grep="chunk-N"`) + the
 test's own neuter clause when describing a test's rationale; reach
 for an issue-path cite ONLY when no durable anchor exists, which
 for a closing fix is never (the chunk evolution chain plus the
-test's neuter assertion are always available).
+test's neuter assertion are always available), OR
+**surface-framing similarity to prior preference-drops does not
+entail disposition similarity — check the THREE dimensions before
+inferring "preference too"** (the `bulkload-index-merge-run-fanin`
+(`ac4af82`) case framed as "profile-driven, matches b83846c /
+91a268a" got CORRECTLY pushed back on by the user with "is this a
+rationalization?" The lazy match collapsed under three concrete
+distinguishing dimensions: (i) foreground-tx (bulkload merger) vs
+background goroutine (91a268a) or degraded-state operation (b83846c);
+(ii) OS-hard-limit (bulkload's EMFILE per-process FD limit) vs
+CPU-only (b83846c) or background-I/O (91a268a); (iii) user-bound-
+exceeded (bulkload's merger read buffers silently doubled the
+MaxTxBufferBytes footprint) vs intrinsic-cost (the prior two had
+no user-configured bound on the affected dimension). The prior
+preference-drops were correctly identified — they pass all three
+dimension checks. THIS case fails all three. The 3:3:2:1 split
+across nine profile-driven closes (`0893be5` / `43ac8df` /
+`5800299` → clause-violation fix via substrate; `b83846c` /
+`9d060ba` / `91a268a` → preference → spec-amend only; `de9e7c1` →
+cleanup-fix bucket; `400c95d` → spec-internal-inconsistency-
+close bucket; `ac4af82` → clause-violation fix on the FD +
+read-buffer dimension via cascaded multi-pass merger) shows the
+right disposition is a per-candidate dimension audit, not a
+prior-bucket pattern-match. Lesson: when applying the established
+re-derivation rubric, run the THREE-DIMENSION check (foreground/
+background, OS-hard-limit/CPU, user-bound-exceeded/intrinsic)
+PER CANDIDATE before assigning a bucket. Framing similarity is
+NOT disposition entailment, OR
+**a spec phrase's broad-reading is authoritative even when the
+implementation interprets narrowly — the impl's narrow reading is
+the bug, not the spec's "appears comprehensive" wording.** The
+`bulkload-index-merge-run-fanin` (`ac4af82`) case found
+`bulkload.md §Interaction with Indexes` line 192 "keeping the
+combined in-memory sort footprint bounded by MaxTxBufferBytes" was
+being read narrowly by the impl (= phase-1 sorter accumulator
+chunk only, matching impl comment at `bulkload_indexed.go:59`)
+while a user reasonably reads it broadly (= entire sort's in-
+memory state including the merge phase's 64 KiB-per-run read
+buffers). The impl's narrow reading silently let the merger
+allocate 256 MiB of additional read-buffer memory outside the
+user-configured 256 MiB budget — a clause violation under the
+broad reading. Per CLAUDE.md the spec is authoritative; the
+impl conforms to spec, not the reverse. Lesson: when an impl
+comment narrows a spec phrase's scope ("X = phase-1 only" when
+spec says "X" without qualifier), the impl's narrow reading is
+the BUG. Re-derivation that finds the impl silently exceeds a
+user-configured bound is a clause violation even when the impl-
+comment "fits" the impl's behavior. The diagnostic test: read
+the spec phrase the way a USER reads it (without the impl's
+comment in front of you); if a user would expect the broader
+scope and the impl silently exceeds it, that's a violation, OR
+**adding a new invariant that touches a pre-existing imprecisely-
+stated property — the invariant inherits the imprecision; fix
+in-place via spec disambiguation, not file as adjacent.** The
+`bulkload-index-merge-run-fanin` (`ac4af82`) Round-1 L-2 surfaced
+this: my first cut of the new clause-explicit invariant claimed
+merger memory bounded at `O(maxMergeFanIn × 64 KiB)` — but that's
+the bufio READ-BUFFER bound; the merge heap's per-slot key+value
+bytes (one `make([]byte, n)` per `readRunField` call, lifetime =
+one merge step) are a separate `O(maxMergeFanIn × max-record-
+size)` term inherited unchanged from the pre-existing
+`sortMerger`. The new invariant inherited the imprecision —
+claiming a total memory bound when only read-buffer memory is
+bounded. Classified adjacent (cause-line pre-existing) but fixed
+in-place under smallest-correct-change + spec-amend-candidate (a
+~10-char tightening saying "bufio read-buffer memory" with a
+clarifying clause about the heap-memory term). Lesson: while
+authoring NEW spec-tier invariants for a recently-touched area,
+the new prose can pick up adjacent pre-existing imprecisions that
+make the new invariant misleading even when the impl is correct.
+The smallest-correct-change disposition is in-place
+disambiguation (cheap text), not filing as adjacent (which would
+leave the new invariant misleading). Same trap class as
+`rplchain-head-tail-terminology-conflict` Round-1 L-1 —
+rewording a comment without auditing the underlying claim's
+accuracy preserves wrong framing.
 
 **The protocol that prevents these traps** (per `~/.claude/CLAUDE.md`):
 
@@ -1582,109 +1764,104 @@ close-out.
 
 ## Backlog state (updated at end of each session)
 
-This session closed `setkeyspace-delete-range-bulk-walker` (commit
-`400c95d`) — picked per the user's confirmation of the
-recommendation at session-start. Re-validated on HEAD `aa9cfd7`:
-the v1 SetKeyspace.DeleteRange's snapshot-then-Delete loop in
-`set_keyspace.go:1220-1278` reproduced as described
-(`O(K log N)` per-key descents + `O(K × keysize)` snapshot
-allocation upfront). First-principles re-derivation surfaced a
-spec internal inconsistency: `set-keyspace.md` line 17 said
-"Range delete on SetKeyspaces uses … the range-delete walk of
-range-delete.md" (sounds walker-normative), but the chunk-6.8
-user-locked partial-progress contract + chunk-7.10 "matches the
-chunk-6.8 SetKeyspace.DeleteRange partial-progress contract"
-amendment locked the v1 per-row-atomic behavior; the
-api-surface.md godoc promised "future O(K+log N) bulk-walker
-rewrite will honor the same (deleted_so_far, err) contract" —
-structurally impossible (a walker is naturally all-or-nothing OR
-per-leaf, not per-row without per-row sub-savepoints).
+This session closed `bulkload-index-merge-run-fanin` (commit
+`ac4af82`) — picked per the user's confirmation of the
+recommendation at session-start. Re-validated on HEAD `a0093e7`:
+`bulkload_indexed.go` `newMerger` opens all spilled-run files
+simultaneously for a single k-way merge — `O(#runs)` open FDs +
+64 KiB bufio per run, exactly as the issue framed. First-
+principles re-derivation against `bulkload.md §Interaction with
+Indexes` line 192 ("keeping the combined in-memory sort
+footprint bounded by MaxTxBufferBytes") found two readings:
+narrow (impl-comment, accumulator-only) vs broad (user
+expectation, entire sort including merger). Under broad reading
+the merger's 64 KiB-per-run buffers are a clause violation
+(256 MiB at 4000 runs doubles the user-configured 256 MiB
+budget); FD dimension separately hits per-process EMFILE
+(macOS default 256, Linux 1024). 
 
-User-picked mechanism after a 4-round discussion exploring the
-mechanism space (v1 stay, walker-all-or-nothing, streaming
-cursor, hybrid mixed-atomicity, configurable knob): **walker
-all-or-nothing** for un-indexed (Option B), preserving per-row
-atomic for indexed via dispatch (matches Keyspace.DeleteRange's
-chunk-7.10 split). Honest scope estimate surfaced mid-discussion:
-hybrid (d) was ~2× larger code (~420 LOC) for ~0 practical-
-failure-mode benefit; user re-confirmed clean-break atomic walker
-shape (~225 LOC).
+**User-pushback corrected my lazy framing.** My first cut framed
+the disposition as "preference-drop + spec-amend, mirrors
+b83846c (rplsegments-clone-cost) and 91a268a (compaction-full-
+forest-walk-per-pass)" — a surface-similar pattern-match. User
+pushed back with "is matching b83846c and 91a268a a
+rationalization?" Re-examination via THREE dimensions found
+bulkload differs from both prior preference-drops on:
+(i) foreground vs background (bulkload runs in user write tx;
+b83846c is degraded-state savepoint Begin; 91a268a is
+maintenance goroutine);
+(ii) OS-hard-limit vs CPU-only (bulkload's EMFILE is a per-
+process FD limit; b83846c is CPU + heap; 91a268a is background
+read I/O);
+(iii) user-bound-exceeded vs intrinsic (bulkload's merger read
+buffers silently doubled the user's MaxTxBufferBytes; the prior
+two had no user-configured bound on the affected dimension).
+b83846c and 91a268a pass all three dimension checks → defensible
+preferences. THIS case fails all three → clause-violation fix.
 
-Disposition: **fix** (clause-explicit close — set-keyspace.md
-line 17 + spec internal inconsistency + the actual perf benefit
-all align under one mechanism). New
-`btree.PerCellFreeFn` type + threaded through
-`deleteRangeFrom*`; new `keyspaceCellFree` (Kind=0: overflow +
-count=1) + `setKeyspaceCellFree` (Kind=1: subpage Count /
-NestedCount via `FreeSubtree` / overflow + count=1) callbacks.
-`SetKeyspace.DeleteRange` dispatches by `len(ks.indexes) > 0`:
-indexed → lifted `deleteRangePerKey` (wrap-immune accumulator
-per R2 L-2); un-indexed → `btree.DeleteRange` with
-`setKeyspaceCellFree`. `Keyspace.DeleteRange` updated to pass
-`keyspaceCellFree`.
+User picked Option C (cascaded multi-pass merger; issue's
+proposed remediation; ~200 LOC) over Option A (preference-drop
+spec amend; ~30 LOC; rejected after dimension analysis) and
+Option B (cleanup-fix per-run buffer cap; ~15 LOC; rejected
+because leaves the FD dimension uncovered).
 
-Spec promotions: `range-delete.md` gains new `§Set Keyspace
-Range Delete` section describing dispatch + atomicity contracts
-(atomic un-indexed + per-row indexed); `set-keyspace.md` line 17
-narrative aligned (drops walker-shape over-claim); `set-keyspace.md`
-§Invariants gains new entailed dispatch-direction invariant
-recording the contract differential and citing the
-`SetDeleteRangeCalledHookForTest` instrumentation hook (R2 M-1);
-`api-surface.md` `Keyspace.DeleteRange` godoc gains atomicity-
-contract spell-out matching `SetKeyspace.DeleteRange`'s godoc
-(spec-amend 1).
+Mechanism: `var maxMergeFanIn = 128` cap + new
+`(*indexSorter).cascadeRuns()` + `mergeGroupToScratchRun(
+scratchDir, runs)`. Cascade reduces `len(s.runs)` to ≤ cap via
+groups of ≤ cap runs each, repeating until cap fits. Pre-level
+runs removed only AFTER next level fully writes (mid-pass-error
+safety). Bounds open FDs + bufio read-buffer memory at O(cap)
+regardless of #runs, costs O(log_fanin(#runs)) extra scratch
+I/O. Preserves unique-violation-at-merge-output (detection runs
+on the post-cascade stream). New `setMaxMergeFanInForTest(n)`
+swap-restore + `bulkLoadMergeCascadeHookForTest` (mirrors
+`readTxCleanupHookForTest` from `5800299` /
+`SetDeleteRangeCalledHookForTest` from `400c95d`).
 
-5 new regression tests (each neuter-verified individually):
-- `TestSetKeyspaceDeleteRangeUnindexedNoLeakWithNestedTreeAtBoundary`
-- `TestSetKeyspaceDeleteRangeUnindexedNoLeakInteriorSubtreeRetire`
-  (workload scaled to 500 keys × 60-byte keys to force a multi-
-  leaf parent tree so Phase 2 `FreeSubtree` actually fires per
-  R1 M-1 fix; probe assertion fails the test if root is not a
-  TypeBranch with cellCount >= 2)
-- `TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance`
-- `TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker` (R2 M-1
-  hook-based dispatch pinning)
-- `TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker`
+Spec promotions: `bulkload.md §Invariants` new clause-explicit
+invariant for the cap with gitfs SQLite → gmdb migration as
+violation= (disambiguates bufio read-buffer memory vs heap
+key+value memory per R1 L-2); `§Interaction with Indexes` new
+"**Merge fan-in cap.**" subsection describing cascade mechanism,
+intermediate-run lifecycle (next-level-writes-before-prior-
+level-removed safety), per-pass FD ceiling (cap+1), end-to-end
+memory contract.
 
-R1=0H/3M/2L/2nit (M-1 test interior-path workload too small +
-M-2 docstring over-claims + M-3 spec atomic-on-error wording
-missing in-memory pre-call state sentence — all fixed in-place;
-L-1 NestedRoot==0 strictness disputed; L-2 error-wrap depth
-divergence disputed; nit-1/2 godoc rewords fixed).
-R2=0H/1M/2L/0nit (introduced M-1 un-indexed dispatch not
-test-pinned → user picked fix-in-place via new
-`SetDeleteRangeCalledHookForTest` hook + 2 dispatch tests;
-introduced L-1 NestedCount sanity check absent in
-`setKeyspaceCellFree` → user picked fix-in-place mirroring
-`SetKeyspace.Delete`'s defense; introduced L-2 `deleteRangePerKey`
-before/after subtraction → user picked fix-in-place via wrap-
-immune per-iteration accumulator; spec-amend 1 → user picked
-mirror to Keyspace; spec-amend 2 → user picked add entailed
-invariant).
-R3=0H/2M/4L/1nit (introduced M-1 violation= clause reachability
-mis-framed → fixed in-place rewriting to "caller invokes
-DeleteRange + pager error mid-walk" reachable user-visible
-fault; introduced M-2 dispatch tests asserted only hook, no
-count → fixed in-place adding `n != 2` assertions; introduced L-3
-comment phrasing "Mirrors Keyspace.deleteRangeIndexed's
-wrap-immune shape" inaccurate → fixed in-place; introduced L-4
-entailed from= claim now clause-explicit → fixed in-place
-re-framing; L-1 Begin error nil-deref pervasive pattern
-adjacent; L-2 interior-path NestedCount asymmetry adjacent — pre-
-existing freeSubtreeAt; loop converged).
+1 new regression test (neuter-verified):
+- `TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn`
+  (`setMaxMergeFanInForTest(2)` + 900 rows × 8 KiB
+  MaxTxBufferBytes; `preRuns >= 2*testCap+1` probe defends
+  multi-pass exercise against silent workload shrinkage; pins
+  postRuns ≤ cap + end-to-end correctness + scratch cleanup;
+  neuter-verified by commenting out `s.cascadeRuns()` →
+  postRuns=6 > cap=2 → deterministic fail).
 
-3:3:2 split now across eight profile-driven closes:
+R1=0H/0M/3L/3nit (introduced L-1 docstring math fragile → fixed
+in-place via workload-drift-resilient phrasing; adjacent L-2
+new invariant inherits merger heap-memory imprecision → fixed
+in-place via spec disambiguation "bufio read-buffer memory" +
+separate heap-memory clause; introduced L-3 single-element
+cascade-group rewrite disputed as design-uniform; introduced
+nit-1 cascadeRuns panic-window disputed unreachable; nit-2
+panic guard sound; introduced nit-3 per-index hook scope by-
+design).
+R2=0H/0M/1L/0nit (introduced L-1 cap=4 typo in docstring after
+R1 cap=2 rewrite → fixed in-place). Converged.
+
+3:3:2:1 split now across nine profile-driven closes:
 `0893be5` / `43ac8df` / `5800299` → clause-explicit violation →
 fix via substrate; `b83846c` / `9d060ba` / `91a268a` →
 preference → spec-amend only; `de9e7c1` → third-class cleanup-
 fix (no clause violated, no preference to drop, structural
-redundancy consolidation); THIS session → spec internal
-inconsistency + clause-explicit close (set-keyspace.md line 17
-walker promise + spec ↔ impl gap + clean-break atomicity
-realignment).
+redundancy consolidation); `400c95d` → spec-internal-
+inconsistency-close (set-keyspace.md line 17 walker promise +
+spec ↔ impl gap + clean-break atomicity realignment); THIS
+session → clause-violation fix on the broad-reading of "in-
+memory sort footprint" (FD + read-buffer dimension) via
+cascaded multi-pass merger.
 
-Prior session closed `setkeyspace-indexing-perf-and-edge` — see
-commit `de9e7c1` for that change set's details.
+Prior session closed `setkeyspace-delete-range-bulk-walker` — see
+commit `400c95d` for that change set's details.
 
 | Commit | Issue | Outcome |
 |--------|-------|---------|
@@ -1709,6 +1886,7 @@ commit `de9e7c1` for that change set's details.
 | `91a268a` | compaction-full-forest-walk-per-pass | **Closed** — Option 3 (close as obsolete + spec amend, no code change) per first-principles re-derivation finding the strict `background-maintenance.md §Cost per pass` clause "worst-case I/O is `CompactionBatchSize × (1 + depth) × PageSize` … the slab must hold the whole cascade" is SATISFIED for pwrite I/O (slab = in-memory CoW write buffer). Read cost is unenumerated, scales with live B+tree node pages (workload-history-dependent — matches `rplsegments-clone-cost` `b83846c` shape, NOT MaxSize-scaling like `0893be5` / `43ac8df`); structural ceiling `MaxSize`/`PageSize` for a fully-allocated database. No demonstrated fault — slow is not wrong/unsafe; per CLAUDE.md Project invariants the implicit "small read cost" expectation is a preference. The issue's "Related: compaction self-signals fragmentation trigger" sub-concern independently re-derived as preference (the issue itself framed it "self-limiting … arguably desirable … not a correctness defect"). Spec promotions: `background-maintenance.md §Cost per pass` rewritten into "Two cost dimensions, separately bounded" — Write cost (existing material kept, with "Bounded by `CompactionBatchSize` and depth, independent of total database size" sharpening) + new Read cost paragraph naming O(live B+tree node pages) workload-dependent with `MaxSize/PageSize` structural ceiling, citing `relocateNode`'s read-then-predicate on B+tree nodes and `relocateLeaf`'s predicate-then-relocate on overflow chains (so the O() expression precisely includes nested-tree subtree pages via the recursive `relocateNode` at `relocate.go:199`, excludes overflow chain pages which are not walked); `§Trigger` gains a paragraph documenting inclusive-count is intentional self-limiting, per-tx "don't count" flag explicitly rejected. NO code change; NO new tests. R1=0H/0M/3L/1nit (introduced L-1 §Cost-per-pass §Read-cost "page" vs "B+tree node" precision: original wording was precise for B+tree node descent but imprecise for overflow-chain case at `relocate.go:175` where predicate gates the chain read → fixed in-place: tightened to "on B+tree nodes shouldRelocate(id) runs only after the page is read … overflow chains are gated the other way, predicate-then-relocate, with no walk-time read of their pages" + "page" → "node" in 3 spots; adjacent L-2 `v0-implementation.md:2062` chunk-12.6 narrative cite of the closed slug — disputed as past-tense historical fact per close-out protocol; adjacent L-3 `handoff.md` candidate-list cites — fixed via end-of-session protocol rewrite). R2=0H/0M/0L/0nit (converged, ship). |
 | `de9e7c1` | setkeyspace-indexing-perf-and-edge | **Closed** — consolidated two-layer atomicity (chunk-7.6 H-2 wrapper-internal snap + chunk-7.9 caller `rowSnap`) to caller-only by deleting the four `applyIndexMaintenanceOn{Put,Delete}` wrappers (Keyspace + SetKeyspace mirrors) and renaming each `*Inner` to the public name. Folded chunk-7.6 Keyspace symmetric sites (`Keyspace.Put` / `Delete` / `Cursor.Delete`) under "structurally-larger-but-simpler" exception. Added 5 caller-side `restoreIndexes(ks.indexes, rowSnap)` lines on the helper-error branches; `SetKeyspace.Delete` bulk branch already restored. Disposition is **third class** outside the prior 3:3 split: no spec clause violated, but NOT a preference-drop either — a constant-factor inefficiency where the cleanup is structurally small and correct-preserving (so 3:3:1 split). Spec promotions: chunk-7.6 H-2 → chunk-7.9 evolution chain moved inline into renamed `applyIndexMaintenanceOnPut` godoc + restructured `indexSnapshot` type godoc (3-bullet Capture/Restore/Purpose contract); each caller's helper-error branch comment documents the snapshot-less helper contract. 6 new regression tests (one per caller site, each neuter-verified individually — produces deterministic pinned-mutated failure on line removal). R1=0H/2M/2L/1nit (introduced M-1 = no-cite invariant violation in new test godoc citing the slug → fixed in-place by retargeting to chunk-7.6 → chunk-7.9 evolution chain + git log mechanism; ADJACENT same-class pre-existing cite at `index_types_test.go:240` → fixed in-place; introduced M-2 = test coverage gap, only 3 mechanisms had tests but 6 caller sites bear the encoded invariant individually, reviewer empirically neuter-verified the SetKeyspace.Put line could be removed with zero suite failures → fixed by adding 3 more tests; L-1/L-2 = bulk-test godoc phrasing → fixed; nit-1 = indexSnapshot godoc structure → restructured to lead with current 3-bullet contract). R2=0H/0M/0L/0nit (converged, ship). |
 | `400c95d` | setkeyspace-delete-range-bulk-walker | **Closed** — un-indexed `SetKeyspace.DeleteRange` migrated from chunk-6.8 v1 snapshot-then-Delete loop (`O(K log N)` per-key descents + `O(K × keysize)` upfront snapshot) to the chunk-5.7 atomic three-phase walker via new `btree.PerCellFreeFn` callback abstraction. Indexed path preserved per-row via lifted `deleteRangePerKey` (chunk-7.10 contract retained). Atomicity change for un-indexed: per-row → atomic (`(0, err)` on failure), clean break of chunk-6.8 user-lock per pre-v1 default. `keyspaceCellFree` (overflow + count=1) + `setKeyspaceCellFree` (subpage Count / NestedCount via `FreeSubtree` with NestedCount sanity check / overflow + count=1) callbacks; the walker stays SetKeyspace-agnostic. Spec promotions: `range-delete.md §Set Keyspace Range Delete` (new section), `set-keyspace.md` §17 narrative align + §Invariants new entailed dispatch-direction invariant, `api-surface.md` symmetric atomicity-contract godoc on both `SetKeyspace.DeleteRange` (new spell-out) and `Keyspace.DeleteRange` (R2 spec-amend 1 — mirrored from SetKeyspace). New `SetDeleteRangeCalledHookForTest` instrumentation hook in `internal/btree/range_delete.go` (mirrors `readTxCleanupHookForTest` pattern from `5800299`) pins the dispatch-direction invariant via 2 dispatch-direction tests. 5 new regression tests: `TestSetKeyspaceDeleteRangeUnindexedNoLeakWithNestedTreeAtBoundary`, `TestSetKeyspaceDeleteRangeUnindexedNoLeakInteriorSubtreeRetire` (workload scaled per R1 M-1 + probe asserts cellCount >= 2), `TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance`, `TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker`, `TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker` — all neuter-verified individually. R1=0H/3M/2L/2nit (introduced M-1 interior-path workload too small + M-2 docstring over-claims + M-3 spec atomic-on-error wording missing in-memory pre-call state sentence; all fixed in-place; L-1/L-2 disputed; nit-1/2 fixed). R2=0H/1M/2L/0nit (introduced M-1 un-indexed dispatch not test-pinned → user picked fix-in-place via hook + 2 tests; introduced L-1 NestedCount sanity check absent → fixed in-place mirroring SetKeyspace.Delete; introduced L-2 `deleteRangePerKey` before/after subtraction → fixed in-place via wrap-immune per-iteration accumulator; spec-amend 1 → Keyspace.DeleteRange godoc parity; spec-amend 2 → entailed dispatch invariant added). R3=0H/2M/4L/1nit (introduced M-1 violation= reachability mis-framed → fixed in-place; M-2 dispatch tests missed count assertion → fixed by adding `n != 2`; introduced L-3 comment phrasing inaccurate + L-4 from= clause encoding nit → fixed in-place; L-1/L-2 adjacent; loop converged). |
+| `ac4af82` | bulkload-index-merge-run-fanin | **Closed** — Option C (cascaded multi-pass merger) per user pick AFTER the user's "is matching b83846c/91a268a a rationalization?" pushback corrected my lazy preference-drop framing. Three-dimension re-derivation found bulkload differs from the prior preference-drops on (i) foreground-tx vs background, (ii) OS-hard-limit (EMFILE) vs CPU-only, (iii) user-bound-exceeded (256 MiB merger read buffers silently doubled the user's 256 MiB MaxTxBufferBytes) vs intrinsic. Disposition: clause-violation fix on the broad-reading of `bulkload.md §Interaction with Indexes` "in-memory sort footprint bounded by MaxTxBufferBytes" (the impl's narrow reading scoped this to phase-1 accumulator; merger read buffers exceeded the bound silently). Mechanism: `var maxMergeFanIn = 128` cap + new `(*indexSorter).cascadeRuns()` + `mergeGroupToScratchRun(scratchDir, runs)` helper; wired into `buildIndexFromSorter` spilled branch before `s.newMerger`. Cascade reduces `len(s.runs)` to ≤ cap via groups of ≤ cap runs each, repeating until cap fits. Pre-level runs removed only AFTER next level fully writes (mid-pass-error safety: data never destroyed before re-encoded). Bounds FDs + bufio read-buffer memory at O(cap) regardless of #runs, costs O(log_fanin(#runs)) extra scratch I/O. Preserves existing unique-violation-at-merge-output contract (detection runs on the post-cascade stream). Spec promotions: `bulkload.md §Invariants` new clause-explicit invariant for the cap with gitfs SQLite → gmdb migration as `violation=` (disambiguates bufio read-buffer memory vs heap key+value memory per R1 L-2); `§Interaction with Indexes` new "Merge fan-in cap" subsection describing cascade mechanism + intermediate lifecycle + per-pass FD ceiling (cap+1) + end-to-end memory contract. New `setMaxMergeFanInForTest(n)` swap-restore helper + `bulkLoadMergeCascadeHookForTest` (mirrors `readTxCleanupHookForTest` from `5800299` / `SetDeleteRangeCalledHookForTest` from `400c95d`). New regression test `TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn` (cap=2 + 900 rows + 8 KiB MaxTxBufferBytes forces multi-pass cascade per `preRuns >= 2*testCap+1` probe; pins postRuns ≤ cap + end-to-end correctness + scratch cleanup; neuter-verified by commenting out `s.cascadeRuns()` → postRuns=6 > cap=2 → deterministic fail). R1=0H/0M/3L/3nit (introduced L-1 docstring math fragile → fixed in-place via workload-drift-resilient phrasing; adjacent L-2 new invariant inherits merger heap-memory imprecision → fixed in-place via spec disambiguation "bufio read-buffer memory" + separate heap-memory clause; introduced L-3 single-element cascade-group rewrite disputed as design-uniform; introduced nit-1 cascadeRuns panic-window disputed unreachable; nit-2 panic guard sound; introduced nit-3 per-index hook scope by-design). R2=0H/0M/1L/0nit (introduced L-1 cap=4 typo in docstring after R1 cap=2 rewrite → fixed in-place). Converged. |
 
 The authoritative live list is `docs/issues/README.md`. Below is a
 snapshot of decisions and findings *known but not yet executed*; use
@@ -1727,9 +1905,12 @@ or condition-triggered.)*
 
 ### Profiling-driven / condition-triggered (re-validate before pulling)
 
-`rpl-segment-relocation`, `pager-test-helper-export`,
-`bulkload-index-merge-run-fanin`. Re-validate live before acting;
-some may now be obsolete.
+`rpl-segment-relocation` (condition-triggered, design-heavy;
+adjacent to recent RPL/savepoint area positionally — the only
+remaining live entry that's pickable),
+`pager-test-helper-export` (condition-triggered, still blocked
+on second-caller arrival — not pickable until that count > 1).
+Re-validate live before acting; some may now be obsolete.
 
 ---
 
@@ -1744,9 +1925,14 @@ condition-triggered; the one condition-triggered entry —
 
 1. **Re-validate the profiling-driven set first** — the recurring
    lesson says issue framings often go stale, *especially* for
-   profiling-driven items. The last seven sessions proved this
-   seven times, with a 3:3:1 split on disposition (fix via
-   substrate / spec-only / fix via cleanup):
+   profiling-driven items. The last nine sessions proved this
+   nine times, with a 3:3:2:1 split on disposition (fix via
+   substrate / spec-only / spec-internal-inconsistency-close /
+   cleanup-fix); the user's "is this a rationalization?" pushback
+   on `ac4af82` showed pattern-match similarity does NOT entail
+   disposition similarity — run the three-dimension check per
+   candidate (foreground/background, OS-hard-limit/CPU,
+   user-bound-exceeded/intrinsic) before assigning a bucket:
    `shallow-savepoint-clone-cost` `43ac8df` → clause-explicit
    cost-clause violation, fix via undo-log substrate;
    `nested-shallow-loose-pop-buffer-alias` `d9ea7d4` → binary
@@ -1782,7 +1968,7 @@ condition-triggered; the one condition-triggered entry —
    is structurally small and correct-preserving. Folded the
    chunk-7.6 Keyspace symmetric sites under structurally-larger-
    but-simpler exception.
-   `setkeyspace-delete-range-bulk-walker` `400c95d` (this session) →
+   `setkeyspace-delete-range-bulk-walker` `400c95d` →
    filed as "v1 snapshot-then-Delete is O(K log N), the chunk-5.7
    walker is O(K + log N) — perf-driven follow-up"; first-principles
    re-derivation surfaced a spec internal inconsistency: `set-
@@ -1799,6 +1985,26 @@ condition-triggered; the one condition-triggered entry —
    close + clause-explicit re-alignment + clean-break atomicity to
    stronger contract**. Filed-and-closed via the chunk-5.7 walker
    substrate; chunk-7.10 indexed dispatch preserved.
+   `bulkload-index-merge-run-fanin` `ac4af82` (this session) →
+   filed as "single-pass merge fan-in; cascaded multi-pass merge is
+   the fix; profiling-driven, unreachable at default
+   MaxTxBufferBytes." My first cut framed disposition as
+   "preference-drop + spec-amend, mirrors b83846c / 91a268a." The
+   user pushed back with "is matching b83846c/91a268a a
+   rationalization?" Three-dimension re-examination found bulkload
+   FAILS all three checks the prior preference-drops pass:
+   (i) foreground tx vs background; (ii) OS-hard-limit (EMFILE) vs
+   CPU-only; (iii) user-bound-exceeded (256 MiB merger read buffers
+   silently double the user's 256 MiB MaxTxBufferBytes per the broad
+   reading of `bulkload.md §Interaction with Indexes` line 192) vs
+   intrinsic. Clause violation under broad reading: spec is
+   authoritative; impl's narrow self-interpretation is the bug. User
+   picked Option C (cascaded multi-pass merger, ~200 LOC) over
+   Option A (preference-drop, rejected after dimension analysis) and
+   Option B (memory-only cleanup-fix, rejected because FD dimension
+   uncovered). New bucket: **clause-violation fix on the broad-
+   reading of a spec phrase the impl was interpreting narrowly,
+   substrate adds new bounded primitive**.
    The disposition is NOT predictable from issue framing alone:
    re-derive each candidate against the spec, asking
    (i) does the unenumerated cost term scale with `MaxSize`
@@ -1823,59 +2029,85 @@ condition-triggered; the one condition-triggered entry —
        each as an independent first-principles re-derivation;
        promote its spec conclusion into the same close-out
        commit but DERIVE it separately;
-   (vi) **new this session**: if neither (i) clause violation
-       nor (ii) preference-drop applies, check whether a
-       structurally-simple consolidation eliminates the
-       redundancy. This is the third bucket: cleanup-fix
-       (smallest correct change applies to code shape even when
-       no bigger-O bound is violated). The signal is "the
-       redundant work was historically load-bearing but a later
-       layer subsumed its contract" — the wrapper-snap +
+   (vi) if neither (i) clause violation nor (ii) preference-drop
+       applies, check whether a structurally-simple consolidation
+       eliminates the redundancy. This is the third bucket:
+       cleanup-fix (smallest correct change applies to code shape
+       even when no bigger-O bound is violated). The signal is
+       "the redundant work was historically load-bearing but a
+       later layer subsumed its contract" — the wrapper-snap +
        rowSnap consolidation is the canonical instance. Before
        inferring "preference, drop from spec," check whether
        the wasted work can simply be deleted under a structural-
        simpler exception.
+   (vii) **new this session**: surface-framing similarity to prior
+       preference-drops (profile-driven, unenumerated cost term,
+       workload-dependent) does NOT entail disposition similarity.
+       Per CLAUDE.md "Analyze, don't rationalize" — when applying
+       the rubric, run the THREE-dimension check per candidate
+       (foreground/background, OS-hard-limit/CPU,
+       user-bound-exceeded/intrinsic) before pattern-matching to a
+       prior bucket. b83846c / 91a268a are correctly preference-
+       drops because they pass all three (CPU-only / background /
+       no user-configured bound on affected dimension). The
+       `bulkload-index-merge-run-fanin` `ac4af82` case FAILS all
+       three (foreground tx + EMFILE OS-hard-limit + merger read
+       buffers exceeding the user's MaxTxBufferBytes) and was
+       correctly disposed as a clause-violation fix once the
+       dimension audit ran. Surface-framing similarity is a TRAP;
+       per-candidate dimension audit is the gate.
+   (viii) **new this session**: a spec phrase's broad-reading is
+       authoritative even when the implementation interprets
+       narrowly. When the impl-comment narrows a spec phrase's
+       scope ("X = phase-1 only" while spec says "X" unqualified),
+       the impl's narrow reading is the BUG, not the spec's
+       "appears comprehensive" wording. The diagnostic test: read
+       the spec phrase the way a USER reads it (without the impl
+       comment in front of you); if a user would expect the
+       broader scope and the impl silently exceeds it, that's a
+       clause violation even when the impl-comment "fits" the
+       impl's behavior. `bulkload.md` line 192 "in-memory sort
+       footprint bounded by MaxTxBufferBytes" was the canonical
+       instance: impl narrow-read it as accumulator-only; user
+       broad-reads it as sort-wide (including merger read
+       buffers); the broad reading wins because the spec is
+       authoritative.
 
-2. **Among re-validated live items, prefer ones whose framing
-   could be wrong in instructive ways** (Ordering criterion 3 —
-   fresh-context-required > mechanical):
-   - `bulkload-index-merge-run-fanin` — single-pass merge opens
-     O(#runs) FDs; pathological tiny buffer + huge input could
-     hit EMFILE. Unreachable at default `MaxTxBufferBytes`.
-     EXTRINSIC bound shape (FD limit) — possibly
-     drop-preference not fix.
-   - `rpl-segment-relocation` — adjacent to recent RPL/savepoint
-     area positionally; design-heavy (immovability assumption
-     may need to change). The condition trigger says "when RPL
-     pages are shown to block consolidation, or when RPL
-     relocation folds into the commit pipeline" — re-validate
-     whether either has been demonstrated.
+2. **`rpl-segment-relocation`** is the only remaining pickable
+   live entry. Condition-triggered ("when RPL pages are shown
+   to block consolidation, or when RPL relocation folds into
+   the commit pipeline"). Adjacent to recent RPL/savepoint
+   area positionally (b83846c / 9d060ba context still warm).
+   Design-heavy — the immovability assumption used by the
+   chunk-12.5b-3 compaction orchestration may need to change.
+   Re-validate whether either trigger has been demonstrated
+   since the issue was filed.
 
 3. **`pager-test-helper-export`** remains blocked on its
    trigger ("when a second cross-package writer-pager fixture
-   caller arrives"); the count is still 1. Not pickable.
+   caller arrives"); the count is still 1. Not pickable until
+   that count > 1.
 
 **Recommended next candidate:**
-`bulkload-index-merge-run-fanin`. Single sub-item, clean session
-shape. Pre-pick advisory: read `bulkload.md` top-down + the
-chunk-8.6 indexed-bulkload sort-spill mechanism. The issue says
-"unreachable at default `MaxTxBufferBytes`" — verify by computing
-the EMFILE threshold (typical ulimit -n 1024 / 4096 / 8192) against
-the worst-case run-fan-in at min `MaxTxBufferBytes`. If genuinely
-unreachable in practice → preference-drop with spec note. If
-reachable at small enough `MaxTxBufferBytes` → fix via cascaded
-multi-pass merge OR caller-knob exposure. Apply the seven-prior-
-session checks (i) — does the cost clause name O(#runs) FD usage?
-— (iii) — is the failure mode a graceful abort vs corruption? —
-and check whether this session's spec internal inconsistency
-pattern applies (does the bulkload.md spec describe a different
-shape than chunk-8.6 implements?).
+`rpl-segment-relocation`. Only pickable live entry.
+Pre-pick advisory: read `free-space.md` and `commit.go` /
+`free_space.go` to understand the current RPL pipeline (alloc /
+chain / reclaim) + read the issue file for the immovability
+assumption's history. Then apply the eight-prior-session
+re-derivation rubric checks (i)-(viii). Specifically: is RPL
+relocation a clause violation (and which clause), preference,
+spec internal inconsistency, or clause-violation-via-broad-
+reading? Run the THREE-dimension audit per (vii) BEFORE
+pattern-matching to a prior bucket.
 
-**Alternative candidate** (if user prefers design-heavy work):
-`rpl-segment-relocation` (immovability assumption may need to
-change; design-heavy). The 3:3:2 "fix or surface a structural
-insight" split across the last eight profile-driven re-derivations
-holds high probability of an instructive outcome per candidate.
+If the trigger condition genuinely hasn't fired — RPL pages
+neither block consolidation nor fold into the commit pipeline
+— the principled disposition is to redefer with a fresher
+condition restatement (`Lands:` rewrite) OR file as obsolete
+if the issue's framing no longer holds. NOT to pull it just
+because it's the only pickable entry; per Ordering criterion
+5 (correctness > perf), pulling without a triggered condition
+is profile-driven-without-justification.
 
 Then resolve it via the full protocol above. **One issue per session
 is the contract — do not start a second.**
