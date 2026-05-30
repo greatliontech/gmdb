@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -325,6 +326,196 @@ func (m *sortMerger) close() {
 	m.readers = nil
 }
 
+// maxMergeFanIn caps the number of spilled-run files the sortMerger
+// opens simultaneously. When the sorter spilled more runs than this
+// cap, runs are first cascaded through one or more intermediate merge
+// passes (each merging up to maxMergeFanIn runs into a single larger
+// run) until the final fan-in fits the cap. Bounds the merger's peak
+// open-file count at O(maxMergeFanIn) and read-buffer memory at
+// O(maxMergeFanIn × 64 KiB) regardless of #runs, at the cost of
+// O(log_fanin(#runs)) extra scratch read+write passes. See
+// bulkload.md §Interaction with Indexes "Merge fan-in cap" for the
+// invariant + workload reasoning.
+//
+// 128 stays comfortably under the typical per-process FD limit (256 on
+// macOS default, 1024+ on Linux distros) while keeping the merge-phase
+// read-buffer budget at 128 × 64 KiB = 8 MiB — small relative to the
+// default 256 MiB MaxTxBufferBytes.
+//
+// Declared as var (not const) so tests can swap to a small value via
+// setMaxMergeFanInForTest; production callers never mutate it.
+var maxMergeFanIn = 128
+
+// setMaxMergeFanInForTest swaps the merge fan-in cap for the duration
+// of the returned restore closure. Global state — tests that call this
+// must NOT call t.Parallel(). Used by TestKeyspaceBulkLoadIndexedMerge
+// CascadeBoundsFanIn to force the cascade path on a small workload.
+func setMaxMergeFanInForTest(n int) (restore func()) {
+	if n < 2 {
+		panic(fmt.Sprintf("setMaxMergeFanInForTest: n=%d below minimum 2 (groups of one cannot reduce the run count)", n))
+	}
+	old := maxMergeFanIn
+	maxMergeFanIn = n
+	return func() { maxMergeFanIn = old }
+}
+
+// bulkLoadMergeCascadeHookForTest, when set, is invoked once per
+// buildIndexFromSorter call that takes the spilled branch, with the
+// (preCascadeRuns, postCascadeRuns) — len(s.runs) before and after
+// cascadeRuns. When no cascade was needed (preCascadeRuns <=
+// maxMergeFanIn), preCascadeRuns == postCascadeRuns. Used by tests to
+// pin the merger's fan-in cap behavior. Global state — tests that
+// install must NOT call t.Parallel(). The hook fires only on the
+// cascade success path: a cascadeRuns error short-circuits before the
+// hook, so tests of the cascade error path observe the wrapped error
+// at the BulkLoad return site instead.
+var bulkLoadMergeCascadeHookForTest atomic.Pointer[func(preCascadeRuns, postCascadeRuns int)]
+
+func setBulkLoadMergeCascadeHookForTest(hook func(preCascadeRuns, postCascadeRuns int)) {
+	if hook == nil {
+		bulkLoadMergeCascadeHookForTest.Store(nil)
+		return
+	}
+	bulkLoadMergeCascadeHookForTest.Store(&hook)
+}
+
+// cascadeRuns reduces s.runs to at most maxMergeFanIn entries by
+// merging groups of up to maxMergeFanIn runs into single intermediate
+// runs and repeating until the count fits the cap. After each
+// successful level the prior runs are removed from scratch and the
+// intermediates replace them in s.runs so the standard cleanup defer
+// still reaches every remaining file on any later failure.
+//
+// On a mid-level error, intermediates created in the failing pass are
+// removed before return; s.runs is left at the start-of-level state
+// so the standard cleanup defer reclaims them. The pre-level runs are
+// NOT pre-emptively removed (only after the next level fully writes)
+// so a write failure mid-pass never destroys data that hasn't been
+// safely re-encoded into the next level.
+//
+// The cap is exclusive of s.mem — newMerger adds the in-memory chunk
+// as one additional reader, so the final merger's open-file count is
+// bounded by len(s.runs) <= maxMergeFanIn after cascadeRuns returns.
+func (s *indexSorter) cascadeRuns() error {
+	for len(s.runs) > maxMergeFanIn {
+		nextLevel := make([]string, 0, (len(s.runs)+maxMergeFanIn-1)/maxMergeFanIn)
+		var cascadeErr error
+		for start := 0; start < len(s.runs); start += maxMergeFanIn {
+			end := min(start+maxMergeFanIn, len(s.runs))
+			outPath, err := mergeGroupToScratchRun(s.scratchDir, s.runs[start:end])
+			if err != nil {
+				cascadeErr = err
+				break
+			}
+			nextLevel = append(nextLevel, outPath)
+		}
+		if cascadeErr != nil {
+			for _, p := range nextLevel {
+				_ = os.Remove(p)
+			}
+			return cascadeErr
+		}
+		oldRuns := s.runs
+		s.runs = nextLevel
+		for _, p := range oldRuns {
+			_ = os.Remove(p)
+		}
+	}
+	return nil
+}
+
+// mergeGroupToScratchRun opens the named spilled-run files, k-way
+// merges them into a single sorted run written to a fresh scratch file
+// in scratchDir, and returns its path. On any open / read / write
+// error all opened readers are closed, the partial output file (if
+// created) is removed, and the wrapped error is returned.
+//
+// Holds at most len(runs)+1 simultaneously-open files (len(runs)
+// readers + 1 output writer), so the cascade's per-pass FD ceiling is
+// maxMergeFanIn+1.
+func mergeGroupToScratchRun(scratchDir string, runs []string) (string, error) {
+	readers := make([]*fileRunReader, 0, len(runs))
+	closeReaders := func() {
+		for _, r := range readers {
+			_ = r.close()
+		}
+	}
+	for _, name := range runs {
+		r, err := openFileRunReader(name)
+		if err != nil {
+			closeReaders()
+			return "", fmt.Errorf("gmdb: BulkLoad cascade open %q: %w", name, err)
+		}
+		readers = append(readers, r)
+	}
+
+	out, err := os.CreateTemp(scratchDir, "gmdb-bulkidx-merge-*.run")
+	if err != nil {
+		closeReaders()
+		return "", fmt.Errorf("gmdb: BulkLoad cascade create scratch in %q: %w", scratchDir, err)
+	}
+	outName := out.Name()
+	bw := bufio.NewWriterSize(out, 64<<10)
+
+	abort := func(werr error) (string, error) {
+		closeReaders()
+		_ = out.Close()
+		_ = os.Remove(outName)
+		return "", werr
+	}
+
+	h := make(recordHeap, 0, len(readers))
+	for i, r := range readers {
+		rec, ok, err := r.next()
+		if err != nil {
+			return abort(fmt.Errorf("gmdb: BulkLoad cascade read %q: %w", runs[i], err))
+		}
+		if ok {
+			h = append(h, recordHeapItem{rec: rec, runIdx: i})
+		}
+	}
+	heap.Init(&h)
+
+	var hdr [binary.MaxVarintLen64]byte
+	putField := func(b []byte) error {
+		n := binary.PutUvarint(hdr[:], uint64(len(b)))
+		if _, werr := bw.Write(hdr[:n]); werr != nil {
+			return werr
+		}
+		_, werr := bw.Write(b)
+		return werr
+	}
+
+	for h.Len() > 0 {
+		it := heap.Pop(&h).(recordHeapItem)
+		if err := putField(it.rec.key); err != nil {
+			return abort(fmt.Errorf("gmdb: BulkLoad cascade write %q: %w", outName, err))
+		}
+		if err := putField(it.rec.val); err != nil {
+			return abort(fmt.Errorf("gmdb: BulkLoad cascade write %q: %w", outName, err))
+		}
+		rec, ok, err := readers[it.runIdx].next()
+		if err != nil {
+			return abort(fmt.Errorf("gmdb: BulkLoad cascade read %q: %w", runs[it.runIdx], err))
+		}
+		if ok {
+			heap.Push(&h, recordHeapItem{rec: rec, runIdx: it.runIdx})
+		}
+	}
+
+	closeReaders()
+	if err := bw.Flush(); err != nil {
+		_ = out.Close()
+		_ = os.Remove(outName)
+		return "", fmt.Errorf("gmdb: BulkLoad cascade flush %q: %w", outName, err)
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(outName)
+		return "", fmt.Errorf("gmdb: BulkLoad cascade close %q: %w", outName, err)
+	}
+	return outName, nil
+}
+
 // indexBuildResult is one index's bulk-built data tree.
 type indexBuildResult struct {
 	root  uint64
@@ -366,6 +557,18 @@ func buildIndexFromSorter(pw bulkPageWriter, cfg page.Config, s *indexSorter, de
 		}
 		root, count, err := b.finish()
 		return indexBuildResult{root: root, count: count}, err
+	}
+
+	// Cascade down to <= maxMergeFanIn final runs before opening them
+	// all at once in newMerger. Pins the merge-phase FD ceiling +
+	// read-buffer memory bound (bulkload.md §Interaction with Indexes
+	// "Merge fan-in cap" invariant).
+	preCascadeRuns := len(s.runs)
+	if err := s.cascadeRuns(); err != nil {
+		return indexBuildResult{}, err
+	}
+	if hook := bulkLoadMergeCascadeHookForTest.Load(); hook != nil {
+		(*hook)(preCascadeRuns, len(s.runs))
 	}
 
 	m, err := s.newMerger()

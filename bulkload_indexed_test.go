@@ -423,6 +423,123 @@ func TestKeyspaceBulkLoadIndexedSpillWriteError(t *testing.T) {
 	}
 }
 
+// TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn forces the sorter to
+// spill more runs than maxMergeFanIn (via setMaxMergeFanInForTest + a
+// small MaxTxBufferBytes) and verifies the cascade reduces the final
+// merge fan-in to <= maxMergeFanIn while preserving end-to-end
+// correctness. Pins the bulkload.md §Interaction with Indexes
+// "Merge fan-in cap" invariant: the merger holds at most maxMergeFanIn
+// run files open concurrently regardless of #runs.
+//
+// Neuter: removing the s.cascadeRuns() call in buildIndexFromSorter
+// (or replacing it with a no-op) leaves postRuns == preRuns > cap=2,
+// failing the postRuns assertion below.
+//
+// The probe assertion (preRuns > cap) defends against silent test-
+// workload shrinkage — if a future edit reduces nrows below the spill
+// threshold, the cascade path never fires and the test would pass for
+// the wrong reason.
+func TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn(t *testing.T) {
+	// cap=2 forces multi-pass cascade with any preRuns >= 2*cap+1 (=5):
+	// pass 1 reduces preRuns → ceil(preRuns/cap) intermediates; pass 2
+	// reduces those further; etc. The preRuns >= 2*testCap+1 probe
+	// below structurally guards multi-pass exercise regardless of the
+	// exact record-encoding size (which depends on the index encoder's
+	// non-unique key shape + sortRecordMemOverhead) — if a future edit
+	// changes encoder sizing, the probe surfaces it.
+	const testCap = 2
+	restoreCap := setMaxMergeFanInForTest(testCap)
+	defer restoreCap()
+	var preRuns, postRuns int
+	var cascadeFired bool
+	setBulkLoadMergeCascadeHookForTest(func(pre, post int) {
+		cascadeFired = true
+		preRuns, postRuns = pre, post
+	})
+	defer setBulkLoadMergeCascadeHookForTest(nil)
+
+	ctx := context.Background()
+	scratch := t.TempDir()
+	db := openWith(t, ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		MaxTxBufferBytes: 8 << 10, // 8 KiB / 1 index → ~135 records/run
+		ScratchDir:       scratch,
+	})
+	defer db.Close()
+	tx, err := db.Begin(ctx, true)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	decl := testDecl("by_first", "first")
+	decl.Extract = firstByteExtract
+	ks, err := tx.CreateKeyspace("items", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+
+	// 900 rows at 8 KiB budget empirically produces ~6 spilled runs
+	// (the encoded non-unique index key + sortRecordMemOverhead per
+	// record fits ~130 records per spill); the preRuns probe below
+	// enforces the multi-pass minimum without depending on the exact
+	// encoding constant.
+	const nrows = 900
+	rows := genKVs(nrows, 12)
+	if _, err := ks.BulkLoad(seqOf(rows)); err != nil {
+		t.Fatalf("BulkLoad: %v", err)
+	}
+
+	if !cascadeFired {
+		t.Fatal("merge-cascade hook did not fire; buildIndexFromSorter did not enter the spilled branch")
+	}
+	if preRuns <= testCap {
+		t.Fatalf("preRuns=%d not greater than maxMergeFanIn=%d; test workload too small to exercise cascade — increase nrows or shrink MaxTxBufferBytes",
+			preRuns, testCap)
+	}
+	// Probe a multi-pass cascade so a future workload shrinkage that
+	// silently reduces to a single pass surfaces immediately. With
+	// cap=2 and 6 spills, the first pass produces 3 intermediates
+	// (still > cap=2), so a correct cascade runs a SECOND pass to land
+	// at 2. Anything that would land at preRuns=3 indicates the multi-
+	// pass loop short-circuited.
+	if preRuns < 2*testCap+1 {
+		t.Fatalf("preRuns=%d not >= 2*testCap+1=%d; workload too small to exercise multi-pass cascade",
+			preRuns, 2*testCap+1)
+	}
+	if postRuns > testCap {
+		t.Errorf("postRuns=%d > maxMergeFanIn=%d; cascade did not bound the fan-in",
+			postRuns, testCap)
+	}
+
+	// End-to-end correctness: every row indexed and back-lookups
+	// resolve, identical to the un-cascaded spill path.
+	idx, err := ks.Index("by_first")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if st, _ := idx.Stats(); st.Count != nrows {
+		t.Errorf("cascaded index Count=%d, want %d", st.Count, nrows)
+	}
+	if pairs := collectAllIndexPairs(t, idx); len(pairs) != nrows {
+		t.Errorf("Range over cascaded index yielded %d pairs, want %d", len(pairs), nrows)
+	}
+	wantA := 0
+	for i := range rows {
+		if rows[i].v[0] == 'a' {
+			wantA++
+		}
+	}
+	if got := lookupKeysSorted(t, idx, []byte("a")); len(got) != wantA {
+		t.Errorf("by_first['a'] yielded %d keys, want %d", len(got), wantA)
+	}
+	// Cleanup ran: no leftover scratch files (original spills + cascade
+	// intermediates both match the gmdb-bulkidx-* glob).
+	if got := countScratchRuns(t, scratch); got != 0 {
+		t.Errorf("after cascading BulkLoad: %d leftover scratch run files, want 0", got)
+	}
+}
+
 // TestKeyspaceBulkLoadIndexedAbortReopen verifies that after a unique
 // violation + Rollback, a fresh transaction sees the keyspace and its
 // indexes exactly at their pre-BulkLoad (empty) state — nothing leaked into

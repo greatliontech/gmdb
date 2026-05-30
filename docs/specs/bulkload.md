@@ -97,6 +97,41 @@ Invariant: kind=entailed;
     others rolled back) breaks the atomicity contract user
     code relies on for migrations.
 
+Invariant: kind=clause-explicit;
+  property=The indexed-`BulkLoad` merger holds at most
+    `maxMergeFanIn` spilled-run files open concurrently and uses
+    at most `O(maxMergeFanIn × 64 KiB)` of bufio read-buffer
+    memory at the merge phase, regardless of how many sort runs
+    were spilled (`#runs = inputBytes / budget`, where `budget =
+    MaxTxBufferBytes / #indexes`). The merge heap's per-slot
+    record key+value bytes (one `make([]byte, n)` per
+    `readRunField` call, lifetime = one merge step) are not
+    bounded by `maxMergeFanIn × 64 KiB`; their footprint is a
+    pre-existing property of the merger inherited by the
+    cascade and bounded by `O(maxMergeFanIn × max-record-size)`.
+    When `#runs > maxMergeFanIn`, the merger cascades through
+    one or more intermediate merge passes (each merging up to
+    `maxMergeFanIn` runs into a single larger run) until the
+    final fan-in fits the cap. This bound extends the
+    `MaxTxBufferBytes`-scoped read-buffer footprint from phase-1
+    sorter accumulation to phase-2 merge, independent of input
+    size;
+  from=§Interaction with Indexes "Merge fan-in cap";
+  violation=Without the cap, a multi-gigabyte input under a
+    small `MaxTxBufferBytes` (the gitfs SQLite → gmdb migration
+    the §Interaction with Indexes "Leakage scale warning"
+    describes; e.g. 16 MiB `MaxTxBufferBytes` ÷ 5 indexes ⇒ 3.2
+    MiB per-index budget against 16 GB of index entries ⇒ ~5000
+    spilled runs per index) lets the merger open all runs
+    simultaneously. The open-file count exceeds the per-process
+    FD limit (`EMFILE`; default 256 on macOS, 1024 on most
+    Linux distros), failing the operation; and even when FDs
+    hold, the 64 KiB `bufio.Reader` per open run consumes
+    `O(#runs × 64 KiB)` of read-buffer memory — at 4000 runs,
+    256 MiB of additional memory on top of the user-configured
+    `MaxTxBufferBytes`, effectively doubling the in-tx memory
+    footprint relative to what `MaxTxBufferBytes` promises.
+
 ## API
 
 ```go
@@ -196,13 +231,47 @@ contract).
 When the sort fits in memory the indexes load in a single
 in-memory pass. When it does not, spill chunks are written to a
 per-DB scratch directory (configurable via `Options.ScratchDir`,
-default `os.TempDir`) and merge-sorted in the final pass. Scratch
-files are best-effort deleted on success and failure; an
+default `os.TempDir`) and merge-sorted into the bulk builder.
+Scratch files are best-effort deleted on success and failure; an
 unremovable scratch file (e.g. `ScratchDir` on a vanishing
 tmpfs) is logged via `slog.Logger` and does not fail the
 operation. A spill *write* failure (`ENOSPC` on `ScratchDir`)
 aborts the `BulkLoad` with the underlying I/O error wrapped; no
 rebuilt index entries are committed.
+
+**Merge fan-in cap.** The k-way merger opens every spilled run
+simultaneously to read sorted heads from each, so unbounded
+`#runs` would let merge-time file descriptors and read-buffer
+memory grow with the workload — exceeding the per-process FD
+limit and, separately, exceeding the `MaxTxBufferBytes`-scoped
+memory contract because the 64 KiB `bufio.Reader` per open run
+is allocated outside the phase-1 sorter accumulator. The merger
+therefore caps simultaneous fan-in at `maxMergeFanIn = 128`:
+when `#runs > maxMergeFanIn`, runs are first cascaded through
+one or more intermediate merge passes (each merging up to
+`maxMergeFanIn` runs into a single larger run) until the final
+fan-in fits the cap. Cascade intermediates are written to
+`ScratchDir` with the same spill-file format and are removed as
+soon as the next cascade pass consumes them. The pre-level
+runs are NOT removed pre-emptively — only after the next level
+fully writes — so a write failure mid-pass never destroys data
+that hasn't been safely re-encoded into the next level.
+
+The cascade adds `O(log_fanin(#runs))` extra scratch read+write
+passes but bounds merge-phase resource usage at
+`O(maxMergeFanIn)` simultaneously-open files and
+`O(maxMergeFanIn × 64 KiB) ≈ 8 MiB` bufio read-buffer memory
+regardless of `#runs`. The 128-run cap stays comfortably under
+the typical per-process FD limit (256 on macOS default, 1024+
+on most Linux distros) while keeping the read-buffer budget
+small relative to the default 256 MiB `MaxTxBufferBytes`.
+Per-cascade-pass FD ceiling is `maxMergeFanIn + 1` (the +1 for
+the in-flight cascade-output file). The
+`maxMergeFanIn`-bounded final merger preserves the
+`MaxTxBufferBytes`-scoped memory contract end-to-end: phase-1
+sorter accumulator (`≤ MaxTxBufferBytes / #indexes`) and
+phase-2 merge buffer (`≤ maxMergeFanIn × 64 KiB`) are both
+independent of input size.
 
 **Unique-violation detection happens at the merge output** — the
 external sort's final merge pass yields entries in sorted order,
