@@ -16,11 +16,15 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
-// Tx is a write transaction. The chunk-1 surface exposes raw page-level
-// operations only — Keyspace, Cursor, and the typed layer land in
-// later chunks (5+). The byte slices returned by Page / CoW / AllocSlab
-// / Mutate are valid until Commit / Rollback completes; do not retain
-// them past tx close.
+// Tx is a write transaction. Its surface is keyspace and index
+// management (Open / Create / Delete keyspaces, Rebuild / Drop
+// indexes), nested transactions (BeginChild), and lifecycle (Commit,
+// Rollback). Data operations go through the *Keyspace / *SetKeyspace
+// handles it returns and their cursors and typed wrappers.
+//
+// Byte slices read through a write transaction (own-writes via a
+// Keyspace handle) are valid until Commit / Rollback completes; do not
+// retain them past tx close (api-surface.md §Byte Slice Ownership).
 type Tx struct {
 	db *DB
 
@@ -263,70 +267,6 @@ func formatStack(pcs []uintptr) string {
 		}
 	}
 	return b.String()
-}
-
-// AllocPage allocates a single page following the freespace priority
-// (loose → bitmap → RPL reclamation → file extension). The returned id
-// is the page ID; the caller typically follows with AllocSlab(id) or
-// CoW(src, id) to populate the page's content.
-func (tx *Tx) AllocPage() (uint64, error) {
-	if err := tx.requireOpen(true); err != nil {
-		return 0, err
-	}
-	tx.pgr.SetCurrentTxnID(tx.newTxnID)
-	id, err := tx.pgr.AllocPage()
-	return id, mapPagerErr(err)
-}
-
-// FreePage marks id for retirement. Same-tx pages become loose; prior-
-// tx pages join the RPL at commit.
-func (tx *Tx) FreePage(id uint64) error {
-	if err := tx.requireOpen(true); err != nil {
-		return err
-	}
-	return mapPagerErr(tx.pgr.FreePage(id))
-}
-
-// Page resolves id to a borrowed byte slice. Resolution: slab (own
-// writes this tx) → mmap. Slice is valid until tx close.
-func (tx *Tx) Page(id uint64) ([]byte, error) {
-	if err := tx.requireOpen(false); err != nil {
-		return nil, err
-	}
-	return tx.pgr.Page(id)
-}
-
-// CoW copies the content of srcID into a fresh slab buffer keyed at
-// dstID, returning the writable buffer. Idempotent on re-CoW at the
-// same dstID (returns the existing buffer).
-func (tx *Tx) CoW(srcID, dstID uint64) ([]byte, error) {
-	if err := tx.requireOpen(true); err != nil {
-		return nil, err
-	}
-	buf, err := tx.pgr.CoW(srcID, dstID)
-	return buf, mapPagerErr(err)
-}
-
-// AllocSlab installs a fresh zero-filled slab buffer at id and returns
-// it. For commit-step-0 assembly (RPL segments, modified bitmap pages);
-// also useful for tests that need to fabricate page content without
-// reading a source page.
-func (tx *Tx) AllocSlab(id uint64) ([]byte, error) {
-	if err := tx.requireOpen(true); err != nil {
-		return nil, err
-	}
-	buf, err := tx.pgr.AllocSlab(id)
-	return buf, mapPagerErr(err)
-}
-
-// Mutate returns the slab buffer at id for in-place editing. Returns
-// ErrPageNotDirty if id hasn't been CoW'd or AllocSlab'd in this tx.
-func (tx *Tx) Mutate(id uint64) ([]byte, error) {
-	if err := tx.requireOpen(true); err != nil {
-		return nil, err
-	}
-	buf, err := tx.pgr.Mutate(id)
-	return buf, mapPagerErr(err)
 }
 
 // Commit publishes the transaction's changes via the four-step commit

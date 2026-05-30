@@ -746,15 +746,24 @@ func (tx *Tx) Rollback() error
 // compile time. See db.BeginRead / db.View.
 type ReadTx struct { ... }
 
-// Page resolves the snapshot's view of page id. Returned slice is
-// borrowed from the read-only mmap and is valid until ReadTx close.
-// Callers MUST gate id by the snapshot's meta.HighWaterMark — the
-// chunk-4 cursor/B+tree layer enforces this by only visiting page
-// IDs reachable from the snapshot's KeyspaceRoot.
-func (rtx *ReadTx) Page(id uint64) ([]byte, error)
-
-// Meta returns a copy of the snapshot's meta at Begin time.
-func (rtx *ReadTx) Meta() page.Meta
+// ReadTx's public surface is Commit / Rollback only. The snapshot's
+// raw page bytes and decoded meta are deliberately NOT exposed:
+//
+//   - Page access is an internal concern of the cursor / B+tree
+//     layer, which gates every visited id by the snapshot's
+//     HighWaterMark; a public Page(id) accessor invites an
+//     out-of-range id that SIGBUSes the process (mmap-strategy.md
+//     §Sparse Reservation).
+//   - The decoded meta is internal/page.Meta, a raw on-disk storage
+//     struct; returning it across the public boundary leaks an
+//     internal type that importers cannot even name. Caller-relevant
+//     snapshot statistics are surfaced through DB.Stats (§Statistics),
+//     not a raw meta accessor.
+//
+// Earlier revisions exposed `ReadTx.Page(id) ([]byte, error)` and
+// `ReadTx.Meta() page.Meta`; both were withdrawn as test-only /
+// internal (git log preserves them; white-box tests retain access via
+// export_test.go).
 
 // Commit and Rollback are equivalent for ReadTx — both release the
 // reader slot and close the snapshot. The pair exists for symmetry

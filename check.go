@@ -157,7 +157,7 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue] {
 			return
 		}
 		defer rtx.Rollback()
-		meta := rtx.Meta()
+		meta := rtx.meta
 		c := &checker{
 			pgr:   rtx.pgr,
 			cfg:   page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)},

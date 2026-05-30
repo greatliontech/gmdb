@@ -336,33 +336,6 @@ func (db *DB) View(ctx context.Context, fn func(rtx *ReadTx) error) error {
 	return rbErr
 }
 
-// Page resolves the snapshot's view of page id. Returned slice is
-// borrowed from the read-only mmap and is valid until the ReadTx
-// is closed.
-//
-// Callers MUST gate id by the snapshot's meta.HighWaterMark —
-// accessing past HighWaterMark SIGBUSes (mmap-strategy.md §Sparse
-// Reservation). The chunk-4 cursor/B+tree layer enforces this by
-// only visiting page IDs reachable from the snapshot's
-// KeyspaceRoot.
-//
-// Returns ErrTxClosed after Commit/Rollback; ErrClosed if the DB
-// has been Closed (defense-in-depth use-after-Close guard).
-func (rtx *ReadTx) Page(id uint64) ([]byte, error) {
-	if rtx.closed {
-		return nil, ErrTxClosed
-	}
-	if rtx.db.closeGate.IsClosed() {
-		return nil, ErrClosed
-	}
-	return rtx.pgr.Page(id)
-}
-
-// Meta returns a copy of the snapshot meta. Useful for tests +
-// chunk-11 Stats. The returned value is independent of any
-// subsequent commit.
-func (rtx *ReadTx) Meta() page.Meta { return rtx.meta }
-
 // Commit releases the reader slot and closes the snapshot. For
 // read transactions Commit and Rollback are functionally identical
 // — both names are accepted to mirror the write-tx surface.

@@ -54,7 +54,7 @@ func (db *DB) CopyTo(path string, compact bool) error {
 // rebuild the bitmap + meta. uuid is the copy's database identity (fresh
 // for the public CopyTo; the source's for Compact's in-place rebuild).
 func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
-	meta := rtx.Meta()
+	meta := rtx.meta
 	cfg := page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)}
 	hwm := meta.HighWaterMark
 	firstData := uint64(2) + uint64(meta.BitmapPages)
@@ -246,7 +246,7 @@ func (w *freshFileWriter) WriteDirect(id uint64, buf []byte) error {
 // keyspace-descriptor tree is built with the rewritten roots. The result
 // is a defragmented, minimally-sized copy with an all-allocated bitmap.
 func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
-	meta := rtx.Meta()
+	meta := rtx.meta
 	baseCfg := rtx.pgr.Config()
 	hwm := meta.HighWaterMark
 	firstData := uint64(2) + uint64(meta.BitmapPages)

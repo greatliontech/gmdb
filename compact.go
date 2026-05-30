@@ -107,7 +107,7 @@ func (db *DB) Compact() error {
 	if err != nil {
 		return err
 	}
-	srcUUID := rtx.Meta().UUID
+	srcUUID := rtx.meta.UUID
 	cerr := copyCompact(rtx, tmpPath, srcUUID)
 	_ = rtx.Rollback()
 	if cerr != nil {

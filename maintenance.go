@@ -139,7 +139,7 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 		return // closing / cancelled / poisoned — skip silently
 	}
 	defer rtx.Rollback()
-	meta := rtx.Meta()
+	meta := rtx.meta
 	if !meta.HasFlag(page.MetaFlagPageChecksum) {
 		return // checksums disabled — no footers to verify
 	}
@@ -218,7 +218,7 @@ func (db *DB) maintReclaimLeaks(ctx context.Context) {
 	if err != nil {
 		return // closing / cancelled — skip silently
 	}
-	meta := rtx.Meta()
+	meta := rtx.meta
 	c := &checker{
 		pgr:    rtx.pgr,
 		cfg:    page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)},

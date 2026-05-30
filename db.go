@@ -485,14 +485,6 @@ func (db *DB) Close() error {
 	return nil
 }
 
-// Meta returns a snapshot of the currently-active meta. Useful for
-// tests; the user-facing Stats API arrives in chunk 11.
-func (db *DB) Meta() page.Meta {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.currentMeta
-}
-
 // Begin starts a write transaction. The call blocks until the
 // cross-process write lock can be acquired (cross-process.md §Write
 // Lock), ctx is cancelled, or the DB is closed.
