@@ -36,9 +36,10 @@ insert-delete loop. The two keyspace kinds supply only the projection
 from their mutation to `(prior, next)` index entries. Collapses the
 duplicated probe/insert loop and the two `perIndex` redeclarations.
 
-Composes with `keyspace-setkeyspace-shared-core.md` but is a distinct
-change set — that issue is about the keyspace *struct* infrastructure;
-this is about the index-maintenance *algorithm* living in two places.
+Composes with the keyspaceCore embed (`keyspace_core.go`) but is a
+distinct change set — that work deduplicated the keyspace *struct*
+infrastructure and the shared guard / cursor helpers; this is about the
+index-maintenance *algorithm* living in two places.
 
 ## Notes
 
