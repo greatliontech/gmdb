@@ -397,14 +397,8 @@ func (tx *Tx) cacheOpenSetKeyspace(handle uniqueNameHandle, desc page.KeyspaceDe
 // Errors: ErrKeyEmpty (nil/empty key), ErrKeyspaceClosed (handle
 // invalidated), ErrCorrupted (wrapped) on structural fault.
 func (ks *SetKeyspace) Has(key []byte) (bool, error) {
-	if err := ks.tx.requireOpen(false); err != nil {
+	if err := ks.checkReadable(key); err != nil {
 		return false, err
-	}
-	if ks.dead {
-		return false, ErrKeyspaceClosed
-	}
-	if len(key) == 0 {
-		return false, ErrKeyEmpty
 	}
 	if ks.desc.Root == 0 {
 		return false, nil
@@ -425,14 +419,8 @@ func (ks *SetKeyspace) Has(key []byte) (bool, error) {
 // set-keyspace.md which allows zero-length values),
 // ErrKeyspaceClosed, ErrCorrupted (wrapped).
 func (ks *SetKeyspace) HasValue(key, value []byte) (bool, error) {
-	if err := ks.tx.requireOpen(false); err != nil {
+	if err := ks.checkReadable(key); err != nil {
 		return false, err
-	}
-	if ks.dead {
-		return false, ErrKeyspaceClosed
-	}
-	if len(key) == 0 {
-		return false, ErrKeyEmpty
 	}
 	if ks.desc.Root == 0 {
 		return false, nil
@@ -479,14 +467,8 @@ func (ks *SetKeyspace) cellHasValue(cfg page.Config, e page.LeafEntry, value []b
 //
 // Errors: ErrKeyEmpty, ErrKeyspaceClosed, ErrCorrupted (wrapped).
 func (ks *SetKeyspace) CountValues(key []byte) (uint64, error) {
-	if err := ks.tx.requireOpen(false); err != nil {
+	if err := ks.checkReadable(key); err != nil {
 		return 0, err
-	}
-	if ks.dead {
-		return 0, ErrKeyspaceClosed
-	}
-	if len(key) == 0 {
-		return 0, ErrKeyEmpty
 	}
 	if ks.desc.Root == 0 {
 		return 0, nil
@@ -537,17 +519,8 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error) {
 //   - desc.Count increments by 1 iff added=true.
 //   - State transitions to Dirty (unless already Created).
 func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
-	if err := ks.tx.requireOpen(true); err != nil {
+	if err := ks.checkWritable(key); err != nil {
 		return false, err
-	}
-	if ks.dead {
-		return false, ErrKeyspaceClosed
-	}
-	if ks.readOnly {
-		return false, ErrReadOnly
-	}
-	if len(key) == 0 {
-		return false, ErrKeyEmpty
 	}
 	fvs := ks.desc.FixedValueSize
 	if fvs != 0 && len(value) != int(fvs) {
@@ -775,17 +748,8 @@ func (ks *SetKeyspace) putIntoNestedTree(cfg page.Config, key, value []byte, e p
 // Errors: ErrKeyEmpty, ErrKeyspaceClosed, ErrNotFound (Delete-on-
 // miss), ErrCorrupted, pager allocation errors.
 func (ks *SetKeyspace) Delete(key []byte) (err error) {
-	if err := ks.tx.requireOpen(true); err != nil {
+	if err := ks.checkWritable(key); err != nil {
 		return err
-	}
-	if ks.dead {
-		return ErrKeyspaceClosed
-	}
-	if ks.readOnly {
-		return ErrReadOnly
-	}
-	if len(key) == 0 {
-		return ErrKeyEmpty
 	}
 	if ks.desc.Root == 0 {
 		return ErrNotFound
@@ -893,17 +857,8 @@ func (ks *SetKeyspace) Delete(key []byte) (err error) {
 // (fixed-size keyspace wrong-length value), ErrNotFound (Delete-on-
 // miss), ErrCorrupted, pager allocation errors.
 func (ks *SetKeyspace) DeleteValue(key, value []byte) (err error) {
-	if err := ks.tx.requireOpen(true); err != nil {
+	if err := ks.checkWritable(key); err != nil {
 		return err
-	}
-	if ks.dead {
-		return ErrKeyspaceClosed
-	}
-	if ks.readOnly {
-		return ErrReadOnly
-	}
-	if len(key) == 0 {
-		return ErrKeyEmpty
 	}
 	fvs := ks.desc.FixedValueSize
 	if fvs != 0 && len(value) != int(fvs) {
@@ -1157,14 +1112,8 @@ func setKeyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry)
 //   - state transitions to Dirty unless already Created.
 //   - Every open SetCursor on this keyspace is MarkStale'd.
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
-	if err := ks.tx.requireOpen(true); err != nil {
+	if err := ks.requireWritable(); err != nil {
 		return 0, err
-	}
-	if ks.dead {
-		return 0, ErrKeyspaceClosed
-	}
-	if ks.readOnly {
-		return 0, ErrReadOnly
 	}
 	if start != nil && len(start) == 0 {
 		return 0, ErrKeyEmpty
@@ -1178,45 +1127,19 @@ func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 	if start != nil && end != nil && bytes.Compare(start, end) >= 0 {
 		return 0, nil
 	}
-	cfg := ks.builderCfg()
-
 	if len(ks.indexes) > 0 {
 		// Indexed path: per-key Delete loop preserves chunk-7.9's
 		// applyIndexMaintenanceOnBulkKeyDelete per-row contract +
 		// chunk-6.8 per-row-atomic partial-progress semantic.
+		cfg := ks.builderCfg()
 		return ks.deleteRangePerKey(cfg, start, end)
 	}
 
-	// Un-indexed path: walker (atomic). One descent retires
-	// interior subtrees + rebuilds boundary leaves. setKeyspaceCellFree
-	// at boundary handles subpage / nested-tree / overflow cells +
-	// tallies values; FreeSubtree at interior does the same via its
-	// recursive freeSubtreeAt. Total count is values-correct across
-	// both phases (set-keyspace.md Inv-2 entailed + Inv entailed E2).
-	mergeThreshold := ks.tx.db.opts.MergeThreshold
-	count, newRoot, err := btree.DeleteRange(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, start, end, setKeyspaceCellFree)
-	if err != nil {
-		return 0, mapBtreeErr(err)
-	}
-	if count == 0 {
-		// No-op (no entry in range, or empty subtree) — no
-		// descriptor or cursor invalidation, no state transition.
-		return 0, nil
-	}
-	// Defense-in-depth: a count > desc.Count return from
-	// btree.DeleteRange would indicate corruption (the parent-tree
-	// cell-count accounting diverged from desc.Count). Surface as
-	// ErrCorrupted rather than wrapping desc.Count under uint64
-	// arithmetic. Mirrors Keyspace.DeleteRange's defense-in-depth.
-	if count > ks.desc.Count {
-		return 0, fmt.Errorf("%w: SetKeyspace DeleteRange count=%d exceeds desc.Count=%d for keyspace %q",
-			ErrCorrupted, count, ks.desc.Count, ks.name.Value())
-	}
-	ks.desc.Root = newRoot
-	ks.desc.Count -= count
-	ks.markDirty()
-	ks.markSetCursorsStale()
-	return count, nil
+	// Un-indexed path: atomic walker. setKeyspaceCellFree handles
+	// subpage / nested-tree / overflow cells and tallies values, so the
+	// returned count is values-correct (set-keyspace.md Inv-2 entailed
+	// E2); desc.Count is kept in the same value unit.
+	return ks.deleteRangeUnindexed(start, end, setKeyspaceCellFree, ks.markSetCursorsStale)
 }
 
 // deleteRangePerKey is the indexed-SetKeyspace path for DeleteRange.

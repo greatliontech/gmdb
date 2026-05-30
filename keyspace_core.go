@@ -1,6 +1,11 @@
 package gmdb
 
-import "github.com/thegrumpylion/gmdb/internal/page"
+import (
+	"fmt"
+
+	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/page"
+)
 
 // keyspaceCore is the state and behavior shared by *Keyspace and
 // *SetKeyspace. Both embed it. The only per-kind difference is the
@@ -77,6 +82,107 @@ func (ks *keyspaceCore) builderCfg() page.Config {
 		cfg.RestartGroupTarget = ks.desc.RestartGroupTarget
 	}
 	return cfg
+}
+
+// newRootCursor builds a *btree.Cursor positioned at the keyspace's
+// current root: a writable cursor (carrying the engine merge threshold)
+// on a write transaction, else a read cursor. The per-kind Cursor /
+// SetCursor wrappers attach their own state — and their own
+// openCursors / openSetCursors registration — around the returned
+// cursor.
+func (ks *keyspaceCore) newRootCursor() *btree.Cursor {
+	cfg := ks.builderCfg()
+	if ks.tx.writable {
+		return btree.NewCursor(ks.tx.pgr, cfg, ks.desc.Root, ks.tx.db.opts.MergeThreshold)
+	}
+	return btree.NewReadCursor(ks.tx.pgr, cfg, ks.desc.Root)
+}
+
+// requireWritable verifies the handle is open on a live, writable
+// keyspace: an open non-closed tx, not DeleteKeyspace'd, and not opened
+// read-only. It is the state guard shared by every mutator. Key-taking
+// mutators add the non-empty-key check via checkWritable; key-less and
+// range mutators (BulkLoad, DeleteRange — which permits nil bounds)
+// call this directly and do their own bound/state checks. Returns
+// ErrKeyspaceClosed / ErrReadOnly (or the tx-closed error) on failure.
+func (ks *keyspaceCore) requireWritable() error {
+	if err := ks.tx.requireOpen(true); err != nil {
+		return err
+	}
+	if ks.dead {
+		return ErrKeyspaceClosed
+	}
+	if ks.readOnly {
+		return ErrReadOnly
+	}
+	return nil
+}
+
+// checkWritable is requireWritable plus the non-empty-key check that
+// every key-taking mutator (Keyspace.Put / Delete, SetKeyspace.Put /
+// Delete / DeleteValue) runs before touching the tree. Returns
+// ErrKeyEmpty for a nil/empty key.
+func (ks *keyspaceCore) checkWritable(key []byte) error {
+	if err := ks.requireWritable(); err != nil {
+		return err
+	}
+	if len(key) == 0 {
+		return ErrKeyEmpty
+	}
+	return nil
+}
+
+// checkReadable is the guard every key-taking reader (Keyspace.Get,
+// SetKeyspace.Has / HasValue / CountValues) runs: the handle must be
+// open and live and key non-empty. Unlike checkWritable it permits a
+// read-only handle and does not require a write tx.
+func (ks *keyspaceCore) checkReadable(key []byte) error {
+	if err := ks.tx.requireOpen(false); err != nil {
+		return err
+	}
+	if ks.dead {
+		return ErrKeyspaceClosed
+	}
+	if len(key) == 0 {
+		return ErrKeyEmpty
+	}
+	return nil
+}
+
+// deleteRangeUnindexed runs the atomic three-phase btree.DeleteRange
+// walker over [start, end) on an un-indexed keyspace, then updates
+// desc.Root / desc.Count and broadcasts cursor invalidation via
+// markStale. Shared by the un-indexed paths of Keyspace.DeleteRange and
+// SetKeyspace.DeleteRange; the only per-kind inputs are cellFree (the
+// per-cell release callback — single-value for a Keyspace; subpage /
+// nested-tree / overflow plus value-tally for a SetKeyspace) and the
+// cursor-stale broadcast (markCursorsStale / markSetCursorsStale).
+//
+// The returned count and desc.Count are kept in the same unit per kind
+// (entries for a Keyspace, values for a SetKeyspace — cellFree tallies
+// values), so the desc.Count subtraction is consistent for both. A
+// count exceeding desc.Count is impossible absent corruption and is
+// surfaced as ErrCorrupted rather than underflowing.
+func (ks *keyspaceCore) deleteRangeUnindexed(start, end []byte, cellFree btree.PerCellFreeFn, markStale func()) (uint64, error) {
+	cfg := ks.builderCfg()
+	mergeThreshold := ks.tx.db.opts.MergeThreshold
+	count, newRoot, err := btree.DeleteRange(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, start, end, cellFree)
+	if err != nil {
+		return 0, mapBtreeErr(err)
+	}
+	if count == 0 {
+		// No-op — no descriptor or cursor invalidation, no transition.
+		return 0, nil
+	}
+	if count > ks.desc.Count {
+		return 0, fmt.Errorf("%w: DeleteRange count=%d exceeds desc.Count=%d for keyspace %q",
+			ErrCorrupted, count, ks.desc.Count, ks.name.Value())
+	}
+	ks.desc.Root = newRoot
+	ks.desc.Count -= count
+	ks.markDirty()
+	markStale()
+	return count, nil
 }
 
 // markDirty transitions the handle's state to Dirty unless it is

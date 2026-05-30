@@ -519,14 +519,8 @@ func checkKeyspaceKind(stored, requested uint8) error {
 // ErrKeyspaceClosed if this handle was invalidated by a same-tx
 // DeleteKeyspace.
 func (ks *Keyspace) Get(key []byte) ([]byte, error) {
-	if err := ks.tx.requireOpen(false); err != nil {
+	if err := ks.checkReadable(key); err != nil {
 		return nil, err
-	}
-	if ks.dead {
-		return nil, ErrKeyspaceClosed
-	}
-	if len(key) == 0 {
-		return nil, ErrKeyEmpty
 	}
 	if ks.desc.Root == 0 {
 		return nil, ErrNotFound
@@ -558,17 +552,8 @@ func (ks *Keyspace) Get(key []byte) ([]byte, error) {
 //     which stays Created — both will write at flush).
 //   - Every open Cursor on this keyspace is MarkStale'd.
 func (ks *Keyspace) Put(key, value []byte) error {
-	if err := ks.tx.requireOpen(true); err != nil {
+	if err := ks.checkWritable(key); err != nil {
 		return err
-	}
-	if ks.dead {
-		return ErrKeyspaceClosed
-	}
-	if ks.readOnly {
-		return ErrReadOnly
-	}
-	if len(key) == 0 {
-		return ErrKeyEmpty
 	}
 	cfg := ks.builderCfg()
 	if value == nil {
@@ -684,17 +669,8 @@ func (ks *Keyspace) Put(key, value []byte) error {
 //   - state transitions to Dirty unless already Created.
 //   - Every open Cursor on this keyspace is MarkStale'd.
 func (ks *Keyspace) Delete(key []byte) error {
-	if err := ks.tx.requireOpen(true); err != nil {
+	if err := ks.checkWritable(key); err != nil {
 		return err
-	}
-	if ks.dead {
-		return ErrKeyspaceClosed
-	}
-	if ks.readOnly {
-		return ErrReadOnly
-	}
-	if len(key) == 0 {
-		return ErrKeyEmpty
 	}
 	if ks.desc.Root == 0 {
 		return ErrNotFound
@@ -811,14 +787,8 @@ func keyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry) (u
 }
 
 func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
-	if err := ks.tx.requireOpen(true); err != nil {
+	if err := ks.requireWritable(); err != nil {
 		return 0, err
-	}
-	if ks.dead {
-		return 0, ErrKeyspaceClosed
-	}
-	if ks.readOnly {
-		return 0, ErrReadOnly
 	}
 	// Reject empty-but-non-nil bounds per the chunk-5.1 user-locked
 	// empty-key policy + the chunk-5.7 spec-amend on DeleteRange
@@ -844,29 +814,7 @@ func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 	if len(ks.indexes) > 0 {
 		return ks.deleteRangeIndexed(start, end)
 	}
-	cfg := ks.builderCfg()
-	mergeThreshold := ks.tx.db.opts.MergeThreshold
-	count, newRoot, err := btree.DeleteRange(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, start, end, keyspaceCellFree)
-	if err != nil {
-		return 0, mapBtreeErr(err)
-	}
-	if count == 0 {
-		// No-op — no Cursor invalidation, no state transition.
-		return 0, nil
-	}
-	// Defense-in-depth: a count > desc.Count return from btree.DeleteRange
-	// would indicate corruption (a divergence between the in-memory
-	// Count and the on-disk leaf-entry count). Surface as ErrCorrupted
-	// rather than wrapping desc.Count under uint64 arithmetic.
-	if count > ks.desc.Count {
-		return 0, fmt.Errorf("%w: DeleteRange count=%d exceeds desc.Count=%d for keyspace %q",
-			ErrCorrupted, count, ks.desc.Count, ks.name.Value())
-	}
-	ks.desc.Root = newRoot
-	ks.desc.Count -= count
-	ks.markDirty()
-	ks.markCursorsStale()
-	return count, nil
+	return ks.deleteRangeUnindexed(start, end, keyspaceCellFree, ks.markCursorsStale)
 }
 
 // deleteRangeIndexed is the chunk-7.10 indexed-keyspace fallback
@@ -925,14 +873,7 @@ func (ks *Keyspace) deleteRangeIndexed(start, end []byte) (uint64, error) {
 // cursor doesn't receive markStale from sibling mutations — fine
 // when the cursor itself is the only mutator during its lifetime.
 func newInternalCursor(ks *Keyspace) *Cursor {
-	cfg := ks.builderCfg()
-	var inner *btree.Cursor
-	if ks.tx.writable {
-		inner = btree.NewCursor(ks.tx.pgr, cfg, ks.desc.Root, ks.tx.db.opts.MergeThreshold)
-	} else {
-		inner = btree.NewReadCursor(ks.tx.pgr, cfg, ks.desc.Root)
-	}
-	return &Cursor{inner: inner, tx: ks.tx, ks: ks}
+	return &Cursor{inner: ks.newRootCursor(), tx: ks.tx, ks: ks}
 }
 
 // Cursor returns a new cursor for iterating over this keyspace's
@@ -952,14 +893,7 @@ func newInternalCursor(ks *Keyspace) *Cursor {
 // ErrCursorStale. The caller re-positions via First / Last / Seek /
 // SeekGE and continues.
 func (ks *Keyspace) Cursor() *Cursor {
-	cfg := ks.builderCfg()
-	var inner *btree.Cursor
-	if ks.tx.writable {
-		inner = btree.NewCursor(ks.tx.pgr, cfg, ks.desc.Root, ks.tx.db.opts.MergeThreshold)
-	} else {
-		inner = btree.NewReadCursor(ks.tx.pgr, cfg, ks.desc.Root)
-	}
-	c := &Cursor{inner: inner, tx: ks.tx, ks: ks}
+	c := &Cursor{inner: ks.newRootCursor(), tx: ks.tx, ks: ks}
 	ks.openCursors = append(ks.openCursors, c)
 	return c
 }

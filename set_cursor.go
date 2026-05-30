@@ -113,32 +113,18 @@ type SetCursor struct {
 // mutations — fine when no concurrent ops fire during the
 // internal loop.
 func newInternalSetCursor(ks *SetKeyspace) *SetCursor {
-	cfg := ks.builderCfg()
-	var outer *btree.Cursor
-	if ks.tx.writable {
-		outer = btree.NewCursor(ks.tx.pgr, cfg, ks.desc.Root, ks.tx.db.opts.MergeThreshold)
-	} else {
-		outer = btree.NewReadCursor(ks.tx.pgr, cfg, ks.desc.Root)
-	}
 	return &SetCursor{
 		ks:          ks,
 		tx:          ks.tx,
-		outerCursor: outer,
+		outerCursor: ks.newRootCursor(),
 	}
 }
 
 func (ks *SetKeyspace) Cursor() *SetCursor {
-	cfg := ks.builderCfg()
-	var outer *btree.Cursor
-	if ks.tx.writable {
-		outer = btree.NewCursor(ks.tx.pgr, cfg, ks.desc.Root, ks.tx.db.opts.MergeThreshold)
-	} else {
-		outer = btree.NewReadCursor(ks.tx.pgr, cfg, ks.desc.Root)
-	}
 	c := &SetCursor{
 		ks:          ks,
 		tx:          ks.tx,
-		outerCursor: outer,
+		outerCursor: ks.newRootCursor(),
 	}
 	// Only register cursors on live handles. A dead keyspace's
 	// cursors are rejected by requireOpen anyway (closeErr →

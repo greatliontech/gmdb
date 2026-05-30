@@ -388,14 +388,8 @@ func writeBulkOverflowChain(pw bulkOverflowWriter, cfg page.Config, value []byte
 // ErrIndexUniqueViolation (duplicate key in a unique index), a wrapped I/O
 // error on a sort-spill failure, and the btree key-size / I/O errors.
 func (ks *Keyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
-	if err := ks.tx.requireOpen(true); err != nil {
+	if err := ks.requireWritable(); err != nil {
 		return 0, err
-	}
-	if ks.dead {
-		return 0, ErrKeyspaceClosed
-	}
-	if ks.readOnly {
-		return 0, ErrReadOnly
 	}
 	if ks.desc.Count != 0 {
 		return 0, ErrBulkLoadNonEmpty
@@ -496,14 +490,8 @@ func (ks *Keyspace) bulkLoadRows(rows iter.Seq2[[]byte, []byte], cfg page.Config
 // (duplicate key in a unique index), a wrapped I/O error on a sort-spill
 // failure, and btree/I-O errors.
 func (ks *SetKeyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
-	if err := ks.tx.requireOpen(true); err != nil {
+	if err := ks.requireWritable(); err != nil {
 		return 0, err
-	}
-	if ks.dead {
-		return 0, ErrKeyspaceClosed
-	}
-	if ks.readOnly {
-		return 0, ErrReadOnly
 	}
 	if ks.desc.Count != 0 {
 		return 0, ErrBulkLoadNonEmpty
