@@ -17,11 +17,11 @@ tasks:
       - coverage.html
 
   fuzz:
-    desc: Run fuzz tests (default 30s, override with FUZZTIME)
+    desc: Run each fuzz target for FUZZTIME (default 30s). Go fuzzes one target per run, so iterate.
     vars:
       FUZZTIME: '{{.FUZZTIME | default "30s"}}'
     cmds:
-      - go test -race -fuzz=. -fuzztime={{.FUZZTIME}} ./internal/page/
+      - for t in $(go test -list='^Fuzz' ./internal/page/ | grep '^Fuzz'); do echo "=== fuzz $t ==="; go test -race -run='^$' -fuzz="^$t$" -fuzztime={{.FUZZTIME}} ./internal/page/ || exit 1; done
 
   bench:
     desc: Run benchmarks (override BENCH=pattern, BENCHTIME=200ms)

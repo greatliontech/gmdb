@@ -268,6 +268,26 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		return nr, false, nil
 	}
 
+	// Mid-page insert fast path: when the key sorts strictly inside the leaf
+	// (not an append, not a replace), splice it into its containing group in
+	// place (page-formats.md §Insert and Delete) instead of decoding the whole
+	// leaf. TryInsertAt leaves leftBuf byte-unchanged on decline (group at its
+	// growth cap, page-full, or variant mismatch), so we fall through to the
+	// slow path. A pure insert displaces nothing — no old chain to free,
+	// existed is false.
+	if !searchFound && searchIdx < leafCount && page.TryInsertAt(leftBuf, cfg, searchIdx, newEntry) {
+		if e := pw.FreePage(leafID); e != nil {
+			_ = pw.FreePage(leftID)
+			rollbackNewChain()
+			return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, e)
+		}
+		nr, e := ascendNoSplit(pw, cfg, path, leftID)
+		if e != nil {
+			return 0, false, e
+		}
+		return nr, false, nil
+	}
+
 	// Slow path: decode the leaf, insert/replace, re-build into the CoW
 	// destination (or split into two). The original was validated above and
 	// the CoW'd copy is byte-identical, so the decode skips re-validation.

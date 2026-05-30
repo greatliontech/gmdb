@@ -3,8 +3,62 @@ package gmdb
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"testing"
 )
+
+// BenchmarkPutRandom measures a Put with RANDOM, prefix-sharing keys into a
+// growing keyspace — keys land at interior positions of compressed leaves,
+// exercising the mid-page insert splice (page.TryInsertAt) and its
+// decode/re-encode fallback. (Contrast BenchmarkPutSteadyState, whose ascending
+// keys are all appends → TryAppend.) Keys share the "k" prefix + leading zero
+// padding so the compressed variant groups them, then diverge in the low digits
+// so inserts spread across groups. Run with a bounded -benchtime (see
+// BenchmarkPutSteadyState — the keyspace grows without bound).
+func BenchmarkPutRandom(b *testing.B) {
+	for _, sz := range []int{200} {
+		b.Run(fmt.Sprintf("val=%d", sz), func(b *testing.B) {
+			db, _ := benchDB(b)
+			defer db.Close()
+			ctx := context.Background()
+			val := make([]byte, sz)
+			rng := rand.New(rand.NewPCG(0x9e3779b97f4a7c15, 0xC0FFEE))
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				b.Fatalf("Begin: %v", err)
+			}
+			ks, err := tx.CreateKeyspace("k")
+			if err != nil {
+				b.Fatalf("CreateKeyspace: %v", err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if i > 0 && i%2000 == 0 {
+					b.StopTimer()
+					if err := tx.Commit(); err != nil {
+						b.Fatalf("Commit: %v", err)
+					}
+					tx, err = db.Begin(ctx)
+					if err != nil {
+						b.Fatalf("Begin: %v", err)
+					}
+					ks, err = tx.OpenKeyspace("k")
+					if err != nil {
+						b.Fatalf("OpenKeyspace: %v", err)
+					}
+					b.StartTimer()
+				}
+				key := fmt.Appendf(nil, "k%015d", rng.Uint64()%1_000_000_000_000_000)
+				if err := ks.Put(key, val); err != nil {
+					b.Fatalf("Put #%d: %v", i, err)
+				}
+			}
+			b.StopTimer()
+			_ = tx.Commit()
+		})
+	}
+}
 
 // BenchmarkPutSteadyState measures the cost of a single-value Put into a
 // growing keyspace. Keys ascend, so every Put appends to the rightmost leaf:

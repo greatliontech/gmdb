@@ -2,9 +2,9 @@
 
 **Lands:** proactive — a specced-but-unbuilt performance optimization;
 multi-session feature, port from grove. The format decision is **settled**
-(keep gmdb's format — see DECISION 1, RESOLVED). Chunk 1 (`TryAppend`,
-compressed) is **landed** — see Progress below; resume by porting
-`TryInsertAt` next.
+(keep gmdb's format — see DECISION 1, RESOLVED). Chunks 1-2 (`TryAppend`,
+`TryInsertAt`, compressed) are **landed** — see Progress below; resume by
+porting `TryDeleteAt` next.
 
 **Severity:** [perf] — not a correctness defect; a measured throughput +
 allocation optimization. The current decode/re-encode path is correct.
@@ -45,9 +45,41 @@ splice design. Justified by a CPU profile (below).
     existing leaves keep their structure; Check() validates structurally rather
     than re-encoding leaves, so nothing relies on fresh-rebuild reproducibility
     across an RGT change. Documented in `leaf_splice.go`'s header.
-- **Resume: port `TryInsertAt` next** — mid-group insert (grove
-  `tryInsertAtCompressed:595`, I-B/I-C/I-D cases). Same fast-path + fallback +
-  determinism-test + fuzz discipline; reuse the shared entry-writers.
+- **Chunk 2 — `TryInsertAt` (compressed): LANDED.**
+  `internal/page/leaf_splice.go` (`TryInsertAt` + `tryInsertAtCompressed` +
+  `entryTrailer`); wired as the mid-page insert fast path in `putReportCore`
+  (`!searchFound && searchIdx < leafCount`). Semantic/structural fuzz
+  (`FuzzTryInsertAtCompressed`, mixed cell kinds) + I-B/I-C/I-D + cap/full/
+  variant invariant tests + `BenchmarkTryInsertAtCompressed`. End-to-end
+  `BenchmarkPutRandom` (random prefix-sharing keys → interior inserts): ~41%
+  faster (8056→4759 ns/op), 4× fewer B/op (9877→2497), ~2× fewer allocs/op
+  (46→22). `task fuzz` now iterates each `Fuzz*` target (Go fuzzes one per run).
+  - **DESIGN — localized (non-canonical), data-driven.** A canonical "insert
+    == LeafBuilder rebuild" splice was rejected by measurement: the builder
+    fills groups to `target` with no balancing, so after any build every group
+    is full and a canonical insert would decline ~100% of the time (measured
+    ~0% fast-path vs ~100% for the localized design). So `TryInsertAt` grows the
+    containing group in place up to `min(2*target, 255)` and re-encodes only the
+    displaced successor — a valid compressed leaf a fresh rebuild would group
+    differently. Sanctioned by page-formats.md §Insert ("may shift the
+    containing group's boundaries"; Count ∈ [1,255]); the determinism invariant
+    governs builder output, and `Check()` validates structurally. Its guarantee
+    is **semantic + structural** (decode == expected sequence; `Validate`;
+    free-space zeroed), not byte-identity — so the test oracle is NOT the full
+    rebuild used for `TryAppend`.
+  - **Two gmdb-specific divergences from grove (verified against grove's
+    source):** (1) cap `min(2*target, 255)` — gmdb's `MaxRestartGroupTarget` is
+    255 so `2*target` can reach 510; grove's bare `2*restartTarget` would let a
+    group exceed the uint8 `Count` and corrupt it. (2) ONE contiguous
+    `[succEnd, dataEnd)` shift instead of grove's two copies — simpler and fixes
+    a latent grove bug where, for a net-shrink insert (`byteDelta < 0`) with
+    trailing in-group entries, grove's first copy clobbers the second copy's
+    source.
+- **Resume: port `TryDeleteAt` next** — grove `tryDeleteAtCompressed:851`,
+  D-A/D-B/D-C/D-D cases (D-A `gc==1` removes the whole group → restart-table
+  shrinks). Delete always shrinks (`byteDelta < 0`), so reuse the
+  shrink-and-re-zero path; same semantic/structural oracle as `TryInsertAt`
+  (delete is also localized). Port `TestTryDeleteAtAlwaysShrinks`.
 
 ## Why (measured)
 

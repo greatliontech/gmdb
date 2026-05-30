@@ -1,5 +1,7 @@
 package page
 
+import "bytes"
+
 // In-place leaf splice helpers — the no-decode fast path for leaf
 // insert / delete / split (page-formats.md §Insert and Delete). Each helper
 // mutates a CoW'd page buffer directly when the resulting layout fits,
@@ -11,39 +13,43 @@ package page
 // and the caller falls back to the decode/re-encode path. Correctness never
 // depends on the splice.
 //
-// **Determinism (load-bearing).** A successful splice produces bytes
-// IDENTICAL to a LeafBuilder rebuild of the same logical entries under the
-// config the page was built with — the page-formats.md §Leaf Split
-// deterministic-encoding invariant (which is itself stated per fixed
-// RestartGroupTarget). In the common case the keyspace's RGT is unchanged
-// since the page was built, so this is byte-identity to a rebuild under the
-// current cfg; that is what lets Check() repair and recovery re-encode a
-// spliced page and get the same bytes the original writer produced.
+// **Determinism / correctness of a successful splice** — what it guarantees
+// differs by op:
 //
-// The one wrinkle is a mid-life RestartGroupTarget change (Tx.SetKeyspaceConfig):
-//   - Across the compressed↔uncompressed boundary (RGT 1 ↔ ≥2): TryAppend
-//     declines, so the leaf migrates via the rebuild fallback (see TryAppend).
-//   - Within the compressed range (e.g. 16→8): the splice keeps the page's
-//     existing group structure and encodes the new entry per the new target.
-//     Per keyspaces.md, existing leaves keep their stored structure and the
-//     RGT is only a builder hint for entries written after the change, so a
-//     mix is expected during a transition. Such a page is valid and
-//     read-correct but is not byte-reproduced by a fresh full rebuild under
-//     either RGT until the leaf is next split / merged / rebuilt. Nothing
-//     relies on fresh-rebuild reproducibility across an RGT change (Check()
-//     validates structurally rather than re-encoding leaves).
+//   - TryAppend yields bytes IDENTICAL to a LeafBuilder rebuild of the same
+//     entries under the config the page was built with: an append matches the
+//     builder's own last-entry behavior, so the page stays a builder
+//     fixed-point. This is the page-formats.md §Leaf Split deterministic-
+//     encoding invariant (stated per fixed RestartGroupTarget). The one wrinkle
+//     is a mid-life RGT change (Tx.SetKeyspaceConfig): a compressed↔uncompressed
+//     boundary (RGT 1↔≥2) makes TryAppend decline so the leaf migrates via
+//     rebuild; a within-compressed change leaves an append non-fixed-point
+//     until the leaf is next rebuilt — both spec-allowed (keyspaces.md:
+//     existing leaves keep their structure; RGT is a builder hint).
 //
-// Two mechanisms the helpers rely on for the byte-identity that does hold:
+//   - TryInsertAt is LOCALIZED: it grows the containing group in place (up to
+//     min(2*target, 255)) and re-encodes only the displaced successor. The
+//     builder fills groups to `target` with no balancing, so an "insert ==
+//     rebuild" splice could almost never fire (every full group would decline);
+//     the splice therefore produces a valid compressed leaf that a fresh
+//     rebuild would group differently — sanctioned by §Insert and Delete (an
+//     insert "may shift the containing group's boundaries"; RGT is a hint,
+//     Count ∈ [1,255]). Its guarantee is SEMANTIC + STRUCTURAL (decodes to the
+//     correct entry sequence; passes Validate), not byte-identity.
+//
+// Either way Check() validates structurally rather than re-encoding leaves, so
+// it accepts localized / post-RGT-change pages; the determinism invariant
+// governs builder output (BulkLoad / split).
+//
+// Two mechanisms both ops rely on:
 //
 //   - Entry bytes are written via the shared writeCompressed{Restart,Delta}-
-//     Entry encoders (leaf_builder.go), so the splice and the builder never
-//     diverge on per-entry layout.
-//   - The free-space region [DataEnd, restart-table-start) of an input page
-//     is all-zero (LeafBuilder.Finish zeroes it). A splice only consumes
-//     zeroed free space and only shifts the restart table into bytes that
-//     were already zero, so the region stays zero with no explicit pass —
-//     matching the builder, which zeroes it. (Holds across repeated splices:
-//     each splice leaves a zeroed free-space region for the next.)
+//     Entry encoders (leaf_builder.go), so splice and builder never diverge on
+//     per-entry layout.
+//   - Free space [DataEnd, restart-table-start) stays zeroed: an input page has
+//     it zeroed (LeafBuilder.Finish); a splice consumes only zeroed bytes /
+//     shifts into them, and re-zeroes any tail freed by a net shrink — so the
+//     region stays zero with no full pass, across repeated splices.
 //
 // The helpers assume the page was produced by the current LeafBuilder (true
 // for every leaf in a gmdb tree — a single-encoder, pre-v1 deployment). They
@@ -184,4 +190,199 @@ func tryAppendCompressed(buf []byte, cfg Config, e LeafEntry, prevKey []byte) bo
 	le.PutUint16(buf[leafOffDataEnd:], uint16(wp))
 
 	return true
+}
+
+// TryInsertAt inserts e at absolute index insertIdx of an existing leaf in
+// place — the mid-page insert fast path. The caller MUST establish that
+// insertIdx is e.Key's sorted position and the key is absent (an append is
+// insertIdx == Count(), handled by TryAppend; a replace is a different path).
+//
+// Returns true on a successful in-place insert; false (page byte-unchanged)
+// when the page is empty, the variant doesn't match (see TryAppend), the
+// target group is at its growth cap, or the entry doesn't fit — the caller
+// then falls back to decode + re-encode.
+//
+// Unlike TryAppend this is a LOCALIZED splice: it grows the containing group
+// past RestartGroupTarget (up to min(2*target, 255)). The builder fills groups
+// to the target with no balancing, so a canonical "insert == rebuild" splice
+// could almost never fire (every full group would decline). The result is a
+// valid compressed leaf that a fresh rebuild would group differently — see the
+// file-header determinism note; its guarantee is semantic + structural, not
+// byte-identity.
+func TryInsertAt(buf []byte, cfg Config, insertIdx int, e LeafEntry) bool {
+	typ, _, count, _ := ReadHeader(buf)
+	if count == 0 {
+		return false
+	}
+	// Same variant gate as TryAppend: only splice a compressed leaf whose
+	// variant still matches the configured one; otherwise migrate via rebuild.
+	if typ != TypeLeaf || cfg.EffectiveRestartGroupTarget() == 1 {
+		return false
+	}
+	return tryInsertAtCompressed(buf, cfg, insertIdx, e)
+}
+
+// tryInsertAtCompressed inserts e at insertIdx in a compressed leaf by growing
+// the containing restart group: it writes the new entry and re-encodes only
+// the displaced successor (now a delta against the new key); every other entry
+// keeps its bytes. Returns false (page unchanged) on the growth cap or fit.
+//
+// Three insert positions within the target group (p = position in group,
+// gc = group count), via the >= group-find rule that routes a group-boundary
+// insert into the EARLIER group as p == gc:
+//   - I-B: p == 0 (only when insertIdx == 0) → new entry becomes the group's
+//     restart; the old restart E[0] is re-encoded as a delta against it.
+//   - I-C: 0 < p < gc → new entry is a delta vs E[p-1]; the successor E[p] is
+//     re-encoded as a delta vs the new key.
+//   - I-D: p == gc → new entry appended at the group's tail as a delta vs
+//     E[gc-1]; no successor to re-encode.
+func tryInsertAtCompressed(buf []byte, cfg Config, insertIdx int, e LeafEntry) bool {
+	r := NewLeafReader(buf, cfg)
+	rc := r.rt.RestartCount()
+	contentEnd := cfg.ContentEnd()
+	dataEnd := r.DataEnd()
+	restartTableOff := contentEnd - rc*restartTableEntrySize
+	target := int(cfg.EffectiveRestartGroupTarget())
+
+	// Find the group containing insertIdx. The >= rule routes an insert at a
+	// group boundary into the earlier group (p == gc, the I-D case), so p == 0
+	// (I-B) occurs only for insertIdx == 0.
+	accum, targetGroup, p, gc := 0, rc-1, 0, 0
+	for g := range rc {
+		c := r.rt.GroupEntryCount(g)
+		if accum+c >= insertIdx {
+			targetGroup, p, gc = g, insertIdx-accum, c
+			break
+		}
+		accum += c
+	}
+
+	// Group-growth cap: a group may grow to min(2*target, 255) via inserts
+	// before a decline forces the rebuild to rebalance it. 255 is the hard
+	// uint8 Count limit (page-formats.md §Compressed Leaf); 2*target is the
+	// rebalancing policy (matches grove). Beyond it, decline → rebuild.
+	maxGroup := min(2*target, 255)
+	if gc+1 > maxGroup {
+		return false
+	}
+
+	// Walk the target group from its restart, reconstructing keys, to capture
+	// newShared (E[p-1] vs new key; unused at p == 0) and the successor E[p]
+	// (its flags, full key, value/trailer, byte extent) so it can be re-encoded
+	// as a delta vs the new key. succKey / succVal are cloned because the
+	// running keyBuf is reused across delta decodes.
+	var (
+		newShared, succShared int
+		succKey, succVal       []byte
+		succFlags              uint8
+		succT0, succT1         uint64
+		spliceOff, succEnd     int
+		hasSucc                bool
+	)
+	keyBuf := make([]byte, 0, 64)
+	walkOff := r.rt.Offset(targetGroup)
+	var prevKey []byte
+	// Walk to the successor at i==p; the i<gc bound caps the walk at gc-1 in
+	// the I-D case (p==gc), where there is no successor entry to decode.
+	for i := 0; i <= p && i < gc; i++ {
+		entryStart := walkOff
+		var ent LeafEntry
+		if i == 0 {
+			ent, walkOff = r.decodeRestartEntry(walkOff)
+		} else {
+			ent, walkOff, keyBuf = r.decodeDeltaEntry(walkOff, prevKey, keyBuf)
+		}
+		if i == p-1 {
+			newShared = sharedPrefixLen(ent.Key, e.Key)
+		}
+		if i == p {
+			spliceOff, succEnd, hasSucc = entryStart, walkOff, true
+			succFlags = ent.Flags
+			succKey = bytes.Clone(ent.Key)
+			succShared = sharedPrefixLen(e.Key, ent.Key)
+			if cellHasTrailerOnly(ent.Flags) {
+				succT0, succT1 = entryTrailer(ent)
+			} else {
+				succVal = bytes.Clone(ent.Value)
+			}
+		}
+		prevKey = ent.Key
+	}
+	if p == gc {
+		// I-D: splice just past the group's last entry; no successor.
+		spliceOff, succEnd = walkOff, walkOff
+	}
+
+	// Sizes. The new entry is a restart (full key) at p == 0, else a delta vs
+	// E[p-1]; the successor (if any) becomes a delta vs the new key.
+	var newEntrySize int
+	if p == 0 {
+		newEntrySize = 1 + 2 + len(e.Key) + valuePartSize(e.Flags, e.Value)
+	} else {
+		newEntrySize = 1 + 2 + 2 + (len(e.Key) - newShared) + valuePartSize(e.Flags, e.Value)
+	}
+	newSuccSize := 0
+	if hasSucc {
+		newSuccSize = 1 + 2 + 2 + (len(succKey) - succShared) + valuePartSize(succFlags, succVal)
+	}
+	oldSuccSize := succEnd - spliceOff // 0 for I-D
+	byteDelta := newEntrySize + newSuccSize - oldSuccSize
+	newDataEnd := dataEnd + byteDelta
+	if newDataEnd+rc*restartTableEntrySize > contentEnd {
+		return false
+	}
+
+	// Shift everything after the old successor by byteDelta in ONE contiguous
+	// move: the trailing in-group entries E[p+1..] and all later groups shift by
+	// the same delta (their bytes are unchanged — E[p+1]'s predecessor E[p]'s
+	// full key is unchanged, so its delta is too). copy is memmove (handles
+	// overlap and either sign of byteDelta). Must run BEFORE the writes below,
+	// which would otherwise clobber the source tail when growing.
+	if byteDelta != 0 {
+		copy(buf[succEnd+byteDelta:newDataEnd], buf[succEnd:dataEnd])
+	}
+
+	// Write the new entry at spliceOff, then the re-encoded successor right
+	// after, via the shared entry-writers (gmdb's ValueLen-before-key order).
+	newT0, newT1 := entryTrailer(e)
+	var off int
+	if p == 0 {
+		off = writeCompressedRestartEntry(buf, spliceOff, e.Flags, e.Key, e.Value, newT0, newT1)
+	} else {
+		off = writeCompressedDeltaEntry(buf, spliceOff, e.Flags, newShared, e.Key[newShared:], e.Value, newT0, newT1)
+	}
+	if hasSucc {
+		writeCompressedDeltaEntry(buf, off, succFlags, succShared, succKey[succShared:], succVal, succT0, succT1)
+	}
+
+	// A net shrink (byteDelta < 0: the successor's re-delta saved more than the
+	// new entry cost) frees tail bytes — zero them so free space stays zeroed.
+	if newDataEnd < dataEnd {
+		clear(buf[newDataEnd:dataEnd])
+	}
+
+	// Patch the restart table: bump the target group's Count, shift every later
+	// group's Offset by byteDelta. RestartCount is unchanged (an insert grows a
+	// group, never adds one), so the table itself does not move.
+	buf[restartTableOff+targetGroup*restartTableEntrySize+2] = uint8(gc + 1)
+	for g := targetGroup + 1; g < rc; g++ {
+		off := restartTableOff + g*restartTableEntrySize
+		le.PutUint16(buf[off:], uint16(int(le.Uint16(buf[off:]))+byteDelta))
+	}
+
+	_, _, count, _ := ReadHeader(buf)
+	WriteHeader(buf, TypeLeaf, count+1, 0)
+	le.PutUint16(buf[leafOffDataEnd:], uint16(newDataEnd))
+	return true
+}
+
+// entryTrailer returns an entry's two trailer u64s for the trailer-only cell
+// forms — (OverflowPage, TotalLen) for overflow, (NestedRoot, NestedCount) for
+// nested-tree. Returns (0, 0) for inline / subpage cells (whose value is inline,
+// not a trailer); callers gate on cellHasTrailerOnly before using it.
+func entryTrailer(e LeafEntry) (uint64, uint64) {
+	if e.IsNestedTree() {
+		return e.NestedRoot, e.NestedCount
+	}
+	return e.OverflowPage, e.TotalLen
 }
