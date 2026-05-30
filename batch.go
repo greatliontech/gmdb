@@ -3,6 +3,7 @@ package gmdb
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -13,6 +14,21 @@ type batchCall struct {
 	fn     func(tx *Tx) error
 	ctx    context.Context
 	result chan error
+}
+
+// batchCoordinator holds the lazily-started Batch() coordinator's
+// lifecycle state (transactions.md §Write Batching). The goroutine is
+// started on the first DB.Batch call (ensureBatchCoordinator) and
+// stopped by Close (stopBatchCoordinator); mu guards the start/stop
+// lifecycle fields.
+type batchCoordinator struct {
+	mu      sync.Mutex
+	ch      chan batchCall     // calls from Batch → coordinator
+	done    chan struct{}      // closed when the coordinator exits
+	ctx     context.Context    // coordinator lifetime; its write tx uses it
+	cancel  context.CancelFunc // cancels ctx on Close
+	started bool               // coordinator goroutine launched
+	closed  bool               // Close ran — refuse to (re)start
 }
 
 // Batch submits fn to be batched with other concurrent callers into a
@@ -67,19 +83,19 @@ func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error {
 // context, and ok=false if Close has already run (refuse to start a
 // goroutine that would outlive Close).
 func (db *DB) ensureBatchCoordinator() (chan batchCall, context.Context, bool) {
-	db.batchMu.Lock()
-	defer db.batchMu.Unlock()
-	if db.batchClosed {
+	db.batch.mu.Lock()
+	defer db.batch.mu.Unlock()
+	if db.batch.closed {
 		return nil, nil, false
 	}
-	if !db.batchStarted {
-		db.batchCh = make(chan batchCall)
-		db.batchDone = make(chan struct{})
-		db.batchCtx, db.batchCancel = context.WithCancel(context.Background())
-		db.batchStarted = true
-		go db.batchCoordinator(db.batchCtx, db.batchCh, db.batchDone)
+	if !db.batch.started {
+		db.batch.ch = make(chan batchCall)
+		db.batch.done = make(chan struct{})
+		db.batch.ctx, db.batch.cancel = context.WithCancel(context.Background())
+		db.batch.started = true
+		go db.batchCoordinator(db.batch.ctx, db.batch.ch, db.batch.done)
 	}
-	return db.batchCh, db.batchCtx, true
+	return db.batch.ch, db.batch.ctx, true
 }
 
 // stopBatchCoordinator signals the coordinator to stop and waits for it
@@ -88,12 +104,12 @@ func (db *DB) ensureBatchCoordinator() (chan batchCall, context.Context, bool) {
 // no new batch starts afterward. Idempotent and safe if the coordinator
 // was never started.
 func (db *DB) stopBatchCoordinator() {
-	db.batchMu.Lock()
-	db.batchClosed = true
-	started := db.batchStarted
-	cancel := db.batchCancel
-	done := db.batchDone
-	db.batchMu.Unlock()
+	db.batch.mu.Lock()
+	db.batch.closed = true
+	started := db.batch.started
+	cancel := db.batch.cancel
+	done := db.batch.done
+	db.batch.mu.Unlock()
 	if !started {
 		return
 	}
@@ -101,7 +117,7 @@ func (db *DB) stopBatchCoordinator() {
 	<-done
 }
 
-// batchCoordinator is the single goroutine that drains db.batchCh,
+// batchCoordinator is the single goroutine that drains db.batch.ch,
 // groups calls into batches, and runs each batch in one write
 // transaction. It exits when ctx is cancelled (Close).
 func (db *DB) batchCoordinator(ctx context.Context, ch chan batchCall, done chan struct{}) {

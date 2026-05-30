@@ -498,21 +498,21 @@ func TestMaintenanceScrubCursorAdvancesAndWraps(t *testing.T) {
 		t.Skipf("data region too small (span=%d) to exercise multi-pass cursor", span)
 	}
 
-	if db.scrubCursor != 0 {
-		t.Fatalf("precondition: scrubCursor=%d, want 0", db.scrubCursor)
+	if db.maint.scrubCursor != 0 {
+		t.Fatalf("precondition: scrubCursor=%d, want 0", db.maint.scrubCursor)
 	}
 	db.maintScrubChecksums(ctx)
-	if db.scrubCursor != firstData+2 { // start 0 → clamp firstData → +batch
-		t.Errorf("after pass 1: scrubCursor=%d, want %d (firstData=%d, hwm=%d)", db.scrubCursor, firstData+2, firstData, hwm)
+	if db.maint.scrubCursor != firstData+2 { // start 0 → clamp firstData → +batch
+		t.Errorf("after pass 1: scrubCursor=%d, want %d (firstData=%d, hwm=%d)", db.maint.scrubCursor, firstData+2, firstData, hwm)
 	}
 
 	// Run a full region's worth of passes; the cursor must stay in range
 	// every pass and wrap at least once (decrease) — proving coverage.
-	prev := db.scrubCursor
+	prev := db.maint.scrubCursor
 	wrapped := false
 	for pass := range int(span) {
 		db.maintScrubChecksums(ctx)
-		cur := db.scrubCursor
+		cur := db.maint.scrubCursor
 		if cur < firstData || cur >= hwm {
 			t.Fatalf("pass %d: cursor %d out of [%d,%d)", pass+2, cur, firstData, hwm)
 		}
@@ -565,7 +565,7 @@ func TestMaintenanceDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if db.maintStarted {
+	if db.maint.started {
 		t.Errorf("maintenance goroutine started despite Disable")
 	}
 	if err := db.Close(); err != nil {

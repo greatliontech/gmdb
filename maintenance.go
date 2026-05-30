@@ -9,17 +9,35 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
+// maintenance holds the background-maintenance goroutine's lifecycle
+// state (background-maintenance.md). Started at Open unless
+// Options.Maintenance.Disable; stopped by Close (stopMaintenance)
+// before the Coord / pager teardown (Inv-M6). cancel aborts a pass
+// blocked in AcquireWriter so it unwinds on Close. Single start (Open)
+// + single stop (CAS-guarded Close) ⇒ no lifecycle mutex needed.
+type maintenance struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
+	started bool
+
+	// scrubCursor is the next page id the checksum scrubber verifies,
+	// wrapping at HighWaterMark (background-maintenance.md §Checksum
+	// Scrubbing). Touched only by the maintenance goroutine.
+	scrubCursor uint64
+}
+
 // stopMaintenance cancels the maintenance goroutine and waits for it to
 // exit. Called by Close before the Coord / pager teardown so an in-flight
-// pass unwinds first (maintCancel aborts a pass blocked in AcquireWriter)
+// pass unwinds first (maint.cancel aborts a pass blocked in AcquireWriter)
 // and no goroutine outlives the unmap (Inv-M6). Idempotent-safe via the
 // CAS-guarded Close; a no-op when maintenance was disabled.
 func (db *DB) stopMaintenance() {
-	if !db.maintStarted {
+	if !db.maint.started {
 		return
 	}
-	db.maintCancel()
-	<-db.maintDone
+	db.maint.cancel()
+	<-db.maint.done
 }
 
 // maintenanceLoop is the per-DB background maintenance goroutine
@@ -29,7 +47,7 @@ func (db *DB) stopMaintenance() {
 // When immediate is set (an unclean prior shutdown), the first pass runs at
 // startup instead of waiting a full interval.
 func (db *DB) maintenanceLoop(ctx context.Context, immediate bool) {
-	defer close(db.maintDone)
+	defer close(db.maint.done)
 	if immediate {
 		db.runMaintenancePass(ctx)
 	}
@@ -161,7 +179,7 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 	}
 	// Clamp the persistent cursor into [firstData, hwm): the data region's
 	// bounds can move between passes (hwm grows, BitmapPages changes).
-	cursor := db.scrubCursor
+	cursor := db.maint.scrubCursor
 	if cursor < firstData || cursor >= hwm {
 		cursor = firstData
 	}
@@ -194,7 +212,7 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 			}
 		}
 	}
-	db.scrubCursor = cursor
+	db.maint.scrubCursor = cursor
 }
 
 // maintReclaimLeaks reclaims bitmap-leaked pages — allocated in the bitmap

@@ -88,34 +88,11 @@ type DB struct {
 	// path.
 	cleanup runtime.Cleanup
 
-	// Batch coordinator state (transactions.md §Write Batching). The
-	// coordinator goroutine is started lazily on the first DB.Batch call
-	// (ensureBatchCoordinator) and stopped by Close (stopBatchCoordinator).
-	// batchMu guards the start/stop lifecycle fields. See batch.go.
-	batchMu      sync.Mutex
-	batchCh      chan batchCall     // calls from Batch → coordinator
-	batchDone    chan struct{}      // closed when the coordinator exits
-	batchCtx     context.Context    // coordinator lifetime; its write tx uses it
-	batchCancel  context.CancelFunc // cancels batchCtx on Close
-	batchStarted bool               // coordinator goroutine launched
-	batchClosed  bool               // Close ran — refuse to (re)start
-
-	// Background maintenance goroutine (background-maintenance.md).
-	// Started at Open unless Options.Maintenance.Disable; stopped by
-	// Close (stopMaintenance) BEFORE the Coord / pager teardown so the
-	// goroutine never touches a torn-down lock-file mmap or pager
-	// (Inv-M6). maintCancel cancels the goroutine's tx contexts so a
-	// pass blocked in AcquireWriter unwinds on Close. Single start (Open)
-	// + single stop (CAS-guarded Close) ⇒ no lifecycle mutex needed.
-	maintCtx     context.Context
-	maintCancel  context.CancelFunc
-	maintDone    chan struct{}
-	maintStarted bool
-
-	// scrubCursor is the next page id the checksum scrubber verifies,
-	// wrapping at HighWaterMark (Task 3 — background-maintenance.md
-	// §Checksum Scrubbing). Touched only by the maintenance goroutine.
-	scrubCursor uint64
+	// batch holds the lazily-started Batch() coordinator state; maint
+	// holds the background-maintenance goroutine state. See batch.go and
+	// maintenance.go for their lifecycles and the types' field godocs.
+	batch batchCoordinator
+	maint maintenance
 }
 
 // Open opens the database at path. If the file does not exist, it is
@@ -302,10 +279,10 @@ func Open(_ context.Context, path string, opts Options) (*DB, error) {
 	// pass immediately rather than waiting a full interval, to reclaim any
 	// crash-leaked pages promptly.
 	if !opts.Maintenance.Disable {
-		db.maintCtx, db.maintCancel = context.WithCancel(context.Background())
-		db.maintDone = make(chan struct{})
-		db.maintStarted = true
-		go db.maintenanceLoop(db.maintCtx, opened.NoCheckpoint)
+		db.maint.ctx, db.maint.cancel = context.WithCancel(context.Background())
+		db.maint.done = make(chan struct{})
+		db.maint.started = true
+		go db.maintenanceLoop(db.maint.ctx, opened.NoCheckpoint)
 	}
 	return db, nil
 }
