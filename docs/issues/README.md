@@ -20,18 +20,33 @@ into the spec / code where it belongs (kept-current artifact), all
 cites are repointed at the new home, and the issue file is deleted.
 `git log --all -- docs/issues/<file>.md` preserves the history.
 
-The entries below were filed from the **2026-05-30 architecture /
-factoring audit** (concept, package decomposition, public API surface,
-composition/duplication) plus follow-ups surfaced while burning it
-down. The `[H]`/`[M]`/`[L]` tags are that audit's severity ordering (an
-audit artifact, not a work plan) — High = public-API correctness/leak,
-Medium = factoring/duplication, Low = naming/surface nit. Several are
-pre-v1 **clean-break** candidates gated by the first tagged release
-(`development: true`, `.semrel.yaml`). Resolved entries are removed from
-the table and preserved in git history
+This backlog spans **two audit waves**, kept in separate tables below
+because their severity scales differ:
+
+1. **Architecture / factoring audit** (concept, package decomposition,
+   public API surface, composition/duplication). Its `[H]`/`[M]`/`[L]`
+   tags mean High = public-API correctness/leak, Medium =
+   factoring/duplication, Low = naming/surface nit.
+2. **Completeness / correctness / algorithm audit (2026-05-30)** — run
+   with the project treated as **in-progress, not finished**. Its
+   `[H]`/`[M]`/`[L]` scale is **correctness-based**: High = a reachable
+   in-spec input/state that yields a wrong result (data loss, corruption,
+   use-after-reclaim); Medium = a spec'd capability missing or a reachable
+   resource leak; Low = doc/spec-vs-code drift, diagnostics, or
+   latent/narrow-reachability defects. 27 confirmed findings (2 refuted)
+   collapse to the rows below by **shared fix** — the provenance (raw
+   finding numbers, audit run `wf_4ad12a2f-039`) is recorded in each issue
+   file. Several spec'd-but-unbuilt rows carry an explicit
+   *implement-or-document* decision for the user; the cross-process rows
+   carry a scope decision (is concurrent multi-process write in v0?).
+
+In both, the severity tag is an **audit artifact, not a work plan**.
+Several factoring rows are pre-v1 **clean-break** candidates gated by the
+first tagged release (`development: true`, `.semrel.yaml`). Resolved
+entries are removed from their table and preserved in git history
 (`git log --all -- docs/issues/<file>.md`).
 
-## Open
+## Open — architecture / factoring audit
 
 | Slug | Lands | Summary |
 |------|-------|---------|
@@ -44,3 +59,36 @@ the table and preserved in git history
 | [dev-process-artifacts-in-comments](dev-process-artifacts-in-comments.md) | proactive | **[M]** 293 `chunk-N` refs across 49 prod files (+ "spec amend"/`Inv-XXX`) cite the dev process — dangling now the roadmap is done, and contrary to the project's own no-cite convention. Repoint to specs/tests. |
 | [encoder-naming-and-namespace](encoder-naming-and-namespace.md) | before first tagged release | **[L]** Encoder set: inconsistent `BE` prefix, `BENanosEncoder` names the encoding not the type, 11 symbols crowd the root namespace (candidate `gmdb/encoders` sub-package). |
 | [index-noun-overload](index-noun-overload.md) | before first tagged release | **[L]** `Index` is both the query handle and the `Index*` declaration-family prefix. Rename the handle (`IndexHandle`/`IndexQuery`), matching the typed side. |
+
+## Open — completeness / correctness / algorithm audit (2026-05-30)
+
+Filed from deep audit run `wf_4ad12a2f-039` (7 finders + adversarial
+verification; 27 confirmed, 2 refuted) plus a completeness pass. Rows are
+severity-ordered (H → M → L); the `Subsumes` notes record which raw
+findings each shared-fix row covers.
+
+| Slug | Lands | Summary |
+|------|-------|---------|
+| [btree-byte-balanced-split](btree-byte-balanced-split.md) | proactive | **[H]** B+tree split/redistribute partitions by entry **count**, not byte size; the spec-mandated `FindSplitIndex`/`FindSplitGroup` is unbuilt. Valid `Put` of size-skewed data returns spurious `ErrKeyTooLarge` (reproduced via public API); valid `Delete` returns spurious `ErrCorrupted`; fill-floor invariant violated; branch path latent. A dev probe for this was deleted without a fix. *Subsumes findings 0,1,2,3,11,19.* **Leaf paths fixed (`internal/btree/split.go`); branch path (finding 19) remains.** |
+| [overflow-threshold-splittability](overflow-threshold-splittability.md) | proactive | **[M]** `needsOverflow` inlines values up to ~a full page (strict-fit), so a near-full inline value inserted between neighbors can have no contiguous two-page split — a reachable `ErrKeyTooLarge` on valid data. Distinct root cause from the split-point fix (promotion threshold, format-affecting). Surfaced by `btree-byte-balanced-split`; it is the genuine residual once spurious count-split failures are removed. |
+| [cross-process-writer-stale-state](cross-process-writer-stale-state.md) | proactive (scope decision) | **[H]** In-memory meta/bitmap/RPL are loaded only at `Open` and never re-synced after a peer process commits → guaranteed lost-update + page-aliasing corruption for two concurrent cross-process writers; dual metas with equal TxnID. **Open question: is concurrent multi-process write in v0 scope?** *Subsumes findings 6,8.* |
+| [cross-process-coordination-untested](cross-process-coordination-untested.md) | proactive (gate for the two cross-process fixes) | **[H]** The largest, most complex subsystem has **zero** end-to-end coverage with two live handles on one file — the reason the corruption above went unnoticed. Add the cross-handle test matrix (writer interleave + long-lived reader vs. reclaim) under `-race`. *Finding 7.* |
+| [reader-stale-detection-future-heartbeat-guard](reader-stale-detection-future-heartbeat-guard.md) | proactive | **[H]** Reader-scan stale-detection lacks the future-heartbeat guard `recovery.go` already has; `nowNanos-hb` underflows (unsigned) and evicts a live mid-publish (race) or clock-skewed reader → RPL frees pages it still reads (use-after-reclaim / torn snapshot). *Subsumes findings 5,17.* |
+| [rpl-reclamation-checkpoint-bound](rpl-reclamation-checkpoint-bound.md) | proactive (resolve dispute first) | **[H/L — DISPUTED]** Reclamation bound uses `prevMeta.TxnID`, not the spec's `lastCheckpointTxnID`. One finder **confirmed** a SyncLazy crash-recovery corruption; a separate finder's verifier **refuted** it (2-slot double-buffer bounds the gap). Decide via the named regression test; both agree the stale `db.go:577-584` comment is wrong. *Finding 4 vs refuted twin.* |
+| [statistics-surface-unimplemented](statistics-surface-unimplemented.md) | proactive | **[M]** `DBStats`/`TxStats`/`KeyspaceStats` + the four `Stats()` methods (api-surface §Statistics) are entirely unbuilt and were an untracked downscope; plan's chunk-11 "final wiring" claim is false. Implement or file a concrete deferral. *Finding 9.* |
+| [options-readonly-mode](options-readonly-mode.md) | proactive | **[M]** `Options.ReadOnly` (read-only open) is spec'd and **named by the live `options.go:98` godoc**, but the field and the read-only path don't exist. Implement, or strip the dangling godoc/spec reference. *Finding 10.* |
+| [file-growstep-minsize](file-growstep-minsize.md) | proactive | **[M]** File growth does a 1-page `ftruncate` per allocation (persisted `GrowStep` has no effect); `maybeShrink` can truncate below the `MinSize` floor — a clause-explicit invariant violation. Implement GrowStep-aligned grow/shrink or amend the file-format spec. *Finding 12.* |
+| [update-view-panic-recovery](update-view-panic-recovery.md) | proactive | **[M]** A panic in `fn` inside `DB.Update`/`DB.View` unwinds past `Rollback`, leaking the cross-process write grant / reader slot until GC → unbounded writer starvation. Add `defer` cleanup or document the non-recovery contract. *Finding 13.* |
+| [options-coord-intervals](options-coord-intervals.md) | proactive | **[M]** `Options.StaleTimeout`/`HeartbeatInterval`/`LockRetryInterval` are spec'd but absent; `CoordOptions` plumbing is dead (always defaulted), `StaleTimeout` has none. Wire them or strike from the spec. *Finding 14.* |
+| [nextsequence-unbuilt](nextsequence-unbuilt.md) | proactive | **[M]** `Keyspace.NextSequence`/`SetKeyspace.NextSequence` unbuilt — the `NextSeq` descriptor field is serialized but never incremented or read (a stub, not dead state). *Completeness pass.* |
+| [setfileformat-unbuilt](setfileformat-unbuilt.md) | proactive | **[M]** `Tx.SetFileFormat` + the `FileFormat` type are unbuilt, yet the `CopyTo` godoc (`copy.go:35`) already points at them. Implement or remove the dangling reference. *Completeness pass.* |
+| [madvise-options](madvise-options.md) | proactive | **[M]** mmap tuning (`PreloadPages`/`HugePages`/`ReclaimOnClose`) is spec'd in mmap-strategy/overview, but there is no Options field and **no `MADV_*` call anywhere**. Wire `unix.Madvise` or trim the spec. *Completeness pass.* |
+| [errkeytoolarge-sentinel](errkeytoolarge-sentinel.md) | proactive | **[L]** `ErrKeyTooLarge` is documented public (`keyspace.go:543`) but is not a gmdb sentinel; the internal btree error leaks unwrapped from `Put` and `BulkLoad`, so `errors.Is(err, gmdb.ErrKeyTooLarge)` can't compile. *Finding 22.* |
+| [indexstats-shape-and-depth](indexstats-shape-and-depth.md) | proactive | **[L]** Implemented `IndexStats{Count,TreeDepth}` is a smaller, divergent shape vs the spec's 7 fields, and `TreeDepth` is hardwired 0 (depth is available from `btree.Walk`). Reconcile + populate. *Subsumes findings 16,23.* |
+| [byte-level-iterators](byte-level-iterators.md) | proactive | **[L]** Byte-level `Keyspace`/`SetKeyspace.All/Range/Prefix` unbuilt; the typed layer reimplements rather than delegates as the plan claims. Build them or correct the plan. *Finding 15.* |
+| [deleterange-obsolete-comment](deleterange-obsolete-comment.md) | proactive | **[L]** `keyspace.go:766-769` comment claims indexed `DeleteRange` is unimplemented, but it's wired (`deleteRangeIndexed`). Pure doc rot — repoint the comment. *Finding 18.* |
+| [commit-fdatasync](commit-fdatasync.md) | proactive | **[L]** Commit calls `fsync` where every spec and the Design Decisions table specify `fdatasync` (correctness-safe; the per-commit perf rationale is unmet). Use `unix.Fdatasync` or amend the spec. *Finding 24.* |
+| [rpl-corruption-silent-halt](rpl-corruption-silent-halt.md) | proactive | **[L]** A corrupt RPL segment silently halts reclamation and grows the file, surfacing a misleading `ErrDBFull` instead of the real corruption (a deliberate but undocumented availability choice). Document the policy + add a warning/health flag. *Finding 25.* |
+| [lock-ordering-phantom-mutexes](lock-ordering-phantom-mutexes.md) | proactive | **[L]** `lock-ordering.md:58-67` mandates acquisition order for `pager.mu`/`bitmap.mu`, but neither mutex exists. Correct the invariant doc to the locks that do exist. *Finding 26.* |
+| [cross-namespace-reader-heartbeat-liveness](cross-namespace-reader-heartbeat-liveness.md) | condition (when cross-process stale-detection is revisited) | **[L]** Cross-namespace (container) readers have no `kill()` fallback — a >10s heartbeat pause (docker pause, cgroup freeze, swap) evicts a live reader → reads reclaimed-and-reused pages. Document the data-integrity bound + reconsider the default. *Finding 21.* |
+| [writer-heartbeat-after-lock-release](writer-heartbeat-after-lock-release.md) | proactive | **[L]** The heartbeat goroutine can store `WriterHeartbeat` after `LOCK_UN`, contradicting a clause-explicit "only under `LOCK_EX`" invariant (benign on a shared clock; reachable on per-process clocks). Gate the store or downgrade the invariant text. *Finding 20.* |
