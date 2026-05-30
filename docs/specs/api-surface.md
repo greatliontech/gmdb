@@ -750,24 +750,25 @@ func (tx *Tx) Rollback() error
 // compile time. See db.BeginRead / db.View.
 type ReadTx struct { ... }
 
-// ReadTx's public surface is Commit / Rollback only. The snapshot's
-// raw page bytes and decoded meta are deliberately NOT exposed:
+// ReadTx reads keyspace data through its pinned snapshot — gmdb's
+// concurrent-read path (transactions.md §Read Transaction). The read
+// handles it returns observe a consistent, immutable view that a
+// concurrent committed write never changes, and the reader never blocks
+// the single writer (the only contention is reader-slot acquisition at
+// BeginRead). Reads are backed by a read-only *Tx (writable=false) over
+// the snapshot's read-only mmap, so every *Keyspace / *SetKeyspace read
+// op works unchanged and every mutator returns ErrReadOnly.
 //
-//   - Page access is an internal concern of the cursor / B+tree
-//     layer, which gates every visited id by the snapshot's
-//     HighWaterMark; a public Page(id) accessor invites an
-//     out-of-range id that SIGBUSes the process (mmap-strategy.md
-//     §Sparse Reservation).
-//   - The decoded meta is internal/page.Meta, a raw on-disk storage
-//     struct; returning it across the public boundary leaks an
-//     internal type that importers cannot even name. Caller-relevant
-//     snapshot statistics are surfaced through DB.Stats (§Statistics),
-//     not a raw meta accessor.
-//
-// Earlier revisions exposed `ReadTx.Page(id) ([]byte, error)` and
-// `ReadTx.Meta() page.Meta`; both were withdrawn as test-only /
-// internal (git log preserves them; white-box tests retain access via
-// export_test.go).
+// Raw page bytes and the decoded internal meta are NOT exposed: page
+// access is the cursor / B+tree layer's concern (a public Page(id)
+// invites a HighWaterMark-out-of-range SIGBUS — mmap-strategy.md
+// §Sparse Reservation), and page.Meta is an internal storage struct.
+// The snapshot identity callers need is the curated TxnID (uint64);
+// DB.Stats (§Statistics) covers DB-level numbers.
+func (rtx *ReadTx) OpenKeyspaceReadOnly(name string) (*Keyspace, error)
+func (rtx *ReadTx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error)
+func (rtx *ReadTx) ListKeyspaces() ([]string, error)
+func (rtx *ReadTx) TxnID() uint64
 
 // Commit and Rollback are equivalent for ReadTx — both release the
 // reader slot and close the snapshot. The pair exists for symmetry

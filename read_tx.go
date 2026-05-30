@@ -70,6 +70,14 @@ type ReadTx struct {
 	// hold it without referencing *ReadTx (resurrection-forbidden).
 	held *atomic.Bool
 
+	// ksTx is the lazily-built read-only *Tx that backs keyspace reads
+	// through this snapshot (OpenKeyspaceReadOnly etc.). writable=false,
+	// so its keyspace handles' mutators return ErrReadOnly and its reads
+	// resolve against this ReadTx's read-only pager + snapshot root. nil
+	// until the first keyspace is opened; closed in lockstep with the
+	// ReadTx so handle ops fail-fast before the pager is unmapped.
+	ksTx *Tx
+
 	// cleanup is the AddCleanup handle, Stop()'d by Commit/Rollback
 	// in the normal-close path so leak-detection doesn't warn for a
 	// caller-closed tx.
@@ -360,6 +368,12 @@ func (rtx *ReadTx) close() error {
 		return ErrTxClosed
 	}
 	rtx.closed = true
+	// Close the internal keyspace tx first so any outstanding *Keyspace
+	// / *SetKeyspace handle's ops fail-fast with ErrTxClosed via
+	// requireOpen BEFORE rtx.pgr.Close() unmaps the snapshot mmap.
+	if rtx.ksTx != nil {
+		rtx.ksTx.closed = true
+	}
 	rtx.cleanup.Stop()
 	if rtx.held.CompareAndSwap(true, false) {
 		// Cleanup hasn't run; we own the release.

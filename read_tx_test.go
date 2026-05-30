@@ -13,6 +13,117 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
+// TestReadTxKeyspaceReadsAreSnapshotIsolated is the headline test for the
+// concurrent-read surface: a ReadTx reads keyspace data through its
+// pinned snapshot, observes a consistent view a concurrent committed
+// write does NOT change (and that write succeeds while the reader is
+// open — readers never block the writer), rejects mutations with
+// ErrReadOnly, and a fresh snapshot sees the new committed state.
+func TestReadTxKeyspaceReadsAreSnapshotIsolated(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Update(ctx, func(tx *Tx) error {
+		ks, _ := tx.CreateKeyspace("ks")
+		if err := ks.Put([]byte("a"), []byte("1")); err != nil {
+			return err
+		}
+		return ks.Put([]byte("b"), []byte("2"))
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	defer rtx.Rollback()
+	rks, err := rtx.OpenKeyspaceReadOnly("ks")
+	if err != nil {
+		t.Fatalf("OpenKeyspaceReadOnly: %v", err)
+	}
+
+	if v, err := rks.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+		t.Fatalf("Get(a) = %q, %v; want 1, nil", v, err)
+	}
+	got := map[string]string{}
+	c := rks.Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		got[string(k)] = string(v)
+	}
+	if c.Err() != nil {
+		t.Fatalf("cursor err: %v", c.Err())
+	}
+	if len(got) != 2 || got["a"] != "1" || got["b"] != "2" {
+		t.Fatalf("cursor scan = %v, want {a:1,b:2}", got)
+	}
+
+	if err := rks.Put([]byte("c"), []byte("3")); !errors.Is(err, ErrReadOnly) {
+		t.Errorf("Put on read handle: got %v, want ErrReadOnly", err)
+	}
+	if err := rks.Delete([]byte("a")); !errors.Is(err, ErrReadOnly) {
+		t.Errorf("Delete on read handle: got %v, want ErrReadOnly", err)
+	}
+
+	// Concurrent committed write WHILE the read tx is open — must succeed
+	// (reader does not block writer) and must not change the snapshot.
+	if err := db.Update(ctx, func(tx *Tx) error {
+		ks, _ := tx.OpenKeyspace("ks")
+		if err := ks.Put([]byte("a"), []byte("99")); err != nil {
+			return err
+		}
+		return ks.Put([]byte("c"), []byte("3"))
+	}); err != nil {
+		t.Fatalf("concurrent write: %v", err)
+	}
+
+	if v, err := rks.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+		t.Errorf("post-write snapshot Get(a) = %q, %v; want isolated value 1", v, err)
+	}
+	if _, err := rks.Get([]byte("c")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("post-write snapshot Get(c) = %v; want ErrNotFound (not in snapshot)", err)
+	}
+
+	rtx2, _ := db.BeginRead(ctx)
+	defer rtx2.Rollback()
+	rks2, _ := rtx2.OpenKeyspaceReadOnly("ks")
+	if v, err := rks2.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("99")) {
+		t.Errorf("fresh snapshot Get(a) = %q, %v; want 99", v, err)
+	}
+	if v, err := rks2.Get([]byte("c")); err != nil || !bytes.Equal(v, []byte("3")) {
+		t.Errorf("fresh snapshot Get(c) = %q, %v; want 3", v, err)
+	}
+	if rtx.TxnID() >= rtx2.TxnID() {
+		t.Errorf("TxnID: rtx=%d should precede rtx2=%d", rtx.TxnID(), rtx2.TxnID())
+	}
+}
+
+// TestReadTxKeyspaceClosedAfterRollback pins lifecycle safety: after the
+// ReadTx closes (unmapping the snapshot pager), an outstanding read
+// handle fails fast with ErrTxClosed rather than touching the unmapped
+// mmap.
+func TestReadTxKeyspaceClosedAfterRollback(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	_ = db.Update(ctx, func(tx *Tx) error {
+		ks, _ := tx.CreateKeyspace("ks")
+		return ks.Put([]byte("a"), []byte("1"))
+	})
+	rtx, _ := db.BeginRead(ctx)
+	rks, _ := rtx.OpenKeyspaceReadOnly("ks")
+	if err := rtx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if _, err := rks.Get([]byte("a")); !errors.Is(err, ErrTxClosed) {
+		t.Errorf("Get after ReadTx close: got %v, want ErrTxClosed", err)
+	}
+}
+
 func TestBeginReadGenesis(t *testing.T) {
 	// Spec-tier invariant pin (transactions.md §Read Transaction):
 	// BeginRead on a fresh database succeeds, returns a ReadTx
