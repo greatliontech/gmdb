@@ -58,31 +58,7 @@ const (
 // CreateKeyspace returns a fresh *Keyspace while the old handle
 // stays dead until the caller drops it (chunk-5.6 Inv-D).
 type Keyspace struct {
-	tx   *Tx
-	name uniqueNameHandle
-
-	// desc is the in-tx view of the keyspace's descriptor. Mutated
-	// in place by Put / Delete data-op paths (descriptor.Root +
-	// descriptor.Count). The chunk-5.6 deferred-flush refactor
-	// promotes the in-memory desc to the on-disk keyspace B+tree at
-	// Tx.Commit's flushKeyspaces walk — not per data op.
-	desc page.KeyspaceDescriptor
-
-	// state controls how Tx.Commit's flushKeyspaces walk treats this
-	// handle. Created and Dirty cause a btree.Put on the keyspace
-	// B+tree; Clean is skipped. See keyspaceState godocs.
-	state keyspaceState
-
-	// dead is set by Tx.DeleteKeyspace on every handle returned
-	// against this name in this tx (the deleted *Keyspace itself
-	// plus the openKeyspaces cache entry, which DeleteKeyspace
-	// removes from the map AND adds to tx.deadKeyspaces with
-	// dead=true). Once dead, every Keyspace/Cursor op returns
-	// ErrKeyspaceClosed; re-creating the same name via
-	// CreateKeyspace does NOT clear dead on the old handle (a fresh
-	// *Keyspace is allocated; the old stays dead). Per
-	// api-surface.md §Keyspace API DeleteKeyspace.
-	dead bool
+	keyspaceCore
 
 	// openCursors tracks every *Cursor returned by Keyspace.Cursor()
 	// in this tx so Put / Delete can MarkStale them — sibling
@@ -92,50 +68,7 @@ type Keyspace struct {
 	// fields (see btree.Cursor.MarkStale) to avoid returning
 	// dangling references on a subsequent unguarded access.
 	openCursors []*Cursor
-
-	// openIndexHandles tracks every *Index returned by
-	// Keyspace.Index(name) in this tx. The chunk-7.6 atomic
-	// Put/Delete/Cursor.Delete path mutates index trees
-	// (applyIndexMaintenanceOn{Put,Delete}); Tx.RebuildIndex /
-	// Tx.DropIndex replace or free the per-index data tree
-	// wholesale. Each of these mutations CoWs or frees pages reached
-	// by in-flight *btree.Cursor instances opened from these
-	// handles' iter closures (Lookup / Range / LookupKeys
-	// non-unique). markIndexHandlesStale (and the by-name /
-	// dead variants) walk this slice to MarkStale every such
-	// cursor, closing Inv-IHS1. Mirrors openCursors structurally
-	// (the chunk-5.6 markCursorsStale pattern); see indexing.md
-	// §Handle Invalidation for the contract.
-	openIndexHandles []*Index
-
-	// indexes carries the pinned per-index state for this tx, keyed
-	// by IndexDecl.Name. Populated by OpenKeyspace / CreateKeyspace
-	// / CreateKeyspaceIfNotExists at chunk-7.5 with the validated
-	// supplied IndexDecls. First-Extract-wins per indexing.md
-	// §Re-opening: a same-tx second open with structurally identical
-	// hashable inputs but a different Extract function silently keeps
-	// the first call's Extract. Each pinnedIndex carries the user's
-	// IndexDecl (for the Extract function), the schema-hash (cached
-	// from chunk-7.2 schemaHash), and the index's data-tree
-	// root+count (populated from the on-disk registry on Open,
-	// initialized to 0 on Create, updated by chunk-7.6 atomic Put +
-	// chunk-7.8 RebuildIndex/DropIndex).
-	//
-	// nil for keyspaces with no declared indexes.
-	indexes map[string]*pinnedIndex
-
-	// readOnly is true when this handle was opened via
-	// OpenKeyspaceReadOnly. Used by the chunk-7.5 same-tx re-open
-	// idempotence check to surface ErrKeyspaceAlreadyOpen when a
-	// caller mixes OpenKeyspace and OpenKeyspaceReadOnly for the
-	// same name within one tx per indexing.md §Re-opening.
-	readOnly bool
 }
-
-// Name returns the keyspace's name (the unique-interned identity).
-// Allocations: returns the underlying string from the interned handle
-// without copying.
-func (ks *Keyspace) Name() string { return ks.name.Value() }
 
 // OpenKeyspace opens an existing single-value keyspace (Kind=0) for
 // read+write. Returns ErrNotFound if the named keyspace does not
@@ -556,7 +489,7 @@ func (tx *Tx) storeDescriptor(name string, desc page.KeyspaceDescriptor) error {
 // Open paths, Created for Create paths). All Open and Create paths
 // route through here.
 func (tx *Tx) cacheOpenKeyspace(handle uniqueNameHandle, desc page.KeyspaceDescriptor, state keyspaceState) *Keyspace {
-	ks := &Keyspace{tx: tx, name: handle, desc: desc, state: state}
+	ks := &Keyspace{keyspaceCore: keyspaceCore{tx: tx, name: handle, desc: desc, state: state}}
 	if tx.openKeyspaces == nil {
 		tx.openKeyspaces = make(map[uniqueNameHandle]*Keyspace)
 	}
@@ -576,20 +509,6 @@ func checkKeyspaceKind(stored, requested uint8) error {
 		return ErrKeyspaceReserved
 	}
 	return ErrKeyspaceKindMismatch
-}
-
-// builderCfg returns the page.Config to pass to btree.* calls for
-// this keyspace. When the per-keyspace RestartGroupTarget is set
-// (via SetKeyspaceConfig per keyspaces.md invariant #6), it
-// overrides the engine default — newly written leaves use the
-// per-keyspace target. Decoding ignores RestartGroupTarget so the
-// override is safe on Get-side too.
-func (ks *Keyspace) builderCfg() page.Config {
-	cfg := ks.tx.pgr.Config()
-	if ks.desc.RestartGroupTarget != 0 {
-		cfg.RestartGroupTarget = ks.desc.RestartGroupTarget
-	}
-	return cfg
 }
 
 // Get returns the value stored under key in the keyspace. Returns
@@ -841,26 +760,6 @@ func (ks *Keyspace) Delete(key []byte) error {
 	return nil
 }
 
-// markDirty transitions the handle's state to Dirty unless it is
-// already Created (Created stays Created — both flush variants do
-// btree.Put). Centralized so Put / Delete / Cursor.Delete /
-// SetKeyspaceConfig route through one code path.
-func (ks *Keyspace) markDirty() {
-	if ks.state == keyspaceStateCreated {
-		return
-	}
-	ks.state = keyspaceStateDirty
-}
-
-// descriptor returns the in-tx descriptor pointer. Used by the
-// chunk-7.3 registry-CRUD helpers (index_codec.go) to satisfy the
-// descriptorOwner interface — registryPut / registryDelete mutate
-// the descriptor in place AND call markDirty() so the chunk-5.6
-// flushKeyspaces walk persists the mutation. Unexported.
-func (ks *Keyspace) descriptor() *page.KeyspaceDescriptor {
-	return &ks.desc
-}
-
 // DeleteRange deletes every key k with start <= k < end from the
 // keyspace per range-delete.md §Algorithm. Returns the count of
 // entries deleted; empty range (start == end OR start > end) returns
@@ -1089,96 +988,6 @@ func (ks *Keyspace) markCursorsStale() {
 		c.inner.SetRootID(ks.desc.Root)
 	}
 	ks.markIndexHandlesStale()
-}
-
-// markIndexHandlesStale invokes MarkStale on every in-flight
-// *btree.Cursor opened by an *Index handle from this keyspace, and
-// refreshes the cursor's tracked rootID to the (possibly mutated)
-// pinnedIndex.root. Called by Keyspace.Put / Delete / Cursor.Delete
-// after the atomic-maintenance step that mutates index trees:
-// applyIndexMaintenanceOn{Put,Delete} runs btree.Put / btree.Delete
-// on each declared index's data tree → CoWs pages reachable from
-// in-flight iter cursors → those cursors must MarkStale or the next
-// c.Next() reads CoW'd-then-released leaf pages (Inv-IHS1).
-//
-// Also called by Tx.DeleteKeyspace (Inv-IHS3). Caveat: in that path,
-// idx.pinned.root has already been FreeSubtree'd by
-// retireIndexRegistry, so SetRootID stores a FREED pageID into
-// every stale cursor's tracked-root. This is safe under the current
-// API because every *Index entry method (Stats / Lookup / LookupKeys
-// / Range / Prefix / Get / Err) short-circuits via keyspaceDead()
-// before issuing a fresh descent, so the freed-root is never
-// dereferenced. If a future API exposes the underlying *btree.Cursor
-// or weakens the entry-method short-circuit, this SetRootID(freed)
-// store on the DeleteKeyspace path becomes a use-after-free hazard
-// and the caller must skip the SetRootID under ks.dead.
-//
-// Conservative-mark-all (mirrors markCursorsStale): an extractor
-// may emit entries for any subset of declared indexes per Put, and
-// the cheapest correct policy is to stale every in-flight index
-// cursor on any successful row mutation. Dead handles are skipped
-// (their cursors have already been staled by markIndexHandleDead).
-func (ks *Keyspace) markIndexHandlesStale() {
-	for _, idx := range ks.openIndexHandles {
-		if idx.pinned == nil || idx.dead {
-			continue
-		}
-		newRoot := idx.pinned.root
-		for _, c := range idx.openCursors {
-			c.MarkStale()
-			c.SetRootID(newRoot)
-		}
-	}
-}
-
-// markIndexHandleStaleByName invokes MarkStale on in-flight cursors
-// for the named index only. Called by Tx.RebuildIndex after
-// syncRebuildToCachedPinned: only the rebuilt index's tree was
-// replaced (FreeSubtree of the old root + new root published into
-// pinned.root); other indexes' handles must NOT be invalidated.
-// Refreshes the cursor's tracked rootID so a re-position descends
-// from the new root.
-func (ks *Keyspace) markIndexHandleStaleByName(name string) {
-	for _, idx := range ks.openIndexHandles {
-		if idx.pinned == nil || idx.dead {
-			continue
-		}
-		if idx.pinned.decl.Name != name {
-			continue
-		}
-		newRoot := idx.pinned.root
-		for _, c := range idx.openCursors {
-			c.MarkStale()
-			c.SetRootID(newRoot)
-		}
-	}
-}
-
-// markIndexHandleDead marks every *Index handle for the named index
-// as dead (Inv-IHS2): subsequent Lookup / LookupKeys / Range /
-// Prefix / Get / Stats on the cached handle return ErrIndexNotFound.
-// Also MarkStale's in-flight cursors so any iter mid-loop terminates
-// (ErrCursorStale on Err()) instead of walking the FreeSubtree'd
-// data tree pages.
-//
-// Called by Tx.DropIndex after registryDelete + FreeSubtree
-// succeed: the on-disk registry no longer references this index and
-// the data tree pages have been returned to the loose-page pool, so
-// any cached handle pointing at the stale pinnedIndex must reject
-// further use.
-func (ks *Keyspace) markIndexHandleDead(name string) {
-	for _, idx := range ks.openIndexHandles {
-		if idx.pinned == nil || idx.dead {
-			continue
-		}
-		if idx.pinned.decl.Name != name {
-			continue
-		}
-		idx.dead = true
-		for _, c := range idx.openCursors {
-			c.MarkStale()
-		}
-	}
 }
 
 // KeyspaceConfig is the mutable per-keyspace configuration surface

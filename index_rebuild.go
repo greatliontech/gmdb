@@ -287,7 +287,7 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		// 7.10 Round-1 L-1).
 		sks := cachedSKS
 		if sks == nil {
-			sks = &SetKeyspace{tx: tx, name: unique.Make(keyspace), desc: desc, readOnly: true}
+			sks = &SetKeyspace{keyspaceCore: keyspaceCore{tx: tx, name: unique.Make(keyspace), desc: desc, readOnly: true}}
 		}
 		// newInternalSetCursor bypasses openSetCursors registration
 		// so repeated RebuildIndex calls don't leak entries into the

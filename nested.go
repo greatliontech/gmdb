@@ -159,13 +159,15 @@ func cloneKeyspaceHandles(child *Tx, src map[uniqueNameHandle]*Keyspace) map[uni
 	out := make(map[uniqueNameHandle]*Keyspace, len(src))
 	for h, ks := range src {
 		out[h] = &Keyspace{
-			tx:       child,
-			name:     ks.name,
-			desc:     ks.desc,
-			state:    ks.state,
-			dead:     ks.dead,
-			readOnly: ks.readOnly,
-			indexes:  clonePinnedIndexes(ks.indexes),
+			keyspaceCore: keyspaceCore{
+				tx:       child,
+				name:     ks.name,
+				desc:     ks.desc,
+				state:    ks.state,
+				dead:     ks.dead,
+				readOnly: ks.readOnly,
+				indexes:  clonePinnedIndexes(ks.indexes),
+			},
 		}
 	}
 	return out
@@ -180,13 +182,15 @@ func cloneSetKeyspaceHandles(child *Tx, src map[uniqueNameHandle]*SetKeyspace) m
 	out := make(map[uniqueNameHandle]*SetKeyspace, len(src))
 	for h, sks := range src {
 		out[h] = &SetKeyspace{
-			tx:       child,
-			name:     sks.name,
-			desc:     sks.desc,
-			state:    sks.state,
-			dead:     sks.dead,
-			readOnly: sks.readOnly,
-			indexes:  clonePinnedIndexes(sks.indexes),
+			keyspaceCore: keyspaceCore{
+				tx:       child,
+				name:     sks.name,
+				desc:     sks.desc,
+				state:    sks.state,
+				dead:     sks.dead,
+				readOnly: sks.readOnly,
+				indexes:  clonePinnedIndexes(sks.indexes),
+			},
 		}
 	}
 	return out
@@ -246,13 +250,15 @@ func mergeKeyspaceHandles(parent, child *Tx) {
 			parent.openKeyspaces = make(map[uniqueNameHandle]*Keyspace, len(child.openKeyspaces))
 		}
 		parent.openKeyspaces[h] = &Keyspace{
-			tx:       parent,
-			name:     cks.name,
-			desc:     cks.desc,
-			state:    cks.state,
-			dead:     cks.dead,
-			readOnly: cks.readOnly,
-			indexes:  cks.indexes,
+			keyspaceCore: keyspaceCore{
+				tx:       parent,
+				name:     cks.name,
+				desc:     cks.desc,
+				state:    cks.state,
+				dead:     cks.dead,
+				readOnly: cks.readOnly,
+				indexes:  cks.indexes,
+			},
 		}
 	}
 	for h, pks := range parent.openKeyspaces {
@@ -283,13 +289,15 @@ func mergeSetKeyspaceHandles(parent, child *Tx) {
 			parent.openSetKeyspaces = make(map[uniqueNameHandle]*SetKeyspace, len(child.openSetKeyspaces))
 		}
 		parent.openSetKeyspaces[h] = &SetKeyspace{
-			tx:       parent,
-			name:     csks.name,
-			desc:     csks.desc,
-			state:    csks.state,
-			dead:     csks.dead,
-			readOnly: csks.readOnly,
-			indexes:  csks.indexes,
+			keyspaceCore: keyspaceCore{
+				tx:       parent,
+				name:     csks.name,
+				desc:     csks.desc,
+				state:    csks.state,
+				dead:     csks.dead,
+				readOnly: csks.readOnly,
+				indexes:  csks.indexes,
+			},
 		}
 	}
 	for h, psks := range parent.openSetKeyspaces {

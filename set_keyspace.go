@@ -48,27 +48,7 @@ type SetKeyspaceOptions struct {
 // transparently dispatch between subpage in-place edits and nested-
 // tree mutations.
 type SetKeyspace struct {
-	tx   *Tx
-	name uniqueNameHandle
-
-	// desc is the in-tx view of the keyspace's descriptor (Kind=1).
-	// Mutated in place by Put / Delete / DeleteValue data-op paths
-	// (descriptor.Root + descriptor.Count). Persisted to the
-	// keyspace B+tree at Tx.Commit's flushKeyspaces walk per the
-	// chunk-5.6 deferred-flush refactor.
-	desc page.KeyspaceDescriptor
-
-	// state controls how Tx.Commit's flushKeyspaces walk treats this
-	// handle. Same semantics as Keyspace.state: Created or Dirty
-	// triggers a btree.Put on the keyspace B+tree; Clean is skipped.
-	state keyspaceState
-
-	// dead is set by Tx.DeleteKeyspace on every SetKeyspace handle
-	// returned against this name in this tx. Once dead, every
-	// SetKeyspace op returns ErrKeyspaceClosed; re-creating the
-	// same name does NOT reactivate. Per api-surface.md §Keyspace
-	// API DeleteKeyspace.
-	dead bool
+	keyspaceCore
 
 	// openSetCursors tracks every *SetCursor returned by
 	// SetKeyspace.Cursor() in this tx so Put / Delete / DeleteValue
@@ -79,66 +59,12 @@ type SetKeyspace struct {
 	// pattern as Keyspace.openCursors (chunk-5 markCursorsStale
 	// + SetRootID).
 	openSetCursors []*SetCursor
-
-	// openIndexHandles tracks every *Index returned by
-	// SetKeyspace.Index(name) in this tx. Mirror of
-	// Keyspace.openIndexHandles (see that field's godoc for the
-	// invalidation contract); the SetKeyspace mutators
-	// (Put / Delete / DeleteValue / SetCursor.Delete) call
-	// markIndexHandlesStale after applyIndexMaintenanceOn{AddValue,
-	// RemoveValue} to close Inv-IHS1 on the kind-1 side.
-	openIndexHandles []*Index
-
-	// indexes carries the pinned per-index state for this tx (kind-
-	// symmetric partner of Keyspace.indexes — see that godoc).
-	// Populated by OpenSetKeyspace / CreateSetKeyspace /
-	// CreateSetKeyspaceIfNotExists at chunk-7.5. SetKeyspace
-	// extractors run **per (key, value) set member** rather than
-	// per top-level key per indexing.md §Indexes on SetKeyspaces.
-	indexes map[string]*pinnedIndex
-
-	// readOnly is true when this handle was opened via
-	// OpenSetKeyspaceReadOnly. Same semantics as Keyspace.readOnly.
-	readOnly bool
 }
-
-// Name returns the keyspace's name.
-func (ks *SetKeyspace) Name() string { return ks.name.Value() }
 
 // FixedValueSize returns the keyspace's declared fixed-value stride
 // (0 = variable-size values). Immutable after creation per
 // keyspaces.md invariant #5.
 func (ks *SetKeyspace) FixedValueSize() int { return int(ks.desc.FixedValueSize) }
-
-// builderCfg returns the page.Config to pass to btree.* calls for
-// this keyspace. Mirrors Keyspace.builderCfg — the per-keyspace
-// RestartGroupTarget (when set via SetKeyspaceConfig) overrides the
-// engine default for newly-written leaves.
-func (ks *SetKeyspace) builderCfg() page.Config {
-	cfg := ks.tx.pgr.Config()
-	if ks.desc.RestartGroupTarget != 0 {
-		cfg.RestartGroupTarget = ks.desc.RestartGroupTarget
-	}
-	return cfg
-}
-
-// markDirty transitions the handle's state to Dirty unless it is
-// already Created. Centralised so every mutation routes through one
-// code path.
-func (ks *SetKeyspace) markDirty() {
-	if ks.state == keyspaceStateCreated {
-		return
-	}
-	ks.state = keyspaceStateDirty
-}
-
-// descriptor returns the in-tx descriptor pointer. Used by the
-// chunk-7.3 registry-CRUD helpers (index_codec.go) to satisfy the
-// descriptorOwner interface — see *Keyspace.descriptor godoc.
-// Unexported.
-func (ks *SetKeyspace) descriptor() *page.KeyspaceDescriptor {
-	return &ks.desc
-}
 
 // markSetCursorsStale invokes MarkStale on every SetCursor
 // registered on this keyspace AND refreshes their outer-cursor's
@@ -168,64 +94,6 @@ func (ks *SetKeyspace) markSetCursorsStale() {
 	}
 	ks.markIndexHandlesStale()
 }
-
-// markIndexHandlesStale / markIndexHandleStaleByName /
-// markIndexHandleDead are the SetKeyspace mirrors of the
-// Keyspace-side helpers (see keyspace.go for the full contract,
-// including the Inv-IHS3 freed-root caveat for the
-// Tx.DeleteKeyspace caller). They close Inv-IHS1 / Inv-IHS2 /
-// Inv-IHS3 on the Kind=1 side: SetKeyspace.Put / Delete /
-// DeleteValue / SetCursor.Delete run
-// applyIndexMaintenanceOn{AddValue,RemoveValue} which CoWs each
-// declared index's data tree; Tx.RebuildIndex / Tx.DropIndex on a
-// SetKeyspace mutate or free wholesale; Tx.DeleteKeyspace on a
-// SetKeyspace FreeSubtree's the per-index data trees via
-// retireIndexRegistry. Either shape stales in-flight cursors
-// opened by *Index iter closures from this SetKeyspace.
-func (ks *SetKeyspace) markIndexHandlesStale() {
-	for _, idx := range ks.openIndexHandles {
-		if idx.pinned == nil || idx.dead {
-			continue
-		}
-		newRoot := idx.pinned.root
-		for _, c := range idx.openCursors {
-			c.MarkStale()
-			c.SetRootID(newRoot)
-		}
-	}
-}
-
-func (ks *SetKeyspace) markIndexHandleStaleByName(name string) {
-	for _, idx := range ks.openIndexHandles {
-		if idx.pinned == nil || idx.dead {
-			continue
-		}
-		if idx.pinned.decl.Name != name {
-			continue
-		}
-		newRoot := idx.pinned.root
-		for _, c := range idx.openCursors {
-			c.MarkStale()
-			c.SetRootID(newRoot)
-		}
-	}
-}
-
-func (ks *SetKeyspace) markIndexHandleDead(name string) {
-	for _, idx := range ks.openIndexHandles {
-		if idx.pinned == nil || idx.dead {
-			continue
-		}
-		if idx.pinned.decl.Name != name {
-			continue
-		}
-		idx.dead = true
-		for _, c := range idx.openCursors {
-			c.MarkStale()
-		}
-	}
-}
-
 
 // OpenSetKeyspace opens an existing Kind=1 keyspace (SetKeyspace) for
 // read+write with the supplied IndexDecls (chunk-7.5 indexing wiring).
@@ -512,7 +380,7 @@ func validateSetOpts(opts *SetKeyspaceOptions) (uint16, error) {
 // in the tx's per-name cache. All Open / Create paths route through
 // here.
 func (tx *Tx) cacheOpenSetKeyspace(handle uniqueNameHandle, desc page.KeyspaceDescriptor, state keyspaceState) *SetKeyspace {
-	sks := &SetKeyspace{tx: tx, name: handle, desc: desc, state: state}
+	sks := &SetKeyspace{keyspaceCore: keyspaceCore{tx: tx, name: handle, desc: desc, state: state}}
 	if tx.openSetKeyspaces == nil {
 		tx.openSetKeyspaces = make(map[uniqueNameHandle]*SetKeyspace)
 	}
