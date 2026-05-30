@@ -146,8 +146,8 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		return nr, false, e
 	}
 
-	// Phase 1: descend, recording the path. Retain the leaf buffer for
-	// the insertOnly existence peek below.
+	// Phase 1: descend, recording the path. Retain the leaf buffer for the
+	// shared read (validate + search + last-key) below.
 	path := make([]pathFrame, 0, 8)
 	var leafBuf []byte
 	cur := rootID
@@ -180,22 +180,40 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 	}
 	leafID := cur
 
-	// insertOnly fast path: when key is already present, skip the write
-	// entirely (no CoW, no alloc) — InsertIfAbsent's no-op-on-present
-	// contract. Checked on the original leaf before any mutation.
-	if insertOnly {
-		r := page.NewLeafReader(leafBuf, cfg)
-		if e := r.Validate(); e != nil {
-			return 0, false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, leafID, e)
-		}
-		if _, _, found := r.SearchLeaf(key); found {
-			return rootID, true, nil
-		}
+	// Read the original leaf once — validate, then locate the key. Shared by
+	// the InsertIfAbsent existence check, the append fast path, and the slow
+	// path's insertion. Validating the original here also covers the slow path
+	// (its CoW'd copy is byte-identical), so the decode below skips a second
+	// Validate. All reads target the original buffer (valid pre-CoW); the
+	// mutation phase writes only the CoW destination.
+	rdr := page.NewLeafReader(leafBuf, cfg)
+	if e := rdr.Validate(); e != nil {
+		return 0, false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, leafID, e)
+	}
+	searchIdx, _, searchFound := rdr.SearchLeaf(key)
+
+	// InsertIfAbsent no-op-on-present: skip the write entirely (no CoW, no
+	// alloc) when the key already exists.
+	if insertOnly && searchFound {
+		return rootID, true, nil
 	}
 
-	// Phase 2: leaf mutation. CoW the leaf, decode entries (deep-
-	// copy), apply insert/replace, re-build into the CoW
-	// destination (or split into two).
+	// Capture the last key before the CoW for the append fast path — the
+	// original buffer is the safe source for prefix-delta encoding while the
+	// CoW destination is the write target. lkScratch keeps the common case
+	// (key ≤ 256 B) allocation-free; bytes.Clone gives independent ownership
+	// across the CoW + splice regardless of where LastKey sourced the bytes.
+	var prevKey []byte
+	leafCount := rdr.Count()
+	appendPos := !searchFound && leafCount > 0 && searchIdx == leafCount
+	if appendPos {
+		var lkScratch [256]byte
+		lk, _ := rdr.LastKey(lkScratch[:0])
+		prevKey = bytes.Clone(lk)
+	}
+
+	// Phase 2: leaf mutation. CoW the leaf; then either splice the new entry
+	// in place (append fast path) or decode + re-encode (slow path).
 	leftID, err := pw.AllocPage()
 	if err != nil {
 		return 0, false, fmt.Errorf("btree: alloc CoW leaf: %w", err)
@@ -204,27 +222,15 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 	if err != nil {
 		return 0, false, fmt.Errorf("btree: CoW leaf: %w", err)
 	}
-	entries, err := readLeafEntriesDeepCopy(leftBuf, cfg, leafID)
-	if err != nil {
-		return 0, false, err
-	}
 
-	// Determine if the new value needs overflow promotion.
-	// Allocate the chain BEFORE the leaf re-build so a chain-alloc
-	// failure rolls back via FreeRun without leaving the leaf in a
-	// half-written state.
+	// Build the entry to insert. A large value gets promoted to an overflow
+	// chain here, allocated BEFORE the leaf write so a chain-alloc failure
+	// rolls back via FreeRun without leaving the leaf in a half-written state.
 	newEntry, err := buildPutEntry(pw, cfg, key, value)
 	if err != nil {
 		_ = pw.FreePage(leftID)
 		return 0, false, err
 	}
-
-	// insertOrReplaceLeaf returns the displaced entry (zero-valued
-	// on insert) and whether the key existed (replace vs insert), so we
-	// can free its overflow chain after the new leaf is committed and
-	// report existence to PutReportExisting / InsertIfAbsent.
-	var displaced page.LeafEntry
-	entries, displaced, existed = insertOrReplaceLeaf(entries, newEntry)
 
 	// Helper: rollback the freshly-allocated new chain (if any) plus any
 	// inline values promoted to overflow during a size-skewed split (the
@@ -242,6 +248,36 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			_ = pw.FreeRun(pe.OverflowPage, runLen)
 		}
 	}
+
+	// Append fast path: when the key sorts after every existing entry, splice
+	// it in place instead of decoding + re-encoding the whole leaf
+	// (page-formats.md §Insert and Delete). TryAppend leaves leftBuf
+	// byte-unchanged on decline (page-full / unsupported variant), so we fall
+	// through to the slow path. A pure insert displaces nothing — no old
+	// overflow chain to free — and existed is false.
+	if appendPos && page.TryAppend(leftBuf, cfg, newEntry, prevKey) {
+		if e := pw.FreePage(leafID); e != nil {
+			_ = pw.FreePage(leftID)
+			rollbackNewChain()
+			return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, e)
+		}
+		nr, e := ascendNoSplit(pw, cfg, path, leftID)
+		if e != nil {
+			return 0, false, e
+		}
+		return nr, false, nil
+	}
+
+	// Slow path: decode the leaf, insert/replace, re-build into the CoW
+	// destination (or split into two). The original was validated above and
+	// the CoW'd copy is byte-identical, so the decode skips re-validation.
+	// insertOrReplaceLeaf returns the displaced entry (zero-valued on insert)
+	// and whether the key existed (replace vs insert), so we can free its
+	// overflow chain after the new leaf is committed and report existence to
+	// PutReportExisting / InsertIfAbsent.
+	entries := leafEntriesDeepCopyFrom(page.NewLeafReader(leftBuf, cfg))
+	var displaced page.LeafEntry
+	entries, displaced, existed = insertOrReplaceLeaf(entries, newEntry)
 
 	// Store entries into one leaf if they fit, else a byte-balanced
 	// two-page split (page-formats.md §Leaf Split — NOT the entry-count
@@ -462,6 +498,16 @@ func readLeafEntriesDeepCopy(buf []byte, cfg page.Config, pageID uint64) ([]page
 	if err := r.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, pageID, err)
 	}
+	return leafEntriesDeepCopyFrom(r), nil
+}
+
+// leafEntriesDeepCopyFrom decodes every entry of an ALREADY-VALIDATED leaf
+// reader into a fresh LeafEntry slice with independently-allocated Key and
+// Value bytes. Split out of readLeafEntriesDeepCopy so a caller that already
+// validated the page (the Put slow path, which shares the append fast path's
+// Validate) does not pay a second Validate. The deep-copy aliasing-safety
+// rationale is documented on readLeafEntriesDeepCopy above.
+func leafEntriesDeepCopyFrom(r page.LeafReader) []page.LeafEntry {
 	out := make([]page.LeafEntry, 0, r.Count())
 	it := r.IterForReuse(nil, nil, nil)
 	for {
@@ -473,7 +519,7 @@ func readLeafEntriesDeepCopy(buf []byte, cfg page.Config, pageID uint64) ([]page
 		e.Value = bytes.Clone(e.Value)
 		out = append(out, e)
 	}
-	return out, nil
+	return out
 }
 
 // insertOrReplaceLeaf finds the position of `newEntry.Key` in the

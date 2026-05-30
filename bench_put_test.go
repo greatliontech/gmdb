@@ -7,12 +7,18 @@ import (
 )
 
 // BenchmarkPutSteadyState measures the cost of a single-value Put into a
-// growing keyspace — the path that currently decodes the whole target
-// leaf (readLeafEntriesDeepCopy) and re-encodes it via LeafBuilder on
-// every insert. CPU-profile this to size what an in-place splice layer
-// (page-formats.md §Insert and Delete, currently unbuilt) would save:
+// growing keyspace. Keys ascend, so every Put appends to the rightmost leaf:
+// the in-place append splice (page.TryAppend — page-formats.md §Insert and
+// Delete) handles it without decoding, falling back to the whole-leaf
+// decode (readLeafEntriesDeepCopy) + LeafBuilder re-encode only when the
+// splice declines (page-full → split, or a variant/config mismatch).
 //
-//	go test -run='^$' -bench=BenchmarkPutSteadyState -benchtime=3s \
+// CPU-profile with a BOUNDED iteration count: the keyspace grows without
+// bound, so a time-based -benchtime can exhaust the bench DB's MaxSize
+// (~648K puts at val=200, independent of the splice — the rebuild path hits
+// the same wall). A fixed count well under that samples steady state safely:
+//
+//	go test -run='^$' -bench=BenchmarkPutSteadyState -benchtime=300000x \
 //	  -cpuprofile=/tmp/put.prof . && go tool pprof -top -nodecount=20 /tmp/put.prof
 func BenchmarkPutSteadyState(b *testing.B) {
 	for _, sz := range []int{200} {

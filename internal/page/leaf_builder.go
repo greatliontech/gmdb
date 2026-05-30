@@ -281,49 +281,17 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 		b.rgt.StartGroup(b.dataPos)
 	}
 
-	// Write the entry.
-	off := b.dataPos
-	b.buf[off] = flags
-	off++
-
+	// Write the entry. The byte layout — gmdb's ValueLen-before-key order —
+	// is produced by the shared writeCompressed{Restart,Delta}Entry helpers
+	// so the builder and the in-place splice helpers (leaf_splice.go) encode
+	// entries identically; that single source of truth is what lets a
+	// spliced page stay byte-identical to a decode-re-encode (page-formats.md
+	// §Leaf Split deterministic-encoding invariant).
+	var off int
 	if isRestart {
-		le.PutUint16(b.buf[off:], uint16(len(key)))
-		off += 2
-		if cellHasTrailerOnly(flags) {
-			copy(b.buf[off:], key)
-			off += len(key)
-			le.PutUint64(b.buf[off:], ovflPage)
-			off += 8
-			le.PutUint64(b.buf[off:], totalLen)
-			off += 8
-		} else {
-			le.PutUint32(b.buf[off:], uint32(len(value)))
-			off += 4
-			copy(b.buf[off:], key)
-			off += len(key)
-			copy(b.buf[off:], value)
-			off += len(value)
-		}
+		off = writeCompressedRestartEntry(b.buf, b.dataPos, flags, key, value, ovflPage, totalLen)
 	} else {
-		le.PutUint16(b.buf[off:], uint16(sharedLen))
-		off += 2
-		le.PutUint16(b.buf[off:], uint16(len(unsharedKey)))
-		off += 2
-		if cellHasTrailerOnly(flags) {
-			copy(b.buf[off:], unsharedKey)
-			off += len(unsharedKey)
-			le.PutUint64(b.buf[off:], ovflPage)
-			off += 8
-			le.PutUint64(b.buf[off:], totalLen)
-			off += 8
-		} else {
-			le.PutUint32(b.buf[off:], uint32(len(value)))
-			off += 4
-			copy(b.buf[off:], unsharedKey)
-			off += len(unsharedKey)
-			copy(b.buf[off:], value)
-			off += len(value)
-		}
+		off = writeCompressedDeltaEntry(b.buf, b.dataPos, flags, sharedLen, unsharedKey, value, ovflPage, totalLen)
 	}
 
 	b.dataPos = off
@@ -331,6 +299,74 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 	b.count++
 	b.rgt.IncrCount()
 	return true
+}
+
+// writeCompressedRestartEntry writes a restart (full-key) compressed entry
+// at off and returns the offset just past it. Byte layout per
+// page-formats.md §Compressed Leaf restart entry — gmdb's
+// [Flags][KeyLen][ValueLen][Key][Value] order (ValueLen before the key),
+// with the 16-byte trailer form for overflow / nested-tree cells (no
+// ValueLen prefix). ovflPage / totalLen are the generic trailer pair —
+// (OverflowPage, TotalLen) for overflow cells, (NestedRoot, NestedCount)
+// for nested-tree cells (mirrors LeafBuilder.AddEntry's dispatch).
+//
+// Shared by LeafBuilder.addCompressedEntry and the in-place splice helpers
+// so both encoders are byte-identical; do not duplicate the layout.
+func writeCompressedRestartEntry(buf []byte, off int, flags uint8, key, value []byte, ovflPage, totalLen uint64) int {
+	buf[off] = flags
+	off++
+	le.PutUint16(buf[off:], uint16(len(key)))
+	off += 2
+	if cellHasTrailerOnly(flags) {
+		copy(buf[off:], key)
+		off += len(key)
+		le.PutUint64(buf[off:], ovflPage)
+		off += 8
+		le.PutUint64(buf[off:], totalLen)
+		off += 8
+		return off
+	}
+	le.PutUint32(buf[off:], uint32(len(value)))
+	off += 4
+	copy(buf[off:], key)
+	off += len(key)
+	copy(buf[off:], value)
+	off += len(value)
+	return off
+}
+
+// writeCompressedDeltaEntry writes a delta (prefix-compressed) compressed
+// entry at off and returns the offset just past it. Byte layout per
+// page-formats.md §Compressed Leaf delta entry — gmdb's
+// [Flags][SharedLen][UnsharedLen][ValueLen][UnsharedKey][Value] order
+// (ValueLen before the unshared key), with the 16-byte trailer form for
+// overflow / nested-tree cells. ovflPage / totalLen are the generic
+// trailer pair as in writeCompressedRestartEntry.
+//
+// Shared by LeafBuilder.addCompressedEntry and the in-place splice helpers.
+func writeCompressedDeltaEntry(buf []byte, off int, flags uint8, sharedLen int, unsharedKey, value []byte, ovflPage, totalLen uint64) int {
+	buf[off] = flags
+	off++
+	le.PutUint16(buf[off:], uint16(sharedLen))
+	off += 2
+	le.PutUint16(buf[off:], uint16(len(unsharedKey)))
+	off += 2
+	if cellHasTrailerOnly(flags) {
+		copy(buf[off:], unsharedKey)
+		off += len(unsharedKey)
+		le.PutUint64(buf[off:], ovflPage)
+		off += 8
+		le.PutUint64(buf[off:], totalLen)
+		off += 8
+		return off
+	}
+	le.PutUint32(buf[off:], uint32(len(value)))
+	off += 4
+	copy(buf[off:], unsharedKey)
+	off += len(unsharedKey)
+	copy(buf[off:], value)
+	off += len(value)
+	return off
 }
 
 // Finish writes the page header and the lookup table. Returns the entry

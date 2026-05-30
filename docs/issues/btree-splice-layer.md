@@ -2,14 +2,52 @@
 
 **Lands:** proactive — a specced-but-unbuilt performance optimization;
 multi-session feature, port from grove. The format decision is **settled**
-(keep gmdb's format — see DECISION 1, RESOLVED). Resume by porting
-`TryAppend` first.
+(keep gmdb's format — see DECISION 1, RESOLVED). Chunk 1 (`TryAppend`,
+compressed) is **landed** — see Progress below; resume by porting
+`TryInsertAt` next.
 
 **Severity:** [perf] — not a correctness defect; a measured throughput +
 allocation optimization. The current decode/re-encode path is correct.
 
 **Source:** 2026-05-30, while investigating the spec's `FindSplitGroup` /
 splice design. Justified by a CPU profile (below).
+
+## Progress
+
+- **Chunk 1 — `TryAppend` (compressed): LANDED.**
+  `internal/page/leaf_splice.go` (`TryAppend` dispatcher +
+  `tryAppendCompressed`); the per-entry byte layout is extracted to
+  `writeCompressed{Restart,Delta}Entry` in `leaf_builder.go` (single source of
+  truth, shared with `addCompressedEntry`); wired as the append fast path in
+  `putReportCore` (`internal/btree/put.go`), falling back to decode/re-encode
+  on decline. Determinism/parity test + `FuzzTryAppendCompressed` + ported
+  invariant tests in `leaf_splice_test.go`. Bench (`BenchmarkPutSteadyState`,
+  val=200): ~34% faster (7721→5128 ns/op), 4× fewer B/op (11211→2836), 2×
+  fewer allocs/op (51→24).
+  - **Two gmdb-specific divergences from grove (each verified against grove's
+    actual source, not inferred):**
+    1. `isRestart` includes the natural-break clause `shared == 0` — gmdb's
+       builder applies it (`leaf_builder.go` `addCompressedEntry`), grove's does
+       not (`grove .../leaf_compressed.go:421`). A verbatim port would break the
+       determinism invariant whenever a zero-shared-prefix key lands in a
+       non-full last group.
+    2. the dispatcher declines on a compressed↔uncompressed variant mismatch
+       (`EffectiveRestartGroupTarget() == 1` on a compressed page) so the leaf
+       migrates via the rebuild path. gmdb has **mutable** RGT via
+       `Tx.SetKeyspaceConfig` (keyspaces.md); grove's RGT is set once at create
+       and is immutable, so grove never faces this and its dispatcher has no
+       such guard.
+  - **Known, spec-consistent (not a fault):** a *within-compressed* RGT change
+    (e.g. 16→8) lets an append keep the page's existing group sizing while
+    grouping the new entry per the new target; the page stays valid and
+    read-correct but is not byte-reproduced by a fresh rebuild until it is next
+    split/merged/rebuilt. keyspaces.md makes RGT a builder hint and lets
+    existing leaves keep their structure; Check() validates structurally rather
+    than re-encoding leaves, so nothing relies on fresh-rebuild reproducibility
+    across an RGT change. Documented in `leaf_splice.go`'s header.
+- **Resume: port `TryInsertAt` next** — mid-group insert (grove
+  `tryInsertAtCompressed:595`, I-B/I-C/I-D cases). Same fast-path + fallback +
+  determinism-test + fuzz discipline; reuse the shared entry-writers.
 
 ## Why (measured)
 
