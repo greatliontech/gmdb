@@ -37,7 +37,7 @@ func TestCreateKeyspaceWithIndexAllocatesRegistry(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestCreateKeyspaceWithMultipleIndexesAllRegistered(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestCreateKeyspaceWithDuplicateIndexNameReturnsErrIndexExists(t *testing.T)
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestOpenKeyspaceMissingDeclReturnsErrIndexExtractorRequired(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -150,7 +150,7 @@ func TestOpenKeyspaceMissingDeclReturnsErrIndexExtractorRequired(t *testing.T) {
 			t.Fatalf("Open #2: %v", err)
 		}
 		defer db.Close()
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #2: %v", err)
 		}
@@ -176,7 +176,7 @@ func TestOpenKeyspaceExtraDeclReturnsErrIndexUnknown(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -194,7 +194,7 @@ func TestOpenKeyspaceExtraDeclReturnsErrIndexUnknown(t *testing.T) {
 			t.Fatalf("Open #2: %v", err)
 		}
 		defer db.Close()
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #2: %v", err)
 		}
@@ -220,7 +220,7 @@ func TestOpenKeyspaceMatchingDeclSucceeds(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -238,7 +238,7 @@ func TestOpenKeyspaceMatchingDeclSucceeds(t *testing.T) {
 			t.Fatalf("Open #2: %v", err)
 		}
 		defer db.Close()
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #2: %v", err)
 		}
@@ -270,7 +270,7 @@ func TestOpenKeyspaceSchemaHashMismatchReturnsFingerprintError(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -288,7 +288,7 @@ func TestOpenKeyspaceSchemaHashMismatchReturnsFingerprintError(t *testing.T) {
 			t.Fatalf("Open #2: %v", err)
 		}
 		defer db.Close()
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #2: %v", err)
 		}
@@ -328,7 +328,7 @@ func TestOpenKeyspaceVersionMismatchReturnsFingerprintError(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -348,7 +348,7 @@ func TestOpenKeyspaceVersionMismatchReturnsFingerprintError(t *testing.T) {
 			t.Fatalf("Open #2: %v", err)
 		}
 		defer db.Close()
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #2: %v", err)
 		}
@@ -387,7 +387,7 @@ func TestOpenKeyspaceMissingDeclsAgainstMultiIndexRegistry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -408,7 +408,7 @@ func TestOpenKeyspaceMissingDeclsAgainstMultiIndexRegistry(t *testing.T) {
 			t.Fatalf("Open #2: %v", err)
 		}
 		defer db.Close()
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #2: %v", err)
 		}
@@ -433,7 +433,7 @@ func TestOpenKeyspaceSameTxReopenSameDeclsCached(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -450,7 +450,7 @@ func TestOpenKeyspaceSameTxReopenSameDeclsCached(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin #2: %v", err)
 	}
@@ -479,7 +479,7 @@ func TestOpenKeyspaceSameTxReopenDifferentVersionReturnsErrAlreadyOpen(t *testin
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -496,7 +496,7 @@ func TestOpenKeyspaceSameTxReopenDifferentVersionReturnsErrAlreadyOpen(t *testin
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin #2: %v", err)
 	}
@@ -525,7 +525,7 @@ func TestOpenKeyspaceSameTxReopenDifferentExtractFirstWins(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -542,7 +542,7 @@ func TestOpenKeyspaceSameTxReopenDifferentExtractFirstWins(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin #2: %v", err)
 	}
@@ -592,7 +592,7 @@ func TestMixingOpenKeyspaceAndOpenKeyspaceReadOnlyReturnsErrAlreadyOpen(t *testi
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -611,7 +611,7 @@ func TestMixingOpenKeyspaceAndOpenKeyspaceReadOnlyReturnsErrAlreadyOpen(t *testi
 	defer db.Close()
 
 	t.Run("read-then-write", func(t *testing.T) {
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -626,7 +626,7 @@ func TestMixingOpenKeyspaceAndOpenKeyspaceReadOnlyReturnsErrAlreadyOpen(t *testi
 	})
 
 	t.Run("write-then-read", func(t *testing.T) {
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -652,7 +652,7 @@ func TestCreateSetKeyspaceWithIndexesAllocatesRegistry(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -679,7 +679,7 @@ func TestOpenSetKeyspaceMissingDeclReturnsErrIndexExtractorRequired(t *testing.T
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -697,7 +697,7 @@ func TestOpenSetKeyspaceMissingDeclReturnsErrIndexExtractorRequired(t *testing.T
 			t.Fatalf("Open #2: %v", err)
 		}
 		defer db.Close()
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #2: %v", err)
 		}
@@ -732,7 +732,7 @@ func TestCreateKeyspaceWriteFailureRestoresPendingDelete(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -749,7 +749,7 @@ func TestCreateKeyspaceWriteFailureRestoresPendingDelete(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin #2: %v", err)
 	}
@@ -791,7 +791,7 @@ func TestOpenKeyspaceFingerprintFailurePreservesDirtyDescriptor(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -808,7 +808,7 @@ func TestOpenKeyspaceFingerprintFailurePreservesDirtyDescriptor(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin #2: %v", err)
 	}
@@ -844,7 +844,7 @@ func TestCreateSetKeyspaceWriteFailureRestoresPendingDelete(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -861,7 +861,7 @@ func TestCreateSetKeyspaceWriteFailureRestoresPendingDelete(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin #2: %v", err)
 	}
@@ -895,7 +895,7 @@ func TestOpenSetKeyspaceFingerprintFailurePreservesDirtyDescriptor(t *testing.T)
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -912,7 +912,7 @@ func TestOpenSetKeyspaceFingerprintFailurePreservesDirtyDescriptor(t *testing.T)
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin #2: %v", err)
 	}
@@ -948,7 +948,7 @@ func TestOpenKeyspaceReadOnlyHandleRejectsPut(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -965,7 +965,7 @@ func TestOpenKeyspaceReadOnlyHandleRejectsPut(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -999,7 +999,7 @@ func TestOpenSetKeyspaceReadOnlyHandleRejectsPut(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -1016,7 +1016,7 @@ func TestOpenSetKeyspaceReadOnlyHandleRejectsPut(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -1056,7 +1056,7 @@ func TestCreateKeyspaceWithIndexDoesNotPolluteListKeyspaces(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -1101,7 +1101,7 @@ func TestWriteNewIndexRegistryAtomicOnPartialFailure(t *testing.T) {
 	})
 	t.Cleanup(func() { setWriteRegistryFailHookForTest(nil) })
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -1163,7 +1163,7 @@ func TestKind2DescriptorsHaveDistinctIndexRegistryRoots(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

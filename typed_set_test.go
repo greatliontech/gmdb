@@ -11,7 +11,7 @@ func newTypedSetTx(t *testing.T) (*Tx, func()) {
 	t.Helper()
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		_ = db.Close()
 		t.Fatalf("Begin: %v", err)
@@ -281,7 +281,7 @@ func TestTypedSetKSReadOnly(t *testing.T) {
 	defer db.Close()
 	tsk := NewTypedSetKeyspace[uint64, string]("subs", BEUint64Encoder{}, StringEncoder{}, nil)
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestTypedSetKSReadOnly(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 
-	rtx, err := db.Begin(ctx, true)
+	rtx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestTypedSetCursorSignedOrder(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

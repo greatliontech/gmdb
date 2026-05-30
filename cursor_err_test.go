@@ -27,7 +27,7 @@ func TestCursorErrSentinelByState(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestTypedSetCursorErrSentinelByState(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

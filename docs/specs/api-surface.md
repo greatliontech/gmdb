@@ -151,7 +151,6 @@ var (
     ErrKeyEmpty                = errors.New("gmdb: key is nil or empty")
     ErrCorrupted               = errors.New("gmdb: database corrupted")
     ErrBadPageChecksum         = errors.New("gmdb: page checksum mismatch")
-    ErrVersionMismatch         = errors.New("gmdb: format version mismatch")
     ErrReadOnly                = errors.New("gmdb: write operation on read-only transaction")
     ErrTxClosed                = errors.New("gmdb: transaction already committed or rolled back")
     ErrPoisoned                = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
@@ -695,16 +694,12 @@ func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error
 // for the cross-process write lock; once Begin returns a *Tx the
 // context is not stored. For read transactions use BeginRead.
 //
-// **Chunk-3 spec amend.** The original surface declared
-// `Begin(ctx, writable bool) (*Tx, error)` returning a unified
-// *Tx whose write methods returned ErrReadOnly at runtime on a
-// read snapshot. The chunk-3.3 implementation split write and read
-// into distinct types so the type system rejects write methods on
-// read snapshots at compile time; `Begin(ctx, false)` is preserved
-// as an ErrReadOnly hard-error path for the loud-fail of legacy
-// callers, and the read-tx surface lives on db.BeginRead /
-// db.View / *ReadTx.
-func (db *DB) Begin(ctx context.Context, writable bool) (*Tx, error)
+// Read and write transactions are distinct types — write goes through
+// Begin (returning *Tx); read goes through BeginRead (returning
+// *ReadTx) — so the type system rejects write methods on a read
+// snapshot at compile time. (There is no read-via-Begin flag; the
+// read-tx surface lives on db.BeginRead / db.View / *ReadTx.)
+func (db *DB) Begin(ctx context.Context) (*Tx, error)
 
 // BeginRead opens a snapshot read transaction. The returned *ReadTx
 // pins the active meta's TxnID via a reader-table slot; callers

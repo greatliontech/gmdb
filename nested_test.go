@@ -47,7 +47,7 @@ func TestChildCommitMergesIntoParent(t *testing.T) {
 	ctx := context.Background()
 	db := openNestedTestDB(t)
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestChildCommitMergesIntoParent(t *testing.T) {
 	}
 
 	// Re-open: durable.
-	tx2, err := db.Begin(ctx, true)
+	tx2, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin 2: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestChildRollbackDiscardsWork(t *testing.T) {
 	ctx := context.Background()
 	db := openNestedTestDB(t)
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestParentFrozenWhileChildActive(t *testing.T) {
 	ctx := context.Background()
 	db := openNestedTestDB(t)
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestParentFrozenWhileChildActive(t *testing.T) {
 func TestParentCursorFreezeIsTransient(t *testing.T) {
 	ctx := context.Background()
 	db := openNestedTestDB(t)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestParentCursorFreezeIsTransient(t *testing.T) {
 func TestChildClosedAfterResolve(t *testing.T) {
 	ctx := context.Background()
 	db := openNestedTestDB(t)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestChildClosedAfterResolve(t *testing.T) {
 func TestNestedGrandchild(t *testing.T) {
 	ctx := context.Background()
 	db := openNestedTestDB(t)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestNestedGrandchild(t *testing.T) {
 	}
 
 	// Verify final durable state: a, b, d present; c absent.
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	defer tx2.Rollback()
 	ks2, _ := tx2.OpenKeyspace("ks")
 	for k, v := range map[string]string{"a": "1", "b": "2", "d": "4"} {
@@ -382,7 +382,7 @@ func TestNestedGrandchild(t *testing.T) {
 func TestChildCreatesKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db := openNestedTestDB(t)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -449,7 +449,7 @@ func TestChildMutatesIndexedKeyspace(t *testing.T) {
 		},
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -493,7 +493,7 @@ func TestChildMutatesIndexedKeyspace(t *testing.T) {
 	}
 
 	// Durable: re-open and re-query.
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	defer tx2.Rollback()
 	ks2, err := tx2.OpenKeyspace("items", decl)
 	if err != nil {
@@ -528,7 +528,7 @@ func TestChildCreatesIndexedKeyspace(t *testing.T) {
 		},
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -555,7 +555,7 @@ func TestChildCreatesIndexedKeyspace(t *testing.T) {
 	}
 
 	// Re-open: the child-created index is durable.
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	defer tx2.Rollback()
 	ks2, err := tx2.OpenKeyspace("items", decl)
 	if err != nil {
@@ -574,7 +574,7 @@ func TestChildDeletesKeyspace(t *testing.T) {
 	db := openNestedTestDB(t)
 
 	// Set up "victim" durably.
-	tx0, _ := db.Begin(ctx, true)
+	tx0, _ := db.Begin(ctx)
 	if _, err := tx0.CreateKeyspace("victim"); err != nil {
 		t.Fatalf("create victim: %v", err)
 	}
@@ -582,7 +582,7 @@ func TestChildDeletesKeyspace(t *testing.T) {
 		t.Fatalf("commit setup: %v", err)
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -614,7 +614,7 @@ func TestChildDeletesKeyspace(t *testing.T) {
 func TestChildSetKeyspaceRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	db := openNestedTestDB(t)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -658,7 +658,7 @@ func TestChildSetKeyspaceRoundTrip(t *testing.T) {
 func TestChildRollbackSetKeyspaceIsolated(t *testing.T) {
 	ctx := context.Background()
 	db := openNestedTestDB(t)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

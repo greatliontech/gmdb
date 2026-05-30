@@ -12,7 +12,7 @@ func newTypedNumsKS(t *testing.T, n uint64) (*TypedKS[uint64, string], func()) {
 	t.Helper()
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		_ = db.Close()
 		t.Fatalf("Begin: %v", err)
@@ -154,7 +154,7 @@ func TestTypedKSPrefixString(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestTypedCursorSignedOrder(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestTypedCursorDecodeError(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

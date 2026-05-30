@@ -49,7 +49,7 @@ func TestIndexedPutWritesIndexEntries(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestIndexedPutOnEmptyValueWritesNoEntries(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestIndexedPutMultipleRowsAllIndexed(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestIndexedPutUpdateRespectsOldNewDiff(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestIndexedPutUniqueViolationOnDiskConflict(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestIndexedPutUniqueViolationOnCandidateSetCollision(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestIndexedPutNonUniqueAllowsSameColumn(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestIndexedDeleteClearsIndexEntries(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -359,7 +359,7 @@ func TestIndexedDeleteMissingReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -388,7 +388,7 @@ func TestIndexedCursorDeleteClearsIndexEntries(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -432,7 +432,7 @@ func TestIndexedCursorDeleteOnStaleCursorReturnsErrCursorStale(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -484,7 +484,7 @@ func TestIndexedPutPinnedStateRevertsOnCandidateCollision(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -544,7 +544,7 @@ func TestIndexedPutCountPersistsAcrossCommit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -569,7 +569,7 @@ func TestIndexedPutCountPersistsAcrossCommit(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin #2: %v", err)
 	}
@@ -600,7 +600,7 @@ func TestKeyspaceIndexHandleReturnsExisting(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -641,7 +641,7 @@ func TestKeyspaceIndexHandleUnknownNameReturnsErrIndexNotFound(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -700,7 +700,7 @@ func TestApplyIndexMaintenanceAtomicOnKeyspacePut(t *testing.T) {
 	// Setup: create an indexed keyspace with 2 indexes both
 	// producing one entry per row (firstByteExtract on the value).
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -726,7 +726,7 @@ func TestApplyIndexMaintenanceAtomicOnKeyspacePut(t *testing.T) {
 	})
 	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -759,7 +759,7 @@ func TestApplyIndexMaintenanceAtomicOnKeyspaceDelete(t *testing.T) {
 	// Setup: indexed keyspace + 2 rows so Delete has index entries
 	// to remove on both indexes.
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -794,7 +794,7 @@ func TestApplyIndexMaintenanceAtomicOnKeyspaceDelete(t *testing.T) {
 	})
 	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -824,7 +824,7 @@ func TestApplyIndexMaintenanceAtomicOnCursorDelete(t *testing.T) {
 	defer db.Close()
 
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -859,7 +859,7 @@ func TestApplyIndexMaintenanceAtomicOnCursorDelete(t *testing.T) {
 	})
 	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -919,7 +919,7 @@ func TestIndexedPutPinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
 	// btree.Put on BOTH trees in sequence — the fail hook fires after
 	// the first.
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -941,7 +941,7 @@ func TestIndexedPutPinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
 		}
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -1006,7 +1006,7 @@ func TestIndexedDeletePinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
 	defer db.Close()
 
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -1032,7 +1032,7 @@ func TestIndexedDeletePinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
 		}
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -1095,7 +1095,7 @@ func TestCursorDeletePinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
 	defer db.Close()
 
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -1121,7 +1121,7 @@ func TestCursorDeletePinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
 		}
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

@@ -480,17 +480,10 @@ func (db *DB) Close() error {
 // deadlock waiting for db.mu while the coord's stopCh is closed but
 // the flock goroutine still holds the result-channel send.
 //
-// Per the chunk-3 spec amend in api-surface.md, read and write
-// transactions live in distinct types — write goes through Begin
-// (returning *Tx); read goes through BeginRead (returning *ReadTx).
-// The legacy `Begin(ctx, false)` path is preserved as a hard error
-// (ErrReadOnly) so existing callers fail loud rather than silently
-// pass the wrong-typed handle to write-only code; the spec amend
-// removed the unified-Tx writable=false case entirely.
-func (db *DB) Begin(ctx context.Context, write bool) (*Tx, error) {
-	if !write {
-		return nil, ErrReadOnly
-	}
+// Read transactions use the distinct BeginRead (returning *ReadTx) so
+// the type system rejects write methods on a read snapshot at compile
+// time (api-surface.md §Database and Transaction API).
+func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	// Fast-path close check. db.closeGate.IsClosed() is the
 	// spec-tier *closeGate gate (leak-detection.md §Close Ordering
 	// + chunk-3.3 refcount-drain promotion); a release-store at the
@@ -737,7 +730,7 @@ func mapLockErr(err error) error {
 // also fails, both errors are joined via errors.Join so callers can
 // inspect either via errors.Is.
 func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error {
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		return err
 	}

@@ -299,7 +299,7 @@ func (db *DB) runCompaction(ctx context.Context) {
 // relocated. On ErrTxTooLarge (or any error) the tx is rolled back and the
 // error returned; the caller retries with a smaller budget or aborts.
 func (db *DB) compactionPass(ctx context.Context, budget int) (int, error) {
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		return 0, err // closing / cancelled / poisoned
 	}

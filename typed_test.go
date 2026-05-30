@@ -16,7 +16,7 @@ func newTypedTx(t *testing.T) (*Tx, func()) {
 	t.Helper()
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		_ = db.Close()
 		t.Fatalf("Begin: %v", err)
@@ -152,7 +152,7 @@ func TestTypedKSReadOnly(t *testing.T) {
 
 	tks := NewTypedKeyspace[uint64, string]("nums", BEUint64Encoder{}, StringEncoder{})
 	// Create + populate + commit.
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestTypedKSReadOnly(t *testing.T) {
 
 	// Reopen the keyspace read-only on a fresh write tx (OpenReadOnly
 	// yields a handle that rejects mutations with ErrReadOnly).
-	rtx, err := db.Begin(ctx, true)
+	rtx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestTypedKSOpenVariants(t *testing.T) {
 	defer db.Close()
 	tks := NewTypedKeyspace[uint64, string]("nums", BEUint64Encoder{}, StringEncoder{})
 
-	tx1, err := db.Begin(ctx, true)
+	tx1, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin1: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestTypedKSOpenVariants(t *testing.T) {
 		t.Fatalf("Commit1: %v", err)
 	}
 
-	tx2, err := db.Begin(ctx, true)
+	tx2, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin2: %v", err)
 	}

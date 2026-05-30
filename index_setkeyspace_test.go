@@ -134,7 +134,7 @@ func TestSetKeyspaceIndexedPutAddsIndexEntries(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -171,7 +171,7 @@ func TestSetKeyspaceIndexedPutDuplicateNoOp(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -199,7 +199,7 @@ func TestSetKeyspaceIndexedPutUniqueViolation(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Unique = true
@@ -235,7 +235,7 @@ func TestSetKeyspaceIndexedDeleteValueRemovesIndexEntry(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -269,7 +269,7 @@ func TestSetKeyspaceIndexedDeleteWalksAllMembers(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -307,7 +307,7 @@ func TestSetKeyspaceIndexLookupReturnsSetKeyValuePair(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -365,7 +365,7 @@ func TestSetKeyspaceIndexGetUniqueReturnsSetKeyValue(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Unique = true
@@ -402,7 +402,7 @@ func TestSetKeyspaceIndexLookupKeysRejected(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -438,7 +438,7 @@ func TestSetKeyspaceIndexRangeYieldsSetKeyValuePairs(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -477,7 +477,7 @@ func TestSetKeyspaceIndexPrefixYieldsSetKeyValuePairs(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	// 2-column index (topic-first-byte, topic-second-byte).
 	decl := &IndexDecl{
@@ -541,7 +541,7 @@ func TestSetKeyspaceIndexedBulkDeleteAcrossNestedTree(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_value", "v")
 	// Extract returns one entry whose column is the FULL setValue.
@@ -608,7 +608,7 @@ func TestSetKeyspaceIndexedPersistsAcrossCommit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		decl := testDecl("by_topic", "topic")
 		decl.Extract = setKeyspaceFirstByteExtract
 		sks, err := tx.CreateSetKeyspace("subs", nil, decl)
@@ -630,7 +630,7 @@ func TestSetKeyspaceIndexedPersistsAcrossCommit(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -688,7 +688,7 @@ func TestApplyIndexMaintenanceAtomicOnSetKeyspacePut(t *testing.T) {
 	defer db.Close()
 
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -718,7 +718,7 @@ func TestApplyIndexMaintenanceAtomicOnSetKeyspacePut(t *testing.T) {
 	})
 	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -749,7 +749,7 @@ func TestApplyIndexMaintenanceAtomicOnSetKeyspaceDeleteValue(t *testing.T) {
 	defer db.Close()
 
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -781,7 +781,7 @@ func TestApplyIndexMaintenanceAtomicOnSetKeyspaceDeleteValue(t *testing.T) {
 	})
 	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -812,7 +812,7 @@ func TestApplyIndexMaintenanceAtomicOnSetKeyspaceBulkKeyDelete(t *testing.T) {
 	defer db.Close()
 
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -847,7 +847,7 @@ func TestApplyIndexMaintenanceAtomicOnSetKeyspaceBulkKeyDelete(t *testing.T) {
 	})
 	t.Cleanup(func() { setIndexMaintenanceFailHookForTest(nil) })
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -905,7 +905,7 @@ func TestSetKeyspaceBulkDeletePinnedStateRevertsAfterMidLoopFailure(t *testing.T
 	defer db.Close()
 
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -931,7 +931,7 @@ func TestSetKeyspaceBulkDeletePinnedStateRevertsAfterMidLoopFailure(t *testing.T
 		}
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -994,7 +994,7 @@ func TestSetKeyspacePutPinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
 	defer db.Close()
 
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -1016,7 +1016,7 @@ func TestSetKeyspacePutPinnedStateRevertsAfterMidLoopFailure(t *testing.T) {
 		}
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -1076,7 +1076,7 @@ func TestSetKeyspaceDeleteValuePinnedStateRevertsAfterMidLoopFailure(t *testing.
 	defer db.Close()
 
 	{
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin setup: %v", err)
 		}
@@ -1102,7 +1102,7 @@ func TestSetKeyspaceDeleteValuePinnedStateRevertsAfterMidLoopFailure(t *testing.
 		}
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

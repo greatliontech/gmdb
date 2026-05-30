@@ -232,7 +232,7 @@ func TestRegistryGetEmpty(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestRegistryPutThenGet(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestRegistryPutReplace(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestRegistryDeleteLastResetsRootToZero(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestRegistryDeleteMissingReturnsErrIndexNotFound(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestRegistryListLexOrder(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestRegistryListEmpty(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestRegistryPersistsAcrossCommit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -513,7 +513,7 @@ func TestRegistryPersistsAcrossCommit(t *testing.T) {
 			t.Fatalf("Open #2: %v", err)
 		}
 		defer db.Close()
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #2: %v", err)
 		}
@@ -561,7 +561,7 @@ func TestRegistryPutOnReopenedKeyspacePersists(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open #1: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #1: %v", err)
 		}
@@ -585,7 +585,7 @@ func TestRegistryPutOnReopenedKeyspacePersists(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open #2: %v", err)
 		}
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #2: %v", err)
 		}
@@ -616,7 +616,7 @@ func TestRegistryPutOnReopenedKeyspacePersists(t *testing.T) {
 			t.Fatalf("Open #3: %v", err)
 		}
 		defer db.Close()
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin #3: %v", err)
 		}
@@ -656,7 +656,7 @@ func TestRegistryPutEmptyNameReturnsErrKeyEmpty(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

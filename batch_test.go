@@ -17,7 +17,7 @@ import (
 func batchTestDB(t *testing.T) *DB {
 	t.Helper()
 	db := openNestedTestDB(t)
-	tx, err := db.Begin(context.Background(), true)
+	tx, err := db.Begin(context.Background())
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestBatchExactlyOnceAllLand(t *testing.T) {
 	}
 
 	// All keys durable.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.OpenKeyspace("ks")
 	for i := range n {
@@ -121,7 +121,7 @@ func TestBatchClosureErrorIsolated(t *testing.T) {
 		}
 	}
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.OpenKeyspace("ks")
 	// Failed closure's write rolled back.
@@ -179,7 +179,7 @@ func TestBatchClosurePanicIsolated(t *testing.T) {
 		t.Errorf("post-panic Batch err = %v", err)
 	}
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.OpenKeyspace("ks")
 	if v, err := ks.Get([]byte("k000")); err != nil || string(v) != "ok" {
@@ -234,7 +234,7 @@ func TestBatchClosureLeavesChildOpen(t *testing.T) {
 	}
 
 	// Sibling writes landed; the misuser's did not.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.OpenKeyspace("ks")
 	if v, err := ks.Get([]byte("k0")); err != nil || string(v) != "ok" {
@@ -259,7 +259,7 @@ func TestBatchSizeCapFires(t *testing.T) {
 			t.Fatalf("Open: %v", err)
 		}
 		defer db.Close()
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		tx.CreateKeyspace("ks")
 		tx.Commit()
 
@@ -282,7 +282,7 @@ func TestBatchSizeCapFires(t *testing.T) {
 		// and synctest would deadlock the bubble.
 		wg.Wait()
 
-		rtx, _ := db.Begin(ctx, true)
+		rtx, _ := db.Begin(ctx)
 		defer rtx.Rollback()
 		ks, _ := rtx.OpenKeyspace("ks")
 		for i := range n {
@@ -335,7 +335,7 @@ func TestBatchCallerContextCancelled(t *testing.T) {
 		t.Errorf("cancelled Batch err = %v, want context.Canceled", err)
 	}
 
-	tx, _ := db.Begin(context.Background(), true)
+	tx, _ := db.Begin(context.Background())
 	defer tx.Rollback()
 	ks, _ := tx.OpenKeyspace("ks")
 	if _, err := ks.Get([]byte("cancelled")); !errors.Is(err, ErrNotFound) {
@@ -386,7 +386,7 @@ func TestBatchAfterClose(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	// Use the coordinator once so it is started, then close.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	tx.CreateKeyspace("ks")
 	tx.Commit()
 	if err := db.Batch(ctx, func(tx *Tx) error {
@@ -416,7 +416,7 @@ func TestBatchCoalescesWithinDelay(t *testing.T) {
 			t.Fatalf("Open: %v", err)
 		}
 		defer db.Close()
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		tx.CreateKeyspace("ks")
 		tx.Commit()
 
@@ -446,7 +446,7 @@ func TestBatchCoalescesWithinDelay(t *testing.T) {
 		}
 
 		// All writes durable.
-		rtx, _ := db.Begin(ctx, true)
+		rtx, _ := db.Begin(ctx)
 		defer rtx.Rollback()
 		ks, _ := rtx.OpenKeyspace("ks")
 		for i := range n {

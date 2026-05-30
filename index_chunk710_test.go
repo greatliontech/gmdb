@@ -21,7 +21,7 @@ func TestDeleteSetKeyspaceWithIndexesRetiresAllSubtrees(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -64,7 +64,7 @@ func TestRebuildIndexOnSetKeyspaceSeesSameTxPuts(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	v1 := testDecl("by_topic", "topic")
 	v1.Extract = func(_, _ []byte) []IndexEntry { return nil }
@@ -102,7 +102,7 @@ func TestRebuildIndexOnSetKeyspaceUniqueViolation(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	v1 := testDecl("by_topic", "topic")
 	v1.Unique = true
@@ -146,7 +146,7 @@ func TestKeyspaceIndexedDeleteRangeClearsIndexEntries(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -192,7 +192,7 @@ func TestKeyspaceIndexedDeleteRangeOpenBounds(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -230,7 +230,7 @@ func TestSetKeyspaceIndexedDeleteRangeClearsIndexEntries(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract

@@ -165,7 +165,7 @@ func TestTypedIndexEncoderIDDrift(t *testing.T) {
 	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
 
 	// Create with the canonical StringEncoder (ID "gmdb/string").
-	tx1, err := db.Begin(ctx, true)
+	tx1, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin1: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestTypedIndexEncoderIDDrift(t *testing.T) {
 		DecodeFunc: func(src []byte) (string, error) { return string(src), nil },
 		EncoderID:  "myapp/str-v2",
 	}
-	tx2, err := db.Begin(ctx, true)
+	tx2, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin2: %v", err)
 	}

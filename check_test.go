@@ -47,7 +47,7 @@ func TestCheckCleanPopulatedDB(t *testing.T) {
 			return []IndexEntry{{Cols: [][]byte{{value[0]}}}}
 		},
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, err := tx.CreateKeyspace("items", decl)
 	if err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
@@ -115,7 +115,7 @@ func TestCheckDetectsBitmapLeak(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	leaked, err := tx.AllocPage()
 	if err != nil {
 		t.Fatalf("AllocPage: %v", err)
@@ -151,7 +151,7 @@ func TestCheckDetectsBadChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 50 {
 		if err := ks.Put(fmt.Appendf(nil, "key%03d", i), []byte("v")); err != nil {
@@ -162,7 +162,7 @@ func TestCheckDetectsBadChecksum(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 	// Capture the keyspace data-tree root (same-package field access).
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	ks2, _ := tx2.OpenKeyspace("k")
 	root := ks2.desc.Root
 	tx2.Rollback()
@@ -219,7 +219,7 @@ func TestCheckEarlyBreakReleasesReaderSlot(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 50 {
 		_ = ks.Put(fmt.Appendf(nil, "k%03d", i), []byte("v"))
@@ -260,13 +260,13 @@ func TestCheckForgedBranchNoPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 800 { // force a multi-level tree (root is a branch)
 		_ = ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "val%05d", i))
 	}
 	tx.Commit()
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	ks2, _ := tx2.OpenKeyspace("k")
 	root := ks2.desc.Root
 	tx2.Rollback()
@@ -311,7 +311,7 @@ func TestCheckFatalIsLast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 800 {
 		_ = ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "val%05d", i))
@@ -366,7 +366,7 @@ func TestCheckStructuralDetectsForgedSubpage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	sks, err := tx.CreateSetKeyspace("subs", nil)
 	if err != nil {
 		t.Fatalf("CreateSetKeyspace: %v", err)
@@ -379,7 +379,7 @@ func TestCheckStructuralDetectsForgedSubpage(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rsks, _ := rtx.OpenSetKeyspace("subs")
 	root := rsks.desc.Root
 	rtx.Rollback()

@@ -28,7 +28,7 @@ func evacFloorAt(db *DB) uint64 {
 func runCompactForest(t *testing.T, db *DB, floor uint64, budget int) int {
 	t.Helper()
 	ctx := context.Background()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin(compact): %v", err)
 	}
@@ -87,7 +87,7 @@ func TestCompactForestPreservesForest(t *testing.T) {
 	}
 
 	// 1. Populate: a plain keyspace, an indexed keyspace, a tiny keyspace.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	docs, err := tx.CreateKeyspace("docs")
 	if err != nil {
 		t.Fatalf("CreateKeyspace docs: %v", err)
@@ -139,7 +139,7 @@ func TestCompactForestPreservesForest(t *testing.T) {
 	}
 
 	// 2. Fragment: delete a middle band of docs, freeing low pages.
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	d2, _ := tx2.OpenKeyspace("docs")
 	if _, err := d2.DeleteRange(fmt.Appendf(nil, "doc%06d", 300), fmt.Appendf(nil, "doc%06d", 1100)); err != nil {
 		t.Fatalf("DeleteRange: %v", err)
@@ -152,7 +152,7 @@ func TestCompactForestPreservesForest(t *testing.T) {
 	// 3. Capture the index result set before compaction (per index key).
 	lookupKeys := func(t *testing.T, db *DB, idxKey byte) []string {
 		t.Helper()
-		rtx, _ := db.Begin(ctx, true)
+		rtx, _ := db.Begin(ctx)
 		defer rtx.Rollback()
 		ks, _ := rtx.OpenKeyspace("indexed", decl)
 		idx, err := ks.Index("by_first")
@@ -191,7 +191,7 @@ func TestCompactForestPreservesForest(t *testing.T) {
 	assertCheckClean(t, db, "post-compaction")
 
 	// Every surviving doc round-trips; deleted docs stay gone.
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rdocs, _ := rtx.OpenKeyspace("docs")
 	for i, k := range docKeys {
 		got, err := rdocs.Get(k)
@@ -245,7 +245,7 @@ func TestCompactForestBudgetBound(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 1200 {
 		if err := ks.Put(fmt.Appendf(nil, "key%06d", i), fmt.Appendf(nil, "v%06d", i)); err != nil {
@@ -267,7 +267,7 @@ func TestCompactForestBudgetBound(t *testing.T) {
 	}
 	assertCheckClean(t, db, "post-bounded-compaction")
 
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("k")
 	for i := range 1200 {
 		k := fmt.Appendf(nil, "key%06d", i)
@@ -289,7 +289,7 @@ func TestCompactForestEmpty(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	moved, err := tx.compactForest(func(uint64) bool { return true }, 1000)
 	if err != nil || moved != 0 {
 		t.Errorf("empty forest: moved=%d err=%v, want 0,nil", moved, err)
@@ -297,7 +297,7 @@ func TestCompactForestEmpty(t *testing.T) {
 	_ = tx.Rollback()
 
 	// Non-empty forest, zero budget ⇒ no-op.
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	ks, _ := tx2.CreateKeyspace("k")
 	_ = ks.Put([]byte("a"), []byte("b"))
 	moved, err = tx2.compactForest(func(uint64) bool { return true }, 0)
@@ -387,7 +387,7 @@ func TestCompactionShrinksFileMonotonically(t *testing.T) {
 	defer db.Close()
 
 	// 3000 rows, delete a wide middle band → high HWM held by RPL'd dead pages.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 3000 {
 		if err := ks.Put(fmt.Appendf(nil, "key%06d", i), fmt.Appendf(nil, "val%06d", i)); err != nil {
@@ -395,7 +395,7 @@ func TestCompactionShrinksFileMonotonically(t *testing.T) {
 		}
 	}
 	tx.Commit()
-	txd, _ := db.Begin(ctx, true)
+	txd, _ := db.Begin(ctx)
 	ksd, _ := txd.OpenKeyspace("k")
 	if _, err := ksd.DeleteRange(fmt.Appendf(nil, "key%06d", 100), fmt.Appendf(nil, "key%06d", 2900)); err != nil {
 		t.Fatalf("DeleteRange: %v", err)
@@ -403,7 +403,7 @@ func TestCompactionShrinksFileMonotonically(t *testing.T) {
 	txd.Commit()
 	// Intervening commit: advances prevMeta.TxnID past the deletes so their
 	// freed pages are reclaim-eligible at the first pass (no bootstrap growth).
-	txn, _ := db.Begin(ctx, true)
+	txn, _ := db.Begin(ctx)
 	ksn, _ := txn.OpenKeyspace("k")
 	_ = ksn.Put([]byte("nudge"), []byte("x"))
 	txn.Commit()
@@ -425,7 +425,7 @@ func TestCompactionShrinksFileMonotonically(t *testing.T) {
 	}
 
 	// Survivors intact, deleted gone, Check clean.
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("k")
 	for _, i := range []int{0, 50, 99, 2900, 2999} {
 		if _, err := rks.Get(fmt.Appendf(nil, "key%06d", i)); err != nil {
@@ -448,7 +448,7 @@ func buildOversizeForest(t *testing.T, db *DB) {
 	ctx := context.Background()
 	big := bytes.Repeat([]byte{0x5A}, 6000) // overflow value (~2 follower pages)
 	for batch := range 12 {
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin batch %d: %v", batch, err)
 		}
@@ -515,7 +515,7 @@ func TestRunCompactionNeverSurfacesTxTooLarge(t *testing.T) {
 	assertCheckClean(t, db, "post-runCompaction")
 
 	// Every value still readable.
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("k")
 	big := bytes.Repeat([]byte{0x5A}, 6000)
 	for batch := range 12 {
@@ -546,7 +546,7 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	// One overflow value (multi-page chain) plus filler so the tree has shape.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("ovf")
 	if err := ks.Put([]byte("big"), bytes.Repeat([]byte{0xCC}, 9000)); err != nil {
 		t.Fatalf("Put big: %v", err)
@@ -559,7 +559,7 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 	}
 
 	// Locate the overflow chain's first page, then a FOLLOWER (first+1).
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("ovf")
 	root := rks.desc.Root
 	var first uint64
@@ -603,7 +603,7 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 
 	// Relocate everything (floor=firstData): relocating the chain reads the
 	// corrupt follower via pw.Page → ErrBadPageChecksum, rolled back.
-	tx2, _ := db2.Begin(ctx, true)
+	tx2, _ := db2.Begin(ctx)
 	_, err = tx2.compactForest(func(uint64) bool { return true }, 1<<20)
 	tx2.Rollback()
 	if !errors.Is(err, ErrBadPageChecksum) {
@@ -630,7 +630,7 @@ func TestMaintCompactDisabledIsNoOp(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 50 {
 		_ = ks.Put(fmt.Appendf(nil, "k%05d", i), fmt.Appendf(nil, "v%05d", i))

@@ -175,7 +175,7 @@ func (db *DB) runBatch(ctx context.Context, batch []batchCall) {
 	// are checked per-closure below) so a single caller's cancellation
 	// never aborts the shared commit, while Close can still unblock the
 	// lock wait.
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		replyAll(batch, err)
 		return

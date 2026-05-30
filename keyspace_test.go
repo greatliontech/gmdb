@@ -32,7 +32,7 @@ func TestCreateOpenKeyspaceRoundTrip(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestCreateKeyspaceDuplicateReturnsErrKeyExists(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestOpenKeyspaceMissingReturnsErrNotFound(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestCreateKeyspaceIfNotExistsOpenOrCreate(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestEmptyNameReturnsErrKeyEmpty(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestKeyspaceRootCoWPropagatesAcrossCommit(t *testing.T) {
 		t.Fatalf("initial NumKeyspaces = %d, want 0", db.Meta().NumKeyspaces)
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestKeyspaceRootCoWPropagatesAcrossCommit(t *testing.T) {
 	if db2.Meta().NumKeyspaces != 2 {
 		t.Errorf("re-Open NumKeyspaces = %d, want 2", db2.Meta().NumKeyspaces)
 	}
-	tx2, err := db2.Begin(ctx, true)
+	tx2, err := db2.Begin(ctx)
 	if err != nil {
 		t.Fatalf("re-Open Begin: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestListKeyspacesReturnsSortedNames(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestListKeyspacesEmpty(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestListKeyspacesFiltersKindIndexInternal(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestOpenKeyspaceRejectsForgedKindMismatch(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -361,7 +361,7 @@ func TestOpenKeyspaceRejectsForgedKindReserved(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -390,7 +390,7 @@ func TestOpenKeyspaceRejectsForgedUnknownKind(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -430,7 +430,7 @@ func TestOpenKeyspaceRejectsForgedFixedValueSizeOnKind0(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestKeyspaceMethodsOnClosedTxReturnErrTxClosed(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

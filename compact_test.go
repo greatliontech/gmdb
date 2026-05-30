@@ -16,7 +16,7 @@ import (
 func buildChurnedDB(t *testing.T, db *DB) {
 	t.Helper()
 	ctx := context.Background()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 3000 {
 		if err := ks.Put(fmt.Appendf(nil, "key%06d", i), fmt.Appendf(nil, "val%06d", i)); err != nil {
@@ -26,7 +26,7 @@ func buildChurnedDB(t *testing.T, db *DB) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	ks2, _ := tx2.OpenKeyspace("k")
 	if _, err := ks2.DeleteRange(fmt.Appendf(nil, "key%06d", 100), fmt.Appendf(nil, "key%06d", 2900)); err != nil {
 		t.Fatalf("DeleteRange: %v", err)
@@ -79,7 +79,7 @@ func TestCompactReclaimsAndPreservesData(t *testing.T) {
 			t.Errorf("post-Compact BitmapLeak at page %d", iss.PageID)
 		}
 	}
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("k")
 	for _, i := range []int{0, 50, 99, 2900, 2999} {
 		if _, err := rks.Get(fmt.Appendf(nil, "key%06d", i)); err != nil {
@@ -92,7 +92,7 @@ func TestCompactReclaimsAndPreservesData(t *testing.T) {
 	rtx.Rollback()
 
 	// The handle is usable for further writes after the reopen.
-	wtx, err := db.Begin(ctx, true)
+	wtx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin after Compact: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestCompactReclaimsAndPreservesData(t *testing.T) {
 	if err := wtx.Commit(); err != nil {
 		t.Fatalf("Commit after Compact: %v", err)
 	}
-	vtx, _ := db.Begin(ctx, true)
+	vtx, _ := db.Begin(ctx)
 	vks, _ := vtx.OpenKeyspace("k")
 	if got, err := vks.Get([]byte("postcompact")); err != nil || string(got) != "ok" {
 		t.Errorf("post-Compact write not durable: got %q err %v", got, err)
@@ -146,7 +146,7 @@ func TestCompactReclaimsAcrossReopen(t *testing.T) {
 			t.Errorf("reopened Check error: code=%s msg=%s", iss.Code, iss.Message)
 		}
 	}
-	rtx, _ := db2.Begin(ctx, true)
+	rtx, _ := db2.Begin(ctx)
 	defer rtx.Rollback()
 	rks, _ := rtx.OpenKeyspace("k")
 	if _, err := rks.Get(fmt.Appendf(nil, "key%06d", 2999)); err != nil {
@@ -186,7 +186,7 @@ func TestCompactReadersActive(t *testing.T) {
 	}
 	// DB still usable + data intact after the aborted Compact (the reader
 	// is still open here).
-	r2, _ := db.Begin(ctx, true)
+	r2, _ := db.Begin(ctx)
 	rks, _ := r2.OpenKeyspace("k")
 	if _, gerr := rks.Get(fmt.Appendf(nil, "key%06d", 0)); gerr != nil {
 		t.Errorf("data unreadable after aborted Compact: %v", gerr)
@@ -218,7 +218,7 @@ func TestCompactConcurrentWriterNoCrash(t *testing.T) {
 	defer db.Close()
 	// A sizable keyspace so each Compact copy takes long enough that the
 	// racing Begin reliably blocks in AcquireWriter mid-Compact.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 8000 {
 		if err := ks.Put(fmt.Appendf(nil, "key%06d", i), fmt.Appendf(nil, "val%06d", i)); err != nil {
@@ -236,7 +236,7 @@ func TestCompactConcurrentWriterNoCrash(t *testing.T) {
 		// behind it (the H1 window).
 		time.Sleep(300 * time.Microsecond)
 
-		wtx, err := db.Begin(ctx, true)
+		wtx, err := db.Begin(ctx)
 		if err != nil {
 			<-done
 			t.Fatalf("iter %d Begin: %v", iter, err)
@@ -262,7 +262,7 @@ func TestCompactConcurrentWriterNoCrash(t *testing.T) {
 		}
 
 		// The concurrent write landed (against whichever pager).
-		vtx, _ := db.Begin(ctx, true)
+		vtx, _ := db.Begin(ctx)
 		vks, _ := vtx.OpenKeyspace("k")
 		if got, gerr := vks.Get(key); gerr != nil || string(got) != "ok" {
 			vtx.Rollback()
@@ -321,7 +321,7 @@ func TestPoisonedHandleRejectsReads(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	_ = ks.Put([]byte("a"), []byte("b"))
 	tx.Commit()
@@ -330,7 +330,7 @@ func TestPoisonedHandleRejectsReads(t *testing.T) {
 	if _, err := db.BeginRead(ctx); !errors.Is(err, ErrPoisoned) {
 		t.Errorf("BeginRead on poisoned handle: got %v, want ErrPoisoned", err)
 	}
-	if _, err := db.Begin(ctx, true); !errors.Is(err, ErrPoisoned) {
+	if _, err := db.Begin(ctx); !errors.Is(err, ErrPoisoned) {
 		t.Errorf("Begin on poisoned handle: got %v, want ErrPoisoned", err)
 	}
 	// Close still works on a poisoned handle (the recovery path).
@@ -354,7 +354,7 @@ func TestCompactEmptyDB(t *testing.T) {
 	if db.Meta().UUID != uuid {
 		t.Errorf("Compact changed UUID on empty DB")
 	}
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin after empty Compact: %v", err)
 	}

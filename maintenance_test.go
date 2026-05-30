@@ -71,7 +71,7 @@ func scrubWarnedPages(t *testing.T, recs *[]slog.Record, mu *sync.Mutex) []uint6
 func makeLeak(t *testing.T, db *DB, n int) uint64 {
 	t.Helper()
 	ctx := context.Background()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestMaintenanceReclaimsLeak(t *testing.T) {
 		t.Errorf("BitmapLeak still present after a maintenance pass")
 	}
 	// Live data survived (no live page mis-reclaimed).
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	defer rtx.Rollback()
 	rks, _ := rtx.OpenKeyspace("k")
 	for i := range n {
@@ -157,7 +157,7 @@ func TestMaintenancePassSkipsWithinInterval(t *testing.T) {
 
 	// A new leak + an in-interval second pass: the claim fails, so nothing
 	// is reclaimed.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	leaked, _ := tx.AllocPage()
 	_, _ = tx.AllocSlab(leaked)
 	tx.Commit()
@@ -198,7 +198,7 @@ func TestMaintenanceCleanClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 200 {
 		_ = ks.Put(fmt.Appendf(nil, "k%04d", i), []byte("v"))
@@ -244,7 +244,7 @@ func TestMaintenanceSkipsReclamationUnderCorruption(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	makeLeak(t, db, 800) // multi-level tree + a leak
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.OpenKeyspace("k")
 	root := ks.desc.Root
 	tx.Rollback()
@@ -330,7 +330,7 @@ func writeKeyspaceForScrub(t *testing.T, path string, n int) (root uint64, pageS
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range n {
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
@@ -444,7 +444,7 @@ func TestMaintenanceScrubCleanDBNoWarnings(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 300 {
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
@@ -474,7 +474,7 @@ func TestMaintenanceScrubCursorAdvancesAndWraps(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 400 {
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
@@ -538,7 +538,7 @@ func TestMaintenanceScrubSkippedWithoutChecksum(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 100 {
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {

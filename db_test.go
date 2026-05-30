@@ -169,7 +169,7 @@ func TestRollbackDiscardsChanges(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -181,18 +181,6 @@ func TestRollbackDiscardsChanges(t *testing.T) {
 	}
 	if db.Meta().TxnID != 0 {
 		t.Errorf("TxnID changed after rollback: %d", db.Meta().TxnID)
-	}
-}
-
-func TestBeginReadOnlyNotYetImplemented(t *testing.T) {
-	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-	if _, err := db.Begin(ctx, false); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("Begin(write=false): got %v, want ErrReadOnly", err)
 	}
 }
 
@@ -247,7 +235,7 @@ func TestRollbackRestoresBitmap(t *testing.T) {
 	}
 
 	// tx3: Begin, allocate (drains RPL → bitmap), rollback.
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -748,7 +736,7 @@ func TestCommitFailurePoisonsHandle(t *testing.T) {
 
 	// Next Begin must surface ErrPoisoned without blocking on the
 	// cross-process write grant.
-	if _, err := db.Begin(ctx, true); !errors.Is(err, ErrPoisoned) {
+	if _, err := db.Begin(ctx); !errors.Is(err, ErrPoisoned) {
 		t.Errorf("post-failure Begin: got %v, want ErrPoisoned", err)
 	}
 	if err := db.Update(ctx, func(tx *Tx) error { return nil }); !errors.Is(err, ErrPoisoned) {
@@ -789,7 +777,7 @@ func TestCommitFailurePoisonsHandle(t *testing.T) {
 //go:noinline
 func leakWriteTx(t *testing.T, db *DB, ctx context.Context) {
 	t.Helper()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin (to leak): %v", err)
 	}
@@ -826,7 +814,7 @@ func TestLeakedTxReleasesWriteLock(t *testing.T) {
 	// the timeout triggers a failure.
 	done := make(chan error, 1)
 	go func() {
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err == nil {
 			_ = tx.Rollback()
 		}
@@ -867,7 +855,7 @@ func TestCommitStopsCleanup(t *testing.T) {
 	runtime.GC()
 	runtime.GC()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin after committed tx: %v", err)
 	}
@@ -958,7 +946,7 @@ func TestBeginRespectsCtxCancellation(t *testing.T) {
 	defer db.Close()
 
 	// Hold the writer with a foreground tx.
-	hold, err := db.Begin(ctx, true)
+	hold, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin hold: %v", err)
 	}
@@ -968,7 +956,7 @@ func TestBeginRespectsCtxCancellation(t *testing.T) {
 	cctx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() {
-		_, e := db.Begin(cctx, true)
+		_, e := db.Begin(cctx)
 		done <- e
 	}()
 	// Let the second Begin enter the AcquireWriter retry loop.
@@ -993,7 +981,7 @@ func TestBeginAfterCloseReturnsErrClosed(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	_, err = db.Begin(ctx, true)
+	_, err = db.Begin(ctx)
 	if !errors.Is(err, ErrClosed) {
 		t.Errorf("got %v, want ErrClosed", err)
 	}
@@ -1055,7 +1043,7 @@ func TestCloseDuringBlockedBegin(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	hold, err := db.Begin(ctx, true)
+	hold, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin hold: %v", err)
 	}
@@ -1063,7 +1051,7 @@ func TestCloseDuringBlockedBegin(t *testing.T) {
 
 	beginErr := make(chan error, 1)
 	go func() {
-		_, e := db.Begin(ctx, true)
+		_, e := db.Begin(ctx)
 		beginErr <- e
 	}()
 	time.Sleep(50 * time.Millisecond)
@@ -1151,7 +1139,7 @@ func TestTxMethodAfterCloseReturnsErrClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -1230,7 +1218,7 @@ func TestDBClosedFlagSharedByPointer(t *testing.T) {
 		t.Fatal("db.closeGate is nil — should be heap-allocated *closeGate")
 	}
 	// Confirm Begin captures the same pointer.
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -1270,7 +1258,7 @@ func TestTxCleanupFnDirectClosedSkipsRelease(t *testing.T) {
 	defer db.Close()
 
 	// Acquire a real grant so info.grant is a meaningful pointer.
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -1348,7 +1336,7 @@ func TestTxCleanupFnDirectClosedFalseRunsRelease(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

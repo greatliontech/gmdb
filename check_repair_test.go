@@ -15,7 +15,7 @@ import (
 func buildKeyspaceWithLeak(t *testing.T, db *DB, n int) uint64 {
 	t.Helper()
 	ctx := context.Background()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -47,7 +47,7 @@ func buildKeyspaceWithLeak(t *testing.T, db *DB, n int) uint64 {
 func assertKeyspaceIntact(t *testing.T, db *DB, n int) {
 	t.Helper()
 	ctx := context.Background()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin (verify): %v", err)
 	}
@@ -70,7 +70,7 @@ func assertKeyspaceIntact(t *testing.T, db *DB, n int) {
 
 func numFreePages(t *testing.T, db *DB) uint64 {
 	t.Helper()
-	tx, err := db.Begin(context.Background(), true)
+	tx, err := db.Begin(context.Background())
 	if err != nil {
 		t.Fatalf("Begin (numFree): %v", err)
 	}
@@ -203,7 +203,7 @@ func TestRepairSkipsUnderCorruption(t *testing.T) {
 	}
 	// Force a multi-level tree so the data-tree root is a branch.
 	buildKeyspaceWithLeak(t, db, 800)
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.OpenKeyspace("k")
 	root := ks.desc.Root
 	tx.Rollback()
@@ -326,7 +326,7 @@ func TestRepairCleanDBNoChange(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 100 {
 		_ = ks.Put(fmt.Appendf(nil, "key%05d", i), []byte("v"))

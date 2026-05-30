@@ -184,7 +184,7 @@ const noReaderTxnID = ^uint64(0)
 // pipeline.
 func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 	return func(yield func(CheckIssue) bool) {
-		tx, err := db.Begin(context.Background(), true)
+		tx, err := db.Begin(context.Background())
 		if err != nil {
 			yield(CheckIssue{
 				Severity: CheckFatal,

@@ -19,7 +19,7 @@ func TestRebuildIndexBasicReplacesExtractor(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestRebuildIndexNilDeclReturnsErrInvalidOptions(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	if _, err := tx.CreateKeyspace("items"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
@@ -103,7 +103,7 @@ func TestRebuildIndexNilExtractReturnsErrIndexExtractorRequired(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	if _, err := tx.CreateKeyspace("items"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
@@ -130,7 +130,7 @@ func TestRebuildIndexMissingKeyspaceReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -150,7 +150,7 @@ func TestRebuildIndexMissingIndexNameReturnsErrIndexNotFound(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	if _, err := tx.CreateKeyspace("items"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
@@ -175,7 +175,7 @@ func TestRebuildIndexUniqueViolationFailsCleanly(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	v1 := testDecl("by_color", "color")
 	v1.Unique = true
@@ -220,7 +220,7 @@ func TestRebuildIndexEmptyKeyspaceProducesEmptyIndex(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -254,7 +254,7 @@ func TestDropIndexRemovesEntry(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -289,7 +289,7 @@ func TestDropIndexLastResetsIndexRegistryRoot(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -317,7 +317,7 @@ func TestDropIndexMissingKeyspaceReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	err = tx.DropIndex("nonexistent", "by_color")
 	if !errors.Is(err, ErrNotFound) {
@@ -333,7 +333,7 @@ func TestDropIndexMissingIndexNameReturnsErrIndexNotFound(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	if _, err := tx.CreateKeyspace("items"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
@@ -361,7 +361,7 @@ func TestRebuildIndexOnSetKeyspaceSucceeds(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	v1 := testDecl("by_topic", "topic")
 	v1.Extract = setKeyspaceFirstByteExtract
@@ -397,7 +397,7 @@ func TestDropIndexOnSetKeyspaceSucceeds(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
@@ -434,7 +434,7 @@ func TestRebuildIndexSeesSameTxPuts(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	v1 := testDecl("by_color", "color")
 	// Extract returns NOTHING under v1 (so the index is empty
@@ -484,7 +484,7 @@ func TestDropIndexThenReopenWithSameDeclErrIndexUnknown(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		decl := testDecl("by_color", "color")
 		decl.Extract = firstByteExtract
 		if _, err := tx.CreateKeyspace("items", decl); err != nil {
@@ -500,7 +500,7 @@ func TestDropIndexThenReopenWithSameDeclErrIndexUnknown(t *testing.T) {
 		t.Fatalf("Open #2: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -536,7 +536,7 @@ func TestRebuildIndexNotCachedPathPersists(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		v1 := testDecl("by_color", "color")
 		v1.Extract = firstByteExtract
 		v1.Version = "v1"
@@ -558,7 +558,7 @@ func TestRebuildIndexNotCachedPathPersists(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open #2: %v", err)
 		}
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		v2 := testDecl("by_color", "color")
 		v2.Extract = firstByteExtract
 		v2.Version = "v2"
@@ -578,7 +578,7 @@ func TestRebuildIndexNotCachedPathPersists(t *testing.T) {
 			t.Fatalf("Open #3: %v", err)
 		}
 		defer db.Close()
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		defer tx.Rollback()
 		v2 := testDecl("by_color", "color")
 		v2.Extract = firstByteExtract
@@ -603,7 +603,7 @@ func TestDropIndexNotCachedPathPersists(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		decl := testDecl("by_color", "color")
 		decl.Extract = firstByteExtract
 		if _, err := tx.CreateKeyspace("items", decl); err != nil {
@@ -619,7 +619,7 @@ func TestDropIndexNotCachedPathPersists(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open #2: %v", err)
 		}
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		if err := tx.DropIndex("items", "by_color"); err != nil {
 			t.Fatalf("DropIndex not-cached: %v", err)
 		}
@@ -635,7 +635,7 @@ func TestDropIndexNotCachedPathPersists(t *testing.T) {
 			t.Fatalf("Open #3: %v", err)
 		}
 		defer db.Close()
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		defer tx.Rollback()
 		if _, err := tx.OpenKeyspace("items"); err != nil {
 			t.Fatalf("OpenKeyspace post-drop (no decl): %v", err)
@@ -657,7 +657,7 @@ func TestDeleteKeyspaceWithIndexesRetiresAllSubtrees(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	decl := testDecl("by_color", "color")
@@ -701,7 +701,7 @@ func TestDeleteKeyspacePersistsAcrossCommit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		decl := testDecl("by_color", "color")
 		decl.Extract = firstByteExtract
 		ks, err := tx.CreateKeyspace("items", decl)
@@ -721,7 +721,7 @@ func TestDeleteKeyspacePersistsAcrossCommit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open #2: %v", err)
 		}
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		if err := tx.DeleteKeyspace("items"); err != nil {
 			t.Fatalf("DeleteKeyspace #2: %v", err)
 		}
@@ -736,7 +736,7 @@ func TestDeleteKeyspacePersistsAcrossCommit(t *testing.T) {
 			t.Fatalf("Open #3: %v", err)
 		}
 		defer db.Close()
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		defer tx.Rollback()
 		names, err := tx.ListKeyspaces()
 		if err != nil {
@@ -799,7 +799,7 @@ func TestRebuildIndexAtomicOnPartialFailure(t *testing.T) {
 	defer db.Close()
 
 	// First tx: create + populate so the rebuild has a real OLD tree.
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -824,7 +824,7 @@ func TestRebuildIndexAtomicOnPartialFailure(t *testing.T) {
 	setRebuildIndexFailHookForTest(func() error { return injected })
 	t.Cleanup(func() { setRebuildIndexFailHookForTest(nil) })
 
-	tx, err = db.Begin(ctx, true)
+	tx, err = db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin 2: %v", err)
 	}
@@ -870,7 +870,7 @@ func TestDropIndexAtomicOnPartialFailure(t *testing.T) {
 
 	// Setup tx: create + populate so DropIndex has a non-trivial data
 	// tree to retire.
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -893,7 +893,7 @@ func TestDropIndexAtomicOnPartialFailure(t *testing.T) {
 	setDropIndexFailHookForTest(func() error { return injected })
 	t.Cleanup(func() { setDropIndexFailHookForTest(nil) })
 
-	tx, err = db.Begin(ctx, true)
+	tx, err = db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin 2: %v", err)
 	}

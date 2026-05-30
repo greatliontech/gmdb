@@ -77,7 +77,7 @@ func TestKeyspaceBulkLoadIndexedRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestKeyspaceBulkLoadIndexedMatchesPut(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestKeyspaceBulkLoadIndexedUniqueViolationCrossRow(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestKeyspaceBulkLoadIndexedUniqueViolationCandidateSet(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestKeyspaceBulkLoadIndexedPartialIndex(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestKeyspaceBulkLoadIndexedSpills(t *testing.T) {
 		ScratchDir:       scratch,
 	})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestKeyspaceBulkLoadIndexedSpillWriteError(t *testing.T) {
 		ScratchDir:       missing,
 	})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn(t *testing.T) {
 		ScratchDir:       scratch,
 	})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -558,7 +558,7 @@ func TestKeyspaceBulkLoadIndexedAbortReopen(t *testing.T) {
 	}
 
 	// tx1: create empty indexed keyspace, commit.
-	tx1, err := db.Begin(ctx, true)
+	tx1, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin tx1: %v", err)
 	}
@@ -570,7 +570,7 @@ func TestKeyspaceBulkLoadIndexedAbortReopen(t *testing.T) {
 	}
 
 	// tx2: BulkLoad with a cross-row unique dup → error → Rollback.
-	tx2, err := db.Begin(ctx, true)
+	tx2, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin tx2: %v", err)
 	}
@@ -587,7 +587,7 @@ func TestKeyspaceBulkLoadIndexedAbortReopen(t *testing.T) {
 	}
 
 	// tx3: reopen — must be empty.
-	tx3, err := db.Begin(ctx, true)
+	tx3, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin tx3: %v", err)
 	}
@@ -616,7 +616,7 @@ func TestSetKeyspaceBulkLoadIndexedRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -671,7 +671,7 @@ func TestSetKeyspaceBulkLoadIndexedMatchesPut(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -733,7 +733,7 @@ func TestSetKeyspaceBulkLoadIndexedUniqueViolation(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -768,7 +768,7 @@ func TestSetKeyspaceBulkLoadIndexedSpills(t *testing.T) {
 		ScratchDir:       scratch,
 	})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -820,7 +820,7 @@ func TestKeyspaceBulkLoadIndexedUniqueViolationSpilled(t *testing.T) {
 		ScratchDir:       t.TempDir(),
 	})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -887,7 +887,7 @@ func TestKeyspaceBulkLoadIndexedReusedKeyBuffer(t *testing.T) {
 		ScratchDir:       t.TempDir(),
 	})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

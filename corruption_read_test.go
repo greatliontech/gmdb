@@ -20,7 +20,7 @@ func TestGetBitrotReturnsBadPageChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 800 { // multi-level tree → data-tree root is a branch
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), []byte("v")); err != nil {
@@ -32,7 +32,7 @@ func TestGetBitrotReturnsBadPageChecksum(t *testing.T) {
 	}
 
 	// Positive RV1: a valid checksummed page verifies and reads cleanly.
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("k")
 	if _, err := rks.Get([]byte("key00000")); err != nil {
 		t.Fatalf("Get on intact DB = %v, want nil", err)
@@ -68,7 +68,7 @@ func TestGetBitrotReturnsBadPageChecksum(t *testing.T) {
 		t.Fatalf("re-Open: %v", err)
 	}
 	defer db2.Close()
-	rtx2, _ := db2.Begin(ctx, true)
+	rtx2, _ := db2.Begin(ctx)
 	defer rtx2.Rollback()
 	ks2, err := rtx2.OpenKeyspace("k")
 	if err != nil {
@@ -96,7 +96,7 @@ func TestGetForgedOutOfRangeChildNoCrash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 800 { // force a multi-level tree (root is a branch)
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "val%05d", i)); err != nil {
@@ -106,7 +106,7 @@ func TestGetForgedOutOfRangeChildNoCrash(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("k")
 	root := rks.desc.Root
 	rtx.Rollback()
@@ -146,7 +146,7 @@ func TestGetForgedOutOfRangeChildNoCrash(t *testing.T) {
 		t.Fatalf("re-Open: %v", err)
 	}
 	defer db2.Close()
-	rtx2, _ := db2.Begin(ctx, true)
+	rtx2, _ := db2.Begin(ctx)
 	defer rtx2.Rollback()
 	ks2, err := rtx2.OpenKeyspace("k")
 	if err != nil {
@@ -170,7 +170,7 @@ func corruptRootChecksumDB(t *testing.T, ctx context.Context) string {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 800 {
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), []byte("v")); err != nil {
@@ -180,7 +180,7 @@ func corruptRootChecksumDB(t *testing.T, ctx context.Context) string {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("k")
 	root := rks.desc.Root
 	rtx.Rollback()
@@ -218,7 +218,7 @@ func TestCursorErrReportsBadPageChecksum(t *testing.T) {
 		t.Fatalf("re-Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, err := tx.OpenKeyspace("k")
 	if err != nil {
@@ -243,7 +243,7 @@ func forgeBranchDirDB(t *testing.T, ctx context.Context) string {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 800 { // multi-level tree → data-tree root is a branch
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "val%05d", i)); err != nil {
@@ -253,7 +253,7 @@ func forgeBranchDirDB(t *testing.T, ctx context.Context) string {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("k")
 	root := rks.desc.Root
 	rtx.Rollback()
@@ -290,7 +290,7 @@ func TestGetForgedBranchDirectoryNoPanic(t *testing.T) {
 		t.Fatalf("re-Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, err := tx.OpenKeyspace("k")
 	if err != nil {
@@ -312,7 +312,7 @@ func TestCursorForgedBranchDirectoryNoPanic(t *testing.T) {
 		t.Fatalf("re-Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, err := tx.OpenKeyspace("k")
 	if err != nil {

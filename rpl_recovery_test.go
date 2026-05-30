@@ -32,7 +32,7 @@ func TestRPLChainSurvivesPartialReclaimAndReuse(t *testing.T) {
 	// Churn: fill then delete, repeatedly — builds a multi-segment RPL and
 	// partially reclaims it (reusing reclaimed segment pages as data).
 	for round := range 40 {
-		tx, _ := db.Begin(ctx, true)
+		tx, _ := db.Begin(ctx)
 		ks, err := tx.OpenKeyspace("k")
 		if err != nil {
 			ks, err = tx.CreateKeyspace("k")
@@ -48,7 +48,7 @@ func TestRPLChainSurvivesPartialReclaimAndReuse(t *testing.T) {
 		if err := tx.Commit(); err != nil {
 			t.Fatalf("Commit fill: %v", err)
 		}
-		txd, _ := db.Begin(ctx, true)
+		txd, _ := db.Begin(ctx)
 		ksd, _ := txd.OpenKeyspace("k")
 		if _, err := ksd.DeleteRange(fmt.Appendf(nil, "r%02d-k%04d", round, 0), fmt.Appendf(nil, "r%02d-k%04d", round, 199)); err != nil {
 			t.Fatalf("DeleteRange: %v", err)

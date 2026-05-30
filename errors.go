@@ -49,11 +49,6 @@ var (
 	// page ID where useful.
 	ErrBadPageChecksum = errors.New("gmdb: page checksum mismatch")
 
-	// ErrVersionMismatch is returned when the on-disk format version
-	// does not match the engine's FormatVersion. Reserved for future
-	// format evolutions; never returned in v0.
-	ErrVersionMismatch = errors.New("gmdb: on-disk format version mismatch")
-
 	// ErrPoisoned is returned by Begin / BeginRead / Update / Compact
 	// after the handle is poisoned. Two causes: (a) a previous write
 	// transaction's commit failed in the publication phase (step-3

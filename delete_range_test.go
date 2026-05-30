@@ -19,7 +19,7 @@ func TestKeyspaceDeleteRangeEmptyRange(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	_ = ks.Put([]byte("a"), []byte("v"))
@@ -44,7 +44,7 @@ func TestKeyspaceDeleteRangeEmptyKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	n, err := ks.DeleteRange([]byte("a"), []byte("z"))
@@ -62,7 +62,7 @@ func TestKeyspaceDeleteRangeRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	for _, k := range []string{"a", "b", "c", "d", "e"} {
@@ -105,7 +105,7 @@ func TestKeyspaceDeleteRangeAllKeys(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	for i := range 30 {
@@ -139,7 +139,7 @@ func TestKeyspaceDeleteRangePersistsAcrossCommit(t *testing.T) {
 	db, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("ks")
 	for i := range 20 {
 		_ = ks.Put([]byte(fmt.Sprintf("k%02d", i)), []byte("v"))
@@ -148,7 +148,7 @@ func TestKeyspaceDeleteRangePersistsAcrossCommit(t *testing.T) {
 		t.Fatalf("Commit #1: %v", err)
 	}
 
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	ks2, _ := tx2.OpenKeyspace("ks")
 	n, err := ks2.DeleteRange([]byte("k05"), []byte("k15"))
 	if err != nil {
@@ -161,7 +161,7 @@ func TestKeyspaceDeleteRangePersistsAcrossCommit(t *testing.T) {
 		t.Fatalf("Commit #2: %v", err)
 	}
 
-	tx3, _ := db.Begin(ctx, true)
+	tx3, _ := db.Begin(ctx)
 	defer tx3.Rollback()
 	ks3, _ := tx3.OpenKeyspace("ks")
 	for i := range 20 {
@@ -184,7 +184,7 @@ func TestKeyspaceDeleteRangeKeyspaceClosedAfterDeleteKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	_ = ks.Put([]byte("a"), []byte("v"))
@@ -201,7 +201,7 @@ func TestKeyspaceDeleteRangeMarksCursorsStale(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	for _, k := range []string{"a", "b", "c"} {
@@ -235,7 +235,7 @@ func TestKeyspaceDeleteRangeNoOpDoesNotMarkCursorsStale(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	_ = ks.Put([]byte("a"), []byte("v"))
@@ -270,7 +270,7 @@ func TestKeyspaceDeleteRangeRejectsEmptyByteBoundary(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	_ = ks.Put([]byte("a"), []byte("v"))
@@ -309,16 +309,11 @@ func TestKeyspaceDeleteRangeReadOnlyTxReturnsErrReadOnly(t *testing.T) {
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
 	// Pre-commit a keyspace.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	if _, err := tx.CreateKeyspace("ks"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
-	}
-	// Now Begin as writable=false → ErrReadOnly per chunk-3 contract
-	// (the legacy false-Begin is an ErrReadOnly hard-error path).
-	if _, err := db.Begin(ctx, false); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("Begin(false): got %v, want ErrReadOnly", err)
 	}
 }

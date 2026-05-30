@@ -37,7 +37,7 @@ func TestDeleteKeyspaceEmptyNameReturnsErrKeyEmpty(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	if err := tx.DeleteKeyspace(""); !errors.Is(err, ErrKeyEmpty) {
 		t.Errorf("DeleteKeyspace(\"\"): got %v, want ErrKeyEmpty", err)
@@ -48,7 +48,7 @@ func TestDeleteKeyspaceMissingReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	if err := tx.DeleteKeyspace("absent"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("DeleteKeyspace(absent): got %v, want ErrNotFound", err)
@@ -63,7 +63,7 @@ func TestDeleteKeyspaceRejectsKindIndexInternal(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	forged := page.KeyspaceDescriptor{Kind: page.KeyspaceKindIndexInternal}
 	if err := tx.storeDescriptor("__idx", forged); err != nil {
@@ -82,7 +82,7 @@ func TestDeleteKeyspaceSameTxOpenReturnsNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	if _, err := tx.CreateKeyspace("ks"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
@@ -103,7 +103,7 @@ func TestDeleteKeyspaceAcrossCommitReturnsNotFound(t *testing.T) {
 	path := tmpPath(t)
 
 	db, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	if _, err := tx.CreateKeyspace("a"); err != nil {
 		t.Fatalf("CreateKeyspace a: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestDeleteKeyspaceAcrossCommitReturnsNotFound(t *testing.T) {
 		t.Fatalf("Commit #1: %v", err)
 	}
 
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	if err := tx2.DeleteKeyspace("a"); err != nil {
 		t.Fatalf("DeleteKeyspace: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestDeleteKeyspaceAcrossCommitReturnsNotFound(t *testing.T) {
 	if got := db2.Meta().NumKeyspaces; got != 1 {
 		t.Errorf("re-Open NumKeyspaces = %d, want 1", got)
 	}
-	tx3, _ := db2.Begin(ctx, true)
+	tx3, _ := db2.Begin(ctx)
 	defer tx3.Rollback()
 	if _, err := tx3.OpenKeyspace("a"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("OpenKeyspace(a) post-Delete-Commit-Reopen: got %v, want ErrNotFound", err)
@@ -169,7 +169,7 @@ func TestDeleteKeyspaceBulkFreesDataSubtree(t *testing.T) {
 	// Commit a keyspace with enough data to materialise a multi-page
 	// B+tree, so the bulk-free walk has branches AND leaves to
 	// retire (not just one root leaf).
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, err := tx.CreateKeyspace("ks")
 	if err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
@@ -188,7 +188,7 @@ func TestDeleteKeyspaceBulkFreesDataSubtree(t *testing.T) {
 	}
 
 	// Enumerate the persisted data subtree's pages BEFORE Delete.
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	desc, found, err := tx2.loadDescriptor("ks")
 	if err != nil || !found {
 		t.Fatalf("loadDescriptor: found=%v err=%v", found, err)
@@ -287,7 +287,7 @@ func TestDeleteKeyspaceInvalidatesHandle(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	ks, _ := tx.CreateKeyspace("ks")
@@ -315,7 +315,7 @@ func TestDeleteKeyspaceInvalidatesCursor(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	ks, _ := tx.CreateKeyspace("ks")
@@ -348,7 +348,7 @@ func TestKeyspaceCursorOnDeadHandleDoesNotRegister(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	ks, _ := tx.CreateKeyspace("ks")
@@ -393,7 +393,7 @@ func TestDeleteKeyspaceRecreateLeavesOldHandleDead(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	ks1, _ := tx.CreateKeyspace("ks")
@@ -432,14 +432,14 @@ func TestDeleteKeyspaceThenCreateSameTxFlushesAsOverwrite(t *testing.T) {
 	db, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks1, _ := tx.CreateKeyspace("ks")
 	_ = ks1.Put([]byte("old"), []byte("data"))
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit #1: %v", err)
 	}
 
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	if err := tx2.DeleteKeyspace("ks"); err != nil {
 		t.Fatalf("DeleteKeyspace: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestDeleteKeyspaceThenCreateSameTxFlushesAsOverwrite(t *testing.T) {
 		t.Fatalf("Commit #2: %v", err)
 	}
 
-	tx3, _ := db.Begin(ctx, true)
+	tx3, _ := db.Begin(ctx)
 	defer tx3.Rollback()
 	ks3, err := tx3.OpenKeyspace("ks")
 	if err != nil {
@@ -477,7 +477,7 @@ func TestCreateThenDeleteSameTxLeavesNoTrace(t *testing.T) {
 	db, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	rootBefore := tx.keyspaceRoot
 	if _, err := tx.CreateKeyspace("ephemeral"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
@@ -511,7 +511,7 @@ func TestDeleteKeyspaceListExcludesDeleted(t *testing.T) {
 	db, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	for _, n := range []string{"a", "b", "c"} {
 		if _, err := tx.CreateKeyspace(n); err != nil {
 			t.Fatalf("CreateKeyspace(%s): %v", n, err)
@@ -521,7 +521,7 @@ func TestDeleteKeyspaceListExcludesDeleted(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	defer tx2.Rollback()
 	if err := tx2.DeleteKeyspace("b"); err != nil {
 		t.Fatalf("DeleteKeyspace: %v", err)
@@ -542,7 +542,7 @@ func TestDeleteKeyspaceMissingAfterDeleteReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	if _, err := tx.CreateKeyspace("ks"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
@@ -571,7 +571,7 @@ func TestDeleteKeyspaceAfterSetKeyspaceConfigClearsDirtyDescriptor(t *testing.T)
 
 	// Pre-commit a keyspace so SetKeyspaceConfig has an on-disk
 	// descriptor to land against.
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	if _, err := tx.CreateKeyspace("ks"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
@@ -579,7 +579,7 @@ func TestDeleteKeyspaceAfterSetKeyspaceConfigClearsDirtyDescriptor(t *testing.T)
 		t.Fatalf("Commit #1: %v", err)
 	}
 
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	// SetKeyspaceConfig without OpenKeyspace lands in dirtyDescriptors.
 	if err := tx2.SetKeyspaceConfig("ks", KeyspaceConfig{RestartGroupTarget: 32}); err != nil {
 		t.Fatalf("SetKeyspaceConfig: %v", err)
@@ -600,7 +600,7 @@ func TestDeleteKeyspaceAfterSetKeyspaceConfigClearsDirtyDescriptor(t *testing.T)
 		t.Fatalf("Commit #2: %v", err)
 	}
 
-	tx3, _ := db.Begin(ctx, true)
+	tx3, _ := db.Begin(ctx)
 	defer tx3.Rollback()
 	if _, err := tx3.OpenKeyspace("ks"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("OpenKeyspace(ks) post-flush: got %v, want ErrNotFound", err)
@@ -616,7 +616,7 @@ func TestCursorErrReturnsKeyspaceClosedOnDeadHandle(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	ks, _ := tx.CreateKeyspace("ks")
@@ -652,7 +652,7 @@ func TestDeferredFlushClosesDescriptorDrift(t *testing.T) {
 	db, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	if _, err := tx.CreateKeyspace("ks"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
@@ -661,7 +661,7 @@ func TestDeferredFlushClosesDescriptorDrift(t *testing.T) {
 	}
 	rootBefore := db.Meta().KeyspaceRoot
 
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	ks, _ := tx2.OpenKeyspace("ks")
 	if err := ks.Put([]byte("k"), []byte("v")); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -675,7 +675,7 @@ func TestDeferredFlushClosesDescriptorDrift(t *testing.T) {
 		t.Errorf("Rollback drift: KeyspaceRoot = %d, want %d", got, rootBefore)
 	}
 
-	tx3, _ := db.Begin(ctx, true)
+	tx3, _ := db.Begin(ctx)
 	defer tx3.Rollback()
 	ks3, err := tx3.OpenKeyspace("ks")
 	if err != nil {
@@ -711,7 +711,7 @@ func TestDeleteKeyspaceAtomicOnPartialRetirement(t *testing.T) {
 	// Setup tx: create a keyspace with TWO indexes so the registry
 	// walk has multiple iterations; populate it so step-1 and the
 	// per-index FreeSubtree have real subtrees to retire.
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -745,7 +745,7 @@ func TestDeleteKeyspaceAtomicOnPartialRetirement(t *testing.T) {
 	})
 	t.Cleanup(func() { setRetireIndexRegistryFailHookForTest(nil) })
 
-	tx, err = db.Begin(ctx, true)
+	tx, err = db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin 2: %v", err)
 	}
@@ -766,7 +766,7 @@ func TestDeleteKeyspaceAtomicOnPartialRetirement(t *testing.T) {
 	// pages free; even if Check shows zero leak this tx, a future
 	// re-allocation of those pages would corrupt the still-live
 	// data tree.)
-	tx, err = db.Begin(ctx, true)
+	tx, err = db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin 3: %v", err)
 	}

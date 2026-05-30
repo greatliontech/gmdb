@@ -46,7 +46,7 @@ func TestSetKeyspaceDeleteRangeUnindexedNoLeakWithNestedTreeAtBoundary(t *testin
 	}
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	sks, err := tx.CreateSetKeyspace("k", nil)
 	if err != nil {
 		t.Fatalf("CreateSetKeyspace: %v", err)
@@ -117,7 +117,7 @@ func TestSetKeyspaceDeleteRangeUnindexedNoLeakInteriorSubtreeRetire(t *testing.T
 	}
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	sks, err := tx.CreateSetKeyspace("k", nil)
 	if err != nil {
 		t.Fatalf("CreateSetKeyspace: %v", err)
@@ -211,7 +211,7 @@ func TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance(t *test
 	}
 	defer db.Close()
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract
 	sks, err := tx.CreateSetKeyspace("subs", nil, decl)
@@ -289,7 +289,7 @@ func TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	sks, err := tx.CreateSetKeyspace("unindexed", nil)
 	if err != nil {
@@ -336,7 +336,7 @@ func TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_topic", "topic")
 	decl.Extract = setKeyspaceFirstByteExtract

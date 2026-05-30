@@ -29,7 +29,7 @@ func TestKeyspacePutGetRoundTrip(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestKeyspaceGetMissingReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	ks, _ := tx.CreateKeyspace("ks")
@@ -73,7 +73,7 @@ func TestKeyspaceDeleteMissingReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	if err := ks.Delete([]byte("missing")); !errors.Is(err, ErrNotFound) {
@@ -85,7 +85,7 @@ func TestKeyspaceEmptyKeyReturnsErrKeyEmpty(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	for _, k := range [][]byte{nil, {}} {
@@ -106,7 +106,7 @@ func TestKeyspaceCountTracksLeafEntries(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 
@@ -139,7 +139,7 @@ func TestKeyspacePutCommitReopenRetrieves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("ks")
 	if err := ks.Put([]byte("k"), []byte("v")); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -154,7 +154,7 @@ func TestKeyspacePutCommitReopenRetrieves(t *testing.T) {
 		t.Fatalf("re-Open: %v", err)
 	}
 	defer db2.Close()
-	tx2, _ := db2.Begin(ctx, true)
+	tx2, _ := db2.Begin(ctx)
 	defer tx2.Rollback()
 	ks2, err := tx2.OpenKeyspace("ks")
 	if err != nil {
@@ -174,7 +174,7 @@ func TestCursorMarkStaleAfterSiblingPut(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	_ = ks.Put([]byte("a"), []byte("1"))
@@ -228,7 +228,7 @@ func TestSetKeyspaceConfigUpdatesRestartGroupTarget(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	if ks.desc.RestartGroupTarget != 0 {
@@ -259,7 +259,7 @@ func TestSetKeyspaceConfigZeroIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	_, _ = tx.CreateKeyspace("ks")
 	desc, _, _ := tx.loadDescriptor("ks")
@@ -278,7 +278,7 @@ func TestSetKeyspaceConfigOversizeReturnsErrInvalidOptions(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	_, _ = tx.CreateKeyspace("ks")
 	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{RestartGroupTarget: 256}); !errors.Is(err, ErrInvalidOptions) {
@@ -290,7 +290,7 @@ func TestSetKeyspaceConfigMissingReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	if err := tx.SetKeyspaceConfig("missing", KeyspaceConfig{RestartGroupTarget: 32}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing keyspace: got %v, want ErrNotFound", err)
@@ -302,7 +302,7 @@ func TestCursorWalkRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	for _, k := range []string{"c", "a", "b"} {
@@ -323,7 +323,7 @@ func TestCursorDeleteAdvancesToSuccessor(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 	for _, k := range []string{"a", "b", "c"} {
@@ -376,7 +376,7 @@ func TestCursorAfterRollbackReturnsErrTxClosed(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("ks")
 	_ = ks.Put([]byte("a"), []byte("v"))
 	c := ks.Cursor()
@@ -406,7 +406,7 @@ func TestKeyspacePutHonorsPerKeyspaceRestartGroupTarget(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 

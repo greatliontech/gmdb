@@ -44,7 +44,7 @@ func TestCreateSetKeyspaceBasic(t *testing.T) {
 	}
 	defer db.Close()
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestCreateSetKeyspaceFixedValueSize(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, err := tx.CreateSetKeyspace("scores", &SetKeyspaceOptions{FixedValueSize: 8})
@@ -82,7 +82,7 @@ func TestCreateSetKeyspaceInvalidFixedValueSize(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	for _, fvs := range []int{-1, 0x10000, 1 << 30} {
@@ -97,7 +97,7 @@ func TestCreateSetKeyspaceDuplicateReturnsErrKeyExists(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	_, err := tx.CreateSetKeyspace("topics", nil)
@@ -114,7 +114,7 @@ func TestCreateSetKeyspaceIfNotExistsMatchesOnReopen(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	// Create then "create if not exists" — second call returns
@@ -136,7 +136,7 @@ func TestCreateSetKeyspaceIfNotExistsMismatchedFixedValueSize(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	_, _ = tx.CreateSetKeyspace("k", &SetKeyspaceOptions{FixedValueSize: 4})
@@ -152,7 +152,7 @@ func TestOpenKeyspaceOnSetKeyspaceReturnsKindMismatch(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	_, _ = tx.CreateSetKeyspace("topics", nil)
@@ -168,7 +168,7 @@ func TestOpenSetKeyspaceOnKeyspaceReturnsKindMismatch(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	_, _ = tx.CreateKeyspace("rows")
@@ -182,7 +182,7 @@ func TestListKeyspacesIncludesSetKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	_, _ = tx.CreateKeyspace("kind0")
@@ -205,7 +205,7 @@ func TestSetKeyspaceHasOnMissingKey(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -219,7 +219,7 @@ func TestSetKeyspaceHasValueOnEmptyKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -233,7 +233,7 @@ func TestSetKeyspaceCountValuesOnMissing(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -252,7 +252,7 @@ func TestSetKeyspacePutGenesis(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -274,7 +274,7 @@ func TestSetKeyspacePutDuplicate(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -296,7 +296,7 @@ func TestSetKeyspacePutMultipleValuesSameKey(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -324,7 +324,7 @@ func TestSetKeyspacePutFixedValueSizeMismatch(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", &SetKeyspaceOptions{FixedValueSize: 4})
@@ -341,7 +341,7 @@ func TestSetKeyspacePutTriggersPromotion(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -396,7 +396,7 @@ func TestSetKeyspacePutDuplicateIntoNestedTreeIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -459,7 +459,7 @@ func TestSetKeyspaceDeleteMissingReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -472,7 +472,7 @@ func TestSetKeyspaceDeleteSubpageCell(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -498,7 +498,7 @@ func TestSetKeyspaceDeleteNestedTreeCellBulkFrees(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -527,7 +527,7 @@ func TestSetKeyspaceDeleteValueMissingKey(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -540,7 +540,7 @@ func TestSetKeyspaceDeleteValueMissingValueInSubpage(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -556,7 +556,7 @@ func TestSetKeyspaceDeleteValueLastValueRemovesParentCell(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -580,7 +580,7 @@ func TestSetKeyspaceDeleteValueFromNestedTreeTriggersDemotion(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -631,7 +631,7 @@ func TestSetKeyspaceDescCountAcrossMutations(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -666,7 +666,7 @@ func TestSetKeyspaceCommitReopenRoundTrip(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	sks, _ := tx.CreateSetKeyspace("topics", &SetKeyspaceOptions{FixedValueSize: 4})
 	for i := range 5 {
 		v := []byte{byte(i), 0, 0, 1}
@@ -682,7 +682,7 @@ func TestSetKeyspaceCommitReopenRoundTrip(t *testing.T) {
 		t.Fatalf("Reopen: %v", err)
 	}
 	defer db2.Close()
-	tx2, _ := db2.Begin(ctx, true)
+	tx2, _ := db2.Begin(ctx)
 	defer tx2.Rollback()
 	sks2, err := tx2.OpenSetKeyspace("topics")
 	if err != nil {
@@ -710,7 +710,7 @@ func TestDeleteKeyspaceMarksSetKeyspaceHandleDead(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -736,7 +736,7 @@ func TestSetKeyspaceDeleteValueFixedValueSizeMismatch(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", &SetKeyspaceOptions{FixedValueSize: 4})
@@ -764,7 +764,7 @@ func TestSetKeyspaceDeleteValueNestedTreeDropsOnZeroCount(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -835,7 +835,7 @@ func TestSetKeyspaceCommitReopenWithPromotedNestedTree(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	sks, _ := tx.CreateSetKeyspace("topics", nil)
 	N := 200
 	values := make([][]byte, 0, N)
@@ -862,7 +862,7 @@ func TestSetKeyspaceCommitReopenWithPromotedNestedTree(t *testing.T) {
 		t.Fatalf("Reopen: %v", err)
 	}
 	defer db2.Close()
-	tx2, _ := db2.Begin(ctx, true)
+	tx2, _ := db2.Begin(ctx)
 	defer tx2.Rollback()
 	sks2, err := tx2.OpenSetKeyspace("topics")
 	if err != nil {
@@ -899,7 +899,7 @@ func TestSetKeyspaceConfigUpdatesSameTxCreatedSetKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -924,7 +924,7 @@ func TestSetKeyspaceDeleteRangeEmptyKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -938,7 +938,7 @@ func TestSetKeyspaceDeleteRangeEmptyBoundsRejected(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -955,7 +955,7 @@ func TestSetKeyspaceDeleteRangeStartGEEndIsNoop(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -979,7 +979,7 @@ func TestSetKeyspaceDeleteRangeFullRangeDeletesAll(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -1013,7 +1013,7 @@ func TestSetKeyspaceDeleteRangePartialBoundsHalfOpen(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -1047,7 +1047,7 @@ func TestSetKeyspaceDeleteRangeLeftOpen(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -1069,7 +1069,7 @@ func TestSetKeyspaceDeleteRangeRightOpen(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -1093,7 +1093,7 @@ func TestSetKeyspaceDeleteRangeMixedCellTypes(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -1139,7 +1139,7 @@ func TestSetKeyspaceDeleteRangeMissingKeysAreNoop(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -1168,7 +1168,7 @@ func TestSetKeyspaceDeleteRangeClosedHandle(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -1186,7 +1186,7 @@ func TestSetKeyspaceDeleteRangeCommitReopen(t *testing.T) {
 	path := tmpPath(t)
 	db, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	sks, _ := tx.CreateSetKeyspace("k", nil)
 	// 5 keys, including one nested-tree.
 	for _, v := range []string{"a", "b"} {
@@ -1215,7 +1215,7 @@ func TestSetKeyspaceDeleteRangeCommitReopen(t *testing.T) {
 
 	db2, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db2.Close()
-	tx2, _ := db2.Begin(ctx, true)
+	tx2, _ := db2.Begin(ctx)
 	defer tx2.Rollback()
 	sks2, _ := tx2.OpenSetKeyspace("k")
 	for _, k := range []string{"k1", "k4", "k5"} {
@@ -1238,7 +1238,7 @@ func TestSetKeyspaceEmptyKeyRejected(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)

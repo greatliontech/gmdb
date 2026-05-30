@@ -40,7 +40,7 @@ func TestCopyToVerbatimRoundTrip(t *testing.T) {
 	}
 
 	const nItems, nPlain, nSet = 800, 100, 200
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, err := tx.CreateKeyspace("items", firstByteDecl())
 	if err != nil {
 		t.Fatalf("CreateKeyspace items: %v", err)
@@ -110,7 +110,7 @@ func TestCopyToVerbatimRoundTrip(t *testing.T) {
 	}
 
 	// Every row + member round-trips.
-	rtx, _ := cp.Begin(ctx, true)
+	rtx, _ := cp.Begin(ctx)
 	defer rtx.Rollback()
 	rks, err := rtx.OpenKeyspace("items", firstByteDecl())
 	if err != nil {
@@ -214,7 +214,7 @@ func TestCopyToVerbatimDropsLeak(t *testing.T) {
 		}
 	}
 	// And the keyspace data still round-trips.
-	rtx, _ := cp.Begin(ctx, true)
+	rtx, _ := cp.Begin(ctx)
 	defer rtx.Rollback()
 	ks, _ := rtx.OpenKeyspace("k")
 	for i := range 50 {
@@ -232,7 +232,7 @@ func TestCopyToFreshUUID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	_ = ks.Put([]byte("a"), []byte("b"))
 	tx.Commit()
@@ -262,7 +262,7 @@ func TestCopyToTargetExists(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	_ = ks.Put([]byte("a"), []byte("b"))
 	tx.Commit()
@@ -308,7 +308,7 @@ func TestCopyToEmptyDatabase(t *testing.T) {
 	for _, iss := range collectIssues(cp.Check()) {
 		t.Errorf("empty-DB copy Check issue: code=%s sev=%d msg=%s", iss.Code, iss.Severity, iss.Message)
 	}
-	vtx, _ := cp.Begin(ctx, true)
+	vtx, _ := cp.Begin(ctx)
 	if names, _ := vtx.ListKeyspaces(); len(names) != 0 {
 		t.Errorf("empty-DB copy has keyspaces: %v", names)
 	}
@@ -325,7 +325,7 @@ func TestCopyToPageChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 400 { // multi-level tree
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "val%05d", i)); err != nil {
@@ -353,7 +353,7 @@ func TestCopyToPageChecksum(t *testing.T) {
 			t.Errorf("checksum copy Check error: code=%s msg=%s", iss.Code, iss.Message)
 		}
 	}
-	rtx, _ := cp.Begin(ctx, true)
+	rtx, _ := cp.Begin(ctx)
 	defer rtx.Rollback()
 	rks, _ := rtx.OpenKeyspace("k")
 	for i := range 400 {
@@ -379,7 +379,7 @@ func TestCopyToConcurrentWriter(t *testing.T) {
 	defer db.Close()
 
 	const nBase = 600
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	base, _ := tx.CreateKeyspace("base")
 	for i := range nBase {
 		if err := base.Put(fmt.Appendf(nil, "base%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
@@ -399,7 +399,7 @@ func TestCopyToConcurrentWriter(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; !stop.Load(); i++ {
-			wtx, err := db.Begin(ctx, true)
+			wtx, err := db.Begin(ctx)
 			if err != nil {
 				return
 			}
@@ -441,7 +441,7 @@ func TestCopyToConcurrentWriter(t *testing.T) {
 				t.Errorf("concurrent copy %d Check error: code=%s msg=%s", r, iss.Code, iss.Message)
 			}
 		}
-		rtx, _ := cp.Begin(ctx, true)
+		rtx, _ := cp.Begin(ctx)
 		rks, err := rtx.OpenKeyspace("base")
 		if err != nil {
 			t.Fatalf("copy %d OpenKeyspace base: %v", r, err)
@@ -470,7 +470,7 @@ func metaOf(t *testing.T, path string) page.Meta {
 		t.Fatalf("Open %q: %v", path, err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	return tx.prevMeta
 }
@@ -490,7 +490,7 @@ func TestCopyToCompactRoundTrip(t *testing.T) {
 
 	const nItems, nHuge, nBig = 800, 400, 5
 	bigVal := bytes.Repeat([]byte("Z"), 6000)
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, err := tx.CreateKeyspace("items", firstByteDecl())
 	if err != nil {
 		t.Fatalf("CreateKeyspace items: %v", err)
@@ -543,7 +543,7 @@ func TestCopyToCompactRoundTrip(t *testing.T) {
 		}
 	}
 
-	rtx, _ := cp.Begin(ctx, true)
+	rtx, _ := cp.Begin(ctx)
 	defer rtx.Rollback()
 	rks, err := rtx.OpenKeyspace("items", firstByteDecl())
 	if err != nil {
@@ -604,7 +604,7 @@ func TestCopyToCompactEmpty(t *testing.T) {
 	for _, iss := range collectIssues(cp.Check()) {
 		t.Errorf("empty compact copy Check issue: code=%s sev=%d msg=%s", iss.Code, iss.Severity, iss.Message)
 	}
-	vtx, _ := cp.Begin(ctx, true)
+	vtx, _ := cp.Begin(ctx)
 	if names, _ := vtx.ListKeyspaces(); len(names) != 0 {
 		t.Errorf("empty compact copy has keyspaces: %v", names)
 	}
@@ -620,7 +620,7 @@ func TestCopyToCompactPageChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 400 {
 		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "val%05d", i)); err != nil {
@@ -647,7 +647,7 @@ func TestCopyToCompactPageChecksum(t *testing.T) {
 			t.Errorf("compact checksum copy Check error: code=%s msg=%s", iss.Code, iss.Message)
 		}
 	}
-	rtx, _ := cp.Begin(ctx, true)
+	rtx, _ := cp.Begin(ctx)
 	defer rtx.Rollback()
 	rks, _ := rtx.OpenKeyspace("k")
 	for i := range 400 {
@@ -672,7 +672,7 @@ func TestCopyToCompactDefragments(t *testing.T) {
 
 	// Build a large keyspace, then delete most of it — leaving many free
 	// pages below a high HighWaterMark (fragmentation).
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("k")
 	for i := range 3000 {
 		if err := ks.Put(fmt.Appendf(nil, "key%06d", i), bytes.Repeat([]byte("v"), 200)); err != nil {
@@ -682,7 +682,7 @@ func TestCopyToCompactDefragments(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	tx2, _ := db.Begin(ctx, true)
+	tx2, _ := db.Begin(ctx)
 	ks2, _ := tx2.OpenKeyspace("k")
 	if _, err := ks2.DeleteRange(fmt.Appendf(nil, "key%06d", 100), fmt.Appendf(nil, "key%06d", 2900)); err != nil {
 		t.Fatalf("DeleteRange: %v", err)
@@ -718,7 +718,7 @@ func TestCopyToCompactDefragments(t *testing.T) {
 			t.Errorf("compact copy Check error: code=%s msg=%s", iss.Code, iss.Message)
 		}
 	}
-	rtx, _ := cp.Begin(ctx, true)
+	rtx, _ := cp.Begin(ctx)
 	defer rtx.Rollback()
 	rks, _ := rtx.OpenKeyspace("k")
 	for _, i := range []int{0, 50, 99, 2900, 2999} { // boundary survivors

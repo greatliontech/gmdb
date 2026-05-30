@@ -50,7 +50,7 @@ func TestKeyspaceBulkLoadRoundTrip(t *testing.T) {
 			kvs := genKVs(3000, 48) // multiple leaves + branch levels
 
 			db := openWith(t, ctx, path, opts)
-			tx, err := db.Begin(ctx, true)
+			tx, err := db.Begin(ctx)
 			if err != nil {
 				t.Fatalf("Begin: %v", err)
 			}
@@ -78,7 +78,7 @@ func TestKeyspaceBulkLoadRoundTrip(t *testing.T) {
 			// Reopen and verify durability via the public read API.
 			db2 := openWith(t, ctx, path, opts)
 			defer db2.Close()
-			tx2, err := db2.Begin(ctx, true)
+			tx2, err := db2.Begin(ctx)
 			if err != nil {
 				t.Fatalf("re-Begin: %v", err)
 			}
@@ -138,7 +138,7 @@ func TestKeyspaceBulkLoadOverflowValues(t *testing.T) {
 			}
 
 			db := openWith(t, ctx, path, opts)
-			tx, err := db.Begin(ctx, true)
+			tx, err := db.Begin(ctx)
 			if err != nil {
 				t.Fatalf("Begin: %v", err)
 			}
@@ -156,7 +156,7 @@ func TestKeyspaceBulkLoadOverflowValues(t *testing.T) {
 
 			db2 := openWith(t, ctx, path, opts)
 			defer db2.Close()
-			tx2, err := db2.Begin(ctx, true)
+			tx2, err := db2.Begin(ctx)
 			if err != nil {
 				t.Fatalf("re-Begin: %v", err)
 			}
@@ -182,7 +182,7 @@ func TestKeyspaceBulkLoadNonEmpty(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestKeyspaceBulkLoadOutOfOrder(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestKeyspaceBulkLoadEmptyKey(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestKeyspaceBulkLoadReadOnlyHandle(t *testing.T) {
 	opts := Options{PageSize: 4096, MinSize: 16, MaxSize: 128}
 	// Create the keyspace first so a read-only open can find it.
 	db := openWith(t, ctx, path, opts)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestKeyspaceBulkLoadReadOnlyHandle(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	tx2, err := db.Begin(ctx, true)
+	tx2, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin2: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestKeyspaceBulkLoadAbortLeavesPreState(t *testing.T) {
 
 	// tx1: create the keyspace empty, commit.
 	db := openWith(t, ctx, path, opts)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestKeyspaceBulkLoadAbortLeavesPreState(t *testing.T) {
 	}
 
 	// tx2: BulkLoad a lot, then ROLLBACK.
-	tx2, err := db.Begin(ctx, true)
+	tx2, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin2: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestKeyspaceBulkLoadAbortLeavesPreState(t *testing.T) {
 	// Reopen: the keyspace exists and is still empty.
 	db2 := openWith(t, ctx, path, opts)
 	defer db2.Close()
-	tx3, err := db2.Begin(ctx, true)
+	tx3, err := db2.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin3: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestKeyspaceBulkLoadEmptyStream(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -366,7 +366,7 @@ func TestKeyspaceBulkLoadReusedKeyBuffer(t *testing.T) {
 
 	const n = 2000
 	db := openWith(t, ctx, path, opts)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestKeyspaceBulkLoadReusedKeyBuffer(t *testing.T) {
 
 	db2 := openWith(t, ctx, path, opts)
 	defer db2.Close()
-	tx2, err := db2.Begin(ctx, true)
+	tx2, err := db2.Begin(ctx)
 	if err != nil {
 		t.Fatalf("re-Begin: %v", err)
 	}
@@ -424,7 +424,7 @@ func TestKeyspaceBulkLoadKeyTooLarge(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}

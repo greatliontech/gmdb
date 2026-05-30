@@ -24,7 +24,7 @@ func bulkTestTx(t *testing.T) (*Tx, func()) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		_ = db.Close()
 		t.Fatalf("Begin: %v", err)

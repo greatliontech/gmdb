@@ -34,7 +34,7 @@ func TestIndexHandleStatsAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -72,7 +72,7 @@ func TestIndexHandleLookupAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -145,7 +145,7 @@ func TestIndexHandleGetAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Unique = true
@@ -180,7 +180,7 @@ func TestIndexHandleInFlightRebuildSurfacesCursorStale(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -228,7 +228,7 @@ func TestIndexHandleInFlightSiblingPutSurfacesCursorStale(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -270,7 +270,7 @@ func TestIndexHandleInFlightSiblingDeleteSurfacesCursorStale(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -312,7 +312,7 @@ func TestIndexHandleInFlightDropSurfacesCursorStaleAndDead(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -366,7 +366,7 @@ func TestIndexHandleAfterRebuildRePositionWorks(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -414,7 +414,7 @@ func TestIndexHandleInFlightCursorDeleteSurfacesCursorStale(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -461,7 +461,7 @@ func TestSetKeyspaceIndexHandleStatsAfterDropReturnsErrIndexNotFound(t *testing.
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -494,7 +494,7 @@ func TestSetKeyspaceIndexHandleInFlightSetCursorDeleteSurfacesCursorStale(t *tes
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -540,7 +540,7 @@ func TestSetKeyspaceIndexHandleInFlightSiblingPutSurfacesCursorStale(t *testing.
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -604,7 +604,7 @@ func TestIndexHandleBareErrAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testin
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -642,7 +642,7 @@ func TestStatsPreservesInFlightStaleSignal(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -702,7 +702,7 @@ func TestErrSymmetricWithStatsAfterDeleteKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -762,7 +762,7 @@ func TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -816,7 +816,7 @@ func TestIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing.
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -857,7 +857,7 @@ func TestIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -933,7 +933,7 @@ func TestIndexHandleGetAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing.T)
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Unique = true
@@ -971,7 +971,7 @@ func TestIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed(t *testing.T
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -1027,7 +1027,7 @@ func TestSetKeyspaceIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed(
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -1067,7 +1067,7 @@ func TestSetKeyspaceIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
@@ -1109,7 +1109,7 @@ func TestSetKeyspaceIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed(t
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract

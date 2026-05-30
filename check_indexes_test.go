@@ -30,7 +30,7 @@ func setupIndexedDB(t *testing.T) *DB {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -196,7 +196,7 @@ func setupCoveringDB(t *testing.T) *DB {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -277,7 +277,7 @@ func setupIndexedSetKeyspace(t *testing.T) *DB {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestCheckIndexesSetKeyspaceNestedTreeCleanPasses(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	sks, err := tx.CreateSetKeyspace("subs", nil, setMemberDecl(setKeyspaceFirstByteExtract))
 	if err != nil {
 		t.Fatalf("CreateSetKeyspace: %v", err)
@@ -386,7 +386,7 @@ func makeIndexedKeyspace(t *testing.T, decl *IndexDecl, rows [][2]string) *DB {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestCheckIndexesSetKeyspaceForgedSubpageNoPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	sks, err := tx.CreateSetKeyspace("subs", nil, setMemberDecl(setKeyspaceFirstByteExtract))
 	if err != nil {
 		t.Fatalf("CreateSetKeyspace: %v", err)
@@ -482,7 +482,7 @@ func TestCheckIndexesSetKeyspaceForgedSubpageNoPanic(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	rtx, _ := db.Begin(ctx, true)
+	rtx, _ := db.Begin(ctx)
 	rsks, err := rtx.OpenSetKeyspace("subs", setMemberDecl(setKeyspaceFirstByteExtract))
 	if err != nil {
 		t.Fatalf("OpenSetKeyspace: %v", err)

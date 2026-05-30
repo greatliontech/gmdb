@@ -23,7 +23,7 @@ func newSetKeyspaceWithData(t *testing.T, opts *SetKeyspaceOptions, pairs map[st
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		db.Close()
 		t.Fatalf("Begin: %v", err)
@@ -304,7 +304,7 @@ func TestSetCursorIteratesAcrossNestedTreeCells(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -436,7 +436,7 @@ func TestSetCursorCommitReopenIteration(t *testing.T) {
 	path := tmpPath(t)
 	db, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	sks, _ := tx.CreateSetKeyspace("k", nil)
 	sks.Put([]byte("a"), []byte("1"))
 	sks.Put([]byte("a"), []byte("2"))
@@ -448,7 +448,7 @@ func TestSetCursorCommitReopenIteration(t *testing.T) {
 
 	db2, _ := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db2.Close()
-	tx2, _ := db2.Begin(ctx, true)
+	tx2, _ := db2.Begin(ctx)
 	defer tx2.Rollback()
 	sks2, _ := tx2.OpenSetKeyspace("k")
 	c := sks2.Cursor()
@@ -490,7 +490,7 @@ func TestSetCursorDeadOnDeleteKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
@@ -518,7 +518,7 @@ func TestSetCursorFixedSizeIteration(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", &SetKeyspaceOptions{FixedValueSize: 4})
@@ -556,7 +556,7 @@ func TestSetCursorDeleteOnNestedTreeAdvances(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, _ := db.Begin(ctx, true)
+	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)

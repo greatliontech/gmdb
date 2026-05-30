@@ -129,7 +129,7 @@ func TestSetKeyspaceBulkLoadRoundTrip(t *testing.T) {
 			})
 
 			db := openWith(t, ctx, path, opts)
-			tx, err := db.Begin(ctx, true)
+			tx, err := db.Begin(ctx)
 			if err != nil {
 				t.Fatalf("Begin: %v", err)
 			}
@@ -159,7 +159,7 @@ func TestSetKeyspaceBulkLoadRoundTrip(t *testing.T) {
 
 			db2 := openWith(t, ctx, path, opts)
 			defer db2.Close()
-			tx2, err := db2.Begin(ctx, true)
+			tx2, err := db2.Begin(ctx)
 			if err != nil {
 				t.Fatalf("re-Begin: %v", err)
 			}
@@ -187,7 +187,7 @@ func TestSetKeyspaceBulkLoadStreamingPromotion(t *testing.T) {
 	}
 
 	db := openWith(t, ctx, path, opts)
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestSetKeyspaceBulkLoadStreamingPromotion(t *testing.T) {
 
 	db2 := openWith(t, ctx, path, opts)
 	defer db2.Close()
-	tx2, err := db2.Begin(ctx, true)
+	tx2, err := db2.Begin(ctx)
 	if err != nil {
 		t.Fatalf("re-Begin: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestSetKeyspaceBulkLoadDedup(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestSetKeyspaceBulkLoadErrors(t *testing.T) {
 	ctx := context.Background()
 	newKS := func(t *testing.T, fvs int) (*SetKeyspace, func()) {
 		db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
-		tx, err := db.Begin(ctx, true)
+		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin: %v", err)
 		}
@@ -333,7 +333,7 @@ func TestSetKeyspaceBulkLoadMatchesPut(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 16384})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestSetKeyspaceBulkLoadStorageShapeMatchesPut(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 16384})
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -452,7 +452,7 @@ func TestSetKeyspaceBulkLoadReadOnly(t *testing.T) {
 	opts := Options{PageSize: 4096, MinSize: 16, MaxSize: 128}
 	db := openWith(t, ctx, path, opts)
 	defer db.Close()
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
@@ -462,7 +462,7 @@ func TestSetKeyspaceBulkLoadReadOnly(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	tx2, err := db.Begin(ctx, true)
+	tx2, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin2: %v", err)
 	}

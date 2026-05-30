@@ -258,7 +258,7 @@ func (db *DB) maintReclaimLeaks(ctx context.Context) {
 		return
 	}
 
-	tx, err := db.Begin(ctx, true)
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		return // closing / cancelled / poisoned — skip silently
 	}
