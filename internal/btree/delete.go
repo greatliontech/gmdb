@@ -168,32 +168,66 @@ func deleteFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uin
 }
 
 func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, srcBuf []byte, key []byte) (uint64, bool, bool, error) {
-	entries, err := readLeafEntriesDeepCopy(srcBuf, cfg, pageID)
-	if err != nil {
-		return 0, false, false, err
+	// Validate once at the boundary (the splice helpers do not bound-check
+	// structurally — they assume a builder-produced page) and locate the key
+	// with SearchLeaf, so neither the fast nor the slow path re-validates or
+	// re-searches. Mirrors the Put append/insert fast-path wiring.
+	r := page.NewLeafReader(srcBuf, cfg)
+	if err := r.Validate(); err != nil {
+		return 0, false, false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, pageID, err)
 	}
-	lo, hi := 0, len(entries)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		cmp := bytes.Compare(entries[mid].Key, key)
-		switch {
-		case cmp < 0:
-			lo = mid + 1
-		case cmp > 0:
-			hi = mid
-		default:
-			// Capture the removed entry's overflow chain (if any)
-			// BEFORE splicing it out of the slice — the chain is
-			// freed AFTER the new leaf is committed so a transient
-			// CoW failure can't orphan the chain (the entry is
-			// still reachable from the original leaf at that
-			// point).
-			removed := entries[mid]
-			entries = append(entries[:mid], entries[mid+1:]...)
-			return rebuildLeafAfterDelete(pw, cfg, mergeThreshold, pageID, entries, removed)
+	idx, removed, found := r.SearchLeaf(key)
+	if !found {
+		return pageID, false, false, nil
+	}
+
+	// Fast path: in-place delete splice on a compressed leaf with more than one
+	// entry. TryDeleteAt declines (→ slow path) on a variant mismatch (a
+	// compressed page reconfigured to RGT==1, the rare mid-life case); count<=1
+	// (page would empty) and uncompressed leaves are routed straight to the slow
+	// path by this gate, so the only speculative CoW is that rare decline.
+	if r.Compressed() && r.Count() > 1 {
+		newID, err := pw.AllocPage()
+		if err != nil {
+			return 0, false, false, fmt.Errorf("btree: alloc CoW leaf for delete: %w", err)
 		}
+		cowBuf, err := pw.CoW(pageID, newID)
+		if err != nil {
+			_ = pw.FreePage(newID)
+			return 0, false, false, fmt.Errorf("btree: CoW leaf %d for delete: %w", pageID, err)
+		}
+		if page.TryDeleteAt(cowBuf, cfg, idx) {
+			// Free the removed entry's overflow chain (if any) AFTER the leaf-
+			// level CoW lands and BEFORE the old leaf is retired, so a transient
+			// failure can't orphan a chain still reachable via the old leaf —
+			// same ordering as rebuildLeafAfterDelete. Only `removed`'s chain
+			// fields (Flags, OverflowPage, TotalLen) are used here; SearchLeaf
+			// populated them (its returned Key is nil, which the chain-free path
+			// does not need).
+			if err := freeOverflowChainIfPresent(pw, cfg, removed); err != nil {
+				_ = pw.FreePage(newID)
+				return 0, false, false, err
+			}
+			if err := pw.FreePage(pageID); err != nil {
+				_ = pw.FreePage(newID)
+				return 0, false, false, fmt.Errorf("btree: free old leaf %d: %w", pageID, err)
+			}
+			return newID, leafUnderflow(cowBuf, cfg, mergeThreshold), true, nil
+		}
+		// Splice declined (variant mismatch) — free the speculative CoW page and
+		// fall through to decode/rebuild, which migrates the leaf to the
+		// configured variant.
+		_ = pw.FreePage(newID)
 	}
-	return pageID, false, false, nil
+
+	// Slow path: decode + rebuild. Handles count<=1 (empty → free page),
+	// uncompressed leaves, and variant migration. Reuses idx from SearchLeaf;
+	// `removed` is re-taken as the deep-copied entry so the rebuild's chain-free
+	// runs on owned bytes, identical to before the fast path existed.
+	entries := leafEntriesDeepCopyFrom(r)
+	removed = entries[idx]
+	entries = append(entries[:idx], entries[idx+1:]...)
+	return rebuildLeafAfterDelete(pw, cfg, mergeThreshold, pageID, entries, removed)
 }
 
 // rebuildLeafAfterDelete handles the post-removal encode for a leaf:

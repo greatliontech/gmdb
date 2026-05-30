@@ -2,9 +2,9 @@
 
 **Lands:** proactive — a specced-but-unbuilt performance optimization;
 multi-session feature, port from grove. The format decision is **settled**
-(keep gmdb's format — see DECISION 1, RESOLVED). Chunks 1-2 (`TryAppend`,
-`TryInsertAt`, compressed) are **landed** — see Progress below; resume by
-porting `TryDeleteAt` next.
+(keep gmdb's format — see DECISION 1, RESOLVED). Chunks 1-3 (`TryAppend`,
+`TryInsertAt`, `TryDeleteAt`, compressed) are **landed** — see Progress below;
+resume by porting the uncompressed variants next.
 
 **Severity:** [perf] — not a correctness defect; a measured throughput +
 allocation optimization. The current decode/re-encode path is correct.
@@ -75,37 +75,65 @@ splice design. Justified by a CPU profile (below).
     a latent grove bug where, for a net-shrink insert (`byteDelta < 0`) with
     trailing in-group entries, grove's first copy clobbers the second copy's
     source.
-- **Resume: port `TryDeleteAt` next.** Read grove `tryDeleteAtCompressed:851`
-  + its tests (`TestTryDeleteAtAlwaysShrinks`,
-  `TestTryDeleteAtReencodingGrowthIsBounded`, `TestTryDeleteAtSingleEntry*`,
-  `TestTryDeleteAtFromMiddleGroup`) IN FULL before designing — do NOT infer the
-  byte mechanics from the case names (HARD RULE #1). Cases (grove doc :835-844):
-  D-A `gc==1` removes the whole group (restart-table shrinks, `rc` decreases —
-  the one case that changes RestartCount); D-B `p==0` the old E[1] delta becomes
-  the new restart; D-C `0<p<gc-1` the successor E[p+1] re-encodes as a delta vs
-  E[p-1] — this re-encode can **GROW** the successor (grove bounds it; verify
-  the `byteDelta` sign + fit handling, do NOT assume delete only shrinks);
-  D-D `p==gc-1` drop the last entry, no successor. grove's `TryDeleteAt` returns
-  freed space (>0) or **-1 = "page would be empty, caller frees it"** (int
-  return, unlike Append/Insert's bool).
-  - Delete is **localized / non-canonical** like `TryInsertAt` → same
-    **semantic + structural** oracle (decode == expected sequence; `Validate`;
-    free-space zeroed), NOT the byte-identity rebuild oracle. The single
-    contiguous memmove generalizes (shift `[afterDeleted, dataEnd)` by
-    `byteDelta`); a net shrink frees tail bytes → reuse the shrink-and-re-zero
-    (`clear`) path.
-  - Wiring: the single-key leaf-mutation site in `internal/btree/delete.go`
-    (gmdb analog of grove `del.go:140`); splice before its decode/rebuild, and
-    on the -1/empty signal let the existing delete path retire the leaf.
-- **Shared infrastructure to REUSE (chunks 1-2; don't reinvent):** entry encode
-  — `writeCompressed{Restart,Delta}Entry`, `entryTrailer`, `valuePartSize`,
-  `cellHasTrailerOnly` (`leaf_builder.go` / `leaf_splice.go`); the group walk —
-  `decodeRestartEntry` / `decodeDeltaEntry` with a reused keyBuf + cloned
-  captured keys; the variant guard — `typ != TypeLeaf ||
-  EffectiveRestartGroupTarget()==1 → decline`; test helpers in
-  `leaf_splice_test.go` — `tryBuild`, `assertLeafDecodesTo`,
-  `assertFreeSpaceZeroed`, `randomFittingMixed`, `randomLeafEntry`,
-  `sortedInsertIdx`, `keyBetween`. `task fuzz` already iterates all `Fuzz*`.
+- **Chunk 3 — `TryDeleteAt` (compressed): LANDED.**
+  `internal/page/leaf_splice.go` (`TryDeleteAt` dispatcher + `tryDeleteAtCompressed`,
+  four cases D-A/D-B/D-C/D-D); wired as the delete fast path in `deleteFromLeaf`
+  (`internal/btree/delete.go`), which now validates once + `SearchLeaf` once, then
+  forks fast (splice) / slow (decode-rebuild) with the slow path reusing the
+  SearchLeaf index. Semantic/structural fuzz (`FuzzTryDeleteAtCompressed`, mixed
+  cell kinds) + position (D-A×3 / D-B / D-C / D-D / overflow) + AlwaysShrinks +
+  ReencodingGrowthIsBounded + empty/variant/uncompressed/checksum tests +
+  `BenchmarkTryDeleteAtCompressed`. End-to-end `BenchmarkDeleteRandom` (val=200):
+  ~23% faster (9263→7146 ns/op), ~1.9× fewer B/op (10257→5485), fewer allocs/op
+  (112→95) — diluted by the merge/empty tail both paths share; the micro-bench
+  shows the pure splice at 3 allocs/op.
+  - **DESIGN — localized (non-canonical), like `TryInsertAt`** → same semantic +
+    structural oracle (decode == expected sequence; `Validate`; free-space
+    zeroed), NOT byte-identity. A delete ALWAYS shrinks the page (no fit-check,
+    always succeeds for count>1): the removed entry outweighs the successor's
+    re-encode growth by the shared-prefix triangle inequality on sorted keys —
+    verified `byteDelta ≤ −5 − valuePart(removed)` for both D-B and D-C, and the
+    successor's value-part cancels so subpage/nested/large-value cells are
+    irrelevant. D-A (`gc==1`, single-entry group) is the only case that changes
+    RestartCount.
+  - **Three gmdb-specific divergences from grove (verified against grove's
+    source):** (1) `bool` return vs grove's `int`/−1 ("page would empty, caller
+    frees it") — gmdb's `deleteFromLeaf` has a decode-rebuild fallback that
+    already frees an emptied leaf, migrates a stale variant, and recomputes
+    underflow via `leafUnderflow`, so the freed-space value and empty code are
+    unneeded; a decline routes to that existing slow path. (2) ONE contiguous
+    left-shift `[spliceEnd, dataEnd)` vs grove's two copies (within-group-trailing
+    + later-groups) — provably equivalent (the two regions are adjacent), and
+    consistent with `TryInsertAt`. grove's two-copy *delete* is actually correct
+    (unlike its two-copy insert); this is a simplicity divergence, not a bug-fix.
+    (3) `bytes.Clone` capture of the predecessor/successor key+value vs grove's
+    scratch-page stash.
+- **Resume: port the uncompressed variants next** (`ucTryAppend`,
+  `ucTryInsertAt`, `ucTryDeleteAt`). Read grove `leaf_uncompressed.go:39` /
+  `:84` / `:152` IN FULL first — do NOT infer the byte mechanics from the names
+  (HARD RULE #1). The uncompressed leaf is a positional offset table + full keys
+  (no delta / restart groups), `ValueLen`-before-key like the compressed form
+  (DECISION 1). This is the RGT==1 variant the three compressed dispatchers
+  currently DECLINE (`typ != TypeLeaf`) → today those fall back to decode-rebuild;
+  the uncompressed splices replace that fallback for RGT==1 keyspaces. Then the
+  final chunk: `trySplitLeafByGroup` (no-decode split). Wiring anchors:
+  `TryAppend`/`TryInsertAt` in `internal/btree/put.go`, `TryDeleteAt` in
+  `deleteFromLeaf` (`internal/btree/delete.go`) — extend each dispatcher's
+  `typ != TypeLeaf` decline into a `ucTry*` call.
+- **Shared infrastructure to REUSE (chunks 1-3; don't reinvent):** compressed
+  entry encode — `writeCompressed{Restart,Delta}Entry`, `entryTrailer`,
+  `valuePartSize`, `cellHasTrailerOnly` (`leaf_builder.go` / `leaf_splice.go`);
+  the group walk — `decodeRestartEntry` / `decodeDeltaEntry` with a reused keyBuf
+  + cloned captured keys; the variant guard — `typ != TypeLeaf ||
+  EffectiveRestartGroupTarget()==1 → decline` (the uncompressed chunk extends the
+  `typ != TypeLeaf` arm into a `ucTry*` call); the delete wiring's validate-once
+  + `SearchLeaf`-once + fast/slow fork (`deleteFromLeaf`); test helpers in
+  `leaf_splice_test.go` — `tryBuild`, `assertLeafDecodesTo` (variant-agnostic
+  semantic oracle), `assertFreeSpaceZeroed`, `insertExpected` / `checkInsert`,
+  `deleteExpected` / `checkDelete`, `randomFittingMixed`, `randomLeafEntry`,
+  `sortedInsertIdx`, `keyBetween`. `task fuzz` already iterates all `Fuzz*`. For
+  the uncompressed variants, the already-present `ucSkipEntry` scaffolding
+  (`leaf_uncompressed.go`) and the uncompressed reader paths are the analogs.
 
 ## Why (measured)
 

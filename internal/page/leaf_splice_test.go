@@ -611,6 +611,298 @@ func BenchmarkTryInsertAtCompressed(b *testing.B) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// TryDeleteAt — localized (non-canonical) splice; same semantic + structural
+// oracle as TryInsertAt (decode → exact entry sequence; Validate; free-space
+// zeroed). A delete ALWAYS shrinks the page (never declines for space), proven
+// by the shared-prefix triangle inequality — _AlwaysShrinks / _Reencoding-
+// GrowthIsBounded pin that bound.
+// ---------------------------------------------------------------------------
+
+func deleteExpected(base []LeafEntry, idx int) []LeafEntry {
+	out := make([]LeafEntry, 0, len(base)-1)
+	out = append(out, base[:idx]...)
+	out = append(out, base[idx+1:]...)
+	return out
+}
+
+// checkDelete builds base, splices out the entry at idx (asserting success), and
+// verifies the result decodes to the expected sequence with zeroed free space.
+// Returns the spliced page for further assertions (e.g. RestartCount).
+func checkDelete(t *testing.T, cfg Config, base []LeafEntry, idx int) []byte {
+	t.Helper()
+	buf, ok := tryBuild(cfg, base)
+	if !ok {
+		t.Fatalf("base (%d entries) did not fit", len(base))
+	}
+	if !TryDeleteAt(buf, cfg, idx) {
+		t.Fatalf("TryDeleteAt declined unexpectedly (base=%d idx=%d)", len(base), idx)
+	}
+	assertLeafDecodesTo(t, buf, cfg, deleteExpected(base, idx))
+	assertFreeSpaceZeroed(t, buf, cfg)
+	return buf
+}
+
+func TestTryDeleteAtCompressed_Positions(t *testing.T) {
+	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
+	ovf := func(k string, pg, tl uint64) LeafEntry {
+		return LeafEntry{Flags: CellFlagOverflow, Key: []byte(k), OverflowPage: pg, TotalLen: tl}
+	}
+	cfg16 := Config{PageSize: 4096, RestartGroupTarget: 16}
+
+	// One group of three (all share "key-") exercises D-B / D-C / D-D; the group
+	// survives so RestartCount stays 1.
+	grp3 := []LeafEntry{mk("key-1", "1"), mk("key-2", "2"), mk("key-3", "3")}
+
+	t.Run("D-B front (E[1] promoted to restart)", func(t *testing.T) {
+		buf := checkDelete(t, cfg16, grp3, 0)
+		if r := NewLeafReader(buf, cfg16); r.RestartCount() != 1 {
+			t.Fatalf("RestartCount = %d, want 1 (group survives)", r.RestartCount())
+		}
+	})
+	t.Run("D-C interior (successor re-deltaed vs E[p-1])", func(t *testing.T) {
+		checkDelete(t, cfg16, grp3, 1)
+	})
+	t.Run("D-D group tail (no successor)", func(t *testing.T) {
+		checkDelete(t, cfg16, grp3, 2)
+	})
+
+	// Three single-entry groups (no shared prefix → natural breaks) exercise
+	// D-A at the first / middle / last group; each removal drops RestartCount.
+	t.Run("D-A first group", func(t *testing.T) {
+		buf := checkDelete(t, cfg16, []LeafEntry{mk("aaa", "1"), mk("bbb", "2"), mk("ccc", "3")}, 0)
+		if r := NewLeafReader(buf, cfg16); r.RestartCount() != 2 {
+			t.Fatalf("RestartCount = %d, want 2 (single-entry group removed)", r.RestartCount())
+		}
+	})
+	t.Run("D-A middle group", func(t *testing.T) {
+		buf := checkDelete(t, cfg16, []LeafEntry{mk("aaa", "1"), mk("bbb", "2"), mk("ccc", "3")}, 1)
+		if r := NewLeafReader(buf, cfg16); r.RestartCount() != 2 {
+			t.Fatalf("RestartCount = %d, want 2", r.RestartCount())
+		}
+	})
+	t.Run("D-A last group", func(t *testing.T) {
+		buf := checkDelete(t, cfg16, []LeafEntry{mk("aaa", "1"), mk("bbb", "2"), mk("ccc", "3")}, 2)
+		if r := NewLeafReader(buf, cfg16); r.RestartCount() != 2 {
+			t.Fatalf("RestartCount = %d, want 2", r.RestartCount())
+		}
+	})
+
+	t.Run("D-B promotes an overflow successor to restart", func(t *testing.T) {
+		checkDelete(t, cfg16, []LeafEntry{mk("key-1", "1"), ovf("key-2", 99, 100000)}, 0)
+	})
+	t.Run("D-C with overflow successor", func(t *testing.T) {
+		checkDelete(t, cfg16, []LeafEntry{mk("key-1", "1"), mk("key-2", "2"), ovf("key-3", 7, 50000)}, 1)
+	})
+	t.Run("D-C deleting an overflow entry", func(t *testing.T) {
+		checkDelete(t, cfg16, []LeafEntry{mk("key-1", "1"), ovf("key-2", 7, 50000), mk("key-3", "3")}, 1)
+	})
+
+	t.Run("D-C with later groups (offsets shift)", func(t *testing.T) {
+		// RGT=4 → 8 shared-prefix keys make two full groups [k0..k3][k4..k7].
+		// Deleting idx 1 (group 0) must shift group 1's stored offset left.
+		cfg4 := Config{PageSize: 4096, RestartGroupTarget: 4}
+		base := []LeafEntry{mk("key-0", "0"), mk("key-1", "1"), mk("key-2", "2"), mk("key-3", "3"),
+			mk("key-4", "4"), mk("key-5", "5"), mk("key-6", "6"), mk("key-7", "7")}
+		buf := checkDelete(t, cfg4, base, 1)
+		r := NewLeafReader(buf, cfg4)
+		if r.RestartCount() != 2 {
+			t.Fatalf("RestartCount = %d, want 2 (delete shrinks a group, never drops one here)", r.RestartCount())
+		}
+		if r.GroupEntryCount(0) != 3 || r.GroupEntryCount(1) != 4 {
+			t.Fatalf("group counts = (%d,%d), want (3,4)", r.GroupEntryCount(0), r.GroupEntryCount(1))
+		}
+	})
+}
+
+func TestTryDeleteAtCompressed_SingleEntryLastInGroupSurvives(t *testing.T) {
+	// A two-entry group where the deleted entry is the tail (D-D), leaving the
+	// group with one entry (still a valid restart-only group).
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
+	buf := checkDelete(t, cfg, []LeafEntry{mk("key-1", "1"), mk("key-2", "2")}, 1)
+	if r := NewLeafReader(buf, cfg); r.GroupEntryCount(0) != 1 {
+		t.Fatalf("group 0 count = %d, want 1", r.GroupEntryCount(0))
+	}
+}
+
+// TestTryDeleteAtCompressed_ReencodingGrowthIsBounded is grove's tight worst
+// case: deleting the middle of "x" / "y"+50×"z" / "y"+50×"z"+"w" forces the
+// successor to re-encode against "x" (shared 0) instead of "y"+50×"z"
+// (shared 51) — the successor ENTRY grows ~51 bytes, yet the page still shrinks
+// because the removed ~60-byte entry dominates. Proves byteDelta < 0 even at the
+// pathological maximum.
+func TestTryDeleteAtCompressed_ReencodingGrowthIsBounded(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	prefix := bytes.Repeat([]byte("z"), 50)
+	base := []LeafEntry{
+		{Key: []byte("x"), Value: []byte("v")},
+		{Key: append([]byte("y"), prefix...), Value: []byte("v")},
+		{Key: append(append([]byte("y"), prefix...), 'w'), Value: []byte("v")},
+	}
+	checkDelete(t, cfg, base, 1)
+}
+
+// TestTryDeleteAtCompressed_AlwaysShrinks deletes EVERY index (on a fresh copy)
+// of a multi-group page that mixes single-entry groups (D-A), full groups, and a
+// short tail group — so every case fires — and asserts each delete succeeds and
+// decodes correctly. The splice never declines for space (a delete always
+// shrinks the page).
+func TestTryDeleteAtCompressed_AlwaysShrinks(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	var base []LeafEntry
+	// Two no-shared-prefix keys → two single-entry groups (D-A).
+	base = append(base, LeafEntry{Key: []byte("aaa"), Value: bytes.Repeat([]byte("v"), 5)})
+	base = append(base, LeafEntry{Key: []byte("mmm"), Value: bytes.Repeat([]byte("v"), 5)})
+	// Then a long shared-prefix run → several full groups + a short tail.
+	for i := range 22 {
+		base = append(base, LeafEntry{
+			Key:   fmt.Appendf(nil, "zzz-%04d-tail", i),
+			Value: bytes.Repeat([]byte("v"), 1+i%7),
+		})
+	}
+	if _, ok := tryBuild(cfg, base); !ok {
+		t.Fatalf("base (%d entries) did not fit", len(base))
+	}
+	for idx := range base {
+		t.Run(fmt.Sprintf("idx=%d", idx), func(t *testing.T) {
+			checkDelete(t, cfg, base, idx)
+		})
+	}
+}
+
+func TestTryDeleteAtCompressed_EmptyDeclines(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	buf, ok := tryBuild(cfg, []LeafEntry{{Key: []byte("only"), Value: []byte("v")}})
+	if !ok {
+		t.Fatal("base did not fit")
+	}
+	before := bytes.Clone(buf)
+	if TryDeleteAt(buf, cfg, 0) {
+		t.Fatal("TryDeleteAt should decline a count==1 page (it would empty — caller frees it)")
+	}
+	if !bytes.Equal(buf, before) {
+		t.Fatal("TryDeleteAt mutated the page on empty-decline")
+	}
+}
+
+func TestTryDeleteAtCompressed_VariantDeclines(t *testing.T) {
+	base := []LeafEntry{{Key: []byte("aaa"), Value: []byte("1")}, {Key: []byte("bbb"), Value: []byte("2")}}
+	buf, ok := tryBuild(Config{PageSize: 4096, RestartGroupTarget: 16}, base)
+	if !ok {
+		t.Fatal("base did not fit")
+	}
+	before := bytes.Clone(buf)
+	// Compressed page, but the keyspace is now configured uncompressed (RGT=1).
+	if TryDeleteAt(buf, Config{PageSize: 4096, RestartGroupTarget: 1}, 0) {
+		t.Fatal("TryDeleteAt should decline a compressed page when RGT=1 (migrate via rebuild)")
+	}
+	if !bytes.Equal(buf, before) {
+		t.Fatal("TryDeleteAt mutated the page on variant-decline")
+	}
+}
+
+func TestTryDeleteAtUncompressedDeclines(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1} // uncompressed variant
+	base := []LeafEntry{{Key: []byte("aaa"), Value: []byte("1")}, {Key: []byte("bbb"), Value: []byte("2")}}
+	buf, ok := tryBuild(cfg, base)
+	if !ok {
+		t.Fatal("base did not fit")
+	}
+	before := bytes.Clone(buf)
+	if TryDeleteAt(buf, cfg, 0) {
+		t.Fatal("TryDeleteAt should decline on an uncompressed leaf (no uc splice yet)")
+	}
+	if !bytes.Equal(buf, before) {
+		t.Fatal("TryDeleteAt mutated an uncompressed page on decline")
+	}
+}
+
+// TestTryDeleteAtCompressed_WithChecksum runs the splice under PageChecksum:true,
+// which lowers ContentEnd by FooterSize and relocates the restart table
+// FooterSize bytes lower — confirming the splice's cfg.ContentEnd()-based math
+// places the table correctly. (The footer itself is recomputed at commit time,
+// not by the splice; Validate checks structure within ContentEnd only.)
+func TestTryDeleteAtCompressed_WithChecksum(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4, PageChecksum: true}
+	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
+	base := []LeafEntry{
+		mk("aaa", "x"), // single-entry group (D-A reachable)
+		mk("key-0", "0"), mk("key-1", "1"), mk("key-2", "2"), mk("key-3", "3"), mk("key-4", "4"),
+	}
+	checkDelete(t, cfg, base, 0) // D-A under checksum (restart table relocates)
+	checkDelete(t, cfg, base, 2) // D-C under checksum
+}
+
+// FuzzTryDeleteAtCompressed asserts the semantic + structural invariant over
+// random leaves and random delete positions: a successful splice decodes to the
+// exact base-minus-idx sequence, passes Validate, and leaves free space zeroed;
+// a count==1 page declines unchanged.
+func FuzzTryDeleteAtCompressed(f *testing.F) {
+	f.Add(uint64(1), uint64(0))
+	f.Add(uint64(42), uint64(3))
+	f.Add(uint64(0xDEADBEEF), uint64(5))
+
+	f.Fuzz(func(t *testing.T, leafSeed, posSeed uint64) {
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+		base := randomFittingMixed(leafSeed, cfg)
+		if len(base) == 0 {
+			return
+		}
+		buf, fit := tryBuild(cfg, base)
+		if !fit {
+			return
+		}
+		deleteIdx := int(posSeed % uint64(len(base)))
+		before := bytes.Clone(buf)
+		if len(base) == 1 {
+			// count==1: the page would empty; the splice declines, unchanged.
+			if TryDeleteAt(buf, cfg, deleteIdx) {
+				t.Fatal("TryDeleteAt should decline a count==1 page")
+			}
+			if !bytes.Equal(buf, before) {
+				t.Fatal("TryDeleteAt mutated a count==1 page on decline")
+			}
+			return
+		}
+		if !TryDeleteAt(buf, cfg, deleteIdx) {
+			t.Fatalf("TryDeleteAt declined for count=%d idx=%d (delete always shrinks)", len(base), deleteIdx)
+		}
+		assertLeafDecodesTo(t, buf, cfg, deleteExpected(base, deleteIdx))
+		assertFreeSpaceZeroed(t, buf, cfg)
+	})
+}
+
+// BenchmarkTryDeleteAtCompressed measures the per-call cost of a mid-group
+// delete at various group fullness and value sizes (clone successor + shift per
+// iteration). Compare against the decode/re-encode fallback it replaces.
+func BenchmarkTryDeleteAtCompressed(b *testing.B) {
+	for _, gc := range []int{4, 8, 16} {
+		for _, valSize := range []int{8, 100} {
+			b.Run(fmt.Sprintf("gc=%d/val=%d", gc, valSize), func(b *testing.B) {
+				cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+				val := bytes.Repeat([]byte("v"), valSize)
+				var base []LeafEntry
+				for i := range gc {
+					base = append(base, LeafEntry{Key: fmt.Appendf(nil, "key-%04d", i), Value: val})
+				}
+				prebuilt, ok := tryBuild(cfg, base)
+				if !ok {
+					b.Fatalf("base did not fit (gc=%d val=%d)", gc, valSize)
+				}
+				work := make([]byte, cfg.PageSize)
+				deleteIdx := gc / 2
+				b.ResetTimer()
+				b.ReportAllocs()
+				for range b.N {
+					copy(work, prebuilt)
+					TryDeleteAt(work, cfg, deleteIdx)
+				}
+			})
+		}
+	}
+}
+
 // randomFittingEntries builds a random sorted, inline-only entry set and
 // returns the prefix that fits one page (stops at the first page-full). The
 // returned entries are independently owned (cloned off the build buffer).
