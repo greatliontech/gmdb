@@ -49,37 +49,43 @@ use-case-simplified (e.g. its `splitLeaf` has no feasibility check / no
 overflow promotion — gmdb's A fix covers that). Read grove per the
 per-feature reference approach; verify against gmdb's spec.
 
-## DECISION 1 (do this first): format-alignment fork
+## DECISION 1: RESOLVED — keep gmdb's format (measured)
 
-gmdb's and grove's compressed-leaf formats are **NOT byte-identical**.
-Inline entry field order:
+gmdb and grove differ in **exactly one** place: the inline entry's
+`ValueLen` (u32) sits **before** the key in gmdb
+(`[Flags][KeyLen][ValueLen][Key][Value]` /
+`[Flags][SharedLen][UnsharedLen][ValueLen][UnsharedKey][Value]`,
+`internal/page/leaf_compressed.go:59,119` + `leaf_uncompressed.go:25,67`)
+and **after** the key in grove. Consistent across compressed *and*
+uncompressed leaves. Everything else is byte-identical: restart table
+`[Offset u16][Count u8][Reserved u8]`, header offsets
+`leafOffRestartCount=8`/`leafOffDataEnd=10`, overflow + nested cells
+(`[…key…][u64][u64]`), and the prefix-delta scheme.
 
-- gmdb: `[Flags][KeyLen][ValueLen][Key][Value]` (restart) /
-  `[Flags][SharedLen][UnsharedLen][ValueLen][UnsharedKey][Value]` (delta)
-  — `ValueLen` **before** the key
-  (`internal/page/leaf_compressed.go:59,119`).
-- grove: `[Flags][KeyLen][Key][ValueLen][Value]` — value part **after**
-  the key (`grove/.../leaf_compressed.go:524-542` + `writeValuePart`).
+A microbenchmark isolating that one variable
+(`internal/page/layout_bench_test.go`, median of 10 runs) shows gmdb's
+order is **~24-26% faster for full-leaf decode** and a wash for search:
 
-gmdb's ordering is **not** actually advantageous (its
-"fixed-fields-before-variable-key" rationale at decodeDeltaEntry:81-85
-holds for grove's layout too; grove's puts the key marginally closer to
-the entry start for the search hot path). A verbatim port of grove's
-splice onto gmdb's layout would **silently corrupt pages** (fuzz-only).
+| | gmdb | grove |
+|---|---|---|
+| iterate val=16 / 256 | ~138 / ~139 ns | ~181 / ~187 ns |
+| search val=16 / 256 | ~126 / ~132 ns | ~129 / ~135 ns |
 
-- **(a) Keep gmdb's format, adapt each helper** to its byte order
-  (re-encode using gmdb's `LeafBuilder` primitives). No format change;
-  delicate per-helper byte work.
-- **(b) Align this encoding to grove's order first** (grove → gmdb; a
-  contained, clean-break format change — gmdb is pre-v1, no installed
-  base — plus a `page-formats.md` update), then port the splice
-  near-verbatim. Safer port; future grove backports stay aligned.
+Reason: with all length fields in the fixed header, the decoder computes
+the next-entry offset without waiting on the key copy (ILP); grove's
+`ValueLen`-after-key serializes each entry's decode. That decode cost is
+paid by every non-spliced read and the splice fallback, so it is real.
 
-Before choosing (b): run a **full gmdb-vs-grove compressed+uncompressed
-format diff** to size total alignment (header offsets, overflow/nested
-encoding, restart table, value part). gmdb's format is a *superset*
-(SetKeyspace subpage / nested-tree cells) — align only the common parts
-gmdb has no reason to differ on.
+**Decision: KEEP gmdb's format.** Aligning to grove (the earlier option
+b) is rejected — it would regress decode ~24% to save port effort.
+
+**Consequence for the port (good news):** the divergence is one localized
+field position, so porting each grove splice helper means adapting only
+the **inline value-part write** to gmdb's order (`[ValueLen][Key]`, not
+`[Key][ValueLen]`) — reuse gmdb's `LeafBuilder` entry-encode for that
+write. The restart-table updates, byte-shift logic, overflow handling,
+and I-B/I-C/I-D insert structure port as-is. Adaptation is contained, not
+pervasive.
 
 ## Port plan (after Decision 1)
 
