@@ -183,12 +183,13 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 		return newID, displaced, nil
 	}
 
-	// Split required.
-	if len(entries) < 2 {
+	// Split required — byte-balanced boundary (page-formats.md §Leaf
+	// Split), not the entry-count midpoint. See findLeafSplitIndex.
+	mid, ok := findLeafSplitIndex(b, leftBuf, cfg, entries)
+	if !ok {
 		_ = pw.FreePage(leftID)
 		return 0, page.LeafEntry{}, ErrKeyTooLarge
 	}
-	mid := len(entries) / 2
 
 	b.Reset(leftBuf, cfg)
 	for _, ent := range entries[:mid] {

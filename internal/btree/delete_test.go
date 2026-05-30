@@ -718,9 +718,12 @@ func checkSlabPartition(t *testing.T, pw *fakeWriter, cfg page.Config, root uint
 // **structurally unreachable** from a valid pre-state for
 // single-key Delete (the inductive maintenance argument: each
 // merge has one input >= MT — the untouched sibling — so combined
-// >= MT and the merged result is >= MT; redistribute can only
-// happen when combined > ContentEnd, which means combined > 2*MT
-// for any MT <= 50, so per-half count split is >= MT). What
+// >= MT and the merged result is >= MT). When a merge instead
+// overflows and redistributes, the byte-balanced split
+// (findLeafSplitIndex) lands each half near 50%; any half still
+// below MT is healed by rebalanceSurvivors' fill re-check — the
+// floor is enforced by that re-check, not by the split being
+// inherently >= MT. What
 // SHOULD be true even so: every successful single-key Delete
 // leaves every non-root page >= MergeThreshold% of ContentEnd.
 //

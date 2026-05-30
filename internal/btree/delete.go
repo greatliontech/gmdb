@@ -539,9 +539,9 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		// re-rebalance loop below will attempt to heal the one on the
 		// side that received the recursed-into child (= descentIdx).
 		// The other half came from the previously-healthy sibling and
-		// inherits the sibling's half of the entries, which the
-		// count-balanced split keeps above MT under non-pathological
-		// entry sizes.
+		// inherits the sibling's half of the entries; the redistribute
+		// keeps it near half-full, and the post-merge re-rebalance loop
+		// below heals any half that still lands below MT.
 		insertedPos = int(descentIdx)
 		if useLeft {
 			insertedID = newRightID
@@ -684,8 +684,8 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 	// triedRedistPos: the sibling position last paired via a
 	// redistribute that did not heal the child's underflow. A second
 	// pairing with the same sibling would re-run the same
-	// count-balanced split with identical inputs and identical outputs
-	// — infinite loop. Skip that position on subsequent picks; if
+	// deterministic redistribute split with identical inputs and
+	// identical outputs — infinite loop. Skip that position on subsequent picks; if
 	// every remaining adjacent slot has already been tried this way,
 	// exit with finalUnderflow=true so the caller threads the residual
 	// upward via deepUnderflowChild. Reset to -1 on merge (cells
@@ -1010,8 +1010,9 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 // LeafBuilder.AddEntry; if every entry fits in one page, the merge
 // is committed. Otherwise the merge buffer is freed (returning to
 // the loose-page pool for re-use inside this tx) and the entries
-// are redistributed across two newly-allocated pages, balancing by
-// entry count and recomputing the boundary separator via
+// are redistributed across two newly-allocated pages at a
+// byte-balanced split point (findLeafSplitIndex, page-formats.md
+// §Leaf Split), recomputing the boundary separator via
 // page.ShortestSeparator.
 //
 // Variant policy. The surviving page(s) are built via
@@ -1088,23 +1089,17 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: free unused merge slab %d: %w", mergedID, err)
 	}
 
-	// Redistribute: split by count and validate per-half fits. With
-	// limits.md key-size bounds (≤ ~PageSize/2 per entry), the
-	// per-half fit check is defense in depth — combined > 1 page
-	// implies ≥ 2 entries, and a count-based split balances them.
-	// Both failure modes (< 2 combined entries; per-half oversize)
-	// are reachable only from a structurally-invalid input (sibling
-	// pages that violate the per-key max or that arrived empty when
-	// they shouldn't), so they wrap ErrCorrupted to give the
-	// chunk-5 keyspace surface a single errors.Is class to switch
-	// on.
-	if len(combined) < 2 {
-		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute leaves with <2 combined entries", ErrCorrupted)
-	}
-	mid := len(combined) / 2
-	leftSplit := combined[:mid]
-	rightSplit := combined[mid:]
-
+	// Redistribute across two pages at a byte-balanced boundary
+	// (page-formats.md §Leaf Split), not the entry-count midpoint: a
+	// count split of size-skewed siblings can place more than a page of
+	// bytes on one half and spuriously fail. The combined entries arrived
+	// from two valid sibling pages, so a feasible two-page partition
+	// always exists (at minimum the original page boundary, which is
+	// at least as balanced as the input); findLeafSplitIndex returning
+	// ok=false therefore means a structurally-invalid input — a stored
+	// entry exceeding page capacity — a genuine ErrCorrupted, not a
+	// balance failure. newLeftBuf doubles as the split-measurement
+	// scratch before it holds the real left half.
 	newLeftID, err := pw.AllocPage()
 	if err != nil {
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-left leaf: %w", err)
@@ -1115,6 +1110,15 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-left slab: %w", err)
 	}
 	lb := page.NewLeafBuilder(newLeftBuf, cfg)
+	mid, ok := findLeafSplitIndex(lb, newLeftBuf, cfg, combined)
+	if !ok {
+		_ = pw.FreePage(newLeftID)
+		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute leaves have no feasible two-page split", ErrCorrupted)
+	}
+	leftSplit := combined[:mid]
+	rightSplit := combined[mid:]
+
+	lb.Reset(newLeftBuf, cfg)
 	for _, e := range leftSplit {
 		if !lb.AddEntry(e) {
 			_ = pw.FreePage(newLeftID)

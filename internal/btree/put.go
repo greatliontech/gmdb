@@ -276,27 +276,28 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		return nr, existed, nil
 	}
 
-	// Split required. Since the new entry has been promoted to
-	// overflow when it'd otherwise exceed single-page capacity,
-	// the only remaining unfit case is "multi-entry leaf that
-	// overflows on one entry's growth" — count-balanced midpoint
-	// split. With limits.md key-size bounds + overflow promotion,
-	// `len(entries) < 2` is unreachable from valid input: an
-	// overflow-promoted single entry fits trivially, and an inline
-	// single entry below the overflow threshold fits trivially.
-	// Guard remains as defense in depth.
-	if len(entries) < 2 {
+	// Split required. Choose a byte-balanced split boundary
+	// (page-formats.md §Leaf Split) — NOT the entry-count midpoint. A
+	// leaf mixing small entries with large inline values (needsOverflow
+	// promotes a value to overflow only when it cannot fit an
+	// otherwise-empty page, so inline values can approach a full page)
+	// has count midpoints that place more than a page of bytes on one
+	// side, spuriously failing a valid Put. findLeafSplitIndex returns a
+	// boundary where both halves fit when one exists; ok=false means the
+	// surviving entries genuinely cannot be partitioned into two leaf
+	// pages (a true ErrKeyTooLarge — e.g. an over-size key per limits.md).
+	mid, ok := findLeafSplitIndex(b, leftBuf, cfg, entries)
+	if !ok {
 		_ = pw.FreePage(leftID)
 		rollbackNewChain()
 		return 0, false, ErrKeyTooLarge
 	}
-	mid := len(entries) / 2
 
-	// Re-Reset the builder on leftBuf and emit the left half.
-	// The previous (partial) write into leftBuf is overwritten —
-	// LeafBuilder writes entries from leafEntryStart forward and
-	// Finish zeros the unused middle, so the resulting page is
-	// byte-identical to a Builder run on a freshly-zeroed buffer.
+	// Re-Reset the builder on leftBuf and emit the left half. The split
+	// index guarantees entries[:mid] fits; AddEntry cannot fail here, but
+	// the guard remains as defense in depth. LeafBuilder writes entries
+	// from leafEntryStart forward and Finish zeros the unused middle, so
+	// the page is byte-identical to a Builder run on a freshly-zeroed buf.
 	b.Reset(leftBuf, cfg)
 	for _, e := range entries[:mid] {
 		if !b.AddEntry(e) {
