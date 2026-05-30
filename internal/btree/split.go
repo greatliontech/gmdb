@@ -101,3 +101,28 @@ func leafEntriesFit(b *page.LeafBuilder, scratch []byte, cfg page.Config, es []p
 	}
 	return true
 }
+
+// largestInlineEntry returns the index of the plain inline entry
+// (Flags == 0) with the largest value — lowest index breaking ties — or
+// -1 if no inline entry remains to promote. The Put split path uses it to
+// pick a value to move to an overflow chain when a leaf is too
+// size-skewed for any two-page split (limits.md §Maximum Value Size
+// guarantees any value is storable): promoting the largest inline value
+// frees the most leaf space, so the
+// retry converges fastest, and the choice is a deterministic function of
+// the entry set. Overflow / subpage / nested cells (Flags != 0) are not
+// inline values and are skipped; -1 means the obstruction is an over-size
+// key, a genuine ErrKeyTooLarge per limits.md §Maximum Key Size.
+func largestInlineEntry(entries []page.LeafEntry) int {
+	best, bestLen := -1, -1
+	for i := range entries {
+		if entries[i].Flags != 0 {
+			continue
+		}
+		if len(entries[i].Value) > bestLen {
+			bestLen = len(entries[i].Value)
+			best = i
+		}
+	}
+	return best
+}

@@ -226,137 +226,162 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 	var displaced page.LeafEntry
 	entries, displaced, existed = insertOrReplaceLeaf(entries, newEntry)
 
-	// Helper: rollback the freshly-allocated new chain (if any) on
-	// failure paths below. Mirrors the AllocPage→CoW→mutate→FreePage
-	// ordering for chains.
+	// Helper: rollback the freshly-allocated new chain (if any) plus any
+	// inline values promoted to overflow during a size-skewed split (the
+	// store loop below) on failure paths. Mirrors the
+	// AllocPage→CoW→mutate→FreePage ordering for chains. promotedChains is
+	// empty until the first promotion, so earlier callers are no-ops.
+	var promotedChains []page.LeafEntry
 	rollbackNewChain := func() {
 		if newEntry.IsOverflow() {
 			runLen := page.OverflowRunLength(cfg, newEntry.TotalLen)
 			_ = pw.FreeRun(newEntry.OverflowPage, runLen)
 		}
-	}
-
-	// Attempt single-page build into leftBuf. LeafBuilder's
-	// AddEntry returns false on page-full — no partial mutation is
-	// committed at that point per internal/page/leaf_builder.go
-	// (the fit check fires before any byte is written).
-	b := page.NewLeafBuilder(leftBuf, cfg)
-	fits := true
-	for _, e := range entries {
-		if !b.AddEntry(e) {
-			fits = false
-			break
+		for _, pe := range promotedChains {
+			runLen := page.OverflowRunLength(cfg, pe.TotalLen)
+			_ = pw.FreeRun(pe.OverflowPage, runLen)
 		}
 	}
-	if fits {
+
+	// Store entries into one leaf if they fit, else a byte-balanced
+	// two-page split (page-formats.md §Leaf Split — NOT the entry-count
+	// midpoint: a leaf mixing small entries with large inline values has
+	// count midpoints that place more than a page of bytes on one side,
+	// since needsOverflow keeps a value inline until it cannot fit an
+	// otherwise-empty page). If the entries are too size-skewed for any
+	// two-page partition, promote the largest inline value to an overflow
+	// chain — shrinking its leaf entry to a small reference — and retry.
+	// limits.md §Maximum Value Size guarantees any value is storable, so
+	// this keeps strict-fit inline for the common case yet never rejects a
+	// valid Put; only an over-size key (no inline value left to promote)
+	// yields ErrKeyTooLarge.
+	b := page.NewLeafBuilder(leftBuf, cfg)
+	for {
+		// Attempt single-page build into leftBuf. AddEntry returns false
+		// on page-full with no partial mutation committed (the fit check
+		// fires before any byte is written, per leaf_builder.go).
+		b.Reset(leftBuf, cfg)
+		fits := true
+		for _, e := range entries {
+			if !b.AddEntry(e) {
+				fits = false
+				break
+			}
+		}
+		if fits {
+			b.Finish()
+			// Post-build cleanup ordering: free the displaced chain FIRST
+			// while the OLD leaf still references it (so a chain-free fault
+			// can't observably orphan the chain — the entry is still
+			// reachable from the not-yet-retired old leaf), then free the
+			// old leaf. On either failure roll back the new state (leftID +
+			// the new/promoted chains) so the "any pages allocated during
+			// this Put are freed on error" contract holds.
+			if err := freeOverflowChainIfPresent(pw, cfg, displaced); err != nil {
+				_ = pw.FreePage(leftID)
+				rollbackNewChain()
+				return 0, false, err
+			}
+			if err := pw.FreePage(leafID); err != nil {
+				_ = pw.FreePage(leftID)
+				rollbackNewChain()
+				return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
+			}
+			nr, e := ascendNoSplit(pw, cfg, path, leftID)
+			if e != nil {
+				return 0, false, e
+			}
+			return nr, existed, nil
+		}
+
+		// Too big for one leaf: byte-balanced split.
+		mid, ok := findLeafSplitIndex(b, leftBuf, cfg, entries)
+		if !ok {
+			// No two-page partition fits (size-skewed leaf). Promote the
+			// largest inline value to overflow and retry — its leaf entry
+			// shrinks to a small reference, freeing space so the set fits
+			// one page or splits. A deterministic choice (largest, lowest
+			// index on ties), so Check()/recovery re-encode preserves it.
+			pi := largestInlineEntry(entries)
+			if pi < 0 {
+				_ = pw.FreePage(leftID)
+				rollbackNewChain()
+				return 0, false, ErrKeyTooLarge
+			}
+			promoted, perr := writeOverflowChain(pw, cfg, entries[pi].Key, entries[pi].Value)
+			if perr != nil {
+				_ = pw.FreePage(leftID)
+				rollbackNewChain()
+				return 0, false, perr
+			}
+			entries[pi] = promoted
+			promotedChains = append(promotedChains, promoted)
+			continue
+		}
+
+		// Emit the left half into leftBuf (the split index guarantees
+		// entries[:mid] fits; the guard is defense in depth). LeafBuilder
+		// writes from leafEntryStart forward and Finish zeros the unused
+		// middle, so the page is byte-identical to a run on a fresh buffer.
+		b.Reset(leftBuf, cfg)
+		for _, e := range entries[:mid] {
+			if !b.AddEntry(e) {
+				_ = pw.FreePage(leftID)
+				rollbackNewChain()
+				return 0, false, ErrKeyTooLarge
+			}
+		}
 		b.Finish()
-		// Post-build cleanup ordering: free the displaced chain
-		// FIRST while the OLD leaf still references it (so a
-		// chain-free fault can't observably orphan the chain —
-		// the entry is still reachable from the old leaf, which
-		// hasn't been retired yet). Then free the old leaf. On
-		// either failure roll back the new state (leftID + the
-		// new chain if it was allocated) so the chunk's
-		// "any pages allocated during this Put are freed on
-		// error" contract holds.
+
+		// Allocate + build right.
+		rightID, err := pw.AllocPage()
+		if err != nil {
+			_ = pw.FreePage(leftID)
+			rollbackNewChain()
+			return 0, false, fmt.Errorf("btree: alloc split-right leaf: %w", err)
+		}
+		rightBuf, err := pw.AllocSlab(rightID)
+		if err != nil {
+			_ = pw.FreePage(leftID)
+			_ = pw.FreePage(rightID)
+			rollbackNewChain()
+			return 0, false, fmt.Errorf("btree: alloc split-right buf: %w", err)
+		}
+		rb := page.NewLeafBuilder(rightBuf, cfg)
+		for _, e := range entries[mid:] {
+			if !rb.AddEntry(e) {
+				_ = pw.FreePage(leftID)
+				_ = pw.FreePage(rightID)
+				rollbackNewChain()
+				return 0, false, ErrKeyTooLarge
+			}
+		}
+		rb.Finish()
+
+		// Post-build cleanup ordering: free the displaced chain first
+		// (still reachable via the not-yet-retired old leaf), then the
+		// old leaf. On either failure roll back leftID + rightID + chains.
 		if err := freeOverflowChainIfPresent(pw, cfg, displaced); err != nil {
 			_ = pw.FreePage(leftID)
+			_ = pw.FreePage(rightID)
 			rollbackNewChain()
 			return 0, false, err
 		}
 		if err := pw.FreePage(leafID); err != nil {
 			_ = pw.FreePage(leftID)
+			_ = pw.FreePage(rightID)
 			rollbackNewChain()
 			return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
 		}
-		nr, e := ascendNoSplit(pw, cfg, path, leftID)
+
+		// Separator: shortest S with leftLast < S <= rightFirst.
+		sep := page.ShortestSeparator(entries[mid-1].Key, entries[mid].Key)
+		nr, e := ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
 		if e != nil {
 			return 0, false, e
 		}
 		return nr, existed, nil
 	}
-
-	// Split required. Choose a byte-balanced split boundary
-	// (page-formats.md §Leaf Split) — NOT the entry-count midpoint. A
-	// leaf mixing small entries with large inline values (needsOverflow
-	// promotes a value to overflow only when it cannot fit an
-	// otherwise-empty page, so inline values can approach a full page)
-	// has count midpoints that place more than a page of bytes on one
-	// side, spuriously failing a valid Put. findLeafSplitIndex returns a
-	// boundary where both halves fit when one exists; ok=false means the
-	// surviving entries genuinely cannot be partitioned into two leaf
-	// pages (a true ErrKeyTooLarge — e.g. an over-size key per limits.md).
-	mid, ok := findLeafSplitIndex(b, leftBuf, cfg, entries)
-	if !ok {
-		_ = pw.FreePage(leftID)
-		rollbackNewChain()
-		return 0, false, ErrKeyTooLarge
-	}
-
-	// Re-Reset the builder on leftBuf and emit the left half. The split
-	// index guarantees entries[:mid] fits; AddEntry cannot fail here, but
-	// the guard remains as defense in depth. LeafBuilder writes entries
-	// from leafEntryStart forward and Finish zeros the unused middle, so
-	// the page is byte-identical to a Builder run on a freshly-zeroed buf.
-	b.Reset(leftBuf, cfg)
-	for _, e := range entries[:mid] {
-		if !b.AddEntry(e) {
-			_ = pw.FreePage(leftID)
-			rollbackNewChain()
-			return 0, false, ErrKeyTooLarge
-		}
-	}
-	b.Finish()
-
-	// Allocate + build right.
-	rightID, err := pw.AllocPage()
-	if err != nil {
-		_ = pw.FreePage(leftID)
-		rollbackNewChain()
-		return 0, false, fmt.Errorf("btree: alloc split-right leaf: %w", err)
-	}
-	rightBuf, err := pw.AllocSlab(rightID)
-	if err != nil {
-		_ = pw.FreePage(leftID)
-		_ = pw.FreePage(rightID)
-		rollbackNewChain()
-		return 0, false, fmt.Errorf("btree: alloc split-right buf: %w", err)
-	}
-	rb := page.NewLeafBuilder(rightBuf, cfg)
-	for _, e := range entries[mid:] {
-		if !rb.AddEntry(e) {
-			_ = pw.FreePage(leftID)
-			_ = pw.FreePage(rightID)
-			rollbackNewChain()
-			return 0, false, ErrKeyTooLarge
-		}
-	}
-	rb.Finish()
-
-	// Post-build cleanup ordering: free the displaced chain first
-	// (still reachable via the not-yet-retired old leaf), then
-	// the old leaf. On either failure roll back leftID + rightID
-	// + the new chain.
-	if err := freeOverflowChainIfPresent(pw, cfg, displaced); err != nil {
-		_ = pw.FreePage(leftID)
-		_ = pw.FreePage(rightID)
-		rollbackNewChain()
-		return 0, false, err
-	}
-	if err := pw.FreePage(leafID); err != nil {
-		_ = pw.FreePage(leftID)
-		_ = pw.FreePage(rightID)
-		rollbackNewChain()
-		return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
-	}
-
-	// Separator: shortest S with leftLast < S <= rightFirst.
-	sep := page.ShortestSeparator(entries[mid-1].Key, entries[mid].Key)
-	nr, e := ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
-	if e != nil {
-		return 0, false, e
-	}
-	return nr, existed, nil
 }
 
 // buildPutEntry constructs the LeafEntry for a Put: an inline entry

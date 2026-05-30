@@ -23,6 +23,14 @@ tasks:
     cmds:
       - go test -race -fuzz=. -fuzztime={{.FUZZTIME}} ./internal/page/
 
+  bench:
+    desc: Run benchmarks (override BENCH=pattern, BENCHTIME=200ms)
+    vars:
+      BENCH: '{{.BENCH | default "."}}'
+      BENCHTIME: '{{.BENCHTIME | default "1s"}}'
+    cmds:
+      - go test -run='^$' -bench={{.BENCH}} -benchmem -benchtime={{.BENCHTIME}} ./...
+
   vet:
     desc: Run go vet
     cmds:

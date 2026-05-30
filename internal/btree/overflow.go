@@ -71,12 +71,20 @@ func overflowRefFitsLeaf(cfg page.Config, key []byte) bool {
 }
 
 // NeedsOverflow exports needsOverflow for the bulk-load construction
-// path (package gmdb), which must make the SAME inline-vs-overflow
+// path (package gmdb), which must make the SAME base inline-vs-overflow
 // decision as the Put path so a value Put would inline, BulkLoad also
 // inlines, and a value Put would promote, BulkLoad also promotes — one
 // threshold, no drift. needsOverflow is conservative (over-estimates leaf
 // overhead), so anything it reports as inline definitely fits an
 // otherwise-empty leaf built by the same page.LeafBuilder.
+//
+// The Put split path may *additionally* promote an already-inline value
+// to overflow when a leaf is too size-skewed for any two-page split (see
+// put.go's store loop / largestInlineEntry). That is an on-demand layer
+// above this threshold, not a threshold change: BulkLoad never needs it
+// (it builds packed leaves bottom-up without splitting), and the leaf
+// records the resulting overflow cell, so the two paths' base decision
+// stays identical even though Put can end up with more overflow cells.
 func NeedsOverflow(cfg page.Config, key, value []byte) bool {
 	return needsOverflow(cfg, key, value)
 }
