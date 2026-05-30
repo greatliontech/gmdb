@@ -75,11 +75,37 @@ splice design. Justified by a CPU profile (below).
     a latent grove bug where, for a net-shrink insert (`byteDelta < 0`) with
     trailing in-group entries, grove's first copy clobbers the second copy's
     source.
-- **Resume: port `TryDeleteAt` next** — grove `tryDeleteAtCompressed:851`,
-  D-A/D-B/D-C/D-D cases (D-A `gc==1` removes the whole group → restart-table
-  shrinks). Delete always shrinks (`byteDelta < 0`), so reuse the
-  shrink-and-re-zero path; same semantic/structural oracle as `TryInsertAt`
-  (delete is also localized). Port `TestTryDeleteAtAlwaysShrinks`.
+- **Resume: port `TryDeleteAt` next.** Read grove `tryDeleteAtCompressed:851`
+  + its tests (`TestTryDeleteAtAlwaysShrinks`,
+  `TestTryDeleteAtReencodingGrowthIsBounded`, `TestTryDeleteAtSingleEntry*`,
+  `TestTryDeleteAtFromMiddleGroup`) IN FULL before designing — do NOT infer the
+  byte mechanics from the case names (HARD RULE #1). Cases (grove doc :835-844):
+  D-A `gc==1` removes the whole group (restart-table shrinks, `rc` decreases —
+  the one case that changes RestartCount); D-B `p==0` the old E[1] delta becomes
+  the new restart; D-C `0<p<gc-1` the successor E[p+1] re-encodes as a delta vs
+  E[p-1] — this re-encode can **GROW** the successor (grove bounds it; verify
+  the `byteDelta` sign + fit handling, do NOT assume delete only shrinks);
+  D-D `p==gc-1` drop the last entry, no successor. grove's `TryDeleteAt` returns
+  freed space (>0) or **-1 = "page would be empty, caller frees it"** (int
+  return, unlike Append/Insert's bool).
+  - Delete is **localized / non-canonical** like `TryInsertAt` → same
+    **semantic + structural** oracle (decode == expected sequence; `Validate`;
+    free-space zeroed), NOT the byte-identity rebuild oracle. The single
+    contiguous memmove generalizes (shift `[afterDeleted, dataEnd)` by
+    `byteDelta`); a net shrink frees tail bytes → reuse the shrink-and-re-zero
+    (`clear`) path.
+  - Wiring: the single-key leaf-mutation site in `internal/btree/delete.go`
+    (gmdb analog of grove `del.go:140`); splice before its decode/rebuild, and
+    on the -1/empty signal let the existing delete path retire the leaf.
+- **Shared infrastructure to REUSE (chunks 1-2; don't reinvent):** entry encode
+  — `writeCompressed{Restart,Delta}Entry`, `entryTrailer`, `valuePartSize`,
+  `cellHasTrailerOnly` (`leaf_builder.go` / `leaf_splice.go`); the group walk —
+  `decodeRestartEntry` / `decodeDeltaEntry` with a reused keyBuf + cloned
+  captured keys; the variant guard — `typ != TypeLeaf ||
+  EffectiveRestartGroupTarget()==1 → decline`; test helpers in
+  `leaf_splice_test.go` — `tryBuild`, `assertLeafDecodesTo`,
+  `assertFreeSpaceZeroed`, `randomFittingMixed`, `randomLeafEntry`,
+  `sortedInsertIdx`, `keyBetween`. `task fuzz` already iterates all `Fuzz*`.
 
 ## Why (measured)
 
