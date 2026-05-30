@@ -187,7 +187,14 @@ the spec promotes the corresponding padding byte(s) from
 spec read it normally; readers compiled against the old spec
 continue to ignore it (degraded but safe). When a meta-format
 reserved slot is consumed, the meta-page format version bumps
-and the strict-reject contract enforces a clean cutover. Spec
+and the strict-reject contract enforces a clean cutover. `Open()`
+surfaces this strict-reject as `ErrVersionMismatch` — distinct from
+`ErrCorrupted` — when meta-0 is an intact gmdb meta (checksum + Magic
+valid) whose `Version` differs from the engine's `FormatVersion`: the
+file is a valid gmdb database of a format this binary cannot read, not
+a damaged one. (The meta identity header — `Magic` @0, `Version` @4,
+checksum footer — is the version-stable surface that makes this
+classification possible across format evolutions.) Spec
 sites should cite this section by category rather than restate
 the policy.
 

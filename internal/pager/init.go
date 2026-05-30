@@ -177,6 +177,15 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 	if _, err := file.ReadAt(meta0Bytes, 0); err != nil {
 		return nil, fmt.Errorf("pager: read meta0: %w", err)
 	}
+	// An intact gmdb meta-0 of a different format version is reported
+	// distinctly from corruption (file-layout.md §Meta Page): the file
+	// is fine, this binary just can't read its format. Checked before
+	// the recovery machinery so a different-version file never
+	// masquerades as a torn/corrupt current-version file.
+	if isVersionMismatchMeta(meta0Bytes) {
+		return nil, fmt.Errorf("pager: %w: meta0 version %d, want %d",
+			ErrVersionMismatch, page.DecodeMeta(meta0Bytes).Version, page.FormatVersion)
+	}
 	var pageSize uint32
 	var meta1Bytes []byte
 	if isGmdbMeta(meta0Bytes) {
@@ -327,6 +336,10 @@ func DiscoverPageSize(file *os.File) (uint32, error) {
 	if _, err := file.ReadAt(meta0, 0); err != nil {
 		return 0, fmt.Errorf("pager: read meta0: %w", err)
 	}
+	if isVersionMismatchMeta(meta0) {
+		return 0, fmt.Errorf("pager: %w: meta0 version %d, want %d",
+			ErrVersionMismatch, page.DecodeMeta(meta0).Version, page.FormatVersion)
+	}
 	if isGmdbMeta(meta0) {
 		ps := page.DecodeMeta(meta0).PageSize
 		if page.ValidPageSize(ps) {
@@ -391,6 +404,24 @@ func isGmdbMeta(buf []byte) bool {
 	}
 	m := page.DecodeMeta(buf)
 	return m.Magic == page.Magic && m.Version == page.FormatVersion
+}
+
+// isVersionMismatchMeta reports whether buf is an intact gmdb meta
+// (checksum verifies, Magic matches) of a DIFFERENT format version — a
+// valid gmdb file this binary cannot read, as opposed to a corrupt one.
+// Mirror of isGmdbMeta with the Version condition flipped. The meta
+// identity header (Magic@0, Version@4, checksum footer) is the
+// version-stable contract that makes this classification possible
+// across format evolutions (file-layout.md §Meta Page). Requiring the
+// checksum to verify is what distinguishes a deliberately-written
+// different-version file from bitrot that merely corrupted the Version
+// field — the latter has no valid checksum and is ErrCorrupted.
+func isVersionMismatchMeta(buf []byte) bool {
+	if !page.VerifyMeta(buf) {
+		return false
+	}
+	m := page.DecodeMeta(buf)
+	return m.Magic == page.Magic && m.Version != page.FormatVersion
 }
 
 // rebuildRPLChain walks the on-disk RPL chain head → tail via

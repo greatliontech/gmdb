@@ -50,6 +50,14 @@ var (
 	// in the wrapped chain.
 	ErrCorrupted = errors.New("pager: structural corruption detected")
 
+	// ErrVersionMismatch is returned by Open / DiscoverPageSize when
+	// meta-0 is an intact gmdb meta (checksum + Magic valid) whose
+	// Version differs from page.FormatVersion: a valid gmdb file written
+	// by a different, unreadable on-disk format version — distinct from
+	// corruption. The root package's mapPagerErr translates this into
+	// gmdb.ErrVersionMismatch.
+	ErrVersionMismatch = errors.New("pager: on-disk format version mismatch")
+
 	// ErrBadPageChecksum is returned by Page when a data page's xxhash64
 	// footer does not match its content (checksums.md §Verification,
 	// Inv-RV1). Distinct from ErrCorrupted: a checksum mismatch is silent

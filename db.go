@@ -679,6 +679,11 @@ func readPersistedPageSize(file *os.File, raceWindow bool) (uint32, error) {
 			return ps, nil
 		}
 		lastErr = err
+		// A version mismatch is deterministic, not the partial-init race
+		// the retry loop exists for — fail fast.
+		if errors.Is(err, pager.ErrVersionMismatch) {
+			break
+		}
 		if i+1 < attempts {
 			time.Sleep(backoff)
 		}

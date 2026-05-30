@@ -184,6 +184,50 @@ func TestRollbackDiscardsChanges(t *testing.T) {
 	}
 }
 
+// TestOpenRejectsDifferentFormatVersion pins that an intact gmdb file
+// written by a different on-disk format version surfaces as the typed
+// ErrVersionMismatch (not ErrCorrupted): the file is not damaged, this
+// binary just can't read its format. Wires page -> pager -> root per
+// file-layout.md §Meta Page.
+func TestOpenRejectsDifferentFormatVersion(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_ = db.Close()
+
+	// Forge meta-0 to a future format version, recomputing the checksum
+	// so the meta is intact (verifies) — a valid gmdb file of a version
+	// this binary cannot read, distinct from corruption.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open file: %v", err)
+	}
+	buf := make([]byte, page.MetaPayloadSize)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read meta0: %v", err)
+	}
+	m := page.DecodeMeta(buf)
+	m.Version = page.FormatVersion + 1
+	page.EncodeMeta(buf, &m)
+	if _, err := f.WriteAt(buf, 0); err != nil {
+		t.Fatalf("write forged meta0: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close file: %v", err)
+	}
+
+	_, err = Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if !errors.Is(err, ErrVersionMismatch) {
+		t.Fatalf("Open of different-version file: got %v, want ErrVersionMismatch", err)
+	}
+	if errors.Is(err, ErrCorrupted) {
+		t.Errorf("different-version file misreported as ErrCorrupted: %v", err)
+	}
+}
+
 func TestInvalidOptions(t *testing.T) {
 	ctx := context.Background()
 	bad := []Options{

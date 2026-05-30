@@ -151,6 +151,7 @@ var (
     ErrKeyEmpty                = errors.New("gmdb: key is nil or empty")
     ErrCorrupted               = errors.New("gmdb: database corrupted")
     ErrBadPageChecksum         = errors.New("gmdb: page checksum mismatch")
+    ErrVersionMismatch         = errors.New("gmdb: on-disk format version mismatch")
     ErrReadOnly                = errors.New("gmdb: write operation on read-only transaction")
     ErrTxClosed                = errors.New("gmdb: transaction already committed or rolled back")
     ErrPoisoned                = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")

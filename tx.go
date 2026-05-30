@@ -662,6 +662,8 @@ func mapPagerErr(err error) error {
 		return ErrDBFull
 	case errors.Is(err, pager.ErrBadPageChecksum):
 		return fmt.Errorf("%w: %w", ErrBadPageChecksum, err)
+	case errors.Is(err, pager.ErrVersionMismatch):
+		return fmt.Errorf("%w: %w", ErrVersionMismatch, err)
 	case errors.Is(err, pager.ErrCorrupted):
 		return fmt.Errorf("%w: %w", ErrCorrupted, err)
 	default:

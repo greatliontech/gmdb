@@ -49,6 +49,15 @@ var (
 	// page ID where useful.
 	ErrBadPageChecksum = errors.New("gmdb: page checksum mismatch")
 
+	// ErrVersionMismatch is returned by Open when the database file is
+	// an intact gmdb file written by a different, incompatible on-disk
+	// format version (the meta page's Version != the engine's
+	// FormatVersion). Distinct from ErrCorrupted: the file is not
+	// damaged — it is a format this binary cannot read, so the operator
+	// should use a matching gmdb version. See file-layout.md §Meta Page
+	// (format-version bump) for the evolution mechanism.
+	ErrVersionMismatch = errors.New("gmdb: on-disk format version mismatch")
+
 	// ErrPoisoned is returned by Begin / BeginRead / Update / Compact
 	// after the handle is poisoned. Two causes: (a) a previous write
 	// transaction's commit failed in the publication phase (step-3
