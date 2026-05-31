@@ -94,6 +94,13 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	// 3. Copy each reachable page verbatim at its original id. PageRaw
 	// borrows the snapshot mmap; WriteAt copies the bytes out. Verbatim
 	// preserves each page's checksum footer (copied to the same id).
+	//
+	// Prefault the source's file-backed extent first (mmap-strategy.md
+	// §Prefaulting: "also performed internally during CopyTo()"): the
+	// copy is a full sequential scan, so MADV_POPULATE_READ turns the
+	// per-page demand faults into one sequential readahead. Advisory —
+	// a silent no-op on kernels < 5.14 / non-Linux.
+	_ = rtx.pgr.AdvisePreload(hwm)
 	for id := firstData; id < hwm; id++ {
 		if !reachable.test(id) {
 			continue

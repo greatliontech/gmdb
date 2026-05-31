@@ -137,6 +137,30 @@ type Options struct {
 	// database read-only. Default: false.
 	ReadOnly bool
 
+	// PreloadPages calls madvise(MADV_POPULATE_READ) on the
+	// file-backed portion of the data mmap (pages 0 through
+	// HighWaterMark-1) at open, prefaulting them into the OS page
+	// cache so the first reads don't pay per-page fault costs
+	// (mmap-strategy.md §Prefaulting). Linux 5.14+; silent no-op on
+	// older kernels and non-Linux. Default: false (demand paging).
+	PreloadPages bool
+
+	// HugePages calls madvise(MADV_HUGEPAGE) on the data mmap at open,
+	// enabling transparent-huge-page backing to cut TLB pressure for
+	// large databases (mmap-strategy.md §Huge Pages). Linux; silent
+	// no-op on non-Linux and on kernels without THP for file-backed
+	// mappings. Default: false.
+	HugePages bool
+
+	// ReclaimOnClose calls madvise(MADV_COLD) over the page range a
+	// read transaction touched when it closes, hinting the kernel it
+	// may reclaim those pages under memory pressure — useful for large
+	// sequential scans (exports, analytics) that would otherwise evict
+	// hotter pages (mmap-strategy.md §Read Transaction Cooldown). Linux
+	// 5.4+; silent no-op on older kernels and non-Linux. Enabling it
+	// costs two atomic min/max updates per page read. Default: false.
+	ReclaimOnClose bool
+
 	// MaxReaders is the reader-table capacity in the lock file
 	// (cross-process.md §Lock File Layout). Set at lock-file creation
 	// and immutable afterwards (re-openers honour the on-disk header).

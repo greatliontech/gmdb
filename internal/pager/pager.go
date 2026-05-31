@@ -89,6 +89,24 @@ type Pager struct {
 	bufPool    *BufPool
 	readOnly   bool
 
+	// Cold-tracking for Options.ReclaimOnClose (mmap-strategy.md §Read
+	// Transaction Cooldown). Enabled per read-tx pager via
+	// EnableColdTracking; Page / pageRaw then record the lowest/highest
+	// page IDs the transaction touches, and AdviseColdAccessed issues a
+	// single MADV_COLD over [accessMin, accessMax] at close. The
+	// counters are atomic so concurrent reads off one ReadTx are safe;
+	// trackCold is set once before any read (no concurrent mutation).
+	// The min/max pair is not updated jointly-atomically, but
+	// AdviseColdAccessed loads both only at close — after every read has
+	// quiesced (the held CAS) — so the final range it advises is exact.
+	// Off (trackCold == false) on every other pager — one branch per
+	// page read when disabled. accessMin is seeded to MaxUint64 so the
+	// first access wins the min CAS; accessMin > accessMax means "no
+	// page accessed" and suppresses the MADV_COLD.
+	trackCold bool
+	accessMin atomic.Uint64
+	accessMax atomic.Uint64
+
 	// Freespace state machine. Populated by AttachBitmap +
 	// SetCommitState + SetRPLChain at the start of the write
 	// transaction; nil/empty on a read-only pager.
@@ -624,6 +642,9 @@ func (p *Pager) pageRaw(id uint64) []byte {
 	if end > uint64(len(p.mmap)) {
 		panic(fmt.Sprintf("pager: pageRaw(%d) past mmap reservation [%d, %d]", id, off, end))
 	}
+	if p.trackCold {
+		p.recordAccess(id)
+	}
 	return p.mmap[off:end]
 }
 
@@ -632,6 +653,77 @@ func (p *Pager) pageRaw(id uint64) []byte {
 // reports corruption as issues rather than aborting on it). It panics
 // past the mmap reservation exactly like pageRaw.
 func (p *Pager) PageRaw(id uint64) []byte { return p.pageRaw(id) }
+
+// AdviseHugePages hints transparent-huge-page backing on the whole data
+// mmap (mmap-strategy.md §Huge Pages, Options.HugePages). Silent no-op
+// on non-Linux and on kernels without THP for file-backed mappings.
+func (p *Pager) AdviseHugePages() error { return madviseHugePage(p.mmap) }
+
+// AdvisePreload prefaults pages [0, throughPage) into the OS page cache
+// via MADV_POPULATE_READ (mmap-strategy.md §Prefaulting,
+// Options.PreloadPages / CopyTo). throughPage is the snapshot's
+// HighWaterMark — the file-backed extent. Silent no-op on non-Linux and
+// on kernels < 5.14.
+func (p *Pager) AdvisePreload(throughPage uint64) error {
+	length := int(throughPage * uint64(p.cfg.PageSize))
+	return madvisePopulateRead(p.mmap, length)
+}
+
+// EnableColdTracking turns on per-transaction accessed-page tracking for
+// Options.ReclaimOnClose (mmap-strategy.md §Read Transaction Cooldown).
+// Must be called before the first page read (the read-tx Begin path), on
+// a read-only pager only. Page / pageRaw then record the min/max page
+// IDs touched; AdviseColdAccessed issues the MADV_COLD on close.
+func (p *Pager) EnableColdTracking() {
+	p.accessMin.Store(^uint64(0)) // MaxUint64: first access wins the min CAS
+	p.accessMax.Store(0)
+	p.trackCold = true
+}
+
+// recordAccess folds page id into the [accessMin, accessMax] range via
+// two atomic CAS loops — the "two atomic min/max updates per page read"
+// of mmap-strategy.md §Read Transaction Cooldown. Only reached when
+// trackCold is set.
+func (p *Pager) recordAccess(id uint64) {
+	for {
+		cur := p.accessMin.Load()
+		if id >= cur {
+			break
+		}
+		if p.accessMin.CompareAndSwap(cur, id) {
+			break
+		}
+	}
+	for {
+		cur := p.accessMax.Load()
+		if id <= cur {
+			break
+		}
+		if p.accessMax.CompareAndSwap(cur, id) {
+			break
+		}
+	}
+}
+
+// AdviseColdAccessed issues a single MADV_COLD over the page range this
+// transaction touched (mmap-strategy.md §Read Transaction Cooldown),
+// hinting the kernel it may reclaim those pages under memory pressure.
+// No-op when cold-tracking is off or no page was accessed (min > max).
+// Called by the read-tx close path BEFORE the mmap is unmapped. Silent
+// no-op on non-Linux and on kernels < 5.4.
+func (p *Pager) AdviseColdAccessed() error {
+	if !p.trackCold {
+		return nil
+	}
+	minID := p.accessMin.Load()
+	maxID := p.accessMax.Load()
+	if minID > maxID {
+		return nil // no page accessed this transaction
+	}
+	off := int(minID * uint64(p.cfg.PageSize))
+	length := int((maxID - minID + 1) * uint64(p.cfg.PageSize))
+	return madviseCold(p.mmap, off, length)
+}
 
 // Page resolves the page at id for the btree read/write paths, returning
 // an error rather than panicking or returning unverified bytes. It is
@@ -662,6 +754,9 @@ func (p *Pager) Page(id uint64) ([]byte, error) {
 	if id >= backedPages {
 		return nil, fmt.Errorf("%w: page id %d beyond file-resident extent (%d pages)",
 			ErrCorrupted, id, backedPages)
+	}
+	if p.trackCold {
+		p.recordAccess(id)
 	}
 	off := id * uint64(p.cfg.PageSize)
 	buf := p.mmap[off : off+uint64(p.cfg.PageSize)]

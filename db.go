@@ -254,6 +254,23 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
+	// Opt-in mmap tuning on the data mmap at open (mmap-strategy.md
+	// §Huge Pages / §Prefaulting). Both are advisory hints: the wrappers
+	// swallow "unsupported kernel" (EINVAL/ENOSYS) so an old kernel is a
+	// silent no-op, and a real error (e.g. EIO mid-prefault) is logged
+	// rather than failing Open — the database is fully usable without
+	// the hint. PreloadPages prefaults pages [0, HighWaterMark).
+	if opts.HugePages {
+		if err := opened.Pager.AdviseHugePages(); err != nil {
+			logger.Warn("gmdb: madvise(MADV_HUGEPAGE) failed", "path", path, "detail", err.Error())
+		}
+	}
+	if opts.PreloadPages {
+		if err := opened.Pager.AdvisePreload(opened.Meta.HighWaterMark); err != nil {
+			logger.Warn("gmdb: madvise(MADV_POPULATE_READ) failed", "path", path, "detail", err.Error())
+		}
+	}
+
 	// Cache this process's identity once. Failures (no /proc,
 	// hardened sandbox, non-Linux ProcessStartTime stub) surface as
 	// 0 — the protocol routes through the heartbeat path when either

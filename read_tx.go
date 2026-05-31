@@ -329,6 +329,12 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		}
 		return nil, mapPagerErr(err)
 	}
+	// Options.ReclaimOnClose: track the pages this read tx touches so
+	// close() can MADV_COLD them (mmap-strategy.md §Read Transaction
+	// Cooldown). Enabled before any read; off ⇒ zero overhead.
+	if db.opts.ReclaimOnClose {
+		pgr.EnableColdTracking()
+	}
 
 	held := &atomic.Bool{}
 	held.Store(true)
@@ -424,6 +430,12 @@ func (rtx *ReadTx) close() error {
 			coord.ReleaseReader(rtx.readerSlot)
 		}
 	}
+	// Options.ReclaimOnClose: hint the kernel it may reclaim the page
+	// range this tx scanned (mmap-strategy.md §Read Transaction
+	// Cooldown), BEFORE the munmap below. No-op unless cold-tracking
+	// was enabled. Advisory — a failure is a missed optimisation, never
+	// a correctness issue, so the result is discarded.
+	_ = rtx.pgr.AdviseColdAccessed()
 	// Close the per-Tx pager (munmap). Safe in the explicit-close
 	// path because we're on the caller's goroutine — not the GC
 	// background goroutine the leak-detection non-blocking rule
