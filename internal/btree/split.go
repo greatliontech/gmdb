@@ -1,6 +1,75 @@
 package btree
 
-import "github.com/thegrumpylion/gmdb/internal/page"
+import (
+	"fmt"
+
+	"github.com/thegrumpylion/gmdb/internal/page"
+)
+
+// trySplitLeafByGroup splits an overflowing compressed leaf at a restart-group
+// boundary WITHOUT decoding entries — the no-decode fast path for the append
+// case (page-formats.md §Leaf Split). It carves the CoW'd leaf (leftBuf/leftID)
+// at the group boundary nearest 50% of its data bytes (page.FindSplitGroup),
+// moves the right groups to a fresh page (page.SplitLeafRightHalf), appends the
+// new (largest) entry to the right (page.TryAppend), and only then truncates the
+// left in place (page.TruncateLeafToGroups). Both halves fit by
+// construction — they are subsets of the already-fitting original leaf, and the
+// right+new-entry is checked by TryAppend.
+//
+// Returns the parent separator, the right page ID, and ok=true on success.
+// Declines (ok=false, no page leaked) when the leaf is not a multi-group
+// compressed page, or the right half cannot absorb the new entry (a large inline
+// append) — the caller then falls back to the byte-balanced decode split
+// (findLeafSplitIndex), which can promote a value to overflow.
+//
+// Precondition: e.Key sorts after every key in leftBuf (the append case), and
+// leftBuf is the freshly CoW'd, already-validated copy of the overflowing leaf
+// (its page ID — leftID at the call site — becomes the left half).
+func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.LeafEntry) (sep []byte, rightID uint64, ok bool, err error) {
+	r := page.NewLeafReader(leftBuf, cfg)
+	if !r.Compressed() || r.RestartCount() <= 1 {
+		// Single group or uncompressed — nothing to carve; decode split.
+		return nil, 0, false, nil
+	}
+
+	splitGroup := page.FindSplitGroup(leftBuf, cfg)
+
+	rightID, err = pw.AllocPage()
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("btree: alloc split-right leaf: %w", err)
+	}
+	rightBuf, err := pw.AllocSlab(rightID)
+	if err != nil {
+		_ = pw.FreePage(rightID)
+		return nil, 0, false, fmt.Errorf("btree: alloc split-right buf: %w", err)
+	}
+
+	// Build the right half into the fresh page — READ-ONLY on leftBuf, so a
+	// decline below leaves leftBuf intact for the decode-split fallback (which
+	// reads that same buffer).
+	leftCount, _ := page.SplitLeafRightHalf(leftBuf, rightBuf, cfg, splitGroup)
+
+	// Append the new (largest) entry to the right half. If it doesn't fit even
+	// after the split (a near-page inline value), decline so the decode split —
+	// which can promote it to an overflow chain — handles the size-skewed case.
+	// leftBuf is still untouched at this point.
+	rightLast, _ := page.NewLeafReader(rightBuf, cfg).LastKey(nil)
+	if !page.TryAppend(rightBuf, cfg, e, rightLast) {
+		_ = pw.FreePage(rightID)
+		return nil, 0, false, nil
+	}
+
+	// Committed: now truncate leftBuf in place to the left half.
+	page.TruncateLeafToGroups(leftBuf, cfg, splitGroup)
+
+	// Separator: leftLast < sep <= rightFirst. rightFirst is the original
+	// boundary entry (the appended e is the right's LAST key, not its first).
+	// ShortestSeparator returns a fresh slice, so neither key is retained.
+	leftLast, _ := page.NewLeafReader(leftBuf, cfg).EntryAt(leftCount-1, nil)
+	firstRight, _ := page.NewLeafReader(rightBuf, cfg).EntryAt(0, nil)
+	sep = page.ShortestSeparator(leftLast.Key, firstRight.Key)
+	return sep, rightID, true, nil
+}
 
 // findLeafSplitIndex chooses the boundary at which an overflowing leaf's
 // entries are split across two pages, per page-formats.md §Leaf Split: a

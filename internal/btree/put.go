@@ -268,6 +268,35 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		return nr, false, nil
 	}
 
+	// Append-overflow group-split fast path: an append that overflowed a
+	// multi-group compressed leaf splits at a group boundary WITHOUT decoding —
+	// carve the page into two and append the new (largest) entry to the right
+	// (page-formats.md §Leaf Split). Declines (→ slow decode split) on a single
+	// group, an uncompressed/variant page, or when the right half can't absorb
+	// the new entry; the decode split then does the byte-balanced (entry-precise)
+	// split, promoting a near-page inline value to overflow if needed.
+	if appendPos {
+		sep, rightID, ok, e := trySplitLeafByGroup(pw, cfg, leftBuf, newEntry)
+		if e != nil {
+			_ = pw.FreePage(leftID)
+			rollbackNewChain()
+			return 0, false, e
+		}
+		if ok {
+			if e := pw.FreePage(leafID); e != nil {
+				_ = pw.FreePage(leftID)
+				_ = pw.FreePage(rightID)
+				rollbackNewChain()
+				return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, e)
+			}
+			nr, e := ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
+			if e != nil {
+				return 0, false, e
+			}
+			return nr, false, nil
+		}
+	}
+
 	// Mid-page insert fast path: when the key sorts strictly inside the leaf
 	// (not an append, not a replace), splice it into its containing group in
 	// place (page-formats.md §Insert and Delete) instead of decoding the whole

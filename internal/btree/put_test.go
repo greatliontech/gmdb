@@ -297,6 +297,43 @@ func TestPutUncompressedInteriorInsert(t *testing.T) {
 	}
 }
 
+// TestPutSequentialGroupSplit drives an ascending (append-only) load into a
+// compressed keyspace large enough to split several times — exercising the
+// no-decode group-split fast path (trySplitLeafByGroup: carve the overflowing
+// leaf at a group boundary, append the new largest entry to the right). Every
+// key must round-trip and the tree must have split into several leaves.
+func TestPutSequentialGroupSplit(t *testing.T) {
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // compressed
+	pw := newFakeWriter(t, 4096)
+	root := uint64(0)
+
+	const N = 400
+	want := make(map[string]string, N)
+	for i := range N {
+		key := fmt.Appendf(nil, "key-%06d", i) // ascending, shared prefix → appends
+		val := bytes.Repeat([]byte{byte('a' + i%26)}, 40)
+		nr, err := Put(pw, cfg, root, key, val)
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+		root = nr
+		want[string(key)] = string(val)
+	}
+	if leafCount := countLeaves(t, pw, cfg, root); leafCount < 3 {
+		t.Fatalf("expected several leaves after %d sequential Puts, got %d", N, leafCount)
+	}
+	for k, v := range want {
+		got, found, err := Get(pw, cfg, root, []byte(k))
+		if err != nil || !found {
+			t.Errorf("Get(%q): found=%v err=%v", k, found, err)
+			continue
+		}
+		if !bytes.Equal(got, []byte(v)) {
+			t.Errorf("Get(%q): value mismatch", k)
+		}
+	}
+}
+
 // countLeaves returns the number of leaf pages reachable from root.
 // Used by variant-pin tests to assert the split path actually fired
 // — a coverage guard against future leaf-density changes silently

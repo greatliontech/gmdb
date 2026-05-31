@@ -2,10 +2,14 @@
 
 **Lands:** proactive — a specced-but-unbuilt performance optimization;
 multi-session feature, port from grove. The format decision is **settled**
-(keep gmdb's format — see DECISION 1, RESOLVED). Chunks 1-4 (`TryAppend`,
-`TryInsertAt`, `TryDeleteAt` compressed + the uncompressed variants) are
-**landed** — see Progress below; resume by porting `trySplitLeafByGroup` (the
-no-decode split) next.
+(keep gmdb's format — see DECISION 1, RESOLVED). **All planned chunks (1-5) are
+landed** — `TryAppend`, `TryInsertAt`, `TryDeleteAt` (compressed), the
+uncompressed splice variants, and `trySplitLeafByGroup` (the compressed no-decode
+split). The splice layer is COMPLETE as planned; see Progress below. **One
+surfaced deferral remains:** the uncompressed no-decode split (grove's
+`splitUCLeafAt`) — uncompressed (RGT==1) append-overflow currently uses the
+correct decode/re-encode split. Decide at close-out whether to build it or file
+it; otherwise this issue is ready for promote-then-delete.
 
 **Severity:** [perf] — not a correctness defect; a measured throughput +
 allocation optimization. The current decode/re-encode path is correct.
@@ -139,16 +143,43 @@ splice design. Justified by a CPU profile (below).
     inline `ValueLen` after the key, grove's order, and mishandled nested cells),
     and the canonical splices don't need it (the sorted+packed offset table gives
     entry extents directly).
-- **Resume: port `trySplitLeafByGroup` next** (the final chunk — no-decode
-  split). Read grove `splitLeafAtGroupCompressed` / `findSplitGroupCompressed`
-  (`leaf_compressed.go`) + the uncompressed split path IN FULL first. This is the
-  no-decode leaf split: pick a group/entry boundary near the byte-size bias and
-  carve the page into two without decoding+re-encoding all entries. Relates to
-  `btree-byte-balanced-split.md` (finding-19 branch path + the byte-balanced
-  `FindSplitGroup`/`FindSplitIndex` the spec mandates) — check that issue at the
-  chunk-start gate. Wiring anchor: the split path in `internal/btree/put.go`
-  (`ascendWithSplit` / the leaf-overflow → split branch).
-- **Shared infrastructure to REUSE (chunks 1-4; don't reinvent):** entry encode
+- **Chunk 5 — `trySplitLeafByGroup` (compressed no-decode split): LANDED.**
+  `internal/page/leaf_split.go` (`FindSplitGroup` — group boundary nearest 50% of
+  data bytes, deterministic, lower-index tiebreak; the two-phase carve
+  `SplitLeafRightHalf` [READ-ONLY on src] + `TruncateLeafToGroups` [mutates src]);
+  `internal/btree/split.go` (`trySplitLeafByGroup`), wired in `putReportCore` as
+  the append-overflow fast path before the decode split. Byte-identity oracle
+  (`assertSplitMatchesRebuild`: each half == LeafBuilder rebuild of its subset +
+  src-read-only) + `FindSplitGroup` + `FuzzSplitLeafAtGroup` + end-to-end
+  `TestPutSequentialGroupSplit`. `BenchmarkPutSteadyState` (ascending = the hot
+  path): ~29% faster (4688→3314 ns/op), ~3.1× fewer B/op (2836→907), ~42% fewer
+  allocs/op (24→14).
+  - **DESIGN — CANONICAL no-decode carve; implements the spec's group-boundary
+    split.** §Leaf Split mandates a *group-boundary* split via `FindSplitGroup`
+    for compressed leaves; this chunk adds it (the prior entry-precise
+    `findLeafSplitIndex` was a fit-guarantee refinement). The carve retains each
+    group's bytes verbatim + rebases restart offsets, so each half is
+    byte-identical to a rebuild (we split at a builder-produced group boundary).
+    Both halves fit by construction (subsets of the already-fitting leaf); the
+    right+new-entry is checked by `TryAppend`. The entry-precise decode split
+    (`findLeafSplitIndex`) REMAINS the fallback for size-skewed appends a group
+    boundary can't fit (declines → decode split → overflow promotion), so the
+    `btree-byte-balanced-split` leaf fix is not regressed.
+  - **Four gmdb-specific divergences from grove (verified):** (1) TWO-PHASE carve
+    (read-only build-right, then truncate-left only on success) vs grove's single
+    in-place `SplitLeafAtGroup` — gmdb's decode-split fallback reads the CoW'd
+    `leftBuf`, so it must stay intact on a decline (a single-phase carve corrupted
+    the fallback in development — found+fixed). (2) both halves' free regions are
+    zeroed (free-space-zeroed invariant). (3) compressed-only — uncompressed
+    append-overflow uses the decode split (the deferral above). (4) fixed 50% bias
+    (no `SplitBias` config).
+  - **`btree-byte-balanced-split` triage (chunk-start gate):** leaf fix done; the
+    branch-split path (finding 19) is NOT touched here (this is a leaf split) →
+    remains open, redeferred. `put-ascend-error-rollback` [L]: `trySplitLeafByGroup`
+    shares the pre-existing ascend-error no-rollback pattern with the decode split
+    (intra-tx pages reclaimed on Rollback) — same filed issue, not widened.
+- **Shared infrastructure (chunks 1-5; the deferred uncompressed no-decode split
+  would reuse it):** entry encode
   — `writeCompressed{Restart,Delta}Entry` (compressed) / `writeUCEntry`
   (uncompressed) / `entryTrailer` / `valuePartSize` / `cellHasTrailerOnly`
   (`leaf_builder.go` / `leaf_splice.go`); the group walk — `decodeRestartEntry` /
