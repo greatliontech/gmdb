@@ -6,33 +6,45 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// trySplitLeafByGroup splits an overflowing compressed leaf at a restart-group
-// boundary WITHOUT decoding entries — the no-decode fast path for the append
-// case (page-formats.md §Leaf Split). It carves the CoW'd leaf (leftBuf/leftID)
-// at the group boundary nearest 50% of its data bytes (page.FindSplitGroup),
-// moves the right groups to a fresh page (page.SplitLeafRightHalf), appends the
-// new (largest) entry to the right (page.TryAppend), and only then truncates the
-// left in place (page.TruncateLeafToGroups). Both halves fit by
-// construction — they are subsets of the already-fitting original leaf, and the
-// right+new-entry is checked by TryAppend.
+// trySplitLeafByGroup splits an overflowing leaf at a restart-group boundary
+// (compressed) or entry boundary (uncompressed) WITHOUT decoding entries — the
+// no-decode fast path for the append case (page-formats.md §Leaf Split). It
+// carves the CoW'd leaf (leftBuf/leftID) at the boundary nearest 50% of its data
+// bytes, moves the right side to a fresh page, appends the new (largest) entry to
+// the right (page.TryAppend), and only then truncates the left in place. Both
+// halves fit by construction — they are subsets of the already-fitting original
+// leaf, and the right+new-entry is checked by TryAppend.
 //
 // Returns the parent separator, the right page ID, and ok=true on success.
-// Declines (ok=false, no page leaked) when the leaf is not a multi-group
-// compressed page, or the right half cannot absorb the new entry (a large inline
-// append) — the caller then falls back to the byte-balanced decode split
-// (findLeafSplitIndex), which can promote a value to overflow.
+// Declines (ok=false, no page leaked) when the leaf has <2 entries, is a
+// single-group compressed page, or the right half cannot absorb the new entry (a
+// large inline append) — the caller then falls back to the byte-balanced decode
+// split (findLeafSplitIndex), which can promote a value to overflow.
+//
+// The carve is two-phase (Split*RightHalf is READ-ONLY on leftBuf; Truncate*
+// mutates it only after TryAppend commits) so a decline leaves leftBuf intact for
+// the decode-split fallback, which reads that same buffer.
 //
 // Precondition: e.Key sorts after every key in leftBuf (the append case), and
 // leftBuf is the freshly CoW'd, already-validated copy of the overflowing leaf
 // (its page ID — leftID at the call site — becomes the left half).
 func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.LeafEntry) (sep []byte, rightID uint64, ok bool, err error) {
 	r := page.NewLeafReader(leftBuf, cfg)
-	if !r.Compressed() || r.RestartCount() <= 1 {
-		// Single group or uncompressed — nothing to carve; decode split.
-		return nil, 0, false, nil
+	if r.Count() <= 1 {
+		return nil, 0, false, nil // nothing to split off
+	}
+	compressed := r.Compressed()
+	if compressed && r.RestartCount() <= 1 {
+		return nil, 0, false, nil // single group — decode split
 	}
 
-	splitGroup := page.FindSplitGroup(leftBuf, cfg)
+	// Boundary nearest 50% of data bytes (variant-specific).
+	var boundary int
+	if compressed {
+		boundary = page.FindSplitGroup(leftBuf, cfg)
+	} else {
+		boundary = page.FindUCSplitIndex(leftBuf, cfg)
+	}
 
 	rightID, err = pw.AllocPage()
 	if err != nil {
@@ -45,9 +57,13 @@ func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.
 	}
 
 	// Build the right half into the fresh page — READ-ONLY on leftBuf, so a
-	// decline below leaves leftBuf intact for the decode-split fallback (which
-	// reads that same buffer).
-	leftCount, _ := page.SplitLeafRightHalf(leftBuf, rightBuf, cfg, splitGroup)
+	// decline below leaves leftBuf intact for the decode-split fallback.
+	var leftCount int
+	if compressed {
+		leftCount, _ = page.SplitLeafRightHalf(leftBuf, rightBuf, cfg, boundary)
+	} else {
+		leftCount, _ = page.SplitUCRightHalf(leftBuf, rightBuf, cfg, boundary)
+	}
 
 	// Append the new (largest) entry to the right half. If it doesn't fit even
 	// after the split (a near-page inline value), decline so the decode split —
@@ -59,8 +75,12 @@ func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.
 		return nil, 0, false, nil
 	}
 
-	// Committed: now truncate leftBuf in place to the left half.
-	page.TruncateLeafToGroups(leftBuf, cfg, splitGroup)
+	// Committed: now truncate leftBuf in place to the left half (variant-specific).
+	if compressed {
+		page.TruncateLeafToGroups(leftBuf, cfg, boundary)
+	} else {
+		page.TruncateUCToEntries(leftBuf, cfg, boundary)
+	}
 
 	// Separator: leftLast < sep <= rightFirst. rightFirst is the original
 	// boundary entry (the appended e is the right's LAST key, not its first).

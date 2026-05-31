@@ -122,3 +122,93 @@ func TruncateLeafToGroups(buf []byte, cfg Config, splitGroup int) (leftCount int
 	clear(buf[leftDataEnd:leftRestartTableOff])
 	return leftCount
 }
+
+// ---------------------------------------------------------------------------
+// Uncompressed leaf split (entry boundary) — the uncompressed analog. An
+// uncompressed leaf is a sorted, packed entry array + sorted offset table, so it
+// splits at an ENTRY boundary (FindUCSplitIndex), and the two-phase byte-carve
+// (SplitUCRightHalf read-only + TruncateUCToEntries mutate-on-success) moves the
+// right entries' bytes verbatim + rebases the offset table — no decode/re-encode,
+// each half byte-identical to a rebuild. (grove's splitUCLeafAt instead
+// decode-rebuilds via LeafBuilder; this byte-carve is the actual no-decode form.)
+// Same canonical + free-space-zeroed + decline-safety properties as the
+// compressed group split above.
+// ---------------------------------------------------------------------------
+
+// FindUCSplitIndex returns the entry index in [1, Count) at which to split an
+// uncompressed leaf: the boundary whose left-side data span is closest to 50% of
+// the data bytes (page-formats.md §Leaf Split FindSplitIndex; lower-index
+// tiebreak). The caller must ensure buf is an uncompressed leaf with Count > 1.
+// Pure function of the page bytes → deterministic.
+func FindUCSplitIndex(buf []byte, cfg Config) int {
+	_, _, count16, _ := ReadHeader(buf)
+	count := int(count16)
+	dataEnd := int(le.Uint16(buf[ucLeafOffDataEnd:]))
+	tableOff := cfg.ContentEnd() - count*ucOffsetEntrySize
+
+	target := (dataEnd - leafEntryStart) / 2
+	best, bestDist := 1, dataEnd-leafEntryStart+1
+	for i := 1; i < count; i++ {
+		leftBytes := int(le.Uint16(buf[tableOff+i*ucOffsetEntrySize:])) - leafEntryStart
+		dist := leftBytes - target
+		if dist < 0 {
+			dist = -dist
+		}
+		if dist < bestDist { // strict < ⇒ the lower index wins ties
+			bestDist = dist
+			best = i
+		}
+	}
+	return best
+}
+
+// SplitUCRightHalf copies entries [splitIdx, Count) of the uncompressed leaf src
+// into dst as a standalone right-half leaf (offsets rebased to leafEntryStart),
+// READ-ONLY on src. Returns the two halves' entry counts. dst must be a distinct
+// page-sized buffer (a split supplies a fresh, zeroed page).
+func SplitUCRightHalf(src, dst []byte, cfg Config, splitIdx int) (leftCount, rightCount int) {
+	_, _, count16, _ := ReadHeader(src)
+	count := int(count16)
+	contentEnd := cfg.ContentEnd()
+	srcDataEnd := int(le.Uint16(src[ucLeafOffDataEnd:]))
+	srcTableOff := contentEnd - count*ucOffsetEntrySize
+
+	rightCount = count - splitIdx
+	rightStart := int(le.Uint16(src[srcTableOff+splitIdx*ucOffsetEntrySize:]))
+	rightDataLen := srcDataEnd - rightStart
+	copy(dst[leafEntryStart:leafEntryStart+rightDataLen], src[rightStart:srcDataEnd])
+
+	adjust := leafEntryStart - rightStart
+	dstTableOff := contentEnd - rightCount*ucOffsetEntrySize
+	for j := range rightCount {
+		srcSlot := srcTableOff + (splitIdx+j)*ucOffsetEntrySize
+		le.PutUint16(dst[dstTableOff+j*ucOffsetEntrySize:], uint16(int(le.Uint16(src[srcSlot:]))+adjust))
+	}
+	rightDataEnd := leafEntryStart + rightDataLen
+	WriteHeader(dst, TypeLeafUncompressed, uint16(rightCount), 0)
+	le.PutUint16(dst[ucLeafOffDataEnd:], uint16(rightDataEnd))
+	le.PutUint16(dst[ucLeafOffDataEnd+2:], 0) // reserved
+	clear(dst[rightDataEnd:dstTableOff])
+
+	return splitIdx, rightCount
+}
+
+// TruncateUCToEntries truncates the uncompressed leaf buf in place to entries
+// [0, splitIdx) — the left half of an entry split. The offset table shrinks
+// (count → splitIdx) and relocates toward ContentEnd; the freed region (dropped
+// right-half data + old table tail) is zeroed. Returns the left entry count.
+func TruncateUCToEntries(buf []byte, cfg Config, splitIdx int) (leftCount int) {
+	_, _, count16, _ := ReadHeader(buf)
+	count := int(count16)
+	contentEnd := cfg.ContentEnd()
+	srcTableOff := contentEnd - count*ucOffsetEntrySize
+
+	// New DataEnd = the offset of entry splitIdx (start of the dropped right).
+	leftDataEnd := int(le.Uint16(buf[srcTableOff+splitIdx*ucOffsetEntrySize:]))
+	newTableOff := contentEnd - splitIdx*ucOffsetEntrySize
+	copy(buf[newTableOff:newTableOff+splitIdx*ucOffsetEntrySize], buf[srcTableOff:srcTableOff+splitIdx*ucOffsetEntrySize])
+	WriteHeader(buf, TypeLeafUncompressed, uint16(splitIdx), 0)
+	le.PutUint16(buf[ucLeafOffDataEnd:], uint16(leftDataEnd))
+	clear(buf[leftDataEnd:newTableOff])
+	return splitIdx
+}

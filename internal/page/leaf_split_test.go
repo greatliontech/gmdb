@@ -161,6 +161,116 @@ func FuzzSplitLeafAtGroup(f *testing.F) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// Uncompressed entry split (byte-carve) — same canonical / read-only-src /
+// free-space-zeroed oracle as the compressed group split, at RGT=1.
+// ---------------------------------------------------------------------------
+
+func assertUCSplitMatchesRebuild(t *testing.T, cfg Config, entries []LeafEntry, splitIdx int) {
+	t.Helper()
+	orig, ok := tryBuild(cfg, entries)
+	if !ok {
+		t.Fatalf("base (%d entries) did not fit", len(entries))
+	}
+	origCopy := bytes.Clone(orig)
+	src := bytes.Clone(orig)
+	dst := make([]byte, cfg.PageSize)
+
+	leftCount, rightCount := SplitUCRightHalf(src, dst, cfg, splitIdx)
+	if !bytes.Equal(src, origCopy) {
+		t.Fatalf("SplitUCRightHalf mutated src (must be read-only): splitIdx=%d", splitIdx)
+	}
+	if leftCount != splitIdx || leftCount+rightCount != len(entries) || rightCount < 1 {
+		t.Fatalf("counts (%d,%d) wrong for splitIdx=%d n=%d", leftCount, rightCount, splitIdx, len(entries))
+	}
+	wantRight, _ := tryBuild(cfg, entries[splitIdx:])
+	if !bytes.Equal(dst, wantRight) {
+		t.Fatalf("UC right half != rebuild(entries[%d:]) (must be canonical)", splitIdx)
+	}
+	assertFreeSpaceZeroed(t, dst, cfg)
+	if err := NewLeafReader(dst, cfg).Validate(); err != nil {
+		t.Fatalf("UC right half fails Validate: %v", err)
+	}
+
+	if tlc := TruncateUCToEntries(src, cfg, splitIdx); tlc != splitIdx {
+		t.Fatalf("TruncateUCToEntries = %d, want %d", tlc, splitIdx)
+	}
+	wantLeft, _ := tryBuild(cfg, entries[:splitIdx])
+	if !bytes.Equal(src, wantLeft) {
+		t.Fatalf("UC left half != rebuild(entries[:%d]) (must be canonical)", splitIdx)
+	}
+	assertFreeSpaceZeroed(t, src, cfg)
+	if err := NewLeafReader(src, cfg).Validate(); err != nil {
+		t.Fatalf("UC left half fails Validate: %v", err)
+	}
+}
+
+func TestUCSplitLeafAt_MatchesRebuild(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1} // uncompressed
+	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
+	t.Run("inline", func(t *testing.T) {
+		var entries []LeafEntry
+		for i := range 10 {
+			entries = append(entries, mk(fmt.Sprintf("k%04d", i), "val"))
+		}
+		for s := 1; s < len(entries); s++ {
+			assertUCSplitMatchesRebuild(t, cfg, entries, s)
+		}
+	})
+	t.Run("mixed cell kinds", func(t *testing.T) {
+		entries := []LeafEntry{
+			mk("k0", "v"),
+			{Flags: CellFlagOverflow, Key: []byte("k1"), OverflowPage: 7, TotalLen: 99},
+			mk("k2", "v"),
+			{Flags: CellFlagMultiValue | CellFlagNestedTree, Key: []byte("k3"), NestedRoot: 3, NestedCount: 4},
+			mk("k4", "v"), mk("k5", "v"),
+		}
+		for s := 1; s < len(entries); s++ {
+			assertUCSplitMatchesRebuild(t, cfg, entries, s)
+		}
+	})
+}
+
+func TestFindUCSplitIndex(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
+	var entries []LeafEntry
+	for i := range 8 { // uniform entries → 50% boundary is the middle index
+		entries = append(entries, mk(fmt.Sprintf("k%04d", i), "val"))
+	}
+	buf := mustBuild(t, cfg, entries)
+	count := NewLeafReader(buf, cfg).Count()
+	s := FindUCSplitIndex(buf, cfg)
+	if s < 1 || s >= count {
+		t.Fatalf("FindUCSplitIndex = %d, want in [1, %d)", s, count)
+	}
+	if s != count/2 {
+		t.Errorf("FindUCSplitIndex = %d, want %d for uniform entries", s, count/2)
+	}
+	if s2 := FindUCSplitIndex(buf, cfg); s2 != s {
+		t.Errorf("FindUCSplitIndex not deterministic: %d then %d", s, s2)
+	}
+}
+
+// FuzzUCSplitLeafAt asserts the canonical/byte-identity + read-only-src
+// invariants over random uncompressed pages (mixed cell kinds) and every valid
+// entry boundary.
+func FuzzUCSplitLeafAt(f *testing.F) {
+	f.Add(uint64(1), uint64(0))
+	f.Add(uint64(42), uint64(1))
+	f.Add(uint64(0xDEADBEEF), uint64(2))
+
+	f.Fuzz(func(t *testing.T, leafSeed, idxSeed uint64) {
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 1} // uncompressed
+		entries := randomFittingMixed(leafSeed, cfg)
+		if len(entries) < 2 {
+			return
+		}
+		splitIdx := 1 + int(idxSeed%uint64(len(entries)-1)) // [1, len)
+		assertUCSplitMatchesRebuild(t, cfg, entries, splitIdx)
+	})
+}
+
 // BenchmarkSplitLeafAtGroup measures the no-decode carve (right-half copy +
 // left truncate) — in-place, zero-alloc — vs the decode/re-encode split it
 // replaces on the append-overflow hot path.

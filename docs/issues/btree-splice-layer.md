@@ -2,14 +2,17 @@
 
 **Lands:** proactive — a specced-but-unbuilt performance optimization;
 multi-session feature, port from grove. The format decision is **settled**
-(keep gmdb's format — see DECISION 1, RESOLVED). **All planned chunks (1-5) are
-landed** — `TryAppend`, `TryInsertAt`, `TryDeleteAt` (compressed), the
-uncompressed splice variants, and `trySplitLeafByGroup` (the compressed no-decode
-split). The splice layer is COMPLETE as planned; see Progress below. **One
-surfaced deferral remains:** the uncompressed no-decode split (grove's
-`splitUCLeafAt`) — uncompressed (RGT==1) append-overflow currently uses the
-correct decode/re-encode split. Decide at close-out whether to build it or file
-it; otherwise this issue is ready for promote-then-delete.
+(keep gmdb's format — see DECISION 1, RESOLVED). **The splice layer is FULLY
+COMPLETE** — both variants (compressed + uncompressed), all ops: `TryAppend`,
+`TryInsertAt`, `TryDeleteAt`, plus the no-decode leaf split (`trySplitLeafByGroup`
+→ `FindSplitGroup`/`SplitLeafRightHalf`/`TruncateLeafToGroups` compressed,
+`FindUCSplitIndex`/`SplitUCRightHalf`/`TruncateUCToEntries` uncompressed), each a
+fast path with the decode/re-encode fallback. **No deferrals remain.** See
+Progress below. This issue is ready for **promote-then-delete** at close-out
+(kept open per the user's decision); the load-bearing rationale to promote is
+DECISION 1 (format) + the per-chunk divergences + the determinism/canonical
+discussion → into page-formats.md §Insert and Delete / §Leaf Split + the
+leaf_splice.go / leaf_split.go headers.
 
 **Severity:** [perf] — not a correctness defect; a measured throughput +
 allocation optimization. The current decode/re-encode path is correct.
@@ -178,8 +181,25 @@ splice design. Justified by a CPU profile (below).
     remains open, redeferred. `put-ascend-error-rollback` [L]: `trySplitLeafByGroup`
     shares the pre-existing ascend-error no-rollback pattern with the decode split
     (intra-tx pages reclaimed on Rollback) — same filed issue, not widened.
-- **Shared infrastructure (chunks 1-5; the deferred uncompressed no-decode split
-  would reuse it):** entry encode
+- **Chunk 6 — uncompressed no-decode split: LANDED.** `internal/page/leaf_split.go`
+  (`FindUCSplitIndex` — entry boundary nearest 50% of data bytes; the two-phase
+  byte-carve `SplitUCRightHalf` [READ-ONLY on src] + `TruncateUCToEntries`);
+  `trySplitLeafByGroup` (`internal/btree/split.go`) now dispatches on variant
+  (compressed group boundary / uncompressed entry boundary) — the prior
+  `!r.Compressed()` decline is gone. Byte-identity oracle
+  (`assertUCSplitMatchesRebuild` + src-read-only) + `FindUCSplitIndex` +
+  `FuzzUCSplitLeafAt`; UC funcs at 100% coverage from the existing UC-variant
+  end-to-end tests (`TestPutDeleteGetUncompressedLeafVariant`).
+  - **Grove finding (HARD RULE #1):** grove's `splitUCLeafAt` is NOT no-decode —
+    it decode-rebuilds via `LeafBuilder` (= gmdb's existing decode-split
+    fallback). So gmdb built the true no-decode BYTE-CARVE (copy the right
+    entries' bytes + rebase the offset table; truncate the left), the
+    uncompressed analog of the compressed group carve — canonical (byte-identical
+    to a rebuild), zero-decode. grove's `findUCSplitIndex` (boundary picker) was
+    reusable; `splitUCLeafAt` was not.
+  - **Divergences from grove:** byte-carve vs grove's decode-rebuild; two-phase
+    decline-safety (gmdb's fallback reads the CoW'd `leftBuf`); fixed 50% bias.
+- **Shared infrastructure (chunks 1-6):** entry encode
   — `writeCompressed{Restart,Delta}Entry` (compressed) / `writeUCEntry`
   (uncompressed) / `entryTrailer` / `valuePartSize` / `cellHasTrailerOnly`
   (`leaf_builder.go` / `leaf_splice.go`); the group walk — `decodeRestartEntry` /
