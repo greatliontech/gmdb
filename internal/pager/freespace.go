@@ -18,8 +18,11 @@ import (
 //  4. Lagging-reader callback — chunk 2 territory; not implemented in
 //     chunk 1.
 //  5. File extension — if no free pages anywhere, advance HighWaterMark
-//     up to maxSizePages, marking newly-mapped pages free in the bitmap
-//     (the one being allocated stays clear).
+//     by one (up to maxSizePages; ErrDBFull at the cap). When the file
+//     must grow, ensureFileCovers extends it by a GrowStep-aligned
+//     increment (file-format.md §File Growth); the extra pages sit above
+//     HighWaterMark — bitmap-clear, not marked free — and are handed out
+//     by subsequent HWM advances without another ftruncate.
 //
 // The returned page id has its bitmap bit cleared (or, for loose pages,
 // is removed from the loose set) and is recorded in pendingAllocs.
@@ -290,15 +293,38 @@ func (p *Pager) AllocPage() (uint64, error) {
 // to MaxSize at Open; ftruncate within the reservation does not require
 // remap on Linux/macOS/FreeBSD (the existing VMA covers the new region).
 func (p *Pager) ensureFileCovers(pages uint64) error {
-	need := int64(pages) * int64(p.cfg.PageSize)
-	if need <= p.fileSize {
+	if int64(pages)*int64(p.cfg.PageSize) <= p.fileSize {
 		return nil
 	}
-	if err := p.file.Truncate(need); err != nil {
-		return fmt.Errorf("pager: ftruncate to %d: %w", need, err)
+	// Grow in GrowStep-aligned increments (file-format.md §File Growth):
+	// newSize = min(alignUp(pages, GrowStep), MaxSize). `pages` is the new
+	// HighWaterMark (= prior HWM + the one page just claimed). The pages
+	// between `pages` and the aligned end are file-backed but above
+	// HighWaterMark, so later AllocPage calls advance HWM into them with NO
+	// further ftruncate — one syscall per GrowStep pages, giving the OS a
+	// large contiguous extent to read ahead. A zero GrowStep (unconfigured
+	// pager / raw-NewWriter test) falls back to growing by the exact need.
+	targetPages := alignUp(pages, p.growStepPages)
+	if p.maxSizePages != 0 {
+		targetPages = min(targetPages, p.maxSizePages)
 	}
-	p.fileSize = need
+	targetPages = max(targetPages, pages) // never under-cover the allocated page
+	target := int64(targetPages) * int64(p.cfg.PageSize)
+	if err := p.file.Truncate(target); err != nil {
+		return fmt.Errorf("pager: ftruncate to %d: %w", target, err)
+	}
+	p.fileSize = target
 	return nil
+}
+
+// alignUp rounds n up to the next multiple of step; step==0 returns n
+// unchanged (a zero GrowStep means "no alignment — grow/shrink by exact
+// need"). n is bounded by MaxSize pages, so n+step-1 cannot overflow uint64.
+func alignUp(n, step uint64) uint64 {
+	if step == 0 {
+		return n
+	}
+	return ((n + step - 1) / step) * step
 }
 
 // FreePage marks id for retirement. The disposition depends on whether

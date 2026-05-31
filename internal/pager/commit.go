@@ -378,16 +378,26 @@ func (p *Pager) buildNewMeta(cp CommitParams, prev page.Meta) page.Meta {
 // to stamp the per-segment TxnID. Idempotent.
 func (p *Pager) SetCurrentTxnID(txnID uint64) { p.currentTxnID = txnID }
 
-// maybeShrink truncates the file down to HWM when the trailing slack
-// exceeds shrinkThreshold pages. Called at the end of Commit after the
-// meta swap. Non-fatal on failure.
+// maybeShrink truncates the file toward a GrowStep-aligned size at or above
+// HighWaterMark, floored at MinSize, when the trailing slack exceeds
+// shrinkThreshold pages (file-format.md §File Shrinkage). It never truncates
+// below MinSize (the user's pre-allocated minimum is never discarded — a
+// clause-explicit invariant) nor below HighWaterMark. Called at the end of
+// Commit after the meta swap. Non-fatal on failure.
 func (p *Pager) maybeShrink(shrinkThreshold uint64) error {
 	if shrinkThreshold == 0 {
 		return nil
 	}
-	target := int64(p.highWaterMark) * int64(p.cfg.PageSize)
+	// newSize = max(alignUp(HighWaterMark, GrowStep), MinSize), never above
+	// the current size. A zero GrowStep aligns to HighWaterMark itself; a
+	// zero MinSize imposes no floor (raw-NewWriter fallback).
+	targetPages := max(alignUp(p.highWaterMark, p.growStepPages), p.minSizePages)
+	target := int64(targetPages) * int64(p.cfg.PageSize)
+	if target >= p.fileSize {
+		return nil // target at/above current size — nothing to shrink
+	}
 	if p.fileSize-target < int64(shrinkThreshold)*int64(p.cfg.PageSize) {
-		return nil
+		return nil // trailing slack below threshold — avoid ftruncate thrash
 	}
 	if err := p.file.Truncate(target); err != nil {
 		return err

@@ -620,6 +620,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	// commit is a checkpoint, so lastCheckpointTxnID == prevMeta.TxnID.
 	bound := min(coord.OldestReaderTxnID(), lastCheckpoint)
 	pgr.SetCommitState(prevMeta.HighWaterMark, prevMeta.MaxSize, bound)
+	pgr.SetSizeParams(prevMeta.GrowStep, prevMeta.MinSize)
 	pgr.BeginTx()
 	// Seed currentTxnID at tx-start so the chunk-5.5 LaggingReader
 	// callback's Lag = currentTxnID - reclamationBound is meaningful

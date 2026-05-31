@@ -96,6 +96,8 @@ type Pager struct {
 	rplSegments      []RPLSegmentRef
 	highWaterMark    uint64
 	maxSizePages     uint64
+	growStepPages    uint64 // GrowStep: file grows in this-aligned increments (file-format.md §File Growth). 0 ⇒ grow by exact need.
+	minSizePages     uint64 // MinSize: shrink never truncates below this (file-format.md §File Shrinkage). 0 ⇒ no floor.
 	reclamationBound uint64
 
 	pendingAllocs map[uint64]struct{}
@@ -372,6 +374,17 @@ func (p *Pager) SetCommitState(highWaterMark, maxSizePages, reclamationBound uin
 	p.highWaterMark = highWaterMark
 	p.maxSizePages = maxSizePages
 	p.reclamationBound = reclamationBound
+}
+
+// SetSizeParams seeds the file growth/shrink parameters from the active meta
+// (GrowStep, MinSize — both in pages). Separate from SetCommitState so the
+// many test callers of the latter keep the zero-value fallback (grow by exact
+// need; no MinSize floor). Called from Open/Resync (attachState) and per write
+// tx (Begin) so a future Tx.SetFileFormat that mutates these is picked up on
+// the next transaction. file-format.md §File Growth / §File Shrinkage.
+func (p *Pager) SetSizeParams(growStepPages, minSizePages uint64) {
+	p.growStepPages = growStepPages
+	p.minSizePages = minSizePages
 }
 
 // SetRPLChain seeds the in-memory RPL segment list. segments is ordered
