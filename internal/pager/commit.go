@@ -49,6 +49,20 @@ type CommitParams struct {
 	NumKeyspaces uint64
 	Flags        uint32
 	Sync         SyncPolicy
+	// SetFileFormat, when non-nil, overrides the mutable file-format meta
+	// fields (MinSize / GrowStep / ShrinkThreshold, in pages) on the new
+	// meta — Tx.SetFileFormat (api-surface.md §File Format, file-format.md).
+	// nil ⇒ the new meta carries the previous values unchanged. MaxSize and
+	// BitmapPages are immutable and are never overridden.
+	SetFileFormat *MetaFileFormat
+}
+
+// MetaFileFormat carries a Tx.SetFileFormat override of the mutable
+// file-format meta fields (in pages) into Commit.
+type MetaFileFormat struct {
+	MinSize         uint64
+	GrowStep        uint64
+	ShrinkThreshold uint64
 }
 
 // CommitResult bundles the post-commit meta state for the caller.
@@ -351,6 +365,15 @@ func (p *Pager) buildNewMeta(cp CommitParams, prev page.Meta) page.Meta {
 	for _, s := range p.rplSegments {
 		entryCount += uint64(s.Count)
 	}
+	// Mutable file-format fields carry forward from prev unless Tx.SetFileFormat
+	// overrode them this commit. MaxSize/BitmapPages are immutable (changing
+	// MaxSize would shift the bitmap region and every data-page offset).
+	minSize, growStep, shrinkThreshold := prev.MinSize, prev.GrowStep, prev.ShrinkThreshold
+	if cp.SetFileFormat != nil {
+		minSize = cp.SetFileFormat.MinSize
+		growStep = cp.SetFileFormat.GrowStep
+		shrinkThreshold = cp.SetFileFormat.ShrinkThreshold
+	}
 	return page.Meta{
 		Magic:           page.Magic,
 		Version:         page.FormatVersion,
@@ -358,10 +381,10 @@ func (p *Pager) buildNewMeta(cp CommitParams, prev page.Meta) page.Meta {
 		Flags:           cp.Flags,
 		BitmapPages:     prev.BitmapPages,
 		UUID:            prev.UUID,
-		MinSize:         prev.MinSize,
+		MinSize:         minSize,
 		MaxSize:         prev.MaxSize,
-		GrowStep:        prev.GrowStep,
-		ShrinkThreshold: prev.ShrinkThreshold,
+		GrowStep:        growStep,
+		ShrinkThreshold: shrinkThreshold,
 		HighWaterMark:   p.highWaterMark,
 		RPLHeadPage:     headID,
 		RPLTailPage:     tailID,

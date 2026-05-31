@@ -42,6 +42,14 @@ type Tx struct {
 	writable   bool
 	closed     bool
 
+	// pendingFileFormat holds a Tx.SetFileFormat override of the mutable
+	// file-format meta fields (MinSize/GrowStep/ShrinkThreshold, in pages),
+	// applied to the new meta at Commit. nil ⇒ no change this tx. The change
+	// is persisted atomically with the commit and takes effect from the NEXT
+	// transaction (the committed meta carries it; the next Begin's
+	// SetSizeParams reloads the pager from it).
+	pendingFileFormat *pager.MetaFileFormat
+
 	// keyspaceRoot and numKeyspaces track the in-progress state of
 	// the keyspace B+tree (see keyspaces.md + file-layout.md §Meta
 	// Page). Seeded from prevMeta at Begin; CreateKeyspace /
@@ -339,11 +347,12 @@ func (tx *Tx) Commit() error {
 		syncPolicy = pager.SyncNone
 	}
 	result, err := tx.pgr.Commit(pager.CommitParams{
-		NewTxnID:     tx.newTxnID,
-		KeyspaceRoot: tx.keyspaceRoot,
-		NumKeyspaces: tx.numKeyspaces,
-		Flags:        flags,
-		Sync:         syncPolicy,
+		NewTxnID:      tx.newTxnID,
+		KeyspaceRoot:  tx.keyspaceRoot,
+		NumKeyspaces:  tx.numKeyspaces,
+		Flags:         flags,
+		Sync:          syncPolicy,
+		SetFileFormat: tx.pendingFileFormat,
 	}, tx.prevMeta, tx.prevActive)
 	if err != nil {
 		// A commit can fail in the no-syscall ASSEMBLY phase (step 0:
