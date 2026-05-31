@@ -213,23 +213,13 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		}
 	}
 
-	// 2) Active-meta selection + validation. Chunk-3.5: prefer
-	// the highest-TxnID valid meta whose MetaFlagCheckpoint is set;
-	// fall back to highest-TxnID valid meta if no checkpoint exists
-	// (durability.md §Recovery step 3 — caller logs warning via
-	// noCheckpoint).
-	active, noCheckpoint, ok := page.ActiveMetaCheckpointPreferring(meta0Bytes, meta1Bytes)
-	if !ok {
-		return nil, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
-	}
-	var m page.Meta
-	if active == 0 {
-		m = page.DecodeMeta(meta0Bytes)
-	} else {
-		m = page.DecodeMeta(meta1Bytes)
-	}
-	if err := page.ValidateMeta(m); err != nil {
-		return nil, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
+	// 2) Active-meta selection + validation (checkpoint-preferring,
+	// durability.md §Recovery step 3; noCheckpoint = the step-3 fallback
+	// where no checkpoint-flagged meta exists — caller logs a warning).
+	// Shared with Resync.
+	m, active, noCheckpoint, err := selectActiveMeta(meta0Bytes, meta1Bytes)
+	if err != nil {
+		return nil, err
 	}
 
 	cfg := page.Config{PageSize: pageSize, PageChecksum: m.HasFlag(page.MetaFlagPageChecksum)}
@@ -241,71 +231,13 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		return nil, err
 	}
 
-	// 4) Build the in-memory bitmap by reading the on-disk bitmap region
-	// from the mmap (which sees the just-written data through the
-	// unified page cache).
-	//
-	// ValidateMeta does not bound BitmapPages, so a checksum-passing
-	// meta with a forged BitmapPages bypasses every existing guard. Two
-	// reachable in-spec corruption shapes that must surface as
-	// ErrCorrupted, not crash the process — checksums.md §Structural
-	// and Allocation Bounds and integrity.md §Forged / structural
-	// corruption tolerance ("the read path... never crashes on corrupt
-	// input — it returns an error instead"):
-	//
-	//   (a) wild-high BitmapPages → `make([]byte, BitmapPages*PageSize)`
-	//       hits runtime OOM via `runtime.throw` (unrecoverable —
-	//       `recover()` does NOT catch this; the test binary dies), or
-	//       at a smaller-but-still-too-big size the subsequent slice
-	//       expression `p.mmap[2*pageSize : 2*pageSize+bitmapBytes]`
-	//       panics with slice-bounds-out-of-range (this one IS
-	//       recoverable, but the wild_high regression case exercises
-	//       the runtime.throw path — a stronger no-crash assertion).
-	//   (b) BitmapPages too small to cover MaxSize (incl. zero) →
-	//       `bitmap.New` panics with "totalPages N exceeds bitmap
-	//       capacity M bits" (entered with empty/under-sized detail).
-	//
-	// File-extent bound (a): the bitmap region lives in pages
-	// [2, firstDataPage) where firstDataPage = 2 + BitmapPages
-	// (Init.go); the metas occupy 0 and 1, so firstDataPage must lie
-	// within the file-resident extent. Use
-	// `min(fileSize/PageSize, MaxSize)` exactly like rebuildRPLChain
-	// (Inv-RV3) and checker.walkRPL (Inv-C1) — established walk-site
-	// pattern; ValidateMeta deliberately does not enforce these per
-	// check.go (avoid rejecting recoverable databases). Capacity bound
-	// (b): BitmapPages*PageSize*8 (bits the detail can address) must be
-	// >= MaxSize (pages the bitmap must represent).
-	backedPages := min(uint64(p.fileSize)/uint64(pageSize), m.MaxSize)
-	firstDataPage := uint64(m.BitmapPages) + 2
-	if firstDataPage > backedPages {
+	// 4–6) Build the in-memory bitmap + RPL chain + commit state from the
+	// on-disk image. Shared with Resync via attachState (which documents the
+	// forged-BitmapPages corruption bounds it enforces).
+	if err := p.attachState(file, m); err != nil {
 		_ = p.Close()
-		return nil, fmt.Errorf("pager: meta firstDataPage %d (BitmapPages %d + 2 metas) exceeds backed extent %d pages: %w", firstDataPage, m.BitmapPages, backedPages, ErrCorrupted)
+		return nil, err
 	}
-	bitmapCapacityBits := uint64(m.BitmapPages) * uint64(pageSize) * 8
-	if bitmapCapacityBits < m.MaxSize {
-		_ = p.Close()
-		return nil, fmt.Errorf("pager: meta BitmapPages %d gives bitmap capacity %d bits, < MaxSize %d pages: %w", m.BitmapPages, bitmapCapacityBits, m.MaxSize, ErrCorrupted)
-	}
-	bitmapBytes := uint64(m.BitmapPages) * uint64(pageSize)
-	detail := make([]byte, bitmapBytes)
-	copy(detail, p.mmap[2*uint64(pageSize):2*uint64(pageSize)+bitmapBytes])
-	bm := newBitmapForOpen(detail, pageSize, m.BitmapPages, m.MaxSize)
-	p.AttachBitmap(bm)
-
-	// 5) Rebuild RPL in-memory chain: walk head → tail via OlderSegment,
-	// reverse for tail-first iteration during reclamation.
-	chain, err := rebuildRPLChain(p, m)
-	if err != nil {
-		_ = p.Close()
-		return nil, fmt.Errorf("pager: rebuild RPL chain: %w", err)
-	}
-	p.SetRPLChain(chain)
-
-	// 6) Seed commit state: HighWaterMark, MaxSize, reclamationBound.
-	// For chunk 1 (no readers, every commit is a checkpoint) the
-	// reclamation bound is the active meta's TxnID — segments freed
-	// strictly before this TxnID are reclaimable.
-	p.SetCommitState(m.HighWaterMark, m.MaxSize, m.TxnID)
 
 	return &OpenedDB{
 		Pager:         p,
@@ -313,6 +245,249 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		ActiveMetaIdx: active,
 		NoCheckpoint:  noCheckpoint,
 	}, nil
+}
+
+// selectActiveMeta decodes the two meta-page byte images, selects the active
+// meta (checkpoint-preferring per durability.md §Recovery), and validates it.
+// noCheckpoint reports the §Recovery step-3 fallback: the selected meta lacks
+// MetaFlagCheckpoint because no checkpoint-flagged meta exists. Shared by Open
+// (first load) and Resync (re-load after a peer commit).
+func selectActiveMeta(meta0Bytes, meta1Bytes []byte) (m page.Meta, active int, noCheckpoint bool, err error) {
+	active, noCheckpoint, ok := page.ActiveMetaCheckpointPreferring(meta0Bytes, meta1Bytes)
+	if !ok {
+		return page.Meta{}, 0, false, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
+	}
+	if active == 0 {
+		m = page.DecodeMeta(meta0Bytes)
+	} else {
+		m = page.DecodeMeta(meta1Bytes)
+	}
+	if err := page.ValidateMeta(m); err != nil {
+		return page.Meta{}, 0, false, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
+	}
+	return m, active, noCheckpoint, nil
+}
+
+// attachState (re)builds the pager's in-memory state from the on-disk image
+// for active meta m: refreshes fileSize, rebuilds the allocation bitmap from
+// the on-disk bitmap region, rebuilds the RPL in-memory chain, and seeds
+// commit state. Shared by Open (first build) and Resync (rebuild after a peer
+// commit). The mmap is NOT touched — MaxSize and PageSize are immutable for
+// the file's life, so the reservation established at NewWriter always covers
+// the current file (a peer can grow the file only up to MaxSize, within the
+// existing sparse mapping).
+//
+// attachState is ATOMIC: it builds the new bitmap and RPL chain into locals
+// and installs them (fileSize, bitmap, RPL, commit-state) only after both
+// succeed. Any error therefore leaves the pager fully unmodified, so the
+// caller can release the grant and return the error WITHOUT poisoning the
+// handle — Resync's stale-but-valid existing state is untouched, and Open
+// simply closes the freshly-built pager it was loading.
+//
+// The freshly-stat'd file size bounds both the bitmap-extent check and the RPL
+// walk (a peer may have grown or shrunk the file since this pager's mmap was
+// established). The bitmap region lives in low pages [2, 2+BitmapPages) which
+// maybeShrink never truncates, so the bitmap copy below is always within the
+// backed extent.
+func (p *Pager) attachState(file *os.File, m page.Meta) error {
+	st, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("pager: stat: %w", err)
+	}
+	newFileSize := st.Size()
+	pageSize := p.cfg.PageSize
+
+	// Build the in-memory bitmap by reading the on-disk bitmap region from
+	// the mmap (MAP_SHARED — sees committed data through the unified page
+	// cache).
+	//
+	// ValidateMeta does not bound BitmapPages, so a checksum-passing meta
+	// with a forged BitmapPages bypasses every existing guard. Two reachable
+	// in-spec corruption shapes that must surface as ErrCorrupted, not crash
+	// the process — checksums.md §Structural and Allocation Bounds and
+	// integrity.md §Forged / structural corruption tolerance ("the read
+	// path... never crashes on corrupt input — it returns an error
+	// instead"):
+	//
+	//   (a) wild-high BitmapPages → `make([]byte, BitmapPages*PageSize)`
+	//       hits runtime OOM via `runtime.throw` (unrecoverable —
+	//       `recover()` does NOT catch this; the test binary dies), or at a
+	//       smaller-but-still-too-big size the subsequent slice expression
+	//       `p.mmap[2*pageSize : 2*pageSize+bitmapBytes]` panics with
+	//       slice-bounds-out-of-range (recoverable, but the wild_high
+	//       regression exercises the runtime.throw path — a stronger
+	//       no-crash assertion).
+	//   (b) BitmapPages too small to cover MaxSize (incl. zero) →
+	//       `bitmap.New` panics with "totalPages N exceeds bitmap capacity M
+	//       bits" (entered with empty/under-sized detail).
+	//
+	// File-extent bound (a): firstDataPage = 2 + BitmapPages must lie within
+	// the file-resident extent. Use `min(fileSize/PageSize, MaxSize)` exactly
+	// like rebuildRPLChain (Inv-RV3) and checker.walkRPL (Inv-C1) —
+	// ValidateMeta deliberately does not enforce these (avoid rejecting
+	// recoverable databases). Capacity bound (b): BitmapPages*PageSize*8 bits
+	// must be >= MaxSize pages.
+	backedPages := min(uint64(newFileSize)/uint64(pageSize), m.MaxSize)
+	firstDataPage := uint64(m.BitmapPages) + 2
+	if firstDataPage > backedPages {
+		return fmt.Errorf("pager: meta firstDataPage %d (BitmapPages %d + 2 metas) exceeds backed extent %d pages: %w", firstDataPage, m.BitmapPages, backedPages, ErrCorrupted)
+	}
+	bitmapCapacityBits := uint64(m.BitmapPages) * uint64(pageSize) * 8
+	if bitmapCapacityBits < m.MaxSize {
+		return fmt.Errorf("pager: meta BitmapPages %d gives bitmap capacity %d bits, < MaxSize %d pages: %w", m.BitmapPages, bitmapCapacityBits, m.MaxSize, ErrCorrupted)
+	}
+	bitmapBytes := uint64(m.BitmapPages) * uint64(pageSize)
+	detail := make([]byte, bitmapBytes)
+	copy(detail, p.mmap[2*uint64(pageSize):2*uint64(pageSize)+bitmapBytes])
+	bm := newBitmapForOpen(detail, pageSize, m.BitmapPages, m.MaxSize)
+
+	// Rebuild the RPL in-memory chain against the NEW bitmap + file size
+	// (locals — not yet installed on the pager), walking head → tail via
+	// OlderSegment, reversed for tail-first reclamation iteration. Building
+	// against locals is what makes attachState atomic: a corrupt chain returns
+	// here with the pager still fully unmodified.
+	chain, err := rebuildRPLChain(p, m, bm, newFileSize)
+	if err != nil {
+		return fmt.Errorf("pager: rebuild RPL chain: %w", err)
+	}
+
+	// All fallible work is done — install every piece of state at once. None
+	// of these assignments can fail, so the pager moves from fully-old to
+	// fully-new with no observable partial state (the caller holds the write
+	// grant). The reclamation bound seeded here is the active meta's TxnID;
+	// the DB layer overrides it per-tx with min(oldestReader, lastCheckpoint)
+	// (free-space.md §RPL Reclamation).
+	p.fileSize = newFileSize
+	p.AttachBitmap(bm)
+	p.SetRPLChain(chain)
+	p.SetCommitState(m.HighWaterMark, m.MaxSize, m.TxnID)
+	return nil
+}
+
+// Resync rebuilds the writer pager's in-memory state from the current on-disk
+// image after a peer process may have committed (cross-process.md §Writer
+// acquisition flow). The caller MUST hold the cross-process write grant, so no
+// concurrent writer mutates the metas/bitmap/RPL and no tx is in flight (the
+// bitmap is replaced wholesale).
+//
+// Base-meta selection is LATEST-COMMITTED (page.ActiveMeta — highest valid
+// TxnID), NOT the checkpoint-preferring selection Open uses. Open is crash
+// recovery, where an uncheckpointed SyncLazy commit past the last checkpoint
+// may be torn and must be rolled back. A live grant handoff is not recovery:
+// the peer cleanly committed and released the flock, so its latest commit —
+// even an uncheckpointed SyncLazy one — is complete and visible (same-host
+// page cache), and rolling back to the last checkpoint would silently lose it
+// (a lost update, and inconsistent with the latest-committed snapshot
+// ReadLatestMeta hands to readers). This also matters single-process: with
+// checkpoint-preferring, a writer's own SyncLazy commit would be rolled back
+// on its next Begin.
+//
+// lastCheckpointTxnID is the highest checkpoint-flagged TxnID among the two
+// on-disk slots (0 if none) — exactly the meta a crash would recover to
+// (checkpoint-preferring), so it bounds RPL reclamation to protect that
+// recoverable tree (free-space.md §RPL Reclamation). The caller adopts it only
+// on changed=true; on changed=false it keeps its own in-memory tracking, which
+// can be tighter (it remembers a checkpoint that SyncLazy commits have since
+// overwritten in the slots).
+//
+// knownTxnID is the caller's cached active-meta TxnID. When the on-disk latest
+// meta still carries it, no peer commit has landed: Resync returns
+// changed=false and rebuilds nothing, so the caller keeps its cached meta AND
+// its in-memory last-checkpoint tracking. Only a genuine peer advance triggers
+// the bitmap+RPL rebuild. The mmap is reused (MaxSize / PageSize immutable for
+// the file's life).
+//
+// On a corrupt on-disk image (both metas invalid, forged BitmapPages, corrupt
+// RPL chain) or a meta-read I/O error, Resync returns a wrapped error with the
+// pager left **fully unmodified** (attachState is atomic and the read/select
+// steps precede it), so the caller releases the grant and returns the error
+// without poisoning — the handle stays usable (a retry re-reads; Close +
+// re-Open invokes Open's own corruption recovery).
+func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m page.Meta, active int, lastCheckpointTxnID uint64, changed bool, err error) {
+	pageSize := p.cfg.PageSize
+	meta0 := make([]byte, page.MetaPayloadSize)
+	if _, err := file.ReadAt(meta0, 0); err != nil {
+		return page.Meta{}, 0, 0, false, fmt.Errorf("pager: resync read meta0: %w", err)
+	}
+	meta1 := make([]byte, page.MetaPayloadSize)
+	if _, err := file.ReadAt(meta1, int64(pageSize)); err != nil {
+		return page.Meta{}, 0, 0, false, fmt.Errorf("pager: resync read meta1: %w", err)
+	}
+	active, ok := page.ActiveMeta(meta0, meta1)
+	if !ok {
+		return page.Meta{}, 0, 0, false, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
+	}
+	if active == 0 {
+		m = page.DecodeMeta(meta0)
+	} else {
+		m = page.DecodeMeta(meta1)
+	}
+	if err := page.ValidateMeta(m); err != nil {
+		return page.Meta{}, 0, 0, false, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
+	}
+	lastCheckpointTxnID = highestCheckpointTxnID(meta0, meta1)
+	if m.TxnID == knownTxnID {
+		return m, active, lastCheckpointTxnID, false, nil
+	}
+	if err := p.attachState(file, m); err != nil {
+		return page.Meta{}, 0, 0, false, err
+	}
+	return m, active, lastCheckpointTxnID, true, nil
+}
+
+// highestCheckpointTxnID returns the greatest TxnID among the two meta-page
+// images that both verify (checksum) AND carry MetaFlagCheckpoint, or 0 if
+// neither qualifies. This is the TxnID a crash would recover to under the
+// checkpoint-preferring rule, hence the RPL reclamation lower bound for a
+// writer that has just adopted a peer's latest (possibly unflagged) commit.
+func highestCheckpointTxnID(meta0, meta1 []byte) uint64 {
+	var best uint64
+	for _, b := range [][]byte{meta0, meta1} {
+		if !page.VerifyMeta(b) {
+			continue
+		}
+		mm := page.DecodeMeta(b)
+		if mm.HasFlag(page.MetaFlagCheckpoint) && mm.TxnID > best {
+			best = mm.TxnID
+		}
+	}
+	return best
+}
+
+// ReadLatestMeta reads both on-disk meta pages and returns the latest
+// COMMITTED one — the highest valid TxnID, NOT checkpoint-preferring. A read
+// transaction wants the newest committed snapshot for visibility (it must
+// observe a peer's completed commit, cross-process.md §Reader Table), whereas
+// recovery/Open want the newest durable checkpoint; the two selections differ
+// only when the newest commit is an unflagged SyncLazy commit, where a reader
+// correctly prefers it. Lock-free: BeginRead holds no write grant, so a writer
+// may be mid-commit on the inactive slot — a torn slot fails its checksum and
+// page.ActiveMeta selects the valid one (the commit writes data pages before
+// the meta, so the selected meta's pages are always readable). pageSize is the
+// file's immutable page size (safely taken from any prior meta snapshot).
+func ReadLatestMeta(file *os.File, pageSize uint32) (page.Meta, error) {
+	meta0 := make([]byte, page.MetaPayloadSize)
+	if _, err := file.ReadAt(meta0, 0); err != nil {
+		return page.Meta{}, fmt.Errorf("pager: read meta0: %w", err)
+	}
+	meta1 := make([]byte, page.MetaPayloadSize)
+	if _, err := file.ReadAt(meta1, int64(pageSize)); err != nil {
+		return page.Meta{}, fmt.Errorf("pager: read meta1: %w", err)
+	}
+	active, ok := page.ActiveMeta(meta0, meta1)
+	if !ok {
+		return page.Meta{}, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
+	}
+	var m page.Meta
+	if active == 0 {
+		m = page.DecodeMeta(meta0)
+	} else {
+		m = page.DecodeMeta(meta1)
+	}
+	if err := page.ValidateMeta(m); err != nil {
+		return page.Meta{}, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
+	}
+	return m, nil
 }
 
 // newBitmapForOpen is a thin wrapper that returns the bitmap package's
@@ -431,7 +606,13 @@ func isVersionMismatchMeta(buf []byte) bool {
 // meta's RPLEntryCount divided by the minimum entries-per-segment
 // (with slack) to catch chain cycles or wild OlderSegment pointers
 // before they cause an infinite loop.
-func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
+//
+// bm and fileSize are passed explicitly (rather than read from p.bitmap /
+// p.fileSize) so attachState can rebuild against the NOT-yet-installed new
+// state — keeping attachState atomic. bm is the reclaimed-segment oracle
+// (free-space.md §Allocation Bitmap: set bit = free → stop at a reclaimed
+// tail); fileSize bounds every segment page id to the file-resident extent.
+func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmapForOpen, fileSize int64) ([]RPLSegmentRef, error) {
 	if m.RPLHeadPage == 0 {
 		return nil, nil
 	}
@@ -469,7 +650,7 @@ func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
 	// to checker.walkRPL's min(fileSize/PageSize, MaxSize) (the root gmdb
 	// package's check.go); the two sibling RPL walkers must agree a wild
 	// pointer is structured corruption, not a crash.
-	backedPages := min(uint64(p.fileSize)/uint64(p.cfg.PageSize), m.MaxSize)
+	backedPages := min(uint64(fileSize)/uint64(p.cfg.PageSize), m.MaxSize)
 	id := m.RPLHeadPage
 	for {
 		if id >= backedPages {
@@ -493,7 +674,7 @@ func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
 		// head: the recovery target's own newest segment is never reclaimed
 		// (the reclamation bound never reaches the last checkpoint's own
 		// TxnID). See free-space.md §RPL (recovery to a non-latest meta).
-		if id != m.RPLHeadPage && p.bitmap.IsSet(id) {
+		if id != m.RPLHeadPage && bm.IsSet(id) {
 			break
 		}
 		visited[id] = struct{}{}

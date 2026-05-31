@@ -77,13 +77,37 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	}
 	defer grant.Release()
 
-	// Re-snapshot under db.mu to pick up any concurrent commit
-	// that may have published a new meta while we were waiting for
-	// the grant. Subsequent steps run against THIS snapshot.
+	// Re-read pgr+file under the post-grant db.mu (Compact may have swapped
+	// them while we waited) and re-sync the writer's in-memory state to
+	// absorb any commit published while we waited — same-process OR a peer
+	// process. The pre-grant snapshot only catches same-process commits
+	// (they update db.currentMeta); a peer's commit leaves db.currentMeta
+	// stale. Re-flagging that stale meta in its stale slot (step 3 below)
+	// would overwrite the peer's newer meta with an older one — silent lost
+	// update (cross-process.md §Writer acquisition flow). Resync also
+	// rebuilds the writer pager's bitmap/RPL so the NEXT Begin (which sees a
+	// matching TxnID and skips its own Resync) starts from a consistent
+	// pager.
 	db.mu.Lock()
 	if db.closeGate.IsClosed() {
 		db.mu.Unlock()
 		return ErrClosed
+	}
+	pgr := db.pgr
+	file = db.file
+	if pgr == nil || file == nil {
+		db.mu.Unlock()
+		return ErrClosed
+	}
+	if m, active, lastCheckpoint, changed, err := pgr.Resync(file, db.currentMeta.TxnID); err != nil {
+		// Resync leaves the pager fully unmodified on error (attachState is
+		// atomic), so the handle stays usable — surface the error; no poison.
+		db.mu.Unlock()
+		return fmt.Errorf("gmdb: checkpoint re-sync: %w", mapPagerErr(err))
+	} else if changed {
+		db.currentMeta = m
+		db.activeMetaIdx = active
+		db.lastCheckpointTxnID = lastCheckpoint
 	}
 	meta := db.currentMeta
 	activeIdx := db.activeMetaIdx

@@ -210,8 +210,10 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 		if pid == 0 {
 			// Case 0: mid-acquire / mid-release / orphan.
 			switch {
-			case hb != 0 && nowNanos-hb <= staleTimeoutNanos:
-				// 0a: live owner mid-acquire/release. Honour the
+			case hb != 0 && !heartbeatStale(nowNanos, hb, staleTimeoutNanos):
+				// 0a: live owner mid-acquire/release (incl. a
+				// future-stamped heartbeat — a mid-publish reader whose
+				// clock read raced ahead of ours). Honour the
 				// TxnID — the owner has CAS'd it and will either
 				// release cleanly or, on crash, the next scan will
 				// catch the aged-out heartbeat.
@@ -240,7 +242,7 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 					if txnID < min {
 						min = txnID
 					}
-				case nowNanos-epoch > staleTimeoutNanos:
+				case heartbeatStale(nowNanos, epoch, staleTimeoutNanos):
 					f.ClearStaleReaderSlot(uint32(i))
 				default:
 					// Epoch set but not yet aged out. Skip
@@ -268,7 +270,7 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 			if err != nil {
 				// Process exists but start time unreadable; fall
 				// back to heartbeat path (conservative).
-				if hb != 0 && nowNanos-hb > staleTimeoutNanos {
+				if hb != 0 && heartbeatStale(nowNanos, hb, staleTimeoutNanos) {
 					f.ClearStaleReaderSlot(uint32(i))
 					continue
 				}
@@ -289,7 +291,7 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 			continue
 		}
 		// Case 2: cross-namespace or namespace-unknown. Heartbeat-only.
-		if hb != 0 && nowNanos-hb > staleTimeoutNanos {
+		if hb != 0 && heartbeatStale(nowNanos, hb, staleTimeoutNanos) {
 			f.ClearStaleReaderSlot(uint32(i))
 			continue
 		}

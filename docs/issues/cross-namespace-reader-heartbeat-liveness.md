@@ -1,8 +1,9 @@
 # Cross-namespace readers reclaimable purely on a 10s heartbeat window with no fallback
 
 **Lands:** condition — when the cross-process stale-detection model is
-revisited (relates to `options-coord-intervals` and
-`reader-stale-detection-future-heartbeat-guard`).
+revisited (relates to `options-coord-intervals` and the heartbeat
+stale-detection guard — `cross-process.md §Reader Table` stale
+detection / `lock.heartbeatStale`).
 
 **Severity:** [L] (partly inherent to heartbeat-based liveness; needs a
 documented bound + a user decision on defaults)

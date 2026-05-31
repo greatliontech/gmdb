@@ -255,10 +255,23 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 	db.mu.Lock()
 	coord := db.coord
 	file := db.file
-	meta := db.currentMeta
+	cachedMeta := db.currentMeta
 	db.mu.Unlock()
 	if coord == nil || file == nil {
 		return nil, ErrClosed
+	}
+
+	// Snapshot the LATEST committed on-disk meta, not the cached one: a peer
+	// process may have committed since this handle last refreshed
+	// db.currentMeta (which is updated only by this handle's own commits),
+	// and a read tx must observe every commit that completed happens-before
+	// its Begin (cross-process.md §Reader Table). PageSize is immutable so
+	// the cached meta is a safe source for it; the lock-free dual-meta read
+	// tolerates a writer mid-commit on the inactive slot — a torn slot fails
+	// its checksum and the valid one is selected.
+	meta, err := pager.ReadLatestMeta(file, cachedMeta.PageSize)
+	if err != nil {
+		return nil, mapPagerErr(err)
 	}
 
 	// Snapshot TxnID for the slot CAS. The per-slot "TxnID == 0 means

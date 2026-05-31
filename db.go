@@ -581,6 +581,28 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 		grant.Release()
 		return nil, ErrClosed
 	}
+
+	// Re-sync the writer's in-memory state (meta, bitmap, RPL, fileSize)
+	// from disk before building the tx: a peer process holding the grant
+	// before us may have committed, leaving our Open-time view stale.
+	// Without this a serialized cross-process writer builds on a stale root
+	// (lost update), writes its meta over the slot holding the peer's newer
+	// commit, and allocates from a stale bitmap (page aliasing) —
+	// cross-process.md §Writer acquisition flow. Cheap no-op when the
+	// on-disk active TxnID is unchanged (the common single-writer path),
+	// which also preserves the in-memory lastCheckpointTxnID tracking.
+	if m, active, lastCheckpoint, changed, err := pgr.Resync(db.file, db.currentMeta.TxnID); err != nil {
+		// Resync leaves the pager fully unmodified on error (attachState is
+		// atomic), so the handle stays usable — release the grant and surface
+		// the error; no poison needed.
+		grant.Release()
+		return nil, fmt.Errorf("gmdb: re-sync writer state on grant: %w", mapPagerErr(err))
+	} else if changed {
+		db.currentMeta = m
+		db.activeMetaIdx = active
+		db.lastCheckpointTxnID = lastCheckpoint
+	}
+
 	prevMeta := db.currentMeta
 	prevActive := db.activeMetaIdx
 	lastCheckpoint := db.lastCheckpointTxnID

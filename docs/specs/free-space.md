@@ -368,6 +368,20 @@ in the RPL at `C`) — either is consistent with `C`'s tree, because
 spurious free-bits for pages the recovered tree might still
 reference.
 
+**Cross-process re-derivation of `C`.** `lastCheckpointTxnID` is
+tracked in-memory as *this* handle commits and checkpoints — the most
+recent checkpoint this handle observed. When a writer acquires the
+grant and finds a peer process has advanced the on-disk state
+(`cross-process.md §Writer acquisition flow`), it re-derives `C` from
+disk: the highest checkpoint-flagged `TxnID` among the two meta slots,
+or `0` if neither is flagged. That is exactly the meta a crash would
+recover to under the checkpoint-preferring rule, so the sufficiency
+argument above holds unchanged. On the common path (no peer advance)
+the handle keeps its in-memory value, which can be *tighter* than the
+on-disk slots reveal — it remembers a checkpoint that later `SyncLazy`
+commits have since overwritten in the two slots — and is always safe
+(a lower-or-equal `C` only reclaims less).
+
 **SyncLazy and partial bitmap flush.** In `SyncLazy` the bitmap
 pwrites for intermediate (post-checkpoint) transactions happen
 without `fdatasync`. The OS may flush some pwrites and not others.

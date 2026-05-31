@@ -272,16 +272,88 @@ func TestOldestReaderTxnIDCase0bStaleHBClears(t *testing.T) {
 	// Clear the slot.
 	f := openTestFile(t, 1)
 	slot := f.Slot(0)
-	now := uint64(1_000_000_000)
+	// now must exceed 2*stale so the "aged out" heartbeat is a genuine PAST
+	// value. (The earlier now=1s, hb=now-2*stale underflowed to a ~2^64
+	// future stamp; the pre-future-guard code cleared it only via a second
+	// underflow in the comparison — a pass for the wrong reason. With the
+	// future-heartbeat guard a future stamp is correctly treated as fresh,
+	// so the stale case must be constructed as an actual past timestamp.)
 	stale := uint64(time.Second)
+	now := 10 * stale
 	Store64(&slot.TxnID, 42)
-	Store64(&slot.Heartbeat, now-2*stale) // aged out
+	Store64(&slot.Heartbeat, now-2*stale) // aged out: now-hb = 2*stale > stale
 	got := f.OldestReaderTxnID(99, now, stale)
 	if got != math.MaxUint64 {
 		t.Errorf("case 0b: got %d, want MaxUint64 (slot cleared)", got)
 	}
 	if Load64(&slot.TxnID) != 0 {
 		t.Errorf("case 0b: slot not cleared")
+	}
+}
+
+func TestOldestReaderTxnIDCase0aFutureHBSkipsClear(t *testing.T) {
+	// Regression (reader-stale-detection future-heartbeat underflow): a
+	// mid-publish reader (PID==0) whose Heartbeat is AHEAD of the scanner's
+	// nowNanos must be treated as live. Pre-fix nowNanos-hb underflowed
+	// (unsigned) to ~2^64, which is not <= staleTimeout, so the slot fell
+	// through to the 0b clear and a live reader was evicted — its pinned
+	// TxnID left the table and RPL reclamation could free pages it was about
+	// to read. The HB-first/PID-last acquire ordering exists precisely to
+	// keep this mid-publish window safe; the underflow defeated it.
+	f := openTestFile(t, 1)
+	slot := f.Slot(0)
+	now := uint64(1_000_000_000)
+	stale := uint64(time.Second)
+	Store64(&slot.TxnID, 42)
+	Store64(&slot.Heartbeat, now+stale) // FUTURE — reader's clock read raced ahead of the scan
+	got := f.OldestReaderTxnID(99, now, stale)
+	if got != 42 {
+		t.Errorf("case 0a future HB: got %d, want 42 (live mid-publish, not evicted)", got)
+	}
+	if Load64(&slot.TxnID) != 42 {
+		t.Errorf("case 0a future HB: live slot cleared (underflow eviction)")
+	}
+}
+
+func TestOldestReaderTxnIDCase0cFutureEpochSkipsClear(t *testing.T) {
+	// Case 0c (PID==0, Heartbeat==0) with a HintEpoch orphan anchor in the
+	// future relative to this scanner (a peer writer stamped it on a clock
+	// ahead of ours). nowNanos-epoch must not underflow-clear a slot whose
+	// orphan timer has not actually elapsed.
+	f := openTestFile(t, 1)
+	slot := f.Slot(0)
+	now := uint64(1_000_000_000)
+	stale := uint64(time.Second)
+	Store64(&slot.TxnID, 9)
+	Store64(&slot.HintEpoch, now+stale) // FUTURE epoch
+	got := f.OldestReaderTxnID(99, now, stale)
+	if got != 9 {
+		t.Errorf("case 0c future epoch: got %d, want 9 (orphan timer not elapsed)", got)
+	}
+	if Load64(&slot.TxnID) != 9 {
+		t.Errorf("case 0c future epoch: live slot cleared (underflow eviction)")
+	}
+}
+
+func TestOldestReaderTxnIDCase2FutureHBSkipsClear(t *testing.T) {
+	// Case 2 (cross-namespace, heartbeat-only liveness) with a future
+	// heartbeat — same underflow guard. On darwin/freebsd the codebase's own
+	// model has per-process CLOCK_MONOTONIC origins so a peer's stamp can
+	// routinely exceed our nowNanos, making this directly reachable.
+	f := openTestFile(t, 1)
+	now := uint64(time.Now().UnixNano())
+	future := now + uint64(DefaultStaleTimeout) // ahead of the scan clock
+	// Foreign namespace (≠ ourPIDNS=99 in the scan) so the heartbeat path is
+	// taken rather than same-namespace IsAlive against a nonexistent PID.
+	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, future); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout))
+	if got != 7 {
+		t.Errorf("case 2 future HB: got %d, want 7 (live, not evicted)", got)
+	}
+	if Load64(&f.Slot(0).TxnID) != 7 {
+		t.Errorf("case 2 future HB: live slot cleared (underflow eviction)")
 	}
 }
 

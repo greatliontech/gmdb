@@ -105,6 +105,31 @@ Invariant: kind=clause-explicit;
     encoding that survives turnover.
 
 Invariant: kind=clause-explicit;
+  property=Every stale-detection age comparison (`now - Heartbeat`
+    and `now - HintEpoch`, in the reader-table scan AND the
+    writer-recovery check) treats a stamp in the FUTURE
+    (`stamp > now`) as fresh/live, never stale — i.e. clears only
+    when `stamp <= now AND now - stamp > StaleTimeout`. The
+    monotonic-clock stamps are unsigned, so a naive `now - stamp >
+    StaleTimeout` underflows to ~2^64 (> any timeout) for a
+    future stamp and clears a live owner;
+  from=this spec §Reader Table (stale detection) and §Stale Writer
+    Recovery (shared future-stamp guard);
+  violation=A mid-publish reader stores `Heartbeat = nowMonotonic()`
+    (step 4a) before its `PID` (step 4e); a writer scanning with an
+    earlier `now` than that reader's clock read — reachable with no
+    happens-before between the two reads, and routine on
+    darwin/freebsd where `CLOCK_MONOTONIC` origins are per-process
+    (§Process Start Time) — sees `Heartbeat > now`, underflows, and
+    clears the live acquirer mid-publish. Its snapshot `TxnID`
+    leaves the table, the reclamation bound advances past it, and
+    RPL reclamation frees pages the reader is about to read:
+    use-after-reclaim / torn snapshot. The HB-first/PID-last acquire
+    ordering exists precisely to make mid-publish safe; the underflow
+    defeats it. Backward clock skew (NTP step-back, manual set) is a
+    second trigger.
+
+Invariant: kind=clause-explicit;
   property=Only the flock goroutine ever calls `flock()`; at most
     one goroutine in the process is attempting `flock` at any
     moment. Writers communicate with the flock goroutine via a
@@ -232,6 +257,40 @@ Invariant: kind=clause-explicit;
     on-disk size SIGBUSes the process on first access to the
     over-mapped region, defeating the cooperatively-cancellable
     design.
+
+Invariant: kind=entailed;
+  property=Writer-grant freshness — a writer holding the
+    cross-process write grant builds its transaction on the current
+    on-disk active meta, with the allocation bitmap, RPL chain, and
+    cached file size all consistent with it. No clause states this
+    directly; it is the assumption the serialized single-writer model
+    rests on (the grant-holder's base state IS the latest commit);
+  from=entailed: §Write Lock serializes writers but says nothing about
+    refreshing the per-process view the previous holder advanced;
+  violation=Peer A commits TxnID=6 and releases the grant; B acquires
+    it with a cached TxnID=5 view, builds its tree on the TxnID=5 root
+    (A's commit silently lost), writes its meta over the slot holding
+    A's TxnID=6 (two metas claiming TxnID=6), and allocates from a
+    stale bitmap handing out pages A's committed tree references (page
+    aliasing). Enforced by the mandatory re-sync in §Writer
+    acquisition flow step 3, and by the cross-handle writer-interleave
+    test.
+
+Invariant: kind=entailed;
+  property=Reader snapshot currency — a read transaction snapshots the
+    latest committed meta visible at `BeginRead`, so it observes every
+    commit (peer-process included) that completed happens-before its
+    begin;
+  from=entailed: the MVCC visibility contract assumes a reader sees the
+    latest commit, which no single clause restates for the
+    cross-process case;
+  violation=Peer A commits `k1` (TxnID=6); a reader opened on handle B
+    afterward snapshots B's cached TxnID=5 and never observes `k1`
+    though A's commit completed before the reader began. (A visibility
+    defect, not corruption: the stale-low TxnID floors the writer's
+    reclamation bound conservatively.) Enforced by the latest-committed
+    snapshot selection in §Reader Table and the cross-handle
+    reader-sees-peer-commit test.
 
 ## Lock File Layout
 
@@ -493,6 +552,43 @@ latency and bounded cancellation latency.
    - `ctx.Done()` first: writer gives up. The flock goroutine
      will detect cancellation when it processes the request and
      skip or release. Return `context.Cause(ctx)`.
+3. **Re-sync in-memory state from disk (mandatory).** A writer's
+   active meta, allocation bitmap, RPL chain, and cached file size
+   are loaded at `Open` and otherwise mutated only by *this* handle's
+   own commits. While we waited for the grant, a **peer** process may
+   have acquired it, committed, and released — leaving every one of
+   those stale. Before building the transaction, re-read both meta
+   pages and, if the on-disk state advanced, rebuild bitmap + RPL +
+   fileSize + commit-state from disk (`Pager.Resync`). The mmap is
+   reused unchanged: `MaxSize` and `PageSize` are immutable for the
+   file's life, so the reservation always covers the current file
+   (a peer can only grow it up to `MaxSize`). Skipping this step is a
+   guaranteed lost-update + page-aliasing corruption for serialized
+   cross-process writers (the writer builds on a stale root, writes
+   its meta over the slot holding the peer's newer commit, and
+   allocates pages the peer's committed tree references) — see the
+   Writer-grant freshness invariant.
+
+   **Selection rule — latest-committed, not checkpoint-preferring.**
+   The re-sync adopts the highest-valid-TxnID meta (`page.ActiveMeta`),
+   NOT the checkpoint-preferring meta `Open` uses. `Open` is crash
+   recovery, where an uncheckpointed `SyncLazy` commit past the last
+   checkpoint may be torn and must roll back. A live grant handoff is
+   not recovery: the peer cleanly committed and released the flock, so
+   its latest commit — even an uncheckpointed `SyncLazy` one — is
+   complete and page-cache-visible, and rolling back to the last
+   checkpoint would silently lose it (and contradict the
+   latest-committed snapshot reads observe — see Reader Table). The
+   reclamation lower bound is computed separately as the highest
+   *checkpoint-flagged* TxnID among the two slots (the meta a crash
+   would recover to — `free-space.md §RPL Reclamation`); on no peer
+   advance the handle keeps its own (possibly tighter) in-memory
+   last-checkpoint tracking.
+
+`Checkpoint()` performs the same re-sync after acquiring the grant,
+for the same reason: it re-flags the active meta in place, so it must
+re-flag the *current* on-disk meta in its *current* slot, never an
+older cached meta over a peer's newer one.
 
 `Commit()` and `Rollback()` signal the flock goroutine to
 release.
@@ -583,6 +679,22 @@ Slot allocation uses a simple scan with atomic CAS — no free
 stack or other auxiliary data structure. The reader table is a
 flat array of 48-byte slots in the lock file's shared mmap. All
 operations use atomic memory ops visible across processes.
+
+**Snapshot selection.** A read transaction (`BeginRead`) snapshots
+the **latest committed** on-disk meta — both meta pages are re-read
+and the highest-valid-TxnID one is chosen (`page.ActiveMeta`) — NOT
+the handle's cached `currentMeta` (which a peer's commit leaves
+stale) and NOT the checkpoint-preferring recovery meta (a reader
+wants visibility of the newest commit, not the newest durable
+checkpoint; the two differ only for an unflagged `SyncLazy` commit,
+which a reader correctly observes). The read is lock-free — readers
+hold no write grant — so a writer may be mid-commit on the inactive
+slot; a torn slot fails its checksum and the valid one is selected,
+and because a commit writes (and, per `SyncMode`, fsyncs) data pages
+before the meta, the selected meta's tree pages are always present.
+This is what lets a reader in one process observe a commit that
+completed (happens-before its `BeginRead`) in another — see the
+Reader snapshot currency invariant.
 
 ### Slot acquire (`Begin` read transaction)
 

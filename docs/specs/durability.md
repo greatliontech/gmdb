@@ -190,3 +190,16 @@ most recent `SyncDurable`-or-`Checkpoint`-set meta, possibly
 losing intervening `SyncLazy` commits from any process. This is
 the same trade-off as `SyncLazy` within a single process; the
 multi-process composition is consistent with that.
+
+**Live visibility vs. crash recovery — distinct selections.** The
+checkpoint-preferring selection above governs *crash recovery* (a
+fresh `Open`). It does **not** govern *live* operation: a writer
+re-syncing on a grant handoff, and a reader beginning a transaction,
+both select the **latest committed** meta (`cross-process.md §Writer
+acquisition flow` / §Reader Table), so an uncheckpointed `SyncLazy`
+commit IS visible to other live handles and is built upon by the next
+writer — it is not silently rolled back during normal operation. The
+asymmetry is intentional and consistent with the `SyncLazy` contract:
+such a commit is *visible-while-live but not crash-durable*. The grant
+serializes writers, so a live handoff is never a torn read; only a
+real crash invokes the recovery rollback.

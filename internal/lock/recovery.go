@@ -76,16 +76,28 @@ func IsStaleWriter(f *File, ourPIDNamespace uint64, nowNanos uint64, staleTimeou
 // the timeout has elapsed since 0, which on any non-trivial clock
 // reading is immediately true — captured by the same comparison.
 func staleByHeartbeat(f *File, nowNanos uint64, staleTimeoutNanos uint64) bool {
-	hb := f.WriterHeartbeat()
-	// Guard against underflow if the recorded heartbeat is somehow
-	// in the future (clock skew across hosts is impossible in
-	// single-host CLOCK_BOOTTIME; cross-host would only matter for
-	// shared-storage deployments which aren't supported). Treat
-	// future-stamped heartbeat as fresh (conservative).
-	if hb > nowNanos {
+	return heartbeatStale(nowNanos, f.WriterHeartbeat(), staleTimeoutNanos)
+}
+
+// heartbeatStale reports whether a monotonic-clock stamp — a reader/writer
+// Heartbeat, or a reader slot's HintEpoch orphan anchor — is older than
+// staleTimeoutNanos relative to nowNanos. A stamp in the FUTURE
+// (stamp > nowNanos) is treated as fresh, never stale: the unsigned
+// subtraction nowNanos-stamp would otherwise underflow to ~2^64 (> any
+// timeout) and evict a live owner. "Future" is reachable two ways —
+// (1) a mid-publish reader whose own monotonic read landed fractionally
+// after the scanner's (there is no happens-before between the two clock
+// reads, and the HB-first/PID-last acquire ordering of §Reader Table
+// relies on this stamp being honoured as live), and (2) backward clock
+// skew (NTP step-back, manual set, or cross-host on shared storage where
+// CLOCK_BOOTTIME origins differ per cross-process.md's own model). Every
+// reader-scan comparison and the writer-recovery check share this guard
+// (cross-process.md §Reader Table stale detection / §Stale Writer Recovery).
+func heartbeatStale(nowNanos, stamp, staleTimeoutNanos uint64) bool {
+	if stamp > nowNanos {
 		return false
 	}
-	return nowNanos-hb > staleTimeoutNanos
+	return nowNanos-stamp > staleTimeoutNanos
 }
 
 // RecoverStaleWriter clears the lock file's writer-header fields
