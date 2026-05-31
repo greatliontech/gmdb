@@ -345,11 +345,17 @@ func (db *DB) View(ctx context.Context, fn func(rtx *ReadTx) error) error {
 	if err != nil {
 		return err
 	}
+	// Panic safety: release the reader slot even if fn panics. A leaked
+	// slot pins RPL reclamation (blocking the writer's free-space
+	// reclamation) and counts toward ErrReadersFull until GC. close() is
+	// idempotent (closed guard + held CAS), so this deferred Rollback
+	// coexists with the explicit success-path close below
+	// (api-surface.md, Update/View panic safety).
+	defer rtx.Rollback()
 	fnErr := fn(rtx)
 	// Rollback is the read-tx idempotent close path (both Commit and
-	// Rollback are equivalent for reads). Pin the spec semantic: a
-	// failing fn does not need to "rollback writes" — there are no
-	// writes — but the slot must be released.
+	// Rollback are equivalent for reads): a failing fn has no writes to
+	// undo, but the slot must be released.
 	rbErr := rtx.Rollback()
 	if fnErr != nil {
 		return fnErr

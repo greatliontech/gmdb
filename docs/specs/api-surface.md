@@ -678,6 +678,15 @@ func (db *DB) View(ctx context.Context, fn func(rtx *ReadTx) error) error
 // Update executes a read-write transaction.
 func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
 
+// Panic safety (Update / View): unlike Batch, these wrappers do NOT recover
+// a panic in fn — it propagates to the caller. They DO, however, release the
+// transaction's resources before the panic unwinds: Update rolls back (freeing
+// the cross-process write grant + pager tx state) and View releases its
+// reader-table slot. A panic recovered higher up the stack therefore never
+// leaks the grant (which would block all writers across all processes on
+// AcquireWriter) or a reader slot (which pins RPL reclamation and counts toward
+// ErrReadersFull) until GC. The release is synchronous, via a deferred close.
+
 // Batch submits a write operation to be batched with other concurrent
 // callers into a single transaction. The context governs the wait for
 // batch inclusion. Each closure runs in its own child transaction and

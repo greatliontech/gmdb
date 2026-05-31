@@ -793,11 +793,26 @@ func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error {
 	if err != nil {
 		return err
 	}
+	// Panic safety: guarantee the tx is closed (cross-process write grant
+	// + pager tx state released) even if fn panics. A recovered panic
+	// higher up the stack — idiomatic in Go services — must not leak the
+	// grant: that blocks every other writer in this AND any other process
+	// on AcquireWriter until GC finalizes the *Tx. `done` is set on the
+	// normal commit/rollback paths, so this deferred rollback fires only on
+	// a panic unwinding through fn (api-surface.md, Update/View panic safety).
+	done := false
+	defer func() {
+		if !done {
+			_ = tx.Rollback()
+		}
+	}()
 	if fnErr := fn(tx); fnErr != nil {
+		done = true
 		if rbErr := tx.Rollback(); rbErr != nil {
 			return errors.Join(fnErr, rbErr)
 		}
 		return fnErr
 	}
+	done = true
 	return tx.Commit()
 }
