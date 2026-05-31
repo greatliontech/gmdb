@@ -624,6 +624,18 @@ func (c *checker) walkRPL(hwm uint64) (bitset, bool) {
 		return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLTailMissing", PageID: head,
 			Message: fmt.Sprintf("RPL head %d set but tail page is 0", head)})
 	}
+	// Recovery may select a NON-latest meta (an older checkpoint, durability.md
+	// §Recovery) whose RPLTailPage is stale: reclamation advanced the live
+	// meta's tail and freed those segment pages without rewriting this older
+	// meta (the Open-time rebuild truncates the in-memory chain but does not
+	// persist a corrected meta until the next commit). So this snapshot's
+	// RPLHeadPage→…→tail walk can run into a reclaimed-and-reused segment page.
+	// Stop at the first reclaimed segment — free in the bitmap (set bit), or a
+	// non-head page that no longer decodes — mirroring the Open-time rebuild
+	// (free-space.md §RPL; internal/pager/init.go rebuildRPLChain). bm is the
+	// snapshot's allocation bitmap; if unavailable we fall back to the
+	// decode-failure boundary alone.
+	bm, bmOK := c.snapshotBitmap()
 	maxSegs := c.meta.RPLEntryCount + 1
 	visited := make(map[uint64]struct{})
 	var segs uint64
@@ -641,11 +653,24 @@ func (c *checker) walkRPL(hwm uint64) (bitset, bool) {
 			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLChainTooLong", PageID: id,
 				Message: fmt.Sprintf("RPL chain exceeds entry-count bound %d (likely cycle)", maxSegs)})
 		}
+		// Reclaimed-segment boundary (see the bm comment above): a non-head
+		// segment page that is free in the bitmap was reclaimed from a stale
+		// tail — stop here. Never the head: the recovery target's own newest
+		// segment is never reclaimed (the reclamation bound never reaches the
+		// last checkpoint's own TxnID).
+		if id != head && bmOK && bm.IsSet(id) {
+			break
+		}
 		visited[id] = struct{}{}
 		seg, ok := page.DecodeRPLSegment(c.pgr.PageRaw(id), c.cfg)
 		if !ok {
-			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentMalformed", PageID: id,
-				Message: fmt.Sprintf("RPL segment page %d malformed", id)})
+			if id == head {
+				return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentMalformed", PageID: id,
+					Message: fmt.Sprintf("RPL head segment page %d malformed", id)})
+			}
+			// Reclaimed-then-reused segment page (now non-segment data): the
+			// same stale-tail boundary as the bitmap check above.
+			break
 		}
 		pending.setIfInRange(id)
 		for _, pid := range seg.PageIDs {

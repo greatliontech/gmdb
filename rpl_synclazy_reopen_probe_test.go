@@ -7,32 +7,37 @@ import (
 	"testing"
 )
 
-// TestRPLSyncLazyReopenCorruptionMinimal is the minimal reproducer for the
-// confirmed [H] RPL-reclamation-bound corruption (rpl-reclamation-checkpoint-
-// bound): standard public API only — SyncLazy Put/Delete churn + periodic
-// Checkpoint + Close/reopen, NO compaction, NO manual internals, background
-// maintenance disabled. Flaky on allocation order (run under -race or -count
-// to hit reliably). When it fires, the reopen fails with
+// TestRPLSyncLazyReopenCorruptionMinimal is the regression for the [H]
+// RPL-reclamation / recovery corruption (FIXED). Standard public API only —
+// SyncLazy Put/Delete churn + periodic Checkpoint + Close/reopen, no
+// compaction, no manual internals, background maintenance disabled. Before the
+// fix this made the DB UNOPENABLE (reopen failed: "rebuild RPL chain: RPL
+// segment at page N malformed"), flakily on allocation order — the 60
+// churn+reopen rounds exercise many orders per run, and Check() after every
+// reopen verifies integrity, not just openability.
 //
-//	gmdb: database is corrupted: pager: rebuild RPL chain:
-//	  pager: RPL segment at page N malformed
+// Two coupled root causes, both fixed:
+//   (1) the reclamation bound used prevMeta.TxnID, which under SyncLazy runs
+//       ahead of the last checkpoint, freeing data pages a still-recoverable
+//       checkpoint's tree references. Fixed: bound = lastCheckpointTxnID
+//       (db.go; free-space.md §RPL Reclamation).
+//   (2) recovery to a NON-latest meta walked its RPLHeadPage→tail chain into a
+//       reclaimed-and-reused segment page (reclamation frees segment pages
+//       from the live tail and advances the live meta's tail without rewriting
+//       older metas). Fixed in BOTH on-disk chain walkers — rebuildRPLChain
+//       (internal/pager/init.go) and Check's walkRPL (check.go) — which stop
+//       at the first reclaimed segment (free in the bitmap, or reused),
+//       checked here via checkClean after every reopen.
 //
-// i.e. a still-recoverable meta's RPL chain walks through a reclaimed-and-
-// reused segment page → the DB is UNOPENABLE.
-//
-// Root cause (confirmed empirically): RPL reclamation frees a segment PAGE
-// that a still-recoverable meta's chain references; on reopen, recovery
-// selects that meta and walks its chain into the freed-and-reused page.
-// Setting bound = 0 (reclaim nothing) eliminates it; SyncDurable (recovery
-// always picks the latest, just-written meta) does not reproduce. NOTE: the
-// spec's bound min(oldestReaderTxnID, lastCheckpointTxnID) is INSUFFICIENT —
-// implementing it exactly still corrupts (a recoverable checkpoint's chain
-// tail references segments tagged below its own TxnID, which bound=checkpoint
-// still frees). The real fix must not free a segment page any recoverable
-// meta's chain references (see docs/issues/rpl-reclamation-checkpoint-bound).
-// Remove the Skip when that lands — this becomes the regression.
+// Regression coverage is allocation-order-probabilistic (the underlying bug
+// was map-randomized): a revert of EITHER tolerance (2) trips within one run
+// (Open fails, or Check reports RPLSegmentMalformed in the stale-tail window);
+// a revert of the bound (1) corrupts the data tree only on the narrower order
+// where a reclaimed tree-referenced page is reused-then-overwritten before
+// reopen, surfacing as Check ReachableInRPL — reliable only at higher
+// iteration. CI should run this with -count to guard part (1); a single run
+// reliably guards part (2).
 func TestRPLSyncLazyReopenCorruptionMinimal(t *testing.T) {
-	t.Skip("reproducer for the confirmed [H] rpl-reclamation-checkpoint-bound corruption (DB unopenable after SyncLazy churn+reopen). Un-skip when reclamation no longer frees segment pages a recoverable meta's chain references (the spec's lastCheckpointTxnID bound alone is insufficient).")
 	ctx := context.Background()
 	path := tmpPath(t)
 	open := func() *DB {
@@ -44,6 +49,19 @@ func TestRPLSyncLazyReopenCorruptionMinimal(t *testing.T) {
 			t.Fatalf("Open: %v", err)
 		}
 		return db
+	}
+	// checkClean asserts Open succeeded AND the recovered tree + RPL are
+	// structurally clean — run in the stale-tail window (after a reopen, before
+	// the next commit heals the on-disk RPLTailPage), so it exercises BOTH RPL
+	// chain walkers (the Open-time rebuild and Check's walkRPL) against the
+	// reclaimed tail of a non-latest recovered meta.
+	checkClean := func(d *DB, tag string) {
+		t.Helper()
+		for _, iss := range collectIssues(d.Check()) {
+			if iss.Severity == CheckError || iss.Severity == CheckFatal {
+				t.Fatalf("%s: Check reported %v %s (page %d): %s", tag, iss.Severity, iss.Code, iss.PageID, iss.Message)
+			}
+		}
 	}
 	db := open()
 	if err := db.Update(ctx, func(tx *Tx) error { _, e := tx.CreateKeyspace("ks"); return e }); err != nil {
@@ -79,8 +97,10 @@ func TestRPLSyncLazyReopenCorruptionMinimal(t *testing.T) {
 		}
 		if round%6 == 5 {
 			_ = db.Close()
-			db = open() // reopen — malformed RPL chain surfaces here
+			db = open() // reopen — pre-fix, a malformed RPL chain surfaced here
+			checkClean(db, fmt.Sprintf("Check after reopen@round%d (stale-tail window)", round))
 		}
 	}
+	checkClean(db, "final Check after SyncLazy churn+reopen")
 	_ = db.Close()
 }

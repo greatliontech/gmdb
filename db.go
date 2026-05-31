@@ -51,7 +51,15 @@ type DB struct {
 	mu            sync.Mutex
 	currentMeta   page.Meta
 	activeMetaIdx int
-	pgr           *pager.Pager
+	// lastCheckpointTxnID is the TxnID of the most recent checkpoint meta —
+	// the meta recovery would select (durability.md §Recovery). It bounds RPL
+	// reclamation per free-space.md §RPL Reclamation: min(oldestReaderTxnID,
+	// lastCheckpointTxnID). Reclaiming past the last checkpoint would free
+	// pages a still-recoverable meta's tree references. Updated to the new
+	// TxnID on a checkpoint commit (SyncDurable/SyncDataOnly) and Checkpoint();
+	// unchanged on SyncLazy/SyncUnsafe commits. Guarded by db.mu.
+	lastCheckpointTxnID uint64
+	pgr                 *pager.Pager
 
 	// poisoned is set when a write tx's commit failed past the
 	// publication boundary (step-3 pwrite or step-4 fdatasync). The
@@ -256,11 +264,17 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		coord:         coord,
 		currentMeta:   opened.Meta,
 		activeMetaIdx: opened.ActiveMetaIdx,
-		pgr:           opened.Pager,
-		closeGate:     newCloseGate(),
+		// Recovery selected the highest-TxnID checkpoint meta, so its TxnID is
+		// the last checkpoint. If no checkpoint meta was found (NoCheckpoint),
+		// there is no recoverable checkpoint to bound against, so reclamation
+		// is pinned off (bound 0) until the next checkpoint re-establishes it.
+		lastCheckpointTxnID: opened.Meta.TxnID,
+		pgr:                 opened.Pager,
+		closeGate:           newCloseGate(),
 	}
 
 	if openWarnNoCheckpoint {
+		db.lastCheckpointTxnID = 0
 		db.logger.Warn(
 			"gmdb: Open accepted non-checkpoint meta",
 			"path", path,
@@ -569,20 +583,20 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	}
 	prevMeta := db.currentMeta
 	prevActive := db.activeMetaIdx
+	lastCheckpoint := db.lastCheckpointTxnID
 
-	// Compute the RPL reclamation bound per free-space.md §RPL
-	// Reclamation: min(oldestActiveReaderTxnID, lastCheckpointTxnID).
-	// We hold flock(LOCK_EX) via the grant (cross-process.md
-	// §Writer's Page Reclamation), so OldestReaderTxnID's
-	// LOCK_EX precondition is satisfied. In chunk 3.4 (SyncMode
-	// not yet wired — that's 3.5), every commit is a checkpoint,
-	// so lastCheckpointTxnID == prevMeta.TxnID; the SyncLazy split
-	// arrives in 3.5 alongside the MetaFlagCheckpoint-bit
-	// interpretation. OldestReaderTxnID returns math.MaxUint64
-	// when no readers are active, which the `min` reduces to
-	// lastCheckpointTxnID — the old chunk-2 behaviour preserved
-	// when no readers exist.
-	bound := min(coord.OldestReaderTxnID(), prevMeta.TxnID)
+	// RPL reclamation bound per free-space.md §RPL Reclamation:
+	// min(oldestActiveReaderTxnID, lastCheckpointTxnID). We hold
+	// flock(LOCK_EX) via the grant (cross-process.md §Writer's Page
+	// Reclamation), so OldestReaderTxnID's LOCK_EX precondition is satisfied;
+	// it returns math.MaxUint64 with no active readers, reducing the min to
+	// lastCheckpointTxnID. The bound MUST use lastCheckpointTxnID, NOT
+	// prevMeta.TxnID: under SyncLazy prevMeta.TxnID runs ahead of the last
+	// checkpoint, and reclaiming past the last checkpoint frees data pages a
+	// still-recoverable checkpoint meta's tree references
+	// (free-space.md §RPL Reclamation). Under SyncDurable/SyncDataOnly every
+	// commit is a checkpoint, so lastCheckpointTxnID == prevMeta.TxnID.
+	bound := min(coord.OldestReaderTxnID(), lastCheckpoint)
 	pgr.SetCommitState(prevMeta.HighWaterMark, prevMeta.MaxSize, bound)
 	pgr.BeginTx()
 	// Seed currentTxnID at tx-start so the chunk-5.5 LaggingReader

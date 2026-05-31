@@ -129,6 +129,11 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	db.mu.Lock()
 	if db.currentMeta.TxnID == meta.TxnID {
 		db.currentMeta = meta
+		// The active meta is now checkpoint-flagged → it is the last
+		// checkpoint, so it bounds RPL reclamation (free-space.md §RPL
+		// Reclamation). We hold the write grant, so no commit advanced
+		// currentMeta past meta while we worked.
+		db.lastCheckpointTxnID = meta.TxnID
 	}
 	db.mu.Unlock()
 	return nil

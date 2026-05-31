@@ -275,6 +275,41 @@ RPL validator) walks `RPLHeadPage → … → RPLTailPage` and stops *at*
 == 0` holds only for a chain whose original tail has never been
 reclaimed; it is not a safe walk terminator.
 
+**Recovery to a non-latest meta: `RPLTailPage` itself may be stale.**
+`RPLTailPage` is the authoritative boundary only for the *live* meta.
+Reclamation advances the live meta's `RPLTailPage` and frees the drained
+segment pages, but it does NOT rewrite older on-disk metas — so a meta
+that is no longer the latest (an older checkpoint that
+`durability.md §Recovery` selects under `SyncLazy`) carries a
+`RPLTailPage`, and a `RPLHeadPage → … → OlderSegment` path, that runs
+*into* segment pages reclamation has since freed (and possibly reused).
+The recovery rebuild therefore walks `RPLHeadPage` forward and stops at
+the **first reclaimed segment** — a segment page that is free in the
+bitmap (set bit), or an allocated page that no longer decodes as a
+segment (reclaimed-then-reused) — in addition to stopping at
+`RPLTailPage`. This is safe and consistent: the reclamation bound
+(`min(oldestActiveReaderTxnID, lastCheckpointTxnID)`) guarantees the
+recovered meta's *tree* pages are intact (a checkpoint's tree never
+references pages retired at or after it), and a reclaimed segment's
+listed data pages are already free in the bitmap, so truncating the
+in-memory chain at the reclaimed boundary yields an RPL consistent with
+the bitmap. The recovered meta's own newest (head) segment is never
+reclaimed, so a head that fails to decode is genuine corruption (a hard
+error), not a stale boundary. Both on-disk chain walkers apply this — the
+in-memory rebuild at Open and `Check`'s RPL validator — since either may run
+on a non-latest meta in the window between a truncating reopen and the next
+commit (which is the first write to persist a corrected `RPLTailPage`).
+Without this, recovering to an older checkpoint under `SyncLazy` fails at Open
+with a malformed-RPL-segment error — the DB becomes unopenable.
+
+Accepted trade: a genuine bitrot of a *live* (bitmap-clear) non-head segment
+also fails to decode and is treated as this boundary, so it degrades to a
+bounded page leak — the orphaned older segments surface as a `BitmapLeak` in
+`Check` — rather than a hard `ErrCorrupted`. Distinguishing reclaimed-reuse
+from live bitrot without a per-segment discriminator is not possible, and a
+bounded, detectable leak is strictly safer than refusing to open an otherwise
+intact database.
+
 ### RPL append (at commit time)
 
 When a write transaction commits with retired pages:

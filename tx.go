@@ -374,6 +374,14 @@ func (tx *Tx) Commit() error {
 	tx.db.mu.Lock()
 	tx.db.currentMeta = result.Meta
 	tx.db.activeMetaIdx = result.ActiveMetaIdx
+	// A checkpoint commit (SyncDurable/SyncDataOnly set MetaFlagCheckpoint)
+	// advances the RPL reclamation bound (free-space.md §RPL Reclamation); a
+	// SyncLazy/SyncUnsafe commit leaves the checkpoint flag clear and the
+	// bound unchanged, so reclamation never frees pages a recoverable
+	// checkpoint meta's tree references.
+	if result.Meta.HasFlag(page.MetaFlagCheckpoint) {
+		tx.db.lastCheckpointTxnID = result.Meta.TxnID
+	}
 	tx.db.mu.Unlock()
 	// The pager's commit-state seeding (HighWaterMark, MaxSize,
 	// reclamationBound) moved to the next write-tx Begin path in

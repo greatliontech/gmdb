@@ -481,11 +481,31 @@ func rebuildRPLChain(p *Pager, m page.Meta) ([]RPLSegmentRef, error) {
 		if uint64(len(headFirst)) > maxSegs {
 			return nil, fmt.Errorf("pager: RPL chain exceeds bound %d (likely cycle): %w", maxSegs, ErrCorrupted)
 		}
+		// Stop at a reclaimed segment. Recovery may select a NON-latest meta
+		// (an older checkpoint, durability.md §Recovery); reclamation drains +
+		// frees segment pages from the live tail and advances the live meta's
+		// RPLTailPage WITHOUT rewriting older metas, so an older meta's
+		// RPLHeadPage→OlderSegment walk can reach a segment whose page was
+		// reclaimed (and possibly reused). A reclaimed segment page is free in
+		// the bitmap (free-space.md §Allocation Bitmap: set bit = free), and
+		// its listed data pages are already free, so truncating the in-memory
+		// chain here is consistent with the bitmap. This never applies to the
+		// head: the recovery target's own newest segment is never reclaimed
+		// (the reclamation bound never reaches the last checkpoint's own
+		// TxnID). See free-space.md §RPL (recovery to a non-latest meta).
+		if id != m.RPLHeadPage && p.bitmap.IsSet(id) {
+			break
+		}
 		visited[id] = struct{}{}
 		buf := p.pageRaw(id)
 		seg, ok := page.DecodeRPLSegment(buf, p.cfg)
 		if !ok {
-			return nil, fmt.Errorf("pager: RPL segment at page %d malformed: %w", id, ErrCorrupted)
+			if id == m.RPLHeadPage {
+				return nil, fmt.Errorf("pager: RPL head segment at page %d malformed: %w", id, ErrCorrupted)
+			}
+			// A reclaimed-then-reused segment page (now holding non-segment
+			// data): same stale-tail boundary as the reclaimed-bit check above.
+			break
 		}
 		headFirst = append(headFirst, RPLSegmentRef{
 			PageID: id,

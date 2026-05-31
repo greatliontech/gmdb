@@ -163,6 +163,13 @@ func (db *DB) reopenAfterCompact(base string) error {
 	db.pgr = opened.Pager
 	db.currentMeta = opened.Meta
 	db.activeMetaIdx = opened.ActiveMetaIdx
+	// Reset the reclamation bound to the freshly-compacted file's checkpoint
+	// (mirror Open). A compacted file is fully durable with a checkpoint meta;
+	// guard the NoCheckpoint case for robustness.
+	db.lastCheckpointTxnID = opened.Meta.TxnID
+	if opened.NoCheckpoint {
+		db.lastCheckpointTxnID = 0
+	}
 	db.mu.Unlock()
 
 	// Re-point the DB leak-detection cleanup at the new pager + file (the
