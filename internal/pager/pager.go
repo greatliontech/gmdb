@@ -534,6 +534,21 @@ func (p *Pager) PendingFrees() map[uint64]struct{}  { return p.pendingFrees }
 func (p *Pager) RetiredPages() []uint64             { return p.retiredPages }
 func (p *Pager) LoosePages() map[uint64]struct{}    { return p.loosePages }
 
+// RPLPageCount returns the number of retired data-page entries pinned in
+// the committed RPL chain (the sum of each segment's entry count) —
+// pages freed by prior transactions that reclamation has not yet handed
+// back, gated by the oldest live reader / last checkpoint. Used by
+// DBStats.RetiredPages. Zero on a read-only pager (no RPL chain loaded).
+// Single-threaded pager contract: callers read it from the writer
+// goroutine or while no write transaction is mutating the chain.
+func (p *Pager) RPLPageCount() uint64 {
+	var n uint64
+	for _, seg := range p.rplSegments {
+		n += uint64(seg.Count)
+	}
+	return n
+}
+
 // Close releases the mmap region. Idempotent. The pager does not close
 // file — that is the DB's responsibility.
 func (p *Pager) Close() error {

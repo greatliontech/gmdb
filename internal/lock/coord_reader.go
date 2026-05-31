@@ -128,6 +128,27 @@ func (c *Coord) OldestReaderTxnID() uint64 {
 	return c.f.OldestReaderTxnID(c.pidNS, c.clock(), c.staleTimeoutNanos())
 }
 
+// CountActiveReaders returns the number of occupied reader slots across
+// the whole lock-file reader table (cluster-wide — every process's
+// readers, not just this handle's). A slot is occupied iff its TxnID is
+// non-zero (the "free" sentinel). The scan is a lock-free, per-slot
+// atomic load: it takes no flock and does NOT clear stale slots, so the
+// count can be off by ±N for N reader acquire/release transitions in
+// flight during the scan. It is a metrics/health signal only, never a
+// synchronization barrier (DBStats.ActiveReaders contract). Stale slots
+// from crashed peers count until a writer or maintenance pass reaps
+// them.
+func (c *Coord) CountActiveReaders() int {
+	max := c.f.MaxReaders()
+	n := 0
+	for i := range max {
+		if Load64(&c.f.Slot(i).TxnID) != 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // ReapStaleReaderSlots acquires the write lock and scans the reader
 // table, clearing slots owned by dead processes
 // (background-maintenance.md §Stale Reader Slot Cleanup). The
