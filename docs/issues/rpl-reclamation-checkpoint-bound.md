@@ -1,11 +1,15 @@
-# RPL reclamation bound uses prevMeta.TxnID, not lastCheckpointTxnID — DISPUTED (confirmed vs. refuted)
+# RPL reclamation bound uses prevMeta.TxnID, not lastCheckpointTxnID — CONFIRMED [H] (regression test)
 
-**Lands:** proactive — but **resolve the dispute first** via the named
-regression test below; the test's verdict decides whether this is a High
-corruption bug or a Low code-clarity fix.
+**Lands:** proactive — **dispute RESOLVED (2026-05-31) by the decisive test:
+CONFIRMED [H] corruption.** The fix is to bound reclamation on the last
+checkpoint TxnID per the spec (see Resolution).
 
-**Severity:** [H] if the corruption is reachable / **[L]** if not —
-**DISPUTED.** See both arguments below.
+**Severity:** **[H]** — confirmed. The decisive regression test
+(`TestRPLSyncLazyReopenCorruptionMinimal`, package `gmdb`, currently
+`t.Skip`ped pending the fix) reproduces an UNOPENABLE database (Open fails:
+`rebuild RPL chain: RPL segment at page N malformed`) from standard public
+API under SyncLazy. The two arguments below are kept for the record; the
+**refutation was incomplete** (see Resolution).
 
 **Source:** 2026-05-30 deep audit (run `wf_4ad12a2f-039`). One finder
 chain **confirmed** this as a High bug (raw finding 4); a *separate*
@@ -67,18 +71,51 @@ stale `db.go:578` comment). Single exclusive writer makes
 `prevMeta.TxnID == latest on-disk meta TxnID`; readers only lower the
 bound. `TestRecoveryPrefersCheckpointMeta` is consistent.
 
-## Resolution
+## Resolution (settled 2026-05-31) — CONFIRMED [H]
 
-1. **Write the decisive test** (finding 4's proposed regression):
-   checkpoint at C, do post-checkpoint SyncLazy commits with churn that
-   triggers `reclaimRPL`, simulate crash, re-Open at C, verify the tree is
-   intact. Run with `MetaFlagCheckpoint` semantics exactly as production.
-   - Test **stays green** → the refutation holds; downgrade to **[L]**:
-     introduce a named `lastCheckpointTxnID` field (set on
-     SyncDurable/SyncDataOnly commits and `Checkpoint`, unchanged on
-     SyncLazy/SyncUnsafe) for clarity, and fix the stale `db.go:577-584`
-     comment.
-   - Test **goes red** → finding 4 holds; the field is a **correctness
-     fix**, not clarity, and `bound` must use it.
-2. Regardless of verdict, fix the stale `db.go:577-584` comment (both
-   chains agree it is wrong).
+The decisive regression test went **RED** → finding 4 holds → **[H]
+correctness bug**. `TestRPLSyncLazyReopenCorruptionMinimal` (package `gmdb`)
+uses only the public API — SyncLazy `Put`/`Delete` churn + periodic
+`Checkpoint` + `Close`/reopen, no compaction — and reproduces (18/20;
+reliable under `-race`/`-count`) an **unopenable** database:
+`Open` fails with `rebuild RPL chain: RPL segment at page N malformed`.
+
+**Root cause (confirmed empirically):** the bound `min(oldestReaderTxnID,
+prevMeta.TxnID)` reclaims RPL segments that a **still-recoverable meta's RPL
+chain** references. On reopen, recovery selects that meta and walks its
+`RPLHeadPage → … → RPLTailPage` chain into a reclaimed-and-reused segment
+page → `ErrCorrupted`. Setting `bound = 0` (reclaim nothing) eliminates it;
+`SyncDurable` (every commit a checkpoint, so `prevMeta.TxnID ==
+lastCheckpointTxnID`) does not reproduce.
+
+**Why the refutation was wrong:** it reasoned only about a recovered
+*checkpoint's data tree* (overwritten at C+2 before its pages are freed). The
+corruption is in the recovered meta's **RPL chain pointers**, not its data
+tree, and the recovered meta can be a non-checkpoint step-3 fallback — neither
+covered by the double-buffer argument.
+
+**Fix — DEEPER than the spec's bound; `free-space.md`'s bound is itself
+insufficient (proven 2026-05-31).** Implementing the spec's exact bound
+`min(oldestReaderTxnID, lastCheckpointTxnID)` — tracked correctly (verified by
+instrumentation: `bound` drops to the last checkpoint, e.g. `bound=8` while
+`prevMeta.TxnID=10`) — STILL corrupts **30/30**. Refined root cause: a
+recoverable checkpoint K's RPL chain references segments tagged **below** K
+(its older tail, retired by commits `< K`). A post-checkpoint SyncLazy commit
+reclaims with `bound = K`, freeing segments tagged `< K` — exactly K's tail —
+while K is still on-disk and recovery-preferred, so reopening to K walks its
+chain into a freed-and-reused segment page. So `lastCheckpointTxnID` does NOT
+prevent it: **the spec's bound is defective.**
+
+The correct invariant: reclamation must not free a segment **page** that any
+on-disk (recoverable) meta's RPL chain still references. Candidate designs (a
+decision to settle, surfaced to the user):
+  - (a) bound by the OLDEST segment TxnID any recoverable meta's chain
+    references (much lower than `lastCheckpointTxnID`);
+  - (b) defer freeing a segment page until the meta that chains it is
+    overwritten (track per-slot chain ownership);
+  - (c) make recovery tolerant — `rebuildRPLChain` stops at the first
+    un-decodable segment (the reclaimed-tail case) instead of erroring,
+    treating `RPLTailPage` as advisory.
+Amend `free-space.md §RPL Reclamation` to the chosen design. Verify by
+un-skipping `TestRPLSyncLazyReopenCorruptionMinimal` (green under
+`-race -count`). Also fix the stale `db.go` reclamation-bound comment.

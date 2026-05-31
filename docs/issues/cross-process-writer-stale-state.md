@@ -1,9 +1,9 @@
 # Cross-process writers corrupt the file: in-memory meta/bitmap/RPL never re-synced after a peer commits
 
-**Lands:** proactive — but **gated by a scope decision** (see Open
-question): confirm whether concurrent cross-process *writers* are in v0
-scope. The bug is real either way; the resolution (fix vs. documented
-limitation) depends on the answer.
+**Lands:** proactive — **scope decision resolved 2026-05-31: multi-process
+writing IS in v0 scope → implement the fix** (see Scope decision below). The
+bug is a confirmed [H]; the resolution is the re-sync fix, not a documented
+limitation.
 
 **Severity:** [H]
 
@@ -72,14 +72,18 @@ on-disk bitmap region and the RPL chain from `RPLHeadPage`/`RPLTailPage`.
 Cheap when unchanged: compare `TxnID` and skip. The `reopenAfterCompact`
 path already does this full reload — factor it.
 
-## Open question (surface to user)
+## Scope decision (resolved 2026-05-31)
 
-Finding 8's reviewer notes the alternative: **if concurrent cross-process
-writes are not intended for v0**, that must be surfaced and documented as
-an explicit limitation in `overview.md` / `cross-process.md` — but the
-current spec strongly implies it is in scope (the entire lock-file /
-reader-table / heartbeat subsystem exists to support it). This is a
-scope decision for the user, not an implementation default.
+**Decided: concurrent/serialized cross-process writing IS in v0 scope → fix
+the bug** (re-sync on write-grant acquisition, per the Fix section above).
+This matches the spec's evident intent — the entire lock-file / reader-table
+/ heartbeat / WriterPID-handoff / stale-writer-recovery subsystem exists to
+support a writing process that changes over the file's life (serialized via
+the flock, including failover after a holder dies). The `Fix` is therefore a
+real correctness fix, not a documentation-only limitation. A spec gap remains
+to close as part of it: `cross-process.md §Writer acquisition flow` covers the
+lock handoff but never states the re-sync-meta-on-grant step the multi-writer
+contract requires — amend it.
 
 ## Verification
 
