@@ -1289,7 +1289,19 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, leftID, rightID
 	if len(combined) < 3 {
 		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute branches with <3 combined cells", ErrCorrupted)
 	}
-	mid := len(combined) / 2
+	// Choose the boundary by BYTE size, not the cell-count midpoint
+	// (btree-byte-balanced-split, page-formats.md §Leaf Split). The merge
+	// above already failed, so `combined` exceeds one page; a count midpoint
+	// can overflow a half on size-skewed separators (spurious ErrCorrupted)
+	// or leave a half below MergeThreshold (range-delete.md §Invariants
+	// fill-floor). Balancing to ~50% both fits each half and keeps it above
+	// the floor. !ok ⇒ no feasible two-page split, which from two sibling
+	// branches that each already fit one page (separators ≤ the limits.md
+	// §Maximum Key Size bound) is unreachable ⇒ genuine corruption.
+	mid, ok := findBranchSplitIndex(cfg, combined)
+	if !ok {
+		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute branches have no feasible two-page split", ErrCorrupted)
+	}
 	newSep := combined[mid].Key
 	newRightLeftmost := combined[mid].Child
 	newLeftCells := combined[:mid]

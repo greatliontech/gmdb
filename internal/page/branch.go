@@ -230,6 +230,18 @@ func BranchEncodedSize(cfg Config, cells []BranchCell) int {
 	return size
 }
 
+// BranchCellCost returns the bytes a single cell with a key of keyLen
+// bytes adds to a branch page's encoded size: the key, its trailing child
+// pointer, and its cell-directory entry. It is the additive per-cell term
+// of BranchEncodedSize — branch cells carry no inter-cell prefix
+// compression, so a running sum of BranchCellCost over a cell set plus the
+// empty-branch base (BranchEncodedSize(cfg, nil)) equals that set's
+// BranchEncodedSize. The byte-balanced branch splitter and the bulk-load
+// branch builder both size prospective pages with it.
+func BranchCellCost(keyLen int) int {
+	return keyLen + branchChildPtrSize + branchDirEntrySize
+}
+
 // DecodeBranch returns all cells from a branch page in directory
 // order. Convenience for tests + tree-walk consumers; hot-path
 // search uses BranchCellAt + binary search to avoid materializing

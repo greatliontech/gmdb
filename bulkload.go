@@ -292,9 +292,11 @@ func (b *bulkBuilder) writeBranch(bl *bulkBranchLevel) (uint64, error) {
 }
 
 // branchCellCost is the increase in a branch page's encoded size from
-// adding one cell with the given separator key.
+// adding one cell with the given separator key — page.BranchCellCost, the
+// shared additive per-cell term also used by the byte-balanced branch
+// splitter.
 func (b *bulkBuilder) branchCellCost(sep []byte) int {
-	return page.BranchEncodedSize(b.cfg, []page.BranchCell{{Key: sep}}) - b.emptyBranchSize
+	return page.BranchCellCost(len(sep))
 }
 
 // bulkOverflowWriter is the pager surface the streaming overflow-chain

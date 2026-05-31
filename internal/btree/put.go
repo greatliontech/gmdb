@@ -711,20 +711,27 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 			return ascendNoSplit(pw, cfg, path[:i], newBranchID)
 		}
 
-		// Branch split required.
-		if len(newCells) < 2 {
-			// Single oversize cell — unreachable under the
-			// limits.md §Maximum Key Size bound (per-key cap
-			// ≤ ~PageSize/2 guarantees ≥2 cells fit any
-			// branch). Defense in depth against a future
-			// max-key-size relaxation.
+		// Branch split required. Choose the boundary by BYTE size, not the
+		// cell-count midpoint: a branch mixing a few long (low-prefix-
+		// sharing) separators with short ones has count midpoints that put
+		// more than one page of cells on a side — a spurious failure on a
+		// valid Put though a feasible byte-balanced boundary exists
+		// (btree-byte-balanced-split, page-formats.md §Leaf Split). The
+		// chosen halves are guaranteed to fit, so the EncodeBranch calls
+		// below cannot fail on size.
+		mid, ok := findBranchSplitIndex(cfg, newCells)
+		if !ok {
+			// No feasible two-page partition: a single separator exceeds
+			// page capacity. Unreachable under limits.md §Maximum Key Size
+			// (per-key cap ≤ ~PageSize/2 guarantees ≥2 cells fit any branch,
+			// so a byte-balanced boundary always exists here); defense in
+			// depth against a future max-key-size relaxation.
 			_ = pw.FreePage(newBranchID)
 			return 0, ErrKeyTooLarge
 		}
-		mid := len(newCells) / 2
-		// In a branch split, the MIDDLE cell's Key becomes the
+		// In a branch split, the lifted cell's Key becomes the
 		// separator propagated to the next level up; the
-		// middle cell's Child becomes the leftmost child of the
+		// lifted cell's Child becomes the leftmost child of the
 		// new right branch. The left branch keeps cells [0:mid]
 		// and its leftmost is unchanged. The right branch gets
 		// cells [mid+1:] with leftmost = newCells[mid].Child.

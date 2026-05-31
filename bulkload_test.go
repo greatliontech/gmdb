@@ -175,6 +175,48 @@ func TestBulkBuilderRootTypeProgression(t *testing.T) {
 	}
 }
 
+// genSkewedSeparatorKVs produces sorted entries that drive the bulk branch
+// builder with LARGE, variable-size separators: keys within a cluster share
+// a long prefix (deep common prefix → long ShortestSeparator at leaf
+// boundaries), cluster transitions diverge at byte 0 (tiny separators), and
+// large values keep each leaf small so a cluster spans many leaves.
+func genSkewedSeparatorKVs(clusters, per, prefixLen, valueLen int) []kv {
+	var kvs []kv
+	for c := range clusters {
+		prefix := append([]byte{byte('A' + c)}, bytes.Repeat([]byte("p"), prefixLen)...)
+		for j := range per {
+			k := append(append([]byte(nil), prefix...), fmt.Appendf(nil, "%06d", j)...)
+			v := bytes.Repeat([]byte{byte('a' + j%26)}, valueLen)
+			kvs = append(kvs, kv{k, v})
+		}
+	}
+	return kvs
+}
+
+// TestBulkBuilderLargeSeparatorsByteDriven covers the bulk branch builder
+// under size-skewed separators (btree-byte-balanced-split, step 3). The
+// bottom-up builder is fill-driven by construction — addLink appends a cell
+// only while bl.size+branchCellCost <= ContentEnd (bulkload.go) — so unlike
+// the top-down Put/Delete split it never chose a count midpoint and cannot
+// overflow a branch page. This pins that property end-to-end: ~1400-byte
+// separators build a multi-branch-level tree that round-trips intact.
+func TestBulkBuilderLargeSeparatorsByteDriven(t *testing.T) {
+	tx, cleanup := bulkTestTx(t)
+	defer cleanup()
+	cfg := tx.pgr.Config()
+
+	kvs := genSkewedSeparatorKVs(6, 20, 1400, 1300)
+	root, count := buildBulkTree(t, tx.pgr, cfg, kvs)
+	if count != uint64(len(kvs)) {
+		t.Errorf("count = %d, want %d", count, len(kvs))
+	}
+	// Large keys + values force many leaves and at least one branch level.
+	if typ, _, _, _ := page.ReadHeader(tx.pgr.PageRaw(root)); typ != page.TypeBranch {
+		t.Fatalf("root type = %d, want TypeBranch (no branch level built)", typ)
+	}
+	verifyBulkTree(t, tx.pgr, cfg, root, kvs)
+}
+
 // TestBulkBuilderOutOfOrder verifies a non-ascending key is rejected with
 // ErrBulkLoadOutOfOrder (not a LeafBuilder panic).
 func TestBulkBuilderOutOfOrder(t *testing.T) {
