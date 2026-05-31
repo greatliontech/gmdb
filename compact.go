@@ -54,6 +54,9 @@ const compactDrainPoll = 2 * time.Millisecond
 // poisoned (subsequent ops return ErrPoisoned); Close and re-Open recovers
 // against the renamed file.
 func (db *DB) Compact() error {
+	if db.readOnly {
+		return ErrDatabaseReadOnly
+	}
 	if db.closeGate.IsClosed() {
 		return ErrClosed
 	}

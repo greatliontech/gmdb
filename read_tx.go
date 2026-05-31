@@ -163,7 +163,12 @@ func readTxCleanupFn(info readTxCleanupInfo) {
 		return
 	}
 	defer info.gate.ExitCleanup()
-	info.coord.ReleaseReader(info.slot)
+	// coord == nil on the read-only lock-free path (slot == NoSlot);
+	// nothing to release. ReleaseReader(NoSlot) is itself a no-op, but
+	// the nil-guard avoids the deref.
+	if info.coord != nil {
+		info.coord.ReleaseReader(info.slot)
+	}
 	// Test-only synchronization point. Fires AFTER ReleaseReader so a
 	// waiting test observes the slot already cleared (TxnID=0 stored)
 	// when the signal arrives — the prior wall-clock-poll shape in
@@ -257,7 +262,12 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 	file := db.file
 	cachedMeta := db.currentMeta
 	db.mu.Unlock()
-	if coord == nil || file == nil {
+	// file == nil means Close raced us. coord == nil means EITHER Close
+	// raced (then file is also nil and the line above catches it) OR
+	// this is a read-only handle that fell back to lock-free reads on
+	// read-only media (db.readOnly, no lock file). The latter proceeds
+	// without a reader slot.
+	if file == nil || (coord == nil && !db.readOnly) {
 		return nil, ErrClosed
 	}
 
@@ -274,21 +284,29 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		return nil, mapPagerErr(err)
 	}
 
-	// Snapshot TxnID for the slot CAS. The per-slot "TxnID == 0 means
-	// free" sentinel collides with a legitimate genesis snapshot of 0
-	// — clamp to 1 so the genesis snapshot is still pinnable.
-	// Reclamation safety is unaffected: the reclamation bound rule
-	// (min(oldestReader, lastCheckpointTxnID)) uses 1 here, and only
-	// RPL entries with TxnID < 1 (i.e. zero, which never appears in
-	// the RPL) become reclaimable — that's correct for a genesis
-	// snapshot which references no retired pages.
-	snapTxnID := meta.TxnID
-	if snapTxnID == 0 {
-		snapTxnID = 1
-	}
-	slot, err := coord.AcquireReader(ctx, snapTxnID)
-	if err != nil {
-		return nil, mapReaderAcquireErr(err)
+	// Acquire a reader slot to pin this snapshot against a concurrent
+	// (cross-process) writer's RPL reclamation. A read-only handle on
+	// read-only media has no lock file (coord == nil) and skips this —
+	// slot stays NoSlot and the read runs lock-free (the torn-read
+	// trade-off is documented on Options.ReadOnly).
+	slot := lock.NoSlot
+	if coord != nil {
+		// Snapshot TxnID for the slot CAS. The per-slot "TxnID == 0 means
+		// free" sentinel collides with a legitimate genesis snapshot of 0
+		// — clamp to 1 so the genesis snapshot is still pinnable.
+		// Reclamation safety is unaffected: the reclamation bound rule
+		// (min(oldestReader, lastCheckpointTxnID)) uses 1 here, and only
+		// RPL entries with TxnID < 1 (i.e. zero, which never appears in
+		// the RPL) become reclaimable — that's correct for a genesis
+		// snapshot which references no retired pages.
+		snapTxnID := meta.TxnID
+		if snapTxnID == 0 {
+			snapTxnID = 1
+		}
+		slot, err = coord.AcquireReader(ctx, snapTxnID)
+		if err != nil {
+			return nil, mapReaderAcquireErr(err)
+		}
 	}
 
 	// Bring up a fresh read-only pager. Per the doc on ReadTx.pgr, a
@@ -304,8 +322,11 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 	pgr, err := pager.NewReader(file, cfg, reservation)
 	if err != nil {
 		// Slot acquisition succeeded; release before surfacing the
-		// pager error so we don't pin reclamation for nothing.
-		coord.ReleaseReader(slot)
+		// pager error so we don't pin reclamation for nothing. No-op
+		// when coord == nil (read-only lock-free path; slot == NoSlot).
+		if coord != nil {
+			coord.ReleaseReader(slot)
+		}
 		return nil, mapPagerErr(err)
 	}
 

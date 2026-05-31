@@ -15,6 +15,14 @@ import (
 // request and the goroutine exited before granting.
 var ErrClosed = errors.New("lock: coord closed")
 
+// ErrReadOnlyCoord is returned by AcquireWriter on a Coord constructed
+// with CoordOptions.ReadOnly — a read-only handle never takes LOCK_EX,
+// so the flock-grant goroutine is not started and there is nothing to
+// grant. Defensive: the gmdb layer rejects writes (ErrDatabaseReadOnly)
+// before ever reaching AcquireWriter, so this is a backstop, not a
+// reachable production path.
+var ErrReadOnlyCoord = errors.New("lock: AcquireWriter on a read-only coord")
+
 // DefaultRetryInterval bounds Close() and per-writer ctx-cancellation
 // latency under sustained cross-process contention. The goroutine
 // burns one wasted flock(LOCK_EX|LOCK_NB) syscall per tick while
@@ -86,6 +94,14 @@ type Coord struct {
 	staleTimeout      time.Duration
 	clock             func() uint64
 	heartbeatDoneCh   chan struct{}
+
+	// readOnly marks a Coord that backs a read-only DB handle
+	// (CoordOptions.ReadOnly). The flock-grant goroutine (run) is not
+	// started — only the heartbeat goroutine runs, refreshing the
+	// reader slots this handle acquires so a concurrent cross-process
+	// writer cannot stale-evict them. AcquireWriter returns
+	// ErrReadOnlyCoord; Close waits only on the heartbeat goroutine.
+	readOnly bool
 
 	// readerSlotHint is the process-local scan-start offset for
 	// AcquireReader (cross-process.md §Reader Table: "Start scanning
@@ -191,6 +207,14 @@ type CoordOptions struct {
 	// CLOCK_MONOTONIC elsewhere). Tests inject deterministic clocks
 	// here to assert heartbeat values without flakiness.
 	Clock func() uint64
+
+	// ReadOnly marks a Coord backing a read-only DB handle. The
+	// flock-grant goroutine is not started (the handle never takes
+	// LOCK_EX); AcquireWriter returns ErrReadOnlyCoord. The heartbeat
+	// goroutine and the reader-slot path (AcquireReader / ReleaseReader)
+	// run unchanged so read transactions still pin their snapshots
+	// against a concurrent cross-process writer's reclamation.
+	ReadOnly bool
 }
 
 // NewCoord constructs a Coord and starts its flock goroutine. The
@@ -226,8 +250,17 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 		staleTimeout:      staleTimeout,
 		clock:             clock,
 		heartbeatDoneCh:   make(chan struct{}),
+		readOnly:          opts.ReadOnly,
 	}
-	go c.run()
+	// A read-only coord never takes LOCK_EX, so the flock-grant
+	// goroutine is not started. Close must not wait on doneCh in that
+	// case — nothing closes it. The heartbeat goroutine still runs to
+	// keep this handle's reader slots live.
+	if !c.readOnly {
+		go c.run()
+	} else {
+		close(c.doneCh)
+	}
 	go c.heartbeat()
 	return c
 }
@@ -268,6 +301,13 @@ func (c *Coord) Close() error {
 // against this caller — Close ordering guarantees that a request
 // observed as denied via stopCh was never granted.
 func (c *Coord) AcquireWriter(ctx context.Context) (*Grant, error) {
+	if c.readOnly {
+		// Defensive backstop: the flock-grant goroutine was never
+		// started, so there is no receiver on writerCh — a send would
+		// block forever. The gmdb layer rejects writes with
+		// ErrDatabaseReadOnly long before here.
+		return nil, ErrReadOnlyCoord
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, context.Cause(ctx)
 	}

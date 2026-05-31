@@ -54,6 +54,9 @@ import (
 //   - ErrPoisoned if the handle is poisoned.
 //   - Any pwrite/fdatasync error wrapped under "gmdb: checkpoint".
 func (db *DB) Checkpoint(ctx context.Context) error {
+	if db.readOnly {
+		return ErrDatabaseReadOnly
+	}
 	if db.closeGate.IsClosed() {
 		return ErrClosed
 	}

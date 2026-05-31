@@ -167,57 +167,9 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 	if op.MaxTxBufferBytes <= 0 {
 		return nil, fmt.Errorf("pager: MaxTxBufferBytes must be > 0")
 	}
-	// 1) Discover PageSize. Prefer meta-0's PageSize when meta-0
-	//    verifies; otherwise probe meta-1 candidate offsets. A passing
-	//    checksum is the only thing that authorizes trust in any meta
-	//    field — `ValidPageSize` alone is not enough because a flip
-	//    that breaks the checksum can still produce a syntactically
-	//    valid (but wrong) PageSize value.
-	meta0Bytes := make([]byte, page.MetaPayloadSize)
-	if _, err := file.ReadAt(meta0Bytes, 0); err != nil {
-		return nil, fmt.Errorf("pager: read meta0: %w", err)
-	}
-	// An intact gmdb meta-0 of a different format version is reported
-	// distinctly from corruption (file-layout.md §Meta Page): the file
-	// is fine, this binary just can't read its format. Checked before
-	// the recovery machinery so a different-version file never
-	// masquerades as a torn/corrupt current-version file.
-	if isVersionMismatchMeta(meta0Bytes) {
-		return nil, fmt.Errorf("pager: %w: meta0 version %d, want %d",
-			ErrVersionMismatch, page.DecodeMeta(meta0Bytes).Version, page.FormatVersion)
-	}
-	var pageSize uint32
-	var meta1Bytes []byte
-	if isGmdbMeta(meta0Bytes) {
-		pageSize = page.DecodeMeta(meta0Bytes).PageSize
-		if !page.ValidPageSize(pageSize) {
-			// Checksum agrees with a value that the format rejects:
-			// the file was written by a different format version or
-			// the checksum collided. Either way, ErrCorrupted.
-			return nil, fmt.Errorf("pager: meta0 verified but PageSize %d invalid: %w", pageSize, ErrCorrupted)
-		}
-	} else {
-		var perr error
-		pageSize, meta1Bytes, perr = probeMetaPageSize(file)
-		if perr != nil {
-			return nil, fmt.Errorf("pager: meta1 probe read: %w", perr)
-		}
-		if pageSize == 0 {
-			return nil, fmt.Errorf("pager: meta0 verify failed and meta1 probe found no recoverable meta: %w", ErrCorrupted)
-		}
-	}
-	if meta1Bytes == nil {
-		meta1Bytes = make([]byte, page.MetaPayloadSize)
-		if _, err := file.ReadAt(meta1Bytes, int64(pageSize)); err != nil {
-			return nil, fmt.Errorf("pager: read meta1: %w", err)
-		}
-	}
-
-	// 2) Active-meta selection + validation (checkpoint-preferring,
-	// durability.md §Recovery step 3; noCheckpoint = the step-3 fallback
-	// where no checkpoint-flagged meta exists — caller logs a warning).
-	// Shared with Resync.
-	m, active, noCheckpoint, err := selectActiveMeta(meta0Bytes, meta1Bytes)
+	// 1–2) Discover PageSize, select + validate the active meta. Shared
+	// with OpenReadOnly (which then builds a reader pager instead).
+	m, active, noCheckpoint, pageSize, err := readAndSelectMeta(file)
 	if err != nil {
 		return nil, err
 	}
@@ -245,6 +197,94 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		ActiveMetaIdx: active,
 		NoCheckpoint:  noCheckpoint,
 	}, nil
+}
+
+// OpenReadOnly opens a read-only pager over file for a read-only DB
+// handle (Options.ReadOnly). It performs the SAME meta discovery,
+// active-meta selection, and validation as Open (readAndSelectMeta),
+// but builds a NewReader pager — no writer slab, no in-memory
+// bitmap/RPL, no attachState — because a read-only handle never
+// allocates, frees, or commits. op.Pool / op.MaxTxBufferBytes are not
+// consulted (no writer slab is built).
+//
+// The returned pager owns the data mmap (PROT_READ) for the handle's
+// lifetime and backs handle-level raw reads (e.g. Check); each read
+// transaction still brings up its own per-snapshot reader pager (the
+// root package's BeginRead). file may be opened O_RDONLY — nothing in
+// this path writes it.
+func OpenReadOnly(file *os.File, op OpenParams) (*OpenedDB, error) {
+	m, active, noCheckpoint, pageSize, err := readAndSelectMeta(file)
+	if err != nil {
+		return nil, err
+	}
+	cfg := page.Config{PageSize: pageSize, PageChecksum: m.HasFlag(page.MetaFlagPageChecksum)}
+	reservation := int64(m.MaxSize) * int64(pageSize)
+	p, err := NewReader(file, cfg, reservation)
+	if err != nil {
+		return nil, err
+	}
+	return &OpenedDB{
+		Pager:         p,
+		Meta:          m,
+		ActiveMetaIdx: active,
+		NoCheckpoint:  noCheckpoint,
+	}, nil
+}
+
+// readAndSelectMeta reads the two meta-page images, discovers the
+// PageSize (trusting meta-0's only when its checksum verifies,
+// otherwise probing meta-1 candidate offsets — a passing checksum is
+// the only thing that authorizes trust in any meta field, since
+// ValidPageSize alone can't catch a checksum-breaking flip that still
+// yields a syntactically valid value), and selects + validates the
+// active meta (checkpoint-preferring, durability.md §Recovery step 3;
+// noCheckpoint = the step-3 fallback where no checkpoint-flagged meta
+// exists — the caller logs a warning). Shared by Open (then NewWriter +
+// attachState) and OpenReadOnly (then NewReader).
+func readAndSelectMeta(file *os.File) (m page.Meta, active int, noCheckpoint bool, pageSize uint32, err error) {
+	meta0Bytes := make([]byte, page.MetaPayloadSize)
+	if _, err := file.ReadAt(meta0Bytes, 0); err != nil {
+		return page.Meta{}, 0, false, 0, fmt.Errorf("pager: read meta0: %w", err)
+	}
+	// An intact gmdb meta-0 of a different format version is reported
+	// distinctly from corruption (file-layout.md §Meta Page): the file
+	// is fine, this binary just can't read its format. Checked before
+	// the recovery machinery so a different-version file never
+	// masquerades as a torn/corrupt current-version file.
+	if isVersionMismatchMeta(meta0Bytes) {
+		return page.Meta{}, 0, false, 0, fmt.Errorf("pager: %w: meta0 version %d, want %d",
+			ErrVersionMismatch, page.DecodeMeta(meta0Bytes).Version, page.FormatVersion)
+	}
+	var meta1Bytes []byte
+	if isGmdbMeta(meta0Bytes) {
+		pageSize = page.DecodeMeta(meta0Bytes).PageSize
+		if !page.ValidPageSize(pageSize) {
+			// Checksum agrees with a value that the format rejects:
+			// the file was written by a different format version or
+			// the checksum collided. Either way, ErrCorrupted.
+			return page.Meta{}, 0, false, 0, fmt.Errorf("pager: meta0 verified but PageSize %d invalid: %w", pageSize, ErrCorrupted)
+		}
+	} else {
+		var perr error
+		pageSize, meta1Bytes, perr = probeMetaPageSize(file)
+		if perr != nil {
+			return page.Meta{}, 0, false, 0, fmt.Errorf("pager: meta1 probe read: %w", perr)
+		}
+		if pageSize == 0 {
+			return page.Meta{}, 0, false, 0, fmt.Errorf("pager: meta0 verify failed and meta1 probe found no recoverable meta: %w", ErrCorrupted)
+		}
+	}
+	if meta1Bytes == nil {
+		meta1Bytes = make([]byte, page.MetaPayloadSize)
+		if _, err := file.ReadAt(meta1Bytes, int64(pageSize)); err != nil {
+			return page.Meta{}, 0, false, 0, fmt.Errorf("pager: read meta1: %w", err)
+		}
+	}
+	m, active, noCheckpoint, err = selectActiveMeta(meta0Bytes, meta1Bytes)
+	if err != nil {
+		return page.Meta{}, 0, false, 0, err
+	}
+	return m, active, noCheckpoint, pageSize, nil
 }
 
 // selectActiveMeta decodes the two meta-page byte images, selects the active

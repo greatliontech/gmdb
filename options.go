@@ -119,6 +119,24 @@ type Options struct {
 	// this returns ErrTxTooLarge. Default 256 MiB.
 	MaxTxBufferBytes int
 
+	// ReadOnly opens the database read-only: the writer pager path is
+	// not initialised, no background maintenance runs, and the write
+	// entry points (Begin / Update / Batch / Compact / Checkpoint)
+	// return ErrDatabaseReadOnly. Reads (BeginRead / View) work
+	// normally; the data mmap is always PROT_READ regardless.
+	//
+	// A read-only handle still pins reader slots so a concurrent
+	// cross-process writer cannot reclaim pages under an in-flight
+	// read: when the lock file can be opened read-write, Open starts
+	// the heartbeat goroutine and read transactions acquire slots as
+	// usual — only the writer flock-grant goroutine is skipped. On
+	// truly read-only media (lock file not openable read-write), Open
+	// falls back to lock-free snapshot reads and logs a warning
+	// (mmap-strategy.md §Read-Only). When ReadOnly is set and the file
+	// does not exist, Open returns os.ErrNotExist — it never creates a
+	// database read-only. Default: false.
+	ReadOnly bool
+
 	// MaxReaders is the reader-table capacity in the lock file
 	// (cross-process.md §Lock File Layout). Set at lock-file creation
 	// and immutable afterwards (re-openers honour the on-disk header).

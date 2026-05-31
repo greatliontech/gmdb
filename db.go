@@ -46,6 +46,15 @@ type DB struct {
 	lockFile *lock.File
 	coord    *lock.Coord
 
+	// readOnly is set when the DB was opened with Options.ReadOnly. The
+	// writer pager path is never built; the write entry points (Begin /
+	// Update / Batch / Compact / Checkpoint) reject with
+	// ErrDatabaseReadOnly. When the lock file could not be opened
+	// read-write (read-only media), coord and lockFile are nil and the
+	// read path runs lock-free (no reader-slot pinning). Immutable after
+	// Open.
+	readOnly bool
+
 	// Pager state for the currently-active reader baseline. mu guards
 	// against concurrent Begin from multiple goroutines.
 	mu            sync.Mutex
@@ -138,23 +147,38 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gmdb: open dir %q: %w", dir, err)
 	}
-	// Per api-surface.md §Database Initialization: try O_CREATE|O_EXCL
-	// first and on EEXIST fall back to the normal-open path. This is
-	// the correct ordering against a concurrent Open race — the
-	// loser observes EEXIST and proceeds as a regular open of the
-	// just-created file.
-	file, err := root.OpenFile(base, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-	created := true
-	if err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			_ = root.Close()
-			return nil, fmt.Errorf("gmdb: create %q: %w", path, err)
-		}
-		created = false
-		file, err = root.OpenFile(base, os.O_RDWR, 0o600)
+	var file *os.File
+	created := false
+	if opts.ReadOnly {
+		// Read-only never creates: open O_RDONLY so the path works on
+		// read-only media / read-only filesystem permissions. A missing
+		// file surfaces as os.ErrNotExist (wrapped, so errors.Is still
+		// matches) per api-surface.md §Options.ReadOnly — opening
+		// read-only-then-creating would be a contradiction.
+		file, err = root.OpenFile(base, os.O_RDONLY, 0)
 		if err != nil {
 			_ = root.Close()
-			return nil, fmt.Errorf("gmdb: open %q: %w", path, err)
+			return nil, fmt.Errorf("gmdb: open %q read-only: %w", path, err)
+		}
+	} else {
+		// Per api-surface.md §Database Initialization: try O_CREATE|O_EXCL
+		// first and on EEXIST fall back to the normal-open path. This is
+		// the correct ordering against a concurrent Open race — the
+		// loser observes EEXIST and proceeds as a regular open of the
+		// just-created file.
+		file, err = root.OpenFile(base, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		created = true
+		if err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				_ = root.Close()
+				return nil, fmt.Errorf("gmdb: create %q: %w", path, err)
+			}
+			created = false
+			file, err = root.OpenFile(base, os.O_RDWR, 0o600)
+			if err != nil {
+				_ = root.Close()
+				return nil, fmt.Errorf("gmdb: open %q: %w", path, err)
+			}
 		}
 	}
 
@@ -193,10 +217,20 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	pool := pager.NewBufPool(int(persistedPageSize))
-	opened, err := pager.Open(file, pager.OpenParams{
+	pop := pager.OpenParams{
 		Pool:             pool,
 		MaxTxBufferBytes: opts.MaxTxBufferBytes,
-	})
+	}
+	var opened *pager.OpenedDB
+	if opts.ReadOnly {
+		// Read-only handle: build a reader pager (no writer slab / no
+		// in-memory bitmap / no RPL chain) — it owns the data mmap and
+		// backs handle-level raw reads (Check). Each read tx still spins
+		// up its own per-snapshot reader pager (BeginRead).
+		opened, err = pager.OpenReadOnly(file, pop)
+	} else {
+		opened, err = pager.Open(file, pop)
+	}
 	if err != nil {
 		_ = file.Close()
 		_ = root.Close()
@@ -211,51 +245,75 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 	// Options.Logger (or discard) once it has been resolved.
 	openWarnNoCheckpoint := opened.NoCheckpoint
 
-	// Open the lock file under the same os.Root — symlink-escape
-	// protection is shared with the data file. The DataUUID is the
-	// just-opened pager's meta UUID; a stale lock file with a
-	// different UUID is unlinked-and-recreated by lock.Open.
-	lockFile, err := lock.Open(lock.OpenParams{
-		Root:       root,
-		Base:       lock.BaseFor(base),
-		DataUUID:   opened.Meta.UUID,
-		MaxReaders: opts.MaxReaders,
-	})
-	if err != nil {
-		_ = opened.Pager.Close()
-		_ = file.Close()
-		_ = root.Close()
-		return nil, mapLockErr(err)
+	// Capture Options.Logger with the chunk-5.5 spec-amend default
+	// (nil → discard handler) so per-DB logging routes to the
+	// caller's chosen sink — never to slog.Default(). Built before the
+	// lock section so the read-only fallback can warn through it.
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
 	// Cache this process's identity once. Failures (no /proc,
 	// hardened sandbox, non-Linux ProcessStartTime stub) surface as
 	// 0 — the protocol routes through the heartbeat path when either
-	// value is unavailable. logging is not yet wired (Options.Logger
-	// arrives with the chunk that needs it).
+	// value is unavailable.
 	processStartTime, _ := lock.ProcessStartTime(os.Getpid())
 	pidNamespace, _ := lock.PIDNamespace()
 
-	coord := lock.NewCoord(lockFile, lock.CoordOptions{
-		PID:              uint64(os.Getpid()),
-		ProcessStartTime: processStartTime,
-		PIDNamespace:     pidNamespace,
-		// The three cross-process coordination intervals come straight
-		// from Options (already resolved to their lock-package defaults
-		// by applyDefaults, and validated — StaleTimeout > Heartbeat-
-		// Interval). See cross-process.md §Heartbeat Goroutine / §Write
-		// Lock and the Options godoc.
-		RetryInterval:     opts.LockRetryInterval,
-		HeartbeatInterval: opts.HeartbeatInterval,
-		StaleTimeout:      opts.StaleTimeout,
+	// Open the lock file under the same os.Root — symlink-escape
+	// protection is shared with the data file. The DataUUID is the
+	// just-opened pager's meta UUID; a stale lock file with a
+	// different UUID is unlinked-and-recreated by lock.Open.
+	var lockFile *lock.File
+	var coord *lock.Coord
+	lockFile, err = lock.Open(lock.OpenParams{
+		Root:       root,
+		Base:       lock.BaseFor(base),
+		DataUUID:   opened.Meta.UUID,
+		MaxReaders: opts.MaxReaders,
 	})
-
-	// Capture Options.Logger with the chunk-5.5 spec-amend default
-	// (nil → discard handler) so per-DB logging routes to the
-	// caller's chosen sink — never to slog.Default().
-	logger := opts.Logger
-	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	switch {
+	case err == nil:
+		coord = lock.NewCoord(lockFile, lock.CoordOptions{
+			PID:              uint64(os.Getpid()),
+			ProcessStartTime: processStartTime,
+			PIDNamespace:     pidNamespace,
+			// The three cross-process coordination intervals come straight
+			// from Options (already resolved to their lock-package defaults
+			// by applyDefaults, and validated — StaleTimeout > Heartbeat-
+			// Interval). See cross-process.md §Heartbeat Goroutine / §Write
+			// Lock and the Options godoc.
+			RetryInterval:     opts.LockRetryInterval,
+			HeartbeatInterval: opts.HeartbeatInterval,
+			StaleTimeout:      opts.StaleTimeout,
+			// A read-only handle never takes LOCK_EX: the flock-grant
+			// goroutine is skipped, but the heartbeat goroutine and the
+			// reader-slot path still run so read transactions pin their
+			// snapshots against a concurrent cross-process writer.
+			ReadOnly: opts.ReadOnly,
+		})
+	case opts.ReadOnly:
+		// Read-only fallback (mmap-strategy.md §Read-Only): the lock
+		// file can't be opened read-write — read-only media or
+		// read-only filesystem permissions. Proceed lock-free; reads
+		// come from the data mmap and don't need the lock file. The
+		// trade-off (a concurrent writer on shared storage could
+		// reclaim under an in-flight reader) is documented on
+		// Options.ReadOnly; a read-only medium normally precludes any
+		// writer. lockFile/coord stay nil; BeginRead skips slot
+		// acquisition and the teardown paths nil-guard both.
+		logger.Warn(
+			"gmdb: read-only open could not acquire the lock file; "+
+				"proceeding lock-free (no cross-process reader-slot protection)",
+			"path", path,
+			"detail", mapLockErr(err).Error(),
+		)
+	default:
+		_ = opened.Pager.Close()
+		_ = file.Close()
+		_ = root.Close()
+		return nil, mapLockErr(err)
 	}
 
 	db := &DB{
@@ -276,6 +334,7 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		lastCheckpointTxnID: opened.Meta.TxnID,
 		pgr:                 opened.Pager,
 		closeGate:           newCloseGate(),
+		readOnly:            opts.ReadOnly,
 	}
 
 	if openWarnNoCheckpoint {
@@ -309,7 +368,7 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 	// (opened.NoCheckpoint — an unclean prior shutdown) schedules the first
 	// pass immediately rather than waiting a full interval, to reclaim any
 	// crash-leaked pages promptly.
-	if !opts.Maintenance.Disable {
+	if !opts.Maintenance.Disable && !opts.ReadOnly {
 		db.maint.ctx, db.maint.cancel = context.WithCancel(context.Background())
 		db.maint.done = make(chan struct{})
 		db.maint.started = true
@@ -515,6 +574,14 @@ func (db *DB) Close() error {
 // the type system rejects write methods on a read snapshot at compile
 // time (api-surface.md §Database and Transaction API).
 func (db *DB) Begin(ctx context.Context) (*Tx, error) {
+	// A read-only handle has no writer pager and never takes the
+	// cross-process write lock — reject before any close/poison/lock
+	// work (api-surface.md §Options.ReadOnly). This also covers Update,
+	// which begins through here. Checked first: read-only is a
+	// permanent property of the handle, so the cause is unambiguous.
+	if db.readOnly {
+		return nil, ErrDatabaseReadOnly
+	}
 	// Fast-path close check. db.closeGate.IsClosed() is the
 	// spec-tier *closeGate gate (leak-detection.md §Close Ordering
 	// + chunk-3.3 refcount-drain promotion); a release-store at the

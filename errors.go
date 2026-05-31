@@ -12,8 +12,18 @@ var (
 	// ErrTxClosed is returned by Tx methods after Commit / Rollback.
 	ErrTxClosed = errors.New("gmdb: transaction is closed")
 
-	// ErrReadOnly is returned by mutating methods on a read transaction.
+	// ErrReadOnly is returned by mutating methods on a read transaction
+	// (BeginRead / View) or a read-only keyspace handle (OpenKeyspace-
+	// ReadOnly). Distinct from ErrDatabaseReadOnly, which signals the
+	// whole DB was opened read-only.
 	ErrReadOnly = errors.New("gmdb: read-only transaction")
+
+	// ErrDatabaseReadOnly is returned by the write entry points (Begin /
+	// Update / Batch / Compact / Checkpoint) when the database was
+	// opened with Options.ReadOnly. The writer pager path is never
+	// initialised, so writes are rejected at the door rather than
+	// failing partway. Reads (BeginRead / View) work normally.
+	ErrDatabaseReadOnly = errors.New("gmdb: database opened read-only")
 
 	// ErrBatchClosurePanic wraps a panic raised inside a DB.Batch
 	// closure. The coordinator recovers the panic, rolls back that

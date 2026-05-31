@@ -152,7 +152,8 @@ var (
     ErrCorrupted               = errors.New("gmdb: database corrupted")
     ErrBadPageChecksum         = errors.New("gmdb: page checksum mismatch")
     ErrVersionMismatch         = errors.New("gmdb: on-disk format version mismatch")
-    ErrReadOnly                = errors.New("gmdb: write operation on read-only transaction")
+    ErrReadOnly                = errors.New("gmdb: read-only transaction")
+    ErrDatabaseReadOnly        = errors.New("gmdb: database opened read-only")
     ErrTxClosed                = errors.New("gmdb: transaction already committed or rolled back")
     ErrPoisoned                = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
     ErrClosed                  = errors.New("gmdb: database is closed")
@@ -573,10 +574,24 @@ type Options struct {
     // Default: false.
     ReclaimOnClose bool
 
-    // ReadOnly opens the database in read-only mode: lock file not
-    // opened for write, flock goroutine not started, write
-    // transactions return ErrReadOnly. The data mmap is always
+    // ReadOnly opens the database in read-only mode: the writer pager
+    // path is not initialised, no background maintenance runs, and the
+    // write entry points (Begin / Update / Batch / Compact /
+    // Checkpoint) return ErrDatabaseReadOnly. The data mmap is always
     // PROT_READ regardless.
+    //
+    // Cross-process safety. A read-only handle still participates in
+    // the reader-table protocol so a concurrent cross-process WRITER
+    // cannot reclaim pages out from under it: when the lock file can
+    // be opened read-write, Open starts the heartbeat goroutine and
+    // every read transaction acquires a reader slot exactly as a
+    // read-write handle does — only the writer flock-grant goroutine
+    // is skipped (this handle never takes LOCK_EX). On truly read-only
+    // media (the lock file cannot be opened read-write), Open falls
+    // back to lock-free snapshot reads and logs a warning; in that
+    // fallback a concurrent writer on shared storage could reclaim
+    // pages under an in-flight reader (torn reads) — but a read-only
+    // medium normally precludes any writer, so the common case is safe.
     //
     // When ReadOnly is true and the data file does not exist, Open()
     // returns the underlying os.ErrNotExist (it never creates a

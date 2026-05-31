@@ -84,10 +84,24 @@ page cache serves the data.
 
 `Options.ReadOnly` controls whether the writer path is initialised
 at all (the data mmap mode does not change — it is always
-read-only). When `ReadOnly = true`, the lock file is not opened
-for write, the flock goroutine is not started, and write
-transactions return `ErrReadOnly`. Suitable for read-only media or
-read-only filesystem permissions.
+read-only). When `ReadOnly = true`, the writer pager is not built,
+no background maintenance runs, and the write entry points
+(`Begin` / `Update` / `Batch` / `Compact` / `Checkpoint`) return
+`ErrDatabaseReadOnly`. The `writer flock-grant goroutine` is not
+started — a read-only handle never takes `LOCK_EX`.
+
+A read-only handle still participates in the reader-table protocol
+so a concurrent cross-process *writer* cannot reclaim pages out
+from under an in-flight read: when the lock file can be opened
+read-write, `Open` starts the heartbeat goroutine and each read
+transaction acquires a reader slot exactly as a read-write handle
+does (cross-process.md §Reader Table). Only on truly read-only
+media — where the lock file cannot be opened read-write — does
+`Open` fall back to lock-free snapshot reads (logging a warning);
+in that fallback a writer on shared storage could reclaim pages
+under a reader (torn reads), but a read-only medium normally
+precludes any writer. Suitable for read-only media or read-only
+filesystem permissions.
 
 ## Page Memory Management
 

@@ -54,6 +54,9 @@ type batchCoordinator struct {
 //   - context.Cause(ctx) if ctx fires before the call is queued.
 //   - ErrClosed if the DB is closing / closed.
 func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error {
+	if db.readOnly {
+		return ErrDatabaseReadOnly
+	}
 	if err := ctx.Err(); err != nil {
 		return context.Cause(ctx)
 	}

@@ -552,3 +552,52 @@ func TestStalledLiveCreatorAdopterSucceeds(t *testing.T) {
 	}
 }
 
+
+// TestReadOnlyCoordSkipsFlockGrant verifies the read-only coord mode
+// (CoordOptions.ReadOnly): the flock-grant goroutine is not started so
+// AcquireWriter is refused with ErrReadOnlyCoord, while the reader-slot
+// path (served without the flock goroutine) and a prompt Close still
+// work. A Close that hung — doneCh never closed because run() never
+// started — would trip the test's deadline.
+func TestReadOnlyCoordSkipsFlockGrant(t *testing.T) {
+	root, base, _ := tmpLock(t)
+	f, err := Open(OpenParams{
+		Root: root, Base: base, DataUUID: [16]byte{0x5A}, MaxReaders: 4,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	c := NewCoord(f, CoordOptions{
+		PID:           1,
+		ReadOnly:      true,
+		RetryInterval: 10 * time.Millisecond,
+	})
+
+	// No flock-grant goroutine: AcquireWriter is refused outright
+	// rather than blocking forever on an unserved writerCh.
+	if _, err := c.AcquireWriter(context.Background()); !errors.Is(err, ErrReadOnlyCoord) {
+		t.Errorf("AcquireWriter on read-only coord: got %v, want ErrReadOnlyCoord", err)
+	}
+
+	// Reader-slot acquisition (and release) still works.
+	idx, err := c.AcquireReader(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("AcquireReader on read-only coord: %v", err)
+	}
+	if idx == NoSlot {
+		t.Fatal("AcquireReader returned NoSlot")
+	}
+	c.ReleaseReader(idx)
+
+	// Close must return promptly even though run() never started
+	// (doneCh was pre-closed). Guard with a deadline so a regression
+	// that waits on an un-closed doneCh fails loudly instead of hanging.
+	done := make(chan struct{})
+	go func() { _ = c.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("read-only coord Close hung (doneCh never closed?)")
+	}
+}
