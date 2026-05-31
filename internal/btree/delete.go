@@ -298,9 +298,16 @@ func leafUnderflow(buf []byte, cfg page.Config, mergeThreshold uint8) bool {
 	return used*100 < int(mergeThreshold)*cfg.ContentEnd()
 }
 
-// branchUnderflow is the analogue for a branch page.
+// branchUnderflow is the analogue for a branch page. The fill-floor is
+// measured on the LOGICAL (uncompressed) content size, not the physical
+// compressed size (range-delete.md §Invariants): within-page prefix
+// truncation (page-formats.md §Branch Page) is a storage optimization that
+// shrinks a same-cluster branch's bytes without reducing its fanout, so a
+// logically-dense branch must not read as underfull just because its shared
+// prefix compressed away. Capacity ("does it fit a page?") still uses the
+// physical BranchEncodedSize; only this floor check is logical.
 func branchUnderflow(cfg page.Config, cells []page.BranchCell, mergeThreshold uint8) bool {
-	size := page.BranchEncodedSize(cfg, cells)
+	size := page.BranchLogicalSize(cells)
 	return size*100 < int(mergeThreshold)*cfg.ContentEnd()
 }
 

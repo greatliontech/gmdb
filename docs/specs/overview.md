@@ -57,7 +57,7 @@ consistency in `indexing.md`.
 | Write lock | Intra-process writer queue (channel) + single flock goroutine (cross-process) | Context-aware blocking; zero goroutine accumulation on cancellation; flock alone doesn't block same-process goroutines |
 | Lock ordering | Documented globally (lifecycle → registry → per-keyspace → commit → bitmap) | Prevents deadlock; mandatory acquisition order for all internal mutex paths |
 | Lagging readers | Callback-based notification | Application controls policy; no silent unbounded growth |
-| Branch keys | Prefix-truncated separators | Shortest distinguishing prefix; maximizes fan-out; shallower trees; full keys in leaves only |
+| Branch keys | Prefix-truncated separators (across levels + within page) | Shortest distinguishing prefix across levels; page-level prefix truncation stores a page's shared separator prefix once, so fan-out stays high even for deep-shared-prefix keys; shallow trees; full keys in leaves only |
 | Leaf compression | Two variants: prefix-compressed leaves (variable-size restart groups, default) and uncompressed leaves (`RestartGroupTarget = 1`) | Density gains for shared-prefix workloads (directory listings, composite keys); per-keyspace tuning picks compressed or uncompressed; the uncompressed variant trades compression for single-O(log N) lookup, O(1) `Prev`, and simpler `Check()` walks |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |

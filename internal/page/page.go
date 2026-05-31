@@ -34,7 +34,13 @@ func IsLeafType(typ uint8) bool {
 // [0x67, 0x6D, 0x64, 0x62] = "gmdb" readable in hex dumps.
 const Magic uint32 = 0x62646D67
 
-// FormatVersion is the current on-disk format version.
+// FormatVersion is the current on-disk format version. It is NOT bumped for
+// pre-v1 format changes (e.g. the within-page branch prefix-truncation
+// format, page-formats.md §Branch Page): with no installed base, a version
+// discriminator would be backcompat scaffolding for files that do not exist —
+// the clean break is to change the format and regenerate. The field exists
+// for the post-v1 compatibility contract; it advances only once a released
+// format must be distinguished from its successor.
 const FormatVersion uint32 = 1
 
 // Supported page-size range. PageSize is set at database creation, persisted

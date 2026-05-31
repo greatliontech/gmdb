@@ -58,8 +58,22 @@ func TestValidateBranchRejectsForged(t *testing.T) {
 
 	t.Run("cell offset out of range", func(t *testing.T) {
 		b := base()
-		b[16] = 0xFF // first dir entry offset low byte
-		b[17] = 0xFF // high byte → offset 0xFFFF > ContentEnd
+		// First directory entry begins at branchHeaderEnd (offset 20):
+		// (Offset uint16, SuffixLen uint16). Forge the offset past ContentEnd.
+		b[branchHeaderEnd] = 0xFF   // dir[0] offset low byte
+		b[branchHeaderEnd+1] = 0xFF // high byte → offset 0xFFFF
+		if err := ValidateBranch(b, cfg); !errors.Is(err, ErrCorrupted) {
+			t.Errorf("got %v, want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("prefix region overlaps directory", func(t *testing.T) {
+		b := base()
+		// PrefixLen uint16 lives at branchPrefixLenOff (offset 16). A huge
+		// value pushes the prefix region (ContentEnd-PrefixLen) below the cell
+		// directory — structural corruption the new format must reject.
+		b[branchPrefixLenOff] = 0xFF
+		b[branchPrefixLenOff+1] = 0xFF // PrefixLen = 0xFFFF
 		if err := ValidateBranch(b, cfg); !errors.Is(err, ErrCorrupted) {
 			t.Errorf("got %v, want ErrCorrupted", err)
 		}

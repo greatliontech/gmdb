@@ -38,6 +38,29 @@ Invariant: kind=clause-explicit;
     so Get returns `ErrNotFound` for keys that are actually present —
     silent data loss to the caller.
 
+Invariant: kind=entailed;
+  property=A branch cell stores only the separator suffix after the
+    page-wide prefix `P` (`PrefixLen` bytes); the full separator is
+    `P || Suffix[i]`. A reader MUST account for `P` before comparing
+    suffixes — compare `target` against `P` first (descend leftmost
+    when `target < P`, rightmost when `target > P` without sharing all
+    of `P`) and binary-search suffixes only for a `target` that starts
+    with `P`. The encoding round-trips: `decode(encode(cells))`
+    reconstructs every cell's full key `P || Suffix[i]` and child
+    exactly;
+  from=entailed: the clause-explicit separator-routing invariant above
+    fixes the separator VALUES but not how a within-page-compressed
+    branch stores or searches them; no single clause states that the
+    page-prefix split must round-trip and that search must reconstruct
+    it;
+  violation=A target `t` with `t[:k] == P[:k]` diverging at some
+    `k < PrefixLen` routed by a suffix-only search (one that skips the
+    prefix comparison) descends the wrong child — every
+    separator-routing clause still holds, yet `Get` returns
+    `ErrNotFound` for a key that is present. Equivalently, a
+    prefix/suffix split that drops or duplicates a boundary byte
+    reconstructs a wrong full key on decode and on the split-time lift.
+
 Invariant: kind=clause-explicit;
   property=Within a leaf restart group, the entry at the group's
     restart position stores a full key; every subsequent delta entry
@@ -135,52 +158,88 @@ Invariant: kind=entailed;
 
 ## Branch Page (Internal B+tree Node)
 
-Branch pages store keys and child page pointers. They do NOT store
-values.
+Branch pages store separator keys and child page pointers. They do
+NOT store values. Separators are **prefix-truncated within the page**:
+the single common prefix `P` of all separators on the page is stored
+once, and each cell stores only the separator's suffix after `P` (see
+§Prefix-Truncated Branch Keys for why this is effective and how it
+composes with the cross-level truncation).
 
 ```
 Branch Page
-+-----------------------+
-| Page Header (8 bytes) |
-+-----------------------+
++-----------------------+ offset 0
+| Page Header (8 bytes) | Type=TypeBranch, Count=N
++-----------------------+ offset 8
 | Ptr[0] (uint64)       |  leftmost child pointer (8 bytes)
-+-----------------------+
-| Cell Directory        |  Array of (Offset uint16, KeyLen uint16)
++-----------------------+ offset 16
+| PrefixLen (uint16)    |  length of the page-wide shared prefix P
+| Reserved  (uint16)    |  zero on write (keeps the directory at offset 20)
++-----------------------+ offset 20
+| Cell Directory        |  Array of (Offset uint16, SuffixLen uint16)
 | ...                   |  grows forward, 4 bytes per cell
 +-----------------------+
 |       free space      |
 +-----------------------+
 | ...                   |
-| Cell Data 1           |  packed from end of page, grows backward
-| Cell Data 0           |
-+-----------------------+
+| Cell Data 1           |  each cell: SuffixBytes || ChildPtr(uint64),
+| Cell Data 0           |  packed below the prefix region, growing backward
++-----------------------+ ContentEnd - PrefixLen
+| Prefix bytes P        |  the page-wide shared prefix, PrefixLen bytes
++-----------------------+ ContentEnd (PageSize - optional 8-byte footer)
 ```
 
-Each cell in the data area:
+Each cell in the data area stores the separator **suffix** (the bytes
+after the page-wide prefix `P`) followed by its right child pointer:
 
 ```
 Branch Cell
-+----------+----------+
-| Key bytes| ChildPtr |
-|          | uint64   |
-+----------+----------+
++--------------+----------+
+| Suffix bytes | ChildPtr |
+| key[len(P):] | uint64   |
++--------------+----------+
 ```
+
+The full separator key of cell `i` is `P || Suffix[i]`. Because cells
+are stored in sorted key order, `P = commonPrefix(cell[0], cell[N-1])`
+— the common prefix of the whole sorted set. When the separators share
+no common prefix (e.g. a branch spanning a cluster boundary)
+`PrefixLen` is 0 and each cell stores its full key, identical to the
+uncompressed case with no size penalty beyond the fixed header fields.
 
 Keys are stored in sorted order. For a branch with N cells (N keys)
 there are N+1 child pointers: `Ptr[0]` (leftmost, stored after the
 page header) plus one `ChildPtr` per cell.
 
-Search algorithm: binary-search the cell directory for the first
-separator `Key[i]` such that `target < Key[i]`. If found, descend to
-the child to the left of that separator — `ChildPtr` of cell `i-1`,
-or `Ptr[0]` when `i == 0`. If no separator is greater than the
-target, descend to the last cell's `ChildPtr` (rightmost child).
-When `target == Key[i]`, the target belongs in the right child since
-separators are lower bounds of the right child.
+**Search algorithm.** Let `m = PrefixLen` and `P` the prefix bytes. To
+find the child for `target`:
 
-The cell directory stores `(Offset, KeyLen)` per cell, enabling
-binary search over variable-length keys without parsing the key data
-area.
+1. If `len(target) >= m` and `target[:m] == P`: binary-search
+   `target[m:]` against the cells' suffixes for the first suffix
+   strictly greater than `target[m:]`. That index `i` is the descent
+   index.
+2. Otherwise `target` does not start with `P`: if `target < P` every
+   separator exceeds it → descend leftmost (`i == 0`); if `target > P`
+   every separator is below it → descend rightmost (`i == N`).
+
+The descent index `i` selects the child exactly as in the uncompressed
+case: `i == 0` → `Ptr[0]`; `0 < i <= N` → `ChildPtr` of cell `i-1`.
+When `target` equals a separator key, the suffix binary search returns
+the index past it, so the target descends into that separator's right
+child (separators are right-child lower bounds). Comparing `target`
+against `P` once per page — rather than against each full key at every
+binary-search probe — also makes the descent compare fewer bytes than
+an uncompressed branch would.
+
+The cell directory stores `(Offset, SuffixLen)` per cell, enabling
+binary search over the variable-length suffixes without parsing the
+cell data area; `Offset` points at the suffix's first byte and the
+child pointer follows the `SuffixLen` suffix bytes.
+
+The encoding is a pure function of `(cfg, leftmost, cells)` — `P`,
+the suffixes, the directory, and the cell packing order all follow
+deterministically — so a `Check()` re-encode is byte-identical to the
+original writer's output (the §Leaf Split deterministic-encoding
+invariant, for branch pages).
 
 ### Prefix-Truncated Branch Keys
 
@@ -209,18 +268,34 @@ At merge time, the separator is removed from the parent. At
 redistribute time, the separator is recomputed from the new boundary
 keys and the parent updated.
 
-**Complementary with leaf prefix compression**: branch pages compress
-keys *across* tree levels (separator < either boundary); leaf pages
-compress redundancy *within* a page. The two techniques are
-independent and complementary.
+**Two complementary compressions on branch pages.** Branch separators
+are compressed *across* tree levels (the shortest distinguishing
+prefix, this section) **and** *within* a page (page-level prefix
+truncation, §Branch Page — the one common prefix of a page's
+separators stored once + per-cell suffixes). Leaf pages independently
+compress redundancy within a page via restart-group delta encoding
+(§Compressed Leaf). Cross-level and within-page truncation compose: a
+leaf-adjacent branch whose separators all share a long cluster prefix
+stores that prefix once, so its fan-out stays high even when each
+separator approaches the §Maximum Key Size bound — the case that,
+without within-page truncation, collapses fan-out toward 2 (a branch
+holding only ~2 near-max separators) and builds trees born below the
+`range-delete.md §Invariants` fill-floor.
 
 **Interaction with maximum key size**: the maximum-key-size limit
 applies to full keys stored in leaves (reconstructed from delta
 encoding). Branch separators are always shorter than or equal to the
-full keys.
+full keys. Within-page prefix truncation does not relax the limit:
+the worst case is two separators sharing no prefix (`PrefixLen == 0`),
+each stored in full, so a branch must still hold two full-size
+separators to split (see `limits.md §Maximum Key Size`).
 
-**Benefits**: higher fan-out → shallower trees → fewer page accesses
-per lookup; less data read per branch traversal.
+**Benefits**: high fan-out → shallow trees → fewer page accesses per
+lookup, *including* for keys that share deep prefixes (within-page
+truncation stores the shared bytes once instead of once per
+separator); less data read per branch traversal, and a single prefix
+comparison per page instead of a full-key comparison at every
+binary-search probe.
 
 ## Leaf Page
 

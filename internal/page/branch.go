@@ -6,52 +6,76 @@ import (
 	"sort"
 )
 
-// Branch-page layout per page-formats.md §Branch Page:
+// Branch-page layout per page-formats.md §Branch Page. Separators are
+// prefix-truncated WITHIN the page: the single common prefix P of all
+// separators on the page is stored once at the content tail, and each cell
+// stores only the suffix key[len(P):] followed by its right child pointer.
 //
 //	+-----------------------+ offset 0
 //	| Page Header (8 bytes) | Type=TypeBranch, Count=N (cell count)
 //	+-----------------------+ offset 8
 //	| Ptr[0] (uint64)       | leftmost child pointer
 //	+-----------------------+ offset 16
-//	| Cell Directory        | N × (Offset uint16, KeyLen uint16) = N × 4 bytes
-//	| ...                   |
-//	+-----------------------+ grows forward
+//	| PrefixLen uint16      | length of the page-wide shared prefix P
+//	| Reserved  uint16      | zero on write (keeps the directory at offset 20)
+//	+-----------------------+ offset 20
+//	| Cell Directory        | N × (Offset uint16, SuffixLen uint16) = N × 4 bytes
+//	| ...                   | grows forward
+//	+-----------------------+
 //	|       free space      |
 //	+-----------------------+
-//	| Cell Data 1           | each cell: KeyBytes || ChildPtr(uint64)
-//	| Cell Data 0           | packed from end of page, grows backward
+//	| Cell Data 1           | each cell: SuffixBytes || ChildPtr(uint64),
+//	| Cell Data 0           | packed below the prefix region, growing backward
+//	+-----------------------+ ContentEnd - PrefixLen
+//	| Prefix bytes P        | the page-wide shared prefix
 //	+-----------------------+ ContentEnd (PageSize - optional 8-byte footer)
 //
-// Cells store (Key, ChildPtr) — the ChildPtr is the right child of the
-// separator key. For N cells there are N+1 child pointers: Ptr[0]
-// (leftmost) + N ChildPtrs (one per cell).
+// The full separator of cell i is P || Suffix[i]. Cells are stored in sorted
+// key order, so P = commonPrefix(cell[0], cell[N-1]) — the common prefix of
+// the whole sorted set. For N cells there are N+1 child pointers: Ptr[0]
+// (leftmost) + N ChildPtrs (one per cell). When the separators share no
+// prefix, PrefixLen is 0 and each cell stores its full key (the uncompressed
+// case, no penalty beyond the fixed header fields).
 
 const (
-	// branchHeaderEnd is the byte offset where the cell directory
-	// begins: after the common page header (8 bytes) and the
-	// leftmost child pointer (8 bytes).
-	branchHeaderEnd = 16
-
-	// branchDirEntrySize is the per-cell directory size:
-	// (Offset uint16, KeyLen uint16).
-	branchDirEntrySize = 4
-
-	// branchChildPtrSize is the trailing-pointer byte length on
-	// each cell.
+	// branchChildPtrSize is the trailing child-pointer byte length on each
+	// cell.
 	branchChildPtrSize = 8
 
-	// branchLeftmostOff is the byte offset of the leftmost child
-	// pointer Ptr[0] within the page.
-	branchLeftmostOff = HeaderSize
+	// branchDirEntrySize is the per-cell directory size:
+	// (Offset uint16, SuffixLen uint16).
+	branchDirEntrySize = 4
+
+	// branchLeftmostOff is the byte offset of the leftmost child pointer
+	// Ptr[0] within the page.
+	branchLeftmostOff = HeaderSize // 8
+
+	// branchPrefixLenOff is the byte offset of the PrefixLen uint16 (the
+	// page-wide shared-separator-prefix length), after the leftmost child
+	// pointer. A Reserved uint16 follows it (zero on write).
+	branchPrefixLenOff = HeaderSize + branchChildPtrSize // 16
+
+	// branchHeaderEnd is the byte offset where the cell directory begins:
+	// after the page header (8), the leftmost child pointer (8), and the
+	// PrefixLen + Reserved uint16 pair (4).
+	branchHeaderEnd = branchPrefixLenOff + 4 // 20
 )
 
-// BranchCell is the decoded form of one branch cell: a separator
-// key + the right child pointer. The Key slice borrows from the
-// underlying page buffer — do not retain past page-buffer lifetime.
+// BranchCell is the decoded form of one branch cell: the full separator key
+// + the right child pointer. The Key is the reconstructed full separator
+// (P || suffix); DecodeBranch / BranchCellAt return it as an owned slice (the
+// on-page prefix and suffix are non-contiguous, so the full key cannot alias
+// the buffer), so callers may retain it past the page-buffer lifetime.
 type BranchCell struct {
 	Key   []byte
 	Child uint64
 }
+
+// branchPrefixLen reads the page-wide shared-prefix length from the header.
+func branchPrefixLen(buf []byte) int { return int(le.Uint16(buf[branchPrefixLenOff:])) }
+
+// setBranchPrefixLen writes the page-wide shared-prefix length.
+func setBranchPrefixLen(buf []byte, n int) { le.PutUint16(buf[branchPrefixLenOff:], uint16(n)) }
 
 // BranchLeftmostChild returns Ptr[0] (the leftmost child pointer)
 // from a branch page. Panics on a buffer too small to hold the
@@ -86,6 +110,10 @@ func BranchCellCount(buf []byte) uint16 {
 // pointer changes (no cell directory churn). i must be a valid
 // cell index [0, N); the leftmost child (Ptr[0]) is rewritten via
 // SetBranchLeftmostChild instead.
+//
+// The child pointer sits immediately after the cell's stored suffix, so a
+// child-only rewrite is independent of the page-wide prefix and needs no
+// re-encode.
 func SetBranchCellChild(buf []byte, cfg Config, i uint16, child uint64) {
 	cfg.mustValidate()
 	n := BranchCellCount(buf)
@@ -94,46 +122,67 @@ func SetBranchCellChild(buf []byte, cfg Config, i uint16, child uint64) {
 	}
 	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
 	off := le.Uint16(buf[dirOff:])
-	klen := le.Uint16(buf[dirOff+2:])
-	le.PutUint64(buf[int(off)+int(klen):], child)
+	slen := le.Uint16(buf[dirOff+2:])
+	le.PutUint64(buf[int(off)+int(slen):], child)
 }
 
-// BranchCellAt returns the i-th branch cell. Panics on a malformed
-// page (cell directory entry points outside the page) or on
-// out-of-range index.
+// BranchCellAt returns the i-th branch cell with its full reconstructed
+// separator key (P || suffix). Panics on a malformed page (cell directory
+// entry points outside the page) or on out-of-range index.
 //
-// The returned BranchCell.Key slice references mmap-backed bytes
-// within buf — callers MUST NOT modify and MUST NOT retain past
-// the page buffer's lifetime.
+// The returned BranchCell.Key is a freshly-allocated owned slice (the
+// on-page prefix and suffix are non-contiguous), so it is safe to retain and
+// to modify. This is off the hot descent path — BranchSearch / BranchChildAt
+// read the page directly without reconstructing keys.
 func BranchCellAt(buf []byte, cfg Config, i uint16) BranchCell {
 	cfg.mustValidate()
 	n := BranchCellCount(buf)
 	if i >= n {
 		panic(fmt.Sprintf("page: BranchCellAt(%d) out of range [0, %d)", i, n))
 	}
+	ce := cfg.ContentEnd()
+	m := branchPrefixLen(buf)
+	prefixStart := ce - m
 	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
-	off := le.Uint16(buf[dirOff:])
-	klen := le.Uint16(buf[dirOff+2:])
-	end := int(off) + int(klen) + branchChildPtrSize
-	if int(off) < branchHeaderEnd+int(n)*branchDirEntrySize || end > cfg.ContentEnd() {
-		panic(fmt.Sprintf("page: BranchCellAt(%d) offset/len out of range: off=%d klen=%d", i, off, klen))
+	off := int(le.Uint16(buf[dirOff:]))
+	slen := int(le.Uint16(buf[dirOff+2:]))
+	end := off + slen + branchChildPtrSize
+	if off < branchHeaderEnd+int(n)*branchDirEntrySize || end > prefixStart {
+		panic(fmt.Sprintf("page: BranchCellAt(%d) offset/len out of range: off=%d slen=%d prefixStart=%d", i, off, slen, prefixStart))
 	}
+	key := make([]byte, m+slen)
+	copy(key, buf[prefixStart:ce])
+	copy(key[m:], buf[off:off+slen])
 	return BranchCell{
-		Key:   buf[off : off+uint16(klen)],
-		Child: le.Uint64(buf[off+uint16(klen):]),
+		Key:   key,
+		Child: le.Uint64(buf[off+slen:]),
 	}
+}
+
+// branchCellChild reads the right child pointer of cell i (0-based) directly
+// from the directory + cell data, without reconstructing the separator key.
+// Hot-path helper for BranchChildAt.
+func branchCellChild(buf []byte, i uint16) uint64 {
+	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
+	off := int(le.Uint16(buf[dirOff:]))
+	slen := int(le.Uint16(buf[dirOff+2:]))
+	return le.Uint64(buf[off+slen:])
 }
 
 // BranchFreeSpace returns the number of unused bytes between the
 // end of the cell directory and the start of the first packed cell.
 // Used by branch insert/split logic to decide when to split.
 //
+// The page-wide prefix region sits above all cells (at the content tail), so
+// the free-space window is [dirEnd, lowestCellOffset); the walk starts from
+// the prefix region's low edge (ContentEnd - PrefixLen) so an empty page
+// (no cells) reports the correct free span.
+//
 // Implementation note: EncodeBranch packs cells in directory-index
 // order with strictly-decreasing offsets, so the last directory
 // entry (index N-1) always points to the lowest packed offset.
 // The function nonetheless walks all N entries to find the minimum
-// — defense in depth against future encoders (e.g., in-place
-// insert that pre-allocates a hole) that may not preserve the
+// — defense in depth against future encoders that may not preserve the
 // monotonic-offset invariant. The O(N) walk is acceptable: branch
 // pages hold tens of cells at typical key sizes, and the splitter
 // path that consumes BranchFreeSpace is not in the read hot path.
@@ -141,7 +190,7 @@ func BranchFreeSpace(buf []byte, cfg Config) int {
 	cfg.mustValidate()
 	n := int(BranchCellCount(buf))
 	dirEnd := branchHeaderEnd + n*branchDirEntrySize
-	low := cfg.ContentEnd() // walking backward from here
+	low := cfg.ContentEnd() - branchPrefixLen(buf) // walking backward from the prefix region
 	for i := range n {
 		dirOff := branchHeaderEnd + i*branchDirEntrySize
 		off := int(le.Uint16(buf[dirOff:]))
@@ -163,23 +212,28 @@ func EncodeBranchEmpty(buf []byte, cfg Config, leftmost uint64) {
 	clear(buf)
 	WriteHeader(buf, TypeBranch, 0, 0)
 	SetBranchLeftmostChild(buf, leftmost)
+	// PrefixLen + Reserved are left zero by clear.
 }
 
-// EncodeBranch writes cells + leftmost into buf in sorted-key order.
-// Convenience entry point for fresh branch pages (split products,
-// initial root). The directory is laid out contiguously after the
-// header+leftmost; cells are packed from the high end downward in
-// the SAME order as the cell directory (cell 0 lowest offset → cell
-// N-1 highest), so the iteration order on disk matches the
-// cell-directory index.
+// EncodeBranch writes cells + leftmost into buf in sorted-key order, applying
+// within-page prefix truncation (page-formats.md §Branch Page). The page-wide
+// prefix P = commonPrefix(cells[0], cells[N-1]) is stored once at the content
+// tail; each cell stores its suffix key[len(P):] + child pointer. The
+// directory is laid out contiguously after the header; cells are packed from
+// just below the prefix region downward in the SAME order as the directory
+// (cell 0 highest offset → cell N-1 lowest), so the on-disk iteration order
+// matches the cell-directory index.
 //
-// Returns an error if the cells don't fit. The caller computes
-// "will this fit?" with BranchEncodedSize and acts BEFORE calling
+// Returns an error if the cells don't fit cfg.ContentEnd(). The caller
+// computes "will this fit?" with BranchEncodedSize and acts BEFORE calling
 // EncodeBranch — the error here is a defense-in-depth guard.
 //
-// Keys MUST be in ascending byte order; EncodeBranch verifies via a
-// sort check and returns an error on violation (callers compose the
-// cell slice; the codec doesn't reorder).
+// Keys MUST be in ascending byte order; EncodeBranch verifies via a sort
+// check and returns an error on violation (callers compose the cell slice;
+// the codec doesn't reorder). The output is a pure function of (cfg,
+// leftmost, cells): P, suffixes, directory, and packing order are all
+// deterministic (page-formats.md §Leaf Split deterministic-encoding
+// invariant, for branch pages).
 func EncodeBranch(buf []byte, cfg Config, leftmost uint64, cells []BranchCell) error {
 	cfg.mustValidate()
 	if len(buf) != int(cfg.PageSize) {
@@ -190,62 +244,103 @@ func EncodeBranch(buf []byte, cfg Config, leftmost uint64, cells []BranchCell) e
 	}) {
 		return fmt.Errorf("page: EncodeBranch cells not sorted by Key")
 	}
+	ce := cfg.ContentEnd()
 	need := BranchEncodedSize(cfg, cells)
-	if need > int(cfg.PageSize) {
-		return fmt.Errorf("page: EncodeBranch %d cells need %d bytes, page is %d", len(cells), need, cfg.PageSize)
+	if need > ce {
+		return fmt.Errorf("page: EncodeBranch %d cells need %d bytes, content end is %d", len(cells), need, ce)
 	}
 	clear(buf)
 	WriteHeader(buf, TypeBranch, uint16(len(cells)), 0)
 	SetBranchLeftmostChild(buf, leftmost)
 
-	// Cell data packs from ContentEnd downward; entries are placed
-	// so iteration index i lands at successively LOWER offsets (so
-	// the cell at index 0 has the highest offset, cell N-1 the
-	// lowest). That keeps "find lowest packed offset" trivially
-	// equal to "last cell's offset" for the free-space check.
-	off := cfg.ContentEnd()
+	var m int
+	if len(cells) > 0 {
+		m = sharedPrefixLen(cells[0].Key, cells[len(cells)-1].Key)
+		// Prefix bytes at the content tail: [ContentEnd-m, ContentEnd).
+		// Guarded by len(cells) > 0 so cells[0] is never indexed on an
+		// empty (leftmost-only) branch, where m is 0 anyway.
+		copy(buf[ce-m:ce], cells[0].Key[:m])
+	}
+	setBranchPrefixLen(buf, m)
+
+	// Cell data packs from just below the prefix region downward; entries
+	// are placed so iteration index i lands at successively LOWER offsets
+	// (cell 0 highest, cell N-1 lowest). That keeps "find lowest packed
+	// offset" trivially equal to "last cell's offset" for the free-space
+	// check.
+	off := ce - m
 	for i, c := range cells {
-		cellSize := len(c.Key) + branchChildPtrSize
+		suffix := c.Key[m:]
+		cellSize := len(suffix) + branchChildPtrSize
 		off -= cellSize
-		copy(buf[off:], c.Key)
-		le.PutUint64(buf[off+len(c.Key):], c.Child)
+		copy(buf[off:], suffix)
+		le.PutUint64(buf[off+len(suffix):], c.Child)
 		dirOff := branchHeaderEnd + i*branchDirEntrySize
 		le.PutUint16(buf[dirOff:], uint16(off))
-		le.PutUint16(buf[dirOff+2:], uint16(len(c.Key)))
+		le.PutUint16(buf[dirOff+2:], uint16(len(suffix)))
 	}
 	return nil
 }
 
-// BranchEncodedSize returns the byte size a branch page with the
-// given cells would occupy. Used by the splitter to decide when a
-// proposed cell set fits a page. Includes header(8) + leftmost(8) +
-// cell directory + cells (key + child pointer each). DOES NOT
-// include the optional footer — callers compare against
-// cfg.ContentEnd() (which already excludes the footer).
+// BranchEncodedSizeOf returns the encoded byte size of a branch page holding
+// n cells whose full separator keys total keyLenSum bytes and share a common
+// prefix of prefixLen bytes. It is the single source of truth for the
+// (non-additive) branch sizing: the shared prefix is stored once, so a cell's
+// stored cost is its suffix (len(key)-prefixLen) + child pointer + directory
+// entry. BranchEncodedSize, the byte-balanced branch splitter, and the
+// bulk-load branch builder all size prospective pages through it.
+//
+// Branch sizing is non-additive because prefixLen depends on the whole cell
+// set: adding a separator that shares less prefix lengthens every other
+// cell's stored suffix. There is therefore no fixed per-cell cost (the prior
+// BranchCellCost) — callers track (n, keyLenSum, prefixLen) and recompute.
+func BranchEncodedSizeOf(n, keyLenSum, prefixLen int) int {
+	// header + N directory entries + N child pointers + the suffixes
+	// (keyLenSum - N*prefixLen) + the shared prefix stored once (prefixLen):
+	//   = branchHeaderEnd + N*(dir+child) + keyLenSum - (N-1)*prefixLen
+	return branchHeaderEnd + n*(branchDirEntrySize+branchChildPtrSize) + keyLenSum - (n-1)*prefixLen
+}
+
+// BranchEncodedSize returns the byte size a branch page with the given cells
+// would occupy under within-page prefix truncation. Used by the splitter and
+// bulk-load to decide when a proposed cell set fits a page (compared against
+// cfg.ContentEnd(), which already excludes the optional footer). cfg is
+// accepted for call-site stability; the size is configuration-independent.
 func BranchEncodedSize(cfg Config, cells []BranchCell) int {
-	size := branchHeaderEnd + len(cells)*branchDirEntrySize
-	for _, c := range cells {
-		size += len(c.Key) + branchChildPtrSize
+	if len(cells) == 0 {
+		return BranchEncodedSizeOf(0, 0, 0)
 	}
-	return size
+	m := sharedPrefixLen(cells[0].Key, cells[len(cells)-1].Key)
+	keyLenSum := 0
+	for _, c := range cells {
+		keyLenSum += len(c.Key)
+	}
+	return BranchEncodedSizeOf(len(cells), keyLenSum, m)
 }
 
-// BranchCellCost returns the bytes a single cell with a key of keyLen
-// bytes adds to a branch page's encoded size: the key, its trailing child
-// pointer, and its cell-directory entry. It is the additive per-cell term
-// of BranchEncodedSize — branch cells carry no inter-cell prefix
-// compression, so a running sum of BranchCellCost over a cell set plus the
-// empty-branch base (BranchEncodedSize(cfg, nil)) equals that set's
-// BranchEncodedSize. The byte-balanced branch splitter and the bulk-load
-// branch builder both size prospective pages with it.
-func BranchCellCost(keyLen int) int {
-	return keyLen + branchChildPtrSize + branchDirEntrySize
+// BranchLogicalSize returns the branch's UNCOMPRESSED content size — the
+// bytes the cells would occupy with NO within-page prefix truncation
+// (Σ full-key + child-pointer + directory costs; equals
+// BranchEncodedSizeOf(n, keyLenSum, 0)). This is the measure for the
+// range-delete.md §Invariants fill-floor: within-page compression is a
+// storage optimization that must not, by itself, make a logically-dense
+// branch look underfull (a fanout-many same-cluster branch compresses to few
+// bytes yet carries plenty of children). So "is this branch underfull?" is
+// asked of the LOGICAL content (this function), while "does this cell set fit
+// a page?" uses the PHYSICAL compressed size (BranchEncodedSize). The two
+// notions coincide exactly when the separators share no prefix.
+func BranchLogicalSize(cells []BranchCell) int {
+	keyLenSum := 0
+	for _, c := range cells {
+		keyLenSum += len(c.Key)
+	}
+	return BranchEncodedSizeOf(len(cells), keyLenSum, 0)
 }
 
-// DecodeBranch returns all cells from a branch page in directory
-// order. Convenience for tests + tree-walk consumers; hot-path
-// search uses BranchCellAt + binary search to avoid materializing
-// the full slice.
+// DecodeBranch returns all cells from a branch page in directory order, each
+// with its full reconstructed key. Convenience for tests + tree-walk /
+// split / merge consumers; hot-path search uses BranchSearch + BranchChildAt
+// to avoid materializing keys.
 func DecodeBranch(buf []byte, cfg Config) (leftmost uint64, cells []BranchCell) {
 	cfg.mustValidate()
 	n := BranchCellCount(buf)
@@ -260,32 +355,57 @@ func DecodeBranch(buf []byte, cfg Config) (leftmost uint64, cells []BranchCell) 
 	return leftmost, cells
 }
 
-// BranchSearch binary-searches the branch's cells for the first
-// separator key strictly greater than `target`. Returns the index
-// `i` of that separator, or `n` if every separator is <= target.
+// BranchSearch binary-searches the branch's separators for the first one
+// strictly greater than `target`, returning the descent index `i` (or `n` if
+// every separator is <= target) per page-formats.md §Branch Page.
+//
+// Separators are prefix-truncated within the page, so the search is two-step
+// and entirely zero-copy (no full-key reconstruction):
+//
+//	1. Compare target against the page-wide prefix P. If target does not start
+//	   with P, it sorts before every separator (descend leftmost, i=0) or
+//	   after every separator (descend rightmost, i=n) — decided by
+//	   bytes.Compare(target, P).
+//	2. Otherwise binary-search target[len(P):] against the cells' suffixes.
 //
 // The descent caller uses i to pick the next child:
 //   - i == 0   → Ptr[0]    (leftmost child)
-//   - 0 < i ≤ N → ChildPtr of cell i-1 (separators are right-child
-//     lower bounds, so i-1's child holds keys < separators[i])
+//   - 0 < i ≤ N → ChildPtr of cell i-1 (separators are right-child lower
+//     bounds, so i-1's child holds keys < separators[i])
 //   - i == N   → ChildPtr of last cell  (rightmost child)
 //
-// Per page-formats.md: "binary-search the cell directory for the
-// first separator Key[i] such that target < Key[i]". When target ==
-// Key[i], the target belongs in the right child (descend via cell
-// i's right child), which the i+1 → ChildPtr[i] mapping above
-// captures because the binary search finds the LEAST i with target <
-// Key[i], i.e., for target == Key[k] it returns k+1.
+// When target == Key[k], step 2 returns k+1 (the suffix search finds the
+// LEAST i with target[len(P):] < suffix[i]), so the target descends into that
+// separator's right child — separators are right-child lower bounds.
 func BranchSearch(buf []byte, cfg Config, target []byte) uint16 {
 	cfg.mustValidate()
-	n := BranchCellCount(buf)
-	// sort.Search returns the smallest i in [0, n] such that f(i)
-	// is true; we use f(i) := target < Key[i].
-	lo, hi := 0, int(n)
+	n := int(BranchCellCount(buf))
+	if n == 0 {
+		return 0
+	}
+	ce := cfg.ContentEnd()
+	m := branchPrefixLen(buf)
+	prefix := buf[ce-m : ce]
+
+	// Step 1: locate target relative to the page-wide prefix.
+	if len(target) < m || !bytes.Equal(target[:m], prefix) {
+		// target does not start with P.
+		if bytes.Compare(target, prefix) < 0 {
+			return 0 // target < every separator → leftmost child
+		}
+		return uint16(n) // target > every separator → rightmost child
+	}
+
+	// Step 2: binary-search the suffix tail against the cells' suffixes.
+	// f(i) := tail < suffix[i]; sort.Search returns the least such i.
+	tail := target[m:]
+	lo, hi := 0, n
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
-		c := BranchCellAt(buf, cfg, uint16(mid))
-		if bytes.Compare(target, c.Key) < 0 {
+		dirOff := branchHeaderEnd + mid*branchDirEntrySize
+		off := int(le.Uint16(buf[dirOff:]))
+		slen := int(le.Uint16(buf[dirOff+2:]))
+		if bytes.Compare(tail, buf[off:off+slen]) < 0 {
 			hi = mid
 		} else {
 			lo = mid + 1
@@ -300,6 +420,10 @@ func BranchSearch(buf []byte, cfg Config, target []byte) uint16 {
 // Branch Keys. Constructed as the common prefix of left and right
 // extended by exactly one byte from right at the first divergence
 // position.
+//
+// This is the CROSS-LEVEL truncation (the separator distinguishes left from
+// right subtree); it is independent of the WITHIN-page prefix truncation that
+// EncodeBranch applies to the resulting separator set.
 //
 // Precondition: left < right (strict). Callers compute this from
 // the boundary keys of a freshly-split pair (last key of left leaf,
@@ -321,10 +445,7 @@ func ShortestSeparator(left, right []byte) []byte {
 	if bytes.Compare(left, right) >= 0 {
 		panic(fmt.Sprintf("page: ShortestSeparator left >= right: left=%q right=%q", left, right))
 	}
-	n := len(left)
-	if len(right) < n {
-		n = len(right)
-	}
+	n := min(len(left), len(right))
 	for i := range n {
 		if left[i] != right[i] {
 			// Divergence at i — separator is right[:i+1].
@@ -341,17 +462,16 @@ func ShortestSeparator(left, right []byte) []byte {
 	return sep
 }
 
-// ValidateBranch reports whether buf is a structurally well-formed
-// branch page: the header type is TypeBranch, the buffer covers the
-// page content region, the cell directory fits, and every cell's
-// (Offset, KeyLen) points within the content region with room for the
-// trailing 8-byte child pointer. It returns a non-nil error (wrapping
-// ErrCorrupted) on any violation and never panics — the chunk-4.2
-// "total over input, never panics on a forged page" decoder-robustness
-// contract extended to branch pages, so reachability walks (Check,
-// FreeSubtree) and the btree readers can call BranchChildAt /
-// BranchCellAt safely after Validate passes. Mirrors the per-cell
-// bounds BranchCellAt would otherwise panic on.
+// ValidateBranch reports whether buf is a structurally well-formed branch
+// page: the header type is TypeBranch, the buffer covers the page content
+// region, the page-wide prefix region fits above the directory, and every
+// cell's (Offset, SuffixLen) points within the cell-data region [dirEnd,
+// ContentEnd-PrefixLen) with room for the trailing 8-byte child pointer. It
+// returns a non-nil error (wrapping ErrCorrupted) on any violation and never
+// panics — the decoder-robustness contract ("total over input, never panics
+// on a forged page"), so reachability walks (Check, FreeSubtree) and the
+// btree readers can call BranchSearch / BranchCellAt / BranchChildAt safely
+// after Validate passes. Mirrors the per-cell bounds those readers assume.
 func ValidateBranch(buf []byte, cfg Config) error {
 	contentEnd := cfg.ContentEnd()
 	if len(buf) < contentEnd {
@@ -361,18 +481,23 @@ func ValidateBranch(buf []byte, cfg Config) error {
 	if typ != TypeBranch {
 		return fmt.Errorf("%w: branch page has type %d (want %d)", ErrCorrupted, typ, TypeBranch)
 	}
+	m := branchPrefixLen(buf)
+	prefixStart := contentEnd - m
 	dirEnd := branchHeaderEnd + int(n)*branchDirEntrySize
-	if dirEnd > contentEnd {
-		return fmt.Errorf("%w: branch cell directory (%d cells) overruns content end %d", ErrCorrupted, n, contentEnd)
+	if prefixStart < dirEnd {
+		// Covers an over-long PrefixLen and a directory that overruns the
+		// content/prefix region (prefixStart <= contentEnd always since m>=0).
+		return fmt.Errorf("%w: branch prefix region (PrefixLen=%d) overlaps cell directory (%d cells): prefixStart=%d dirEnd=%d",
+			ErrCorrupted, m, n, prefixStart, dirEnd)
 	}
 	for i := 0; i < int(n); i++ {
 		dirOff := branchHeaderEnd + i*branchDirEntrySize
 		off := int(le.Uint16(buf[dirOff:]))
-		klen := int(le.Uint16(buf[dirOff+2:]))
-		end := off + klen + branchChildPtrSize
-		if off < dirEnd || end > contentEnd {
-			return fmt.Errorf("%w: branch cell %d offset/len out of range: off=%d klen=%d end=%d (dirEnd=%d contentEnd=%d)",
-				ErrCorrupted, i, off, klen, end, dirEnd, contentEnd)
+		slen := int(le.Uint16(buf[dirOff+2:]))
+		end := off + slen + branchChildPtrSize
+		if off < dirEnd || end > prefixStart {
+			return fmt.Errorf("%w: branch cell %d offset/len out of range: off=%d slen=%d end=%d (dirEnd=%d prefixStart=%d)",
+				ErrCorrupted, i, off, slen, end, dirEnd, prefixStart)
 		}
 	}
 	return nil
@@ -382,10 +507,13 @@ func ValidateBranch(buf []byte, cfg Config) error {
 // BranchSearch:
 //   - i == 0 → leftmost (Ptr[0])
 //   - 0 < i ≤ N → ChildPtr of cell i-1
+//
+// Reads the child pointer directly (no separator-key reconstruction), so it
+// is allocation-free on the hot descent path.
 func BranchChildAt(buf []byte, cfg Config, i uint16) uint64 {
 	cfg.mustValidate()
 	if i == 0 {
 		return BranchLeftmostChild(buf)
 	}
-	return BranchCellAt(buf, cfg, i-1).Child
+	return branchCellChild(buf, i-1)
 }

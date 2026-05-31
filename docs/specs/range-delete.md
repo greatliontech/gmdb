@@ -82,52 +82,71 @@ Invariant: kind=entailed;
 
 Invariant: kind=clause-explicit;
   property=After a successful `DeleteRange` returns, every non-root
-    page reachable from the new root has encoded fill
-    `>= MergeThreshold%` of the page's `ContentEnd` **where that floor
-    is reachable**. The root is exempt — a partially-emptied tree's
-    root may shrink arbitrarily (and may root-collapse to a leaf or to
-    0 / empty). The same floor holds for single-key `Delete`.
-    **Reachability qualifier (load-bearing).** The floor is reachable —
-    and so unconditionally enforced — for the common case and for
-    `Put`-built trees whose **separators are short**: splits then
-    balance roughly at 50%, above MergeThreshold's [1, 50] range. It is
-    **NOT** reachable for **large branch separators**. Branch pages
-    store full separators with **no within-page prefix compression**
-    (see `page-formats.md` §Prefix-Truncated Branch Keys — branches
-    truncate *across* levels, not *within* a page), so keys that share
-    deep prefixes yield separators approaching the §Maximum Key Size
-    bound; a branch then holds only ~2 of them (fanout 2, ~35% fill),
-    and because a branch redistribute **lifts** the boundary separator
-    to the parent, both halves lose its bytes and land below MT. Such a
-    branch is **born below the floor at `Put`-build time** and cannot be
-    raised to it by any merge (combined > one page) or redistribute
-    (both halves below MT) under `Delete`. A page whose every adjacent
-    pairing both overflows-on-merge and cannot clear the floor on
-    redistribute is **accepted below-floor**, and the rebalance MUST
-    terminate rather than loop attempting to heal it. Where reachable,
-    the floor is maintained by tightening the merge/redistribute
+    page reachable from the new root has fill `>= MergeThreshold%` of
+    the page's `ContentEnd` **where that floor is reachable**. The root
+    is exempt — a partially-emptied tree's root may shrink arbitrarily
+    (and may root-collapse to a leaf or to 0 / empty). The same floor
+    holds for single-key `Delete`.
+    **Two size notions (load-bearing).** For a **branch** page the floor
+    is measured on **logical (uncompressed) content** — the bytes its
+    separators would occupy with no within-page prefix truncation
+    (`page.BranchLogicalSize`) — NOT its physical compressed size.
+    Within-page branch prefix truncation (`page-formats.md` §Branch
+    Page) stores a page's shared separator prefix once, so a
+    maximally-dense same-cluster branch carries high fan-out yet few
+    physical bytes; measuring the floor on compressed bytes would
+    spuriously flag it as underfull. The physical (compressed) size is
+    used only for **capacity** ("does a cell set fit one page?"); the
+    floor, the underflow trigger, and the redistribute split-balance all
+    use logical content. For a **leaf** page the floor is physical fill
+    (leaf restart-group compression keeps byte-fill representative
+    because leaves also store values).
+    **Reachability qualifier.** The floor is reachable — and so
+    enforced — for the common case AND for deep-shared-prefix branches:
+    within-page truncation packs many such separators per page (high
+    fan-out, high logical content), so they land above MT, not at
+    fanout-2. It is **NOT** reachable in two residual cases. (a) A branch
+    reduced to a **single near-§Maximum-Key-Size separator**: no feasible
+    split's logical content reaches MT (e.g. one ~1400-byte separator at
+    MergeThreshold 50), and because a branch redistribute **lifts** the
+    boundary separator to the parent, both halves can fall below MT. (b) A
+    **cluster-seam branch** — a large within-cluster separator plus a tiny
+    cross-cluster one — whose neighbours are dense same-cluster branches:
+    absorbing more cells would un-compress across the cluster boundary and
+    overflow a physical page, so no merge (combined > one page) and no
+    redistribute (every physically-fitting split leaves the seam half
+    logically below MT) can raise it. A page that no adjacent merge or
+    floor-clearing redistribute can heal is **accepted below-floor**, and
+    the rebalance MUST terminate rather than loop attempting to heal it.
+    Where reachable, the floor is maintained by the merge/redistribute
     contract: when a local merge produces a still-below-MT page,
     `rebalanceSurvivors` re-attempts merge with the next adjacent
-    survivor; a branch redistribute that cannot clear the floor for both
-    halves **declines** (changes nothing) so the deficit is not
-    relocated to a sibling — the underflowing child is threaded upward
-    as `deepUnderflowChild` for a higher level (with more cousins) to
-    heal, or accepted below-floor if unreachable everywhere; when the
-    2-survivor cousin-cascade case (`leftIdx=0 ∧ rightIdx=cellCount` at
-    the parent of two below-MT survivors) leaves the parent degenerate,
-    the still-below-MT page is threaded upward as `deepUnderflowChild`
-    and rebalanced against its cousins after the parent's own
-    cascade-merge produces a sibling-rich branch — see §Algorithm Phase
-    3 Rebalance below;
+    survivor; a branch redistribute balances on **logical** content under
+    the physical-fit constraint (so it never piles the cheap same-cluster
+    cells on one half and strands the other below MT), and one that still
+    cannot clear the floor for both halves **declines** (changes nothing)
+    so the deficit is not relocated to a sibling — the underflowing child
+    is threaded upward as `deepUnderflowChild` for a higher level (with
+    more cousins) to heal, or accepted below-floor if unreachable
+    everywhere; when the 2-survivor cousin-cascade case (`leftIdx=0 ∧
+    rightIdx=cellCount` at the parent of two below-MT survivors) leaves the
+    parent degenerate, the still-below-MT page is threaded upward as
+    `deepUnderflowChild` and rebalanced against its cousins after the
+    parent's own cascade-merge produces a sibling-rich branch — see
+    §Algorithm Phase 3 Rebalance below;
   from=this spec §Algorithm Phase 3 rebalance + `api-surface.md`
     Options.MergeThreshold godoc (the percentage doubles as the
-    merge **trigger** AND the post-mutation **floor**);
+    merge **trigger** AND the post-mutation **floor**) +
+    `page-formats.md` §Branch Page (within-page truncation + the
+    physical-vs-logical size distinction);
   violation=Two distinct failures. (1) **Reachable floor left
-    unmet**: a `DeleteRange`/`Delete` whose cascade leaves a page at
-    e.g. 8% fill as a non-root child *when a feasible merge or
-    floor-clearing redistribute existed* — the page-fill property the
+    unmet**: a `DeleteRange`/`Delete` whose cascade leaves a page below
+    MT (logical) as a non-root child *when a feasible merge or
+    logical-floor-clearing redistribute existed* — e.g. a redistribute
+    balanced on COMPRESSED size that piled cheap same-cluster cells on
+    one half and stranded the other below MT. The page-fill property the
     rest of the engine (compaction pacing, leak-detection
-    page-utilization heuristics, splitting fairness) reasons against
+    page-utilization heuristics, splitting fairness) reasons against then
     drifts silently. (2) **Non-termination on an unreachable floor**:
     the rebalance loops/recurses trying to heal a page the floor cannot
     reach (a redistribute that merely relocates the sub-MT deficit to a
@@ -179,10 +198,12 @@ subtree)`.
   `api-surface.md`).
 - **Post-merge re-rebalance.** A single merge of two below-MT
   siblings can leave the merged page itself below MT. The local
-  rebalance loop checks the merge result's encoded fill against
-  `MergeThreshold` and, when the result is still below the floor,
-  re-attempts merge with the next adjacent survivor in the same
-  parent. The loop converges in `O(survivors)` iterations.
+  rebalance loop checks the merge result's fill against
+  `MergeThreshold` — **logical** content for branches, physical fill
+  for leaves (see the §Invariants two-size-notions) — and, when the
+  result is still below the floor, re-attempts merge with the next
+  adjacent survivor in the same parent. The loop converges in
+  `O(survivors)` iterations.
 - **Cousin-cascade rebalance.** When the recursed-into branch's
   survivor list reduces to a single still-below-MT child (the
   `leftIdx=0 ∧ rightIdx=cellCount` boundary case where both

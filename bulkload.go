@@ -46,9 +46,8 @@ type bulkPageWriter interface {
 // needs in its own parent (max(prev sibling subtree) < S ≤ min(this
 // subtree) holds at every level).
 type bulkBuilder struct {
-	pw              bulkPageWriter
-	cfg             page.Config
-	emptyBranchSize int // BranchEncodedSize of a cell-less branch page
+	pw  bulkPageWriter
+	cfg page.Config
 
 	// Leaf level (level 0).
 	leaf     *page.LeafBuilder
@@ -72,7 +71,7 @@ type bulkBranchLevel struct {
 	leftmost  uint64            // leftmost child of the in-progress page
 	cells     []page.BranchCell // (separator, child) for non-leftmost children
 	sep       []byte            // separator routing to the in-progress page in its parent (nil = first page at this level)
-	size      int               // running BranchEncodedSize of the in-progress page
+	keyLenSum int               // Σ len(cell.Key) of the in-progress page's cells (for non-additive size tracking)
 	closedAny bool              // a page at this level was already closed+propagated (⇒ >1 page exists here)
 }
 
@@ -81,9 +80,8 @@ type bulkBranchLevel struct {
 // RestartGroupTarget, so leaves match the keyspace's leaf encoding).
 func newBulkBuilder(pw bulkPageWriter, cfg page.Config) *bulkBuilder {
 	return &bulkBuilder{
-		pw:              pw,
-		cfg:             cfg,
-		emptyBranchSize: page.BranchEncodedSize(cfg, nil),
+		pw:  pw,
+		cfg: cfg,
 	}
 }
 
@@ -240,10 +238,19 @@ func (b *bulkBuilder) addLink(level int, sep []byte, child uint64) error {
 		b.startBranch(bl, sep, child)
 		return nil
 	}
-	cost := b.branchCellCost(sep)
-	if bl.size+cost <= b.cfg.ContentEnd() {
+	// Branch sizing is NON-additive (page-formats.md §Branch Page): the
+	// page-wide shared prefix is stored once, so adding sep — which can only
+	// shrink that prefix (cells arrive in ascending order, sep is the new
+	// largest, prefix = commonPrefix(cells[0], sep)) — lengthens every
+	// existing cell's stored suffix. Recompute the would-be size against the
+	// new prefix rather than accumulating a per-cell cost.
+	newPrefixLen := len(sep)
+	if len(bl.cells) > 0 {
+		newPrefixLen = commonPrefixLen(bl.cells[0].Key, sep)
+	}
+	if page.BranchEncodedSizeOf(len(bl.cells)+1, bl.keyLenSum+len(sep), newPrefixLen) <= b.cfg.ContentEnd() {
 		bl.cells = append(bl.cells, page.BranchCell{Key: sep, Child: child})
-		bl.size += cost
+		bl.keyLenSum += len(sep)
 		return nil
 	}
 	// The in-progress page is full: write it, then start a new page whose
@@ -270,7 +277,7 @@ func (b *bulkBuilder) startBranch(bl *bulkBranchLevel, sep []byte, leftmost uint
 	bl.leftmost = leftmost
 	bl.cells = bl.cells[:0]
 	bl.sep = sep
-	bl.size = b.emptyBranchSize
+	bl.keyLenSum = 0
 	bl.have = true
 }
 
@@ -291,12 +298,17 @@ func (b *bulkBuilder) writeBranch(bl *bulkBranchLevel) (uint64, error) {
 	return id, nil
 }
 
-// branchCellCost is the increase in a branch page's encoded size from
-// adding one cell with the given separator key — page.BranchCellCost, the
-// shared additive per-cell term also used by the byte-balanced branch
-// splitter.
-func (b *bulkBuilder) branchCellCost(sep []byte) int {
-	return page.BranchCellCost(len(sep))
+// commonPrefixLen returns the length of the longest common byte prefix of a
+// and b. Used by the bulk-load branch builder to track the page-wide shared
+// separator prefix incrementally for non-additive branch sizing.
+func commonPrefixLen(a, b []byte) int {
+	n := min(len(a), len(b))
+	for i := range n {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
 }
 
 // bulkOverflowWriter is the pager surface the streaming overflow-chain

@@ -231,9 +231,12 @@ func TestDeleteCascadesBranchMergeAndRootCollapse(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
-	// Long keys (60B) and large values (512B) to force a depth-2 or
-	// deeper tree (same shape as TestPutForcesMultiLevelTreeAndBranchSplit).
-	const N = 400
+	// Long shared-prefix keys (~57B) and large values (512B) to force a
+	// depth-2+ tree (same shape as TestPutForcesMultiLevelTreeAndBranchSplit).
+	// N=1500: within-page branch prefix truncation packs ~260 shared-prefix
+	// separators per branch, so a multi-level branch structure needs ~375
+	// leaves' worth of keys (the prior 400 fit one compressed root branch).
+	const N = 1500
 	keyPrefix := bytes.Repeat([]byte("k"), 50)
 	keys := make([][]byte, N)
 	for i := range N {
@@ -297,10 +300,12 @@ func TestDeleteForcesBranchMergeAndRedistribute(t *testing.T) {
 	// (mergeOrRedistributeBranches). Build a depth-2+ tree, then
 	// delete enough that branches at depth 1 fall below threshold
 	// and merge with each other — invariants checked per delete.
+	// N=1500: with within-page branch prefix truncation, ~260 shared-prefix
+	// separators fit one branch, so a multi-level tree needs ~375 leaves.
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
-	const N = 400
+	const N = 1500
 	keyPrefix := bytes.Repeat([]byte("k"), 50)
 	keys := make([][]byte, N)
 	for i := range N {
@@ -668,9 +673,15 @@ func checkUnderflowInvariant(t *testing.T, pw *fakeWriter, cfg page.Config, root
 		case page.TypeBranch:
 			lm, cells := page.DecodeBranch(buf, cfg)
 			if !isRoot {
-				size := page.BranchEncodedSize(cfg, cells)
+				// Fill-floor is measured on LOGICAL (uncompressed) content,
+				// not compressed bytes (range-delete.md §Invariants): within-
+				// page prefix truncation shrinks a dense same-cluster branch's
+				// bytes without reducing its fanout, so the floor would
+				// spuriously fire on a maximally-dense page if measured on
+				// compressed size.
+				size := page.BranchLogicalSize(cells)
 				if size*100 < int(threshold)*cfg.ContentEnd() {
-					t.Errorf("non-root branch %d underflowed: size=%d (%.1f%% of %d), threshold=%d%%",
+					t.Errorf("non-root branch %d underflowed: logical size=%d (%.1f%% of %d), threshold=%d%%",
 						id, size, float64(size)*100/float64(cfg.ContentEnd()), cfg.ContentEnd(), threshold)
 				}
 			}
@@ -683,6 +694,106 @@ func checkUnderflowInvariant(t *testing.T, pw *fakeWriter, cfg page.Config, root
 		}
 	}
 	walk(root, true)
+}
+
+// checkReachableFloor asserts the rebalance left no below-floor branch that
+// COULD have been raised above the fill-floor by merging or redistributing
+// with an adjacent same-parent sibling. The fill-floor is LOGICAL
+// (range-delete.md §Invariants); within-page prefix truncation
+// (page-formats.md §Branch Page) makes some branches genuinely un-healable —
+// a cluster-SEAM branch (a large within-cluster separator plus a tiny
+// cross-cluster one) whose neighbours are dense same-cluster branches cannot
+// absorb more cells without un-compressing across the cluster boundary and
+// overflowing a physical page. Those are the "where reachable" exception and
+// are allowed below the floor. A below-floor branch that IS healable is a
+// rebalance defect (e.g. balancing a redistribute on compressed instead of
+// logical size piles the cheap same-cluster cells on one half and strands the
+// other below the floor). This is the precise post-compression statement of
+// the floor guarantee — strictly stronger than "no branch below floor", which
+// no longer holds for multi-cluster (seam-bearing) workloads.
+//
+// Scope: it checks healing against an adjacent SAME-PARENT sibling only, not
+// the cousin-cascade (a below-floor child healed by being merged into a
+// sibling-rich branch one level up, range-delete.md §Phase 3). That makes it
+// conservatively UNDER-strict — a cousin-only-healable branch is reported as
+// stuck, never the reverse — so it cannot raise a spurious failure; it does
+// catch the same-parent compressed-vs-logical balance defect it is here for.
+func checkReachableFloor(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64, mt uint8) {
+	t.Helper()
+	if root == 0 {
+		return
+	}
+	ce := cfg.ContentEnd()
+	below := func(n int) bool { return n*100 < int(mt)*ce }
+
+	type binfo struct {
+		cells    []page.BranchCell
+		leftmost uint64
+		children []uint64 // leftmost + each cell's child, in descent order
+	}
+	branches := map[uint64]*binfo{}
+	parentOf := map[uint64]uint64{}
+	idxOf := map[uint64]int{}
+	var walk func(id uint64)
+	walk = func(id uint64) {
+		buf, _ := pw.Page(id)
+		if typ, _, _, _ := page.ReadHeader(buf); typ != page.TypeBranch {
+			return
+		}
+		lm, cells := page.DecodeBranch(buf, cfg)
+		children := []uint64{lm}
+		for _, c := range cells {
+			children = append(children, c.Child)
+		}
+		branches[id] = &binfo{cells: cells, leftmost: lm, children: children}
+		for i, ch := range children {
+			parentOf[ch] = id
+			idxOf[ch] = i
+			walk(ch)
+		}
+	}
+	walk(root)
+
+	for id, bi := range branches {
+		if id == root || !below(page.BranchLogicalSize(bi.cells)) {
+			continue
+		}
+		pi := branches[parentOf[id]]
+		idx := idxOf[id]
+		// Replicate mergeOrRedistributeBranches against an adjacent sibling:
+		// combine cells (with the parent separator between them), then either
+		// full-merge (fits one page) or redistribute via findBranchSplitIndex
+		// (both halves fit AND both clear the logical floor).
+		heal := func(sibIdx int) bool {
+			if sibIdx < 0 || sibIdx >= len(pi.children) {
+				return false
+			}
+			sib, ok := branches[pi.children[sibIdx]]
+			if !ok {
+				return false
+			}
+			lo := min(idx, sibIdx)
+			left, right := bi, sib
+			if idx > sibIdx {
+				left, right = sib, bi
+			}
+			combined := append([]page.BranchCell{}, left.cells...)
+			combined = append(combined, page.BranchCell{Key: pi.cells[lo].Key, Child: right.leftmost})
+			combined = append(combined, right.cells...)
+			if page.BranchEncodedSize(cfg, combined) <= ce {
+				return true // a full merge would heal it
+			}
+			if m, ok := findBranchSplitIndex(cfg, combined); ok {
+				return !below(page.BranchLogicalSize(combined[:m])) && !below(page.BranchLogicalSize(combined[m+1:]))
+			}
+			return false
+		}
+		if heal(idx-1) || heal(idx+1) {
+			ls := page.BranchLogicalSize(bi.cells)
+			t.Errorf("reachable-floor violation: below-floor branch %d (logical %d, %.1f%% < %d%%) is healable via an adjacent sibling — rebalance stranded a reachable branch below the floor",
+				id, ls, float64(ls)*100/float64(ce), mt)
+		}
+	}
 }
 
 // checkSlabPartition asserts every allocated page is either reachable

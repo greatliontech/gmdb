@@ -71,6 +71,12 @@ CRC32C in earlier designs):
 
 Enforced at `Put()`. Keys exceeding return `ErrKeyTooLarge`.
 
+Within-page branch prefix truncation (`page-formats.md §Branch Page`)
+does **not** relax this bound: the worst case is two separators that
+share no prefix, where each is stored in full exactly as in the
+uncompressed format, so a branch must still be able to hold two
+full-size separators in order to split.
+
 The limit applies to branch separator capacity. Leaf prefix
 compression can store keys up to this size at restart points
 (full keys). Delta entries store only the unshared suffix, so

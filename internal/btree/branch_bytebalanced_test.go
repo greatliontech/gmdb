@@ -75,20 +75,26 @@ func TestPutSizeSkewedBranchSplitNoSpuriousError(t *testing.T) {
 }
 
 // TestDeleteSizeSkewedBranchRedistributePreservesFillFloor exercises the
-// delete-side byte-balanced branch redistribute in the floor-REACHABLE
-// regime. It builds a depth-3 tree with moderate (~700-byte) separators,
-// then deletes ~80% of keys at DefaultMergeThreshold, cascading branch-level
-// merges and redistributes. The byte-balanced boundary must keep each
-// redistribute half within a page AND above the range-delete.md §Invariants
-// fill-floor (checked after every delete, branches included), and must not
-// return a spurious ErrCorrupted.
+// delete-side byte-balanced branch redistribute over a multi-cluster,
+// size-skewed tree (~700-byte within-cluster separators, 1-byte cluster
+// seams). It builds a depth-3 tree, then deletes ~80% of keys at
+// DefaultMergeThreshold, cascading branch-level merges and redistributes.
 //
-// The separator size is deliberately moderate: at the *maximum* threshold
-// (50) with large (~1400-byte) separators the fill-floor is genuinely
-// unreachable — a redistribute of N large cells cannot make both halves
-// >=50% — which is the range-delete.md §Invariants "where reachable"
-// exception, not a splitter defect. This test pins what the byte-balanced
-// finder guarantees where the floor IS reachable.
+// The guarantee asserted (after every delete) is the post-compression form of
+// the range-delete.md §Invariants fill-floor: the redistribute leaves no
+// branch below the LOGICAL floor that COULD have been raised above it by a
+// merge or redistribute with an adjacent sibling (checkReachableFloor). The
+// STRICT "no branch below floor" no longer holds under within-page prefix
+// truncation: a cluster-SEAM branch (a large within-cluster separator plus a
+// tiny cross-cluster one) whose neighbours are dense same-cluster branches is
+// genuinely un-healable — absorbing more cells would un-compress across the
+// cluster boundary and overflow a physical page. That is the "where
+// reachable" exception. The finder must (a) keep every redistribute half
+// within a physical page, (b) balance on LOGICAL content so it never strands
+// a reachable half below the floor, and (c) not return a spurious
+// ErrCorrupted. (The compressed-vs-logical balance distinction is the
+// finding-19 successor: balancing the redistribute on compressed bytes piles
+// cheap same-cluster cells on one half and falsely trips the decline.)
 func TestDeleteSizeSkewedBranchRedistributePreservesFillFloor(t *testing.T) {
 	const threshold = DefaultMergeThreshold
 	cfg := page.Config{PageSize: 4096}
@@ -125,7 +131,7 @@ func TestDeleteSizeSkewedBranchRedistributePreservesFillFloor(t *testing.T) {
 		}
 		root = nr
 		deleted[i] = true
-		checkUnderflowInvariant(t, pw, cfg, root, threshold)
+		checkReachableFloor(t, pw, cfg, root, threshold)
 		checkBalance(t, pw, cfg, root)
 	}
 

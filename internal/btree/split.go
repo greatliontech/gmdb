@@ -219,7 +219,7 @@ func largestInlineEntry(entries []page.LeafEntry) int {
 // findBranchSplitIndex chooses the boundary at which an overflowing branch's
 // cells are split across two pages — the byte-balanced analogue of
 // findLeafSplitIndex for branch (internal) nodes, per page-formats.md
-// §Leaf Split (the ~50%-of-data-bytes bias + lower-index tiebreak) and
+// §Leaf Split (the ~50%-of-content bias + lower-index tiebreak) and
 // §Prefix-Truncated Branch Keys (the boundary cell is lifted as the parent
 // separator).
 //
@@ -227,28 +227,32 @@ func largestInlineEntry(entries []page.LeafEntry) int {
 // for the returned mid (1 <= mid <= len(cells)-1) the left branch keeps
 // cells[:mid], the right branch gets cells[mid+1:], and cells[mid] is lifted
 // to the parent as the separator (its Child becomes the right branch's
-// leftmost). Both halves are guaranteed to encode within one page
-// (BranchEncodedSize <= cfg.ContentEnd()).
+// leftmost).
 //
-// Splitting by cell COUNT (len(cells)/2) is wrong for size-skewed branches.
-// Separators are prefix-truncated (page-formats.md §Prefix-Truncated Branch
-// Keys) so they are usually short, but adjacent leaves that share long
-// prefixes produce long separators, up to the limits.md §Maximum Key Size
-// bound (~(PageSize-40)/2). A branch mixing a few long separators with many
-// short ones then has count midpoints that place more than one page of cells
-// on a side — a spurious encode failure on a valid Put (surfaced as
-// ErrKeyTooLarge) or ErrCorrupted on a valid Delete redistribute — even
-// though a feasible byte-balanced boundary exists. Balancing to ~50% also
-// keeps both halves above the range-delete.md §Invariants fill-floor
-// (MergeThreshold's [1,50] range), the redistribute-path guarantee.
+// TWO size metrics, deliberately distinct (page-formats.md §Branch Page +
+// range-delete.md §Invariants):
 //
-// Unlike leaf entries (prefix-delta compressed, so fill is non-additive and
-// must be measured through a real LeafBuilder), branch cells carry no
-// inter-cell compression: BranchEncodedSize is a prefix sum, so the
-// most-balanced feasible boundary is found exactly by an O(n) scan rather
-// than the leaf path's greedy rebuild. Kept parallel to findLeafSplitIndex
-// (not a shared abstraction) because the sizing model and partition shape
-// differ.
+//   - FIT (constraint): each half must encode within one physical page, so
+//     the constraint uses the PHYSICAL (compressed) page.BranchEncodedSize —
+//     this is what EncodeBranch will actually write, so the "halves fit"
+//     decision can't skew from the encoder. Within-page prefix truncation
+//     makes this non-additive (each half recomputes its own shared prefix),
+//     so it is measured per candidate rather than via a prefix sum.
+//   - BALANCE (objective): among fitting boundaries, minimize the LOGICAL
+//     (uncompressed) imbalance via page.BranchLogicalSize. The fill-floor is
+//     a logical-content property, so balancing logical content is what keeps
+//     a redistribute's two halves both above the floor (range-delete.md
+//     §Invariants) where reachable; a compressed-balanced split could pile
+//     the cheap same-cluster cells on one side and leave the other logically
+//     underfull, spuriously tripping the decline. Balancing logical content
+//     is also exactly the original finding-19 byte-balance (pre-compression,
+//     encoded size == uncompressed == logical), so size-skewed Put splits
+//     still divide the real separator bytes evenly and never overflow a half.
+//
+// Splitting by cell COUNT (len(cells)/2) is wrong for size-skewed branches:
+// a count midpoint can pile a page-worth of long separators on one half (a
+// spurious ErrKeyTooLarge on a valid Put, or ErrCorrupted on a valid Delete
+// redistribute) even though a feasible balanced boundary exists.
 //
 // ok=false means no contiguous two-page partition fits — a single separator
 // genuinely exceeds page capacity (unreachable under limits.md §Maximum Key
@@ -261,36 +265,31 @@ func largestInlineEntry(entries []page.LeafEntry) int {
 // Determinism (page-formats.md §Leaf Split deterministic-encoding
 // invariant): a pure function of (cfg, cells); ties in balance resolve to
 // the lower-index boundary (the strict-< update below).
+//
+// Cost is O(n²) — n lift positions, each sizing two halves in O(half) —
+// rather than the O(n) prefix-sum the old additive (uncompressed) model
+// allowed, because within-page truncation makes a half's compressed size
+// depend on its own shared prefix. n is a branch's cell count (tens at
+// typical key sizes) and this runs only on split/redistribute, off the read
+// hot path, so the quadratic scan is not optimized further.
 func findBranchSplitIndex(cfg page.Config, cells []page.BranchCell) (mid int, ok bool) {
 	n := len(cells)
 	if n < 2 {
 		return 0, false
 	}
 	ce := cfg.ContentEnd()
-	base := page.BranchEncodedSize(cfg, nil) // header + leftmost child — in both halves
 
-	// cumVar[i] = summed per-cell cost of cells[:i]. leftSize / rightSize
-	// below exclude the lifted cell cells[mid] from both halves.
-	cumVar := make([]int, n+1)
-	for i, c := range cells {
-		cumVar[i+1] = cumVar[i] + page.BranchCellCost(len(c.Key))
-	}
-	total := cumVar[n]
-
-	// leftSize increases and rightSize decreases monotonically in mid, so the
-	// feasible region {mid: both halves fit} is a contiguous interval and the
-	// signed imbalance (leftSize-rightSize) is strictly increasing. Scan all
-	// lift positions and keep the feasible one with the smallest absolute
-	// imbalance; the strict < makes the lowest-index boundary win ties (two
-	// boundaries equidistant from balance across the sign change).
+	// Scan every lift position. left = cells[:m], right = cells[m+1:] (the
+	// boundary cell cells[m] is lifted to the parent, in neither half).
+	// Constraint: both halves must FIT physically (compressed). Objective:
+	// among fitting boundaries, smallest LOGICAL imbalance; strict < makes the
+	// lowest-index boundary win ties.
 	best, bestDiff := -1, 0
 	for m := 1; m <= n-1; m++ {
-		leftSize := base + cumVar[m]
-		rightSize := base + (total - cumVar[m+1])
-		if leftSize > ce || rightSize > ce {
-			continue
+		if page.BranchEncodedSize(cfg, cells[:m]) > ce || page.BranchEncodedSize(cfg, cells[m+1:]) > ce {
+			continue // a half doesn't fit a physical page
 		}
-		diff := leftSize - rightSize
+		diff := page.BranchLogicalSize(cells[:m]) - page.BranchLogicalSize(cells[m+1:])
 		if diff < 0 {
 			diff = -diff
 		}

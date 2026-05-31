@@ -496,17 +496,17 @@ func TestPutManyKeysAllRetrievable(t *testing.T) {
 
 func TestPutForcesMultiLevelTreeAndBranchSplit(t *testing.T) {
 	// Force the tree past depth-1 by inserting keys with large
-	// values so each leaf holds few entries. With value=512B,
-	// each leaf fits ~7 entries; 200 entries → ~30 leaves; a
-	// branch with 30 cells of 8-byte keys fits one page, so we
-	// still wouldn't split branches. Bump value to 1024B and
-	// add many distinct large keys to force a deeper tree.
+	// values so each leaf holds few entries. These keys share a
+	// 50-byte prefix, so within-page branch prefix truncation
+	// (page-formats.md §Branch Page) packs ~260 separators per
+	// branch page — fanout is high, so a multi-level (depth >= 2)
+	// branch structure needs many leaves. N=1500 (~375 leaves)
+	// clears that threshold; the prior count (400, ~100 leaves)
+	// fit a single compressed root branch (depth 1).
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
-	// Use longer keys (60B) so each branch cell takes more bytes
-	// — forces branch splits sooner. ~50 cells per branch.
-	const N = 400
+	const N = 1500
 	keyPrefix := bytes.Repeat([]byte("k"), 50)
 	for i := range N {
 		key := fmt.Appendf(nil, "%s-%05d", keyPrefix, i)

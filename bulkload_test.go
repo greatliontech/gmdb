@@ -196,7 +196,7 @@ func genSkewedSeparatorKVs(clusters, per, prefixLen, valueLen int) []kv {
 // TestBulkBuilderLargeSeparatorsByteDriven covers the bulk branch builder
 // under size-skewed separators (btree-byte-balanced-split, step 3). The
 // bottom-up builder is fill-driven by construction — addLink appends a cell
-// only while bl.size+branchCellCost <= ContentEnd (bulkload.go) — so unlike
+// only while the page's BranchEncodedSizeOf stays <= ContentEnd (bulkload.go) — so unlike
 // the top-down Put/Delete split it never chose a count midpoint and cannot
 // overflow a branch page. This pins that property end-to-end: ~1400-byte
 // separators build a multi-branch-level tree that round-trips intact.
@@ -289,22 +289,56 @@ func TestBulkBuilderRandomKeys(t *testing.T) {
 	}
 }
 
-// TestBulkBuilderBranchSizeAccounting locks the incremental branch-size
-// tracking (bl.size += branchCellCost) against a full BranchEncodedSize
-// recompute, so a future change to the branch encoding's per-cell overhead
-// can't silently desync the fit check.
+// TestBulkBuilderBranchSizeAccounting locks the bulk builder's incremental
+// branch-size tracking against a full BranchEncodedSize recompute. Branch
+// sizing is NON-additive (page-formats.md §Branch Page): the page-wide shared
+// prefix is stored once and shrinks as separators that share less prefix are
+// appended, lengthening every existing cell's suffix — so there is no fixed
+// per-cell cost. addLink tracks (keyLenSum, prefix) and sizes via
+// BranchEncodedSizeOf; this mirrors that exact accounting and asserts it
+// equals the authoritative BranchEncodedSize after every append, across a
+// shared-prefix run, a distinct-prefix run, and a run where the page prefix
+// collapses mid-build.
 func TestBulkBuilderBranchSizeAccounting(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
-	b := newBulkBuilder(nil, cfg) // pw unused: no page is written
-	var cells []page.BranchCell
-	size := b.emptyBranchSize
-	for i, seplen := range []int{1, 4, 13, 40, 100, 250} {
-		sep := bytes.Repeat([]byte{byte('a' + i)}, seplen)
-		size += b.branchCellCost(sep)
-		cells = append(cells, page.BranchCell{Key: sep, Child: uint64(i + 1)})
-		if got := page.BranchEncodedSize(cfg, cells); got != size {
-			t.Fatalf("incremental size %d != BranchEncodedSize %d after %d cells", size, got, i+1)
-		}
+	withPrefix := func(p []byte, suffix string) []byte {
+		return append(append([]byte(nil), p...), suffix...)
+	}
+	pfx := bytes.Repeat([]byte("shared/"), 40) // ~280-byte shared prefix
+	cases := map[string][][]byte{
+		"shared-prefix": {
+			withPrefix(pfx, "0001"), withPrefix(pfx, "0002"),
+			withPrefix(pfx, "0500"), withPrefix(pfx, "9999"),
+		},
+		"distinct-prefix": {
+			bytes.Repeat([]byte{'a'}, 1), bytes.Repeat([]byte{'b'}, 4),
+			bytes.Repeat([]byte{'c'}, 13), bytes.Repeat([]byte{'d'}, 250),
+		},
+		"prefix-collapses-midway": {
+			withPrefix(pfx, "01"), withPrefix(pfx, "02"),
+			[]byte("zzz-different-cluster"), // shrinks the page prefix to nothing
+		},
+	}
+	for name, keys := range cases {
+		t.Run(name, func(t *testing.T) {
+			var cells []page.BranchCell
+			keyLenSum := 0
+			for i, k := range keys {
+				// Mirror addLink: prefix = commonPrefix(cells[0], new key)
+				// (cells arrive ascending, so the new key is the largest and
+				// commonPrefix(first,last) is the whole-set prefix).
+				prefixLen := len(k)
+				if len(cells) > 0 {
+					prefixLen = commonPrefixLen(cells[0].Key, k)
+				}
+				incr := page.BranchEncodedSizeOf(len(cells)+1, keyLenSum+len(k), prefixLen)
+				cells = append(cells, page.BranchCell{Key: k, Child: uint64(i + 1)})
+				keyLenSum += len(k)
+				if got := page.BranchEncodedSize(cfg, cells); got != incr {
+					t.Fatalf("after %d cells: incremental size %d != BranchEncodedSize %d", i+1, incr, got)
+				}
+			}
+		})
 	}
 }
 
