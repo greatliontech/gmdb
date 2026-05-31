@@ -196,6 +196,25 @@ func (ks *keyspaceCore) markDirty() {
 	ks.state = keyspaceStateDirty
 }
 
+// NextSequence increments the keyspace's persisted sequence counter and
+// returns the new value — a monotonically increasing, per-keyspace number
+// (the first call on a fresh keyspace returns 1), à la bbolt's
+// Bucket.NextSequence. The increment rides the enclosing write transaction:
+// it is persisted atomically at Commit (via the descriptor flush) and
+// discarded on Rollback, and the counter survives reopen. Defined on
+// keyspaceCore so both Keyspace and SetKeyspace expose it (api-surface.md
+// §Keyspace API / §Set API). Returns ErrReadOnly on a read-only handle,
+// ErrKeyspaceClosed if the keyspace was deleted in this tx, or the tx-closed
+// error.
+func (ks *keyspaceCore) NextSequence() (uint64, error) {
+	if err := ks.requireWritable(); err != nil {
+		return 0, err
+	}
+	ks.desc.NextSeq++
+	ks.markDirty()
+	return ks.desc.NextSeq, nil
+}
+
 // descriptor returns the in-tx descriptor pointer. Used by the
 // chunk-7.3 registry-CRUD helpers (index_codec.go) to satisfy the
 // descriptorOwner interface — registryPut / registryDelete mutate the
