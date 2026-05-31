@@ -9,10 +9,66 @@ returns spurious `ErrCorrupted`).
 **Source:** 2026-05-30 deep audit (run `wf_4ad12a2f-039`), raw findings
 0, 1, 2, 3, 11, 19 — six finders converged on one root cause.
 
-**Governing spec:** `docs/specs/page-formats.md:549-558` (Leaf Split —
-mandates the 50%-of-data-bytes boundary via `FindSplitGroup` /
-`FindSplitIndex`); `docs/specs/range-delete.md:83-112` (post-mutation
-fill-floor invariant).
+**Governing spec:** `docs/specs/page-formats.md` §Leaf Split (mandates
+the ~50%-of-data-bytes boundary) + §Prefix-Truncated Branch Keys (the
+`BranchEncodedSize` analog for branch cells); `docs/specs/range-delete.md`
+§Invariants (post-mutation fill-floor). (Section refs, not line numbers —
+the §Insert and Delete / §Leaf Split region shifted ~15 lines when the
+splice-layer close-out promoted DECISION 1's format rationale into
+§Compressed Leaf.)
+
+## Resume (2026-05-31) — leaf paths FIXED; branch paths (finding 19) remain
+
+**Current state (audited at this date):**
+
+- **Leaf split + redistribute: byte-balanced — DONE.** All three leaf sites
+  route through `findLeafSplitIndex` (`internal/btree/split.go:127`) — the
+  entry-precise, fit-guaranteeing byte-balance (measures fill through a real
+  `LeafBuilder`, promotes the largest inline value to overflow if no two-page
+  partition fits): `put.go:383` (Put leaf split), `entry_ops.go:188` (PutEntry
+  split), `delete.go:1149` (leaf merge→redistribute). Faults 1 (spurious
+  `ErrKeyTooLarge`) and 2 (spurious `ErrCorrupted`) are fixed for leaves; the
+  delete path uses the feasible byte-balanced boundary, not a count midpoint.
+- **Branch split + redistribute: STILL count-balanced — finding 19, the open
+  work.** `put.go:724` (`mid := len(newCells) / 2`, the branch split in the
+  `ascendWithSplit` path) and `delete.go:1292` (`mid := len(combined) / 2`, the
+  branch merge→redistribute) partition branch CELLS by count, not by
+  `page.BranchEncodedSize`. `delete.go` already uses `BranchEncodedSize` for the
+  fit-CHECKS around 1259-1306 — the splitter just doesn't use it for the boundary
+  CHOICE. Latent under adversarial separator-size skew (long, low-prefix-sharing
+  keys → large branch cells): a count midpoint can overflow a half (spurious
+  error) or leave a half below `MergeThreshold` (fault 3, fill-floor violation).
+- **NOT this issue — do not confuse:** the splice layer's `page.FindSplitGroup` /
+  `page.FindUCSplitIndex` (`leaf_split.go`) are NO-DECODE leaf-split boundary
+  pickers (fit guaranteed there by the subset property of an append-split); they
+  are NOT the fit-guaranteeing byte-balance this issue is about (that is
+  `findLeafSplitIndex`). Don't route branch splits through them.
+
+**To resolve PROPERLY AND FULLY (full refactor OK):**
+
+1. Implement a byte-balanced BRANCH split point — `findBranchSplitIndex`,
+   `BranchEncodedSize`-aware, fit-guaranteeing (each half ≤ `ContentEnd`) AND
+   fill-floor-respecting (each redistribute half ≥ `MergeThreshold` where
+   reachable) — mirroring `findLeafSplitIndex`. If a clean shared abstraction
+   emerges (parameterize the finder by an encoded-size measurer over a generic
+   item slice), unify the leaf + branch finders — refactor if it cuts duplication
+   without contorting either path; otherwise keep them parallel.
+2. Route `put.go:724` (branch split) + `delete.go:1292` (branch redistribute)
+   through it; promote the correct separator (the boundary cell's key).
+3. Confirm `BulkLoad`'s bottom-up branch builder is size-aware (the Fix section
+   below suspects it already is — cover it with a test, don't assume).
+4. Tests (Root-cause: anchor each to a DEMONSTRATED fault): adversarial branch
+   split AND redistribute with long, low-prefix-sharing keys (large separator
+   cells) where the count midpoint overflows a half but a byte-balanced boundary
+   fits; a branch fill-floor test (each redistribute half ≥ `MergeThreshold`).
+
+**Read first (Spec-first + Root-cause):** this issue IN FULL; `page-formats.md`
+§Leaf Split + §Prefix-Truncated Branch Keys; `range-delete.md` §Invariants
+(fill-floor); `split.go` (`findLeafSplitIndex` — the leaf template to mirror);
+`put.go` ~660-730 (`ascendWithSplit` / branch split, `splitBranch` if present);
+`delete.go` ~1250-1310 (branch redistribute + the existing `BranchEncodedSize`
+fit-checks); `branch.go` (`BranchEncodedSize`, `BranchCell`, the branch builder /
+`ShortestSeparator`). State the `Diagnosis:` for each branch fault before the cut.
 
 ## Problem
 
