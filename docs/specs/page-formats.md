@@ -359,6 +359,21 @@ beyond the restart header, and the delta avoids `SharedLen` bytes
 of key data. Net saving per delta entry is `SharedLen - 2` bytes —
 positive whenever keys share more than a 2-byte prefix.
 
+**Field ordering — `ValueLen` precedes the key (decode-speed
+rationale).** Every fixed-length length field (`KeyLen`, `ValueLen`,
+and a delta's `SharedLen` / `UnsharedLen`) sits in the entry header
+*before* the variable-length key and value, so the decoder computes
+the next entry's start offset from the header alone (`KeyLen +
+ValueLen`) without waiting on the key copy — the offset arithmetic
+overlaps the copy (instruction-level parallelism). A microbenchmark
+isolating this single variable (`internal/page/layout_bench_test.go`)
+measures ~24% faster full-leaf decode versus placing `ValueLen`
+after the key, for a wash on search; that decode cost is paid by
+every non-spliced read and the splice fallback, so the order is
+load-bearing, not incidental. (Overflow / nested-tree forms instead
+carry a fixed 16-byte trailer after the key — `KeyLen` in the header
+still makes the next offset header-computable.)
+
 #### Overflow reference at a restart point (CellFlags bit 0 set)
 
 ```
