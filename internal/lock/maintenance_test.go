@@ -97,7 +97,7 @@ func TestCoordReapStaleReaderSlotsClearsStaleKeepsLive(t *testing.T) {
 		_ = f.Close()
 	})
 
-	stale := staleTimeoutNanos()
+	stale := c.staleTimeoutNanos()
 	// Slot 0: stale — cross-NS (NS=0 ⇒ heartbeat path), heartbeat aged
 	// past StaleTimeout. Raw stores: a deliberate manufactured pre-state.
 	s0 := f.Slot(0)

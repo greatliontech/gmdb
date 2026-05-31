@@ -1,9 +1,10 @@
 # Cross-namespace readers reclaimable purely on a 10s heartbeat window with no fallback
 
 **Lands:** condition — when the cross-process stale-detection model is
-revisited (relates to `options-coord-intervals` and the heartbeat
-stale-detection guard — `cross-process.md §Reader Table` stale
-detection / `lock.heartbeatStale`).
+revisited. `StaleTimeout` is now tunable (`Options.StaleTimeout`), but
+per-process tuning cannot bound a *peer's* heartbeat cadence, so this
+gap stands; relates to the heartbeat stale-detection guard —
+`cross-process.md §Reader Table` stale detection / `lock.heartbeatStale`.
 
 **Severity:** [L] (partly inherent to heartbeat-based liveness; needs a
 documented bound + a user decision on defaults)
@@ -38,5 +39,9 @@ should **(a)** state the *hard-correctness* consequence of a
 and **(b)** consider a larger default or an explicit guidance/clamp so
 operators sizing `StaleTimeout` understand it is a **data-integrity
 bound, not a performance knob**. At minimum, surface it to the user as a
-documented limitation rather than leaving it implicit. (Ties to
-`options-coord-intervals`, which makes `StaleTimeout` tunable.)
+documented limitation rather than leaving it implicit. (`StaleTimeout` is
+now tunable via `Options.StaleTimeout`, whose godoc already frames it as a
+data-integrity bound — but per-process tuning cannot bound a *peer's*
+heartbeat cadence: the real bound is `StaleTimeout > max(peer
+HeartbeatInterval)`, which is not locally knowable, so the cross-namespace
+gap is not closed by the tunable alone.)

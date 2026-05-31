@@ -677,6 +677,54 @@ func TestCoordOldestReaderTxnIDLiveWithFlock(t *testing.T) {
 	c.ReleaseReader(idxB)
 }
 
+func TestCoordStaleTimeoutThreadsToOldestReaderTxnID(t *testing.T) {
+	// The configured CoordOptions.StaleTimeout — not the hard-coded
+	// DefaultStaleTimeout — governs reader-slot stale eviction in
+	// OldestReaderTxnID (the stale-detection window is caller-tunable
+	// via Options.StaleTimeout). Manufacture one cross-namespace reader slot
+	// whose heartbeat lags the scan clock by `age`, then read it back
+	// under two coords whose StaleTimeouts straddle `age`: the short
+	// window evicts the slot (no live reader ⇒ MaxUint64 sentinel); the
+	// long window keeps it (returns its TxnID).
+	const now uint64 = 1_000_000_000_000 // 1000 s in ns
+	const age = 5 * time.Second
+	aged := now - uint64(age)
+
+	read := func(stale time.Duration) uint64 {
+		f := openTestFile(t, 4)
+		// Manufacture a slot whose namespace stays 0 so the scan (with
+		// ourPIDNS = 0) takes the cross-/unknown-namespace heartbeat
+		// path rather than the same-NS kill() path.
+		s := f.Slot(0)
+		Store64(&s.TxnID, 42)
+		Store64(&s.PID, 9999)
+		Store64(&s.Heartbeat, aged)
+		c := NewCoord(f, CoordOptions{
+			PID:           1,
+			PIDNamespace:  0,
+			RetryInterval: 10 * time.Millisecond,
+			StaleTimeout:  stale,
+			Clock:         func() uint64 { return now },
+		})
+		t.Cleanup(func() { _ = c.Close() })
+		// OldestReaderTxnID's documented precondition: caller holds
+		// LOCK_EX. The Coord's flock goroutine never flocks here (no
+		// writer request is issued), so taking it directly is safe.
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			t.Fatalf("flock: %v", err)
+		}
+		defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+		return c.OldestReaderTxnID()
+	}
+
+	if got := read(age - 2*time.Second); got != math.MaxUint64 {
+		t.Errorf("StaleTimeout (%v) < slot age (%v): got %d, want MaxUint64 (slot evicted)", age-2*time.Second, age, got)
+	}
+	if got := read(age + 2*time.Second); got != 42 {
+		t.Errorf("StaleTimeout (%v) > slot age (%v): got %d, want 42 (slot retained)", age+2*time.Second, age, got)
+	}
+}
+
 // TestAcquireReaderConcurrentNoSlotAliasing exercises the CAS-
 // serialisation: N goroutines acquire concurrently; assert no two
 // land on the same slot. Pinpoints invariant: the CAS on TxnID

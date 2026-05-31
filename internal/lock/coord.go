@@ -15,18 +15,21 @@ import (
 // request and the goroutine exited before granting.
 var ErrClosed = errors.New("lock: coord closed")
 
-// defaultRetryInterval bounds Close() and per-writer ctx-cancellation
+// DefaultRetryInterval bounds Close() and per-writer ctx-cancellation
 // latency under sustained cross-process contention. The goroutine
 // burns one wasted flock(LOCK_EX|LOCK_NB) syscall per tick while
 // another process holds the lock; 50 ms keeps Close-latency at one
 // tick worst-case while keeping the contended-syscall rate at 20/s.
-const defaultRetryInterval = 50 * time.Millisecond
+// Exported so the gmdb Options layer shares a single source of truth
+// for the LockRetryInterval default (cross-process.md §Write Lock).
+const DefaultRetryInterval = 50 * time.Millisecond
 
-// defaultHeartbeatInterval matches the cross-process.md §Heartbeat
+// DefaultHeartbeatInterval matches the cross-process.md §Heartbeat
 // Goroutine default ("ticks every ~1 s"). Must remain well under
 // StaleTimeout (10 s) so a few missed ticks don't trip false-stale
-// detection.
-const defaultHeartbeatInterval = 1 * time.Second
+// detection. Exported so the gmdb Options layer shares a single
+// source of truth for the HeartbeatInterval default.
+const DefaultHeartbeatInterval = 1 * time.Second
 
 // Coord owns cross-process write-lock acquisition for one *File. A
 // single "flock goroutine" runs for the lifetime of the Coord and is
@@ -80,6 +83,7 @@ type Coord struct {
 	activeSlots   []uint32
 
 	heartbeatInterval time.Duration
+	staleTimeout      time.Duration
 	clock             func() uint64
 	heartbeatDoneCh   chan struct{}
 
@@ -160,16 +164,27 @@ type CoordOptions struct {
 	PIDNamespace uint64
 
 	// RetryInterval is the flock(LOCK_EX|LOCK_NB) retry tick. Zero ⇒
-	// defaultRetryInterval (50 ms). Bounds Close() and per-writer
+	// DefaultRetryInterval (50 ms). Bounds Close() and per-writer
 	// ctx-cancellation latency under sustained contention.
 	RetryInterval time.Duration
 
 	// HeartbeatInterval is how often the heartbeat goroutine refreshes
 	// WriterHeartbeat (while holding LOCK_EX) and the Heartbeat field
 	// of every reader slot in the active list. Zero ⇒
-	// defaultHeartbeatInterval (1 s). Must remain well under
+	// DefaultHeartbeatInterval (1 s). Must remain well under
 	// StaleTimeout (10 s, per cross-process.md §Heartbeat Goroutine).
 	HeartbeatInterval time.Duration
+
+	// StaleTimeout is how long a reader-slot or writer Heartbeat must
+	// be older than the scan clock before stale-detection reclaims it
+	// (cross-process.md §Heartbeat Goroutine). Zero ⇒
+	// DefaultStaleTimeout (10 s). Consumed by OldestReaderTxnID (and
+	// thus ReapStaleReaderSlots); the writer-recovery path under
+	// LOCK_EX is timeout-independent (any non-zero WriterPID held while
+	// we own LOCK_EX is definitionally stale). Must be significantly
+	// larger than HeartbeatInterval for scheduling jitter — the caller
+	// (gmdb.Options.validate) enforces StaleTimeout > HeartbeatInterval.
+	StaleTimeout time.Duration
 
 	// Clock returns the monotonic clock value in nanoseconds. Nil ⇒
 	// the per-platform default (CLOCK_BOOTTIME on Linux,
@@ -184,11 +199,15 @@ type CoordOptions struct {
 func NewCoord(f *File, opts CoordOptions) *Coord {
 	retry := opts.RetryInterval
 	if retry <= 0 {
-		retry = defaultRetryInterval
+		retry = DefaultRetryInterval
 	}
 	hbInterval := opts.HeartbeatInterval
 	if hbInterval <= 0 {
-		hbInterval = defaultHeartbeatInterval
+		hbInterval = DefaultHeartbeatInterval
+	}
+	staleTimeout := opts.StaleTimeout
+	if staleTimeout <= 0 {
+		staleTimeout = DefaultStaleTimeout
 	}
 	clock := opts.Clock
 	if clock == nil {
@@ -204,6 +223,7 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 		doneCh:            make(chan struct{}),
 		retryInterval:     retry,
 		heartbeatInterval: hbInterval,
+		staleTimeout:      staleTimeout,
 		clock:             clock,
 		heartbeatDoneCh:   make(chan struct{}),
 	}
@@ -556,6 +576,27 @@ func (c *Coord) ActiveReaderSlots() int {
 // stamp the lock file's LastMaintenanceTime, so the comparison and the
 // stamp share one clock source.
 func (c *Coord) Clock() uint64 { return c.clock() }
+
+// StaleTimeout returns the effective per-process stale-detection
+// window — the configured CoordOptions.StaleTimeout, or
+// DefaultStaleTimeout (10 s) when unset. It governs how long a reader
+// slot's (or writer's) Heartbeat may lag the scan clock before
+// stale-detection reclaims it; OldestReaderTxnID uses it via
+// staleTimeoutNanos. Exposed for diagnostics and to let the gmdb
+// Options layer confirm the value it passed in took effect.
+func (c *Coord) StaleTimeout() time.Duration { return c.staleTimeout }
+
+// HeartbeatInterval returns the effective heartbeat-refresh cadence —
+// the configured CoordOptions.HeartbeatInterval, or
+// DefaultHeartbeatInterval (1 s) when unset. Companion to
+// StaleTimeout() for diagnostics and Options pass-through assertions.
+func (c *Coord) HeartbeatInterval() time.Duration { return c.heartbeatInterval }
+
+// RetryInterval returns the effective flock(LOCK_EX|LOCK_NB) retry
+// tick — the configured CoordOptions.RetryInterval, or
+// DefaultRetryInterval (50 ms) when unset. Companion to
+// StaleTimeout() for diagnostics and Options pass-through assertions.
+func (c *Coord) RetryInterval() time.Duration { return c.retryInterval }
 
 // UnregisterReaderSlot removes slot index i from the active list.
 // MUST be called BEFORE the reader-side clears the slot's

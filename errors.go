@@ -275,4 +275,6 @@ var (
 	errInvalidMaxBatchSize       = errors.New("gmdb: MaxBatchSize must be >= 1")
 	errInvalidMaxBatchDelay      = errors.New("gmdb: MaxBatchDelay must be >= 0")
 	errInvalidMaintenance        = errors.New("gmdb: invalid MaintenanceOptions (Interval/ScrubBatchSize/CompactionBatchSize must be >= 0; CompactionThreshold in [0,1])")
+	errInvalidCoordInterval      = errors.New("gmdb: StaleTimeout/HeartbeatInterval/LockRetryInterval must be >= 0")
+	errStaleTimeoutTooSmall      = errors.New("gmdb: StaleTimeout must be > HeartbeatInterval (cross-process.md §Heartbeat Goroutine: significantly larger, for scheduling jitter)")
 )

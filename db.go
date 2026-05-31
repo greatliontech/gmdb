@@ -240,9 +240,14 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		PID:              uint64(os.Getpid()),
 		ProcessStartTime: processStartTime,
 		PIDNamespace:     pidNamespace,
-		// RetryInterval / HeartbeatInterval default to the lock-package
-		// constants (cross-process.md). Exposed via Options when a
-		// caller needs to tune them.
+		// The three cross-process coordination intervals come straight
+		// from Options (already resolved to their lock-package defaults
+		// by applyDefaults, and validated — StaleTimeout > Heartbeat-
+		// Interval). See cross-process.md §Heartbeat Goroutine / §Write
+		// Lock and the Options godoc.
+		RetryInterval:     opts.LockRetryInterval,
+		HeartbeatInterval: opts.HeartbeatInterval,
+		StaleTimeout:      opts.StaleTimeout,
 	})
 
 	// Capture Options.Logger with the chunk-5.5 spec-amend default

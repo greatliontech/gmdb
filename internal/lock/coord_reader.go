@@ -6,13 +6,15 @@ import (
 	"time"
 )
 
-// staleTimeoutNanos converts the package's DefaultStaleTimeout to the
+// staleTimeoutNanos converts this Coord's effective StaleTimeout to the
 // uint64 nanoseconds the reader-table helpers expect. Per
-// cross-process.md §Heartbeat Goroutine the default is 10 s; the
-// coord exposes a getter so chunk-3.4 (RPL reclamation bound) and
-// chunk-3.5 (Checkpoint) callers reuse the same value.
-func staleTimeoutNanos() uint64 {
-	return uint64(DefaultStaleTimeout / time.Nanosecond)
+// cross-process.md §Heartbeat Goroutine the default is 10 s
+// (DefaultStaleTimeout), tunable via Options.StaleTimeout /
+// CoordOptions.StaleTimeout; the reader-stale-detection callers
+// (OldestReaderTxnID, and ReapStaleReaderSlots through it) all reuse
+// this one value so a single per-process window governs eviction.
+func (c *Coord) staleTimeoutNanos() uint64 {
+	return uint64(c.staleTimeout / time.Nanosecond)
 }
 
 // readerSlotHint is the process-local scan-start offset for
@@ -123,7 +125,7 @@ func (c *Coord) ReleaseReader(idx uint32) {
 // invariant is enforced by call-site discipline. Tests that exercise
 // stale-clearing acquire flock first.
 func (c *Coord) OldestReaderTxnID() uint64 {
-	return c.f.OldestReaderTxnID(c.pidNS, c.clock(), staleTimeoutNanos())
+	return c.f.OldestReaderTxnID(c.pidNS, c.clock(), c.staleTimeoutNanos())
 }
 
 // ReapStaleReaderSlots acquires the write lock and scans the reader

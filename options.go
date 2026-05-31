@@ -212,6 +212,35 @@ type Options struct {
 	// transactions.md §Write Batching.
 	MaxBatchDelay time.Duration
 
+	// StaleTimeout is how long a reader slot's (or a peer writer's)
+	// heartbeat may lag this process's monotonic clock before
+	// cross-process stale-detection reclaims it (cross-process.md
+	// §Heartbeat Goroutine). It is a *data-integrity* bound, not a
+	// performance knob: a window shorter than a live peer's effective
+	// heartbeat cadence lets a writer's RPL-reclamation scan evict that
+	// peer's still-live reader and reclaim pages it is still reading.
+	// Must be significantly larger than HeartbeatInterval to absorb
+	// scheduling jitter; Open rejects StaleTimeout <= HeartbeatInterval
+	// with ErrInvalidOptions. Zero ⇒ default. Default: 10s.
+	StaleTimeout time.Duration
+
+	// HeartbeatInterval is how often the per-DB heartbeat goroutine
+	// refreshes WriterHeartbeat (while this process holds the write
+	// lock) and the Heartbeat field of every active reader slot
+	// (cross-process.md §Heartbeat Goroutine). Must be well under
+	// StaleTimeout so a few missed ticks don't trip false-stale
+	// detection. Zero ⇒ default. Default: 1s.
+	HeartbeatInterval time.Duration
+
+	// LockRetryInterval is the polling tick the flock goroutine uses
+	// when flock(LOCK_EX|LOCK_NB) returns EWOULDBLOCK under
+	// cross-process write-lock contention (cross-process.md §Write
+	// Lock). It bounds both Close() shutdown latency and per-writer ctx
+	// cancellation latency while another process holds the lock — one
+	// wasted non-blocking flock syscall per tick. Zero ⇒ default.
+	// Default: 50ms.
+	LockRetryInterval time.Duration
+
 	// CompactDrainTimeout bounds how long Compact() waits for active
 	// in-process read transactions to commit/rollback before aborting
 	// with ErrCompactReadersActive. Default: 30s. Per api-surface.md
@@ -278,6 +307,14 @@ func (o Options) applyDefaults() Options {
 	o.ScratchDir = cmp.Or(o.ScratchDir, os.TempDir())
 	o.MaxBatchSize = cmp.Or(o.MaxBatchSize, defaultMaxBatchSize)
 	o.MaxBatchDelay = cmp.Or(o.MaxBatchDelay, defaultMaxBatchDelay)
+	// The cross-process coordination intervals share the lock package's
+	// own defaults as the single source of truth (NewCoord applies the
+	// same zero⇒default fallback as defense-in-depth). Resolving them
+	// here lets validate() check the StaleTimeout > HeartbeatInterval
+	// relation against effective values rather than raw zeros.
+	o.StaleTimeout = cmp.Or(o.StaleTimeout, lock.DefaultStaleTimeout)
+	o.HeartbeatInterval = cmp.Or(o.HeartbeatInterval, lock.DefaultHeartbeatInterval)
+	o.LockRetryInterval = cmp.Or(o.LockRetryInterval, lock.DefaultRetryInterval)
 	o.CompactDrainTimeout = cmp.Or(o.CompactDrainTimeout, defaultCompactDrainTimeout)
 	o.Maintenance.Interval = cmp.Or(o.Maintenance.Interval, defaultMaintenanceInterval)
 	o.Maintenance.ScrubBatchSize = cmp.Or(o.Maintenance.ScrubBatchSize, defaultScrubBatchSize)
@@ -347,6 +384,23 @@ func (o Options) validate() error {
 	}
 	if o.MaxBatchDelay < 0 {
 		return errInvalidMaxBatchDelay
+	}
+	// Cross-process coordination intervals: validated after
+	// applyDefaults, so a zero is already the default and only an
+	// explicit negative (which cmp.Or leaves untouched) reaches here.
+	if o.StaleTimeout < 0 || o.HeartbeatInterval < 0 || o.LockRetryInterval < 0 {
+		return errInvalidCoordInterval
+	}
+	// StaleTimeout > HeartbeatInterval is a data-integrity precondition,
+	// not a tuning preference (cross-process.md §Heartbeat Goroutine:
+	// "Must be significantly larger than the heartbeat interval ... for
+	// scheduling jitter"). At or below the heartbeat cadence, a single
+	// jitter-delayed tick lets a writer's OldestReaderTxnID scan
+	// misclassify a live reader slot as stale and reclaim pages it is
+	// still reading (use-after-reclaim). Reject the always-unsafe region
+	// at Open; the godoc recommends a window several times larger.
+	if o.StaleTimeout <= o.HeartbeatInterval {
+		return errStaleTimeoutTooSmall
 	}
 	// Maintenance: validated after applyDefaults (a zero Interval /
 	// ScrubBatchSize / CompactionBatchSize / CompactionThreshold is already
