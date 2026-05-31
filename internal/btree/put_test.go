@@ -250,6 +250,53 @@ func TestPutDeleteGetUncompressedLeafVariant(t *testing.T) {
 	}
 }
 
+// TestPutUncompressedInteriorInsert drives interior (non-append) Puts into an
+// uncompressed keyspace (RestartGroupTarget=1), exercising ucTryInsertAt through
+// the put fast-path wiring — the ascending-key TestPutDeleteGetUncompressedLeaf-
+// Variant only hits ucTryAppend. Odd keys are inserted first, then even keys,
+// so the evens land between existing odds (interior positions); every key must
+// round-trip and the leaves must stay uncompressed.
+func TestPutUncompressedInteriorInsert(t *testing.T) {
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 1}
+	pw := newFakeWriter(t, 4096)
+	root := uint64(0)
+
+	const N = 50
+	want := make(map[string]string, N)
+	order := make([]int, 0, N)
+	for i := 1; i < N; i += 2 { // sparse odds first
+		order = append(order, i)
+	}
+	for i := 0; i < N; i += 2 { // evens slot in between → interior inserts
+		order = append(order, i)
+	}
+	for _, i := range order {
+		key := fmt.Appendf(nil, "uc-%05d", i)
+		val := bytes.Repeat([]byte{byte('a' + i%26)}, 80)
+		nr, err := Put(pw, cfg, root, key, val)
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+		root = nr
+		want[string(key)] = string(val)
+	}
+
+	walkLeavesUC(t, pw, cfg, root)
+	if leafCount := countLeaves(t, pw, cfg, root); leafCount < 2 {
+		t.Fatalf("test no longer exercises split path: %d leaf(s); expected ≥ 2", leafCount)
+	}
+	for k, v := range want {
+		got, found, err := Get(pw, cfg, root, []byte(k))
+		if err != nil || !found {
+			t.Errorf("Get(%q): found=%v err=%v", k, found, err)
+			continue
+		}
+		if !bytes.Equal(got, []byte(v)) {
+			t.Errorf("Get(%q): value mismatch", k)
+		}
+	}
+}
+
 // countLeaves returns the number of leaf pages reachable from root.
 // Used by variant-pin tests to assert the split path actually fired
 // — a coverage guard against future leaf-density changes silently

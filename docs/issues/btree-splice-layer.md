@@ -2,9 +2,10 @@
 
 **Lands:** proactive — a specced-but-unbuilt performance optimization;
 multi-session feature, port from grove. The format decision is **settled**
-(keep gmdb's format — see DECISION 1, RESOLVED). Chunks 1-3 (`TryAppend`,
-`TryInsertAt`, `TryDeleteAt`, compressed) are **landed** — see Progress below;
-resume by porting the uncompressed variants next.
+(keep gmdb's format — see DECISION 1, RESOLVED). Chunks 1-4 (`TryAppend`,
+`TryInsertAt`, `TryDeleteAt` compressed + the uncompressed variants) are
+**landed** — see Progress below; resume by porting `trySplitLeafByGroup` (the
+no-decode split) next.
 
 **Severity:** [perf] — not a correctness defect; a measured throughput +
 allocation optimization. The current decode/re-encode path is correct.
@@ -108,32 +109,62 @@ splice design. Justified by a CPU profile (below).
     (unlike its two-copy insert); this is a simplicity divergence, not a bug-fix.
     (3) `bytes.Clone` capture of the predecessor/successor key+value vs grove's
     scratch-page stash.
-- **Resume: port the uncompressed variants next** (`ucTryAppend`,
-  `ucTryInsertAt`, `ucTryDeleteAt`). Read grove `leaf_uncompressed.go:39` /
-  `:84` / `:152` IN FULL first — do NOT infer the byte mechanics from the names
-  (HARD RULE #1). The uncompressed leaf is a positional offset table + full keys
-  (no delta / restart groups), `ValueLen`-before-key like the compressed form
-  (DECISION 1). This is the RGT==1 variant the three compressed dispatchers
-  currently DECLINE (`typ != TypeLeaf`) → today those fall back to decode-rebuild;
-  the uncompressed splices replace that fallback for RGT==1 keyspaces. Then the
-  final chunk: `trySplitLeafByGroup` (no-decode split). Wiring anchors:
-  `TryAppend`/`TryInsertAt` in `internal/btree/put.go`, `TryDeleteAt` in
-  `deleteFromLeaf` (`internal/btree/delete.go`) — extend each dispatcher's
-  `typ != TypeLeaf` decline into a `ucTry*` call.
-- **Shared infrastructure to REUSE (chunks 1-3; don't reinvent):** compressed
-  entry encode — `writeCompressed{Restart,Delta}Entry`, `entryTrailer`,
-  `valuePartSize`, `cellHasTrailerOnly` (`leaf_builder.go` / `leaf_splice.go`);
-  the group walk — `decodeRestartEntry` / `decodeDeltaEntry` with a reused keyBuf
-  + cloned captured keys; the variant guard — `typ != TypeLeaf ||
-  EffectiveRestartGroupTarget()==1 → decline` (the uncompressed chunk extends the
-  `typ != TypeLeaf` arm into a `ucTry*` call); the delete wiring's validate-once
-  + `SearchLeaf`-once + fast/slow fork (`deleteFromLeaf`); test helpers in
-  `leaf_splice_test.go` — `tryBuild`, `assertLeafDecodesTo` (variant-agnostic
-  semantic oracle), `assertFreeSpaceZeroed`, `insertExpected` / `checkInsert`,
-  `deleteExpected` / `checkDelete`, `randomFittingMixed`, `randomLeafEntry`,
-  `sortedInsertIdx`, `keyBetween`. `task fuzz` already iterates all `Fuzz*`. For
-  the uncompressed variants, the already-present `ucSkipEntry` scaffolding
-  (`leaf_uncompressed.go`) and the uncompressed reader paths are the analogs.
+- **Chunk 4 — uncompressed variants (`ucTryAppend` / `ucTryInsertAt` /
+  `ucTryDeleteAt`): LANDED.** `internal/page/leaf_splice.go` (three `ucTry*`
+  helpers; each dispatcher `TryAppend`/`TryInsertAt`/`TryDeleteAt` gained a
+  variant switch — splice only when the page's on-disk variant matches the
+  configured one, else decline → rebuild migrates). Shared `writeUCEntry`
+  extracted in `leaf_builder.go` (single source of truth, used by `addUCEntry` +
+  the uc splices). Append/insert reuse the existing put-fast-path wiring
+  unchanged; delete relaxed its gate to `r.Count() > 1` (`internal/btree/
+  delete.go`) so uncompressed leaves reach the splice. Byte-identity oracles
+  (`assertUC{Insert,Delete}MatchesRebuild`) + position/variant/empty tests +
+  `FuzzUCTry{Append,InsertAt,DeleteAt}` + micro-benches +
+  `TestPutUncompressedInteriorInsert` (end-to-end, exercises `ucTryInsertAt` at
+  100% via put.go). Micro-bench: **0 allocs/op** (in-place, zero-alloc).
+  - **DESIGN — CANONICAL in-place (diverges from grove).** An uncompressed leaf
+    is a sorted, packed entry array + sorted offset table, so all three splices
+    are array-style edits (shift the data tail, splice one offset slot) that are
+    **byte-identical to a LeafBuilder rebuild** — unlike the compressed
+    insert/delete (localized/semantic), these get the byte-identity oracle.
+    grove rebuilds insert/delete through a page-sized **scratch** buffer; gmdb's
+    in-place form is consistent with the compressed splices (no scratch param)
+    and zero-alloc. page-formats.md §Insert and Delete sanctions it ("the
+    per-entry data shifts but no key re-encoding occurs").
+  - **Three gmdb-specific divergences from grove (verified against grove's
+    source):** (1) canonical in-place vs grove's scratch-rebuild (insert/delete);
+    (2) all three return `bool` (delete: vs grove's `int`/−1 — gmdb's
+    `deleteFromLeaf` fallback frees an emptied leaf); (3) the pre-staged
+    `ucSkipEntry` was **deleted** — it had zero callers and was buggy (read
+    inline `ValueLen` after the key, grove's order, and mishandled nested cells),
+    and the canonical splices don't need it (the sorted+packed offset table gives
+    entry extents directly).
+- **Resume: port `trySplitLeafByGroup` next** (the final chunk — no-decode
+  split). Read grove `splitLeafAtGroupCompressed` / `findSplitGroupCompressed`
+  (`leaf_compressed.go`) + the uncompressed split path IN FULL first. This is the
+  no-decode leaf split: pick a group/entry boundary near the byte-size bias and
+  carve the page into two without decoding+re-encoding all entries. Relates to
+  `btree-byte-balanced-split.md` (finding-19 branch path + the byte-balanced
+  `FindSplitGroup`/`FindSplitIndex` the spec mandates) — check that issue at the
+  chunk-start gate. Wiring anchor: the split path in `internal/btree/put.go`
+  (`ascendWithSplit` / the leaf-overflow → split branch).
+- **Shared infrastructure to REUSE (chunks 1-4; don't reinvent):** entry encode
+  — `writeCompressed{Restart,Delta}Entry` (compressed) / `writeUCEntry`
+  (uncompressed) / `entryTrailer` / `valuePartSize` / `cellHasTrailerOnly`
+  (`leaf_builder.go` / `leaf_splice.go`); the group walk — `decodeRestartEntry` /
+  `decodeDeltaEntry` with a reused keyBuf + cloned captured keys; the variant
+  switch — splice only when the page's on-disk variant matches the configured one
+  (compressed ⇔ RGT≥2, uncompressed ⇔ RGT==1), else decline → rebuild migrates
+  (in all three dispatchers); the delete wiring's validate-once + `SearchLeaf`-
+  once + fast/slow fork (`deleteFromLeaf`); test helpers in `leaf_splice_test.go`
+  — `tryBuild`, `assertLeafDecodesTo` (semantic oracle, compressed insert/delete),
+  the byte-identity oracles `assertAppendMatchesRebuild` /
+  `assertUC{Insert,Delete}MatchesRebuild` (canonical splices), `assertFreeSpace-
+  Zeroed`, `insertExpected`/`deleteExpected`, `randomFittingMixed`,
+  `randomLeafEntry`, `sortedInsertIdx`, `keyBetween`. `task fuzz` iterates all six
+  `Fuzz*` targets. For the split chunk, the uncompressed reader paths
+  (`ucOffset`/`ucDecodeEntry`) and `compressedLastKey` are the boundary-key
+  analogs.
 
 ## Why (measured)
 

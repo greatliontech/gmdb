@@ -160,18 +160,3 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 	}
 	return lo, e, false, it
 }
-
-// ucSkipEntry advances past an uncompressed entry at off, returning the
-// next entry's byte offset. Standalone helper for the in-place splice
-// machinery in chunk-4.6β.
-func ucSkipEntry(buf []byte, off int) int {
-	flags := buf[off]
-	off++
-	keyLen := int(le.Uint16(buf[off:]))
-	off += 2 + keyLen
-	if flags&CellFlagOverflow != 0 {
-		return off + 16
-	}
-	valLen := int(le.Uint32(buf[off:]))
-	return off + 4 + valLen
-}

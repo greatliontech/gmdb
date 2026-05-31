@@ -72,9 +72,10 @@ import "bytes"
 // last key, used for prefix-delta encoding on a compressed leaf.
 //
 // Returns true on a successful in-place append; false (page byte-unchanged)
-// when the page is empty, the entry does not fit, or the variant has no
-// append splice yet, in which case the caller falls back to decode +
-// re-encode.
+// when the page is empty, the entry does not fit, or the page's variant does
+// not match the configured one (a mid-life RGT change across the compressed↔
+// uncompressed boundary — migrate via rebuild), in which case the caller falls
+// back to decode + re-encode.
 func TryAppend(buf []byte, cfg Config, e LeafEntry, prevKey []byte) bool {
 	typ, _, count, _ := ReadHeader(buf)
 	if count == 0 {
@@ -82,31 +83,23 @@ func TryAppend(buf []byte, cfg Config, e LeafEntry, prevKey []byte) bool {
 		// genesis and empty-leaf cases build via LeafBuilder, not the splice.
 		return false
 	}
-	// Splice only a compressed leaf whose variant still matches the keyspace's
-	// configured variant. Two declines route to the decode/re-encode fallback:
-	//
-	//   - typ != TypeLeaf (uncompressed page): the uncompressed append splice
-	//     lands in a later chunk (port order: compressed ops first).
-	//   - compressed page but RGT==1 now selects the uncompressed variant:
-	//     RestartGroupTarget was changed across the compressed↔uncompressed
-	//     boundary since this leaf was built. The leaf must migrate to the new
-	//     variant through the rebuild fallback — keyspaces.md: existing leaves
-	//     migrate "when they next split, merge, or are rebuilt" (the slow-path
-	//     Put is a rebuild). Splicing the stale variant would defeat the
-	//     configured variant and build degenerate single-entry restart groups
-	//     (every appended entry its own group, since target==1).
-	//
-	// A within-compressed RGT change (e.g. 16→8, still compressed) is NOT
-	// declined: the splice keeps the existing groups and encodes the new entry
-	// per the new target — spec-consistent ("existing leaves keep their stored
-	// group structure; the new value is a builder hint for leaves written
-	// after the change"). The resulting page is valid and read-correct but is
-	// not what a fresh full rebuild would produce until the leaf is next
-	// rebuilt; see the determinism note in the file header.
-	if typ != TypeLeaf || cfg.EffectiveRestartGroupTarget() == 1 {
+	// Splice only when the page's on-disk variant matches the keyspace's
+	// currently-configured variant (compressed ⇔ RGT≥2, uncompressed ⇔ RGT==1).
+	// A mismatch — RGT was changed across the compressed↔uncompressed boundary
+	// since this leaf was written — declines so the leaf migrates to the
+	// configured variant through the rebuild fallback (keyspaces.md: existing
+	// leaves migrate when next split / merged / rebuilt; the slow-path Put is a
+	// rebuild). A within-compressed RGT change (e.g. 16→8, still compressed) is
+	// NOT a mismatch — tryAppendCompressed keeps the existing groups and encodes
+	// the new entry per the new target; see the file-header determinism note.
+	switch {
+	case typ == TypeLeaf && cfg.EffectiveRestartGroupTarget() != 1:
+		return tryAppendCompressed(buf, cfg, e, prevKey)
+	case typ == TypeLeafUncompressed && cfg.EffectiveRestartGroupTarget() == 1:
+		return ucTryAppend(buf, cfg, e)
+	default:
 		return false
 	}
-	return tryAppendCompressed(buf, cfg, e, prevKey)
 }
 
 // tryAppendCompressed appends e to a compressed leaf in place. e.Key must
@@ -202,34 +195,85 @@ func tryAppendCompressed(buf []byte, cfg Config, e LeafEntry, prevKey []byte) bo
 	return true
 }
 
+// ucTryAppend appends e to an uncompressed leaf in place — the uncompressed
+// analog of tryAppendCompressed (dispatched by TryAppend when the page and the
+// configured variant are both uncompressed). e.Key must sort after every
+// existing key. An uncompressed leaf is a sorted, packed entry array with a
+// parallel sorted offset table, so an append is CANONICAL: it writes the entry
+// at DataEnd and adds its offset in the table's high (last) slot — byte-
+// identical to a LeafBuilder rebuild (page-formats.md §Leaf Split determinism
+// invariant). Returns false (page byte-unchanged) when the entry does not fit.
+func ucTryAppend(buf []byte, cfg Config, e LeafEntry) bool {
+	_, _, count16, _ := ReadHeader(buf)
+	count := int(count16)
+	contentEnd := cfg.ContentEnd()
+	dataEnd := int(le.Uint16(buf[ucLeafOffDataEnd:]))
+
+	// Fit check — identical to LeafBuilder.addUCEntry's. Must fire before any
+	// write so a decline leaves the page byte-unchanged.
+	entrySize := 1 + 2 + len(e.Key) + valuePartSize(e.Flags, e.Value)
+	if dataEnd+entrySize+(count+1)*ucOffsetEntrySize > contentEnd {
+		return false
+	}
+
+	// Write the new entry at DataEnd via the shared uncompressed encoder
+	// (gmdb's ValueLen-before-key order; entryTrailer supplies the trailer u64s
+	// for overflow / nested cells, ignored for inline / subpage).
+	t0, t1 := entryTrailer(e)
+	newDataEnd := writeUCEntry(buf, dataEnd, e.Flags, e.Key, e.Value, t0, t1)
+
+	// Grow the offset table by one slot. The table grows backward from
+	// ContentEnd, so adding a slot shifts the existing `count` offsets one slot
+	// toward DataEnd (into formerly-zero free space); the new entry's offset
+	// goes in the freed high slot — the append is the largest key, so its slot
+	// is the table's last (sorted) position, matching a rebuild.
+	oldTableStart := contentEnd - count*ucOffsetEntrySize
+	newTableStart := contentEnd - (count+1)*ucOffsetEntrySize
+	copy(buf[newTableStart:newTableStart+count*ucOffsetEntrySize], buf[oldTableStart:oldTableStart+count*ucOffsetEntrySize])
+	le.PutUint16(buf[newTableStart+count*ucOffsetEntrySize:], uint16(dataEnd))
+
+	// Header: bump Count, update DataEnd. The free region [newDataEnd,
+	// newTableStart) was already zeroed (the append consumes only zeroed bytes
+	// and shifts the table into them), so no re-zero pass is needed.
+	WriteHeader(buf, TypeLeafUncompressed, uint16(count+1), 0)
+	le.PutUint16(buf[ucLeafOffDataEnd:], uint16(newDataEnd))
+	return true
+}
+
 // TryInsertAt inserts e at absolute index insertIdx of an existing leaf in
 // place — the mid-page insert fast path. The caller MUST establish that
 // insertIdx is e.Key's sorted position and the key is absent (an append is
 // insertIdx == Count(), handled by TryAppend; a replace is a different path).
 //
 // Returns true on a successful in-place insert; false (page byte-unchanged)
-// when the page is empty, the variant doesn't match (see TryAppend), the
-// target group is at its growth cap, or the entry doesn't fit — the caller
-// then falls back to decode + re-encode.
+// when the page is empty, the page variant doesn't match the configured one
+// (see TryAppend), the target group is at its growth cap (compressed only), or
+// the entry doesn't fit — the caller then falls back to decode + re-encode.
 //
-// Unlike TryAppend this is a LOCALIZED splice: it grows the containing group
-// past RestartGroupTarget (up to min(2*target, 255)). The builder fills groups
-// to the target with no balancing, so a canonical "insert == rebuild" splice
-// could almost never fire (every full group would decline). The result is a
-// valid compressed leaf that a fresh rebuild would group differently — see the
-// file-header determinism note; its guarantee is semantic + structural, not
-// byte-identity.
+// The guarantee differs by variant. On a COMPRESSED leaf this is a LOCALIZED
+// splice: it grows the containing group past RestartGroupTarget (up to
+// min(2*target, 255)) because the builder fills groups to the target with no
+// balancing, so a canonical "insert == rebuild" splice could almost never fire;
+// the result is a valid compressed leaf a fresh rebuild would group differently
+// (guarantee: semantic + structural, see the file-header note). On an
+// UNCOMPRESSED leaf the insert is CANONICAL — a sorted-array insert (shift the
+// data tail, splice the offset table) that is byte-identical to a rebuild, since
+// there are no restart groups to rebalance.
 func TryInsertAt(buf []byte, cfg Config, insertIdx int, e LeafEntry) bool {
 	typ, _, count, _ := ReadHeader(buf)
 	if count == 0 {
 		return false
 	}
-	// Same variant gate as TryAppend: only splice a compressed leaf whose
-	// variant still matches the configured one; otherwise migrate via rebuild.
-	if typ != TypeLeaf || cfg.EffectiveRestartGroupTarget() == 1 {
+	// Same variant gate as TryAppend: splice only when the page's on-disk
+	// variant matches the configured one; otherwise migrate via rebuild.
+	switch {
+	case typ == TypeLeaf && cfg.EffectiveRestartGroupTarget() != 1:
+		return tryInsertAtCompressed(buf, cfg, insertIdx, e)
+	case typ == TypeLeafUncompressed && cfg.EffectiveRestartGroupTarget() == 1:
+		return ucTryInsertAt(buf, cfg, insertIdx, e)
+	default:
 		return false
 	}
-	return tryInsertAtCompressed(buf, cfg, insertIdx, e)
 }
 
 // tryInsertAtCompressed inserts e at insertIdx in a compressed leaf by growing
@@ -386,6 +430,63 @@ func tryInsertAtCompressed(buf []byte, cfg Config, insertIdx int, e LeafEntry) b
 	return true
 }
 
+// ucTryInsertAt inserts e at insertIdx in an uncompressed leaf in place — the
+// uncompressed analog of tryInsertAtCompressed (dispatched by TryInsertAt when
+// page and config are both uncompressed). The caller MUST establish that
+// insertIdx is e.Key's sorted position, the key is absent, and insertIdx <
+// Count() (an append is TryAppend). Returns false (page byte-unchanged) when the
+// entry doesn't fit.
+//
+// CANONICAL: an uncompressed leaf is a sorted, packed entry array, so this is a
+// sorted-array insert — open a gap of entrySize at the new key's data position
+// (shift the tail up), write the entry, and splice its offset into the table —
+// byte-identical to a LeafBuilder rebuild (page-formats.md §Insert and Delete:
+// "the per-entry data shifts but no key re-encoding occurs"; §Leaf Split
+// determinism invariant). No restart groups → no localized/rebalance case.
+func ucTryInsertAt(buf []byte, cfg Config, insertIdx int, e LeafEntry) bool {
+	_, _, count16, _ := ReadHeader(buf)
+	count := int(count16)
+	contentEnd := cfg.ContentEnd()
+	dataEnd := int(le.Uint16(buf[ucLeafOffDataEnd:]))
+
+	entrySize := 1 + 2 + len(e.Key) + valuePartSize(e.Flags, e.Value)
+	if dataEnd+entrySize+(count+1)*ucOffsetEntrySize > contentEnd {
+		return false
+	}
+
+	// The new entry's data belongs where entry insertIdx currently starts
+	// (sorted + packed → insert before it). Open a gap there by shifting the
+	// data tail [gapOff, dataEnd) up by entrySize (memmove handles the right
+	// shift), then write the entry into the gap via the shared encoder.
+	oldTableStart := contentEnd - count*ucOffsetEntrySize
+	gapOff := int(le.Uint16(buf[oldTableStart+insertIdx*ucOffsetEntrySize:]))
+	copy(buf[gapOff+entrySize:dataEnd+entrySize], buf[gapOff:dataEnd])
+	t0, t1 := entryTrailer(e)
+	writeUCEntry(buf, gapOff, e.Flags, e.Key, e.Value, t0, t1)
+
+	// Offset-table surgery (count → count+1; the table grows one slot toward
+	// DataEnd). The three regions are disjoint by construction:
+	//   1. Slots [insertIdx, count) point to data that shifted up by entrySize;
+	//      bump each in place. Old slot k lands at new slot k+1 at the SAME byte
+	//      position (the table grew one slot lower), so no move — just += S.
+	//   2. Slots [0, insertIdx) are unchanged in value but relocate one slot
+	//      lower (left shift by ucOffsetEntrySize; memmove).
+	//   3. Write the new entry's slot (= gapOff) at insertIdx.
+	newTableStart := contentEnd - (count+1)*ucOffsetEntrySize
+	for k := insertIdx; k < count; k++ {
+		off := oldTableStart + k*ucOffsetEntrySize
+		le.PutUint16(buf[off:], uint16(int(le.Uint16(buf[off:]))+entrySize))
+	}
+	copy(buf[newTableStart:newTableStart+insertIdx*ucOffsetEntrySize], buf[oldTableStart:oldTableStart+insertIdx*ucOffsetEntrySize])
+	le.PutUint16(buf[newTableStart+insertIdx*ucOffsetEntrySize:], uint16(gapOff))
+
+	// The gap-shift + table-relocate consume only previously-zeroed free bytes,
+	// so [newDataEnd, newTableStart) stays zeroed — no re-zero pass.
+	WriteHeader(buf, TypeLeafUncompressed, uint16(count+1), 0)
+	le.PutUint16(buf[ucLeafOffDataEnd:], uint16(dataEnd+entrySize))
+	return true
+}
+
 // TryDeleteAt removes the entry at absolute index deleteIdx from an existing
 // leaf in place — the delete fast path. The caller MUST establish that
 // deleteIdx is a present entry's index (e.g. via SearchLeaf).
@@ -404,24 +505,31 @@ func tryInsertAtCompressed(buf []byte, cfg Config, insertIdx int, e LeafEntry) b
 // neither the freed-space value nor an explicit empty code is needed here. This
 // keeps TryDeleteAt's signature uniform with TryAppend / TryInsertAt.
 //
-// Like TryInsertAt this is a LOCALIZED splice (it shrinks one group; a fresh
-// rebuild would re-pack the survivors), so a successful splice's guarantee is
-// semantic + structural, not byte-identity — see the file-header note.
+// The guarantee differs by variant. On a COMPRESSED leaf this is a LOCALIZED
+// splice (it shrinks one group; a fresh rebuild would re-pack the survivors),
+// so its guarantee is semantic + structural, not byte-identity — see the
+// file-header note. On an UNCOMPRESSED leaf the delete is CANONICAL — a
+// sorted-array delete (shift the data tail, splice the offset table) that is
+// byte-identical to a rebuild.
 func TryDeleteAt(buf []byte, cfg Config, deleteIdx int) bool {
 	typ, _, count, _ := ReadHeader(buf)
 	if count <= 1 {
 		// The page would become empty. The caller's decode-rebuild fallback
 		// retires the leaf (rebuildLeafAfterDelete with an empty entry set); the
-		// splice has no emptied-page form to produce, so decline.
+		// splice has no emptied-page form to produce, so decline. (Both variants.)
 		return false
 	}
-	// Same variant gate as TryAppend / TryInsertAt: only splice a compressed leaf
-	// whose variant still matches the configured one; otherwise the leaf migrates
-	// to the configured variant through the rebuild fallback.
-	if typ != TypeLeaf || cfg.EffectiveRestartGroupTarget() == 1 {
+	// Same variant gate as TryAppend / TryInsertAt: splice only when the page's
+	// on-disk variant matches the configured one; otherwise the leaf migrates to
+	// the configured variant through the rebuild fallback.
+	switch {
+	case typ == TypeLeaf && cfg.EffectiveRestartGroupTarget() != 1:
+		return tryDeleteAtCompressed(buf, cfg, deleteIdx)
+	case typ == TypeLeafUncompressed && cfg.EffectiveRestartGroupTarget() == 1:
+		return ucTryDeleteAt(buf, cfg, deleteIdx)
+	default:
 		return false
 	}
-	return tryDeleteAtCompressed(buf, cfg, deleteIdx)
 }
 
 // tryDeleteAtCompressed removes the entry at deleteIdx from a compressed leaf by
@@ -619,6 +727,61 @@ func tryDeleteAtCompressed(buf []byte, cfg Config, deleteIdx int) bool {
 
 	WriteHeader(buf, TypeLeaf, uint16(count-1), 0)
 	le.PutUint16(buf[leafOffDataEnd:], uint16(newDataEnd))
+	return true
+}
+
+// ucTryDeleteAt removes the entry at deleteIdx from an uncompressed leaf in
+// place — the uncompressed analog of tryDeleteAtCompressed (dispatched by
+// TryDeleteAt when page and config are both uncompressed, count > 1). Returns
+// true; an uncompressed delete always shrinks (no re-encoding growth — entries
+// are independent), so there is no fit-check.
+//
+// CANONICAL: a sorted-array delete — the entry's byte extent comes straight from
+// the offset table (sorted + packed ⇒ entry j spans [offset[j], offset[j+1]),
+// the last ending at DataEnd), close the gap by shifting the data tail down, and
+// splice the slot out of the table — byte-identical to a LeafBuilder rebuild.
+func ucTryDeleteAt(buf []byte, cfg Config, deleteIdx int) bool {
+	_, _, count16, _ := ReadHeader(buf)
+	count := int(count16)
+	contentEnd := cfg.ContentEnd()
+	dataEnd := int(le.Uint16(buf[ucLeafOffDataEnd:]))
+	oldTableStart := contentEnd - count*ucOffsetEntrySize
+
+	// Deleted entry's extent from the offset table (no parse needed).
+	deletedOff := int(le.Uint16(buf[oldTableStart+deleteIdx*ucOffsetEntrySize:]))
+	deletedEnd := dataEnd
+	if deleteIdx+1 < count {
+		deletedEnd = int(le.Uint16(buf[oldTableStart+(deleteIdx+1)*ucOffsetEntrySize:]))
+	}
+	entrySize := deletedEnd - deletedOff
+	newDataEnd := dataEnd - entrySize
+
+	// Close the gap: shift the data tail [deletedEnd, dataEnd) down by entrySize
+	// (memmove handles the left shift).
+	copy(buf[deletedOff:deletedOff+(dataEnd-deletedEnd)], buf[deletedEnd:dataEnd])
+
+	// Offset-table surgery (count → count-1; the table shrinks one slot,
+	// relocating one slot toward ContentEnd). Mirror of ucTryInsertAt:
+	//   1. Slots (deleteIdx, count) point to data that shifted down by
+	//      entrySize; -= it in place (old slot k → new slot k-1 at the SAME
+	//      byte position, since the table shrank one slot higher).
+	//   2. Slots [0, deleteIdx) are unchanged in value but relocate one slot
+	//      higher (right shift by ucOffsetEntrySize; memmove).
+	newTableStart := contentEnd - (count-1)*ucOffsetEntrySize
+	for k := deleteIdx + 1; k < count; k++ {
+		off := oldTableStart + k*ucOffsetEntrySize
+		le.PutUint16(buf[off:], uint16(int(le.Uint16(buf[off:]))-entrySize))
+	}
+	copy(buf[newTableStart:newTableStart+deleteIdx*ucOffsetEntrySize], buf[oldTableStart:oldTableStart+deleteIdx*ucOffsetEntrySize])
+
+	// Zero the freed bytes — the data tail [newDataEnd, dataEnd) and the vacated
+	// low table slot [oldTableStart, newTableStart) — so free space stays
+	// zeroed. Runs after the surgery (which reads the old low slots); the new
+	// table [newTableStart, ContentEnd) is disjoint.
+	clear(buf[newDataEnd:newTableStart])
+
+	WriteHeader(buf, TypeLeafUncompressed, uint16(count-1), 0)
+	le.PutUint16(buf[ucLeafOffDataEnd:], uint16(newDataEnd))
 	return true
 }
 

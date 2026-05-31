@@ -531,15 +531,14 @@ in §Uncompressed Leaf above (single-phase O(log N) lookup, trivial
 Insert and delete within a leaf splice the page in place when the
 resulting layout fits — `tryAppendCompressed`,
 `tryInsertAtCompressed`, `tryDeleteAtCompressed` for the compressed
-variant; `tryAppendUncompressed`, `tryInsertAtUncompressed`,
-`tryDeleteAtUncompressed` for the uncompressed. Inserting between
-two compressed delta entries re-encodes the successor entry's delta
-against the new predecessor and may shift the containing group's
-boundaries; the splice helpers return false when the layout impact
-crosses a boundary in a way the local rewrite can't predict, at
-which point the caller falls back to the full
-decode-and-rebuild path (`tryInsertAt` / `tryDeleteAt` callers in
-`internal/btree`).
+variant; `ucTryAppend`, `ucTryInsertAt`, `ucTryDeleteAt` for the
+uncompressed. Inserting between two compressed delta entries
+re-encodes the successor entry's delta against the new predecessor
+and may shift the containing group's boundaries; the splice helpers
+return false when the layout impact crosses a boundary in a way the
+local rewrite can't predict, at which point the caller falls back to
+the full decode-and-rebuild path (the `TryInsertAt` / `TryDeleteAt`
+dispatchers' callers in `internal/btree`).
 
 The restart table is rebuilt only when group composition changes —
 not on every insert / delete. Uncompressed leaves rebuild only the

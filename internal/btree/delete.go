@@ -181,12 +181,14 @@ func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID
 		return pageID, false, false, nil
 	}
 
-	// Fast path: in-place delete splice on a compressed leaf with more than one
-	// entry. TryDeleteAt declines (→ slow path) on a variant mismatch (a
-	// compressed page reconfigured to RGT==1, the rare mid-life case); count<=1
-	// (page would empty) and uncompressed leaves are routed straight to the slow
-	// path by this gate, so the only speculative CoW is that rare decline.
-	if r.Compressed() && r.Count() > 1 {
+	// Fast path: in-place delete splice for any leaf with more than one entry.
+	// TryDeleteAt handles both variants (canonical for uncompressed, localized
+	// for compressed) and declines (→ slow path) only on a variant mismatch (a
+	// page whose on-disk variant differs from the configured one after a mid-life
+	// RGT change — the rare case); count<=1 (page would empty) is routed straight
+	// to the slow path by this gate. On a decline the speculative CoW is freed
+	// and the slow path runs (and migrates the variant).
+	if r.Count() > 1 {
 		newID, err := pw.AllocPage()
 		if err != nil {
 			return 0, false, false, fmt.Errorf("btree: alloc CoW leaf for delete: %w", err)

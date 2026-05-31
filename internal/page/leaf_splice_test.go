@@ -234,21 +234,55 @@ func TestTryAppendOnEmptyPage(t *testing.T) {
 	}
 }
 
-// TestTryAppendUncompressedDeclines confirms the dispatcher falls back (false,
-// unchanged) for uncompressed leaves until the uncompressed splice lands.
-func TestTryAppendUncompressedDeclines(t *testing.T) {
+// TestUCTryAppend_MatchesRebuild: an append to an uncompressed leaf (RGT=1)
+// splices in place and is byte-identical to a LeafBuilder rebuild — uncompressed
+// appends are CANONICAL (a sorted, packed entry array + sorted offset table, so
+// an append is exactly the builder's last action). Reuses the TryAppend byte-
+// identity oracle with an uncompressed config.
+func TestUCTryAppend_MatchesRebuild(t *testing.T) {
 	cfg := Config{PageSize: 4096, RestartGroupTarget: 1} // uncompressed variant
+	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
+	cases := []struct {
+		name string
+		base []LeafEntry
+		e    LeafEntry
+	}{
+		{"inline", []LeafEntry{mk("aaa", "1"), mk("bbb", "2")}, mk("ccc", "3")},
+		{"single-entry base", []LeafEntry{mk("aaa", "1")}, mk("bbb", "2")},
+		{"overflow", []LeafEntry{mk("k1", "v")}, LeafEntry{Flags: CellFlagOverflow, Key: []byte("k2"), OverflowPage: 42, TotalLen: 100000}},
+		{"nested", []LeafEntry{mk("k1", "v")}, LeafEntry{Flags: CellFlagMultiValue | CellFlagNestedTree, Key: []byte("k2"), NestedRoot: 7, NestedCount: 9}},
+		{"subpage", []LeafEntry{mk("k1", "v")}, LeafEntry{Flags: CellFlagMultiValue, Key: []byte("k2"), Value: []byte("sub")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, spliced := assertAppendMatchesRebuild(t, cfg, tc.base, tc.e); !spliced {
+				t.Fatal("expected uncompressed TryAppend to land in place")
+			}
+		})
+	}
+}
+
+// TestTryAppendVariantMismatchDeclines: a page whose on-disk variant differs
+// from the configured one must decline (false, byte-unchanged) so the leaf
+// migrates via rebuild. The compressed-page + RGT==1 direction is covered by
+// TestTryAppendCompressedDeclinesWhenConfiguredUncompressed; this covers the
+// uncompressed-page + RGT>=2 direction.
+func TestTryAppendVariantMismatchDeclines(t *testing.T) {
 	base := []LeafEntry{{Key: []byte("aaa"), Value: []byte("1")}, {Key: []byte("bbb"), Value: []byte("2")}}
-	buf, ok := tryBuild(cfg, base)
+	buf, ok := tryBuild(Config{PageSize: 4096, RestartGroupTarget: 1}, base) // uncompressed page
 	if !ok {
 		t.Fatal("base did not fit")
 	}
+	if buf[0] != TypeLeafUncompressed {
+		t.Fatalf("base is not an uncompressed leaf: type=%d", buf[0])
+	}
 	before := bytes.Clone(buf)
-	if TryAppend(buf, cfg, LeafEntry{Key: []byte("ccc"), Value: []byte("3")}, []byte("bbb")) {
-		t.Fatal("TryAppend should decline on an uncompressed leaf (no uc splice yet)")
+	// Same uncompressed page, but the keyspace is now configured compressed.
+	if TryAppend(buf, Config{PageSize: 4096, RestartGroupTarget: 16}, LeafEntry{Key: []byte("ccc"), Value: []byte("3")}, []byte("bbb")) {
+		t.Fatal("TryAppend should decline an uncompressed page when RGT>=2 (migrate to compressed via rebuild)")
 	}
 	if !bytes.Equal(buf, before) {
-		t.Fatal("TryAppend mutated an uncompressed page on decline")
+		t.Fatal("TryAppend mutated the page on variant-decline")
 	}
 }
 
@@ -302,6 +336,28 @@ func FuzzTryAppendCompressed(f *testing.F) {
 			val[i] = byte(appendSeed >> uint(8*(i%8)))
 		}
 		assertAppendMatchesRebuild(t, cfg, base, LeafEntry{Key: appendKey, Value: val})
+	})
+}
+
+// FuzzUCTryAppend asserts the byte-identity invariant for UNCOMPRESSED appends
+// (RGT=1) over random leaves + random appended entries of mixed cell kinds
+// (overflow / nested / subpage / inline). Uncompressed appends are canonical, so
+// the oracle is the same byte-identical-to-rebuild check as the compressed
+// append.
+func FuzzUCTryAppend(f *testing.F) {
+	f.Add(uint64(1), uint64(2))
+	f.Add(uint64(42), uint64(7))
+	f.Add(uint64(0xDEADBEEF), uint64(0xCAFEBABE))
+
+	f.Fuzz(func(t *testing.T, leafSeed, appendSeed uint64) {
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 1} // uncompressed variant
+		base := randomFittingMixed(leafSeed, cfg)
+		if len(base) == 0 {
+			return
+		}
+		appendKey := keyAfterSeed(base[len(base)-1].Key, appendSeed)
+		e := randomLeafEntry(rand.New(rand.NewPCG(appendSeed, appendSeed^0xABCD1234EF567890)), appendKey)
+		assertAppendMatchesRebuild(t, cfg, base, e)
 	})
 }
 
@@ -802,21 +858,9 @@ func TestTryDeleteAtCompressed_VariantDeclines(t *testing.T) {
 	}
 }
 
-func TestTryDeleteAtUncompressedDeclines(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 1} // uncompressed variant
-	base := []LeafEntry{{Key: []byte("aaa"), Value: []byte("1")}, {Key: []byte("bbb"), Value: []byte("2")}}
-	buf, ok := tryBuild(cfg, base)
-	if !ok {
-		t.Fatal("base did not fit")
-	}
-	before := bytes.Clone(buf)
-	if TryDeleteAt(buf, cfg, 0) {
-		t.Fatal("TryDeleteAt should decline on an uncompressed leaf (no uc splice yet)")
-	}
-	if !bytes.Equal(buf, before) {
-		t.Fatal("TryDeleteAt mutated an uncompressed page on decline")
-	}
-}
+// (Uncompressed delete is now spliced in place — covered positively by
+// TestUCTryDeleteAt_MatchesRebuild, and the uncompressed-page-under-compressed-
+// config decline by TestUCSpliceVariantMismatchDeclines.)
 
 // TestTryDeleteAtCompressed_WithChecksum runs the splice under PageChecksum:true,
 // which lowers ContentEnd by FooterSize and relocates the restart table
@@ -892,6 +936,261 @@ func BenchmarkTryDeleteAtCompressed(b *testing.B) {
 				}
 				work := make([]byte, cfg.PageSize)
 				deleteIdx := gc / 2
+				b.ResetTimer()
+				b.ReportAllocs()
+				for range b.N {
+					copy(work, prebuilt)
+					TryDeleteAt(work, cfg, deleteIdx)
+				}
+			})
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Uncompressed insert / delete — CANONICAL splices (a sorted, packed entry array
+// + sorted offset table → array insert/delete is byte-identical to a rebuild),
+// so the oracle is byte-identity, not the compressed ops' semantic oracle.
+// ---------------------------------------------------------------------------
+
+// assertUCInsertMatchesRebuild: the spliced page must equal a LeafBuilder
+// rebuild of base with e at idx; or, if that rebuild overflows, TryInsertAt must
+// decline leaving the page byte-unchanged.
+func assertUCInsertMatchesRebuild(t *testing.T, cfg Config, base []LeafEntry, idx int, e LeafEntry) {
+	t.Helper()
+	orig, ok := tryBuild(cfg, base)
+	if !ok {
+		t.Fatalf("base (%d entries) did not fit", len(base))
+	}
+	expected, expFits := tryBuild(cfg, insertExpected(base, e, idx))
+	actual := bytes.Clone(orig)
+	got := TryInsertAt(actual, cfg, idx, e)
+	if !expFits {
+		if got {
+			t.Fatalf("TryInsertAt succeeded but a rebuild overflowed (base=%d idx=%d)", len(base), idx)
+		}
+		if !bytes.Equal(actual, orig) {
+			t.Fatalf("TryInsertAt declined but mutated the page")
+		}
+		return
+	}
+	if !got {
+		t.Fatalf("TryInsertAt declined but a rebuild fit (base=%d idx=%d)", len(base), idx)
+	}
+	if !bytes.Equal(actual, expected) {
+		t.Fatalf("uncompressed insert != rebuild (must be canonical): base=%d idx=%d", len(base), idx)
+	}
+	if err := NewLeafReader(actual, cfg).Validate(); err != nil {
+		t.Fatalf("spliced page fails Validate: %v", err)
+	}
+}
+
+// assertUCDeleteMatchesRebuild: for len(base) > 1 the spliced page must equal a
+// rebuild of base without idx; for len(base) == 1 the splice declines (the page
+// would empty — the btree slow path retires it), page byte-unchanged.
+func assertUCDeleteMatchesRebuild(t *testing.T, cfg Config, base []LeafEntry, idx int) {
+	t.Helper()
+	orig, ok := tryBuild(cfg, base)
+	if !ok {
+		t.Fatalf("base (%d entries) did not fit", len(base))
+	}
+	actual := bytes.Clone(orig)
+	got := TryDeleteAt(actual, cfg, idx)
+	if len(base) == 1 {
+		if got {
+			t.Fatalf("TryDeleteAt should decline a count==1 page")
+		}
+		if !bytes.Equal(actual, orig) {
+			t.Fatalf("TryDeleteAt mutated a count==1 page on decline")
+		}
+		return
+	}
+	if !got {
+		t.Fatalf("TryDeleteAt declined for count=%d idx=%d (uncompressed delete always shrinks)", len(base), idx)
+	}
+	expected, _ := tryBuild(cfg, deleteExpected(base, idx))
+	if !bytes.Equal(actual, expected) {
+		t.Fatalf("uncompressed delete != rebuild (must be canonical): base=%d idx=%d", len(base), idx)
+	}
+	if err := NewLeafReader(actual, cfg).Validate(); err != nil {
+		t.Fatalf("spliced page fails Validate: %v", err)
+	}
+}
+
+func TestUCTryInsertAt_MatchesRebuild(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
+	ovf := func(k string, pg, tl uint64) LeafEntry {
+		return LeafEntry{Flags: CellFlagOverflow, Key: []byte(k), OverflowPage: pg, TotalLen: tl}
+	}
+	t.Run("front", func(t *testing.T) {
+		assertUCInsertMatchesRebuild(t, cfg, []LeafEntry{mk("bbb", "1"), mk("ccc", "2")}, 0, mk("aaa", "x"))
+	})
+	t.Run("interior", func(t *testing.T) {
+		assertUCInsertMatchesRebuild(t, cfg, []LeafEntry{mk("aaa", "1"), mk("ccc", "2")}, 1, mk("bbb", "x"))
+	})
+	t.Run("new overflow interior", func(t *testing.T) {
+		assertUCInsertMatchesRebuild(t, cfg, []LeafEntry{mk("aaa", "1"), mk("ccc", "2")}, 1, ovf("bbb", 7, 50000))
+	})
+	t.Run("overflow successor displaced", func(t *testing.T) {
+		assertUCInsertMatchesRebuild(t, cfg, []LeafEntry{mk("aaa", "1"), ovf("ccc", 9, 99)}, 1, mk("bbb", "x"))
+	})
+	t.Run("nested successor displaced", func(t *testing.T) {
+		nested := LeafEntry{Flags: CellFlagMultiValue | CellFlagNestedTree, Key: []byte("ccc"), NestedRoot: 3, NestedCount: 4}
+		assertUCInsertMatchesRebuild(t, cfg, []LeafEntry{mk("aaa", "1"), nested}, 1, mk("bbb", "x"))
+	})
+	t.Run("many-entry interior", func(t *testing.T) {
+		var base []LeafEntry
+		for i := range 10 {
+			base = append(base, LeafEntry{Key: fmt.Appendf(nil, "key-%04d", i*2), Value: []byte("v")})
+		}
+		assertUCInsertMatchesRebuild(t, cfg, base, 5, mk("key-0009", "x"))
+	})
+}
+
+func TestUCTryDeleteAt_MatchesRebuild(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
+	// Mixed cell kinds; delete every position and assert byte-identity to a
+	// rebuild of the survivors.
+	base := []LeafEntry{
+		mk("aaa", "1"),
+		{Flags: CellFlagOverflow, Key: []byte("bbb"), OverflowPage: 7, TotalLen: 50000},
+		mk("ccc", "3"),
+		{Flags: CellFlagMultiValue | CellFlagNestedTree, Key: []byte("ddd"), NestedRoot: 9, NestedCount: 4},
+		mk("eee", "5"),
+	}
+	for idx := range base {
+		t.Run(fmt.Sprintf("idx=%d", idx), func(t *testing.T) {
+			assertUCDeleteMatchesRebuild(t, cfg, base, idx)
+		})
+	}
+	t.Run("single-entry declines", func(t *testing.T) {
+		assertUCDeleteMatchesRebuild(t, cfg, []LeafEntry{mk("only", "v")}, 0)
+	})
+}
+
+// TestUCSpliceVariantMismatchDeclines: an uncompressed page under a compressed
+// config (RGT>=2) must decline insert AND delete, byte-unchanged (migrate via
+// rebuild) — the dispatchers' variant switch, exercised for the insert/delete ops.
+func TestUCSpliceVariantMismatchDeclines(t *testing.T) {
+	ucCfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	compressedCfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	base := []LeafEntry{{Key: []byte("aaa"), Value: []byte("1")}, {Key: []byte("ccc"), Value: []byte("2")}}
+	ucBuf, ok := tryBuild(ucCfg, base)
+	if !ok {
+		t.Fatal("base did not fit")
+	}
+	if ucBuf[0] != TypeLeafUncompressed {
+		t.Fatalf("base is not uncompressed: type=%d", ucBuf[0])
+	}
+	ins := bytes.Clone(ucBuf)
+	if TryInsertAt(ins, compressedCfg, 1, LeafEntry{Key: []byte("bbb"), Value: []byte("x")}) {
+		t.Fatal("TryInsertAt should decline an uncompressed page under RGT>=2")
+	}
+	if !bytes.Equal(ins, ucBuf) {
+		t.Fatal("TryInsertAt mutated the page on variant-decline")
+	}
+	del := bytes.Clone(ucBuf)
+	if TryDeleteAt(del, compressedCfg, 1) {
+		t.Fatal("TryDeleteAt should decline an uncompressed page under RGT>=2")
+	}
+	if !bytes.Equal(del, ucBuf) {
+		t.Fatal("TryDeleteAt mutated the page on variant-decline")
+	}
+}
+
+// FuzzUCTryInsertAt asserts the byte-identity invariant for uncompressed inserts
+// over random leaves + random interior positions/keys (mixed cell kinds).
+func FuzzUCTryInsertAt(f *testing.F) {
+	f.Add(uint64(1), uint64(2), uint64(0))
+	f.Add(uint64(42), uint64(7), uint64(3))
+	f.Add(uint64(0xDEADBEEF), uint64(0xCAFEBABE), uint64(5))
+
+	f.Fuzz(func(t *testing.T, leafSeed, keySeed, posSeed uint64) {
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+		base := randomFittingMixed(leafSeed, cfg)
+		if len(base) == 0 {
+			return
+		}
+		insertIdx := int(posSeed % uint64(len(base))) // [0, len): interior/front
+		var lo []byte
+		if insertIdx > 0 {
+			lo = base[insertIdx-1].Key
+		}
+		newKey, ok := keyBetween(lo, base[insertIdx].Key, keySeed)
+		if !ok {
+			return
+		}
+		e := randomLeafEntry(rand.New(rand.NewPCG(keySeed, keySeed^0xABCD1234EF567890)), newKey)
+		assertUCInsertMatchesRebuild(t, cfg, base, insertIdx, e)
+	})
+}
+
+// FuzzUCTryDeleteAt asserts the byte-identity invariant for uncompressed deletes
+// over random leaves + random positions (mixed cell kinds).
+func FuzzUCTryDeleteAt(f *testing.F) {
+	f.Add(uint64(1), uint64(0))
+	f.Add(uint64(42), uint64(3))
+	f.Add(uint64(0xDEADBEEF), uint64(5))
+
+	f.Fuzz(func(t *testing.T, leafSeed, posSeed uint64) {
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+		base := randomFittingMixed(leafSeed, cfg)
+		if len(base) == 0 {
+			return
+		}
+		assertUCDeleteMatchesRebuild(t, cfg, base, int(posSeed%uint64(len(base))))
+	})
+}
+
+// BenchmarkUCTryInsertAt / BenchmarkUCTryDeleteAt measure the per-call cost of an
+// uncompressed mid-page splice (in-place, zero-alloc — no clones, unlike the
+// compressed ops). Compare against the decode/re-encode fallback they replace.
+func BenchmarkUCTryInsertAt(b *testing.B) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	for _, n := range []int{8, 32} {
+		for _, valSize := range []int{8, 100} {
+			b.Run(fmt.Sprintf("n=%d/val=%d", n, valSize), func(b *testing.B) {
+				val := bytes.Repeat([]byte("v"), valSize)
+				var base []LeafEntry
+				for i := range n {
+					base = append(base, LeafEntry{Key: fmt.Appendf(nil, "key-%04d", i*2), Value: val})
+				}
+				prebuilt, ok := tryBuild(cfg, base)
+				if !ok {
+					b.Fatalf("base did not fit (n=%d val=%d)", n, valSize)
+				}
+				work := make([]byte, cfg.PageSize)
+				insertIdx := n / 2
+				e := LeafEntry{Key: fmt.Appendf(nil, "key-%04d", insertIdx*2-1), Value: val}
+				b.ResetTimer()
+				b.ReportAllocs()
+				for range b.N {
+					copy(work, prebuilt)
+					TryInsertAt(work, cfg, insertIdx, e)
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkUCTryDeleteAt(b *testing.B) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 1}
+	for _, n := range []int{8, 32} {
+		for _, valSize := range []int{8, 100} {
+			b.Run(fmt.Sprintf("n=%d/val=%d", n, valSize), func(b *testing.B) {
+				val := bytes.Repeat([]byte("v"), valSize)
+				var base []LeafEntry
+				for i := range n {
+					base = append(base, LeafEntry{Key: fmt.Appendf(nil, "key-%04d", i), Value: val})
+				}
+				prebuilt, ok := tryBuild(cfg, base)
+				if !ok {
+					b.Fatalf("base did not fit (n=%d val=%d)", n, valSize)
+				}
+				work := make([]byte, cfg.PageSize)
+				deleteIdx := n / 2
 				b.ResetTimer()
 				b.ReportAllocs()
 				for range b.N {
