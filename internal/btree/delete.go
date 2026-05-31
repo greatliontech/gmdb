@@ -1324,7 +1324,7 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold 
 		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute branches with <3 combined cells", ErrCorrupted)
 	}
 	// Choose the boundary by BYTE size, not the cell-count midpoint
-	// (btree-byte-balanced-split, page-formats.md §Leaf Split). The merge
+	// (page-formats.md §Leaf Split; see findBranchSplitIndex). The merge
 	// above already failed, so `combined` exceeds one page; a count midpoint
 	// can overflow a half on size-skewed separators (spurious ErrCorrupted)
 	// or leave a half below MergeThreshold (range-delete.md §Invariants

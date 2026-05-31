@@ -24,10 +24,11 @@ public surface — they'd have to import the internal package (impossible)
 or string-match. Same defect shape as `ErrVersionMismatch` had before it
 was wired this session.
 
-**Relationship to the split bug:** the count-vs-byte split bug
-(`btree-byte-balanced-split`) currently *surfaces* as this leaked error on
-valid data. This sentinel fix is still independently required: even after
-the split fix, a genuinely oversize key must return a wrapped, detectable
+**Relationship to the split bug:** the count-vs-byte split bug (resolved —
+split boundaries are byte/logical-balanced; `page-formats.md` §Leaf Split +
+§Prefix-Truncated Branch Keys) historically *surfaced* as this leaked error
+on valid data. This sentinel fix is still independently required: a
+genuinely oversize key must return a wrapped, detectable
 `gmdb.ErrKeyTooLarge`.
 
 ## Fix

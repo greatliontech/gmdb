@@ -716,7 +716,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		// sharing) separators with short ones has count midpoints that put
 		// more than one page of cells on a side — a spurious failure on a
 		// valid Put though a feasible byte-balanced boundary exists
-		// (btree-byte-balanced-split, page-formats.md §Leaf Split). The
+		// (page-formats.md §Leaf Split; see findBranchSplitIndex). The
 		// chosen halves are guaranteed to fit, so the EncodeBranch calls
 		// below cannot fail on size.
 		mid, ok := findBranchSplitIndex(cfg, newCells)

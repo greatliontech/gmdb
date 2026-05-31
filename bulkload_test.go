@@ -194,7 +194,8 @@ func genSkewedSeparatorKVs(clusters, per, prefixLen, valueLen int) []kv {
 }
 
 // TestBulkBuilderLargeSeparatorsByteDriven covers the bulk branch builder
-// under size-skewed separators (btree-byte-balanced-split, step 3). The
+// under size-skewed separators (page-formats.md §Prefix-Truncated Branch
+// Keys). The
 // bottom-up builder is fill-driven by construction — addLink appends a cell
 // only while the page's BranchEncodedSizeOf stays <= ContentEnd (bulkload.go) — so unlike
 // the top-down Put/Delete split it never chose a count midpoint and cannot

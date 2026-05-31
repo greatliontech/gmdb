@@ -9,7 +9,7 @@ import (
 )
 
 // TestPutSizeSkewedLeafSplitNoSpuriousError reproduces the headline
-// byte-split fault (btree-byte-balanced-split) through the public API:
+// byte-split fault (page-formats.md §Leaf Split) through the public API:
 // Put of valid size-skewed data — many small entries interleaved with
 // occasional large inline values, the directory/metadata shape — must
 // not return a spurious ErrKeyTooLarge, and every value must read back

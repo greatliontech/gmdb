@@ -24,8 +24,8 @@ func splitTestBuilder() (*page.LeafBuilder, []byte, page.Config) {
 }
 
 // TestFindLeafSplitIndexFeasibleWhenCountMidpointFails is the core
-// regression for the byte-balanced split (btree-byte-balanced-split,
-// page-formats.md §Leaf Split). A size-skewed leaf whose entry-count
+// regression for the byte-balanced split (page-formats.md §Leaf Split).
+// A size-skewed leaf whose entry-count
 // midpoint places more than a page of bytes on one half — while a
 // feasible byte-balanced boundary exists — must split successfully. The
 // prior `len(entries)/2` split returned a spurious ErrKeyTooLarge on
@@ -142,7 +142,8 @@ func branchTestCell(lead byte, idx int, keyLen int) page.BranchCell {
 // (16 + 2·1412 + 3·14 = 2882 ≤ 4096), so inserting a third big separator
 // is an in-spec mutation. The entry-count midpoint (idx 3) then clusters
 // all three bigs on the left half (16 + 3·1412 = 4252 > 4096), the exact
-// btree-byte-balanced-split fault for branches (finding 19).
+// count-midpoint branch-split fault (page-formats.md §Prefix-Truncated
+// Branch Keys).
 func skewedBranchCells() []page.BranchCell {
 	return []page.BranchCell{
 		branchTestCell(0x10, 0, 1400),
@@ -164,7 +165,8 @@ func branchHalvesFit(cfg page.Config, cells []page.BranchCell, mid int) bool {
 }
 
 // TestBranchCountSplitFaultDemonstration is the demonstrated-fault anchor
-// for the branch half of btree-byte-balanced-split (finding 19). It proves,
+// for the branch count-midpoint split fault (page-formats.md
+// §Prefix-Truncated Branch Keys). It proves,
 // against page.BranchEncodedSize alone, that the entry-COUNT midpoint
 // (`mid := len(cells)/2`, what put.go/delete.go chose) places more than one
 // page of cells on a half for a reachable cell set, so the count split
