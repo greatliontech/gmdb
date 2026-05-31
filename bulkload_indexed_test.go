@@ -128,7 +128,7 @@ func TestKeyspaceBulkLoadIndexedRoundTrip(t *testing.T) {
 	if got := lookupKeysSorted(t, idxFirst, []byte("b")); len(got) != 2 || got[0] != "k2" || got[1] != "k3" {
 		t.Errorf("by_first['b'] = %v, want [k2 k3]", got)
 	}
-	if st, err := idxFirst.Stats(); err != nil || st.Count != 6 {
+	if st, err := idxFirst.Stats(); err != nil || st.Entries != 6 {
 		t.Errorf("by_first Stats = %+v err=%v, want Count 6", st, err)
 	}
 
@@ -143,7 +143,7 @@ func TestKeyspaceBulkLoadIndexedRoundTrip(t *testing.T) {
 	if string(pk) != "k2" || string(val) != "banana" {
 		t.Errorf("by_value.Get(banana) = (%s, %s), want (k2, banana)", pk, val)
 	}
-	if st, err := idxValue.Stats(); err != nil || st.Count != 6 {
+	if st, err := idxValue.Stats(); err != nil || st.Entries != 6 {
 		t.Errorf("by_value Stats = %+v err=%v, want Count 6", st, err)
 	}
 }
@@ -217,8 +217,8 @@ func TestKeyspaceBulkLoadIndexedMatchesPut(t *testing.T) {
 		}
 		sp, _ := ip.Stats()
 		sb, _ := ib.Stats()
-		if sp.Count != sb.Count {
-			t.Errorf("index %q: Put Count=%d, BulkLoad Count=%d", name, sp.Count, sb.Count)
+		if sp.Entries != sb.Entries {
+			t.Errorf("index %q: Put Count=%d, BulkLoad Count=%d", name, sp.Entries, sb.Entries)
 		}
 	}
 }
@@ -318,8 +318,8 @@ func TestKeyspaceBulkLoadIndexedPartialIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	if st, _ := idx.Stats(); st.Count != 1 {
-		t.Errorf("partial index Count=%d, want 1", st.Count)
+	if st, _ := idx.Stats(); st.Entries != 1 {
+		t.Errorf("partial index Count=%d, want 1", st.Entries)
 	}
 	if got := lookupKeysSorted(t, idx, []byte("x")); len(got) != 1 || got[0] != "k1" {
 		t.Errorf("by_first['x'] = %v, want [k1]", got)
@@ -361,8 +361,8 @@ func TestKeyspaceBulkLoadIndexedSpills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	if st, _ := idx.Stats(); st.Count != nrows {
-		t.Errorf("spilled index Count=%d, want %d", st.Count, nrows)
+	if st, _ := idx.Stats(); st.Entries != nrows {
+		t.Errorf("spilled index Count=%d, want %d", st.Entries, nrows)
 	}
 	// Every entry present and back-lookups resolve: a full Range yields nrows.
 	if pairs := collectAllIndexPairs(t, idx); len(pairs) != nrows {
@@ -518,8 +518,8 @@ func TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	if st, _ := idx.Stats(); st.Count != nrows {
-		t.Errorf("cascaded index Count=%d, want %d", st.Count, nrows)
+	if st, _ := idx.Stats(); st.Entries != nrows {
+		t.Errorf("cascaded index Count=%d, want %d", st.Entries, nrows)
 	}
 	if pairs := collectAllIndexPairs(t, idx); len(pairs) != nrows {
 		t.Errorf("Range over cascaded index yielded %d pairs, want %d", len(pairs), nrows)
@@ -603,8 +603,8 @@ func TestKeyspaceBulkLoadIndexedAbortReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index tx3: %v", err)
 	}
-	if st, _ := idx.Stats(); st.Count != 0 {
-		t.Errorf("after abort+reopen: index Count=%d, want 0", st.Count)
+	if st, _ := idx.Stats(); st.Entries != 0 {
+		t.Errorf("after abort+reopen: index Count=%d, want 0", st.Entries)
 	}
 }
 
@@ -660,8 +660,8 @@ func TestSetKeyspaceBulkLoadIndexedRoundTrip(t *testing.T) {
 	if !slicesEqualStr(aPairs, want) {
 		t.Errorf("by_first['a'] = %v, want %v", aPairs, want)
 	}
-	if st, _ := idx.Stats(); st.Count != 4 {
-		t.Errorf("Stats Count=%d, want 4", st.Count)
+	if st, _ := idx.Stats(); st.Entries != 4 {
+		t.Errorf("Stats Count=%d, want 4", st.Entries)
 	}
 }
 
@@ -931,8 +931,8 @@ func TestKeyspaceBulkLoadIndexedReusedKeyBuffer(t *testing.T) {
 			t.Fatalf("Get(%s) = (%s,%s), want (%s,%s)", rows[i].v, pk, val, rows[i].k, rows[i].v)
 		}
 	}
-	if st, _ := idxValue.Stats(); st.Count != nrows {
-		t.Errorf("by_value Count=%d, want %d", st.Count, nrows)
+	if st, _ := idxValue.Stats(); st.Entries != nrows {
+		t.Errorf("by_value Count=%d, want %d", st.Entries, nrows)
 	}
 	// Non-unique index intact: total entries == nrows.
 	idxFirst, err := ks.Index("by_first")

@@ -81,40 +81,54 @@ type Index struct {
 }
 
 // IndexStats is the persistent count + tree statistics for an index.
-// Returned by Index.Stats(). The Count is sourced from the
-// in-memory pinnedIndex (updated eagerly by chunk-7.6 atomic
-// Put/Delete); the tree depth/page count statistics land at chunk
-// 7.7 (depth requires walking the index data tree).
+// IndexStats is a point-in-time snapshot of one index's data B+tree
+// shape (api-surface.md §Statistics). Entries / Unique / Covering are
+// O(1) (in-memory pinned state + the IndexDecl); Depth / BranchPages /
+// LeafPages / SizeBytes come from an O(tree) walk of the index data
+// tree.
 type IndexStats struct {
-	// Count is the number of entries in the index. O(1) — read
-	// from the in-memory pinnedIndex, kept in sync with the on-
-	// disk registry entry via flushIndexRegistry at Tx.Commit.
-	Count uint64
-	// TreeDepth is the index data B+tree depth. Zero at chunk
-	// 7.6 (will be populated at chunk 7.7 alongside the Lookup
-	// API which already walks the tree).
-	TreeDepth int
+	// Depth is the number of B+tree levels from root to leaf (1 for a
+	// single-leaf index, 0 for an empty index).
+	Depth int
+
+	// BranchPages / LeafPages count the index data tree's pages by kind.
+	BranchPages uint64
+	LeafPages   uint64
+
+	// Entries is the number of index entries. O(1) — read from the
+	// in-memory pinnedIndex, kept in sync with the on-disk registry
+	// entry via flushIndexRegistry at Tx.Commit.
+	Entries uint64
+
+	// Unique reports whether the index rejects duplicate index keys
+	// (IndexDecl.Unique). Covering reports whether the index carries
+	// pinned covering columns (len(IndexDecl.Covering) > 0).
+	Unique   bool
+	Covering bool
+
+	// SizeBytes is the index data tree's on-disk footprint — every
+	// branch, leaf, and overflow page it occupies, times PageSize.
+	SizeBytes uint64
 }
 
-// Stats returns the index's persistent count + B+tree statistics.
-// Chunk-7.6 surface: Count is populated; TreeDepth is zero
-// (deferred to chunk 7.7).
+// Stats returns the index's persistent entry count plus its data
+// B+tree shape (depth, page counts, size) and Unique/Covering flags.
 //
 // Returns ErrKeyspaceClosed when the parent keyspace was
 // Tx.DeleteKeyspace'd (Inv-IHS3) and ErrIndexNotFound (with the
 // keyspace/index name in the wrap) when the handle has been
 // invalidated by a same-tx Tx.DropIndex (Inv-IHS2). Without these
-// guards Stats would return the pre-Delete/pre-Drop count from the
-// still-pinned in-memory state, because idx.pinned.count is
-// in-memory and survives both Drop and DeleteKeyspace even after
-// the on-disk tree has been FreeSubtree'd.
+// guards Stats would walk pages the on-disk tree no longer owns
+// (idx.pinned.root points at FreeSubtree'd pages after Drop /
+// DeleteKeyspace, even though idx.pinned survives in memory).
 //
 // Sentinel ordering (mirroring Cursor.Err's dead-check-wins): the
 // parent ks/sks dead check fires before the idx.dead check, so a
 // drop-then-delete sequence reports ErrKeyspaceClosed (the broader
-// truth) rather than ErrIndexNotFound. Stats does NOT touch
-// idx.err — the iter-side sticky cause (Inv-IHS1, e.g. mid-iter
-// ErrCursorStale) survives across Stats calls and remains
+// truth) rather than ErrIndexNotFound; the tx-state check (requireOpen)
+// runs last so a still-live handle on a closed tx reports ErrTxClosed.
+// Stats does NOT touch idx.err — the iter-side sticky cause (Inv-IHS1,
+// e.g. mid-iter ErrCursorStale) survives across Stats calls and remains
 // observable via idx.Err() until a fresh iter resets it.
 func (idx *Index) Stats() (IndexStats, error) {
 	if idx.keyspaceDead() {
@@ -123,9 +137,34 @@ func (idx *Index) Stats() (IndexStats, error) {
 	if idx.dead {
 		return IndexStats{}, idx.indexNotFoundError()
 	}
+	tx := idx.coreTx()
+	if err := tx.requireOpen(false); err != nil {
+		return IndexStats{}, err
+	}
+	pr := tx.pgr
+	cfg := pr.Config()
+	ts, err := walkTreePageStats(pr, cfg, idx.pinned.root, tx.statsHWM())
+	if err != nil {
+		return IndexStats{}, err
+	}
 	return IndexStats{
-		Count: idx.pinned.count,
+		Depth:       ts.depth,
+		BranchPages: ts.branchPages,
+		LeafPages:   ts.leafPages,
+		Entries:     idx.pinned.count,
+		Unique:      idx.pinned.decl != nil && idx.pinned.decl.Unique,
+		Covering:    idx.pinned.decl != nil && len(idx.pinned.decl.Covering) > 0,
+		SizeBytes:   (ts.branchPages + ts.leafPages + ts.overflowPages) * uint64(cfg.PageSize),
 	}, nil
+}
+
+// coreTx returns the owning transaction of this index's parent keyspace
+// (exactly one of idx.ks / idx.sks is non-nil — both embed keyspaceCore).
+func (idx *Index) coreTx() *Tx {
+	if idx.ks != nil {
+		return idx.ks.tx
+	}
+	return idx.sks.tx
 }
 
 // keyspaceDead reports whether the parent Keyspace or SetKeyspace

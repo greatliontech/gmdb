@@ -26,7 +26,7 @@ import (
 // TestIndexHandleStatsAfterDropReturnsErrIndexNotFound is the
 // deterministic Inv-IHS2 regression. On HEAD, a cached *Index handle
 // retains idx.pinned even after tx.DropIndex removes the entry from
-// ks.indexes, so idx.Stats() returns IndexStats{Count: prev_count}, nil
+// ks.indexes, so idx.Stats() returns IndexStats{Entries: prev_count}, nil
 // — the user sees the index as still populated when it is gone. With
 // the fix, the dead-handle check at Stats() entry returns
 // ErrIndexNotFound.
@@ -58,8 +58,8 @@ func TestIndexHandleStatsAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	if !errors.Is(err, ErrIndexNotFound) {
 		t.Errorf("Stats after Drop: err = %v, want ErrIndexNotFound", err)
 	}
-	if stats.Count != 0 {
-		t.Errorf("Stats after Drop: Count = %d, want 0 (handle is dead)", stats.Count)
+	if stats.Entries != 0 {
+		t.Errorf("Stats after Drop: Count = %d, want 0 (handle is dead)", stats.Entries)
 	}
 }
 
@@ -679,8 +679,8 @@ func TestStatsPreservesInFlightStaleSignal(t *testing.T) {
 	if statsErr != nil {
 		t.Errorf("Stats on live ks: err = %v, want nil", statsErr)
 	}
-	if stats.Count != 3 {
-		t.Errorf("Stats.Count = %d, want 3 (a,b + the sibling Put 'c')", stats.Count)
+	if stats.Entries != 3 {
+		t.Errorf("Stats.Count = %d, want 3 (a,b + the sibling Put 'c')", stats.Entries)
 	}
 	if !errors.Is(idx.Err(), ErrCursorStale) {
 		t.Errorf("post-Stats idx.Err() = %v, want ErrCursorStale (Stats must not destroy the sticky stale signal)", idx.Err())
@@ -808,7 +808,7 @@ func TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed(t *testing.T) {
 
 // TestIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed is
 // the deterministic Inv-IHS3 regression on the Stats path (no cursor,
-// no back-lookup). On HEAD, Stats returns IndexStats{Count: pre-delete
+// no back-lookup). On HEAD, Stats returns IndexStats{Entries: pre-delete
 // count}, nil because the cached idx.pinned.count is read without
 // consulting idx.ks.dead. With the fix, the ks.dead-check-wins guard
 // at Stats entry returns ErrKeyspaceClosed.
@@ -840,8 +840,8 @@ func TestIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing.
 	if !errors.Is(err, ErrKeyspaceClosed) {
 		t.Errorf("Stats after DeleteKeyspace: err = %v, want ErrKeyspaceClosed", err)
 	}
-	if stats.Count != 0 {
-		t.Errorf("Stats after DeleteKeyspace: Count = %d, want 0 (handle is closed)", stats.Count)
+	if stats.Entries != 0 {
+		t.Errorf("Stats after DeleteKeyspace: Count = %d, want 0 (handle is closed)", stats.Entries)
 	}
 }
 
@@ -1049,8 +1049,8 @@ func TestSetKeyspaceIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed(
 	if !errors.Is(err, ErrKeyspaceClosed) {
 		t.Errorf("SetKeyspace Stats after DeleteKeyspace: err = %v, want ErrKeyspaceClosed", err)
 	}
-	if stats.Count != 0 {
-		t.Errorf("SetKeyspace Stats after DeleteKeyspace: Count = %d, want 0", stats.Count)
+	if stats.Entries != 0 {
+		t.Errorf("SetKeyspace Stats after DeleteKeyspace: Count = %d, want 0", stats.Entries)
 	}
 }
 

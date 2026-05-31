@@ -619,15 +619,15 @@ func TestKeyspaceIndexHandleReturnsExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
-	if st.Count != 0 {
-		t.Errorf("fresh index Stats.Count: got %d want 0", st.Count)
+	if st.Entries != 0 {
+		t.Errorf("fresh index Stats.Count: got %d want 0", st.Entries)
 	}
 	if err := ks.Put([]byte("k"), []byte{0x42}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	st, _ = idx.Stats()
-	if st.Count != 1 {
-		t.Errorf("post-Put Stats.Count: got %d want 1", st.Count)
+	if st.Entries != 1 {
+		t.Errorf("post-Put Stats.Count: got %d want 1", st.Entries)
 	}
 }
 

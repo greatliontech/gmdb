@@ -1,5 +1,10 @@
 package gmdb
 
+import (
+	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/page"
+)
+
 // DBStats is a point-in-time snapshot of database-level metrics
 // (api-surface.md §Statistics). All values are for metrics / health
 // diagnostics only — never synchronization barriers.
@@ -89,4 +94,130 @@ func (db *DB) Stats() DBStats {
 		s.ActiveReaders = coord.CountActiveReaders()
 	}
 	return s
+}
+
+// statsHWM returns the page-id bound for a stats tree walk: a write
+// transaction's pager tracks the live HighWaterMark (which grows as the
+// tx allocates), whereas a read transaction's pager is a read-only
+// snapshot whose HighWaterMark is carried on prevMeta (the snapshot
+// meta). Walk rejects any child pointer >= this bound, so it must cover
+// every page the (in-tx or committed) tree can reference.
+func (tx *Tx) statsHWM() uint64 {
+	if tx.writable {
+		return tx.pgr.HighWaterMark()
+	}
+	return tx.prevMeta.HighWaterMark
+}
+
+// treePageStats tallies B+tree page kinds and the maximum descent depth.
+type treePageStats struct {
+	depth         int // number of levels (root→leaf); 0 for an empty tree
+	branchPages   uint64
+	leafPages     uint64
+	overflowPages uint64
+}
+
+// walkTreePageStats walks the B+tree rooted at root (a no-op for root ==
+// 0) and tallies branch / leaf / overflow page counts and the max
+// branch-or-leaf descent depth. Overflow pages are counted but do NOT
+// contribute to depth (Walk reports them at their leaf's depth + 1). For
+// a SetKeyspace the walk recurses into nested set-member subtrees, so
+// the depth is the deepest path including nesting. O(tree pages).
+func walkTreePageStats(pr btree.PageReader, cfg page.Config, root, hwm uint64) (treePageStats, error) {
+	var s treePageStats
+	maxLevel := -1
+	err := btree.Walk(pr, cfg, root, hwm, func(_ uint64, kind btree.PageKind, depth int) error {
+		switch kind {
+		case btree.PageKindBranch:
+			s.branchPages++
+			if depth > maxLevel {
+				maxLevel = depth
+			}
+		case btree.PageKindLeaf:
+			s.leafPages++
+			if depth > maxLevel {
+				maxLevel = depth
+			}
+		case btree.PageKindOverflow:
+			s.overflowPages++
+		}
+		return nil
+	})
+	if err != nil {
+		return treePageStats{}, mapBtreeErr(err)
+	}
+	s.depth = maxLevel + 1 // empty tree: maxLevel stays -1 ⇒ depth 0
+	return s, nil
+}
+
+// KeyspaceStats is a point-in-time snapshot of one keyspace's B+tree
+// shape (api-surface.md §Statistics). The page counts and depth come
+// from an O(tree) walk of the keyspace's data tree; Entries is the O(1)
+// descriptor count.
+type KeyspaceStats struct {
+	// Depth is the number of B+tree levels from root to leaf (1 for a
+	// single-leaf tree, 0 for an empty keyspace). For a SetKeyspace it
+	// is the deepest path including nested set-member subtrees.
+	Depth int
+
+	// BranchPages / LeafPages / OverflowPages count the pages reachable
+	// from the data tree by kind (overflow = the pages of large values'
+	// overflow runs). For a SetKeyspace these include the nested
+	// set-member subtree pages.
+	BranchPages   uint64
+	LeafPages     uint64
+	OverflowPages uint64
+
+	// Entries is the number of key-value pairs (for a SetKeyspace, the
+	// total members across all value sets) — the descriptor's Count.
+	Entries uint64
+
+	// IndexCount is the number of secondary indexes registered on the
+	// keyspace (counted from the on-disk index registry, independent of
+	// how many were opened with an IndexDecl this transaction).
+	IndexCount int
+}
+
+// Stats returns the keyspace's B+tree statistics, or ErrKeyspaceClosed
+// when the keyspace was DeleteKeyspace'd in this tx (or the tx-state
+// error from requireOpen). Defined on the shared keyspaceCore so both
+// *Keyspace and *SetKeyspace expose it via embedding. The walk observes
+// the handle's transactional view (in-tx mutations on a write tx; the
+// snapshot on a read tx).
+func (kc *keyspaceCore) Stats() (KeyspaceStats, error) {
+	if err := kc.tx.requireOpen(false); err != nil {
+		return KeyspaceStats{}, err
+	}
+	if kc.dead {
+		return KeyspaceStats{}, ErrKeyspaceClosed
+	}
+	pr := kc.tx.pgr
+	cfg := pr.Config()
+	hwm := kc.tx.statsHWM()
+
+	ts, err := walkTreePageStats(pr, cfg, kc.desc.Root, hwm)
+	if err != nil {
+		return KeyspaceStats{}, err
+	}
+
+	// IndexCount: the index registry tree maps index-name → registry
+	// entry, so its key count is the number of registered indexes.
+	var indexCount int
+	if kc.desc.IndexRegistryRoot != 0 {
+		if err := btree.WalkKV(pr, cfg, kc.desc.IndexRegistryRoot, hwm, func(_, _ []byte) error {
+			indexCount++
+			return nil
+		}); err != nil {
+			return KeyspaceStats{}, mapBtreeErr(err)
+		}
+	}
+
+	return KeyspaceStats{
+		Depth:         ts.depth,
+		BranchPages:   ts.branchPages,
+		LeafPages:     ts.leafPages,
+		OverflowPages: ts.overflowPages,
+		Entries:       kc.desc.Count,
+		IndexCount:    indexCount,
+	}, nil
 }
