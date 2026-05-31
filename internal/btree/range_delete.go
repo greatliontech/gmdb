@@ -593,6 +593,27 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 			return newBranchID, deletedCount, true, residual, nil
 		}
 	}
+	// A survivor still below MT after rebalanceSurvivors is one whose
+	// branch redistribute DECLINED — no adjacent merge fit and no
+	// redistribute could clear the floor for both halves. Thread its child
+	// up as the deepUnderflowChild (and force underflow) exactly as
+	// patchBranchAfterChildDelete's post-merge loop does for the single-key
+	// path, so a higher level with more cousins gets a chance to heal it
+	// rather than this level silently dropping the sub-MT child. By
+	// construction survivors[j].child is a direct child of newBranchID
+	// (newLeftmost or a newCells entry — the deep-heal loop above already
+	// re-pointed it to its re-encoded value). At the next level above,
+	// newBranchID merges with a sibling in that level's case-C path, and by
+	// the same wrapper-propagation geometry as patchBranchAfterChildDelete
+	// (delete.go) survivors[j].child stays a direct child of the merge
+	// result, where the receiving cousin pass searches for it. If genuinely
+	// unreachable everywhere it ascends to the exempt root (range-delete.md
+	// §Invariants "where reachable").
+	for j := range survivors {
+		if survivors[j].underflow {
+			return newBranchID, deletedCount, true, survivors[j].child, nil
+		}
+	}
 	return newBranchID, deletedCount, branchUnderflow(cfg, newCells, mergeThreshold), 0, nil
 }
 
@@ -692,10 +713,21 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 		if leftIsLeaf {
 			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID)
 		} else {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, leftPairID, rightPairID, separator)
+			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator)
 		}
 		if err != nil {
 			return err
+		}
+
+		if !isMerge && newLeftID == 0 {
+			// DECLINE (branch only): the redistribute could not restore the
+			// fill-floor for both halves (large lifted separator), so it
+			// changed nothing. Leave both survivors as-is — the underflowing
+			// one stays below MT, accepted per range-delete.md §Invariants
+			// "where reachable". Advance to the next survivor WITHOUT rewind:
+			// no page churn means no infinite re-pairing of an unhealable
+			// pair (the unreachable-floor cascade guard).
+			continue
 		}
 
 		if isMerge {
@@ -821,6 +853,15 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 			// Both ordering cases collapse to: the "tracked" output
 			// (= curID's side) sits at leftJ if siblingPos>j (right
 			// sibling used) or rightJ if siblingPos<j (left sibling used).
+			//
+			// Termination: this rewind is bounded. A redistribute only
+			// fires (vs DECLINE) when both halves clear the floor, so a
+			// rewind here can re-underflow a half ONLY via a cousin shrink,
+			// which strictly reduces the combined cell count of the
+			// re-paired branch; the count cannot fall forever, so the slot
+			// must eventually merge (slice shrinks) or DECLINE (j advances,
+			// never rewinds). No infinite redistribute/decline ping-pong —
+			// the analogue of rebalanceChildAtPos's triedLeft/triedRight.
 			if leftUf || rightUf {
 				j = min(leftJ, rightJ) - 1
 			}

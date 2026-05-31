@@ -535,7 +535,7 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	case leftIsLeaf:
 		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID)
 	case leftTyp == page.TypeBranch && rightTyp == page.TypeBranch:
-		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, leftPairID, rightPairID, separator)
+		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator)
 	default:
 		return 0, false, 0, fmt.Errorf("%w: sibling page %d unexpected type %d", ErrCorrupted, leftPairID, leftTyp)
 	}
@@ -550,7 +550,8 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	}
 	var insertedPos int
 	var insertedID uint64
-	if isMerge {
+	switch {
+	case isMerge:
 		// posLeftPair's slot becomes the merged page; posRightPair's
 		// cell (the separator + child pointer) is removed.
 		if posLeftPair == 0 {
@@ -561,7 +562,17 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		cells = append(cells[:separatorIdx], cells[separatorIdx+1:]...)
 		insertedPos = posLeftPair
 		insertedID = mergedID
-	} else {
+	case newLeftID == 0:
+		// DECLINE (branch only): the redistribute could not restore the
+		// floor for both halves, so it changed nothing. The parent's cells
+		// are unchanged — the underflowing child remains at descentIdx. Let
+		// the post-merge re-rebalance loop below give it a chance against
+		// OTHER siblings (a merge may yet fit), and thread it up as
+		// deepUnderflowChild if none can heal it. No page churn, so the
+		// cousin cascade cannot relocate the deficit.
+		insertedPos = int(descentIdx)
+		insertedID = newChildID
+	default:
 		if posLeftPair == 0 {
 			leftmost = newLeftID
 		} else {
@@ -570,14 +581,10 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		// posRightPair is always ≥ 1 since posRightPair = posLeftPair + 1.
 		cells[posRightPair-1].Child = newRightID
 		cells[separatorIdx].Key = newSeparator
-		// Redistribute leaves two new pages in the parent. Either could
-		// be below MT under pathological size skew; the post-merge
-		// re-rebalance loop below will attempt to heal the one on the
-		// side that received the recursed-into child (= descentIdx).
-		// The other half came from the previously-healthy sibling and
-		// inherits the sibling's half of the entries; the redistribute
-		// keeps it near half-full, and the post-merge re-rebalance loop
-		// below heals any half that still lands below MT.
+		// Redistribute restored the floor for both halves (the decline
+		// guard in mergeOrRedistributeBranches guarantees it); the
+		// recursed-into side (= descentIdx) is healthy. The post-merge
+		// re-rebalance loop below still runs for defense in depth.
 		insertedPos = int(descentIdx)
 		if useLeft {
 			insertedID = newRightID
@@ -648,7 +655,7 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		// propagate finalID as deepUnderflowChildOut. finalID is a
 		// direct child of this branch's CoW (at *leftmost when the
 		// loop fully consumed cells, or at cells[finalPos-1].Child
-		// when triedRedistPos exhaustion broke the loop early with
+		// when both-sides-tried/declined exhaustion broke the loop early with
 		// cells > 0 still). Either way the wrapper-propagation
 		// invariant holds: at the next level above, finalID stays at
 		// a direct-child position of merge_GP by the case-C merge
@@ -717,16 +724,19 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, leftmost *uint64, cells *[]page.BranchCell, startPos int, startID uint64) (int, uint64, bool, error) {
 	curPos := startPos
 	curID := startID
-	// triedRedistPos: the sibling position last paired via a
-	// redistribute that did not heal the child's underflow. A second
-	// pairing with the same sibling would re-run the same
-	// deterministic redistribute split with identical inputs and
-	// identical outputs — infinite loop. Skip that position on subsequent picks; if
-	// every remaining adjacent slot has already been tried this way,
-	// exit with finalUnderflow=true so the caller threads the residual
-	// upward via deepUnderflowChild. Reset to -1 on merge (cells
-	// layout changed, so adjacency is different now).
-	triedRedistPos := -1
+	// triedLeft/triedRight: whether the left/right adjacent sibling has
+	// already been paired and DECLINED (merge overflows a page and a
+	// redistribute cannot restore the floor for both halves — see
+	// mergeOrRedistributeBranches). A decline changes no pages, so
+	// re-pairing the same sibling reruns the identical decision forever; a
+	// single "last tried" marker is insufficient because with both
+	// neighbours present the loop would ping-pong (try left, try right,
+	// re-allow left, …). Once both adjacent slots are tried/declined,
+	// exit with finalUnderflow=true so the caller threads the residual up.
+	// Reset on merge (cell layout changed). A successful merge or
+	// redistribute heals curID, so the next iteration returns before these
+	// matter; they bound only the decline path.
+	triedLeft, triedRight := false, false
 	for {
 		// Read current child to compute fill.
 		buf, err := pw.Page(curID)
@@ -753,20 +763,20 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 			return curPos, curID, true, nil
 		}
 		// Pick adjacent sibling: left-preferred if curPos>0, else right,
-		// skipping any position last paired via a redistribute that did
-		// not heal (see triedRedistPos commentary above the loop).
+		// skipping a side already tried-and-declined (see the triedLeft/
+		// triedRight commentary above the loop).
 		var siblingPos, separatorIdx int
 		switch {
-		case curPos > 0 && curPos-1 != triedRedistPos:
+		case curPos > 0 && !triedLeft:
 			siblingPos = curPos - 1
 			separatorIdx = curPos - 1
-		case curPos+1 <= len(*cells) && curPos+1 != triedRedistPos:
+		case curPos+1 <= len(*cells) && !triedRight:
 			siblingPos = curPos + 1
 			separatorIdx = curPos
 		default:
 			// Both adjacent slots either don't exist or were already
-			// tried; another iteration cannot make progress at this
-			// level. Propagate the residual underflow upward.
+			// tried-and-declined; another iteration cannot make progress at
+			// this level. Propagate the residual underflow upward.
 			return curPos, curID, true, nil
 		}
 		var siblingID uint64
@@ -803,12 +813,13 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 		if leftIsLeaf {
 			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID)
 		} else {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, leftPairID, rightPairID, separator)
+			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator)
 		}
 		if err != nil {
 			return 0, 0, false, err
 		}
-		if isMerge {
+		switch {
+		case isMerge:
 			if posLeftPair == 0 {
 				*leftmost = mergedID
 			} else {
@@ -817,10 +828,23 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 			*cells = append((*cells)[:separatorIdx], (*cells)[separatorIdx+1:]...)
 			curPos = posLeftPair
 			curID = mergedID
-			// Cells layout changed — old triedRedistPos no longer
-			// references the same slot relative to curPos.
-			triedRedistPos = -1
-		} else {
+			// Cell layout changed — re-explore both neighbours of curPos.
+			triedLeft, triedRight = false, false
+		case newLeftID == 0:
+			// DECLINE: the branch redistribute could not restore the floor
+			// for both halves (large lifted separator), so it changed
+			// nothing. Mark this side tried; when both are tried the loop
+			// exits with the underflow threaded up. No page churn, so the
+			// cascade cannot relocate the deficit.
+			if siblingPos < curPos {
+				triedLeft = true
+			} else {
+				triedRight = true
+			}
+		default:
+			// Redistribute restored the floor for both halves (the decline
+			// guard guarantees it), so curID is now ≥ MT and the next
+			// iteration returns. Project the two new pages into the parent.
 			if posLeftPair == 0 {
 				*leftmost = newLeftID
 			} else {
@@ -828,8 +852,6 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 			}
 			(*cells)[posRightPair-1].Child = newRightID
 			(*cells)[separatorIdx].Key = bytes.Clone(newSeparator)
-			// Track the side curID was on so the next iteration
-			// re-checks the right output.
 			if siblingPos < curPos {
 				curPos = posRightPair
 				curID = newRightID
@@ -837,11 +859,7 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 				curPos = posLeftPair
 				curID = newLeftID
 			}
-			// Mark this sibling slot as tried via redistribute. Cells
-			// layout is unchanged (redistribute preserves cell count
-			// and positions), so siblingPos remains a valid index
-			// relative to the unchanged curPos.
-			triedRedistPos = siblingPos
+			triedLeft, triedRight = false, false
 		}
 		// Loop re-checks underflow on curID.
 	}
@@ -926,7 +944,16 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 	// the residual cascades back here as `recResidual` and the
 	// caller's own cascade continues unchanged.
 	residual := uint64(0)
-	if finalUnderflow && len(cells) == 0 {
+	if finalUnderflow {
+		// The local heal could not lift deepID to the floor — either no
+		// siblings remain (len(cells)==0) or every adjacent pairing declined
+		// (a merge would overflow a page and a redistribute could not restore
+		// the floor for both halves; see mergeOrRedistributeBranches). Thread
+		// deepID up as the residual instead of running the descendant scan.
+		// The scan recurses on THIS branch, so for an unhealable child it
+		// re-encodes and re-recurses without progress (the unreachable-floor
+		// OOM); it is sound only AFTER a successful heal, where a merge may
+		// have buried a sub-MT descendant a cousin pass must reach.
 		residual = finalID
 	} else {
 		// Post-rebalance descendant scan (Round 2 review H-1 + H-3).
@@ -1207,7 +1234,7 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 // leftmost child; cells before/after split into the two new branches.
 // This mirrors the chunk-4.4 branch-split path's separator-lift
 // convention.
-func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, leftID, rightID uint64, separator []byte) (bool, uint64, uint64, uint64, []byte, error) {
+func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold uint8, leftID, rightID uint64, separator []byte) (bool, uint64, uint64, uint64, []byte, error) {
 	// An empty parent separator is unreachable from a tree built via
 	// Put — page.ShortestSeparator always returns ≥1 byte. Reject
 	// explicitly: an empty separator embedded in `combined` would
@@ -1317,6 +1344,21 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, leftID, rightID
 	}
 	if page.BranchEncodedSize(cfg, newRightCells) > cfg.ContentEnd() {
 		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute branch right half exceeds page capacity", ErrCorrupted)
+	}
+
+	// Decline (no alloc, both inputs untouched) when this redistribute
+	// cannot restore the fill-floor for BOTH halves. A branch redistribute
+	// lifts the boundary separator to the parent, so both halves lose its
+	// bytes; with a large separator the halves land below MergeThreshold
+	// even though `combined` exceeds one page. Performing it would merely
+	// relocate the sub-MT deficit to a sibling, which the cousin-rebalance
+	// cascade then chases without converging — the fill-floor is unreachable
+	// here (range-delete.md §Invariants "where reachable"). Declining lets
+	// the caller accept the underflowing child as-is and terminate. In the
+	// reachable regime (short separators) both halves clear the floor, so
+	// this never fires and redistribute proceeds unchanged.
+	if branchUnderflow(cfg, newLeftCells, mergeThreshold) || branchUnderflow(cfg, newRightCells, mergeThreshold) {
+		return false, 0, 0, 0, nil, nil
 	}
 
 	newLeftID, err := pw.AllocPage()

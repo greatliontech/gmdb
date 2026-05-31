@@ -83,33 +83,58 @@ Invariant: kind=entailed;
 Invariant: kind=clause-explicit;
   property=After a successful `DeleteRange` returns, every non-root
     page reachable from the new root has encoded fill
-    `>= MergeThreshold%` of the page's `ContentEnd`. The root is
-    exempt — a partially-emptied tree's root may shrink arbitrarily
-    (and may root-collapse to a leaf or to 0 / empty). The same
-    floor holds for single-key `Delete` and applies inductively:
-    a `Put`-only build maintains it (splits balance roughly at 50%,
-    above MergeThreshold's [1, 50] range); the post-mutation pass
-    must preserve it. Maintained by tightening the merge/redistribute
+    `>= MergeThreshold%` of the page's `ContentEnd` **where that floor
+    is reachable**. The root is exempt — a partially-emptied tree's
+    root may shrink arbitrarily (and may root-collapse to a leaf or to
+    0 / empty). The same floor holds for single-key `Delete`.
+    **Reachability qualifier (load-bearing).** The floor is reachable —
+    and so unconditionally enforced — for the common case and for
+    `Put`-built trees whose **separators are short**: splits then
+    balance roughly at 50%, above MergeThreshold's [1, 50] range. It is
+    **NOT** reachable for **large branch separators**. Branch pages
+    store full separators with **no within-page prefix compression**
+    (see `page-formats.md` §Prefix-Truncated Branch Keys — branches
+    truncate *across* levels, not *within* a page), so keys that share
+    deep prefixes yield separators approaching the §Maximum Key Size
+    bound; a branch then holds only ~2 of them (fanout 2, ~35% fill),
+    and because a branch redistribute **lifts** the boundary separator
+    to the parent, both halves lose its bytes and land below MT. Such a
+    branch is **born below the floor at `Put`-build time** and cannot be
+    raised to it by any merge (combined > one page) or redistribute
+    (both halves below MT) under `Delete`. A page whose every adjacent
+    pairing both overflows-on-merge and cannot clear the floor on
+    redistribute is **accepted below-floor**, and the rebalance MUST
+    terminate rather than loop attempting to heal it. Where reachable,
+    the floor is maintained by tightening the merge/redistribute
     contract: when a local merge produces a still-below-MT page,
     `rebalanceSurvivors` re-attempts merge with the next adjacent
-    survivor; when the 2-survivor cousin-cascade case
-    (`leftIdx=0 ∧ rightIdx=cellCount` at the parent of two below-MT
-    survivors) leaves the parent degenerate, the still-below-MT
-    page is threaded upward as `deepUnderflowChild` and rebalanced
-    against its cousins after the parent's own cascade-merge
-    produces a sibling-rich branch — see §Algorithm Phase 3
-    Rebalance below;
+    survivor; a branch redistribute that cannot clear the floor for both
+    halves **declines** (changes nothing) so the deficit is not
+    relocated to a sibling — the underflowing child is threaded upward
+    as `deepUnderflowChild` for a higher level (with more cousins) to
+    heal, or accepted below-floor if unreachable everywhere; when the
+    2-survivor cousin-cascade case (`leftIdx=0 ∧ rightIdx=cellCount` at
+    the parent of two below-MT survivors) leaves the parent degenerate,
+    the still-below-MT page is threaded upward as `deepUnderflowChild`
+    and rebalanced against its cousins after the parent's own
+    cascade-merge produces a sibling-rich branch — see §Algorithm Phase
+    3 Rebalance below;
   from=this spec §Algorithm Phase 3 rebalance + `api-surface.md`
     Options.MergeThreshold godoc (the percentage doubles as the
     merge **trigger** AND the post-mutation **floor**);
-  violation=A `DeleteRange` whose 2-survivor cascade leaves a leaf
-    at e.g. 8% fill as a non-root child of the merged grandparent —
-    the page-fill invariant the rest of the engine (compaction
-    pacing, leak-detection page-utilization heuristics, splitting
-    fairness across concurrent writers) reasons against drifts
-    silently, and the soft "eventual-convergence" rationale (that
-    subsequent mutations heal it) becomes a forced load-bearing
-    assumption with no localized enforcement.
+  violation=Two distinct failures. (1) **Reachable floor left
+    unmet**: a `DeleteRange`/`Delete` whose cascade leaves a page at
+    e.g. 8% fill as a non-root child *when a feasible merge or
+    floor-clearing redistribute existed* — the page-fill property the
+    rest of the engine (compaction pacing, leak-detection
+    page-utilization heuristics, splitting fairness) reasons against
+    drifts silently. (2) **Non-termination on an unreachable floor**:
+    the rebalance loops/recurses trying to heal a page the floor cannot
+    reach (a redistribute that merely relocates the sub-MT deficit to a
+    sibling, which the cousin cascade then chases) — a valid in-spec
+    `Delete` never returns / exhausts memory. The accepted below-floor
+    page in the genuinely-unreachable regime is **not** a violation; it
+    is this qualifier's sanctioned outcome.
 
 ## Algorithm (un-indexed keyspaces)
 

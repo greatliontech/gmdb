@@ -884,7 +884,7 @@ func TestMergeBranchesForgedSiblingNoPanic(t *testing.T) {
 	right[16], right[17] = 0xFF, 0xFF
 	pw.pages[2] = right
 
-	_, _, _, _, _, err := mergeOrRedistributeBranches(pw, cfg, 1, 2, []byte("sep"))
+	_, _, _, _, _, err := mergeOrRedistributeBranches(pw, cfg, DefaultMergeThreshold, 1, 2, []byte("sep"))
 	if !errors.Is(err, ErrCorrupted) {
 		t.Fatalf("mergeOrRedistributeBranches with forged sibling = %v, want ErrCorrupted (no panic)", err)
 	}
