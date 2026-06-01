@@ -31,7 +31,7 @@ func TestTypedKSRoundTrip(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("nums", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -106,7 +106,7 @@ func TestTypedKSDeleteRange(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("nums", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -150,7 +150,7 @@ func TestTypedKSReadOnly(t *testing.T) {
 	db := openWith(t, ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
 
-	tks := NewTypedKeyspace[uint64, string]("nums", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 	// Create + populate + commit.
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -187,13 +187,13 @@ func TestTypedKSReadOnly(t *testing.T) {
 }
 
 // TestTypedKSEncoderError verifies a key/value encoder error propagates
-// instead of writing partial state. BENanosEncoder rejects out-of-range
+// instead of writing partial state. TimeEncoder rejects out-of-range
 // times.
 func TestTypedKSEncoderError(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[time.Time, string]("events", BENanosEncoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[time.Time, string]("events", TimeEncoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -223,7 +223,7 @@ func TestTypedKSOpenVariants(t *testing.T) {
 	path := tmpPath(t)
 	db := openWith(t, ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tks := NewTypedKeyspace[uint64, string]("nums", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 
 	tx1, err := db.Begin(ctx)
 	if err != nil {

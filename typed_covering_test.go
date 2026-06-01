@@ -16,7 +16,7 @@ func TestTypedIndexCoverValueRoundTrip(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 	covering := &TypedIndex[uint64, string, string]{
 		Name: "by_first_cov", IKEnc: StringEncoder{}, Extract: firstLetterIK, CoverValue: true,
 	}
@@ -76,7 +76,7 @@ func TestTypedIndexCoverValueUniqueGet(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 	idx := &TypedIndex[uint64, string, string]{
 		Name: "by_name", IKEnc: StringEncoder{}, Unique: true, Extract: wholeValIK, CoverValue: true,
 	}
@@ -105,7 +105,7 @@ func TestTypedIndexCoverValueLargeValue(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("docs", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("docs", Uint64Encoder{}, StringEncoder{})
 	idx := &TypedIndex[uint64, string, string]{
 		Name: "by_first", IKEnc: StringEncoder{}, CoverValue: true,
 		Extract: func(_ uint64, v string) []string {
@@ -151,7 +151,7 @@ func TestTypedIndexCoverValueNULBytes(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, []byte]("blobs", BEUint64Encoder{}, BytesEncoder{})
+	tks := NewTypedKeyspace[uint64, []byte]("blobs", Uint64Encoder{}, BytesEncoder{})
 	idx := &TypedIndex[uint64, []byte, string]{
 		Name: "all", IKEnc: StringEncoder{}, CoverValue: true,
 		// Constant IK so Lookup("k") returns every row (non-unique).
@@ -213,7 +213,7 @@ func TestTypedIndexCoverValueDrift(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin1: %v", err)
 	}
-	tksA := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
+	tksA := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 	if _, err := tksA.Create(tx1, mkIndex()); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestTypedIndexCoverValueDrift(t *testing.T) {
 		t.Fatalf("Begin2: %v", err)
 	}
 	defer tx2.Rollback()
-	tksB := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, altVal)
+	tksB := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, altVal)
 	if _, err := tksB.Open(tx2, mkIndex()); !errors.Is(err, ErrIndexFingerprintMismatch) {
 		t.Fatalf("Open with drifted value encoder = %v, want ErrIndexFingerprintMismatch", err)
 	}
@@ -250,7 +250,7 @@ func TestTypedIndexCoverValueEmptyValEncID(t *testing.T) {
 		DecodeFunc: func(src []byte) (string, error) { return string(src), nil },
 		EncoderID:  "",
 	}
-	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, emptyVal)
+	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, emptyVal)
 	idx := &TypedIndex[uint64, string, string]{Name: "by_name", IKEnc: StringEncoder{}, Extract: wholeValIK, CoverValue: true}
 	if _, err := tks.Create(tx, idx); !errors.Is(err, ErrIndexEncoderIDEmpty) {
 		t.Errorf("Create CoverValue with empty value-encoder ID = %v, want ErrIndexEncoderIDEmpty", err)

@@ -95,35 +95,35 @@ func (BytesEncoder) ID() string { return "gmdb/bytes" }
 
 // --- unsigned integers --------------------------------------------
 
-// BEUint64Encoder encodes uint64 as 8-byte big-endian; lex order =
+// Uint64Encoder encodes uint64 as 8-byte big-endian; lex order =
 // natural uint64 order.
-type BEUint64Encoder struct{}
+type Uint64Encoder struct{}
 
-func (BEUint64Encoder) AppendEncode(dst []byte, v uint64) ([]byte, error) {
+func (Uint64Encoder) AppendEncode(dst []byte, v uint64) ([]byte, error) {
 	return binary.BigEndian.AppendUint64(dst, v), nil
 }
-func (BEUint64Encoder) Decode(src []byte) (uint64, error) {
+func (Uint64Encoder) Decode(src []byte) (uint64, error) {
 	if len(src) != 8 {
 		return 0, errDecode("gmdb/be-uint64", len(src), 8)
 	}
 	return binary.BigEndian.Uint64(src), nil
 }
-func (BEUint64Encoder) ID() string { return "gmdb/be-uint64" }
+func (Uint64Encoder) ID() string { return "gmdb/be-uint64" }
 
-// BEUint32Encoder encodes uint32 as 4-byte big-endian; lex order =
+// Uint32Encoder encodes uint32 as 4-byte big-endian; lex order =
 // natural uint32 order.
-type BEUint32Encoder struct{}
+type Uint32Encoder struct{}
 
-func (BEUint32Encoder) AppendEncode(dst []byte, v uint32) ([]byte, error) {
+func (Uint32Encoder) AppendEncode(dst []byte, v uint32) ([]byte, error) {
 	return binary.BigEndian.AppendUint32(dst, v), nil
 }
-func (BEUint32Encoder) Decode(src []byte) (uint32, error) {
+func (Uint32Encoder) Decode(src []byte) (uint32, error) {
 	if len(src) != 4 {
 		return 0, errDecode("gmdb/be-uint32", len(src), 4)
 	}
 	return binary.BigEndian.Uint32(src), nil
 }
-func (BEUint32Encoder) ID() string { return "gmdb/be-uint32" }
+func (Uint32Encoder) ID() string { return "gmdb/be-uint32" }
 
 // --- signed integers (sign-bit XOR, lex-preserving) ---------------
 
@@ -137,35 +137,35 @@ const (
 	signBit32 uint32 = 1 << 31
 )
 
-// BEInt64Encoder encodes int64 as 8-byte big-endian with the sign bit
+// Int64Encoder encodes int64 as 8-byte big-endian with the sign bit
 // XOR'd (NOT zigzag); lex order = natural int64 order.
-type BEInt64Encoder struct{}
+type Int64Encoder struct{}
 
-func (BEInt64Encoder) AppendEncode(dst []byte, v int64) ([]byte, error) {
+func (Int64Encoder) AppendEncode(dst []byte, v int64) ([]byte, error) {
 	return binary.BigEndian.AppendUint64(dst, uint64(v)^signBit64), nil
 }
-func (BEInt64Encoder) Decode(src []byte) (int64, error) {
+func (Int64Encoder) Decode(src []byte) (int64, error) {
 	if len(src) != 8 {
 		return 0, errDecode("gmdb/be-int64", len(src), 8)
 	}
 	return int64(binary.BigEndian.Uint64(src) ^ signBit64), nil
 }
-func (BEInt64Encoder) ID() string { return "gmdb/be-int64" }
+func (Int64Encoder) ID() string { return "gmdb/be-int64" }
 
-// BEInt32Encoder encodes int32 as 4-byte big-endian with the sign bit
+// Int32Encoder encodes int32 as 4-byte big-endian with the sign bit
 // XOR'd; lex order = natural int32 order.
-type BEInt32Encoder struct{}
+type Int32Encoder struct{}
 
-func (BEInt32Encoder) AppendEncode(dst []byte, v int32) ([]byte, error) {
+func (Int32Encoder) AppendEncode(dst []byte, v int32) ([]byte, error) {
 	return binary.BigEndian.AppendUint32(dst, uint32(v)^signBit32), nil
 }
-func (BEInt32Encoder) Decode(src []byte) (int32, error) {
+func (Int32Encoder) Decode(src []byte) (int32, error) {
 	if len(src) != 4 {
 		return 0, errDecode("gmdb/be-int32", len(src), 4)
 	}
 	return int32(binary.BigEndian.Uint32(src) ^ signBit32), nil
 }
-func (BEInt32Encoder) ID() string { return "gmdb/be-int32" }
+func (Int32Encoder) ID() string { return "gmdb/be-int32" }
 
 // --- time ----------------------------------------------------------
 
@@ -173,7 +173,7 @@ func (BEInt32Encoder) ID() string { return "gmdb/be-int32" }
 // nanoseconds since the epoch. time.Time.UnixNano() is undefined
 // (silently wraps) outside ~[1678, 2262]; a wrapped value would sort in
 // the wrong lex position, violating the lex=time invariant — so
-// BENanosEncoder rejects out-of-range times rather than corrupting
+// TimeEncoder rejects out-of-range times rather than corrupting
 // order. time.Time.Unix() floors toward −∞ and Nanosecond() is always
 // in [0, 1e9), so the representable extremes are:
 //
@@ -191,15 +191,15 @@ const (
 	nanosMinRem int64 = 145224192   // math.MinInt64 − nanosMinSec·1e9
 )
 
-// BENanosEncoder encodes time.Time as int64 nanoseconds since the Unix
-// epoch with the same sign-bit-XOR transform as BEInt64Encoder; lex
+// TimeEncoder encodes time.Time as int64 nanoseconds since the Unix
+// epoch with the same sign-bit-XOR transform as Int64Encoder; lex
 // order = natural time order. Decode returns a UTC time; the monotonic
 // clock reading and location are NOT preserved (only the instant).
 // AppendEncode rejects times outside the int64-nanoseconds range with
 // an error rather than silently wrapping.
-type BENanosEncoder struct{}
+type TimeEncoder struct{}
 
-func (BENanosEncoder) AppendEncode(dst []byte, v time.Time) ([]byte, error) {
+func (TimeEncoder) AppendEncode(dst []byte, v time.Time) ([]byte, error) {
 	sec, nsec := v.Unix(), int64(v.Nanosecond())
 	if sec < nanosMinSec || (sec == nanosMinSec && nsec < nanosMinRem) ||
 		sec > nanosMaxSec || (sec == nanosMaxSec && nsec > nanosMaxRem) {
@@ -207,14 +207,14 @@ func (BENanosEncoder) AppendEncode(dst []byte, v time.Time) ([]byte, error) {
 	}
 	return binary.BigEndian.AppendUint64(dst, uint64(v.UnixNano())^signBit64), nil
 }
-func (BENanosEncoder) Decode(src []byte) (time.Time, error) {
+func (TimeEncoder) Decode(src []byte) (time.Time, error) {
 	if len(src) != 8 {
 		return time.Time{}, errDecode("gmdb/be-time-nanos", len(src), 8)
 	}
 	nanos := int64(binary.BigEndian.Uint64(src) ^ signBit64)
 	return time.Unix(0, nanos).UTC(), nil
 }
-func (BENanosEncoder) ID() string { return "gmdb/be-time-nanos" }
+func (TimeEncoder) ID() string { return "gmdb/be-time-nanos" }
 
 // --- UUID (raw 16 bytes) ------------------------------------------
 
@@ -258,11 +258,11 @@ func (UUIDv7Encoder) ID() string { return "gmdb/uuid-v7" }
 var (
 	_ Encoder[string]    = StringEncoder{}
 	_ Encoder[[]byte]    = BytesEncoder{}
-	_ Encoder[uint64]    = BEUint64Encoder{}
-	_ Encoder[uint32]    = BEUint32Encoder{}
-	_ Encoder[int64]     = BEInt64Encoder{}
-	_ Encoder[int32]     = BEInt32Encoder{}
-	_ Encoder[time.Time] = BENanosEncoder{}
+	_ Encoder[uint64]    = Uint64Encoder{}
+	_ Encoder[uint32]    = Uint32Encoder{}
+	_ Encoder[int64]     = Int64Encoder{}
+	_ Encoder[int32]     = Int32Encoder{}
+	_ Encoder[time.Time] = TimeEncoder{}
 	_ Encoder[[16]byte]  = UUIDv4Encoder{}
 	_ Encoder[[16]byte]  = UUIDv7Encoder{}
 )

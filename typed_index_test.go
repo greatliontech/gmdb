@@ -24,7 +24,7 @@ func TestTypedIndexLookupNonUnique(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 	byFirst := &TypedIndex[uint64, string, string]{
 		Name:    "by_first",
 		IKEnc:   StringEncoder{},
@@ -87,15 +87,15 @@ func TestTypedIndexLookupNonUnique(t *testing.T) {
 // IK-encode failure (the byte IndexExtractor is infallible; silently
 // dropping the entry would diverge the index from the rows). The only
 // reachable trigger with a canonical encoder is an out-of-range
-// BENanosEncoder index key.
+// TimeEncoder index key.
 func TestTypedIndexEncodeErrorPanics(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("events", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("events", Uint64Encoder{}, StringEncoder{})
 	byTime := &TypedIndex[uint64, string, time.Time]{
 		Name:  "by_time",
-		IKEnc: BENanosEncoder{},
+		IKEnc: TimeEncoder{},
 		// Yields an out-of-range time → IKEnc.AppendEncode fails.
 		Extract: func(_ uint64, _ string) []time.Time {
 			return []time.Time{time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)}
@@ -119,7 +119,7 @@ func TestTypedIndexUniqueGet(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 	byName := &TypedIndex[uint64, string, string]{
 		Name:    "by_name",
 		IKEnc:   StringEncoder{},
@@ -162,7 +162,7 @@ func TestTypedIndexEncoderIDDrift(t *testing.T) {
 	path := tmpPath(t)
 	db := openWith(t, ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 
 	// Create with the canonical StringEncoder (ID "gmdb/string").
 	tx1, err := db.Begin(ctx)
@@ -209,7 +209,7 @@ func TestTypedIndexEmptyEncoderID(t *testing.T) {
 	// (a) Referenced by a typed index → ErrIndexEncoderIDEmpty.
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
-	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 	badIdx := &TypedIndex[uint64, string, string]{Name: "by_name", IKEnc: emptyID, Extract: wholeValIK}
 	if _, err := tks.Create(tx, badIdx); !errors.Is(err, ErrIndexEncoderIDEmpty) {
 		t.Errorf("Create with empty-ID index encoder = %v, want ErrIndexEncoderIDEmpty", err)
@@ -237,10 +237,10 @@ func TestTypedIndexRange(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 	byLen := &TypedIndex[uint64, string, int64]{
 		Name:    "by_len",
-		IKEnc:   BEInt64Encoder{},
+		IKEnc:   Int64Encoder{},
 		Extract: func(_ uint64, v string) []int64 { return []int64{int64(len(v))} },
 	}
 	ks, err := tks.Create(tx, byLen)
@@ -254,7 +254,7 @@ func TestTypedIndexRange(t *testing.T) {
 		}
 	}
 	h, _ := ks.Index("by_len")
-	q := NewTypedIndexQuery[uint64, string, int64](h, BEInt64Encoder{})
+	q := NewTypedIndexQuery[uint64, string, int64](h, Int64Encoder{})
 
 	// Range [2, 4) → lengths 2,3 → ids 2,3.
 	var got []uint64
@@ -282,7 +282,7 @@ func TestTypedIndexQueryBindMismatch(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 	idx := &TypedIndex[uint64, string, string]{Name: "by_name", IKEnc: StringEncoder{}, Extract: wholeValIK}
 	ks, err := tks.Create(tx, idx)
 	if err != nil {

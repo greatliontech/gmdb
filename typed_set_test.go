@@ -26,7 +26,7 @@ func TestTypedSetKSRoundTrip(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", BEUint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -106,7 +106,7 @@ func TestTypedSetKSCursorAndIterators(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", BEUint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -179,7 +179,7 @@ func TestTypedSetKSEmptyValueMember(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", BEUint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -245,7 +245,7 @@ func TestTypedSetCursorLastPrevSeek(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", BEUint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -279,7 +279,7 @@ func TestTypedSetKSReadOnly(t *testing.T) {
 	path := tmpPath(t)
 	db := openWith(t, ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", BEUint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -319,7 +319,7 @@ func TestTypedSetKSFixedValueSize(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, uint64]("fixed", BEUint64Encoder{}, BEUint64Encoder{},
+	tsk := NewTypedSetKeyspace[uint64, uint64]("fixed", Uint64Encoder{}, Uint64Encoder{},
 		&SetKeyspaceOptions{FixedValueSize: 8})
 	ks, err := tsk.Create(tx)
 	if err != nil {
@@ -358,7 +358,7 @@ func TestTypedSetCursorSignedOrder(t *testing.T) {
 		t.Fatalf("Begin: %v", err)
 	}
 	defer tx.Rollback()
-	tsk := NewTypedSetKeyspace[int64, string]("signed", BEInt64Encoder{}, StringEncoder{}, nil)
+	tsk := NewTypedSetKeyspace[int64, string]("signed", Int64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)

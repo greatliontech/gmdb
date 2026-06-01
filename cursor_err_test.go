@@ -100,7 +100,7 @@ func TestTypedSetCursorErrSentinelByState(t *testing.T) {
 		t.Fatalf("Begin: %v", err)
 	}
 	defer tx.Rollback()
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", BEUint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)

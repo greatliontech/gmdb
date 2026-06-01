@@ -414,11 +414,11 @@ common column types. The full canonical set:
 |---|---|---|---|
 | `gmdb.StringEncoder` | `"gmdb/string"` | natural string order | UTF-8 bytes, no normalization |
 | `gmdb.BytesEncoder` | `"gmdb/bytes"` | natural byte order | identity |
-| `gmdb.BEUint64Encoder` | `"gmdb/be-uint64"` | natural uint64 order | 8-byte big-endian |
-| `gmdb.BEUint32Encoder` | `"gmdb/be-uint32"` | natural uint32 order | 4-byte big-endian |
-| `gmdb.BEInt64Encoder` | `"gmdb/be-int64"` | natural int64 order | 8-byte big-endian with sign bit XOR'd (XOR `0x80` on the top byte); maps two's-complement to lex order |
-| `gmdb.BEInt32Encoder` | `"gmdb/be-int32"` | natural int32 order | 4-byte big-endian with sign bit XOR'd |
-| `gmdb.BENanosEncoder` | `"gmdb/be-time-nanos"` | natural time order | int64 nanos since epoch, same sign-bit-XOR transform as `be-int64` |
+| `gmdb.Uint64Encoder` | `"gmdb/be-uint64"` | natural uint64 order | 8-byte big-endian |
+| `gmdb.Uint32Encoder` | `"gmdb/be-uint32"` | natural uint32 order | 4-byte big-endian |
+| `gmdb.Int64Encoder` | `"gmdb/be-int64"` | natural int64 order | 8-byte big-endian with sign bit XOR'd (XOR `0x80` on the top byte); maps two's-complement to lex order |
+| `gmdb.Int32Encoder` | `"gmdb/be-int32"` | natural int32 order | 4-byte big-endian with sign bit XOR'd |
+| `gmdb.TimeEncoder` | `"gmdb/be-time-nanos"` | natural time order | int64 nanos since epoch, same sign-bit-XOR transform as `be-int64` |
 | `gmdb.UUIDv4Encoder` | `"gmdb/uuid-v4"` | natural lex (random) | 16 bytes raw |
 | `gmdb.UUIDv7Encoder` | `"gmdb/uuid-v7"` | natural time order | 16 bytes raw; v7 timestamp prefix preserves lex=time |
 
@@ -435,7 +435,7 @@ change to the encoding logic for an existing ID would silently
 corrupt every on-disk index built with the old encoder. If a bug
 is discovered in a canonical encoder, the fix ships under a NEW
 ID (e.g. `"gmdb/be-int64/v2"`) with a separate type (e.g.
-`gmdb.BEInt64EncoderV2`); the old type and ID remain available
+`gmdb.Int64EncoderV2`); the old type and ID remain available
 for backward read of existing indexes. Operators migrating from
 the buggy encoder rebuild the affected indexes via
 `tx.Indexes().Rebuild` with the new typed decl. This convention

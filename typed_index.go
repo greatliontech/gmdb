@@ -52,7 +52,7 @@ func isTypedCoverValueIndex(decl *IndexDecl) bool {
 // so an IKEnc.AppendEncode failure during maintenance PANICS with a
 // descriptive error rather than silently dropping an index entry (which
 // would diverge the index from the rows). For all canonical encoders
-// except an out-of-range BENanosEncoder value this never fires; use
+// except an out-of-range TimeEncoder value this never fires; use
 // infallible index-key encoders, or ensure Extract never yields an
 // unrepresentable value.
 //

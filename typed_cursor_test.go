@@ -17,7 +17,7 @@ func newTypedNumsKS(t *testing.T, n uint64) (*TypedKeyspaceHandle[uint64, string
 		_ = db.Close()
 		t.Fatalf("Begin: %v", err)
 	}
-	tks := NewTypedKeyspace[uint64, string]("nums", BEUint64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		_ = tx.Rollback()
@@ -179,7 +179,7 @@ func TestTypedKSPrefixString(t *testing.T) {
 }
 
 // TestTypedCursorSignedOrder is the end-to-end Inv-T1 integration check:
-// int64 keys with BEInt64Encoder must iterate in numeric order
+// int64 keys with Int64Encoder must iterate in numeric order
 // (negatives below positives) through the cursor — not raw
 // two's-complement byte order.
 func TestTypedCursorSignedOrder(t *testing.T) {
@@ -191,7 +191,7 @@ func TestTypedCursorSignedOrder(t *testing.T) {
 		t.Fatalf("Begin: %v", err)
 	}
 	defer tx.Rollback()
-	tks := NewTypedKeyspace[int64, string]("signed", BEInt64Encoder{}, StringEncoder{})
+	tks := NewTypedKeyspace[int64, string]("signed", Int64Encoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)

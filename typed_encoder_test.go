@@ -57,11 +57,11 @@ func TestEncoderRoundTrip(t *testing.T) {
 
 	assertRoundTrip(t, StringEncoder{}, []string{"", "a", "hello", "\x00\xff"}, eqStr)
 	assertRoundTrip(t, BytesEncoder{}, [][]byte{{}, {0x00}, {0xff, 0x00, 0x01}}, eqBytes)
-	assertRoundTrip(t, BEUint64Encoder{}, []uint64{0, 1, math.MaxUint64}, eqU64)
-	assertRoundTrip(t, BEUint32Encoder{}, []uint32{0, 1, math.MaxUint32}, eqU32)
-	assertRoundTrip(t, BEInt64Encoder{}, []int64{math.MinInt64, -1, 0, 1, math.MaxInt64}, eqI64)
-	assertRoundTrip(t, BEInt32Encoder{}, []int32{math.MinInt32, -1, 0, 1, math.MaxInt32}, eqI32)
-	assertRoundTrip(t, BENanosEncoder{}, []time.Time{
+	assertRoundTrip(t, Uint64Encoder{}, []uint64{0, 1, math.MaxUint64}, eqU64)
+	assertRoundTrip(t, Uint32Encoder{}, []uint32{0, 1, math.MaxUint32}, eqU32)
+	assertRoundTrip(t, Int64Encoder{}, []int64{math.MinInt64, -1, 0, 1, math.MaxInt64}, eqI64)
+	assertRoundTrip(t, Int32Encoder{}, []int32{math.MinInt32, -1, 0, 1, math.MaxInt32}, eqI32)
+	assertRoundTrip(t, TimeEncoder{}, []time.Time{
 		time.Unix(0, -1_000_000_000).UTC(), time.Unix(0, 0).UTC(), time.Unix(1_700_000_000, 123).UTC(),
 	}, eqTime)
 	assertRoundTrip(t, UUIDv4Encoder{}, [][16]byte{{}, {1: 0xaa}, {15: 0xff}}, eqUUID)
@@ -75,11 +75,11 @@ func TestEncoderRoundTrip(t *testing.T) {
 func TestEncoderLexOrder(t *testing.T) {
 	assertLexOrder(t, StringEncoder{}, []string{"", "a", "aa", "ab", "b", "z"})
 	assertLexOrder(t, BytesEncoder{}, [][]byte{{}, {0x00}, {0x00, 0x01}, {0x01}, {0xff}})
-	assertLexOrder(t, BEUint64Encoder{}, []uint64{0, 1, 256, 1 << 32, math.MaxUint64})
-	assertLexOrder(t, BEUint32Encoder{}, []uint32{0, 1, 256, math.MaxUint32})
-	assertLexOrder(t, BEInt64Encoder{}, []int64{math.MinInt64, -1 << 32, -256, -1, 0, 1, 256, 1 << 32, math.MaxInt64})
-	assertLexOrder(t, BEInt32Encoder{}, []int32{math.MinInt32, -65536, -1, 0, 1, 65536, math.MaxInt32})
-	assertLexOrder(t, BENanosEncoder{}, []time.Time{
+	assertLexOrder(t, Uint64Encoder{}, []uint64{0, 1, 256, 1 << 32, math.MaxUint64})
+	assertLexOrder(t, Uint32Encoder{}, []uint32{0, 1, 256, math.MaxUint32})
+	assertLexOrder(t, Int64Encoder{}, []int64{math.MinInt64, -1 << 32, -256, -1, 0, 1, 256, 1 << 32, math.MaxInt64})
+	assertLexOrder(t, Int32Encoder{}, []int32{math.MinInt32, -65536, -1, 0, 1, 65536, math.MaxInt32})
+	assertLexOrder(t, TimeEncoder{}, []time.Time{
 		time.Unix(-1_000_000, 0).UTC(), // pre-epoch
 		time.Unix(0, -1).UTC(),
 		time.Unix(0, 0).UTC(),
@@ -100,11 +100,11 @@ func TestCanonicalEncoderIDs(t *testing.T) {
 	}{
 		{StringEncoder{}.ID(), "gmdb/string"},
 		{BytesEncoder{}.ID(), "gmdb/bytes"},
-		{BEUint64Encoder{}.ID(), "gmdb/be-uint64"},
-		{BEUint32Encoder{}.ID(), "gmdb/be-uint32"},
-		{BEInt64Encoder{}.ID(), "gmdb/be-int64"},
-		{BEInt32Encoder{}.ID(), "gmdb/be-int32"},
-		{BENanosEncoder{}.ID(), "gmdb/be-time-nanos"},
+		{Uint64Encoder{}.ID(), "gmdb/be-uint64"},
+		{Uint32Encoder{}.ID(), "gmdb/be-uint32"},
+		{Int64Encoder{}.ID(), "gmdb/be-int64"},
+		{Int32Encoder{}.ID(), "gmdb/be-int32"},
+		{TimeEncoder{}.ID(), "gmdb/be-time-nanos"},
 		{UUIDv4Encoder{}.ID(), "gmdb/uuid-v4"},
 		{UUIDv7Encoder{}.ID(), "gmdb/uuid-v7"},
 	}
@@ -126,28 +126,28 @@ func TestCanonicalEncoderIDs(t *testing.T) {
 // TestEncoderDecodeLengthErrors verifies fixed-width encoders reject a
 // wrong-length src rather than panicking (Encoder.Decode contract).
 func TestEncoderDecodeLengthErrors(t *testing.T) {
-	if _, err := (BEUint64Encoder{}).Decode([]byte{1, 2, 3}); err == nil {
-		t.Error("BEUint64 Decode(3 bytes) = nil err, want error")
+	if _, err := (Uint64Encoder{}).Decode([]byte{1, 2, 3}); err == nil {
+		t.Error("Uint64Encoder.Decode(3 bytes) = nil err, want error")
 	}
-	if _, err := (BEUint32Encoder{}).Decode([]byte{1, 2, 3, 4, 5}); err == nil {
-		t.Error("BEUint32 Decode(5 bytes) = nil err, want error")
+	if _, err := (Uint32Encoder{}).Decode([]byte{1, 2, 3, 4, 5}); err == nil {
+		t.Error("Uint32Encoder.Decode(5 bytes) = nil err, want error")
 	}
-	if _, err := (BEInt64Encoder{}).Decode(nil); err == nil {
-		t.Error("BEInt64 Decode(nil) = nil err, want error")
+	if _, err := (Int64Encoder{}).Decode(nil); err == nil {
+		t.Error("Int64Encoder.Decode(nil) = nil err, want error")
 	}
-	if _, err := (BENanosEncoder{}).Decode([]byte{1}); err == nil {
-		t.Error("BENanos Decode(1 byte) = nil err, want error")
+	if _, err := (TimeEncoder{}).Decode([]byte{1}); err == nil {
+		t.Error("TimeEncoder.Decode(1 byte) = nil err, want error")
 	}
 	if _, err := (UUIDv4Encoder{}).Decode(make([]byte, 15)); err == nil {
 		t.Error("UUIDv4 Decode(15 bytes) = nil err, want error")
 	}
 }
 
-// TestBENanosEncoderRange verifies in-range times encode and out-of-
+// TestTimeEncoderRange verifies in-range times encode and out-of-
 // range times (beyond ~year 2262 / before ~1678) are rejected rather
 // than silently wrapping to a wrong lex position (Inv-T1).
-func TestBENanosEncoderRange(t *testing.T) {
-	enc := BENanosEncoder{}
+func TestTimeEncoderRange(t *testing.T) {
+	enc := TimeEncoder{}
 	// In range: a far-future-but-representable time round-trips.
 	ok := time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
 	if _, err := enc.AppendEncode(nil, ok); err != nil {
