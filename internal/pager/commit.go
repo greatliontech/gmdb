@@ -135,7 +135,7 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 	// falls back to the last checkpoint-flagged meta whose data
 	// IS durable.
 	if cp.Sync != SyncNone {
-		if err := p.file.Sync(); err != nil {
+		if err := fdatasync(p.file); err != nil {
 			p.AbortTx()
 			return CommitResult{}, fmt.Errorf("pager: step 2 fdatasync: %w", err)
 		}
@@ -174,7 +174,7 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 	// step 2). Recovery's checkpoint-preferring selector reads
 	// the flag.
 	if cp.Sync == SyncBoth {
-		if err := p.file.Sync(); err != nil {
+		if err := fdatasync(p.file); err != nil {
 			p.AbortTx()
 			return CommitResult{}, fmt.Errorf("pager: step 4 fdatasync meta: %w", err)
 		}
