@@ -568,3 +568,77 @@ func TestAllocContiguousFragmentationStats(t *testing.T) {
 		}
 	})
 }
+
+// TestReclaimRPLQuarantinesCorruptSegment pins the quarantine behaviour:
+// a torn RPL segment must NOT halt reclamation of newer eligible
+// segments behind it (each segment's reclaimability is independent).
+// The corrupt segment is skipped (its pages leak, bounded — recoverable
+// via Check/Repair), the newer segment still reclaims, the count is
+// tracked for DBStats, and the callback fires for the log.
+func TestReclaimRPLQuarantinesCorruptSegment(t *testing.T) {
+	p, _, f := setupWriter(t, 32)
+	defer p.Close()
+	defer f.Close()
+	cfg := page.Config{PageSize: testPageSize}
+
+	const (
+		corruptPageID = 10 // oldest, index 0 — written as garbage
+		validPageID   = 11 // newer, index 1 — a valid segment
+		validPayload  = 21
+		corruptTxnID  = 100
+		validTxnID    = 200
+	)
+	bad := make([]byte, testPageSize)
+	for i := range bad {
+		bad[i] = 0xFF // not a decodable RPL segment
+	}
+	if _, err := f.WriteAt(bad, int64(corruptPageID)*int64(testPageSize)); err != nil {
+		t.Fatalf("write corrupt seg: %v", err)
+	}
+	good := make([]byte, testPageSize)
+	page.EncodeRPLSegment(good, cfg, validTxnID, 0, []uint64{validPayload})
+	if _, err := f.WriteAt(good, int64(validPageID)*int64(testPageSize)); err != nil {
+		t.Fatalf("write valid seg: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	p.Close()
+	pool := NewBufPool(testPageSize)
+	p, err := NewWriter(f, cfg, 32*testPageSize, pool, 16<<20)
+	if err != nil {
+		t.Fatalf("re-open: %v", err)
+	}
+	bm := bitmap.New(make([]byte, testPageSize), testPageSize, 1, 32)
+	p.AttachBitmap(bm)
+	p.SetRPLChain([]RPLSegmentRef{
+		{PageID: corruptPageID, TxnID: corruptTxnID, Count: 1},
+		{PageID: validPageID, TxnID: validTxnID, Count: 1},
+	})
+	p.SetCommitState(13, 32, validTxnID+1) // bound past both → both eligible
+
+	var cbFired []uint64
+	p.SetRPLCorruptCallback(func(seg uint64) { cbFired = append(cbFired, seg) })
+
+	count := p.reclaimRPL()
+
+	if count != 2 {
+		t.Errorf("reclaimRPL count = %d, want 2 (newer segment reclaimed past the corrupt one)", count)
+	}
+	if p.RPLCorruptCount() != 1 {
+		t.Errorf("RPLCorruptCount() = %d, want 1", p.RPLCorruptCount())
+	}
+	if len(cbFired) != 1 || cbFired[0] != corruptPageID {
+		t.Errorf("corrupt callback = %v, want [%d]", cbFired, corruptPageID)
+	}
+	if !bm.IsSet(validPayload) {
+		t.Errorf("valid payload page %d not reclaimed (quarantine wrongly halted)", validPayload)
+	}
+	if !bm.IsSet(validPageID) {
+		t.Errorf("valid segment page %d not reclaimed", validPageID)
+	}
+	if bm.IsSet(corruptPageID) {
+		t.Errorf("corrupt segment page %d was freed; it must stay allocated (leaked, bounded)", corruptPageID)
+	}
+}

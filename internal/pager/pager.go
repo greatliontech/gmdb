@@ -122,6 +122,17 @@ type Pager struct {
 	minSizePages     uint64 // MinSize: shrink never truncates below this (file-format.md §File Shrinkage). 0 ⇒ no floor.
 	reclamationBound uint64
 
+	// rplCorruptCount counts RPL-segment quarantine occurrences this
+	// session (a torn segment re-encountered after an aborted write tx
+	// counts again; the signal is "corruption present", not an exact
+	// distinct-segment count) because they failed to decode (free-space.md
+	// §RPL Reclamation). Surfaced via RPLCorruptCount → DBStats so a
+	// long-running embedder can detect corruption without an explicit
+	// Check(). rplCorruptCb, if set, is invoked once per quarantined
+	// segment for an immediate log.
+	rplCorruptCount uint64
+	rplCorruptCb    func(segPageID uint64)
+
 	pendingAllocs map[uint64]struct{}
 	pendingFrees  map[uint64]struct{}
 	retiredPages  []uint64
@@ -594,6 +605,20 @@ func (p *Pager) SetCommitStep4HookForTest(fn func() error) {
 // AllocPage call.
 func (p *Pager) SetLaggingReaderCallback(cb func(LaggingReaderInfo) LaggingReaderAction) {
 	p.laggingReader = cb
+}
+
+// RPLCorruptCount returns the number of RPL segments quarantined this
+// session due to a decode failure during reclamation (free-space.md
+// §RPL Reclamation). Non-zero means reclamation skipped a corrupt
+// segment: its pages leak (bounded to that segment) until a Check()
+// /Repair structural walk reclaims them.
+func (p *Pager) RPLCorruptCount() uint64 { return p.rplCorruptCount }
+
+// SetRPLCorruptCallback installs a callback invoked once per RPL
+// segment quarantined during reclamation, with the segment's page id.
+// The root package wires it to its slog logger. nil clears it.
+func (p *Pager) SetRPLCorruptCallback(cb func(segPageID uint64)) {
+	p.rplCorruptCb = cb
 }
 
 // SetReclamationBoundRefresh installs the bound-refresh closure used

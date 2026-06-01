@@ -63,6 +63,15 @@ type DBStats struct {
 	// Cross-process writer slab usage is not visible from any one DB
 	// handle, and aggregate cluster-wide slab usage is not tracked.
 	SlabBytes int64
+
+	// RPLCorruptSegments counts RPL-segment quarantine occurrences this
+	// process saw during reclamation — a decode failure (free-space.md
+	// §RPL Reclamation). Non-zero means a torn RPL segment was skipped:
+	// its pages leak (bounded to that segment) until Check()/Repair
+	// reclaims them, and the file may extend past genuinely-free space.
+	// Distinguishes corruption from genuine capacity — an ErrDBFull
+	// while this is non-zero is a corruption symptom, not a full DB.
+	RPLCorruptSegments uint64
 }
 
 // Stats returns a database-level metrics snapshot (api-surface.md
@@ -88,6 +97,7 @@ func (db *DB) Stats() DBStats {
 		s.RetiredPages = pgr.RPLPageCount()
 		s.FileSize = uint64(pgr.FileSize())
 		s.SlabBytes = int64(pgr.DirtyBytes())
+		s.RPLCorruptSegments = pgr.RPLCorruptCount()
 	}
 	if lockFile != nil {
 		s.MaxReaders = lockFile.MaxReaders()

@@ -732,6 +732,17 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	// fires only when "a reader in the reader table is blocking
 	// reclamation." Skip the user callback in the no-reader case and
 	// return Wait so the pager falls through to file extension.
+	// Surface RPL-segment corruption: reclamation quarantines a torn
+	// segment and continues (free-space.md §RPL Reclamation), so the
+	// corruption would otherwise be invisible until an explicit Check().
+	// Log it (db.logger defaults to a discard handler) and DBStats
+	// carries the count for programmatic detection.
+	pgr.SetRPLCorruptCallback(func(segPageID uint64) {
+		db.logger.Warn("gmdb: corrupt RPL segment quarantined during reclamation; "+
+			"its pages leak until Check()/Repair reclaims them",
+			"segPageID", segPageID)
+	})
+
 	if userCallback := db.opts.LaggingReader; userCallback != nil {
 		const noReader = ^uint64(0)
 		pgr.SetLaggingReaderCallback(func(info pager.LaggingReaderInfo) pager.LaggingReaderAction {

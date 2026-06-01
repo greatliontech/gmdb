@@ -310,6 +310,23 @@ from live bitrot without a per-segment discriminator is not possible, and a
 bounded, detectable leak is strictly safer than refusing to open an otherwise
 intact database.
 
+**Runtime reclamation (`reclaimRPL`).** When the writer drains eligible
+segments back to the bitmap and a segment fails to decode (bitrot, a torn
+write), reclamation **quarantines** it rather than halting: the corrupt
+segment is popped from the in-memory chain and reclamation continues with
+the newer eligible segments behind it. Each segment's reclaimability is
+independent (a segment retired at TxnID `T` is reclaimable once the bound
+passes `T`, regardless of older segments), so skipping one torn segment
+does not strand the free space of every newer one. The quarantined
+segment's listed pages and its own segment page cannot be reclaimed
+(undecodable / unsafe to free), so they leak — bounded to that one
+segment, and recoverable by a `Check()`/`Repair` structural walk (they
+surface as `BitmapLeak`). The corruption is **observable without an
+explicit `Check()`**: `DBStats.RPLCorruptSegments` counts quarantined
+segments and the DB logs a warning (naming the segment page) on each. A
+growing file or an `ErrDBFull` while `RPLCorruptSegments > 0` is a
+corruption symptom, not genuine capacity exhaustion.
+
 ### RPL append (at commit time)
 
 When a write transaction commits with retired pages:

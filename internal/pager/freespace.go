@@ -449,10 +449,23 @@ func (p *Pager) reclaimRPL() int {
 		buf := p.pageRaw(seg.PageID)
 		decoded, ok := page.DecodeRPLSegment(buf, p.cfg)
 		if !ok {
-			// Corrupt RPL segment — surface via the integrity-check
-			// path. Halt reclamation here to avoid feeding
-			// garbage page IDs to the bitmap.
-			break
+			// Corrupt RPL segment. We cannot decode its page IDs to
+			// reclaim them, nor safely free the segment page itself,
+			// so those pages leak — but the leak is bounded to THIS
+			// segment and recoverable later via Check()/Repair's
+			// structural walk. Quarantine it: record + surface the
+			// corruption, pop it from the chain, and CONTINUE so newer
+			// eligible segments still reclaim (each segment's
+			// reclaimability is independent of older ones). Halting the
+			// whole queue here would strand every newer segment's free
+			// space behind one torn segment (free-space.md §RPL
+			// Reclamation).
+			p.rplCorruptCount++
+			if p.rplCorruptCb != nil {
+				p.rplCorruptCb(seg.PageID)
+			}
+			p.trimRPLChainTail(1)
+			continue
 		}
 		for _, id := range decoded.PageIDs {
 			p.bitmap.Set(id)
