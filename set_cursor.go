@@ -71,7 +71,7 @@ type SetCursor struct {
 
 	// values is the materialized sorted value-set for currentKey.
 	// Each entry is a heap copy (independent of leaf-buffer borrow
-	// lifetimes). Always sorted (Inv-2 + nested-tree btree-order).
+	// lifetimes). Always sorted (set-keyspace.md §Invariants + nested-tree btree-order).
 	values [][]byte
 
 	// innerIdx is the position within values:
@@ -486,7 +486,7 @@ func (c *SetCursor) CountValues() (uint64, error) {
 // to the next (key, value) pair OR transitions to end-of-iteration
 // — matching the Cursor.Delete post-state contract.
 //
-// Last-value-of-key delete drops the parent cell per Inv-1 (empty
+// Last-value-of-key delete drops the parent cell per set-keyspace.md §Invariants (empty
 // sets must not persist); the cursor's subsequent Next would land
 // on the next key's first value.
 //
@@ -617,7 +617,7 @@ func (c *SetCursor) Err() error {
 		}
 		// mapBtreeErr covers btree.ErrCorrupted AND the pager sentinels
 		// (ErrBadPageChecksum / ErrCorrupted) now reachable through a
-		// cursor read via the verifying Page (Inv-RV1/RV3); other errors
+		// cursor read via the verifying Page (checksums.md §Verification + checksums.md §Structural and Allocation Bounds); other errors
 		// pass through unwrapped, preserving the prior behaviour.
 		return mapBtreeErr(err)
 	}
@@ -687,7 +687,7 @@ func (c *SetCursor) materializeAtOuter() error {
 			ErrCorrupted, e.Flags, k)
 	}
 	if len(c.values) == 0 {
-		return fmt.Errorf("%w: SetCursor: zero-value cell at key %q (Inv-1 violation)",
+		return fmt.Errorf("%w: SetCursor: zero-value cell at key %q (empty-set invariant violation)",
 			ErrCorrupted, k)
 	}
 	c.positioned = true

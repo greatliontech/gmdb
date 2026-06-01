@@ -53,7 +53,7 @@ type Bitmap struct {
 	// openSnapshots tracks every Snapshot returned by Snapshot() that
 	// has not yet been Restored or Discarded. Slice order is begin-
 	// order (outermost first); strict-LIFO contract per the pager's
-	// Inv-N2 nesting (transactions.md §Why this is cheap). recordFlip
+	// Nesting per transactions.md §Why this is cheap. recordFlip
 	// is a no-op when this is empty — no Restore can replay an entry
 	// no Snapshot will reference.
 	openSnapshots []*Snapshot

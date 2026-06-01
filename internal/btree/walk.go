@@ -181,7 +181,7 @@ func walkKVAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, key
 			}
 			switch {
 			case e.IsOverflow():
-				// Inv-RV4: uint64 run length — a forged TotalLen whose
+				// Forged-length bound (checksums.md §Structural and Allocation Bounds): uint64 run length — a forged TotalLen whose
 				// uint32 run truncates to a small value is caught here
 				// (run64 > hwm), before readOverflowValue allocates.
 				run64 := page.OverflowRunLength64(cfg, e.TotalLen)
@@ -263,7 +263,7 @@ func walkAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, visit
 			}
 			switch {
 			case e.IsOverflow():
-				// Inv-RV4: uint64 run length (the visit loop is then
+				// Forged-length bound (checksums.md §Structural and Allocation Bounds): uint64 run length (the visit loop is then
 				// bounded by hwm, never by a truncated forged run).
 				run64 := page.OverflowRunLength64(cfg, e.TotalLen)
 				if e.OverflowPage == 0 || e.OverflowPage >= hwm || e.OverflowPage+run64 > hwm {

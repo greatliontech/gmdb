@@ -59,8 +59,7 @@ var (
 	ErrVersionMismatch = errors.New("pager: on-disk format version mismatch")
 
 	// ErrBadPageChecksum is returned by Page when a data page's xxhash64
-	// footer does not match its content (checksums.md §Verification,
-	// Inv-RV1). Distinct from ErrCorrupted: a checksum mismatch is silent
+	// footer does not match its content (checksums.md §Verification). Distinct from ErrCorrupted: a checksum mismatch is silent
 	// bitrot on a structurally-plausible page, whereas ErrCorrupted is a
 	// structural-layout violation. mapPagerErr translates this into
 	// gmdb.ErrBadPageChecksum, the public api-surface.md sentinel.
@@ -150,7 +149,7 @@ type Pager struct {
 	// savepointDepth counts active (unresolved) NESTED-kind savepoints
 	// (transactions.md §Nested Transactions). While > 0, AllocPage
 	// suspends loose-page reuse so a child cannot hand out a page id
-	// whose slab buffer an ancestor's tree still references (Inv-N1).
+	// whose slab buffer an ancestor's tree still references (pager-slab.md §Slab Lifecycle Across Nested Transactions).
 	// Managed by BeginSavepoint / RestoreSavepoint / ReleaseSavepoint;
 	// reset to 0 by AbortTx. See savepoint.go.
 	//
@@ -203,7 +202,7 @@ type Pager struct {
 	savepointUndoLog []savepointUndoEntry
 
 	// verified is the per-transaction checksum-verification cache
-	// (checksums.md §Verification, Inv-RV2): a mmap page whose xxhash64
+	// (checksums.md §Verification): a mmap page whose xxhash64
 	// footer has been verified once in this tx is recorded here and not
 	// re-verified on subsequent accesses within the tx. A compact
 	// []uint64 bitset indexed by page id, lazily allocated on the first
@@ -437,7 +436,7 @@ func (p *Pager) BeginTx() {
 	p.resetTxCounters()
 	// Reset the checksum-verification cache at every write-tx boundary:
 	// the previous commit may have rewritten mmap pages, so verifications
-	// from the prior tx no longer hold (Inv-RV2). Done before the early
+	// from the prior tx no longer hold (checksums.md §Verification). Done before the early
 	// return so it runs regardless of bitmap-attachment ordering.
 	p.resetVerified()
 	if p.readOnly || p.bitmap == nil {
@@ -759,12 +758,12 @@ func (p *Pager) AdviseColdAccessed() error {
 // the boundary that enforces the read-path corruption-tolerance
 // invariants (checksums.md §Verification):
 //
-//   - Inv-RV3: a content-derived id is bounded against the file-resident
+//   - File-resident bound (checksums.md §Structural and Allocation Bounds): a content-derived id is bounded against the file-resident
 //     extent before any mmap access, so a forged/out-of-range id yields
 //     ErrCorrupted instead of a SIGBUS on the unbacked MaxSize
 //     reservation. (A dirty slab buffer lives in process memory and is
 //     this-tx content, so it is returned without bound or verification.)
-//   - Inv-RV1/RV2: when checksums are enabled, the xxhash64 footer is
+//   - Checksum verification (checksums.md §Verification): when checksums are enabled, the xxhash64 footer is
 //     verified on the page's first mmap access within the transaction
 //     and the id recorded in p.verified so subsequent accesses skip the
 //     re-hash; a mismatch yields ErrBadPageChecksum.
@@ -774,7 +773,7 @@ func (p *Pager) Page(id uint64) ([]byte, error) {
 			return *buf, nil
 		}
 	}
-	// Inv-RV3: bound id against the file-resident page count BEFORE any
+	// File-resident bound (checksums.md §Structural and Allocation Bounds): bound id against the file-resident page count BEFORE any
 	// mmap access. The mmap spans the whole MaxSize reservation, but only
 	// the first p.fileSize bytes are file-backed — reading the gap
 	// SIGBUSes. Comparing page counts (not byte offsets) keeps id*PageSize
@@ -789,7 +788,7 @@ func (p *Pager) Page(id uint64) ([]byte, error) {
 	}
 	off := id * uint64(p.cfg.PageSize)
 	buf := p.mmap[off : off+uint64(p.cfg.PageSize)]
-	// Inv-RV1/RV2: verify the footer on first access this tx, then cache.
+	// Checksum verification (checksums.md §Verification): verify the footer on first access this tx, then cache.
 	if p.cfg.PageChecksum && !p.isVerified(id) {
 		if !page.VerifyPageFooter(buf, p.cfg.PageSize) {
 			return nil, fmt.Errorf("%w: page %d", ErrBadPageChecksum, id)
@@ -800,7 +799,7 @@ func (p *Pager) Page(id uint64) ([]byte, error) {
 }
 
 // isVerified reports whether page id's footer has already been verified
-// in this transaction (Inv-RV2). Out-of-range ids (never cached) return
+// in this transaction (checksums.md §Verification). Out-of-range ids (never cached) return
 // false; the file-resident bound in Page rejects them before this is
 // reached, so the guard is purely defensive.
 func (p *Pager) isVerified(id uint64) bool {
@@ -962,7 +961,7 @@ func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
 // stays O(depth × pageSize) regardless of input size, never charging the
 // MaxTxBufferBytes budget.
 //
-// Contract (the WriteDirect invariant, bulkload.md Inv-WD):
+// Contract (the WriteDirect invariant, bulkload.md §Slab Bypass):
 //   - id MUST have been allocated in this transaction (present in
 //     pendingAllocs). This reserves id's bitmap bit (cleared = in-use)
 //     so no other allocation in the tx reuses it, and guarantees the

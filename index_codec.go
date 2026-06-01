@@ -185,7 +185,7 @@ func decodeRegistryEntry(data []byte) (*indexRegistryEntry, error) {
 	}
 	colCount := int(binary.LittleEndian.Uint16(data[off:]))
 	off += 2
-	// Inv-RV4: before allocating the slice, verify the remaining bytes can
+	// Forged-length bound (checksums.md §Structural and Allocation Bounds): before allocating the slice, verify the remaining bytes can
 	// hold at least one 2-byte NameLen per column. A forged ColumnCount on
 	// a truncated on-disk entry would otherwise force a multi-MB make()
 	// before the per-iteration bounds check trips.
@@ -216,7 +216,7 @@ func decodeRegistryEntry(data []byte) (*indexRegistryEntry, error) {
 	}
 	covCount := int(binary.LittleEndian.Uint16(data[off:]))
 	off += 2
-	// Inv-RV4: same pre-allocation bound as ColumnCount above.
+	// Same forged-length pre-allocation bound as ColumnCount above (checksums.md §Structural and Allocation Bounds).
 	if covCount*2 > len(data)-off {
 		return nil, fmt.Errorf("%w: CoveringCount %d needs ≥%d bytes, %d remain at offset %d",
 			errRegistryEntryShort, covCount, covCount*2, len(data)-off, off)
@@ -370,12 +370,12 @@ func (tx *Tx) registryDelete(owner descriptorOwner, name string) error {
 // no declared indexes (IndexRegistryRoot == 0). Read-only.
 //
 // On a corrupt registry tree the result is bounded by construction: the
-// cursor reads through the verifying pager.Page (Inv-RV3 file-resident
+// cursor reads through the verifying pager.Page (checksums.md §Structural and Allocation Bounds, file-resident
 // bound + branch validation), so it cannot yield more entries than the
 // finite registry tree holds, and cur.Err() surfaces ErrCorrupted /
 // ErrBadPageChecksum. No separate output cap is therefore needed — the
 // allocation is bounded by the file. (decodeRegistryEntry bounds the
-// per-entry count fields; see Inv-RV4 there.)
+// per-entry count fields; see the forged-length bound, checksums.md §Structural and Allocation Bounds.)
 func (tx *Tx) registryList(owner descriptorOwner) ([]string, error) {
 	desc := owner.descriptor()
 	if desc.IndexRegistryRoot == 0 {

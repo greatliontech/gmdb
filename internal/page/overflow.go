@@ -57,7 +57,7 @@ func OverflowRunLength(cfg Config, valLen uint64) uint32 {
 // there; the READ/validation path must use this form, because a forged
 // on-disk TotalLen can imply a run length that overflows uint32 and
 // truncates to a small value — making a naive run-vs-extent guard pass
-// while the TotalLen-sized allocation is enormous (Inv-RV4). Callers
+// while the TotalLen-sized allocation is enormous (checksums.md §Structural and Allocation Bounds). Callers
 // bound the returned count against the file-resident extent before
 // trusting TotalLen for any allocation.
 func OverflowRunLength64(cfg Config, valLen uint64) uint64 {

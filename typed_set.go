@@ -28,7 +28,7 @@ type TypedSetKeyspace[K, V any] struct {
 }
 
 // NewTypedSetKeyspace creates a typed set keyspace descriptor. keyEnc
-// MUST produce lexicographically ordered output (Inv-T1). opts carries
+// MUST produce lexicographically ordered output (typed-keyspaces.md §Invariants). opts carries
 // the create-time SetKeyspace options (e.g. FixedValueSize); it is
 // consulted only by Create / CreateIfNotExists.
 func NewTypedSetKeyspace[K, V any](name string, keyEnc Encoder[K], valEnc Encoder[V], opts *SetKeyspaceOptions) *TypedSetKeyspace[K, V] {

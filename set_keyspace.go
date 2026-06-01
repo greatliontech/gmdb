@@ -34,7 +34,7 @@ type SetKeyspaceOptions struct {
 //     opened against it); subsequent operations return
 //     ErrKeyspaceClosed.
 //   - Re-creating the same name via CreateSetKeyspace in the same tx
-//     does NOT reactivate the old handle (Inv-D).
+//     does NOT reactivate the old handle (api-surface.md §Keyspace API DeleteKeyspace).
 //
 // All values for a key are stored as either:
 //   - An inline subpage cell (CellFlagMultiValue, NestedTree clear)
@@ -458,7 +458,7 @@ func (ks *SetKeyspace) cellHasValue(cfg page.Config, e page.LeafEntry, value []b
 }
 
 // CountValues returns the number of values stored under key. Returns
-// (0, nil) when the key is absent (per Inv-1: empty sets don't
+// (0, nil) when the key is absent (per set-keyspace.md §Invariants: empty sets don't
 // persist, so a missing key has zero values).
 //
 // O(1) for nested-tree cells (read from cell's NestedCount field);
@@ -848,7 +848,7 @@ func (ks *SetKeyspace) Delete(key []byte) (err error) {
 //
 // On a subpage cell: removes the value from the subpage; if the
 // subpage now has zero values, removes the parent cell entirely
-// (Inv-1: empty sets must not persist).
+// (set-keyspace.md §Invariants: empty sets must not persist).
 // On a nested-tree cell: removes the value via btree.Delete; on
 // success, checks DemoteNestedTreeIfFits and replaces the parent
 // cell with a subpage when the nested tree shrinks below the
@@ -933,7 +933,7 @@ func (ks *SetKeyspace) DeleteValue(key, value []byte) (err error) {
 // deleteValueFromSubpage handles DeleteValue when the cell is a
 // subpage. If the value is not present, returns ErrNotFound (Delete-
 // on-miss). If the deletion would leave the subpage empty (Count=0),
-// removes the parent cell entirely (Inv-1: empty sets must not
+// removes the parent cell entirely (set-keyspace.md §Invariants: empty sets must not
 // persist).
 func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte, e page.LeafEntry) error {
 	fvs := ks.desc.FixedValueSize
@@ -982,7 +982,7 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 //
 //   - Nested-tree cell (CellFlagMultiValue|CellFlagNestedTree):
 //     recursively retires the nested B+tree via btree.FreeSubtree;
-//     contributes NestedCount values (per set-keyspace.md Inv-2
+//     contributes NestedCount values (per set-keyspace.md §Invariants
 //     entailed: the cell's Count field equals the number of leaf
 //     entries reachable from Root). FreeSubtree's returned count
 //     IS that NestedCount by construction — it walks the nested
@@ -1005,7 +1005,7 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 // interior subtrees in the same DeleteRange call. The two paths
 // must agree on count semantics so the (interior + boundary)
 // total returned by DeleteRange equals desc.Count's per-cell
-// accounting (set-keyspace.md Inv-2 entailed + Inv entailed E2).
+// accounting (set-keyspace.md §Invariants, entailed value-count accounting).
 func setKeyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry) (uint64, error) {
 	switch {
 	case e.IsNestedTree():
@@ -1019,7 +1019,7 @@ func setKeyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry)
 		// Defense-in-depth (mirrors SetKeyspace.Delete's bulk-free
 		// path at set_keyspace.go's deleteFromNestedTree branch): the
 		// cell's NestedCount field MUST equal the walked-leaf tally
-		// per set-keyspace.md §Invariants Inv-2 entailed ("the
+		// per set-keyspace.md §Invariants entailed ("the
 		// nested-tree reference cell's Count field equals the number
 		// of leaf entries reachable from Root"). A divergence is
 		// on-disk corruption — surface as ErrCorrupted rather than
@@ -1138,7 +1138,7 @@ func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 
 	// Un-indexed path: atomic walker. setKeyspaceCellFree handles
 	// subpage / nested-tree / overflow cells and tallies values, so the
-	// returned count is values-correct (set-keyspace.md Inv-2 entailed
+	// returned count is values-correct (set-keyspace.md §Invariants entailed
 	// E2); desc.Count is kept in the same value unit.
 	return ks.deleteRangeUnindexed(start, end, setKeyspaceCellFree, ks.markSetCursorsStale)
 }

@@ -50,7 +50,7 @@ import (
 // against maxMoves — once a descendant/chain/nested-root moves, the
 // parent/leaf must be rewritten regardless. The total CoW count is
 // therefore bounded by ~maxMoves×(1+depth), and the caller sizes maxMoves
-// so that fits MaxTxBufferBytes (Inv-M4). A CoW or slab alloc that
+// so that fits MaxTxBufferBytes (background-maintenance.md §Invariants). A CoW or slab alloc that
 // nonetheless overruns the budget surfaces ErrTxTooLarge, which the caller
 // rolls back — never on-disk corruption.
 //

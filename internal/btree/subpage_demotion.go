@@ -96,7 +96,7 @@ func DemoteNestedTreeIfFits(
 		return nil, false, fmt.Errorf("%w: nested-tree leaf %d: %w", ErrCorrupted, rootID, err)
 	}
 
-	// Defensive: a zero-entry nested leaf violates §Invariants Inv-1
+	// Defensive: a zero-entry nested leaf violates set-keyspace.md §Invariants (empty-set ban)
 	// ("empty value sets do not exist on disk"). The caller invokes
 	// demote only after a successful btree.Delete that left ≥1
 	// value; reaching here with Count=0 means the on-disk state is
@@ -105,7 +105,7 @@ func DemoteNestedTreeIfFits(
 	// silently builds a 4-byte Count=0 subpage and the caller
 	// installs an empty cell.
 	if r.Count() == 0 {
-		return nil, false, fmt.Errorf("%w: nested-tree leaf %d has zero entries (violates Inv-1: empty sets must not persist)",
+		return nil, false, fmt.Errorf("%w: nested-tree leaf %d has zero entries (empty sets must not persist)",
 			ErrCorrupted, rootID)
 	}
 
@@ -138,7 +138,7 @@ func DemoteNestedTreeIfFits(
 		// fixedValueSize-uniform) are entailed by the nested tree's
 		// own structural invariants — out-of-order or duplicate
 		// keys never escape the btree write path; a mismatched-size
-		// key on a Kind=1 fixed-size keyspace is Inv-3 corruption.
+		// key on a Kind=1 fixed-size keyspace is fixed-size-stride corruption (set-keyspace.md §Invariants).
 		// So any EncodeSubpage error here indicates a corrupt
 		// nested leaf — re-wrap as ErrCorrupted so the
 		// SetKeyspace surface can distinguish on-disk corruption

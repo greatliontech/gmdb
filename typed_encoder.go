@@ -11,12 +11,12 @@ import (
 // values to bytes through an Encoder[T]; the byte layer stores the
 // bytes. Two contracts make the encoders load-bearing:
 //
-//   - Key ordering (Inv-T1): a key Encoder MUST produce byte sequences
+//   - Key ordering (typed-keyspaces.md §Invariants): a key Encoder MUST produce byte sequences
 //     whose lex order matches the desired key order, so range / prefix
 //     queries route correctly. The canonical integer encoders use
 //     big-endian with a sign-bit XOR for signed types — NOT zigzag,
 //     which is not lex-preserving for big-endian byte order.
-//   - ID stability (Inv-T2/T4): ID() is a stable, non-empty, unique
+//   - ID stability (typed-keyspaces.md §Invariants): ID() is a stable, non-empty, unique
 //     string hashed into a typed index's schema fingerprint. Canonical
 //     engine IDs are forever immutable — a bug fix ships under a NEW id
 //     + type (e.g. "gmdb/be-int64/v2"), never by mutating an existing

@@ -49,7 +49,7 @@ func (p *Pager) AllocPage() (uint64, error) {
 	// an ancestor's tree still references (the ancestor's saved
 	// root), so reusing it would overwrite a buffer the ancestor
 	// holds — violating the transactions.md §Invariants "child never
-	// mutates a parent's slab buffer in place" guarantee (Inv-N1).
+	// mutates a parent's slab buffer in place" guarantee (pager-slab.md §Slab Lifecycle Across Nested Transactions).
 	// While savepointDepth > 0 the allocator skips straight to the
 	// bitmap; freed pages remain loose (not reusable) until every
 	// nested child resolves and the stack empties.
@@ -131,7 +131,7 @@ func (p *Pager) AllocPage() (uint64, error) {
 			// window means buf is in-window content; replay must drop
 			// it, not re-install it (re-installing would leak the
 			// in-window buffer into the parent tx's dirty map post-
-			// Restore — Inv-N2 violation). See loosePopEntry godoc.
+			// Restore — pager-slab.md byte-slice-ownership violation). See loosePopEntry godoc.
 			for _, sp := range p.activeSavepoints {
 				if sp.kind != SavepointShallow {
 					continue
@@ -401,7 +401,7 @@ func (p *Pager) FreePage(id uint64) error {
 // drains). A genuinely leaked page is referenced by NO snapshot, so it
 // needs no reader-pinned deferral — but that is only true under verified
 // exclusive access (no concurrent readers or writers). The caller (the
-// exclusive Repair path; gmdb Inv-C5) is responsible for establishing
+// exclusive Repair path; api-surface.md §Check, CopyTo, Compact) is responsible for establishing
 // that precondition; this method does not and cannot check it.
 //
 // Atomicity: the freed bit is dirtied in the in-memory bitmap ONLY. It

@@ -153,12 +153,12 @@ func readOverflowValue(pr PageReader, cfg page.Config, entry page.LeafEntry) ([]
 	if !entry.IsOverflow() {
 		return nil, fmt.Errorf("btree: readOverflowValue called on non-overflow entry")
 	}
-	// Inv-RV4: a forged on-disk TotalLen can imply a run of billions of
+	// Forged-length bound (checksums.md §Structural and Allocation Bounds): a forged on-disk TotalLen can imply a run of billions of
 	// pages (OverflowRunLength truncates to uint32, so a naive
 	// run-vs-extent guard would pass while make([]byte, TotalLen) is
 	// enormous). Compute the run length in uint64 and read pages ONE AT A
 	// TIME — pr.Page bounds each id against the file-resident extent
-	// (Inv-RV3), so a run that walks past the file aborts here, before the
+	// (checksums.md §Structural and Allocation Bounds), so a run that walks past the file aborts here, before the
 	// TotalLen-sized allocation. Do not pre-size `pages` to run64 (itself
 	// possibly forged-huge); a run that stays in-bounds is ≤ the file's
 	// page count, which bounds TotalLen ≤ file size for the assembly.

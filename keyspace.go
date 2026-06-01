@@ -56,7 +56,7 @@ const (
 // ErrKeyspaceClosed. Re-creating the same name via CreateKeyspace
 // in the same tx does NOT reactivate the old handle — the new
 // CreateKeyspace returns a fresh *Keyspace while the old handle
-// stays dead until the caller drops it (Inv-D).
+// stays dead until the caller drops it (api-surface.md §Keyspace API DeleteKeyspace).
 type Keyspace struct {
 	keyspaceCore
 
@@ -1309,7 +1309,7 @@ func (c *Cursor) Err() error {
 		}
 		// mapBtreeErr covers btree.ErrCorrupted AND the pager sentinels
 		// (ErrBadPageChecksum / ErrCorrupted) now reachable through a
-		// cursor read via the verifying Page (Inv-RV1/RV3); other errors
+		// cursor read via the verifying Page (checksums.md §Verification + checksums.md §Structural and Allocation Bounds); other errors
 		// pass through unwrapped, preserving the prior behaviour.
 		return mapBtreeErr(err)
 	}
@@ -1338,7 +1338,7 @@ func (c *Cursor) Err() error {
 // AbortTx on Tx.Rollback or flush-walk failure):
 //   - Every page reachable from desc.Root retires into loosePages
 //     (same-tx allocations) or retiredPages (prior-tx pages, RPL'd
-//     at commit) per Inv-B.
+//     at commit) per free-space.md §Retired Page Log (RPL).
 //   - The name is added to tx.pendingDeletes (or, when the *Keyspace
 //     was Created in this tx, the entry is simply dropped — there is
 //     no on-disk descriptor to btree.Delete at flush).
@@ -1349,7 +1349,7 @@ func (c *Cursor) Err() error {
 //
 // Re-creation in same tx: a subsequent CreateKeyspace with the same
 // name allocates a fresh *Keyspace; the old handle stays dead per
-// Inv-D (api-surface.md §Keyspace API DeleteKeyspace permanent-
+// api-surface.md §Keyspace API DeleteKeyspace (permanent-
 // invalidation clause).
 func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 	if err := tx.requireOpen(true); err != nil {
@@ -1518,8 +1518,8 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 //
 // The btree read path resolves pages through pager.Page (the verifying
 // accessor), so a read can now surface pager.ErrBadPageChecksum (a
-// bitrotted footer, Inv-RV1) or pager.ErrCorrupted (a content-derived id
-// past the file-resident extent, Inv-RV3). Both are mapped to their
+// bitrotted footer, checksums.md §Verification) or pager.ErrCorrupted (a content-derived id
+// past the file-resident extent, checksums.md §Structural and Allocation Bounds). Both are mapped to their
 // public gmdb sentinels here so callers' errors.Is checks work.
 //
 // btree.ErrKeyTooLarge — a key too large even for an overflow-reference

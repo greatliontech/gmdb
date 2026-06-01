@@ -10,7 +10,7 @@ import (
 // canonical user-facing primitive (transactions.md §Nested
 // Transactions, BeginChild semantics) that suspends loose-pop for the
 // duration so a child can never hand out a page id whose slab buffer
-// the parent's tree still references (Inv-N1). The Shallow kind is
+// the parent's tree still references (pager-slab.md §Slab Lifecycle Across Nested Transactions). The Shallow kind is
 // the internal-helper flavour used by per-row indexed maintenance
 // (Keyspace.Put / Delete / Cursor.Delete; SetKeyspace.Put / Delete /
 // DeleteValue) to make the helper + the subsequent row btree mutation
@@ -51,7 +51,7 @@ const (
 // must drop buf back to the pool instead of installing it — installing
 // would re-introduce an in-window buffer post-Restore, leaking it into
 // the parent tx's slab state with no corresponding dirtyBytes account
-// reading, breaking Inv-N2 / pager-slab.md byte-slice ownership). The
+// reading, breaking pager-slab.md byte-slice ownership). The
 // flag is set at loose-pop time (freespace.go: AllocPage loose-pop
 // branch) by scanning the savepoint's window slice of savepointUndoLog
 // for any prior `(fieldDirty, id, false)` entry — O(this-savepoint-
@@ -234,7 +234,7 @@ func (p *Pager) recordSavepointUndo(field savepointUndoField, key uint64, wasPre
 // a child can never hand out a page id whose slab buffer an ancestor's
 // tree still references — the transactions.md §Invariants clause-
 // explicit "child never mutates a parent's slab buffer in place"
-// guarantee (Inv-N1). Returns nil on a read-only pager.
+// guarantee (pager-slab.md §Slab Lifecycle Across Nested Transactions). Returns nil on a read-only pager.
 //
 // The returned *Savepoint is owned by the caller; pass it back to
 // exactly one of RestoreSavepoint (child rollback) or ReleaseSavepoint
@@ -467,7 +467,7 @@ func (p *Pager) RestoreSavepoint(sp *Savepoint) {
 	//     pop). Restore must drop it to the pool and NOT re-install:
 	//     pre-window dirty[entry.id] was absent. Re-installing would
 	//     leak an in-window buffer into the post-Restore dirty map
-	//     (Inv-N2 violation; dirtyBytes accounting desync; pager-
+	//     (dirtyBytes accounting desync; pager-
 	//     slab.md byte-slice-ownership invariant violation if anyone
 	//     held a []byte from the in-window CoW).
 	if sp.kind == SavepointShallow {

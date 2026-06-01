@@ -363,7 +363,7 @@ func (p *Pager) attachState(file *os.File, m page.Meta) error {
 	//
 	// File-extent bound (a): firstDataPage = 2 + BitmapPages must lie within
 	// the file-resident extent. Use `min(fileSize/PageSize, MaxSize)` exactly
-	// like rebuildRPLChain (Inv-RV3) and checker.walkRPL (Inv-C1) —
+	// like rebuildRPLChain (checksums.md §Structural and Allocation Bounds) and checker.walkRPL (api-surface.md §Check, CopyTo, Compact) —
 	// ValidateMeta deliberately does not enforce these (avoid rejecting
 	// recoverable databases). Capacity bound (b): BitmapPages*PageSize*8 bits
 	// must be >= MaxSize pages.
@@ -687,7 +687,7 @@ func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmapForOpen, fileSize int64) (
 	// extent capped by MaxSize — NOT meta.HighWaterMark (ValidateMeta does
 	// not enforce HighWaterMark <= MaxSize, so a forged meta can inflate it
 	// past the reservation) and NOT MaxSize alone (the file may be shorter
-	// than the reservation). This is Pager.Page's Inv-RV3 bound, identical
+	// than the reservation). This is Pager.Page's file-resident bound (checksums.md §Structural and Allocation Bounds), identical
 	// to checker.walkRPL's min(fileSize/PageSize, MaxSize) (the root gmdb
 	// package's check.go); the two sibling RPL walkers must agree a wild
 	// pointer is structured corruption, not a crash.

@@ -245,7 +245,7 @@ exceeds `MaxTxBufferBytes`) and `ErrDBFull` (file extension hits
 `MaxSize`) — step 1+ performs no allocation — so `Commit` returning
 either leaves the handle recoverable and retryable (a fresh, smaller
 transaction), never poisoned. This is what lets background
-compaction's Inv-M4 budget-halving retry an over-large batch, and a
+compaction's budget-halving retry an over-large batch (background-maintenance.md §Invariants), and a
 single large delete whose RPL append overruns the budget recover
 cleanly.
 
@@ -1123,7 +1123,7 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
 
 // DeleteRange deletes every (key, value) pair whose KEY falls in
 // [start, end) and returns the count of VALUES deleted (NOT keys
-// — Inv-2 entailed E2 accounting). Returns (0, nil) for an empty
+// — set-keyspace.md §Invariants entailed value-count accounting). Returns (0, nil) for an empty
 // range. Boundary semantics match Keyspace.DeleteRange: nil =
 // open-boundary; non-nil zero-length is rejected with
 // ErrKeyEmpty.
@@ -1143,7 +1143,7 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
 //     (deleted_so_far, err); iterations 0..i-1 have completed
 //     and are in-memory visible; the failing iteration and
 //     remainder are untouched. Each successful per-row delete
-//     satisfies Inv-1 / E1 / E2; the in-memory + on-disk state
+//     satisfies set-keyspace.md §Invariants value-count accounting; the in-memory + on-disk state
 //     is consistent-but-partial. The only safe recovery is
 //     Tx.Rollback() (which restores via the pager bitmap
 //     snapshot).

@@ -35,7 +35,7 @@ type bulkPageWriter interface {
 // tree level plus one separator/cell set per level (each bounded by a
 // page's worth of cells), independent of the number of entries.
 //
-// Inv-Builder (entailed, bulkload.md): the emitted tree satisfies the
+// Entailed (bulkload.md §Invariants): the emitted tree satisfies the
 // branch routing contract — every separator S between adjacent children
 // satisfies max(left subtree) < S ≤ min(right subtree) — so btree.Get and
 // btree.Cursor over the result return each key's value. Leaf-level

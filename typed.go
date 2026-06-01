@@ -9,7 +9,7 @@ import (
 // encodes its K / V arguments through the keyspace's Encoder[K] /
 // Encoder[V] and delegates to the corresponding byte-layer method,
 // decoding results on the way out. The key encoder MUST produce
-// lexicographically ordered output (Inv-T1) so range / prefix / cursor
+// lexicographically ordered output (typed-keyspaces.md §Invariants) so range / prefix / cursor
 // order matches the intended key order.
 
 // AnyTypedIndex is the type-erased interface satisfied by every
@@ -47,7 +47,7 @@ type TypedKeyspace[K, V any] struct {
 
 // NewTypedKeyspace creates a typed keyspace descriptor. keyEnc MUST
 // produce lexicographically ordered output for the desired key order
-// (Inv-T1; for uint64 keys big-endian, for strings the natural byte
+// (typed-keyspaces.md §Invariants; for uint64 keys big-endian, for strings the natural byte
 // representation — see the canonical encoders).
 func NewTypedKeyspace[K, V any](name string, keyEnc Encoder[K], valEnc Encoder[V]) *TypedKeyspace[K, V] {
 	return &TypedKeyspace[K, V]{name: name, keyEnc: keyEnc, valEnc: valEnc}

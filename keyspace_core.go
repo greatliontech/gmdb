@@ -35,7 +35,7 @@ type keyspaceCore struct {
 	// ErrKeyspaceClosed; re-creating the same name via a Create* call
 	// does NOT clear dead on the old handle (a fresh handle is
 	// allocated; the old stays dead). Per api-surface.md §Keyspace API
-	// DeleteKeyspace (Inv-D).
+	// DeleteKeyspace.
 	dead bool
 
 	// openIndexHandles tracks every *Index returned by Index(name) in

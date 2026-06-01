@@ -33,7 +33,7 @@ func isTypedCoverValueIndex(decl *IndexDecl) bool {
 // encoders so the extractor closure can decode the stored (key,value)
 // before running the user's typed Extract and encoding each IK.
 //
-// Schema-hash drift (Inv-T7): the synthesized IndexColumn's Name is set
+// Schema-hash drift (typed-keyspaces.md §Invariants): the synthesized IndexColumn's Name is set
 // to IKEnc.ID(). Since the byte schema-hash hashes column names (which
 // are pure fingerprint inputs, never read at decode), swapping IKEnc for
 // one with a different ID changes the column name and therefore the
@@ -44,7 +44,7 @@ func isTypedCoverValueIndex(decl *IndexDecl) bool {
 //
 // Extract produces zero or more IK values per row; an empty/nil slice
 // skips the row (partial index). IKEnc encodes each IK to lex-safe
-// bytes and MUST have a stable non-empty ID() (Inv-T2) — an empty ID is
+// bytes and MUST have a stable non-empty ID() (typed-keyspaces.md §Invariants) — an empty ID is
 // rejected at Open with ErrIndexEncoderIDEmpty.
 //
 // IKEnc MUST be able to encode every value Extract produces: the
@@ -92,7 +92,7 @@ func (t *TypedIndex[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (
 	decl := &IndexDecl{
 		Name: t.Name,
 		// One opaque column for the IK; its Name = IKEnc.ID() folds the
-		// encoder identity into the schema-hash fingerprint (Inv-T7).
+		// encoder identity into the schema-hash fingerprint (typed-keyspaces.md §Invariants).
 		Columns: []IndexColumn{{Name: ikID}},
 		Unique:  t.Unique,
 		Version: t.Version,

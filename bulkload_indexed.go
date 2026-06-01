@@ -32,12 +32,12 @@ import (
 //     unique violation, no I/O error) are the row root + all pinned index
 //     roots advanced. A failure in step 2 publishes nothing — the meta
 //     swap at commit keeps the pre-BulkLoad state; the pwritten row /
-//     index pages are unreferenced bounded leakage (Inv-IdxBulk-1).
+//     index pages are unreferenced bounded leakage (bulkload.md §Interaction with Indexes).
 //
 // The index entries are encoded EXACTLY as the per-Put maintenance path
 // (extractEntriesAsKeySet / setKeyspaceExtractEntries + indexEntryValue),
 // so a BulkLoad-built keyspace answers Lookups identically to the same
-// keyspace built via Put (Inv-IdxBulk-2).
+// keyspace built via Put (bulkload.md §Interaction with Indexes).
 
 // sortRecord is one (indexKey, indexValue) pair awaiting bulk load. Both
 // slices are owned by the sorter (the emit helpers hand it fresh copies),
@@ -56,7 +56,7 @@ const sortRecordMemOverhead = 48
 // order for the bulk builder. Memory is bounded: once the in-memory chunk
 // exceeds budget it is sorted and spilled to a scratch run file, and the
 // final tree is built from a k-way merge of all spilled runs plus the last
-// in-memory chunk (Inv-IdxBulk-4: aggregate in-memory footprint across all
+// in-memory chunk (bulkload.md §Interaction with Indexes: aggregate in-memory footprint across all
 // indexes ≈ MaxTxBufferBytes, since budget = MaxTxBufferBytes / #indexes).
 type indexSorter struct {
 	scratchDir string
@@ -131,7 +131,7 @@ func (s *indexSorter) spill() error {
 
 // cleanup best-effort removes every spilled run file. An unremovable file
 // is logged via the DB's Logger and does NOT fail the operation
-// (bulkload.md §Interaction with Indexes; Inv-IdxBulk-5). Safe to call once
+// (bulkload.md §Interaction with Indexes). Safe to call once
 // per sorter regardless of success or failure; run readers are already
 // closed by the merger before cleanup runs.
 func (s *indexSorter) cleanup(logger *slog.Logger) {
@@ -612,7 +612,7 @@ func bulkUniqueViolation(indexName, ksName string, key []byte) error {
 // Keyspace row, encoding each produced entry to its on-disk (key, value)
 // and feeding it to that index's sorter. Reuses extractEntriesAsKeySet so
 // the within-row candidate-set dedup + unique candidate-set rejection match
-// the Put path byte-for-byte (Inv-IdxBulk-2). The encoded key/value are
+// the Put path byte-for-byte (bulkload.md §Interaction with Indexes). The encoded key/value are
 // fresh allocations, safe to retain past the caller's buffer reuse.
 func emitKeyspaceIndexEntries(s *indexSorter, decl *IndexDecl, key, value []byte) error {
 	m, err := extractEntriesAsKeySet(decl, key, value)
@@ -650,7 +650,7 @@ func emitSetKeyspaceIndexEntries(s *indexSorter, decl *IndexDecl, setKey, setVal
 
 // newIndexSorters builds one sorter per index, dividing MaxTxBufferBytes
 // across them so the aggregate phase-1 in-memory footprint stays bounded by
-// MaxTxBufferBytes (Inv-IdxBulk-4). names must be non-empty.
+// MaxTxBufferBytes (bulkload.md §Interaction with Indexes). names must be non-empty.
 func newIndexSorters(opts Options, names []string) map[string]*indexSorter {
 	budget := opts.MaxTxBufferBytes / len(names)
 	sorters := make(map[string]*indexSorter, len(names))
@@ -663,7 +663,7 @@ func newIndexSorters(opts Options, names []string) map[string]*indexSorter {
 // finalizeIndexBuild builds every index's data tree (detecting unique
 // violations) and — only after ALL succeed — publishes the new roots into
 // the pinned map, returning the prior roots to retire. On any build error
-// it returns (nil, err) having published NOTHING (Inv-IdxBulk-1): the
+// it returns (nil, err) having published NOTHING (bulkload.md §Interaction with Indexes): the
 // caller then leaves desc.Root + pinned state untouched. Each sorter's
 // in-memory chunk is released as soon as its tree is built.
 func finalizeIndexBuild(pw bulkPageWriter, cfg page.Config, ksName string, names []string, indexes map[string]*pinnedIndex, sorters map[string]*indexSorter) (oldRoots map[string]uint64, err error) {

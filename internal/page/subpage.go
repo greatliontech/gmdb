@@ -20,12 +20,12 @@ package page
 // Invariants the codec maintains and Validate checks
 // (`set-keyspace.md §Invariants`):
 //
-//   - Inv-2 (sorted-order): values are stored in sorted (lex) order.
-//   - Inv-3 (fixed-size stride): when fixedValueSize ≠ 0 every entry
+//   - Sorted order (set-keyspace.md §Invariants): values are stored in sorted (lex) order.
+//   - Fixed-size stride (set-keyspace.md §Invariants): when fixedValueSize ≠ 0 every entry
 //     is exactly fixedValueSize bytes; no entry carries a ValueLen
 //     prefix.
 //
-// Empty-set policy (Inv-1): a Count=0 subpage is a structurally valid
+// Empty-set policy (set-keyspace.md §Invariants): a Count=0 subpage is a structurally valid
 // transient state for in-place operations (e.g. Delete that empties
 // the subpage; the SetKeyspace surface then removes the
 // parent cell entirely so an empty subpage never persists). This
@@ -66,7 +66,7 @@ var ErrSubpageCorrupted = errors.New("page: subpage structural corruption")
 
 // ErrSubpageValueSize is returned by Insert / EncodeSubpage when a
 // caller-supplied value's length disagrees with the keyspace's
-// declared fixedValueSize (Inv-3). The SetKeyspace surface at chunk
+// declared fixedValueSize (set-keyspace.md §Invariants). The SetKeyspace surface at chunk
 // 6.6 maps this to the public gmdb.ErrValueSizeMismatch sentinel.
 var ErrSubpageValueSize = errors.New("page: subpage value-size mismatch")
 
@@ -81,7 +81,7 @@ var ErrSubpageValueSize = errors.New("page: subpage value-size mismatch")
 //     length against the header's DataSize.
 //   - fixedValueSize is the SetKeyspace's per-descriptor stride (0
 //     for variable-size). Mis-supplying the value silently decodes
-//     garbage entries (Inv-3 violation); the leaf-level caller pulls
+//     garbage entries (set-keyspace.md §Invariants violation); the leaf-level caller pulls
 //     this from the keyspace descriptor and has no source for an
 //     inconsistent value.
 type SubpageReader struct {
@@ -141,7 +141,7 @@ func (r SubpageReader) FixedValueSize() uint16 { return r.fixedValueSize }
 //   - Per-entry walk: variable-size entries' ValueLen does not overrun
 //     DataSize; fixed-size entries sum to exactly DataSize and Count is
 //     consistent with DataSize / fixedValueSize.
-//   - Entries are stored in sorted (Inv-2) order; duplicates are
+//   - Entries are stored in sorted (set-keyspace.md §Invariants) order; duplicates are
 //     forbidden (a SetKeyspace cannot contain the same value twice
 //     per the set semantics in keyspaces.md §API split).
 //
@@ -538,7 +538,7 @@ func SubpagePromotionThreshold(cfg Config) int {
 //     round-trip property tests.
 //
 // Returns a Count=0 subpage (4-byte header, all zeroes) for an
-// empty values input; the empty-set ban (Inv-1) is enforced at the
+// empty values input; the empty-set ban (set-keyspace.md §Invariants) is enforced at the
 // SetKeyspace surface, not here.
 func EncodeSubpage(values [][]byte, fixedValueSize uint16) ([]byte, error) {
 	dataSize := 0

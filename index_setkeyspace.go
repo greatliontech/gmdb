@@ -22,7 +22,7 @@ import (
 // terminator 0x00 0x00 and from the escape sequence 0x00 0xFF.
 // Inside escape(setKey) and escape(setValue), every literal 0x00
 // is already escaped to 0x00 0xFF — so the only raw 0x00 0x01 in
-// the compound PK is the separator. (set-keyspace.md Inv-6,
+// the compound PK is the separator. (set-keyspace.md §Compound-PK encoding,
 // promoted to enforced tests.)
 //
 // The full SetKeyspace non-unique index key is:
@@ -58,14 +58,14 @@ func encodeSetKeyspaceCompoundPK(setKey, setValue []byte) []byte {
 
 // decodeSetKeyspaceCompoundPK reverses encodeSetKeyspaceCompoundPK.
 // Splits on the first literal 0x00 0x01 sequence (the separator
-// is unique within the compound by Inv-6: every 0x00 inside an
+// is unique within the compound per set-keyspace.md §Compound-PK encoding: every 0x00 inside an
 // escaped half is followed by 0xFF, never 0x01).
 //
 // Returns errCompoundPKMalformed wrapped in ErrCorrupted at the
 // caller's boundary if no 0x00 0x01 separator is found OR if
 // either escaped half fails to unescape.
 func decodeSetKeyspaceCompoundPK(encoded []byte) (setKey, setValue []byte, err error) {
-	// Scan for the first 0x00 0x01 — Inv-6 ensures this is the
+	// Scan for the first 0x00 0x01 — set-keyspace.md §Compound-PK encoding ensures this is the
 	// separator, since every other 0x00 in the compound is part of
 	// an 0x00 0xFF escape pair.
 	for i := 0; i < len(encoded)-1; i++ {

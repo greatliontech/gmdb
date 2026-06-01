@@ -61,7 +61,7 @@ type CheckOptions struct {
 	// nothing and emits a single CheckError "Repair.ReadersActive" — run
 	// plain Check (no Repair) for read-only diagnostics in that case.
 	//
-	// Repair is conservative (gmdb Inv-C5): it frees a page ONLY when the
+	// Repair is conservative (api-surface.md §Check, CopyTo, Compact): it frees a page ONLY when the
 	// structural walk completed without being stopped and emitted NO
 	// CheckError/CheckFatal. Any structural finding makes the reachable
 	// set unreliable, so a corrupt database reports its leaks with
@@ -178,7 +178,7 @@ const noReaderTxnID = ^uint64(0)
 // no other writer runs concurrently — verifies no read transaction is
 // active, runs the structural walk against the write tx's snapshot
 // collecting the BitmapLeak set, and (only when the walk completed
-// cleanly) frees exactly that set in the bitmap and commits. gmdb Inv-C5:
+// cleanly) frees exactly that set in the bitmap and commits. Repair conservatism (api-surface.md §Check, CopyTo, Compact):
 // frees ONLY pages a COMPLETE, error-free walk proved unreachable, under
 // verified no-readers/no-writers exclusivity; atomicity rides the commit
 // pipeline.
@@ -200,7 +200,7 @@ func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 			}
 		}()
 
-		// Exclusivity gate (clause-explicit Inv-C5): we hold the write
+		// Exclusivity gate (api-surface.md §Check, CopyTo, Compact): we hold the write
 		// lock (no concurrent writers); require no live reader in any
 		// process. OldestReaderTxnID's LOCK_EX precondition is satisfied
 		// by the grant the write tx holds (same as db.Begin's bound
@@ -228,7 +228,7 @@ func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 		}
 		c.run()
 
-		// Inv-C5 completeness gate: free only when the walk ran to
+		// Completeness gate (api-surface.md §Check, CopyTo, Compact): free only when the walk ran to
 		// completion (caller did not break) and reported no structural
 		// error/fatal. Otherwise the reachable set is unreliable and a
 		// live page could be misclassified as leaked.
@@ -288,7 +288,7 @@ type checker struct {
 	reachable bitset
 
 	// sawError latches true once any CheckError/CheckFatal is emitted —
-	// the Inv-C5 completeness gate keys Repair off it (a structurally
+	// the completeness gate keys Repair off it (a structurally
 	// dirty walk leaves the reachable set unreliable, so Repair frees
 	// nothing).
 	sawError bool
@@ -319,7 +319,7 @@ func (c *checker) checkIndexesEnabled() bool { return c.opts != nil && c.opts.Ch
 
 // emit yields one issue. Returns false (and latches stopped) when the
 // caller has asked to stop iterating. A CheckError/CheckFatal latches
-// sawError (the Inv-C5 completeness gate).
+// sawError (the completeness gate).
 func (c *checker) emit(iss CheckIssue) bool {
 	if c.stopped {
 		return false
@@ -352,7 +352,7 @@ func (c *checker) run() {
 	// in [filePages, MaxSize) would SIGBUS, and sizing the reachable
 	// bitset to a forged-huge HWM/MaxSize would OOM. ValidateMeta does
 	// not bound these, so clamp the walk to the real on-disk page count.
-	// (Inv-C1 no-crash.)
+	// (Check never crashes on a forged page; integrity.md §Forged / structural corruption tolerance.)
 	bound := min(uint64(c.pgr.FileSize())/uint64(c.cfg.PageSize), c.meta.MaxSize)
 	if hwm > bound {
 		c.emit(CheckIssue{Severity: CheckError, Code: "HighWaterMarkOutOfRange",
@@ -694,7 +694,7 @@ func (c *checker) walkRPL(hwm uint64) (bitset, bool) {
 // snapshot's allocation bitmap for every data page in [firstData, hwm):
 // a reachable page the bitmap marks free is a ReachableButFree error; an
 // allocated page that is neither reachable nor RPL-pending is a
-// BitmapLeak warning. (Inv-C2 page-accounting partition.)
+// BitmapLeak warning. (page-accounting partition; api-surface.md §Check, CopyTo, Compact.)
 func (c *checker) accounting(firstData, hwm uint64, rplPages bitset) {
 	bm, ok := c.snapshotBitmap()
 	if !ok {
@@ -706,7 +706,7 @@ func (c *checker) accounting(firstData, hwm uint64, rplPages bitset) {
 		free := bm.IsSet(id) // true = free
 		reach := c.reachable.test(id)
 		pending := rplPages.test(id)
-		// Partition (Inv-C2): a data page is exactly one of {reachable,
+		// Partition (api-surface.md §Check, CopyTo, Compact): a data page is exactly one of {reachable,
 		// free, RPL-pending}. Any overlap is corruption.
 		switch {
 		case reach && free:
@@ -730,7 +730,7 @@ func (c *checker) accounting(firstData, hwm uint64, rplPages bitset) {
 		case !reach && !free && !pending:
 			if c.repair {
 				// Defer emission: checkRepair frees these after the walk
-				// (Inv-C5 needs the COMPLETE reachable set first) and emits
+				// (Repair needs the COMPLETE reachable set first) and emits
 				// each with Repaired set per the outcome.
 				c.leaked = append(c.leaked, id)
 			} else if !c.emitLeak(id, false) {

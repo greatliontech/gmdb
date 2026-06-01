@@ -55,7 +55,7 @@ import (
 //   - ErrCorrupted (wrapped) on a malformed input subpage.
 //   - The newValue-already-present case is treated as ErrCorrupted
 //     because it indicates the caller bypassed the pre-promotion
-//     duplicate check (Inv-2 on the subpage + a Search hit would
+//     duplicate check (set-keyspace.md §Invariants sorted-order on the subpage + a Search hit would
 //     have short-circuited the SetKeyspace.Put before reaching
 //     here).
 //   - Any error from `pw.AllocPage` / `pw.AllocSlab` / `Put`
@@ -83,7 +83,7 @@ func PromoteSubpageToNestedTree(
 	// existing entries. We use LeafBuilder directly (rather than N
 	// separate Put calls) so the promotion costs a single page alloc
 	// instead of N CoWs. The subpage entries are already sorted
-	// (Inv-2) and deduped, so the builder's sort-order assertion
+	// (set-keyspace.md §Invariants) and deduped, so the builder's sort-order assertion
 	// holds by construction.
 	newLeafID, err := pw.AllocPage()
 	if err != nil {

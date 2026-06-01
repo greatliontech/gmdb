@@ -503,7 +503,7 @@ func (db *DB) Close() error {
 	db.stopBatchCoordinator()
 	// Step 1a″ — stop the maintenance goroutine and wait for it to exit.
 	// Done before the Coord / pager teardown so an in-flight pass's tx
-	// unwinds and the goroutine never touches a torn-down mmap (Inv-M6).
+	// unwinds and the goroutine never touches a torn-down mmap (leak-detection.md §Close() Ordering).
 	db.stopMaintenance()
 	// Step 1b — drain in-flight Tx cleanups. Cleanups that observed
 	// closed=false BEFORE our store may still be mid-work touching

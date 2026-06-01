@@ -77,7 +77,7 @@ type Tx struct {
 	// successful Open / Create; DeleteKeyspace removes the entry
 	// (and migrates the *Keyspace to deadKeyspaces with dead=true so
 	// post-Delete handle ops return ErrKeyspaceClosed per the
-	// Inv-D invariant).
+	// api-surface.md §Keyspace API DeleteKeyspace permanent-invalidation invariant).
 	openKeyspaces map[uniqueNameHandle]*Keyspace
 
 	// openSetKeyspaces caches *SetKeyspace handles by interned name
@@ -383,7 +383,7 @@ func (tx *Tx) Commit() error {
 		// MaxTxBufferBytes) and ErrDBFull (file extension hits MaxSize) —
 		// step 1+ performs no allocation. Poisoning those would brick a
 		// recoverable handle (e.g. a single large delete whose RPL append
-		// overruns the budget, or background compaction's Inv-M4 retry).
+		// overruns the budget, or background compaction's budget-halving retry (background-maintenance.md §Invariants)).
 		if !errors.Is(err, pager.ErrTxTooLarge) && !errors.Is(err, pager.ErrDBFull) {
 			tx.db.poisoned.Store(true)
 		}

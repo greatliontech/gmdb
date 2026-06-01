@@ -14,7 +14,7 @@ import (
 // length cfg.PageSize. The btree does not re-validate the size — the
 // reader's verifying Page enforces the file-resident bound and the
 // per-page checksum, and is the boundary at which an out-of-range id
-// (Inv-RV3) or a bitrotted page (Inv-RV1) surfaces as an error.
+// (checksums.md §Structural and Allocation Bounds) or a bitrotted page (checksums.md §Verification) surfaces as an error.
 type PageReader interface {
 	// Page returns the page bytes at id, or an error. A conforming
 	// reader bounds id against the file-resident extent before any

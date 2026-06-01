@@ -398,7 +398,7 @@ reverse from the marker (reverting bit flips) and reinstalls
 captured scalars (`hint`, `numFree`) plus the dirty-set clone;
 **Discard** releases a marker without replaying (child commit /
 top-level Commit success). Markers must be released in LIFO
-order — the parent-freeze rule (Inv-N3) and the BeginTx/Commit
+order — the parent-freeze rule (§Nested Transactions) and the BeginTx/Commit
 pairing already guarantee this; an out-of-order Restore or Discard
 panics rather than silently corrupt state. Memory per open marker
 is `O(bit flips since the marker)` + `O(bitmap-pages dirty at

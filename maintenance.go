@@ -12,7 +12,7 @@ import (
 // maintenance holds the background-maintenance goroutine's lifecycle
 // state (background-maintenance.md). Started at Open unless
 // Options.Maintenance.Disable; stopped by Close (stopMaintenance)
-// before the Coord / pager teardown (Inv-M6). cancel aborts a pass
+// before the Coord / pager teardown (leak-detection.md §Close() Ordering). cancel aborts a pass
 // blocked in AcquireWriter so it unwinds on Close. Single start (Open)
 // + single stop (CAS-guarded Close) ⇒ no lifecycle mutex needed.
 type maintenance struct {
@@ -30,7 +30,7 @@ type maintenance struct {
 // stopMaintenance cancels the maintenance goroutine and waits for it to
 // exit. Called by Close before the Coord / pager teardown so an in-flight
 // pass unwinds first (maint.cancel aborts a pass blocked in AcquireWriter)
-// and no goroutine outlives the unmap (Inv-M6). Idempotent-safe via the
+// and no goroutine outlives the unmap (leak-detection.md §Close() Ordering). Idempotent-safe via the
 // CAS-guarded Close; a no-op when maintenance was disabled.
 func (db *DB) stopMaintenance() {
 	if !db.maint.started {
@@ -43,7 +43,7 @@ func (db *DB) stopMaintenance() {
 // maintenanceLoop is the per-DB background maintenance goroutine
 // (background-maintenance.md). It runs a pass every Interval (each pass
 // self-coordinates cross-process via LastMaintenanceTime, so the global
-// rate is ≤1 pass / Interval — Inv-M1) until ctx is cancelled by Close.
+// rate is ≤1 pass / Interval — background-maintenance.md §Invariants) until ctx is cancelled by Close.
 // When immediate is set (an unclean prior shutdown), the first pass runs at
 // startup instead of waiting a full interval.
 func (db *DB) maintenanceLoop(ctx context.Context, immediate bool) {
@@ -65,10 +65,10 @@ func (db *DB) maintenanceLoop(ctx context.Context, immediate bool) {
 
 // runMaintenancePass runs one maintenance pass: it claims this interval's
 // slot cross-process (skipping if another process or a recent pass holds
-// it — Inv-M1), then runs the enabled tasks. A pass is skipped entirely on
+// it — background-maintenance.md §Invariants), then runs the enabled tasks. A pass is skipped entirely on
 // a closing or poisoned handle. The captured coord / lockFile stay valid
 // for the pass's duration because Close blocks in stopMaintenance (waiting
-// for this goroutine) before tearing them down (Inv-M6).
+// for this goroutine) before tearing them down (leak-detection.md §Close() Ordering).
 func (db *DB) runMaintenancePass(ctx context.Context) {
 	db.mu.Lock()
 	coord := db.coord
@@ -112,7 +112,7 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 	// Task 4 — incremental compaction (background-maintenance.md §Incremental
 	// Compaction). When the contiguous-allocation fragmentation rate exceeds
 	// CompactionThreshold, relocates a budgeted batch of high-watermark pages
-	// to consolidate free space (Inv-M4: never surfaces ErrTxTooLarge).
+	// to consolidate free space (background-maintenance.md §Invariants: never surfaces ErrTxTooLarge).
 	db.maintCompact(ctx)
 }
 
@@ -122,8 +122,8 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 // silent bitrot proactively — before a user transaction reads the page and
 // hits ErrBadPageChecksum.
 //
-// Read-only and report-only (Inv-M3): a mismatch is logged as a
-// CheckWarning carrying the page id (Inv-M5) and nothing is rewritten —
+// Read-only and report-only (background-maintenance.md §Invariants): a mismatch is logged as a
+// CheckWarning carrying the page id (background-maintenance.md §Invariants) and nothing is rewritten —
 // repair is the explicit CheckWithOptions(Repair) / CopyTo(compact=true)
 // path. Skipped entirely when PageChecksum is disabled.
 //
@@ -207,7 +207,7 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 			// re-read; genuine bitrot (or an unwritten allocated page, which
 			// has no footer) persists.
 			if !page.VerifyPageFooter(rtx.pgr.PageRaw(id), pageSize) {
-				// Inv-M3 report-only / Inv-M5 logged with page id.
+				// Report-only and logged with page id (background-maintenance.md §Invariants).
 				db.logger.Warn("gmdb: scrub detected bad page checksum", "page", id)
 			}
 		}
@@ -227,7 +227,7 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 // Unlike CheckWithOptions(Repair) this needs NO exclusive access: a leaked
 // page's bitmap bit is clear (allocated), so no allocator can hand it out
 // and no writer can reference it — it cannot become un-leaked between the
-// two phases (Inv-M2). As with Repair, reclamation is gated on a clean walk
+// two phases (background-maintenance.md §Invariants). As with Repair, reclamation is gated on a clean walk
 // (no structural CheckError/CheckFatal): a walk-aborting corrupt subtree
 // would leave its live pages unvisited and thus mis-classified as leaked,
 // so on any structural finding the pass reclaims nothing and logs.

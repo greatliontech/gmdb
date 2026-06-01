@@ -57,7 +57,7 @@ import (
 // out-of-band-relocation case lives in git history).
 //
 // A relocation that would overrun MaxTxBufferBytes surfaces ErrTxTooLarge,
-// which compactForest returns to the caller for rollback (Inv-M4: the
+// which compactForest returns to the caller for rollback (background-maintenance.md §Invariants: the
 // maintenance orchestration catches it and reduces the batch — it is never
 // user-visible). Partial work already applied to the slab is discarded by
 // the caller's rollback; nothing is committed.
@@ -230,7 +230,7 @@ func (tx *Tx) compactIndexRegistry(regRoot uint64, shouldRelocate func(uint64) b
 // enabled), runs a budgeted high-watermark relocation batch to consolidate
 // free space and let the file shrink.
 //
-// Inv-M4: the pass never surfaces ErrTxTooLarge. runCompaction halves the
+// Per background-maintenance.md §Invariants, the pass never surfaces ErrTxTooLarge. runCompaction halves the
 // batch and retries when a relocation would exceed MaxTxBufferBytes, and gives
 // up (logs) if not even one page's cascade fits — the user never sees a
 // maintenance-induced ErrTxTooLarge.
@@ -266,7 +266,7 @@ func compactionTriggered(attempts, fragFails uint64, threshold float64) bool {
 
 // runCompaction runs compaction batches until one succeeds (or there is
 // nothing to do), halving the budget on ErrTxTooLarge so a too-large batch is
-// reduced rather than surfaced (Inv-M4). Benign tx-open failures (closing /
+// reduced rather than surfaced (background-maintenance.md §Invariants). Benign tx-open failures (closing /
 // cancelled / poisoned) are silent; other errors are logged. Each successful
 // batch is one committed transaction.
 func (db *DB) runCompaction(ctx context.Context) {
@@ -372,7 +372,7 @@ func evacuationFloor(firstData, hwm, numFreePages uint64, budget int) (uint64, b
 
 // mapCompactErr maps the btree + pager error surfaces that the relocation
 // engine spans onto the gmdb public sentinels, so the orchestration layer can
-// match ErrTxTooLarge (Inv-M4) and callers see consistent errors.
+// match ErrTxTooLarge (background-maintenance.md §Invariants) and callers see consistent errors.
 func mapCompactErr(err error) error {
 	if err == nil {
 		return nil
