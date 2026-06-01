@@ -207,7 +207,7 @@ func TestSetCursorNextKeySkipsValues(t *testing.T) {
 	})
 	defer cleanup()
 	c := sks.Cursor()
-	c.First() // (k1, a)
+	c.First()     // (k1, a)
 	c.NextValue() // (k1, b)
 	// NextKey skips c, advances to k2's first value.
 	k, v := c.NextKey()
@@ -617,4 +617,3 @@ func TestSetCursorStaleClearsOnReposition(t *testing.T) {
 		t.Errorf("Err post-recover=%v, want nil (stale should be cleared)", err)
 	}
 }
-

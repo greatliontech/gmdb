@@ -270,4 +270,3 @@ func setWriteRegistryFailHookForTest(hook func(i int) error) {
 	}
 	writeRegistryFailHookForTest.Store(&hook)
 }
-

@@ -219,7 +219,7 @@ func TestCrossProcessCheckpointDoesNotClobberPeerCommit(t *testing.T) {
 			return ks.Put([]byte(k), []byte(v))
 		})
 	}
-	put(b, "kb", "vb")  // B's cached meta now unflagged; activeMetaIdx = slot0
+	put(b, "kb", "vb") // B's cached meta now unflagged; activeMetaIdx = slot0
 	put(a, "ka1", "va1")
 	put(a, "ka2", "va2") // even A-commit count returns the newest meta to slot0
 

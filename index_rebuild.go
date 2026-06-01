@@ -421,11 +421,11 @@ func (tx *Tx) syncRebuildToCachedPinned(cachedKS *Keyspace, cachedSKS *SetKeyspa
 // API DeleteKeyspace; chunk-7.8 wires this). For each index entry
 // in the registry sub-tree:
 //
-//   1. Decode the entry to read its Root (the index data tree).
-//   2. FreeSubtree the index data tree (when Root != 0; an
-//      empty index's data tree was never allocated).
-//   3. After all per-index data trees are retired, FreeSubtree
-//      the registry sub-tree itself.
+//  1. Decode the entry to read its Root (the index data tree).
+//  2. FreeSubtree the index data tree (when Root != 0; an
+//     empty index's data tree was never allocated).
+//  3. After all per-index data trees are retired, FreeSubtree
+//     the registry sub-tree itself.
 //
 // On a mid-walk failure: in-flight FreeSubtree calls have returned
 // pages to the loose pool, but the descriptor itself is still

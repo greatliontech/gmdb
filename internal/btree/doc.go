@@ -17,16 +17,16 @@
 //   - 4.5 — Delete + merge/redistribute. MergeThreshold option.
 //   - 4.6 — Leaf format reset + cursor.
 //     · α — spec amend (variable-size restart groups +
-//       uncompressed-variant + LeafIter + gen counter).
+//     uncompressed-variant + LeafIter + gen counter).
 //     · β — page-package rewrite: LeafReader / LeafBuilder /
-//       LeafIter; old encoders (DecodeLeaf / EncodeLeaf /
-//       LeafLookup / LeafEncodedSize / LeafRestartInterval) dropped.
+//     LeafIter; old encoders (DecodeLeaf / EncodeLeaf /
+//     LeafLookup / LeafEncodedSize / LeafRestartInterval) dropped.
 //     · γ (this) — btree port onto the new leaf surface: Put,
-//       Delete, Get, merge/redistribute all migrated to
-//       LeafReader + LeafBuilder. Validate runs at the pager-
-//       resolve boundary per the chunk-4.6β leaf-doc contract.
+//     Delete, Get, merge/redistribute all migrated to
+//     LeafReader + LeafBuilder. Validate runs at the pager-
+//     resolve boundary per the chunk-4.6β leaf-doc contract.
 //     · δ — bidirectional cursor on LeafIter + generation counter
-//       per transactions.md §Cursor State Machine.
+//     per transactions.md §Cursor State Machine.
 //   - 4.7 — Overflow inline-value support: Put with values >
 //     leaf-page capacity writes an overflow run.
 //

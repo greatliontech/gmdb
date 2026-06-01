@@ -92,14 +92,14 @@ func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS, heartbeat 
 // ReleaseReaderSlot performs the strict release-ordered atomic stores
 // from cross-process.md §Reader Table (slot release):
 //
-//	1. PID = 0          — first, so a stale-detector scan between the
-//	   next acquirer's CAS and its PID-store sees PID == 0 and falls
-//	   through to the heartbeat / HintEpoch path rather than running
-//	   kill() against this (about-to-be-exited) PID.
-//	2. Heartbeat = 0    — reset the heartbeat-liveness marker so the
-//	   next acquirer starts clean.
-//	3. HintEpoch = 0    — clear any orphan-detection anchor.
-//	4. TxnID = 0        — final observable-free signal.
+//  1. PID = 0          — first, so a stale-detector scan between the
+//     next acquirer's CAS and its PID-store sees PID == 0 and falls
+//     through to the heartbeat / HintEpoch path rather than running
+//     kill() against this (about-to-be-exited) PID.
+//  2. Heartbeat = 0    — reset the heartbeat-liveness marker so the
+//     next acquirer starts clean.
+//  3. HintEpoch = 0    — clear any orphan-detection anchor.
+//  4. TxnID = 0        — final observable-free signal.
 //
 // Caller MUST have unregistered the slot from the heartbeat goroutine's
 // active list BEFORE invoking this (the active-list removal happens
@@ -127,10 +127,10 @@ func (f *File) ReleaseReaderSlot(idx uint32) {
 // ClearStaleReaderSlot implements the writer-side stale-clear ordering
 // from cross-process.md §Reader Table (clear ordering):
 //
-//	1. HintEpoch = 0   — clears the orphan-detection anchor while the
-//	   slot is still observably non-free, preventing a fresh acquirer
-//	   from inheriting a stale epoch.
-//	2. TxnID = 0       — final release.
+//  1. HintEpoch = 0   — clears the orphan-detection anchor while the
+//     slot is still observably non-free, preventing a fresh acquirer
+//     from inheriting a stale epoch.
+//  2. TxnID = 0       — final release.
 //
 // The HintEpoch-first ordering is load-bearing; reversed, a fresh
 // acquirer could CAS-win TxnID, crash before its Heartbeat store,

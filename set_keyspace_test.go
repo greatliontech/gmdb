@@ -1262,4 +1262,3 @@ func TestSetKeyspaceEmptyKeyRejected(t *testing.T) {
 func mustErr[T any](_ T, err error) error { return err }
 
 func mustErrPut(_ bool, err error) error { return err }
-

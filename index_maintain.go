@@ -204,11 +204,11 @@ func (ks *Keyspace) applyIndexMaintenanceOnPut(key, oldValue, newValue []byte, e
 
 	// Steps 1-2: extract per-index old/new sets.
 	type perIndex struct {
-		p     *pinnedIndex
-		olds  map[string]IndexEntry
-		news  map[string]IndexEntry
-		dels  []string // keys to delete (old \ new)
-		ins   []string // keys to insert (new \ old)
+		p    *pinnedIndex
+		olds map[string]IndexEntry
+		news map[string]IndexEntry
+		dels []string // keys to delete (old \ new)
+		ins  []string // keys to insert (new \ old)
 	}
 	plans := make([]*perIndex, 0, len(names))
 	for _, name := range names {
@@ -533,4 +533,3 @@ func fireIndexMaintenanceFailHookForTest(i int) error {
 	}
 	return (*hook)(i)
 }
-

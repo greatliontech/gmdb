@@ -17,17 +17,18 @@ import (
 // reopen verifies integrity, not just openability.
 //
 // Two coupled root causes, both fixed:
-//   (1) the reclamation bound used prevMeta.TxnID, which under SyncLazy runs
-//       ahead of the last checkpoint, freeing data pages a still-recoverable
-//       checkpoint's tree references. Fixed: bound = lastCheckpointTxnID
-//       (db.go; free-space.md §RPL Reclamation).
-//   (2) recovery to a NON-latest meta walked its RPLHeadPage→tail chain into a
-//       reclaimed-and-reused segment page (reclamation frees segment pages
-//       from the live tail and advances the live meta's tail without rewriting
-//       older metas). Fixed in BOTH on-disk chain walkers — rebuildRPLChain
-//       (internal/pager/init.go) and Check's walkRPL (check.go) — which stop
-//       at the first reclaimed segment (free in the bitmap, or reused),
-//       checked here via checkClean after every reopen.
+//
+//	(1) the reclamation bound used prevMeta.TxnID, which under SyncLazy runs
+//	    ahead of the last checkpoint, freeing data pages a still-recoverable
+//	    checkpoint's tree references. Fixed: bound = lastCheckpointTxnID
+//	    (db.go; free-space.md §RPL Reclamation).
+//	(2) recovery to a NON-latest meta walked its RPLHeadPage→tail chain into a
+//	    reclaimed-and-reused segment page (reclamation frees segment pages
+//	    from the live tail and advances the live meta's tail without rewriting
+//	    older metas). Fixed in BOTH on-disk chain walkers — rebuildRPLChain
+//	    (internal/pager/init.go) and Check's walkRPL (check.go) — which stop
+//	    at the first reclaimed segment (free in the bitmap, or reused),
+//	    checked here via checkClean after every reopen.
 //
 // Regression coverage is allocation-order-probabilistic (the underlying bug
 // was map-randomized): a revert of EITHER tolerance (2) trips within one run

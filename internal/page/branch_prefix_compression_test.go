@@ -129,8 +129,8 @@ func TestBranchSearchEquivalence(t *testing.T) {
 	}
 
 	prefixes := [][]byte{
-		{},                                     // P == 0 (no sharing) — degenerate
-		[]byte("p"),                            // 1-byte
+		{},                                      // P == 0 (no sharing) — degenerate
+		[]byte("p"),                             // 1-byte
 		bytes.Repeat([]byte("deep/shared/"), 8), // ~96-byte deep prefix
 	}
 	for pi, prefix := range prefixes {
@@ -148,7 +148,7 @@ func TestBranchSearchEquivalence(t *testing.T) {
 			var targets [][]byte
 			add := func(b []byte) { targets = append(targets, b) }
 			for _, c := range cells {
-				add(append([]byte(nil), c.Key...))             // exact separator
+				add(append([]byte(nil), c.Key...))              // exact separator
 				add(append(append([]byte(nil), c.Key...), 'x')) // separator + 1 byte
 				if len(c.Key) > 0 {
 					add(c.Key[:len(c.Key)-1]) // separator minus last byte
@@ -169,8 +169,8 @@ func TestBranchSearchEquivalence(t *testing.T) {
 					}
 				}
 			}
-			add([]byte{})       // empty target
-			add([]byte{0x00})   // sorts before almost everything
+			add([]byte{})                 // empty target
+			add([]byte{0x00})             // sorts before almost everything
 			add([]byte{0xff, 0xff, 0xff}) // sorts after almost everything
 			for range 20 {                // random keys
 				r := make([]byte, rng.IntN(len(prefix)+8))

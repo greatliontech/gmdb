@@ -83,7 +83,7 @@ func TestIsStaleWriterSameNSAliveDifferentStart(t *testing.T) {
 func TestIsStaleWriterCrossNSFreshHeartbeat(t *testing.T) {
 	// Different namespaces (1 vs 2) — routes through heartbeat. Fresh
 	// heartbeat ⇒ alive.
-	now := uint64(100_000_000_000) // 100 s monotonic
+	now := uint64(100_000_000_000)    // 100 s monotonic
 	hb := now - uint64(1_000_000_000) // 1 s ago — fresh vs 10 s timeout
 	f := staleWriterFile(t, 12345, 999, 1, hb)
 	if IsStaleWriter(f, 2, now, uint64(DefaultStaleTimeout.Nanoseconds())) {

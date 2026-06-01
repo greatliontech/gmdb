@@ -156,9 +156,10 @@ func TestDeleteKeyspaceAcrossCommitReturnsNotFound(t *testing.T) {
 // reachable from desc.Root pre-Delete enters retiredPages (prior-tx
 // pages — the Put committed earlier) or loosePages (same-tx pages —
 // the keyspace-B+tree CoW path may produce some). Counts:
-//   N data pages alive pre-Delete = unique page IDs reachable from
-//   desc.Root via a recursive walk. Post-Delete: every one of those
-//   IDs is in tx.pgr.RetiredPages() ∪ tx.pgr.LoosePages().
+//
+//	N data pages alive pre-Delete = unique page IDs reachable from
+//	desc.Root via a recursive walk. Post-Delete: every one of those
+//	IDs is in tx.pgr.RetiredPages() ∪ tx.pgr.LoosePages().
 func TestDeleteKeyspaceBulkFreesDataSubtree(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)

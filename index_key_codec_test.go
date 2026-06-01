@@ -241,7 +241,7 @@ func TestEncodedColumnPrefixFreeness(t *testing.T) {
 	// naive encodings (e.g. without the terminator-prefix-freeness
 	// guarantee):
 	pairs := [][2][]byte{
-		{{}, {0x00}},          // empty vs single-zero
+		{{}, {0x00}},           // empty vs single-zero
 		{{0x00}, {0x00, 0x00}}, // single-zero vs double-zero
 		{{0x00, 0x00}, {0x00}}, // reverse
 		{{0xFF}, {0xFF, 0xFF}}, // single-FF vs double-FF

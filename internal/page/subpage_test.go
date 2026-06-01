@@ -167,11 +167,11 @@ func TestSearchVariableSizeMissReturnsInsertionPoint(t *testing.T) {
 		target  string
 		wantIdx int
 	}{
-		{"aaa", 0},     // before all
-		{"beta", 1},    // between alpha and gamma
-		{"foo", 1},     // between alpha and gamma (alphabetically)
-		{"hotel", 2},   // between gamma and kappa
-		{"zulu", 3},    // after all
+		{"aaa", 0},   // before all
+		{"beta", 1},  // between alpha and gamma
+		{"foo", 1},   // between alpha and gamma (alphabetically)
+		{"hotel", 2}, // between gamma and kappa
+		{"zulu", 3},  // after all
 	}
 	for _, tc := range cases {
 		idx, found := r.Search([]byte(tc.target))

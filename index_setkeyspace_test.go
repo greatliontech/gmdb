@@ -64,7 +64,7 @@ func TestSetKeyspaceCompoundPKSeparatorPrefixFree(t *testing.T) {
 	// Pathological input: setKey contains a literal 0x00, setValue
 	// contains 0xFF + 0x01. These bytes would NOT collide with the
 	// 0x00 0x01 separator after escaping.
-	sk := []byte{0x00, 0xAB}     // escape: 00 FF AB
+	sk := []byte{0x00, 0xAB}             // escape: 00 FF AB
 	sv := []byte{0xFF, 0x01, 0x00, 0x01} // escape: FF 01 00 FF 01
 	encoded := encodeSetKeyspaceCompoundPK(sk, sv)
 	// Count 0x00 0x01 occurrences in the encoded bytes; should
@@ -448,8 +448,8 @@ func TestSetKeyspaceIndexRangeYieldsSetKeyValuePairs(t *testing.T) {
 	}
 	// First-byte tags: 0x41 (A), 0x42 (B), 0x43 (C).
 	pairs := []struct{ k, v string }{
-		{"u1", "alpha"}, // first byte 0x61 (a)
-		{"u2", "beta"},  // first byte 0x62 (b)
+		{"u1", "alpha"},  // first byte 0x61 (a)
+		{"u2", "beta"},   // first byte 0x62 (b)
 		{"u3", "carrot"}, // first byte 0x63 (c)
 	}
 	for _, p := range pairs {

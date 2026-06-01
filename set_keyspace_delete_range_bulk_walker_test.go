@@ -220,8 +220,8 @@ func TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance(t *test
 	}
 	pairs := []struct{ k, v string }{
 		{"u1", "alpha"}, {"u1", "apple"}, // u1: 2 values
-		{"u2", "bee"},                    // u2: 1 value
-		{"u3", "carrot"},                 // u3: 1 value (kept)
+		{"u2", "bee"},    // u2: 1 value
+		{"u3", "carrot"}, // u3: 1 value (kept)
 	}
 	for _, p := range pairs {
 		if _, err := sks.Put([]byte(p.k), []byte(p.v)); err != nil {

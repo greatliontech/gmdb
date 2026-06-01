@@ -194,18 +194,18 @@ func (idx *Index) keyspaceDead() bool {
 //
 // Ordering:
 //
-//   1. keyspaceDead → ErrKeyspaceClosed. Symmetric with Stats /
-//      Lookup / LookupKeys / Range / Prefix / Get: the user
-//      polling Err() to ask "is the handle still usable?" sees the
-//      broadest truth, not a stale Inv-IHS1 cause from a prior
-//      bad-cols Lookup.
-//   2. idx.err sticky (chunk-7.6 / 5.6 Inv-IHS1 contract). On a
-//      live keyspace, a mid-iter Drop or sibling-mutation stamps
-//      idx.err = ErrCursorStale via mapCursorErr; Err() reports
-//      that ErrCursorStale until the next iter call resets it.
-//   3. idx.dead → wrapped ErrIndexNotFound. Bare-Err on a Dropped
-//      handle (no intervening iter) reports the dead-handle
-//      sentinel even with no sticky idx.err.
+//  1. keyspaceDead → ErrKeyspaceClosed. Symmetric with Stats /
+//     Lookup / LookupKeys / Range / Prefix / Get: the user
+//     polling Err() to ask "is the handle still usable?" sees the
+//     broadest truth, not a stale Inv-IHS1 cause from a prior
+//     bad-cols Lookup.
+//  2. idx.err sticky (chunk-7.6 / 5.6 Inv-IHS1 contract). On a
+//     live keyspace, a mid-iter Drop or sibling-mutation stamps
+//     idx.err = ErrCursorStale via mapCursorErr; Err() reports
+//     that ErrCursorStale until the next iter call resets it.
+//  3. idx.dead → wrapped ErrIndexNotFound. Bare-Err on a Dropped
+//     handle (no intervening iter) reports the dead-handle
+//     sentinel even with no sticky idx.err.
 //
 // Inv-IHS2 (Drop) keeps a residual Err-vs-Stats asymmetry on a
 // (bad-cols Lookup → Drop → bare Err) sequence: Err reports the

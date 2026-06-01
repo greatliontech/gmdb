@@ -186,4 +186,3 @@ func (c *Coord) ReapStaleReaderSlots(ctx context.Context) error {
 	c.OldestReaderTxnID() // discard min; the in-place stale-clear is the goal
 	return nil
 }
-

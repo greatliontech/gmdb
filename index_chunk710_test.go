@@ -241,8 +241,8 @@ func TestSetKeyspaceIndexedDeleteRangeClearsIndexEntries(t *testing.T) {
 	// Per-user-key set of (key, value) pairs.
 	pairs := []struct{ k, v string }{
 		{"u1", "alpha"}, {"u1", "apple"}, // u1 has 2 values
-		{"u2", "bee"},                    // u2 has 1
-		{"u3", "carrot"},                 // u3 has 1
+		{"u2", "bee"},    // u2 has 1
+		{"u3", "carrot"}, // u3 has 1
 	}
 	for _, p := range pairs {
 		if _, err := sks.Put([]byte(p.k), []byte(p.v)); err != nil {

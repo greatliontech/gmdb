@@ -365,9 +365,9 @@ func TestRPLChainOrientationMultiSegment(t *testing.T) {
 	// (TxnID, expected drain order) and which slice index a given
 	// segment lives at after SetRPLChain.
 	const (
-		tailPageID  = 10  // ordered tail per convention: index 0, oldest
-		midPageID   = 11  // middle: index 1
-		headPageID  = 12  // ordered head per convention: last index, newest
+		tailPageID  = 10 // ordered tail per convention: index 0, oldest
+		midPageID   = 11 // middle: index 1
+		headPageID  = 12 // ordered head per convention: last index, newest
 		tailPayload = 20
 		midPayload  = 21
 		headPayload = 22

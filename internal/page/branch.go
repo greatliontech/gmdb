@@ -362,11 +362,11 @@ func DecodeBranch(buf []byte, cfg Config) (leftmost uint64, cells []BranchCell) 
 // Separators are prefix-truncated within the page, so the search is two-step
 // and entirely zero-copy (no full-key reconstruction):
 //
-//	1. Compare target against the page-wide prefix P. If target does not start
-//	   with P, it sorts before every separator (descend leftmost, i=0) or
-//	   after every separator (descend rightmost, i=n) — decided by
-//	   bytes.Compare(target, P).
-//	2. Otherwise binary-search target[len(P):] against the cells' suffixes.
+//  1. Compare target against the page-wide prefix P. If target does not start
+//     with P, it sorts before every separator (descend leftmost, i=0) or
+//     after every separator (descend rightmost, i=n) — decided by
+//     bytes.Compare(target, P).
+//  2. Otherwise binary-search target[len(P):] against the cells' suffixes.
 //
 // The descent caller uses i to pick the next child:
 //   - i == 0   → Ptr[0]    (leftmost child)

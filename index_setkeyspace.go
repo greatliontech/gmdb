@@ -227,8 +227,8 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnAddValue(setKey, setValue []byte) 
 
 	// Extract per-index new entry set.
 	type perIndex struct {
-		p   *pinnedIndex
-		ins []string // encoded index keys to insert
+		p    *pinnedIndex
+		ins  []string // encoded index keys to insert
 		news map[string]IndexEntry
 	}
 	plans := make([]*perIndex, 0, len(names))

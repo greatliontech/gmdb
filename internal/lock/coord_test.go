@@ -552,7 +552,6 @@ func TestStalledLiveCreatorAdopterSucceeds(t *testing.T) {
 	}
 }
 
-
 // TestReadOnlyCoordSkipsFlockGrant verifies the read-only coord mode
 // (CoordOptions.ReadOnly): the flock-grant goroutine is not started so
 // AcquireWriter is refused with ErrReadOnlyCoord, while the reader-slot

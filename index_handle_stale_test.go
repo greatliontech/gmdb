@@ -747,9 +747,9 @@ func TestErrSymmetricWithStatsAfterDeleteKeyspace(t *testing.T) {
 // broader sentinel) — NOT ErrIndexNotFound (the narrower one).
 // indexing.md §Handle Invalidation explicitly records this:
 //
-//   "a handle whose index was dropped AND whose keyspace was then
-//    deleted in the same tx reports `ErrKeyspaceClosed` (the
-//    broader truth) rather than `ErrIndexNotFound`."
+//	"a handle whose index was dropped AND whose keyspace was then
+//	 deleted in the same tx reports `ErrKeyspaceClosed` (the
+//	 broader truth) rather than `ErrIndexNotFound`."
 //
 // Without this test, a future refactor swapping the entry-method
 // guard order ("idx.dead first" looks like a micro-optimization
