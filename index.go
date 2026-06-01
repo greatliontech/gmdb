@@ -80,7 +80,6 @@ type Index struct {
 	openCursors []*btree.Cursor
 }
 
-// IndexStats is the persistent count + tree statistics for an index.
 // IndexStats is a point-in-time snapshot of one index's data B+tree
 // shape (api-surface.md §Statistics). Entries / Unique / Covering are
 // O(1) (in-memory pinned state + the IndexDecl); Depth / BranchPages /
