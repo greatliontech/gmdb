@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"iter"
 	"testing"
-
-	"github.com/thegrumpylion/gmdb/internal/btree"
 )
 
 func boolStr(b bool) string {
@@ -419,7 +417,9 @@ func TestKeyspaceBulkLoadReusedKeyBuffer(t *testing.T) {
 }
 
 // TestKeyspaceBulkLoadKeyTooLarge verifies a key too large for even an
-// overflow-reference entry surfaces ErrKeyTooLarge.
+// overflow-reference entry surfaces the public gmdb.ErrKeyTooLarge
+// sentinel (the internal btree.ErrKeyTooLarge is translated by
+// mapBtreeErr at the BulkLoad boundary).
 func TestKeyspaceBulkLoadKeyTooLarge(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -436,7 +436,7 @@ func TestKeyspaceBulkLoadKeyTooLarge(t *testing.T) {
 	// A key larger than the leaf content area can't fit even as an
 	// overflow reference.
 	bigKey := bytes.Repeat([]byte("K"), 4096)
-	if _, err := ks.BulkLoad(seqOf([]kv{{bigKey, []byte("v")}})); !errors.Is(err, btree.ErrKeyTooLarge) {
-		t.Errorf("BulkLoad oversize key = %v, want btree.ErrKeyTooLarge", err)
+	if _, err := ks.BulkLoad(seqOf([]kv{{bigKey, []byte("v")}})); !errors.Is(err, ErrKeyTooLarge) {
+		t.Errorf("BulkLoad oversize key = %v, want gmdb.ErrKeyTooLarge", err)
 	}
 }

@@ -128,6 +128,15 @@ var (
 	// sentinel.
 	ErrKeyEmpty = errors.New("gmdb: key is nil or empty")
 
+	// ErrKeyTooLarge is returned by Put / Delete / Get and BulkLoad when
+	// a key exceeds the maximum size — too large even for an
+	// overflow-reference leaf entry (limits.md §Maximum Key Size; the
+	// per-key cap is ~(PageSize-40)/2). Values never trip it: oversize
+	// values promote to an overflow chain. The internal
+	// btree.ErrKeyTooLarge is translated to this public sentinel by
+	// mapBtreeErr so callers' errors.Is(err, ErrKeyTooLarge) works.
+	ErrKeyTooLarge = errors.New("gmdb: key exceeds maximum size")
+
 	// ErrKeyspaceKindMismatch is returned by Tx.OpenKeyspace when
 	// the stored descriptor's Kind does not match the API used (e.g.
 	// OpenKeyspace on a Kind=1 SetKeyspace, OpenSetKeyspace on a

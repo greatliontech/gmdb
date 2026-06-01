@@ -418,7 +418,11 @@ func (ks *Keyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
 	cfg := ks.builderCfg()
 	b := newBulkBuilder(ks.tx.pgr, cfg)
 	if err := ks.bulkLoadRows(rows, cfg, b, nil); err != nil {
-		return 0, err
+		// mapBtreeErr translates btree.ErrKeyTooLarge (an oversize key
+		// from bulkLeafEntry) to the public gmdb.ErrKeyTooLarge sentinel
+		// and passes every other error (ErrKeyEmpty, ordering, I/O)
+		// through unchanged.
+		return 0, mapBtreeErr(err)
 	}
 	root, count, err := b.finish()
 	if err != nil {

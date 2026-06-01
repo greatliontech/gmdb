@@ -1522,12 +1522,11 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 // past the file-resident extent, Inv-RV3). Both are mapped to their
 // public gmdb sentinels here so callers' errors.Is checks work.
 //
-// Chunk-5.4 caveat: btree.ErrKeyTooLarge is reachable through
-// storeDescriptor if a future caller supplies a pathologically long
-// keyspace name. Chunk 5.4 does not impose a name-length cap (api-
-// surface.md is silent on it). Chunk 5.5's data-op surface should add
-// the cap and the public ErrKeyTooLarge translation before exposing
-// user-controlled keys via Keyspace.Put.
+// btree.ErrKeyTooLarge — a key too large even for an overflow-reference
+// leaf entry (limits.md §Maximum Key Size) — is translated to the public
+// gmdb.ErrKeyTooLarge sentinel here so a caller's
+// errors.Is(err, ErrKeyTooLarge) works through Keyspace.Put / Delete /
+// Get and (via the bulkLeafEntry → mapBtreeErr path) BulkLoad.
 func mapBtreeErr(err error) error {
 	if err == nil {
 		return nil
@@ -1537,6 +1536,8 @@ func mapBtreeErr(err error) error {
 		return fmt.Errorf("%w: %v", ErrBadPageChecksum, err)
 	case errors.Is(err, btree.ErrCorrupted), errors.Is(err, pager.ErrCorrupted):
 		return fmt.Errorf("%w: %v", ErrCorrupted, err)
+	case errors.Is(err, btree.ErrKeyTooLarge):
+		return fmt.Errorf("%w: %v", ErrKeyTooLarge, err)
 	}
 	return err
 }

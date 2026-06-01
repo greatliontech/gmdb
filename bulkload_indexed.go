@@ -730,7 +730,7 @@ func (ks *Keyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, err
 		return nil
 	}
 	if err := ks.bulkLoadRows(rows, cfg, b, onRow); err != nil {
-		return 0, err
+		return 0, mapBtreeErr(err) // btree.ErrKeyTooLarge → gmdb.ErrKeyTooLarge
 	}
 	rowRoot, count, err := b.finish()
 	if err != nil {
