@@ -361,6 +361,7 @@ func (p *Pager) FreePage(id uint64) error {
 		_, wasInLoose := p.loosePages[id]
 		p.loosePages[id] = struct{}{}
 		if !wasInLoose {
+			p.tc.loose++ // TxStats: distinct pages that went loose this tx
 			p.recordSavepointUndo(fieldLoosePages, id, false)
 		}
 		_, wasInPendingAllocs := p.pendingAllocs[id]
@@ -474,6 +475,7 @@ func (p *Pager) reclaimRPL() int {
 		// region per LIFO locality.
 		p.bitmap.SetHint(lastReclaimed)
 	}
+	p.tc.reclaimed += uint64(count) // TxStats: RPL pages reclaimed this tx
 	return count
 }
 

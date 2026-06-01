@@ -256,6 +256,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnPut(key, oldValue, newValue []byte, e
 			if pl.p.root == 0 {
 				continue // empty index, no possible conflict
 			}
+			ks.tx.pgr.RecordIndexProbe() // TxStats.IndexUniqueProbes
 			_, found, err := btree.Get(ks.tx.pgr, cfg, pl.p.root, []byte(k))
 			if err != nil {
 				return mapBtreeErr(err)
@@ -300,6 +301,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnPut(key, oldValue, newValue []byte, e
 			}
 			pl.p.root = newRoot
 			pl.p.count--
+			ks.tx.pgr.AddIndexDeleted(1) // TxStats.IndexEntriesDeleted
 			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
 				return err
 			}
@@ -319,6 +321,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnPut(key, oldValue, newValue []byte, e
 			}
 			pl.p.root = newRoot
 			pl.p.count++
+			ks.tx.pgr.AddIndexInserted(1) // TxStats.IndexEntriesInserted
 			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
 				return err
 			}
@@ -383,6 +386,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnDelete(key, oldValue []byte) error {
 			}
 			p.root = newRoot
 			p.count--
+			ks.tx.pgr.AddIndexDeleted(1) // TxStats.IndexEntriesDeleted
 			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
 				return err
 			}

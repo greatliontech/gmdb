@@ -549,6 +549,9 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	if err != nil {
 		return 0, false, 0, err
 	}
+	if isMerge {
+		recordMerge(pw) // two siblings combined into one (TxStats.Merges)
+	}
 
 	// Project the helper's result back into the parent's child array.
 	posLeftPair, posRightPair := int(descentIdx), siblingPos
@@ -824,6 +827,9 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 		}
 		if err != nil {
 			return 0, 0, false, err
+		}
+		if isMerge {
+			recordMerge(pw) // two siblings combined into one (TxStats.Merges)
 		}
 		switch {
 		case isMerge:

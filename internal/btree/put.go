@@ -658,6 +658,11 @@ func ascendNoSplit(pw PageWriter, cfg page.Config, path []pathFrame, newChildID 
 // new root branch is allocated with two children: leftID and
 // rightID, separator sep.
 func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID uint64, sep []byte, rightID uint64) (uint64, error) {
+	// ascendWithSplit is reached only after a leaf split (its two call
+	// sites in putReportCore) — count that one leaf split here; each
+	// branch split inside the loop is counted at its completion below
+	// (TxStats.Splits).
+	recordSplit(pw)
 	for i := len(path) - 1; i >= 0; i-- {
 		f := path[i]
 		newBranchID, err := pw.AllocPage()
@@ -764,6 +769,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		if err := pw.FreePage(f.pageID); err != nil {
 			return 0, fmt.Errorf("btree: free old branch %d: %w", f.pageID, err)
 		}
+		recordSplit(pw) // branch divided into two (TxStats.Splits)
 		// Loop up with the new (sep, right) pair.
 		leftID = newBranchID
 		sep = nextSep

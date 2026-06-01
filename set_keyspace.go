@@ -522,6 +522,7 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 	if err := ks.checkWritable(key); err != nil {
 		return false, err
 	}
+	ks.tx.pgr.RecordPut() // TxStats.Puts
 	fvs := ks.desc.FixedValueSize
 	if fvs != 0 && len(value) != int(fvs) {
 		return false, fmt.Errorf("%w: value len %d, keyspace FixedValueSize %d", ErrValueSizeMismatch, len(value), fvs)
@@ -751,6 +752,7 @@ func (ks *SetKeyspace) Delete(key []byte) (err error) {
 	if err := ks.checkWritable(key); err != nil {
 		return err
 	}
+	ks.tx.pgr.RecordDelete() // TxStats.Deletes
 	if ks.desc.Root == 0 {
 		return ErrNotFound
 	}

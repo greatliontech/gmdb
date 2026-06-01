@@ -120,7 +120,8 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 	newActive := 1 - prevActive
 
 	// Step 1 — pwrite data + RPL + bitmap pages.
-	if err := p.commitStep1(); err != nil {
+	nWritten, err := p.commitStep1()
+	if err != nil {
 		p.AbortTx()
 		return CommitResult{}, fmt.Errorf("pager: step 1: %w", err)
 	}
@@ -184,6 +185,12 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 		// Non-fatal. Bounded trailing slack reclaimable next commit.
 		_ = err
 	}
+
+	// TxStats: data/RPL/bitmap pages pwritten in step 1, plus the one
+	// meta page pwritten in step 3 (api-surface.md §Statistics
+	// TxStats.WrittenPages). Recorded on the success path so a
+	// post-commit Stats() (before the next BeginTx) sees the total.
+	p.setWrittenPages(uint64(nWritten) + 1)
 
 	p.discardTxSnapshot()
 	p.ReleaseAll()
@@ -332,24 +339,27 @@ func (p *Pager) headPageID() uint64 {
 // modified bitmap pages from the bitmap struct. Computes the xxhash64
 // footer for each page that needs one (data + RPL — bitmap pages carry
 // no checksum per checksums.md §Storage).
-func (p *Pager) commitStep1() error {
+func (p *Pager) commitStep1() (int, error) {
 	pageSize := int(p.cfg.PageSize)
+	written := 0
 	for id, buf := range p.dirty {
 		if p.cfg.PageChecksum {
 			page.WritePageFooter(*buf, p.cfg.PageSize)
 		}
 		off := int64(id) * int64(pageSize)
 		if _, err := p.file.WriteAt(*buf, off); err != nil {
-			return fmt.Errorf("pwrite page %d: %w", id, err)
+			return written, fmt.Errorf("pwrite page %d: %w", id, err)
 		}
+		written++
 	}
 	for _, idx := range p.bitmap.DirtyPages() {
 		off := int64(2+uint64(idx)) * int64(pageSize)
 		if _, err := p.file.WriteAt(p.bitmap.PageBytes(idx), off); err != nil {
-			return fmt.Errorf("pwrite bitmap page %d: %w", idx, err)
+			return written, fmt.Errorf("pwrite bitmap page %d: %w", idx, err)
 		}
+		written++
 	}
-	return nil
+	return written, nil
 }
 
 // buildNewMeta composes the new meta payload from CommitParams + the

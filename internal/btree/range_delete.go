@@ -718,6 +718,9 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 		if err != nil {
 			return err
 		}
+		if isMerge {
+			recordMerge(pw) // two siblings combined into one (TxStats.Merges)
+		}
 
 		if !isMerge && newLeftID == 0 {
 			// DECLINE (branch only): the redistribute could not restore the

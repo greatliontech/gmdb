@@ -522,6 +522,7 @@ func (ks *Keyspace) Get(key []byte) ([]byte, error) {
 	if err := ks.checkReadable(key); err != nil {
 		return nil, err
 	}
+	ks.tx.pgr.RecordGet() // TxStats.Gets
 	if ks.desc.Root == 0 {
 		return nil, ErrNotFound
 	}
@@ -555,6 +556,7 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	if err := ks.checkWritable(key); err != nil {
 		return err
 	}
+	ks.tx.pgr.RecordPut() // TxStats.Puts
 	cfg := ks.builderCfg()
 	if value == nil {
 		value = []byte{}
@@ -672,6 +674,7 @@ func (ks *Keyspace) Delete(key []byte) error {
 	if err := ks.checkWritable(key); err != nil {
 		return err
 	}
+	ks.tx.pgr.RecordDelete() // TxStats.Deletes
 	if ks.desc.Root == 0 {
 		return ErrNotFound
 	}

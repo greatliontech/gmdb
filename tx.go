@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unique"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
@@ -41,6 +42,13 @@ type Tx struct {
 	newTxnID   uint64
 	writable   bool
 	closed     bool
+
+	// startTime / endTime bound the transaction's lifetime for
+	// TxStats.Duration. startTime is stamped at Begin; endTime is stamped
+	// when the tx is finalized (Commit / Rollback). While the tx is live
+	// (endTime zero) Stats reports time.Since(startTime).
+	startTime time.Time
+	endTime   time.Time
 
 	// pendingFileFormat holds a Tx.SetFileFormat override of the mutable
 	// file-format meta fields (MinSize/GrowStep/ShrinkThreshold, in pages),
@@ -313,6 +321,7 @@ func (tx *Tx) Commit() error {
 	tx.cleanup.Stop()
 	defer tx.releaseGrant()
 	tx.closed = true
+	tx.endTime = time.Now() // TxStats.Duration: tx open Begin → Commit
 	tx.pgr.SetCurrentTxnID(tx.newTxnID)
 	if err := tx.flushKeyspaces(); err != nil {
 		// Flush failed before pager.Commit ran — AbortTx is sufficient.
@@ -425,6 +434,7 @@ func (tx *Tx) Rollback() error {
 	tx.cleanup.Stop()
 	defer tx.releaseGrant()
 	tx.closed = true
+	tx.endTime = time.Now() // TxStats.Duration: tx open Begin → Rollback
 	tx.pgr.AbortTx()
 	return nil
 }

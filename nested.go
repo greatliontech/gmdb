@@ -1,6 +1,9 @@
 package gmdb
 
-import "maps"
+import (
+	"maps"
+	"time"
+)
 
 // BeginChild creates a child transaction nested within tx
 // (transactions.md §Nested Transactions). The child shares tx's pager
@@ -42,6 +45,7 @@ func (tx *Tx) BeginChild() (*Tx, error) {
 		writable:   true,
 		parent:     tx,
 		savepoint:  sp,
+		startTime:  time.Now(), // TxStats.Duration anchor (child lifetime)
 		// held / grant deliberately nil: only the top-level parent owns
 		// the cross-process write grant and releases it on Commit /
 		// Rollback. The child never registers a leak-detection cleanup —
@@ -78,6 +82,7 @@ func (tx *Tx) BeginChild() (*Tx, error) {
 func (tx *Tx) commitChild() error {
 	parent := tx.parent
 	tx.closed = true
+	tx.endTime = time.Now() // TxStats.Duration: child open BeginChild → Commit
 
 	parent.keyspaceRoot = tx.keyspaceRoot
 	parent.numKeyspaces = tx.numKeyspaces
@@ -139,6 +144,7 @@ func (tx *Tx) cascadeRollback() {
 func (tx *Tx) rollbackChild() error {
 	parent := tx.parent
 	tx.closed = true
+	tx.endTime = time.Now() // TxStats.Duration: child open BeginChild → Rollback
 	tx.pgr.RestoreSavepoint(tx.savepoint)
 	tx.savepoint = nil
 	parent.activeChild = nil

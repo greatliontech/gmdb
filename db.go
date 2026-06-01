@@ -775,6 +775,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 		grant:        grant,
 		keyspaceRoot: prevMeta.KeyspaceRoot,
 		numKeyspaces: prevMeta.NumKeyspaces,
+		startTime:    time.Now(), // TxStats.Duration anchor
 	}
 	// Wire the leak-detection cleanup per leak-detection.md. The
 	// cleanup info captures the shared *closeGate by pointer

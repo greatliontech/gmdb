@@ -1,6 +1,8 @@
 package gmdb
 
 import (
+	"time"
+
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
@@ -220,4 +222,82 @@ func (kc *keyspaceCore) Stats() (KeyspaceStats, error) {
 		Entries:       kc.desc.Count,
 		IndexCount:    indexCount,
 	}, nil
+}
+
+// TxStats is a point-in-time snapshot of one write transaction's
+// activity counters (api-surface.md §Statistics). Read it from the
+// goroutine that owns the transaction (a write tx is single-threaded);
+// it may be read after Commit / Rollback — before the next Begin in this
+// process resets the counters — to capture the final values (e.g.
+// WrittenPages, which is only known at commit). A child transaction
+// (BeginChild) shares the parent's pager, so its counters are the
+// cumulative parent+child totals; only its Duration is child-scoped.
+//
+// Counting scope: Gets/Puts/Deletes count the named Keyspace /
+// SetKeyspace Get / Put / Delete calls — not the range or value variants
+// (DeleteRange, DeleteValue) or cursor scans. Splits/Merges count B+tree
+// node structural events. The counts reflect *attempted* operations: an
+// op that fails partway (and rolls its page state back via the internal
+// savepoint) still leaves its increments in place, so on heavy error
+// paths the counts can exceed the committed work.
+type TxStats struct {
+	// Page-allocator activity (counts, in pages).
+	CowPages       uint64 // pages copied-on-write
+	LoosePages     uint64 // pages that went loose (alloc+free within the tx)
+	ReclaimedPages uint64 // RPL pages reclaimed to the free bitmap
+	WrittenPages   uint64 // data + RPL + bitmap + meta pages pwritten at commit
+
+	// SlabPeakBytes is the maximum slab usage observed during the
+	// transaction's lifetime — useful for tuning MaxTxBufferBytes.
+	// Rollback resets it to 0 (the rolled-back work is not
+	// representative); Commit preserves it so the caller can read it
+	// immediately after Commit.
+	SlabPeakBytes int64
+
+	// B+tree operation counts.
+	Gets    uint64 // keyspace / set-keyspace Get calls
+	Puts    uint64 // keyspace / set-keyspace Put calls
+	Deletes uint64 // keyspace / set-keyspace Delete calls
+	Splits  uint64 // node splits (leaf or branch)
+	Merges  uint64 // node merges (two siblings combined into one)
+
+	// Index maintenance counts.
+	IndexEntriesInserted uint64
+	IndexEntriesDeleted  uint64
+	IndexUniqueProbes    uint64
+
+	// Duration is the mutation window — from Begin until Commit /
+	// Rollback is *called* (it does not include the commit's pwrite /
+	// fdatasync I/O, which runs after the window closes). While the tx
+	// is still live it is the elapsed time so far.
+	Duration time.Duration
+}
+
+// Stats returns this write transaction's activity-counter snapshot (see
+// TxStats). Safe to call while the tx is open or after it is finalized
+// (until the next Begin in this process). Must be read from the
+// transaction's own goroutine — a write tx, and thus its pager, is
+// single-threaded.
+func (tx *Tx) Stats() TxStats {
+	snap := tx.pgr.TxStatsSnapshot()
+	dur := time.Since(tx.startTime)
+	if !tx.endTime.IsZero() {
+		dur = tx.endTime.Sub(tx.startTime)
+	}
+	return TxStats{
+		CowPages:             snap.CowPages,
+		LoosePages:           snap.LoosePages,
+		ReclaimedPages:       snap.ReclaimedPages,
+		WrittenPages:         snap.WrittenPages,
+		SlabPeakBytes:        snap.SlabPeakBytes,
+		Gets:                 snap.Gets,
+		Puts:                 snap.Puts,
+		Deletes:              snap.Deletes,
+		Splits:               snap.Splits,
+		Merges:               snap.Merges,
+		IndexEntriesInserted: snap.IndexInserted,
+		IndexEntriesDeleted:  snap.IndexDeleted,
+		IndexUniqueProbes:    snap.IndexProbes,
+		Duration:             dur,
+	}
 }

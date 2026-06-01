@@ -107,6 +107,11 @@ type Pager struct {
 	accessMin atomic.Uint64
 	accessMax atomic.Uint64
 
+	// tc holds the per-write-transaction activity counters that back
+	// TxStats (see txstats.go). Reset by BeginTx, read via
+	// TxStatsSnapshot. Unused on a read-only pager.
+	tc txCounters
+
 	// Freespace state machine. Populated by AttachBitmap +
 	// SetCommitState + SetRPLChain at the start of the write
 	// transaction; nil/empty on a read-only pager.
@@ -426,6 +431,10 @@ func (p *Pager) RPLChain() []RPLSegmentRef { return p.rplSegments }
 // it would leak the prior Snapshot into openSnapshots and grow the
 // undo log unbounded.
 func (p *Pager) BeginTx() {
+	// Reset the per-tx TxStats counters at the write-tx boundary so each
+	// transaction's Stats() start from zero (runs unconditionally, like
+	// resetVerified below).
+	p.resetTxCounters()
 	// Reset the checksum-verification cache at every write-tx boundary:
 	// the previous commit may have rewritten mmap pages, so verifications
 	// from the prior tx no longer hold (Inv-RV2). Done before the early
@@ -468,6 +477,11 @@ func (p *Pager) AbortTx() {
 	p.bitmapSnapshot = nil
 	p.rplChainSnapshot = nil
 	p.haveTxSnapshot = false
+	// TxStats: a rolled-back tx's slab peak is not representative of
+	// steady-state need (api-surface.md §Statistics), so a post-rollback
+	// Stats() reports SlabPeakBytes = 0. The other counters persist to
+	// reflect the (rolled-back) activity until the next BeginTx resets.
+	p.zeroSlabPeak()
 	p.ReleaseAll()
 	clear(p.pendingAllocs)
 	clear(p.pendingFrees)
@@ -853,6 +867,8 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 	copy(*buf, src)
 	p.dirty[dstID] = buf
 	p.dirtyBytes += int(p.cfg.PageSize)
+	p.tc.cow++
+	p.bumpSlabPeak()
 	// Reaching this branch means dirty[dstID] was absent (the
 	// idempotent shortcut above returned otherwise), so the dirty-add
 	// undo entry has wasPresent=false. RestoreSavepoint deletes
@@ -882,6 +898,7 @@ func (p *Pager) AllocSlab(id uint64) ([]byte, error) {
 	buf := p.bufPool.Get()
 	p.dirty[id] = buf
 	p.dirtyBytes += int(p.cfg.PageSize)
+	p.bumpSlabPeak()
 	p.recordSavepointUndo(fieldDirty, id, false)
 	return *buf, nil
 }
@@ -934,6 +951,7 @@ func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
 		p.recordSavepointUndo(fieldDirty, id, false)
 		out[i] = *buf
 	}
+	p.bumpSlabPeak()
 	return out, nil
 }
 
