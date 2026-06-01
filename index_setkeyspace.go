@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -222,79 +221,7 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnAddValue(setKey, setValue []byte) 
 	if len(ks.indexes) == 0 {
 		return nil
 	}
-	names := sortedIndexNames(ks.indexes)
-	cfg := ks.tx.pgr.Config()
-
-	// Extract per-index new entry set.
-	type perIndex struct {
-		p    *pinnedIndex
-		ins  []string // encoded index keys to insert
-		news map[string]IndexEntry
-	}
-	plans := make([]*perIndex, 0, len(names))
-	for _, name := range names {
-		p := ks.indexes[name]
-		news, err := setKeyspaceExtractEntries(p.decl, setKey, setValue)
-		if err != nil {
-			return err
-		}
-		if len(news) == 0 {
-			plans = append(plans, &perIndex{p: p})
-			continue
-		}
-		ins := make([]string, 0, len(news))
-		for k := range news {
-			ins = append(ins, k)
-		}
-		sort.Strings(ins)
-		plans = append(plans, &perIndex{p: p, ins: ins, news: news})
-	}
-
-	// Step 1: unique-index probes (against on-disk).
-	for _, pl := range plans {
-		if !pl.p.decl.Unique {
-			continue
-		}
-		for _, k := range pl.ins {
-			if pl.p.root == 0 {
-				continue
-			}
-			ks.tx.pgr.RecordIndexProbe() // TxStats.IndexUniqueProbes
-			_, found, err := btree.Get(ks.tx.pgr, cfg, pl.p.root, []byte(k))
-			if err != nil {
-				return mapBtreeErr(err)
-			}
-			if found {
-				return fmt.Errorf("%w: index %q on SetKeyspace %q: key %x (setKey=%x setValue=%x)",
-					ErrIndexUniqueViolation, pl.p.decl.Name, ks.name.Value(), []byte(k), setKey, setValue)
-			}
-		}
-	}
-
-	// Step 2: inserts. opIdx exposes per-btree.Put progress to
-	// indexMaintenanceFailHookForTest for the regression test that
-	// pins the caller-site savepoint rollback.
-	compoundPK := encodeSetKeyspaceCompoundPK(setKey, setValue)
-	opIdx := 0
-	for _, pl := range plans {
-		hasCovering := len(pl.p.decl.Covering) > 0
-		for _, k := range pl.ins {
-			entry := pl.news[k]
-			val := indexEntryValue(entry, compoundPK, pl.p.decl.Unique, hasCovering)
-			newRoot, err := btree.Put(btreeWriter{ks.tx.pgr}, cfg, pl.p.root, []byte(k), val)
-			if err != nil {
-				return mapBtreeErr(err)
-			}
-			pl.p.root = newRoot
-			pl.p.count++
-			ks.tx.pgr.AddIndexInserted(1) // TxStats.IndexEntriesInserted
-			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
-				return err
-			}
-			opIdx++
-		}
-	}
-	return nil
+	return ks.newIndexMaintainer(setKey, setValue).onReplace(nil, setValue, false)
 }
 
 // applyIndexMaintenanceOnBulkKeyDelete iterates every value in the
@@ -371,46 +298,5 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnRemoveValue(setKey, setValue []byt
 	if len(ks.indexes) == 0 {
 		return nil
 	}
-	names := sortedIndexNames(ks.indexes)
-	cfg := ks.tx.pgr.Config()
-	mergeThreshold := ks.tx.db.opts.MergeThreshold
-
-	opIdx := 0
-	for _, name := range names {
-		p := ks.indexes[name]
-		olds, err := setKeyspaceExtractEntries(p.decl, setKey, setValue)
-		if err != nil {
-			return err
-		}
-		if len(olds) == 0 {
-			continue
-		}
-		keys := make([]string, 0, len(olds))
-		for k := range olds {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if p.root == 0 {
-				return fmt.Errorf("%w: SetKeyspace index %q: delete of %x but root is 0",
-					ErrCorrupted, p.decl.Name, []byte(k))
-			}
-			newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, p.root, mergeThreshold, []byte(k))
-			if err != nil {
-				if errors.Is(err, btree.ErrNotFound) {
-					return fmt.Errorf("%w: SetKeyspace index %q: delete of %x missed (row/index divergence)",
-						ErrCorrupted, p.decl.Name, []byte(k))
-				}
-				return mapBtreeErr(err)
-			}
-			p.root = newRoot
-			p.count--
-			ks.tx.pgr.AddIndexDeleted(1) // TxStats.IndexEntriesDeleted
-			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
-				return err
-			}
-			opIdx++
-		}
-	}
-	return nil
+	return ks.newIndexMaintainer(setKey, setValue).onDelete(setValue)
 }

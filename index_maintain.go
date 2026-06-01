@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"sync/atomic"
-
-	"github.com/thegrumpylion/gmdb/internal/btree"
 )
 
 // Atomic index maintenance for chunk-7.6 Keyspace.Put / Delete /
@@ -198,138 +196,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnPut(key, oldValue, newValue []byte, e
 	if len(ks.indexes) == 0 {
 		return nil
 	}
-	names := sortedIndexNames(ks.indexes)
-	cfg := ks.tx.pgr.Config()
-	mergeThreshold := ks.tx.db.opts.MergeThreshold
-
-	// Steps 1-2: extract per-index old/new sets.
-	type perIndex struct {
-		p    *pinnedIndex
-		olds map[string]IndexEntry
-		news map[string]IndexEntry
-		dels []string // keys to delete (old \ new)
-		ins  []string // keys to insert (new \ old)
-	}
-	plans := make([]*perIndex, 0, len(names))
-	for _, name := range names {
-		p := ks.indexes[name]
-		var olds map[string]IndexEntry
-		if existedBefore {
-			var err error
-			olds, err = extractEntriesAsKeySet(p.decl, key, oldValue)
-			if err != nil {
-				return err
-			}
-		}
-		news, err := extractEntriesAsKeySet(p.decl, key, newValue)
-		if err != nil {
-			return err
-		}
-		// Diff: dels = olds \ news; ins = news \ olds.
-		var dels, ins []string
-		for k := range olds {
-			if _, ok := news[k]; !ok {
-				dels = append(dels, k)
-			}
-		}
-		for k := range news {
-			if _, ok := olds[k]; !ok {
-				ins = append(ins, k)
-			}
-		}
-		sort.Strings(dels)
-		sort.Strings(ins)
-		plans = append(plans, &perIndex{p: p, olds: olds, news: news, dels: dels, ins: ins})
-	}
-
-	// Step 3: unique-index probes (BEFORE any mutation).
-	for _, pl := range plans {
-		if !pl.p.decl.Unique {
-			continue
-		}
-		for _, k := range pl.ins {
-			// Skip if this insert's key was in olds — that's an
-			// in-place same-PK overwrite (the row's key didn't
-			// change), handled by the diff. Actually if k ∈ ins
-			// then k ∉ olds by construction. Probe against the
-			// on-disk index.
-			if pl.p.root == 0 {
-				continue // empty index, no possible conflict
-			}
-			ks.tx.pgr.RecordIndexProbe() // TxStats.IndexUniqueProbes
-			_, found, err := btree.Get(ks.tx.pgr, cfg, pl.p.root, []byte(k))
-			if err != nil {
-				return mapBtreeErr(err)
-			}
-			if found {
-				return fmt.Errorf("%w: index %q on keyspace %q: key %x",
-					ErrIndexUniqueViolation, pl.p.decl.Name, ks.name.Value(), []byte(k))
-			}
-		}
-	}
-
-	// Steps 4-5 mutate index data trees. The opIdx counter is the
-	// per-call monotonic index of successful btree.Put/Delete
-	// operations exposed to indexMaintenanceFailHookForTest so
-	// regression tests can deterministically inject a mid-loop
-	// failure that exercises the caller's savepoint rollback.
-	opIdx := 0
-
-	// Step 4: apply deletes.
-	for _, pl := range plans {
-		for _, k := range pl.dels {
-			if pl.p.root == 0 {
-				// Stale old extractor output: index was empty when
-				// we computed olds. This would be a logic error
-				// since we only added k to olds because extract
-				// emitted it. Surface as ErrCorrupted.
-				return fmt.Errorf("%w: index %q: delete of %x but index root is 0",
-					ErrCorrupted, pl.p.decl.Name, []byte(k))
-			}
-			newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, pl.p.root, mergeThreshold, []byte(k))
-			if err != nil {
-				if errors.Is(err, btree.ErrNotFound) {
-					// Stale old extractor output: extractor said this
-					// key exists in the index for the old value, but
-					// it's not actually there. Surface as ErrCorrupted
-					// (row/index divergence — chunk-11 Check would
-					// catch this normally).
-					return fmt.Errorf("%w: index %q: delete of %x missed (row/index divergence)",
-						ErrCorrupted, pl.p.decl.Name, []byte(k))
-				}
-				return mapBtreeErr(err)
-			}
-			pl.p.root = newRoot
-			pl.p.count--
-			ks.tx.pgr.AddIndexDeleted(1) // TxStats.IndexEntriesDeleted
-			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
-				return err
-			}
-			opIdx++
-		}
-	}
-
-	// Step 5: apply inserts.
-	for _, pl := range plans {
-		hasCovering := len(pl.p.decl.Covering) > 0
-		for _, k := range pl.ins {
-			entry := pl.news[k]
-			val := indexEntryValue(entry, key, pl.p.decl.Unique, hasCovering)
-			newRoot, err := btree.Put(btreeWriter{ks.tx.pgr}, cfg, pl.p.root, []byte(k), val)
-			if err != nil {
-				return mapBtreeErr(err)
-			}
-			pl.p.root = newRoot
-			pl.p.count++
-			ks.tx.pgr.AddIndexInserted(1) // TxStats.IndexEntriesInserted
-			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
-				return err
-			}
-			opIdx++
-		}
-	}
-
-	return nil
+	return ks.newIndexMaintainer(key).onReplace(oldValue, newValue, existedBefore)
 }
 
 // applyIndexMaintenanceOnDelete runs the per-index work for an
@@ -352,48 +219,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnDelete(key, oldValue []byte) error {
 	if len(ks.indexes) == 0 {
 		return nil
 	}
-	names := sortedIndexNames(ks.indexes)
-	cfg := ks.tx.pgr.Config()
-	mergeThreshold := ks.tx.db.opts.MergeThreshold
-
-	opIdx := 0
-	for _, name := range names {
-		p := ks.indexes[name]
-		olds, err := extractEntriesAsKeySet(p.decl, key, oldValue)
-		if err != nil {
-			return err
-		}
-		if len(olds) == 0 {
-			continue
-		}
-		keys := make([]string, 0, len(olds))
-		for k := range olds {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if p.root == 0 {
-				return fmt.Errorf("%w: index %q: delete of %x but index root is 0",
-					ErrCorrupted, p.decl.Name, []byte(k))
-			}
-			newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, p.root, mergeThreshold, []byte(k))
-			if err != nil {
-				if errors.Is(err, btree.ErrNotFound) {
-					return fmt.Errorf("%w: index %q: delete of %x missed (row/index divergence)",
-						ErrCorrupted, p.decl.Name, []byte(k))
-				}
-				return mapBtreeErr(err)
-			}
-			p.root = newRoot
-			p.count--
-			ks.tx.pgr.AddIndexDeleted(1) // TxStats.IndexEntriesDeleted
-			if err := fireIndexMaintenanceFailHookForTest(opIdx); err != nil {
-				return err
-			}
-			opIdx++
-		}
-	}
-	return nil
+	return ks.newIndexMaintainer(key).onDelete(oldValue)
 }
 
 // sortedIndexNames returns the index names in lex order so the
