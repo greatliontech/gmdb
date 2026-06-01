@@ -739,37 +739,6 @@ func (ks *Keyspace) Delete(key []byte) error {
 	return nil
 }
 
-// DeleteRange deletes every key k with start <= k < end from the
-// keyspace per range-delete.md §Algorithm. Returns the count of
-// entries deleted; empty range (start == end OR start > end) returns
-// (0, nil) without mutating the tree per the
-// "bulk operations report rows-affected, not membership" decision.
-//
-// Boundary semantics (range-delete.md §Invariants #1):
-//   - nil start = open-left ("from the first key").
-//   - nil end = open-right ("through the last key").
-//   - (nil, nil) deletes every key.
-//
-// Errors:
-//   - ErrKeyspaceClosed if the handle was invalidated by a same-tx
-//     DeleteKeyspace.
-//   - ErrTxClosed / ErrReadOnly via Tx.requireOpen.
-//   - Pager errors (ErrTxTooLarge, ErrDBFull) pass through.
-//   - ErrCorrupted (wrapped) on a structural anomaly observed by the
-//     three-phase walk.
-//
-// Side effects on success (in-memory; persisted at Tx.Commit's
-// flushKeyspaces walk per the deferred-flush refactor):
-//   - desc.Root reflects the new btree root (0 if the keyspace was
-//     emptied).
-//   - desc.Count decrements by the returned count.
-//   - state transitions to Dirty unless already Created.
-//   - Every open Cursor on this keyspace is MarkStale'd.
-//
-// Indexed-keyspace fallback is not yet implemented;
-// DeleteRange operates on Kind=0 keyspaces only. The
-// surface will reroute indexed keyspaces through a per-row
-// cursor walk per range-delete.md §Indexed-keyspace fallback.
 // keyspaceCellFree is the per-cell free callback Keyspace.DeleteRange
 // passes to btree.DeleteRange. Per range-delete.md §Algorithm, Kind=0
 // (plain key→value) cells carry at most one overflow chain and
@@ -789,6 +758,38 @@ func keyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry) (u
 	return 1, nil
 }
 
+// DeleteRange deletes every key k with start <= k < end from the
+// keyspace per range-delete.md §Algorithm. Returns the count of
+// entries deleted; empty range (start == end OR start > end) returns
+// (0, nil) without mutating the tree per the
+// "bulk operations report rows-affected, not membership" decision.
+//
+// Boundary semantics (range-delete.md §Invariants #1):
+//   - nil start = open-left ("from the first key").
+//   - nil end = open-right ("through the last key").
+//   - (nil, nil) deletes every key.
+//
+// Dispatch by index presence: an indexed keyspace routes through
+// deleteRangeIndexed (a per-row cursor walk that clears each row's
+// index entries, per range-delete.md §Indexed-keyspace fallback); an
+// un-indexed keyspace uses the atomic three-phase btree.DeleteRange
+// walker with keyspaceCellFree.
+//
+// Errors:
+//   - ErrKeyspaceClosed if the handle was invalidated by a same-tx
+//     DeleteKeyspace.
+//   - ErrTxClosed / ErrReadOnly via Tx.requireOpen.
+//   - Pager errors (ErrTxTooLarge, ErrDBFull) pass through.
+//   - ErrCorrupted (wrapped) on a structural anomaly observed by the
+//     three-phase walk.
+//
+// Side effects on success (in-memory; persisted at Tx.Commit's
+// flushKeyspaces walk per the deferred-flush refactor):
+//   - desc.Root reflects the new btree root (0 if the keyspace was
+//     emptied).
+//   - desc.Count decrements by the returned count.
+//   - state transitions to Dirty unless already Created.
+//   - Every open Cursor on this keyspace is MarkStale'd.
 func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 	if err := ks.requireWritable(); err != nil {
 		return 0, err
