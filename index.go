@@ -12,12 +12,11 @@ import (
 // Index is a handle for querying a declared index on a Keyspace or
 // SetKeyspace. Returned by Keyspace.Index(name) /
 // SetKeyspace.Index(name). The query surface (Lookup / LookupKeys /
-// Range / Prefix / Get) lands at chunk 7.7; chunk 7.6 ships only
-// the Stats / Err surface, plus the handle plumbing.
+// Range / Prefix / Get), the Stats / Err surface, and the handle plumbing.
 //
 // Index handles are not safe for concurrent use by multiple
 // goroutines. Each call to ks.Index(name) returns a fresh handle
-// (or, for chunk-7.6 implementations, the same handle bound to the
+// (or the same handle bound to the
 // same pinnedIndex — overlapping iterators on one handle race per
 // api-surface.md §Index Lookup API).
 //
@@ -198,7 +197,7 @@ func (idx *Index) keyspaceDead() bool {
 //     polling Err() to ask "is the handle still usable?" sees the
 //     broadest truth, not a stale Inv-IHS1 cause from a prior
 //     bad-cols Lookup.
-//  2. idx.err sticky (chunk-7.6 / 5.6 Inv-IHS1 contract). On a
+//  2. idx.err sticky (Inv-IHS1 contract). On a
 //     live keyspace, a mid-iter Drop or sibling-mutation stamps
 //     idx.err = ErrCursorStale via mapCursorErr; Err() reports
 //     that ErrCursorStale until the next iter call resets it.
@@ -209,7 +208,7 @@ func (idx *Index) keyspaceDead() bool {
 // Inv-IHS2 (Drop) keeps a residual Err-vs-Stats asymmetry on a
 // (bad-cols Lookup → Drop → bare Err) sequence: Err reports the
 // sticky ErrInvalidOptions wrap, Stats reports ErrIndexNotFound.
-// This is the prior chunk-7.6 contract and out of scope for the
+// This is the prior contract and out of scope for the
 // Inv-IHS3 fix (different cause-line from DeleteKeyspace).
 func (idx *Index) Err() error {
 	if idx.keyspaceDead() {
@@ -354,7 +353,7 @@ func (idx *Index) rowTx() *Tx {
 //
 // For a SetKeyspace index (idx.sks != nil), routes to the
 // SetKeyspace-aware path which yields (setKey, setValue) tuples
-// instead of (rowKey, rowValue) per chunk 7.9. Covering is not
+// instead of (rowKey, rowValue). Covering is not
 // returned for SetKeyspace indexes — set-keyspace.md §Indexes
 // makes the (setKey, setValue) pair the natural query result
 // (no back-lookup to save), and the byte-layer covering-return
@@ -463,8 +462,7 @@ func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []by
 // **all** declared columns. Supplying fewer or more columns than
 // the index declares sets idx.Err() to an ErrInvalidOptions wrap
 // and yields nothing — this prevents the partial-cols-silently-
-// widens-to-Prefix footgun the chunk-7.7 Round-1 H-1 review
-// surfaced. Use Prefix for partial-cols semantics.
+// widens-to-Prefix footgun. Use Prefix for partial-cols semantics.
 //
 // For a unique index, yields at most one pair. For a non-unique
 // index, yields every row whose extractor produced the matching
@@ -493,7 +491,7 @@ func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []by
 // goroutine.
 func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
-		// Per-sequence Err reset (chunk-7.7 Round-1 M-2 fix).
+		// Per-sequence Err reset.
 		idx.err = nil
 		// Dead-keyspace check (Inv-IHS3): Tx.DeleteKeyspace on the
 		// parent ks/sks freed the index data tree via
@@ -897,8 +895,8 @@ func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error) {
 }
 
 // extractSetKeyspacePKAndValue decodes a SetKeyspace index entry
-// into the per-set-member (setKey, setValue) pair (chunk 7.9
-// SetKeyspace lookup contract; see api-surface.md §Index Lookup
+// into the per-set-member (setKey, setValue) pair (the SetKeyspace
+// lookup contract; see api-surface.md §Index Lookup
 // API). For SetKeyspace indexes, the iter.Seq2 yields
 // (setKey, setValue) rather than (rowKey, rowValue): the
 // "primary key" of an index entry is the compound (setKey,

@@ -13,8 +13,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
-// ReadTx is a snapshot read transaction. Per the api-surface.md spec
-// amend scheduled for chunk 3.6, read and write transactions are
+// ReadTx is a snapshot read transaction. Per api-surface.md, read and write transactions are
 // distinct types so the type system rejects write methods on read
 // snapshots at compile time (vs the original spec's single *Tx with
 // writable=false runtime check).

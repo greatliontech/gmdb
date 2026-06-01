@@ -57,7 +57,7 @@ func (tx *Tx) BeginChild() (*Tx, error) {
 		pendingDeletes:   maps.Clone(tx.pendingDeletes),
 	}
 	// Clone the parent's in-memory keyspace state so the child sees the
-	// parent's uncommitted descriptor mutations (the chunk-5.6
+	// parent's uncommitted descriptor mutations (the
 	// deferred-flush design keeps them on the handles, not on disk) yet
 	// can mutate and roll them back without touching the parent. Done
 	// after constructing child so the clones can point their tx at it.

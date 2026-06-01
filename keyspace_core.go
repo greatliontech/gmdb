@@ -20,7 +20,7 @@ type keyspaceCore struct {
 
 	// desc is the in-tx view of the keyspace's descriptor. Mutated in
 	// place by the Put / Delete data-op paths (descriptor.Root +
-	// descriptor.Count); the chunk-5.6 deferred-flush refactor promotes
+	// descriptor.Count); the deferred-flush refactor promotes
 	// it to the on-disk keyspace B+tree at Tx.Commit's flushKeyspaces
 	// walk, not per data op.
 	desc page.KeyspaceDescriptor
@@ -35,7 +35,7 @@ type keyspaceCore struct {
 	// ErrKeyspaceClosed; re-creating the same name via a Create* call
 	// does NOT clear dead on the old handle (a fresh handle is
 	// allocated; the old stays dead). Per api-surface.md §Keyspace API
-	// DeleteKeyspace (chunk-5.6 Inv-D).
+	// DeleteKeyspace (Inv-D).
 	dead bool
 
 	// openIndexHandles tracks every *Index returned by Index(name) in
@@ -58,7 +58,7 @@ type keyspaceCore struct {
 	indexes map[string]*pinnedIndex
 
 	// readOnly is true when the handle was opened via an *ReadOnly
-	// method. Used by the chunk-7.5 same-tx re-open idempotence check to
+	// method. Used by the same-tx re-open idempotence check to
 	// surface ErrKeyspaceAlreadyOpen when a caller mixes a read-write
 	// and a read-only open of the same name within one tx (indexing.md
 	// §Re-opening).
@@ -216,9 +216,9 @@ func (ks *keyspaceCore) NextSequence() (uint64, error) {
 }
 
 // descriptor returns the in-tx descriptor pointer. Used by the
-// chunk-7.3 registry-CRUD helpers (index_codec.go) to satisfy the
+// registry-CRUD helpers (index_codec.go) to satisfy the
 // descriptorOwner interface — registryPut / registryDelete mutate the
-// descriptor in place AND call markDirty() so the chunk-5.6
+// descriptor in place AND call markDirty() so the
 // flushKeyspaces walk persists the mutation. Unexported.
 func (ks *keyspaceCore) descriptor() *page.KeyspaceDescriptor {
 	return &ks.desc

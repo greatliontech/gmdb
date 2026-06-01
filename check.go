@@ -478,7 +478,7 @@ func (c *checker) checkSetKeyspaceSubpages(ks string, dataRoot uint64, fvs uint1
 		}
 		// NewSubpageReader panics below SubpageHeaderSize and Validate is
 		// not total over a malformed header — bound the length first, the
-		// same guard the chunk-11.4a CheckIndexes path uses.
+		// same guard the CheckIndexes path uses.
 		if len(e.Value) < page.SubpageHeaderSize {
 			if !c.emit(CheckIssue{Severity: CheckError, Code: "SubpageCorrupt", Keyspace: ks,
 				Message: fmt.Sprintf("set key %q subpage is %d bytes (< header %d)", e.Key, len(e.Value), page.SubpageHeaderSize)}) {
@@ -914,7 +914,7 @@ func (c *checker) expectedSetKeyspaceIndex(decl *IndexDecl, dataRoot uint64, fvs
 			// surface as ErrCorrupted (→ a RowsUnreadable warning), never
 			// a panic: NewSubpageReader panics below SubpageHeaderSize and
 			// AllValues is not total over a malformed header. This upholds
-			// the chunk-11 "Check never panics on a forged page" contract.
+			// the "Check never panics on a forged page" contract.
 			if len(e.Value) < page.SubpageHeaderSize {
 				return fmt.Errorf("%w: SetKeyspace subpage for key %q is %d bytes (< header %d)",
 					btree.ErrCorrupted, e.Key, len(e.Value), page.SubpageHeaderSize)

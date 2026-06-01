@@ -77,7 +77,7 @@ type Tx struct {
 	// successful Open / Create; DeleteKeyspace removes the entry
 	// (and migrates the *Keyspace to deadKeyspaces with dead=true so
 	// post-Delete handle ops return ErrKeyspaceClosed per the
-	// chunk-5.6 invariant Inv-D).
+	// Inv-D invariant).
 	openKeyspaces map[uniqueNameHandle]*Keyspace
 
 	// openSetKeyspaces caches *SetKeyspace handles by interned name
@@ -93,10 +93,10 @@ type Tx struct {
 
 	// dirtyDescriptors holds descriptor mutations on names that have
 	// no *Keyspace handle in openKeyspaces (today: SetKeyspaceConfig
-	// on an unopened name — kind-agnostic per the chunk-5.5 godoc on
+	// on an unopened name — kind-agnostic per the godoc on
 	// api-surface.md §Keyspace API SetKeyspaceConfig, so the
 	// mutation cannot be carried on a *Keyspace which is Kind=0
-	// only). These are flushed at Commit (the chunk-5.6 deferred-
+	// only). These are flushed at Commit (the deferred-
 	// flush refactor) alongside openKeyspaces with state ∈
 	// {created, dirty}. Invariant: a name is in at most one of
 	// {openKeyspaces, dirtyDescriptors, pendingDeletes}.
@@ -189,7 +189,7 @@ type Tx struct {
 // Captures the shared *closeGate by pointer (leak-detection.md
 // clause-explicit invariant — required because runtime.AddCleanup
 // provides no ordering between the DB cleanup and Tx cleanups, and
-// chunk-3.3 promoted the gate from a plain *atomic.Bool to a
+// the gate was promoted from a plain *atomic.Bool to a
 // *closeGate with an additional inflight-cleanup refcount so
 // Close can drain in-flight cleanups before unmap). Also captures
 // *Pager and *Grant directly (not via *DB) so a concurrent
@@ -289,7 +289,7 @@ func formatStack(pcs []uintptr) string {
 // protocol (pager-slab.md §Commit Write Ordering). On success the DB's
 // active meta advances and the write-lock is released.
 //
-// Descriptor flush (chunk-5.6 deferred-flush refactor). All same-tx
+// Descriptor flush (deferred-flush refactor). All same-tx
 // descriptor mutations (Keyspace.Put / Delete / Cursor.Delete /
 // Tx.SetKeyspaceConfig / Tx.CreateKeyspace* / Tx.DeleteKeyspace) are
 // kept in memory on the *Keyspace handles, in tx.dirtyDescriptors,
@@ -299,7 +299,7 @@ func formatStack(pcs []uintptr) string {
 // path (bitmap snapshot restore, slab pool return, retired+loose
 // page clearance) and the on-disk state is unchanged — no new poison
 // machinery is needed because no on-disk write has yet been issued.
-// The chunk-5.5 round-1 H1 (a partial-mutation failure mode where a
+// The motivating case (a partial-mutation failure mode where a
 // per-op storeDescriptor write could fail AFTER a successful data-tree
 // mutation, producing on-disk orphan pages on a subsequent Commit) is
 // closed by this design move: the two-write-no-atomicity window per
@@ -402,8 +402,8 @@ func (tx *Tx) Commit() error {
 	}
 	tx.db.mu.Unlock()
 	// The pager's commit-state seeding (HighWaterMark, MaxSize,
-	// reclamationBound) moved to the next write-tx Begin path in
-	// chunk 3.4 so the reclamation bound reflects the reader-table
+	// reclamationBound) moved to the next write-tx Begin path
+	// so the reclamation bound reflects the reader-table
 	// scan AT begin-time rather than at the previous commit-time.
 	// Between Commit and the next Begin, no Tx-bound alloc fires;
 	// the writer pager's stale highWaterMark / reclamationBound
@@ -544,7 +544,7 @@ func (tx *Tx) flushKeyspaces() error {
 		buf := make([]byte, page.KeyspaceDescriptorSize)
 		for _, name := range names {
 			ks := tx.openKeyspaces[unique.Make(name)]
-			// Sync chunk-7.6 in-memory pinnedIndex root/count back
+			// Sync the in-memory pinnedIndex root/count back
 			// to the registry sub-tree BEFORE encoding the
 			// descriptor — registryPut updates ks.desc.IndexRegistryRoot,
 			// and we want that final root in the flushed descriptor.
@@ -565,7 +565,7 @@ func (tx *Tx) flushKeyspaces() error {
 	// Symmetric to 2a — the descriptor encoding is kind-agnostic
 	// (EncodeKeyspaceDescriptor writes the full struct including
 	// Kind + FixedValueSize), so the only difference is the source
-	// map and the *SetKeyspace handle type. Sync the chunk-7.9
+	// map and the *SetKeyspace handle type. Sync the
 	// SetKeyspace pinnedIndex root/count back to the registry
 	// sub-tree BEFORE encoding the descriptor, mirroring Step 2a.
 	if tx.hasDirtyOpenSetKeyspaces() {

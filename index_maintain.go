@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 )
 
-// Atomic index maintenance for chunk-7.6 Keyspace.Put / Delete /
+// Atomic index maintenance for Keyspace.Put / Delete /
 // Cursor.Delete. Implements indexing.md §Write Path: Atomic Index
 // Maintenance + §Unique Indexes.
 //
@@ -29,7 +29,7 @@ import (
 
 // indexEntryKey returns the on-disk index-tree key for a single
 // extractor-produced IndexEntry on a Keyspace row (the PK is the
-// row's key). For SetKeyspace at chunk 7.9 the pk argument is the
+// row's key). For a SetKeyspace the pk argument is the
 // compound `escape(setKey) || 0x00 0x01 || escape(setValue)`.
 func indexEntryKey(entry IndexEntry, pk []byte, unique bool) []byte {
 	if unique {
@@ -103,7 +103,7 @@ var errIndexValueShort = errors.New("index entry value malformed")
 // extractEntriesAsKeySet runs the extractor and returns a
 // map[string]IndexEntry keyed by the encoded index-tree key. The
 // set semantic (not multiset) collapses duplicate IndexEntry
-// outputs from a single extractor invocation per the chunk-7.1
+// outputs from a single extractor invocation per the
 // entailed invariant on atomic index maintenance.
 //
 // extractor==nil or returning nil/empty slice: returns nil (no
@@ -164,8 +164,8 @@ func extractEntriesAsKeySet(decl *IndexDecl, key, value []byte) (map[string]Inde
 //     failure path — this helper returning an error, or the
 //     subsequent row btree.Put failing. This helper does NOT snapshot
 //     pinned state itself: a single caller-side snapshot covers both
-//     failure modes (chunk-7.6 H-2 originally took the snapshot at
-//     the helper layer; consolidated to caller-only when chunk-7.9
+//     failure modes (originally the snapshot was taken at
+//     the helper layer; consolidated to caller-only when a later refactor
 //     made every caller already hold rowSnap for the post-helper
 //     failure case — the helper-layer snapshot became a redundant
 //     allocation paying O(indexes) per indexed write). Without the
@@ -334,7 +334,7 @@ func restoreIndexes(indexes map[string]*pinnedIndex, snap indexSnapshot) {
 // loop with that error so a regression test can deterministically
 // exercise the caller-site savepoint-backed rollback (the per-row
 // case of the page-orphan-on-Commit-after-error contract). The hook
-// signature mirrors writeRegistryFailHookForTest (chunk-7.5 sibling
+// signature mirrors writeRegistryFailHookForTest (the sibling
 // in index_open.go). Test-only; installed via
 // setIndexMaintenanceFailHookForTest and cleared via t.Cleanup.
 var indexMaintenanceFailHookForTest atomic.Pointer[func(i int) error]

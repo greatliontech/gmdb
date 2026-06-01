@@ -9,7 +9,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// Compound-PK codec for SetKeyspace indexes (chunk 7.9), per
+// Compound-PK codec for SetKeyspace indexes, per
 // set-keyspace.md §Indexes on SetKeyspaces.
 //
 // The "primary key" for a SetKeyspace index entry is the
@@ -23,7 +23,7 @@ import (
 // Inside escape(setKey) and escape(setValue), every literal 0x00
 // is already escaped to 0x00 0xFF — so the only raw 0x00 0x01 in
 // the compound PK is the separator. (set-keyspace.md Inv-6,
-// promoted to enforced tests at chunk 7.9.)
+// promoted to enforced tests.)
 //
 // The full SetKeyspace non-unique index key is:
 //
@@ -178,7 +178,7 @@ func compoundPKHasPrefix(indexKey, encodedColPrefix []byte) bool {
 }
 
 // setKeyspaceExtractEntries runs the extractor on (setKey,
-// setValue) and dedupes into a key-set. Mirrors chunk-7.6's
+// setValue) and dedupes into a key-set. Mirrors
 // extractEntriesAsKeySet but uses the SetKeyspace-aware index
 // entry key builder (encodeSetKeyspaceIndexKey with the compound
 // PK appended for non-unique). Candidate-set collisions on unique

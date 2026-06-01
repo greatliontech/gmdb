@@ -18,8 +18,8 @@ import (
 //     guarantee between a DB cleanup and the Tx cleanups that
 //     depend on observing it.
 //
-//  2. The `txInflight` counter — a chunk-3.3 promotion of the
-//     same spec clause to address a race the writer-only chunk-2.8
+//  2. The `txInflight` counter — a promotion of the
+//     same spec clause to address a race the writer-only earlier
 //     promotion didn't surface: a leaked-Tx cleanup that loaded
 //     `closed=false` MAY then proceed to touch the lock-file mmap
 //     (the read-tx slot release path) while `Close()` advances

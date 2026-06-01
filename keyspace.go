@@ -20,7 +20,7 @@ import (
 type uniqueNameHandle = unique.Handle[string]
 
 // keyspaceState tracks a *Keyspace's pending-flush status within the
-// owning write tx (chunk-5.6 deferred-flush refactor). The keyspace
+// owning write tx (deferred-flush refactor). The keyspace
 // descriptor's on-disk state propagates to the keyspace B+tree at
 // Tx.Commit's flushKeyspaces walk — not per data-op.
 type keyspaceState uint8
@@ -56,7 +56,7 @@ const (
 // ErrKeyspaceClosed. Re-creating the same name via CreateKeyspace
 // in the same tx does NOT reactivate the old handle — the new
 // CreateKeyspace returns a fresh *Keyspace while the old handle
-// stays dead until the caller drops it (chunk-5.6 Inv-D).
+// stays dead until the caller drops it (Inv-D).
 type Keyspace struct {
 	keyspaceCore
 
@@ -78,7 +78,7 @@ type Keyspace struct {
 // (wrapping the codec validate error) if the descriptor fails
 // ValidateKeyspaceDescriptor.
 //
-// IndexDecl handling (chunk 7.5): every declared index on the
+// IndexDecl handling: every declared index on the
 // keyspace must be supplied with a matching IndexDecl. Missing
 // decls return ErrIndexExtractorRequired; extras return
 // ErrIndexUnknown; schema-hash or Version drift returns
@@ -137,7 +137,7 @@ func (tx *Tx) OpenKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, error
 	// removal until validation succeeds — a fingerprint mismatch on
 	// open of a name that has an in-flight SetKeyspaceConfig
 	// mutation in dirtyDescriptors must not silently drop that
-	// mutation (chunk-7.5 Round-1 M-2 fix).
+	// mutation.
 	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean)
 	if err := tx.validatePinnedAgainstRegistry(ks, name, pinned); err != nil {
 		delete(tx.openKeyspaces, handle)
@@ -204,7 +204,7 @@ func (tx *Tx) OpenKeyspaceReadOnly(name string) (*Keyspace, error) {
 // For each supplied IndexDecl, a fresh registry entry is written to
 // the new keyspace's index registry sub-tree (allocated lazily on
 // the first registryPut). Each entry starts with Root=0 (empty
-// index data tree) — chunk-7.6 atomic Put populates entries as
+// index data tree) — atomic Put populates entries as
 // rows are written.
 //
 // Delete-then-Create in the same tx is permitted; any previously-
@@ -246,7 +246,7 @@ func (tx *Tx) CreateKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, err
 			// numKeyspaces++ was eager; symmetric decrement here.
 			// If we cleared a pending-delete entry above (pendingDelete
 			// was true), restore it so the original on-disk descriptor
-			// still gets removed at Commit (chunk-7.5 Round-1 M-1 fix).
+			// still gets removed at Commit.
 			delete(tx.openKeyspaces, handle)
 			tx.numKeyspaces--
 			if pendingDelete {
@@ -338,7 +338,7 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Ke
 // parent keyspace's index registry, not by name. Names are returned
 // in sorted byte order.
 //
-// Iteration uses a chunk-4 cursor against the keyspace B+tree's
+// Iteration uses a cursor against the keyspace B+tree's
 // current in-tx root, then merges:
 //   - in-memory openKeyspaces entries with state=Created (created in
 //     this tx, not yet persisted),
@@ -466,7 +466,7 @@ func (tx *Tx) loadDescriptor(name string) (page.KeyspaceDescriptor, bool, error)
 
 // storeDescriptor encodes desc and writes it directly into the
 // on-disk keyspace B+tree under name. Mutates tx.keyspaceRoot to the
-// new root. The chunk-5.6 deferred-flush refactor moved every
+// new root. The deferred-flush refactor moved every
 // production caller to in-memory state + Tx.Commit's flushKeyspaces
 // walk; storeDescriptor remains as an internal helper that
 // keyspace-machinery tests (Kind-mismatch forging, Kind-reserved
@@ -545,7 +545,7 @@ func (ks *Keyspace) Get(key []byte) ([]byte, error) {
 // for slab-budget exhaustion).
 //
 // Side effects on success (all in-memory; persisted at Tx.Commit's
-// flushKeyspaces walk per chunk-5.6 deferred-flush refactor):
+// flushKeyspaces walk per the deferred-flush refactor):
 //   - descriptor.Root is updated to the new btree root.
 //   - descriptor.Count is incremented iff the key did not previously
 //     exist in the keyspace.
@@ -561,7 +561,7 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	if value == nil {
 		value = []byte{}
 	}
-	// Indexed-keyspace path (chunk 7.6): read the old value (if
+	// Indexed-keyspace path: read the old value (if
 	// any), apply per-index maintenance BEFORE the row write so a
 	// unique-probe failure aborts cleanly without partial state.
 	var oldValue []byte
@@ -586,7 +586,7 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	}
 	// For an un-indexed keyspace `existed` is not known yet — the single
 	// btree.PutReportExisting descent below reports it, collapsing the
-	// chunk-7 redundant btree.Has probe + btree.Put into one descent.
+	// redundant btree.Has probe + btree.Put into one descent.
 	// Index maintenance is a no-op with no indexes, so invoking it with
 	// the provisional existed=false on that path is harmless.
 	//
@@ -596,7 +596,7 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	//   (a) rowSnap + restoreIndexes covers in-memory pinnedIndex.
 	//       {root,count} so flushIndexRegistry at Commit-after-error
 	//       does not write a half-mutated registry entry pointing at
-	//       a row that was never written (chunk-7.6 Round-1 H-2 fix).
+	//       a row that was never written.
 	//
 	//   (b) BeginShallowSavepoint / ReleaseSavepoint(success) /
 	//       RestoreSavepoint(error) covers on-disk page allocations
@@ -660,7 +660,7 @@ func (ks *Keyspace) Put(key, value []byte) error {
 
 // Delete removes the entry under key. Returns ErrNotFound if the key
 // does not exist (api-surface.md §Invariants — keyed-removal returns
-// ErrNotFound on miss; chunk-5.1 user-locked decision). ErrKeyEmpty
+// ErrNotFound on miss). ErrKeyEmpty
 // if key is nil or empty. ErrKeyspaceClosed if the handle was
 // invalidated by a same-tx DeleteKeyspace.
 //
@@ -680,7 +680,7 @@ func (ks *Keyspace) Delete(key []byte) error {
 	}
 	cfg := ks.builderCfg()
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
-	// Indexed-keyspace path (chunk 7.6): fetch the old value first
+	// Indexed-keyspace path: fetch the old value first
 	// so the extractor can compute the index entries to delete;
 	// then apply index maintenance; then delete the row.
 	//
@@ -742,7 +742,7 @@ func (ks *Keyspace) Delete(key []byte) error {
 // DeleteRange deletes every key k with start <= k < end from the
 // keyspace per range-delete.md §Algorithm. Returns the count of
 // entries deleted; empty range (start == end OR start > end) returns
-// (0, nil) without mutating the tree per the chunk-5.1 user-locked
+// (0, nil) without mutating the tree per the
 // "bulk operations report rows-affected, not membership" decision.
 //
 // Boundary semantics (range-delete.md §Invariants #1):
@@ -759,22 +759,22 @@ func (ks *Keyspace) Delete(key []byte) error {
 //     three-phase walk.
 //
 // Side effects on success (in-memory; persisted at Tx.Commit's
-// flushKeyspaces walk per chunk-5.6 deferred-flush refactor):
+// flushKeyspaces walk per the deferred-flush refactor):
 //   - desc.Root reflects the new btree root (0 if the keyspace was
 //     emptied).
 //   - desc.Count decrements by the returned count.
 //   - state transitions to Dirty unless already Created.
 //   - Every open Cursor on this keyspace is MarkStale'd.
 //
-// Indexed-keyspace fallback (chunk 7) is not yet implemented;
-// DeleteRange operates on Kind=0 keyspaces only at chunk 5.7. The
-// chunk-7 surface will reroute indexed keyspaces through a per-row
+// Indexed-keyspace fallback is not yet implemented;
+// DeleteRange operates on Kind=0 keyspaces only. The
+// surface will reroute indexed keyspaces through a per-row
 // cursor walk per range-delete.md §Indexed-keyspace fallback.
 // keyspaceCellFree is the per-cell free callback Keyspace.DeleteRange
 // passes to btree.DeleteRange. Per range-delete.md §Algorithm, Kind=0
 // (plain key→value) cells carry at most one overflow chain and
 // contribute exactly 1 to the values count — no subpage or nested-
-// tree cases. Mirrors the prior chunk-5.7 in-place
+// tree cases. Mirrors the prior in-place
 // freeOverflowChainIfPresent + uint64(len(deleted)) shape; the count
 // semantics are preserved exactly (count of cells == count of values
 // for Kind=0).
@@ -793,8 +793,8 @@ func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 	if err := ks.requireWritable(); err != nil {
 		return 0, err
 	}
-	// Reject empty-but-non-nil bounds per the chunk-5.1 user-locked
-	// empty-key policy + the chunk-5.7 spec-amend on DeleteRange
+	// Reject empty-but-non-nil bounds per the
+	// empty-key policy + the DeleteRange
 	// boundary semantics (nil = open, []byte{} = invalid). Treats
 	// both bounds independently so the caller's malformed shape
 	// surfaces at the originating arg.
@@ -808,7 +808,7 @@ func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 		return 0, nil
 	}
 	// Indexed-keyspace fallback per range-delete.md §Indexed-keyspace
-	// fallback (chunk-7.10): when the keyspace has declared indexes,
+	// fallback: when the keyspace has declared indexes,
 	// the O(pages) subtree-retirement fast path is unsafe because
 	// the extractor needs each row's value to compute the prior
 	// index keys. Cursor-walk + Cursor.Delete per row instead. Cost
@@ -820,24 +820,24 @@ func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error) {
 	return ks.deleteRangeUnindexed(start, end, keyspaceCellFree, ks.markCursorsStale)
 }
 
-// deleteRangeIndexed is the chunk-7.10 indexed-keyspace fallback
+// deleteRangeIndexed is the indexed-keyspace fallback
 // for Keyspace.DeleteRange per range-delete.md §Indexed-keyspace
 // fallback. Walks the [start, end) range with a cursor, calling
-// Cursor.Delete per row. Each Cursor.Delete invokes the chunk-7.6
+// Cursor.Delete per row. Each Cursor.Delete invokes the
 // atomic index maintenance to clear the row's index entries
 // before removing the row, so post-condition: row + all its index
 // entries are gone, atomically per row.
 //
 // Returns (count_deleted, err). On a per-row delete error, the
-// loop stops and returns (count_so_far, err) — the chunk-6.8
+// loop stops and returns (count_so_far, err) — the
 // SetKeyspace.DeleteRange partial-progress contract applies here
-// too: the chunk-5.7 atomic contract of Keyspace.DeleteRange is
+// too: the atomic contract of Keyspace.DeleteRange is
 // replaced by per-row atomicity when indexes force the cursor
 // walker.
 func (ks *Keyspace) deleteRangeIndexed(start, end []byte) (uint64, error) {
 	// Internal cursor — bypass ks.Cursor() registration in
 	// ks.openCursors so repeated DeleteRange calls don't grow
-	// the slice unboundedly (chunk-7.10 Round-1 M-1 fix). The
+	// the slice unboundedly. The
 	// internal cursor is the sole mutator during this loop, so
 	// it self-recovers via btree.Cursor.Delete's internal SeekGE
 	// without needing the sibling-stale broadcast that
@@ -869,7 +869,7 @@ func (ks *Keyspace) deleteRangeIndexed(start, end []byte) (uint64, error) {
 }
 
 // newInternalCursor returns a *Cursor on this keyspace WITHOUT
-// registering in ks.openCursors. Used by chunk-7.10 internal
+// registering in ks.openCursors. Used by internal
 // helpers (deleteRangeIndexed) where the cursor's lifetime is
 // scoped to a single helper call and registration would leak
 // entries into the per-tx openCursors slice. The non-registered
@@ -953,7 +953,7 @@ type KeyspaceConfig struct {
 // RestartGroupTarget field lives independently of Kind). Returns:
 //
 //   - ErrNotFound if the named keyspace does not exist (consistent
-//     with Tx.DeleteKeyspace and the chunk-5.1 Delete-on-miss
+//     with Tx.DeleteKeyspace and the Delete-on-miss
 //     invariant family per api-surface.md §Invariants).
 //   - ErrKeyEmpty for an empty name.
 //   - ErrInvalidOptions when cfg.RestartGroupTarget > 255.
@@ -977,8 +977,8 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 	}
 	// 0 = leave unchanged. No other fields are configurable today.
 	if cfg.RestartGroupTarget == 0 {
-		// Existence still needs to be verified — the user-locked
-		// chunk-5.5 contract requires ErrNotFound for a missing
+		// Existence still needs to be verified — the
+		// contract requires ErrNotFound for a missing
 		// name even on a no-op call.
 		_, found, err := tx.lookupDescriptor(name)
 		if err != nil {
@@ -1168,7 +1168,7 @@ func (c *Cursor) Delete() error {
 	if !c.requireOpen(true) {
 		return c.closeErr
 	}
-	// Indexed-keyspace path (chunk 7.6): apply per-index
+	// Indexed-keyspace path: apply per-index
 	// maintenance BEFORE the row delete, using the cursor's
 	// current (key, value). Copy out because c.inner.Delete may
 	// CoW or free the underlying mmap-borrowed slices.
@@ -1192,8 +1192,8 @@ func (c *Cursor) Delete() error {
 			// cursor's Err() reports ErrCursorStale when a sibling
 			// mutation invalidated state; nil-from-Current with
 			// no inner error is the Unpositioned state. Without
-			// this branch, chunk-7.6 would translate stale to
-			// ErrCursorUnpositioned, regressing the chunk-5/6
+			// this branch, the indexed path would translate stale to
+			// ErrCursorUnpositioned, regressing the
 			// state machine contract that the non-indexed path
 			// preserves via btree.ErrCursorStale at the
 			// inner.Delete error path below.
@@ -1219,7 +1219,7 @@ func (c *Cursor) Delete() error {
 		}
 	}
 	if err := c.inner.Delete(); err != nil {
-		// chunk-7.6 H-2 atomicity: revert pinned state on row-write
+		// Atomicity: revert pinned state on row-write
 		// failure so flushIndexRegistry doesn't commit partial-
 		// state indexes pointing at a still-existing row.
 		restoreIndexes(c.ks.indexes, rowSnap)
@@ -1243,7 +1243,7 @@ func (c *Cursor) Delete() error {
 	// Cursor.Delete mutated the keyspace's B+tree. Update the
 	// in-memory descriptor (mirrors Keyspace.Delete's post-
 	// conditions). The descriptor is persisted at Tx.Commit's
-	// flushKeyspaces walk per chunk-5.6 deferred-flush refactor.
+	// flushKeyspaces walk per the deferred-flush refactor.
 	c.ks.desc.Root = c.inner.RootID()
 	c.ks.desc.Count--
 	c.ks.markDirty()
@@ -1321,11 +1321,11 @@ func (c *Cursor) Err() error {
 // of the three subtree-retirement steps documented in the spec:
 //
 //  1. The keyspace's own B+tree (this implementation).
-//  2. Engine-internal index keyspaces — chunk 7.
-//  3. The per-keyspace index registry sub-tree — chunk 7.
+//  2. Engine-internal index keyspaces.
+//  3. The per-keyspace index registry sub-tree.
 //
 // SetKeyspace nested-tree retirement (set members promoted to nested
-// B+trees per set-keyspace.md) lands at chunk 6.
+// B+trees per set-keyspace.md).
 //
 // Errors:
 //   - ErrKeyEmpty on an empty name.
@@ -1338,7 +1338,7 @@ func (c *Cursor) Err() error {
 // AbortTx on Tx.Rollback or flush-walk failure):
 //   - Every page reachable from desc.Root retires into loosePages
 //     (same-tx allocations) or retiredPages (prior-tx pages, RPL'd
-//     at commit) per chunk-5.6 Inv-B.
+//     at commit) per Inv-B.
 //   - The name is added to tx.pendingDeletes (or, when the *Keyspace
 //     was Created in this tx, the entry is simply dropped — there is
 //     no on-disk descriptor to btree.Delete at flush).
@@ -1405,8 +1405,8 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 	cfg := tx.pgr.Config()
 
 	// Three-subtree retirement per api-surface.md §Keyspace API
-	// DeleteKeyspace (chunk-7.8 wires steps 2 + 3; step 1 already
-	// existed at chunk 5.6):
+	// DeleteKeyspace (wires steps 2 + 3; step 1 already
+	// existed):
 	//
 	//   1. Data subtree FreeSubtree.
 	//   2. Per-index Kind=2 data tree FreeSubtree (walk registry).
@@ -1488,7 +1488,7 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 		// requireOpen probes c.ks.dead at every entry and sticks
 		// closeErr = ErrKeyspaceClosed before touching outerCursor,
 		// so a freed-leaf dereference is impossible (set_cursor.go
-		// requireOpen, chunk 6.7).
+		// requireOpen).
 		delete(tx.openSetKeyspaces, handle)
 		existingSKS.dead = true
 		tx.deadSetKeyspaces = append(tx.deadSetKeyspaces, existingSKS)

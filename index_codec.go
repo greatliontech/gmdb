@@ -249,12 +249,12 @@ func decodeRegistryEntry(data []byte) (*indexRegistryEntry, error) {
 // descriptorOwner is the contract a *Keyspace or *SetKeyspace
 // satisfies for the registry-CRUD helpers: read+mutate the parent
 // keyspace's descriptor, AND transition the owning handle's
-// flush-state so the chunk-5.6 flushKeyspaces walk persists the
+// flush-state so the flushKeyspaces walk persists the
 // mutation at Commit. registryPut / registryDelete take this
 // interface (not a raw *page.KeyspaceDescriptor) so that calling
 // the helper without also marking the parent dirty is structurally
-// impossible — closes the H-1 silent-data-loss path the chunk-7.3
-// Round 1 adversarial review surfaced.
+// impossible — closes the silent-data-loss path that
+// adversarial review surfaced.
 //
 // *Keyspace.markDirty (keyspace.go) and *SetKeyspace.markDirty
 // (set_keyspace.go) both preserve a Created state (Created stays
@@ -274,7 +274,7 @@ type descriptorOwner interface {
 //
 // Returns ErrKeyEmpty if name is "" (defense-in-depth against
 // internal callers bypassing validateIndexDecls; matches the
-// chunk-7.1 api-surface.md Tx.RebuildIndex / DropIndex empty-
+// api-surface.md Tx.RebuildIndex / DropIndex empty-
 // IndexDecl.Name sentinel).
 func (tx *Tx) registryGet(owner descriptorOwner, name string) (*indexRegistryEntry, error) {
 	if name == "" {
@@ -302,7 +302,7 @@ func (tx *Tx) registryGet(owner descriptorOwner, name string) (*indexRegistryEnt
 // sub-tree, allocating the sub-tree on first index, bumping the
 // descriptor's IndexRegistryRoot to the post-Put root, AND
 // transitioning the owner's flush state via markDirty() so the
-// chunk-5.6 flushKeyspaces walk persists the new root at Commit.
+// flushKeyspaces walk persists the new root at Commit.
 //
 // Mutates owner.descriptor() and calls owner.markDirty() only on
 // success — a btree.Put error leaves both untouched. Idempotent
@@ -336,7 +336,7 @@ func (tx *Tx) registryPut(owner descriptorOwner, name string, entry *indexRegist
 // If the deleted entry was the last (registry sub-tree shrinks to
 // empty), btree.Delete returns newRoot == 0; IndexRegistryRoot then
 // reflects the empty-registry canonical-at-zero representation per
-// the chunk-7.1 indexing.md entailed invariant. The btree layer
+// the indexing.md entailed invariant. The btree layer
 // frees the (now-orphan) registry leaf via the pager's free list,
 // so the "retire the registry sub-tree pages" portion of the
 // invariant is structurally satisfied.

@@ -1,7 +1,7 @@
 // Package gmdb is a memory-mapped, multi-process, embedded key-value
 // database for Go 1.24+.
 //
-// This file scopes Options to the chunk-1 acceptance surface only: page
+// This file scopes Options to: page
 // size, checksum, file-size bounds, and the slab budget. The full
 // option set in api-surface.md lands incrementally as later chunks
 // require it (SyncMode, MaxReaders, RestartGroupTarget, etc.).

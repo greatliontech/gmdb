@@ -2,8 +2,8 @@ package gmdb
 
 import "errors"
 
-// Sentinel errors. The chunk-1 surface is intentionally small; the full
-// inventory from api-surface.md lands as each surfacing path arrives.
+// Sentinel errors. This surface is intentionally small; the full
+// inventory from api-surface.md is added as each surfacing path arrives.
 var (
 	// ErrInvalidOptions is returned by Open for any Options-validation
 	// failure. Wrap a specific sub-error (errInvalidPageSize, etc.).
@@ -111,7 +111,7 @@ var (
 	// the addressed item is absent: Tx.OpenKeyspace on a missing
 	// keyspace name; Tx.DeleteKeyspace on a missing name;
 	// Keyspace.Delete / SetKeyspace.Delete / SetKeyspace.DeleteValue
-	// per the chunk-5.1 Delete-on-miss invariant
+	// per the Delete-on-miss invariant
 	// (api-surface.md §Invariants).
 	ErrNotFound = errors.New("gmdb: key not found")
 
@@ -188,7 +188,7 @@ var (
 	// creation (keyspaces.md invariant #5), so the API cannot
 	// silently coerce the caller's opts to the existing value
 	// without misleading the caller about the storage layout. Per
-	// chunk-6.1 spec amendment.
+	// api-surface.md.
 	ErrFixedValueSizeMismatch = errors.New("gmdb: keyspace exists with different FixedValueSize")
 
 	// ErrIndexExtractorRequired is returned by Tx.OpenKeyspace /
@@ -243,13 +243,13 @@ var (
 	// let callers dispatch between keyspace-missing
 	// (ErrNotFound — keyspace-management dimension) and
 	// index-name-missing (ErrIndexNotFound — index-management
-	// dimension) per chunk-7.1 user-locked.
+	// dimension).
 	ErrIndexNotFound = errors.New("gmdb: index not found")
 
 	// ErrIndexEncoderIDEmpty is returned by TypedIndex declaration
 	// when the supplied Encoder[T].ID() returns "" — encoder IDs
 	// must be unique non-empty strings for schema-hash
-	// determinism. Per typed-keyspaces.md (lands at chunk 9).
+	// determinism. Per typed-keyspaces.md.
 	ErrIndexEncoderIDEmpty = errors.New("gmdb: typed index encoder returned empty ID() — encoder IDs must be unique non-empty strings")
 
 	// ErrBulkLoadOutOfOrder is returned by Keyspace.BulkLoad /

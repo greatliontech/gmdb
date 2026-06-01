@@ -192,7 +192,7 @@ func DecodeCoveringTuple(value []byte) ([][]byte, error) {
 //
 // A SetKeyspace compound-PK component (escape(setKey) || 0x00 0x01
 // || escape(setValue)) contains a literal 0x00 0x01 that this
-// strict decoder rejects — chunk-7.9 SetKeyspace lookup uses an
+// strict decoder rejects — SetKeyspace lookup uses an
 // ad-hoc PK-component decoder that allows the 0x00 0x01 separator,
 // not this strict function.
 //

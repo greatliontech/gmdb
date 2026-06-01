@@ -34,7 +34,7 @@ type SetKeyspaceOptions struct {
 //     opened against it); subsequent operations return
 //     ErrKeyspaceClosed.
 //   - Re-creating the same name via CreateSetKeyspace in the same tx
-//     does NOT reactivate the old handle (chunk-5.6 Inv-D).
+//     does NOT reactivate the old handle (Inv-D).
 //
 // All values for a key are stored as either:
 //   - An inline subpage cell (CellFlagMultiValue, NestedTree clear)
@@ -44,7 +44,7 @@ type SetKeyspaceOptions struct {
 //     CountValues.
 //
 // Per set-keyspace.md §Storage Strategy. The promotion / demotion is
-// engine-managed (chunk 6.4 / 6.5); SetKeyspace.Put / DeleteValue
+// engine-managed; SetKeyspace.Put / DeleteValue
 // transparently dispatch between subpage in-place edits and nested-
 // tree mutations.
 type SetKeyspace struct {
@@ -56,7 +56,7 @@ type SetKeyspace struct {
 	// B+tree (parent OR a cell's nested tree) invalidate cursor
 	// state because the cursor's outer btree.Cursor and inner
 	// materialized values may both be stale post-mutation. Same
-	// pattern as Keyspace.openCursors (chunk-5 markCursorsStale
+	// pattern as Keyspace.openCursors (markCursorsStale
 	// + SetRootID).
 	openSetCursors []*SetCursor
 }
@@ -96,7 +96,7 @@ func (ks *SetKeyspace) markSetCursorsStale() {
 }
 
 // OpenSetKeyspace opens an existing Kind=1 keyspace (SetKeyspace) for
-// read+write with the supplied IndexDecls (chunk-7.5 indexing wiring).
+// read+write with the supplied IndexDecls.
 // Same shape as OpenKeyspace: validation against the stored registry
 // returns ErrIndexExtractorRequired / ErrIndexUnknown /
 // ErrIndexFingerprintMismatch as appropriate; same-tx re-open returns
@@ -139,8 +139,7 @@ func (tx *Tx) OpenSetKeyspace(name string, indexes ...*IndexDecl) (*SetKeyspace,
 	if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindSetKeyspace); err != nil {
 		return nil, err
 	}
-	// Defer dirtyDescriptors removal until validation succeeds —
-	// chunk-7.5 Round-1 M-2 fix.
+	// Defer dirtyDescriptors removal until validation succeeds.
 	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean)
 	if err := tx.validatePinnedAgainstRegistry(sks, name, pinned); err != nil {
 		delete(tx.openSetKeyspaces, handle)
@@ -249,7 +248,7 @@ func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions, indexes .
 	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated)
 	if len(pinned) > 0 {
 		if err := tx.writeNewIndexRegistry(sks, pinned); err != nil {
-			// chunk-7.5 Round-1 M-1 fix: restore pendingDeletes
+			// Restore pendingDeletes
 			// state if we cleared it above.
 			delete(tx.openSetKeyspaces, handle)
 			tx.numKeyspaces--
@@ -495,13 +494,13 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error) {
 
 // Put inserts value into the set stored under key. added reports
 // whether the set actually grew (false iff (key, value) was already
-// present — the call is a no-op in that case). Per the chunk-6.1
-// user-locked SetKeyspace.Put signature.
+// present — the call is a no-op in that case). Per the
+// SetKeyspace.Put signature.
 //
 // On a missing key: creates a new subpage cell with just (value).
 // On an existing key with subpage cell: inserts into the subpage; if
 // the result exceeds SubpagePromotionThreshold, promotes to a
-// nested B+tree (chunk 6.4 PromoteSubpageToNestedTree).
+// nested B+tree (PromoteSubpageToNestedTree).
 // On an existing key with nested-tree cell: inserts into the nested
 // tree via btree.InsertIfAbsent (one descent, a no-op if the value is
 // already a member); on insert, updates the parent cell's NestedCount.
@@ -532,7 +531,7 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 	}
 	cfg := ks.builderCfg()
 
-	// Indexed-keyspace path (chunk 7.9): pre-probe the membership
+	// Indexed-keyspace path: pre-probe the membership
 	// to determine if this Put is an add or a no-op. The spec at
 	// indexing.md §Write Path requires maintenance BEFORE the row
 	// write so a unique-probe failure aborts cleanly; for
@@ -738,8 +737,8 @@ func (ks *SetKeyspace) putIntoNestedTree(cfg page.Config, key, value []byte, e p
 }
 
 // Delete removes the key and ALL its values from the SetKeyspace.
-// Returns ErrNotFound when the key does not exist (per the chunk-5.1
-// user-locked Delete-on-miss invariant for keyed-removal APIs —
+// Returns ErrNotFound when the key does not exist (per the
+// Delete-on-miss invariant for keyed-removal APIs —
 // api-surface.md §Invariants).
 //
 // For a key with a nested-tree cell, bulk-frees the nested subtree
@@ -765,7 +764,7 @@ func (ks *SetKeyspace) Delete(key []byte) (err error) {
 		return ErrNotFound
 	}
 
-	// Indexed-keyspace path (chunk 7.9 + indexing.md §Indexes on
+	// Indexed-keyspace path (indexing.md §Indexes on
 	// SetKeyspaces): bulk-key Delete on an indexed SetKeyspace
 	// cannot use the bulk-free fast path because each (key, value)
 	// pair must have its index entries removed via the extractor.
@@ -844,7 +843,7 @@ func (ks *SetKeyspace) Delete(key []byte) (err error) {
 
 // DeleteValue removes a single (key, value) pair. Returns
 // ErrNotFound when the key does not exist OR when the key exists but
-// value is not in its set (per the chunk-5.1 Delete-on-miss
+// value is not in its set (per the Delete-on-miss
 // invariant — api-surface.md §Invariants).
 //
 // On a subpage cell: removes the value from the subpage; if the
@@ -871,7 +870,7 @@ func (ks *SetKeyspace) DeleteValue(key, value []byte) (err error) {
 	}
 	cfg := ks.builderCfg()
 
-	// Indexed-keyspace path (chunk 7.9): pre-probe that the
+	// Indexed-keyspace path: pre-probe that the
 	// (key, value) pair exists, then run index maintenance BEFORE
 	// the actual subpage / nested-tree delete. On any subsequent
 	// failure, restore pinned state.
@@ -1066,7 +1065,7 @@ func setKeyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry)
 //
 // Mechanism splits on whether the SetKeyspace has secondary
 // indexes declared (per range-delete.md §Indexed-keyspace
-// fallback chunk-7.10 amendment — the same dispatch shape
+// fallback — the same dispatch shape
 // Keyspace.DeleteRange uses):
 //
 //   - **Un-indexed (len(ks.indexes) == 0)**: dispatches to
@@ -1081,12 +1080,12 @@ func setKeyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry)
 //     (0, err) with no observable mutations (tx-level Rollback
 //     restores via pager bitmap snapshot per pager-slab.md), the
 //     same all-or-nothing contract as Keyspace.DeleteRange. The
-//     chunk-6.8 per-row partial-progress contract no longer
+//     per-row partial-progress contract no longer
 //     applies on this path; an error means nothing was deleted.
 //
 //   - **Indexed (len(ks.indexes) > 0)**: dispatches to the per-
 //     key Delete loop helper (deleteRangePerKey). Each
-//     SetKeyspace.Delete invokes chunk-7.9's
+//     SetKeyspace.Delete invokes
 //     applyIndexMaintenanceOnBulkKeyDelete, walking every
 //     (setKey, setValue) pair and clearing index entries via the
 //     extractor. **Per-row atomic on error**: returns
@@ -1096,7 +1095,7 @@ func setKeyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry)
 //     = keys in range, M = average set size per key.
 //
 // The atomicity-contract split between the two paths mirrors
-// Keyspace.DeleteRange's chunk-7.10 split (atomic walker for
+// Keyspace.DeleteRange's split (atomic walker for
 // Kind=0 un-indexed; per-row cursor walk for Kind=0 indexed).
 //
 // Errors:
@@ -1130,9 +1129,9 @@ func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 		return 0, nil
 	}
 	if len(ks.indexes) > 0 {
-		// Indexed path: per-key Delete loop preserves chunk-7.9's
+		// Indexed path: per-key Delete loop preserves
 		// applyIndexMaintenanceOnBulkKeyDelete per-row contract +
-		// chunk-6.8 per-row-atomic partial-progress semantic.
+		// a per-row-atomic partial-progress semantic.
 		cfg := ks.builderCfg()
 		return ks.deleteRangePerKey(cfg, start, end)
 	}
@@ -1158,7 +1157,7 @@ func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 // INCREASE (a corruption signal — set-keyspace.md §Invariants
 // entailed E2 has desc.Count strictly decrease per successful
 // Delete on a non-empty cell), and accumulate the per-row delta.
-// Compared to the chunk-6.8 v1 pattern (`before - ks.desc.Count`
+// Compared to the v1 pattern (`before - ks.desc.Count`
 // once at end) the per-iteration shape is wrap-immune even under
 // a corrupt on-disk state where Delete might leave desc.Count
 // above its pre-call value. Cannot use Keyspace.deleteRangeIndexed's

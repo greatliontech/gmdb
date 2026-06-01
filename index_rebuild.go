@@ -13,7 +13,7 @@ import (
 
 // descAdapterValue implements descriptorOwner for code paths that
 // work directly on a *page.KeyspaceDescriptor without a *Keyspace /
-// *SetKeyspace handle (chunk-7.8 RebuildIndex / DropIndex on a
+// *SetKeyspace handle (RebuildIndex / DropIndex on a
 // keyspace not currently cached in tx.openKeyspaces, per
 // indexing.md §Recovery pattern after ErrIndexFingerprintMismatch
 // where OpenKeyspace fails BEFORE caching). The dirty flag is
@@ -32,7 +32,7 @@ func (a *descAdapterValue) markDirty()                           { a.dirty = tru
 //   - owner: a descriptorOwner the caller passes to registry CRUD
 //     helpers. For a currently-open Kind=0 keyspace, the cached
 //     *Keyspace handle. For a currently-open Kind=1 SetKeyspace
-//     (chunk 7.10 wires this), the cached *SetKeyspace. Otherwise,
+//     the cached *SetKeyspace. Otherwise,
 //     a descAdapterValue that the caller propagates to
 //     tx.dirtyDescriptors at the end of the op.
 //   - cachedKS / cachedSKS: non-nil when the keyspace is cached
@@ -65,7 +65,7 @@ func (tx *Tx) resolveKeyspaceForIndexOp(name string) (owner descriptorOwner, cac
 		return nil, nil, nil, page.KeyspaceDescriptor{}, ErrKeyspaceReserved
 	}
 	// Not-cached path: build an adapter the caller propagates.
-	// Chunk-7.10 removes the chunk-7.8 H-1 Kind=1 gate now that
+	// The Kind=1 gate is removed now that
 	// RebuildIndex's row-walk is kind-aware.
 	adapter := &descAdapterValue{desc: d}
 	return adapter, nil, nil, d, nil
@@ -107,10 +107,10 @@ func (tx *Tx) propagateNotCachedDescChange(name string, owner descriptorOwner) {
 // Errors:
 //   - ErrKeyEmpty if keyspace or decl.Name is empty.
 //   - ErrIndexExtractorRequired if decl.Extract is nil.
-//   - ErrNotFound if the keyspace does not exist (chunk-7.1
-//     user-locked: keyspace-management dimension).
+//   - ErrNotFound if the keyspace does not exist
+//     (keyspace-management dimension).
 //   - ErrIndexNotFound if the keyspace exists but decl.Name is
-//     not in its registry (chunk-7.1 user-locked: index-management
+//     not in its registry (index-management
 //     dimension).
 //   - ErrKeyspaceReserved if the keyspace name resolves to Kind=2.
 //   - ErrIndexUniqueViolation on duplicate keys from the new
@@ -223,8 +223,7 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	isSetKeyspace := desc.Kind == page.KeyspaceKindSetKeyspace
 
 	// processPair builds and writes index entries for one extractor
-	// input. For Keyspace: k1=rowKey, k2=rowValue. For SetKeyspace
-	// (chunk-7.10): k1=setKey, k2=setValue — per-(setKey, setValue)
+	// input. For Keyspace: k1=rowKey, k2=rowValue. For SetKeyspace: k1=setKey, k2=setValue — per-(setKey, setValue)
 	// extractor invocation per indexing.md §Indexes on SetKeyspaces.
 	processPair := func(k1, k2 []byte) error {
 		entries := decl.Extract(k1, k2)
@@ -291,7 +290,7 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		}
 		// newInternalSetCursor bypasses openSetCursors registration
 		// so repeated RebuildIndex calls don't leak entries into the
-		// per-tx slice (chunk-7.10 Round-1 M-1 fix).
+		// per-tx slice.
 		sc := newInternalSetCursor(sks)
 		for sk, sv := sc.First(); sk != nil; sk, sv = sc.Next() {
 			skCopy := bytes.Clone(sk)
@@ -317,7 +316,7 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		}
 	}
 
-	// Publish-then-retire ordering (chunk-7.8 Round-1 H-2 fix):
+	// Publish-then-retire ordering:
 	// registryPut the new entry FIRST so a registryPut failure
 	// leaves the old data tree intact. Only after the registry
 	// points at the new root do we FreeSubtree the old root —
@@ -418,7 +417,7 @@ func (tx *Tx) syncRebuildToCachedPinned(cachedKS *Keyspace, cachedSKS *SetKeyspa
 
 // retireIndexRegistry implements steps 2+3 of the three-subtree
 // retirement in Keyspace.DeleteKeyspace (api-surface.md §Keyspace
-// API DeleteKeyspace; chunk-7.8 wires this). For each index entry
+// API DeleteKeyspace). For each index entry
 // in the registry sub-tree:
 //
 //  1. Decode the entry to read its Root (the index data tree).
@@ -431,9 +430,9 @@ func (tx *Tx) syncRebuildToCachedPinned(cachedKS *Keyspace, cachedSKS *SetKeyspa
 // pages to the loose pool, but the descriptor itself is still
 // reachable from the caller's tx state (DeleteKeyspace's removal
 // of the descriptor from the keyspace B+tree happens at the
-// chunk-5.6 flushKeyspaces Step 1, which runs at Commit). Tx
+// flushKeyspaces Step 1, which runs at Commit). Tx
 // Rollback restores via AbortTx; Commit-after-error leaks (same
-// rest-of-tx-continues contract as chunk 7.5+7.6).
+// rest-of-tx-continues contract).
 func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) error {
 	cfg := tx.pgr.Config()
 	mergeThreshold := tx.db.opts.MergeThreshold
@@ -482,7 +481,7 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 // data sub-tree pages (via btree.FreeSubtree) and removes the
 // registry entry. If the dropped index was the keyspace's last,
 // registryDelete's btree.Delete returns root=0, structurally
-// satisfying the chunk-7.1 indexing.md entailed invariant on
+// satisfying the indexing.md entailed invariant on
 // empty-registry canonical-at-zero.
 //
 // Errors mirror RebuildIndex: ErrKeyEmpty, ErrNotFound (keyspace),
@@ -529,7 +528,7 @@ func (tx *Tx) DropIndex(keyspace, indexName string) (retErr error) {
 		tx.pgr.ReleaseSavepoint(sp)
 	}()
 
-	// Publish-then-retire ordering (chunk-7.8 Round-1 H-2 fix):
+	// Publish-then-retire ordering:
 	// remove the registry entry FIRST so any failure leaves the
 	// data tree intact (and recoverable). Only after the registry
 	// is updated do we FreeSubtree the data tree pages.

@@ -161,7 +161,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 // snapshot's meta: the keyspace B+tree, plus every keyspace's data tree
 // (including set-keyspace nested trees and overflow runs, which btree.Walk
 // recurses), index registry sub-tree, and index data trees. Mirrors the
-// chunk-11.2 Check structural walk, but records ids only. A walk failure
+// Check structural walk, but records ids only. A walk failure
 // (corrupt/forged tree) is returned to the caller.
 func collectReachable(rtx *ReadTx, cfg page.Config, meta page.Meta, hwm, firstData uint64) (bitset, error) {
 	reachable := newBitset(hwm)
@@ -207,7 +207,7 @@ func collectReachable(rtx *ReadTx, cfg page.Config, meta page.Meta, hwm, firstDa
 // freshFileWriter is the bulkPageWriter + bulkOverflowWriter for CopyTo's
 // compacting rebuild: it allocates page ids sequentially from firstData and
 // pwrites fully-formed pages into the destination file. It shares the
-// chunk-8 bottom-up builders (bulkBuilder / setBulk / bulkLeafEntry) with
+// bottom-up builders (bulkBuilder / setBulk / bulkLeafEntry) with
 // BulkLoad — the only difference is the destination (a fresh file rather
 // than the live pager).
 type freshFileWriter struct {

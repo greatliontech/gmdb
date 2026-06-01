@@ -33,8 +33,7 @@ import (
 // Mechanics (durability.md §Checkpoint mechanics):
 //
 //  1. Acquire the write lock via the flock goroutine — serialises
-//     against any concurrent write tx and against Compact (when
-//     chunk 11 wires it). Concurrent reads are unaffected. Honours
+//     against any concurrent write tx and against Compact. Concurrent reads are unaffected. Honours
 //     ctx for the wait; once the lock is granted, ctx is not
 //     checked further (the fsync + pwrite sequence completes
 //     unconditionally, bounded and short relative to a Compact

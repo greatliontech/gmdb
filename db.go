@@ -30,8 +30,8 @@ type DB struct {
 	pool *pager.BufPool
 	opts Options
 
-	// logger captures Options.Logger at Open with the chunk-5.5
-	// nil → discard-handler fallback (the spec-amend default: a nil
+	// logger captures Options.Logger at Open with the
+	// nil → discard-handler fallback (the default: a nil
 	// Options.Logger discards diagnostic output rather than routing
 	// to slog.Default()). Cleanup paths reference this via cleanup-
 	// closure captures rather than slog.Default() so per-DB logging
@@ -84,7 +84,7 @@ type DB struct {
 	// closeGate is a heap-allocated coordination struct shared by
 	// pointer with every txCleanupInfo, every readTxCleanupInfo, and
 	// the dbCleanupInfo. Composes the (closed bool, txInflight
-	// counter) pair the chunk-3.3 promotion of leak-detection.md
+	// counter) pair that leak-detection.md
 	// §Cleanup Behavior + §Close Ordering requires — see closegate.go
 	// for the full rationale.
 	//
@@ -207,8 +207,8 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 	// be in the middle of pager.Init (file exists but metas not yet
 	// written). Read meta-0 with bounded retry-on-empty so we don't
 	// observe a half-initialised file and fail with a misleading
-	// "PageSize invalid" error. Chunk 2's lock file resolves the
-	// race structurally; until then this is a chunk-1 defensive
+	// "PageSize invalid" error. The lock file resolves the
+	// race structurally; this is a defensive
 	// measure.
 	persistedPageSize, err := readPersistedPageSize(ctx, file, !created)
 	if err != nil {
@@ -245,7 +245,7 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 	// Options.Logger (or discard) once it has been resolved.
 	openWarnNoCheckpoint := opened.NoCheckpoint
 
-	// Capture Options.Logger with the chunk-5.5 spec-amend default
+	// Capture Options.Logger with the default
 	// (nil → discard handler) so per-DB logging routes to the
 	// caller's chosen sink — never to slog.Default(). Built before the
 	// lock section so the read-only fallback can warn through it.
@@ -600,8 +600,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 		return nil, ErrDatabaseReadOnly
 	}
 	// Fast-path close check. db.closeGate.IsClosed() is the
-	// spec-tier *closeGate gate (leak-detection.md §Close Ordering
-	// + chunk-3.3 refcount-drain promotion); a release-store at the
+	// spec-tier *closeGate gate (leak-detection.md §Close Ordering); a release-store at the
 	// top of Close makes this Load-true any time after Close begins.
 	// The subsequent snapshot under db.mu is still required: a Begin
 	// that interleaves between this Load and Close's CAS sees
@@ -711,7 +710,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	pgr.SetCommitState(prevMeta.HighWaterMark, prevMeta.MaxSize, bound)
 	pgr.SetSizeParams(prevMeta.GrowStep, prevMeta.MinSize)
 	pgr.BeginTx()
-	// Seed currentTxnID at tx-start so the chunk-5.5 LaggingReader
+	// Seed currentTxnID at tx-start so the LaggingReader
 	// callback's Lag = currentTxnID - reclamationBound is meaningful
 	// when AllocPage fires from the user path (Keyspace.Put →
 	// btree.Put → pw.AllocPage). Without this, currentTxnID stays
@@ -801,7 +800,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 // corruption falls through to the wrapped ErrCorrupted from
 // DiscoverPageSize after the final attempt. Chunk-2's lock file
 // resolves the race window structurally; the retry remains here as a
-// chunk-1 defensive measure.
+// defensive measure.
 func readPersistedPageSize(ctx context.Context, file *os.File, raceWindow bool) (uint32, error) {
 	const (
 		maxAttempts = 50

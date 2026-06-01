@@ -104,7 +104,7 @@ type SetCursor struct {
 // returned by this method that is still reachable; subsequent
 // non-repositioning ops surface ErrCursorStale until re-Seeked.
 // newInternalSetCursor returns a *SetCursor on this SetKeyspace
-// WITHOUT registering in ks.openSetCursors. Used by chunk-7.10
+// WITHOUT registering in ks.openSetCursors. Used by
 // internal helpers (RebuildIndex's per-(setKey, setValue) walk
 // on the cached path) where the cursor's lifetime is scoped to a
 // single helper call. Registration would leak entries into the
@@ -484,7 +484,7 @@ func (c *SetCursor) CountValues() (uint64, error) {
 // Positioned at a real value (not value-EOF / value-BOF);
 // otherwise returns ErrCursorUnpositioned. After delete, advances
 // to the next (key, value) pair OR transitions to end-of-iteration
-// — matching the chunk-4 Cursor.Delete post-state contract.
+// — matching the Cursor.Delete post-state contract.
 //
 // Last-value-of-key delete drops the parent cell per Inv-1 (empty
 // sets must not persist); the cursor's subsequent Next would land

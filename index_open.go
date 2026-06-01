@@ -23,30 +23,30 @@ type pinnedIndex struct {
 	// Extract.
 	decl *IndexDecl
 
-	// schemaHash is the chunk-7.2 schema-hash computed from decl
+	// schemaHash is the schema-hash computed from decl
 	// at open time. Cached so same-tx re-open comparison doesn't
 	// re-hash.
 	schemaHash uint64
 
 	// root is the index data B+tree root page ID (the registry
 	// entry's Root field). Empty index → root == 0. Updated by
-	// chunk-7.6 atomic Put / chunk-7.8 RebuildIndex / chunk-7.8
+	// atomic Put / RebuildIndex /
 	// DropIndex.
 	root uint64
 
 	// count is the number of entries in the index data tree
-	// (registry entry's Count field). Updated by chunk-7.6.
+	// (registry entry's Count field). Updated by atomic Put.
 	count uint64
 }
 
 // indexesEqualByHashableInputs reports whether two pinned-index maps
-// are equivalent for the chunk-7.5 same-tx re-open idempotence check
+// are equivalent for the same-tx re-open idempotence check
 // (indexing.md §Re-opening). Equality is by **hashable inputs only**:
 // the set of index names, each index's schema-hash, each index's
 // Version. The Extract function pointer is NOT a hashable input —
 // per the spec "Go function values are not comparable, so the
 // Extract function pointer is NOT part of the hashable-inputs
-// comparison." Encoder IDs (typed indexes) land at chunk 9.
+// comparison." Encoder IDs (typed indexes).
 func indexesEqualByHashableInputs(a, b map[string]*pinnedIndex) bool {
 	if len(a) != len(b) {
 		return false
@@ -89,7 +89,7 @@ func buildPinnedIndexMap(decls []*IndexDecl) (map[string]*pinnedIndex, error) {
 
 // validatePinnedAgainstRegistry compares the supplied pinned-index
 // set against the on-disk registry stored under owner. Implements
-// the chunk-7.5 open-time validation per indexing.md §Open
+// the open-time validation per indexing.md §Open
 // Semantics:
 //
 //   - Each registry entry must have a matching supplied IndexDecl
@@ -189,11 +189,11 @@ func (tx *Tx) validatePinnedAgainstRegistry(
 
 // writeNewIndexRegistry writes a fresh registry entry per pinned
 // index to the parent keyspace's registry sub-tree. Used by
-// CreateKeyspace / CreateSetKeyspace at chunk-7.5: the parent
+// CreateKeyspace / CreateSetKeyspace: the parent
 // descriptor is newly-created with IndexRegistryRoot=0, so the
 // first registryPut allocates the registry sub-tree; subsequent
 // entries grow it. Each new entry starts with Root=0 and Count=0
-// (empty index data tree — populated by chunk-7.6 atomic Put as
+// (empty index data tree — populated by atomic Put as
 // rows are written).
 //
 // The pinned-index map's root/count fields are left at zero (they
