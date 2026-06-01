@@ -1150,10 +1150,14 @@ review):
 Chunk-5-precedent deferrals carried forward at chunk-6
 (no explicit issue doc filed; chunk-5 set the same precedent for
 `Keyspace`): `SetKeyspace.NextSequence`, `SetKeyspace.Stats`,
-`SetKeyspace.All / Range / Prefix` `iter.Seq2` helpers. (Lands:
-when corresponding `Keyspace.*` lands.) `SetKeyspace.Index` is
-chunk 7. `SetKeyspace.BulkLoad` is chunk 8 (covered in §Chunk 8
-scope alongside `Keyspace.BulkLoad`).
+`SetKeyspace.All / Range / Prefix` `iter.Seq2` helpers. These were
+all subsequently built as backlog burn-down — `NextSequence` and
+`Stats` (with the `Keyspace` analogues), and the byte-level
+`All / Range / Prefix` for both `Keyspace` and `SetKeyspace` (the
+authoritative description is api-surface.md §Range Iterators;
+`iterators.go`, with the typed layer delegating to them).
+`SetKeyspace.Index` is chunk 7. `SetKeyspace.BulkLoad` is chunk 8
+(covered in §Chunk 8 scope alongside `Keyspace.BulkLoad`).
 
 ### Chunk 7 — Indexing
 

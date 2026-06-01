@@ -1,7 +1,6 @@
 package gmdb
 
 import (
-	"bytes"
 	"iter"
 )
 
@@ -247,8 +246,7 @@ func (t *TypedKS[K, V]) Cursor() *TypedCursor[K, V] {
 // the spec's typed-iterator surface).
 func (t *TypedKS[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		c := t.ks.Cursor()
-		for kb, vb := c.First(); kb != nil; kb, vb = c.Next() {
+		for kb, vb := range t.ks.All() {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
@@ -267,17 +265,7 @@ func (t *TypedKS[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 		if err != nil {
 			return
 		}
-		c := t.ks.Cursor()
-		var kb, vb []byte
-		if sb != nil {
-			kb, vb = c.SeekGE(sb)
-		} else {
-			kb, vb = c.First()
-		}
-		for ; kb != nil; kb, vb = c.Next() {
-			if eb != nil && bytes.Compare(kb, eb) >= 0 {
-				return
-			}
+		for kb, vb := range t.ks.Range(sb, eb) {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
@@ -292,11 +280,7 @@ func (t *TypedKS[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
 		if err != nil {
 			return
 		}
-		c := t.ks.Cursor()
-		for kb, vb := c.SeekGE(pb); kb != nil; kb, vb = c.Next() {
-			if !bytes.HasPrefix(kb, pb) {
-				return
-			}
+		for kb, vb := range t.ks.Prefix(pb) {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return

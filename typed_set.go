@@ -1,7 +1,6 @@
 package gmdb
 
 import (
-	"bytes"
 	"iter"
 )
 
@@ -207,8 +206,7 @@ func (t *TypedSetKS[K, V]) Cursor() *TypedSetCursor[K, V] {
 // error visibility), matching TypedKS.
 func (t *TypedSetKS[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
-		c := t.sks.Cursor()
-		for kb, vb := c.First(); kb != nil; kb, vb = c.Next() {
+		for kb, vb := range t.sks.All() {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
@@ -227,17 +225,7 @@ func (t *TypedSetKS[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 		if err != nil {
 			return
 		}
-		c := t.sks.Cursor()
-		var kb, vb []byte
-		if sb != nil {
-			kb, vb = c.SeekGE(sb)
-		} else {
-			kb, vb = c.First()
-		}
-		for ; kb != nil; kb, vb = c.Next() {
-			if eb != nil && bytes.Compare(kb, eb) >= 0 {
-				return
-			}
+		for kb, vb := range t.sks.Range(sb, eb) {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
@@ -252,11 +240,7 @@ func (t *TypedSetKS[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
 		if err != nil {
 			return
 		}
-		c := t.sks.Cursor()
-		for kb, vb := c.SeekGE(pb); kb != nil; kb, vb = c.Next() {
-			if !bytes.HasPrefix(kb, pb) {
-				return
-			}
+		for kb, vb := range t.sks.Prefix(pb) {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
