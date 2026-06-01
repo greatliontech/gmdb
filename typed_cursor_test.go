@@ -8,7 +8,7 @@ import (
 
 // newTypedNumsKS creates a TypedKeyspace[uint64,string] populated with
 // keys 1..n (value "v<k>") and returns the handle + cleanup.
-func newTypedNumsKS(t *testing.T, n uint64) (*TypedKS[uint64, string], func()) {
+func newTypedNumsKS(t *testing.T, n uint64) (*TypedKeyspaceHandle[uint64, string], func()) {
 	t.Helper()
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})

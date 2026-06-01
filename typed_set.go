@@ -19,7 +19,7 @@ import (
 
 // TypedSetKeyspace wraps a SetKeyspace with type-safe encoding. Stateless
 // descriptor (name + encoders + creation options); Open / Create return
-// a transaction-scoped TypedSetKS handle.
+// a transaction-scoped TypedSetKeyspaceHandle handle.
 type TypedSetKeyspace[K, V any] struct {
 	name   string
 	keyEnc Encoder[K]
@@ -35,41 +35,22 @@ func NewTypedSetKeyspace[K, V any](name string, keyEnc Encoder[K], valEnc Encode
 	return &TypedSetKeyspace[K, V]{name: name, keyEnc: keyEnc, valEnc: valEnc, opts: opts}
 }
 
-func (tsk *TypedSetKeyspace[K, V]) translateIndexes(indexes []AnyTypedIndex[K, V]) ([]*IndexDecl, error) {
-	if len(indexes) == 0 {
-		return nil, nil
-	}
-	decls := make([]*IndexDecl, 0, len(indexes))
-	for _, idx := range indexes {
-		d, err := idx.indexDecl(tsk.keyEnc, tsk.valEnc)
-		if err != nil {
-			return nil, err
-		}
-		decls = append(decls, d)
-	}
-	return decls, nil
-}
-
-func (tsk *TypedSetKeyspace[K, V]) wrap(sks *SetKeyspace) *TypedSetKS[K, V] {
-	return &TypedSetKS[K, V]{sks: sks, keyEnc: tsk.keyEnc, valEnc: tsk.valEnc}
+func (tsk *TypedSetKeyspace[K, V]) wrap(sks *SetKeyspace) *TypedSetKeyspaceHandle[K, V] {
+	return &TypedSetKeyspaceHandle[K, V]{sks: sks, keyEnc: tsk.keyEnc, valEnc: tsk.valEnc}
 }
 
 // Open opens the set keyspace for read+write within tx with the supplied
 // typed indexes. OpenReadOnly opens for reads only (no index decls).
 // Create / CreateIfNotExists create with the descriptor's options.
-func (tsk *TypedSetKeyspace[K, V]) Open(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedSetKS[K, V], error) {
-	decls, err := tsk.translateIndexes(indexes)
-	if err != nil {
-		return nil, err
-	}
-	sks, err := tx.OpenSetKeyspace(tsk.name, decls...)
-	if err != nil {
-		return nil, err
-	}
-	return tsk.wrap(sks), nil
+// All three share openTypedHandle (typed.go) with the byte SetKeyspace
+// factory target; only OpenReadOnly takes no index decls.
+func (tsk *TypedSetKeyspace[K, V]) Open(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedSetKeyspaceHandle[K, V], error) {
+	return openTypedHandle(tsk.keyEnc, tsk.valEnc, indexes,
+		func(decls []*IndexDecl) (*SetKeyspace, error) { return tx.OpenSetKeyspace(tsk.name, decls...) },
+		tsk.wrap)
 }
 
-func (tsk *TypedSetKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedSetKS[K, V], error) {
+func (tsk *TypedSetKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedSetKeyspaceHandle[K, V], error) {
 	sks, err := tx.OpenSetKeyspaceReadOnly(tsk.name)
 	if err != nil {
 		return nil, err
@@ -77,39 +58,31 @@ func (tsk *TypedSetKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedSetKS[K, V], erro
 	return tsk.wrap(sks), nil
 }
 
-func (tsk *TypedSetKeyspace[K, V]) Create(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedSetKS[K, V], error) {
-	decls, err := tsk.translateIndexes(indexes)
-	if err != nil {
-		return nil, err
-	}
-	sks, err := tx.CreateSetKeyspace(tsk.name, tsk.opts, decls...)
-	if err != nil {
-		return nil, err
-	}
-	return tsk.wrap(sks), nil
+func (tsk *TypedSetKeyspace[K, V]) Create(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedSetKeyspaceHandle[K, V], error) {
+	return openTypedHandle(tsk.keyEnc, tsk.valEnc, indexes,
+		func(decls []*IndexDecl) (*SetKeyspace, error) {
+			return tx.CreateSetKeyspace(tsk.name, tsk.opts, decls...)
+		},
+		tsk.wrap)
 }
 
-func (tsk *TypedSetKeyspace[K, V]) CreateIfNotExists(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedSetKS[K, V], error) {
-	decls, err := tsk.translateIndexes(indexes)
-	if err != nil {
-		return nil, err
-	}
-	sks, err := tx.CreateSetKeyspaceIfNotExists(tsk.name, tsk.opts, decls...)
-	if err != nil {
-		return nil, err
-	}
-	return tsk.wrap(sks), nil
+func (tsk *TypedSetKeyspace[K, V]) CreateIfNotExists(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedSetKeyspaceHandle[K, V], error) {
+	return openTypedHandle(tsk.keyEnc, tsk.valEnc, indexes,
+		func(decls []*IndexDecl) (*SetKeyspace, error) {
+			return tx.CreateSetKeyspaceIfNotExists(tsk.name, tsk.opts, decls...)
+		},
+		tsk.wrap)
 }
 
-// TypedSetKS is a handle to an opened typed set keyspace within a tx.
-type TypedSetKS[K, V any] struct {
+// TypedSetKeyspaceHandle is a handle to an opened typed set keyspace within a tx.
+type TypedSetKeyspaceHandle[K, V any] struct {
 	sks    *SetKeyspace
 	keyEnc Encoder[K]
 	valEnc Encoder[V]
 }
 
 // Has reports whether key has any members.
-func (t *TypedSetKS[K, V]) Has(key K) (bool, error) {
+func (t *TypedSetKeyspaceHandle[K, V]) Has(key K) (bool, error) {
 	kb, err := t.keyEnc.AppendEncode(nil, key)
 	if err != nil {
 		return false, err
@@ -118,7 +91,7 @@ func (t *TypedSetKS[K, V]) Has(key K) (bool, error) {
 }
 
 // HasValue reports whether (key, value) is a member.
-func (t *TypedSetKS[K, V]) HasValue(key K, value V) (bool, error) {
+func (t *TypedSetKeyspaceHandle[K, V]) HasValue(key K, value V) (bool, error) {
 	kb, err := t.keyEnc.AppendEncode(nil, key)
 	if err != nil {
 		return false, err
@@ -133,7 +106,7 @@ func (t *TypedSetKS[K, V]) HasValue(key K, value V) (bool, error) {
 // Put inserts value into key's sorted set. added is false iff (key,
 // value) was already present (mirrors SetKeyspace.Put — the membership
 // probe is already paid by the insert path).
-func (t *TypedSetKS[K, V]) Put(key K, value V) (added bool, err error) {
+func (t *TypedSetKeyspaceHandle[K, V]) Put(key K, value V) (added bool, err error) {
 	kb, err := t.keyEnc.AppendEncode(nil, key)
 	if err != nil {
 		return false, err
@@ -147,7 +120,7 @@ func (t *TypedSetKS[K, V]) Put(key K, value V) (added bool, err error) {
 
 // Delete removes key and all its members, returning ErrNotFound if key
 // has no members.
-func (t *TypedSetKS[K, V]) Delete(key K) error {
+func (t *TypedSetKeyspaceHandle[K, V]) Delete(key K) error {
 	kb, err := t.keyEnc.AppendEncode(nil, key)
 	if err != nil {
 		return err
@@ -157,7 +130,7 @@ func (t *TypedSetKS[K, V]) Delete(key K) error {
 
 // DeleteValue removes one (key, value) member, returning ErrNotFound if
 // the pair does not exist.
-func (t *TypedSetKS[K, V]) DeleteValue(key K, value V) error {
+func (t *TypedSetKeyspaceHandle[K, V]) DeleteValue(key K, value V) error {
 	kb, err := t.keyEnc.AppendEncode(nil, key)
 	if err != nil {
 		return err
@@ -170,7 +143,7 @@ func (t *TypedSetKS[K, V]) DeleteValue(key K, value V) error {
 }
 
 // CountValues returns the number of members under key (0 if absent).
-func (t *TypedSetKS[K, V]) CountValues(key K) (uint64, error) {
+func (t *TypedSetKeyspaceHandle[K, V]) CountValues(key K) (uint64, error) {
 	kb, err := t.keyEnc.AppendEncode(nil, key)
 	if err != nil {
 		return 0, err
@@ -179,9 +152,9 @@ func (t *TypedSetKS[K, V]) CountValues(key K) (uint64, error) {
 }
 
 // DeleteRange deletes every key (and all its members) with *start <= key
-// < *end. nil pointer = open boundary; see TypedKS.DeleteRange for the
+// < *end. nil pointer = open boundary; see TypedKeyspaceHandle.DeleteRange for the
 // boundary-encoding semantics. Returns the number of members deleted.
-func (t *TypedSetKS[K, V]) DeleteRange(start, end *K) (uint64, error) {
+func (t *TypedSetKeyspaceHandle[K, V]) DeleteRange(start, end *K) (uint64, error) {
 	sb, err := encodeBound(t.keyEnc, start)
 	if err != nil {
 		return 0, err
@@ -195,7 +168,7 @@ func (t *TypedSetKS[K, V]) DeleteRange(start, end *K) (uint64, error) {
 
 // Cursor returns a member-level typed cursor (each position is a
 // distinct (key, value) member).
-func (t *TypedSetKS[K, V]) Cursor() *TypedSetCursor[K, V] {
+func (t *TypedSetKeyspaceHandle[K, V]) Cursor() *TypedSetCursor[K, V] {
 	return &TypedSetCursor[K, V]{sc: t.sks.Cursor(), keyEnc: t.keyEnc, valEnc: t.valEnc}
 }
 
@@ -203,8 +176,8 @@ func (t *TypedSetKS[K, V]) Cursor() *TypedSetCursor[K, V] {
 // restricts to members whose key is in [*start, *end); Prefix to members
 // whose encoded key has the encoded prefix as a byte prefix. Best-effort
 // (a cursor / decode error ends the sequence — use Cursor()+Err() for
-// error visibility), matching TypedKS.
-func (t *TypedSetKS[K, V]) All() iter.Seq2[K, V] {
+// error visibility), matching TypedKeyspaceHandle.
+func (t *TypedSetKeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		for kb, vb := range t.sks.All() {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
@@ -215,7 +188,7 @@ func (t *TypedSetKS[K, V]) All() iter.Seq2[K, V] {
 	}
 }
 
-func (t *TypedSetKS[K, V]) Range(start, end *K) iter.Seq2[K, V] {
+func (t *TypedSetKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		sb, err := encodeBound(t.keyEnc, start)
 		if err != nil {
@@ -234,7 +207,7 @@ func (t *TypedSetKS[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 	}
 }
 
-func (t *TypedSetKS[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
+func (t *TypedSetKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		pb, err := t.keyEnc.AppendEncode(nil, prefix)
 		if err != nil {
@@ -249,7 +222,7 @@ func (t *TypedSetKS[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
 	}
 }
 
-// TypedSetCursor is a member-level type-safe cursor over a TypedSetKS.
+// TypedSetCursor is a member-level type-safe cursor over a TypedSetKeyspaceHandle.
 // Navigation returns (K, V, ok); a decode/encode error is sticky and
 // surfaces via Err().
 type TypedSetCursor[K, V any] struct {

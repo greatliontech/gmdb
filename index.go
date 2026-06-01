@@ -52,7 +52,7 @@ type Index struct {
 	// coverValue, when true, makes Lookup/Range/Prefix/Get return the
 	// row value from the index entry's covering blob instead of
 	// back-looking-up the row keyspace (typed full-row covering). Set
-	// only by the typed layer (TypedKS.Index) for indexes whose covering
+	// only by the typed layer (TypedKeyspaceHandle.Index) for indexes whose covering
 	// it recognizes as a full encoded-value column; default false ⇒
 	// back-lookup, the behavior for every byte-layer and non-covering
 	// index. Keyspace-only (a SetKeyspace index's value lives in its
@@ -339,7 +339,7 @@ func (idx *Index) rowTx() *Tx {
 // row_value is the user-facing value, selected by index shape:
 //
 //   - Typed full-row covering (idx.coverValue=true, set by
-//     TypedKS.Index for an index whose covering is the typed full-row
+//     TypedKeyspaceHandle.Index for an index whose covering is the typed full-row
 //     sentinel column): the covering blob's single column is decoded
 //     and returned as the encoded V — the typed wrapper then runs
 //     valEnc.Decode on it.

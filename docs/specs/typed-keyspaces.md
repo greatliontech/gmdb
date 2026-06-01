@@ -8,8 +8,8 @@ declarations via `TypedIndex[K, V, IK]`.
 Scope:
 - `Encoder[T]` interface and `FuncEncoder[T]` adapter.
 - Engine-provided canonical encoders.
-- `TypedKeyspace[K, V]` / `TypedKS[K, V]` (single-value typed
-  keyspace) and `TypedSetKeyspace[K, V]` / `TypedSetKS[K, V]`
+- `TypedKeyspace[K, V]` / `TypedKeyspaceHandle[K, V]` (single-value typed
+  keyspace) and `TypedSetKeyspace[K, V]` / `TypedSetKeyspaceHandle[K, V]`
   (typed set keyspace) wrappers.
 - `TypedCursor[K, V]` and `TypedSetCursor[K, V]`.
 - `TypedIndex[K, V, IK]`, sealed-interface `AnyTypedIndex`,
@@ -25,6 +25,19 @@ Depends on / interacts with:
   layer constructs internally.
 - `api-surface.md` for the byte-oriented `Cursor` / `Index`
   methods that this layer delegates to.
+
+**Naming convention.** Each typed tier has two types: a stateless
+*declaration* carrying the name + encoders (`TypedKeyspace`,
+`TypedSetKeyspace`, `TypedIndex`), and a transaction-scoped *handle*
+with a `Handle` suffix returned by Open / Create
+(`TypedKeyspaceHandle`, `TypedSetKeyspaceHandle`, `TypedIndexHandle`).
+The declaration is the prepared form (`New…` builds it once, outside any
+transaction); `decl.Open(tx)` / `decl.Create(tx)` returns the opened,
+tx-bound handle. `TypedCursor` / `TypedSetCursor` and the bound
+`TypedIndexQuery` are handles in their own right. The byte layer has no
+such split — its `Keyspace` / `SetKeyspace` are opened directly by name
+— so the `…Handle` suffix is what distinguishes the typed handle from
+its declaration.
 
 ## Invariants
 
@@ -160,29 +173,29 @@ func NewTypedKeyspace[K, V any](
 
 // Open / Create / CreateIfNotExists within a transaction.
 // The variadic indexes are TypedIndex declarations.
-func (tks *TypedKeyspace[K, V]) Open(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKS[K, V], error)
-func (tks *TypedKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedKS[K, V], error)
-func (tks *TypedKeyspace[K, V]) Create(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKS[K, V], error)
-func (tks *TypedKeyspace[K, V]) CreateIfNotExists(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKS[K, V], error)
+func (tks *TypedKeyspace[K, V]) Open(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKeyspaceHandle[K, V], error)
+func (tks *TypedKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedKeyspaceHandle[K, V], error)
+func (tks *TypedKeyspace[K, V]) Create(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKeyspaceHandle[K, V], error)
+func (tks *TypedKeyspace[K, V]) CreateIfNotExists(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKeyspaceHandle[K, V], error)
 
-// TypedKS is a handle to an opened typed keyspace within a transaction.
-type TypedKS[K, V any] struct { ... }
+// TypedKeyspaceHandle is a handle to an opened typed keyspace within a transaction.
+type TypedKeyspaceHandle[K, V any] struct { ... }
 
-func (t *TypedKS[K, V]) Get(key K) (V, error)
-func (t *TypedKS[K, V]) Put(key K, value V) error
+func (t *TypedKeyspaceHandle[K, V]) Get(key K) (V, error)
+func (t *TypedKeyspaceHandle[K, V]) Put(key K, value V) error
 
 // Delete returns ErrNotFound when the key does not exist
 // (per api-surface.md §Invariants — keyed-removal returns
-// ErrNotFound on miss; applies to TypedKS / TypedSetKS too).
-func (t *TypedKS[K, V]) Delete(key K) error
+// ErrNotFound on miss; applies to TypedKeyspaceHandle / TypedSetKeyspaceHandle too).
+func (t *TypedKeyspaceHandle[K, V]) Delete(key K) error
 
 // DeleteRange returns (0, nil) for an empty range.
-func (t *TypedKS[K, V]) DeleteRange(start, end *K) (uint64, error)
-func (t *TypedKS[K, V]) Cursor() *TypedCursor[K, V]
-func (t *TypedKS[K, V]) All() iter.Seq2[K, V]
-func (t *TypedKS[K, V]) Range(start, end *K) iter.Seq2[K, V]
-func (t *TypedKS[K, V]) Prefix(prefix K) iter.Seq2[K, V]
-func (t *TypedKS[K, V]) Index(name string) (*TypedIndexHandle, error)
+func (t *TypedKeyspaceHandle[K, V]) DeleteRange(start, end *K) (uint64, error)
+func (t *TypedKeyspaceHandle[K, V]) Cursor() *TypedCursor[K, V]
+func (t *TypedKeyspaceHandle[K, V]) All() iter.Seq2[K, V]
+func (t *TypedKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V]
+func (t *TypedKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V]
+func (t *TypedKeyspaceHandle[K, V]) Index(name string) (*TypedIndexHandle, error)
 
 type TypedCursor[K, V any] struct { ... }
 
@@ -230,11 +243,11 @@ func NewTypedSetKeyspace[K, V any](
     opts *SetKeyspaceOptions,
 ) *TypedSetKeyspace[K, V]
 
-// TypedSetKS[K, V] is a handle to an opened typed set keyspace.
-type TypedSetKS[K, V any] struct { /* ... */ }
+// TypedSetKeyspaceHandle[K, V] is a handle to an opened typed set keyspace.
+type TypedSetKeyspaceHandle[K, V any] struct { /* ... */ }
 
-func (t *TypedSetKS[K, V]) Has(key K) (bool, error)
-func (t *TypedSetKS[K, V]) HasValue(key K, value V) (bool, error)
+func (t *TypedSetKeyspaceHandle[K, V]) Has(key K) (bool, error)
+func (t *TypedSetKeyspaceHandle[K, V]) HasValue(key K, value V) (bool, error)
 
 // Put inserts value into the key's sorted set. added reports whether
 // the set actually grew (false iff (key, value) was already present).
@@ -242,28 +255,28 @@ func (t *TypedSetKS[K, V]) HasValue(key K, value V) (bool, error)
 // the load-bearing rationale (membership probe is already paid by
 // the insert path, surfacing the bool collapses Put + HasValue retry
 // patterns without a TOCTOU window). Chunk-6.1 user-locked decision.
-func (t *TypedSetKS[K, V]) Put(key K, value V) (added bool, err error)
+func (t *TypedSetKeyspaceHandle[K, V]) Put(key K, value V) (added bool, err error)
 
 // Delete returns ErrNotFound when the key does not exist (per
 // api-surface.md §Invariants).
-func (t *TypedSetKS[K, V]) Delete(key K) error
+func (t *TypedSetKeyspaceHandle[K, V]) Delete(key K) error
 
 // DeleteValue returns ErrNotFound when the (key, value) pair
 // does not exist (per api-surface.md §Invariants).
-func (t *TypedSetKS[K, V]) DeleteValue(key K, value V) error
+func (t *TypedSetKeyspaceHandle[K, V]) DeleteValue(key K, value V) error
 
-func (t *TypedSetKS[K, V]) CountValues(key K) (uint64, error)
+func (t *TypedSetKeyspaceHandle[K, V]) CountValues(key K) (uint64, error)
 
 // DeleteRange returns (0, nil) for an empty range.
-func (t *TypedSetKS[K, V]) DeleteRange(start, end *K) (uint64, error)
-func (t *TypedSetKS[K, V]) Cursor() *TypedSetCursor[K, V]
-func (t *TypedSetKS[K, V]) All() iter.Seq2[K, V]
-func (t *TypedSetKS[K, V]) Range(start, end *K) iter.Seq2[K, V]
-func (t *TypedSetKS[K, V]) Prefix(prefix K) iter.Seq2[K, V]
+func (t *TypedSetKeyspaceHandle[K, V]) DeleteRange(start, end *K) (uint64, error)
+func (t *TypedSetKeyspaceHandle[K, V]) Cursor() *TypedSetCursor[K, V]
+func (t *TypedSetKeyspaceHandle[K, V]) All() iter.Seq2[K, V]
+func (t *TypedSetKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V]
+func (t *TypedSetKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V]
 ```
 
-`TypedKS` has `Get`, `Put`, `Delete` — straightforward.
-`TypedSetKS` has `Has`, `HasValue`, `Put`, `Delete`,
+`TypedKeyspaceHandle` has `Get`, `Put`, `Delete` — straightforward.
+`TypedSetKeyspaceHandle` has `Has`, `HasValue`, `Put`, `Delete`,
 `DeleteValue`, `CountValues` — set operations.
 
 ## Typed Indexes

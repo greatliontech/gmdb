@@ -80,7 +80,7 @@ func TestTypedSetKSRoundTrip(t *testing.T) {
 }
 
 // collectSetMembers returns "k/v" strings for every member via All().
-func collectSetMembers(ks *TypedSetKS[uint64, string]) []string {
+func collectSetMembers(ks *TypedSetKeyspaceHandle[uint64, string]) []string {
 	var out []string
 	for k, v := range ks.All() {
 		out = append(out, itoa(k)+"/"+v)

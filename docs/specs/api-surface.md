@@ -70,8 +70,8 @@ Invariant: kind=clause-explicit;
     `ErrNotFound` when the addressed item is absent. The scope is
     `Keyspace.Delete(k)` / `SetKeyspace.Delete(k)` /
     `SetKeyspace.DeleteValue(k, v)` and their typed equivalents
-    (`TypedKS.Delete`, `TypedSetKS.Delete`,
-    `TypedSetKS.DeleteValue`): all return `ErrNotFound` iff the
+    (`TypedKeyspaceHandle.Delete`, `TypedSetKeyspaceHandle.Delete`,
+    `TypedSetKeyspaceHandle.DeleteValue`): all return `ErrNotFound` iff the
     addressed item (the key, or the `(key, value)` pair for the
     value-level variant) does not exist at call time, never
     `nil` for a no-op miss. `Cursor.Delete()` and
@@ -1108,7 +1108,7 @@ func (ks *SetKeyspace) HasValue(key, value []byte) (bool, error)
 // broadcasts, ref-counted indexes, idempotent retries — all of which
 // need to know "did this call cause the set to grow" without the
 // TOCTOU window of HasValue-then-Put. (Chunk-6.1 user-locked decision;
-// the typed mirror TypedSetKS.Put propagates the bool.)
+// the typed mirror TypedSetKeyspaceHandle.Put propagates the bool.)
 func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error)
 
 // Delete returns ErrNotFound when the key does not exist (per

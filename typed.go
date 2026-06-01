@@ -38,7 +38,7 @@ type AnyTypedIndex[K, V any] interface {
 
 // TypedKeyspace wraps a single-value Keyspace with type-safe encoding.
 // It is a stateless descriptor (name + encoders); Open / Create return
-// a transaction-scoped TypedKS handle.
+// a transaction-scoped TypedKeyspaceHandle handle.
 type TypedKeyspace[K, V any] struct {
 	name   string
 	keyEnc Encoder[K]
@@ -53,17 +53,18 @@ func NewTypedKeyspace[K, V any](name string, keyEnc Encoder[K], valEnc Encoder[V
 	return &TypedKeyspace[K, V]{name: name, keyEnc: keyEnc, valEnc: valEnc}
 }
 
-// translateIndexes lowers the typed index declarations to byte-layer
+// buildTypedIndexDecls lowers typed index declarations to byte-layer
 // *IndexDecl, threading the keyspace's encoders so each TypedIndex can
 // build its extractor closure and validate encoder IDs. A nil/empty
-// slice yields a nil decl slice (indexless keyspace).
-func (tks *TypedKeyspace[K, V]) translateIndexes(indexes []AnyTypedIndex[K, V]) ([]*IndexDecl, error) {
+// slice yields a nil decl slice (indexless keyspace). Shared by the
+// Keyspace and SetKeyspace typed factories.
+func buildTypedIndexDecls[K, V any](keyEnc Encoder[K], valEnc Encoder[V], indexes []AnyTypedIndex[K, V]) ([]*IndexDecl, error) {
 	if len(indexes) == 0 {
 		return nil, nil
 	}
 	decls := make([]*IndexDecl, 0, len(indexes))
 	for _, idx := range indexes {
-		d, err := idx.indexDecl(tks.keyEnc, tks.valEnc)
+		d, err := idx.indexDecl(keyEnc, valEnc)
 		if err != nil {
 			return nil, err
 		}
@@ -72,26 +73,44 @@ func (tks *TypedKeyspace[K, V]) translateIndexes(indexes []AnyTypedIndex[K, V]) 
 	return decls, nil
 }
 
+// openTypedHandle translates the typed index declarations, invokes the
+// byte-layer open/create call with them, and wraps the resulting byte
+// handle. Shared by the TypedKeyspace and TypedSetKeyspace
+// Open / Create / CreateIfNotExists methods — the only per-call
+// difference is the byte target (byteOpen) and the handle wrap.
+func openTypedHandle[K, V, BK, H any](
+	keyEnc Encoder[K], valEnc Encoder[V],
+	indexes []AnyTypedIndex[K, V],
+	byteOpen func(decls []*IndexDecl) (BK, error),
+	wrap func(BK) H,
+) (H, error) {
+	decls, err := buildTypedIndexDecls(keyEnc, valEnc, indexes)
+	if err != nil {
+		var zero H
+		return zero, err
+	}
+	bk, err := byteOpen(decls)
+	if err != nil {
+		var zero H
+		return zero, err
+	}
+	return wrap(bk), nil
+}
+
 // Open opens the keyspace for read+write within tx, declaring the
 // supplied typed indexes. Delegates to Tx.OpenKeyspace; index drift,
 // missing/extra indexes, and encoder-ID errors surface from there
 // (indexing.md §Open Semantics + ErrIndexEncoderIDEmpty).
-func (tks *TypedKeyspace[K, V]) Open(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKS[K, V], error) {
-	decls, err := tks.translateIndexes(indexes)
-	if err != nil {
-		return nil, err
-	}
-	ks, err := tx.OpenKeyspace(tks.name, decls...)
-	if err != nil {
-		return nil, err
-	}
-	return tks.wrap(ks), nil
+func (tks *TypedKeyspace[K, V]) Open(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKeyspaceHandle[K, V], error) {
+	return openTypedHandle(tks.keyEnc, tks.valEnc, indexes,
+		func(decls []*IndexDecl) (*Keyspace, error) { return tx.OpenKeyspace(tks.name, decls...) },
+		tks.wrap)
 }
 
 // OpenReadOnly opens the keyspace for reads only (no index decls; index
 // lookups still work against stored entries). Mutations on the returned
 // handle return ErrReadOnly.
-func (tks *TypedKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedKS[K, V], error) {
+func (tks *TypedKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedKeyspaceHandle[K, V], error) {
 	ks, err := tx.OpenKeyspaceReadOnly(tks.name)
 	if err != nil {
 		return nil, err
@@ -101,40 +120,28 @@ func (tks *TypedKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedKS[K, V], error) {
 
 // Create creates the keyspace (error if it already exists) with the
 // supplied typed indexes and returns a write handle.
-func (tks *TypedKeyspace[K, V]) Create(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKS[K, V], error) {
-	decls, err := tks.translateIndexes(indexes)
-	if err != nil {
-		return nil, err
-	}
-	ks, err := tx.CreateKeyspace(tks.name, decls...)
-	if err != nil {
-		return nil, err
-	}
-	return tks.wrap(ks), nil
+func (tks *TypedKeyspace[K, V]) Create(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKeyspaceHandle[K, V], error) {
+	return openTypedHandle(tks.keyEnc, tks.valEnc, indexes,
+		func(decls []*IndexDecl) (*Keyspace, error) { return tx.CreateKeyspace(tks.name, decls...) },
+		tks.wrap)
 }
 
 // CreateIfNotExists creates the keyspace if absent, else opens the
 // existing one (which must match the supplied index set per the
 // byte-layer re-open rules).
-func (tks *TypedKeyspace[K, V]) CreateIfNotExists(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKS[K, V], error) {
-	decls, err := tks.translateIndexes(indexes)
-	if err != nil {
-		return nil, err
-	}
-	ks, err := tx.CreateKeyspaceIfNotExists(tks.name, decls...)
-	if err != nil {
-		return nil, err
-	}
-	return tks.wrap(ks), nil
+func (tks *TypedKeyspace[K, V]) CreateIfNotExists(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKeyspaceHandle[K, V], error) {
+	return openTypedHandle(tks.keyEnc, tks.valEnc, indexes,
+		func(decls []*IndexDecl) (*Keyspace, error) { return tx.CreateKeyspaceIfNotExists(tks.name, decls...) },
+		tks.wrap)
 }
 
-func (tks *TypedKeyspace[K, V]) wrap(ks *Keyspace) *TypedKS[K, V] {
-	return &TypedKS[K, V]{ks: ks, keyEnc: tks.keyEnc, valEnc: tks.valEnc}
+func (tks *TypedKeyspace[K, V]) wrap(ks *Keyspace) *TypedKeyspaceHandle[K, V] {
+	return &TypedKeyspaceHandle[K, V]{ks: ks, keyEnc: tks.keyEnc, valEnc: tks.valEnc}
 }
 
-// TypedKS is a handle to an opened typed keyspace within a transaction.
+// TypedKeyspaceHandle is a handle to an opened typed keyspace within a transaction.
 // Valid for the lifetime of the owning transaction.
-type TypedKS[K, V any] struct {
+type TypedKeyspaceHandle[K, V any] struct {
 	ks     *Keyspace
 	keyEnc Encoder[K]
 	valEnc Encoder[V]
@@ -144,7 +151,7 @@ type TypedKS[K, V any] struct {
 // key is absent. Encoder Decode errors (malformed stored bytes) and
 // ErrKeyEmpty (a key that encodes to empty bytes) propagate from the
 // byte layer / encoder.
-func (t *TypedKS[K, V]) Get(key K) (V, error) {
+func (t *TypedKeyspaceHandle[K, V]) Get(key K) (V, error) {
 	var zero V
 	kb, err := t.keyEnc.AppendEncode(nil, key)
 	if err != nil {
@@ -160,7 +167,7 @@ func (t *TypedKS[K, V]) Get(key K) (V, error) {
 // Put inserts or replaces (key, value). A value that encodes to empty
 // bytes is stored as empty (the byte layer's nil-value-as-empty rule);
 // a key that encodes to empty bytes returns ErrKeyEmpty.
-func (t *TypedKS[K, V]) Put(key K, value V) error {
+func (t *TypedKeyspaceHandle[K, V]) Put(key K, value V) error {
 	kb, err := t.keyEnc.AppendEncode(nil, key)
 	if err != nil {
 		return err
@@ -175,7 +182,7 @@ func (t *TypedKS[K, V]) Put(key K, value V) error {
 // Delete removes key, returning ErrNotFound if it does not exist
 // (api-surface.md §Invariants — keyed-removal returns ErrNotFound on
 // miss).
-func (t *TypedKS[K, V]) Delete(key K) error {
+func (t *TypedKeyspaceHandle[K, V]) Delete(key K) error {
 	kb, err := t.keyEnc.AppendEncode(nil, key)
 	if err != nil {
 		return err
@@ -189,7 +196,7 @@ func (t *TypedKS[K, V]) Delete(key K) error {
 // non-nil boundary that encodes to empty bytes is rejected with
 // ErrKeyEmpty rather than silently collapsing to an open boundary.
 // Returns (0, nil) for an empty range.
-func (t *TypedKS[K, V]) DeleteRange(start, end *K) (uint64, error) {
+func (t *TypedKeyspaceHandle[K, V]) DeleteRange(start, end *K) (uint64, error) {
 	sb, err := encodeBound(t.keyEnc, start)
 	if err != nil {
 		return 0, err
@@ -228,7 +235,7 @@ func encodeBound[T any](enc Encoder[T], p *T) ([]byte, error) {
 // return (K, V, ok); ok is false at end-of-iteration, when unpositioned,
 // or after a decode/encode error — Err() distinguishes those states
 // (transactions.md §Cursor State Machine, mirrored for the typed layer).
-func (t *TypedKS[K, V]) Cursor() *TypedCursor[K, V] {
+func (t *TypedKeyspaceHandle[K, V]) Cursor() *TypedCursor[K, V] {
 	return &TypedCursor[K, V]{bc: t.ks.Cursor(), keyEnc: t.keyEnc, valEnc: t.valEnc}
 }
 
@@ -244,7 +251,7 @@ func (t *TypedKS[K, V]) Cursor() *TypedCursor[K, V] {
 // that must observe such errors should iterate with Cursor() and check
 // Err(); the bare iter.Seq2 has no error channel by design (matching
 // the spec's typed-iterator surface).
-func (t *TypedKS[K, V]) All() iter.Seq2[K, V] {
+func (t *TypedKeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		for kb, vb := range t.ks.All() {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
@@ -255,7 +262,7 @@ func (t *TypedKS[K, V]) All() iter.Seq2[K, V] {
 	}
 }
 
-func (t *TypedKS[K, V]) Range(start, end *K) iter.Seq2[K, V] {
+func (t *TypedKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		sb, err := encodeBound(t.keyEnc, start)
 		if err != nil {
@@ -274,7 +281,7 @@ func (t *TypedKS[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 	}
 }
 
-func (t *TypedKS[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
+func (t *TypedKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		pb, err := t.keyEnc.AppendEncode(nil, prefix)
 		if err != nil {
@@ -307,7 +314,7 @@ func decodeKV[K, V any](keyEnc Encoder[K], valEnc Encoder[V], kb, vb []byte) (K,
 	return k, v, true
 }
 
-// TypedCursor is a type-safe cursor over a TypedKS. Mirrors the byte
+// TypedCursor is a type-safe cursor over a TypedKeyspaceHandle. Mirrors the byte
 // Cursor (transactions.md §Cursor State Machine) with K / V
 // decoding. A decode or encode error is sticky and surfaces via Err().
 type TypedCursor[K, V any] struct {

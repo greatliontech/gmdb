@@ -10,7 +10,7 @@ import (
 // full-row-covering typed index (TypedIndex.CoverValue). The column name
 // is typedCoverValuePrefix + valEnc.ID(), so the value encoder's
 // identity is folded into the schema-hash fingerprint (drift detection)
-// AND TypedKS.Index can recognize the index as full-row covering and
+// AND TypedKeyspaceHandle.Index can recognize the index as full-row covering and
 // enable the byte-layer covering-return. This prefix is a reserved
 // covering-column namespace — a byte-API IndexDecl that names a covering
 // column with it would be (mis)treated as full-row covering on the typed
@@ -156,7 +156,7 @@ func (t *TypedIndex[K, V, IK]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V
 // keyspace. The returned *TypedIndexHandle carries the keyspace's K/V
 // encoders (type-erased); bind it to a specific IK type with
 // NewTypedIndexQuery. Returns ErrIndexNotFound if no such index.
-func (t *TypedKS[K, V]) Index(name string) (*TypedIndexHandle, error) {
+func (t *TypedKeyspaceHandle[K, V]) Index(name string) (*TypedIndexHandle, error) {
 	idx, err := t.ks.Index(name)
 	if err != nil {
 		return nil, err
@@ -174,7 +174,7 @@ func (t *TypedKS[K, V]) Index(name string) (*TypedIndexHandle, error) {
 // set keyspace. For a SetKeyspace index the query yields (setKey,
 // setValue) pairs, so bind K = the set-key type and V = the set-value
 // type in NewTypedIndexQuery.
-func (t *TypedSetKS[K, V]) Index(name string) (*TypedIndexHandle, error) {
+func (t *TypedSetKeyspaceHandle[K, V]) Index(name string) (*TypedIndexHandle, error) {
 	idx, err := t.sks.Index(name)
 	if err != nil {
 		return nil, err

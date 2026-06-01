@@ -454,7 +454,7 @@ violation, not an engine error.
 The typed full-row covering helper (`TypedIndex.CoverValue`,
 see `typed-keyspaces.md §Covering`) is the typed-layer
 specialization: its extractor stores `encode(V)` as the single
-covering column, and `TypedKS.Index` enables an internal
+covering column, and `TypedKeyspaceHandle.Index` enables an internal
 single-column unwrap so `TypedIndexQuery.Lookup` returns `V`
 without forcing the caller to call `DecodeCoveringTuple`
 themselves.

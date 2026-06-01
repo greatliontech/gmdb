@@ -17,7 +17,7 @@ import (
 // Errors: the iter.Seq2 has no error channel by design. A cursor I/O
 // error simply ends the sequence (the cursor returns a nil key); callers
 // that must observe such errors should iterate with Cursor() and check
-// Err(). The typed layer (TypedKS / TypedSetKS) delegates to these.
+// Err(). The typed layer (TypedKeyspaceHandle / TypedSetKeyspaceHandle) delegates to these.
 
 // All yields every (key, value) pair in ascending key order.
 func (ks *Keyspace) All() iter.Seq2[[]byte, []byte] {
