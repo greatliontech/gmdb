@@ -19,16 +19,11 @@ Depends on / interacts with:
 Invariant: kind=clause-explicit;
   property=Every internal code path that acquires more than one of
     the locks listed below acquires them in the documented outer
-    → inner order. A write transaction must not initiate an
-    internal read snapshot (which acquires `activeSlotsMu`) while
-    holding `pager.mu`;
+    → inner order;
   from=this spec §Lock Ordering;
   violation=Out-of-order acquisition introduces a cycle and
     deadlock — the exact failure mode this global order exists to
-    prevent. Internal read snapshots taken by write-flow
-    operations (e.g., the read-snapshot side of `Compact()`'s copy
-    phase) must therefore be initiated *before* the writer's
-    pager work begins, or *after* it completes.
+    prevent.
 
 Invariant: kind=clause-explicit;
   property=Cleanup callbacks (`runtime.AddCleanup`) run on GC
@@ -61,9 +56,7 @@ Outer  →  flock goroutine queue (db.writerCh)
        →  intra-process write lock (held implicitly by write txn)
        →  per-keyspace open registry (db.keyspaceRegistry.mu)
        →  active-slot list (db.activeSlotsMu — for heartbeat coord)
-       →  pager mutex (per write txn, db.pager.mu — for slab map updates)
-       →  reader-table slot CAS (no mutex — atomic CAS only)
-Inner  →  bitmap mutex (in-process, db.bitmap.mu — for two-level summary)
+Inner  →  reader-table slot CAS (no mutex — atomic CAS only)
 ```
 
 ### Notes
@@ -83,13 +76,14 @@ Inner  →  bitmap mutex (in-process, db.bitmap.mu — for two-level summary)
   to snapshot the slot list) and issues atomic stores to
   shared-memory reader-slot fields outside the mutex. It does not
   enter any writer-side lock.
-- A write transaction must NOT open an internal read snapshot
-  (which would acquire `activeSlotsMu`) while holding `pager.mu`,
-  because that would invert the documented order. Internal read
-  snapshots taken by write-flow operations (e.g., the
-  read-snapshot side of `Compact()`'s copy phase) must be
-  initiated *before* the writer's pager work begins, or after it
-  completes.
+- The pager slab map and the bitmap are NOT lock-ordering
+  participants: they are mutated only by the sole writer (or the
+  maintenance goroutine, both under the intra-process write grant +
+  cross-process `flock(LOCK_EX)`), so the write grant serializes
+  them without a dedicated mutex. Internal read snapshots taken by
+  write-flow operations (e.g., the read-snapshot side of
+  `Compact()`'s copy phase) acquire `activeSlotsMu` in the normal
+  outer→inner order under the write grant.
 - Cleanup callbacks (`runtime.AddCleanup`) run on GC background
   goroutines and only do non-blocking operations — they do not
   acquire any of the above locks.
