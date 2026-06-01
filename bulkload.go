@@ -11,11 +11,13 @@ import (
 )
 
 // errBulkEntryTooLarge is an internal sentinel: a single leaf entry does
-// not fit on an otherwise-empty leaf page. The bulk builder is fed
-// already-fitting entries (the Keyspace layer promotes over-inline values
-// to overflow-reference entries, and SetKeyspace bounds value size at the
-// declaration layer), so this is a defensive guard against a caller bug,
-// never a reachable in-spec input.
+// not fit on an otherwise-empty leaf page. By the time an entry reaches
+// the builder its key is known to fit: the Keyspace layer promotes
+// over-inline values to overflow-reference entries and pre-checks the key
+// (bulkLeafEntry → ErrKeyTooLarge), and the SetKeyspace layer bounds value
+// size at the declaration layer and pre-checks the set key
+// (setBulk.flush → ErrKeyTooLarge). So this remains a defensive guard
+// against a caller/engine bug, not a reachable in-spec input.
 var errBulkEntryTooLarge = errors.New("gmdb: bulkload entry too large for an empty leaf page")
 
 // bulkPageWriter is the slice of the pager surface the bottom-up bulk
@@ -527,14 +529,14 @@ func (ks *SetKeyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) 
 		threshold: page.SubpagePromotionThreshold(cfg),
 	}
 	if err := ks.bulkLoadStream(rows, sb, nil); err != nil {
-		return 0, err
+		return 0, mapBtreeErr(err)
 	}
 	if err := sb.flush(); err != nil {
-		return 0, err
+		return 0, mapBtreeErr(err)
 	}
 	root, _, err := sb.top.finish()
 	if err != nil {
-		return 0, err
+		return 0, mapBtreeErr(err)
 	}
 	if _, err := btree.FreeSubtree(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root); err != nil {
 		return 0, mapBtreeErr(err)
@@ -714,6 +716,14 @@ func (sb *setBulk) promote() error {
 func (sb *setBulk) flush() error {
 	if !sb.haveKey {
 		return nil
+	}
+	// Pre-check the set key fits a leaf entry (mirrors bulkLeafEntry on
+	// the Keyspace path): an oversize set key surfaces the public
+	// ErrKeyTooLarge at the BulkLoad boundary rather than the internal
+	// errBulkEntryTooLarge from the builder's empty-leaf guard. The
+	// SetKeyspace layer bounds value size but not the set key.
+	if !btree.OverflowRefFitsLeaf(sb.cfg, sb.curKey) {
+		return btree.ErrKeyTooLarge
 	}
 	if sb.nested != nil {
 		root, cnt, err := sb.nested.finish()

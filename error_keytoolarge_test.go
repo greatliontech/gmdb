@@ -51,11 +51,20 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		t.Errorf("Keyspace.BulkLoad oversize key: got %v, want ErrKeyTooLarge", e)
 	}
 
-	// NOTE: SetKeyspace.BulkLoad of an oversize set key surfaces a
-	// DIFFERENT error (the bulk builder's errBulkEntryTooLarge, because
-	// the set-key path does not pre-check the key the way the Keyspace
-	// path's bulkLeafEntry does) — tracked separately under
-	// setkeyspace-bulkload-oversize-key, out of scope for this sentinel.
+	// SetKeyspace.BulkLoad (non-indexed): the set-key path now pre-checks
+	// the set key (setBulk.flush) and the boundary translates via
+	// mapBtreeErr, so an oversize set key surfaces the public sentinel
+	// (was the internal errBulkEntryTooLarge).
+	if e := db.Update(ctx, func(tx *Tx) error {
+		sks, err := tx.CreateSetKeyspace("sks", nil)
+		if err != nil {
+			return err
+		}
+		_, err = sks.BulkLoad(oneBig)
+		return err
+	}); !errors.Is(e, ErrKeyTooLarge) {
+		t.Errorf("SetKeyspace.BulkLoad oversize set key: got %v, want ErrKeyTooLarge", e)
+	}
 
 	// Indexed Keyspace.BulkLoad (the indexed-path wrap).
 	if e := db.Update(ctx, func(tx *Tx) error {
