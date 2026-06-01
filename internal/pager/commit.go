@@ -16,15 +16,15 @@ import (
 //     SyncDurable. Sets MetaFlagCheckpoint on the new meta.
 //   - SyncDataOnly: fdatasync at step 2; skip step 4. Maps from
 //     SyncDataOnly. Sets MetaFlagCheckpoint (data is durable).
-//   - SyncNone: skip both. Maps from SyncLazy and SyncUnsafe.
+//   - SyncNone: skip both. Maps from SyncLazy.
 //     Caller decides MetaFlagCheckpoint via the Flags field
-//     (SyncLazy clears it; SyncUnsafe also clears).
+//     (SyncLazy clears it).
 type SyncPolicy uint8
 
 const (
 	SyncBoth     SyncPolicy = iota // step 2 + step 4 fdatasync. SyncDurable.
 	SyncDataOnly                   // step 2 fdatasync only. SyncDataOnly.
-	SyncNone                       // no fdatasync. SyncLazy / SyncUnsafe.
+	SyncNone                       // no fdatasync. SyncLazy.
 )
 
 // CommitParams supplies the meta-level updates a commit publishes.
@@ -169,7 +169,7 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 	// Step 4 — fdatasync (atomic commit point) per SyncPolicy.
 	// SyncBoth fsyncs; SyncDataOnly + SyncNone skip — but the
 	// MetaFlagCheckpoint composition in cp.Flags reflects that
-	// fact (caller has cleared the flag on SyncLazy / SyncUnsafe;
+	// fact (caller has cleared the flag on SyncLazy;
 	// SyncDataOnly KEEPS the flag because data IS durable per
 	// step 2). Recovery's checkpoint-preferring selector reads
 	// the flag.

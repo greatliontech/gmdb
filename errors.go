@@ -288,7 +288,6 @@ var (
 	errInvalidTxBuffer           = errors.New("gmdb: MaxTxBufferBytes must be > 0")
 	errInvalidMaxReaders         = errors.New("gmdb: MaxReaders must be in [1, 65536]")
 	errInvalidSyncMode           = errors.New("gmdb: SyncMode out of range")
-	errSyncUnsafeRequiresOptIn   = errors.New("gmdb: SyncUnsafe requires AllowSyncUnsafe=true")
 	errInvalidMergeThreshold     = errors.New("gmdb: MergeThreshold must be in [1, 50]")
 	errInvalidRestartGroupTarget = errors.New("gmdb: RestartGroupTarget must be in [0, 255]")
 	errInvalidMaxBatchSize       = errors.New("gmdb: MaxBatchSize must be >= 1")

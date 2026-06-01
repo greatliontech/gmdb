@@ -52,7 +52,7 @@ consistency in `indexing.md`.
 | File format | Dynamic grow/shrink with configurable bounds; MaxSize immutable after creation | Auto-compaction via tail refund, no manual compaction needed; MaxSize fixed because bitmap region size depends on it |
 | Isolation | Dual meta pages + CoW | No WAL needed, atomic commit |
 | Crash safety | CoW + atomic meta page swap; lazy bitmap-leak reclamation via background maintenance | Tree is always consistent (CoW); on-disk bitmap leakage bounded by crashed txn's allocations and reclaimed by background maintenance — fast Open after crash |
-| Durability | Three sync modes (Durable, DataOnly, Lazy) + unsafe opt-in Unsafe | Configurable ACID vs. performance; SyncUnsafe requires explicit `AllowSyncUnsafe` flag |
+| Durability | Three sync modes (Durable, DataOnly, Lazy) | Configurable ACID vs. performance |
 | Cross-process | Shared memory lock file (`structs.HostLayout` structs, uint64 PIDs + process start times + PID namespace inodes + heartbeats) | C ABI layout guarantee for mmap'd structs; fixed-size reader table (scan+CAS); stale writer/reader recovery via PID liveness + start time comparison; cross-namespace via heartbeat |
 | Write lock | Intra-process writer queue (channel) + single flock goroutine (cross-process) | Context-aware blocking; zero goroutine accumulation on cancellation; flock alone doesn't block same-process goroutines |
 | Lock ordering | Documented globally (lifecycle → registry → per-keyspace → commit → bitmap) | Prevents deadlock; mandatory acquisition order for all internal mutex paths |

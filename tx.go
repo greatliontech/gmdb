@@ -339,9 +339,9 @@ func (tx *Tx) Commit() error {
 	//     durable post-step-2 fsync; meta MAY not be durable in
 	//     DataOnly mode but the previous meta is — recovery picks
 	//     whichever survives).
-	//   - SyncLazy / SyncUnsafe: CLEAR Checkpoint (data MAY NOT
-	//     be durable; recovery's checkpoint-preferring selector
-	//     will fall back to the last checkpoint-flagged meta).
+	//   - SyncLazy: CLEAR Checkpoint (data MAY NOT be durable;
+	//     recovery's checkpoint-preferring selector will fall back
+	//     to the last checkpoint-flagged meta).
 	flags := tx.prevMeta.Flags & page.MetaFlagPageChecksum
 	syncPolicy := pager.SyncBoth
 	switch tx.db.opts.SyncMode {
@@ -351,7 +351,7 @@ func (tx *Tx) Commit() error {
 	case SyncDataOnly:
 		flags |= page.MetaFlagCheckpoint
 		syncPolicy = pager.SyncDataOnly
-	case SyncLazy, SyncUnsafe:
+	case SyncLazy:
 		// Checkpoint NOT set.
 		syncPolicy = pager.SyncNone
 	}
@@ -394,7 +394,7 @@ func (tx *Tx) Commit() error {
 	tx.db.activeMetaIdx = result.ActiveMetaIdx
 	// A checkpoint commit (SyncDurable/SyncDataOnly set MetaFlagCheckpoint)
 	// advances the RPL reclamation bound (free-space.md §RPL Reclamation); a
-	// SyncLazy/SyncUnsafe commit leaves the checkpoint flag clear and the
+	// SyncLazy commit leaves the checkpoint flag clear and the
 	// bound unchanged, so reclamation never frees pages a recoverable
 	// checkpoint meta's tree references.
 	if result.Meta.HasFlag(page.MetaFlagCheckpoint) {

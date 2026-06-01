@@ -25,11 +25,6 @@ import (
 // for SyncDataOnly (where step-4 was skipped — the active meta may
 // not be on stable storage; Checkpoint re-pwrites and fsyncs it).
 //
-// In SyncUnsafe, Checkpoint syncs the file but does not retroactively
-// fix the ordering of prior commits' pwrites — those may already be
-// out-of-order on disk. The flag is set anyway; the documentation
-// for SyncUnsafe warns this is benchmarks-and-ephemeral-data only.
-//
 // Mechanics (durability.md §Checkpoint mechanics):
 //
 //  1. Acquire the write lock via the flock goroutine — serialises

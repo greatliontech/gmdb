@@ -28,9 +28,6 @@ import (
 //     meta). ~2× faster than SyncDurable.
 //   - SyncLazy: skip both syncs. Recovery rolls back to the last
 //     `Checkpoint()`. DB is always consistent (no corruption).
-//   - SyncUnsafe: skip both syncs, no safety net. Requires explicit
-//     AllowSyncUnsafe=true. Risk of corruption on crash; benchmarks
-//     and ephemeral data only.
 //
 // SyncMode is a per-process option, not persisted on disk —
 // different processes attached to the same database may use
@@ -43,7 +40,6 @@ const (
 	SyncDurable  SyncMode = iota // syncs data + meta. Full ACID. Default.
 	SyncDataOnly                 // syncs data; not meta. Last txn may be lost on crash.
 	SyncLazy                     // skips all syncs. Rolls back to last Checkpoint() on crash.
-	SyncUnsafe                   // skips all syncs, no safety net. Requires AllowSyncUnsafe.
 )
 
 // LaggingReaderInfo carries the diagnostic context the
@@ -176,12 +172,6 @@ type Options struct {
 	// Per-process, not persisted; cross-process composition uses the
 	// on-disk MetaFlagCheckpoint to coordinate recovery.
 	SyncMode SyncMode
-
-	// AllowSyncUnsafe must be true when SyncMode == SyncUnsafe.
-	// Without it, Open returns ErrInvalidOptions per durability.md
-	// §SyncUnsafe Warning — "a silently-enabled SyncUnsafe lets a
-	// benchmark configuration leak into a production deploy."
-	AllowSyncUnsafe bool
 
 	// RestartGroupTarget is the engine-wide default for the leaf
 	// restart-group target — the maximum entries per group on
@@ -404,11 +394,6 @@ func (o Options) validate() error {
 	}
 	switch o.SyncMode {
 	case SyncDurable, SyncDataOnly, SyncLazy:
-		// All safe modes.
-	case SyncUnsafe:
-		if !o.AllowSyncUnsafe {
-			return errSyncUnsafeRequiresOptIn
-		}
 	default:
 		return errInvalidSyncMode
 	}

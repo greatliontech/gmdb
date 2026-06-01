@@ -1,15 +1,13 @@
 # Durability Modes
 
-Three safe sync modes (`SyncDurable`, `SyncDataOnly`, `SyncLazy`)
-and one explicitly opt-in unsafe mode (`SyncUnsafe`). The mode
-controls which `fdatasync()` calls fire during commit and how
+Three sync modes (`SyncDurable`, `SyncDataOnly`, `SyncLazy`). The
+mode controls which `fdatasync()` calls fire during commit and how
 recovery selects the active meta page after a crash.
 
 Scope:
 - `Options.SyncMode` semantics.
 - Checkpoint flag on the meta page and `DB.Checkpoint()` mechanics.
 - Recovery rules (which meta is selected).
-- `SyncUnsafe` opt-in requirement.
 - Cross-process `SyncMode` interleaving.
 
 Depends on / interacts with:
@@ -18,8 +16,7 @@ Depends on / interacts with:
   Checkpoint).
 - `free-space.md` for the checkpoint-bound used by RPL
   reclamation in `SyncLazy`.
-- `api-surface.md` for `SyncMode` constants, `AllowSyncUnsafe`,
-  and `Checkpoint`.
+- `api-surface.md` for `SyncMode` constants and `Checkpoint`.
 
 ## Invariants
 
@@ -44,14 +41,6 @@ Invariant: kind=clause-explicit;
     may not be durable — readers can traverse into pages the
     OS never flushed, surfacing as `ErrBadPageChecksum` or
     wrong values.
-
-Invariant: kind=clause-explicit;
-  property=`Options.SyncMode = SyncUnsafe` is rejected at
-    `Open()` unless `Options.AllowSyncUnsafe = true`;
-  from=this spec §SyncUnsafe Warning;
-  violation=A silently-enabled `SyncUnsafe` mode lets a benchmark
-    configuration leak into a production deploy — corruption on
-    crash without any explicit opt-in.
 
 Invariant: kind=entailed;
   property=`DB.Checkpoint()` makes prior `SyncLazy` commits
@@ -80,18 +69,16 @@ Invariant: kind=entailed;
 
 ## Durability Modes
 
-Three safe modes and one unsafe mode, configurable via
-`Options.SyncMode`. The mode controls which `fdatasync()` calls
-are performed during commit. All safe modes preserve **database
-integrity** (the file is always structurally valid). `SyncUnsafe`
-requires explicit opt-in via `Options.AllowSyncUnsafe = true`.
+Three modes, configurable via `Options.SyncMode`. The mode
+controls which `fdatasync()` calls are performed during commit.
+All modes preserve **database integrity** (the file is always
+structurally valid).
 
 | Mode | Data Sync | Meta Sync | On Crash | Performance |
 |------|-----------|-----------|----------|-------------|
 | `SyncDurable` (default) | `fdatasync()` | `fdatasync()` | No data loss. Full ACID. | Slowest |
 | `SyncDataOnly` | `fdatasync()` | skip | Last committed transaction may be lost. DB is consistent — falls back to previous meta page. | ~2× faster |
 | `SyncLazy` | skip | skip | Rolls back to the last **checkpoint**. DB is always consistent — no corruption. | Much faster |
-| `SyncUnsafe` | skip | skip | **Risk of corruption.** Requires `AllowSyncUnsafe`. Benchmarks and ephemeral data only. | Fastest |
 
 ## Checkpoints
 
@@ -165,16 +152,6 @@ tree. Accepting a partially-durable tree would risk surfacing
 `ErrCorrupted` on later reads when traversals reach unflushed
 pages. The checkpoint's tree is guaranteed intact because CoW
 never modifies existing pages.
-
-## SyncUnsafe Warning
-
-Provides no crash safety. Without `fdatasync()` after pwrite, the
-meta page could reach disk before the bitmap pages. A crash
-leaves the meta pointing to a tree whose bitmap state is
-inconsistent — the database may be **corrupted**.
-
-`SyncUnsafe` requires `Options.AllowSyncUnsafe = true`. Setting
-it without the opt-in returns an error from `Open()`.
 
 ## Cross-process SyncMode interleaving
 

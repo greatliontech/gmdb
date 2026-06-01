@@ -9,28 +9,6 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-func TestSyncUnsafeRequiresOptIn(t *testing.T) {
-	// Spec-tier invariant (durability.md): SyncUnsafe is rejected
-	// at Open unless AllowSyncUnsafe=true.
-	ctx := context.Background()
-	_, err := Open(ctx, tmpPath(t), Options{
-		PageSize: 4096, MinSize: 16, MaxSize: 64,
-		SyncMode: SyncUnsafe,
-	})
-	if !errors.Is(err, ErrInvalidOptions) {
-		t.Errorf("SyncUnsafe without AllowSyncUnsafe: got %v, want ErrInvalidOptions", err)
-	}
-	// With opt-in, accepted.
-	db, err := Open(ctx, tmpPath(t), Options{
-		PageSize: 4096, MinSize: 16, MaxSize: 64,
-		SyncMode: SyncUnsafe, AllowSyncUnsafe: true,
-	})
-	if err != nil {
-		t.Fatalf("SyncUnsafe with AllowSyncUnsafe: %v", err)
-	}
-	_ = db.Close()
-}
-
 func TestSyncModesAllAccepted(t *testing.T) {
 	for name, m := range map[string]SyncMode{
 		"SyncDurable":  SyncDurable,

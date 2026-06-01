@@ -112,12 +112,6 @@ Invariant: kind=clause-explicit;
     file operations.
 
 Invariant: kind=clause-explicit;
-  property=`Options.SyncMode = SyncUnsafe` is rejected at
-    `Open()` unless `Options.AllowSyncUnsafe = true`;
-  from=this spec §Types and Options + `durability.md`;
-  violation=See `durability.md`.
-
-Invariant: kind=clause-explicit;
   property=`tx.SetFileFormat()` rejects a change to
     `FileFormat.Upper` (alias `MaxSize`) that differs from
     the stored value with a non-nil error; `MinSize`,
@@ -444,7 +438,6 @@ const (
     SyncDurable    SyncMode = iota // syncs data + meta. Full ACID. Default.
     SyncDataOnly                   // syncs data; not meta. Last txn may be lost on crash.
     SyncLazy                       // skips all syncs. Rolls back to last Checkpoint() on crash.
-    SyncUnsafe                     // skips all syncs, no safety net. Requires AllowSyncUnsafe.
 )
 
 // Options for opening a database.
@@ -464,11 +457,6 @@ type Options struct {
 
     // SyncMode controls durability. Default: SyncDurable.
     SyncMode SyncMode
-
-    // AllowSyncUnsafe must be true when using SyncUnsafe mode.
-    // Without it, Open() returns an error when SyncMode = SyncUnsafe.
-    // Default: false.
-    AllowSyncUnsafe bool
 
     // MaxReaders is the maximum number of concurrent reader slots.
     // Default: 4096. Only used when creating a new lock file.
@@ -664,8 +652,7 @@ func (db *DB) Close() error
 // Checkpoint flushes all outstanding writes to stable storage. In
 // SyncLazy mode this creates a checkpoint (database will roll back to
 // this point at most on crash). In SyncDurable/SyncDataOnly modes,
-// no-op (commits already sync). In SyncUnsafe, syncs but does not
-// retroactively fix ordering from prior commits.
+// no-op (commits already sync).
 //
 // Checkpoint acquires the write lock for its duration via the flock
 // goroutine's FIFO queue; it serializes with concurrent write

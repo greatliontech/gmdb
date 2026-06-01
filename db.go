@@ -66,7 +66,7 @@ type DB struct {
 	// lastCheckpointTxnID). Reclaiming past the last checkpoint would free
 	// pages a still-recoverable meta's tree references. Updated to the new
 	// TxnID on a checkpoint commit (SyncDurable/SyncDataOnly) and Checkpoint();
-	// unchanged on SyncLazy/SyncUnsafe commits. Guarded by db.mu.
+	// unchanged on SyncLazy commits. Guarded by db.mu.
 	lastCheckpointTxnID uint64
 	pgr                 *pager.Pager
 
