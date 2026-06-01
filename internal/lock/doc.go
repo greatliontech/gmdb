@@ -3,12 +3,12 @@
 // cross-process write-lock state (a single flock'd region) and the
 // reader-table.
 //
-// This is the chunk-2 surface. It exposes the lock-file lifecycle
+// This package exposes the lock-file lifecycle
 // (create-on-first-open, validate-or-recreate on UUID mismatch, mmap
 // MAP_SHARED) plus the typed shared-memory accessors for the
 // header and reader-slot fields. The flock goroutine, heartbeat
 // goroutine, stale-writer recovery, and reader-slot acquire/release
-// land in later chunk-2 sub-chunks (and chunk-3 for the reader-side).
+// build on this surface.
 //
 // Atomic discipline. Every read/write of a shared-memory uint64 goes
 // through the function-based sync/atomic helpers in this package —

@@ -16,7 +16,7 @@ import (
 var (
 	// ErrCorrupted is returned when an existing lock file fails
 	// validation (Magic mismatch, MaxReaders out of range, file size
-	// inconsistent with the header). The chunk-2 lifecycle treats
+	// inconsistent with the header). The lock-file lifecycle treats
 	// these as recoverable by delete-and-recreate when the cause is
 	// a stale leftover; a freshly-created lock file that fails its
 	// own validation indicates a runtime defect and surfaces this
@@ -52,7 +52,7 @@ var (
 // OpenParams configures the lock file's discovery + creation.
 //
 // The lock file is identified by a directory (Root) + a base name
-// (Base) rather than an absolute path. This composes with chunk-1's
+// (Base) rather than an absolute path. This composes with the
 // path-traversal guard: db.Open opens the data file's directory via
 // os.OpenRoot, and the same *os.Root is passed here so the lock file
 // shares the same symlink-escape protection.
@@ -80,7 +80,7 @@ type OpenParams struct {
 }
 
 // File is an opened lock file. Holds the on-disk file descriptor (so
-// the flock goroutine can invoke flock() on it in chunk 2.4) plus the
+// the flock goroutine can invoke flock() on it) plus the
 // MAP_SHARED mmap region overlaid with typed accessors for the header
 // and each reader slot.
 //
@@ -125,7 +125,7 @@ type File struct {
 //
 // UUID mismatch unlinks the stale file and retries; a Magic /
 // MaxReaders / size validation failure on a finalised file surfaces
-// ErrCorrupted without unlinking (chunk-2 does not auto-recover
+// ErrCorrupted without unlinking (the package does not auto-recover
 // externally-tampered or crashed-mid-init files).
 //
 // Retry budget. Adopter sees errPartialInit at most O(init-window)
@@ -416,7 +416,7 @@ func createAndInit(p OpenParams) (*File, error) {
 // the process crashes mid-init (after Truncate but before Sync),
 // the kernel releases LOCK_EX on fd close; the next opener acquires
 // LOCK_SH, reads the half-init'd header (Magic == 0), and surfaces
-// ErrCorrupted. Manual cleanup is required — chunk-2 does not
+// ErrCorrupted. Manual cleanup is required — gmdb does not
 // auto-recover from crashed-mid-init files.
 func initLockFile(f *os.File, uuid [16]byte, maxReaders uint32, fileSize int64) error {
 	if err := f.Truncate(fileSize); err != nil {
@@ -498,7 +498,7 @@ func (f *File) Close() error {
 }
 
 // Fd returns the lock file's underlying file descriptor. Used by the
-// flock goroutine (chunk 2.4) to issue flock() syscalls. The fd is
+// flock goroutine to issue flock() syscalls. The fd is
 // valid until Close. Panics on a closed *File.
 func (f *File) Fd() uintptr {
 	if f.f == nil {
@@ -625,7 +625,7 @@ func (f *File) SetLastMaintenanceTime(v uint64) {
 // interval's pass. Otherwise (a recent pass, or a peer won the CAS) it
 // returns false and the caller skips. The CAS makes the check-and-claim
 // atomic across processes sharing the lock file, so at most one process per
-// interval runs maintenance (background-maintenance.md Inv-M1).
+// interval runs maintenance (background-maintenance.md).
 //
 // On Linux nowNanos is CLOCK_BOOTTIME, which is kernel-wide, so all
 // processes share one clock origin and nowNanos >= LastMaintenanceTime
@@ -637,7 +637,7 @@ func (f *File) SetLastMaintenanceTime(v uint64) {
 // (CAS), rather than skipping forever (which would stall maintenance after
 // a peer crash). Off-Linux the worst case is a redundant pass (wasted I/O)
 // — never a double-reclaim, since the CAS serialises any single instant and
-// reclamation is leak-safe (Inv-M2).
+// reclamation is leak-safe (background-maintenance.md).
 func (f *File) TryClaimMaintenance(nowNanos, intervalNanos uint64) bool {
 	if f.header == nil {
 		panic("lock: TryClaimMaintenance on closed *File")
@@ -652,7 +652,7 @@ func (f *File) TryClaimMaintenance(nowNanos, intervalNanos uint64) bool {
 // BaseFor returns the conventional lock-file base name for a data
 // file whose path is dataPath. The convention appends ".lock" to the
 // base name; callers compose with an os.Root over the data file's
-// directory (the chunk-1 path-traversal pattern) to assemble the
+// directory (the path-traversal-safe pattern) to assemble the
 // full open.
 func BaseFor(dataPath string) string {
 	return baseName(dataPath) + ".lock"

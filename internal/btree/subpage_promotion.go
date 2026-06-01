@@ -2,7 +2,7 @@ package btree
 
 // SetKeyspace subpage → nested-B+tree promotion per
 // set-keyspace.md §Subpage Promotion Threshold + §Promotion. Fires
-// when the SetKeyspace surface (chunk 6.6) detects that inserting a
+// when the SetKeyspace surface detects that inserting a
 // new value would push the existing subpage past the
 // `page.SubpagePromotionThreshold` byte budget; this file's
 // PromoteSubpageToNestedTree implements the 4-step atomic algorithm

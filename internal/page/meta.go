@@ -186,7 +186,7 @@ func VerifyMeta(buf []byte) bool {
 //     and return noCheckpoint=true so the caller can warn.
 //  4. Neither valid → ok=false.
 //
-// The chunk-3.5 promotion of the durability.md §Recovery rule; the
+// The promotion of the durability.md §Recovery rule; the
 // raw highest-TxnID selector (ActiveMeta) is preserved for tests and
 // callers who want the pre-checkpoint behaviour.
 //
@@ -271,7 +271,7 @@ func ActiveMetaCheckpointPreferring(meta0, meta1 []byte) (active int, noCheckpoi
 //   - Neither valid → ok=false.
 //
 // The checkpoint-flag precedence rule from durability.md is layered on
-// top by the SyncMode-aware caller (chunk 3); this function returns the
+// top by the SyncMode-aware caller; this function returns the
 // raw highest-valid-TxnID winner.
 func ActiveMeta(meta0, meta1 []byte) (active int, ok bool) {
 	ok0 := VerifyMeta(meta0)

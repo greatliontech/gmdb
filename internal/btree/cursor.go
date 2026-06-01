@@ -17,7 +17,7 @@ var ErrCursorUnpositioned = errors.New("btree: cursor not positioned")
 
 // ErrReadOnly is returned by Cursor.Delete when invoked on a
 // read-only cursor (constructed via NewReadCursor or on a tx /
-// keyspace without write privileges). The chunk-5 public-API layer
+// keyspace without write privileges). The public-API layer
 // maps this to gmdb.ErrReadOnly.
 var ErrReadOnly = errors.New("btree: cursor is read-only")
 
@@ -30,10 +30,10 @@ var ErrReadOnly = errors.New("btree: cursor is read-only")
 // past its own mutation per transactions.md §Cursor.Delete
 // post-delete state).
 //
-// At chunk-4.6δ, only Cursor.Delete is a mutation source visible
+// Currently only Cursor.Delete is a mutation source visible
 // to the cursor, and it self-clears the stale flag before
 // returning — so this sentinel is unreachable from internal use.
-// The mechanism is scaffolding for chunk-5+ keyspace integration,
+// The mechanism is scaffolding for keyspace integration,
 // where sibling cursors and keyspace.Put/Delete will bump gen
 // externally and surface this sentinel.
 var ErrCursorStale = errors.New("btree: cursor invalidated by external mutation")
@@ -373,7 +373,7 @@ func (c *Cursor) Prev() (key, value []byte) {
 // Current. The caller must re-position via First / Last / Seek /
 // SeekGE before retrying. (curKey may alias storage the external
 // mutation has freed; proceeding with bytes.Clone(c.curKey) could
-// stage a delete against garbage. The check at chunk-4.6δ is
+// stage a delete against garbage. This check is
 // scaffolding — only Cursor.Delete itself bumps gen and it
 // self-re-Seeks, so the path is unreachable from internal use.
 // Chunk-5+ keyspace wiring will exercise it.)
@@ -416,7 +416,7 @@ func (c *Cursor) Delete() error {
 
 // MarkStale bumps the cursor's generation counter, causing the
 // next non-repositioning op (Next / Prev / Current / Delete) to
-// return / surface ErrCursorStale. The chunk-5.5 keyspace layer
+// return / surface ErrCursorStale. The keyspace layer
 // calls this on cursors whose state may have been invalidated by
 // a sibling mutator (keyspace.Put / Delete, or a sibling cursor's
 // Delete). Also clears curKey / curValue / iter so a caller that
@@ -431,13 +431,13 @@ func (c *Cursor) MarkStale() {
 
 // SetRootID updates the cursor's tracked root after a sibling
 // mutation moved the keyspace's root via CoW. Called by the
-// chunk-5.5 Keyspace.markCursorsStale path immediately after
+// Keyspace.markCursorsStale path immediately after
 // MarkStale so a caller re-positioning via First / Last / Seek /
 // SeekGE descends from the live root rather than the (now-retired)
 // pre-mutation root.
 //
-// Adjacent-fix from chunk-5.7 round 1: a pre-existing latent bug in
-// chunk 5.5 captured `rootID` at construction and never refreshed
+// A pre-existing latent bug
+// captured `rootID` at construction and never refreshed
 // it on sibling mutations. Re-positioning a stale cursor would
 // descend from a FreePage'd root whose mmap-resident bytes survive
 // only until the loose-pool reuses the id, producing either stale

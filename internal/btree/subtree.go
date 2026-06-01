@@ -7,10 +7,10 @@ import (
 )
 
 // FreeSubtree retires every page reachable from rootID and returns
-// the count of "user-visible values" freed. Used by chunk-5.6
-// DeleteKeyspace (count discarded for Kind=0; chunk-6.6 uses count
-// for desc.Count delta on Kind=1), chunk-5.7 DeleteRange (count
-// surfaces as part of the rowsDeleted return), and chunk-6.5
+// the count of "user-visible values" freed. Used by
+// DeleteKeyspace (count discarded for Kind=0; uses count
+// for desc.Count delta on Kind=1), DeleteRange (count
+// surfaces as part of the rowsDeleted return), and
 // per-key bulk-free for SetKeyspaces (called on the cell's
 // NestedRoot to retire one key's nested tree — `set-keyspace.md
 // §Bulk Free`). For the per-key path, this function retires only
@@ -37,7 +37,7 @@ import (
 // For Kind=0 keyspaces (plain key→value, no MultiValue cells)
 // behaviour is unchanged: count = number of leaf entries.
 //
-// Empty subtree (rootID == 0) returns (0, nil) — the chunk-5.6 caller
+// Empty subtree (rootID == 0) returns (0, nil) — the caller
 // may pass an unmaterialised keyspace's desc.Root.
 //
 // Errors:

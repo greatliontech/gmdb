@@ -341,7 +341,7 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 
 	if leftIdx == rightIdx {
 		// Single child overlaps the range. Recurse into it; reuse the
-		// chunk-4 patchBranchAfterChildDelete for the parent update +
+		// patchBranchAfterChildDelete for the parent update +
 		// underflow handling — which also threads the fill-floor
 		// cousin-cascade signal (deepUnderflowChild) through its
 		// case-C cousin step.

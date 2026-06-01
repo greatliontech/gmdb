@@ -64,7 +64,7 @@ type PageWriter interface {
 // ErrKeyTooLarge is returned by Put when the key is too large even
 // for an overflow-reference leaf entry (key + overflow-ref header
 // exceeds a single-entry leaf page's capacity). Per limits.md
-// §Maximum Key Size the cap is ~(PageSize-40)/2; the chunk-7
+// §Maximum Key Size the cap is ~(PageSize-40)/2; the
 // tree-depth bound lifts this further. Values exceeding inline
 // capacity are automatically promoted to an overflow chain — the
 // sentinel fires only on oversize KEYS, never on oversize values.
@@ -80,8 +80,7 @@ type pathFrame struct {
 }
 
 // Put inserts or updates key=value in the tree rooted at rootID.
-// Returns the new rootID — the caller (keyspace descriptor update,
-// chunk 5+) records this in the keyspace descriptor and propagates
+// Returns the new rootID — the caller (keyspace descriptor update) records this in the keyspace descriptor and propagates
 // the descriptor update via CoW to the meta page.
 //
 // Mutations:
@@ -101,7 +100,7 @@ type pathFrame struct {
 // Leaf format. Every leaf produced by Put is built via
 // page.LeafBuilder against cfg.RestartGroupTarget (compressed when
 // ≥2 / 0, uncompressed when ==1 — see internal/page/leaf_builder.go
-// for variant dispatch). The chunk-4.6β builder owns natural-break
+// for variant dispatch). The builder owns natural-break
 // heuristics + table layout; btree treats leaves as opaque past
 // the LeafReader / LeafBuilder interface.
 func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint64, error) {

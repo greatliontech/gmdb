@@ -43,7 +43,7 @@ func (c *Coord) staleTimeoutNanos() uint64 {
 //
 // txnID must be > 0 (the per-slot "TxnID == 0 means free" sentinel).
 // Callers wrap a snapshot meta's TxnID via max(meta.TxnID, 1) — the
-// chunk-3.3 wiring does this.
+// *ReadTx wiring does this.
 //
 // Returns the slot index. The caller MUST eventually call
 // ReleaseReader(idx) — leaking the slot pins RPL reclamation until
@@ -55,7 +55,7 @@ func (c *Coord) AcquireReader(ctx context.Context, txnID uint64) (uint32, error)
 	if txnID == 0 {
 		// Programmer-error precondition mirrored on AcquireReaderSlot;
 		// surface as a structured error rather than the file-level
-		// panic so the chunk-3.3 *ReadTx wrapper can map it cleanly.
+		// panic so the *ReadTx wrapper can map it cleanly.
 		return NoSlot, errors.New("lock: AcquireReader requires txnID > 0")
 	}
 	hint := c.readerSlotHint.Load()
@@ -114,7 +114,7 @@ func (c *Coord) ReleaseReader(idx uint32) {
 // slots (per the cross-process.md §Reader Table stale-detection
 // rules) are reclaimed in place as a side effect.
 //
-// Caller MUST hold flock(LOCK_EX) on the lock-file fd. The chunk-3.4
+// Caller MUST hold flock(LOCK_EX) on the lock-file fd. The
 // wiring point is the write transaction's pre-commit state: the flock
 // goroutine has just granted LOCK_EX, so the calling goroutine (the
 // writer) can safely invoke this. A general-purpose helper without

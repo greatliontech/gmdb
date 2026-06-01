@@ -5,7 +5,7 @@ package lock
 import "errors"
 
 // errUnsupportedPlatform mirrors internal/pager's same-name shim:
-// macOS and FreeBSD shims for the lock file land later in chunk 2.
+// macOS and FreeBSD shims for the lock file are not yet implemented.
 // Until then this file keeps the package buildable on every supported
 // OS.
 var errUnsupportedPlatform = errors.New("lock: mmap not implemented on this platform yet")

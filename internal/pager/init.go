@@ -68,7 +68,7 @@ func Init(file *os.File, ip InitParams) error {
 	}
 	// At init, the "no transactions yet" state is also the latest
 	// checkpoint. Set the Checkpoint flag so Open's durability-aware
-	// caller (chunk 3) sees this meta as the recovery target.
+	// caller sees this meta as the recovery target.
 	flags |= page.MetaFlagCheckpoint
 
 	m := page.Meta{
@@ -159,7 +159,7 @@ type OpenedDB struct {
 // page size against meta-1's offset. The file-layout.md dual-meta
 // atomicity invariant guarantees recoverability if at least one meta
 // has a passing checksum at its correct offset; the probe is the
-// chunk-1 mechanism that honours it.
+// probe mechanism that honours it.
 func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 	if op.Pool == nil {
 		return nil, fmt.Errorf("pager: Pool must not be nil")

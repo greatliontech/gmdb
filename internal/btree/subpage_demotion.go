@@ -3,13 +3,13 @@ package btree
 // SetKeyspace nested-tree → subpage demotion per set-keyspace.md
 // §Demotion. Fires when a `SetKeyspace.DeleteValue` reduces a
 // nested B+tree to a single leaf page whose values would fit as a
-// subpage (below SubpagePromotionThreshold). The chunk-6.6
+// subpage (below SubpagePromotionThreshold). The
 // SetKeyspace surface invokes DemoteNestedTreeIfFits after each
 // successful nested-tree btree.Delete; on demoted=true the surface
 // replaces the parent cell with a subpage cell and the caller's
 // stats reflect a freed nested-root leaf.
 //
-// Mirror-image of chunk-6.4 PromoteSubpageToNestedTree: same E3
+// Mirror-image of PromoteSubpageToNestedTree: same E3
 // atomicity contract — on any error returns (nil, false, err) with
 // no observable post-tx-commit state change (pages allocated by
 // this call's EncodeSubpage path are heap-only; the freed leaf is
@@ -140,7 +140,7 @@ func DemoteNestedTreeIfFits(
 		// keys never escape the btree write path; a mismatched-size
 		// key on a Kind=1 fixed-size keyspace is Inv-3 corruption.
 		// So any EncodeSubpage error here indicates a corrupt
-		// nested leaf — re-wrap as ErrCorrupted so the chunk-6.6
+		// nested leaf — re-wrap as ErrCorrupted so the
 		// SetKeyspace surface can distinguish on-disk corruption
 		// from user-input errors (ErrSubpageValueSize would
 		// otherwise map to the public ErrValueSizeMismatch

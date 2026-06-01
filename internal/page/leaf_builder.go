@@ -12,7 +12,7 @@ import (
 // leaf (target == 1).
 //
 // Entries MUST be added in ascending key order. The builder verifies via
-// a debug assertion (panic in tests; the chunk-5 keyspace layer pre-sorts
+// a debug assertion (panic in tests; the keyspace layer pre-sorts
 // for BulkLoad and the btree splice helpers always insert in-order).
 //
 // Inline backing arrays avoid heap allocation in the common case:
@@ -438,7 +438,7 @@ func valuePartSize(flags uint8, value []byte) int {
 	return 4 + len(value) // ValueLen uint32 + value bytes
 }
 
-// zeroFreeSpace clears bytes in [lo, hi). Mirrors the chunk-4.2
+// zeroFreeSpace clears bytes in [lo, hi). Mirrors the
 // "clear(buf)-before-encode" behavior so two encoders for the same input
 // produce byte-identical pages — the deterministic-encoding invariant
 // per page-formats.md §Leaf Split.

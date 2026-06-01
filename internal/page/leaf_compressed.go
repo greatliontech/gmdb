@@ -21,7 +21,7 @@ import "bytes"
 //	+-----------------------+ ContentEnd
 //
 // Per-entry encoding (restart vs delta, inline vs overflow) is identical
-// to the entries the chunk-4.2 EncodeLeaf produced — only the page-level
+// to the entries the former EncodeLeaf produced — only the page-level
 // framing (variable-group restart table, no per-page RestartInterval
 // field) changed.
 
@@ -418,6 +418,6 @@ func (r LeafReader) compressedEntryAt(idx int, keyBuf []byte) (LeafEntry, []byte
 }
 
 // (compareAndCommonLen was used by the kcpl-skip optimization in
-// compressedSearchLeaf; dropped along with that optimization in the
-// chunk-4.6β simplification. Restore here when profiling justifies the
+// compressedSearchLeaf; dropped along with that optimization in a
+// later simplification. Restore here when profiling justifies the
 // kcpl revival.)

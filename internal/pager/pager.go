@@ -130,7 +130,7 @@ type Pager struct {
 
 	// detachedBufs holds slab buffers that were severed from
 	// p.dirty when their page id was loose-popped by AllocPage.
-	// Required by the chunk-5.4 fix to the loose-page reuse contract:
+	// Required by the loose-page reuse contract:
 	// the original-tx caller of the slab buffer holds a borrowed
 	// []byte (byte-slice ownership valid through tx close), so the
 	// buffer must stay alive; but a fresh CoW / AllocSlab on the
@@ -236,7 +236,7 @@ type Pager struct {
 	// Production callers must not set this.
 	commitStep4HookForTest func() error
 
-	// laggingReader is the chunk-5.5 LaggingReader callback per
+	// laggingReader is the LaggingReader callback per
 	// lock-ordering.md §Lagging Reader Handling and free-space.md
 	// §Page Allocation Priority step 4. Invoked when AllocPage /
 	// AllocContiguous detect bitmap-exhausted AND RPL-reclaim-
@@ -244,7 +244,7 @@ type Pager struct {
 	// busy loops.
 	laggingReader func(LaggingReaderInfo) LaggingReaderAction
 
-	// refreshReclamationBound is the chunk-5.5 plumb-through for
+	// refreshReclamationBound is the plumb-through for
 	// "go re-poll the reader table and re-compute the bound." Used
 	// after LaggingReaderWait. DB.Begin captures coord and supplies
 	// a closure that re-derives the bound from coord.OldestReaderTxnID
@@ -270,9 +270,9 @@ type Pager struct {
 }
 
 // LaggingReaderInfo is the pager-side mirror of gmdb.LaggingReaderInfo.
-// Passed to the chunk-5.5 callback by AllocPage / AllocContiguous when
+// Passed to the LaggingReader callback by AllocPage / AllocContiguous when
 // reclamation is blocked by a reader. PID/HeldPages are zero when the
-// pager cannot cheaply derive them — the chunk-5.5 wiring fills only
+// pager cannot cheaply derive them — the wiring fills only
 // TxnID and Lag from local state.
 type LaggingReaderInfo struct {
 	PID       uint32
@@ -417,7 +417,7 @@ func (p *Pager) SetRPLChain(segments []RPLSegmentRef) {
 }
 
 // RPLChain returns the current in-memory segment list. Used by commit
-// step 0 to pwrite newly-appended segment pages and by chunk-11
+// step 0 to pwrite newly-appended segment pages and by the
 // integrity check.
 func (p *Pager) RPLChain() []RPLSegmentRef { return p.rplSegments }
 
@@ -541,7 +541,7 @@ func (p *Pager) NumFreePages() uint64 {
 }
 
 // PendingAllocs / PendingFrees / RetiredPages expose the tx-scoped
-// bookkeeping for the commit-step-0 caller (chunk 1.8). Returned
+// bookkeeping for the commit-step-0 caller. Returned
 // slices/maps are owned by the pager — callers must not mutate.
 func (p *Pager) PendingAllocs() map[uint64]struct{} { return p.pendingAllocs }
 func (p *Pager) PendingFrees() map[uint64]struct{}  { return p.pendingFrees }
@@ -589,7 +589,7 @@ func (p *Pager) SetCommitStep4HookForTest(fn func() error) {
 	p.commitStep4HookForTest = fn
 }
 
-// SetLaggingReaderCallback installs the chunk-5.5 LaggingReader
+// SetLaggingReaderCallback installs the LaggingReader
 // callback. nil clears. AllocPage / AllocContiguous invoke this when
 // bitmap-exhausted AND reclamation-blocked-by-bound. At most once per
 // AllocPage call.
@@ -838,7 +838,7 @@ func (p *Pager) resetVerified() { p.verified = nil }
 
 // CoW installs a fresh slab buffer at dstID populated from the current
 // content of srcID. dstID is supplied by the caller's allocator (see
-// free-space.md §Page Allocation Priority — wired in chunk 1.7); srcID
+// free-space.md §Page Allocation Priority); srcID
 // is the page being CoW'd from (may be mmap-backed or already in
 // p.dirty).
 //
@@ -906,7 +906,7 @@ func (p *Pager) AllocSlab(id uint64) ([]byte, error) {
 // AllocSlabRun installs n fresh zero-filled slab buffers covering the
 // contiguous run [firstID, firstID+n) previously reserved via
 // AllocContiguous. pages[i] is the buffer for firstID + uint64(i).
-// Implements the chunk-4.7 PageWriter contract used by the
+// Implements the PageWriter contract used by the
 // overflow-chain Put path (internal/btree.overflow).
 //
 // Atomicity: the slab budget is checked once against the full n*PageSize
@@ -1064,7 +1064,7 @@ func (p *Pager) IsDirty(id uint64) bool {
 //
 // Note: per the byte-slice ownership invariant, callers must not Discard
 // a buffer whose contents have been handed to the user as a borrowed
-// []byte until tx close. The freespace state machine (chunk 1.7)
+// []byte until tx close. The freespace state machine
 // enforces this by only Discarding at commit / rollback time.
 func (p *Pager) Discard(id uint64) {
 	if p.readOnly {
@@ -1082,7 +1082,7 @@ func (p *Pager) Discard(id uint64) {
 // ReleaseAll returns every slab buffer to the pool and empties the
 // dirty map. Used by commit (after pwrites complete) and by rollback.
 // Also drains p.detachedBufs (buffers detached from p.dirty by the
-// AllocPage loose-pop path — see the chunk-5.4 fix comment on
+// AllocPage loose-pop path — see the comment on
 // detachedBufs). The pager is left in a state where Page() returns
 // mmap-only views.
 func (p *Pager) ReleaseAll() {

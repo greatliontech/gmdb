@@ -8,7 +8,7 @@ import (
 )
 
 // SyncPolicy selects which fdatasync calls fire during commit. The
-// chunk-3.5 promotion of durability.md §Durability Modes; mapped 1:1
+// promotion of durability.md §Durability Modes; mapped 1:1
 // onto the root package's gmdb.SyncMode but kept narrow here so the
 // pager doesn't import the root.
 //
@@ -33,7 +33,7 @@ const (
 //     prev.TxnID (or, for the genesis commit on a TxnID==0 file, equal
 //     to 1).
 //   - KeyspaceRoot / NumKeyspaces: root-state snapshot for the new
-//     meta. Chunk 1 leaves these zero; chunk 5+ wires them.
+//     meta. Supplied by the caller's current root state.
 //   - Flags: meta-page Flags for the new meta. The caller composes
 //     MetaFlagPageChecksum (from prev) and MetaFlagCheckpoint (per
 //     SyncMode policy). The pager does NOT auto-set Checkpoint based

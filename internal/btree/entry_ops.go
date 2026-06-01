@@ -1,7 +1,7 @@
 package btree
 
-// LeafEntry-level read/write primitives used by chunk-6.6 SetKeyspace
-// surface. The chunk-4 Get/Put pair operates on (key, value []byte)
+// LeafEntry-level read/write primitives used by the SetKeyspace
+// surface. The Get/Put pair operates on (key, value []byte)
 // — flags are always 0 (Put) and ignored (Get returns just the
 // value). SetKeyspace cells carry CellFlagMultiValue and (for
 // nested-tree references) CellFlagNestedTree, which the value-only
@@ -75,7 +75,7 @@ func GetEntry(pr PageReader, cfg page.Config, rootID uint64, key []byte) (page.L
 
 // PutEntry inserts or replaces e in the tree rooted at rootID. The
 // caller has full control over e's encoding via Flags / Value /
-// OverflowPage+TotalLen / NestedRoot+NestedCount. Used by chunk-6.6
+// OverflowPage+TotalLen / NestedRoot+NestedCount. Used by
 // SetKeyspace.Put to install Subpage or NestedTree cells whose
 // encoding btree.Put does not support (Put writes flags=0 only).
 //
@@ -236,7 +236,7 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 }
 
 // putEmptyEntry allocates a single-leaf root containing just e.
-// Mirrors putEmpty (chunk-4 putEmpty's overflow-promotion path is
+// Mirrors putEmpty (putEmpty's overflow-promotion path is
 // inapplicable here — the caller has already constructed e with any
 // overflow / nested-tree references in place).
 func putEmptyEntry(pw PageWriter, cfg page.Config, e page.LeafEntry) (uint64, error) {
@@ -259,13 +259,13 @@ func putEmptyEntry(pw PageWriter, cfg page.Config, e page.LeafEntry) (uint64, er
 }
 
 // readLeafEntriesDeepCopyWithTrailers is the entry-trailer-aware
-// counterpart of readLeafEntriesDeepCopy. Chunk-4's helper clones
-// only Key and Value — sufficient for the chunk-4 use case where
+// counterpart of readLeafEntriesDeepCopy. The base helper clones
+// only Key and Value — sufficient for the common case where
 // entries are plain inline or overflow (the Overflow trailer
 // fields OverflowPage / TotalLen are uint64 values, copied by
 // value in the LeafEntry struct, so no clone needed).
 //
-// For chunk-6.6 PutEntry, the same observation holds: NestedTree
+// For PutEntry, the same observation holds: NestedTree
 // trailer fields NestedRoot / NestedCount are uint64s. So
 // readLeafEntriesDeepCopy works correctly for SetKeyspace cells
 // too — this helper is a forwarding alias kept for documentation

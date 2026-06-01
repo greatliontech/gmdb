@@ -5,7 +5,7 @@ package page
 // inline in the leaf cell's value area when the set is small enough
 // to fit below the 50%-of-leaf promotion threshold
 // (`set-keyspace.md §Subpage Promotion Threshold` — enforced at the
-// SetKeyspace surface in chunk 6.4, not by this codec).
+// SetKeyspace surface, not by this codec).
 //
 // Layout (`set-keyspace.md §Subpage Format`):
 //
@@ -27,7 +27,7 @@ package page
 //
 // Empty-set policy (Inv-1): a Count=0 subpage is a structurally valid
 // transient state for in-place operations (e.g. Delete that empties
-// the subpage; the SetKeyspace surface at chunk 6.5 then removes the
+// the subpage; the SetKeyspace surface then removes the
 // parent cell entirely so an empty subpage never persists). This
 // codec accepts and produces Count=0 subpages; the persistence ban is
 // enforced one layer up.
@@ -52,7 +52,7 @@ const (
 // MaxSubpageDataSize is the maximum DataSize a single subpage may
 // carry. The on-disk DataSize field is uint16 — at fill, the
 // per-keyspace 50%-of-leaf promotion threshold enforces a much
-// tighter bound (chunk 6.4). The codec rejects DataSize values that
+// tighter bound. The codec rejects DataSize values that
 // exceed uint16-max so a malformed buf returns ErrSubpageCorrupted
 // from Validate rather than corrupting downstream reads.
 const MaxSubpageDataSize = (1 << 16) - 1
@@ -121,7 +121,7 @@ func (r SubpageReader) SizeBytes() int { return SubpageHeaderSize + r.dataSize }
 
 // Buf returns the underlying subpage buffer (header + entries) for
 // callers that need to copy or splice the subpage at a higher layer
-// (the leaf-cell builder at chunk 6.3).
+// (the leaf-cell builder).
 func (r SubpageReader) Buf() []byte { return r.buf[:r.SizeBytes()] }
 
 // FixedValueSize returns the per-keyspace stride this reader was
@@ -147,7 +147,7 @@ func (r SubpageReader) FixedValueSize() uint16 { return r.fixedValueSize }
 //
 // NewSubpageReader is intentionally NOT a validation boundary: it
 // only initialises header state. Callers resolving a subpage from
-// disk (the chunk 6.3 leaf-walker) MUST call Validate before any
+// disk (the leaf-walker) MUST call Validate before any
 // Search / ValueAt / Insert / Delete op; in-memory subpages
 // produced by this package's own Insert / Delete / EncodeSubpage
 // helpers do not need re-validation because the producers
@@ -300,7 +300,7 @@ func (r SubpageReader) AllValues(yield func(value []byte) bool) {
 //     length — a wrong-length target is compared via bytes.Compare
 //     and necessarily mismatches every stored entry, so the call
 //     returns (insertion-point, false) without panic. The SetKeyspace
-//     surface at chunk 6.6 rejects wrong-length values at the Put
+//     surface rejects wrong-length values at the Put
 //     boundary with gmdb.ErrValueSizeMismatch BEFORE reaching here;
 //     this codec's contract is "given a target, where does it go" —
 //     not "is the target well-formed for this keyspace".
@@ -360,7 +360,7 @@ func (r SubpageReader) Search(target []byte) (idx int, found bool) {
 //   - (_, false, ErrSubpageValueSize) for a fixed-size subpage when
 //     len(value) ≠ fixedValueSize.
 //
-// Caller-facing length budget: the caller (chunk 6.4) is responsible
+// Caller-facing length budget: the caller is responsible
 // for the 50%-of-leaf promotion-threshold check BEFORE calling
 // Insert. This codec does not have visibility into leaf usable space
 // and will happily produce a subpage that exceeds the threshold.
@@ -384,7 +384,7 @@ func (r SubpageReader) Insert(value []byte) ([]byte, bool, error) {
 	// elided — same on-disk format, internal codec change only.
 	entryBytes := subpageEntrySize(value, r.fixedValueSize)
 	// Header-field overflow guard: Count and DataSize are uint16 on
-	// disk. The 50%-of-leaf promotion-threshold check at chunk 6.4
+	// disk. The 50%-of-leaf promotion-threshold check
 	// keeps a well-behaved caller well below these caps, but the
 	// codec's contract (godoc line ~50: "rejects DataSize values
 	// that exceed uint16-max so a malformed buf returns
@@ -419,7 +419,7 @@ func (r SubpageReader) Insert(value []byte) ([]byte, bool, error) {
 // Returns:
 //
 //   - (r.buf[:r.SizeBytes()], false, nil) if value is not present
-//     (the SetKeyspace surface at chunk 6.6 maps this to
+//     (the SetKeyspace surface maps this to
 //     gmdb.ErrNotFound per api-surface.md §Invariants Delete-on-miss).
 //     The returned slice is the original buf — caller must not
 //     mutate.
@@ -531,10 +531,10 @@ func SubpagePromotionThreshold(cfg Config) int {
 // disagrees with fixedValueSize on a fixed-size keyspace.
 //
 // Use cases:
-//   - Demotion at chunk 6.5: a nested B+tree that shrinks to a
+//   - Demotion: a nested B+tree that shrinks to a
 //     single-leaf-fits-as-subpage is rebuilt as a subpage from the
 //     leaf's enumerated entries.
-//   - Test fixtures and the chunk 6.4 promotion's inverse for
+//   - Test fixtures and the promotion's inverse for
 //     round-trip property tests.
 //
 // Returns a Count=0 subpage (4-byte header, all zeroes) for an

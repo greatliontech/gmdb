@@ -12,7 +12,7 @@ const NoSlot uint32 = math.MaxUint32
 
 // ErrReadersFull is returned by AcquireReaderSlot after a full
 // scan-with-wraparound finds no free slot. Surfaces at the public API
-// as gmdb.ErrReadersFull (chunk 3.3 adds the sentinel) so callers can
+// as gmdb.ErrReadersFull so callers can
 // distinguish "table at capacity" from other Open/Begin failures.
 var ErrReadersFull = errors.New("lock: reader table full")
 
@@ -45,7 +45,7 @@ var ErrReadersFull = errors.New("lock: reader table full")
 //
 // txnID is the snapshot TxnID from the active meta. txnID == 0 is
 // rejected (the per-slot "TxnID == 0 means free" sentinel collides
-// with a legitimate genesis snapshot of 0; the chunk-3 caller passes
+// with a legitimate genesis snapshot of 0; the caller passes
 // max(activeMeta.TxnID, 1) to dodge this — documenting the precondition
 // here rather than silently coercing).
 func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS, heartbeat uint64) (uint32, error) {

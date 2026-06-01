@@ -23,12 +23,12 @@ var ErrNotFound = errors.New("btree: key not found")
 const MaxMergeThreshold uint8 = 50
 
 // DefaultMergeThreshold mirrors api-surface.md Options.MergeThreshold
-// default (25%). Re-exported here so chunk-4 tests can run without
-// pulling the chunk-5 Options surface.
+// default (25%). Re-exported here so tests can run without
+// pulling the Options surface.
 const DefaultMergeThreshold uint8 = 25
 
 // Delete removes key from the tree rooted at rootID. Returns the new
-// rootID — the chunk-5 keyspace caller records this in the keyspace
+// rootID — the keyspace caller records this in the keyspace
 // descriptor and propagates the descriptor update via CoW to the
 // meta page.
 //
@@ -374,8 +374,7 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 // heal locally (0 if none); deepUnderflowChildOut is the corresponding
 // signal this level propagates upward (0 if fully healed here).
 // Used by both deleteFromBranch (single-key delete) and
-// deleteRangeFromBranch's single-child overlap case (chunk-5.7
-// DeleteRange).
+// deleteRangeFromBranch's single-child overlap case (DeleteRange).
 func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, descentIdx uint16, newChildID uint64, childUnderflow bool, deepUnderflowChildIn uint64) (uint64, bool, uint64, error) {
 	// CoW the parent for mutation and decode its (leftmost, cells)
 	// form. Deep-clone every cell Key — DecodeBranch returns Keys
@@ -512,7 +511,7 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	// the same depth per the B+tree balance invariant. A mismatch
 	// is structural corruption. Leaf-vs-leaf is the only valid
 	// leaf pairing; the dispatcher tolerates either compressed or
-	// uncompressed variant on either side (the chunk-4.6β leaf
+	// uncompressed variant on either side (the leaf
 	// format permits per-leaf variant choice — merge/redistribute
 	// just rebuilds via cfg.RestartGroupTarget).
 	leftSrc, err := pw.Page(leftPairID)
@@ -1093,7 +1092,7 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 //
 // Variant policy. The surviving page(s) are built via
 // cfg.RestartGroupTarget — the input leaves' on-page variant is
-// not preserved. With the chunk-4.6β format the per-leaf variant
+// not preserved. With the current format the per-leaf variant
 // is a build-time policy choice, not a per-page invariant; merge/
 // redistribute homogenizes toward the keyspace-level target. No
 // spec clause requires variant preservation across merge.
@@ -1245,7 +1244,7 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 // Redistribute → pick a middle cell whose Key is the new separator
 // lifted to the parent and whose Child becomes the new right branch's
 // leftmost child; cells before/after split into the two new branches.
-// This mirrors the chunk-4.4 branch-split path's separator-lift
+// This mirrors the branch-split path's separator-lift
 // convention.
 func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold uint8, leftID, rightID uint64, separator []byte) (bool, uint64, uint64, uint64, []byte, error) {
 	// An empty parent separator is unreachable from a tree built via

@@ -225,7 +225,7 @@ func (r LeafReader) GroupEntryCount(i int) int {
 // smallest key strictly greater than target, or Count() if every entry is
 // less than target). Same robustness contract as the per-variant
 // decoders: total over input; errors flow through return-error variants
-// (TODO: chunk-4.6γ will wire an err-returning sibling).
+// (TODO: an err-returning sibling could be added).
 func (r LeafReader) SearchLeaf(target []byte) (index int, entry LeafEntry, found bool) {
 	if r.count == 0 {
 		return 0, LeafEntry{}, false
@@ -642,7 +642,7 @@ func (r LeafReader) ensureBytes(off, n int) error {
 }
 
 // (commonPrefixLen alias removed — sharedPrefixLen in restart.go is the
-// canonical implementation; chunk-4.2's external callers have been
-// retired in the 4.6β rewrite.)
+// canonical implementation; its external callers were
+// retired in the rewrite.)
 
 var _ = bytes.Equal // keep bytes imported for future use

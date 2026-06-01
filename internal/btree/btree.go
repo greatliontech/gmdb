@@ -36,7 +36,7 @@ const MaxTreeDepth = 64
 
 // ErrCorrupted is returned by Get/Has on any structural integrity
 // violation observed during descent: bad page type, null child
-// pointer, leaf structural fault, cyclic branch chain. The chunk-5
+// pointer, leaf structural fault, cyclic branch chain. The
 // db-level mapping translates this to gmdb.ErrCorrupted — same
 // pattern as pager.ErrCorrupted.
 var ErrCorrupted = errors.New("btree: structural corruption detected")
@@ -48,7 +48,7 @@ var ErrCorrupted = errors.New("btree: structural corruption detected")
 var ErrTreeTooDeep = fmt.Errorf("%w: descent exceeded MaxTreeDepth (cycle or corrupt tree)", ErrCorrupted)
 
 // validateBranchPage validates a branch page's directory structure
-// before its separators/children are read — the chunk-4.6β "the first
+// before its separators/children are read — the "first
 // resolver validates an arbitrary on-disk page" contract, extended from
 // leaves (LeafReader.Validate) to branches. A forged directory (count
 // past capacity, a cell offset outside the page) would otherwise make
@@ -87,10 +87,10 @@ func validateBranchPage(buf []byte, cfg page.Config, id uint64) error {
 //
 // Validation boundary. Every leaf page resolved during descent is
 // passed through LeafReader.Validate before SearchLeaf — the
-// chunk-4.6β contract per internal/page/leaf.go (NewLeafReader is
+// contract per internal/page/leaf.go (NewLeafReader is
 // O(1) and assumes structural validity; arbitrary on-disk pages
 // must be validated by their first resolver). Any validation
-// failure surfaces as ErrCorrupted, preserving the chunk-4.3
+// failure surfaces as ErrCorrupted, preserving the
 // errors.Is contract under the new leaf format.
 func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, bool, error) {
 	if rootID == 0 {

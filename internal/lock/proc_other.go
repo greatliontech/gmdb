@@ -7,7 +7,7 @@ import "errors"
 // errStartTimeUnsupported is returned by ProcessStartTime on platforms
 // where the per-platform implementation is not present in this build
 // (macOS / FreeBSD ship Linux-only stubs until the sysctl-based
-// helpers land in a later chunk-2 sub-chunk). On error, callers fall
+// helpers are implemented). On error, callers fall
 // back to the heartbeat-based liveness check per
 // cross-process.md §Process Start Time.
 var errStartTimeUnsupported = errors.New("lock: ProcessStartTime not implemented on this platform")

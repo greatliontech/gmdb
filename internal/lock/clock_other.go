@@ -4,7 +4,7 @@ package lock
 
 // Build tag matches proc.go's `linux || darwin || freebsd` — the
 // package's effective supported set. netbsd/openbsd are not
-// covered by chunk-2's proc/flock helpers either, so this file
+// covered by the package's proc/flock helpers either, so this file
 // stays in lockstep rather than diverging from proc.go's tag.
 // Adding a platform requires extending this set in both files.
 
