@@ -869,3 +869,45 @@ func makeInterleaved(n int) []int {
 	}
 	return out
 }
+
+// TestPutAscendErrorRollsBackAllocations pins the rollback contract on
+// the branch-ascend error path. Build a multi-level tree, then inject an
+// AllocPage failure during the ascend of a final non-splitting Put: the
+// leaf CoW (leftID) is alloc 1, the ascend's branch CoW is alloc 2.
+// Failing alloc 2 drives ascendNoSplit to error AFTER leftID is
+// allocated. Regression: the ascend-error returns used to drop leftID
+// (and the new value chain) without freeing them, leaking intra-tx
+// loose pages. The fix gives those returns the same
+// FreePage(leftID)+rollbackNewChain() the sibling error paths use.
+func TestPutAscendErrorRollsBackAllocations(t *testing.T) {
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16}
+	fake := newFakeWriter(t, cfg.PageSize)
+	root := uint64(0)
+	const N = 60
+	for i := range N {
+		key := fmt.Appendf(nil, "k-%05d", i)
+		val := bytes.Repeat([]byte{byte('a' + i%26)}, 100)
+		nr, err := Put(fake, cfg, root, key, val)
+		if err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+		root = nr
+	}
+	if countLeaves(t, fake, cfg, root) < 2 {
+		t.Fatalf("tree too shallow to exercise the branch ascend")
+	}
+
+	// Wrap the built tree so the SECOND AllocPage of the next Put fails
+	// (alloc 1 = leaf CoW leftID; alloc 2 = ascend's branch CoW).
+	pw := &failingFakeWriter{fakeWriter: fake, allocPageCallsToFail: 2}
+	leftID := fake.nextID // the next AllocPage hands out leftID
+
+	// A small mid-range insert: CoWs an existing leaf (no split) and
+	// ascends to repoint the branch — so alloc 2 is the ascend's.
+	if _, err := Put(pw, cfg, root, []byte("k-00000-x"), []byte("v")); err == nil {
+		t.Fatal("expected injected ascend AllocPage error, got nil")
+	}
+	if _, freed := fake.freed[leftID]; !freed {
+		t.Errorf("ascend-error path leaked leftID=%d (not freed); freed=%v", leftID, fake.freed)
+	}
+}

@@ -260,6 +260,8 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		}
 		nr, e := ascendNoSplit(pw, cfg, path, leftID)
 		if e != nil {
+			_ = pw.FreePage(leftID)
+			rollbackNewChain()
 			return 0, false, e
 		}
 		return nr, false, nil
@@ -288,6 +290,9 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			}
 			nr, e := ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
 			if e != nil {
+				_ = pw.FreePage(leftID)
+				_ = pw.FreePage(rightID)
+				rollbackNewChain()
 				return 0, false, e
 			}
 			return nr, false, nil
@@ -309,6 +314,8 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		}
 		nr, e := ascendNoSplit(pw, cfg, path, leftID)
 		if e != nil {
+			_ = pw.FreePage(leftID)
+			rollbackNewChain()
 			return 0, false, e
 		}
 		return nr, false, nil
@@ -371,6 +378,8 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			}
 			nr, e := ascendNoSplit(pw, cfg, path, leftID)
 			if e != nil {
+				_ = pw.FreePage(leftID)
+				rollbackNewChain()
 				return 0, false, e
 			}
 			return nr, existed, nil
@@ -460,6 +469,9 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		sep := page.ShortestSeparator(entries[mid-1].Key, entries[mid].Key)
 		nr, e := ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
 		if e != nil {
+			_ = pw.FreePage(leftID)
+			_ = pw.FreePage(rightID)
+			rollbackNewChain()
 			return 0, false, e
 		}
 		return nr, existed, nil
