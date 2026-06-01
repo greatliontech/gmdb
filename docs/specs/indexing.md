@@ -7,7 +7,7 @@ row. The engine applies index changes inside every write
 transaction that modifies the keyspace, atomic with the row write.
 
 Scope:
-- `IndexDecl`, `IndexColumn`, `CoveringColumn`, `IndexEntry`,
+- `IndexDecl`, `IndexColumn`, `IndexCoveringColumn`, `IndexEntry`,
   `IndexExtractor`.
 - Drift guard (schema hash + version tag).
 - Column encoding (the NUL-escape scheme is defined in
@@ -198,7 +198,7 @@ Invariant: kind=entailed;
 type IndexDecl struct {
     Name     string             // unique within the keyspace
     Columns  []IndexColumn      // ordered; concatenated lex-safely
-    Covering []CoveringColumn   // optional; stored in the index value
+    Covering []IndexCoveringColumn   // optional; stored in the index value
     Unique   bool               // engine rejects extractor-produced duplicates
     Version  string             // user-supplied; bump after extractor-logic changes
     Extract  IndexExtractor
@@ -216,13 +216,13 @@ type IndexColumn struct {
     Name string
 }
 
-type CoveringColumn struct {
+type IndexCoveringColumn struct {
     Name string // same semantics as IndexColumn.Name
 }
 
 type IndexEntry struct {
     Cols  [][]byte // one byte slice per IndexColumn; lex-safe encoded by caller
-    Cover [][]byte // one per CoveringColumn (omit when Covering is nil)
+    Cover [][]byte // one per IndexCoveringColumn (omit when Covering is nil)
 }
 
 // IndexExtractor produces zero or more IndexEntry values for a row.
@@ -430,7 +430,7 @@ column names in declaration order, so adding / removing /
 reordering covering columns triggers
 `ErrIndexFingerprintMismatch`.
 
-**Byte-API return contract.** For the byte-oriented `*Index`
+**Byte-API return contract.** For the byte-oriented `*IndexHandle`
 surface, the bytes `Lookup` / `Range` / `Prefix` / `Get` yield
 as the `value` ARE the encoded covering tuple stored by the
 engine — the NUL-escape multi-column blob produced from
@@ -448,7 +448,7 @@ A covering tuple with zero entries (extractor returned
 stored as empty bytes and `Lookup` returns an empty `value`;
 the engine permits this case to keep the storage / read paths
 total. The extractor contract is "one `Cover[i]` per declared
-`CoveringColumn`" — producing fewer is a caller-side contract
+`IndexCoveringColumn`" — producing fewer is a caller-side contract
 violation, not an engine error.
 
 The typed full-row covering helper (`TypedIndex.CoverValue`,
@@ -484,7 +484,7 @@ the predicate. Simpler API, equivalent expressive power.
 
 ## Lookup API
 
-Index queries are exposed on a `*Index` handle returned by
+Index queries are exposed on a `*IndexHandle` handle returned by
 `Keyspace.Index(name)` or `SetKeyspace.Index(name)`. The
 canonical query is `Lookup`; `LookupKeys` is the cost-sensitive
 escape hatch.
@@ -507,7 +507,7 @@ API`. Brief summary:
   `ErrIndexNotUnique` on a non-unique index.
 - `Err()` returns the first error encountered during the last
   sequence's iteration. The `Err` state is per-handle; two
-  overlapping iterators on the same `*Index` race — open the
+  overlapping iterators on the same `*IndexHandle` race — open the
   keyspace in separate transactions, or call
   `ks.Index(name)` once per goroutine.
 
@@ -528,7 +528,7 @@ inconsistency surfaces only via `Check()`.
 
 ### Handle Invalidation
 
-An `*Index` handle returned by `ks.Index(name)` is bound to the
+An `*IndexHandle` handle returned by `ks.Index(name)` is bound to the
 parent keyspace for the lifetime of the transaction. Mutations
 that replace or free the index's data tree pages within the same
 transaction invalidate in-flight observers tied to that handle.
@@ -556,7 +556,7 @@ sentinel — identical to the row-cursor contract that
   cached handle's re-`Lookup` with the OLD shape returns
   `ErrInvalidOptions` (`got N cols, want M`); full recovery from a
   shape-changing rebuild is to re-`OpenKeyspace` with the new
-  `IndexDecl` and obtain a fresh `*Index` via `ks.Index(name)`.
+  `IndexDecl` and obtain a fresh `*IndexHandle` via `ks.Index(name)`.
   `BulkLoad` is invalidation-irrelevant here: its precondition
   (`Count == 0`) makes any in-flight iter cursor unreachable (the
   iter closures early-return at `pinned.root == 0`).
@@ -582,7 +582,7 @@ sentinel — identical to the row-cursor contract that
   sentinel because the WHOLE keyspace is gone, not just this
   index. Closes the
   `transactions.md §Cursor invalidation by DeleteKeyspace` clause
-  for `*Index` handles (the clause names them but the row-cursor
+  for `*IndexHandle` handles (the clause names them but the row-cursor
   fix that landed at chunk 5.6 did not enforce it on the iter
   surface). Dead-check ordering is "parent first":
   `Stats` / `Lookup` / etc. probe the parent ks/sks `dead` flag
@@ -603,7 +603,7 @@ sentinel — identical to the row-cursor contract that
 Three invariants pin this contract:
 
 - **Inv-IHS1 (cursor-on-stale-tree).** A `*btree.Cursor` opened by
-  an `*Index` iter closure is `MarkStale`'d (and its tracked rootID
+  an `*IndexHandle` iter closure is `MarkStale`'d (and its tracked rootID
   refreshed to `idx.pinned.root`) before any same-tx code path
   completes that frees or replaces the index data tree pages it
   walks. Violation: an iter's `c.Next()` reads CoW'd-then-released
@@ -611,7 +611,7 @@ Three invariants pin this contract:
   yields or layout-decode panics.
 
 - **Inv-IHS2 (post-drop handle dead).** After `tx.Indexes().Drop(ks,
-  name)` succeeds, every previously-handed-out `*Index` handle for
+  name)` succeeds, every previously-handed-out `*IndexHandle` handle for
   the `(ks, name)` pair rejects subsequent
   `Lookup` / `LookupKeys` / `Range` / `Prefix` / `Get` / `Stats`
   with `ErrIndexNotFound`. Violation: `idx.Stats()` returns the
@@ -619,7 +619,7 @@ Three invariants pin this contract:
 
 - **Inv-IHS3 (post-DeleteKeyspace handle closed).** After
   `tx.DeleteKeyspace(ks.Name())` succeeds, every previously-
-  handed-out `*Index` handle whose parent is `ks` rejects
+  handed-out `*IndexHandle` handle whose parent is `ks` rejects
   subsequent `Lookup` / `LookupKeys` / `Range` / `Prefix` / `Get`
   / `Stats` / `Err` with `ErrKeyspaceClosed` — checked BEFORE the
   Inv-IHS2 `idx.dead` check, so the broader sentinel wins on a
@@ -644,7 +644,7 @@ Three invariants pin this contract:
   yields stale entries from the just-`FreeSubtree`'d pages with
   no MarkStale signal. Closes the
   `transactions.md §Cursor invalidation by DeleteKeyspace` clause
-  for `*Index` handles (the clause names them but the row-cursor
+  for `*IndexHandle` handles (the clause names them but the row-cursor
   fix that landed at chunk 5.6 did not enforce it on the iter
   surface).
 

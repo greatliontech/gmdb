@@ -615,7 +615,7 @@ func TestIndexedPutWritesCoveringBytes(t *testing.T) {
 	decl := &IndexDecl{
 		Name:     "by_color",
 		Columns:  []IndexColumn{{Name: "color"}},
-		Covering: []CoveringColumn{{Name: "size"}},
+		Covering: []IndexCoveringColumn{{Name: "size"}},
 		Unique:   true,
 		Extract: func(_, value []byte) []IndexEntry {
 			if len(value) < 2 {
@@ -685,7 +685,7 @@ func TestByteAPIUniqueCoveringLookupReturnsCovering(t *testing.T) {
 	decl := &IndexDecl{
 		Name:     "by_color",
 		Columns:  []IndexColumn{{Name: "color"}},
-		Covering: []CoveringColumn{{Name: "size"}},
+		Covering: []IndexCoveringColumn{{Name: "size"}},
 		Unique:   true,
 		Extract: func(_, value []byte) []IndexEntry {
 			if len(value) < 2 {
@@ -775,7 +775,7 @@ func TestByteAPIUniqueCoveringMultiColumnRoundTrip(t *testing.T) {
 	decl := &IndexDecl{
 		Name:     "by_lead",
 		Columns:  []IndexColumn{{Name: "lead"}},
-		Covering: []CoveringColumn{{Name: "a"}, {Name: "b"}},
+		Covering: []IndexCoveringColumn{{Name: "a"}, {Name: "b"}},
 		Unique:   true,
 		Extract: func(_, value []byte) []IndexEntry {
 			if len(value) < 1 {
@@ -849,7 +849,7 @@ func TestByteAPINonUniqueCoveringLookupReturnsCovering(t *testing.T) {
 	decl := &IndexDecl{
 		Name:     "by_color",
 		Columns:  []IndexColumn{{Name: "color"}},
-		Covering: []CoveringColumn{{Name: "size"}},
+		Covering: []IndexCoveringColumn{{Name: "size"}},
 		Unique:   false,
 		Extract: func(_, value []byte) []IndexEntry {
 			if len(value) < 2 {
@@ -913,7 +913,7 @@ func TestByteAPICoveringGetReturnsCovering(t *testing.T) {
 	decl := &IndexDecl{
 		Name:     "by_color",
 		Columns:  []IndexColumn{{Name: "color"}},
-		Covering: []CoveringColumn{{Name: "size"}},
+		Covering: []IndexCoveringColumn{{Name: "size"}},
 		Unique:   true,
 		Extract: func(_, value []byte) []IndexEntry {
 			if len(value) < 2 {
@@ -967,7 +967,7 @@ func TestByteAPICoveringRangeReturnsCovering(t *testing.T) {
 	decl := &IndexDecl{
 		Name:     "by_color",
 		Columns:  []IndexColumn{{Name: "color"}},
-		Covering: []CoveringColumn{{Name: "size"}},
+		Covering: []IndexCoveringColumn{{Name: "size"}},
 		Unique:   true,
 		Extract: func(_, value []byte) []IndexEntry {
 			if len(value) < 2 {
@@ -1109,7 +1109,7 @@ func TestByteAPICoveringNilCoverReturnsEmpty(t *testing.T) {
 	decl := &IndexDecl{
 		Name:     "by_color",
 		Columns:  []IndexColumn{{Name: "color"}},
-		Covering: []CoveringColumn{{Name: "size"}}, // declared, but...
+		Covering: []IndexCoveringColumn{{Name: "size"}}, // declared, but...
 		Unique:   true,
 		Extract: func(_, value []byte) []IndexEntry {
 			if len(value) < 1 {

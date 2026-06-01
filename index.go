@@ -43,7 +43,7 @@ import (
 // btree.ErrCursorStale to ErrKeyspaceClosed (not ErrCursorStale —
 // the "re-position to recover" semantic does not apply when the
 // parent is gone).
-type Index struct {
+type IndexHandle struct {
 	ks     *Keyspace
 	sks    *SetKeyspace // nil iff ks != nil
 	pinned *pinnedIndex
@@ -128,7 +128,7 @@ type IndexStats struct {
 // Stats does NOT touch idx.err — the iter-side sticky cause (Inv-IHS1,
 // e.g. mid-iter ErrCursorStale) survives across Stats calls and remains
 // observable via idx.Err() until a fresh iter resets it.
-func (idx *Index) Stats() (IndexStats, error) {
+func (idx *IndexHandle) Stats() (IndexStats, error) {
 	if idx.keyspaceDead() {
 		return IndexStats{}, ErrKeyspaceClosed
 	}
@@ -158,7 +158,7 @@ func (idx *Index) Stats() (IndexStats, error) {
 
 // coreTx returns the owning transaction of this index's parent keyspace
 // (exactly one of idx.ks / idx.sks is non-nil — both embed keyspaceCore).
-func (idx *Index) coreTx() *Tx {
+func (idx *IndexHandle) coreTx() *Tx {
 	if idx.ks != nil {
 		return idx.ks.tx
 	}
@@ -172,7 +172,7 @@ func (idx *Index) coreTx() *Tx {
 // not set. Centralized so the entry-method guards (Stats, Lookup,
 // LookupKeys, Range, Prefix, Get) and mapCursorErr's mid-iter
 // translation share one statement of Inv-IHS3's dead-check.
-func (idx *Index) keyspaceDead() bool {
+func (idx *IndexHandle) keyspaceDead() bool {
 	if idx.ks != nil && idx.ks.dead {
 		return true
 	}
@@ -210,7 +210,7 @@ func (idx *Index) keyspaceDead() bool {
 // sticky ErrInvalidOptions wrap, Stats reports ErrIndexNotFound.
 // This is the prior contract and out of scope for the
 // Inv-IHS3 fix (different cause-line from DeleteKeyspace).
-func (idx *Index) Err() error {
+func (idx *IndexHandle) Err() error {
 	if idx.keyspaceDead() {
 		return ErrKeyspaceClosed
 	}
@@ -228,7 +228,7 @@ func (idx *Index) Err() error {
 // declared. The handle is valid for the lifetime of the owning
 // transaction; subsequent operations on this Keyspace's parent
 // tx after Commit/Rollback will return ErrTxClosed.
-func (ks *Keyspace) Index(name string) (*Index, error) {
+func (ks *Keyspace) Index(name string) (*IndexHandle, error) {
 	if ks.dead {
 		return nil, ErrKeyspaceClosed
 	}
@@ -240,7 +240,7 @@ func (ks *Keyspace) Index(name string) (*Index, error) {
 		return nil, fmt.Errorf("gmdb: index %q on keyspace %q: %w",
 			name, ks.name.Value(), ErrIndexNotFound)
 	}
-	idx := &Index{ks: ks, pinned: p}
+	idx := &IndexHandle{ks: ks, pinned: p}
 	// Register so the parent keyspace's mutators (Put / Delete /
 	// Cursor.Delete / TxIndexes.Rebuild / TxIndexes.Drop) can find and
 	// MarkStale every in-flight cursor on this handle and mark the
@@ -251,7 +251,7 @@ func (ks *Keyspace) Index(name string) (*Index, error) {
 
 // Index returns a query handle for the named index on this
 // SetKeyspace. Mirror of Keyspace.Index.
-func (sks *SetKeyspace) Index(name string) (*Index, error) {
+func (sks *SetKeyspace) Index(name string) (*IndexHandle, error) {
 	if sks.dead {
 		return nil, ErrKeyspaceClosed
 	}
@@ -263,7 +263,7 @@ func (sks *SetKeyspace) Index(name string) (*Index, error) {
 		return nil, fmt.Errorf("gmdb: index %q on keyspace %q: %w",
 			name, sks.name.Value(), ErrIndexNotFound)
 	}
-	idx := &Index{sks: sks, pinned: p}
+	idx := &IndexHandle{sks: sks, pinned: p}
 	sks.openIndexHandles = append(sks.openIndexHandles, idx)
 	return idx, nil
 }
@@ -273,7 +273,7 @@ func (sks *SetKeyspace) Index(name string) (*Index, error) {
 // Keyspace.Index / SetKeyspace.Index's miss path so a caller that
 // uses errors.Is(err, ErrIndexNotFound) handles cached-dead-handle
 // and fresh-lookup-miss symmetrically.
-func (idx *Index) indexNotFoundError() error {
+func (idx *IndexHandle) indexNotFoundError() error {
 	name := ""
 	if idx.pinned != nil && idx.pinned.decl != nil {
 		name = idx.pinned.decl.Name
@@ -294,14 +294,14 @@ func (idx *Index) indexNotFoundError() error {
 // with a defer'd unregisterCursor at the iter closure's exit so the
 // slice does not grow unboundedly across iterations on the same
 // handle.
-func (idx *Index) registerCursor(c *btree.Cursor) {
+func (idx *IndexHandle) registerCursor(c *btree.Cursor) {
 	idx.openCursors = append(idx.openCursors, c)
 }
 
 // unregisterCursor removes c from idx.openCursors. Swap-and-truncate
 // — the slice has no ordering requirement (mark operations walk
 // every entry). Single-goroutine per spec, so no mutex needed.
-func (idx *Index) unregisterCursor(c *btree.Cursor) {
+func (idx *IndexHandle) unregisterCursor(c *btree.Cursor) {
 	for i, x := range idx.openCursors {
 		if x == c {
 			last := len(idx.openCursors) - 1
@@ -316,7 +316,7 @@ func (idx *Index) unregisterCursor(c *btree.Cursor) {
 // rowRoot returns the row keyspace's current B+tree root (the
 // back-lookup target) and the keyspace's name (for error reporting).
 // Routes through ks or sks depending on which is non-nil.
-func (idx *Index) rowRoot() (uint64, string) {
+func (idx *IndexHandle) rowRoot() (uint64, string) {
 	if idx.ks != nil {
 		return idx.ks.desc.Root, idx.ks.name.Value()
 	}
@@ -324,7 +324,7 @@ func (idx *Index) rowRoot() (uint64, string) {
 }
 
 // rowTx returns the owning tx for back-lookup routing.
-func (idx *Index) rowTx() *Tx {
+func (idx *IndexHandle) rowTx() *Tx {
 	if idx.ks != nil {
 		return idx.ks.tx
 	}
@@ -364,7 +364,7 @@ func (idx *Index) rowTx() *Tx {
 // indexing.md §Lookup API §Intra-transaction consistency); the
 // caller treats this as a missed entry and continues iteration
 // without setting idx.err.
-func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []byte, skip bool, err error) {
+func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, value []byte, skip bool, err error) {
 	if idx.sks != nil {
 		return idx.extractSetKeyspacePKAndValue(indexKey, indexValue)
 	}
@@ -486,10 +486,10 @@ func (idx *Index) extractPKAndValue(indexKey, indexValue []byte) (pk, value []by
 // idx.Err() is reset at the start of each call (per api-surface.md
 // §Index Lookup API "first error encountered during the **last**
 // sequence's iteration"). The returned iter.Seq2 is bound to this
-// *Index's transaction; concurrent iteration on the same handle
+// *IndexHandle's transaction; concurrent iteration on the same handle
 // races. For concurrent queries, call ks.Index(name) once per
 // goroutine.
-func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
+func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset.
 		idx.err = nil
@@ -562,7 +562,7 @@ func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 // when index pages are CoW'd or freed (Inv-IHS1). The defer'd
 // unregister keeps the slice bounded across long-running tx with
 // many iter calls on the same handle.
-func (idx *Index) iteratePrefix(prefix []byte, yield func([]byte, []byte) bool) {
+func (idx *IndexHandle) iteratePrefix(prefix []byte, yield func([]byte, []byte) bool) {
 	tx := idx.rowTx()
 	cfg := tx.pgr.Config()
 	mergeThreshold := tx.db.opts.MergeThreshold
@@ -623,9 +623,9 @@ func (idx *Index) iteratePrefix(prefix []byte, yield func([]byte, []byte) bool) 
 // Without this translation, idx.Err() after a MarkStale leaks the
 // internal btree.ErrCursorStale across the public boundary — the
 // same defect class as the cursor-err-unpositioned-state issue
-// (commit 24ec951). Made a method on *Index so it can probe the
+// (commit 24ec951). Made a method on *IndexHandle so it can probe the
 // parent ks/sks dead state for the Inv-IHS3 case.
-func (idx *Index) mapCursorErr(err error) error {
+func (idx *IndexHandle) mapCursorErr(err error) error {
 	if errors.Is(err, btree.ErrCursorStale) {
 		if idx.keyspaceDead() {
 			return ErrKeyspaceClosed
@@ -641,7 +641,7 @@ func (idx *Index) mapCursorErr(err error) error {
 // keyspace, so it does not observe the silent-skip case — every
 // index entry yields its raw PK, even when the row has somehow
 // vanished. Use Check() for row/index consistency verification.
-func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
+func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
@@ -742,7 +742,7 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 // the encoded covering tuple (decode via DecodeCoveringTuple)
 // when IndexDecl.Covering is non-empty, otherwise the row's
 // stored bytes via back-lookup. See indexing.md §Covering Indexes.
-func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
+func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
@@ -809,7 +809,7 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 // have to compute the upper bound. Same value semantics as Lookup
 // — covering tuple when IndexDecl.Covering is non-empty, row
 // bytes via back-lookup otherwise.
-func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] {
+func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset (M-2 fix).
 		idx.err = nil
@@ -844,7 +844,7 @@ func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] {
 // semantics as Lookup — covering tuple when IndexDecl.Covering is
 // non-empty (decode via DecodeCoveringTuple), row bytes via
 // back-lookup otherwise.
-func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error) {
+func (idx *IndexHandle) Get(cols ...[]byte) (pk, value []byte, err error) {
 	// Per-sequence Err reset (M-2 fix; Get isn't strictly a sequence,
 	// but the handle's Err() is shared and a stale prior error
 	// should not surface to a fresh Get).
@@ -915,7 +915,7 @@ func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error) {
 // (setKey, setValue) pair has been removed from the SetKeyspace
 // between index Put and Lookup (engine bug / external corruption),
 // the iterator skips the entry without setting idx.err.
-func (idx *Index) extractSetKeyspacePKAndValue(indexKey, indexValue []byte) (setKey, setValue []byte, skip bool, err error) {
+func (idx *IndexHandle) extractSetKeyspacePKAndValue(indexKey, indexValue []byte) (setKey, setValue []byte, skip bool, err error) {
 	var compoundPK []byte
 	if idx.pinned.decl.Unique {
 		pk, _, decErr := decodeUniqueIndexValue(indexValue)

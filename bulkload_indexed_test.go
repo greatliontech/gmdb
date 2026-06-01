@@ -32,7 +32,7 @@ func dupColExtract(_, _ []byte) []IndexEntry {
 // collectAllIndexPairs walks the whole index via Range(nil,nil) and returns
 // sorted "pk=value" strings — a canonical snapshot of the index's
 // (pk, rowValue) contents for cross-checking BulkLoad vs Put.
-func collectAllIndexPairs(t *testing.T, idx *Index) []string {
+func collectAllIndexPairs(t *testing.T, idx *IndexHandle) []string {
 	t.Helper()
 	var out []string
 	for pk, v := range idx.Range(nil, nil) {
@@ -46,7 +46,7 @@ func collectAllIndexPairs(t *testing.T, idx *Index) []string {
 }
 
 // lookupKeysSorted returns the sorted PK list for a non-unique exact match.
-func lookupKeysSorted(t *testing.T, idx *Index, cols ...[]byte) []string {
+func lookupKeysSorted(t *testing.T, idx *IndexHandle, cols ...[]byte) []string {
 	t.Helper()
 	var out []string
 	for pk := range idx.LookupKeys(cols...) {

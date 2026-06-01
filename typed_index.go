@@ -104,7 +104,7 @@ func (t *TypedIndex[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (
 		}
 		// One covering column carrying the full encoded value; its name
 		// folds the value-encoder identity into the fingerprint.
-		decl.Covering = []CoveringColumn{{Name: typedCoverValueColumn(valID)}}
+		decl.Covering = []IndexCoveringColumn{{Name: typedCoverValueColumn(valID)}}
 	}
 	decl.Extract = t.makeExtractor(keyEnc, valEnc)
 	return decl, nil
@@ -183,20 +183,20 @@ func (t *TypedSetKeyspaceHandle[K, V]) Index(name string) (*TypedIndexHandle, er
 }
 
 // TypedIndexHandle is a type-erased handle to an opened index on a typed
-// keyspace. It carries the byte *Index plus the keyspace's K/V encoders
+// keyspace. It carries the byte *IndexHandle plus the keyspace's K/V encoders
 // (as any); NewTypedIndexQuery re-introduces the static K/V/IK types.
 type TypedIndexHandle struct {
-	idx    *Index
+	idx    *IndexHandle
 	keyEnc any // Encoder[K] of the owning keyspace
 	valEnc any // Encoder[V]
 }
 
 // TypedIndexQuery is a statically-typed query over an index whose
 // index-key type is IK and whose owning keyspace is keyed/valued by
-// K/V. Construct via NewTypedIndexQuery. Like the byte *Index, a query
+// K/V. Construct via NewTypedIndexQuery. Like the byte *IndexHandle, a query
 // handle is not safe for concurrent iteration; Err() is per-handle.
 type TypedIndexQuery[K, V, IK any] struct {
-	idx     *Index
+	idx     *IndexHandle
 	keyEnc  Encoder[K]
 	valEnc  Encoder[V]
 	ikEnc   Encoder[IK]

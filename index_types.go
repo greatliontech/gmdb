@@ -26,7 +26,7 @@ type IndexDecl struct {
 	// Covering optionally pins columns to be carried in the index
 	// entry value. Lookup returns covering bytes directly when the
 	// caller's query is satisfied by the covering set.
-	Covering []CoveringColumn
+	Covering []IndexCoveringColumn
 
 	// Unique rejects extractor-produced duplicate index keys
 	// (ErrIndexUniqueViolation on Put). Detection runs against both
@@ -59,16 +59,16 @@ type IndexColumn struct {
 	Name string
 }
 
-// CoveringColumn names a positional column in an index's covering
+// IndexCoveringColumn names a positional column in an index's covering
 // tuple. Same semantics as IndexColumn.Name. Adding / removing /
 // reordering covering columns triggers ErrIndexFingerprintMismatch.
-type CoveringColumn struct {
+type IndexCoveringColumn struct {
 	Name string
 }
 
 // IndexEntry is one row's contribution to an index, produced by the
 // IndexExtractor. Cols holds the per-IndexColumn lex-safe byte
-// encoding; Cover holds the per-CoveringColumn bytes (omit when
+// encoding; Cover holds the per-IndexCoveringColumn bytes (omit when
 // the IndexDecl declares no Covering). Per indexing.md §Overview.
 type IndexEntry struct {
 	Cols  [][]byte

@@ -7,24 +7,24 @@ import (
 	"testing"
 )
 
-// --- *Index handle invalidation regression tests for
+// --- *IndexHandle invalidation regression tests for
 // docs/specs/indexing.md §Handle Invalidation. These pin the two
 // invariants stated in the spec section:
 //
 //   Inv-IHS1 (cursor-on-stale-tree): a *btree.Cursor opened by an
-//   *Index iter is MarkStale'd before any same-tx code path completes
+//   *IndexHandle iter is MarkStale'd before any same-tx code path completes
 //   that frees or replaces the index data tree pages it walks.
 //   Violation: mid-iter RebuildIndex/DropIndex/atomic Put yields wrong-
 //   key reads or layout-decode panics from freed/reallocated pages.
 //
 //   Inv-IHS2 (post-drop handle dead): after tx.Indexes().Drop(ks, name),
-//   every previously-handed-out *Index for (ks, name) rejects
+//   every previously-handed-out *IndexHandle for (ks, name) rejects
 //   subsequent Lookup/Range/Prefix/Get/Stats/LookupKeys with
 //   ErrIndexNotFound. Violation: cached idx.Stats() returns the stale
 //   pre-drop count; cached idx.Lookup walks freed root pages.
 
 // TestIndexHandleStatsAfterDropReturnsErrIndexNotFound is the
-// deterministic Inv-IHS2 regression. On HEAD, a cached *Index handle
+// deterministic Inv-IHS2 regression. On HEAD, a cached *IndexHandle
 // retains idx.pinned even after tx.DropIndex removes the entry from
 // ks.indexes, so idx.Stats() returns IndexStats{Entries: prev_count}, nil
 // — the user sees the index as still populated when it is gone. With
@@ -409,7 +409,7 @@ func TestIndexHandleAfterRebuildRePositionWorks(t *testing.T) {
 // Keyspace. Cursor.Delete on an indexed keyspace runs
 // applyIndexMaintenanceOnDelete → mutates index trees; the
 // open-coded markIndexHandlesStale call in keyspace.go's
-// Cursor.Delete must stale every in-flight *Index iter cursor.
+// Cursor.Delete must stale every in-flight *IndexHandle iter cursor.
 func TestIndexHandleInFlightCursorDeleteSurfacesCursorStale(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -456,7 +456,7 @@ func TestIndexHandleInFlightCursorDeleteSurfacesCursorStale(t *testing.T) {
 // --- SetKeyspace mirror ---------------------------------------------
 
 // TestSetKeyspaceIndexHandleStatsAfterDropReturnsErrIndexNotFound:
-// Inv-IHS2 on a SetKeyspace-anchored *Index.
+// Inv-IHS2 on a SetKeyspace-anchored *IndexHandle.
 func TestSetKeyspaceIndexHandleStatsAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -489,7 +489,7 @@ func TestSetKeyspaceIndexHandleStatsAfterDropReturnsErrIndexNotFound(t *testing.
 // delegates to SetKeyspace.DeleteValue which runs
 // applyIndexMaintenanceOnRemoveValue → mutates index trees;
 // markSetCursorsStale's consolidation calls markIndexHandlesStale,
-// staling the in-flight *Index iter cursor.
+// staling the in-flight *IndexHandle iter cursor.
 func TestSetKeyspaceIndexHandleInFlightSetCursorDeleteSurfacesCursorStale(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -575,12 +575,12 @@ func TestSetKeyspaceIndexHandleInFlightSiblingPutSurfacesCursorStale(t *testing.
 	}
 }
 
-// --- *Index handle invalidation by tx.DeleteKeyspace --------------------
+// --- *IndexHandle invalidation by tx.DeleteKeyspace --------------------
 //
 // These pin Inv-IHS3 (post-DeleteKeyspace handle closed — indexing.md
 // §Handle Invalidation): once tx.DeleteKeyspace succeeds on the parent
 // keyspace, every subsequent call on every previously-handed-out
-// *Index for that keyspace returns ErrKeyspaceClosed, and any in-
+// *IndexHandle for that keyspace returns ErrKeyspaceClosed, and any in-
 // flight *btree.Cursor opened by an idx iter closure is MarkStale'd
 // before the FreeSubtree returns. The mid-iter case translates
 // btree.ErrCursorStale to ErrKeyspaceClosed (not ErrCursorStale)
@@ -589,7 +589,7 @@ func TestSetKeyspaceIndexHandleInFlightSiblingPutSurfacesCursorStale(t *testing.
 // (mirroring row Cursor.Err's dead-check-wins ordering).
 
 // TestIndexHandleBareErrAfterDeleteKeyspaceReturnsErrKeyspaceClosed
-// pins the bare-Err() path: a user who opens an *Index, calls
+// pins the bare-Err() path: a user who opens an *IndexHandle, calls
 // tx.DeleteKeyspace, then probes idx.Err() WITHOUT an intervening
 // iter call must see ErrKeyspaceClosed. The entry-method guards on
 // Lookup/Stats/etc. set idx.err on the iter path, but a user
@@ -1019,7 +1019,7 @@ func TestIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed(t *testing.T
 // --- SetKeyspace mirror -------------------------------------------------
 
 // TestSetKeyspaceIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed:
-// Inv-IHS3 on a SetKeyspace-anchored *Index, Stats path. Stats reads
+// Inv-IHS3 on a SetKeyspace-anchored *IndexHandle, Stats path. Stats reads
 // idx.pinned.count without any keyspace probe, so the entry-time
 // sks.dead guard is the only mechanism — no accidental enforcement
 // via extractSetKeyspacePKAndValue's HasValue back-lookup.

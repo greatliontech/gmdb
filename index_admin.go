@@ -44,7 +44,7 @@ func (tx *Tx) Indexes() TxIndexes {
 //     unchanged.
 //
 // Handle invalidation (indexing.md §Handle Invalidation): every
-// in-flight *Index iter on this name surfaces ErrCursorStale on the
+// in-flight *IndexHandle iter on this name surfaces ErrCursorStale on the
 // next yield. The handle stays usable — a re-iterate after the rebuild
 // opens a fresh cursor on the new pinned.root.
 //
@@ -70,7 +70,7 @@ func (ix TxIndexes) Rebuild(keyspace string, decl *IndexDecl) error {
 // retires the registry sub-tree (keyspaces.md invariant #7 entailed).
 //
 // Handle invalidation (indexing.md §Handle Invalidation): every
-// previously-handed-out *Index handle for this (keyspace, name) pair
+// previously-handed-out *IndexHandle for this (keyspace, name) pair
 // becomes dead — subsequent Lookup/LookupKeys/Range/Prefix/Get/Stats
 // return ErrIndexNotFound. An in-flight iter at the moment of the drop
 // surfaces ErrCursorStale on the next yield, after which the handle

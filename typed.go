@@ -38,7 +38,7 @@ type AnyTypedIndex[K, V any] interface {
 
 // TypedKeyspace wraps a single-value Keyspace with type-safe encoding.
 // It is a stateless descriptor (name + encoders); Open / Create return
-// a transaction-scoped TypedKeyspaceHandle handle.
+// a transaction-scoped TypedKeyspaceHandle.
 type TypedKeyspace[K, V any] struct {
 	name   string
 	keyEnc Encoder[K]

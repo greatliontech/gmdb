@@ -80,7 +80,7 @@ func (ks *SetKeyspace) FixedValueSize() int { return int(ks.desc.FixedValueSize)
 // caller (Put / Delete / DeleteValue / SetCursor.Delete / BulkLoad
 // success paths) post-dates the mutation and, on the indexed path,
 // has just CoW'd index trees via applyIndexMaintenanceOn{AddValue,
-// RemoveValue} or finalizeIndexBuild. The in-flight *Index iter
+// RemoveValue} or finalizeIndexBuild. The in-flight *IndexHandle iter
 // cursors must MarkStale or read CoW'd/freed leaves. Centralized
 // here so every existing call site gets index-handle invalidation
 // for free; no-op when openIndexHandles is empty (no

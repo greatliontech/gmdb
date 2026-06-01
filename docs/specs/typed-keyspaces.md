@@ -23,7 +23,7 @@ Depends on / interacts with:
   contracts that this layer wraps.
 - `indexing.md` for the byte-oriented `IndexDecl` the typed
   layer constructs internally.
-- `api-surface.md` for the byte-oriented `Cursor` / `Index`
+- `api-surface.md` for the byte-oriented `Cursor` / `IndexHandle`
   methods that this layer delegates to.
 
 **Naming convention.** Each typed tier has two types: a stateless
@@ -324,7 +324,7 @@ type AnyTypedIndex[K, V any] interface {
 // the sealed method.
 func (t *TypedIndex[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*IndexDecl, error) { /* implements AnyTypedIndex */ }
 
-// TypedIndexHandle is the typed wrapper around Index for queries
+// TypedIndexHandle is the typed wrapper around IndexHandle for queries
 // where IK is known.
 type TypedIndexHandle struct { /* unexported */ }
 

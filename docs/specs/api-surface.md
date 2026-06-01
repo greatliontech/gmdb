@@ -953,7 +953,7 @@ func (tx *Tx) Indexes() TxIndexes
 // `indexing.md §Rebuild` section for the recovery pattern.
 //
 // Handle invalidation (indexing.md §Handle Invalidation): every
-// in-flight *Index iter on this name surfaces ErrCursorStale on
+// in-flight *IndexHandle iter on this name surfaces ErrCursorStale on
 // the next yield. The handle stays usable — a re-iterate after
 // the rebuild opens a fresh cursor on the new pinned.root.
 //
@@ -990,7 +990,7 @@ func (ix TxIndexes) Rebuild(keyspace string, decl *IndexDecl) error
 // (per `keyspaces.md` invariant #7 entailed).
 //
 // Handle invalidation (indexing.md §Handle Invalidation): every
-// previously-handed-out *Index handle for this (keyspace, name)
+// previously-handed-out *IndexHandle for this (keyspace, name)
 // pair becomes dead — subsequent Lookup/LookupKeys/Range/Prefix/
 // Get/Stats return ErrIndexNotFound. An in-flight iter at the
 // moment of the drop surfaces ErrCursorStale on the next yield,
@@ -1059,7 +1059,7 @@ func (ks *Keyspace) Cursor() *Cursor
 // Index returns a handle for querying the named index on this
 // keyspace. Returns ErrIndexNotFound if no index with this name is
 // registered. See `indexing.md §Lookup API` for query semantics.
-func (ks *Keyspace) Index(name string) (*Index, error)
+func (ks *Keyspace) Index(name string) (*IndexHandle, error)
 
 func (ks *Keyspace) BulkLoad(yield func(yield func(key, value []byte) bool)) (uint64, error)
 
@@ -1150,7 +1150,7 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error)
 func (ks *SetKeyspace) NextSequence() (uint64, error)
 func (ks *SetKeyspace) Cursor() *SetCursor
-func (ks *SetKeyspace) Index(name string) (*Index, error)
+func (ks *SetKeyspace) Index(name string) (*IndexHandle, error)
 func (ks *SetKeyspace) BulkLoad(yield func(yield func(key, value []byte) bool)) (uint64, error)
 
 // SetCursor for iterating over set keyspace key-value pairs.
@@ -1195,7 +1195,7 @@ func (ks *SetKeyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte]
 ## Index Lookup API
 
 ```go
-type Index struct { /* unexported */ }
+type IndexHandle struct { /* unexported */ }
 
 // Lookup returns (pk, value) pairs matching the **exact** column
 // tuple. The number of supplied cols MUST equal the index's
@@ -1234,7 +1234,7 @@ type Index struct { /* unexported */ }
 // ErrKeyspaceClosed — the whole keyspace is gone, not just this
 // index; the parent-dead sentinel wins over the per-handle dead
 // sentinel (mirroring Cursor.Err's dead-check ordering).
-func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
+func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
 
 // LookupKeys returns matching primary keys without back-lookup or
 // covering decode. Iteration cost is O(matches) leaf scans only.
@@ -1248,7 +1248,7 @@ func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
 // on Lookup) — every index entry yields its raw PK, even if the
 // corresponding row has somehow vanished. Use Check() for
 // row/index consistency verification.
-func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
+func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
 
 // Range returns matches in [start, end). Each tuple is a slice of
 // per-column byte slices; nil tuple = open-ended. Same value
@@ -1277,7 +1277,7 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
 // same lead bytes. Use Prefix for the equivalent "leading cols ==
 // X" query (single-bound shorthand).
 // (Chunk-7.7 spec amendment.)
-func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
+func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
 
 // Prefix returns matches whose leading columns equal the prefix.
 // The number of leading columns must be ≤ the index's declared
@@ -1289,7 +1289,7 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
 // Prefix don't need to compute that upper bound themselves. Same
 // value semantics and Inv-IHS3 / Inv-IHS2 dead-handle contract as
 // Lookup.
-func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
+func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
 
 // Get is shorthand for unique indexes: returns the single (pk, value)
 // or ErrNotFound. Returns ErrIndexNotUnique when called on a
@@ -1300,7 +1300,7 @@ func (idx *Index) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
 // as Lookup: covering tuple (decode via DecodeCoveringTuple) when
 // IndexDecl.Covering is non-empty, row bytes via back-lookup
 // otherwise.
-func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error)
+func (idx *IndexHandle) Get(cols ...[]byte) (pk, value []byte, err error)
 
 // Err returns the broader handle-invalid sentinel if the parent
 // keyspace was DeleteKeyspace'd (Inv-IHS3 → ErrKeyspaceClosed,
@@ -1313,10 +1313,10 @@ func (idx *Index) Get(cols ...[]byte) (pk, value []byte, err error)
 //
 // Index handles are not safe for concurrent use by multiple
 // goroutines. The Err state is per-handle, so two overlapping
-// iterators on the same *Index would race. Open the keyspace in
+// iterators on the same *IndexHandle would race. Open the keyspace in
 // separate transactions, or call ks.Index(name) once per goroutine,
 // for concurrent index queries.
-func (idx *Index) Err() error
+func (idx *IndexHandle) Err() error
 
 // Stats returns the index's persistent count + tree statistics, or
 // ErrKeyspaceClosed (Inv-IHS3) when the parent keyspace was
@@ -1324,13 +1324,13 @@ func (idx *Index) Err() error
 // wrap) when this index was Drop'd. Stats does NOT clear the
 // sticky iter cause on idx.err (Inv-IHS1) — the cause remains
 // observable via idx.Err() until a fresh iter resets it.
-func (idx *Index) Stats() (IndexStats, error)
+func (idx *IndexHandle) Stats() (IndexStats, error)
 
 // DecodeCoveringTuple decodes the byte slice returned by Lookup /
 // Get / Range / Prefix on an index whose IndexDecl.Covering is
 // non-empty (the byte-API covering return contract — see
 // indexing.md §Covering Indexes). The returned [][]byte has one
-// entry per declared CoveringColumn in declaration order, each
+// entry per declared IndexCoveringColumn in declaration order, each
 // carrying the extractor's IndexEntry.Cover[i] bytes verbatim.
 //
 // Returns an error wrapping ErrCoveringTupleMalformed (declared

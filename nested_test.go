@@ -11,7 +11,7 @@ import (
 
 // lookupPKs returns the sorted primary keys an index maps the given
 // single-byte column value to.
-func lookupPKs(idx *Index, col byte) []string {
+func lookupPKs(idx *IndexHandle, col byte) []string {
 	var pks []string
 	for pk := range idx.LookupKeys([]byte{col}) {
 		pks = append(pks, string(pk))

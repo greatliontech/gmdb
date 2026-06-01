@@ -173,7 +173,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		}
 		tx.propagateNotCachedDescChange(keyspace, owner)
 		tx.syncRebuildToCachedPinned(cachedKS, cachedSKS, decl, 0, 0)
-		// Inv-IHS1: any in-flight *Index iter on this name walks the
+		// Inv-IHS1: any in-flight *IndexHandle iter on this name walks the
 		// just-FreeSubtree'd old root. MarkStale every such cursor
 		// (by-name — other declared indexes were not touched) and
 		// refresh the cursor's tracked rootID to the new (0, empty)
@@ -333,7 +333,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	tx.syncRebuildToCachedPinned(cachedKS, cachedSKS, decl, newRoot, newCount)
 	// Inv-IHS1: see the empty-parent branch above. The pinned root
 	// was just swapped to newRoot and the OLD tree FreeSubtree'd —
-	// any in-flight *Index iter cursor on this name is now walking
+	// any in-flight *IndexHandle iter cursor on this name is now walking
 	// freed pages. MarkStale by-name (only this index, not siblings)
 	// and refresh the cursor's rootID to newRoot.
 	if cachedKS != nil {
@@ -530,7 +530,7 @@ func (tx *Tx) dropIndex(keyspace, indexName string) (retErr error) {
 	if cachedSKS != nil {
 		delete(cachedSKS.indexes, indexName)
 	}
-	// Inv-IHS2 + Inv-IHS1: any cached *Index handle whose pinned
+	// Inv-IHS2 + Inv-IHS1: any cached *IndexHandle whose pinned
 	// matches this (ks, name) pair must now reject further use —
 	// the on-disk registry entry is gone and the data tree pages
 	// have been FreeSubtree'd. markIndexHandleDead poisons the

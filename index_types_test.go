@@ -86,7 +86,7 @@ func TestSchemaHashSensitiveToUniqueFlip(t *testing.T) {
 // §Covering Indexes.
 func TestSchemaHashSensitiveToCoveringAdd(t *testing.T) {
 	a := &IndexDecl{Name: "x", Columns: []IndexColumn{{Name: "owner"}}}
-	b := &IndexDecl{Name: "x", Columns: []IndexColumn{{Name: "owner"}}, Covering: []CoveringColumn{{Name: "size"}}}
+	b := &IndexDecl{Name: "x", Columns: []IndexColumn{{Name: "owner"}}, Covering: []IndexCoveringColumn{{Name: "size"}}}
 	if schemaHash(a) == schemaHash(b) {
 		t.Fatalf("schemaHash collides after Covering add: %016x", schemaHash(a))
 	}
@@ -123,7 +123,7 @@ func TestSchemaHashLengthPrefixingDisambiguates(t *testing.T) {
 // uvarint-counted sections).
 func TestSchemaHashColumnVsCoveringDisambiguated(t *testing.T) {
 	a := &IndexDecl{Name: "x", Columns: []IndexColumn{{Name: "owner"}}}
-	b := &IndexDecl{Name: "x", Covering: []CoveringColumn{{Name: "owner"}}}
+	b := &IndexDecl{Name: "x", Covering: []IndexCoveringColumn{{Name: "owner"}}}
 	if schemaHash(a) == schemaHash(b) {
 		t.Fatalf("schemaHash collides between Columns and Covering placement: %016x", schemaHash(a))
 	}
@@ -145,13 +145,13 @@ func TestSchemaHashNamePrefixPreventsCollision(t *testing.T) {
 	a := &IndexDecl{
 		Name:     "ab",
 		Columns:  []IndexColumn{{Name: ""}},
-		Covering: []CoveringColumn{{Name: ""}},
+		Covering: []IndexCoveringColumn{{Name: ""}},
 		Unique:   true,
 	}
 	b := &IndexDecl{
 		Name:     "ab\x01",
 		Columns:  []IndexColumn{},
-		Covering: []CoveringColumn{{Name: ""}},
+		Covering: []IndexCoveringColumn{{Name: ""}},
 		Unique:   true,
 	}
 	if schemaHash(a) == schemaHash(b) {

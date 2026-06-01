@@ -38,7 +38,7 @@ type keyspaceCore struct {
 	// DeleteKeyspace.
 	dead bool
 
-	// openIndexHandles tracks every *Index returned by Index(name) in
+	// openIndexHandles tracks every *IndexHandle returned by Index(name) in
 	// this tx. Atomic Put / Delete / Cursor.Delete mutate index trees
 	// (applyIndexMaintenanceOn*); TxIndexes.Rebuild / TxIndexes.Drop replace
 	// or free a per-index data tree wholesale. Each of those CoWs or
@@ -47,7 +47,7 @@ type keyspaceCore struct {
 	// the by-name / dead variants) walk this slice to MarkStale every
 	// such cursor (Inv-IHS1). Mirrors the per-kind openCursors /
 	// openSetCursors structurally; see indexing.md §Handle Invalidation.
-	openIndexHandles []*Index
+	openIndexHandles []*IndexHandle
 
 	// indexes carries the pinned per-index state for this tx, keyed by
 	// IndexDecl.Name. Populated by the Open* / Create* keyspace methods
@@ -225,7 +225,7 @@ func (ks *keyspaceCore) descriptor() *page.KeyspaceDescriptor {
 }
 
 // markIndexHandlesStale invokes MarkStale on every in-flight
-// *btree.Cursor opened by an *Index handle from this keyspace, and
+// *btree.Cursor opened by an *IndexHandle from this keyspace, and
 // refreshes the cursor's tracked rootID to the (possibly mutated)
 // pinnedIndex.root. Called by Put / Delete / Cursor.Delete after the
 // atomic-maintenance step that mutates index trees:
@@ -238,7 +238,7 @@ func (ks *keyspaceCore) descriptor() *page.KeyspaceDescriptor {
 // idx.pinned.root has already been FreeSubtree'd by
 // retireIndexRegistry, so SetRootID stores a FREED pageID into every
 // stale cursor's tracked-root. This is safe under the current API
-// because every *Index entry method (Stats / Lookup / LookupKeys /
+// because every *IndexHandle entry method (Stats / Lookup / LookupKeys /
 // Range / Prefix / Get / Err) short-circuits via keyspaceDead() before
 // issuing a fresh descent, so the freed-root is never dereferenced. If
 // a future API exposes the underlying *btree.Cursor or weakens the
@@ -286,7 +286,7 @@ func (ks *keyspaceCore) markIndexHandleStaleByName(name string) {
 	}
 }
 
-// markIndexHandleDead marks every *Index handle for the named index as
+// markIndexHandleDead marks every *IndexHandle for the named index as
 // dead (Inv-IHS2): subsequent Lookup / LookupKeys / Range / Prefix /
 // Get / Stats on the cached handle return ErrIndexNotFound. Also
 // MarkStale's in-flight cursors so any iter mid-loop terminates

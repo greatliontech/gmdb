@@ -184,7 +184,7 @@ func coverFirstB(_, value []byte) []IndexEntry {
 
 func coveringDecl(extract IndexExtractor) *IndexDecl {
 	d := testDecl("cov", "b0")
-	d.Covering = []CoveringColumn{{Name: "rest"}}
+	d.Covering = []IndexCoveringColumn{{Name: "rest"}}
 	d.Extract = extract
 	return d
 }

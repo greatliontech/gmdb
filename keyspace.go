@@ -921,7 +921,7 @@ func (ks *Keyspace) Cursor() *Cursor {
 // Also delegates to markIndexHandlesStale (Inv-IHS1): every site
 // that stales row cursors here is post-mutation and, on the indexed
 // path, has just CoW'd index trees via applyIndexMaintenanceOn{Put,
-// Delete}; the in-flight *Index iter cursors must MarkStale or read
+// Delete}; the in-flight *IndexHandle iter cursors must MarkStale or read
 // CoW'd-then-released leaf pages. Centralized here so every existing
 // markCursorsStale caller (Put / Delete / DeleteRange non-indexed
 // fast path) gets the index-handle invalidation for free without
@@ -1258,7 +1258,7 @@ func (c *Cursor) Delete() error {
 		}
 	}
 	// Inv-IHS1: indexed Cursor.Delete ran applyIndexMaintenanceOnDelete
-	// which CoW'd index trees. Stale every in-flight *Index iter cursor
+	// which CoW'd index trees. Stale every in-flight *IndexHandle iter cursor
 	// on this keyspace. (Open-coded here rather than via the
 	// markCursorsStale helper because Cursor.Delete sibling-stales only
 	// OTHER row cursors — not all — so the row-cursor stale loop is
@@ -1473,7 +1473,7 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 			c.inner.MarkStale()
 		}
 		// Inv-IHS3 (indexing.md §Handle Invalidation): MarkStale every
-		// in-flight *btree.Cursor opened by an *Index iter closure on
+		// in-flight *btree.Cursor opened by an *IndexHandle iter closure on
 		// this keyspace's handles. retireIndexRegistry above
 		// FreeSubtree'd every declared index's data tree, so any
 		// cursor still iterating idx.pinned.root would walk loose
@@ -1492,7 +1492,7 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 		delete(tx.openSetKeyspaces, handle)
 		existingSKS.dead = true
 		tx.deadSetKeyspaces = append(tx.deadSetKeyspaces, existingSKS)
-		// Inv-IHS3 mirror on Kind=1: stale every in-flight *Index
+		// Inv-IHS3 mirror on Kind=1: stale every in-flight *IndexHandle
 		// iter cursor opened from sks-side handles, same rationale
 		// as the Keyspace branch above. SetCursor's per-method
 		// dead-check is insufficient here — the iter closure runs

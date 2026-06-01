@@ -19,7 +19,7 @@ import (
 
 // TypedSetKeyspace wraps a SetKeyspace with type-safe encoding. Stateless
 // descriptor (name + encoders + creation options); Open / Create return
-// a transaction-scoped TypedSetKeyspaceHandle handle.
+// a transaction-scoped TypedSetKeyspaceHandle.
 type TypedSetKeyspace[K, V any] struct {
 	name   string
 	keyEnc Encoder[K]

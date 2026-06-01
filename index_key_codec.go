@@ -163,7 +163,7 @@ var ErrCoveringTupleMalformed = errors.New("gmdb: covering tuple malformed")
 // is non-empty (the byte-API covering return contract — see
 // indexing.md §Covering Indexes and api-surface.md §Index Lookup
 // API). The returned `[][]byte` has one entry per declared
-// `CoveringColumn` in declaration order, each carrying the
+// `IndexCoveringColumn` in declaration order, each carrying the
 // extractor's `IndexEntry.Cover[i]` bytes verbatim.
 //
 // Returns an error wrapping `ErrCoveringTupleMalformed` if the

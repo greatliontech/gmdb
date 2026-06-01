@@ -390,7 +390,7 @@ func TestSetKeyspaceIndexGetUniqueReturnsSetKeyValue(t *testing.T) {
 // --- Regression: Round-1 H-1 (LookupKeys broken on SetKeyspace) --
 
 // TestSetKeyspaceIndexLookupKeysRejected verifies the chunk-7.9
-// H-1 fix: LookupKeys on a SetKeyspace *Index handle sets
+// H-1 fix: LookupKeys on a SetKeyspace *IndexHandle sets
 // idx.Err() to a wrapped ErrInvalidOptions and yields nothing.
 // LookupKeys' iter.Seq[[]byte] surface cannot represent the
 // compound (setKey, setValue) PK; callers use Lookup
