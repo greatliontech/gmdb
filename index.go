@@ -568,7 +568,7 @@ func (idx *Index) iteratePrefix(prefix []byte, yield func([]byte, []byte) bool) 
 	tx := idx.rowTx()
 	cfg := tx.pgr.Config()
 	mergeThreshold := tx.db.opts.MergeThreshold
-	c := btree.NewCursor(tx.pgr, cfg, idx.pinned.root, mergeThreshold)
+	c := btree.NewCursor(btreeWriter{tx.pgr}, cfg, idx.pinned.root, mergeThreshold)
 	idx.registerCursor(c)
 	defer idx.unregisterCursor(c)
 	for k, v := c.SeekGE(prefix); k != nil; k, v = c.Next() {
@@ -706,7 +706,7 @@ func (idx *Index) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 		}
 		// Non-unique: cursor-walk prefix, extract PK from key suffix.
 		// Register so sibling mutations MarkStale us (Inv-IHS1).
-		c := btree.NewCursor(tx.pgr, cfg, idx.pinned.root, mergeThreshold)
+		c := btree.NewCursor(btreeWriter{tx.pgr}, cfg, idx.pinned.root, mergeThreshold)
 		idx.registerCursor(c)
 		defer idx.unregisterCursor(c)
 		for k, _ := c.SeekGE(encoded); k != nil; k, _ = c.Next() {
@@ -771,7 +771,7 @@ func (idx *Index) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 		tx := idx.rowTx()
 		cfg := tx.pgr.Config()
 		mergeThreshold := tx.db.opts.MergeThreshold
-		c := btree.NewCursor(tx.pgr, cfg, idx.pinned.root, mergeThreshold)
+		c := btree.NewCursor(btreeWriter{tx.pgr}, cfg, idx.pinned.root, mergeThreshold)
 		idx.registerCursor(c)
 		defer idx.unregisterCursor(c)
 		var k, v []byte

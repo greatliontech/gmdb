@@ -521,7 +521,7 @@ func (tx *Tx) flushKeyspaces() error {
 	if len(tx.pendingDeletes) > 0 {
 		names := sortedKeys(tx.pendingDeletes)
 		for _, name := range names {
-			newRoot, err := btree.Delete(tx.pgr, cfg, tx.keyspaceRoot, mergeThreshold, []byte(name))
+			newRoot, err := btree.Delete(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, mergeThreshold, []byte(name))
 			if err != nil {
 				if errors.Is(err, btree.ErrNotFound) {
 					// Internal invariant violation: pendingDeletes only
@@ -552,7 +552,7 @@ func (tx *Tx) flushKeyspaces() error {
 				return fmt.Errorf("flushKeyspaces: index registry sync %q: %w", name, err)
 			}
 			page.EncodeKeyspaceDescriptor(buf, ks.desc)
-			newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte(name), buf)
+			newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
 			if err != nil {
 				return fmt.Errorf("flushKeyspaces: btree.Put %q: %w", name, mapBtreeErr(err))
 			}
@@ -577,7 +577,7 @@ func (tx *Tx) flushKeyspaces() error {
 				return fmt.Errorf("flushKeyspaces: index registry sync %q (SetKeyspace): %w", name, err)
 			}
 			page.EncodeKeyspaceDescriptor(buf, sks.desc)
-			newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte(name), buf)
+			newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
 			if err != nil {
 				return fmt.Errorf("flushKeyspaces: btree.Put %q (SetKeyspace): %w", name, mapBtreeErr(err))
 			}
@@ -597,7 +597,7 @@ func (tx *Tx) flushKeyspaces() error {
 		for _, name := range names {
 			desc := tx.dirtyDescriptors[name]
 			page.EncodeKeyspaceDescriptor(buf, desc)
-			newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte(name), buf)
+			newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
 			if err != nil {
 				return fmt.Errorf("flushKeyspaces: btree.Put (dirty descriptor) %q: %w", name, mapBtreeErr(err))
 			}

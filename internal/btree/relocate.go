@@ -218,7 +218,7 @@ func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldR
 	if refsRewritten {
 		// Re-encode with the updated overflow / nested-tree refs (keys and
 		// every other field unchanged ⇒ fits the same page, no split).
-		nbuf, err := pw.AllocSlab(nid)
+		nbuf, err := pw.ZeroPage(nid)
 		if err != nil {
 			return 0, false, err
 		}
@@ -229,7 +229,7 @@ func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldR
 			}
 		}
 		b.Finish()
-	} else if _, err := pw.CoW(id, nid); err != nil {
+	} else if _, err := pw.CopyPage(id, nid); err != nil {
 		return 0, false, err
 	}
 	if err := pw.FreePage(id); err != nil {
@@ -252,7 +252,7 @@ func relocateOverflowChain(pw PageWriter, oldFirst uint64, runLen uint32) (uint6
 	if err != nil {
 		return 0, err
 	}
-	dst, err := pw.AllocSlabRun(newFirst, runLen)
+	dst, err := pw.ZeroPageRun(newFirst, runLen)
 	if err != nil {
 		return 0, err
 	}
@@ -278,7 +278,7 @@ func relocateVerbatim(pw PageWriter, id uint64) (uint64, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	buf, err := pw.CoW(id, nid)
+	buf, err := pw.CopyPage(id, nid)
 	if err != nil {
 		return 0, nil, err
 	}

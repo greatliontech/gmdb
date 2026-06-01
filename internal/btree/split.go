@@ -50,7 +50,7 @@ func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("btree: alloc split-right leaf: %w", err)
 	}
-	rightBuf, err := pw.AllocSlab(rightID)
+	rightBuf, err := pw.ZeroPage(rightID)
 	if err != nil {
 		_ = pw.FreePage(rightID)
 		return nil, 0, false, fmt.Errorf("btree: alloc split-right buf: %w", err)

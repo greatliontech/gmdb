@@ -866,9 +866,9 @@ func TestDeleteSingleKeyPreservesFillFloor(t *testing.T) {
 
 	buildLeaf := func(id uint64, keys []string) {
 		t.Helper()
-		buf, err := pw.AllocSlab(id)
+		buf, err := pw.ZeroPage(id)
 		if err != nil {
-			t.Fatalf("AllocSlab(%d): %v", id, err)
+			t.Fatalf("ZeroPage(%d): %v", id, err)
 		}
 		b := page.NewLeafBuilder(buf, cfg)
 		for _, k := range keys {
@@ -911,9 +911,9 @@ func TestDeleteSingleKeyPreservesFillFloor(t *testing.T) {
 
 	buildBranch := func(id uint64, leftmost uint64, cells []page.BranchCell) {
 		t.Helper()
-		buf, err := pw.AllocSlab(id)
+		buf, err := pw.ZeroPage(id)
 		if err != nil {
-			t.Fatalf("AllocSlab(%d): %v", id, err)
+			t.Fatalf("ZeroPage(%d): %v", id, err)
 		}
 		if err := page.EncodeBranch(buf, cfg, leftmost, cells); err != nil {
 			t.Fatalf("EncodeBranch(%d): %v", id, err)

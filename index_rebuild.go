@@ -193,7 +193,7 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 			return err
 		}
 		if existing.Root != 0 {
-			if _, err := btree.FreeSubtree(tx.pgr, cfg, existing.Root); err != nil {
+			if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, existing.Root); err != nil {
 				return fmt.Errorf("RebuildIndex %q.%q: free old subtree: %w", keyspace, decl.Name, mapBtreeErr(err))
 			}
 		}
@@ -267,7 +267,7 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 				pkForValue = k1
 			}
 			val := indexEntryValue(entry, pkForValue, decl.Unique, hasCovering)
-			updated, err := btree.Put(tx.pgr, cfg, newRoot, ikBytes, val)
+			updated, err := btree.Put(btreeWriter{tx.pgr}, cfg, newRoot, ikBytes, val)
 			if err != nil {
 				return fmt.Errorf("RebuildIndex %q.%q: btree.Put: %w", keyspace, decl.Name, mapBtreeErr(err))
 			}
@@ -304,7 +304,7 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 			return fmt.Errorf("RebuildIndex %q.%q: set cursor: %w", keyspace, decl.Name, mapBtreeErr(err))
 		}
 	} else {
-		rowCursor := btree.NewCursor(tx.pgr, cfg, desc.Root, mergeThreshold)
+		rowCursor := btree.NewCursor(btreeWriter{tx.pgr}, cfg, desc.Root, mergeThreshold)
 		for rowKey, rowValue := rowCursor.First(); rowKey != nil; rowKey, rowValue = rowCursor.Next() {
 			kCopy := bytes.Clone(rowKey)
 			vCopy := bytes.Clone(rowValue)
@@ -352,7 +352,7 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	// Free the OLD index data tree only after the registry has
 	// been atomically advanced.
 	if existing.Root != 0 {
-		if _, err := btree.FreeSubtree(tx.pgr, cfg, existing.Root); err != nil {
+		if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, existing.Root); err != nil {
 			return fmt.Errorf("RebuildIndex %q.%q: free old subtree: %w", keyspace, decl.Name, mapBtreeErr(err))
 		}
 	}
@@ -439,7 +439,7 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 	mergeThreshold := tx.db.opts.MergeThreshold
 	// Walk the registry sub-tree with a cursor; collect each
 	// entry's Root for FreeSubtree.
-	cur := btree.NewCursor(tx.pgr, cfg, registryRoot, mergeThreshold)
+	cur := btree.NewCursor(btreeWriter{tx.pgr}, cfg, registryRoot, mergeThreshold)
 	i := 0
 	for k, v := cur.First(); k != nil; k, v = cur.Next() {
 		// Copy v because the next cursor op may invalidate.
@@ -451,7 +451,7 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 				ErrCorrupted, keyspaceName, string(k), err)
 		}
 		if entry.Root != 0 {
-			if _, err := btree.FreeSubtree(tx.pgr, cfg, entry.Root); err != nil {
+			if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, entry.Root); err != nil {
 				return fmt.Errorf("DeleteKeyspace %q: free index %q data subtree: %w",
 					keyspaceName, string(k), mapBtreeErr(err))
 			}
@@ -472,7 +472,7 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 		return fmt.Errorf("DeleteKeyspace %q: registry walk: %w", keyspaceName, mapBtreeErr(err))
 	}
 	// Step 3: free the registry sub-tree itself.
-	if _, err := btree.FreeSubtree(tx.pgr, cfg, registryRoot); err != nil {
+	if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, registryRoot); err != nil {
 		return fmt.Errorf("DeleteKeyspace %q: free registry subtree: %w", keyspaceName, mapBtreeErr(err))
 	}
 	return nil
@@ -548,7 +548,7 @@ func (tx *Tx) DropIndex(keyspace, indexName string) (retErr error) {
 		}
 	}
 	if existing.Root != 0 {
-		if _, err := btree.FreeSubtree(tx.pgr, cfg, existing.Root); err != nil {
+		if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, existing.Root); err != nil {
 			return fmt.Errorf("DropIndex %q.%q: free data subtree: %w", keyspace, indexName, mapBtreeErr(err))
 		}
 	}

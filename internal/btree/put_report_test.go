@@ -11,7 +11,7 @@ import (
 // that collapse the Has-then-Put double descent (set-keyspace.md
 // putIntoNestedTree, keyspace.go non-indexed Put). PutReportExisting
 // always writes and reports replace-vs-insert; InsertIfAbsent skips the
-// write entirely when the key is present (no CoW, no alloc) so a
+// write entirely when the key is present (no CopyPage, no alloc) so a
 // duplicate set-insert neither churns nor orphans pages.
 
 func TestPutReportExistingReportsInsertVsReplace(t *testing.T) {
@@ -67,8 +67,8 @@ func TestInsertIfAbsentNoOpOnPresent(t *testing.T) {
 	}
 
 	// Duplicate insert: NOT added, and a true no-op — the root is
-	// unchanged (no CoW) and no page is allocated. allocBefore captures
-	// the fakeWriter's monotonic page counter; a CoW would bump it and
+	// unchanged (no CopyPage) and no page is allocated. allocBefore captures
+	// the fakeWriter's monotonic page counter; a CopyPage would bump it and
 	// return a fresh root, orphaning the rewritten pages on commit
 	// (the leak the issue's single-PutReportExisting sketch would cause).
 	allocBefore := pw.nextID
@@ -80,7 +80,7 @@ func TestInsertIfAbsentNoOpOnPresent(t *testing.T) {
 		t.Errorf("duplicate insert: added=true, want false")
 	}
 	if root2 != root {
-		t.Errorf("duplicate insert changed root %d -> %d; must be a no-op (no CoW)", root, root2)
+		t.Errorf("duplicate insert changed root %d -> %d; must be a no-op (no CopyPage)", root, root2)
 	}
 	if pw.nextID != allocBefore {
 		t.Errorf("duplicate insert allocated %d page(s); InsertIfAbsent must not allocate on present", pw.nextID-allocBefore)

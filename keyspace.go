@@ -476,7 +476,7 @@ func (tx *Tx) storeDescriptor(name string, desc page.KeyspaceDescriptor) error {
 	buf := make([]byte, page.KeyspaceDescriptorSize)
 	page.EncodeKeyspaceDescriptor(buf, desc)
 	cfg := tx.pgr.Config()
-	newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte(name), buf)
+	newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
 	if err != nil {
 		return mapBtreeErr(err)
 	}
@@ -635,9 +635,9 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	var newRoot uint64
 	var err error
 	if indexed {
-		newRoot, err = btree.Put(ks.tx.pgr, cfg, ks.desc.Root, key, value)
+		newRoot, err = btree.Put(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, key, value)
 	} else {
-		newRoot, existed, err = btree.PutReportExisting(ks.tx.pgr, cfg, ks.desc.Root, key, value)
+		newRoot, existed, err = btree.PutReportExisting(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, key, value)
 	}
 	if err != nil {
 		restoreIndexes(ks.indexes, rowSnap)
@@ -718,7 +718,7 @@ func (ks *Keyspace) Delete(key []byte) error {
 			return err
 		}
 	}
-	newRoot, err := btree.Delete(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, key)
+	newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, mergeThreshold, key)
 	if err != nil {
 		restoreIndexes(ks.indexes, rowSnap)
 		if indexed {
@@ -1447,7 +1447,7 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 		}
 		tx.pgr.ReleaseSavepoint(sp)
 	}()
-	if _, err := btree.FreeSubtree(tx.pgr, cfg, desc.Root); err != nil {
+	if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, desc.Root); err != nil {
 		return fmt.Errorf("DeleteKeyspace %q: data subtree: %w", name, mapBtreeErr(err))
 	}
 

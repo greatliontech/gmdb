@@ -594,7 +594,7 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 		if err != nil {
 			return false, fmt.Errorf("SetKeyspace.Put: encode genesis subpage: %w", err)
 		}
-		newRoot, _, err := btree.PutEntry(ks.tx.pgr, cfg, ks.desc.Root, page.LeafEntry{
+		newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, page.LeafEntry{
 			Flags: page.CellFlagMultiValue,
 			Key:   key,
 			Value: sp,
@@ -619,7 +619,7 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 		if err != nil {
 			return false, fmt.Errorf("SetKeyspace.Put: encode new-key subpage: %w", err)
 		}
-		newRoot, _, err := btree.PutEntry(ks.tx.pgr, cfg, ks.desc.Root, page.LeafEntry{
+		newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, page.LeafEntry{
 			Flags: page.CellFlagMultiValue,
 			Key:   key,
 			Value: sp,
@@ -665,7 +665,7 @@ func (ks *SetKeyspace) putIntoSubpage(cfg page.Config, key, value []byte, e page
 	threshold := page.SubpagePromotionThreshold(cfg)
 	if len(newSubpage) <= threshold {
 		// Fits — update the subpage cell in place via PutEntry.
-		newRoot, _, err := btree.PutEntry(ks.tx.pgr, cfg, ks.desc.Root, page.LeafEntry{
+		newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, page.LeafEntry{
 			Flags: page.CellFlagMultiValue,
 			Key:   key,
 			Value: newSubpage,
@@ -682,11 +682,11 @@ func (ks *SetKeyspace) putIntoSubpage(cfg page.Config, key, value []byte, e page
 	// Promote: build the nested tree from the EXISTING subpage +
 	// the new value (PromoteSubpageToNestedTree handles the 4-step
 	// algorithm using the pre-insert subpage bytes).
-	root, count, err := btree.PromoteSubpageToNestedTree(ks.tx.pgr, cfg, e.Value, fvs, value)
+	root, count, err := btree.PromoteSubpageToNestedTree(btreeWriter{ks.tx.pgr}, cfg, e.Value, fvs, value)
 	if err != nil {
 		return false, mapBtreeErr(err)
 	}
-	newRoot, _, err := btree.PutEntry(ks.tx.pgr, cfg, ks.desc.Root, page.LeafEntry{
+	newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, page.LeafEntry{
 		Flags:       page.CellFlagMultiValue | page.CellFlagNestedTree,
 		Key:         key,
 		NestedRoot:  root,
@@ -713,7 +713,7 @@ func (ks *SetKeyspace) putIntoNestedTree(cfg page.Config, key, value []byte, e p
 	// true no-op (no CoW, no alloc) — so a duplicate set-insert neither
 	// pays a second descent (the old btree.Has + btree.Put) nor orphans
 	// rewritten pages.
-	newNestedRoot, added, err := btree.InsertIfAbsent(ks.tx.pgr, cfg, e.NestedRoot, value, nil)
+	newNestedRoot, added, err := btree.InsertIfAbsent(btreeWriter{ks.tx.pgr}, cfg, e.NestedRoot, value, nil)
 	if err != nil {
 		return false, mapBtreeErr(err)
 	}
@@ -726,7 +726,7 @@ func (ks *SetKeyspace) putIntoNestedTree(cfg page.Config, key, value []byte, e p
 		NestedRoot:  newNestedRoot,
 		NestedCount: e.NestedCount + 1,
 	}
-	newRoot, _, err := btree.PutEntry(ks.tx.pgr, cfg, ks.desc.Root, newCell)
+	newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, newCell)
 	if err != nil {
 		return false, mapBtreeErr(err)
 	}
@@ -809,7 +809,7 @@ func (ks *SetKeyspace) Delete(key []byte) (err error) {
 		// Bulk-free the nested subtree first (the parent cell still
 		// references it). FreeSubtree's count is sanity-checkable
 		// against e.NestedCount per entailed invariant E1.
-		freed, err := btree.FreeSubtree(ks.tx.pgr, cfg, e.NestedRoot)
+		freed, err := btree.FreeSubtree(btreeWriter{ks.tx.pgr}, cfg, e.NestedRoot)
 		if err != nil {
 			return mapBtreeErr(err)
 		}
@@ -825,7 +825,7 @@ func (ks *SetKeyspace) Delete(key []byte) (err error) {
 
 	// Remove the cell from the parent tree.
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
-	newRoot, err := btree.Delete(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, key)
+	newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, mergeThreshold, key)
 	if err != nil {
 		if errors.Is(err, btree.ErrNotFound) {
 			// Race-impossible (we just observed the cell via
@@ -950,7 +950,7 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 	if newReader.Count() == 0 {
 		// Removed the last value — drop the parent cell.
 		mergeThreshold := ks.tx.db.opts.MergeThreshold
-		newRoot, err := btree.Delete(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, key)
+		newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, mergeThreshold, key)
 		if err != nil {
 			return mapBtreeErr(err)
 		}
@@ -961,7 +961,7 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 		return nil
 	}
 	// Replace cell with shrunk subpage.
-	newRoot, _, err := btree.PutEntry(ks.tx.pgr, cfg, ks.desc.Root, page.LeafEntry{
+	newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, page.LeafEntry{
 		Flags: page.CellFlagMultiValue,
 		Key:   key,
 		Value: newSubpage,
@@ -1236,7 +1236,7 @@ func (ks *SetKeyspace) snapshotKeysInRange(cfg page.Config, start, end []byte) (
 func (ks *SetKeyspace) deleteValueFromNestedTree(cfg page.Config, key, value []byte, e page.LeafEntry) error {
 	fvs := ks.desc.FixedValueSize
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
-	newNestedRoot, err := btree.Delete(ks.tx.pgr, cfg, e.NestedRoot, mergeThreshold, value)
+	newNestedRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, e.NestedRoot, mergeThreshold, value)
 	if err != nil {
 		if errors.Is(err, btree.ErrNotFound) {
 			return ErrNotFound
@@ -1249,7 +1249,7 @@ func (ks *SetKeyspace) deleteValueFromNestedTree(cfg page.Config, key, value []b
 		// (A NestedTree with 1 value at the start of DeleteValue
 		// would already be a candidate for demote-then-delete at
 		// the SetKeyspace surface; defensively handle the edge.)
-		newRoot, err := btree.Delete(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, key)
+		newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, mergeThreshold, key)
 		if err != nil {
 			return mapBtreeErr(err)
 		}
@@ -1260,7 +1260,7 @@ func (ks *SetKeyspace) deleteValueFromNestedTree(cfg page.Config, key, value []b
 		return nil
 	}
 	// Try to demote.
-	subpageBytes, demoted, err := btree.DemoteNestedTreeIfFits(ks.tx.pgr, cfg, fvs, newNestedRoot)
+	subpageBytes, demoted, err := btree.DemoteNestedTreeIfFits(btreeWriter{ks.tx.pgr}, cfg, fvs, newNestedRoot)
 	if err != nil {
 		return mapBtreeErr(err)
 	}
@@ -1279,7 +1279,7 @@ func (ks *SetKeyspace) deleteValueFromNestedTree(cfg page.Config, key, value []b
 			NestedCount: newCount,
 		}
 	}
-	newRoot, _, err := btree.PutEntry(ks.tx.pgr, cfg, ks.desc.Root, newCell)
+	newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, newCell)
 	if err != nil {
 		return mapBtreeErr(err)
 	}

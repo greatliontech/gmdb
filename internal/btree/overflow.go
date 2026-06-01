@@ -107,7 +107,7 @@ func writeOverflowChain(pw PageWriter, cfg page.Config, key, value []byte) (page
 	if err != nil {
 		return page.LeafEntry{}, fmt.Errorf("btree: alloc overflow chain (run=%d): %w", runLen, err)
 	}
-	pages, err := pw.AllocSlabRun(firstID, runLen)
+	pages, err := pw.ZeroPageRun(firstID, runLen)
 	if err != nil {
 		_ = pw.FreeRun(firstID, runLen)
 		return page.LeafEntry{}, fmt.Errorf("btree: alloc overflow slab run: %w", err)

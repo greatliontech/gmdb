@@ -193,7 +193,7 @@ func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID
 		if err != nil {
 			return 0, false, false, fmt.Errorf("btree: alloc CoW leaf for delete: %w", err)
 		}
-		cowBuf, err := pw.CoW(pageID, newID)
+		cowBuf, err := pw.CopyPage(pageID, newID)
 		if err != nil {
 			_ = pw.FreePage(newID)
 			return 0, false, false, fmt.Errorf("btree: CoW leaf %d for delete: %w", pageID, err)
@@ -257,7 +257,7 @@ func rebuildLeafAfterDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8
 	if err != nil {
 		return 0, false, false, fmt.Errorf("btree: alloc CoW leaf for delete: %w", err)
 	}
-	newBuf, err := pw.CoW(pageID, newID)
+	newBuf, err := pw.CopyPage(pageID, newID)
 	if err != nil {
 		return 0, false, false, fmt.Errorf("btree: CoW leaf %d for delete: %w", pageID, err)
 	}
@@ -386,7 +386,7 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	if err != nil {
 		return 0, false, 0, fmt.Errorf("btree: alloc CoW branch for delete: %w", err)
 	}
-	parentBuf, err := pw.CoW(pageID, newBranchID)
+	parentBuf, err := pw.CopyPage(pageID, newBranchID)
 	if err != nil {
 		return 0, false, 0, fmt.Errorf("btree: CoW branch %d for delete: %w", pageID, err)
 	}
@@ -1060,7 +1060,7 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 	if err != nil {
 		return 0, false, 0, fmt.Errorf("btree: cousinRebalanceBranch alloc: %w", err)
 	}
-	newBuf, err := pw.AllocSlab(newBranchID)
+	newBuf, err := pw.ZeroPage(newBranchID)
 	if err != nil {
 		return 0, false, 0, fmt.Errorf("btree: cousinRebalanceBranch alloc slab: %w", err)
 	}
@@ -1136,7 +1136,7 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 	if err != nil {
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc merged leaf: %w", err)
 	}
-	mergedBuf, err := pw.AllocSlab(mergedID)
+	mergedBuf, err := pw.ZeroPage(mergedID)
 	if err != nil {
 		_ = pw.FreePage(mergedID)
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc merged leaf slab: %w", err)
@@ -1180,7 +1180,7 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 	if err != nil {
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-left leaf: %w", err)
 	}
-	newLeftBuf, err := pw.AllocSlab(newLeftID)
+	newLeftBuf, err := pw.ZeroPage(newLeftID)
 	if err != nil {
 		_ = pw.FreePage(newLeftID)
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-left slab: %w", err)
@@ -1208,7 +1208,7 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 		_ = pw.FreePage(newLeftID)
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-right leaf: %w", err)
 	}
-	newRightBuf, err := pw.AllocSlab(newRightID)
+	newRightBuf, err := pw.ZeroPage(newRightID)
 	if err != nil {
 		_ = pw.FreePage(newLeftID)
 		_ = pw.FreePage(newRightID)
@@ -1301,7 +1301,7 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold 
 		if err != nil {
 			return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc merged branch: %w", err)
 		}
-		mergedBuf, err := pw.AllocSlab(mergedID)
+		mergedBuf, err := pw.ZeroPage(mergedID)
 		if err != nil {
 			_ = pw.FreePage(mergedID)
 			return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc merged branch slab: %w", err)
@@ -1378,7 +1378,7 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold 
 	if err != nil {
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-left branch: %w", err)
 	}
-	newLeftBuf, err := pw.AllocSlab(newLeftID)
+	newLeftBuf, err := pw.ZeroPage(newLeftID)
 	if err != nil {
 		_ = pw.FreePage(newLeftID)
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-left branch slab: %w", err)
@@ -1388,7 +1388,7 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold 
 		_ = pw.FreePage(newLeftID)
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-right branch: %w", err)
 	}
-	newRightBuf, err := pw.AllocSlab(newRightID)
+	newRightBuf, err := pw.ZeroPage(newRightID)
 	if err != nil {
 		_ = pw.FreePage(newLeftID)
 		_ = pw.FreePage(newRightID)

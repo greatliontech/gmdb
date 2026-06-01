@@ -355,18 +355,18 @@ func (f *failingFakeWriter) AllocPage() (uint64, error) {
 	return f.fakeWriter.AllocPage()
 }
 
-func (f *failingFakeWriter) AllocSlab(id uint64) ([]byte, error) {
+func (f *failingFakeWriter) ZeroPage(id uint64) ([]byte, error) {
 	f.allocSlabCalls++
 	if f.allocSlabCallsToFail != 0 && f.allocSlabCalls == f.allocSlabCallsToFail {
-		return nil, errors.New("injected: AllocSlab")
+		return nil, errors.New("injected: ZeroPage")
 	}
-	return f.fakeWriter.AllocSlab(id)
+	return f.fakeWriter.ZeroPage(id)
 }
 
 func TestPromoteSubpageAtomicityAllocSlabFailure(t *testing.T) {
-	// Inject: AllocSlab fails on its first call (which is the
+	// Inject: ZeroPage fails on its first call (which is the
 	// step-1+2 nested-root leaf slab). AllocPage(call=1) succeeds
-	// returning newLeafID=1; then AllocSlab(call=1) fails. The
+	// returning newLeafID=1; then ZeroPage(call=1) fails. The
 	// function must return (0, 0, err) AND FreePage(1) before
 	// returning so the caller's bookkeeping observes no leaked
 	// page. (Per the chunk-6.3 contract + E3, the post-call state
@@ -381,7 +381,7 @@ func TestPromoteSubpageAtomicityAllocSlabFailure(t *testing.T) {
 	subpage, _ := page.EncodeSubpage([][]byte{[]byte("a"), []byte("b")}, 0)
 	root, count, err := PromoteSubpageToNestedTree(pw, cfg, subpage, 0, []byte("c"))
 	if err == nil {
-		t.Fatalf("Promote did not error on injected AllocSlab failure")
+		t.Fatalf("Promote did not error on injected ZeroPage failure")
 	}
 	if root != 0 || count != 0 {
 		t.Errorf("on error want (0,0,err); got (%d,%d,%v)", root, count, err)
@@ -424,7 +424,7 @@ func TestPromoteSubpageAtomicityAllocPageFailure(t *testing.T) {
 }
 
 func TestPromoteSubpageAtomicityPutFailure(t *testing.T) {
-	// Inject: Put internally calls AllocPage for the CoW leaf. So
+	// Inject: Put internally calls AllocPage for the CopyPage leaf. So
 	// the 2nd AllocPage call is Put's first allocation. Failing it
 	// triggers Put's rollback (which doesn't free newLeafID — that
 	// belongs to the promotion's caller).

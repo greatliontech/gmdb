@@ -272,7 +272,7 @@ func TestFreeSubtreeSubpageCellCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllocPage: %v", err)
 	}
-	leafBuf, _ := fake.AllocSlab(leafID)
+	leafBuf, _ := fake.ZeroPage(leafID)
 	b := page.NewLeafBuilder(leafBuf, cfg)
 	sp2, _ := page.EncodeSubpage([][]byte{[]byte("a"), []byte("b")}, 0)
 	sp3, _ := page.EncodeSubpage([][]byte{[]byte("a"), []byte("b"), []byte("c")}, 0)
@@ -323,7 +323,7 @@ func TestFreeSubtreeNestedTreeCellRecursesAndCounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllocPage parent: %v", err)
 	}
-	parentBuf, _ := pw.AllocSlab(parentID)
+	parentBuf, _ := pw.ZeroPage(parentID)
 	b := page.NewLeafBuilder(parentBuf, cfg)
 	if !b.AddNestedTreeRef([]byte("topic"), nestedRoot, nestedCount) {
 		t.Fatalf("AddNestedTreeRef: false")
@@ -356,7 +356,7 @@ func TestFreeSubtreeMixedKind1Cells(t *testing.T) {
 
 	// Parent leaf with subpage(2 values) + nested-tree-ref(5 values) + subpage(3 values).
 	parentID, _ := pw.AllocPage()
-	parentBuf, _ := pw.AllocSlab(parentID)
+	parentBuf, _ := pw.ZeroPage(parentID)
 	b := page.NewLeafBuilder(parentBuf, cfg)
 	sp2, _ := page.EncodeSubpage([][]byte{[]byte("x"), []byte("y")}, 0)
 	sp3, _ := page.EncodeSubpage([][]byte{[]byte("p"), []byte("q"), []byte("r")}, 0)
@@ -383,7 +383,7 @@ func TestFreeSubtreeRejectsNestedTreeNullRoot(t *testing.T) {
 	fake := newFakeWriter(t, cfg.PageSize)
 
 	leafID, _ := fake.AllocPage()
-	leafBuf, _ := fake.AllocSlab(leafID)
+	leafBuf, _ := fake.ZeroPage(leafID)
 	b := page.NewLeafBuilder(leafBuf, cfg)
 	b.AddNestedTreeRef([]byte("k"), 0, 5) // bad: root=0
 	b.Finish()
@@ -409,7 +409,7 @@ func TestFreeSubtreeSubpageCellCountFixedSize(t *testing.T) {
 	const fvs uint16 = 4
 
 	leafID, _ := fake.AllocPage()
-	leafBuf, _ := fake.AllocSlab(leafID)
+	leafBuf, _ := fake.ZeroPage(leafID)
 	b := page.NewLeafBuilder(leafBuf, cfg)
 	sp1, _ := page.EncodeSubpage([][]byte{
 		{0, 0, 0, 1}, {0, 0, 0, 2},

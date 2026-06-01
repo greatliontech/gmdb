@@ -431,7 +431,7 @@ func (ks *Keyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) {
 	// Retire any leftover root (a truly empty keyspace has Root == 0;
 	// this is defense for an empty-but-allocated root) before publishing
 	// the bulk-built tree. FreeSubtree(0) is a no-op.
-	if _, err := btree.FreeSubtree(ks.tx.pgr, cfg, ks.desc.Root); err != nil {
+	if _, err := btree.FreeSubtree(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root); err != nil {
 		return 0, mapBtreeErr(err)
 	}
 	ks.desc.Root = root
@@ -536,7 +536,7 @@ func (ks *SetKeyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) 
 	if err != nil {
 		return 0, err
 	}
-	if _, err := btree.FreeSubtree(ks.tx.pgr, cfg, ks.desc.Root); err != nil {
+	if _, err := btree.FreeSubtree(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root); err != nil {
 		return 0, mapBtreeErr(err)
 	}
 	ks.desc.Root = root

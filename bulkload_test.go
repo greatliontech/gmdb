@@ -360,7 +360,7 @@ func TestBulkBuilderMatchesTopDownGet(t *testing.T) {
 	// Top-down tree built via btree.Put (the production insert path).
 	var topRoot uint64
 	for _, e := range kvs {
-		nr, err := btree.Put(tx.pgr, cfg, topRoot, e.k, e.v)
+		nr, err := btree.Put(btreeWriter{tx.pgr}, cfg, topRoot, e.k, e.v)
 		if err != nil {
 			t.Fatalf("btree.Put(%q): %v", e.k, err)
 		}

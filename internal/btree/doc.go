@@ -33,6 +33,6 @@
 // Atomic-state contract. btree functions take immutable snapshots
 // of (cfg, rootID); write operations return the NEW rootID after
 // CoW propagation. The pager + tx owns the actual root storage and
-// the slab buffer lifetime; btree never holds a *pager.Pager
+// the page-buffer lifetime; btree never holds a *pager.Pager
 // reference past its single-call entry point.
 package btree

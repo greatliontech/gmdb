@@ -369,7 +369,7 @@ func TestCursorDeleteOnReadOnlyCursorReturnsErr(t *testing.T) {
 
 func TestCursorDeleteCowMergeCascadeTolerance(t *testing.T) {
 	// Spec-tier invariant (kind=entailed): Cursor.Delete tolerates
-	// CoW + merge cascade — pre-delete leaf may be freed
+	// CopyPage + merge cascade — pre-delete leaf may be freed
 	// mid-operation, yet post-Delete Next/Prev/Current return
 	// structurally-correct entries.
 	//

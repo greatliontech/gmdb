@@ -752,7 +752,7 @@ func (ks *Keyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, err
 	ks.desc.Count = count
 	ks.markDirty()
 	ks.markCursorsStale()
-	if err := retireBulkOldRoots(ks.tx.pgr, cfg, oldRowRoot, oldRoots); err != nil {
+	if err := retireBulkOldRoots(btreeWriter{ks.tx.pgr}, cfg, oldRowRoot, oldRoots); err != nil {
 		return 0, err
 	}
 	return count, nil
@@ -809,7 +809,7 @@ func (ks *SetKeyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, 
 	ks.desc.Count = sb.total
 	ks.markDirty()
 	ks.markSetCursorsStale()
-	if err := retireBulkOldRoots(ks.tx.pgr, cfg, oldRowRoot, oldRoots); err != nil {
+	if err := retireBulkOldRoots(btreeWriter{ks.tx.pgr}, cfg, oldRowRoot, oldRoots); err != nil {
 		return 0, err
 	}
 	return sb.total, nil

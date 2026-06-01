@@ -273,7 +273,7 @@ func deleteRangeFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("btree: alloc CoW leaf for DeleteRange: %w", err)
 	}
-	newBuf, err := pw.CoW(pageID, newID)
+	newBuf, err := pw.CopyPage(pageID, newID)
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("btree: CoW leaf %d for DeleteRange: %w", pageID, err)
 	}
@@ -516,7 +516,7 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	if err != nil {
 		return 0, 0, false, 0, fmt.Errorf("btree: alloc CoW branch for DeleteRange: %w", err)
 	}
-	parentBuf, err := pw.CoW(pageID, newBranchID)
+	parentBuf, err := pw.CopyPage(pageID, newBranchID)
 	if err != nil {
 		return 0, 0, false, 0, fmt.Errorf("btree: CoW branch %d for DeleteRange: %w", pageID, err)
 	}

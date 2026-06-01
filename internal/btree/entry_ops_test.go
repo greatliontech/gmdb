@@ -235,7 +235,7 @@ func TestPutEntryDoesNotFreeDisplacedTrailerPages(t *testing.T) {
 	if _, leaked := fake.freed[42]; leaked {
 		t.Errorf("page 42 was FreePage'd by PutEntry; caller-owned (NestedRoot trailer should not be auto-freed)")
 	}
-	// Sanity: PutEntry did free its own CoW'd leaf, so the freed
+	// Sanity: PutEntry did free its own CopyPage'd leaf, so the freed
 	// set MUST have grown (by exactly 1 — the prior root).
 	if len(fake.freed) <= freedCountBefore {
 		t.Errorf("freed did not grow; PutEntry should have FreePage'd the prior root")

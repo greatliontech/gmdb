@@ -93,7 +93,7 @@ func (ks *keyspaceCore) builderCfg() page.Config {
 func (ks *keyspaceCore) newRootCursor() *btree.Cursor {
 	cfg := ks.builderCfg()
 	if ks.tx.writable {
-		return btree.NewCursor(ks.tx.pgr, cfg, ks.desc.Root, ks.tx.db.opts.MergeThreshold)
+		return btree.NewCursor(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, ks.tx.db.opts.MergeThreshold)
 	}
 	return btree.NewReadCursor(ks.tx.pgr, cfg, ks.desc.Root)
 }
@@ -166,7 +166,7 @@ func (ks *keyspaceCore) checkReadable(key []byte) error {
 func (ks *keyspaceCore) deleteRangeUnindexed(start, end []byte, cellFree btree.PerCellFreeFn, markStale func()) (uint64, error) {
 	cfg := ks.builderCfg()
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
-	count, newRoot, err := btree.DeleteRange(ks.tx.pgr, cfg, ks.desc.Root, mergeThreshold, start, end, cellFree)
+	count, newRoot, err := btree.DeleteRange(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, mergeThreshold, start, end, cellFree)
 	if err != nil {
 		return 0, mapBtreeErr(err)
 	}

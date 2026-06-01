@@ -20,7 +20,7 @@ import (
 
 const pagerTestPageSize = 4096
 
-func setupPagerWriter(t *testing.T, pages int) (*pager.Pager, *bitmap.Bitmap, *os.File) {
+func setupPagerWriter(t *testing.T, pages int) (pagerWriter, *bitmap.Bitmap, *os.File) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "db.gmdb")
@@ -47,7 +47,7 @@ func setupPagerWriter(t *testing.T, pages int) (*pager.Pager, *bitmap.Bitmap, *o
 	for id := bm.FirstDataPage(); id < uint64(pages); id++ {
 		bm.Set(id)
 	}
-	return p, bm, f
+	return pagerWriter{p}, bm, f
 }
 
 // TestPagerOverflowPutGetDelete pins Inv-3: a Put with a value larger
@@ -162,4 +162,25 @@ func TestPagerOverflowReplaceFreesOldChain(t *testing.T) {
 		t.Errorf("Get after replace: found=%v, value matches=%v",
 			found, bytes.Equal(got, value2))
 	}
+}
+
+// pagerWriter adapts *pager.Pager to btree.PageWriter for these
+// parity tests, mirroring the root package's gmdb.btreeWriter (which
+// is unreachable here: importing gmdb from internal/btree would
+// cycle). The pager keeps its MVCC/slab vocabulary (CoW/AllocSlab);
+// btree consumes the storage-neutral CopyPage/ZeroPage/ZeroPageRun.
+// Pager methods (Config, Close, PendingAllocs, ...) reach callers
+// through the embedded pointer.
+type pagerWriter struct{ *pager.Pager }
+
+func (w pagerWriter) CopyPage(srcID, dstID uint64) ([]byte, error) {
+	return w.Pager.CoW(srcID, dstID)
+}
+
+func (w pagerWriter) ZeroPage(id uint64) ([]byte, error) {
+	return w.Pager.AllocSlab(id)
+}
+
+func (w pagerWriter) ZeroPageRun(firstID uint64, n uint32) ([][]byte, error) {
+	return w.Pager.AllocSlabRun(firstID, n)
 }

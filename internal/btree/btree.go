@@ -8,24 +8,22 @@ import (
 )
 
 // PageReader is the read-only page resolution interface the btree
-// needs. *pager.Pager satisfies it (Page resolves slab-then-mmap
-// for writers, mmap-only for readers).
+// needs. *pager.Pager satisfies it.
 //
 // Callers MUST supply a reader whose Page(id) returns a slice of
 // length cfg.PageSize. The btree does not re-validate the size — the
-// pager's verifying Page enforces the file-resident bound and the
+// reader's verifying Page enforces the file-resident bound and the
 // per-page checksum, and is the boundary at which an out-of-range id
 // (Inv-RV3) or a bitrotted page (Inv-RV1) surfaces as an error.
 type PageReader interface {
-	// Page returns the page bytes at id, or an error. The pager's
-	// implementation bounds id against the file-resident extent
-	// before any mmap access (so a forged/out-of-range id yields
-	// ErrCorrupted, never a SIGBUS) and, when checksums are
-	// enabled, verifies the xxhash64 footer on first access in the
-	// transaction (mismatch yields ErrBadPageChecksum). The
-	// returned slice is valid for the duration of the caller's
-	// enclosing tx (per the pager-slab.md byte-slice ownership
-	// invariant).
+	// Page returns the page bytes at id, or an error. A conforming
+	// reader bounds id against the file-resident extent before any
+	// access (so a forged/out-of-range id yields ErrCorrupted, never
+	// a SIGBUS) and, when checksums are enabled, verifies the
+	// per-page checksum footer on first access in the transaction
+	// (mismatch yields ErrBadPageChecksum). The returned slice stays
+	// valid for the duration of the caller's enclosing transaction;
+	// btree reads it only within the call that obtained it.
 	Page(id uint64) ([]byte, error)
 }
 

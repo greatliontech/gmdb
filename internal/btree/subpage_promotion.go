@@ -89,7 +89,7 @@ func PromoteSubpageToNestedTree(
 	if err != nil {
 		return 0, 0, fmt.Errorf("PromoteSubpageToNestedTree: alloc nested-root leaf: %w", err)
 	}
-	leafBuf, err := pw.AllocSlab(newLeafID)
+	leafBuf, err := pw.ZeroPage(newLeafID)
 	if err != nil {
 		// AbortTx restores the bitmap snapshot and is sufficient for
 		// in-tx cleanup, but the explicit FreePage keeps the

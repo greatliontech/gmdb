@@ -11,7 +11,7 @@ import (
 
 // fakeWriter implements PageWriter for unit tests. Pages are
 // stored in a map keyed by id; allocations hand out monotonically-
-// increasing ids. CoW copies the source bytes into a fresh
+// increasing ids. CopyPage copies the source bytes into a fresh
 // allocation. FreePage marks the id reusable (loose-page semantics
 // — actually freed at the end of a logical commit; for tests we
 // don't release).
@@ -47,10 +47,10 @@ func (f *fakeWriter) AllocPage() (uint64, error) {
 	return id, nil
 }
 
-func (f *fakeWriter) CoW(srcID, dstID uint64) ([]byte, error) {
+func (f *fakeWriter) CopyPage(srcID, dstID uint64) ([]byte, error) {
 	src, ok := f.pages[srcID]
 	if !ok {
-		return nil, fmt.Errorf("fakeWriter.CoW: src %d not allocated", srcID)
+		return nil, fmt.Errorf("fakeWriter.CopyPage: src %d not allocated", srcID)
 	}
 	dst := make([]byte, f.pageSize)
 	copy(dst, src)
@@ -58,7 +58,7 @@ func (f *fakeWriter) CoW(srcID, dstID uint64) ([]byte, error) {
 	return dst, nil
 }
 
-func (f *fakeWriter) AllocSlab(id uint64) ([]byte, error) {
+func (f *fakeWriter) ZeroPage(id uint64) ([]byte, error) {
 	buf := make([]byte, f.pageSize)
 	f.pages[id] = buf
 	return buf, nil
@@ -93,13 +93,13 @@ func (f *fakeWriter) AllocContiguous(n uint32) (uint64, error) {
 	return first, nil
 }
 
-// AllocSlabRun returns fresh zero-filled slab buffers for each id
-// in [firstID, firstID+n). Mirrors AllocSlab semantics page-by-
+// ZeroPageRun returns fresh zero-filled slab buffers for each id
+// in [firstID, firstID+n). Mirrors ZeroPage semantics page-by-
 // page; the caller (writeOverflowChain) writes via
 // page.EncodeOverflowRun.
-func (f *fakeWriter) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
+func (f *fakeWriter) ZeroPageRun(firstID uint64, n uint32) ([][]byte, error) {
 	if n == 0 {
-		return nil, fmt.Errorf("fakeWriter.AllocSlabRun: n=0 invalid")
+		return nil, fmt.Errorf("fakeWriter.ZeroPageRun: n=0 invalid")
 	}
 	pages := make([][]byte, n)
 	for i := range n {
@@ -744,8 +744,8 @@ func TestPutRejectsOversizeKey(t *testing.T) {
 }
 
 func TestPutFreesEveryRetiredPageAfterSplits(t *testing.T) {
-	// Spec-tier invariant for CoW correctness (transactions.md
-	// §Write Transaction step 3): pages CoW'd out of the live
+	// Spec-tier invariant for CopyPage correctness (transactions.md
+	// §Write Transaction step 3): pages CopyPage'd out of the live
 	// tree must be retired. A leaked old page (not freed but no
 	// longer referenced) is a slab/disk leak that surfaces only
 	// later as RPL bloat or bitmap drift.

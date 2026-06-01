@@ -9,57 +9,55 @@ import (
 )
 
 // PageWriter extends PageReader with the write-path operations
-// btree mutations need. *pager.Pager satisfies it.
+// btree mutations need. A writer adapter over the page store
+// satisfies it (the root package adapts *pager.Pager).
 //
 // Lifecycle contract: every page the btree allocates is either
 // (a) installed in the tree (chain reachable from the returned new
 // rootID), or (b) freed (via FreePage for single pages, FreeRun
-// for overflow chains) before Put returns. The pager's slab
-// manages the byte buffers; btree never owns them past the Put
-// call.
+// for overflow chains) before Put returns. The writer owns the
+// page-buffer storage; btree never holds a buffer past the call
+// that produced it.
 type PageWriter interface {
 	PageReader
 
-	// AllocPage returns a fresh page ID, sourced from the
-	// freespace allocator's priority order (loose → bitmap → RPL
-	// reclamation → file extension; see free-space.md).
+	// AllocPage returns a fresh page ID from the writer's
+	// free-space allocator. The allocation source and ordering are
+	// the writer's concern; btree treats the result as an opaque
+	// fresh page.
 	AllocPage() (uint64, error)
 
-	// CoW installs a fresh slab buffer at dstID, populated with
-	// the current content of srcID. dstID is supplied by the
-	// caller's prior AllocPage. Returns the writable buffer.
-	CoW(srcID, dstID uint64) ([]byte, error)
+	// CopyPage returns a writable copy of srcID's bytes installed at
+	// dstID (supplied by the caller's prior AllocPage). This is
+	// btree's copy-on-write primitive: mutate the returned buffer,
+	// never srcID.
+	CopyPage(srcID, dstID uint64) ([]byte, error)
 
-	// AllocSlab installs a fresh zero-filled slab buffer at id
-	// without reading any source page. Used for newly-encoded
-	// pages (split halves, new root branch) that have no prior
-	// on-disk content.
-	AllocSlab(id uint64) ([]byte, error)
+	// ZeroPage returns a fresh zero-filled writable buffer for id,
+	// reading no source page. Used for newly-encoded pages (split
+	// halves, a new root branch) with no prior on-disk content.
+	ZeroPage(id uint64) ([]byte, error)
 
-	// FreePage retires id. Same-tx pages (from earlier in this
-	// Put or the same write tx) become loose pages reusable
-	// within the tx; prior-tx pages enter the RPL at commit.
+	// FreePage retires id. A page allocated earlier in this same
+	// write operation becomes reusable immediately; a page that
+	// predates this operation is reclaimed when the writer's
+	// transaction commits.
 	FreePage(id uint64) error
 
 	// AllocContiguous returns the first page ID of a fresh
-	// contiguous run of n pages. Used for overflow-chain
-	// allocation per page-formats.md §Overflow Page (followers
-	// have no header and must be addressable as firstID+1,
-	// firstID+2, ..., firstID+n-1). The pager's bitmap
-	// contiguous-run search backs this (free-space.md
-	// §Contiguous-run search).
+	// contiguous run of n pages. Used for overflow-chain allocation
+	// per page-formats.md §Overflow Page (followers have no header
+	// and must be addressable as firstID+1, ..., firstID+n-1).
 	AllocContiguous(n uint32) (uint64, error)
 
-	// AllocSlabRun returns the slab buffers for the n pages of a
-	// run previously allocated via AllocContiguous. pages[i] is
-	// the buffer for firstID + uint64(i). All buffers are fresh
-	// zero-filled page-sized slices.
-	AllocSlabRun(firstID uint64, n uint32) (pages [][]byte, err error)
+	// ZeroPageRun returns fresh zero-filled writable buffers for the
+	// n pages of a run previously reserved via AllocContiguous.
+	// pages[i] is the buffer for firstID + uint64(i).
+	ZeroPageRun(firstID uint64, n uint32) (pages [][]byte, err error)
 
 	// FreeRun retires a contiguous run of n pages starting at
-	// firstID. Each id [firstID, firstID+n) is treated like an
-	// individual FreePage by the pager's bookkeeping (loose
-	// within this tx; RPL'd at commit if prior-tx).
+	// firstID. Each id in [firstID, firstID+n) is retired exactly
+	// like an individual FreePage.
 	FreeRun(firstID uint64, n uint32) error
 }
 
@@ -218,7 +216,7 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 	if err != nil {
 		return 0, false, fmt.Errorf("btree: alloc CoW leaf: %w", err)
 	}
-	leftBuf, err := pw.CoW(leafID, leftID)
+	leftBuf, err := pw.CopyPage(leafID, leftID)
 	if err != nil {
 		return 0, false, fmt.Errorf("btree: CoW leaf: %w", err)
 	}
@@ -425,7 +423,7 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			rollbackNewChain()
 			return 0, false, fmt.Errorf("btree: alloc split-right leaf: %w", err)
 		}
-		rightBuf, err := pw.AllocSlab(rightID)
+		rightBuf, err := pw.ZeroPage(rightID)
 		if err != nil {
 			_ = pw.FreePage(leftID)
 			_ = pw.FreePage(rightID)
@@ -500,7 +498,7 @@ func putEmpty(pw PageWriter, cfg page.Config, key, value []byte) (uint64, error)
 		}
 		return 0, fmt.Errorf("btree: alloc genesis leaf: %w", err)
 	}
-	buf, err := pw.AllocSlab(id)
+	buf, err := pw.ZeroPage(id)
 	if err != nil {
 		_ = pw.FreePage(id)
 		if newEntry.IsOverflow() {
@@ -625,7 +623,7 @@ func ascendNoSplit(pw PageWriter, cfg page.Config, path []pathFrame, newChildID 
 		if err != nil {
 			return 0, fmt.Errorf("btree: alloc branch CoW: %w", err)
 		}
-		buf, err := pw.CoW(f.pageID, newBranchID)
+		buf, err := pw.CopyPage(f.pageID, newBranchID)
 		if err != nil {
 			return 0, fmt.Errorf("btree: CoW branch %d: %w", f.pageID, err)
 		}
@@ -669,7 +667,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		if err != nil {
 			return 0, fmt.Errorf("btree: alloc branch CoW (split): %w", err)
 		}
-		buf, err := pw.CoW(f.pageID, newBranchID)
+		buf, err := pw.CopyPage(f.pageID, newBranchID)
 		if err != nil {
 			return 0, fmt.Errorf("btree: CoW branch %d (split): %w", f.pageID, err)
 		}
@@ -750,7 +748,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 			_ = pw.FreePage(newBranchID)
 			return 0, fmt.Errorf("btree: alloc split-right branch: %w", err)
 		}
-		newRightBuf, err := pw.AllocSlab(newRightID)
+		newRightBuf, err := pw.ZeroPage(newRightID)
 		if err != nil {
 			_ = pw.FreePage(newBranchID)
 			_ = pw.FreePage(newRightID)
@@ -782,7 +780,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 	if err != nil {
 		return 0, fmt.Errorf("btree: alloc new root branch: %w", err)
 	}
-	newRootBuf, err := pw.AllocSlab(newRootID)
+	newRootBuf, err := pw.ZeroPage(newRootID)
 	if err != nil {
 		_ = pw.FreePage(newRootID)
 		return 0, fmt.Errorf("btree: alloc new root slab: %w", err)

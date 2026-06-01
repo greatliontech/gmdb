@@ -286,7 +286,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnPut(key, oldValue, newValue []byte, e
 				return fmt.Errorf("%w: index %q: delete of %x but index root is 0",
 					ErrCorrupted, pl.p.decl.Name, []byte(k))
 			}
-			newRoot, err := btree.Delete(ks.tx.pgr, cfg, pl.p.root, mergeThreshold, []byte(k))
+			newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, pl.p.root, mergeThreshold, []byte(k))
 			if err != nil {
 				if errors.Is(err, btree.ErrNotFound) {
 					// Stale old extractor output: extractor said this
@@ -315,7 +315,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnPut(key, oldValue, newValue []byte, e
 		for _, k := range pl.ins {
 			entry := pl.news[k]
 			val := indexEntryValue(entry, key, pl.p.decl.Unique, hasCovering)
-			newRoot, err := btree.Put(ks.tx.pgr, cfg, pl.p.root, []byte(k), val)
+			newRoot, err := btree.Put(btreeWriter{ks.tx.pgr}, cfg, pl.p.root, []byte(k), val)
 			if err != nil {
 				return mapBtreeErr(err)
 			}
@@ -376,7 +376,7 @@ func (ks *Keyspace) applyIndexMaintenanceOnDelete(key, oldValue []byte) error {
 				return fmt.Errorf("%w: index %q: delete of %x but index root is 0",
 					ErrCorrupted, p.decl.Name, []byte(k))
 			}
-			newRoot, err := btree.Delete(ks.tx.pgr, cfg, p.root, mergeThreshold, []byte(k))
+			newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, p.root, mergeThreshold, []byte(k))
 			if err != nil {
 				if errors.Is(err, btree.ErrNotFound) {
 					return fmt.Errorf("%w: index %q: delete of %x missed (row/index divergence)",

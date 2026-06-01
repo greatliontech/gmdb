@@ -320,7 +320,7 @@ func (tx *Tx) registryPut(owner descriptorOwner, name string, entry *indexRegist
 		return err
 	}
 	desc := owner.descriptor()
-	newRoot, err := btree.Put(tx.pgr, tx.pgr.Config(), desc.IndexRegistryRoot, []byte(name), encoded)
+	newRoot, err := btree.Put(btreeWriter{tx.pgr}, tx.pgr.Config(), desc.IndexRegistryRoot, []byte(name), encoded)
 	if err != nil {
 		return fmt.Errorf("registryPut %q: %w", name, mapBtreeErr(err))
 	}
@@ -352,7 +352,7 @@ func (tx *Tx) registryDelete(owner descriptorOwner, name string) error {
 	if desc.IndexRegistryRoot == 0 {
 		return ErrIndexNotFound
 	}
-	newRoot, err := btree.Delete(tx.pgr, tx.pgr.Config(), desc.IndexRegistryRoot,
+	newRoot, err := btree.Delete(btreeWriter{tx.pgr}, tx.pgr.Config(), desc.IndexRegistryRoot,
 		tx.db.opts.MergeThreshold, []byte(name))
 	if err != nil {
 		if errors.Is(err, btree.ErrNotFound) {
@@ -381,7 +381,7 @@ func (tx *Tx) registryList(owner descriptorOwner) ([]string, error) {
 	if desc.IndexRegistryRoot == 0 {
 		return nil, nil
 	}
-	cur := btree.NewCursor(tx.pgr, tx.pgr.Config(), desc.IndexRegistryRoot, tx.db.opts.MergeThreshold)
+	cur := btree.NewCursor(btreeWriter{tx.pgr}, tx.pgr.Config(), desc.IndexRegistryRoot, tx.db.opts.MergeThreshold)
 	var names []string
 	k, _ := cur.First()
 	for k != nil {

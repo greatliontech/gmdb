@@ -406,7 +406,7 @@ func TestOpenKeyspaceRejectsForgedUnknownKind(t *testing.T) {
 	page.EncodeKeyspaceDescriptor(buf, page.KeyspaceDescriptor{Kind: page.KeyspaceKindKeyspace})
 	buf[16] = 3 // forge Kind byte to an unknown value
 	cfg := tx.pgr.Config()
-	newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte("bad"), buf)
+	newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte("bad"), buf)
 	if err != nil {
 		t.Fatalf("btree.Put forged: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestOpenKeyspaceRejectsForgedFixedValueSizeOnKind0(t *testing.T) {
 		FixedValueSize: 8, // illegal on Kind=0
 	})
 	cfg := tx.pgr.Config()
-	newRoot, err := btree.Put(tx.pgr, cfg, tx.keyspaceRoot, []byte("bad"), buf)
+	newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte("bad"), buf)
 	if err != nil {
 		t.Fatalf("btree.Put forged: %v", err)
 	}

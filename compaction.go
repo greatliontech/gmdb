@@ -65,7 +65,7 @@ func (tx *Tx) compactForest(shouldRelocate func(uint64) bool, budget int) (int, 
 	if tx.keyspaceRoot == 0 || budget <= 0 {
 		return 0, nil
 	}
-	pw := tx.pgr
+	pw := btreeWriter{tx.pgr}
 	baseCfg := pw.Config()
 	hwm := pw.HighWaterMark()
 	remaining := budget
@@ -158,7 +158,7 @@ func (tx *Tx) compactForest(shouldRelocate func(uint64) bool, budget int) (int, 
 // as pages move. Uses cfg (the base pager cfg) for both the registry tree and
 // the index data trees, matching the runtime's maintenance of them.
 func (tx *Tx) compactIndexRegistry(regRoot uint64, shouldRelocate func(uint64) bool, cfg page.Config, hwm uint64, remaining *int) (uint64, int, error) {
-	pw := tx.pgr
+	pw := btreeWriter{tx.pgr}
 	moved := 0
 
 	// Snapshot the registry entries (name + decoded entry) before mutating.

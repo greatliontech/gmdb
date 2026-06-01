@@ -281,7 +281,7 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnAddValue(setKey, setValue []byte) 
 		for _, k := range pl.ins {
 			entry := pl.news[k]
 			val := indexEntryValue(entry, compoundPK, pl.p.decl.Unique, hasCovering)
-			newRoot, err := btree.Put(ks.tx.pgr, cfg, pl.p.root, []byte(k), val)
+			newRoot, err := btree.Put(btreeWriter{ks.tx.pgr}, cfg, pl.p.root, []byte(k), val)
 			if err != nil {
 				return mapBtreeErr(err)
 			}
@@ -331,7 +331,7 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnBulkKeyDelete(cfg page.Config, key
 		return walkErr
 	case e.IsNestedTree():
 		mergeThreshold := ks.tx.db.opts.MergeThreshold
-		c := btree.NewCursor(ks.tx.pgr, cfg, e.NestedRoot, mergeThreshold)
+		c := btree.NewCursor(btreeWriter{ks.tx.pgr}, cfg, e.NestedRoot, mergeThreshold)
 		for k, _ := c.First(); k != nil; k, _ = c.Next() {
 			// Nested-tree value is the key in the inner tree (per
 			// set-keyspace.md §Storage Strategy: each value becomes
@@ -395,7 +395,7 @@ func (ks *SetKeyspace) applyIndexMaintenanceOnRemoveValue(setKey, setValue []byt
 				return fmt.Errorf("%w: SetKeyspace index %q: delete of %x but root is 0",
 					ErrCorrupted, p.decl.Name, []byte(k))
 			}
-			newRoot, err := btree.Delete(ks.tx.pgr, cfg, p.root, mergeThreshold, []byte(k))
+			newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, p.root, mergeThreshold, []byte(k))
 			if err != nil {
 				if errors.Is(err, btree.ErrNotFound) {
 					return fmt.Errorf("%w: SetKeyspace index %q: delete of %x missed (row/index divergence)",

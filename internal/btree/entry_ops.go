@@ -149,7 +149,7 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 	if err != nil {
 		return 0, page.LeafEntry{}, fmt.Errorf("btree: alloc CoW leaf: %w", err)
 	}
-	leftBuf, err := pw.CoW(leafID, leftID)
+	leftBuf, err := pw.CopyPage(leafID, leftID)
 	if err != nil {
 		return 0, page.LeafEntry{}, fmt.Errorf("btree: CoW leaf: %w", err)
 	}
@@ -205,7 +205,7 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 		_ = pw.FreePage(leftID)
 		return 0, page.LeafEntry{}, fmt.Errorf("btree: alloc split-right leaf: %w", err)
 	}
-	rightBuf, err := pw.AllocSlab(rightID)
+	rightBuf, err := pw.ZeroPage(rightID)
 	if err != nil {
 		_ = pw.FreePage(leftID)
 		_ = pw.FreePage(rightID)
@@ -244,7 +244,7 @@ func putEmptyEntry(pw PageWriter, cfg page.Config, e page.LeafEntry) (uint64, er
 	if err != nil {
 		return 0, fmt.Errorf("btree: alloc genesis leaf: %w", err)
 	}
-	buf, err := pw.AllocSlab(id)
+	buf, err := pw.ZeroPage(id)
 	if err != nil {
 		_ = pw.FreePage(id)
 		return 0, fmt.Errorf("btree: alloc genesis slab: %w", err)
