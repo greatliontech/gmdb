@@ -2078,9 +2078,12 @@ Primary files: `db.go`, `alloc.go`, `lock.go`.
 - **`SyncMode` plumbing** lands incrementally: `SyncDurable` in
   Chunk 1, `SyncDataOnly` / `SyncLazy` / `SyncUnsafe` in Chunk
   3 (alongside RPL reclamation's checkpoint-bound consumer).
-- **`Stats()` collection** evolves per chunk — `DBStats` gains
-  fields as the corresponding subsystems land; final wiring in
-  Chunk 11.
+- **`Stats()` collection** — the api-surface.md §Statistics surface
+  (`DBStats` / `TxStats` / `KeyspaceStats` / `IndexStats` and their
+  `Stats()` methods) was NOT delivered by the chunk roadmap (chunk 11
+  shipped without it). It was implemented later as a proactive backlog
+  item; the authoritative description is api-surface.md §Statistics and
+  the `stats.go` / `internal/pager/txstats.go` godocs.
 - **Error sentinels** in `errors.go` are added as their
   surfacing path arrives; the final inventory is the one in
   `api-surface.md`.
