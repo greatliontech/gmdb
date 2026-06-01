@@ -24,6 +24,23 @@ func newFakeClock(initial uint64) *fakeClock {
 	return c
 }
 
+// pollUntil polls cond every 2 ms until it returns true or the
+// deadline elapses, returning cond's final result. Used to make
+// heartbeat assertions robust against scheduler latency on contended
+// CI without depending on a fixed-time sleep landing on a tick.
+func pollUntil(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // newHeartbeatCoord opens a fresh *File and Coord with the supplied
 // heartbeat interval and clock. The Coord is registered for Close in
 // t.Cleanup; the *File is closed AFTER the Coord (Coord.Close
@@ -108,9 +125,11 @@ func TestHeartbeatWriterRefreshesWhileHolding(t *testing.T) {
 }
 
 func TestHeartbeatNoWriteOffHold(t *testing.T) {
-	// Invariant 1 negative case: when no writer is held, the
-	// heartbeat goroutine MUST NOT write WriterHeartbeat — otherwise
-	// it would stomp another process's heartbeat.
+	// Invariant (cross-process.md §Invariants): WriterHeartbeat is
+	// written only by the lock-holding flock goroutine. The general
+	// heartbeat goroutine MUST NOT write WriterHeartbeat at all —
+	// doing so would stomp the value of whichever process actually
+	// holds the lock.
 	clk := newFakeClock(0)
 	_, f := newHeartbeatCoord(t, 2*time.Millisecond, clk.now)
 
@@ -122,7 +141,9 @@ func TestHeartbeatNoWriteOffHold(t *testing.T) {
 	clk.set(123_000_000)
 
 	// Run the heartbeat goroutine for several ticks. We never call
-	// AcquireWriter — holdingWriter stays false.
+	// AcquireWriter, so the flock goroutine never enters its hold
+	// loop; the heartbeat goroutine, the only other goroutine
+	// ticking, never writes WriterHeartbeat.
 	time.Sleep(30 * time.Millisecond)
 
 	if got := f.WriterHeartbeat(); got != sentinel {
@@ -132,18 +153,18 @@ func TestHeartbeatNoWriteOffHold(t *testing.T) {
 }
 
 func TestHeartbeatStopsAfterRelease(t *testing.T) {
-	// After grant.Release the goroutine sets holdingWriter=false BEFORE
-	// unlocking. Subsequent ticks must not advance WriterHeartbeat
-	// (with the bounded benign-race acknowledgement that a single
-	// in-flight tick may stomp once — we tolerate one tick worth).
+	// After grant.Release the flock goroutine leaves its step-4 hold
+	// loop and stops its ticker, so WriterHeartbeat is never written
+	// again (the heartbeat goroutine never writes it at all). There is
+	// no post-unlock stomp window — the refresh lives in the
+	// lock-holding goroutine, not behind a cross-goroutine flag.
 	//
 	// Robustness: instead of asserting a value at a fixed-time
 	// snapshot (which races scheduler latency on contended CI), we
-	// poll for stability — observe a settled value, advance the
-	// clock, then assert the value never advances over a multi-tick
-	// window. The benign single-stomp window is bounded by one
-	// HeartbeatInterval after Release; we wait that long, snapshot,
-	// then verify across the next 10 ticks.
+	// settle past any final under-lock refresh (the clock is held
+	// constant across that window so it is a value-preserving no-op),
+	// snapshot, then assert the value never advances once the clock
+	// jumps — proving nothing refreshes WriterHeartbeat off-hold.
 	clk := newFakeClock(1_000)
 	c, f := newHeartbeatCoord(t, 5*time.Millisecond, clk.now)
 
@@ -153,14 +174,16 @@ func TestHeartbeatStopsAfterRelease(t *testing.T) {
 	}
 	grant.Release()
 
-	// Settle: one full tick interval lets any in-flight tick land.
+	// Settle: one full tick interval lets the flock goroutine exit its
+	// hold loop (any final under-lock refresh lands at the still-held
+	// clock value).
 	time.Sleep(20 * time.Millisecond)
 	settled := f.WriterHeartbeat()
 
 	// Advance clock by a large delta and poll: across the next 200 ms
-	// (~40 ticks) WriterHeartbeat MUST NOT change. holdingWriter is
-	// false; the heartbeat goroutine must skip the WriterHeartbeat
-	// store on every subsequent tick.
+	// (~40 ticks) WriterHeartbeat MUST NOT change. The flock goroutine
+	// has left its hold loop and the heartbeat goroutine never writes
+	// WriterHeartbeat, so nothing refreshes it once we are off-hold.
 	clk.set(10_000_000)
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -169,6 +192,64 @@ func TestHeartbeatStopsAfterRelease(t *testing.T) {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestHeartbeatWriterRefreshConfinedToLockHolder(t *testing.T) {
+	// The relocation guarantee (cross-process.md §Invariants):
+	// WriterHeartbeat is refreshed ONLY by the flock goroutine while
+	// it holds LOCK_EX (its step-4 hold loop), never by the general
+	// heartbeat goroutine. Prove the division of labor by contrast —
+	// after the writer releases, the heartbeat goroutine is
+	// demonstrably still alive and ticking (it keeps refreshing a
+	// registered reader slot), yet WriterHeartbeat is frozen because
+	// the only goroutine that ever wrote it (the flock goroutine) has
+	// left its hold window. A regression that re-adds a WriterHeartbeat
+	// write to the heartbeat goroutine fails the final assertion.
+	clk := newFakeClock(1_000)
+	c, f := newHeartbeatCoord(t, 5*time.Millisecond, clk.now)
+
+	// A live reader slot witnesses that the heartbeat goroutine keeps
+	// ticking across the whole test.
+	c.RegisterReaderSlot(0)
+
+	grant, err := c.AcquireWriter(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireWriter: %v", err)
+	}
+
+	// While holding: advance the clock and wait for both the writer
+	// heartbeat (refreshed by the flock goroutine) and the reader slot
+	// (refreshed by the heartbeat goroutine) to reach the new value.
+	clk.set(2_000_000)
+	if !pollUntil(200*time.Millisecond, func() bool {
+		return f.WriterHeartbeat() == 2_000_000 && Load64(&f.Slot(0).Heartbeat) == 2_000_000
+	}) {
+		t.Fatalf("while holding: writer=%d slot=%d, want both 2_000_000",
+			f.WriterHeartbeat(), Load64(&f.Slot(0).Heartbeat))
+	}
+
+	grant.Release()
+	// Settle: let the flock goroutine leave its hold loop. The clock
+	// is still 2_000_000, so any final under-lock refresh is a no-op
+	// value-wise.
+	time.Sleep(20 * time.Millisecond)
+	frozenWriter := f.WriterHeartbeat()
+
+	// After release, advance the clock. The reader slot MUST keep
+	// advancing (heartbeat goroutine alive and ticking) — while
+	// WriterHeartbeat MUST stay frozen (no goroutine writes it once
+	// the hold window ends).
+	clk.set(9_000_000)
+	if !pollUntil(200*time.Millisecond, func() bool {
+		return Load64(&f.Slot(0).Heartbeat) == 9_000_000
+	}) {
+		t.Fatalf("reader slot did not advance after release: got %d, want 9_000_000 "+
+			"(heartbeat goroutine should still be ticking)", Load64(&f.Slot(0).Heartbeat))
+	}
+	if got := f.WriterHeartbeat(); got != frozenWriter {
+		t.Errorf("WriterHeartbeat advanced after release while not held: frozen=%d now=%d",
+			frozenWriter, got)
 	}
 }
 

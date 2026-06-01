@@ -529,12 +529,12 @@ type Options struct {
     // heartbeats. Default: 10s.
     StaleTimeout time.Duration
 
-    // HeartbeatInterval is how often the heartbeat goroutine
-    // refreshes `WriterHeartbeat` (while this process holds
-    // `LOCK_EX`) and the `Heartbeat` field of every active reader
-    // slot. Must be significantly less than `StaleTimeout` for
-    // scheduling jitter. Default: 1s. See cross-process.md §Heartbeat
-    // Goroutine.
+    // HeartbeatInterval is the refresh cadence for both heartbeat
+    // fields: the flock goroutine refreshes `WriterHeartbeat` at this
+    // interval while it holds `LOCK_EX`, and the heartbeat goroutine
+    // refreshes the `Heartbeat` field of every active reader slot.
+    // Must be significantly less than `StaleTimeout` for scheduling
+    // jitter. Default: 1s. See cross-process.md §Heartbeat Goroutine.
     HeartbeatInterval time.Duration
 
     // LockRetryInterval is the polling interval the flock goroutine

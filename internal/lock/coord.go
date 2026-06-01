@@ -70,18 +70,6 @@ type Coord struct {
 
 	retryInterval time.Duration
 
-	// holdingWriter is true iff the flock goroutine currently holds
-	// LOCK_EX on this process's behalf. Set true between the publish-
-	// identity step (3) and the clear-before-unlock step (4). The
-	// heartbeat goroutine reads it under a benign-race contract: a
-	// stale read can stomp WriterHeartbeat by at most one tick's
-	// worth (the next acquirer's publish-heartbeat in step 3
-	// immediately overwrites; intermediate values are still monotonic
-	// and within a small delta, so cross-namespace stale-detection
-	// using StaleTimeout=10s default tolerates this). See heartbeat()
-	// for the discussion.
-	holdingWriter atomic.Bool
-
 	// activeSlotsMu protects activeSlots. cross-process.md §Heartbeat
 	// Goroutine: RegisterReaderSlot / UnregisterReaderSlot mutate
 	// under the mutex; the heartbeat goroutine snapshots-and-releases
@@ -184,11 +172,13 @@ type CoordOptions struct {
 	// ctx-cancellation latency under sustained contention.
 	RetryInterval time.Duration
 
-	// HeartbeatInterval is how often the heartbeat goroutine refreshes
-	// WriterHeartbeat (while holding LOCK_EX) and the Heartbeat field
-	// of every reader slot in the active list. Zero ⇒
-	// DefaultHeartbeatInterval (1 s). Must remain well under
-	// StaleTimeout (10 s, per cross-process.md §Heartbeat Goroutine).
+	// HeartbeatInterval is the refresh cadence for both heartbeat
+	// fields: the flock goroutine refreshes WriterHeartbeat at this
+	// interval while it holds LOCK_EX (step-4 hold loop), and the
+	// heartbeat goroutine refreshes the Heartbeat field of every
+	// reader slot in the active list. Zero ⇒ DefaultHeartbeatInterval
+	// (1 s). Must remain well under StaleTimeout (10 s, per
+	// cross-process.md §Heartbeat Goroutine).
 	HeartbeatInterval time.Duration
 
 	// StaleTimeout is how long a reader-slot or writer Heartbeat must
@@ -470,33 +460,43 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 	//
 	// WriterHeartbeat: published synchronously under LOCK_EX so any
 	// peer observing WriterPID != 0 immediately also sees a non-zero
-	// recent heartbeat. The heartbeat goroutine refreshes it on each
-	// tick while holdingWriter is true; without this initial
-	// publication, a cross-namespace stale-detection scan between
-	// grant and the first tick would see WriterHeartbeat = 0 and
-	// false-stale this fresh writer.
+	// recent heartbeat. Step 4's hold loop refreshes it each
+	// HeartbeatInterval tick while we hold LOCK_EX; without this
+	// initial publication, a cross-namespace stale-detection scan
+	// between grant and the first refresh would see WriterHeartbeat =
+	// 0 and false-stale this fresh writer.
 	c.f.SetWriterPID(c.pid)
 	c.f.SetWriterStartTime(c.startTime)
 	c.f.SetWriterPIDNamespace(c.pidNS)
 	c.f.SetWriterHeartbeat(c.clock())
-	c.holdingWriter.Store(true)
 	req.result <- nil
 
-	// Step 4: hold until release or stopCh.
+	// Step 4: hold until release or stopCh, refreshing WriterHeartbeat
+	// each HeartbeatInterval tick. The flock goroutine holds LOCK_EX
+	// continuously across this loop — from the step-3 publish above to
+	// the clear+unlock below — so every refresh here lands under
+	// LOCK_EX by construction. This is what makes the "WriterHeartbeat
+	// is written only while holding LOCK_EX" invariant
+	// (cross-process.md §Invariants) hold structurally: this goroutine
+	// is the sole writer of WriterHeartbeat, and it writes only inside
+	// this hold window. There is no in-process holding flag a separate
+	// goroutine could read stale and so stomp the field after our
+	// LOCK_UN.
+	hbTicker := time.NewTicker(c.heartbeatInterval)
 	stopped := false
-	select {
-	case <-req.release:
-	case <-c.stopCh:
-		stopped = true
+holdLoop:
+	for {
+		select {
+		case <-req.release:
+			break holdLoop
+		case <-c.stopCh:
+			stopped = true
+			break holdLoop
+		case <-hbTicker.C:
+			c.f.SetWriterHeartbeat(c.clock())
+		}
 	}
-
-	// Stop heartbeat writes BEFORE clearing identity / unlocking. A
-	// stale Load in the heartbeat goroutine can still write
-	// WriterHeartbeat one tick after this Store — that race is benign
-	// (the next acquirer's publish-heartbeat overwrites; intermediate
-	// values are still monotonic and within a small delta of the
-	// new holder's clock).
-	c.holdingWriter.Store(false)
+	hbTicker.Stop()
 
 	// Clear header BEFORE unlock — clause-explicit invariant
 	// (cross-process.md §Invariants): a peer that acquires LOCK_EX
@@ -547,11 +547,15 @@ func SetReleaseHookForTest(hook func()) {
 
 // heartbeat is the periodic-refresh goroutine started by NewCoord
 // and stopped by Close. Per cross-process.md §Heartbeat Goroutine it
-// refreshes WriterHeartbeat (while this process holds LOCK_EX) and
-// every active reader slot's Heartbeat field once per
-// HeartbeatInterval. The activeSlotsMu snapshot pattern keeps tick
-// cost bounded — the lock is held only long enough to copy the slot
-// index list; atomic stores happen outside the lock so a slow
+// refreshes every active reader slot's Heartbeat field once per
+// HeartbeatInterval. It does NOT touch WriterHeartbeat: that field is
+// refreshed exclusively by the flock goroutine inside its step-4 hold
+// loop (process) — the only context in which this process holds
+// LOCK_EX — so the "WriterHeartbeat written only under LOCK_EX"
+// invariant holds by construction rather than via a cross-goroutine
+// holding flag. The activeSlotsMu snapshot pattern keeps tick cost
+// bounded — the lock is held only long enough to copy the slot index
+// list; atomic stores happen outside the lock so a slow
 // Register/Unregister cannot stall the tick.
 func (c *Coord) heartbeat() {
 	defer close(c.heartbeatDoneCh)
@@ -563,9 +567,6 @@ func (c *Coord) heartbeat() {
 			return
 		case <-ticker.C:
 			now := c.clock()
-			if c.holdingWriter.Load() {
-				c.f.SetWriterHeartbeat(now)
-			}
 			c.activeSlotsMu.Lock()
 			// Snapshot to a local. activeSlots is typically O(active
 			// readers) — small. The alloc is the only per-tick

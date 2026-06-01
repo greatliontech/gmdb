@@ -382,8 +382,8 @@ encode/decode).
 - **WriterPIDNamespace**: PID namespace inode of the writer
   (Linux), 0 on other platforms.
 - **WriterHeartbeat**: `CLOCK_BOOTTIME` nanos (Linux) /
-  `CLOCK_MONOTONIC` elsewhere, updated periodically by the
-  heartbeat goroutine while the write lock is held.
+  `CLOCK_MONOTONIC` elsewhere, updated periodically by the flock
+  goroutine (the lock holder) while the write lock is held.
 - **LastMaintenanceTime**: updated after a maintenance pass
   completes (see `background-maintenance.md`).
 
@@ -518,9 +518,9 @@ Loop:
 3. Store `WriterPID`, `WriterStartTime`, `WriterPIDNamespace`,
    and `WriterHeartbeat = nowMonotonic()` in the lock-file header.
    `WriterHeartbeat` is published synchronously here — under
-   `LOCK_EX` — so any peer scanning between grant and the
-   heartbeat goroutine's first tick observes a non-zero, recent
-   heartbeat alongside the non-zero `WriterPID` (see §Stale
+   `LOCK_EX` — so any peer scanning between grant and the flock
+   goroutine's first refresh tick (step 4) observes a non-zero,
+   recent heartbeat alongside the non-zero `WriterPID` (see §Stale
    Writer Recovery case 2 for why a zero `WriterHeartbeat` at
    that instant would false-stale the fresh writer).
    Relative store order across these four is not load-bearing —
@@ -529,7 +529,14 @@ Loop:
    load-bearing — see §Reader Table (slot acquire) for the
    asymmetry. Send `nil` on `req.result` — writer holds the
    lock.
-4. `select` on (writer's release channel, `db.stopCh`).
+4. **Hold loop.** `select` on (writer's release channel,
+   `db.stopCh`, a `HeartbeatInterval` ticker).
+   - Ticker: re-store `WriterHeartbeat = nowMonotonic()` and loop.
+     The flock goroutine holds `LOCK_EX` across the whole loop, so
+     every refresh lands under `LOCK_EX` *by construction* — this is
+     the sole `WriterHeartbeat`-refresh site, keeping a long-held
+     writer fresh against cross-namespace stale-detection without a
+     cross-goroutine "holding" flag that could straddle the unlock.
    - Release: clear `WriterPID` / `WriterStartTime` /
      `WriterPIDNamespace` *before* `flock(LOCK_UN)` (see the
      clear-before-unlock invariant), then loop to step 1.
@@ -953,9 +960,12 @@ is the correct conservative behavior.
 ## Heartbeat Goroutine
 
 The DB struct maintains a **heartbeat goroutine** (started at
-Open, stopped at Close) that periodically updates the
-`Heartbeat` field on all reader slots and `WriterHeartbeat` on
-the lock-file header held by this process.
+Open, stopped at Close) that periodically refreshes the
+`Heartbeat` field on every reader slot this process holds.
+`WriterHeartbeat` is *not* refreshed here — it is refreshed by the
+flock goroutine inside its §Write Lock step-4 hold loop, the only
+context in which this process holds `LOCK_EX` (see **Writer-only
+updates** below).
 
 Ticks every ~1 s. Writes current monotonic clock
 (`CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on other
@@ -967,26 +977,30 @@ heartbeat goroutine takes a brief snapshot of the list under
 the mutex each tick and issues the atomic stores outside the
 lock to keep tick cost bounded.
 
-**Writer-only updates.** The heartbeat goroutine writes
-`WriterHeartbeat` ONLY while this process holds `LOCK_EX` on the
-lock file (tracked via an in-process `atomic.Bool`,
-`holdingWriter`, set true at §Write Lock step 3 and false in
-step 4 before the field clear and unlock). When `holdingWriter`
-is false, the goroutine skips the `WriterHeartbeat` store
-entirely — concurrent peers (in other processes) are the only
-writers, and stomping their value would corrupt cross-namespace
-stale-detection (§Stale Writer Recovery case 2). The active-slot
-list updates are independent of `holdingWriter` — reader-slot
-Heartbeats refresh every tick regardless of write-lock state.
+**Writer-only updates.** `WriterHeartbeat` is refreshed only by
+the flock goroutine, inside its §Write Lock step-4 hold loop, at
+the same `HeartbeatInterval` cadence. The flock goroutine holds
+`LOCK_EX` continuously from the step-3 publish to the step-4
+clear+unlock, so every refresh lands under `LOCK_EX` *by
+construction*: this goroutine is the sole writer of
+`WriterHeartbeat` and writes it only inside the hold window. There
+is no in-process "holding" flag a separate goroutine could read
+stale and so stomp the field after this process's `LOCK_UN`. The
+general heartbeat goroutine never writes `WriterHeartbeat` — it
+refreshes only reader-slot Heartbeats, every tick, regardless of
+write-lock state. Were a non-holder to write `WriterHeartbeat` it
+would stomp the value of whichever process actually holds the lock
+and corrupt cross-namespace stale-detection (§Stale Writer
+Recovery case 2); confining the write to the lock-holding
+goroutine's hold window makes that illegal state unrepresentable.
 
 **Initial publish on grant.** §Write Lock step 3 stores
 `WriterHeartbeat = nowMonotonic()` synchronously under `LOCK_EX`,
-*before* sending `nil` on the writer's result channel. The
-heartbeat goroutine's subsequent ticks merely refresh that
-initial value while `holdingWriter` remains true; a peer
-observing `WriterPID != 0` therefore always also sees a non-zero,
-recent `WriterHeartbeat` from the same writer, even before the
-heartbeat goroutine's first tick fires.
+*before* sending `nil` on the writer's result channel. The flock
+goroutine's step-4 hold loop then refreshes that value each tick
+while the lock is held; a peer observing `WriterPID != 0`
+therefore always also sees a non-zero, recent `WriterHeartbeat`
+from the same writer, even before the first refresh tick fires.
 
 `CLOCK_BOOTTIME` on Linux because it is monotonic, survives
 suspend/resume, and is shared across all containers on the
