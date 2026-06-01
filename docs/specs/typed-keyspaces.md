@@ -425,7 +425,7 @@ ID (e.g. `"gmdb/be-int64/v2"`) with a separate type (e.g.
 `gmdb.BEInt64EncoderV2`); the old type and ID remain available
 for backward read of existing indexes. Operators migrating from
 the buggy encoder rebuild the affected indexes via
-`tx.RebuildIndex` with the new typed decl. This convention
+`tx.Indexes().Rebuild` with the new typed decl. This convention
 extends to application-defined encoders
 (`"<pkg>/<type>[/<version>]"` — bump the version segment when
 the encoding logic changes; see `Encoder.ID()` godoc).

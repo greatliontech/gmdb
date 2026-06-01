@@ -492,7 +492,7 @@ idempotent.
 A **write-helper** is an internal API on `*Tx` (or on a `*Keyspace` /
 `*SetKeyspace` rooted in a `*Tx`) that mutates more than one page
 inside a single user-visible operation — the DDL surface
-(`CreateKeyspace` with indexes, `Tx.RebuildIndex`, `Tx.DropIndex`,
+(`CreateKeyspace` with indexes, `TxIndexes.Rebuild`, `TxIndexes.Drop`,
 `tx.DeleteKeyspace`'s three-subtree retirement), the per-row indexed
 maintenance path (`Keyspace.Put`/`Delete`, `Cursor.Delete`,
 `SetKeyspace.Put`/`Delete`/`DeleteValue`), and any future helper
@@ -541,7 +541,7 @@ shape:
 
 - **Nested savepoint** (`Pager.BeginSavepoint` / `RestoreSavepoint(on
   error)` / `ReleaseSavepoint(on success)`) for one-shot DDL helpers
-  (`writeNewIndexRegistry`, `Tx.RebuildIndex`, `Tx.DropIndex`,
+  (`writeNewIndexRegistry`, `TxIndexes.Rebuild`, `TxIndexes.Drop`,
   `tx.DeleteKeyspace`'s retirement). Nested kind suspends loose-page
   reuse for the duration — acceptable here because each helper runs
   at most once per tx and the suspension window does not multiply.

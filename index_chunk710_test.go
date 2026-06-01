@@ -84,7 +84,7 @@ func TestRebuildIndexOnSetKeyspaceSeesSameTxPuts(t *testing.T) {
 	v2 := testDecl("by_topic", "topic")
 	v2.Extract = setKeyspaceFirstByteExtract
 	v2.Version = "v2"
-	if err := tx.RebuildIndex("subs", v2); err != nil {
+	if err := tx.Indexes().Rebuild("subs", v2); err != nil {
 		t.Fatalf("RebuildIndex SetKeyspace: %v", err)
 	}
 	if got := sks.indexes["by_topic"].count; got != 3 {
@@ -125,7 +125,7 @@ func TestRebuildIndexOnSetKeyspaceUniqueViolation(t *testing.T) {
 	v2.Extract = func(_, _ []byte) []IndexEntry {
 		return []IndexEntry{{Cols: [][]byte{{0xFF}}}}
 	}
-	err = tx.RebuildIndex("subs", v2)
+	err = tx.Indexes().Rebuild("subs", v2)
 	if !errors.Is(err, ErrIndexUniqueViolation) {
 		t.Fatalf("expected ErrIndexUniqueViolation, got %v", err)
 	}

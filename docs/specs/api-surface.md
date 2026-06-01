@@ -86,7 +86,7 @@ Invariant: kind=clause-explicit;
     and typed equivalents) are also out of scope: they return
     `(0, nil)` for an empty range — "no rows matched" is success
     for a bulk op, not absence. Index-namespace removal
-    (`Tx.DropIndex(keyspace, indexName)`) uses a distinct
+    (`TxIndexes.Drop(keyspace, indexName)`) uses a distinct
     sentinel (`ErrIndexNotFound`) by namespace, not a different
     policy — out of scope here. Keyspace-management
     (`Tx.DeleteKeyspace(name)` returning `ErrNotFound`) is
@@ -928,7 +928,24 @@ type KeyspaceConfig struct {
     RestartGroupTarget uint16 // 0 = leave unchanged; otherwise [1, 255]
 }
 
-// RebuildIndex drops and re-populates the named index using the
+// TxIndexes is the index-administration surface of a write
+// transaction, returned by Tx.Indexes. Its operations address a
+// keyspace by NAME rather than through an opened *Keyspace handle:
+// Rebuild is the recovery path after ErrIndexFingerprintMismatch,
+// invoked while OpenKeyspace is still FAILING for that keyspace — so
+// no writable *Keyspace handle exists at the point of call
+// (indexing.md §Rebuild, §Recovery pattern after
+// ErrIndexFingerprintMismatch). Drop shares the surface for symmetry.
+// TxIndexes carries the parent transaction's read-only / closed state
+// (Rebuild and Drop return ErrReadOnly / ErrTxClosed exactly as the
+// other write APIs).
+type TxIndexes struct { /* unexported: bound to the parent *Tx */ }
+
+// Indexes returns the index-administration surface for this write
+// transaction. See TxIndexes.
+func (tx *Tx) Indexes() TxIndexes
+
+// Rebuild drops and re-populates the named index using the
 // supplied IndexDecl (whose Name must match an existing registry
 // entry on the keyspace). Bypasses the open-time fingerprint check;
 // this is the recovery path after ErrIndexFingerprintMismatch.
@@ -948,7 +965,7 @@ type KeyspaceConfig struct {
 //     dimension; matches Tx.DeleteKeyspace and Tx.SetKeyspaceConfig).
 //   - ErrIndexNotFound if the keyspace exists but decl.Name does not
 //     match any registry entry on the keyspace (index-management
-//     dimension; matches Tx.DropIndex). Distinct sentinel from
+//     dimension; matches TxIndexes.Drop). Distinct sentinel from
 //     ErrNotFound so callers writing the recovery loop (see
 //     `indexing.md §Recovery pattern after ErrIndexFingerprintMismatch`)
 //     can dispatch between keyspace-missing and index-name-missing
@@ -964,9 +981,9 @@ type KeyspaceConfig struct {
 //
 // (Chunk-7.1 user-locked: ErrNotFound for keyspace-missing +
 // ErrIndexNotFound for decl.Name-missing.)
-func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error
+func (ix TxIndexes) Rebuild(keyspace string, decl *IndexDecl) error
 
-// DropIndex removes the named index entirely. Retires the index's
+// Drop removes the named index entirely. Retires the index's
 // internal Kind=2 keyspace pages and the registry entry; if the
 // dropped index was the keyspace's last, resets
 // desc.IndexRegistryRoot to 0 and retires the registry sub-tree
@@ -988,7 +1005,7 @@ func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) error
 //   - ErrKeyspaceReserved if the keyspace name resolves to a
 //     Kind=2 entry.
 //   - ErrReadOnly / ErrTxClosed as for other write APIs.
-func (tx *Tx) DropIndex(keyspace, indexName string) error
+func (ix TxIndexes) Drop(keyspace, indexName string) error
 
 // Keyspace is a handle to a named single-value keyspace.
 type Keyspace struct { ... }
@@ -1203,13 +1220,13 @@ type Index struct { /* unexported */ }
 //
 // Handle invalidation (indexing.md §Handle Invalidation): a
 // mid-iter mutation that CoWs or frees this index's data tree
-// pages (Tx.RebuildIndex for this name; Tx.DropIndex for this
+// pages (TxIndexes.Rebuild for this name; TxIndexes.Drop for this
 // name; Put / Delete / Cursor.Delete on the parent indexed
 // keyspace; the SetKeyspace mutator analogues) MarkStale's the
 // iter's cursor — the next yield surfaces nothing and idx.Err()
 // reports ErrCursorStale. The caller's recovery is to re-iterate
 // on a fresh idx.Lookup, which opens a new cursor on the current
-// post-mutation pinned.root. After Tx.DropIndex on this name the
+// post-mutation pinned.root. After TxIndexes.Drop on this name the
 // handle becomes dead — subsequent Lookup/LookupKeys/Range/
 // Prefix/Get/Stats return ErrIndexNotFound (the same sentinel
 // ks.Index(name) returns for a now-missing index). After

@@ -46,7 +46,7 @@ func TestRebuildIndexBasicReplacesExtractor(t *testing.T) {
 	v2 := testDecl("by_color", "color")
 	v2.Extract = firstByteExtract
 	v2.Version = "v2"
-	if err := tx.RebuildIndex("items", v2); err != nil {
+	if err := tx.Indexes().Rebuild("items", v2); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 	if got := ks.indexes["by_color"].count; got != 3 {
@@ -87,7 +87,7 @@ func TestRebuildIndexNilDeclReturnsErrInvalidOptions(t *testing.T) {
 	if _, err := tx.CreateKeyspace("items"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	err = tx.RebuildIndex("items", nil)
+	err = tx.Indexes().Rebuild("items", nil)
 	if !errors.Is(err, ErrInvalidOptions) {
 		t.Errorf("nil decl: got %v want ErrInvalidOptions", err)
 	}
@@ -114,7 +114,7 @@ func TestRebuildIndexNilExtractReturnsErrIndexExtractorRequired(t *testing.T) {
 		Version: "v1",
 		// Extract: nil
 	}
-	err = tx.RebuildIndex("items", noExtract)
+	err = tx.Indexes().Rebuild("items", noExtract)
 	if !errors.Is(err, ErrIndexExtractorRequired) {
 		t.Errorf("nil Extract: got %v want ErrIndexExtractorRequired", err)
 	}
@@ -134,7 +134,7 @@ func TestRebuildIndexMissingKeyspaceReturnsErrNotFound(t *testing.T) {
 	defer tx.Rollback()
 	decl := testDecl("by_color", "color")
 	decl.Extract = firstByteExtract
-	err = tx.RebuildIndex("nonexistent", decl)
+	err = tx.Indexes().Rebuild("nonexistent", decl)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing keyspace: got %v want ErrNotFound", err)
 	}
@@ -157,7 +157,7 @@ func TestRebuildIndexMissingIndexNameReturnsErrIndexNotFound(t *testing.T) {
 	}
 	decl := testDecl("by_nothing", "x")
 	decl.Extract = firstByteExtract
-	err = tx.RebuildIndex("items", decl)
+	err = tx.Indexes().Rebuild("items", decl)
 	if !errors.Is(err, ErrIndexNotFound) {
 		t.Errorf("missing index: got %v want ErrIndexNotFound", err)
 	}
@@ -199,7 +199,7 @@ func TestRebuildIndexUniqueViolationFailsCleanly(t *testing.T) {
 	v2.Extract = func(_, _ []byte) []IndexEntry {
 		return []IndexEntry{{Cols: [][]byte{{0xFF}}}}
 	}
-	err = tx.RebuildIndex("items", v2)
+	err = tx.Indexes().Rebuild("items", v2)
 	if !errors.Is(err, ErrIndexUniqueViolation) {
 		t.Fatalf("expected ErrIndexUniqueViolation, got %v", err)
 	}
@@ -231,7 +231,7 @@ func TestRebuildIndexEmptyKeyspaceProducesEmptyIndex(t *testing.T) {
 	v2 := testDecl("by_color", "color")
 	v2.Extract = firstByteExtract
 	v2.Version = "v2"
-	if err := tx.RebuildIndex("items", v2); err != nil {
+	if err := tx.Indexes().Rebuild("items", v2); err != nil {
 		t.Fatalf("RebuildIndex on empty: %v", err)
 	}
 	p := ks.indexes["by_color"]
@@ -265,7 +265,7 @@ func TestDropIndexRemovesEntry(t *testing.T) {
 	if err := ks.Put([]byte("k"), []byte{0x42}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if err := tx.DropIndex("items", "by_color"); err != nil {
+	if err := tx.Indexes().Drop("items", "by_color"); err != nil {
 		t.Fatalf("DropIndex: %v", err)
 	}
 	if _, ok := ks.indexes["by_color"]; ok {
@@ -300,7 +300,7 @@ func TestDropIndexLastResetsIndexRegistryRoot(t *testing.T) {
 	if ks.desc.IndexRegistryRoot == 0 {
 		t.Fatalf("IndexRegistryRoot 0 after CreateKeyspace with index")
 	}
-	if err := tx.DropIndex("items", "by_color"); err != nil {
+	if err := tx.Indexes().Drop("items", "by_color"); err != nil {
 		t.Fatalf("DropIndex: %v", err)
 	}
 	if ks.desc.IndexRegistryRoot != 0 {
@@ -319,7 +319,7 @@ func TestDropIndexMissingKeyspaceReturnsErrNotFound(t *testing.T) {
 	defer db.Close()
 	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
-	err = tx.DropIndex("nonexistent", "by_color")
+	err = tx.Indexes().Drop("nonexistent", "by_color")
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing keyspace: got %v want ErrNotFound", err)
 	}
@@ -338,7 +338,7 @@ func TestDropIndexMissingIndexNameReturnsErrIndexNotFound(t *testing.T) {
 	if _, err := tx.CreateKeyspace("items"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	err = tx.DropIndex("items", "by_nothing")
+	err = tx.Indexes().Drop("items", "by_nothing")
 	if !errors.Is(err, ErrIndexNotFound) {
 		t.Errorf("missing index: got %v want ErrIndexNotFound", err)
 	}
@@ -377,7 +377,7 @@ func TestRebuildIndexOnSetKeyspaceSucceeds(t *testing.T) {
 	v2 := testDecl("by_topic", "topic")
 	v2.Extract = setKeyspaceFirstByteExtract
 	v2.Version = "v2"
-	if err := tx.RebuildIndex("subs", v2); err != nil {
+	if err := tx.Indexes().Rebuild("subs", v2); err != nil {
 		t.Fatalf("RebuildIndex SetKeyspace: %v", err)
 	}
 	if sks.indexes["by_topic"].count != 1 {
@@ -408,7 +408,7 @@ func TestDropIndexOnSetKeyspaceSucceeds(t *testing.T) {
 	if _, err := sks.Put([]byte("u1"), []byte("alpha")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if err := tx.DropIndex("subs", "by_topic"); err != nil {
+	if err := tx.Indexes().Drop("subs", "by_topic"); err != nil {
 		t.Fatalf("DropIndex SetKeyspace: %v", err)
 	}
 	if _, ok := sks.indexes["by_topic"]; ok {
@@ -457,7 +457,7 @@ func TestRebuildIndexSeesSameTxPuts(t *testing.T) {
 	v2 := testDecl("by_color", "color")
 	v2.Extract = firstByteExtract
 	v2.Version = "v2"
-	if err := tx.RebuildIndex("items", v2); err != nil {
+	if err := tx.Indexes().Rebuild("items", v2); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 	if got := ks.indexes["by_color"].count; got != 3 {
@@ -507,7 +507,7 @@ func TestDropIndexThenReopenWithSameDeclErrIndexUnknown(t *testing.T) {
 	if _, err := tx.OpenKeyspace("items", decl); err != nil {
 		t.Fatalf("OpenKeyspace: %v", err)
 	}
-	if err := tx.DropIndex("items", "by_color"); err != nil {
+	if err := tx.Indexes().Drop("items", "by_color"); err != nil {
 		t.Fatalf("DropIndex: %v", err)
 	}
 	// Subsequent OpenKeyspace with the now-dropped decl: the
@@ -562,7 +562,7 @@ func TestRebuildIndexNotCachedPathPersists(t *testing.T) {
 		v2 := testDecl("by_color", "color")
 		v2.Extract = firstByteExtract
 		v2.Version = "v2"
-		if err := tx.RebuildIndex("items", v2); err != nil {
+		if err := tx.Indexes().Rebuild("items", v2); err != nil {
 			t.Fatalf("RebuildIndex not-cached: %v", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -620,7 +620,7 @@ func TestDropIndexNotCachedPathPersists(t *testing.T) {
 			t.Fatalf("Open #2: %v", err)
 		}
 		tx, _ := db.Begin(ctx)
-		if err := tx.DropIndex("items", "by_color"); err != nil {
+		if err := tx.Indexes().Drop("items", "by_color"); err != nil {
 			t.Fatalf("DropIndex not-cached: %v", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -841,7 +841,7 @@ func TestRebuildIndexAtomicOnPartialFailure(t *testing.T) {
 	v2 := testDecl("by_color", "color")
 	v2.Extract = firstByteExtract
 	v2.Version = "v2"
-	if err := tx.RebuildIndex("items", v2); !errors.Is(err, injected) {
+	if err := tx.Indexes().Rebuild("items", v2); !errors.Is(err, injected) {
 		tx.Rollback()
 		t.Fatalf("RebuildIndex err = %v, want injected failure", err)
 	}
@@ -908,7 +908,7 @@ func TestDropIndexAtomicOnPartialFailure(t *testing.T) {
 	// rebuild, which re-writes the registry from ks.indexes (still
 	// pinned) so the leak vanishes from the committed state — a
 	// faulty test, not a safe outcome.
-	if err := tx.DropIndex("items", "by_color"); !errors.Is(err, injected) {
+	if err := tx.Indexes().Drop("items", "by_color"); !errors.Is(err, injected) {
 		tx.Rollback()
 		t.Fatalf("DropIndex err = %v, want injected failure", err)
 	}

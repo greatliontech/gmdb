@@ -274,7 +274,7 @@ type descriptorOwner interface {
 //
 // Returns ErrKeyEmpty if name is "" (defense-in-depth against
 // internal callers bypassing validateIndexDecls; matches the
-// api-surface.md Tx.RebuildIndex / DropIndex empty-
+// api-surface.md TxIndexes.Rebuild / Drop empty-
 // IndexDecl.Name sentinel).
 func (tx *Tx) registryGet(owner descriptorOwner, name string) (*indexRegistryEntry, error) {
 	if name == "" {

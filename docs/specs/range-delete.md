@@ -362,7 +362,7 @@ applies to the indexed `SetKeyspace.DeleteRange` dispatch — see
 Callers needing the O(pages) fast path on indexed data can:
 
 - Drop the indexes before the bulk operation, run `DeleteRange`,
-  then rebuild the indexes (`tx.RebuildIndex`).
+  then rebuild the indexes (`tx.Indexes().Rebuild`).
 - Or use `DeleteKeyspace` to drop the whole keyspace (which also
   drops its indexes — the engine cleans up internal index keyspaces
   and the per-keyspace index registry).

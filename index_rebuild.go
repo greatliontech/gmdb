@@ -86,38 +86,12 @@ func (tx *Tx) propagateNotCachedDescChange(name string, owner descriptorOwner) {
 	tx.dirtyDescriptors[name] = a.desc
 }
 
-// RebuildIndex drops and re-populates the named index using the
-// supplied IndexDecl. Per indexing.md §Rebuild + §Recovery pattern
-// after ErrIndexFingerprintMismatch:
-//
-//   - The previous index is preserved until commit; a mid-rebuild
-//     failure leaves the old index intact.
-//   - decl.Name must match an existing registry entry's stored
-//     Name; mismatch returns ErrIndexNotFound.
-//   - decl.Extract must be non-nil (ErrIndexExtractorRequired).
-//   - On success the stored SchemaHash and Version are replaced
-//     by decl's values — this is the canonical recovery path after
-//     ErrIndexFingerprintMismatch (bypasses the open-time
-//     fingerprint check).
-//   - Existing rows are re-extracted via decl.Extract; for unique
-//     indexes a duplicate output aborts the rebuild with
-//     ErrIndexUniqueViolation and the existing registry entry is
-//     unchanged.
-//
-// Errors:
-//   - ErrKeyEmpty if keyspace or decl.Name is empty.
-//   - ErrIndexExtractorRequired if decl.Extract is nil.
-//   - ErrNotFound if the keyspace does not exist
-//     (keyspace-management dimension).
-//   - ErrIndexNotFound if the keyspace exists but decl.Name is
-//     not in its registry (index-management
-//     dimension).
-//   - ErrKeyspaceReserved if the keyspace name resolves to Kind=2.
-//   - ErrIndexUniqueViolation on duplicate keys from the new
-//     extractor.
-//   - ErrReadOnly on a read-only transaction; ErrTxClosed on a
-//     closed transaction.
-func (tx *Tx) RebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
+// rebuildIndex implements TxIndexes.Rebuild: it drops and re-populates
+// the named index using the supplied IndexDecl. The full caller-facing
+// contract (error set, recovery semantics after
+// ErrIndexFingerprintMismatch) lives on TxIndexes.Rebuild in
+// index_admin.go.
+func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	if err := tx.requireOpen(true); err != nil {
 		return err
 	}
@@ -477,17 +451,14 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 	return nil
 }
 
-// DropIndex removes the named index. Retires the index's Kind=2
-// data sub-tree pages (via btree.FreeSubtree) and removes the
-// registry entry. If the dropped index was the keyspace's last,
-// registryDelete's btree.Delete returns root=0, structurally
-// satisfying the indexing.md entailed invariant on
-// empty-registry canonical-at-zero.
-//
-// Errors mirror RebuildIndex: ErrKeyEmpty, ErrNotFound (keyspace),
-// ErrIndexNotFound (index name), ErrKeyspaceReserved (Kind=2),
-// ErrReadOnly / ErrTxClosed.
-func (tx *Tx) DropIndex(keyspace, indexName string) (retErr error) {
+// dropIndex implements TxIndexes.Drop: it removes the named index,
+// retiring the index's Kind=2 data sub-tree pages (via
+// btree.FreeSubtree) and the registry entry. If the dropped index was
+// the keyspace's last, registryDelete's btree.Delete returns root=0,
+// structurally satisfying the indexing.md entailed invariant on
+// empty-registry canonical-at-zero. The full caller-facing contract
+// lives on TxIndexes.Drop in index_admin.go.
+func (tx *Tx) dropIndex(keyspace, indexName string) (retErr error) {
 	if err := tx.requireOpen(true); err != nil {
 		return err
 	}
@@ -578,7 +549,7 @@ func (tx *Tx) DropIndex(keyspace, indexName string) (retErr error) {
 }
 
 // rebuildIndexFailHookForTest, when set, is invoked once inside
-// Tx.RebuildIndex after the publish-then-retire registryPut succeeded
+// rebuildIndex after the publish-then-retire registryPut succeeded
 // but before FreeSubtree of the OLD index data tree runs. A non-nil
 // return injects a failure that exercises the savepoint-backed restore
 // (revert pager state + restore IndexRegistryRoot). Test-only;
@@ -597,7 +568,7 @@ func setRebuildIndexFailHookForTest(hook func() error) {
 }
 
 // dropIndexFailHookForTest, when set, is invoked once inside
-// Tx.DropIndex after the publish-then-retire registryDelete succeeded
+// dropIndex after the publish-then-retire registryDelete succeeded
 // but before FreeSubtree of the OLD data tree runs. Test-only.
 var dropIndexFailHookForTest atomic.Pointer[func() error]
 

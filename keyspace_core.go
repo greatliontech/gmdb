@@ -40,7 +40,7 @@ type keyspaceCore struct {
 
 	// openIndexHandles tracks every *Index returned by Index(name) in
 	// this tx. Atomic Put / Delete / Cursor.Delete mutate index trees
-	// (applyIndexMaintenanceOn*); Tx.RebuildIndex / Tx.DropIndex replace
+	// (applyIndexMaintenanceOn*); TxIndexes.Rebuild / TxIndexes.Drop replace
 	// or free a per-index data tree wholesale. Each of those CoWs or
 	// frees pages reached by in-flight *btree.Cursor instances opened
 	// from these handles' iter closures, so markIndexHandlesStale (and
@@ -265,7 +265,7 @@ func (ks *keyspaceCore) markIndexHandlesStale() {
 }
 
 // markIndexHandleStaleByName invokes MarkStale on in-flight cursors for
-// the named index only. Called by Tx.RebuildIndex after
+// the named index only. Called by TxIndexes.Rebuild after
 // syncRebuildToCachedPinned: only the rebuilt index's tree was replaced
 // (FreeSubtree of the old root + new root published into pinned.root);
 // other indexes' handles must NOT be invalidated. Refreshes the
@@ -293,7 +293,7 @@ func (ks *keyspaceCore) markIndexHandleStaleByName(name string) {
 // (ErrCursorStale on Err()) instead of walking the FreeSubtree'd data
 // tree pages.
 //
-// Called by Tx.DropIndex after registryDelete + FreeSubtree succeed:
+// Called by TxIndexes.Drop after registryDelete + FreeSubtree succeed:
 // the on-disk registry no longer references this index and the data
 // tree pages have been returned to the loose-page pool, so any cached
 // handle pointing at the stale pinnedIndex must reject further use.

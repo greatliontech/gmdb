@@ -298,7 +298,7 @@ gmdb: index "by_repository" fingerprint mismatch (schema-hash):
   stored=0x3f2a... supplied=0xc104... — caller must RebuildIndex
 ```
 
-The caller's recovery path is `tx.RebuildIndex` — see Rebuild
+The caller's recovery path is `tx.Indexes().Rebuild` — see Rebuild
 below.
 
 The schema hash catches structural drift (column add / remove /
@@ -537,7 +537,7 @@ sentinel — identical to the row-cursor contract that
 `transactions.md §Cursor State Machine` defines:
 
 - **`ErrCursorStale` (mid-iter cursor invalidation).** Triggered by
-  `tx.RebuildIndex(ks, decl)` for the named index, `tx.DropIndex`
+  `tx.Indexes().Rebuild(ks, decl)` for the named index, `tx.Indexes().Drop`
   for the named index, or any successful mutation of the parent
   indexed keyspace that runs the atomic index-maintenance step:
   Keyspace `Put` / `Delete` / `DeleteRange` (indexed-fallback —
@@ -562,7 +562,7 @@ sentinel — identical to the row-cursor contract that
   iter closures early-return at `pinned.root == 0`).
 
 - **`ErrIndexNotFound` (post-Drop dead-handle).** Triggered by
-  `tx.DropIndex(ks, name)` on the handle's index. The handle
+  `tx.Indexes().Drop(ks, name)` on the handle's index. The handle
   transitions to "dead": every subsequent
   `Lookup` / `LookupKeys` / `Range` / `Prefix` / `Get` / `Stats`
   call sets `idx.Err()` (or returns directly, for `Get` / `Stats`)
@@ -610,7 +610,7 @@ Three invariants pin this contract:
   or `FreeSubtree`'d-then-reallocated leaf pages → wrong-key
   yields or layout-decode panics.
 
-- **Inv-IHS2 (post-drop handle dead).** After `tx.DropIndex(ks,
+- **Inv-IHS2 (post-drop handle dead).** After `tx.Indexes().Drop(ks,
   name)` succeeds, every previously-handed-out `*Index` handle for
   the `(ks, name)` pair rejects subsequent
   `Lookup` / `LookupKeys` / `Range` / `Prefix` / `Get` / `Stats`
@@ -720,14 +720,14 @@ IN range` with secondary indexes. Predictable and correct.
 Callers needing the O(pages) fast path on indexed data can:
 
 - Drop the indexes before the bulk operation, run
-  `DeleteRange`, then rebuild the indexes (`tx.RebuildIndex`).
+  `DeleteRange`, then rebuild the indexes (`tx.Indexes().Rebuild`).
 - Or use `DeleteKeyspace` to drop the whole keyspace (which
   also drops its indexes — the engine cleans up internal
   index keyspaces and the per-keyspace index registry).
 
 ## Rebuild
 
-`tx.RebuildIndex(keyspace, decl)` drops the named index's data
+`tx.Indexes().Rebuild(keyspace, decl)` drops the named index's data
 and re-runs the extractor supplied in `decl` over every row in
 the keyspace, writing fresh index entries. Blocking — runs
 inside the current write transaction. The previous index is
@@ -786,7 +786,7 @@ for {
     if d == nil {
         return fmt.Errorf("drifted index %q not in supplied decls", fpErr.IndexName)
     }
-    if err := tx.RebuildIndex("workspaces", d); err != nil {
+    if err := tx.Indexes().Rebuild("workspaces", d); err != nil {
         return err
     }
 }
@@ -953,7 +953,7 @@ needing both shapes use separate transactions.
 
 ## Removing an Index
 
-`tx.DropIndex(keyspace, indexName)` removes the index entry
+`tx.Indexes().Drop(keyspace, indexName)` removes the index entry
 from the per-keyspace registry and retires the index's
 internal keyspace pages. Future `OpenKeyspace` calls must
 omit the corresponding `IndexDecl`, or a fresh declaration

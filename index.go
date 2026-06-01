@@ -23,13 +23,13 @@ import (
 // Invalidation contract (Inv-IHS1, Inv-IHS2, Inv-IHS3 — see
 // indexing.md §Handle Invalidation): mutations that replace or
 // free the index data tree's pages within the same tx
-// (Tx.RebuildIndex on this name; Tx.DropIndex on this name;
+// (TxIndexes.Rebuild on this name; TxIndexes.Drop on this name;
 // Keyspace.Put / Delete / Cursor.Delete on the parent indexed
 // keyspace; the SetKeyspace analogues) MarkStale every in-flight
 // *btree.Cursor opened by this handle's iter closures. A stale
 // cursor surfaces as ErrCursorStale on the iter's Err() and
 // terminates iteration; a fresh iter call re-opens on the current
-// pinned.root. After Tx.DropIndex on this index's name the handle
+// pinned.root. After TxIndexes.Drop on this index's name the handle
 // additionally transitions to "dead": every subsequent Lookup /
 // LookupKeys / Range / Prefix / Get / Stats returns
 // ErrIndexNotFound (matching the sentinel ks.Index(name) returns
@@ -59,7 +59,7 @@ type Index struct {
 	// compound PK, so there is no back-lookup to skip).
 	coverValue bool
 
-	// dead is set by Tx.DropIndex on the parent keyspace via
+	// dead is set by TxIndexes.Drop on the parent keyspace via
 	// markIndexHandleDead when this index's name is dropped. Once
 	// dead, every iter / Get / Stats call surfaces ErrIndexNotFound
 	// (Inv-IHS2). Distinct from idx.pinned == nil: a dead handle
@@ -115,7 +115,7 @@ type IndexStats struct {
 // Returns ErrKeyspaceClosed when the parent keyspace was
 // Tx.DeleteKeyspace'd (Inv-IHS3) and ErrIndexNotFound (with the
 // keyspace/index name in the wrap) when the handle has been
-// invalidated by a same-tx Tx.DropIndex (Inv-IHS2). Without these
+// invalidated by a same-tx TxIndexes.Drop (Inv-IHS2). Without these
 // guards Stats would walk pages the on-disk tree no longer owns
 // (idx.pinned.root points at FreeSubtree'd pages after Drop /
 // DeleteKeyspace, even though idx.pinned survives in memory).
@@ -242,7 +242,7 @@ func (ks *Keyspace) Index(name string) (*Index, error) {
 	}
 	idx := &Index{ks: ks, pinned: p}
 	// Register so the parent keyspace's mutators (Put / Delete /
-	// Cursor.Delete / Tx.RebuildIndex / Tx.DropIndex) can find and
+	// Cursor.Delete / TxIndexes.Rebuild / TxIndexes.Drop) can find and
 	// MarkStale every in-flight cursor on this handle and mark the
 	// handle dead on Drop — Inv-IHS1 / Inv-IHS2.
 	ks.openIndexHandles = append(ks.openIndexHandles, idx)
@@ -504,7 +504,7 @@ func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 			idx.err = ErrKeyspaceClosed
 			return
 		}
-		// Dead-handle check (Inv-IHS2): Tx.DropIndex on this name
+		// Dead-handle check (Inv-IHS2): TxIndexes.Drop on this name
 		// poisoned the handle; pinned.root points at FreeSubtree'd
 		// pages. Set ErrIndexNotFound and yield nothing.
 		if idx.dead {
@@ -558,7 +558,7 @@ func (idx *Index) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 //
 // The cursor is registered on idx.openCursors for the closure's
 // lifetime so the parent keyspace's mutators (Put / Delete /
-// Cursor.Delete / Tx.RebuildIndex / Tx.DropIndex) can MarkStale it
+// Cursor.Delete / TxIndexes.Rebuild / TxIndexes.Drop) can MarkStale it
 // when index pages are CoW'd or freed (Inv-IHS1). The defer'd
 // unregister keeps the slice bounded across long-running tx with
 // many iter calls on the same handle.

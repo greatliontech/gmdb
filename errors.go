@@ -194,7 +194,7 @@ var (
 	// ErrIndexExtractorRequired is returned by Tx.OpenKeyspace /
 	// Tx.OpenSetKeyspace when an IndexDecl is missing for an index
 	// already declared in the keyspace's registry (the caller passed
-	// fewer IndexDecls than the stored set), or by Tx.RebuildIndex
+	// fewer IndexDecls than the stored set), or by TxIndexes.Rebuild
 	// when the supplied decl.Extract is nil. Per
 	// indexing.md §Open Semantics + §Rebuild.
 	ErrIndexExtractorRequired = errors.New("gmdb: index extractor required for OpenKeyspace")
@@ -209,7 +209,7 @@ var (
 	// ErrIndexFingerprintMismatch is returned wrapped in
 	// *IndexFingerprintError when an opened keyspace's stored
 	// schema-hash or Version tag differs from the supplied
-	// IndexDecl's. Caller's recovery path is Tx.RebuildIndex (per
+	// IndexDecl's. Caller's recovery path is TxIndexes.Rebuild (per
 	// indexing.md §Drift Guard + §Rebuild).
 	ErrIndexFingerprintMismatch = errors.New("gmdb: index fingerprint mismatch — RebuildIndex required")
 
@@ -237,8 +237,8 @@ var (
 
 	// ErrIndexNotFound is returned by Keyspace.Index /
 	// SetKeyspace.Index when no index with the supplied name is
-	// registered on the keyspace, and by Tx.DropIndex /
-	// Tx.RebuildIndex when the index name does not match any
+	// registered on the keyspace, and by TxIndexes.Drop /
+	// TxIndexes.Rebuild when the index name does not match any
 	// registry entry on the keyspace. Distinct from ErrNotFound to
 	// let callers dispatch between keyspace-missing
 	// (ErrNotFound — keyspace-management dimension) and

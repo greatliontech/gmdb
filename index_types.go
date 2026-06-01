@@ -197,7 +197,7 @@ func writeLenPrefixedString(h *xxhash.Digest, buf []byte, s string) {
 //   - nil decl in the slice → ErrInvalidOptions (caller bug; the
 //     slice itself is malformed).
 //   - empty decl.Name → ErrKeyEmpty (consistent with
-//     api-surface.md §Database and Transaction API Tx.RebuildIndex
+//     api-surface.md §Keyspace API TxIndexes.Rebuild
 //     godoc: "ErrKeyEmpty if … decl.Name is empty"; both call sites
 //     surface the same sentinel for the same fault).
 //   - duplicate Name → ErrIndexExists naming the offending name.

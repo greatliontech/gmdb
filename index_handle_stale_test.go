@@ -17,7 +17,7 @@ import (
 //   Violation: mid-iter RebuildIndex/DropIndex/atomic Put yields wrong-
 //   key reads or layout-decode panics from freed/reallocated pages.
 //
-//   Inv-IHS2 (post-drop handle dead): after tx.DropIndex(ks, name),
+//   Inv-IHS2 (post-drop handle dead): after tx.Indexes().Drop(ks, name),
 //   every previously-handed-out *Index for (ks, name) rejects
 //   subsequent Lookup/Range/Prefix/Get/Stats/LookupKeys with
 //   ErrIndexNotFound. Violation: cached idx.Stats() returns the stale
@@ -51,7 +51,7 @@ func TestIndexHandleStatsAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	if err := tx.DropIndex("items", "by_color"); err != nil {
+	if err := tx.Indexes().Drop("items", "by_color"); err != nil {
 		t.Fatalf("DropIndex: %v", err)
 	}
 	stats, err := idx.Stats()
@@ -89,7 +89,7 @@ func TestIndexHandleLookupAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	if err := tx.DropIndex("items", "by_color"); err != nil {
+	if err := tx.Indexes().Drop("items", "by_color"); err != nil {
 		t.Fatalf("DropIndex: %v", err)
 	}
 	// Lookup (non-unique iter path): yield nothing, idx.Err() = ErrIndexNotFound.
@@ -161,7 +161,7 @@ func TestIndexHandleGetAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	if err := tx.DropIndex("items", "by_color"); err != nil {
+	if err := tx.Indexes().Drop("items", "by_color"); err != nil {
 		t.Fatalf("DropIndex: %v", err)
 	}
 	_, _, err = idx.Get([]byte{0x42})
@@ -207,7 +207,7 @@ func TestIndexHandleInFlightRebuildSurfacesCursorStale(t *testing.T) {
 			// publishes the new root via syncRebuildToCachedPinned.
 			newDecl := testDecl("by_color", "color")
 			newDecl.Extract = firstByteExtract
-			if err := tx.RebuildIndex("items", newDecl); err != nil {
+			if err := tx.Indexes().Rebuild("items", newDecl); err != nil {
 				t.Fatalf("RebuildIndex: %v", err)
 			}
 		}
@@ -333,7 +333,7 @@ func TestIndexHandleInFlightDropSurfacesCursorStaleAndDead(t *testing.T) {
 	for range idx.Lookup([]byte{0x42}) {
 		yielded++
 		if yielded == 1 {
-			if err := tx.DropIndex("items", "by_color"); err != nil {
+			if err := tx.Indexes().Drop("items", "by_color"); err != nil {
 				t.Fatalf("DropIndex: %v", err)
 			}
 		}
@@ -386,7 +386,7 @@ func TestIndexHandleAfterRebuildRePositionWorks(t *testing.T) {
 	// Run rebuild before any iter.
 	newDecl := testDecl("by_color", "color")
 	newDecl.Extract = firstByteExtract
-	if err := tx.RebuildIndex("items", newDecl); err != nil {
+	if err := tx.Indexes().Rebuild("items", newDecl); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 	// Fresh iter on the cached handle: descends from the NEW root.
@@ -476,7 +476,7 @@ func TestSetKeyspaceIndexHandleStatsAfterDropReturnsErrIndexNotFound(t *testing.
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	if err := tx.DropIndex("members", "by_color"); err != nil {
+	if err := tx.Indexes().Drop("members", "by_color"); err != nil {
 		t.Fatalf("DropIndex: %v", err)
 	}
 	if _, err := idx.Stats(); !errors.Is(err, ErrIndexNotFound) {
@@ -778,7 +778,7 @@ func TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	// Drop first → idx.dead = true.
-	if err := tx.DropIndex("items", "by_color"); err != nil {
+	if err := tx.Indexes().Drop("items", "by_color"); err != nil {
 		t.Fatalf("DropIndex: %v", err)
 	}
 	// DeleteKeyspace second → ks.dead = true. Both dead-flags now hold.
