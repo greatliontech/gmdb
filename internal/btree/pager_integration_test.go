@@ -2,6 +2,7 @@ package btree
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,9 +15,13 @@ import (
 // Chunk-5.2 Inv-3: PageWriter parity — the chunk-4.7 overflow chain
 // semantics (Put-replace / Delete free the chain) hold over a real
 // *pager.Pager implementation of the PageWriter interface, not just
-// fakeWriter. setupPagerWriter mirrors internal/pager/freespace_test.go's
-// setupWriter — kept local to avoid an internal/pager test-helper
-// export.
+// fakeWriter. setupPagerWriter is a sibling of
+// internal/pager/freespace_test.go's setupWriter (kept local to avoid an
+// internal/pager test-helper export) but seeds the fixture differently on
+// purpose: setupWriter starts with an empty free list to exercise the
+// free-space machinery, whereas this fixture pre-frees the whole space as
+// a frictionless page pool for btree allocation (see the SetCommitState
+// comment below for why the HWM sits at the top, not at firstDataPage).
 
 const pagerTestPageSize = 4096
 
@@ -39,7 +44,16 @@ func setupPagerWriter(t *testing.T, pages int) (pagerWriter, *bitmap.Bitmap, *os
 	}
 	bm := bitmap.New(make([]byte, pagerTestPageSize), pagerTestPageSize, 1, uint64(pages))
 	p.AttachBitmap(bm)
-	p.SetCommitState(bm.FirstDataPage(), uint64(pages), 0)
+	// HWM = pages (the full file), NOT firstDataPage: every data page is
+	// marked free below, so the HWM must sit at the top of the space for
+	// the fixture to stay internally consistent. With HWM at
+	// firstDataPage the free bits would sit *above* the HWM — a state a
+	// real pager never reaches — and exhausting the bitmap would fall to
+	// file extension (freespace.go AllocPage step 5), which re-hands-out
+	// firstDataPage (a duplicate of the first bitmap allocation) instead
+	// of ErrDBFull. HWM = pages makes AllocPage return ErrDBFull at
+	// capacity. See TestSetupPagerWriterExhaustsToDBFull.
+	p.SetCommitState(uint64(pages), uint64(pages), 0)
 	// Mark every data page free so the bitmap path can satisfy
 	// AllocPage / AllocContiguous without falling through to HWM
 	// extension. (Real pagers seed this from the on-disk bitmap; the
@@ -48,6 +62,44 @@ func setupPagerWriter(t *testing.T, pages int) (pagerWriter, *bitmap.Bitmap, *os
 		bm.Set(id)
 	}
 	return pagerWriter{p}, bm, f
+}
+
+// TestSetupPagerWriterExhaustsToDBFull pins the corrected setupPagerWriter
+// fixture: with HWM at the top of the space, AllocPage hands out each data
+// page exactly once and returns ErrDBFull at capacity — never a duplicate
+// id. This is a regression guard for the prior fixture, which pinned HWM at
+// firstDataPage while marking pages free above it: exhausting the bitmap
+// then fell to file extension (AllocPage step 5) and re-handed-out
+// firstDataPage, a duplicate of the first bitmap allocation, instead of
+// ErrDBFull. The duplicate-id assertion below fails against that prior
+// shape.
+func TestSetupPagerWriterExhaustsToDBFull(t *testing.T) {
+	const pages = 16
+	pw, bm, f := setupPagerWriter(t, pages)
+	defer pw.Close()
+	defer f.Close()
+
+	// Usable capacity = data pages = total minus the meta+bitmap region.
+	capacity := int(uint64(pages) - bm.FirstDataPage())
+	seen := make(map[uint64]bool, capacity)
+	for i := range capacity {
+		id, err := pw.AllocPage()
+		if err != nil {
+			t.Fatalf("AllocPage %d/%d: unexpected error %v (want %d distinct pages before ErrDBFull)",
+				i+1, capacity, err, capacity)
+		}
+		if seen[id] {
+			t.Fatalf("AllocPage returned duplicate id %d at allocation %d "+
+				"(double-allocation: HWM not bounding the free region)", id, i+1)
+		}
+		seen[id] = true
+	}
+	// One past capacity: the bitmap is exhausted and HWM == maxSizePages,
+	// so AllocPage must report ErrDBFull rather than re-handing-out a
+	// live page.
+	if id, err := pw.AllocPage(); !errors.Is(err, pager.ErrDBFull) {
+		t.Fatalf("AllocPage past capacity = (id=%d, err=%v), want ErrDBFull", id, err)
+	}
 }
 
 // TestPagerOverflowPutGetDelete pins Inv-3: a Put with a value larger

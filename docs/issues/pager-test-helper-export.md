@@ -41,3 +41,11 @@ Surfaced by the chunk-5.2 adversarial review (Round 1 L-3). Not a
 defect today — the duplication is tracked, justified inline, and the
 helpers are simple enough that drift detection is cheap. Filed so it
 doesn't get lost when the next caller arrives.
+
+The two helpers **intentionally diverge in seeding** and a unification
+must parameterize that, not collapse it: `pager.setupWriter` starts with
+an *empty* free list (HWM at `firstDataPage`) to exercise the free-space
+machinery it tests, while `btree.setupPagerWriter` pre-frees the whole
+space as a frictionless page pool (HWM at the top of the space — see its
+`SetCommitState` comment). A shared constructor needs a "prefill" knob
+(or two named variants), or it will break one of the two domains.
