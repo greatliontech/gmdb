@@ -13,7 +13,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 3. btree-retired-pages-rollback
 - [x] 4. pager-rpl-footer-verification
 - [x] 5. pager-freed-page-write-skip
-- [ ] 6. lock-stale-slot-clear-identity
+- [x] 6. lock-stale-slot-clear-identity
 - [ ] 7. reader-begin-publish-race
 - [ ] 8. lagging-reader-bound-checkpoint-term
 - [ ] 9. checkpoint-failure-poisoning

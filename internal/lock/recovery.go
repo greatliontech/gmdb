@@ -149,16 +149,12 @@ func RecoverStaleWriter(f *File, ourPIDNamespace uint64) {
 				// different (live) process. Skip.
 				continue
 			}
-			// Spec slot-release ordering (§Reader Table slot
-			// release): PID → Heartbeat → HintEpoch → TxnID. PID
-			// first ensures any concurrent (other-process) scan
-			// sees PID == 0 and falls through to the heartbeat
-			// path rather than running kill() against the dead
-			// (or recycled) PID.
-			Store64(&slot.PID, 0)
-			Store64(&slot.Heartbeat, 0)
-			Store64(&slot.HintEpoch, 0)
-			Store64(&slot.TxnID, 0)
+			// Single home for the 4-store clear ordering (spec
+			// §Reader Table clear ordering): PID first so any
+			// concurrent other-process scan sees PID == 0 and
+			// falls through to the heartbeat path rather than
+			// running kill() against the dead (or recycled) PID.
+			f.ClearStaleReaderSlot(uint32(i))
 		}
 	}
 

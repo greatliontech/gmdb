@@ -125,19 +125,37 @@ func (f *File) ReleaseReaderSlot(idx uint32) {
 }
 
 // ClearStaleReaderSlot implements the writer-side stale-clear ordering
-// from cross-process.md §Reader Table (clear ordering):
+// from cross-process.md §Reader Table (clear ordering) — the SAME
+// four-store order as ReleaseReaderSlot:
 //
-//  1. HintEpoch = 0   — clears the orphan-detection anchor while the
+//  1. PID = 0         — the dead occupant's identity must not survive
+//     the clear: the next acquirer's CAS→publish window is otherwise
+//     observably `TxnID=fresh, PID=dead, Heartbeat=stale`, and a
+//     concurrent scan classifies by pid != 0 — same-namespace
+//     IsAlive(deadPID)=false or cross-namespace stale heartbeat —
+//     and immediately evicts the LIVE acquirer (its snapshot leaves
+//     the table, the reclamation bound advances past it, and its own
+//     later release zeroes a slot a third reader may have won).
+//  2. Heartbeat = 0   — same reason for the pid == 0 sub-cases: a
+//     leftover stale heartbeat would put the mid-publish acquirer in
+//     case 0b (immediate clear) instead of case 0c (epoch-anchored,
+//     StaleTimeout-bounded).
+//  3. HintEpoch = 0   — clears the orphan-detection anchor while the
 //     slot is still observably non-free, preventing a fresh acquirer
 //     from inheriting a stale epoch.
-//  2. TxnID = 0       — final release.
+//  4. TxnID = 0       — final release; only after this store can an
+//     acquirer CAS the slot, so acquirers never observe a partial
+//     clear (scans are excluded by LOCK_EX).
 //
-// The HintEpoch-first ordering is load-bearing; reversed, a fresh
-// acquirer could CAS-win TxnID, crash before its Heartbeat store,
-// and then be re-cleared by the next stale-detection scan via the
-// already-aged HintEpoch — evicting the (genuinely dead) new acquirer
-// faster than StaleTimeout and violating the per-occupant timer
-// invariant.
+// ProcessStartTime/PIDNamespace are left as-is, exactly like the
+// release path: the classification consults them only when PID != 0.
+//
+// The HintEpoch-before-TxnID ordering is load-bearing; reversed, a
+// fresh acquirer could CAS-win TxnID, crash before its Heartbeat
+// store, and then be re-cleared by the next stale-detection scan via
+// the already-aged HintEpoch — evicting the (genuinely dead) new
+// acquirer faster than StaleTimeout and violating the per-occupant
+// timer invariant.
 //
 // Caller MUST hold flock(LOCK_EX) — only one process at a time may
 // clear stale slots, or two concurrent recoveries could race and
@@ -150,6 +168,8 @@ func (f *File) ClearStaleReaderSlot(idx uint32) {
 		panic("lock: ClearStaleReaderSlot index out of range")
 	}
 	slot := &f.slots[idx]
+	Store64(&slot.PID, 0)
+	Store64(&slot.Heartbeat, 0)
 	Store64(&slot.HintEpoch, 0)
 	Store64(&slot.TxnID, 0)
 }

@@ -82,17 +82,27 @@ Invariant: kind=clause-explicit;
     pinned, blocking all future reclamation.
 
 Invariant: kind=clause-explicit;
-  property=When a writer clears a stale slot, it stores
-    `HintEpoch = 0` *before* `TxnID = 0`. The slot is observably
-    non-free during the `HintEpoch` reset, preventing a fresh
-    acquirer from inheriting a stale epoch;
+  property=When a writer clears a stale slot, it performs the SAME
+    four atomic stores in the SAME order as slot release:
+    `PID = 0`, `Heartbeat = 0`, `HintEpoch = 0`, `TxnID = 0` —
+    the dead occupant's identity never survives the clear, and the
+    slot is observably free only after every other field is clean;
   from=this spec §Reader Table (stale detection — clear ordering);
-  violation=Reversed order leaves a window where a fresh acquirer
-    can CAS-win `TxnID` and then crash before its `Heartbeat`
-    store, inheriting the prior epoch (already aged out) — the
-    next scan immediately re-clears the slot, evicting a genuinely
-    in-progress acquirer faster than `StaleTimeout` and violating
-    the per-occupant timer invariant.
+  violation=A clear that leaves the dead occupant's PID/Heartbeat
+    behind makes the next acquirer's CAS→publish window observably
+    `TxnID = fresh, PID = dead, Heartbeat = stale`; the scan
+    classifies by `PID != 0` (same-namespace `IsAlive` failure or
+    cross-namespace stale heartbeat) and immediately evicts the
+    LIVE acquirer — snapshot leaves the table, reclamation bound
+    advances past it (use-after-reclaim), and its own later
+    release zeroes a slot a third reader may have won. Reversing
+    only HintEpoch/TxnID instead leaves the narrower window where
+    a fresh acquirer inherits the prior epoch (already aged out)
+    and a genuinely-crashed acquirer is re-cleared faster than
+    `StaleTimeout`, violating the per-occupant timer invariant.
+    (Enforced by `ClearStaleReaderSlot`; pinned by
+    `TestClearedSlotDoesNotEvictMidPublishAcquirer` in
+    `internal/lock/reader_test.go`.)
 
 Invariant: kind=clause-explicit;
   property=`HintEpoch` lives in the shared-memory lock file (not
@@ -823,22 +833,42 @@ back to PID-only liveness (legacy path).
 
 ### Clearing a stale slot
 
-When the writer clears a stale slot, it stores in this exact
-order:
+When the writer clears a stale slot, it stores in the SAME exact
+order as slot release:
 
-1. `HintEpoch = 0` (atomic). Resets the orphan-detection anchor
+1. `PID = 0` (atomic). The dead occupant's identity must not
+   survive the clear. If it did, the next acquirer's CAS→publish
+   window would be observably `TxnID = fresh, PID = dead
+   occupant, Heartbeat = stale` — and the stale-detection scan
+   classifies by `PID != 0`: same-namespace `IsAlive(deadPID)`
+   fails (or the cross-namespace heartbeat is stale), so the scan
+   immediately evicts the LIVE acquirer. Its snapshot leaves the
+   table, the reclamation bound advances past it (the
+   use-after-reclaim failure mode), and its own later release
+   zeroes a slot a third reader may since have won.
+2. `Heartbeat = 0` (atomic). Same hazard for the `PID == 0`
+   sub-cases: a leftover stale heartbeat puts the mid-publish
+   acquirer in case (b) — immediate clear — instead of case (c),
+   the epoch-anchored StaleTimeout-bounded path that mid-publish
+   protection relies on.
+3. `HintEpoch = 0` (atomic). Resets the orphan-detection anchor
    *while the slot is still observably non-free*, so no acquirer
    can race into the slot and inherit a stale epoch.
-2. `TxnID = 0` (atomic). Final release — slot is now free.
+4. `TxnID = 0` (atomic). Final release — slot is now free. Only
+   after this store can an acquirer CAS the slot, so acquirers
+   never observe a partial clear; concurrent scans are excluded
+   by flock(LOCK_EX).
 
-The slot's PID/PST/PIDN/Heartbeat are left as-is and will be
-overwritten by the next acquirer per the acquire ordering above.
+`PST`/`PIDN` are left as-is, exactly like the release path — the
+classification consults them only when `PID != 0`, which steps
+1–4 guarantee is false until the next acquirer publishes its own
+identity.
 
-The HintEpoch-first ordering is load-bearing: reversed, a window
-exists between `TxnID = 0` and `HintEpoch = 0` during which a
-fresh acquirer can CAS-win `TxnID` and crash before step 4a
-(heartbeat store). A subsequent stale-detection scan would then
-see `TxnID != 0, PID == 0, Heartbeat == 0,
+The HintEpoch-before-TxnID ordering is load-bearing: reversed, a
+window exists between `TxnID = 0` and `HintEpoch = 0` during
+which a fresh acquirer can CAS-win `TxnID` and crash before step
+4a (heartbeat store). A subsequent stale-detection scan would
+then see `TxnID != 0, PID == 0, Heartbeat == 0,
 HintEpoch = <stale value from prior cycle>` and immediately
 re-clear the slot via case (c)'s timer (already aged out),
 evicting the (genuinely dead) new acquirer faster than

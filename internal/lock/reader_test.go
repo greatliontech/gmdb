@@ -813,3 +813,80 @@ func TestCoordReaderHeartbeatRegistration(t *testing.T) {
 		t.Errorf("post-Release Heartbeat = %d, want 0 (active-list unregister failed)", got)
 	}
 }
+
+// TestClearedSlotDoesNotEvictMidPublishAcquirer pins the stale-clear
+// identity rule (cross-process.md §Clearing a stale slot): after a
+// stale slot is cleared, a fresh acquirer that has CAS-won TxnID but
+// not yet published its heartbeat/identity must classify as case 0c
+// (epoch-anchored, StaleTimeout-bounded) — NOT inherit the dead
+// occupant's PID/heartbeat and be evicted immediately by the next
+// scan. Covers both misclassification shapes the leftover identity
+// caused: same-namespace IsAlive(deadPID) and the pid==0 stale-
+// heartbeat case 0b.
+func TestClearedSlotDoesNotEvictMidPublishAcquirer(t *testing.T) {
+	now := uint64(100 * uint64(time.Second))
+	staleTimeout := uint64(time.Second)
+	ourNS := uint64(99)
+
+	run := func(t *testing.T, stampDead func(s *ReaderSlot)) {
+		f := openTestFile(t, 1)
+		slot := f.Slot(0)
+		stampDead(slot)
+		f.ClearStaleReaderSlot(0)
+
+		// Fresh acquirer CAS-wins TxnID and is preempted before its
+		// heartbeat/identity stores (the AcquireReaderSlot publish
+		// sequence, frozen at its first step).
+		if !CAS64(&slot.TxnID, 0, 77) {
+			t.Fatalf("fixture: TxnID CAS failed; slot not cleared? TxnID=%d", Load64(&slot.TxnID))
+		}
+
+		// A concurrent writer scan must treat the slot as a live
+		// mid-publish acquirer: TxnID stays, enters the min, and the
+		// orphan epoch gets anchored — never an immediate clear.
+		got := f.OldestReaderTxnID(ourNS, now, staleTimeout)
+		if got != 77 {
+			t.Errorf("OldestReaderTxnID = %d, want 77 (mid-publish acquirer must pin the bound)", got)
+		}
+		if txn := Load64(&slot.TxnID); txn != 77 {
+			t.Fatalf("mid-publish acquirer evicted: TxnID = %d, want 77", txn)
+		}
+		// The scan must have taken case 0c (epoch anchor), which is
+		// only reachable when the clear zeroed PID and Heartbeat —
+		// pin those directly so the assertion does not depend on the
+		// anchoring side effect alone.
+		if pid := Load64(&slot.PID); pid != 0 {
+			t.Fatalf("cleared slot retains dead PID %d", pid)
+		}
+		if hb := Load64(&slot.Heartbeat); hb != 0 {
+			t.Fatalf("cleared slot retains dead heartbeat %d", hb)
+		}
+		if epoch := Load64(&slot.HintEpoch); epoch != now {
+			t.Fatalf("HintEpoch = %d, want %d (case 0c first-observer anchor)", epoch, now)
+		}
+	}
+
+	t.Run("dead-same-namespace-occupant", func(t *testing.T) {
+		run(t, func(s *ReaderSlot) {
+			// PID 4194305 exceeds the kernel hard cap PID_MAX_LIMIT
+			// (4194304 on 64-bit Linux; other supported platforms cap
+			// far lower), so it can never be allocated — reliably not
+			// alive regardless of the host's pid_max setting; same
+			// namespace as the scanner.
+			Store64(&s.TxnID, 42)
+			Store64(&s.PID, 4194305)
+			Store64(&s.PIDNamespace, 99)
+			Store64(&s.ProcessStartTime, 12345)
+			Store64(&s.Heartbeat, now-10*staleTimeout)
+		})
+	})
+	t.Run("stale-cross-namespace-occupant", func(t *testing.T) {
+		run(t, func(s *ReaderSlot) {
+			Store64(&s.TxnID, 42)
+			Store64(&s.PID, 4194305)
+			Store64(&s.PIDNamespace, 7) // != scanner's 99
+			Store64(&s.ProcessStartTime, 12345)
+			Store64(&s.Heartbeat, now-10*staleTimeout)
+		})
+	})
+}

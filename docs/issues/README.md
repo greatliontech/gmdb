@@ -80,7 +80,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [lock-stale-slot-clear-identity](lock-stale-slot-clear-identity.md) | chunk 6 | **[H]** Stale-clear leaves dead PID/heartbeat; next acquirer falsely evicted mid-publish → use-after-reclaim. Spec prescribes the defect (amend with fix). |
 | [reader-begin-publish-race](reader-begin-publish-race.md) | chunk 7 | **[H]** Meta read before reader-slot publish, no re-validation — reclamation can free the snapshot's pages in the gap. Two auditors converged. |
 | [lagging-reader-bound-checkpoint-term](lagging-reader-bound-checkpoint-term.md) | chunk 8 | **[H]** Bound-refresh uses prevMeta.TxnID not lastCheckpointTxnID — reclaims past the checkpoint under SyncLazy; deterministic corruption after crash recovery. |
 | [checkpoint-failure-poisoning](checkpoint-failure-poisoning.md) | chunk 9 | **[H]** Checkpoint step-2/3/4 failures don't poison the handle — torn active meta (split brain) or fsyncgate false certification. |
