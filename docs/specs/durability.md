@@ -165,6 +165,36 @@ on-disk state, so a poisoned handle converges instead of compounding.
 re-check and the no-poison clause pinned by
 `TestCheckpointPoisonEdges`.)
 
+### Directory-entry durability
+
+fdatasync on the database file makes its BYTES durable; POSIX makes
+the directory ENTRY durable only after the parent directory is
+fsynced. Three sites carry that obligation:
+
+- **Every writable Open.** Open fsyncs the parent directory on every
+  writable open, not only the creating one: a create-retry after a failed dir fsync and an Open
+  racing a creator that crashed before its fsync both land on the
+  existing-file path, so a creation-only sync would leave those
+  dirents non-durable forever. Failure fails the Open. Without the
+  obligation, power loss after N acked SyncDurable commits can leave
+  the file absent — total loss of a "durable" database. Read-only
+  opens skip it (nothing to make durable; read-only media would
+  reject the fsync). The lock file is exempt: transient coordination
+  state Open recreates.
+- **CopyTo.** The copy's bytes are fsynced before return; the output
+  file's dirent is made durable by fsyncing its parent directory,
+  else the "completed" backup can vanish in a crash.
+- **Compact's rename.** The new inode replaces the old atomically,
+  but the replacement is durable only after the directory fsync;
+  failure poisons the handle (the on-disk outcome is unknowable — a
+  crash may resurrect the old inode while this handle would serve
+  the new one).
+
+(Enforced by `syncDir`/`syncDirPath` at all three sites; pinned by
+`TestOpenSyncsParentDir` and
+`TestCompactDirSyncFailurePoisons`.)
+
+
 ## Recovery
 
 On recovery (Open after crash):

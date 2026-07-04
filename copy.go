@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
@@ -152,6 +153,13 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("gmdb: CopyTo fsync: %w", err)
+	}
+	// Dirent durability for the copy (durability.md §Directory-entry
+	// durability): the bytes are synced, but the output file's
+	// directory entry survives a crash only after its parent
+	// directory is fsynced.
+	if err := syncDirPath(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("gmdb: CopyTo fsync dir: %w", err)
 	}
 	committed = true
 	return nil
@@ -393,6 +401,13 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("gmdb: CopyTo(compact) fsync: %w", err)
+	}
+	// Dirent durability for the copy (durability.md §Directory-entry
+	// durability): the bytes are synced, but the output file's
+	// directory entry survives a crash only after its parent
+	// directory is fsynced.
+	if err := syncDirPath(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("gmdb: CopyTo(compact) fsync dir: %w", err)
 	}
 	committed = true
 	return nil

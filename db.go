@@ -199,6 +199,27 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		}
 	}
 
+	// Dirent durability (durability.md §Directory-entry durability):
+	// pager.Init fsyncs the FILE, but POSIX makes the directory entry
+	// durable only after the parent directory is fsynced — without
+	// it, power loss after N acked SyncDurable commits can lose the
+	// database file entirely. Every WRITABLE Open re-establishes the
+	// obligation, not just the creating one: the create-retry after a
+	// failed dir fsync and any Open racing a creator that crashed
+	// before ITS fsync both land on the EEXIST-fallback path, so a
+	// creation-only sync would leave those dirents non-durable
+	// forever. One fsync per Open, through the pinned root (symlink
+	// guard). Read-only opens skip it (nothing to make durable;
+	// read-only media would EROFS). The lock file's dirent needs no
+	// such guarantee — transient coordination state Open recreates.
+	if !opts.ReadOnly {
+		if err := syncDir(root); err != nil {
+			_ = file.Close()
+			_ = root.Close()
+			return nil, fmt.Errorf("gmdb: open %q: parent directory fsync: %w", path, err)
+		}
+	}
+
 	// Read the on-disk meta-0 PageSize so the pool matches the
 	// persisted size — opts.PageSize is authoritative only at
 	// creation; re-opens honour what was written.

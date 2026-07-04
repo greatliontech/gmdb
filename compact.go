@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
@@ -101,7 +101,6 @@ func (db *DB) Compact() error {
 
 	// 3. Write the compacted copy to a temp file beside the original,
 	// preserving the UUID (the renamed file IS this database).
-	dir := filepath.Dir(db.path)
 	base := filepath.Base(db.path)
 	tmpPath := db.path + ".compact"
 	_ = os.Remove(tmpPath) // clear any stale temp from a crashed Compact
@@ -123,7 +122,15 @@ func (db *DB) Compact() error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("gmdb: Compact rename: %w", err)
 	}
-	syncDir(dir, db.logger)
+	// The rename is durable only once the parent directory is fsynced;
+	// on failure the on-disk outcome is unknowable (a crash may
+	// resurrect the old inode while this handle would serve the new
+	// one — acked commits silently diverging). Same failure class as
+	// the reopen path below: poison, Close + re-Open recovers.
+	if err := syncDir(db.root); err != nil {
+		db.poisoned.Store(true)
+		return fmt.Errorf("gmdb: Compact dir fsync (handle poisoned — Close and re-Open): %w", err)
+	}
 
 	if err := db.reopenAfterCompact(base); err != nil {
 		return err
@@ -198,18 +205,48 @@ func (db *DB) reopenAfterCompact(base string) error {
 	return nil
 }
 
-// syncDir fsyncs the directory so a rename survives a crash (POSIX:
-// renaming is durable only after the parent directory is fsynced).
-// Best-effort: a failure is logged, not fatal — the rename has already
-// occurred in the page cache.
-func syncDir(dir string, logger *slog.Logger) {
-	d, err := os.Open(dir)
+// syncDir fsyncs the directory so a created or renamed entry survives
+// a crash (POSIX: dirents are durable only after the parent directory
+// is fsynced — durability.md §Directory-entry durability). Callers
+// treat failure as fatal for their operation: an unsynced dirent means
+// a crash can lose the file (create) or resurrect the replaced inode
+// (Compact rename) despite acked SyncDurable commits.
+// syncDir fsyncs through the handle's pinned os.Root, so the fsync
+// hits the SAME directory the data file was opened under even if a
+// path component was re-pointed since (the symlink-guard rationale on
+// DB.root).
+func syncDir(root *os.Root) error {
+	d, err := root.Open(".")
 	if err != nil {
-		logger.Warn("gmdb: Compact could not open dir for fsync", "dir", dir, "err", err)
-		return
+		return err
 	}
 	defer d.Close()
 	if err := d.Sync(); err != nil {
-		logger.Warn("gmdb: Compact dir fsync failed", "dir", dir, "err", err)
+		return err
 	}
+	if hook := syncDirHookForTest.Load(); hook != nil {
+		return (*hook)(root.Name())
+	}
+	return nil
 }
+
+// syncDirPath is the path-addressed variant for targets with no
+// pinned root (CopyTo's freshly-created output file).
+func syncDirPath(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return err
+	}
+	if hook := syncDirHookForTest.Load(); hook != nil {
+		return (*hook)(dir)
+	}
+	return nil
+}
+
+// syncDirHookForTest observes/injects after syncDir's real fsync
+// succeeded — the dirent-durability contract's test seam.
+var syncDirHookForTest atomic.Pointer[func(dir string) error]

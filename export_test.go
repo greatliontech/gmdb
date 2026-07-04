@@ -145,3 +145,14 @@ func SetCheckpointStepHookForTest(hook func(step int) error) (restore func()) {
 
 // PgrForTest exposes the writer pager for white-box fault injection.
 func (db *DB) PgrForTest() *pager.Pager { return db.pgr }
+
+// SetSyncDirHookForTest observes (and optionally injects a failure
+// into) syncDir calls, after the real directory fsync succeeded.
+func SetSyncDirHookForTest(hook func(dir string) error) (restore func()) {
+	if hook == nil {
+		syncDirHookForTest.Store(nil)
+		return func() {}
+	}
+	syncDirHookForTest.Store(&hook)
+	return func() { syncDirHookForTest.Store(nil) }
+}
