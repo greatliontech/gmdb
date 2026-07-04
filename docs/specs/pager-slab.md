@@ -246,6 +246,14 @@ leakage.
   `HighWaterMark`.
 - Move remaining loose pages into `tx.pendingFrees` (they bypass the
   RPL because no reader can reference a same-tx page).
+- Drop freed pages' slab buffers from the write set: every `p.dirty`
+  entry whose page this commit marks free (`tx.pendingFrees`) or that
+  the tail refund moved past the new `HighWaterMark` is discarded,
+  not pwritten — such a page is referenced by no meta, no tree, and
+  no RPL entry, so writing its bytes is pure write amplification.
+  The buffers must survive in `p.dirty` until this step (an open
+  shallow savepoint may resurrect the operation that freed them;
+  step 0 runs with every savepoint resolved).
 - Allocate RPL segment pages for `tx.retiredPages` and fill them with
   per-segment TxnID + sorted PageID entries. Insert into `p.dirty`
   (counts against `MaxTxBufferBytes`). Append the new segment page

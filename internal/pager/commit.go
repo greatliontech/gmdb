@@ -224,6 +224,31 @@ func (p *Pager) commitStep0() error {
 		delete(p.loosePages, id)
 	}
 
+	// (b2) Drop freed pages' slab buffers from the write set: a page
+	// that this commit marks free is unreachable from every meta (it
+	// was allocated and freed within this tx and bypasses the RPL),
+	// so pwriting its bytes is pure write amplification —
+	// rebalance-heavy transactions otherwise pwrite every
+	// intermediate page they built and threw away. This is the
+	// commit-time Discard the buffer-ownership rules point at:
+	// buffers must survive in p.dirty until here because an open
+	// shallow savepoint could resurrect the op that freed them, and
+	// all savepoints are resolved before Commit. Runs BEFORE (c) so
+	// the sweep never sees appendRPL's fresh segment buffers
+	// (AllocPage's defensive pendingFrees delete would protect them
+	// anyway; the ordering makes that protection moot).
+	for id := range p.dirty {
+		_, freed := p.pendingFrees[id]
+		// id >= highWaterMark: the page was freed at the tail and (a)
+		// refunded it — it left the bitmap-tracked extent entirely
+		// (FreePage sets the free bit immediately, so TailRefund sees
+		// same-tx tail frees), and pwriting past the new HWM would
+		// resurrect file bytes the commit just shrank away.
+		if freed || id >= p.highWaterMark {
+			p.Discard(id)
+		}
+	}
+
 	// (c) Allocate RPL segment pages for the retired-pages list and
 	// fill them with (TxnID, sorted PageIDs). Each segment goes into
 	// p.dirty via AllocSlab so step 1 pwrites it.

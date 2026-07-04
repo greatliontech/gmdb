@@ -249,3 +249,61 @@ func boolStr(b bool) string {
 	}
 	return "false"
 }
+
+// TestCommitStep0DropsFreedPagesFromWriteSet pins the freed-page
+// write-set sweep (pager-slab.md §Step 0, grounded in free-space.md's
+// loose-page invariant): a page allocated and
+// freed within the same transaction is unreachable from every meta —
+// it bypasses the RPL and goes straight to free-in-bitmap — so its
+// slab buffer must be dropped from p.dirty at commit assembly, not
+// pwritten. The buffer deliberately survives in p.dirty until step 0
+// (an open shallow savepoint could resurrect the op that freed it);
+// step 0 runs with every savepoint resolved.
+func TestCommitStep0DropsFreedPagesFromWriteSet(t *testing.T) {
+	p, _, f := setupWriter(t, 16)
+	defer p.Close()
+	defer f.Close()
+	p.SetCurrentTxnID(1)
+
+	// Three pages: `inner` freed below the surviving tail (the
+	// loose→pendingFrees path), `kept` surviving, `tail` freed at the
+	// tail (FreePage sets the free bit immediately, so step 0's
+	// TailRefund refunds it past the new HWM).
+	alloc := func(name string) uint64 {
+		id, err := p.AllocPage()
+		if err != nil {
+			t.Fatalf("AllocPage(%s): %v", name, err)
+		}
+		if _, err := p.AllocSlab(id); err != nil {
+			t.Fatalf("AllocSlab(%s): %v", name, err)
+		}
+		return id
+	}
+	inner := alloc("inner")
+	kept := alloc("kept")
+	tail := alloc("tail")
+	if err := p.FreePage(inner); err != nil {
+		t.Fatalf("FreePage(inner): %v", err)
+	}
+	if err := p.FreePage(tail); err != nil {
+		t.Fatalf("FreePage(tail): %v", err)
+	}
+
+	if err := p.commitStep0(); err != nil {
+		t.Fatalf("commitStep0: %v", err)
+	}
+	for name, id := range map[string]uint64{"inner": inner, "tail": tail} {
+		if _, ok := p.dirty[id]; ok {
+			t.Errorf("%s freed page %d still in the write set after step 0 (write amplification)", name, id)
+		}
+	}
+	if _, ok := p.dirty[kept]; !ok {
+		t.Errorf("kept page %d missing from the write set after step 0", kept)
+	}
+	if _, ok := p.pendingFrees[inner]; !ok {
+		t.Errorf("inner freed page %d not in pendingFrees after step 0", inner)
+	}
+	if hwm := p.highWaterMark; tail < hwm {
+		t.Errorf("tail page %d below post-refund HWM %d (fixture expected a refund)", tail, hwm)
+	}
+}
