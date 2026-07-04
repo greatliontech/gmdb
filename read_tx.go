@@ -13,6 +13,12 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
+// beginReadPreAcquireHookForTest fires between BeginRead's first meta
+// read and the reader-slot acquire — the window the snapshot
+// restabilization loop exists to close. Tests inject racing commits
+// here.
+var beginReadPreAcquireHookForTest atomic.Pointer[func()]
+
 // ReadTx is a snapshot read transaction. Per api-surface.md, read and write transactions are
 // distinct types so the type system rejects write methods on read
 // snapshots at compile time (vs the original spec's single *Tx with
@@ -302,9 +308,54 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		if snapTxnID == 0 {
 			snapTxnID = 1
 		}
+		if hook := beginReadPreAcquireHookForTest.Load(); hook != nil {
+			(*hook)()
+		}
 		slot, err = coord.AcquireReader(ctx, snapTxnID)
 		if err != nil {
 			return nil, mapReaderAcquireErr(err)
+		}
+		// Snapshot restabilization (cross-process.md §Reader Table,
+		// slot acquire): the meta above was read BEFORE this slot was
+		// visible, so a writer whose bound-computation scan completed
+		// in that window may already have reclaimed the snapshot
+		// tree's pages. Re-read the latest meta now that the slot is
+		// published and raise the pinned TxnID until stable. Safety
+		// argument: pages of tree T are only reclaimed via RPL
+		// segments with TxnID t > T, and reclamation runs strictly
+		// after the meta carrying t was written — so if the re-read
+		// still returns T, no such meta existed at re-read time,
+		// nothing of tree T was reclaimed, and from re-read onward
+		// every writer's bound scan sees this slot (bound <= T).
+		for {
+			m2, rerr := pager.ReadLatestMeta(file, cachedMeta.PageSize)
+			if rerr != nil {
+				coord.ReleaseReader(slot)
+				return nil, mapPagerErr(rerr)
+			}
+			if m2.TxnID == meta.TxnID {
+				break
+			}
+			if m2.TxnID < meta.TxnID {
+				// Valid metas never regress under the single-writer
+				// alternating-slot protocol — a lower re-read means
+				// the higher slot's bytes were corrupted mid-session.
+				// Error-not-crash (integrity.md): surface instead of
+				// letting the monotonic slot raise panic.
+				coord.ReleaseReader(slot)
+				return nil, fmt.Errorf("%w: latest meta regressed %d -> %d during reader snapshot restabilization",
+					ErrCorrupted, meta.TxnID, m2.TxnID)
+			}
+			meta = m2
+			snapTxnID = meta.TxnID
+			if snapTxnID == 0 {
+				snapTxnID = 1
+			}
+			coord.RaiseReaderSlotTxnID(slot, snapTxnID)
+			if cerr := ctx.Err(); cerr != nil {
+				coord.ReleaseReader(slot)
+				return nil, context.Cause(ctx)
+			}
 		}
 	}
 

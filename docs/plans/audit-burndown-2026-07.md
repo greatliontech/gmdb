@@ -14,7 +14,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 4. pager-rpl-footer-verification
 - [x] 5. pager-freed-page-write-skip
 - [x] 6. lock-stale-slot-clear-identity
-- [ ] 7. reader-begin-publish-race
+- [x] 7. reader-begin-publish-race
 - [ ] 8. lagging-reader-bound-checkpoint-term
 - [ ] 9. checkpoint-failure-poisoning
 - [ ] 10. create-dirent-durability

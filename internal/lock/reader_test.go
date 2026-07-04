@@ -890,3 +890,34 @@ func TestClearedSlotDoesNotEvictMidPublishAcquirer(t *testing.T) {
 		})
 	})
 }
+
+// TestRaiseReaderSlotTxnIDGuards pins the owner-only/monotonic
+// contract's four panic guards.
+func TestRaiseReaderSlotTxnIDGuards(t *testing.T) {
+	f := openTestFile(t, 2)
+	idx, err := f.AcquireReaderSlot(0, 10, 1234, 1, 42, 100)
+	if err != nil {
+		t.Fatalf("AcquireReaderSlot: %v", err)
+	}
+	mustPanic := func(name string, fn func()) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: no panic", name)
+			}
+		}()
+		fn()
+	}
+	mustPanic("zero txnID", func() { f.RaiseReaderSlotTxnID(idx, 0) })
+	mustPanic("lower raise", func() { f.RaiseReaderSlotTxnID(idx, 9) })
+	mustPanic("index out of range", func() { f.RaiseReaderSlotTxnID(2, 11) })
+	// Equal and higher raises succeed.
+	f.RaiseReaderSlotTxnID(idx, 10)
+	f.RaiseReaderSlotTxnID(idx, 12)
+	if got := Load64(&f.Slot(idx).TxnID); got != 12 {
+		t.Errorf("TxnID = %d, want 12", got)
+	}
+	closed := openTestFile(t, 1)
+	_ = closed.Close()
+	mustPanic("closed file", func() { closed.RaiseReaderSlotTxnID(0, 1) })
+}

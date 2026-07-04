@@ -286,6 +286,23 @@ Invariant: kind=entailed;
     acquisition flow step 3, and by the cross-handle writer-interleave
     test.
 
+Invariant: kind=clause-explicit;
+  property=Reader snapshot pinning — a read transaction's snapshot
+    tree is protected from RPL reclamation for the transaction's
+    whole lifetime: the reader-slot TxnID it publishes is
+    restabilized against the latest meta AFTER the slot is visible
+    (§Reader Table, slot acquire step 8), so the interval in which
+    the snapshot was chosen but the slot invisible cannot admit a
+    writer that reclaims the snapshot's pages;
+  from=this spec §Reader Table (slot acquire, snapshot
+    restabilization);
+  violation=Without the post-publish re-read, a reader descheduled
+    between its meta read and its slot CAS while a writer commits
+    twice and reclaims the first tree's RPL segment traverses
+    reclaimed-and-reused pages — wrong values or ErrCorrupted on a
+    perfectly healthy database. (Pinned by
+    `TestBeginReadRestabilizesSnapshotAfterRacingCommits`.)
+
 Invariant: kind=entailed;
   property=Reader snapshot currency — a read transaction snapshots the
     latest committed meta visible at `BeginRead`, so it observes every
@@ -739,6 +756,24 @@ path is only used once the full identity has been populated).
 6. Update `coord.readerSlotHint`.
 7. If all slots occupied (full wraparound), return
    `ErrReadersFull`.
+8. **Snapshot restabilization.** The meta whose TxnID seeded step 3
+   was read BEFORE the slot became visible, so a writer whose
+   bound-computation scan completed inside that window may already
+   have reclaimed that snapshot tree's pages. After the slot is
+   published: re-read the latest meta; if its TxnID differs from the
+   pinned one, raise the slot's `TxnID` to the new value (an owner-
+   only, monotonic overwrite — a concurrent scan reading the old
+   value computes a lower, strictly conservative, bound) and repeat
+   until one re-read returns the pinned TxnID unchanged. The
+   transaction proceeds on the stabilized meta.
+
+   Why a stable re-read is sufficient: pages of tree `T` are only
+   reclaimed through RPL segments with `TxnID t > T`, and
+   reclamation runs strictly after the meta carrying `t` was
+   written. If the post-publish re-read still returns `T`, no such
+   meta existed at re-read time — nothing of tree `T` had been
+   reclaimed — and from that instant every writer's bound scan sees
+   this slot, flooring the bound at `T`.
 
 The hint is process-local, updated with a relaxed atomic store —
 no cross-process coordination. Under steady-state load, the hint

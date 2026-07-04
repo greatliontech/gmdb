@@ -105,3 +105,24 @@ func (tx *Tx) RetiredPagesLen() int { return len(tx.pgr.RetiredPages()) }
 // MaxTxBufferBytes cap (e.g. to keep commit headroom while
 // exercising per-op budget failures).
 func (tx *Tx) DirtyBytes() int { return tx.pgr.DirtyBytes() }
+
+// SetBeginReadPreAcquireHookForTest installs (or clears, with nil) the
+// hook firing between BeginRead's first meta read and its reader-slot
+// acquire. Returns a restore func for defer.
+func SetBeginReadPreAcquireHookForTest(hook func()) (restore func()) {
+	if hook == nil {
+		beginReadPreAcquireHookForTest.Store(nil)
+		return func() {}
+	}
+	beginReadPreAcquireHookForTest.Store(&hook)
+	return func() { beginReadPreAcquireHookForTest.Store(nil) }
+}
+
+// SlotTxnID reports the pinned TxnID of this read transaction's
+// reader slot (0 when running lock-free).
+func (rtx *ReadTx) SlotTxnID() uint64 {
+	if rtx.db.coord == nil {
+		return 0
+	}
+	return rtx.db.coord.ReaderSlotTxnID(rtx.readerSlot)
+}

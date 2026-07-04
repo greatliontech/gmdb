@@ -91,6 +91,26 @@ func (c *Coord) AcquireReader(ctx context.Context, txnID uint64) (uint32, error)
 	}
 }
 
+// RaiseReaderSlotTxnID raises an owned slot's pinned TxnID — the
+// post-publish snapshot-restabilization step (see
+// File.RaiseReaderSlotTxnID). No-op on NoSlot (lock-free read-only
+// path).
+func (c *Coord) RaiseReaderSlotTxnID(idx uint32, txnID uint64) {
+	if idx == NoSlot {
+		return
+	}
+	c.f.RaiseReaderSlotTxnID(idx, txnID)
+}
+
+// ReaderSlotTxnID returns the slot's currently pinned TxnID —
+// observability for the restabilization tests.
+func (c *Coord) ReaderSlotTxnID(idx uint32) uint64 {
+	if idx == NoSlot {
+		return 0
+	}
+	return Load64(&c.f.Slot(idx).TxnID)
+}
+
 // ReleaseReader is the Coord-mediated reader-slot release path. It
 // unregisters the slot from the heartbeat goroutine's active list
 // BEFORE clearing the on-mmap fields (cross-process.md §Heartbeat

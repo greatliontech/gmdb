@@ -2,6 +2,7 @@ package lock
 
 import (
 	"errors"
+	"fmt"
 	"math"
 )
 
@@ -172,6 +173,33 @@ func (f *File) ClearStaleReaderSlot(idx uint32) {
 	Store64(&slot.Heartbeat, 0)
 	Store64(&slot.HintEpoch, 0)
 	Store64(&slot.TxnID, 0)
+}
+
+// RaiseReaderSlotTxnID overwrites an OWNED slot's pinned TxnID with a
+// higher one — the post-publish snapshot-restabilization step of the
+// reader-begin protocol (cross-process.md §Reader Table, slot
+// acquire): after the acquirer's CAS is visible it re-reads the
+// latest meta and raises the slot to match until the meta is stable.
+// Owner-only (the slot must have been acquired by this process and
+// not released) and monotonic (txnID must be >= the current value):
+// a concurrent scan reading the OLD value computes a lower — strictly
+// conservative — reclamation bound, so no ordering beyond the single
+// atomic store is needed.
+func (f *File) RaiseReaderSlotTxnID(idx uint32, txnID uint64) {
+	if f.slots == nil {
+		panic("lock: RaiseReaderSlotTxnID on closed *File")
+	}
+	if idx >= uint32(len(f.slots)) {
+		panic("lock: RaiseReaderSlotTxnID index out of range")
+	}
+	if txnID == 0 {
+		panic("lock: RaiseReaderSlotTxnID called with txnID=0")
+	}
+	slot := &f.slots[idx]
+	if cur := Load64(&slot.TxnID); txnID < cur {
+		panic(fmt.Sprintf("lock: RaiseReaderSlotTxnID(%d) would lower pinned TxnID %d -> %d", idx, cur, txnID))
+	}
+	Store64(&slot.TxnID, txnID)
 }
 
 // OldestReaderTxnID scans the reader table and returns the minimum

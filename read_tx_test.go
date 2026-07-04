@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -631,4 +632,101 @@ func TestReadTxLeakAfterCloseNoCrash(t *testing.T) {
 	runtime.GC()
 	runtime.GC()
 	time.Sleep(50 * time.Millisecond)
+}
+
+// TestBeginReadRestabilizesSnapshotAfterRacingCommits pins the
+// snapshot-restabilization step of the reader-begin protocol
+// (cross-process.md §Reader Table, slot acquire): BeginRead reads the
+// meta BEFORE its reader slot is visible, so commits landing in that
+// window — up to and including reclamation of the just-read
+// snapshot's tree — must be detected by the post-publish re-read,
+// with the slot's pinned TxnID raised to the stabilized snapshot.
+// Without the loop the reader would traverse tree pages a concurrent
+// writer already reclaimed and reused.
+func TestBeginReadRestabilizesSnapshotAfterRacingCommits(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 512,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Seed.
+	if err := db.Update(ctx, func(tx *Tx) error {
+		ks, err := tx.CreateKeyspace("k")
+		if err != nil {
+			return err
+		}
+		for i := range 200 {
+			if err := ks.Put(fmt.Appendf(nil, "k%04d", i), bytes.Repeat([]byte{'v'}, 200)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// The hook fires between BeginRead's first meta read and its slot
+	// CAS: run several churn commits that retire the just-read tree
+	// and recycle its pages (small MaxSize keeps alloc pressure high,
+	// so reclamation runs at every Begin via the alloc priority).
+	var hookRan bool
+	restore := SetBeginReadPreAcquireHookForTest(func() {
+		hookRan = true
+		for round := range 3 {
+			if err := db.Update(ctx, func(tx *Tx) error {
+				ks, err := tx.OpenKeyspace("k")
+				if err != nil {
+					return err
+				}
+				for i := range 200 {
+					if err := ks.Put(fmt.Appendf(nil, "k%04d", i), bytes.Repeat([]byte{byte('a' + round)}, 200)); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Errorf("hook churn round %d: %v", round, err)
+			}
+		}
+	})
+	defer restore()
+
+	preMeta := db.Meta()
+	rtx, err := db.BeginRead(ctx)
+	restore() // one racing window is enough; later BeginReads run clean
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	defer rtx.Rollback()
+	if !hookRan {
+		t.Fatalf("fixture: pre-acquire hook did not run")
+	}
+
+	m := rtx.Meta()
+	if m.TxnID <= preMeta.TxnID {
+		t.Fatalf("snapshot TxnID = %d, want > %d (restabilization must observe the racing commits)", m.TxnID, preMeta.TxnID)
+	}
+	if got := rtx.SlotTxnID(); got != m.TxnID {
+		t.Fatalf("reader slot pinned TxnID = %d, want %d (slot must be raised with the snapshot)", got, m.TxnID)
+	}
+	// The stabilized snapshot must read the final round's values.
+	ks, err := rtx.OpenKeyspaceReadOnly("k")
+	if err != nil {
+		t.Fatalf("OpenKeyspaceReadOnly: %v", err)
+	}
+	want := bytes.Repeat([]byte{'c'}, 200)
+	for i := range 200 {
+		v, err := ks.Get(fmt.Appendf(nil, "k%04d", i))
+		if err != nil {
+			t.Fatalf("Get(k%04d): %v", i, err)
+		}
+		if !bytes.Equal(v, want) {
+			t.Fatalf("Get(k%04d) = %q..., want final-round values", i, v[:8])
+		}
+	}
 }
