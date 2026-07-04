@@ -130,6 +130,41 @@ stays within one page (an unaligned tear cannot affect a single
 contiguous sub-page region, and the xxhash64 checksum catches
 any partial write — recovery falls back to the other slot).
 
+### Checkpoint failure semantics
+
+Steps 2–4 of the checkpoint sequence (data fdatasync, active-slot
+meta pwrite, meta fdatasync) are Checkpoint's publication phase. Any
+failure there POISONS the handle — every subsequent
+transaction-opening operation returns `ErrPoisoned`, and Close +
+re-Open is the only recovery — mirroring the commit pipeline's
+publication contract:
+
+- A failed fdatasync consumes the kernel's per-fd error state while
+  marking the pages clean; a retried Checkpoint's fdatasync then
+  succeeds trivially and stamps `MetaFlagCheckpoint` over data that
+  never reached stable storage — recovery selects the checkpoint
+  meta and traverses into unwritten pages (the exact violation
+  §Durability Modes warns about).
+- A torn active-slot pwrite leaves the only on-disk copy of the
+  active meta checksum-invalid while the process keeps serving it
+  from memory; a peer writer's re-sync then selects the other
+  (older) slot and commits its own tree over pages the newer tree
+  references — split brain, page aliasing.
+
+For the torn-write case, poison BOUNDS the divergence rather than
+preventing it — the torn slot is already on disk and the write grant
+passes to peers regardless; poison stops this handle from continuing
+to serve and extend a tree the disk no longer describes, and re-Open
+converges it to the peers' view.
+
+Failures BEFORE step 2 (grant acquisition, re-sync) leave disk and
+pager state untouched and do not poison. Re-Open re-reads the actual
+on-disk state, so a poisoned handle converges instead of compounding.
+(Enforced in `DB.Checkpoint`; pinned per step by
+`TestCheckpointPublicationFailurePoisonsHandle`, with the post-grant
+re-check and the no-poison clause pinned by
+`TestCheckpointPoisonEdges`.)
+
 ## Recovery
 
 On recovery (Open after crash):

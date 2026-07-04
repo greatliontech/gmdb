@@ -80,7 +80,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [checkpoint-failure-poisoning](checkpoint-failure-poisoning.md) | chunk 9 | **[H]** Checkpoint step-2/3/4 failures don't poison the handle — torn active meta (split brain) or fsyncgate false certification. |
 | [create-dirent-durability](create-dirent-durability.md) | chunk 10 | **[M]** No parent-dir fsync at create; acked SyncDurable commits can vanish with the file. Compact downgrades a syncDir failure to a warning. |
 | [beginread-close-lifecycle](beginread-close-lifecycle.md) | chunk 11 | **[M]** BeginRead racing Close panics/SIGSEGVs instead of ErrClosed — close gate never covers the BeginRead window. |
 | [update-unresolved-child-grant](update-unresolved-child-grant.md) | chunk 12 | **[M]** Update with an unresolved child tx leaks the cross-process write grant until GC; all writers block. Demonstrated. |

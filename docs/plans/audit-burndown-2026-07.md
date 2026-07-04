@@ -16,7 +16,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 6. lock-stale-slot-clear-identity
 - [x] 7. reader-begin-publish-race
 - [x] 8. lagging-reader-bound-checkpoint-term
-- [ ] 9. checkpoint-failure-poisoning
+- [x] 9. checkpoint-failure-poisoning
 - [ ] 10. create-dirent-durability
 - [ ] 11. beginread-close-lifecycle
 - [ ] 12. update-unresolved-child-grant

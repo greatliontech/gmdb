@@ -68,13 +68,18 @@ var (
 	// (format-version bump) for the evolution mechanism.
 	ErrVersionMismatch = errors.New("gmdb: on-disk format version mismatch")
 
-	// ErrPoisoned is returned by Begin / BeginRead / Update / Compact
-	// after the handle is poisoned. Two causes: (a) a previous write
+	// ErrPoisoned is returned by every transaction-opening operation
+	// (Begin / BeginRead / Update / Compact / Checkpoint) after the
+	// handle is poisoned. Three causes: (a) a previous write
 	// transaction's commit failed in the publication phase (step-3
 	// pwrite or step-4 fdatasync), leaving the on-disk active meta
 	// potentially advanced while the in-memory pager state has been
 	// rolled back to pre-tx; (b) a Compact reopen failed after the
-	// rename, leaving the handle mapping the stale, now-unlinked inode.
+	// rename, leaving the handle mapping the stale, now-unlinked
+	// inode; (c) a Checkpoint failed in its publication phase
+	// (durability.md §Checkpoint failure semantics — a retried
+	// checkpoint after a consumed fsync error would falsely certify
+	// non-durable data).
 	// In case (b) even reads are unsafe (they would observe pre-Compact
 	// data), so BeginRead is rejected too. The caller must Close() and
 	// re-Open() to recover. Close() works normally on a poisoned handle.

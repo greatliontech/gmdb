@@ -1,6 +1,9 @@
 package gmdb
 
-import "github.com/thegrumpylion/gmdb/internal/page"
+import (
+	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/thegrumpylion/gmdb/internal/pager"
+)
 
 // Test-only handle methods.
 //
@@ -126,3 +129,19 @@ func (rtx *ReadTx) SlotTxnID() uint64 {
 	}
 	return rtx.db.coord.ReaderSlotTxnID(rtx.readerSlot)
 }
+
+// SetCheckpointStepHookForTest injects an error at Checkpoint's
+// step 2, 3, or 4 (the hook receives the step number and returns the
+// error to simulate for that step; nil return = no failure). Returns
+// a restore func.
+func SetCheckpointStepHookForTest(hook func(step int) error) (restore func()) {
+	if hook == nil {
+		checkpointStepHookForTest.Store(nil)
+		return func() {}
+	}
+	checkpointStepHookForTest.Store(&hook)
+	return func() { checkpointStepHookForTest.Store(nil) }
+}
+
+// PgrForTest exposes the writer pager for white-box fault injection.
+func (db *DB) PgrForTest() *pager.Pager { return db.pgr }

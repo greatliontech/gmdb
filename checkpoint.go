@@ -4,10 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
+
+// checkpointStepHookForTest injects a failure after Checkpoint's
+// step-2/3/4 syscall succeeded, simulating the syscall failing —
+// the publication-phase poison contract's test seam.
+var checkpointStepHookForTest atomic.Pointer[func(step int) error]
 
 // Checkpoint flushes all outstanding writes to stable storage and
 // stamps the active meta with MetaFlagCheckpoint so subsequent
@@ -74,6 +80,16 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	}
 	defer grant.Release()
 
+	// Re-check poison under the grant — a concurrent commit could
+	// have poisoned the handle while we were waiting (its publication
+	// failure consumed the kernel's fsync error state; proceeding
+	// would stamp the checkpoint flag over non-durable data — the
+	// fsyncgate window this contract closes). Same shape as Begin's
+	// post-grant re-check.
+	if db.poisoned.Load() {
+		return ErrPoisoned
+	}
+
 	// Re-read pgr+file under the post-grant db.mu (Compact may have swapped
 	// them while we waited) and re-sync the writer's in-memory state to
 	// absorb any commit published while we waited — same-process OR a peer
@@ -110,9 +126,44 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	activeIdx := db.activeMetaIdx
 	db.mu.Unlock()
 
+	// Steps 2–4 are the publication phase: any failure poisons the
+	// handle (Close + re-Open is the only recovery), mirroring
+	// Tx.Commit's publication contract. Two failure modes make
+	// continuing unsafe rather than merely unsuccessful:
+	//
+	//   - A failed fdatasync (steps 2/4) consumes the kernel's error
+	//     state while marking pages clean; a retried Checkpoint's
+	//     fsync then succeeds trivially and stamps MetaFlagCheckpoint
+	//     over data that never reached disk — recovery selects the
+	//     checkpoint and traverses unwritten pages.
+	//   - A torn step-3 WriteAt leaves the ONLY on-disk copy of the
+	//     active meta checksum-invalid while this handle keeps
+	//     serving it from memory; a peer's Resync then selects the
+	//     other (older) slot and commits over this tree — split
+	//     brain, page aliasing.
+	//
+	// Re-Open re-reads the actual disk state, so a poisoned handle
+	// converges instead of compounding. (durability.md §Checkpoint
+	// failure semantics.)
+	failStep := func(step int, err error) error {
+		db.poisoned.Store(true)
+		db.logger.Error("gmdb: checkpoint publication failure; handle poisoned — Close and re-Open",
+			"step", step, "err", err)
+		return fmt.Errorf("gmdb: checkpoint step %d: %w (handle poisoned)", step, err)
+	}
+	stepErr := func(step int) error {
+		if hook := checkpointStepHookForTest.Load(); hook != nil {
+			return (*hook)(step)
+		}
+		return nil
+	}
+
 	// Step 2 — fdatasync to flush prior SyncLazy pwrites.
 	if err := file.Sync(); err != nil {
-		return fmt.Errorf("gmdb: checkpoint step 2 fdatasync: %w", err)
+		return failStep(2, err)
+	}
+	if err := stepErr(2); err != nil {
+		return failStep(2, err)
 	}
 
 	// Step 3 — set MetaFlagCheckpoint on the active meta, recompute
@@ -133,7 +184,10 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 		page.EncodeMeta(buf, &meta)
 		off := int64(activeIdx) * int64(pageSize)
 		if _, err := file.WriteAt(buf, off); err != nil {
-			return fmt.Errorf("gmdb: checkpoint step 3 write meta: %w", err)
+			return failStep(3, err)
+		}
+		if err := stepErr(3); err != nil {
+			return failStep(3, err)
 		}
 	}
 
@@ -142,7 +196,10 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	// for any in-flight meta pwrite — defense in depth for the
 	// SyncDataOnly case.)
 	if err := file.Sync(); err != nil {
-		return fmt.Errorf("gmdb: checkpoint step 4 fdatasync meta: %w", err)
+		return failStep(4, err)
+	}
+	if err := stepErr(4); err != nil {
+		return failStep(4, err)
 	}
 
 	// Publish the updated meta to db.currentMeta so subsequent
