@@ -1,5 +1,22 @@
 # gmdb v0 — issue burn-down continuation
 
+> **SUPERSEDING DIRECTIVE (2026-07-04).** A full-codebase audit (5
+> subsystem auditors) filed a new wave of issues; the user ordered:
+> **"fix them all, bottoms up. if a refactor is in order we do it. you
+> have full authority over specs, docs, code, and commit cadence."**
+> Work `docs/plans/audit-burndown-2026-07.md` in chunk order — do NOT
+> propose-and-wait for issue selection (that standing approval covers
+> ordering, the spec amendments flagged in the issue docs, and
+> commits). Everything below about *how* to resolve an issue
+> (re-derive from first principles, Diagnosis/gates, adversarial
+> review loop, close-out promote-then-delete, end-of-session rewrite
+> of this file) still applies unchanged. The pre-existing backlog
+> tables below refer to the 2026-05-30 wave; the older
+> `recovery-model-highest-epoch` and
+> `cross-namespace-reader-heartbeat-liveness` rows remain
+> condition-triggered and are NOT part of the burn-down order unless a
+> chunk's triage gate pulls them.
+
 You are continuing a multi-session burn-down of `docs/issues/` for gmdb,
 an embedded MVCC KV store in Go. **One issue per context reset.** Each
 session picks one issue, re-derives it from first principles, resolves

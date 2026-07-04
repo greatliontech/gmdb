@@ -64,3 +64,39 @@ findings each shared-fix row covers.
 |------|-------|---------|
 | [recovery-model-highest-epoch](recovery-model-highest-epoch.md) | condition (commit/recovery/RPL redesign, or grove-backport rotation) | **design direction** Replace per-commit checkpoint-preferring recovery with a highest-valid-epoch rule + an on-disk `durableEpoch` marker, retiring the live-vs-recovery meta asymmetry, the `lastCheckpointTxnID` bound, and the genesis-rollback gotcha. Multi-process design questions; substantial Spec-first effort. Spun out of `sync-mode-surface-consolidation`. |
 | [cross-namespace-reader-heartbeat-liveness](cross-namespace-reader-heartbeat-liveness.md) | condition (when cross-process stale-detection is revisited) | **[L]** Cross-namespace (container) readers have no `kill()` fallback — a >10s heartbeat pause (docker pause, cgroup freeze, swap) evicts a live reader → reads reclaimed-and-reused pages. Document the data-integrity bound + reconsider the default. *Finding 21.* |
+
+## Open — full-codebase audit (2026-07-04)
+
+Filed from the 2026-07-04 audit (5 parallel subsystem auditors:
+durability/recovery, concurrency/locking, btree/pager/free-space,
+indexing/typed, bulkload/compaction/maintenance; several findings
+carry failing-on-HEAD reproducers noted in the issue files). Worked as
+an active burn-down in the chunk order of
+`docs/plans/audit-burndown-2026-07.md` under the user's 2026-07-04
+blanket authority (fix all, bottoms-up, spec amendments included).
+Rows in chunk order; severity tags are the audit's.
+
+| Slug | Lands | Summary |
+|------|-------|---------|
+| [page-compressed-leaf-sharedlen-validation](page-compressed-leaf-sharedlen-validation.md) | chunk 1 | **[M]** Validate skips the SharedLen semantic check but decodeDeltaEntry slices unguarded — checksums-off bit-flip panics or fabricates keys. |
+| [btree-delete-separator-branch-overflow](btree-delete-separator-branch-overflow.md) | chunk 2 | **[M]** Redistribute-grown separator can overflow a full parent branch; no split fallback on the delete path; siblings already retired at the failure return. |
+| [btree-retired-pages-rollback](btree-retired-pages-rollback.md) | chunk 3 | **[H]** Failed un-indexed Put/Delete retires still-referenced pages; commit publishes them to the RPL → reclamation frees live tree pages → committed-data corruption. |
+| [pager-rpl-footer-verification](pager-rpl-footer-verification.md) | chunk 4 | **[H]** RPL segments never checksum-verified on reclaim/Open walks — decodable bit-flip frees live pages or panics in the bitmap. |
+| [pager-freed-page-write-skip](pager-freed-page-write-skip.md) | chunk 5 | **[L]** Freed/tail-refunded pages' slab buffers still pwritten at commit — write amplification only. |
+| [lock-stale-slot-clear-identity](lock-stale-slot-clear-identity.md) | chunk 6 | **[H]** Stale-clear leaves dead PID/heartbeat; next acquirer falsely evicted mid-publish → use-after-reclaim. Spec prescribes the defect (amend with fix). |
+| [reader-begin-publish-race](reader-begin-publish-race.md) | chunk 7 | **[H]** Meta read before reader-slot publish, no re-validation — reclamation can free the snapshot's pages in the gap. Two auditors converged. |
+| [lagging-reader-bound-checkpoint-term](lagging-reader-bound-checkpoint-term.md) | chunk 8 | **[H]** Bound-refresh uses prevMeta.TxnID not lastCheckpointTxnID — reclaims past the checkpoint under SyncLazy; deterministic corruption after crash recovery. |
+| [checkpoint-failure-poisoning](checkpoint-failure-poisoning.md) | chunk 9 | **[H]** Checkpoint step-2/3/4 failures don't poison the handle — torn active meta (split brain) or fsyncgate false certification. |
+| [create-dirent-durability](create-dirent-durability.md) | chunk 10 | **[M]** No parent-dir fsync at create; acked SyncDurable commits can vanish with the file. Compact downgrades a syncDir failure to a warning. |
+| [beginread-close-lifecycle](beginread-close-lifecycle.md) | chunk 11 | **[M]** BeginRead racing Close panics/SIGSEGVs instead of ErrClosed — close gate never covers the BeginRead window. |
+| [update-unresolved-child-grant](update-unresolved-child-grant.md) | chunk 12 | **[M]** Update with an unresolved child tx leaks the cross-process write grant until GC; all writers block. Demonstrated. |
+| [maintenance-reclaim-snapshot-guard](maintenance-reclaim-snapshot-guard.md) | chunk 13 | **[H]** Leak detection uses snapshot tree + live bitmap; concurrent commit → live pages freed (demonstrated, default config). Cross-process overlap variant shares the fix. |
+| [compact-peer-handle-generation](compact-peer-handle-generation.md) | chunk 14 | **[H]** Compact renames the inode under peer handles; peer writes land on the unlinked inode — silent write loss. Generation stamp in the lock header. |
+| [check-consistency-classes](check-consistency-classes.md) | chunk 15 | **[M]** Check() verifies none of: key ordering, separator routing, desc.Count, NestedCount, NumKeyspaces — classes api-surface.md claims. |
+| [iterator-cursor-unregistration](iterator-cursor-unregistration.md) | chunk 16 | **[M]** All/Range/Prefix leak cursor registrations for the tx lifetime — quadratic degradation in long transactions. |
+| [index-covering-value-diff](index-covering-value-diff.md) | chunk 17 | **[H]** Covering bytes never rewritten on value-only updates (key-only diff) — stale covering lookups; Check flags normal workloads. Failing repro. + align rebuild/maintenance dup tie-break. |
+| [index-child-merge-handle-reconciliation](index-child-merge-handle-reconciliation.md) | chunk 18 | **[H]** Child commit swaps pks.indexes but never re-points parent IndexHandles — silently stale lookups; freed-page reads after child Drop. Failing repro. |
+| [readonly-index-lookups](readonly-index-lookups.md) | chunk 19 | **[M]** RO opens never load declared indexes — spec'd RO index lookups unreachable on every surface. Failing repro. |
+| [setkeyspace-bulkload-error-mapping](setkeyspace-bulkload-error-mapping.md) | chunk 20 | **[M]** Indexed SetKeyspace.BulkLoad leaks internal sentinels (missing mapBtreeErr); oversize-first-value returns errBulkEntryTooLarge. |
+| [set-cursor-materialization-bound](set-cursor-materialization-bound.md) | chunk 21 | **[L]** SetCursor materializes whole value sets per position; CountValues O(set) vs advertised O(1). Fix streaming or spec the bound. |
+| [api-and-doc-drift-sweep](api-and-doc-drift-sweep.md) | chunk 22 | **[L]** 9-item sweep: Range arity check, lock-ordering.md phantom locks, leak-detection.md Close ordering, pager-slab budget clause, limits.md max-key decision, checkpoint stale-read note, RO-fleet reaping, plain/overflow cell contradiction, truncated comment. |
