@@ -697,6 +697,14 @@ func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmapForOpen, fileSize int64) (
 		if id >= backedPages {
 			return nil, fmt.Errorf("pager: RPL segment page %d beyond file-resident extent %d pages: %w", id, backedPages, ErrCorrupted)
 		}
+		if id < bm.FirstDataPage() {
+			// Below the meta/bitmap region — no segment can live
+			// there. Reachable when a corrupt/forged meta's geometry
+			// (BitmapPages) shifted firstDataPage above a persisted
+			// chain pointer; reclaimRPL would panic in Bitmap.Set on
+			// such an id, so it must not enter the chain.
+			return nil, fmt.Errorf("pager: RPL segment page %d inside the meta/bitmap region (firstDataPage=%d): %w", id, bm.FirstDataPage(), ErrCorrupted)
+		}
 		if _, seen := visited[id]; seen {
 			return nil, fmt.Errorf("pager: RPL chain cycle at page %d: %w", id, ErrCorrupted)
 		}
@@ -720,6 +728,20 @@ func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmapForOpen, fileSize int64) (
 		}
 		visited[id] = struct{}{}
 		buf := p.pageRaw(id)
+		// Footer verification before decode (checksums.md covers RPL
+		// segments; pageRaw does not verify). Head-vs-non-head
+		// follows the decode-failure branch's convention below: a
+		// checksum-bad HEAD is a hard error, a checksum-bad NON-head
+		// gets the reclaimed-then-reused stale-tail treatment
+		// (recovery to a non-latest meta can reach segments whose
+		// pages were reclaimed and rewritten with other content —
+		// validly-footered or torn).
+		if p.cfg.PageChecksum && !page.VerifyPageFooter(buf, p.cfg.PageSize) {
+			if id == m.RPLHeadPage {
+				return nil, fmt.Errorf("pager: RPL head segment at page %d fails checksum: %w", id, ErrBadPageChecksum)
+			}
+			break
+		}
 		seg, ok := page.DecodeRPLSegment(buf, p.cfg)
 		if !ok {
 			if id == m.RPLHeadPage {

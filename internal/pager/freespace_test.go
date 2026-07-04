@@ -616,7 +616,7 @@ func TestReclaimRPLQuarantinesCorruptSegment(t *testing.T) {
 		{PageID: corruptPageID, TxnID: corruptTxnID, Count: 1},
 		{PageID: validPageID, TxnID: validTxnID, Count: 1},
 	})
-	p.SetCommitState(13, 32, validTxnID+1) // bound past both → both eligible
+	p.SetCommitState(22, 32, validTxnID+1) // bound past both → both eligible; HWM 22 covers pages 10..21
 
 	var cbFired []uint64
 	p.SetRPLCorruptCallback(func(seg uint64) { cbFired = append(cbFired, seg) })
@@ -640,5 +640,161 @@ func TestReclaimRPLQuarantinesCorruptSegment(t *testing.T) {
 	}
 	if bm.IsSet(corruptPageID) {
 		t.Errorf("corrupt segment page %d was freed; it must stay allocated (leaked, bounded)", corruptPageID)
+	}
+}
+
+// TestReclaimRPLQuarantinesChecksumMismatch pins the footer-verification
+// half of the quarantine contract (checksums.md §Verification): a
+// segment page whose payload no longer matches its footer — the exact
+// bitrot shape checksums exist to catch — must be quarantined even
+// though it still DECODES (Type + Count intact, one entry byte
+// flipped). Without the check, reclamation frees whatever page the
+// flipped entry now names — a live tree page — and no later read can
+// detect it.
+func TestReclaimRPLQuarantinesChecksumMismatch(t *testing.T) {
+	p, _, f := setupWriter(t, 32)
+	defer f.Close()
+	cfg := page.Config{PageSize: testPageSize, PageChecksum: true}
+
+	const (
+		badPageID    = 10 // oldest — valid segment, then one entry byte flipped
+		goodPageID   = 11
+		truePayload  = 21 // what the bad segment originally listed
+		wrongPayload = 20 // what the flipped byte makes it list
+		goodPayload  = 22
+	)
+	bad := make([]byte, testPageSize)
+	page.EncodeRPLSegment(bad, cfg, 100, 0, []uint64{truePayload})
+	page.WritePageFooter(bad, testPageSize)
+	// Flip the low byte of entry 0: 21 -> 20. Decode stays valid;
+	// only the footer knows.
+	bad[page.RPLHeaderSize] = wrongPayload
+	if _, err := f.WriteAt(bad, int64(badPageID)*int64(testPageSize)); err != nil {
+		t.Fatalf("write bad seg: %v", err)
+	}
+	good := make([]byte, testPageSize)
+	page.EncodeRPLSegment(good, cfg, 200, 0, []uint64{goodPayload})
+	page.WritePageFooter(good, testPageSize)
+	if _, err := f.WriteAt(good, int64(goodPageID)*int64(testPageSize)); err != nil {
+		t.Fatalf("write good seg: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	p.Close()
+	pool := NewBufPool(testPageSize)
+	p, err := NewWriter(f, cfg, 32*testPageSize, pool, 16<<20)
+	if err != nil {
+		t.Fatalf("re-open: %v", err)
+	}
+	defer p.Close()
+	bm := bitmap.New(make([]byte, testPageSize), testPageSize, 1, 32)
+	p.AttachBitmap(bm)
+	p.SetRPLChain([]RPLSegmentRef{
+		{PageID: badPageID, TxnID: 100, Count: 1},
+		{PageID: goodPageID, TxnID: 200, Count: 1},
+	})
+	p.SetCommitState(23, 32, 201) // HWM 23 covers the fixture pages 10..22
+
+	count := p.reclaimRPL()
+	if count != 2 {
+		t.Errorf("reclaimRPL count = %d, want 2 (good payload + good segment page)", count)
+	}
+	if p.RPLCorruptCount() != 1 {
+		t.Errorf("RPLCorruptCount() = %d, want 1", p.RPLCorruptCount())
+	}
+	for _, id := range []uint64{wrongPayload, truePayload, badPageID} {
+		if bm.IsSet(id) {
+			t.Errorf("page %d freed from a checksum-bad segment; quarantine must free nothing", id)
+		}
+	}
+	if !bm.IsSet(goodPayload) || !bm.IsSet(goodPageID) {
+		t.Errorf("good segment not reclaimed past the quarantined one")
+	}
+}
+
+// TestReclaimRPLQuarantinesOutOfRangeEntry pins the entry-bound half:
+// on a checksums-off database a decodable segment can carry an
+// out-of-range entry (bitrot or a torn write that preserved Type and
+// Count). Reclamation must quarantine the whole segment — atomically,
+// even when a valid entry precedes the wild one — not panic in
+// Bitmap.Set (integrity.md: errors, not crashes, on corrupt input).
+func TestReclaimRPLQuarantinesOutOfRangeEntry(t *testing.T) {
+	cfg := page.Config{PageSize: testPageSize}
+	for _, tc := range []struct {
+		name string
+		ids  []uint64
+	}{
+		{"beyond-totalPages", []uint64{21, 40}}, // valid entry first: atomicity
+		{"below-firstDataPage", []uint64{0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _, f := setupWriter(t, 32)
+			defer f.Close()
+			const segPageID = 10
+			seg := make([]byte, testPageSize)
+			page.EncodeRPLSegment(seg, cfg, 100, 0, tc.ids)
+			if _, err := f.WriteAt(seg, int64(segPageID)*int64(testPageSize)); err != nil {
+				t.Fatalf("write seg: %v", err)
+			}
+			if err := f.Sync(); err != nil {
+				t.Fatalf("sync: %v", err)
+			}
+			p.Close()
+			pool := NewBufPool(testPageSize)
+			p, err := NewWriter(f, cfg, 32*testPageSize, pool, 16<<20)
+			if err != nil {
+				t.Fatalf("re-open: %v", err)
+			}
+			defer p.Close()
+			bm := bitmap.New(make([]byte, testPageSize), testPageSize, 1, 32)
+			p.AttachBitmap(bm)
+			p.SetRPLChain([]RPLSegmentRef{{PageID: segPageID, TxnID: 100, Count: uint32(len(tc.ids))}})
+			p.SetCommitState(22, 32, 200) // HWM 22 covers the in-range fixture pages
+
+			if count := p.reclaimRPL(); count != 0 {
+				t.Errorf("reclaimRPL count = %d, want 0 (whole segment quarantined)", count)
+			}
+			if p.RPLCorruptCount() != 1 {
+				t.Errorf("RPLCorruptCount() = %d, want 1", p.RPLCorruptCount())
+			}
+			for _, id := range tc.ids {
+				if id < 32 && bm.IsSet(id) {
+					t.Errorf("entry %d freed from a quarantined segment (atomicity)", id)
+				}
+			}
+		})
+	}
+}
+
+
+// TestReclaimRPLQuarantinesOutOfRangeSegmentPage pins the segment-page
+// bound: a chain reference whose OWN page id is outside the bitmap's
+// allocatable range (reachable when a corrupt/forged meta's geometry
+// shifted firstDataPage under a persisted chain) must quarantine —
+// before pageRaw (panics past the mmap reservation) and before the
+// final Set (panics outside the allocatable range).
+func TestReclaimRPLQuarantinesOutOfRangeSegmentPage(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pageID uint64
+	}{
+		{"below-firstDataPage", 0},
+		{"beyond-totalPages", 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _, f := setupWriter(t, 32)
+			defer p.Close()
+			defer f.Close()
+			p.SetRPLChain([]RPLSegmentRef{{PageID: tc.pageID, TxnID: 100, Count: 1}})
+			p.SetCommitState(22, 32, 200)
+			if count := p.reclaimRPL(); count != 0 {
+				t.Errorf("reclaimRPL count = %d, want 0 (segment-page id out of range)", count)
+			}
+			if p.RPLCorruptCount() != 1 {
+				t.Errorf("RPLCorruptCount() = %d, want 1", p.RPLCorruptCount())
+			}
+		})
 	}
 }

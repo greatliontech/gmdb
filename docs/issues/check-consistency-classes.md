@@ -24,9 +24,17 @@ routing (max(left) < S ≤ min(right)); desc.Count vs walked entries;
 nested-tree cell NestedCount vs actual members; NumKeyspaces vs
 descriptor-leaf count.
 
+Additional class (redeferred here from the chunk-4 review, finding
+M3): `walkRPL` is a third raw-accessor RPL reader that performs no
+footer verification — a checksum-bad-but-decodable segment passes
+Check clean while reclamation quarantines it, and its flipped entries
+taint the pending accounting set (walkTree footer-verifies tree
+pages; the asymmetry is silent).
+
 ## Fix direction
 
-Extend the Check walk with the five classes (ordering + separator
+Extend the Check walk with the five classes above plus RPL-segment
+footer verification in walkRPL (ordering + separator
 bounds threaded through the walk; counts tallied per keyspace/cell).
 Keep O(live pages), no extra I/O passes. Regression: forge each
 corruption class on a checksums-off DB; assert Check reports it.

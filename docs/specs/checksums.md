@@ -177,6 +177,28 @@ within the same transaction. For a depth-4 lookup the cost is
 page-fault costs. For full-database scans the cost is bounded
 by memory bandwidth.
 
+RPL segment pages are read outside the verifying page accessor
+(the reclamation walk and the Open-time chain rebuild use the raw
+accessor), so those two walkers verify each segment's footer
+themselves before decoding — when the page checksum is enabled;
+with checksums off they fall back to structural decode plus the
+bounds below, and an in-range wrong entry in a decodable segment
+is then inherently undetectable (the trade the `PageChecksum`
+option states). A checksum-bad segment is quarantined by
+reclamation (bounded leak, reclamation continues past it); the
+Open walk rejects a checksum-bad head (the malformed-head
+convention) and treats a checksum-bad non-head as the stale-tail
+boundary. Reclamation additionally bounds the segment page id and
+every decoded entry against the bitmap's allocatable range before
+freeing anything, whole-segment-atomically — a decodable segment
+with a forged entry must quarantine, never free a live in-range
+page unchecked or crash on an out-of-range one (integrity.md's
+error-not-crash contract). (Enforced in `reclaimRPL` /
+`rebuildRPLChain`; pinned by the checksum-mismatch and
+out-of-range-entry quarantine tests in
+`internal/pager/freespace_test.go` and the corrupt-chain reopen
+tests in `rpl_recovery_test.go`.)
+
 Pages CoW'd in the current transaction have their footers
 computed at commit time on the dirty slab buffer, before the
 pwrite.

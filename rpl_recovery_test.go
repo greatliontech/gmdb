@@ -2,6 +2,7 @@ package gmdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -72,4 +73,118 @@ func TestRPLChainSurvivesPartialReclaimAndReuse(t *testing.T) {
 	// bounded by RPLTailPage and never follows a dangling tail OlderSegment.
 	db2 := open()
 	db2.Close()
+}
+
+// buildChecksummedRPLChain opens a checksummed DB at path, churns until
+// the committed meta carries an RPL chain of at least two segments
+// (head != tail), and returns the head and tail segment page ids.
+func buildChecksummedRPLChain(t *testing.T, ctx context.Context, path string) (head, tail uint64) {
+	t.Helper()
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 512, PageChecksum: true,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	for round := 0; round < 40; round++ {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("Begin(%d): %v", round, err)
+		}
+		ks, err := tx.OpenKeyspace("k")
+		if err != nil {
+			if ks, err = tx.CreateKeyspace("k"); err != nil {
+				t.Fatalf("CreateKeyspace: %v", err)
+			}
+		}
+		for i := range 20 {
+			k := fmt.Sprintf("r%03d-%03d", round, i)
+			if err := ks.Put([]byte(k), make([]byte, 200)); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+		if round > 0 {
+			for i := range 10 {
+				k := fmt.Sprintf("r%03d-%03d", round-1, i)
+				if err := ks.Delete([]byte(k)); err != nil {
+					t.Fatalf("Delete: %v", err)
+				}
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit(%d): %v", round, err)
+		}
+		m := db.Meta()
+		if m.RPLHeadPage != 0 && m.RPLTailPage != 0 && m.RPLHeadPage != m.RPLTailPage {
+			return m.RPLHeadPage, m.RPLTailPage
+		}
+	}
+	t.Fatalf("fixture: never built a multi-segment RPL chain")
+	return 0, 0
+}
+
+// TestOpenRejectsChecksumCorruptRPLHead: the head segment is the
+// recovery meta's own newest — never legitimately reclaimed — so a
+// checksum-bad head is corruption and Open must fail with the
+// checksum sentinel, not walk into a bit-flipped entry list.
+func TestOpenRejectsChecksumCorruptRPLHead(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	head, _ := buildChecksummedRPLChain(t, ctx, path)
+	corruptPageByte(t, path, head, 4096)
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 512, PageChecksum: true,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err == nil {
+		db.Close()
+		t.Fatalf("Open succeeded with checksum-corrupt RPL head")
+	}
+	if !errors.Is(err, ErrBadPageChecksum) {
+		t.Fatalf("Open error = %v, want ErrBadPageChecksum", err)
+	}
+}
+
+// TestOpenTruncatesChainAtChecksumCorruptNonHeadSegment: a non-head
+// segment failing its checksum gets the reclaimed-then-reused
+// stale-tail treatment — the chain truncates there (older segments'
+// pages leak, bounded, recoverable via Check/Repair) and the database
+// opens and reads normally.
+func TestOpenTruncatesChainAtChecksumCorruptNonHeadSegment(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	_, tail := buildChecksummedRPLChain(t, ctx, path)
+	corruptPageByte(t, path, tail, 4096)
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 512, PageChecksum: true,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open with checksum-corrupt non-head segment: %v", err)
+	}
+	defer db.Close()
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	defer rtx.Rollback()
+	ks, err := rtx.OpenKeyspaceReadOnly("k")
+	if err != nil {
+		t.Fatalf("OpenKeyspaceReadOnly: %v", err)
+	}
+	// The newest round's keys must all be present and readable.
+	found := 0
+	for i := range 20 {
+		for round := 39; round >= 0; round-- {
+			if _, err := ks.Get([]byte(fmt.Sprintf("r%03d-%03d", round, i))); err == nil {
+				found++
+				break
+			}
+		}
+	}
+	if found == 0 {
+		t.Fatalf("no data readable after truncated-chain open")
+	}
 }

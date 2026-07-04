@@ -59,10 +59,10 @@ func (s RPLSegment) EntryCount() int { return len(s.PageIDs) }
 // of range, or buf too short for cfg.PageSize). Callers must treat false
 // as corruption.
 //
-// Does NOT verify the xxhash64 footer; the pager performs footer
-// verification before calling DecodeRPLSegment, and the cached
-// verification result satisfies the per-tx verification cache invariant
-// from checksums.md.
+// Does NOT verify the xxhash64 footer — every caller that reads
+// segment pages via a raw (non-verifying) accessor must verify the
+// footer itself (VerifyPageFooter, when PageChecksum is enabled)
+// before trusting the decoded view, per checksums.md §Verification.
 func DecodeRPLSegment(buf []byte, cfg Config) (RPLSegment, bool) {
 	cfg.mustValidate()
 	if len(buf) < int(cfg.PageSize) {
