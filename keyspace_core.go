@@ -163,20 +163,34 @@ func (ks *keyspaceCore) checkReadable(key []byte) error {
 // values), so the desc.Count subtraction is consistent for both. A
 // count exceeding desc.Count is impossible absent corruption and is
 // surfaced as ErrCorrupted rather than underflowing.
+//
+// The whole walk runs under a shallow savepoint (see Keyspace.Put's
+// atomicity rationale): the three-phase walker frees subtrees and
+// retires CoW'd pages throughout, and can still fail afterwards
+// (ErrDBFull/ErrTxTooLarge on a boundary rebalance), so a per-op error
+// followed by Tx.Commit would otherwise publish still-referenced
+// retired pages to the RPL and orphan in-flight allocations. The
+// count>desc.Count corruption return restores too — the mutated tree
+// is abandoned in that branch (desc.Root keeps the old root), which
+// without the restore leaves the same inconsistent page state behind.
 func (ks *keyspaceCore) deleteRangeUnindexed(start, end []byte, cellFree btree.PerCellFreeFn, markStale func()) (uint64, error) {
 	cfg := ks.builderCfg()
 	mergeThreshold := ks.tx.db.opts.MergeThreshold
+	sp := ks.tx.pgr.BeginShallowSavepoint()
 	count, newRoot, err := btree.DeleteRange(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, mergeThreshold, start, end, cellFree)
 	if err != nil {
+		ks.tx.pgr.RestoreSavepoint(sp)
 		return 0, mapBtreeErr(err)
 	}
+	if count > ks.desc.Count {
+		ks.tx.pgr.RestoreSavepoint(sp)
+		return 0, fmt.Errorf("%w: DeleteRange count=%d exceeds desc.Count=%d for keyspace %q",
+			ErrCorrupted, count, ks.desc.Count, ks.name.Value())
+	}
+	ks.tx.pgr.ReleaseSavepoint(sp)
 	if count == 0 {
 		// No-op — no descriptor or cursor invalidation, no transition.
 		return 0, nil
-	}
-	if count > ks.desc.Count {
-		return 0, fmt.Errorf("%w: DeleteRange count=%d exceeds desc.Count=%d for keyspace %q",
-			ErrCorrupted, count, ks.desc.Count, ks.name.Value())
 	}
 	ks.desc.Root = newRoot
 	ks.desc.Count -= count

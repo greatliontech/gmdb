@@ -64,6 +64,7 @@ findings each shared-fix row covers.
 |------|-------|---------|
 | [recovery-model-highest-epoch](recovery-model-highest-epoch.md) | condition (commit/recovery/RPL redesign, or grove-backport rotation) | **design direction** Replace per-commit checkpoint-preferring recovery with a highest-valid-epoch rule + an on-disk `durableEpoch` marker, retiring the live-vs-recovery meta asymmetry, the `lastCheckpointTxnID` bound, and the genesis-rollback gotcha. Multi-process design questions; substantial Spec-first effort. Spun out of `sync-mode-surface-consolidation`. |
 | [cross-namespace-reader-heartbeat-liveness](cross-namespace-reader-heartbeat-liveness.md) | condition (when cross-process stale-detection is revisited) | **[L]** Cross-namespace (container) readers have no `kill()` fallback — a >10s heartbeat pause (docker pause, cgroup freeze, swap) evicts a live reader → reads reclaimed-and-reused pages. Document the data-integrity bound + reconsider the default. *Finding 21.* |
+| [commit-headroom-at-tx-budget-cap](commit-headroom-at-tx-budget-cap.md) | condition (slab-budget accounting / commit-pipeline allocation model revisit) | **[M]** Commit-pipeline allocations count against MaxTxBufferBytes, so a tx driven to the cap cannot commit (ErrTxTooLarge at Commit) — partial work only recoverable by Rollback. Found building the chunk-3 regression fixture (2026-07-05). |
 
 ## Open — full-codebase audit (2026-07-04)
 
@@ -78,7 +79,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [btree-retired-pages-rollback](btree-retired-pages-rollback.md) | chunk 3 | **[H]** Failed un-indexed Put/Delete retires still-referenced pages; commit publishes them to the RPL → reclamation frees live tree pages → committed-data corruption. |
 | [pager-rpl-footer-verification](pager-rpl-footer-verification.md) | chunk 4 | **[H]** RPL segments never checksum-verified on reclaim/Open walks — decodable bit-flip frees live pages or panics in the bitmap. |
 | [pager-freed-page-write-skip](pager-freed-page-write-skip.md) | chunk 5 | **[L]** Freed/tail-refunded pages' slab buffers still pwritten at commit — write amplification only. |
 | [lock-stale-slot-clear-identity](lock-stale-slot-clear-identity.md) | chunk 6 | **[H]** Stale-clear leaves dead PID/heartbeat; next acquirer falsely evicted mid-publish → use-after-reclaim. Spec prescribes the defect (amend with fix). |

@@ -73,7 +73,22 @@ Invariant: kind=entailed;
   violation=A bitmap that contradicts the tree set lets the
     allocator hand out an in-use page (false free) or refuses to
     allocate a genuinely free one (false used → file growth +
-    spurious `ErrDBFull`).
+    spurious `ErrDBFull`). The load-bearing reachable case is a row
+    mutation failing AFTER the btree retired prior-tx pages but
+    before its last fallible allocation, followed by Commit (the
+    rest-of-tx-continues contract): the commit would publish
+    still-referenced pages to the RPL (reclamation later hands live
+    tree pages to the allocator) and durably leak the mutation's
+    orphaned allocations. Every keyspace-layer row mutation
+    therefore runs under a shallow pager savepoint restored on the
+    op's error path, indexed or not.
+    (Enforced by the unconditional `BeginShallowSavepoint` in
+    `Keyspace.Put`/`Delete`, `Cursor.Delete`,
+    `SetKeyspace.Put`/`Delete`/`DeleteValue`, and
+    `deleteRangeUnindexed`; pinned by
+    `TestFailedOpsLeavePagerOpStateUnchanged` and
+    `TestCommitAfterFailedOpsSurvivesReclamation` in
+    `op_failure_rollback_test.go`.)
 
 Invariant: kind=entailed;
   property=`NumFreePages` in the meta equals the bit-count of

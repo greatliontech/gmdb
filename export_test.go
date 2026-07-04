@@ -93,3 +93,15 @@ func (db *DB) Meta() page.Meta {
 	defer db.mu.Unlock()
 	return db.currentMeta
 }
+
+// RetiredPagesLen reports how many prior-tx pages the transaction has
+// retired so far (the set Commit publishes to the RPL). White-box
+// probe for the per-op rollback tests: a failed row mutation must not
+// leave retiredPages entries behind.
+func (tx *Tx) RetiredPagesLen() int { return len(tx.pgr.RetiredPages()) }
+
+// DirtyBytes reports the transaction's current slab budget usage.
+// White-box probe for tests that need to stay clear of the
+// MaxTxBufferBytes cap (e.g. to keep commit headroom while
+// exercising per-op budget failures).
+func (tx *Tx) DirtyBytes() int { return tx.pgr.DirtyBytes() }

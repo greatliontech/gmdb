@@ -590,36 +590,34 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	// Index maintenance is a no-op with no indexes, so invoking it with
 	// the provisional existed=false on that path is harmless.
 	//
-	// Two atomicity layers protect the indexed path against a per-op
-	// error followed by Tx.Commit (the rest-of-tx-continues contract):
+	// Two atomicity layers protect against a per-op error followed by
+	// Tx.Commit (the rest-of-tx-continues contract):
 	//
 	//   (a) rowSnap + restoreIndexes covers in-memory pinnedIndex.
 	//       {root,count} so flushIndexRegistry at Commit-after-error
 	//       does not write a half-mutated registry entry pointing at
-	//       a row that was never written.
+	//       a row that was never written. (Indexed keyspaces only —
+	//       trivially a no-op otherwise.)
 	//
 	//   (b) BeginShallowSavepoint / ReleaseSavepoint(success) /
-	//       RestoreSavepoint(error) covers on-disk page allocations
-	//       the maintenance helper's btree.Put / btree.Delete (and a
-	//       subsequent row btree.Put) made — without it those pages
-	//       are unreachable from the active meta yet have bitmap bit
-	//       clear on Commit-after-error (the engine's rest-of-tx-
-	//       continues per-op-error path), violating free-space.md's
-	//       entailed bitmap-consistency invariant ("every page below
-	//       HighWaterMark with bit clear is reachable from the active
-	//       meta, in the RPL, or is a meta/bitmap page"). The SHALLOW
-	//       kind preserves intra-tx loose-page recycling so an indexed
-	//       bulk-Put workload does not grow the file O(N·depth);
-	//       nested-kind savepoint would suspend loose-pop across every
-	//       Put and exhaust MaxSize for moderate batches.
-	//
-	// The un-indexed branch needs neither layer (no index pages
-	// allocated; the row PutReportExisting is the only mutation, and
-	// its own internal CoW failure mode is tracked separately).
-	var sp *pager.Savepoint
-	if indexed {
-		sp = ks.tx.pgr.BeginShallowSavepoint()
-	}
+	//       RestoreSavepoint(error) covers on-disk page state EVERY
+	//       row mutation touches, indexed or not: allocations the
+	//       maintenance helpers and the row btree op made (without
+	//       rollback those pages are unreachable from the active meta
+	//       yet have bitmap bit clear on Commit-after-error), and —
+	//       critically — retiredPages entries the row op appended
+	//       before its last fallible step (btree mutations free the
+	//       old CoW'd pages before the branch ascend, which can still
+	//       fail with ErrDBFull/ErrTxTooLarge; Commit would publish
+	//       those still-referenced pages to the RPL and reclamation
+	//       would hand live tree pages to the allocator — the
+	//       free-space.md bitmap-consistency invariant, both
+	//       directions). The SHALLOW kind preserves intra-tx
+	//       loose-page recycling so a bulk-Put workload does not grow
+	//       the file O(N·depth); nested-kind savepoint would suspend
+	//       loose-pop across every Put and exhaust MaxSize for
+	//       moderate batches.
+	sp := ks.tx.pgr.BeginShallowSavepoint()
 	rowSnap := snapshotIndexes(ks.indexes)
 	if err := ks.applyIndexMaintenanceOnPut(key, oldValue, value, existed); err != nil {
 		// The helper does not snapshot pinned state — see its godoc.
@@ -627,9 +625,7 @@ func (ks *Keyspace) Put(key, value []byte) error {
 		// state, covering both this helper's failure and the row
 		// btree.Put failure below.
 		restoreIndexes(ks.indexes, rowSnap)
-		if indexed {
-			ks.tx.pgr.RestoreSavepoint(sp)
-		}
+		ks.tx.pgr.RestoreSavepoint(sp)
 		return err
 	}
 	var newRoot uint64
@@ -641,14 +637,10 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	}
 	if err != nil {
 		restoreIndexes(ks.indexes, rowSnap)
-		if indexed {
-			ks.tx.pgr.RestoreSavepoint(sp)
-		}
+		ks.tx.pgr.RestoreSavepoint(sp)
 		return mapBtreeErr(err)
 	}
-	if indexed {
-		ks.tx.pgr.ReleaseSavepoint(sp)
-	}
+	ks.tx.pgr.ReleaseSavepoint(sp)
 	ks.desc.Root = newRoot
 	if !existed {
 		ks.desc.Count++
@@ -684,15 +676,16 @@ func (ks *Keyspace) Delete(key []byte) error {
 	// so the extractor can compute the index entries to delete;
 	// then apply index maintenance; then delete the row.
 	//
-	// Atomicity has two layers on the indexed path (see Keyspace.Put
-	// godoc for the full rationale): (a) rowSnap + restoreIndexes for
-	// in-memory pinnedIndex.{root,count}; (b) Pager.BeginShallowSavepoint
-	// / Release|Restore for on-disk page allocations the maintenance
-	// helper's btree.Delete (and the row btree.Delete below) made,
-	// so a per-op error followed by Tx.Commit does not orphan the
-	// in-flight allocations. The SHALLOW kind preserves intra-tx
-	// loose-page recycling so an indexed bulk-Delete workload does
-	// not grow the file O(N·depth).
+	// Atomicity has two layers (see Keyspace.Put godoc for the full
+	// rationale): (a) rowSnap + restoreIndexes for in-memory
+	// pinnedIndex.{root,count} (indexed only); (b) the unconditional
+	// Pager.BeginShallowSavepoint / Release|Restore for on-disk page
+	// state — allocations AND retiredPages the maintenance helpers
+	// and the row btree.Delete made — so a per-op error followed by
+	// Tx.Commit neither orphans in-flight allocations nor publishes
+	// still-referenced retired pages to the RPL. The SHALLOW kind
+	// preserves intra-tx loose-page recycling so a bulk-Delete
+	// workload does not grow the file O(N·depth).
 	var rowSnap indexSnapshot
 	var sp *pager.Savepoint
 	indexed := len(ks.indexes) > 0
@@ -717,21 +710,19 @@ func (ks *Keyspace) Delete(key []byte) error {
 			ks.tx.pgr.RestoreSavepoint(sp)
 			return err
 		}
+	} else {
+		sp = ks.tx.pgr.BeginShallowSavepoint()
 	}
 	newRoot, err := btree.Delete(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, mergeThreshold, key)
 	if err != nil {
 		restoreIndexes(ks.indexes, rowSnap)
-		if indexed {
-			ks.tx.pgr.RestoreSavepoint(sp)
-		}
+		ks.tx.pgr.RestoreSavepoint(sp)
 		if errors.Is(err, btree.ErrNotFound) {
 			return ErrNotFound
 		}
 		return mapBtreeErr(err)
 	}
-	if indexed {
-		ks.tx.pgr.ReleaseSavepoint(sp)
-	}
+	ks.tx.pgr.ReleaseSavepoint(sp)
 	ks.desc.Root = newRoot
 	ks.desc.Count--
 	ks.markDirty()
@@ -1174,14 +1165,16 @@ func (c *Cursor) Delete() error {
 	// current (key, value). Copy out because c.inner.Delete may
 	// CoW or free the underlying mmap-borrowed slices.
 	//
-	// Atomicity has two layers on the indexed path (see Keyspace.Put
-	// godoc for the full rationale): rowSnap + restoreIndexes covers
-	// in-memory pinnedIndex; BeginShallowSavepoint / Release|Restore
-	// covers on-disk page allocations the maintenance helper's
-	// btree.Delete (and the row c.inner.Delete below) made — so a
-	// per-op error followed by Tx.Commit does not orphan the in-
-	// flight allocations. The SHALLOW kind preserves intra-tx
-	// loose-page recycling across the cursor-driven delete loop.
+	// Atomicity has two layers (see Keyspace.Put godoc for the full
+	// rationale): rowSnap + restoreIndexes covers in-memory
+	// pinnedIndex (indexed only); the unconditional
+	// BeginShallowSavepoint / Release|Restore covers on-disk page
+	// state — allocations AND retiredPages — the maintenance helpers
+	// and the row c.inner.Delete made, so a per-op error followed by
+	// Tx.Commit neither orphans in-flight allocations nor publishes
+	// still-referenced retired pages to the RPL. The SHALLOW kind
+	// preserves intra-tx loose-page recycling across the
+	// cursor-driven delete loop.
 	var rowSnap indexSnapshot
 	var sp *pager.Savepoint
 	indexed := len(c.ks.indexes) > 0
@@ -1218,15 +1211,15 @@ func (c *Cursor) Delete() error {
 			c.ks.tx.pgr.RestoreSavepoint(sp)
 			return err
 		}
+	} else {
+		sp = c.ks.tx.pgr.BeginShallowSavepoint()
 	}
 	if err := c.inner.Delete(); err != nil {
 		// Atomicity: revert pinned state on row-write
 		// failure so flushIndexRegistry doesn't commit partial-
 		// state indexes pointing at a still-existing row.
 		restoreIndexes(c.ks.indexes, rowSnap)
-		if indexed {
-			c.ks.tx.pgr.RestoreSavepoint(sp)
-		}
+		c.ks.tx.pgr.RestoreSavepoint(sp)
 		if errors.Is(err, btree.ErrCursorUnpositioned) {
 			return ErrCursorUnpositioned
 		}
@@ -1238,9 +1231,7 @@ func (c *Cursor) Delete() error {
 		}
 		return mapBtreeErr(err)
 	}
-	if indexed {
-		c.ks.tx.pgr.ReleaseSavepoint(sp)
-	}
+	c.ks.tx.pgr.ReleaseSavepoint(sp)
 	// Cursor.Delete mutated the keyspace's B+tree. Update the
 	// in-memory descriptor (mirrors Keyspace.Delete's post-
 	// conditions). The descriptor is persisted at Tx.Commit's
@@ -1539,6 +1530,14 @@ func mapBtreeErr(err error) error {
 		return fmt.Errorf("%w: %v", ErrCorrupted, err)
 	case errors.Is(err, btree.ErrKeyTooLarge):
 		return fmt.Errorf("%w: %v", ErrKeyTooLarge, err)
+	case errors.Is(err, pager.ErrTxTooLarge):
+		return fmt.Errorf("%w: %v", ErrTxTooLarge, err)
+	case errors.Is(err, pager.ErrDBFull):
+		// A btree mutation that runs out of pages mid-op surfaces the
+		// pager sentinel wrapped in btree context; without this arm
+		// the public ErrDBFull contract (errors.go) silently breaks
+		// on every row-op path.
+		return fmt.Errorf("%w: %v", ErrDBFull, err)
 	}
 	return err
 }

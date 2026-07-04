@@ -10,7 +10,7 @@ regression test → adversarial review → close-out gate → commit) per
 
 - [x] 1. page-compressed-leaf-sharedlen-validation
 - [x] 2. btree-delete-separator-branch-overflow
-- [ ] 3. btree-retired-pages-rollback
+- [x] 3. btree-retired-pages-rollback
 - [ ] 4. pager-rpl-footer-verification
 - [ ] 5. pager-freed-page-write-skip
 - [ ] 6. lock-stale-slot-clear-identity

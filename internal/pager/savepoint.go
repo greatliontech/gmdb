@@ -11,11 +11,14 @@ import (
 // Transactions, BeginChild semantics) that suspends loose-pop for the
 // duration so a child can never hand out a page id whose slab buffer
 // the parent's tree still references (pager-slab.md §Slab Lifecycle Across Nested Transactions). The Shallow kind is
-// the internal-helper flavour used by per-row indexed maintenance
-// (Keyspace.Put / Delete / Cursor.Delete; SetKeyspace.Put / Delete /
-// DeleteValue) to make the helper + the subsequent row btree mutation
-// atomic at the page-persistence layer without giving up across-Put
-// loose-page recycling. Loose-pop stays enabled under a Shallow
+// the internal-helper flavour used by every keyspace-layer row
+// mutation, indexed or not (Keyspace.Put / Delete / Cursor.Delete;
+// SetKeyspace.Put / Delete / DeleteValue) and by the un-indexed
+// DeleteRange walk, to make the whole per-op mutation — index
+// maintenance, row btree op, and the retiredPages/allocation state
+// btree mutations accrue before their last fallible step — atomic at
+// the page-persistence layer without giving up across-Put loose-page
+// recycling. Loose-pop stays enabled under a Shallow
 // savepoint; each loose-pop event appends a (id, original-buffer)
 // entry to the savepoint's loosePopLog so Restore can re-attach the
 // detached buffer and re-add id to loosePages.
@@ -242,9 +245,9 @@ func (p *Pager) recordSavepointUndo(field savepointUndoField, key uint64, wasPre
 // resolve before its parent, which the root package enforces via the
 // parent-freeze rule (ErrChildActive).
 //
-// For internal-helper atomicity (per-row indexed maintenance), use
-// BeginShallowSavepoint instead: it preserves loose-pop so across-Put
-// loose-page recycling stays bounded.
+// For internal-helper atomicity (the per-op row mutations, indexed or
+// not), use BeginShallowSavepoint instead: it preserves loose-pop so
+// across-Put loose-page recycling stays bounded.
 func (p *Pager) BeginSavepoint() *Savepoint {
 	if p.readOnly {
 		return nil
@@ -270,13 +273,14 @@ func (p *Pager) BeginSavepoint() *Savepoint {
 // exactly one of RestoreSavepoint (rollback) or ReleaseSavepoint
 // (success). Returns nil on a read-only pager.
 //
-// Shallow savepoints make a per-row indexed-maintenance helper
-// invocation atomic at the page-persistence layer: a per-op error
-// inside an indexed Keyspace.{Put,Delete} / Cursor.Delete /
-// SetKeyspace.{Put,Delete,DeleteValue} followed by Tx.Commit (the
-// engine's rest-of-tx-continues contract) does not orphan the
-// in-flight allocations — see free-space.md's entailed bitmap-
-// consistency invariant.
+// Shallow savepoints make a per-row mutation atomic at the
+// page-persistence layer: a per-op error inside Keyspace.{Put,Delete}
+// / Cursor.Delete / SetKeyspace.{Put,Delete,DeleteValue} (indexed or
+// not) or the un-indexed DeleteRange walk, followed by Tx.Commit (the
+// engine's rest-of-tx-continues contract), neither orphans the
+// in-flight allocations nor publishes still-referenced retired pages
+// to the RPL — see free-space.md's entailed bitmap-consistency
+// invariant.
 //
 // Single-active per pager. At most one SHALLOW savepoint may be
 // active on the pager at any moment (transactions.md §Nested
@@ -287,11 +291,12 @@ func (p *Pager) BeginSavepoint() *Savepoint {
 // so on Restore the outer would pool-Put the buffer the inner just
 // re-installed — leaving the buf simultaneously in the pool free
 // list and in p.dirty[id], a use-after-free in user-visible page
-// data on the next bufPool.Get(). The 6 per-row indexed-maintenance
-// production callers (the only legitimate users of this primitive)
-// each open-and-resolve exactly one shallow per call and do not
-// nest; the panic surfaces a programming-discipline violation at
-// the API surface rather than allowing the buffer alias to form.
+// data on the next bufPool.Get(). The per-op production callers
+// (the keyspace-layer row mutations — indexed or not — and the
+// un-indexed DeleteRange walk; the only legitimate users of this
+// primitive) each open-and-resolve exactly one shallow per call and
+// do not nest; the panic surfaces a programming-discipline violation
+// at the API surface rather than allowing the buffer alias to form.
 //
 // SHALLOW-inside-NESTED is allowed (NESTED suspends loose-pop via
 // savepointDepth > 0, so no loose-pop event fires inside the

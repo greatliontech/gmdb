@@ -421,9 +421,10 @@ truncates the log to length 0 (mirroring `bitmap.Discard`'s
 no-open-Snapshot truncation). Per-Savepoint memory is therefore
 `O(state-changing mutations observed during this savepoint's
 window)`, never `O(cumulative tx state at Begin time)` — which is
-what makes per-row `BeginShallowSavepoint` (one per indexed
+what makes per-row `BeginShallowSavepoint` (one per
 `Keyspace.Put`/`Delete`/`Cursor.Delete`, `SetKeyspace.Put`/
-`Delete`/`DeleteValue`) safe to invoke N times in a single tx:
+`Delete`/`DeleteValue` — indexed or not — plus one per un-indexed
+`DeleteRange` walk) safe to invoke N times in a single tx:
 total clone work across the tx is `O(N)`, not `O(N²)`.
 
 The slab's `dirty` map specifically is tracked via append-only
@@ -453,10 +454,11 @@ loose-pop event. To make the contract structural (illegal-state-
 unrepresentable rather than caller-discipline), `Pager.
 BeginShallowSavepoint` **panics if another SHALLOW savepoint is
 already unresolved on the pager** — at most one SHALLOW is
-active per pager at any moment. The 6 per-row indexed-maintenance
-helpers (the only legitimate callers) each open-and-resolve
-exactly one SHALLOW per call and do not nest, so the rule is
-free in practice. SHALLOW-inside-NESTED and NESTED-inside-
+active per pager at any moment. The per-op callers — every
+keyspace-layer row mutation, indexed or not, plus the un-indexed
+`DeleteRange` walk (the only legitimate callers) — each
+open-and-resolve exactly one SHALLOW per call and do not nest,
+so the rule is free in practice. SHALLOW-inside-NESTED and NESTED-inside-
 SHALLOW remain allowed: NESTED suspends loose-pop via
 `savepointDepth > 0`, so no loose-pop fires inside the nested
 window and no alias can form regardless of which kind is at the
@@ -493,10 +495,12 @@ A **write-helper** is an internal API on `*Tx` (or on a `*Keyspace` /
 `*SetKeyspace` rooted in a `*Tx`) that mutates more than one page
 inside a single user-visible operation — the DDL surface
 (`CreateKeyspace` with indexes, `TxIndexes.Rebuild`, `TxIndexes.Drop`,
-`tx.DeleteKeyspace`'s three-subtree retirement), the per-row indexed
-maintenance path (`Keyspace.Put`/`Delete`, `Cursor.Delete`,
-`SetKeyspace.Put`/`Delete`/`DeleteValue`), and any future helper
-following the same shape.
+`tx.DeleteKeyspace`'s three-subtree retirement), the per-row
+mutation path (`Keyspace.Put`/`Delete`, `Cursor.Delete`,
+`SetKeyspace.Put`/`Delete`/`DeleteValue` — whose btree row op
+retires prior-tx pages before its last fallible step even with no
+indexes declared), the un-indexed `DeleteRange` walk, and any
+future helper following the same shape.
 
 **Rest-of-tx-continues contract.** A per-op error returned by such a
 helper does NOT auto-rollback the tx — `Tx.Commit` is a separate
@@ -546,9 +550,13 @@ shape:
   reuse for the duration — acceptable here because each helper runs
   at most once per tx and the suspension window does not multiply.
 
-- **Shallow savepoint** (`Pager.BeginShallowSavepoint`) for per-row
-  indexed maintenance — `Keyspace.Put`/`Delete`, `Cursor.Delete`,
-  `SetKeyspace.Put`/`Delete`/`DeleteValue`. Shallow preserves
+- **Shallow savepoint** (`Pager.BeginShallowSavepoint`) for every
+  per-row mutation — `Keyspace.Put`/`Delete`, `Cursor.Delete`,
+  `SetKeyspace.Put`/`Delete`/`DeleteValue`, indexed or not (the
+  row btree op itself retires prior-tx pages before its last
+  fallible step; free-space.md's bitmap-consistency invariant
+  needs the rollback regardless of index maintenance) — and for
+  the un-indexed `DeleteRange` walk. Shallow preserves
   loose-pop across the savepoint window so an N-row indexed-Put
   workload stays bounded in file growth (the nested kind's
   loose-pop suspension would multiply to O(N·depth) and exhaust
@@ -559,7 +567,7 @@ shape:
   alias the same loose-popped `*[]byte` across their
   `loosePopLog`s and corrupt the pool/`dirty` invariant on
   Restore (see §Nested Transactions §Why this is cheap for the
-  alias mechanism and the single-owner contract). The six callers
+  alias mechanism and the single-owner contract). The callers
   listed above each open-and-resolve exactly one SHALLOW per
   call and do not nest, so the rule is free in practice.
   SHALLOW-inside-NESTED and NESTED-inside-SHALLOW remain
