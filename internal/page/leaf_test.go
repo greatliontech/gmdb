@@ -619,19 +619,173 @@ func TestLeafReader_Validate_TotalOverInput(t *testing.T) {
 		}
 	})
 
-	t.Run("compressed-delta-UnsharedLen-oversize", func(t *testing.T) {
-		buf := mk()
+	// mkDelta builds a leaf whose first restart group genuinely
+	// contains delta entries (shared-prefix keys defeat the
+	// natural-break heuristic, which would otherwise give every key
+	// its own restart group and leave nothing delta-encoded — a
+	// forgery aimed at a "delta" would then corrupt a restart entry
+	// and pass for the wrong reason). Returns the page, the first
+	// delta's byte offset, and the restart entry's full key.
+	mkDelta := func(t *testing.T) ([]byte, int, []byte) {
+		t.Helper()
+		buf := buildLeaf(t, cfg, [][2]string{
+			{"aaa-1", "v"}, {"aaa-2", "v"}, {"aaa-3", "v"},
+		})
 		r := NewLeafReader(buf, cfg)
-		// Walk to the first delta entry: restart at rt.Offset(0),
-		// delta starts after the restart's body.
+		if gc := r.rt.GroupEntryCount(0); gc < 2 {
+			t.Fatalf("fixture: group 0 has %d entries; need >= 2 for a real delta", gc)
+		}
 		restartOff := r.rt.Offset(0)
-		_, deltaOff := r.decodeRestartEntry(restartOff)
+		re, deltaOff := r.decodeRestartEntry(restartOff)
+		return buf, deltaOff, re.Key
+	}
+
+	t.Run("compressed-delta-UnsharedLen-oversize", func(t *testing.T) {
+		buf, deltaOff, _ := mkDelta(t)
 		// Delta entry layout: [Flags][SharedLen u16][UnsharedLen u16]...
 		// UnsharedLen at deltaOff+3.
 		le.PutUint16(buf[deltaOff+3:], 0xFFFF)
 		err := NewLeafReader(buf, cfg).Validate()
 		if err == nil || !errors.Is(err, ErrCorrupted) {
 			t.Errorf("forged delta UnsharedLen=0xFFFF: err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("compressed-delta-SharedLen-oversize", func(t *testing.T) {
+		// SharedLen far beyond any key: decodeDeltaEntry would panic
+		// slicing a keyBuf-backed prevKey. Validate must reject, not
+		// let read paths hit that panic.
+		buf, deltaOff, _ := mkDelta(t)
+		// SharedLen at deltaOff+1.
+		le.PutUint16(buf[deltaOff+1:], 0xFFFF)
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged delta SharedLen=0xFFFF: err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	// shiftStream moves buf[from:dataEnd) forward by two bytes,
+	// bumps DataEnd, and repoints every restart-table offset >= from
+	// at its shifted position. Every entry remains VALID at its
+	// table-declared offset — only the stream-contiguity rule is
+	// broken (the two bytes left behind at `from` are exactly what a
+	// streaming reader would decode). Forgeries that land mid-entry
+	// get rejected by the CellFlags/bounds checks instead and would
+	// leave the contiguity guard untested (a surviving mutation in
+	// review round 1 caught precisely that).
+	shiftStream := func(t *testing.T, buf []byte, from int) {
+		t.Helper()
+		r := NewLeafReader(buf, cfg)
+		dataEnd := int(le.Uint16(buf[leafOffDataEnd:]))
+		tmp := append([]byte(nil), buf[from:dataEnd]...)
+		copy(buf[from+2:dataEnd+2], tmp)
+		le.PutUint16(buf[leafOffDataEnd:], uint16(dataEnd+2))
+		tableStart := cfg.ContentEnd() - r.rt.RestartCount()*restartTableEntrySize
+		for g := range r.rt.RestartCount() {
+			if off := r.rt.Offset(g); off >= from {
+				le.PutUint16(buf[tableStart+g*restartTableEntrySize:], uint16(off+2))
+			}
+		}
+	}
+
+	t.Run("compressed-restart-offset-not-stream-start", func(t *testing.T) {
+		// Restart-table Offset(0) must equal the entry-data start:
+		// the streaming iterator and FirstKey decode from offset 12
+		// unconditionally, so a table pointing at a valid entry
+		// deeper in the page leaves the leading bytes (which the
+		// stream WILL decode) completely unvalidated.
+		buf, _, _ := mkDelta(t)
+		shiftStream(t, buf, leafEntryStart)
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("valid entries shifted off stream start: err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("compressed-group-gap", func(t *testing.T) {
+		// A second group whose table offset does not equal the end of
+		// the first group's walk (gap) must be rejected — the
+		// streaming iterator crosses group boundaries by
+		// continuation, never via the table.
+		buf := buildLeaf(t, cfg, [][2]string{
+			{"aaa-1", "v"}, {"aaa-2", "v"},
+			{"bbb-1", "v"}, {"bbb-2", "v"}, // natural break → group 1
+		})
+		r := NewLeafReader(buf, cfg)
+		if r.rt.RestartCount() < 2 {
+			t.Fatalf("fixture: RestartCount=%d, need >= 2", r.rt.RestartCount())
+		}
+		shiftStream(t, buf, r.rt.Offset(1))
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("valid group 1 shifted off stream (gap): err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("compressed-DataEnd-trailing-slack", func(t *testing.T) {
+		// DataEnd past the stream end must be rejected: the splice
+		// paths validate and then APPEND at DataEnd, so slack would
+		// place the new entry outside the stream readers decode.
+		buf, _, _ := mkDelta(t)
+		dataEnd := int(le.Uint16(buf[leafOffDataEnd:]))
+		le.PutUint16(buf[leafOffDataEnd:], uint16(dataEnd+9))
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged DataEnd+9 (trailing slack): err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("uncompressed-DataEnd-trailing-slack", func(t *testing.T) {
+		cfgU := Config{PageSize: 4096, RestartGroupTarget: 1}
+		buf := buildLeaf(t, cfgU, [][2]string{{"alpha", "1"}, {"beta", "2"}})
+		dataEnd := int(le.Uint16(buf[ucLeafOffDataEnd:]))
+		le.PutUint16(buf[ucLeafOffDataEnd:], uint16(dataEnd+9))
+		err := NewLeafReader(buf, cfgU).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged uc DataEnd+9 (trailing slack): err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("empty-leaf-DataEnd-slack", func(t *testing.T) {
+		buf := buildLeaf(t, cfg, nil)
+		dataEnd := int(le.Uint16(buf[leafOffDataEnd:]))
+		if dataEnd != leafEntryStart {
+			t.Fatalf("fixture: empty leaf DataEnd=%d, want %d", dataEnd, leafEntryStart)
+		}
+		le.PutUint16(buf[leafOffDataEnd:], uint16(leafEntryStart+9))
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged empty-leaf DataEnd (slack): err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("uncompressed-offset-not-stream-position", func(t *testing.T) {
+		// The uncompressed offset table is positional AND must match
+		// the sequential stream: Next() streams from offset 12 by
+		// continuation. Point entry 1's slot at entry 0 (valid
+		// range, wrong position).
+		cfgU := Config{PageSize: 4096, RestartGroupTarget: 1}
+		buf := buildLeaf(t, cfgU, [][2]string{{"alpha", "1"}, {"beta", "2"}})
+		r := NewLeafReader(buf, cfgU)
+		tableStart := cfgU.ContentEnd() - r.count*ucOffsetEntrySize
+		le.PutUint16(buf[tableStart+ucOffsetEntrySize:], uint16(r.ucOffset(0)))
+		err := NewLeafReader(buf, cfgU).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged uc offset[1] -> offset[0]: err=%v; want ErrCorrupted", err)
+		}
+	})
+
+	t.Run("compressed-delta-SharedLen-exceeds-prev-key", func(t *testing.T) {
+		// The silent variant: SharedLen only slightly beyond the
+		// previous full key. A page-buffer-backed prevKey has spare
+		// capacity, so decode would not panic — it would fabricate a
+		// key from adjacent page bytes. Validate must reject per the
+		// page-formats.md delta-reconstruction invariant.
+		buf, deltaOff, restartKey := mkDelta(t)
+		le.PutUint16(buf[deltaOff+1:], uint16(len(restartKey)+1))
+		err := NewLeafReader(buf, cfg).Validate()
+		if err == nil || !errors.Is(err, ErrCorrupted) {
+			t.Errorf("forged delta SharedLen=len(prevKey)+1: err=%v; want ErrCorrupted", err)
 		}
 	})
 
@@ -719,4 +873,63 @@ func TestConfig_ValidateRejectsBadRestartGroupTarget(t *testing.T) {
 			t.Errorf("Validate(RestartGroupTarget=%d): %v; want nil", ok, err)
 		}
 	}
+}
+
+// FuzzLeafValidateTotal pins the trust-boundary contract stated on
+// Validate: over arbitrary page bytes, Validate never panics, and any
+// page Validate accepts can be fully read (Iter walk + SearchLeaf)
+// without panicking. The read paths deliberately skip bounds checks
+// (hot path), so this property is exactly what makes Validate a
+// sufficient gate for pages resolved from disk.
+func FuzzLeafValidateTotal(f *testing.F) {
+	cfgC := Config{PageSize: 4096, RestartGroupTarget: 4}
+	cfgU := Config{PageSize: 4096, RestartGroupTarget: 1}
+	f.Add(buildLeafF(cfgC, [][2]string{{"aaa-1", "v"}, {"aaa-2", "v"}, {"aaa-3", "v"}}), byte(0), uint16(0))
+	f.Add(buildLeafF(cfgU, [][2]string{{"alpha", "1"}, {"beta", "2"}}), byte(0), uint16(0))
+	f.Fuzz(func(t *testing.T, page []byte, mutByte byte, mutOff uint16) {
+		if len(page) == 0 {
+			return
+		}
+		buf := make([]byte, cfgC.PageSize)
+		copy(buf, page)
+		// One targeted mutation beyond whatever the fuzzer did to the
+		// raw bytes — biases the search toward near-valid pages.
+		buf[int(mutOff)%len(buf)] ^= mutByte
+		// Mirror the production boundary: callers gate on the Type
+		// byte before constructing a LeafReader (which panics on
+		// non-leaf types by documented contract).
+		if typ, _, _, _ := ReadHeader(buf); !IsLeafType(typ) {
+			return
+		}
+		// One cfg suffices: LeafReader never reads RestartGroupTarget
+		// (builder-only), and ContentEnd depends only on
+		// PageSize/PageChecksum — identical across the seed configs.
+		r := NewLeafReader(buf, cfgC)
+		if err := r.Validate(); err != nil {
+			return
+		}
+		it := r.IterForReuse(nil, nil, nil)
+		for {
+			e, ok := it.Next()
+			if !ok {
+				break
+			}
+			// Every accepted entry's key must be searchable
+			// without panicking (found or not — ordering is not
+			// Validate's contract, totality is).
+			r.SearchLeaf(e.Key)
+		}
+	})
+}
+
+// buildLeafF is buildLeaf without the testing.T dependency (fuzz seed
+// construction runs outside a test context).
+func buildLeafF(cfg Config, entries [][2]string) []byte {
+	buf := make([]byte, cfg.PageSize)
+	b := NewLeafBuilder(buf, cfg)
+	for _, e := range entries {
+		b.AddInline([]byte(e[0]), []byte(e[1]))
+	}
+	b.Finish()
+	return buf
 }

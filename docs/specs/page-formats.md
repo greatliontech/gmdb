@@ -70,7 +70,38 @@ Invariant: kind=clause-explicit;
   violation=A delta entry whose `SharedLen` does not actually share
     `SharedLen` bytes with the previous entry's full key
     reconstructs a wrong key — cursor reads return wrong keys and
-    binary search lands in the wrong group.
+    binary search lands in the wrong group. The structurally
+    checkable half — `SharedLen` never exceeds the previous entry's
+    full-key length — is enforced at the read trust boundary
+    (`LeafReader.Validate`): an unbounded `SharedLen` makes decode
+    either panic or fabricate key bytes from adjacent page content.
+    (Enforced by `TestLeafReader_Validate_TotalOverInput` SharedLen
+    cases in `leaf_test.go`.)
+
+Invariant: kind=clause-explicit;
+  property=A leaf page's entry data is one contiguous stream
+    starting at the entry-data start (byte offset 12) and ending
+    exactly at `DataEnd`, entries in index order; every lookup-table
+    entry (compressed restart-table Offset, uncompressed
+    offset-table slot) equals its entry's position in that stream;
+  from=this spec §Cursor Iteration — the streaming iterator and
+    first-key reads decode by continuation from the entry-data
+    start with the unchecked hot-path decoders and never re-consult
+    the lookup tables mid-stream;
+  violation=A page whose table offsets each pass a range check but
+    do not match the stream (garbage bytes at offset 12 with the
+    table pointing past them; a gap or overlap between restart
+    groups) passes a per-table-offset walk, then a streaming read
+    decodes bytes validation never examined — a slice-bounds panic
+    or fabricated entries on a checksums-off page. A `DataEnd` past
+    the stream end (trailing slack) instead corrupts on WRITE: the
+    splice paths validate and then append the next entry at
+    `DataEnd`, placing it outside the stream the readers decode.
+    (Enforced by `LeafReader.Validate` exact stream-position
+    matching; pinned by `TestLeafReader_Validate_TotalOverInput`
+    contiguity cases and `FuzzLeafValidateTotal` — Validate-accepted
+    pages must survive a full Iter walk + SearchLeaf — in
+    `leaf_test.go`.)
 
 Invariant: kind=clause-explicit;
   property=A compressed leaf's `RestartCount × 4` bytes immediately
