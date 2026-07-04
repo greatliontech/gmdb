@@ -134,6 +134,29 @@ Invariant: kind=clause-explicit;
     `deepUnderflowChild` and rebalanced against its cousins after the
     parent's own cascade-merge produces a sibling-rich branch — see
     §Algorithm Phase 3 Rebalance below;
+    **Parent-capacity decline.** A redistribute (leaf or branch pair)
+    replaces the pair's boundary separator in the parent — recomputed
+    via shortest-separator for leaves, lifted from the combined cell
+    set for branches — and the replacement can be much longer than
+    the separator it displaces (a byte-balanced boundary landing
+    inside a long-shared-prefix cluster). A redistribute whose new
+    separator the parent branch cannot **physically** encode (capacity
+    is physical encoded size, the same bound as any branch encode)
+    also **declines**: the check runs on the redistribute plan, and
+    the redistribute allocates and frees nothing on decline. (For a
+    leaf pair the preceding merge *attempt* allocates and frees one
+    self-contained scratch page before the plan is reached; the
+    decline itself changes no page state.) Merges never need this
+    check: a merge removes a parent cell, which cannot grow the
+    parent's encoding. A decline for parent capacity is handled
+    exactly like a fill-floor decline — the underflowing child is
+    threaded upward or accepted below-floor; the delete itself always
+    succeeds. Without this clause a valid Delete/DeleteRange on such
+    a topology would fail with an encode error after the sibling
+    pages were already freed.
+    (Enforced by `parentFits` in the merge/redistribute helpers;
+    pinned by the parent-capacity-decline regression tests in
+    `internal/btree/delete_test.go`.)
   from=this spec §Algorithm Phase 3 rebalance + `api-surface.md`
     Options.MergeThreshold godoc (the percentage doubles as the
     merge **trigger** AND the post-mutation **floor**) +

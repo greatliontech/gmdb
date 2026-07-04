@@ -710,10 +710,29 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 			newRightID   uint64
 			newSeparator []byte
 		)
+		// parentFits candidate: the parent branch is later rebuilt from
+		// the CURRENT survivor boundaries (deleteRangeFromBranch's
+		// newCells loop) — separator keys at origCellKeys[origIdx-1]
+		// with sepKeyIdx's key replaced by the redistribute's newSep.
+		// Later merges only remove cells (never grow the encoding), and
+		// later separator replacements re-run this same check against
+		// the then-current set, so checking the current set is exact
+		// for this step and conservative for the final encode.
+		parentFits := func(newSep []byte) bool {
+			cand := make([]page.BranchCell, 0, len(*survivors)-1)
+			for jj := 1; jj < len(*survivors); jj++ {
+				k := origCellKeys[(*survivors)[jj].origIdx-1]
+				if (*survivors)[jj].origIdx-1 == sepKeyIdx {
+					k = newSep
+				}
+				cand = append(cand, page.BranchCell{Key: k})
+			}
+			return page.BranchEncodedSize(cfg, cand) <= cfg.ContentEnd()
+		}
 		if leftIsLeaf {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID)
+			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID, parentFits)
 		} else {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator)
+			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
 		}
 		if err != nil {
 			return err
@@ -723,13 +742,15 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 		}
 
 		if !isMerge && newLeftID == 0 {
-			// DECLINE (branch only): the redistribute could not restore the
-			// fill-floor for both halves (large lifted separator), so it
-			// changed nothing. Leave both survivors as-is — the underflowing
-			// one stays below MT, accepted per range-delete.md §Invariants
-			// "where reachable". Advance to the next survivor WITHOUT rewind:
-			// no page churn means no infinite re-pairing of an unhealable
-			// pair (the unreachable-floor cascade guard).
+			// DECLINE: the redistribute could not restore the fill-floor
+			// for both halves (branches, large lifted separator) or the
+			// parent cannot fit the recomputed separator (either level),
+			// so it changed nothing. Leave both survivors as-is — the
+			// underflowing one stays below MT, accepted per
+			// range-delete.md §Invariants "where reachable". Advance to
+			// the next survivor WITHOUT rewind: no page churn means no
+			// infinite re-pairing of an unhealable pair (the
+			// unreachable-floor cascade guard).
 			continue
 		}
 

@@ -78,7 +78,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [btree-delete-separator-branch-overflow](btree-delete-separator-branch-overflow.md) | chunk 2 | **[M]** Redistribute-grown separator can overflow a full parent branch; no split fallback on the delete path; siblings already retired at the failure return. |
 | [btree-retired-pages-rollback](btree-retired-pages-rollback.md) | chunk 3 | **[H]** Failed un-indexed Put/Delete retires still-referenced pages; commit publishes them to the RPL → reclamation frees live tree pages → committed-data corruption. |
 | [pager-rpl-footer-verification](pager-rpl-footer-verification.md) | chunk 4 | **[H]** RPL segments never checksum-verified on reclaim/Open walks — decodable bit-flip frees live pages or panics in the bitmap. |
 | [pager-freed-page-write-skip](pager-freed-page-write-skip.md) | chunk 5 | **[L]** Freed/tail-refunded pages' slab buffers still pwritten at commit — write amplification only. |

@@ -9,7 +9,7 @@ regression test → adversarial review → close-out gate → commit) per
 `docs/plans/v0-implementation.md` applies (`development: true`).
 
 - [x] 1. page-compressed-leaf-sharedlen-validation
-- [ ] 2. btree-delete-separator-branch-overflow
+- [x] 2. btree-delete-separator-branch-overflow
 - [ ] 3. btree-retired-pages-rollback
 - [ ] 4. pager-rpl-footer-verification
 - [ ] 5. pager-freed-page-write-skip

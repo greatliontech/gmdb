@@ -995,8 +995,316 @@ func TestMergeBranchesForgedSiblingNoPanic(t *testing.T) {
 	right[16], right[17] = 0xFF, 0xFF
 	pw.pages[2] = right
 
-	_, _, _, _, _, err := mergeOrRedistributeBranches(pw, cfg, DefaultMergeThreshold, 1, 2, []byte("sep"))
+	_, _, _, _, _, err := mergeOrRedistributeBranches(pw, cfg, DefaultMergeThreshold, 1, 2, []byte("sep"),
+		func([]byte) bool { return true })
 	if !errors.Is(err, ErrCorrupted) {
 		t.Fatalf("mergeOrRedistributeBranches with forged sibling = %v, want ErrCorrupted (no panic)", err)
+	}
+}
+
+// buildLeafPageForTest encodes entries into a freshly-zeroed page at
+// id, failing the test if any entry does not fit.
+func buildLeafPageForTest(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, entries []page.LeafEntry) []byte {
+	t.Helper()
+	buf, err := pw.ZeroPage(id)
+	if err != nil {
+		t.Fatalf("ZeroPage(%d): %v", id, err)
+	}
+	b := page.NewLeafBuilder(buf, cfg)
+	for _, e := range entries {
+		if !b.AddEntry(e) {
+			t.Fatalf("fixture leaf %d: entry %q does not fit", id, e.Key)
+		}
+	}
+	b.Finish()
+	return buf
+}
+
+// declineFixture builds the parent-capacity-decline topology shared by
+// the Delete and DeleteRange regression tests below:
+//
+//	root branch (near-full, ~zero slack)
+//	├─ leftmost: L0 — short "aNNN" keys, a hair above the fill floor
+//	├─ cells[0] = {"b", L1} — 1-byte boundary separator
+//	│    L1 — 300-byte-shared-prefix keys, near-full
+//	└─ cells[1..] = filler separators + tiny filler leaves
+//
+// Deleting from L0 underflows it; the pair cannot merge (combined
+// exceeds one page); any redistribute boundary lands inside L1's
+// prefix cluster, recomputing a ~300-byte separator the near-full
+// parent cannot fit — the redistribute must DECLINE.
+type declineFixture struct {
+	rootID     uint64
+	l0Keys     [][]byte
+	l1Keys     [][]byte
+	fillerKeys [][]byte
+	cellCount  int
+	sep0       []byte
+}
+
+func buildDeclineFixture(t *testing.T, pw *fakeWriter, cfg page.Config) declineFixture {
+	t.Helper()
+
+	l0Entries := make([]page.LeafEntry, 8)
+	l0Keys := make([][]byte, len(l0Entries))
+	for i := range l0Entries {
+		l0Keys[i] = fmt.Appendf(nil, "a%03d", i)
+		l0Entries[i] = page.LeafEntry{Key: l0Keys[i], Value: bytes.Repeat([]byte{'v'}, 130)}
+	}
+	pfx := bytes.Repeat([]byte("p"), 300)
+	l1Entries := make([]page.LeafEntry, 10)
+	l1Keys := make([][]byte, len(l1Entries))
+	for i := range l1Entries {
+		l1Keys[i] = fmt.Appendf(nil, "%s-%03d", pfx, i)
+		l1Entries[i] = page.LeafEntry{Key: l1Keys[i], Value: bytes.Repeat([]byte{'w'}, 330)}
+	}
+
+	l0ID, _ := pw.AllocPage()
+	l0Buf := buildLeafPageForTest(t, pw, cfg, l0ID, l0Entries)
+	l1ID, _ := pw.AllocPage()
+	buildLeafPageForTest(t, pw, cfg, l1ID, l1Entries)
+
+	// Fixture property 1: L0 is above the fill floor now, below it
+	// with its first entry gone (scratch measurement).
+	if leafUnderflow(l0Buf, cfg, DefaultMergeThreshold) {
+		t.Fatalf("fixture: L0 already below the fill floor")
+	}
+	scratch := make([]byte, cfg.PageSize)
+	sb := page.NewLeafBuilder(scratch, cfg)
+	for _, e := range l0Entries[1:] {
+		sb.AddEntry(e)
+	}
+	sb.Finish()
+	if !leafUnderflow(scratch, cfg, DefaultMergeThreshold) {
+		t.Fatalf("fixture: L0 minus one entry not below the fill floor")
+	}
+
+	// Fixture property 2: the pair cannot merge into one page.
+	scratch2 := make([]byte, cfg.PageSize)
+	mb := page.NewLeafBuilder(scratch2, cfg)
+	mergeFits := true
+	for _, e := range append(append([]page.LeafEntry{}, l0Entries...), l1Entries...) {
+		if !mb.AddEntry(e) {
+			mergeFits = false
+			break
+		}
+	}
+	if mergeFits {
+		t.Fatalf("fixture: L0+L1 merge fits one page; redistribute never runs")
+	}
+
+	// Parent: 1-byte boundary separator, then filler cells until the
+	// next 150-byte filler no longer fits — leaving slack far below
+	// the ~300-byte separator growth a redistribute would need.
+	sep0 := []byte("b")
+	cells := []page.BranchCell{{Key: sep0, Child: l1ID}}
+	var fillerKeys [][]byte
+	for i := 0; ; i++ {
+		fk := fmt.Appendf(nil, "q%03d-%s", i, bytes.Repeat([]byte{'f'}, 145))
+		cand := append(append([]page.BranchCell{}, cells...), page.BranchCell{Key: fk})
+		if page.BranchEncodedSize(cfg, cand) > cfg.ContentEnd() {
+			break
+		}
+		childID, _ := pw.AllocPage()
+		childKey := append(bytes.Clone(fk), 'z')
+		buildLeafPageForTest(t, pw, cfg, childID, []page.LeafEntry{{Key: childKey, Value: []byte("f")}})
+		fillerKeys = append(fillerKeys, childKey)
+		cells = append(cells, page.BranchCell{Key: fk, Child: childID})
+	}
+
+	// Fixture property 3: a prefix-cluster separator does NOT fit the
+	// parent (this is the guard the fix adds; assert the topology
+	// actually exercises it).
+	probe := append(bytes.Clone(pfx), []byte("-0")...)
+	if parentFitsSeparator(cfg, cells, 0, probe) {
+		t.Fatalf("fixture: parent has room for a %d-byte separator; slack too large", len(probe))
+	}
+
+	rootID, _ := pw.AllocPage()
+	rootBuf, err := pw.ZeroPage(rootID)
+	if err != nil {
+		t.Fatalf("ZeroPage(root): %v", err)
+	}
+	if err := page.EncodeBranch(rootBuf, cfg, l0ID, cells); err != nil {
+		t.Fatalf("fixture: encode parent: %v", err)
+	}
+	return declineFixture{
+		rootID:     rootID,
+		l0Keys:     l0Keys,
+		l1Keys:     l1Keys,
+		fillerKeys: fillerKeys,
+		cellCount:  len(cells),
+		sep0:       sep0,
+	}
+}
+
+// verifyDeclineOutcome asserts the rebalance DECLINED (parent shape
+// unchanged) and every surviving key is still readable.
+func verifyDeclineOutcome(t *testing.T, pw *fakeWriter, cfg page.Config, fx declineFixture, newRoot uint64, deletedKeys [][]byte) {
+	t.Helper()
+	rootBuf, err := pw.Page(newRoot)
+	if err != nil {
+		t.Fatalf("Page(newRoot): %v", err)
+	}
+	if typ, _, _, _ := page.ReadHeader(rootBuf); typ != page.TypeBranch {
+		t.Fatalf("newRoot type = %d, want branch", typ)
+	}
+	_, cells := page.DecodeBranch(rootBuf, cfg)
+	if len(cells) != fx.cellCount {
+		t.Errorf("parent cell count = %d, want %d (decline must not merge/split)", len(cells), fx.cellCount)
+	}
+	if !bytes.Equal(cells[0].Key, fx.sep0) {
+		t.Errorf("boundary separator = %q, want %q (decline must not replace it)", cells[0].Key, fx.sep0)
+	}
+	deleted := make(map[string]bool, len(deletedKeys))
+	for _, k := range deletedKeys {
+		deleted[string(k)] = true
+	}
+	for _, group := range [][][]byte{fx.l0Keys, fx.l1Keys, fx.fillerKeys} {
+		for _, k := range group {
+			_, found, err := Get(pw, cfg, newRoot, k)
+			if err != nil {
+				t.Fatalf("Get(%q): %v", k, err)
+			}
+			if found == deleted[string(k)] {
+				t.Errorf("Get(%q): found=%v, want %v", k, found, !deleted[string(k)])
+			}
+		}
+	}
+	checkSlabPartition(t, pw, cfg, newRoot)
+}
+
+// TestDeleteDeclinesRedistributeWhenParentCannotFitSeparator pins the
+// parent-capacity decline (range-delete.md §Invariants): a valid
+// Delete whose rebalance would recompute a boundary separator the
+// near-full parent cannot physically encode must succeed by declining
+// the redistribute (accepting the below-floor leaf), not fail with an
+// encode error after freeing the sibling pages.
+func TestDeleteDeclinesRedistributeWhenParentCannotFitSeparator(t *testing.T) {
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16}
+	pw := newFakeWriter(t, 4096)
+	fx := buildDeclineFixture(t, pw, cfg)
+
+	newRoot, err := Delete(pw, cfg, fx.rootID, DefaultMergeThreshold, fx.l0Keys[0])
+	if err != nil {
+		t.Fatalf("Delete: %v (want success via redistribute decline)", err)
+	}
+	verifyDeclineOutcome(t, pw, cfg, fx, newRoot, fx.l0Keys[:1])
+}
+
+// TestDeleteRangeDeclinesRedistributeWhenParentCannotFitSeparator is
+// the DeleteRange analogue. The range SPANS the L0/L1 boundary so both
+// leaves become partially-deleted boundary survivors and the healing
+// runs through rebalanceSurvivors — whose parent-fit candidate is
+// built from the survivor boundary keys. (A range inside one leaf
+// routes through the single-Delete rebalance machinery instead and
+// leaves the survivors-path closure unexercised — a mutation test
+// caught exactly that in an earlier version of this test.)
+func TestDeleteRangeDeclinesRedistributeWhenParentCannotFitSeparator(t *testing.T) {
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16}
+	pw := newFakeWriter(t, 4096)
+	fx := buildDeclineFixture(t, pw, cfg)
+
+	// [l0Keys[6], l1Keys[1]) deletes L0's last two keys (underflowing
+	// it) and L1's first key. Fixture property: the post-delete pair
+	// still cannot merge into one page, so the survivor healing must
+	// take the redistribute plan and hit the parent-fit decline.
+	scratch := make([]byte, cfg.PageSize)
+	sb := page.NewLeafBuilder(scratch, cfg)
+	survivorsMerge := true
+	for _, k := range append(append([][]byte{}, fx.l0Keys[:6]...), fx.l1Keys[1:]...) {
+		v, found, err := Get(pw, cfg, fx.rootID, k)
+		if err != nil || !found {
+			t.Fatalf("fixture: Get(%q) pre-delete: found=%v err=%v", k, found, err)
+		}
+		if !sb.AddEntry(page.LeafEntry{Key: k, Value: v}) {
+			survivorsMerge = false
+			break
+		}
+	}
+	if survivorsMerge {
+		t.Fatalf("fixture: post-delete pair merges into one page; redistribute never runs")
+	}
+
+	count, newRoot, err := DeleteRange(pw, cfg, fx.rootID, DefaultMergeThreshold, fx.l0Keys[6], fx.l1Keys[1], plainCellFreeForTest)
+	if err != nil {
+		t.Fatalf("DeleteRange: %v (want success via redistribute decline)", err)
+	}
+	if count != 3 {
+		t.Fatalf("DeleteRange count = %d, want 3", count)
+	}
+	deleted := [][]byte{fx.l0Keys[6], fx.l0Keys[7], fx.l1Keys[0]}
+	verifyDeclineOutcome(t, pw, cfg, fx, newRoot, deleted)
+}
+
+// TestMergeOrRedistributeBranchesParentFitDecline pins the branch
+// helper's parent-capacity decline term directly: a redistribute whose
+// lifted separator the parent cannot encode returns the all-zero
+// decline with nothing allocated or freed; the same topology with a
+// permissive parentFits redistributes normally.
+func TestMergeOrRedistributeBranchesParentFitDecline(t *testing.T) {
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16}
+
+	build := func(pw *fakeWriter, id uint64, leftmost uint64, cells []page.BranchCell) {
+		t.Helper()
+		buf, err := pw.ZeroPage(id)
+		if err != nil {
+			t.Fatalf("ZeroPage(%d): %v", id, err)
+		}
+		if err := page.EncodeBranch(buf, cfg, leftmost, cells); err != nil {
+			t.Fatalf("EncodeBranch(%d): %v", id, err)
+		}
+	}
+	mkCells := func(prefix byte, n int, firstChild uint64) []page.BranchCell {
+		cells := make([]page.BranchCell, n)
+		for i := range cells {
+			// ~310-byte keys with no shared prefix across cells keeps
+			// physical == logical size; 7 cells/side → combined > one
+			// page (forces redistribute) with both halves above the
+			// fill floor (so only parentFits can decline).
+			cells[i] = page.BranchCell{
+				Key:   fmt.Appendf(nil, "%c%02d-%s", prefix, i, bytes.Repeat([]byte{prefix}, 305)),
+				Child: firstChild + uint64(i),
+			}
+		}
+		return cells
+	}
+
+	run := func(fits bool) (bool, uint64, uint64, uint64, []byte, *fakeWriter) {
+		pw := newFakeWriter(t, 4096)
+		leftID, _ := pw.AllocPage()
+		build(pw, leftID, 100, mkCells('c', 7, 101))
+		rightID, _ := pw.AllocPage()
+		build(pw, rightID, 200, mkCells('s', 7, 201))
+		isMerge, mergedID, newLeftID, newRightID, newSep, err := mergeOrRedistributeBranches(
+			pw, cfg, DefaultMergeThreshold, leftID, rightID, []byte("m"),
+			func([]byte) bool { return fits })
+		if err != nil {
+			t.Fatalf("mergeOrRedistributeBranches(fits=%v): %v", fits, err)
+		}
+		if isMerge {
+			t.Fatalf("fixture: pair merged; need redistribute-sized inputs")
+		}
+		return isMerge, mergedID, newLeftID, newRightID, newSep, pw
+	}
+
+	// Permissive parent: redistribute proceeds (also proves the
+	// fixture reaches the redistribute plan, so the decline below is
+	// attributable to parentFits alone).
+	_, _, nl, nr, sep, _ := run(true)
+	if nl == 0 || nr == 0 || len(sep) == 0 {
+		t.Fatalf("fits=true: got (%d, %d, %q), want a performed redistribute", nl, nr, sep)
+	}
+
+	// Unfit parent: decline — all-zero, nothing allocated or freed.
+	_, mergedID, nl, nr, sep, pw := run(false)
+	if mergedID != 0 || nl != 0 || nr != 0 || sep != nil {
+		t.Errorf("fits=false: got (%d, %d, %d, %q), want all-zero decline", mergedID, nl, nr, sep)
+	}
+	if len(pw.freed) != 0 {
+		t.Errorf("fits=false: %d pages freed on decline, want 0", len(pw.freed))
+	}
+	if len(pw.pages) != 2 {
+		t.Errorf("fits=false: %d pages exist after decline, want the 2 inputs", len(pw.pages))
 	}
 }

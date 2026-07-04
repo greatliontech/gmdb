@@ -311,6 +311,22 @@ func branchUnderflow(cfg page.Config, cells []page.BranchCell, mergeThreshold ui
 	return size*100 < int(mergeThreshold)*cfg.ContentEnd()
 }
 
+// parentFitsSeparator reports whether a parent branch with the given
+// cells still encodes within one page when cells[sepIdx].Key is
+// replaced by newSep. Capacity is PHYSICAL (page.BranchEncodedSize —
+// the within-page prefix truncation applies), matching EncodeBranch's
+// own bound. The swap is transient; cells is restored before return.
+// This is the parentFits predicate handed to the merge/redistribute
+// helpers: a redistribute replaces exactly one parent cell key and
+// leaves the cell count unchanged, so this candidate set is exact.
+func parentFitsSeparator(cfg page.Config, cells []page.BranchCell, sepIdx int, newSep []byte) bool {
+	old := cells[sepIdx].Key
+	cells[sepIdx].Key = newSep
+	fits := page.BranchEncodedSize(cfg, cells) <= cfg.ContentEnd()
+	cells[sepIdx].Key = old
+	return fits
+}
+
 // pageUnderflow dispatches to leafUnderflow or branchUnderflow based
 // on the page type at id. Used by the redistribute path in
 // rebalanceSurvivors and other fill-floor re-check sites that need a
@@ -537,11 +553,14 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		newRightID   uint64
 		newSeparator []byte
 	)
+	parentFits := func(newSep []byte) bool {
+		return parentFitsSeparator(cfg, cells, separatorIdx, newSep)
+	}
 	switch {
 	case leftIsLeaf:
-		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID)
+		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID, parentFits)
 	case leftTyp == page.TypeBranch && rightTyp == page.TypeBranch:
-		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator)
+		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
 	default:
 		return 0, false, 0, fmt.Errorf("%w: sibling page %d unexpected type %d", ErrCorrupted, leftPairID, leftTyp)
 	}
@@ -572,13 +591,16 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		insertedPos = posLeftPair
 		insertedID = mergedID
 	case newLeftID == 0:
-		// DECLINE (branch only): the redistribute could not restore the
-		// floor for both halves, so it changed nothing. The parent's cells
-		// are unchanged — the underflowing child remains at descentIdx. Let
-		// the post-merge re-rebalance loop below give it a chance against
-		// OTHER siblings (a merge may yet fit), and thread it up as
-		// deepUnderflowChild if none can heal it. No page churn, so the
-		// cousin cascade cannot relocate the deficit.
+		// DECLINE: the redistribute could not restore the floor for both
+		// halves (branches), or the parent cannot fit the recomputed
+		// boundary separator (either level), so it changed nothing. The
+		// parent's cells are unchanged — the underflowing child remains
+		// at descentIdx. Let the post-merge re-rebalance loop below try
+		// again (it re-pairs this same sibling first — a bounded,
+		// deterministic re-decline — before any other sibling; a merge
+		// may yet fit elsewhere), and thread it up as deepUnderflowChild
+		// if none can heal it. No page churn, so the cousin cascade
+		// cannot relocate the deficit.
 		insertedPos = int(descentIdx)
 		insertedID = newChildID
 	default:
@@ -819,10 +841,13 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 			newRightID   uint64
 			newSeparator []byte
 		)
+		parentFits := func(newSep []byte) bool {
+			return parentFitsSeparator(cfg, *cells, separatorIdx, newSep)
+		}
 		if leftIsLeaf {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID)
+			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID, parentFits)
 		} else {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator)
+			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
 		}
 		if err != nil {
 			return 0, 0, false, err
@@ -843,11 +868,12 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 			// Cell layout changed — re-explore both neighbours of curPos.
 			triedLeft, triedRight = false, false
 		case newLeftID == 0:
-			// DECLINE: the branch redistribute could not restore the floor
-			// for both halves (large lifted separator), so it changed
-			// nothing. Mark this side tried; when both are tried the loop
-			// exits with the underflow threaded up. No page churn, so the
-			// cascade cannot relocate the deficit.
+			// DECLINE: the redistribute could not restore the floor for
+			// both halves (branches, large lifted separator) or the
+			// parent cannot fit the recomputed separator (either level),
+			// so it changed nothing. Mark this side tried; when both are
+			// tried the loop exits with the underflow threaded up. No
+			// page churn, so the cascade cannot relocate the deficit.
 			if siblingPos < curPos {
 				triedLeft = true
 			} else {
@@ -1078,8 +1104,20 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 //   - On merge: mergedID is set; new*ID and newSeparator are zero.
 //   - On redistribute: new*ID and newSeparator are set; mergedID is
 //     zero.
+//   - On DECLINE (all-zero, nil error): the parent cannot physically
+//     accommodate the redistribute's recomputed boundary separator
+//     (parentFits returned false). The redistribute allocated and
+//     freed nothing; the only page churn before a decline is the
+//     failed merge attempt's self-contained scratch (alloc + free of
+//     one loose page). The caller leaves the pair as-is and
+//     threads/accepts the underflow per range-delete.md §Invariants.
 //
-// In both outcomes the input leftID and rightID are freed.
+// On merge and redistribute the input leftID and rightID are freed.
+//
+// parentFits reports whether the parent branch can encode its cell
+// set with the pair's boundary separator replaced by the candidate.
+// A merge never consults it (a merge removes a parent cell, which
+// can only shrink the parent's physical encoding).
 //
 // Decision: build into a freshly-allocated mergedBuf via
 // LeafBuilder.AddEntry; if every entry fits in one page, the merge
@@ -1096,7 +1134,7 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 // is a build-time policy choice, not a per-page invariant; merge/
 // redistribute homogenizes toward the keyspace-level target. No
 // spec clause requires variant preservation across merge.
-func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID uint64) (bool, uint64, uint64, uint64, []byte, error) {
+func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID uint64, parentFits func([]byte) bool) (bool, uint64, uint64, uint64, []byte, error) {
 	leftSrc, err := pw.Page(leftID)
 	if err != nil {
 		return false, 0, 0, 0, nil, err
@@ -1173,8 +1211,33 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 	// at least as balanced as the input); findLeafSplitIndex returning
 	// ok=false therefore means a structurally-invalid input — a stored
 	// entry exceeding page capacity — a genuine ErrCorrupted, not a
-	// balance failure. newLeftBuf doubles as the split-measurement
-	// scratch before it holds the real left half.
+	// balance failure.
+	//
+	// The whole redistribute PLAN (split point + new separator +
+	// parent-fit check) is computed on heap scratch before any page
+	// alloc or free, so a decline changes nothing.
+	scratch := make([]byte, cfg.PageSize)
+	sb := page.NewLeafBuilder(scratch, cfg)
+	mid, ok := findLeafSplitIndex(sb, scratch, cfg, combined)
+	if !ok {
+		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute leaves have no feasible two-page split", ErrCorrupted)
+	}
+	leftSplit := combined[:mid]
+	rightSplit := combined[mid:]
+	newSep := page.ShortestSeparator(leftSplit[len(leftSplit)-1].Key, rightSplit[0].Key)
+
+	// Decline when the parent cannot physically accommodate the
+	// recomputed boundary separator (range-delete.md §Invariants —
+	// parent-capacity decline). The new boundary keys can share a much
+	// longer prefix than the old boundary did, so newSep can outgrow
+	// the parent's remaining capacity; performing the redistribute
+	// would strand the caller with an unencodable parent AFTER the old
+	// siblings were freed. Declining leaves the child below the fill
+	// floor — accepted per the same section's "where reachable" rule.
+	if !parentFits(newSep) {
+		return false, 0, 0, 0, nil, nil
+	}
+
 	newLeftID, err := pw.AllocPage()
 	if err != nil {
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-left leaf: %w", err)
@@ -1185,15 +1248,6 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: alloc redistribute-left slab: %w", err)
 	}
 	lb := page.NewLeafBuilder(newLeftBuf, cfg)
-	mid, ok := findLeafSplitIndex(lb, newLeftBuf, cfg, combined)
-	if !ok {
-		_ = pw.FreePage(newLeftID)
-		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute leaves have no feasible two-page split", ErrCorrupted)
-	}
-	leftSplit := combined[:mid]
-	rightSplit := combined[mid:]
-
-	lb.Reset(newLeftBuf, cfg)
 	for _, e := range leftSplit {
 		if !lb.AddEntry(e) {
 			_ = pw.FreePage(newLeftID)
@@ -1229,7 +1283,6 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 	if err := pw.FreePage(rightID); err != nil {
 		return false, 0, 0, 0, nil, fmt.Errorf("btree: free right leaf %d: %w", rightID, err)
 	}
-	newSep := page.ShortestSeparator(leftSplit[len(leftSplit)-1].Key, rightSplit[0].Key)
 	return false, 0, newLeftID, newRightID, newSep, nil
 }
 
@@ -1246,7 +1299,12 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 // leftmost child; cells before/after split into the two new branches.
 // This mirrors the branch-split path's separator-lift
 // convention.
-func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold uint8, leftID, rightID uint64, separator []byte) (bool, uint64, uint64, uint64, []byte, error) {
+//
+// parentFits has the mergeOrRedistributeLeaves contract: a
+// redistribute whose lifted separator the parent cannot physically
+// encode DECLINES (all-zero return, nothing changed), same as the
+// fill-floor decline below.
+func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold uint8, leftID, rightID uint64, separator []byte, parentFits func([]byte) bool) (bool, uint64, uint64, uint64, []byte, error) {
 	// An empty parent separator is unreachable from a tree built via
 	// Put — page.ShortestSeparator always returns ≥1 byte. Reject
 	// explicitly: an empty separator embedded in `combined` would
@@ -1369,7 +1427,14 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold 
 	// the caller accept the underflowing child as-is and terminate. In the
 	// reachable regime (short separators) both halves clear the floor, so
 	// this never fires and redistribute proceeds unchanged.
-	if branchUnderflow(cfg, newLeftCells, mergeThreshold) || branchUnderflow(cfg, newRightCells, mergeThreshold) {
+	//
+	// Same decline when the parent cannot physically encode its cells
+	// with newSep in place of the old boundary separator
+	// (range-delete.md §Invariants — parent-capacity decline): the
+	// lifted cell can be much longer than the separator it replaces,
+	// and proceeding would strand the caller with an unencodable
+	// parent after the inputs were freed.
+	if branchUnderflow(cfg, newLeftCells, mergeThreshold) || branchUnderflow(cfg, newRightCells, mergeThreshold) || !parentFits(newSep) {
 		return false, 0, 0, 0, nil, nil
 	}
 
