@@ -54,10 +54,13 @@ Invariant: kind=clause-explicit;
     cleanups race the unmap and SIGSEGV.
 
 Invariant: kind=clause-explicit;
-  property=`Close()` drains in-flight Tx cleanups via a heap-shared
-    atomic refcount (`gate.txInflight`, incremented at cleanup
-    entry, decremented at cleanup exit regardless of the skip-vs-
-    work branch) BEFORE unmapping the lock file. A cleanup that
+  property=`Close()` drains the in-flight windows registered on the
+    heap-shared atomic refcount (`gate.txInflight` — incremented at
+    entry, decremented at exit regardless of the skip-vs-work
+    branch) BEFORE unmapping the lock file. Two participant classes
+    hold windows: leaked-Tx cleanups, and `BeginRead`'s acquire
+    sequence (transactions.md §Read Transaction, Close-vs-BeginRead
+    invariant). A cleanup that
     observed `*db.closed == false` (and therefore proceeded into
     the resource-touching path) MUST complete before `Close`
     advances to unmap. The drain pairs with the release-store on
@@ -256,13 +259,16 @@ Cleanup Behavior step 0 above), `Close()` runs in this order:
    `*atomic.Bool` field of the heap-shared `closeGate`) — visible
    to any subsequent Tx cleanup invocation regardless of
    `runtime.AddCleanup` ordering between the DB and its Txs.
-1a. Drain in-flight Tx cleanups by spinning on
+1a. Drain the in-flight windows by spinning on
    `gate.txInflight == 0`. A cleanup that has passed the
    release-store gate but not yet finished its resource-touching
    work (e.g., a leaked-ReadTx mid-`ReleaseReader`) must complete
-   before any unmap. The spin is bounded by cleanup work
-   duration — two atomic stores on the reader slot — so a true
-   sleep would over-pessimise the common case.
+   before any unmap, as must a `BeginRead` mid-acquire (its
+   restabilization loop bails one iteration after Close begins;
+   only the readers-full retry path can extend the drain, up to
+   that caller's ctx deadline). The spin is bounded by those
+   windows — microseconds in the common case — so a true sleep
+   would over-pessimise it.
 2. Stop the heartbeat goroutine via its stop channel and wait for
    its done channel (bounded by the tick interval).
 3. Stop the flock goroutine: close `db.stopCh` (the goroutine's

@@ -66,6 +66,7 @@ findings each shared-fix row covers.
 | [cross-namespace-reader-heartbeat-liveness](cross-namespace-reader-heartbeat-liveness.md) | condition (when cross-process stale-detection is revisited) | **[L]** Cross-namespace (container) readers have no `kill()` fallback — a >10s heartbeat pause (docker pause, cgroup freeze, swap) evicts a live reader → reads reclaimed-and-reused pages. Document the data-integrity bound + reconsider the default. *Finding 21.* |
 | [commit-headroom-at-tx-budget-cap](commit-headroom-at-tx-budget-cap.md) | condition (slab-budget accounting / commit-pipeline allocation model revisit) | **[M]** Commit-pipeline allocations count against MaxTxBufferBytes, so a tx driven to the cap cannot commit (ErrTxTooLarge at Commit) — partial work only recoverable by Rollback. Found building the chunk-3 regression fixture (2026-07-05). |
 | [rpl-head-exemption-reclaimed](rpl-head-exemption-reclaimed.md) | condition (recovery-model redesign or head-convention revisit) | **[M]** rebuildRPLChain hard-fails Open on a bad head, but RPLHeadPage carries forward across no-retire commits, so an older checkpoint's head can be legitimately reclaimed+reused — recovery after a crash-mid-commit becomes unopenable. Chunk-4 review finding. |
+| [dbcleanup-teardown-drain](dbcleanup-teardown-drain.md) | condition (AddCleanup execution model revisit) | **[L]** dbCleanupFn tears down coord/lockFile without the txInflight drain Close performs — safe only while the runtime runs cleanups sequentially. Chunk-11 review finding. |
 
 ## Open — full-codebase audit (2026-07-04)
 
@@ -80,7 +81,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [beginread-close-lifecycle](beginread-close-lifecycle.md) | chunk 11 | **[M]** BeginRead racing Close panics/SIGSEGVs instead of ErrClosed — close gate never covers the BeginRead window. |
 | [update-unresolved-child-grant](update-unresolved-child-grant.md) | chunk 12 | **[M]** Update with an unresolved child tx leaks the cross-process write grant until GC; all writers block. Demonstrated. |
 | [maintenance-reclaim-snapshot-guard](maintenance-reclaim-snapshot-guard.md) | chunk 13 | **[H]** Leak detection uses snapshot tree + live bitmap; concurrent commit → live pages freed (demonstrated, default config). Cross-process overlap variant shares the fix. |
 | [compact-peer-handle-generation](compact-peer-handle-generation.md) | chunk 14 | **[H]** Compact renames the inode under peer handles; peer writes land on the unlinked inode — silent write loss. Generation stamp in the lock header. |

@@ -730,3 +730,61 @@ func TestBeginReadRestabilizesSnapshotAfterRacingCommits(t *testing.T) {
 		}
 	}
 }
+
+// TestBeginReadCloseRaceReturnsErrClosed pins the BeginRead/Close
+// lifecycle contract: a BeginRead racing DB.Close must surface
+// ErrClosed (or complete normally if it won the race) — never panic
+// on the torn-down reader table or SIGSEGV on the unmapped lock mmap.
+// The close gate's inflight window covers the whole acquire sequence,
+// so Close's teardown drain waits for in-flight BeginReads.
+func TestBeginReadCloseRaceReturnsErrClosed(t *testing.T) {
+	ctx := context.Background()
+	for round := range 30 {
+		db, err := Open(ctx, tmpPath(t), Options{
+			PageSize: 4096, MinSize: 16, MaxSize: 128,
+			Maintenance: MaintenanceOptions{Disable: true},
+		})
+		if err != nil {
+			t.Fatalf("Open(%d): %v", round, err)
+		}
+		if err := db.Update(ctx, func(tx *Tx) error {
+			ks, err := tx.CreateKeyspaceIfNotExists("k")
+			if err != nil {
+				return err
+			}
+			return ks.Put([]byte("a"), []byte("v"))
+		}); err != nil {
+			t.Fatalf("seed(%d): %v", round, err)
+		}
+
+		start := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			<-start
+			for {
+				rtx, err := db.BeginRead(ctx)
+				if err != nil {
+					if !errors.Is(err, ErrClosed) {
+						t.Errorf("BeginRead during Close: %v, want ErrClosed", err)
+					}
+					return
+				}
+				ks, err := rtx.OpenKeyspaceReadOnly("k")
+				if err == nil {
+					_, _ = ks.Get([]byte("a"))
+				}
+				_ = rtx.Rollback()
+			}
+		}()
+		close(start)
+		// Tiny stagger so some rounds close mid-BeginRead.
+		for range round % 7 {
+			runtime.Gosched()
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("Close(%d): %v", round, err)
+		}
+		<-done
+	}
+}

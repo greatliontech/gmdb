@@ -18,7 +18,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 8. lagging-reader-bound-checkpoint-term
 - [x] 9. checkpoint-failure-poisoning
 - [x] 10. create-dirent-durability
-- [ ] 11. beginread-close-lifecycle
+- [x] 11. beginread-close-lifecycle
 - [ ] 12. update-unresolved-child-grant
 - [ ] 13. maintenance-reclaim-snapshot-guard
 - [ ] 14. compact-peer-handle-generation

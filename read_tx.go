@@ -252,6 +252,22 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 	if db.closeGate.IsClosed() {
 		return nil, ErrClosed
 	}
+	// Hold the close gate's inflight window for the WHOLE acquire
+	// sequence (slot CAS, snapshot restabilization, reader mmap): a
+	// concurrent Close otherwise runs to completion between the
+	// IsClosed check above and the slot CAS — including
+	// lockFile.Close() — and the CAS lands on an unmapped reader
+	// table (panic or SIGSEGV instead of ErrClosed). Close's drain
+	// waits for this window before tearing down, mirroring the write
+	// path's channel-based protection. Consequence, documented in
+	// transactions.md §Read Transaction: Close blocks until in-flight
+	// BeginRead calls finish — bounded by their ctx deadlines in the
+	// readers-full retry case.
+	if !db.closeGate.EnterCleanup() {
+		db.closeGate.ExitCleanup()
+		return nil, ErrClosed
+	}
+	defer db.closeGate.ExitCleanup()
 	// A poisoned handle may map a stale, now-unlinked inode (a failed
 	// Compact reopen) — reads off it would observe pre-Compact data while
 	// the on-disk file is the new inode. Reject reads too (not just
@@ -355,6 +371,15 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 			if cerr := ctx.Err(); cerr != nil {
 				coord.ReleaseReader(slot)
 				return nil, context.Cause(ctx)
+			}
+			// Bail if Close began: the loop is otherwise bounded by
+			// nothing under a no-deadline ctx while a peer commit
+			// storm keeps advancing the meta — and Close's teardown
+			// drain waits on this window. One iteration is the
+			// drain's worst case this way.
+			if db.closeGate.IsClosed() {
+				coord.ReleaseReader(slot)
+				return nil, ErrClosed
 			}
 		}
 	}

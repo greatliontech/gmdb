@@ -148,6 +148,23 @@ Invariant: kind=clause-explicit;
 
 ## Read Transaction
 
+Invariant: kind=clause-explicit;
+  property=`DB.Close` blocks until in-flight `BeginRead` calls exit
+    their acquire sequence (slot CAS, snapshot restabilization,
+    reader mmap) — the close gate's inflight window covers it — and
+    a `BeginRead` that starts after, or observes, Close mid-acquire
+    returns `ErrClosed` (the restabilization loop re-checks per
+    iteration, so the drain's worst case on that path is one
+    iteration; the readers-full retry path can delay Close by up to
+    the caller's ctx deadline);
+  from=this spec §Read Transaction + leak-detection.md (closeGate
+    inflight contract);
+  violation=Without the window, Close's teardown (lock-file unmap)
+    lands under a concurrent BeginRead's slot CAS — a panic or
+    SIGSEGV on a healthy database instead of ErrClosed.
+    (Enforced by the EnterCleanup window in `BeginRead`; pinned by
+    `TestBeginReadCloseRaceReturnsErrClosed`.)
+
 1. Reader checks `ctx` — returns `context.Cause(ctx)` if already
    cancelled.
 2. Reader acquires a slot in the reader table via scan + CAS and

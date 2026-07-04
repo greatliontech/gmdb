@@ -31,6 +31,16 @@ import (
 //     in `Close()` before `lockFile.Close()` so cleanups that
 //     passed the gate complete before unmap.
 //
+//     Participants: (a) leaked-Tx cleanups (microsecond windows),
+//     and (b) BeginRead's whole acquire sequence (slot CAS,
+//     snapshot restabilization, reader mmap — transactions.md §Read
+//     Transaction Close-vs-BeginRead invariant). The (b) windows
+//     are longer but bounded: the restabilization loop bails per
+//     iteration once Close begins, and only the readers-full retry
+//     path can hold the window up to its caller's ctx deadline —
+//     the documented Close delay. The Gosched drain spin remains
+//     appropriate for these bounds.
+//
 // Pattern, per cleanup:
 //
 //	cleanup:
