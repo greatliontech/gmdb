@@ -941,6 +941,14 @@ func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error {
 		}
 		return fnErr
 	}
+	// done stays false through Commit: a Commit that fails WITHOUT
+	// closing the tx (ErrChildActive — fn left a child unresolved)
+	// must not leak the write grant, so the deferred rollback (which
+	// cascades) fires. A publication-phase Commit failure closes the
+	// tx itself; the deferred Rollback is then a harmless ErrTxClosed.
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	done = true
-	return tx.Commit()
+	return nil
 }

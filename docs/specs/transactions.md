@@ -76,9 +76,15 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=A write transaction with an unresolved child (or any
-    descendant) is **frozen**: data ops, `Commit`, `Rollback`, and
-    a second `BeginChild` all return `ErrChildActive` until the
-    child resolves. Equivalently, the pager savepoint stack is empty
+    descendant) is **frozen**: data ops, `Commit`, and a second
+    `BeginChild` return `ErrChildActive` until the child resolves.
+    `Rollback` is the exception — it CASCADES: the open descendant
+    chain is rolled back deepest-first, then the transaction itself
+    (rollback is the abandon-everything operation; freezing it would
+    leave a caller holding only the parent of a dropped child handle
+    with no API able to release the cross-process write grant until
+    GC — every writer in every process blocked meanwhile).
+    Equivalently, the pager savepoint stack is empty
     when the top-level transaction commits;
   from=this spec §Nested Transactions (Parent freeze);
   violation=Committing the parent while a child holds an open
@@ -321,8 +327,11 @@ if err := riskyOperation(child); err != nil {
 **Parent freeze (LMDB model).** While a child — or any of its
 descendants — is open and unresolved, the parent and every ancestor
 are **frozen**: every operation on a frozen transaction (data ops,
-`Commit`, `Rollback`, and a second `BeginChild`) returns
-`ErrChildActive` until the child commits or rolls back. This
+`Commit`, and a second `BeginChild`) returns `ErrChildActive` until
+the child commits or rolls back — except `Rollback`, which
+cascade-rolls-back the open descendant chain deepest-first and then
+the transaction itself (the same cascade the batch coordinator
+applies to an unresolved closure). This
 prevents the parent and child from racing on the shared
 copy-on-write pager state, and guarantees the savepoint stack is
 empty when the top-level transaction commits. A frozen cursor

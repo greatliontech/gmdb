@@ -19,7 +19,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 9. checkpoint-failure-poisoning
 - [x] 10. create-dirent-durability
 - [x] 11. beginread-close-lifecycle
-- [ ] 12. update-unresolved-child-grant
+- [x] 12. update-unresolved-child-grant
 - [ ] 13. maintenance-reclaim-snapshot-guard
 - [ ] 14. compact-peer-handle-generation
 - [ ] 15. check-consistency-classes

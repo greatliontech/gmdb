@@ -81,7 +81,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [update-unresolved-child-grant](update-unresolved-child-grant.md) | chunk 12 | **[M]** Update with an unresolved child tx leaks the cross-process write grant until GC; all writers block. Demonstrated. |
 | [maintenance-reclaim-snapshot-guard](maintenance-reclaim-snapshot-guard.md) | chunk 13 | **[H]** Leak detection uses snapshot tree + live bitmap; concurrent commit → live pages freed (demonstrated, default config). Cross-process overlap variant shares the fix. |
 | [compact-peer-handle-generation](compact-peer-handle-generation.md) | chunk 14 | **[H]** Compact renames the inode under peer handles; peer writes land on the unlinked inode — silent write loss. Generation stamp in the lock header. |
 | [check-consistency-classes](check-consistency-classes.md) | chunk 15 | **[M]** Check() verifies none of: key ordering, separator routing, desc.Count, NestedCount, NumKeyspaces — classes api-surface.md claims. |

@@ -499,10 +499,11 @@ func (p *Pager) AbortTx() {
 	p.retiredPages = p.retiredPages[:0]
 	p.currentTxnID = 0
 	// A top-level abort supersedes any open child savepoints. The root
-	// package's parent-freeze rule prevents a top-level Rollback while a
-	// child is unresolved, so this is defense-in-depth — but resetting
-	// keeps AllocPage's loose-pop guard correct if a future caller path
-	// ever aborts with a dangling savepoint. The savepointUndoLog reset
+	// package's Rollback cascade resolves the open descendant chain
+	// (draining the savepoint stack) before aborting, so this is
+	// defense-in-depth — but resetting keeps AllocPage's loose-pop
+	// guard correct if a future caller path ever aborts with a
+	// dangling savepoint. The savepointUndoLog reset
 	// is required for the same reason: any leaked entries would
 	// otherwise survive the tx boundary and a later Begin's undoLogPos
 	// would index past stale entries.

@@ -32,12 +32,14 @@ var (
 	// are unaffected. Per transactions.md §Write Batching.
 	ErrBatchClosurePanic = errors.New("gmdb: batch closure panicked")
 
-	// ErrChildActive is returned by every operation on a write
-	// transaction that has an unresolved child transaction open (created
-	// via Tx.BeginChild) — data ops, Commit, Rollback, and a second
-	// BeginChild. The parent, and transitively every ancestor, is frozen
-	// until the active child commits or rolls back. Per transactions.md
-	// §Nested Transactions (LMDB-style parent-freeze).
+	// ErrChildActive is returned by the frozen operations on a write
+	// transaction that has an unresolved child transaction open
+	// (created via Tx.BeginChild) — data ops, Commit, and a second
+	// BeginChild. The parent, and transitively every ancestor, is
+	// frozen until the active child commits or rolls back. Rollback is
+	// the exception: it cascade-rolls-back the open descendant chain
+	// deepest-first and then the transaction itself. Per
+	// transactions.md §Nested Transactions (LMDB-style parent-freeze).
 	ErrChildActive = errors.New("gmdb: transaction is frozen by an active child transaction")
 
 	// ErrTxTooLarge is returned when the per-tx slab budget is

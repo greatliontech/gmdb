@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"time"
 )
 
 // lookupPKs returns the sorted primary keys an index maps the given
@@ -186,7 +187,7 @@ func TestParentFrozenWhileChildActive(t *testing.T) {
 		t.Fatalf("BeginChild: %v", err)
 	}
 
-	// Parent data op, second BeginChild, Commit, and Rollback all frozen.
+	// Parent data op, second BeginChild, and Commit all frozen.
 	if err := ks.Put([]byte("x"), []byte("1")); !errors.Is(err, ErrChildActive) {
 		t.Errorf("frozen parent Put err = %v, want ErrChildActive", err)
 	}
@@ -199,9 +200,11 @@ func TestParentFrozenWhileChildActive(t *testing.T) {
 	if err := tx.Commit(); !errors.Is(err, ErrChildActive) {
 		t.Errorf("frozen parent Commit err = %v, want ErrChildActive", err)
 	}
-	if err := tx.Rollback(); !errors.Is(err, ErrChildActive) {
-		t.Errorf("frozen parent Rollback err = %v, want ErrChildActive", err)
-	}
+	// Rollback is the freeze's one exception — it cascades through the
+	// open descendant chain instead of returning ErrChildActive
+	// (transactions.md §Nested Transactions; pinned by
+	// TestRollbackCascadesUnresolvedDescendants). Not exercised here so
+	// this test can continue with the resolve-then-resume flow.
 
 	// Resolve the child; parent resumes.
 	if err := child.Commit(); err != nil {
@@ -686,4 +689,191 @@ func TestChildRollbackSetKeyspaceIsolated(t *testing.T) {
 	if has, _ := sks.HasValue([]byte("k"), []byte("a")); !has {
 		t.Error("parent set lost member a after child rollback")
 	}
+}
+
+// TestRollbackCascadesUnresolvedDescendants pins the parent-freeze
+// invariant's Rollback exception (transactions.md §Nested
+// Transactions): Rollback on a transaction with an unresolved
+// descendant chain cascade-rolls-back deepest-first and releases the
+// write grant — a caller holding only the parent of a dropped child
+// handle must not be stuck until GC. Commit stays frozen.
+func TestRollbackCascadesUnresolvedDescendants(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if err := db.Update(ctx, func(tx *Tx) error {
+		ks, err := tx.CreateKeyspace("k")
+		if err != nil {
+			return err
+		}
+		return ks.Put([]byte("seed"), []byte("v0"))
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	ks, err := tx.OpenKeyspace("k")
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("parent"), []byte("p")); err != nil {
+		t.Fatalf("parent Put: %v", err)
+	}
+	child, err := tx.BeginChild()
+	if err != nil {
+		t.Fatalf("BeginChild: %v", err)
+	}
+	cks, err := child.OpenKeyspace("k")
+	if err != nil {
+		t.Fatalf("child OpenKeyspace: %v", err)
+	}
+	if err := cks.Put([]byte("child"), []byte("c")); err != nil {
+		t.Fatalf("child Put: %v", err)
+	}
+	if _, err := child.BeginChild(); err != nil {
+		t.Fatalf("grandchild BeginChild: %v", err)
+	}
+
+	// Commit stays frozen; Rollback cascades.
+	if err := tx.Commit(); !errors.Is(err, ErrChildActive) {
+		t.Fatalf("Commit with open descendants: %v, want ErrChildActive", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback with open descendants: %v, want cascade + nil", err)
+	}
+
+	// Grant released: a bounded Begin succeeds.
+	bctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	tx2, err := db.Begin(bctx)
+	if err != nil {
+		t.Fatalf("Begin after cascading rollback: %v (grant leaked?)", err)
+	}
+	defer tx2.Rollback()
+	ks2, err := tx2.OpenKeyspace("k")
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	// Everything the rolled-back chain wrote is gone; the seed remains.
+	if _, err := ks2.Get([]byte("parent")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get(parent) = %v, want ErrNotFound (rolled back)", err)
+	}
+	if _, err := ks2.Get([]byte("child")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get(child) = %v, want ErrNotFound (rolled back)", err)
+	}
+	if v, err := ks2.Get([]byte("seed")); err != nil || string(v) != "v0" {
+		t.Errorf("Get(seed) = %q/%v, want v0", v, err)
+	}
+}
+
+// TestUpdateReleasesGrantOnUnresolvedChild is the audit reproducer:
+// Update whose closure leaves a child transaction unresolved must
+// surface ErrChildActive AND release the cross-process write grant —
+// previously every writer in every process blocked until GC.
+func TestUpdateReleasesGrantOnUnresolvedChild(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	err = db.Update(ctx, func(tx *Tx) error {
+		if _, err := tx.CreateKeyspace("k"); err != nil {
+			return err
+		}
+		if _, err := tx.BeginChild(); err != nil {
+			return err
+		}
+		return nil // child left unresolved
+	})
+	if !errors.Is(err, ErrChildActive) {
+		t.Fatalf("Update = %v, want ErrChildActive", err)
+	}
+
+	bctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	tx, err := db.Begin(bctx)
+	if err != nil {
+		t.Fatalf("Begin after Update-with-unresolved-child: %v (grant leaked until GC?)", err)
+	}
+	_ = tx.Rollback()
+}
+
+// TestChildRollbackCascadesGrandchild pins the cascade on a NON-top
+// Rollback: a child with its own open grandchild rolls back the
+// grandchild first, then itself; the parent thaws and its work
+// survives.
+func TestChildRollbackCascadesGrandchild(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	ks, err := tx.CreateKeyspace("k")
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := ks.Put([]byte("parent"), []byte("p")); err != nil {
+		t.Fatalf("parent Put: %v", err)
+	}
+	child, err := tx.BeginChild()
+	if err != nil {
+		t.Fatalf("BeginChild: %v", err)
+	}
+	if _, err := child.BeginChild(); err != nil {
+		t.Fatalf("grandchild: %v", err)
+	}
+	if err := child.Rollback(); err != nil {
+		t.Fatalf("child Rollback with open grandchild: %v, want cascade + nil", err)
+	}
+	// Parent thawed; its pre-child work intact.
+	if v, err := ks.Get([]byte("parent")); err != nil || string(v) != "p" {
+		t.Errorf("parent Get after child cascade = %q/%v, want p", v, err)
+	}
+}
+
+// TestUpdateFnErrorWithOpenChildReturnsFnErrorAlone pins Update's
+// fn-error path under the cascading Rollback: the rollback now
+// succeeds (cascade), so the caller sees fn's error alone — no
+// errors.Join with ErrChildActive — and the grant is released.
+func TestUpdateFnErrorWithOpenChildReturnsFnErrorAlone(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	sentinel := errors.New("fn failed")
+	err = db.Update(ctx, func(tx *Tx) error {
+		if _, err := tx.BeginChild(); err != nil {
+			return err
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Update = %v, want the fn error", err)
+	}
+	if errors.Is(err, ErrChildActive) {
+		t.Fatalf("Update = %v; the cascading rollback must not join ErrChildActive", err)
+	}
+	bctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	tx, err := db.Begin(bctx)
+	if err != nil {
+		t.Fatalf("Begin after fn-error Update: %v (grant leaked?)", err)
+	}
+	_ = tx.Rollback()
 }

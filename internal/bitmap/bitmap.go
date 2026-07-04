@@ -322,7 +322,8 @@ func (b *Bitmap) ClearDirty() {
 // pops them defensively, but a caller that later passes one of those
 // to Restore or Discard hits the "Snapshot is not open" panic. The
 // pager's BeginTx/BeginSavepoint pairing already enforces LIFO; the
-// parent-freeze rule (ErrChildActive) means children always resolve
+// parent-freeze rule (Commit frozen; Rollback cascades deepest-
+// first) means children always resolve
 // before their parent commits or rolls back.
 type Snapshot struct {
 	bitmap  *Bitmap

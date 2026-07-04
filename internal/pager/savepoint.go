@@ -243,7 +243,8 @@ func (p *Pager) recordSavepointUndo(field savepointUndoField, key uint64, wasPre
 // exactly one of RestoreSavepoint (child rollback) or ReleaseSavepoint
 // (child commit). Savepoints are strictly nested (LIFO): a child must
 // resolve before its parent, which the root package enforces via the
-// parent-freeze rule (ErrChildActive).
+// parent-freeze rule (Commit frozen; Rollback cascades deepest-first,
+// preserving LIFO).
 //
 // For internal-helper atomicity (the per-op row mutations, indexed or
 // not), use BeginShallowSavepoint instead: it preserves loose-pop so

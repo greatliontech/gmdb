@@ -794,8 +794,12 @@ func (rtx *ReadTx) Rollback() error
 // depth. Only valid on a write txn.
 //
 // While the child — or any descendant — is open, the parent and every
-// ancestor are FROZEN: any op on them (data ops, Commit, Rollback, a
-// second BeginChild) returns ErrChildActive until the child resolves.
+// ancestor are FROZEN: data ops, Commit, and a second BeginChild on
+// them return ErrChildActive until the child resolves. Rollback is
+// the exception — it cascade-rolls-back the open descendant chain
+// deepest-first and then the transaction itself (transactions.md
+// §Nested Transactions), so a dropped child handle can never strand
+// the write grant.
 // Handles opened on the child are valid only for the child's lifetime
 // (ErrTxClosed after it resolves); continue through a parent handle.
 // See transactions.md §Nested Transactions.

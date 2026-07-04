@@ -167,11 +167,12 @@ type Tx struct {
 
 	// activeChild is this tx's currently-open, unresolved child (from
 	// BeginChild), or nil. While non-nil this tx — and transitively
-	// every ancestor — is FROZEN: data ops, Commit, Rollback, and a
-	// second BeginChild all return ErrChildActive until the child
-	// commits or rolls back (parent-freeze / LMDB nested-txn model,
-	// transactions.md §Nested Transactions). Cleared by the child's
-	// commitChild / rollbackChild.
+	// every ancestor — is FROZEN: data ops, Commit, and a second
+	// BeginChild return ErrChildActive until the child commits or
+	// rolls back (parent-freeze / LMDB nested-txn model,
+	// transactions.md §Nested Transactions); Rollback instead
+	// cascades through the chain. Cleared by the child's
+	// commitChild / rollbackChild / cascadeRollback.
 	activeChild *Tx
 
 	// savepoint is the pager savepoint captured at BeginChild; nil for a
@@ -417,14 +418,26 @@ func (tx *Tx) Commit() error {
 // tx-scoped bookkeeping is cleared. The on-disk state is unchanged
 // (no pwrites occurred). Safe to call on an already-closed tx (returns
 // ErrTxClosed without side effects).
+//
+// Unresolved descendants do not freeze Rollback: the open child chain
+// is cascade-rolled-back deepest-first and then this transaction —
+// the parent-freeze invariant's one exception (transactions.md
+// §Nested Transactions), so a dropped child handle can never strand
+// the cross-process write grant.
 func (tx *Tx) Rollback() error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	// Parent-freeze: a frozen parent cannot roll back until its child
-	// resolves (the user must Commit/Rollback the child first).
+	// Rollback cascades through an unresolved descendant chain
+	// (deepest-first) instead of freezing (transactions.md §Nested
+	// Transactions, parent-freeze invariant): rollback is the
+	// abandon-everything operation, and freezing it would leave a
+	// caller holding only the parent of a dropped child handle with
+	// no API able to release the cross-process write grant until GC.
+	// Commit stays frozen — committing over an unresolved child is
+	// ambiguous and must be resolved explicitly.
 	if tx.activeChild != nil {
-		return ErrChildActive
+		tx.activeChild.cascadeRollback()
 	}
 	// A child transaction rolls back by restoring its pager savepoint
 	// and discarding its keyspace state — the parent is untouched.
@@ -444,11 +457,12 @@ func (tx *Tx) requireOpen(needsWrite bool) error {
 		return ErrTxClosed
 	}
 	// Parent-freeze (transactions.md §Nested Transactions): a tx with an
-	// unresolved child is frozen — every operation, including a read,
-	// Commit, and Rollback, returns ErrChildActive until the child
-	// resolves. This guards both the public data-op surface and the
-	// top-level Commit path; Rollback checks activeChild separately
-	// because it does not route through requireOpen.
+	// unresolved child is frozen — every operation, including a read
+	// and Commit, returns ErrChildActive until the child resolves.
+	// This guards both the public data-op surface and the top-level
+	// Commit path. Rollback does not route through requireOpen: it
+	// handles activeChild itself by cascading the chain (the freeze's
+	// one exception).
 	if tx.activeChild != nil {
 		return ErrChildActive
 	}

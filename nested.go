@@ -12,11 +12,13 @@ import (
 // may nest to arbitrary depth.
 //
 // While the returned child — or any of its descendants — is open and
-// unresolved, tx is FROZEN: every operation on tx, including Commit,
-// Rollback, and a second BeginChild, returns ErrChildActive until the
-// child commits or rolls back (LMDB-style parent-freeze). This prevents
-// the parent and child from racing on the shared copy-on-write pager
-// state.
+// unresolved, tx is FROZEN: every operation on tx, including Commit
+// and a second BeginChild, returns ErrChildActive until the child
+// commits or rolls back (LMDB-style parent-freeze). Rollback is the
+// exception — it cascade-rolls-back the open descendant chain
+// deepest-first and then tx itself, so a dropped child handle can
+// never strand the write grant. The freeze prevents the parent and
+// child from racing on the shared copy-on-write pager state.
 //
 // Handle lifetime. Keyspace / SetKeyspace / Cursor handles opened on the
 // child are valid only for the child's lifetime — every child handle
@@ -112,14 +114,14 @@ func (tx *Tx) commitChild() error {
 // cascadeRollback rolls tx and every still-open descendant back, deepest
 // first (LIFO savepoint order), ignoring the parent-freeze. The batch
 // coordinator uses it to recover when a closure returns having left a
-// nested child (a grandchild of the batch tx) unresolved: an ordinary
-// tx.Rollback would itself be frozen by that open descendant
-// (ErrChildActive) and could not clear the freeze. After cascadeRollback
-// returns, tx and all its descendants are closed and tx.parent.activeChild
-// is cleared, so the enclosing transaction is no longer frozen.
+// nested child (a grandchild of the batch tx) unresolved. After
+// cascadeRollback returns, tx and all its descendants are closed and
+// tx.parent.activeChild is cleared, so the enclosing transaction is no
+// longer frozen.
 //
-// tx must be a child (tx.parent != nil); the coordinator only calls this
-// on a closure's child handle.
+// tx must be a child (tx.parent != nil); callers are the batch
+// coordinator (on a closure's child handle) and Tx.Rollback's cascade
+// (on its own activeChild — always a child by construction).
 func (tx *Tx) cascadeRollback() {
 	if tx.activeChild != nil {
 		tx.activeChild.cascadeRollback()
@@ -128,6 +130,7 @@ func (tx *Tx) cascadeRollback() {
 		return
 	}
 	tx.closed = true
+	tx.endTime = time.Now() // TxStats.Duration: BeginChild → cascaded rollback
 	tx.pgr.RestoreSavepoint(tx.savepoint)
 	tx.savepoint = nil
 	if tx.parent != nil {
