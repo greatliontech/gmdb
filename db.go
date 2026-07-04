@@ -719,9 +719,15 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	newTxnID := prevMeta.TxnID + 1
 	pgr.SetCurrentTxnID(newTxnID)
 
-	// Chunk-5.5 LaggingReader wiring: pass the user's callback into
-	// the pager, plus a bound-refresh closure that re-derives
-	// min(coord.OldestReaderTxnID(), prevMeta.TxnID) after Wait.
+	// LaggingReader wiring: pass the user's callback into the pager,
+	// plus a bound-refresh closure that re-derives
+	// min(coord.OldestReaderTxnID(), lastCheckpointTxnID) after Wait
+	// — the SAME formula as the Begin-time bound above, checkpoint
+	// term included. Refreshing against prevMeta.TxnID instead would,
+	// under SyncLazy (where prevMeta runs ahead of the last
+	// checkpoint), reclaim segments the last checkpoint's tree still
+	// references — deterministic corruption after crash recovery
+	// selects that checkpoint.
 	//
 	// The wrapper checks coord.OldestReaderTxnID() before invoking
 	// the user callback — when no reader is active, OldestReaderTxnID
@@ -765,7 +771,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 			}
 		})
 		pgr.SetReclamationBoundRefresh(func() uint64 {
-			return min(coord.OldestReaderTxnID(), prevMeta.TxnID)
+			return min(coord.OldestReaderTxnID(), lastCheckpoint)
 		})
 	} else {
 		pgr.SetLaggingReaderCallback(nil)

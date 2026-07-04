@@ -624,7 +624,10 @@ func (p *Pager) SetRPLCorruptCallback(cb func(segPageID uint64)) {
 // SetReclamationBoundRefresh installs the bound-refresh closure used
 // after LaggingReaderWait. nil clears (no refresh, fall through to
 // file extension). DB.Begin captures coord and supplies a closure
-// that recomputes min(coord.OldestReaderTxnID(), prevMeta.TxnID).
+// that recomputes min(coord.OldestReaderTxnID(), lastCheckpointTxnID)
+// — the same formula as the Begin-time bound; the checkpoint term is
+// load-bearing under SyncLazy (refreshing against prevMeta.TxnID
+// would reclaim segments the last checkpoint's tree references).
 func (p *Pager) SetReclamationBoundRefresh(refresh func() uint64) {
 	p.refreshReclamationBound = refresh
 }
@@ -634,8 +637,8 @@ func (p *Pager) SetReclamationBoundRefresh(refresh func() uint64) {
 // returns the number of pages reclaimed. It first refreshes the bound IF a
 // refresh hook is wired (SetReclamationBoundRefresh — only with a LaggingReader
 // configured); otherwise it uses the bound seeded at BeginTx
-// (min(oldestReader, prevMeta.TxnID)), the same gate AllocPage's lazy reclaim
-// uses. Normally reclamation is lazy —
+// (min(oldestReader, lastCheckpointTxnID)), the same gate AllocPage's
+// lazy reclaim uses. Normally reclamation is lazy —
 // AllocPage triggers it only when the bitmap is exhausted. Incremental
 // compaction calls this at the start of its transaction so that (a) already-
 // reclaimable free space is available to relocate *into* before the first
