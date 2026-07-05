@@ -741,7 +741,7 @@ func (ks *Keyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, err
 	// error here must leave the keyspace at its pre-BulkLoad state).
 	oldRoots, err := finalizeIndexBuild(ks.tx.pgr, cfg, ks.name.Value(), names, ks.indexes, sorters)
 	if err != nil {
-		return 0, err
+		return 0, mapBtreeErr(bulkMapEntryTooLarge(err))
 	}
 
 	// All-or-nothing publish: row root + count (pinned index roots were
@@ -789,19 +789,19 @@ func (ks *SetKeyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, 
 		return nil
 	}
 	if err := ks.bulkLoadStream(rows, sb, onMember); err != nil {
-		return 0, err
+		return 0, mapBtreeErr(bulkMapEntryTooLarge(err))
 	}
 	if err := sb.flush(); err != nil {
-		return 0, err
+		return 0, mapBtreeErr(bulkMapEntryTooLarge(err))
 	}
 	rowRoot, _, err := sb.top.finish()
 	if err != nil {
-		return 0, err
+		return 0, mapBtreeErr(err)
 	}
 
 	oldRoots, err := finalizeIndexBuild(ks.tx.pgr, cfg, ks.name.Value(), names, ks.indexes, sorters)
 	if err != nil {
-		return 0, err
+		return 0, mapBtreeErr(bulkMapEntryTooLarge(err))
 	}
 
 	oldRowRoot := ks.desc.Root

@@ -84,6 +84,5 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [setkeyspace-bulkload-error-mapping](setkeyspace-bulkload-error-mapping.md) | chunk 20 | **[M]** Indexed SetKeyspace.BulkLoad leaks internal sentinels (missing mapBtreeErr); oversize-first-value returns errBulkEntryTooLarge. |
 | [set-cursor-materialization-bound](set-cursor-materialization-bound.md) | chunk 21 | **[L]** SetCursor materializes whole value sets per position; CountValues O(set) vs advertised O(1). Fix streaming or spec the bound. |
 | [api-and-doc-drift-sweep](api-and-doc-drift-sweep.md) | chunk 22 | **[L]** 9-item sweep: Range arity check, lock-ordering.md phantom locks, leak-detection.md Close ordering, pager-slab budget clause, limits.md max-key decision, checkpoint stale-read note, RO-fleet reaping, plain/overflow cell contradiction, truncated comment. |

@@ -11,14 +11,33 @@ import (
 )
 
 // errBulkEntryTooLarge is an internal sentinel: a single leaf entry does
-// not fit on an otherwise-empty leaf page. By the time an entry reaches
-// the builder its key is known to fit: the Keyspace layer promotes
-// over-inline values to overflow-reference entries and pre-checks the key
-// (bulkLeafEntry → ErrKeyTooLarge), and the SetKeyspace layer bounds value
-// size at the declaration layer and pre-checks the set key
-// (setBulk.flush → ErrKeyTooLarge). So this remains a defensive guard
-// against a caller/engine bug, not a reachable in-spec input.
+// not fit on an otherwise-empty leaf page. On the KEYSPACE path it is a
+// defensive guard against a caller/engine bug — the layer promotes
+// over-inline values to overflow-reference entries and pre-checks the
+// key (bulkLeafEntry → ErrKeyTooLarge). On the SET path it IS reachable
+// in-spec for variable-size sets: a key's FIRST value bypasses the
+// promotion threshold by design (matching Put's genesis shape, which
+// never threshold-checks a single value), so an oversize first value —
+// or an oversize member reaching a nested builder as its key — hits
+// this guard; bulkMapEntryTooLarge translates it to the public
+// ErrKeyTooLarge exactly as the same input surfaces through Put.
 var errBulkEntryTooLarge = errors.New("gmdb: bulkload entry too large for an empty leaf page")
+
+// bulkMapEntryTooLarge translates the builder's empty-leaf guard
+// into btree.ErrKeyTooLarge wherever a USER-derived entry can reach
+// it in-spec — set values and members (the first-value/nested cases
+// in the sentinel doc) and extractor-produced index keys or covering
+// payloads on the index-build boundary (limits.md subjects index
+// keys to the ordinary key maximum, and nothing bounds them at
+// declaration). The BulkLoad boundary's mapBtreeErr then surfaces
+// the public sentinel, matching what the same input yields through
+// Put. Every other error passes through unchanged.
+func bulkMapEntryTooLarge(err error) error {
+	if err != nil && errors.Is(err, errBulkEntryTooLarge) {
+		return fmt.Errorf("%w: %v", btree.ErrKeyTooLarge, err)
+	}
+	return err
+}
 
 // bulkPageWriter is the slice of the pager surface the bottom-up bulk
 // builder needs: allocate a fresh page ID and write a fully-formed page
@@ -529,10 +548,10 @@ func (ks *SetKeyspace) BulkLoad(rows iter.Seq2[[]byte, []byte]) (uint64, error) 
 		threshold: page.SubpagePromotionThreshold(cfg),
 	}
 	if err := ks.bulkLoadStream(rows, sb, nil); err != nil {
-		return 0, mapBtreeErr(err)
+		return 0, mapBtreeErr(bulkMapEntryTooLarge(err))
 	}
 	if err := sb.flush(); err != nil {
-		return 0, mapBtreeErr(err)
+		return 0, mapBtreeErr(bulkMapEntryTooLarge(err))
 	}
 	root, _, err := sb.top.finish()
 	if err != nil {

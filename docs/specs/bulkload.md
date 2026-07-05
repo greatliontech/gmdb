@@ -165,6 +165,17 @@ func (ks *Keyspace) BulkLoad(yield func(yield func(key, value []byte) bool)) (ui
 func (ks *SetKeyspace) BulkLoad(yield func(yield func(key, value []byte) bool)) (uint64, error)
 ```
 
+Error sentinels: BulkLoad surfaces the same public sentinels as the
+per-op paths on EVERY variant — indexed and non-indexed, Keyspace
+and SetKeyspace: an oversize key (row key, set key, or an
+extractor-produced index key on the indexed variants) and an
+oversize set value that cannot fit a leaf even alone (including a
+key's FIRST value, which by design bypasses the promotion threshold
+to match Put's genesis shape) surface `ErrKeyTooLarge`, exactly as
+the same input would through `Put`. Internal builder sentinels never
+escape the BulkLoad boundary. (Pinned per path by
+TestErrKeyTooLargeSentinel.)
+
 ## Algorithm
 
 Standard bottom-up B+tree construction:
