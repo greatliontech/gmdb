@@ -1011,6 +1011,17 @@ populates it as rows are written; existing rows are NOT
 auto-indexed — call `RebuildIndex` if you want existing rows
 indexed).
 
+`Drop` (and `Rebuild`) work whether or not the keyspace is
+currently open in the transaction, and the outcome is
+order-independent within the transaction: a subsequent same-tx
+open of the keyspace — any variant, including read-only —
+observes the post-Drop registry, and the drop persists at
+commit regardless of intervening opens. The same holds for
+`Tx.SetKeyspaceConfig` (`keyspaces.md §Per-Keyspace
+Configuration`): a descriptor mutation staged against a
+not-yet-open keyspace is never silently discarded by a later
+open of that keyspace in the same transaction.
+
 ## Statistics
 
 `Index.Stats()` returns the index's persistent count + B+tree

@@ -69,7 +69,6 @@ findings each shared-fix row covers.
 | [dbcleanup-teardown-drain](dbcleanup-teardown-drain.md) | condition (AddCleanup execution model revisit) | **[L]** dbCleanupFn tears down coord/lockFile without the txInflight drain Close performs — safe only while the runtime runs cleanups sequentially. Chunk-11 review finding. |
 | [pagechecksum-default-drift](pagechecksum-default-drift.md) | condition (Options breaking-change window) | **[M]** checksums.md + godoc promise PageChecksum default-on; applyDefaults never sets the plain bool, so the effective default is off — spec-promised bitrot detection silently absent. Chunk-15 review finding. |
 | [child-index-handle-outlives-child](child-index-handle-outlives-child.md) | condition (iter-closure requireOpen guard) | **[M]** A child-created IndexHandle keeps serving lookups after child Commit (Err nil) and descends savepoint-reverted pages after child Rollback — iter closures lack the requireOpen probe Stats has. Chunk-18 review finding, reviewer-reproduced. |
-| [drop-then-open-loses-staged-descriptor](drop-then-open-loses-staged-descriptor.md) | condition (open paths preserve staged dirty descriptors) | **[H]** Same-tx TxIndexes.Drop on a not-open keyspace, then any open of it: the open discards the staged descriptor, commit resurrects the registry entry over FreeSubtree-d pages. Chunk-19 review finding, reviewer-reproduced on base. |
 
 ## Open — full-codebase audit (2026-07-04)
 

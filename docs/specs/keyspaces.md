@@ -226,6 +226,13 @@ Two per-keyspace properties currently:
   keyspaces with mostly distinct keys to reduce per-`Prev()`
   group decode cost.
 
+`SetKeyspaceConfig` works whether or not the keyspace is open in
+the transaction, and its effect is order-independent within the
+transaction: a later same-tx open of the keyspace observes the
+new configuration, and the change persists at commit regardless
+of intervening opens (the same rule index administration follows,
+`indexing.md §Removing an Index`).
+
 Per-keyspace page size is **not** supported — single file with
 uniform page size is a core design strength (see
 `overview.md §Design Decisions`).

@@ -92,14 +92,20 @@ type Tx struct {
 	openSetKeyspaces map[uniqueNameHandle]*SetKeyspace
 
 	// dirtyDescriptors holds descriptor mutations on names that have
-	// no *Keyspace handle in openKeyspaces (today: SetKeyspaceConfig
-	// on an unopened name — kind-agnostic per the godoc on
-	// api-surface.md §Keyspace API SetKeyspaceConfig, so the
+	// no handle in openKeyspaces / openSetKeyspaces. Writers:
+	// SetKeyspaceConfig on an unopened name (kind-agnostic per the
+	// godoc on api-surface.md §Keyspace API SetKeyspaceConfig, so the
 	// mutation cannot be carried on a *Keyspace which is Kind=0
-	// only). These are flushed at Commit (the deferred-
-	// flush refactor) alongside openKeyspaces with state ∈
-	// {created, dirty}. Invariant: a name is in at most one of
-	// {openKeyspaces, dirtyDescriptors, pendingDeletes}.
+	// only); the index-admin adapter path (TxIndexes.Drop / Rebuild
+	// on an uncached keyspace via propagateNotCachedDescChange); and
+	// compactForest's relocated-root staging. These are flushed at
+	// Commit (the deferred-flush refactor) alongside openKeyspaces
+	// with state ∈ {created, dirty}. A later same-tx open of a staged
+	// name MOVES the entry's flush obligation into the cached handle
+	// (openCacheState seeds state=dirty, then the open deletes the
+	// entry); DeleteKeyspace supersedes an entry into pendingDeletes.
+	// Invariant: a name is in at most one of {openKeyspaces,
+	// openSetKeyspaces, dirtyDescriptors, pendingDeletes}.
 	dirtyDescriptors map[string]page.KeyspaceDescriptor
 
 	// pendingDeletes is the set of keyspace names whose persisted
@@ -510,8 +516,11 @@ func (tx *Tx) releaseGrant() {
 //  2. For every *Keyspace in openKeyspaces whose state is Created or
 //     Dirty (alphabetical by name), encode the descriptor and issue
 //     btree.Put.
-//  3. For every name in dirtyDescriptors not in openKeyspaces and not
-//     in pendingDeletes (alphabetical), encode and issue btree.Put.
+//  3. For every name in dirtyDescriptors (alphabetical), encode and
+//     issue btree.Put. No openKeyspaces / pendingDeletes filter is
+//     applied — the disjointness invariant on the tx field godocs
+//     guarantees no overlap (every open of a staged name moves the
+//     entry into the handle; DeleteKeyspace supersedes it).
 //
 // Ordering across the three steps doesn't affect the final on-disk
 // state because the three sets are disjoint by construction (see

@@ -138,7 +138,7 @@ func (tx *Tx) OpenKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, error
 	// open of a name that has an in-flight SetKeyspaceConfig
 	// mutation in dirtyDescriptors must not silently drop that
 	// mutation.
-	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean)
+	ks := tx.cacheOpenKeyspace(handle, desc, tx.openCacheState(name))
 	if err := tx.validatePinnedAgainstRegistry(ks, name, pinned); err != nil {
 		delete(tx.openKeyspaces, handle)
 		return nil, err
@@ -189,7 +189,7 @@ func (tx *Tx) OpenKeyspaceReadOnly(name string) (*Keyspace, error) {
 	if err != nil {
 		return nil, err
 	}
-	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean)
+	ks := tx.cacheOpenKeyspace(handle, desc, tx.openCacheState(name))
 	ks.readOnly = true
 	ks.indexes = indexes
 	delete(tx.dirtyDescriptors, name)
@@ -314,7 +314,7 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Ke
 		if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindKeyspace); err != nil {
 			return nil, err
 		}
-		ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean)
+		ks := tx.cacheOpenKeyspace(handle, desc, tx.openCacheState(name))
 		if err := tx.validatePinnedAgainstRegistry(ks, name, pinned); err != nil {
 			delete(tx.openKeyspaces, handle)
 			return nil, err
@@ -439,6 +439,24 @@ func (tx *Tx) lookupDescriptor(name string) (page.KeyspaceDescriptor, bool, erro
 		return desc, true, nil
 	}
 	return tx.loadDescriptor(name)
+}
+
+// openCacheState returns the flush state for a handle being cached by
+// an open of an existing keyspace. Clean when the descriptor came from
+// disk; Dirty when it came from a staged tx.dirtyDescriptors entry —
+// the open's subsequent delete of that entry MOVES the pending-flush
+// obligation into the handle rather than discarding it. Without the
+// Dirty transfer, a same-tx SetKeyspaceConfig or index-admin mutation
+// (TxIndexes.Drop / Rebuild) staged while the keyspace was uncached is
+// silently lost at Commit: flushKeyspaces skips Clean handles, so the
+// mutated descriptor never lands while its page-level effects
+// (FreeSubtree of dropped index trees) do — the on-disk registry entry
+// resurrects pointing at freed pages.
+func (tx *Tx) openCacheState(name string) keyspaceState {
+	if _, staged := tx.dirtyDescriptors[name]; staged {
+		return keyspaceStateDirty
+	}
+	return keyspaceStateClean
 }
 
 // loadDescriptor reads the descriptor for name directly from the

@@ -140,7 +140,7 @@ func (tx *Tx) OpenSetKeyspace(name string, indexes ...*IndexDecl) (*SetKeyspace,
 		return nil, err
 	}
 	// Defer dirtyDescriptors removal until validation succeeds.
-	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean)
+	sks := tx.cacheOpenSetKeyspace(handle, desc, tx.openCacheState(name))
 	if err := tx.validatePinnedAgainstRegistry(sks, name, pinned); err != nil {
 		delete(tx.openSetKeyspaces, handle)
 		return nil, err
@@ -189,7 +189,7 @@ func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error) {
 	if err != nil {
 		return nil, err
 	}
-	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean)
+	sks := tx.cacheOpenSetKeyspace(handle, desc, tx.openCacheState(name))
 	sks.readOnly = true
 	sks.indexes = indexes
 	delete(tx.dirtyDescriptors, name)
@@ -340,7 +340,7 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 			return nil, fmt.Errorf("%w: existing FixedValueSize=%d, opts.FixedValueSize=%d",
 				ErrFixedValueSizeMismatch, desc.FixedValueSize, fvs)
 		}
-		sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateClean)
+		sks := tx.cacheOpenSetKeyspace(handle, desc, tx.openCacheState(name))
 		if err := tx.validatePinnedAgainstRegistry(sks, name, pinned); err != nil {
 			delete(tx.openSetKeyspaces, handle)
 			return nil, err
