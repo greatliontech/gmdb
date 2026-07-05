@@ -372,6 +372,28 @@ member and call the extractor to compute prior index entries for
 deletion. See `indexing.md §Indexes on SetKeyspaces` and
 `§Bulk Operations on Indexed Keyspaces`.
 
+## Cursor Value Streaming
+
+A `SetCursor` position on a nested-tree key streams members through
+a lazy cursor over the nested tree: positioning costs O(tree depth)
+memory and time regardless of set size, and `CountValues` reads the
+cell's persisted `NestedCount` in O(1). Subpage keys materialize
+their value slice — bounded by one page by construction. The value
+state machine (value-BOF / value-EOF, `SeekValue` leaving the
+position unchanged on a miss) is uniform across both storage modes.
+
+Invariant: kind=clause-explicit;
+  property=A SetCursor position never allocates memory proportional
+    to the current key's member count when the key is stored as a
+    nested tree;
+  from=this spec §Cursor Value Streaming;
+  violation=Positioning on a postings-list key with millions of
+    members (the workload §Overview targets) copies every member
+    into memory per position — an O(set) allocation spike on a
+    read path advertised as streaming.
+    (Enforced by the nested-mode value helpers in set_cursor.go;
+    pinned by TestSetCursorNestedPositionIsStreamed.)
+
 ## Fixed-Size Value Sets
 
 When a SetKeyspace is created with `FixedValueSize` (non-zero), all

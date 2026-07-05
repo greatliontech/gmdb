@@ -617,3 +617,306 @@ func TestSetCursorStaleClearsOnReposition(t *testing.T) {
 		t.Errorf("Err post-recover=%v, want nil (stale should be cleared)", err)
 	}
 }
+
+// TestSetCursorNestedPositionIsStreamed pins the streaming contract
+// (set-keyspace.md §Cursor value streaming): positioning on a
+// nested-tree key must cost O(tree depth) allocations, NOT O(set) —
+// the pre-fix cursor copied every member into memory per position
+// (audit finding: unbounded allocation on the postings-list
+// workloads the spec targets). CountValues comes from the persisted
+// NestedCount in O(1).
+func TestSetCursorNestedPositionIsStreamed(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	sks, err := tx.CreateSetKeyspace("k", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const N = 20000
+	for i := range N {
+		v := make([]byte, 16)
+		v[0], v[1], v[2] = byte(i>>16), byte(i>>8), byte(i)
+		if _, err := sks.Put([]byte("posting"), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := sks.Cursor()
+	allocs := testing.AllocsPerRun(10, func() {
+		if k, _ := c.Seek([]byte("posting")); k == nil {
+			t.Fatal("Seek missed")
+		}
+	})
+	// O(depth) work: a materializing cursor would allocate ~N copies
+	// (20k+); streaming stays in the dozens.
+	if allocs > 200 {
+		t.Errorf("Seek on a %d-member nested set allocated %.0f objects per run — O(set) materialization regressed", N, allocs)
+	}
+
+	if k, _ := c.Seek([]byte("posting")); k == nil {
+		t.Fatal("Seek missed")
+	}
+	cnt, err := c.CountValues()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != N {
+		t.Errorf("CountValues = %d, want %d", cnt, N)
+	}
+
+	// Full walk still yields every member, in order, through the
+	// streamed position.
+	seen := 0
+	var last []byte
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if last != nil && bytes.Compare(last, v) >= 0 {
+			t.Fatalf("member order violation at %d", seen)
+		}
+		last = append(last[:0], v...)
+		seen++
+	}
+	if seen != N {
+		t.Errorf("streamed walk yielded %d members, want %d", seen, N)
+	}
+}
+
+// TestSetCursorNestedE4Transitions pins the nested-mode value state
+// machine parity (set-keyspace.md §Cursor Value Streaming: "uniform
+// across both storage modes"): BOF/EOF recovery, SeekValue hit and
+// miss-leaves-position, on a promoted (nested-tree) key.
+func TestSetCursorNestedE4Transitions(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	defer db.Close()
+	tx, _ := db.Begin(ctx)
+	defer tx.Rollback()
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	N := 300
+	for i := range N {
+		v := make([]byte, 20)
+		v[0], v[1] = byte(i/256), byte(i%256)
+		if _, err := sks.Put([]byte("key"), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := sks.Cursor()
+	if k, _ := c.First(); k == nil {
+		t.Fatal("First failed")
+	}
+
+	// value-BOF: PrevValue at first → nil; NextValue recovers to first.
+	if v := c.PrevValue(); v != nil {
+		t.Fatalf("PrevValue at first = %v, want nil (value-BOF)", v)
+	}
+	first := c.NextValue()
+	if first == nil || first[0] != 0 || first[1] != 0 {
+		t.Fatalf("NextValue from BOF = %v, want first member", first)
+	}
+
+	// value-EOF: LastValue then NextValue → nil; PrevValue recovers to last.
+	last := c.LastValue()
+	if last == nil || int(last[0])*256+int(last[1]) != N-1 {
+		t.Fatalf("LastValue = %v, want member %d", last, N-1)
+	}
+	if v := c.NextValue(); v != nil {
+		t.Fatalf("NextValue at last = %v, want nil (value-EOF)", v)
+	}
+	back := c.PrevValue()
+	if back == nil || int(back[0])*256+int(back[1]) != N-1 {
+		t.Fatalf("PrevValue from EOF = %v, want last member", back)
+	}
+
+	// SeekValue hit.
+	target := make([]byte, 20)
+	target[0], target[1] = 0, 42
+	if v := c.SeekValue(target); v == nil || v[1] != 42 {
+		t.Fatalf("SeekValue hit = %v, want member 42", v)
+	}
+	// SeekValue miss: position UNCHANGED (still at member 42).
+	miss := make([]byte, 21)
+	if v := c.SeekValue(miss); v != nil {
+		t.Fatalf("SeekValue miss = %v, want nil", v)
+	}
+	_, cur := c.Current()
+	if cur == nil || cur[1] != 42 {
+		t.Fatalf("position after SeekValue miss = %v, want member 42 (unchanged)", cur)
+	}
+}
+
+// TestSetCursorEmptyMemberNotSkipped pins the empty-member walk: an
+// empty ([]byte{}) member is a REAL position (api-surface.md §Nil
+// and Empty Semantics), returned as a non-nil empty slice — the
+// review demonstrated a nil-sentinel dispatch silently skipping it
+// and crossing keys early on the reverse walk.
+func TestSetCursorEmptyMemberNotSkipped(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx)
+	defer tx.Rollback()
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	if _, err := sks.Put([]byte("a"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sks.Put([]byte("k"), nil); err != nil { // empty member
+		t.Fatal(err)
+	}
+	if _, err := sks.Put([]byte("k"), []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+
+	c := sks.Cursor()
+	forward := 0
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		forward++
+		if v == nil {
+			t.Errorf("forward walk yielded nil value at %q (want non-nil empty)", k)
+		}
+	}
+	if forward != 3 {
+		t.Errorf("forward walk = %d pairs, want 3", forward)
+	}
+	reverse := 0
+	for k, v := c.Last(); k != nil; k, v = c.Prev() {
+		reverse++
+		if v == nil {
+			t.Errorf("reverse walk yielded nil value at %q", k)
+		}
+	}
+	if reverse != 3 {
+		t.Errorf("reverse walk = %d pairs, want 3 (empty member skipped?)", reverse)
+	}
+}
+
+// TestSetCursorEmptyMemberInNestedTree pins the empty member in the
+// NESTED regime, where the btree cursor's nil-collapse on an
+// empty-key HIT (Seek returning nil curKey) broke both new Seek call
+// sites — review round 2: Delete at the "" member landed
+// end-of-iteration with 200 members remaining, and SeekValue("")
+// destroyed the position on a hit.
+func TestSetCursorEmptyMemberInNestedTree(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	defer db.Close()
+	tx, _ := db.Begin(ctx)
+	defer tx.Rollback()
+	sks, _ := tx.CreateSetKeyspace("k", nil)
+	if _, err := sks.Put([]byte("big"), nil); err != nil { // empty member
+		t.Fatal(err)
+	}
+	N := 200
+	for i := range N {
+		v := make([]byte, 20)
+		v[0], v[1], v[2] = 'm', byte(i/256), byte(i%256)
+		if _, err := sks.Put([]byte("big"), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := sks.Cursor()
+	// Full walk sees N+1 members, empty first, non-nil.
+	seen := 0
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if seen == 0 && (v == nil || len(v) != 0) {
+			t.Fatalf("first member = %v, want non-nil empty", v)
+		}
+		seen++
+	}
+	if seen != N+1 {
+		t.Errorf("walk = %d members, want %d", seen, N+1)
+	}
+
+	// SeekValue("") is a HIT: returns the empty member, position at it.
+	if k, _ := c.First(); k == nil {
+		t.Fatal("First failed")
+	}
+	if v := c.SeekValue([]byte{}); v == nil || len(v) != 0 {
+		t.Fatalf("SeekValue(empty) = %v, want non-nil empty (hit)", v)
+	}
+	if _, cur := c.Current(); cur == nil || len(cur) != 0 {
+		t.Fatalf("position after SeekValue(empty) = %v, want the empty member", cur)
+	}
+
+	// Delete at the "" member advances to member 0 — NOT end-of-
+	// iteration with 200 members remaining.
+	if err := c.Delete(); err != nil {
+		t.Fatalf("Delete at empty member: %v", err)
+	}
+	k, v := c.Current()
+	if string(k) != "big" || v == nil || v[0] != 'm' || v[1] != 0 || v[2] != 0 {
+		t.Fatalf("post-delete position = (%q, %v), want (big, member 0)", k, v)
+	}
+	cnt, err := c.CountValues()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnt != uint64(N) {
+		t.Errorf("CountValues after delete = %d, want %d", cnt, N)
+	}
+}
+
+// TestSetCursorDeleteFailureLeavesPositionIntact pins the retry
+// contract on the nested path: a FAILED Delete must leave the value
+// position unchanged — the successor peek must not move the live
+// inner cursor (the review demonstrated a moved cursor silently
+// skipping a member on the next NextValue after a failed indexed
+// delete).
+func TestSetCursorDeleteFailureLeavesPositionIntact(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	defer db.Close()
+	tx, _ := db.Begin(ctx)
+	defer tx.Rollback()
+	sks, err := tx.CreateSetKeyspace("k", nil, &IndexDecl{
+		Name:    "by_m",
+		Columns: []IndexColumn{{Name: "m"}},
+		Extract: func(_, member []byte) []IndexEntry {
+			return []IndexEntry{{Cols: [][]byte{member[:1]}}}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	N := 300 // promoted to a nested tree
+	for i := range N {
+		v := make([]byte, 20)
+		v[0], v[1], v[2] = 'm', byte(i/256), byte(i%256)
+		if _, err := sks.Put([]byte("key"), v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := sks.Cursor()
+	if k, _ := c.First(); k == nil {
+		t.Fatal("First failed")
+	}
+
+	// Fail the delete inside index maintenance (after the peek).
+	boom := errors.New("boom")
+	setIndexMaintenanceFailHookForTest(func(int) error { return boom })
+	err = c.Delete()
+	setIndexMaintenanceFailHookForTest(nil)
+	if !errors.Is(err, boom) {
+		t.Fatalf("Delete with failing maintenance: %v, want boom", err)
+	}
+
+	// Retry contract: position unchanged — Current is still member 0
+	// and NextValue yields member 1 (a moved inner cursor would skip
+	// to member 2).
+	_, cur := c.Current()
+	if cur == nil || cur[1] != 0 || cur[2] != 0 {
+		t.Fatalf("position after failed Delete = %v, want member 0", cur)
+	}
+	nv := c.NextValue()
+	if nv == nil || nv[1] != 0 || nv[2] != 1 {
+		t.Fatalf("NextValue after failed Delete = %v, want member 1 (member skipped?)", nv)
+	}
+}

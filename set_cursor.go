@@ -19,10 +19,13 @@ import (
 //   - OUTER (key): tracked by an inner btree.Cursor over the parent
 //     SetKeyspace tree. Outer moves are First / Last / Next / Prev /
 //     Seek / SeekGE / NextKey / PrevKey.
-//   - INNER (value within current key's set): tracked by an int
-//     index into a `values [][]byte` slice materialized when the
-//     outer cursor advances to a new key. Inner moves are
-//     FirstValue / LastValue / NextValue / PrevValue / SeekValue.
+//   - INNER (value within current key's set): subpage cells
+//     materialize their (page-bounded) value slice and track an int
+//     index; nested-tree cells STREAM members through a lazy inner
+//     btree cursor, so a position costs O(1) memory on
+//     arbitrarily large sets (set-keyspace.md §Cursor value
+//     streaming). Inner moves are FirstValue / LastValue /
+//     NextValue / PrevValue / SeekValue, uniform across both modes.
 //
 // Entailed invariant E4 (set-keyspace.md §Invariants): `NextValue`
 // from the last value of a key transitions the cursor to
@@ -30,12 +33,13 @@ import (
 // / NextKey advance across keys. Symmetric for PrevValue / value-
 // BOF / Prev / PrevKey.
 //
-// Materialization strategy (v1 simplification): on every outer-key
-// transition the cursor decodes the cell and materialises ALL
-// values for that key into a [][]byte. Cost is O(N) per key
-// transition; for very large nested-tree cells this allocates a
-// matching-size slice. Acceptable for v1; a lazy-iteration
-// rewrite is a perf-driven follow-up.
+// Value storage strategy (set-keyspace.md §Cursor Value Streaming):
+// subpage cells materialize their value slice on each outer-key
+// transition — bounded by one page by construction; nested-tree
+// cells stream members through a lazy inner cursor, so a position
+// costs O(tree depth) regardless of set size. Returned member
+// slices are fresh copies (tx-lifetime ownership, api-surface.md
+// §Byte Slice Ownership); empty members surface as []byte{}.
 //
 // Sibling-mutation contract: SetKeyspace tracks every open
 // SetCursor in `openSetCursors`. SetKeyspace.Put / Delete /
@@ -59,9 +63,9 @@ type SetCursor struct {
 	// outer-key positioning; we read the LeafEntry via outerCursor.
 	outerCursor *btree.Cursor
 
-	// positioned is true iff the cursor holds a valid (currentKey,
-	// values, innerIdx) triple representing a (key, value) pair.
-	// False on Unpositioned (pre-First) or End-of-iteration.
+	// positioned is true iff the cursor holds a valid current key +
+	// value-position state (either mode). False on Unpositioned
+	// (pre-First) or End-of-iteration.
 	positioned bool
 
 	// currentKey is a heap-copy of the current outer-key (the
@@ -79,6 +83,26 @@ type SetCursor struct {
 	//   len(values)      — Value-EOF (NextValue past last value).
 	//   -1               — Value-BOF (PrevValue past first value).
 	innerIdx int
+
+	// Nested-mode value navigation (set-keyspace.md §Cursor Value
+	// Streaming): when the current key's cell is a nested tree, the
+	// member set is NOT materialized — values stays nil and the
+	// fields below stream members through a lazy inner cursor, so a
+	// cursor position costs O(1) memory on million-member sets.
+	// Subpage cells keep the materialized slice (bounded by one
+	// page). innerIdx is meaningful only in subpage mode; the
+	// BOF/EOF sentinels map to innerState in nested mode.
+	nestedActive bool
+	nestedRoot   uint64
+	nestedCount  uint64
+	// inner is the lazy member cursor; nil until a value op
+	// positions it, and discarded on BOF/EOF transitions (a btree
+	// cursor that has walked off an end re-descends on recovery).
+	inner *btree.Cursor
+	// innerState: 0 = at curVal, -1 = value-BOF, +1 = value-EOF.
+	innerState int8
+	// curVal is a heap copy of the current member (innerState == 0).
+	curVal []byte
 
 	// stale is set by markSetCursorsStale (called from
 	// SetKeyspace.Put / Delete / DeleteValue) and cleared by
@@ -221,8 +245,11 @@ func (c *SetCursor) First() (key, value []byte) {
 		c.closeErr = err
 		return nil, nil
 	}
-	c.innerIdx = 0
-	return c.currentKey, c.values[0]
+	v := c.valSetFirst()
+	if v == nil {
+		return nil, nil // nested descend failed — Err() carries the cause
+	}
+	return c.currentKey, v
 }
 
 // Last positions at the (lastKey, lastValueOfLastKey) pair.
@@ -239,8 +266,11 @@ func (c *SetCursor) Last() (key, value []byte) {
 		c.closeErr = err
 		return nil, nil
 	}
-	c.innerIdx = len(c.values) - 1
-	return c.currentKey, c.values[c.innerIdx]
+	v := c.valSetLast()
+	if v == nil {
+		return nil, nil
+	}
+	return c.currentKey, v
 }
 
 // Next advances by one (key, value) pair. Walks values within the
@@ -255,10 +285,14 @@ func (c *SetCursor) Next() (key, value []byte) {
 	if !c.positioned {
 		return c.First()
 	}
-	// In-key advance.
-	if c.innerIdx+1 < len(c.values) {
-		c.innerIdx++
-		return c.currentKey, c.values[c.innerIdx]
+	// In-key advance (E4 machinery, but Next DOES cross keys on
+	// value exhaustion). Dispatch on ok, never on slice nil-ness —
+	// an empty member is a real position.
+	if v, ok := c.valNext(); ok {
+		return c.currentKey, v
+	}
+	if c.closeErr != nil {
+		return nil, nil // read error mid-key — do not cross keys past it
 	}
 	// Cross to next key.
 	return c.advanceOuterForward()
@@ -273,9 +307,11 @@ func (c *SetCursor) Prev() (key, value []byte) {
 	if !c.positioned {
 		return c.Last()
 	}
-	if c.innerIdx > 0 {
-		c.innerIdx--
-		return c.currentKey, c.values[c.innerIdx]
+	if v, ok := c.valPrev(); ok {
+		return c.currentKey, v
+	}
+	if c.closeErr != nil {
+		return nil, nil
 	}
 	return c.advanceOuterBackward()
 }
@@ -296,8 +332,11 @@ func (c *SetCursor) Seek(target []byte) (key, value []byte) {
 		c.closeErr = err
 		return nil, nil
 	}
-	c.innerIdx = 0
-	return c.currentKey, c.values[0]
+	v := c.valSetFirst()
+	if v == nil {
+		return nil, nil // nested descend failed — Err() carries the cause
+	}
+	return c.currentKey, v
 }
 
 // SeekGE positions at the (smallest-key-≥-target, firstValueOf
@@ -315,8 +354,11 @@ func (c *SetCursor) SeekGE(target []byte) (key, value []byte) {
 		c.closeErr = err
 		return nil, nil
 	}
-	c.innerIdx = 0
-	return c.currentKey, c.values[0]
+	v := c.valSetFirst()
+	if v == nil {
+		return nil, nil // nested descend failed — Err() carries the cause
+	}
+	return c.currentKey, v
 }
 
 // Current returns the current (key, value) without advancing.
@@ -330,10 +372,10 @@ func (c *SetCursor) Current() (key, value []byte) {
 	if !c.positioned {
 		return nil, nil
 	}
-	if c.innerIdx < 0 || c.innerIdx >= len(c.values) {
-		return nil, nil
+	if v, ok := c.valCurrent(); ok {
+		return c.currentKey, v
 	}
-	return c.currentKey, c.values[c.innerIdx]
+	return nil, nil
 }
 
 // FirstValue rewinds to the first value of the current key. Returns
@@ -345,8 +387,7 @@ func (c *SetCursor) FirstValue() (value []byte) {
 	if !c.positioned {
 		return nil
 	}
-	c.innerIdx = 0
-	return c.values[0]
+	return c.valSetFirst()
 }
 
 // LastValue forwards to the last value of the current key.
@@ -357,8 +398,7 @@ func (c *SetCursor) LastValue() (value []byte) {
 	if !c.positioned {
 		return nil
 	}
-	c.innerIdx = len(c.values) - 1
-	return c.values[c.innerIdx]
+	return c.valSetLast()
 }
 
 // NextValue advances by one VALUE within the current key's set.
@@ -372,19 +412,8 @@ func (c *SetCursor) NextValue() (value []byte) {
 	if !c.positioned {
 		return nil
 	}
-	if c.innerIdx < 0 {
-		// Value-BOF → first value.
-		c.innerIdx = 0
-		return c.values[0]
-	}
-	if c.innerIdx+1 >= len(c.values) {
-		// Already at last value (or past it). Transition to
-		// value-EOF and return nil. Does NOT advance outer.
-		c.innerIdx = len(c.values)
-		return nil
-	}
-	c.innerIdx++
-	return c.values[c.innerIdx]
+	v, _ := c.valNext()
+	return v
 }
 
 // PrevValue steps back by one value within the current key's set.
@@ -396,18 +425,8 @@ func (c *SetCursor) PrevValue() (value []byte) {
 	if !c.positioned {
 		return nil
 	}
-	if c.innerIdx >= len(c.values) {
-		// Value-EOF → last value.
-		c.innerIdx = len(c.values) - 1
-		return c.values[c.innerIdx]
-	}
-	if c.innerIdx <= 0 {
-		// At first value (or before). Transition to value-BOF.
-		c.innerIdx = -1
-		return nil
-	}
-	c.innerIdx--
-	return c.values[c.innerIdx]
+	v, _ := c.valPrev()
+	return v
 }
 
 // NextKey skips the remainder of the current key's value set and
@@ -447,8 +466,11 @@ func (c *SetCursor) PrevKey() (key, value []byte) {
 		if k == nil {
 			return nil, nil
 		}
-		c.innerIdx = 0
-		return c.currentKey, c.values[0]
+		v := c.valSetFirst()
+		if v == nil {
+			return nil, nil // nested descend failed — Err() carries the cause
+		}
+		return c.currentKey, v
 	}
 	// Need to go to PREVIOUS key. outerCursor.Prev() steps back
 	// one outer-key, then materialize and position innerIdx=0.
@@ -472,12 +494,8 @@ func (c *SetCursor) SeekValue(target []byte) (value []byte) {
 	if !c.positioned {
 		return nil
 	}
-	idx, found := binarySearchValues(c.values, target)
-	if !found {
-		return nil
-	}
-	c.innerIdx = idx
-	return c.values[idx]
+	v, _ := c.valSeek(target)
+	return v
 }
 
 // CountValues returns the number of values in the current key's
@@ -492,7 +510,7 @@ func (c *SetCursor) CountValues() (uint64, error) {
 	if !c.positioned {
 		return 0, nil
 	}
-	return uint64(len(c.values)), nil
+	return c.valCount(), nil
 }
 
 // Delete removes the current (key, value) pair. Cursor must be
@@ -515,20 +533,24 @@ func (c *SetCursor) Delete() error {
 		}
 		return ErrCursorStale
 	}
-	if !c.positioned || c.innerIdx < 0 || c.innerIdx >= len(c.values) {
+	if !c.positioned || !c.valAtReal() {
 		return ErrCursorUnpositioned
 	}
 	k := bytes.Clone(c.currentKey)
-	v := bytes.Clone(c.values[c.innerIdx])
+	cur, _ := c.valCurrent()
+	v := bytes.Clone(cur)
 
 	// Determine the successor pre-delete:
 	//   - in-key: next value within current set.
 	//   - cross-key: first value of next outer key (we'll re-seek
 	//     using "any value ≥ (k+sentinel)" via outerCursor's next).
+	// valPeekSuccessor may move the nested inner cursor; the whole
+	// position is discarded by the re-seek below, so that is never
+	// observed.
 	var sucKey, sucValue []byte
-	if c.innerIdx+1 < len(c.values) {
+	if sv := c.valPeekSuccessor(); sv != nil {
 		sucKey = k
-		sucValue = bytes.Clone(c.values[c.innerIdx+1])
+		sucValue = sv
 	}
 
 	// Mutate the keyspace. SetKeyspace.DeleteValue runs its full
@@ -559,7 +581,9 @@ func (c *SetCursor) Delete() error {
 			c.closeErr = err
 			return err
 		}
-		c.innerIdx = 0
+		if c.valSetFirst() == nil && c.closeErr != nil {
+			return c.closeErr
+		}
 		return nil
 	}
 	// In-key: re-Seek to sucKey, then SeekValue to sucValue.
@@ -577,22 +601,26 @@ func (c *SetCursor) Delete() error {
 			c.closeErr = err
 			return err
 		}
-		c.innerIdx = 0
+		if c.valSetFirst() == nil && c.closeErr != nil {
+			return c.closeErr
+		}
 		return nil
 	}
 	if err := c.materializeAtOuter(); err != nil {
 		c.closeErr = err
 		return err
 	}
-	idx, found := binarySearchValues(c.values, sucValue)
-	if !found {
+	if _, ok := c.valSeek(sucValue); !ok {
+		if c.closeErr != nil {
+			return c.closeErr // read error during the re-seek, not a miss
+		}
 		// Defensive: the successor value vanished (post-demote
-		// merge of values? shouldn't happen). Fall back to
-		// innerIdx=0.
-		c.innerIdx = 0
-		return nil
+		// merge of values? shouldn't happen). Fall back to the
+		// first value.
+		if c.valSetFirst() == nil && c.closeErr != nil {
+			return c.closeErr
+		}
 	}
-	c.innerIdx = idx
 	return nil
 }
 
@@ -641,6 +669,233 @@ func (c *SetCursor) Err() error {
 
 // --- internal helpers ---
 
+// --- value navigation (mode-dispatching) ---
+//
+// The helpers below are the ONLY code that touches values/innerIdx
+// (subpage mode) or inner/innerState/curVal (nested mode). Public
+// ops express the E4 value state machine through them.
+
+// nonNilValue normalizes an empty member to []byte{} at the helper
+// boundary: api-surface.md §Nil and Empty Semantics — cursors return
+// (key, []byte{}) for empty values, and the public ops dispatch on
+// the ok flag, never on slice nil-ness (an empty member is a real
+// position — a nil-sentinel dispatch skipped it, demonstrated in
+// review).
+func nonNilValue(v []byte) []byte {
+	if v == nil {
+		return []byte{}
+	}
+	return v
+}
+
+// valSetFirst positions at the current key's first value.
+func (c *SetCursor) valSetFirst() []byte {
+	if !c.nestedActive {
+		c.innerIdx = 0
+		return nonNilValue(c.values[0])
+	}
+	return c.nestedDescend(true)
+}
+
+// valSetLast positions at the current key's last value.
+func (c *SetCursor) valSetLast() []byte {
+	if !c.nestedActive {
+		c.innerIdx = len(c.values) - 1
+		return nonNilValue(c.values[c.innerIdx])
+	}
+	return c.nestedDescend(false)
+}
+
+// nestedDescend opens a fresh inner cursor at the first/last member.
+// A nil walk result (empty nested tree — unreachable in-spec, empty
+// sets never persist — or a read error, reported via Err) degrades
+// to value-EOF.
+func (c *SetCursor) nestedDescend(first bool) []byte {
+	c.inner = btree.NewReadCursor(c.tx.pgr, c.ks.builderCfg(), c.nestedRoot)
+	var nk []byte
+	if first {
+		nk, _ = c.inner.First()
+	} else {
+		nk, _ = c.inner.Last()
+	}
+	if nk == nil {
+		if err := c.inner.Err(); err != nil {
+			c.closeErr = mapBtreeErr(err)
+		}
+		c.inner = nil
+		c.innerState = 1
+		return nil
+	}
+	// Fresh copy per step: returned member slices keep the
+	// tx-lifetime ownership contract (api-surface.md §Byte Slice
+	// Ownership) — no reuse buffer that a later cursor op would
+	// overwrite under the caller.
+	c.curVal = nonNilValue(bytes.Clone(nk))
+	c.innerState = 0
+	return c.curVal
+}
+
+// valNext advances one value within the key; E4: never crosses keys.
+// ok=false ONLY on the value-EOF transition/state (an empty member
+// is ok=true with an empty slice).
+func (c *SetCursor) valNext() ([]byte, bool) {
+	if !c.nestedActive {
+		if c.innerIdx < 0 {
+			c.innerIdx = 0
+			return nonNilValue(c.values[0]), true
+		}
+		if c.innerIdx+1 >= len(c.values) {
+			c.innerIdx = len(c.values)
+			return nil, false
+		}
+		c.innerIdx++
+		return nonNilValue(c.values[c.innerIdx]), true
+	}
+	switch c.innerState {
+	case -1:
+		v := c.nestedDescend(true)
+		return v, c.innerState == 0
+	case 1:
+		return nil, false
+	}
+	nk, _ := c.inner.Next()
+	if nk == nil {
+		if err := c.inner.Err(); err != nil {
+			c.closeErr = mapBtreeErr(err)
+		}
+		c.inner = nil
+		c.innerState = 1
+		return nil, false
+	}
+	c.curVal = nonNilValue(bytes.Clone(nk))
+	return c.curVal, true
+}
+
+// valPrev steps back one value within the key; E4 symmetric.
+func (c *SetCursor) valPrev() ([]byte, bool) {
+	if !c.nestedActive {
+		if c.innerIdx >= len(c.values) {
+			c.innerIdx = len(c.values) - 1
+			return nonNilValue(c.values[c.innerIdx]), true
+		}
+		if c.innerIdx <= 0 {
+			c.innerIdx = -1
+			return nil, false
+		}
+		c.innerIdx--
+		return nonNilValue(c.values[c.innerIdx]), true
+	}
+	switch c.innerState {
+	case 1:
+		v := c.nestedDescend(false)
+		return v, c.innerState == 0
+	case -1:
+		return nil, false
+	}
+	nk, _ := c.inner.Prev()
+	if nk == nil {
+		if err := c.inner.Err(); err != nil {
+			c.closeErr = mapBtreeErr(err)
+		}
+		c.inner = nil
+		c.innerState = -1
+		return nil, false
+	}
+	c.curVal = nonNilValue(bytes.Clone(nk))
+	return c.curVal, true
+}
+
+// valSeek locates target within the current key's set. On miss it
+// returns ok=false and leaves the position UNCHANGED (E4) — nested
+// mode probes with a point Get before moving anything.
+func (c *SetCursor) valSeek(target []byte) ([]byte, bool) {
+	if !c.nestedActive {
+		idx, found := binarySearchValues(c.values, target)
+		if !found {
+			return nil, false
+		}
+		c.innerIdx = idx
+		return nonNilValue(c.values[idx]), true
+	}
+	_, found, err := btree.Get(c.tx.pgr, c.ks.builderCfg(), c.nestedRoot, target)
+	if err != nil {
+		c.closeErr = mapBtreeErr(err)
+		return nil, false
+	}
+	if !found {
+		return nil, false
+	}
+	c.inner = btree.NewReadCursor(c.tx.pgr, c.ks.builderCfg(), c.nestedRoot)
+	nk, _ := c.inner.Seek(target)
+	if nk == nil {
+		// The member vanished between probe and descent — same-tx
+		// impossible (no mutation between), defensive only.
+		c.inner = nil
+		c.innerState = 1
+		return nil, false
+	}
+	c.curVal = nonNilValue(bytes.Clone(nk))
+	c.innerState = 0
+	return c.curVal, true
+}
+
+// valCurrent returns the current value; ok=false at BOF/EOF.
+func (c *SetCursor) valCurrent() ([]byte, bool) {
+	if !c.nestedActive {
+		if c.innerIdx < 0 || c.innerIdx >= len(c.values) {
+			return nil, false
+		}
+		return nonNilValue(c.values[c.innerIdx]), true
+	}
+	if c.innerState != 0 {
+		return nil, false
+	}
+	return c.curVal, true
+}
+
+// valAtReal reports whether the cursor is at a real value (not
+// BOF/EOF) — Delete's precondition.
+func (c *SetCursor) valAtReal() bool {
+	if !c.nestedActive {
+		return c.innerIdx >= 0 && c.innerIdx < len(c.values)
+	}
+	return c.innerState == 0
+}
+
+// valCount is the current key's member count — O(1) in both modes
+// (subpage slice length; the nested cell's persisted NestedCount).
+func (c *SetCursor) valCount() uint64 {
+	if !c.nestedActive {
+		return uint64(len(c.values))
+	}
+	return c.nestedCount
+}
+
+// valPeekSuccessor returns a copy of the value after the current
+// one, or nil at the key's end — Delete's pre-delete successor
+// probe. Nested mode probes with a THROWAWAY cursor: the live inner
+// cursor must not move, because a failed DeleteValue leaves this
+// cursor un-staled and the documented retry contract promises its
+// position unchanged (a moved inner cursor would skip a member —
+// demonstrated in review).
+func (c *SetCursor) valPeekSuccessor() []byte {
+	if !c.nestedActive {
+		if c.innerIdx+1 < len(c.values) {
+			return bytes.Clone(c.values[c.innerIdx+1])
+		}
+		return nil
+	}
+	tmp := btree.NewReadCursor(c.tx.pgr, c.ks.builderCfg(), c.nestedRoot)
+	if nk, _ := tmp.Seek(c.curVal); nk == nil {
+		return nil // current member unreadable — Delete's own path will surface it
+	}
+	nk, _ := tmp.Next()
+	if nk == nil {
+		return nil
+	}
+	return bytes.Clone(nk)
+}
+
 // clearPosition resets the position state to Unpositioned and
 // clears the stale flag — re-positioning ops use this to recover
 // from a sibling-mutation-induced stale state. (The underlying
@@ -652,16 +907,20 @@ func (c *SetCursor) clearPosition() {
 	c.currentKey = nil
 	c.values = nil
 	c.innerIdx = 0
+	c.nestedActive = false
+	c.nestedRoot = 0
+	c.nestedCount = 0
+	c.inner = nil
+	c.innerState = 0
+	c.curVal = nil
 	c.stale = false
 }
 
 // materializeAtOuter reads the current outerCursor's (key, cell)
-// and populates currentKey + values. Caller is responsible for
-// setting innerIdx after this call.
-//
-// Allocates new []byte for currentKey and each value (independent
-// of leaf-buffer borrow). For nested-tree cells, walks the entire
-// nested tree to materialize.
+// and establishes the value-navigation mode: subpage cells
+// materialize their (page-bounded) value slice; nested-tree cells
+// record root + persisted count and stream members lazily through
+// the val* helpers. Caller positions via valSetFirst/valSetLast.
 func (c *SetCursor) materializeAtOuter() error {
 	// outerCursor's Current returns (key, opaqueValue) but we need
 	// the full cell flags. Re-fetch via the keyspace's GetEntry
@@ -679,7 +938,15 @@ func (c *SetCursor) materializeAtOuter() error {
 		return fmt.Errorf("%w: SetCursor: outerCursor key %q not found via GetEntry", ErrCorrupted, k)
 	}
 	c.currentKey = append([]byte(nil), k...)
+	// Reset BOTH mode states — the previous position may have been
+	// the other cell kind.
 	c.values = c.values[:0]
+	c.nestedActive = false
+	c.nestedRoot = 0
+	c.nestedCount = 0
+	c.inner = nil
+	c.innerState = 0
+	c.curVal = nil
 	switch {
 	case e.IsSubpage():
 		sp := page.NewSubpageReader(e.Value, c.ks.desc.FixedValueSize)
@@ -688,20 +955,24 @@ func (c *SetCursor) materializeAtOuter() error {
 			return true
 		})
 	case e.IsNestedTree():
-		// Walk the nested tree's leaves and copy each key.
-		nestedCfg := cfg
-		inner := btree.NewReadCursor(c.tx.pgr, nestedCfg, e.NestedRoot)
-		for nk, _ := inner.First(); nk != nil; nk, _ = inner.Next() {
-			c.values = append(c.values, append([]byte(nil), nk...))
-		}
-		if err := inner.Err(); err != nil {
-			return mapBtreeErr(err)
-		}
+		// Nested-tree cells stream: record the root + persisted
+		// count; the value helpers walk lazily (O(1) memory per
+		// position on arbitrarily large sets).
+		c.nestedActive = true
+		c.nestedRoot = e.NestedRoot
+		c.nestedCount = e.NestedCount
+		c.inner = nil
+		c.innerState = 0
+		c.curVal = nil
 	default:
 		return fmt.Errorf("%w: SetCursor: unexpected cell flags 0x%x at key %q",
 			ErrCorrupted, e.Flags, k)
 	}
-	if len(c.values) == 0 {
+	empty := len(c.values) == 0
+	if c.nestedActive {
+		empty = c.nestedRoot == 0 || c.nestedCount == 0
+	}
+	if empty {
 		return fmt.Errorf("%w: SetCursor: zero-value cell at key %q (empty-set invariant violation)",
 			ErrCorrupted, k)
 	}
@@ -722,8 +993,11 @@ func (c *SetCursor) advanceOuterForward() (key, value []byte) {
 		c.closeErr = err
 		return nil, nil
 	}
-	c.innerIdx = 0
-	return c.currentKey, c.values[0]
+	v := c.valSetFirst()
+	if v == nil {
+		return nil, nil // nested descend failed — Err() carries the cause
+	}
+	return c.currentKey, v
 }
 
 // advanceOuterBackward moves outerCursor.Prev() and materializes
@@ -739,8 +1013,11 @@ func (c *SetCursor) advanceOuterBackward() (key, value []byte) {
 		c.closeErr = err
 		return nil, nil
 	}
-	c.innerIdx = len(c.values) - 1
-	return c.currentKey, c.values[c.innerIdx]
+	v := c.valSetLast()
+	if v == nil {
+		return nil, nil
+	}
+	return c.currentKey, v
 }
 
 // prevOuterFirstValue moves outerCursor.Prev() and positions at
@@ -755,8 +1032,11 @@ func (c *SetCursor) prevOuterFirstValue() (key, value []byte) {
 		c.closeErr = err
 		return nil, nil
 	}
-	c.innerIdx = 0
-	return c.currentKey, c.values[0]
+	v := c.valSetFirst()
+	if v == nil {
+		return nil, nil // nested descend failed — Err() carries the cause
+	}
+	return c.currentKey, v
 }
 
 // binarySearchValues finds target in a sorted [][]byte slice.

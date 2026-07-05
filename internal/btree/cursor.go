@@ -492,6 +492,9 @@ func (c *Cursor) reclaimIterBuffers() {
 // failure so the caller can decide whether to continue.
 func (c *Cursor) adoptEntry(e page.LeafEntry) {
 	c.curKey = e.Key
+	if c.curKey == nil {
+		c.curKey = emptyPositionedKey // see adoptTargetKey — nil is the miss channel
+	}
 	c.curValue = c.valueFor(e)
 }
 
@@ -522,7 +525,20 @@ func (c *Cursor) valueFor(e page.LeafEntry) []byte {
 func (c *Cursor) adoptTargetKey(target []byte) {
 	c.curKeyBuf = append(c.curKeyBuf[:0], target...)
 	c.curKey = c.curKeyBuf
+	if c.curKey == nil {
+		// A hit on the EMPTY key (legitimate in nested member
+		// trees): nil is the cursor's miss/unpositioned channel, so
+		// a positioned curKey must never be nil — a fresh cursor's
+		// nil curKeyBuf would otherwise collapse the hit into a
+		// reported miss.
+		c.curKey = emptyPositionedKey
+	}
 }
+
+// emptyPositionedKey is the non-nil zero-length key a positioned
+// cursor reports for the empty stored key. Shared and immutable
+// (len 0 — no writes can go through it).
+var emptyPositionedKey = []byte{}
 
 // descendLeftmost walks from rootID down through leftmost child
 // pointers, populating c.path with branch frames (childIdx = 0
