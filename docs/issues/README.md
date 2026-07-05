@@ -82,7 +82,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [index-covering-value-diff](index-covering-value-diff.md) | chunk 17 | **[H]** Covering bytes never rewritten on value-only updates (key-only diff) — stale covering lookups; Check flags normal workloads. Failing repro. + align rebuild/maintenance dup tie-break. |
 | [index-child-merge-handle-reconciliation](index-child-merge-handle-reconciliation.md) | chunk 18 | **[H]** Child commit swaps pks.indexes but never re-points parent IndexHandles — silently stale lookups; freed-page reads after child Drop. Failing repro. |
 | [readonly-index-lookups](readonly-index-lookups.md) | chunk 19 | **[M]** RO opens never load declared indexes — spec'd RO index lookups unreachable on every surface. Failing repro. |
 | [setkeyspace-bulkload-error-mapping](setkeyspace-bulkload-error-mapping.md) | chunk 20 | **[M]** Indexed SetKeyspace.BulkLoad leaks internal sentinels (missing mapBtreeErr); oversize-first-value returns errBulkEntryTooLarge. |

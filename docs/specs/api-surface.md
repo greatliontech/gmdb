@@ -1396,6 +1396,10 @@ type TxStats struct {
     Merges  uint64
 
     // Indexing.
+    // IndexEntriesInserted counts index-tree Puts, INCLUDING
+    // in-place covering rewrites (same key, changed payload) — so
+    // Inserted - Deleted is not the net entry-count delta when
+    // covering updates occurred.
     IndexEntriesInserted uint64
     IndexEntriesDeleted  uint64
     IndexUniqueProbes    uint64

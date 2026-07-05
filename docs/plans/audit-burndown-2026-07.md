@@ -24,7 +24,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 14. compact-peer-handle-generation
 - [x] 15. check-consistency-classes
 - [x] 16. iterator-cursor-unregistration
-- [ ] 17. index-covering-value-diff
+- [x] 17. index-covering-value-diff
 - [ ] 18. index-child-merge-handle-reconciliation
 - [ ] 19. readonly-index-lookups
 - [ ] 20. setkeyspace-bulkload-error-mapping

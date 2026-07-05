@@ -430,6 +430,39 @@ column names in declaration order, so adding / removing /
 reordering covering columns triggers
 `ErrIndexFingerprintMismatch`.
 
+**Update rewrites covering.** The covering payload is extracted
+from the ROW VALUE, so replacing a row's value can change the
+stored covering bytes even when every index key stays the same.
+Index maintenance therefore diffs VALUES as well as keys: an
+entry present in both the old and new candidate sets whose
+encoded value differs is rewritten in place (no delete —
+entry count unchanged; the unique probe skips it, since the
+on-disk hit at that key is the row's own old entry and the
+overwrite is benign).
+
+Invariant: kind=clause-explicit;
+  property=After any row mutation commits, every covering index
+    entry's stored payload equals the payload extracted from
+    the row's CURRENT value;
+  from=this spec §Covering Indexes (update rewrites covering);
+  violation=Put(k, v1) then Put(k, v2) with an unchanged index
+    key: Lookup serves v1's covering bytes forever while the
+    row keyspace serves v2 — a wrong-result read the checker
+    reports as FingerprintDrift.
+    (Enforced by the value-diff in buildReplacePlans; pinned by
+    TestCoveringValueRewrittenOnUpdate /
+    TestByteCoveringRewrittenOnUpdate.)
+
+**Duplicate collapse is last-wins everywhere.** An extractor
+emitting two entries with the same encoded key in one
+invocation collapses to the LAST entry (set semantic) on the
+live maintenance path, during `Rebuild`, during `BulkLoad`
+(which reuses the live path's extraction), and in the checker's
+expected-set construction — a rebuilt index is byte-identical
+to a live-maintained one. (For unique indexes the duplicate is
+an `ErrIndexUniqueViolation` candidate-set collision instead.)
+Pinned by TestRebuildMatchesLiveDuplicateCollapse.
+
 **Byte-API return contract.** For the byte-oriented `*IndexHandle`
 surface, the bytes `Lookup` / `Range` / `Prefix` / `Get` yield
 as the `value` ARE the encoded covering tuple stored by the

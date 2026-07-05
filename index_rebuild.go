@@ -217,7 +217,11 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 					return fmt.Errorf("%w: index %q during rebuild: candidate-set duplicate for row %x",
 						ErrIndexUniqueViolation, decl.Name, k1)
 				}
-				continue
+				// LAST-wins overwrite — the same set semantic as the
+				// live path's extractEntriesAsKeySet, so a rebuilt
+				// index is byte-identical to a live-maintained one
+				// (first-wins here diverged the covering payload and
+				// produced FingerprintDrift false positives).
 			}
 			seen[ik] = e
 		}

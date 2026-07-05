@@ -1,6 +1,7 @@
 package gmdb
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -15,9 +16,16 @@ import (
 // indexEntryValue reads the IndexEntry behind each key in `ins`.
 type indexPlan struct {
 	p    *pinnedIndex
-	news map[string]IndexEntry // insert source: index key -> entry
+	news map[string]IndexEntry // insert/update source: index key -> entry
 	dels []string              // sorted index keys to delete (old \ new)
 	ins  []string              // sorted index keys to insert (new \ old)
+	// upds: sorted index keys present in BOTH sets whose stored value
+	// (covering payload) changed — rewritten in place by applyInserts.
+	// Skipped by the unique probe: the on-disk hit at such a key is
+	// this row's own old entry, and the overwrite is benign. Only
+	// covering-bearing indexes can populate this (without covering,
+	// the value is a function of the unchanged key + row PK).
+	upds []string
 }
 
 // indexMaintainer is the kind-agnostic secondary-index maintenance
@@ -167,20 +175,42 @@ func (m *indexMaintainer) buildReplacePlans(oldValue, newValue []byte, hadOld bo
 		if err != nil {
 			return nil, err
 		}
-		var dels, ins []string
+		var dels, ins, upds []string
+		hasCovering := len(p.decl.Covering) > 0
+		var pk []byte
+		pkLoaded := false // lazy: the pure-insert path never pays for it
 		for k := range olds {
 			if _, ok := news[k]; !ok {
 				dels = append(dels, k)
 			}
 		}
-		for k := range news {
-			if _, ok := olds[k]; !ok {
+		for k, ne := range news {
+			oe, ok := olds[k]
+			if !ok {
 				ins = append(ins, k)
+				continue
+			}
+			// Key unchanged: the stored value can still differ — the
+			// covering payload is extracted from the ROW VALUE, which
+			// this operation is replacing (indexing.md §Covering
+			// Indexes). Without the rewrite, lookups serve the stale
+			// covering forever while Check(CheckIndexes) reports
+			// FingerprintDrift.
+			if hadOld && hasCovering {
+				if !pkLoaded {
+					pk = m.valuePK()
+					pkLoaded = true
+				}
+				if !bytes.Equal(indexEntryValue(oe, pk, p.decl.Unique, hasCovering),
+					indexEntryValue(ne, pk, p.decl.Unique, hasCovering)) {
+					upds = append(upds, k)
+				}
 			}
 		}
 		sort.Strings(dels)
 		sort.Strings(ins)
-		plans = append(plans, indexPlan{p: p, news: news, dels: dels, ins: ins})
+		sort.Strings(upds)
+		plans = append(plans, indexPlan{p: p, news: news, dels: dels, ins: ins, upds: upds})
 	}
 	return plans, nil
 }
@@ -265,6 +295,23 @@ func (m *indexMaintainer) applyInserts(plans []indexPlan, opIdx *int) error {
 			pl.p.root = newRoot
 			pl.p.count++
 			m.tx.pgr.AddIndexInserted(1) // TxStats.IndexEntriesInserted
+			if err := fireIndexMaintenanceFailHookForTest(*opIdx); err != nil {
+				return err
+			}
+			*opIdx++
+		}
+		// Covering-value rewrites: same key, changed payload. The Put
+		// overwrites in place — entry count unchanged, but the write
+		// is a real index mutation for stats and the failure hook.
+		for _, k := range pl.upds {
+			entry := pl.news[k]
+			val := indexEntryValue(entry, pk, pl.p.decl.Unique, hasCovering)
+			newRoot, err := btree.Put(btreeWriter{m.tx.pgr}, m.cfg, pl.p.root, []byte(k), val)
+			if err != nil {
+				return mapBtreeErr(err)
+			}
+			pl.p.root = newRoot
+			m.tx.pgr.AddIndexInserted(1) // TxStats.IndexEntriesInserted (value rewrite)
 			if err := fireIndexMaintenanceFailHookForTest(*opIdx); err != nil {
 				return err
 			}
