@@ -1,6 +1,8 @@
 package gmdb
 
 import (
+	"context"
+
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
@@ -155,4 +157,32 @@ func SetSyncDirHookForTest(hook func(dir string) error) (restore func()) {
 	}
 	syncDirHookForTest.Store(&hook)
 	return func() { syncDirHookForTest.Store(nil) }
+}
+
+// SetMaintDetectHookForTest installs the hook firing inside
+// maintReclaimLeaks's detection window. Returns a restore func.
+func SetMaintDetectHookForTest(hook func()) (restore func()) {
+	if hook == nil {
+		maintDetectHookForTest.Store(nil)
+		return func() {}
+	}
+	maintDetectHookForTest.Store(&hook)
+	return func() { maintDetectHookForTest.Store(nil) }
+}
+
+// MaintReclaimLeaksForTest drives one leak-reclamation pass directly,
+// reporting (freed, discarded).
+func (db *DB) MaintReclaimLeaksForTest(ctx context.Context) (int, bool) {
+	return db.maintReclaimLeaks(ctx)
+}
+
+// SetMaintPreReclaimHookForTest installs the hook firing between
+// maintReclaimLeaks's detection and reclamation phases.
+func SetMaintPreReclaimHookForTest(hook func()) (restore func()) {
+	if hook == nil {
+		maintPreReclaimHookForTest.Store(nil)
+		return func() {}
+	}
+	maintPreReclaimHookForTest.Store(&hook)
+	return func() { maintPreReclaimHookForTest.Store(nil) }
 }

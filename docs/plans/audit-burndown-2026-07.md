@@ -20,7 +20,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 10. create-dirent-durability
 - [x] 11. beginread-close-lifecycle
 - [x] 12. update-unresolved-child-grant
-- [ ] 13. maintenance-reclaim-snapshot-guard
+- [x] 13. maintenance-reclaim-snapshot-guard
 - [ ] 14. compact-peer-handle-generation
 - [ ] 15. check-consistency-classes
 - [ ] 16. iterator-cursor-unregistration

@@ -3,11 +3,22 @@ package gmdb
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
+
+// maintDetectHookForTest fires inside maintReclaimLeaks's detection
+// window (after the snapshot read tx begins, before the walk) — the
+// seam for injecting a racing commit.
+var maintDetectHookForTest atomic.Pointer[func()]
+
+// maintPreReclaimHookForTest fires between detection (read tx closed,
+// leaked set computed) and the reclamation Begin — the seam for
+// injecting a Compact or realigning commits.
+var maintPreReclaimHookForTest atomic.Pointer[func()]
 
 // maintenance holds the background-maintenance goroutine's lifecycle
 // state (background-maintenance.md). Started at Open unless
@@ -225,16 +236,30 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 //  2. Reclamation (write tx): free exactly that set in the bitmap.
 //
 // Unlike CheckWithOptions(Repair) this needs NO exclusive access: a leaked
-// page's bitmap bit is clear (allocated), so no allocator can hand it out
-// and no writer can reference it — it cannot become un-leaked between the
-// two phases (background-maintenance.md §Invariants). As with Repair, reclamation is gated on a clean walk
+// page's bitmap bit is clear (allocated), so no allocator can hand it
+// out — but that argument only covers pages already leaked at snapshot
+// time. The classification itself reads the LIVE bitmap, so a commit
+// landing inside the detection window makes fresh allocations look
+// leaked; the reclamation tx's snapshot-currency guard (TxnID
+// equality plus writer-pager identity, under the write grant) is
+// what makes the set trustworthy (background-maintenance.md
+// §Invariants). As with Repair, reclamation is gated on a clean walk
 // (no structural CheckError/CheckFatal): a walk-aborting corrupt subtree
 // would leave its live pages unvisited and thus mis-classified as leaked,
 // so on any structural finding the pass reclaims nothing and logs.
-func (db *DB) maintReclaimLeaks(ctx context.Context) {
+//
+// Returns (freed, discarded): discarded=true means the guard rejected
+// a non-empty leaked set.
+func (db *DB) maintReclaimLeaks(ctx context.Context) (freed int, discarded bool) {
+	db.mu.Lock()
+	detPgr := db.pgr // writer-pager identity at detection time
+	db.mu.Unlock()
 	rtx, err := db.BeginRead(ctx)
 	if err != nil {
-		return // closing / cancelled — skip silently
+		return 0, false // closing / cancelled — skip silently
+	}
+	if hook := maintDetectHookForTest.Load(); hook != nil {
+		(*hook)() // test seam: a commit landing inside the detection window
 	}
 	meta := rtx.meta
 	c := &checker{
@@ -252,15 +277,18 @@ func (db *DB) maintReclaimLeaks(ctx context.Context) {
 		// Structural issues present: the reachable set is unreliable, so
 		// reclaiming "leaked" pages could free live ones. Skip + log.
 		db.logger.Warn("gmdb: maintenance leak reclamation skipped — structural issues present in the snapshot")
-		return
+		return 0, false
 	}
 	if len(leaked) == 0 {
-		return
+		return 0, false
 	}
 
+	if hook := maintPreReclaimHookForTest.Load(); hook != nil {
+		(*hook)() // test seam: activity between detection and reclamation
+	}
 	tx, err := db.Begin(ctx)
 	if err != nil {
-		return // closing / cancelled / poisoned — skip silently
+		return 0, false // closing / cancelled / poisoned — skip silently
 	}
 	committed := false
 	defer func() {
@@ -268,7 +296,35 @@ func (db *DB) maintReclaimLeaks(ctx context.Context) {
 			_ = tx.Rollback()
 		}
 	}()
-	freed := 0
+	// Snapshot-currency guard (background-maintenance.md §Bitmap Leak
+	// Reclamation): the leaked classification compared the SNAPSHOT
+	// tree against the LIVE bitmap (which has no MVCC — a concurrent
+	// commit pwrites it in place), so a page that was a free hole at
+	// snapshot time and was allocated into the live tree by any
+	// commit since — this process's writers or a peer's, including a
+	// peer's own maintenance pass — classifies as leaked and would be
+	// freed out from under the live tree. Begin holds the write grant
+	// and Resync'd to the latest meta: if any commit landed after the
+	// detection snapshot, the set is stale — discard it; the next
+	// pass recomputes. While the grant is held no further commit can
+	// land, so equality here makes the set exact.
+	db.mu.Lock()
+	cur := db.currentMeta.TxnID
+	curPgr := db.pgr
+	db.mu.Unlock()
+	// The pager-identity term catches a same-process Compact() that
+	// completed between detection and this Begin: Compact rebuilds
+	// the file densely and RESETS TxnID (fresh MVCC counter), so
+	// TxnID comparison alone could spuriously pass while every
+	// detected id now names a different page. (A peer process's
+	// Compact replaces the inode out from under this handle — that
+	// divergence is governed by Compact's own cross-process
+	// contract, not this guard.)
+	if cur != meta.TxnID || curPgr != detPgr {
+		db.logger.Info("gmdb: maintenance leak reclamation discarded — commits or a compaction landed during detection",
+			"detectedAt", meta.TxnID, "current", cur)
+		return 0, true
+	}
 	for _, id := range leaked {
 		if err := tx.pgr.FreeLeakedPage(id); err != nil {
 			// Stale leak entry (a concurrent reclaimer, or the page is no
@@ -279,12 +335,13 @@ func (db *DB) maintReclaimLeaks(ctx context.Context) {
 		freed++
 	}
 	if freed == 0 {
-		return // nothing actually freed; defer rolls back
+		return 0, false // nothing actually freed; defer rolls back
 	}
 	if err := tx.Commit(); err != nil {
 		db.logger.Warn("gmdb: maintenance leak reclamation commit failed", "err", err)
-		return
+		return 0, false
 	}
 	committed = true
 	db.logger.Info("gmdb: maintenance reclaimed leaked pages", "count", freed)
+	return freed, false
 }

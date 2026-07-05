@@ -37,16 +37,31 @@ Invariant: kind=clause-explicit;
     in the best case, correctness loss in the worst.
 
 Invariant: kind=clause-explicit;
-  property=A page identified as leaked in the bitmap-leak
-    detection phase's read snapshot cannot become un-leaked
-    by the time the write transaction runs: the leaked-page
-    set is a function of the snapshot's tree, and that tree
-    is immutable for the duration of the read transaction;
-  from=this spec §Bitmap Leak Reclamation;
-  violation=Reclaiming a "leaked" page that has since become
-    referenced by the active tree hands the page to two
+  property=The reclamation write transaction frees a detected
+    leaked set ONLY when no commit — this process's or a
+    peer's, including a peer's own maintenance pass — landed
+    after the detection snapshot was taken: it compares the
+    current meta TxnID AND the writer-pager identity (a
+    same-process Compact rebuilds the file densely and resets
+    TxnID, so the TxnID term alone could spuriously pass)
+    against the snapshot's — under the write grant, so no
+    further commit can intervene — and discards the whole set
+    on any change. The snapshot's tree alone
+    does NOT make the set stable: detection classifies against
+    the LIVE bitmap (which has no MVCC), so a page that was a
+    free hole at snapshot time and was allocated by an
+    intervening commit classifies as leaked;
+  from=this spec §Bitmap Leak Reclamation (reclamation phase,
+    snapshot-currency guard);
+  violation=Reclaiming a "leaked" page that an intervening
+    commit allocated into the live tree hands the page to two
     consumers — the same allocator/aliasing bug
-    `free-space.md` invariants forbid.
+    `free-space.md` invariants forbid (demonstrated: a commit
+    landing inside the detection window made freshly-allocated
+    live pages classify as leaked; reclamation freed them and
+    Check reported ReachableButFree).
+    (Enforced by the TxnID + pager-identity guard in maintReclaimLeaks;
+    pinned by TestMaintenanceReclaimDiscardsStaleDetection.)
 
 Invariant: kind=clause-explicit;
   property=The checksum scrubber only reports corruption; it
@@ -171,15 +186,25 @@ interrupted by ENOSPC.
 
 **Reclamation phase** (write transaction):
 
-1. Open a write transaction.
-2. For each leaked page, set its bitmap bit.
-3. Commit.
+1. Open a write transaction (holds the write grant; its re-sync
+   observes the latest committed meta).
+2. Snapshot-currency guard: if the current meta TxnID differs
+   from the detection snapshot's, OR the writer-pager identity
+   changed (a same-process Compact rebuilt the file and reset
+   TxnID), activity landed during or after detection — discard
+   the whole set (the next pass recomputes). This is also what
+   makes overlapping cross-process maintenance passes safe: a
+   peer's reclamation commit advances the TxnID.
+3. For each leaked page, set its bitmap bit.
+4. Commit.
 
-**Safety.** A leaked page is permanently stuck — its bitmap
-bit is clear so no future transaction can allocate it, and no
-tree references it. A page identified as leaked in the read
-snapshot cannot become un-leaked by the time the write
-transaction runs.
+**Safety.** A genuinely leaked page is permanently stuck — its
+bitmap bit is clear so no future transaction can allocate it,
+and no tree references it. That argument covers only pages
+already leaked at snapshot time; because detection classifies
+against the LIVE bitmap, the snapshot-currency guard (step 2)
+is what makes the set trustworthy — see the reclamation
+invariant above.
 
 **Trigger.** Every maintenance pass. Additionally, if `Open()`
 recovered from an unclean prior shutdown — signalled by accepting

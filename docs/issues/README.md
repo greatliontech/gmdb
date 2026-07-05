@@ -81,7 +81,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [maintenance-reclaim-snapshot-guard](maintenance-reclaim-snapshot-guard.md) | chunk 13 | **[H]** Leak detection uses snapshot tree + live bitmap; concurrent commit → live pages freed (demonstrated, default config). Cross-process overlap variant shares the fix. |
 | [compact-peer-handle-generation](compact-peer-handle-generation.md) | chunk 14 | **[H]** Compact renames the inode under peer handles; peer writes land on the unlinked inode — silent write loss. Generation stamp in the lock header. |
 | [check-consistency-classes](check-consistency-classes.md) | chunk 15 | **[M]** Check() verifies none of: key ordering, separator routing, desc.Count, NestedCount, NumKeyspaces — classes api-surface.md claims. |
 | [iterator-cursor-unregistration](iterator-cursor-unregistration.md) | chunk 16 | **[M]** All/Range/Prefix leak cursor registrations for the tx lifetime — quadratic degradation in long transactions. |
