@@ -23,7 +23,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 13. maintenance-reclaim-snapshot-guard
 - [x] 14. compact-peer-handle-generation
 - [x] 15. check-consistency-classes
-- [ ] 16. iterator-cursor-unregistration
+- [x] 16. iterator-cursor-unregistration
 - [ ] 17. index-covering-value-diff
 - [ ] 18. index-child-merge-handle-reconciliation
 - [ ] 19. readonly-index-lookups

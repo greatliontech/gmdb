@@ -138,6 +138,21 @@ func (ks *SetKeyspace) Cursor() *SetCursor {
 	return c
 }
 
+// unregisterSetCursor removes c from ks.openSetCursors — the
+// SetCursor analogue of Keyspace.unregisterCursor; see its doc for
+// the pairing contract.
+func (ks *SetKeyspace) unregisterSetCursor(c *SetCursor) {
+	for i, x := range ks.openSetCursors {
+		if x == c {
+			last := len(ks.openSetCursors) - 1
+			ks.openSetCursors[i] = ks.openSetCursors[last]
+			ks.openSetCursors[last] = nil
+			ks.openSetCursors = ks.openSetCursors[:last]
+			return
+		}
+	}
+}
+
 // requireOpen short-circuits closed-state and dead-keyspace checks.
 // Used by RE-POSITIONING ops (First / Last / Seek / SeekGE) which
 // recover from a stale state and so should be permitted to run

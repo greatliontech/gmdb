@@ -1183,6 +1183,14 @@ func (ks *SetKeyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte]
 func (ks *SetKeyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte]
 ```
 
+Mutation during iteration: a loop-body mutation on the same keyspace
+stales the iterator's cursor and ENDS the sequence early (the Seq2
+error model has no channel; the stale surfaces as end-of-sequence) —
+recovery is a fresh All/Range/Prefix. Iterator cursors are registered
+with the keyspace only while the loop is live and unregister at loop
+exit (completed or broken), unlike explicit Cursor() handles, which
+stay registered — and re-positionable — for the transaction lifetime.
+
 ## Index Lookup API
 
 ```go

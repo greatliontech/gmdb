@@ -18,11 +18,22 @@ import (
 // error simply ends the sequence (the cursor returns a nil key); callers
 // that must observe such errors should iterate with Cursor() and check
 // Err(). The typed layer (TypedKeyspaceHandle / TypedSetKeyspaceHandle) delegates to these.
+//
+// Registration lifecycle: each closure registers its cursor while the
+// loop is live (a loop-body mutation on the same keyspace must reach
+// it via the staleness broadcast — which then ENDS the sequence; a
+// fresh iterator resumes) and unregisters at loop exit, completed or
+// broken, so iteration in a long transaction does not grow the
+// per-mutation stale walk. An iter.Pull2 consumer that abandons next
+// without calling stop leaks the registration for the tx lifetime —
+// the same cost as an explicit Cursor(), and the iter.Pull contract
+// already requires stop.
 
 // All yields every (key, value) pair in ascending key order.
 func (ks *Keyspace) All() iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
+		defer ks.unregisterCursor(c) // registered while live: the loop body may mutate
 		for kb, vb := c.First(); kb != nil; kb, vb = c.Next() {
 			if !yield(kb, vb) {
 				return
@@ -37,6 +48,7 @@ func (ks *Keyspace) All() iter.Seq2[[]byte, []byte] {
 func (ks *Keyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
+		defer ks.unregisterCursor(c)
 		var kb, vb []byte
 		if start != nil {
 			kb, vb = c.SeekGE(start)
@@ -59,6 +71,7 @@ func (ks *Keyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 func (ks *Keyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
+		defer ks.unregisterCursor(c)
 		for kb, vb := c.SeekGE(prefix); kb != nil; kb, vb = c.Next() {
 			if !bytes.HasPrefix(kb, prefix) {
 				return
@@ -75,6 +88,7 @@ func (ks *Keyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte] {
 func (ks *SetKeyspace) All() iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
+		defer ks.unregisterSetCursor(c)
 		for kb, vb := c.First(); kb != nil; kb, vb = c.Next() {
 			if !yield(kb, vb) {
 				return
@@ -88,6 +102,7 @@ func (ks *SetKeyspace) All() iter.Seq2[[]byte, []byte] {
 func (ks *SetKeyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
+		defer ks.unregisterSetCursor(c)
 		var kb, vb []byte
 		if start != nil {
 			kb, vb = c.SeekGE(start)
@@ -110,6 +125,7 @@ func (ks *SetKeyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 func (ks *SetKeyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
+		defer ks.unregisterSetCursor(c)
 		for kb, vb := c.SeekGE(prefix); kb != nil; kb, vb = c.Next() {
 			if !bytes.HasPrefix(kb, prefix) {
 				return

@@ -901,6 +901,25 @@ func (ks *Keyspace) Cursor() *Cursor {
 	return c
 }
 
+// unregisterCursor removes c from ks.openCursors — swap-and-truncate,
+// no ordering requirement (mark operations walk every entry).
+// Paired with a defer at the range-iterator closures' exit so the
+// slice does not grow unboundedly across iterations in one tx (each
+// registered entry costs a markCursorsStale visit on every sibling
+// mutation). Explicit Cursor() callers are never unregistered — their
+// cursors stay re-positionable for the tx lifetime by contract.
+func (ks *Keyspace) unregisterCursor(c *Cursor) {
+	for i, x := range ks.openCursors {
+		if x == c {
+			last := len(ks.openCursors) - 1
+			ks.openCursors[i] = ks.openCursors[last]
+			ks.openCursors[last] = nil
+			ks.openCursors = ks.openCursors[:last]
+			return
+		}
+	}
+}
+
 // markCursorsStale invokes MarkStale on every cursor registered on
 // this keyspace AND refreshes their tracked rootID to the keyspace's
 // current desc.Root. Called by Put / Delete / DeleteRange after a
