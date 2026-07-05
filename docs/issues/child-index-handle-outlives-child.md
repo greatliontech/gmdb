@@ -2,8 +2,7 @@
 
 **Lands:** when the IndexHandle iter closures gain the requireOpen
 guard that Stats already has (index.go — Lookup/LookupKeys/Range/
-Prefix/Get closures), or with the chunk-22 API/doc sweep if pulled
-there.
+Prefix/Get closures).
 
 **Severity:** [M] — after a child COMMIT, a handle obtained from the
 child's own OpenKeyspace keeps serving lookups (2 rows, Err()==nil in

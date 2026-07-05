@@ -69,7 +69,15 @@ CRC32C in earlier designs):
 | 16 KB | ~8172 bytes | ~8168 bytes |
 | 64 KB | ~32748 bytes | ~32744 bytes |
 
-Enforced at `Put()`. Keys exceeding return `ErrKeyTooLarge`.
+Enforced deterministically at every entry gate — `btree.Put`,
+`btree.PutEntry` (set keys), the bulk-load builders including set
+members, and CopyTo's rebuild (one threshold, no drift): a key
+whose two full separators cannot share a branch page returns
+`ErrKeyTooLarge` at the operation. The split machinery itself
+tolerates single-cell branch halves, so the uniform gate is spec
+conformance — the same input is accepted or rejected identically
+on every path, and a database built by any path always rebuilds
+through CopyTo. (Pinned by TestKeyTooLargeDeterministicAtBound.)
 
 Within-page branch prefix truncation (`page-formats.md §Branch Page`)
 does **not** relax this bound: the worst case is two separators that

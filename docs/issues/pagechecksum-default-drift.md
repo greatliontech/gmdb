@@ -2,8 +2,7 @@
 
 **Lands:** condition — when the Options surface next takes a breaking
 change (pre-v1 clean break makes inverting the flag or a *bool
-straightforward), or with the chunk-22 limits/options sweep if pulled
-there.
+straightforward).
 
 **Severity:** [M] — spec'd protection silently absent: checksums.md
 ("opt-out, on by default") and the Options.PageChecksum godoc

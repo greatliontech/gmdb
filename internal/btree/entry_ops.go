@@ -108,6 +108,12 @@ func GetEntry(pr PageReader, cfg page.Config, rootID uint64, key []byte) (page.L
 // chain rollback (caller-managed), and the displaced entry is
 // returned to the caller instead of being freed internally.
 func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (newRoot uint64, displaced page.LeafEntry, err error) {
+	// Split-safety key bound — same gate as Put (limits.md §Maximum
+	// Key Size): without it a set key admitted here diverges from
+	// every other entry point and fails CopyTo's gated rebuild.
+	if !branchHoldsTwoSeparators(cfg, len(e.Key)) {
+		return 0, page.LeafEntry{}, ErrKeyTooLarge
+	}
 	if rootID == 0 {
 		id, err := putEmptyEntry(pw, cfg, e)
 		return id, page.LeafEntry{}, err

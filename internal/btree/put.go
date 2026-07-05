@@ -138,6 +138,15 @@ func InsertIfAbsent(pw PageWriter, cfg page.Config, rootID uint64, key, value []
 // any page (the InsertIfAbsent no-op-on-present contract); otherwise it
 // performs the standard replace-or-insert.
 func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte, insertOnly bool) (newRoot uint64, existed bool, err error) {
+	// Split-safety key bound (limits.md §Maximum Key Size): a branch
+	// must hold TWO full separators of this key. This is the spec's
+	// stated bound (~(PageSize-40)/2), enforced at the entry gate so
+	// acceptance is uniform across Put, PutEntry, and the bulk
+	// builders — the split machinery itself tolerates single-cell
+	// halves, so this is spec conformance, not a crash guard.
+	if !branchHoldsTwoSeparators(cfg, len(key)) {
+		return 0, false, ErrKeyTooLarge
+	}
 	if rootID == 0 {
 		nr, e := putEmpty(pw, cfg, key, value)
 		return nr, false, e

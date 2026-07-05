@@ -970,8 +970,9 @@ func (tx *Tx) Indexes() TxIndexes
 //   - ErrReadOnly on a read-only transaction; ErrTxClosed on a
 //     closed transaction.
 //
-// (Chunk-7.1 user-locked: ErrNotFound for keyspace-missing +
-// ErrIndexNotFound for decl.Name-missing.)
+// The error split is deliberate: ErrNotFound for a missing
+// keyspace, ErrIndexNotFound for a missing decl.Name — two
+// different management dimensions.
 func (ix TxIndexes) Rebuild(keyspace string, decl *IndexDecl) error
 
 // Drop removes the named index entirely. Retires the index's
@@ -1275,7 +1276,11 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
 // shorter tuples naturally sort before longer ones sharing the
 // same lead bytes. Use Prefix for the equivalent "leading cols ==
 // X" query (single-bound shorthand).
-// (Chunk-7.7 spec amendment.)
+//
+// A bound with MORE columns than the index declares can never
+// match the encoding: Err() reports ErrInvalidOptions (matching
+// Lookup / LookupKeys / Prefix). Fewer columns is the documented
+// prefix-bound semantics above.
 func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
 
 // Prefix returns matches whose leading columns equal the prefix.

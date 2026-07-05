@@ -220,7 +220,7 @@ func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions, indexes .
 	if name == "" {
 		return nil, ErrKeyEmpty
 	}
-	fvs, err := validateSetOpts(opts)
+	fvs, err := validateSetOpts(opts, tx.pgr.Config())
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +283,7 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 	if name == "" {
 		return nil, ErrKeyEmpty
 	}
-	fvs, err := validateSetOpts(opts)
+	fvs, err := validateSetOpts(opts, tx.pgr.Config())
 	if err != nil {
 		return nil, err
 	}
@@ -368,14 +368,22 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 
 // validateSetOpts normalises a *SetKeyspaceOptions into the uint16
 // fixedValueSize stored in the descriptor. Returns ErrInvalidOptions
-// for negative or > 65535 values; nil opts → 0.
-func validateSetOpts(opts *SetKeyspaceOptions) (uint16, error) {
+// for negative or > 65535 values, and for a size exceeding the
+// member bound (limits.md: set values are bounded by the maximum key
+// size) — a declarable-but-unusable keyspace whose every
+// correct-length Put would fail ErrKeyTooLarge forever
+// (reviewer-demonstrated). nil opts → 0.
+func validateSetOpts(opts *SetKeyspaceOptions, cfg page.Config) (uint16, error) {
 	if opts == nil {
 		return 0, nil
 	}
 	if opts.FixedValueSize < 0 || opts.FixedValueSize > 0xFFFF {
 		return 0, fmt.Errorf("%w: SetKeyspaceOptions.FixedValueSize %d out of range [0, 65535]",
 			ErrInvalidOptions, opts.FixedValueSize)
+	}
+	if opts.FixedValueSize > 0 && !btree.KeyFitsBranchSeparators(cfg, opts.FixedValueSize) {
+		return 0, fmt.Errorf("%w: SetKeyspaceOptions.FixedValueSize %d exceeds the maximum set value size for PageSize %d (limits.md §Maximum Key Size)",
+			ErrInvalidOptions, opts.FixedValueSize, cfg.PageSize)
 	}
 	return uint16(opts.FixedValueSize), nil
 }
@@ -529,7 +537,24 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 	ks.tx.pgr.RecordPut() // TxStats.Puts
 	fvs := ks.desc.FixedValueSize
 	if fvs != 0 && len(value) != int(fvs) {
+		// fvs precedence first (matching BulkLoad's stream order): a
+		// wrong-length value on a fixed-size set is the more
+		// specific fault; a CORRECT-length fvs value can never be
+		// over-bound (fvs is validated against the member bound at
+		// declaration).
 		return false, fmt.Errorf("%w: value len %d, keyspace FixedValueSize %d", ErrValueSizeMismatch, len(value), fvs)
+	}
+	// Member bound (limits.md: set values are bounded by the maximum
+	// key size — a member becomes a nested-tree KEY on promotion).
+	// Gated at entry so a member is accepted or rejected identically
+	// whether the key's set is a genesis subpage or already promoted
+	// — without this, an over-bound member is stored fine at genesis
+	// and then fails the promotion insert when a SECOND value
+	// arrives (the tree-shape-dependent late failure the uniform
+	// gate exists to prevent).
+	if !btree.KeyFitsBranchSeparators(ks.builderCfg(), len(value)) {
+		return false, fmt.Errorf("gmdb: set value exceeds maximum size (%d bytes): %w: %v",
+			len(value), ErrKeyTooLarge, btree.ErrKeyTooLarge)
 	}
 	if value == nil {
 		value = []byte{}
@@ -1016,11 +1041,13 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 //     (decoded from the 2-byte Count header at offset 0 of
 //     e.Value; matches btree.FreeSubtree's subpage handling for
 //     consistency).
-//   - Plain cell (no MultiValue flag): contributes 1 value. If
-//     CellFlagOverflow is set, the overflow chain is retired via
-//     pw.FreeRun. Reachable for SetKeyspace only when the user
-//     stores a single inline value above the subpage promotion
-//     threshold (rare but in-spec).
+//   - Plain / overflow cell (no MultiValue flag): ErrCorrupted. No
+//     SetKeyspace write path produces one — a key's single value is
+//     stored as a one-entry subpage (Put's genesis shape; BulkLoad
+//     matches) — and the other cell-type-complete readers (CopyTo's
+//     rebuild, Check's subpage validation) already treat the shape
+//     as corruption. Tolerating it here would let DeleteRange
+//     under-count a corrupt tree instead of surfacing it.
 //
 // Mirrors the cell-type-aware retire + count logic in
 // btree.freeSubtreeAt (subtree.go §Count semantics) used for
@@ -1060,15 +1087,12 @@ func setKeyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry)
 		// (Count is independent of variable/fixed mode).
 		sp := page.NewSubpageReader(e.Value, 0)
 		return uint64(sp.Count()), nil
-	case e.IsOverflow():
-		runLen := page.OverflowRunLength(cfg, e.TotalLen)
-		if err := pw.FreeRun(e.OverflowPage, runLen); err != nil {
-			return 0, fmt.Errorf("btree: SetKeyspace DeleteRange free overflow chain at %d (run=%d): %w",
-				e.OverflowPage, runLen, err)
-		}
-		return 1, nil
 	default:
-		return 1, nil
+		// Plain or overflow cell: no SetKeyspace write path produces
+		// these (see the doc comment) — corruption, matching CopyTo
+		// and Check.
+		return 0, fmt.Errorf("%w: SetKeyspace DeleteRange: plain/overflow cell (flags 0x%x) — no set write path produces this shape",
+			btree.ErrCorrupted, e.Flags)
 	}
 }
 

@@ -963,6 +963,26 @@ StaleTimeout — benign for that slot but violating the
 per-occupant timer invariant. Zeroing HintEpoch first closes
 the window.
 
+### Read-only fleets never reap
+
+Every stale-slot clear path runs from a WRITER-side context (the
+stale scan is part of writer acquisition and maintenance, both of
+which hold `flock(LOCK_EX)`), and a read-only handle's coordinator
+refuses `AcquireWriter` while background maintenance is not started
+for read-only handles at all. Consequence — a documented deployment
+bound: in a fleet consisting EXCLUSIVELY of read-only handles, a
+crashed reader's slot is never reaped, and its stale `TxnID` pins
+the reclamation bound until any writable handle opens the database
+(its first grant acquisition scans and clears). Deployments that
+run long-lived read-only fleets over a database that also grows
+should include at least one writable opener (or periodic writable
+maintenance opens); pure-RO fleets over a static database are
+unaffected (nothing reclaims, so nothing is pinned). Granting
+read-only handles a narrow reap-only `LOCK_EX` path was considered
+and rejected: it would break the invariant that every bitmap/table
+mutation is writer-serialized, for a corner that a single writable
+open resolves.
+
 ### Why HintEpoch lives in shared memory
 
 A process-local epoch would not survive writer-process turnover:

@@ -538,22 +538,27 @@ func dbCleanupFn(info dbCleanupInfo) {
 // Spec contract (leak-detection.md §Close Ordering clause-explicit
 // invariant + cross-process.md Close-releases invariant):
 //
-//  1. Store `*db.closed = true` (release-store on the shared
-//     *atomic.Bool). Visible to any subsequent Tx cleanup callback
-//     regardless of runtime.AddCleanup ordering between the DB and
-//     its Txs — they observe the close state and exit without
-//     touching torn-down resources.
-//  2. Drain the heartbeat + flock goroutines via Coord.Close (which
-//     blocks on done-channels). The flock goroutine clears writer-
-//     header fields and unlocks if a writer was held at Close time;
-//     the heartbeat goroutine exits before any unmap.
-//  3. Munmap the lock file. Safe only after step 2.
-//  4. Close pager (munmaps data file).
-//  5. Close data-file fd.
-//  6. Close *os.Root.
+//  1. Win the close CAS (release-store on the shared *atomic.Bool).
+//     Visible to any subsequent Tx cleanup callback regardless of
+//     runtime.AddCleanup ordering between the DB and its Txs — they
+//     observe the close state and exit without touching torn-down
+//     resources. A second Close returns immediately.
+//  2. Stop the batch coordinator (context cancel; its in-flight
+//     write transaction unwinds and releases the grant first).
+//  3. Stop the maintenance goroutine and wait for exit.
+//  4. Drain in-flight Tx cleanup windows (closeGate.BeginClose spins
+//     on the txInflight counter).
+//  5. Capture and nil the resource pointers under db.mu.
+//  6. Drain the heartbeat + flock goroutines via Coord.Close (which
+//     blocks on done-channels; the flock goroutine clears writer-
+//     header fields, unlocks a held writer, and fails pending
+//     acquisitions).
+//  7. Munmap the lock file, close the pager (data-file munmap), the
+//     data-file fd, and the *os.Root.
 //
-// Steps 1 → 2 ordering: ANY swap is the public release-store. Steps
-// 2 → 3 ordering: the SIGSEGV path the spec exists to prevent
+// Steps 1 → 4 ordering: the CAS is the public release-store; the
+// drain completes before any teardown. Steps 6 → 7 ordering: the
+// SIGSEGV path the spec exists to prevent
 // (final heartbeat tick on unmapped memory).
 //
 // Not safe to call concurrently with active write or batch
@@ -571,24 +576,24 @@ func dbCleanupFn(info dbCleanupInfo) {
 // runtime.AddCleanup ordering pathologies. See leak-detection.md
 // §Database Handle Leak Detection for the full discussion.
 func (db *DB) Close() error {
-	// Step 1a — release-store closed=true via gate.CAS. Idempotency:
+	// Step 1 — release-store closed=true via gate.CAS. Idempotency:
 	// a second Close returns immediately because only one caller
 	// wins the CAS.
 	if !db.closeGate.CompareAndSwapClosed(false, true) {
 		return nil
 	}
-	// Step 1a′ — stop the batch coordinator (transactions.md §Write
+	// Step 2 — stop the batch coordinator (transactions.md §Write
 	// Batching coordinator lifecycle). Cancel its context (refusing new
 	// batches and unblocking any pending write-lock wait) and wait for it
 	// to exit. Done before the Coord / pager teardown below so the
 	// coordinator's in-flight write transaction unwinds and releases its
 	// grant first, and no coordinator goroutine outlives the unmap.
 	db.stopBatchCoordinator()
-	// Step 1a″ — stop the maintenance goroutine and wait for it to exit.
+	// Step 3 — stop the maintenance goroutine and wait for it to exit.
 	// Done before the Coord / pager teardown so an in-flight pass's tx
 	// unwinds and the goroutine never touches a torn-down mmap (leak-detection.md §Close() Ordering).
 	db.stopMaintenance()
-	// Step 1b — drain in-flight Tx cleanups. Cleanups that observed
+	// Step 4 — drain in-flight Tx cleanups. Cleanups that observed
 	// closed=false BEFORE our store may still be mid-work touching
 	// the lock-file mmap (the read-tx slot-release path); we MUST
 	// wait for them to complete before unmapping. The gate's
@@ -621,25 +626,26 @@ func (db *DB) Close() error {
 	db.root = nil
 	db.mu.Unlock()
 
-	// Step 2 — drain goroutines. Coord.Close blocks until both the
+	// Step 6 — drain goroutines (step 5 was the pointer capture
+	// above). Coord.Close blocks until both the
 	// flock goroutine and the heartbeat goroutine have exited; with
 	// a writer held at Close time, the stopCh path clears the
 	// writer-header fields and issues flock(LOCK_UN) before exit.
 	if coord != nil {
 		_ = coord.Close()
 	}
-	// Step 3 — munmap the lock file. Safe: closeGate.BeginClose
+	// Step 7 — munmap the lock file. Safe: closeGate.BeginClose
 	// drained Tx cleanups that might still write to lockFile's
 	// mmap; Coord.Close drained heartbeat + flock goroutines that
 	// also touch lockFile mmap.
 	if lockFile != nil {
 		_ = lockFile.Close()
 	}
-	// Step 4 — release pager (munmaps data file).
+	// Step 7 (cont.) — release pager (munmaps data file).
 	if pgr != nil {
 		_ = pgr.Close()
 	}
-	// Steps 5–6 — close fds.
+	// Step 7 (cont.) — close fds.
 	if file != nil {
 		_ = file.Close()
 	}

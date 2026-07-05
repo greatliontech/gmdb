@@ -1273,3 +1273,56 @@ func byteSlicesString(s [][]byte) string {
 func stringJoinList(parts []string) string {
 	return strings.Join(parts, ", ")
 }
+
+// TestIndexRangeArityValidation pins the Range tuple-arity check
+// (api-surface.md §Index Lookup API; matches Lookup / LookupKeys /
+// Prefix): a bound with more columns than the index declares can
+// never match the encoding and must surface ErrInvalidOptions, not
+// a silent empty range.
+func TestIndexRangeArityValidation(t *testing.T) {
+	ctx := context.Background()
+	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, _ := db.Begin(ctx)
+	defer tx.Rollback()
+	ks, err := tx.CreateKeyspace("t", &IndexDecl{
+		Name:    "by_c",
+		Columns: []IndexColumn{{Name: "c"}},
+		Extract: func(_, value []byte) []IndexEntry {
+			return []IndexEntry{{Cols: [][]byte{value[:1]}}}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ks.Put([]byte("k"), []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	h, err := ks.Index("by_c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range h.Range([][]byte{[]byte("a"), []byte("extra")}, nil) {
+		t.Fatal("over-arity start yielded")
+	}
+	if err := h.Err(); !errors.Is(err, ErrInvalidOptions) {
+		t.Errorf("over-arity start: Err=%v, want ErrInvalidOptions", err)
+	}
+	for range h.Range(nil, [][]byte{[]byte("a"), []byte("extra")}) {
+		t.Fatal("over-arity end yielded")
+	}
+	if err := h.Err(); !errors.Is(err, ErrInvalidOptions) {
+		t.Errorf("over-arity end: Err=%v, want ErrInvalidOptions", err)
+	}
+	// Fewer columns = prefix semantics, still valid.
+	n := 0
+	for range h.Range([][]byte{}, nil) {
+		n++
+	}
+	if err := h.Err(); err != nil {
+		t.Errorf("empty-tuple Range: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("empty-tuple Range yielded %d, want 1", n)
+	}
+}

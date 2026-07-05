@@ -255,47 +255,44 @@ a contended fast path.
 To make per-Tx leak cleanups safe against an early `Close()` (see
 Cleanup Behavior step 0 above), `Close()` runs in this order:
 
-1. Store `*db.closed = true` (release-store on the shared
-   `*atomic.Bool` field of the heap-shared `closeGate`) — visible
-   to any subsequent Tx cleanup invocation regardless of
-   `runtime.AddCleanup` ordering between the DB and its Txs.
-1a. Drain the in-flight windows by spinning on
-   `gate.txInflight == 0`. A cleanup that has passed the
-   release-store gate but not yet finished its resource-touching
-   work (e.g., a leaked-ReadTx mid-`ReleaseReader`) must complete
-   before any unmap, as must a `BeginRead` mid-acquire (its
-   restabilization loop bails one iteration after Close begins;
-   only the readers-full retry path can extend the drain, up to
-   that caller's ctx deadline). The spin is bounded by those
-   windows — microseconds in the common case — so a true sleep
-   would over-pessimise it.
-2. Stop the heartbeat goroutine via its stop channel and wait for
-   its done channel (bounded by the tick interval).
-3. Stop the flock goroutine: close `db.stopCh` (the goroutine's
-   `select` honors it within at most
-   `Options.LockRetryInterval`). Wait for the goroutine's done
-   channel to signal exit; on exit it has released any held flock
-   and cleared its writer header fields. **After** the done
-   signal, `Close()`'s own goroutine closes `db.writerCh` and
-   ranges over it, sending `ErrTxClosed` on each pending
-   `writerRequest.result` channel — the flock goroutine is no
-   longer reading from the channel at this point, so `Close()` is
-   the sole drainer.
-4. Stop the batch coordinator (if started): close `db.batchCh`,
-   drain pending calls with `ErrTxClosed`, wait for exit.
-5. Stop the maintenance goroutine (if running): stop channel +
-   wait.
-6. Munmap the data file and lock file.
-7. Close all file descriptors.
+1. Win the close CAS (`closeGate.CompareAndSwapClosed(false,
+   true)` — a release-store visible to any subsequent Tx cleanup
+   regardless of `runtime.AddCleanup` ordering between the DB and
+   its Txs). A second `Close()` returns immediately.
+2. Stop the batch coordinator (if started): cancel its context
+   (new submissions refused), wait for the coordinator goroutine
+   to exit — its in-flight write transaction unwinds and releases
+   the write grant first.
+3. Stop the maintenance goroutine (if running): stop channel +
+   wait, so no maintenance pass touches a torn-down mmap.
+4. Drain the in-flight cleanup windows by spinning on
+   `gate.txInflight == 0` (`closeGate.BeginClose`). A cleanup that
+   has passed the release-store gate but not yet finished its
+   resource-touching work (e.g., a leaked-ReadTx
+   mid-`ReleaseReader`) must complete before any unmap, as must a
+   `BeginRead` mid-acquire (its restabilization loop bails one
+   iteration after Close begins; only the readers-full retry path
+   can extend the drain, up to that caller's ctx deadline). The
+   spin is bounded by those windows — microseconds in the common
+   case.
+5. Capture and nil the resource pointers (coord, lock file, pager,
+   data file, directory root) under `db.mu`, so a concurrent
+   `Begin` sees a consistent pre-close or post-nil view.
+6. `Coord.Close`: blocks until both the flock goroutine and the
+   heartbeat goroutine have exited. The flock goroutine's stop
+   path releases any held flock, clears the writer-header fields,
+   and fails pending `AcquireWriter` requests — writer-queue
+   drainage lives inside the Coord, not in `Close()` itself.
+7. Munmap the lock file, then the data file; close all file
+   descriptors.
 
-Any Tx cleanup invoked between steps 1 and 6 sees
+Any Tx cleanup invoked between steps 1 and 7 sees
 `db.closed = true` and exits without touching the soon-to-be-
-unmapped memory. After step 6 the mmap is gone but the cleanup's
-guard at step 0 prevents the SEGV. Any Tx cleanup invoked *after*
-step 7 is fine — the guard still prevents access. Cleanups that
-*had already passed* the guard at the moment step 1 fired
-complete fully before step 6 runs, because step 1a spins on the
-in-flight refcount until they decrement.
+unmapped memory. After step 7 the mmap is gone but the cleanup's
+guard at step 0 prevents the SEGV. Cleanups that *had already
+passed* the guard at the moment step 1 fired complete fully
+before step 7 runs, because step 4 spins on the in-flight
+refcount until they decrement.
 
 `Close()` is **not** safe to call concurrently with active write
 or batch transactions in the same process. Active *read*

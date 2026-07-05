@@ -67,7 +67,30 @@ func needsOverflow(cfg page.Config, key, value []byte) bool {
 // too large for even the overflow form (ErrKeyTooLarge surface).
 func overflowRefFitsLeaf(cfg page.Config, key []byte) bool {
 	refSize := overflowEntryHeaderOverhead + len(key)
-	return refSize <= cfg.ContentEnd()-singleEntryPageOverhead
+	if refSize > cfg.ContentEnd()-singleEntryPageOverhead {
+		return false
+	}
+	return branchHoldsTwoSeparators(cfg, len(key))
+}
+
+// KeyFitsBranchSeparators exports the split-safety key bound for the
+// bulk-load construction path (package gmdb), which must gate keys
+// identically to Put — one threshold, no drift.
+func KeyFitsBranchSeparators(cfg page.Config, keyLen int) bool {
+	return branchHoldsTwoSeparators(cfg, keyLen)
+}
+
+// branchHoldsTwoSeparators reports whether a branch page can hold TWO
+// full separators of the given key length with no shared prefix — the
+// spec's key bound (limits.md §Maximum Key Size, ~(PageSize-40)/2).
+// The split machinery itself tolerates single-cell branch halves, so
+// keys in the gap (leaf-entry-fit but not two-per-branch) did not
+// crash — enforcing the bound at every entry gate is spec
+// conformance, keeping acceptance uniform across Put / PutEntry /
+// bulk / CopyTo rebuild. Worst case is zero shared prefix, so the
+// bound uses prefixLen=0.
+func branchHoldsTwoSeparators(cfg page.Config, keyLen int) bool {
+	return page.BranchEncodedSizeOf(2, 2*keyLen, 0) <= cfg.ContentEnd()
 }
 
 // NeedsOverflow exports needsOverflow for the bulk-load construction

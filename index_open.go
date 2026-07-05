@@ -49,7 +49,9 @@ type pinnedIndex struct {
 // Version. The Extract function pointer is NOT a hashable input —
 // per the spec "Go function values are not comparable, so the
 // Extract function pointer is NOT part of the hashable-inputs
-// comparison." Encoder IDs (typed indexes).
+// comparison." Encoder IDs (typed indexes) need no separate term:
+// the typed layer synthesizes column names that embed them, so they
+// are already covered through each index's schema hash.
 func indexesEqualByHashableInputs(a, b map[string]*pinnedIndex) bool {
 	if len(a) != len(b) {
 		return false

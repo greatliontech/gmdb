@@ -399,10 +399,14 @@ func TestSetKeyspaceBulkLoadStorageShapeMatchesPut(t *testing.T) {
 	}
 	defer tx.Rollback()
 
-	// One ~2050-byte value: a single-value subpage exceeds the ~2040-byte
-	// threshold at 4 KB, yet (like Put's genesis) must stay a subpage. Two
-	// ~1500-byte values exceed the threshold together → nested.
-	big := bytes.Repeat([]byte("Z"), 2050)
+	// With the split-safety member bound (~2026 at 4 KiB, limits.md
+	// §Maximum Key Size) no LEGAL single value can exceed the ~2040-
+	// byte promotion threshold anymore — the genesis
+	// single-value-stays-subpage rule is now exercised by the largest
+	// legal member, and an over-bound member is rejected identically
+	// on both paths (asserted below). Two ~1500-byte values exceed
+	// the threshold together → nested.
+	big := bytes.Repeat([]byte("Z"), 2000)
 	a := bytes.Repeat([]byte("a"), 1500)
 	b := bytes.Repeat([]byte("b"), 1500)
 

@@ -130,6 +130,21 @@ stays within one page (an unaligned tear cannot affect a single
 contiguous sub-page region, and the xxhash64 checksum catches
 any partial write — recovery falls back to the other slot).
 
+Bounded live-read anomaly: a LOCK-FREE cross-process reader (a
+read-only handle on a database with no lock file access) can
+read the active meta slot concurrently with step 3's pwrite and
+observe a torn/invalid checksum for that instant. This is
+harmless by construction: the reader's meta selection rejects
+the invalid slot on checksum and falls back to the OTHER slot —
+a valid, older meta — and reclamation never runs under a
+checkpoint-flag toggle (the TxnID is unchanged, so the snapshot
+the fallback pins is reclamation-protected exactly like any
+other reader of that meta). The anomaly is a transient
+one-instant stale read, never a wrong or unprotected snapshot.
+In-process readers and lock-coordinated peers are unaffected
+(their meta reads go through the handle's published
+currentMeta / the restabilization loop).
+
 ### Checkpoint failure semantics
 
 Steps 2–4 of the checkpoint sequence (data fdatasync, active-slot

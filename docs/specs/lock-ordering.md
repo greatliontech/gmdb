@@ -51,20 +51,32 @@ they are acquired in the following strict order. Code that
 violates this order is a bug.
 
 ```
-Outer  →  flock goroutine queue (db.writerCh)
-       →  cross-process flock(LOCK_EX) on lock file fd
-       →  intra-process write lock (held implicitly by write txn)
-       →  per-keyspace open registry (db.keyspaceRegistry.mu)
-       →  active-slot list (db.activeSlotsMu — for heartbeat coord)
-Inner  →  reader-table slot CAS (no mutex — atomic CAS only)
+Outer  →  write grant (Coord.AcquireWriter: request queue to the
+          flock goroutine → cross-process flock(LOCK_EX);
+          serializes writers across and within processes)
+       →  db.mu (handle state: currentMeta / pgr / coord swaps,
+          poison + generation checks — held briefly, never across
+          I/O or a grant acquisition)
+       →  db.batch.mu (batch-coordinator queue state — held
+          briefly; never acquired with db.mu held or vice versa
+          today, ordered here for future composition)
+       →  Coord.activeSlotsMu (in-process reader-slot registry —
+          for heartbeat and drain coordination)
+Inner  →  reader-table slot CAS (no mutex — atomic CAS/store per
+          cross-process.md §Atomic Operations Convention)
 ```
+
+Transaction-local state (the open-keyspace map, cursors, pinned
+indexes, the pager slab) is single-goroutine by the transaction
+contract and takes no lock at all; it is not an ordering
+participant.
 
 ### Notes
 
-- A read transaction only ever touches the reader-table CAS path
-  and the active-slot list mutex (briefly, on
-  Begin/Commit/Rollback). It does not enter any of the
-  writer-side locks above.
+- A read transaction only ever touches the reader-table CAS path,
+  a brief db.mu acquisition (meta snapshot + generation check),
+  and activeSlotsMu (slot registration) on
+  Begin/Commit/Rollback. It does not take the write grant.
 - The flock goroutine never calls into the application;
   application goroutines never call into the flock goroutine
   except by sending on `db.writerCh`. This breaks any potential
@@ -76,6 +88,10 @@ Inner  →  reader-table slot CAS (no mutex — atomic CAS only)
   to snapshot the slot list) and issues atomic stores to
   shared-memory reader-slot fields outside the mutex. It does not
   enter any writer-side lock.
+- The commit path acquires db.mu (to publish currentMeta) while
+  HOLDING the write grant — grant-then-db.mu is the canonical
+  outer→inner pair; acquiring the grant while holding db.mu is a
+  violation.
 - The pager slab map and the bitmap are NOT lock-ordering
   participants: they are mutated only by the sole writer (or the
   maintenance goroutine, both under the intra-process write grant +

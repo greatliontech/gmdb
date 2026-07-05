@@ -756,6 +756,21 @@ func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 			idx.err = idx.indexNotFoundError()
 			return
 		}
+		// Tuple-arity validation (matches Lookup / LookupKeys /
+		// Prefix): a bound with more columns than the index declares
+		// can never match its encoding and would silently yield an
+		// empty range instead of the documented ErrInvalidOptions.
+		// Prefix semantics permit FEWER columns.
+		if got, max := len(start), len(idx.pinned.decl.Columns); got > max {
+			idx.err = fmt.Errorf("gmdb: index %q Range: start has %d cols, index declares %d: %w",
+				idx.pinned.decl.Name, got, max, ErrInvalidOptions)
+			return
+		}
+		if got, max := len(end), len(idx.pinned.decl.Columns); got > max {
+			idx.err = fmt.Errorf("gmdb: index %q Range: end has %d cols, index declares %d: %w",
+				idx.pinned.decl.Name, got, max, ErrInvalidOptions)
+			return
+		}
 		if idx.pinned.root == 0 {
 			return
 		}

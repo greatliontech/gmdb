@@ -694,6 +694,16 @@ func (sb *setBulk) entrySize(v []byte) int {
 // order). Buffers it as a subpage entry, or — once the subpage would exceed
 // the promotion threshold — streams it into the nested builder.
 func (sb *setBulk) addValue(v []byte) error {
+	// Member bound (limits.md: set values are bounded by the maximum
+	// key size — a member becomes a nested-tree KEY on promotion):
+	// the same gate the online putIntoNestedTree applies via
+	// btree.Put, so bulk and incremental loads accept identical
+	// data. Checked before EITHER storage branch — the post-
+	// promotion nested path must not readmit what the subpage path
+	// rejects.
+	if !btree.KeyFitsBranchSeparators(sb.cfg, len(v)) {
+		return btree.ErrKeyTooLarge
+	}
 	sb.total++
 	if sb.nested != nil {
 		return sb.nested.add(page.LeafEntry{Key: v})
@@ -779,6 +789,14 @@ func (sb *setBulk) flush() error {
 func bulkLeafEntry(pw bulkOverflowWriter, cfg page.Config, key, value []byte) (page.LeafEntry, error) {
 	if value == nil {
 		value = []byte{}
+	}
+	// Split-safety key bound first (limits.md §Maximum Key Size) —
+	// the same spec-bound gate as btree.Put, so bulk and per-op
+	// loads accept identical keys; OverflowRefFitsLeaf subsumes it
+	// on the overflow branch, but an inline-fitting key must be
+	// bounded here too.
+	if !btree.KeyFitsBranchSeparators(cfg, len(key)) {
+		return page.LeafEntry{}, btree.ErrKeyTooLarge
 	}
 	if !btree.NeedsOverflow(cfg, key, value) {
 		return page.LeafEntry{Key: key, Value: value}, nil

@@ -1262,3 +1262,21 @@ func TestSetKeyspaceEmptyKeyRejected(t *testing.T) {
 func mustErr[T any](_ T, err error) error { return err }
 
 func mustErrPut(_ bool, err error) error { return err }
+
+// TestSetKeyspaceCellFreeRejectsPlainCells pins the cell-type
+// alignment (set-keyspace.md §Storage Strategy): no SetKeyspace
+// write path produces a plain or overflow cell, and the DeleteRange
+// free callback now surfaces ErrCorrupted for the shape — matching
+// CopyTo's rebuild and Check — instead of silently under-counting a
+// corrupt tree.
+func TestSetKeyspaceCellFreeRejectsPlainCells(t *testing.T) {
+	cfg := page.Config{PageSize: 4096}
+	if _, err := setKeyspaceCellFree(nil, cfg, page.LeafEntry{Key: []byte("k"), Value: []byte("v")}); !errors.Is(err, btree.ErrCorrupted) {
+		t.Errorf("plain cell: %v, want btree.ErrCorrupted", err)
+	}
+	if _, err := setKeyspaceCellFree(nil, cfg, page.LeafEntry{
+		Key: []byte("k"), Flags: page.CellFlagOverflow, OverflowPage: 9, TotalLen: 100,
+	}); !errors.Is(err, btree.ErrCorrupted) {
+		t.Errorf("overflow cell: %v, want btree.ErrCorrupted", err)
+	}
+}

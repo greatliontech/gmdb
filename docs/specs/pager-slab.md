@@ -58,13 +58,18 @@ Invariant: kind=clause-explicit;
     (pool reuse).
 
 Invariant: kind=clause-explicit;
-  property=`MaxTxBufferBytes` bounds the sum of all page-sized buffers
-    held by the transaction: live (routed via `dirty[id]`), loose, and
-    commit-time assembly buffers (RPL segments, modified bitmap pages,
-    meta-page buffer). `ErrTxTooLarge` fires on the first CoW or
-    commit-step-0 allocation that would exceed the bound;
+  property=`MaxTxBufferBytes` bounds the sum of all page-sized SLAB
+    buffers held by the transaction: live (routed via `dirty[id]`),
+    loose, and commit-step-0 RPL segment assembly buffers.
+    `ErrTxTooLarge` fires on the first CoW or commit-step-0
+    allocation that would exceed the bound. Two commit-time writes
+    are deliberately OUTSIDE the budget because they are not
+    slab-allocated: modified bitmap pages pwrite directly from the
+    in-memory bitmap's own storage (bounded by `BitmapPages`, a
+    file-geometry constant), and the meta page is one page-sized
+    scratch allocation per commit;
   from=this spec §Slab Budget and `ErrTxTooLarge`;
-  violation=Unbounded slab growth (loose buffers excluded, or commit
+  violation=Unbounded slab growth (loose buffers excluded, or RPL
     assembly excluded) lets a transaction OOM the process despite
     nominal compliance with `MaxTxBufferBytes`, breaking the cost model
     callers use to size the budget.
@@ -318,8 +323,9 @@ leakage, tree integrity preserved.
 
 A pwrite error during step 1 or step 3 returns the error to the
 caller; the transaction must be rolled back. Rollback releases every
-slab buffer (live, loose, assembled bitmap, RPL segments, meta-page
-buffer) back to the pool. The on-disk meta is untouched, so the
+slab buffer (live, loose, assembled RPL segments) back to the pool;
+the bitmap restores from its transaction snapshot and the meta
+scratch buffer is garbage-collected (neither is pool-managed). The on-disk meta is untouched, so the
 database remains consistent with the previous meta; any
 partially-pwritten data/RPL/bitmap pages are unreferenced and become
 bounded crash leakage reclaimed by background maintenance.

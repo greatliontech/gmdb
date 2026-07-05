@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -170,5 +171,99 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		return err
 	}); !errors.Is(e, ErrKeyTooLarge) {
 		t.Errorf("SetKeyspace.Put oversize value: got %v, want ErrKeyTooLarge", e)
+	}
+}
+
+// TestKeyTooLargeDeterministicAtBound pins the split-safety key
+// bound (limits.md §Maximum Key Size): every entry gate enforces the
+// spec's two-full-separators-per-branch bound (~(PageSize-40)/2), so
+// a key in the gap between leaf-entry fit and the spec bound fails
+// ErrKeyTooLarge AT the operation, uniformly across Put and the bulk
+// builders. Keys at the bound must work through real splits.
+func TestKeyTooLargeDeterministicAtBound(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 512})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// ~3000 bytes at 4 KiB: fits a single leaf entry (the old gate
+	// accepted it) but two such separators cannot share a branch.
+	gapKey := bytes.Repeat([]byte("g"), 3000)
+	if e := db.Update(ctx, func(tx *Tx) error {
+		ks, err := tx.CreateKeyspace("gap")
+		if err != nil {
+			return err
+		}
+		return ks.Put(gapKey, []byte("v"))
+	}); !errors.Is(e, ErrKeyTooLarge) {
+		t.Errorf("gap-key Put: got %v, want ErrKeyTooLarge (deterministic at the entry gate)", e)
+	}
+
+	// SetKeyspace top-level key (PutEntry path — H-shape from review:
+	// an ungated set key was accepted by Put and then failed CopyTo's
+	// gated rebuild) and set MEMBERS (bulk path) obey the same bound.
+	if e := db.Update(ctx, func(tx *Tx) error {
+		sks, err := tx.CreateSetKeyspace("sgap", nil)
+		if err != nil {
+			return err
+		}
+		_, err = sks.Put(gapKey, []byte("m"))
+		return err
+	}); !errors.Is(e, ErrKeyTooLarge) {
+		t.Errorf("set gap-key Put: got %v, want ErrKeyTooLarge", e)
+	}
+	gapMember := bytes.Repeat([]byte("m"), 3000)
+	if e := db.Update(ctx, func(tx *Tx) error {
+		sks, err := tx.CreateSetKeyspace("smem", nil)
+		if err != nil {
+			return err
+		}
+		_, err = sks.BulkLoad(func(yield func([]byte, []byte) bool) {
+			yield([]byte("k"), gapMember)
+		})
+		return err
+	}); !errors.Is(e, ErrKeyTooLarge) {
+		t.Errorf("set gap-member BulkLoad: got %v, want ErrKeyTooLarge", e)
+	}
+	if e := db.Update(ctx, func(tx *Tx) error {
+		sks, err := tx.CreateSetKeyspace("smem2", nil)
+		if err != nil {
+			return err
+		}
+		_, err = sks.Put([]byte("k"), gapMember)
+		return err
+	}); !errors.Is(e, ErrKeyTooLarge) {
+		t.Errorf("set gap-member Put: got %v, want ErrKeyTooLarge", e)
+	}
+
+	// A FixedValueSize above the member bound is rejected at
+	// declaration — otherwise the keyspace would accept nothing (its
+	// every correct-length Put failing the member gate forever).
+	if e := db.Update(ctx, func(tx *Tx) error {
+		_, err := tx.CreateSetKeyspace("fvsbig", &SetKeyspaceOptions{FixedValueSize: 3000})
+		return err
+	}); !errors.Is(e, ErrInvalidOptions) {
+		t.Errorf("over-bound FixedValueSize declaration: got %v, want ErrInvalidOptions", e)
+	}
+
+	// At-bound keys (~1900 bytes, safely under (4096-40)/2) must
+	// survive enough inserts to force branch splits.
+	if err := db.Update(ctx, func(tx *Tx) error {
+		ks, err := tx.CreateKeyspace("bound")
+		if err != nil {
+			return err
+		}
+		for i := range 60 {
+			k := bytes.Repeat([]byte{byte('a' + i%26)}, 1900)
+			k = append(k, byte(i))
+			if err := ks.Put(k, []byte("v")); err != nil {
+				return fmt.Errorf("at-bound Put %d: %w", i, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("at-bound keys through splits: %v", err)
 	}
 }
