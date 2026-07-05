@@ -26,7 +26,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 16. iterator-cursor-unregistration
 - [x] 17. index-covering-value-diff
 - [x] 18. index-child-merge-handle-reconciliation
-- [ ] 19. readonly-index-lookups
+- [x] 19. readonly-index-lookups
 - [ ] 20. setkeyspace-bulkload-error-mapping
 - [ ] 21. set-cursor-materialization-bound
 - [ ] 22. api-and-doc-drift-sweep

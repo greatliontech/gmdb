@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"sort"
 	"sync/atomic"
+
+	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // pinnedIndex carries the per-index state that survives the open-time
@@ -83,6 +86,53 @@ func buildPinnedIndexMap(decls []*IndexDecl) (map[string]*pinnedIndex, error) {
 			decl:       d,
 			schemaHash: schemaHash(d),
 		}
+	}
+	return out, nil
+}
+
+// loadReadOnlyIndexes synthesizes an extractor-less pinned-index map
+// from the on-disk registry for a READ-ONLY keyspace open
+// (indexing.md §Open Semantics: "Index lookups still work — they
+// read stored index entries directly"). The synthesized IndexDecl
+// carries the persisted schema (Columns / Covering / Unique /
+// Version) with a nil Extract: lookups never invoke the extractor,
+// and the read-only write guard rejects every mutation before index
+// maintenance could need it. Returns nil for a keyspace with no
+// registry.
+func (tx *Tx) loadReadOnlyIndexes(desc page.KeyspaceDescriptor) (map[string]*pinnedIndex, error) {
+	if desc.IndexRegistryRoot == 0 {
+		return nil, nil
+	}
+	cfg := tx.pgr.Config()
+	hwm := tx.statsHWM()
+	out := make(map[string]*pinnedIndex)
+	err := btree.WalkKV(tx.pgr, cfg, desc.IndexRegistryRoot, hwm, func(k, v []byte) error {
+		e, derr := decodeRegistryEntry(v)
+		if derr != nil {
+			return fmt.Errorf("%w: read-only index load %q: %w", ErrCorrupted, k, derr)
+		}
+		name := string(k)
+		decl := &IndexDecl{
+			Name:    name,
+			Unique:  e.Unique,
+			Version: e.UserVersion,
+		}
+		for _, c := range e.Columns {
+			decl.Columns = append(decl.Columns, IndexColumn{Name: c})
+		}
+		for _, c := range e.Covering {
+			decl.Covering = append(decl.Covering, IndexCoveringColumn{Name: c})
+		}
+		out[name] = &pinnedIndex{
+			decl:       decl,
+			schemaHash: e.SchemaHash,
+			root:       e.Root,
+			count:      e.Count,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, mapBtreeErr(err)
 	}
 	return out, nil
 }

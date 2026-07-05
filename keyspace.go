@@ -185,8 +185,13 @@ func (tx *Tx) OpenKeyspaceReadOnly(name string) (*Keyspace, error) {
 	if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindKeyspace); err != nil {
 		return nil, err
 	}
+	indexes, err := tx.loadReadOnlyIndexes(desc)
+	if err != nil {
+		return nil, err
+	}
 	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateClean)
 	ks.readOnly = true
+	ks.indexes = indexes
 	delete(tx.dirtyDescriptors, name)
 	return ks, nil
 }
