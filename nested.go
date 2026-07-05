@@ -250,6 +250,7 @@ func mergeKeyspaceHandles(parent, child *Tx) {
 			pks.state = cks.state
 			pks.dead = cks.dead
 			pks.indexes = cks.indexes
+			pks.reconcileIndexHandles()
 			if rootMoved {
 				pks.markCursorsStale()
 			}
@@ -273,6 +274,18 @@ func mergeKeyspaceHandles(parent, child *Tx) {
 	for h, pks := range parent.openKeyspaces {
 		if _, stillOpen := child.openKeyspaces[h]; !stillOpen {
 			pks.dead = true
+			// Mirror within-tx DeleteKeyspace's invalidation
+			// (Inv-IHS3): the child FreeSubtree'd this keyspace's
+			// row and index trees, so any parent cursor or index
+			// iter still in flight would yield from freed (and
+			// possibly reallocated) pages. Row cursors go stale
+			// (requireOpen then short-circuits on dead); index
+			// handle cursors likewise, with the closure mapping the
+			// stale to ErrKeyspaceClosed.
+			for _, c := range pks.openCursors {
+				c.inner.MarkStale()
+			}
+			pks.markIndexHandlesStale()
 			parent.deadKeyspaces = append(parent.deadKeyspaces, pks)
 			delete(parent.openKeyspaces, h)
 		}
@@ -289,6 +302,7 @@ func mergeSetKeyspaceHandles(parent, child *Tx) {
 			psks.state = csks.state
 			psks.dead = csks.dead
 			psks.indexes = csks.indexes
+			psks.reconcileIndexHandles()
 			if rootMoved {
 				psks.markSetCursorsStale()
 			}
@@ -312,6 +326,11 @@ func mergeSetKeyspaceHandles(parent, child *Tx) {
 	for h, psks := range parent.openSetKeyspaces {
 		if _, stillOpen := child.openSetKeyspaces[h]; !stillOpen {
 			psks.dead = true
+			// SetCursor needs no explicit stale walk (requireOpen
+			// probes dead before touching outerCursor — the same
+			// argument as within-tx DeleteKeyspace), but index
+			// handle iters do (Inv-IHS3 mirror, as above).
+			psks.markIndexHandlesStale()
 			parent.deadSetKeyspaces = append(parent.deadSetKeyspaces, psks)
 			delete(parent.openSetKeyspaces, h)
 		}

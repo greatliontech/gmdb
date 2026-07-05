@@ -254,7 +254,10 @@ func (ks *keyspaceCore) descriptor() *page.KeyspaceDescriptor {
 // stale cursor's tracked-root. This is safe under the current API
 // because every *IndexHandle entry method (Stats / Lookup / LookupKeys /
 // Range / Prefix / Get / Err) short-circuits via keyspaceDead() before
-// issuing a fresh descent, so the freed-root is never dereferenced. If
+// issuing a fresh descent, so the freed-root is never dereferenced —
+// covering both freed-root callers: Tx.DeleteKeyspace and the
+// child-commit merge's deleted-keyspace branch (dead is set before
+// the stale walk in both). If
 // a future API exposes the underlying *btree.Cursor or weakens the
 // entry-method short-circuit, this SetRootID(freed) store on the
 // DeleteKeyspace path becomes a use-after-free hazard and the caller
@@ -296,6 +299,42 @@ func (ks *keyspaceCore) markIndexHandleStaleByName(name string) {
 		for _, c := range idx.openCursors {
 			c.MarkStale()
 			c.SetRootID(newRoot)
+		}
+	}
+}
+
+// reconcileIndexHandles re-points every open *IndexHandle at the
+// same-name entry of ks.indexes. Called by the child-commit merges
+// (mergeKeyspaceHandles / mergeSetKeyspaceHandles) right after they
+// swap ks.indexes for the child's map: the parent's handles still
+// reference the PRE-child pinnedIndex objects — without re-pointing,
+// lookups silently serve the pre-child tree (stale results with
+// Err()==nil), and after a child Drop+FreeSubtree the handle would
+// descend freed pages. A name absent from the incoming map means the
+// child dropped the index: the handle goes dead (Inv-IHS2), exactly
+// as markIndexHandleDead would have done had the drop run in this
+// tx. Live handles' in-flight cursors are stale-marked with the new
+// root so a re-position descends the merged tree.
+//
+// Runs UNCONDITIONALLY (not gated on the row root moving): a child
+// Rebuild replaces an index tree without touching the row tree.
+func (ks *keyspaceCore) reconcileIndexHandles() {
+	for _, idx := range ks.openIndexHandles {
+		if idx.pinned == nil || idx.dead {
+			continue
+		}
+		np, ok := ks.indexes[idx.pinned.decl.Name]
+		if !ok {
+			idx.dead = true
+			for _, c := range idx.openCursors {
+				c.MarkStale()
+			}
+			continue
+		}
+		idx.pinned = np
+		for _, c := range idx.openCursors {
+			c.MarkStale()
+			c.SetRootID(np.root)
 		}
 	}
 }

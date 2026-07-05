@@ -689,6 +689,22 @@ invariants are spec-tier *and* enforced (regression tests
 et al. on the package, plus the markup of the contract on this
 section).
 
+- **Inv-IHS4 (child-commit handle reconciliation).** When a child
+  transaction commits, every `*IndexHandle` the PARENT handed out
+  before `BeginChild` is re-pointed at the merged (child-committed)
+  index state: lookups and `Stats` reflect the child's work exactly
+  as a freshly-opened handle would; a child `Drop` leaves the
+  parent's handle dead per Inv-IHS2 (the child freed the subtree —
+  the handle must never descend it); in-flight cursors are
+  stale-marked with the merged root. Violation: the parent handle
+  keeps serving the pre-child tree — silently wrong results with
+  `Err() == nil` (the audit demonstrated 1 row via the stale handle
+  vs 201 via a fresh one), or a freed-page descent after a child
+  Drop. (Enforced by reconcileIndexHandles in the child-commit
+  merges; pinned by TestIndexHandleSeesChildCommit /
+  TestIndexHandleDeadAfterChildDrop /
+  TestSetIndexHandleSeesChildCommit.)
+
 ## Write Path: Atomic Index Maintenance
 
 For an indexed keyspace, every `Put`, `Delete`, and
