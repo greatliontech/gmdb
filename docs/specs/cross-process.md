@@ -249,7 +249,7 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=Every process that mmaps a lock file does so with
-    size = 72 + (48 × LockFileHeader.MaxReaders), where
+    size = 80 + (48 × LockFileHeader.MaxReaders), where
     MaxReaders is the value of the lock file's MaxReaders field
     at the moment the mmap is established. The mmap size is
     established once at Open and is never resized; MaxReaders is
@@ -324,7 +324,7 @@ Invariant: kind=entailed;
 ```
 Lock File
 +----------------------------------------------+
-| Header (72 bytes)                            |
+| Header (80 bytes)                            |
 | Magic              | uint64                  |
 | MaxReaders         | uint32                  |
 | Padding            | 4 bytes                 |
@@ -393,7 +393,7 @@ automatically when the UUID does not match the data file's). The
 data file itself is fully portable (little-endian, explicit
 encode/decode).
 
-### Header fields (72 bytes)
+### Header fields (80 bytes)
 
 - **Magic**: identifies the file as a gmdb lock file.
 - **MaxReaders**: number of reader slots, set at lock-file creation
@@ -413,6 +413,8 @@ encode/decode).
   goroutine (the lock holder) while the write lock is held.
 - **LastMaintenanceTime**: updated after a maintenance pass
   completes (see `background-maintenance.md`).
+- **DataGeneration** (atomic): counts data-file replacements
+  (Compact's rename-over). See §Data-file generation below.
 
 ### Reader slot (48 bytes)
 
@@ -434,12 +436,12 @@ encode/decode).
   writer-process turnover. Cleared back to 0 by slot release and
   by successful acquire's field-write phase.
 
-Total size: `72 + (48 × MaxReaders)`. Default 4096 readers:
-`72 + 196608 = 196680` bytes (~192 KB).
+Total size: `80 + (48 × MaxReaders)`. Default 4096 readers:
+`80 + 196608 = 196688` bytes (~192 KB).
 
 `MaxReaders` is bounded `[1, 65536]`. The lower bound is one slot
 (degenerate but legal); the upper bound caps the mmap at
-`72 + 48 × 65536 ≈ 3 MiB`, so a corrupted or maliciously-crafted
+`80 + 48 × 65536 ≈ 3 MiB`, so a corrupted or maliciously-crafted
 header value cannot demand a petabyte-scale mmap. A header
 `MaxReaders` value outside this range is treated as `ErrCorrupted`
 by `Open`.
@@ -463,6 +465,56 @@ Non-zero: determine whether the writer is still alive via
 `kill(pid, 0)` + `WriterStartTime` comparison (see Process Start
 Time). Dead or recycled: writer crashed; see Stale Writer
 Recovery.
+
+### Data-file generation
+
+`Compact()` replaces the data file by renaming a rebuilt inode over
+`db.path`. The lock file is deliberately NOT renamed (the UUID and
+reader table survive), so a peer process's open handle keeps its fd
+and mmap on the old, now-unlinked inode — and, without a guard, its
+next write grant acquires normally and commits to the dead file:
+writes permanently invisible to every other process, reads frozen
+pre-Compact forever.
+
+The `DataGeneration` header field closes this. Protocol:
+
+1. Every handle caches the field's value at `Open()`, then
+   verifies its data fd still names the path's inode (fstat vs
+   path stat) — an Open racing a peer Compact would otherwise
+   cache the post-bump value while mapping the replaced inode,
+   defeating every later check; a mismatch retries the Open
+   against the current inode. The rename happens-before the
+   bump, so a same-inode stat proves any unobserved bump belongs
+   to a later compact, which the per-operation checks catch.
+2. `Compact()`, holding the write grant, bumps the field atomically
+   IMMEDIATELY after the rename (and updates its own cache — the
+   compacting handle stays valid). The directory fsync follows; its
+   failure poisons the compacting handle but the bump stands — the
+   live directory entry already changed, so peers must converge
+   regardless.
+3. After every write-grant acquisition, and after every reader-slot
+   publish, the handle compares the field against its cache. A
+   mismatch means a peer replaced the inode this handle still maps:
+   the handle POISONS itself (grant released / slot freed first) and
+   the operation returns `ErrPoisoned` — Close + re-Open converges on
+   the new inode.
+
+Invariant: kind=clause-explicit;
+  property=No transaction begins against a data-file inode that a
+    completed peer `Compact()` has replaced: the generation check
+    runs after the write-grant acquisition (writers) and after the
+    reader-slot publish (readers), both strictly before any page
+    access;
+  from=this spec §Data-file generation;
+  violation=A peer handle that misses the replacement commits to the
+    unlinked inode — the write succeeds locally, is invisible to
+    every other process and every future opener, and the two files
+    diverge silently (the api-surface.md §Compact all-or-nothing
+    contract broken across processes).
+    (Enforced by the generation checks in Begin/BeginRead/
+    Checkpoint/Compact plus the Open-time inode verification;
+    pinned per entry point by the peer-handle tests in
+    compact_generation_test.go.)
 
 ### Creator-side flock protocol
 

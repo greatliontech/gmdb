@@ -81,6 +81,14 @@ type DB struct {
 	// from disk and is internally consistent.
 	poisoned atomic.Bool
 
+	// dataGeneration caches the lock header's data-file replacement
+	// counter as of Open (or this handle's own Compact). Compared
+	// against the live header after every write-grant acquisition and
+	// reader-slot publish (cross-process.md §Data-file generation): a
+	// mismatch means a peer's Compact replaced the inode this handle
+	// still maps — poison, Close + re-Open converges.
+	dataGeneration atomic.Uint64
+
 	// closeGate is a heap-allocated coordination struct shared by
 	// pointer with every txCleanupInfo, every readTxCleanupInfo, and
 	// the dbCleanupInfo. Composes the (closed bool, txInflight
@@ -141,6 +149,32 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 	if err := opts.validate(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidOptions, err)
 	}
+	// Open-time inode verification retry (cross-process.md §Data-file
+	// generation): a peer's Compact can rename the data file between
+	// this Open's fd acquisition and its generation-cache read, in
+	// which case the handle would cache the post-bump generation
+	// while mapping the replaced inode — every later check passing.
+	// openAttempt detects the mismatch (fd inode vs path inode,
+	// checked AFTER the cache read; the rename happens-before the
+	// bump, so either the stat sees the new inode or the per-op check
+	// fires) and we retry against the new inode. Three attempts:
+	// each retry needs a fresh completed Compact to fail again.
+	var lastErr error
+	for range 3 {
+		db, err := openAttempt(ctx, path, opts)
+		if err == nil || !errors.Is(err, errStaleInodeAtOpen) {
+			return db, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// errStaleInodeAtOpen is the internal retry signal for the Open-time
+// inode verification.
+var errStaleInodeAtOpen = errors.New("gmdb: data file replaced during Open")
+
+func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
 	root, err := os.OpenRoot(dir)
@@ -373,6 +407,34 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		pgr:                 opened.Pager,
 		closeGate:           newCloseGate(),
 		readOnly:            opts.ReadOnly,
+	}
+	if coord != nil {
+		db.dataGeneration.Store(coord.DataGeneration())
+		// Inode verification AFTER the generation cache read: if a
+		// peer's Compact replaced the path's inode since our fd was
+		// opened, the fd and the path disagree — tear down and let
+		// Open retry against the current inode. (Ordering argument:
+		// the rename happens-before the bump, so a same-inode stat
+		// here proves any not-yet-observed bump belongs to a LATER
+		// compact, which the per-op checks catch.)
+		fdInfo, ferr := file.Stat()
+		pathInfo, perr := root.Stat(base)
+		if ferr != nil || perr != nil {
+			// Genuine stat failure (out-of-band deletion, fd trouble)
+			// — not the replaced-inode retry case; surface it as its
+			// own inspectable error, no retry.
+			_ = db.Close()
+			return nil, fmt.Errorf("gmdb: open %q: inode verification: %w", path, errors.Join(ferr, perr))
+		}
+		if !os.SameFile(fdInfo, pathInfo) {
+			_ = db.Close()
+			return nil, errStaleInodeAtOpen
+		}
+		// Benign false positive: an fd that landed on the NEW inode
+		// between a peer's rename and bump caches the pre-bump value,
+		// passes SameFile, and this handle's first operation then
+		// spuriously poisons a correctly-mapped handle — safe-
+		// conservative, one Close + re-Open converges.
 	}
 
 	if openWarnNoCheckpoint {
@@ -665,6 +727,17 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	// Re-check poison under the grant — a concurrent commit could
 	// have poisoned the handle while we were waiting.
 	if db.poisoned.Load() {
+		grant.Release()
+		return nil, ErrPoisoned
+	}
+	// Data-file generation check (cross-process.md §Data-file
+	// generation): a peer's Compact replaced the inode this handle
+	// maps — committing would write to the unlinked file, silently
+	// diverging from every other process.
+	if gen := coord.DataGeneration(); gen != db.dataGeneration.Load() {
+		db.poisoned.Store(true)
+		db.logger.Error("gmdb: data file replaced by a peer Compact; handle poisoned — Close and re-Open",
+			"cachedGeneration", db.dataGeneration.Load(), "currentGeneration", gen)
 		grant.Release()
 		return nil, ErrPoisoned
 	}

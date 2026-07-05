@@ -36,3 +36,9 @@ func CAS64(p *uint64, old, new uint64) bool {
 // the size argument used to mmap.
 func Load32(p *uint32) uint32     { return atomic.LoadUint32(p) }
 func Store32(p *uint32, v uint32) { atomic.StoreUint32(p, v) }
+
+// Add64 atomically adds delta to a shared-memory uint64 field and
+// returns the new value.
+func Add64(p *uint64, delta uint64) uint64 {
+	return atomic.AddUint64(p, delta)
+}

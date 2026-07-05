@@ -89,6 +89,15 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	if db.poisoned.Load() {
 		return ErrPoisoned
 	}
+	// Data-file generation check (cross-process.md §Data-file
+	// generation): flagging a meta on the unlinked inode would
+	// certify a file no other process can see.
+	if gen := coord.DataGeneration(); gen != db.dataGeneration.Load() {
+		db.poisoned.Store(true)
+		db.logger.Error("gmdb: data file replaced by a peer Compact; handle poisoned — Close and re-Open",
+			"cachedGeneration", db.dataGeneration.Load(), "currentGeneration", gen)
+		return ErrPoisoned
+	}
 
 	// Re-read pgr+file under the post-grant db.mu (Compact may have swapped
 	// them while we waited) and re-sync the writer's in-memory state to

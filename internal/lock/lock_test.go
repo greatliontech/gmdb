@@ -43,8 +43,8 @@ func TestFileSize(t *testing.T) {
 }
 
 func TestStructSizes(t *testing.T) {
-	if HeaderSize != 72 {
-		t.Errorf("HeaderSize = %d, want 72", HeaderSize)
+	if HeaderSize != 80 {
+		t.Errorf("HeaderSize = %d, want 80", HeaderSize)
 	}
 	if SlotSize != 48 {
 		t.Errorf("SlotSize = %d, want 48", SlotSize)

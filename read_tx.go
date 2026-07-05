@@ -382,6 +382,18 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 				return nil, ErrClosed
 			}
 		}
+		// Data-file generation check (cross-process.md §Data-file
+		// generation): a peer's Compact replaced the inode this
+		// handle maps — the snapshot just pinned belongs to the
+		// unlinked file and would read frozen pre-Compact data
+		// forever. Slot released before poisoning.
+		if gen := coord.DataGeneration(); gen != db.dataGeneration.Load() {
+			coord.ReleaseReader(slot)
+			db.poisoned.Store(true)
+			db.logger.Error("gmdb: data file replaced by a peer Compact; handle poisoned — Close and re-Open",
+				"cachedGeneration", db.dataGeneration.Load(), "currentGeneration", gen)
+			return nil, ErrPoisoned
+		}
 	}
 
 	// Bring up a fresh read-only pager. Per the doc on ReadTx.pgr, a

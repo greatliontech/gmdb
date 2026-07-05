@@ -618,6 +618,14 @@ func (c *Coord) ActiveReaderSlots() int {
 // stamp share one clock source.
 func (c *Coord) Clock() uint64 { return c.clock() }
 
+// DataGeneration reads the lock header's data-file replacement
+// counter (format.go DataGeneration).
+func (c *Coord) DataGeneration() uint64 { return c.f.DataGeneration() }
+
+// BumpDataGeneration increments the counter — Compact's post-rename
+// publish step; caller must hold the write grant.
+func (c *Coord) BumpDataGeneration() uint64 { return c.f.BumpDataGeneration() }
+
 // StaleTimeout returns the effective per-process stale-detection
 // window — the configured CoordOptions.StaleTimeout, or
 // DefaultStaleTimeout (10 s) when unset. It governs how long a reader

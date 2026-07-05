@@ -89,6 +89,19 @@ func (db *DB) Compact() error {
 	if db.closeGate.IsClosed() {
 		return ErrClosed
 	}
+	// Data-file generation check (cross-process.md §Data-file
+	// generation): a peer compacted while we waited for the grant —
+	// compacting the unlinked inode this handle still maps would fork
+	// the database. Fail-fast only: even without this check the copy
+	// phase's own BeginRead fires the read-path generation check
+	// before anything is renamed (the peer-Compact test pins that
+	// outcome); this earlier exit just skips the reader-drain wait.
+	if gen := coord.DataGeneration(); gen != db.dataGeneration.Load() {
+		db.poisoned.Store(true)
+		db.logger.Error("gmdb: data file replaced by a peer Compact; handle poisoned — Close and re-Open",
+			"cachedGeneration", db.dataGeneration.Load(), "currentGeneration", gen)
+		return ErrPoisoned
+	}
 
 	// 2. Drain in-process readers (bounded by CompactDrainTimeout).
 	deadline := time.Now().Add(db.opts.CompactDrainTimeout)
@@ -122,11 +135,20 @@ func (db *DB) Compact() error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("gmdb: Compact rename: %w", err)
 	}
+	// Publish the replacement to every peer handle (cross-process.md
+	// §Data-file generation) IMMEDIATELY after the rename: the live
+	// directory entry already changed, so peers must converge from
+	// this instant regardless of what the fsync below does — a
+	// dir-fsync failure poisons only this handle, never un-renames.
+	// Bumped under the grant, before our own reopen (even if that
+	// fails and poisons us, peers still observe the replacement). Our
+	// cache updates in the same step so this handle's later checks
+	// pass.
+	db.dataGeneration.Store(coord.BumpDataGeneration())
 	// The rename is durable only once the parent directory is fsynced;
-	// on failure the on-disk outcome is unknowable (a crash may
-	// resurrect the old inode while this handle would serve the new
-	// one — acked commits silently diverging). Same failure class as
-	// the reopen path below: poison, Close + re-Open recovers.
+	// on failure the on-disk outcome is unknowable across a crash (the
+	// old inode may resurrect) — same failure class as the reopen path
+	// below: poison, Close + re-Open recovers.
 	if err := syncDir(db.root); err != nil {
 		db.poisoned.Store(true)
 		return fmt.Errorf("gmdb: Compact dir fsync (handle poisoned — Close and re-Open): %w", err)

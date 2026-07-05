@@ -81,7 +81,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [compact-peer-handle-generation](compact-peer-handle-generation.md) | chunk 14 | **[H]** Compact renames the inode under peer handles; peer writes land on the unlinked inode — silent write loss. Generation stamp in the lock header. |
 | [check-consistency-classes](check-consistency-classes.md) | chunk 15 | **[M]** Check() verifies none of: key ordering, separator routing, desc.Count, NestedCount, NumKeyspaces — classes api-surface.md claims. |
 | [iterator-cursor-unregistration](iterator-cursor-unregistration.md) | chunk 16 | **[M]** All/Range/Prefix leak cursor registrations for the tx lifetime — quadratic degradation in long transactions. |
 | [index-covering-value-diff](index-covering-value-diff.md) | chunk 17 | **[H]** Covering bytes never rewritten on value-only updates (key-only diff) — stale covering lookups; Check flags normal workloads. Failing repro. + align rebuild/maintenance dup tie-break. |

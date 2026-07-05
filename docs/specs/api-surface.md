@@ -1614,6 +1614,18 @@ func (db *DB) CopyTo(path string, compact bool) error
 // normally. There is no observable inconsistency window for
 // cross-process readers.
 //
+// Peer HANDLES post-rename (cross-process.md §Data-file generation):
+// a peer process's already-open DB handle keeps its fd/mmap on the
+// replaced inode. Compact bumps the lock header's DataGeneration
+// (under the write grant, after the rename + directory fsync, before
+// its own reopen), and every handle re-checks the field after each
+// write-grant acquisition and reader-slot publish: the stale peer's
+// next Begin / BeginRead / Checkpoint / Compact poisons its handle
+// and returns ErrPoisoned instead of committing to (or reading) the
+// unlinked file — the silent cross-process fork the all-or-nothing
+// invariant forbids. Close + re-Open converges the peer on the new
+// inode.
+//
 // Reopen failure: if the reopen in step 4 fails AFTER the rename
 // succeeded (the on-disk file is the new inode, but this handle could
 // not remap it), the handle is POISONED — every subsequent operation

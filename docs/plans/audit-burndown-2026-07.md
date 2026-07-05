@@ -21,7 +21,7 @@ regression test → adversarial review → close-out gate → commit) per
 - [x] 11. beginread-close-lifecycle
 - [x] 12. update-unresolved-child-grant
 - [x] 13. maintenance-reclaim-snapshot-guard
-- [ ] 14. compact-peer-handle-generation
+- [x] 14. compact-peer-handle-generation
 - [ ] 15. check-consistency-classes
 - [ ] 16. iterator-cursor-unregistration
 - [ ] 17. index-covering-value-diff

@@ -130,7 +130,7 @@ type File struct {
 //
 // Retry budget. Adopter sees errPartialInit at most O(init-window)
 // times before the creator publishes. Init is bounded by one
-// Truncate + 72-byte WriteAt + one fdatasync — typically sub-ms on
+// Truncate + header WriteAt + one fdatasync — typically sub-ms on
 // SSD, up to ~100 ms on contended HDDs. The budget + capped
 // exponential backoff (1, 2, 4, 8, 16, 32, 64, 128, 256, 256 ms;
 // total ~800 ms) covers a slow disk while bounding caller latency.
@@ -554,6 +554,25 @@ func (f *File) WriterPID() uint64 {
 		panic("lock: WriterPID on closed *File")
 	}
 	return Load64(&f.header.WriterPID)
+}
+
+// DataGeneration reads the data-file replacement counter (see the
+// field doc in format.go).
+func (f *File) DataGeneration() uint64 {
+	if f.header == nil {
+		panic("lock: DataGeneration on closed *File")
+	}
+	return Load64(&f.header.DataGeneration)
+}
+
+// BumpDataGeneration increments the data-file replacement counter.
+// Caller MUST hold the write grant (flock LOCK_EX) — Compact's
+// post-rename publish step.
+func (f *File) BumpDataGeneration() uint64 {
+	if f.header == nil {
+		panic("lock: BumpDataGeneration on closed *File")
+	}
+	return Add64(&f.header.DataGeneration, 1)
 }
 
 func (f *File) SetWriterPID(v uint64) {

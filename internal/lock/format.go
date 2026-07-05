@@ -11,7 +11,7 @@ const Magic uint64 = 0x6B636F6C62646D67
 
 // HeaderSize is the on-disk byte length of LockFileHeader. Frozen at
 // the value enforced by the compile-time size check in this file.
-const HeaderSize = 72
+const HeaderSize = 80
 
 // SlotSize is the on-disk byte length of one ReaderSlot, ditto.
 const SlotSize = 48
@@ -49,6 +49,14 @@ type LockFileHeader struct {
 	WriterPIDNamespace  uint64
 	WriterHeartbeat     uint64
 	LastMaintenanceTime uint64
+	// DataGeneration counts data-file replacements (Compact's
+	// rename-over). A handle caches the value at Open and re-checks it
+	// after every write-grant acquisition and reader-slot publish: a
+	// mismatch means a peer replaced the inode this handle still maps —
+	// continuing would commit to (or read) the unlinked file, silently
+	// diverging from every other process. Bumped atomically by Compact
+	// under the write grant, after the rename + directory fsync.
+	DataGeneration uint64
 }
 
 // ReaderSlot overlays one 48-byte slot in the reader table. All six
