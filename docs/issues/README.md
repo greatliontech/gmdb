@@ -67,6 +67,7 @@ findings each shared-fix row covers.
 | [commit-headroom-at-tx-budget-cap](commit-headroom-at-tx-budget-cap.md) | condition (slab-budget accounting / commit-pipeline allocation model revisit) | **[M]** Commit-pipeline allocations count against MaxTxBufferBytes, so a tx driven to the cap cannot commit (ErrTxTooLarge at Commit) — partial work only recoverable by Rollback. Found building the chunk-3 regression fixture (2026-07-05). |
 | [rpl-head-exemption-reclaimed](rpl-head-exemption-reclaimed.md) | condition (recovery-model redesign or head-convention revisit) | **[M]** rebuildRPLChain hard-fails Open on a bad head, but RPLHeadPage carries forward across no-retire commits, so an older checkpoint's head can be legitimately reclaimed+reused — recovery after a crash-mid-commit becomes unopenable. Chunk-4 review finding. |
 | [dbcleanup-teardown-drain](dbcleanup-teardown-drain.md) | condition (AddCleanup execution model revisit) | **[L]** dbCleanupFn tears down coord/lockFile without the txInflight drain Close performs — safe only while the runtime runs cleanups sequentially. Chunk-11 review finding. |
+| [pagechecksum-default-drift](pagechecksum-default-drift.md) | condition (Options breaking-change window or chunk-22 sweep) | **[M]** checksums.md + godoc promise PageChecksum default-on; applyDefaults never sets the plain bool, so the effective default is off — spec-promised bitrot detection silently absent. Chunk-15 review finding. |
 
 ## Open — full-codebase audit (2026-07-04)
 
@@ -81,7 +82,6 @@ Rows in chunk order; severity tags are the audit's.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [check-consistency-classes](check-consistency-classes.md) | chunk 15 | **[M]** Check() verifies none of: key ordering, separator routing, desc.Count, NestedCount, NumKeyspaces — classes api-surface.md claims. |
 | [iterator-cursor-unregistration](iterator-cursor-unregistration.md) | chunk 16 | **[M]** All/Range/Prefix leak cursor registrations for the tx lifetime — quadratic degradation in long transactions. |
 | [index-covering-value-diff](index-covering-value-diff.md) | chunk 17 | **[H]** Covering bytes never rewritten on value-only updates (key-only diff) — stale covering lookups; Check flags normal workloads. Failing repro. + align rebuild/maintenance dup tie-break. |
 | [index-child-merge-handle-reconciliation](index-child-merge-handle-reconciliation.md) | chunk 18 | **[H]** Child commit swaps pks.indexes but never re-points parent IndexHandles — silently stale lookups; freed-page reads after child Drop. Failing repro. |

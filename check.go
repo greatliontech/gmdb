@@ -408,8 +408,16 @@ func (c *checker) run() {
 // is unguarded and would panic/SIGBUS on a corrupt or forged tree —
 // Check must not crash on the corruption it exists to detect).
 func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
+	// The keyspace-descriptor tree itself is order-validated too — a
+	// routing flip there makes OpenKeyspace descent miss a keyspace
+	// mid-op while every per-page check stays clean.
+	if _, _, ok, _ := c.validateTreeOrder("", "(keyspace tree)", c.meta.KeyspaceRoot, 0, hwm); !ok {
+		return false
+	}
+	var keyspaceCount uint64
 	err := btree.WalkKV(rawPageReader{c.pgr}, c.cfg, c.meta.KeyspaceRoot, hwm, func(k, v []byte) error {
 		name := string(k)
+		keyspaceCount++
 		if len(v) != page.KeyspaceDescriptorSize {
 			if !c.emit(CheckIssue{Severity: CheckError, Code: "KeyspaceDescriptorSize", Keyspace: name,
 				Message: fmt.Sprintf("descriptor value length %d != %d", len(v), page.KeyspaceDescriptorSize)}) {
@@ -436,6 +444,20 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 		if !c.walkTree(name, "", desc.Root, firstData, hwm) {
 			return errCheckStop
 		}
+		if entries, values, ok, structural := c.validateTreeOrder(name, "", desc.Root, desc.FixedValueSize, hwm); !ok {
+			return errCheckStop
+		} else if !structural {
+			want, unit := entries, "entries"
+			if desc.Kind == page.KeyspaceKindSetKeyspace {
+				want, unit = values, "values"
+			}
+			if desc.Count != want {
+				if !c.emit(CheckIssue{Severity: CheckError, Code: "KeyspaceCountMismatch", Keyspace: name,
+					Message: fmt.Sprintf("descriptor Count %d, tree holds %d %s", desc.Count, want, unit)}) {
+					return errCheckStop
+				}
+			}
+		}
 		// SetKeyspace subpage payloads are INLINE in the outer-tree leaf
 		// cells, not pages, so the page-level reachability walk above does
 		// not see them. Validate them here so the structural Check honours
@@ -454,7 +476,43 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 		}
 		return nil
 	})
+	if err == nil && keyspaceCount != c.meta.NumKeyspaces {
+		if !c.emit(CheckIssue{Severity: CheckError, Code: "NumKeyspacesMismatch",
+			Message: fmt.Sprintf("meta.NumKeyspaces %d, descriptor tree holds %d", c.meta.NumKeyspaces, keyspaceCount)}) {
+			return false
+		}
+	}
 	return c.dispositionEnumErr(err, "KeyspaceWalkFailed", "", "keyspace enumeration")
+}
+
+// validateTreeOrder runs the tree-level ordering/consistency pass
+// (api-surface.md §Check: key ordering, separator routing,
+// nested-tree member counts, descriptor counts) that per-page
+// checksums and structural Validate cannot see. One extra read pass
+// over the keyspace's live pages; violations are CheckError. A
+// structural walk failure is NOT re-reported here — walkTree already
+// ran on this root.
+func (c *checker) validateTreeOrder(ks, idx string, root uint64, fvs uint16, hwm uint64) (entries, values uint64, ok, structural bool) {
+	stopped := false
+	entries, values, err := btree.ValidateOrder(rawPageReader{c.pgr}, c.cfg, root, hwm, fvs,
+		func(kind btree.OrderViolationKind, pageID uint64, msg string) bool {
+			code := "KeyOrderViolation"
+			if kind == btree.OrderNestedCount {
+				code = "NestedCountMismatch"
+			}
+			if !c.emit(CheckIssue{Severity: CheckError, Code: code, PageID: pageID, Keyspace: ks, Index: idx, Message: msg}) {
+				stopped = true
+				return false
+			}
+			return true
+		})
+	if stopped {
+		return 0, 0, false, false
+	}
+	if err != nil {
+		return 0, 0, true, true // structural failure already reported by walkTree
+	}
+	return entries, values, true, false
 }
 
 // checkSetKeyspaceSubpages validates every SetKeyspace subpage cell's
@@ -509,6 +567,9 @@ func (c *checker) walkRegistry(ks string, desc page.KeyspaceDescriptor, firstDat
 	if !c.walkTree(ks, "", desc.IndexRegistryRoot, firstData, hwm) {
 		return false
 	}
+	if _, _, ok, _ := c.validateTreeOrder(ks, "(index registry)", desc.IndexRegistryRoot, 0, hwm); !ok {
+		return false
+	}
 	err := btree.WalkKV(rawPageReader{c.pgr}, c.cfg, desc.IndexRegistryRoot, hwm, func(k, v []byte) error {
 		idxName := string(k)
 		entry, derr := decodeRegistryEntry(v)
@@ -525,6 +586,9 @@ func (c *checker) walkRegistry(ks string, desc page.KeyspaceDescriptor, firstDat
 			}
 		}
 		if !c.walkTree(ks, idxName, entry.Root, firstData, hwm) {
+			return errCheckStop
+		}
+		if _, _, ok, _ := c.validateTreeOrder(ks, idxName, entry.Root, 0, hwm); !ok {
 			return errCheckStop
 		}
 		return nil
@@ -662,7 +726,26 @@ func (c *checker) walkRPL(hwm uint64) (bitset, bool) {
 			break
 		}
 		visited[id] = struct{}{}
-		seg, ok := page.DecodeRPLSegment(c.pgr.PageRaw(id), c.cfg)
+		segBuf := c.pgr.PageRaw(id)
+		// Footer verification before decode (checksums.md §Verification
+		// — RPL segments are read via the raw accessor here, like the
+		// pager's own walkers): a checksum-bad-but-decodable segment
+		// would otherwise pass Check clean while reclamation
+		// quarantines it, and its flipped entries would taint the
+		// pending accounting set. Head-vs-non-head mirrors the decode
+		// branch below.
+		if c.cfg.PageChecksum && !page.VerifyPageFooter(segBuf, c.cfg.PageSize) {
+			if id == head {
+				return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentChecksum", PageID: id,
+					Message: fmt.Sprintf("RPL head segment page %d fails checksum", id)})
+			}
+			if !c.emit(CheckIssue{Severity: CheckWarning, Code: "RPLSegmentChecksum", PageID: id,
+				Message: fmt.Sprintf("RPL segment page %d fails checksum; chain walk stopped before tail %d (pages behind the boundary surface as BitmapLeak until reclamation quarantines the segment)", id, tail)}) {
+				return pending, false
+			}
+			break
+		}
+		seg, ok := page.DecodeRPLSegment(segBuf, c.cfg)
 		if !ok {
 			if id == head {
 				return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentMalformed", PageID: id,

@@ -188,3 +188,46 @@ func TestOpenTruncatesChainAtChecksumCorruptNonHeadSegment(t *testing.T) {
 		t.Fatalf("no data readable after truncated-chain open")
 	}
 }
+
+// TestCheckReportsChecksumBadRPLSegment pins Check's walkRPL footer
+// verification (checksums.md §Verification — walkRPL reads segments
+// via the raw accessor like the pager's own walkers): a
+// checksum-bad-but-decodable segment must surface as
+// RPLSegmentChecksum instead of silently tainting the pending
+// accounting set. The corruption is applied while the DB is open
+// (the Open-time chain rebuild would otherwise truncate the chain
+// before Check ever sees the segment).
+func TestCheckReportsChecksumBadRPLSegment(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	_, tail := buildChecksummedRPLChain(t, ctx, path)
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 512, PageChecksum: true,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	// The chain may have advanced; use the live meta's tail.
+	m := db.Meta()
+	if m.RPLHeadPage == 0 || m.RPLHeadPage == m.RPLTailPage {
+		t.Fatalf("fixture: no multi-segment chain (head=%d tail=%d)", m.RPLHeadPage, m.RPLTailPage)
+	}
+	// Flip a byte at offset 16 — the tail segment's OlderSegment low
+	// byte, which the walk never follows (it stops AT the tail), so
+	// decode stays valid while the footer does not. Mid-chain reuse of
+	// this fixture would corrupt the chain link itself — tail only.
+	corruptPageByte(t, path, m.RPLTailPage, 4096)
+	_ = tail
+
+	found := false
+	for iss := range db.Check() {
+		if iss.Code == "RPLSegmentChecksum" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("checksum-bad RPL segment not reported")
+	}
+}

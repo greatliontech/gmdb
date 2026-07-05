@@ -1451,9 +1451,17 @@ type CheckIssue struct {
 }
 
 // Check performs a structural integrity walk. Verifies meta + page
-// checksums, B+tree integrity, bitmap consistency, RPL chain, page
-// accounting, prefix-compression integrity, keyspace descriptor
-// consistency, and set keyspace subpage / nested B+tree integrity.
+// checksums (including RPL segment footers on the chain walk),
+// B+tree integrity — page structure AND tree-level ordering: leaf
+// and branch keys strictly increasing, separator routing
+// (max(left) < S <= min(right)) threaded through a dedicated
+// ordering pass — bitmap consistency, RPL chain, page accounting,
+// prefix-compression integrity, keyspace descriptor consistency
+// (descriptor Count vs the tree's actual entry/value count;
+// meta.NumKeyspaces vs the descriptor tree), nested-tree member
+// counts (NestedCount vs the actual subtree), and set keyspace
+// subpage integrity. The ordering/count pass is one extra read
+// traversal per tree over the page-cache-resident snapshot.
 // Returns issues as an iter.Seq.
 //
 // Walk failures (I/O errors, unreadable pages) are reported as

@@ -178,9 +178,9 @@ page-fault costs. For full-database scans the cost is bounded
 by memory bandwidth.
 
 RPL segment pages are read outside the verifying page accessor
-(the reclamation walk and the Open-time chain rebuild use the raw
-accessor), so those two walkers verify each segment's footer
-themselves before decoding — when the page checksum is enabled;
+(the reclamation walk, the Open-time chain rebuild, and Check's
+chain walk all use the raw accessor), so each of those walkers
+verifies every segment's footer itself before decoding — when the page checksum is enabled;
 with checksums off they fall back to structural decode plus the
 bounds below, and an in-range wrong entry in a decodable segment
 is then inherently undetectable (the trade the `PageChecksum`
