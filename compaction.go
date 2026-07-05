@@ -127,10 +127,19 @@ func (tx *Tx) compactForest(shouldRelocate func(uint64) bool, budget int) (int, 
 		}
 
 		if dirty {
+			if err := tx.ensureKeyspacePathLen(); err != nil {
+				return 0, err
+			}
 			if tx.dirtyDescriptors == nil {
 				tx.dirtyDescriptors = make(map[string]page.KeyspaceDescriptor)
 			}
 			tx.dirtyDescriptors[string(ks.name)] = ks.desc
+			tx.recalcFlushReserve()
+			// Obligation-edge admission; any error discards the whole
+			// batch via the caller's rollback.
+			if err := tx.checkReserveAffordable(); err != nil {
+				return 0, err
+			}
 		}
 	}
 

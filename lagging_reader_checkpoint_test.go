@@ -83,12 +83,19 @@ func TestSyncLazyLaggingReaderRefreshRespectsCheckpointBound(t *testing.T) {
 	if err := db.Checkpoint(ctx); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
-	// Snapshot both meta slots as the checkpoint left them on disk.
+	// Snapshot both meta slots AND the bitmap page as the checkpoint
+	// left them on disk (pages 0,1 = meta slots; page 2 = the single
+	// bitmap page this MaxSize=384 geometry needs). Under SyncLazy
+	// nothing after Checkpoint() is fsynced, so a crash can lose the
+	// later lazy commits' meta AND bitmap pwrites while any subset of
+	// their data pwrites survives via writeback — the checkpoint
+	// meta+bitmap with full later data is a valid (and for the
+	// checkpoint-tree-intact property, worst-case) crash image.
 	fileNow, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read post-checkpoint file: %v", err)
 	}
-	metaSlots := append([]byte(nil), fileNow[:2*4096]...)
+	metaSlots := append([]byte(nil), fileNow[:3*4096]...)
 
 	// Two lazy commits retiring checkpoint-tree pages (segments C+1,
 	// C+2), then a reader pinned ABOVE the checkpoint — the shape
@@ -113,20 +120,18 @@ func TestSyncLazyLaggingReaderRefreshRespectsCheckpointBound(t *testing.T) {
 		t.Fatalf("fixture: lagging-reader callback never fired; no reclamation pressure")
 	}
 
-	// Crash image: SyncLazy syncs nothing after Checkpoint(), so a
-	// real crash can leave the meta slots exactly as the checkpoint
-	// left them while any subset of the later lazy DATA writes hit
-	// disk via writeback. Construct the worst case: full page-cache
-	// data (every post-checkpoint overwrite present — including any
-	// reuse of wrongly-reclaimed pages) with both meta slots restored
-	// to their post-checkpoint bytes. Recovery must select the
-	// checkpoint meta and find its tree intact — which is exactly
-	// what the checkpoint term of the reclamation bound guarantees.
+	// Crash image: full page-cache data (every post-checkpoint
+	// overwrite present — including any reuse of wrongly-reclaimed
+	// pages) with the meta slots and bitmap page restored to their
+	// post-checkpoint bytes (see the snapshot above for why that is a
+	// valid crash subset). Recovery must select the checkpoint meta
+	// and find its tree intact — which is exactly what the checkpoint
+	// term of the reclamation bound guarantees.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read db file: %v", err)
 	}
-	copy(data[:2*4096], metaSlots)
+	copy(data[:3*4096], metaSlots)
 	copyPath := filepath.Join(t.TempDir(), "crash.gmdb")
 	if err := os.WriteFile(copyPath, data, 0o600); err != nil {
 		t.Fatalf("write copy: %v", err)

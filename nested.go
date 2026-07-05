@@ -55,6 +55,7 @@ func (tx *Tx) BeginChild() (*Tx, error) {
 		// Commit/Rollback (or its leak cleanup) resolves the pager.
 		keyspaceRoot:     tx.keyspaceRoot,
 		numKeyspaces:     tx.numKeyspaces,
+		ksPathLen:        tx.ksPathLen,
 		dirtyDescriptors: maps.Clone(tx.dirtyDescriptors),
 		pendingDeletes:   maps.Clone(tx.pendingDeletes),
 	}
@@ -90,9 +91,13 @@ func (tx *Tx) commitChild() error {
 	parent.numKeyspaces = tx.numKeyspaces
 	parent.dirtyDescriptors = tx.dirtyDescriptors
 	parent.pendingDeletes = tx.pendingDeletes
+	parent.ksPathLen = tx.ksPathLen
 
 	mergeKeyspaceHandles(parent, tx)
 	mergeSetKeyspaceHandles(parent, tx)
+	// The merged obligation set is now the parent's; re-price the
+	// commit-flush reserve from the parent's view (shared pager).
+	parent.recalcFlushReserve()
 
 	// Dead handles the child created migrate to the parent (re-pointed
 	// so a post-merge op on them still finds the parent's closed checks).
@@ -151,6 +156,9 @@ func (tx *Tx) rollbackChild() error {
 	tx.pgr.RestoreSavepoint(tx.savepoint)
 	tx.savepoint = nil
 	parent.activeChild = nil
+	// The child's flush obligations died with its clones; re-price the
+	// shared pager's commit-flush reserve from the parent's view.
+	parent.recalcFlushReserve()
 	return nil
 }
 
@@ -169,13 +177,15 @@ func cloneKeyspaceHandles(child *Tx, src map[uniqueNameHandle]*Keyspace) map[uni
 	for h, ks := range src {
 		out[h] = &Keyspace{
 			keyspaceCore: keyspaceCore{
-				tx:       child,
-				name:     ks.name,
-				desc:     ks.desc,
-				state:    ks.state,
-				dead:     ks.dead,
-				readOnly: ks.readOnly,
-				indexes:  clonePinnedIndexes(ks.indexes),
+				tx:             child,
+				name:           ks.name,
+				desc:           ks.desc,
+				state:          ks.state,
+				dead:           ks.dead,
+				readOnly:       ks.readOnly,
+				indexes:        clonePinnedIndexes(ks.indexes),
+				regPathLen:     ks.regPathLen,
+				reserveCharged: ks.reserveCharged,
 			},
 		}
 	}
@@ -192,13 +202,15 @@ func cloneSetKeyspaceHandles(child *Tx, src map[uniqueNameHandle]*SetKeyspace) m
 	for h, sks := range src {
 		out[h] = &SetKeyspace{
 			keyspaceCore: keyspaceCore{
-				tx:       child,
-				name:     sks.name,
-				desc:     sks.desc,
-				state:    sks.state,
-				dead:     sks.dead,
-				readOnly: sks.readOnly,
-				indexes:  clonePinnedIndexes(sks.indexes),
+				tx:             child,
+				name:           sks.name,
+				desc:           sks.desc,
+				state:          sks.state,
+				dead:           sks.dead,
+				readOnly:       sks.readOnly,
+				indexes:        clonePinnedIndexes(sks.indexes),
+				regPathLen:     sks.regPathLen,
+				reserveCharged: sks.reserveCharged,
 			},
 		}
 	}
@@ -250,6 +262,8 @@ func mergeKeyspaceHandles(parent, child *Tx) {
 			pks.state = cks.state
 			pks.dead = cks.dead
 			pks.indexes = cks.indexes
+			pks.regPathLen = cks.regPathLen
+			pks.reserveCharged = cks.reserveCharged
 			pks.reconcileIndexHandles()
 			if rootMoved {
 				pks.markCursorsStale()
@@ -261,13 +275,15 @@ func mergeKeyspaceHandles(parent, child *Tx) {
 		}
 		parent.openKeyspaces[h] = &Keyspace{
 			keyspaceCore: keyspaceCore{
-				tx:       parent,
-				name:     cks.name,
-				desc:     cks.desc,
-				state:    cks.state,
-				dead:     cks.dead,
-				readOnly: cks.readOnly,
-				indexes:  cks.indexes,
+				tx:             parent,
+				name:           cks.name,
+				desc:           cks.desc,
+				state:          cks.state,
+				dead:           cks.dead,
+				readOnly:       cks.readOnly,
+				indexes:        cks.indexes,
+				regPathLen:     cks.regPathLen,
+				reserveCharged: cks.reserveCharged,
 			},
 		}
 	}
@@ -302,6 +318,8 @@ func mergeSetKeyspaceHandles(parent, child *Tx) {
 			psks.state = csks.state
 			psks.dead = csks.dead
 			psks.indexes = csks.indexes
+			psks.regPathLen = csks.regPathLen
+			psks.reserveCharged = csks.reserveCharged
 			psks.reconcileIndexHandles()
 			if rootMoved {
 				psks.markSetCursorsStale()
@@ -313,13 +331,15 @@ func mergeSetKeyspaceHandles(parent, child *Tx) {
 		}
 		parent.openSetKeyspaces[h] = &SetKeyspace{
 			keyspaceCore: keyspaceCore{
-				tx:       parent,
-				name:     csks.name,
-				desc:     csks.desc,
-				state:    csks.state,
-				dead:     csks.dead,
-				readOnly: csks.readOnly,
-				indexes:  csks.indexes,
+				tx:             parent,
+				name:           csks.name,
+				desc:           csks.desc,
+				state:          csks.state,
+				dead:           csks.dead,
+				readOnly:       csks.readOnly,
+				indexes:        csks.indexes,
+				regPathLen:     csks.regPathLen,
+				reserveCharged: csks.reserveCharged,
 			},
 		}
 	}

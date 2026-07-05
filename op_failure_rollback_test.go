@@ -65,19 +65,20 @@ func opFailureFixture(t *testing.T) (*DB, []string) {
 // CoW a mid-level branch not yet touched this tx — a one-page
 // allocation. The failing shape is a split-inducing insert under a
 // FRESH mid-branch: leaf CoW and split-right succeed, the old leaf is
-// retired, then the mid CoW trips ErrTxTooLarge. That window is one
-// page wide, so the loop approaches it in EXACT one-page steps:
+// retired, then the mid CoW trips ErrTxTooLarge with headroom exactly
+// two pages at the probe's start.
 //
-//   phase 0  warm every first-half mid-branch (stride 125);
-//   filler   same-size updates on fresh first-half leaves (stride 25,
-//            warm mids) — exactly one leaf-CoW page per op, no
-//            splits, no fallible post-retire step;
-//   probe    when headroom ∈ [2,3) pages: 3000-byte inserts under
-//            fresh second-half mids — leaf CoW + split-right land
-//            headroom below one page, the old leaf is retired, the
-//            mid CoW fails; the rollback restores headroom so the
-//            following Commit (whose own allocations count against
-//            the budget) still fits.
+// Every btree mutation on this depth-3 tree costs one fresh buffer
+// per touched level (three pages for a leaf update — loose-page reuse
+// recycles page IDs, not buffers), so tree ops cannot approach the
+// two-page window in one-page steps. The loop therefore fills with
+// tree ops to within a few pages, then lands on the window exactly
+// with white-box one-page burns (AllocPage+AllocSlab), freed again
+// before return so the commit publishes no unreferenced pages.
+//
+// Headroom is measured against the effective admission limit
+// budget − CommitReserveBytes − DirtyBytes: the pager keeps the RPL
+// segment cost reserved during the ops phase so Commit always fits.
 func probeOpsUntilBudgetFailures(t *testing.T, tx *Tx, ks *Keyspace, keys []string) map[string]bool {
 	t.Helper()
 	live := make(map[string]bool, len(keys))
@@ -89,6 +90,9 @@ func probeOpsUntilBudgetFailures(t *testing.T, tx *Tx, ks *Keyspace, keys []stri
 	val := make([]byte, 120)
 	splitVal := make([]byte, 3000)
 	half := len(keys) / 2
+	headroomPages := func() int {
+		return (budget - tx.CommitReserveBytes() - tx.DirtyBytes()) / pageSz
+	}
 
 	// Phase 0: warm all first-half mid-branches.
 	for j := 0; j < half; j += 125 {
@@ -97,46 +101,64 @@ func probeOpsUntilBudgetFailures(t *testing.T, tx *Tx, ks *Keyspace, keys []stri
 		}
 	}
 
-	failures, fill, probe := 0, 12, 0
-	for iter := 0; failures < 3 && iter < 10000; iter++ {
-		headroom := budget - tx.DirtyBytes()
-		switch {
-		case headroom >= 3*pageSz:
-			// Filler: exact one-page step (fresh leaf, warm mid,
-			// same-size in-place value update — no split possible).
-			if fill+25 >= half {
-				t.Fatalf("fixture: filler keys exhausted at headroom %d", headroom)
-			}
-			fill += 25
-			if err := ks.Put([]byte(keys[fill]), val); err != nil {
-				t.Fatalf("filler Put(%s) at headroom %d: %v", keys[fill], headroom, err)
-			}
-		case headroom >= 2*pageSz:
-			// Probe: must fail AFTER retiring the old leaf.
-			probe++
-			if half+probe*250 >= len(keys) {
-				t.Fatalf("fixture: probe mids exhausted")
-			}
-			k := fmt.Sprintf("%s~%03d", keys[half+probe*250], probe)
-			before := tx.RetiredPagesLen()
-			err := ks.Put([]byte(k), splitVal)
-			switch {
-			case err == nil:
-				t.Fatalf("fixture: probe Put(%q) succeeded at headroom %d; window math off", k, headroom)
-			case errors.Is(err, ErrTxTooLarge) || errors.Is(err, ErrDBFull):
-				failures++
-				if after := tx.RetiredPagesLen(); after != before {
-					t.Fatalf("failed op (%q) left retired-pages residue: %d -> %d", k, before, after)
-				}
-			default:
-				t.Fatalf("probe Put(%q): %v", k, err)
-			}
-		default:
-			t.Fatalf("fixture: headroom %d below probe window; step math off", headroom)
+	// Phase 1: fillers (same-size updates on fresh first-half leaves)
+	// until within a few pages of the window.
+	fill := 12
+	for headroomPages() > 5 {
+		if fill+25 >= half {
+			t.Fatalf("fixture: filler keys exhausted at headroom %d pages", headroomPages())
+		}
+		fill += 25
+		if err := ks.Put([]byte(keys[fill]), val); err != nil {
+			t.Fatalf("filler Put(%s) at headroom %d pages: %v", keys[fill], headroomPages(), err)
 		}
 	}
-	if failures == 0 {
-		t.Fatalf("fixture: no budget failure observed; probe loop vacuous")
+
+	// Phase 2: exact one-page burns onto the two-page window.
+	var burned []uint64
+	for headroomPages() > 2 {
+		id, err := tx.pgr.AllocPage()
+		if err != nil {
+			t.Fatalf("burn AllocPage: %v", err)
+		}
+		if _, err := tx.pgr.AllocSlab(id); err != nil {
+			t.Fatalf("burn AllocSlab: %v", err)
+		}
+		burned = append(burned, id)
+	}
+	if hp := headroomPages(); hp != 2 {
+		t.Fatalf("fixture: landed at headroom %d pages, want 2", hp)
+	}
+
+	// Phase 3: probes — each must fail AFTER retiring the old leaf,
+	// and each failure must leave the retired set exactly as it was.
+	failures := 0
+	for probe := 1; failures < 3; probe++ {
+		if half+probe*250 >= len(keys) {
+			t.Fatalf("fixture: probe mids exhausted")
+		}
+		k := fmt.Sprintf("%s~%03d", keys[half+probe*250], probe)
+		before := tx.RetiredPagesLen()
+		err := ks.Put([]byte(k), splitVal)
+		switch {
+		case err == nil:
+			t.Fatalf("fixture: probe Put(%q) succeeded at headroom 2 pages; window math off", k)
+		case errors.Is(err, ErrTxTooLarge) || errors.Is(err, ErrDBFull):
+			failures++
+			if after := tx.RetiredPagesLen(); after != before {
+				t.Fatalf("failed op (%q) left retired-pages residue: %d -> %d", k, before, after)
+			}
+		default:
+			t.Fatalf("probe Put(%q): %v", k, err)
+		}
+	}
+
+	// Release the burns: same-tx frees go loose and are discarded at
+	// commit, so the published state carries no unreferenced pages.
+	for _, id := range burned {
+		if err := tx.pgr.FreePage(id); err != nil {
+			t.Fatalf("burn FreePage(%d): %v", id, err)
+		}
 	}
 	return live
 }
@@ -300,9 +322,10 @@ func TestFailedDeleteRangeLeavesPagerOpStateUnchanged(t *testing.T) {
 			t.Fatalf("warm Put(%s): %v", keys[j], err)
 		}
 	}
-	for fill := 12; budget-tx.DirtyBytes() > 4*4096; fill += 25 {
+	// Effective headroom: admission stops at budget − CommitReserveBytes.
+	for fill := 12; budget-tx.CommitReserveBytes()-tx.DirtyBytes() > 4*4096; fill += 25 {
 		if fill >= half {
-			t.Fatalf("fixture: filler keys exhausted at headroom %d", budget-tx.DirtyBytes())
+			t.Fatalf("fixture: filler keys exhausted at headroom %d", budget-tx.CommitReserveBytes()-tx.DirtyBytes())
 		}
 		if err := ks.Put([]byte(keys[fill]), val); err != nil {
 			t.Fatalf("filler Put(%s): %v", keys[fill], err)
@@ -315,7 +338,7 @@ func TestFailedDeleteRangeLeavesPagerOpStateUnchanged(t *testing.T) {
 	before := tx.RetiredPagesLen()
 	_, err = ks.DeleteRange([]byte(keys[half]), []byte(keys[len(keys)-1]))
 	if err == nil {
-		t.Fatalf("fixture: DeleteRange succeeded within %d headroom; widen the range", budget-tx.DirtyBytes())
+		t.Fatalf("fixture: DeleteRange succeeded within %d headroom; widen the range", budget-tx.CommitReserveBytes()-tx.DirtyBytes())
 	}
 	if !errors.Is(err, ErrTxTooLarge) && !errors.Is(err, ErrDBFull) {
 		t.Fatalf("DeleteRange: %v (want ErrTxTooLarge)", err)

@@ -101,6 +101,13 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 		return CommitResult{}, fmt.Errorf("pager: NewTxnID %d must be strictly greater than prev TxnID %d", cp.NewTxnID, prev.TxnID)
 	}
 
+	// Enter the commit phase: admission draws from the RPL reserve
+	// (admissionLimit returns the raw cap), which step 0's appendRPL
+	// consumes exactly. Cleared on every exit so a failed commit
+	// leaves the pager back under ops-phase admission.
+	p.inCommit = true
+	defer func() { p.inCommit = false }()
+
 	// Step 0 — assembly. May call ftruncate up via the allocator's
 	// file-extension path, which is reader-observability-safe (the
 	// active meta still says HWM=prev.HighWaterMark, so no reader

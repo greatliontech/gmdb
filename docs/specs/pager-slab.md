@@ -74,6 +74,36 @@ Invariant: kind=clause-explicit;
     nominal compliance with `MaxTxBufferBytes`, breaking the cost model
     callers use to size the budget.
 
+Invariant: kind=clause-explicit;
+  property=Ops-phase slab admission maintains
+    `dirtyBytes + commitReserve ≤ MaxTxBufferBytes`, where
+    `commitReserve` is an exact projection of the commit sequence's
+    total slab allocation: the RPL segment pages for the pages
+    retired so far (`ceil(retired / entriesPerSegment)`,
+    pager-internal, recomputed live) plus the descriptor-flush cost
+    (one CoW page per tree-path level per pending flush write, with
+    slack for the flush's own retires — maintained by the
+    transaction layer at every flush-obligation event). Retiring a
+    page is itself admission-checked (a `FreeSubtree`-heavy
+    operation can grow the projection with no intervening CoW). The
+    commit phase draws from the reserved space, checked against the
+    raw bound as a backstop. Consequence: a transaction whose
+    operation failed with `ErrTxTooLarge` can always commit its
+    applied work — `Commit` never fails the budget for in-spec use.
+    INV-COMMIT-HEADROOM: enforced by
+    `TestCommitSucceedsAfterTxTooLarge`,
+    `TestCommitNeedsOnlyReservedHeadroom`, and
+    `TestRetireBudgetGuard`;
+  from=this spec §Slab Budget and `ErrTxTooLarge` +
+    `transactions.md` write-helper error contract (the
+    rest-of-tx-continues shape is incoherent if the engine's own
+    commit can exceed the budget ops were admitted under);
+  violation=Ops admitted up to the raw bound leave no headroom for
+    commit's own allocations: fill a transaction until a Put fails
+    `ErrTxTooLarge`, then `Commit` — the commit fails the same way
+    and the applied work is recoverable only by `Rollback`, i.e.
+    lost, while every other budget clause still holds.
+
 Invariant: kind=entailed;
   property=Commit step 0 (pre-pwrite assembly) issues no syscall that
     publishes content reachable from any active or recoverable meta.
@@ -126,8 +156,10 @@ Invariant: kind=entailed;
     mutates the existing slab buffer in place — no second buffer is
     allocated and no second page ID is consumed for the same logical
     write;
-  from=entailed: `MaxTxBufferBytes` cost model in §Slab Budget assumes
-    one buffer per *unique* CoW destination;
+  from=entailed: the `MaxTxBufferBytes` cost model in §Slab Budget
+    prices one buffer per unique CoW destination; within a single
+    operation the tree layer re-mutates the destination it already
+    owns, and this invariant keeps that re-mutation free;
   violation=A re-CoW that re-allocates pushes the slab budget into
     multiplicative behaviour over operation count, and consumes a
     second page ID that must be reclaimed via the RPL even though no
@@ -205,13 +237,30 @@ budget covers every page-sized buffer the transaction has allocated:
 - Live buffers (`dirty[id]` routes here).
 - Loose buffers (CoW'd then freed mid-tx; retained to honour the
   byte-slice ownership invariant above).
-- Commit-time assembly buffers — RPL segment pages and modified
-  bitmap pages allocated in step 0 of commit.
+- Commit-time assembly buffers — the RPL segment pages allocated in
+  step 0 of commit. (Modified bitmap pages are NOT slab-allocated:
+  step 1 pwrites them directly from the in-memory bitmap's own
+  storage, outside the budget per the Invariants above.)
 
 `ErrTxTooLarge` fires on the first CoW (during the transaction body)
 or step-0 allocation (during commit) that would push `dirtyBytes`
-over `maxBytes`. The commit-time variant is detected before any
-pwrite — rollback is clean (no on-disk side effects).
+over the admission limit. The commit-time variant is detected before
+any pwrite — rollback is clean (no on-disk side effects).
+
+**Commit reserve.** The ops-phase admission limit is not the raw
+bound but `MaxTxBufferBytes − commitReserve`
+(INV-COMMIT-HEADROOM above): the pager continuously reserves the
+exact slab cost of the commit sequence — its own RPL segment
+projection plus the transaction layer's descriptor-flush projection
+— and the commit phase draws from that reserved space. Every flush
+write is a same-size upsert (descriptors are fixed-width; registry
+entries change only fixed-width fields after open; descriptor
+inserts and deletes happen eagerly inside `CreateKeyspace*` /
+`DeleteKeyspace`, under ops-phase admission), so it can neither
+split nor merge and costs exactly one CoW page per tree-path level —
+which is what makes the projection exact rather than an estimate.
+Operations therefore fail `ErrTxTooLarge` slightly earlier than the
+raw bound, and `Commit` never fails it.
 
 Buffers are **not** returned to the pool when a page becomes loose
 within the transaction. They are returned only at `Commit()` or
@@ -228,13 +277,16 @@ Cross-transaction reuse keeps allocator pressure low for steady write
 workloads; cross-process slab usage is not visible from any one DB
 handle (each process holds its own pool).
 
-**Cost-model note.** A transaction that CoWs the same logical page
-multiple times still pays one buffer (the re-modify invariant above)
-— but a transaction that CoWs different pages at different tree
-levels accumulates one buffer per unique destination. The 256 MiB
-default sizes against `unique CoW destinations × pageSize`, not
-operation count. Typical worst case is `pages-touched × depth × (1 +
-indexes)`. Bulk operations have a dedicated escape hatch — see
+**Cost-model note.** Within one operation, re-modifying a page the
+operation already CoW'd pays nothing further (the re-modify
+invariant above). Across operations, however, each tree-level
+modification allocates a fresh destination page whose superseded
+same-tx predecessor's buffer remains held until transaction close
+(the byte-slice ownership invariant; loose-page reuse recycles page
+IDs, not buffers). The budget therefore sizes against the SUM of
+per-operation path costs — `operations × depth × (1 + indexes)`
+buffers in the worst case — not against the final tree's unique
+page count. Bulk operations have a dedicated escape hatch — see
 `bulkload.md`.
 
 ## Commit Write Ordering
@@ -263,11 +315,12 @@ leakage.
   per-segment TxnID + sorted PageID entries. Insert into `p.dirty`
   (counts against `MaxTxBufferBytes`). Append the new segment page
   IDs to the in-memory RPL segment list.
-- For each modified bitmap page (derived from `tx.pendingAllocs ∪
-  tx.pendingFrees`), read the current bitmap page from the mmap, apply
-  pending bit changes into a freshly allocated slab buffer, and insert
-  the buffer into `p.dirty` keyed by its bitmap page ID. Counts
-  against `MaxTxBufferBytes`.
+- Bitmap-bit changes need no assembly: they were applied to the
+  in-memory bitmap inline as work happened (AllocPage / FreePage /
+  tail refund / reclamation), and step 1 pwrites each modified
+  bitmap page directly from the bitmap's own storage — no slab
+  buffer, outside `MaxTxBufferBytes` (bounded by `BitmapPages`, a
+  file-geometry constant).
 - Construct the new meta page payload (new roots, new TxnID, updated
   `HighWaterMark`, updated RPL pointers and counters, recomputed
   xxhash64 checksum) into a fresh buffer held on the transaction (not

@@ -63,6 +63,23 @@ type keyspaceCore struct {
 	// and a read-only open of the same name within one tx (indexing.md
 	// §Re-opening).
 	readOnly bool
+
+	// reserveCharged marks that a mutator's requireWritable gate
+	// pre-charged this (then-Clean) handle into the commit-flush
+	// reserve before the op ran. The charge is admission-checked at
+	// the gate; markDirty later makes the state itself carry the
+	// obligation. Never cleared once set (an op failing after the
+	// gate leaves a safe overcharge).
+	reserveCharged bool
+
+	// regPathLen is the measured root-to-leaf page count of this
+	// keyspace's index registry sub-tree (0 = no registry). Feeds the
+	// commit-flush reserve (Tx.recalcFlushReserve): flushIndexRegistry
+	// performs one same-size registry-entry upsert per pinned index,
+	// each costing exactly one CoW page per path level. Measured at
+	// open/create and refreshed by registry DDL (Rebuild/Drop), the
+	// only operations that change the registry tree's structure.
+	regPathLen int
 }
 
 // Name returns the keyspace's name (the unique-interned identity).
@@ -114,6 +131,34 @@ func (ks *keyspaceCore) requireWritable() error {
 	}
 	if ks.readOnly {
 		return ErrReadOnly
+	}
+	// Obligation-edge admission (INV-COMMIT-HEADROOM): the flush
+	// charge for the Clean→Dirty transition this mutator is about to
+	// make is admitted BEFORE the op's allocations consume the
+	// headroom its flush write needs. On rejection nothing has been
+	// mutated — the op fails up front.
+	return ks.admitDirtyingCharge()
+}
+
+// admitDirtyingCharge pre-charges the commit-flush reserve for a
+// mutator about to make this handle's first Clean→Dirty transition,
+// failing with ErrTxTooLarge (and unwinding the charge) when the
+// obligation does not fit. No-op once charged or once non-Clean.
+// Shared by requireWritable and by the mutation entry points that do
+// not route through it (Cursor.Delete).
+func (ks *keyspaceCore) admitDirtyingCharge() error {
+	if ks.state != keyspaceStateClean || ks.reserveCharged {
+		return nil
+	}
+	if err := ks.tx.ensureKeyspacePathLen(); err != nil {
+		return err
+	}
+	ks.reserveCharged = true
+	ks.tx.recalcFlushReserve()
+	if err := ks.tx.checkReserveAffordable(); err != nil {
+		ks.reserveCharged = false
+		ks.tx.recalcFlushReserve()
+		return err
 	}
 	return nil
 }
@@ -202,12 +247,17 @@ func (ks *keyspaceCore) deleteRangeUnindexed(start, end []byte, cellFree btree.P
 // markDirty transitions the handle's state to Dirty unless it is
 // already Created (Created stays Created — both flush variants do
 // btree.Put). Centralized so Put / Delete / Cursor.Delete /
-// SetKeyspaceConfig route through one code path.
+// SetKeyspaceConfig route through one code path. A Clean→Dirty
+// transition adds this handle to the commit-flush reserve; the
+// recompute is pure arithmetic over path lengths cached at open /
+// create time, so this stays allocation- and I/O-free on the hot
+// path (and a no-op transition recomputes nothing).
 func (ks *keyspaceCore) markDirty() {
-	if ks.state == keyspaceStateCreated {
+	if ks.state != keyspaceStateClean {
 		return
 	}
 	ks.state = keyspaceStateDirty
+	ks.tx.recalcFlushReserve()
 }
 
 // NextSequence increments the keyspace's persisted sequence counter and

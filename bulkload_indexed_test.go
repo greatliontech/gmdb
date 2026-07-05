@@ -335,7 +335,9 @@ func TestKeyspaceBulkLoadIndexedSpills(t *testing.T) {
 	scratch := t.TempDir()
 	db := openWith(t, ctx, tmpPath(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		MaxTxBufferBytes: 16 << 10, // > genesis slab page, < dataset → spill
+		// 48 KiB: < dataset → still spills, with room for the indexed
+		// create's eager writes + the commit reserve.
+		MaxTxBufferBytes: 48 << 10,
 		ScratchDir:       scratch,
 	})
 	defer db.Close()
@@ -351,7 +353,7 @@ func TestKeyspaceBulkLoadIndexedSpills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	const nrows = 600
+	const nrows = 1800
 	rows := genKVs(nrows, 12) // values cycle 26 first-bytes
 	if _, err := ks.BulkLoad(seqOf(rows)); err != nil {
 		t.Fatalf("BulkLoad: %v", err)
@@ -392,7 +394,7 @@ func TestKeyspaceBulkLoadIndexedSpillWriteError(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "does-not-exist")
 	db := openWith(t, ctx, tmpPath(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		MaxTxBufferBytes: 16 << 10,
+		MaxTxBufferBytes: 48 << 10,
 		ScratchDir:       missing,
 	})
 	defer db.Close()
@@ -408,7 +410,7 @@ func TestKeyspaceBulkLoadIndexedSpillWriteError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	rows := genKVs(600, 12)
+	rows := genKVs(1800, 12)
 	_, err = ks.BulkLoad(seqOf(rows))
 	if err == nil {
 		t.Fatal("BulkLoad with nonexistent ScratchDir returned nil, want a spill I/O error")
@@ -462,7 +464,11 @@ func TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn(t *testing.T) {
 	scratch := t.TempDir()
 	db := openWith(t, ctx, tmpPath(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		MaxTxBufferBytes: 8 << 10, // 8 KiB / 1 index → ~135 records/run
+		// 32 KiB / 1 index → ~540 records/run. Sized so the indexed
+		// CreateKeyspace's eager descriptor+registry writes plus the
+		// commit reserve fit (a few pages), while the sorter still
+		// spills often enough to exceed the merge fan-in below.
+		MaxTxBufferBytes: 32 << 10,
 		ScratchDir:       scratch,
 	})
 	defer db.Close()
@@ -484,7 +490,7 @@ func TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn(t *testing.T) {
 	// record fits ~130 records per spill); the preRuns probe below
 	// enforces the multi-pass minimum without depending on the exact
 	// encoding constant.
-	const nrows = 900
+	const nrows = 3600
 	rows := genKVs(nrows, 12)
 	if _, err := ks.BulkLoad(seqOf(rows)); err != nil {
 		t.Fatalf("BulkLoad: %v", err)
@@ -764,7 +770,7 @@ func TestSetKeyspaceBulkLoadIndexedSpills(t *testing.T) {
 	scratch := t.TempDir()
 	db := openWith(t, ctx, tmpPath(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		MaxTxBufferBytes: 16 << 10,
+		MaxTxBufferBytes: 48 << 10,
 		ScratchDir:       scratch,
 	})
 	defer db.Close()
@@ -781,7 +787,7 @@ func TestSetKeyspaceBulkLoadIndexedSpills(t *testing.T) {
 		t.Fatalf("CreateSetKeyspace: %v", err)
 	}
 	var rows []kv
-	for k := range 40 {
+	for k := range 120 {
 		key := fmt.Appendf(nil, "key%03d", k)
 		for m := range 15 {
 			rows = append(rows, kv{key, fmt.Appendf(nil, "%c-mem-%03d", byte('a'+m%26), m)})
@@ -816,7 +822,7 @@ func TestKeyspaceBulkLoadIndexedUniqueViolationSpilled(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		MaxTxBufferBytes: 16 << 10, // forces spilling at ~600 rows
+		MaxTxBufferBytes: 48 << 10, // forces spilling well before 1800 rows
 		ScratchDir:       t.TempDir(),
 	})
 	defer db.Close()
@@ -833,9 +839,9 @@ func TestKeyspaceBulkLoadIndexedUniqueViolationSpilled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	// 600 rows, ascending keys, globally-distinct values EXCEPT rows 100 and
-	// 500 share the value "DUPLICATE" → a cross-row unique collision.
-	const nrows = 600
+	// 1800 rows, ascending keys, globally-distinct values EXCEPT two rows
+	// that share the value "DUPLICATE" → a cross-row unique collision.
+	const nrows = 1800
 	rows := make([]kv, nrows)
 	for i := range rows {
 		rows[i] = kv{k: fmt.Appendf(nil, "row%05d", i), v: fmt.Appendf(nil, "val-%05d", i)}
@@ -883,7 +889,10 @@ func TestKeyspaceBulkLoadIndexedReusedKeyBuffer(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		MaxTxBufferBytes: 16 << 10, // forces spill → exercise the merge path too
+		// 48 KiB: forces spill (→ exercise the merge path too) while
+		// leaving room for the two-index CreateKeyspace's eager
+		// writes plus the commit reserve.
+		MaxTxBufferBytes: 48 << 10,
 		ScratchDir:       t.TempDir(),
 	})
 	defer db.Close()
@@ -903,7 +912,7 @@ func TestKeyspaceBulkLoadIndexedReusedKeyBuffer(t *testing.T) {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
 
-	const nrows = 600
+	const nrows = 1800
 	rows := make([]kv, nrows)
 	for i := range rows {
 		rows[i] = kv{k: fmt.Appendf(nil, "row%05d", i), v: fmt.Appendf(nil, "%c-val-%05d", byte('a'+i%26), i)}

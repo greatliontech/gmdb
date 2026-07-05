@@ -234,11 +234,14 @@ A failure in the **assembly phase** (step 0: tail refund, loose
 migration, RPL-segment slab allocation and file extension) does NOT
 poison: no pwrite has occurred, `AbortTx` fully restores the pre-tx
 in-memory state, and the handle stays usable. The only commit errors
-that can originate in assembly are `ErrTxTooLarge` (RPL-segment slab
-exceeds `MaxTxBufferBytes`) and `ErrDBFull` (file extension hits
-`MaxSize`) — step 1+ performs no allocation — so `Commit` returning
-either leaves the handle recoverable and retryable (a fresh, smaller
-transaction), never poisoned. This is what lets background
+that can originate in assembly are `ErrTxTooLarge` (a defensive
+backstop — ops-phase admission reserves the commit sequence's exact
+slab cost, so the budget cannot be exceeded at `Commit` by in-spec
+use; see `pager-slab.md §Slab Budget` INV-COMMIT-HEADROOM) and
+`ErrDBFull` (file extension hits `MaxSize`) — step 1+ performs no
+allocation — so `Commit` returning either leaves the handle
+recoverable and retryable (a fresh, smaller transaction), never
+poisoned. This is what lets background
 compaction's budget-halving retry an over-large batch (background-maintenance.md §Invariants), and a
 single large delete whose RPL append overruns the budget recover
 cleanly.
@@ -467,15 +470,21 @@ type Options struct {
     MaxReaders uint32
 
     // MaxTxBufferBytes bounds the per-write-transaction slab (live +
-    // loose + commit-time assembly buffers). A write transaction
-    // that dirties more pages than this fails the next CoW (or
-    // step 0 of commit) with ErrTxTooLarge.
+    // loose + commit-time assembly buffers). Operations fail with
+    // ErrTxTooLarge once the budget net of the commit reserve is
+    // exhausted; the reserve holds the exact slab cost of Commit's
+    // own work (RPL segment assembly + the descriptor flush), so a
+    // transaction that saw ErrTxTooLarge from an operation can
+    // still Commit the work it applied
+    // (pager-slab.md §Slab Budget, INV-COMMIT-HEADROOM).
     //
     // Sizing guide: each Put/Delete on an indexed keyspace with I
     // indexes can CoW up to depth × (I + 1) pages in the worst case
-    // (row tree + each index tree, one CoW per level). At 4 KB
-    // pages, depth 5, and 3 indexes: ~80 KB of unique CoW
-    // destinations per maximally-touching Put; the 256 MiB default
+    // (row tree + each index tree, one CoW per level); the buffers
+    // of pages a later operation supersedes remain held until the
+    // transaction closes, so the budget sizes against the SUM of
+    // per-operation costs. At 4 KB pages, depth 5, and 3 indexes:
+    // ~80 KB per maximally-touching Put; the 256 MiB default
     // accommodates ~3,000–3,200 such Puts before ErrTxTooLarge. For
     // larger workloads, use BulkLoad (which bypasses the slab via
     // streaming pwrite) or chunk the work across multiple write

@@ -768,7 +768,6 @@ func TestReclaimRPLQuarantinesOutOfRangeEntry(t *testing.T) {
 	}
 }
 
-
 // TestReclaimRPLQuarantinesOutOfRangeSegmentPage pins the segment-page
 // bound: a chain reference whose OWN page id is outside the bitmap's
 // allocatable range (reachable when a corrupt/forged meta's geometry

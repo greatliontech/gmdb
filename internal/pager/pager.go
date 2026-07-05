@@ -88,6 +88,22 @@ type Pager struct {
 	bufPool    *BufPool
 	readOnly   bool
 
+	// inCommit marks the commit phase (the db layer's descriptor
+	// flush + Commit's assembly/pwrite steps). While set, slab
+	// admission checks against the raw maxBytes instead of
+	// maxBytes − reserve: the commit sequence's allocations are
+	// exactly what the reserve was maintained for, so they draw from
+	// the reserved space. The raw-cap check remains as the spec's
+	// backstop (pager-slab.md §Slab Budget: ErrTxTooLarge fires on a
+	// commit-step-0 allocation that would exceed the bound). Set via
+	// SetCommitPhase and by Commit itself.
+	inCommit bool
+
+	// externalReserve is the db layer's commit-reserve contribution
+	// (descriptor-flush projection); see SetExternalReserve. Reset per
+	// write transaction by BeginTx.
+	externalReserve int
+
 	// Cold-tracking for Options.ReclaimOnClose (mmap-strategy.md §Read
 	// Transaction Cooldown). Enabled per read-tx pager via
 	// EnableColdTracking; Page / pageRaw then record the lowest/highest
@@ -450,6 +466,9 @@ func (p *Pager) BeginTx() {
 	// from the prior tx no longer hold (checksums.md §Verification). Done before the early
 	// return so it runs regardless of bitmap-attachment ordering.
 	p.resetVerified()
+	// Reset the per-tx commit reserve contributions.
+	p.externalReserve = 0
+	p.inCommit = false
 	if p.readOnly || p.bitmap == nil {
 		return
 	}
@@ -667,6 +686,67 @@ func (p *Pager) DirtyBytes() int { return p.dirtyBytes }
 
 // MaxBytes returns the slab budget (writable pagers only).
 func (p *Pager) MaxBytes() int { return p.maxBytes }
+
+// rplReserveBytes is the exact slab cost of the RPL segment pages
+// commit step 0 will allocate for the pages retired so far:
+// ceil(len(retiredPages) / RPLEntriesPerSegment) segment pages. The
+// projection is live — savepoint rollback truncates retiredPages, so
+// the reserve shrinks with it — and exact, because appendRPL's
+// AllocSlab calls are the only slab allocations Commit performs
+// (descriptor-flush writes are pre-paid during the ops phase per
+// transactions.md §Commit Pipeline, bitmap pages pwrite from the
+// bitmap's own storage, and the meta page is a non-slab scratch
+// buffer).
+func (p *Pager) rplReserveBytes() int {
+	n := len(p.retiredPages)
+	if n == 0 {
+		return 0
+	}
+	capPerSeg := page.RPLEntriesPerSegment(p.cfg)
+	if capPerSeg <= 0 {
+		// Commit will reject this geometry loudly (appendRPL errors);
+		// no reserve can make it committable.
+		return 0
+	}
+	segs := (n + capPerSeg - 1) / capPerSeg
+	return segs * int(p.cfg.PageSize)
+}
+
+// SetExternalReserve installs the caller-maintained portion of the
+// commit reserve — the db layer's projection of the slab cost of its
+// commit-time descriptor flush (Tx.recalcFlushReserve). The pager
+// treats it opaquely: ops-phase admission subtracts it alongside the
+// internal RPL projection, and the commit phase draws from it.
+func (p *Pager) SetExternalReserve(n int) {
+	if n < 0 {
+		n = 0
+	}
+	p.externalReserve = n
+}
+
+// SetCommitPhase toggles commit-phase admission (see the inCommit
+// field). The db layer sets it around its commit-time descriptor
+// flush, which runs before Commit; Commit manages the flag itself
+// for its own steps.
+func (p *Pager) SetCommitPhase(on bool) { p.inCommit = on }
+
+// CommitReserveBytes exposes the live commit-time reserve (internal
+// RPL projection + external descriptor-flush projection) — the gap
+// between MaxBytes and the ops-phase admission limit. Used by
+// budget-edge tests to compute effective headroom.
+func (p *Pager) CommitReserveBytes() int { return p.rplReserveBytes() + p.externalReserve }
+
+// admissionLimit is the effective slab budget for ops-phase
+// allocations: maxBytes minus the commit-time reserve, so a
+// transaction the admission accepts can always afford its own commit
+// (pager-slab.md §Slab Budget). During the commit phase the reserve
+// is released — commit's allocations are the reserved pages.
+func (p *Pager) admissionLimit() int {
+	if p.inCommit {
+		return p.maxBytes
+	}
+	return p.maxBytes - p.rplReserveBytes() - p.externalReserve
+}
 
 // IsReadOnly reports whether mutating operations are rejected.
 func (p *Pager) IsReadOnly() bool { return p.readOnly }
@@ -887,7 +967,7 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 		// Idempotent re-CoW: same destination already owned by this tx.
 		return *existing, nil
 	}
-	if p.dirtyBytes+int(p.cfg.PageSize) > p.maxBytes {
+	if p.dirtyBytes+int(p.cfg.PageSize) > p.admissionLimit() {
 		return nil, ErrTxTooLarge
 	}
 	src := p.pageRaw(srcID)
@@ -906,10 +986,9 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 }
 
 // AllocSlab installs a fresh zero-filled slab buffer at id without
-// reading any source page. Used by commit step 0 to assemble RPL segment
-// pages, modified bitmap pages, and similar structures that have no
-// prior on-disk content for this transaction. Returns ErrTxTooLarge on
-// budget overrun.
+// reading any source page. Used by commit step 0 to assemble RPL
+// segment pages and by tx-body writers building pages with no prior
+// on-disk content. Returns ErrTxTooLarge on budget overrun.
 //
 // Idempotent: if a buffer already exists at id, the existing buffer is
 // returned and no further accounting occurs.
@@ -920,7 +999,7 @@ func (p *Pager) AllocSlab(id uint64) ([]byte, error) {
 	if existing, ok := p.dirty[id]; ok {
 		return *existing, nil
 	}
-	if p.dirtyBytes+int(p.cfg.PageSize) > p.maxBytes {
+	if p.dirtyBytes+int(p.cfg.PageSize) > p.admissionLimit() {
 		return nil, ErrTxTooLarge
 	}
 	buf := p.bufPool.Get()
@@ -963,7 +1042,7 @@ func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
 	}
 	// int64 arithmetic on the budget check so GOARCH=386/arm overflow
 	// isn't reachable for large n (uint32 max × 64 KB PageSize ≈ 2^48).
-	if int64(p.dirtyBytes)+fresh*int64(p.cfg.PageSize) > int64(p.maxBytes) {
+	if int64(p.dirtyBytes)+fresh*int64(p.cfg.PageSize) > int64(p.admissionLimit()) {
 		return nil, ErrTxTooLarge
 	}
 	out := make([][]byte, n)

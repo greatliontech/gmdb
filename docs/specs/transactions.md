@@ -532,9 +532,13 @@ future helper following the same shape.
 helper does NOT auto-rollback the tx — `Tx.Commit` is a separate
 caller decision, and `Tx.Rollback` is recovery-of-last-resort. After
 a helper returns an error the caller may legitimately `Commit` to
-publish the work done before the failure (a use case the atomicity
-comment in `writeNewIndexRegistry`'s body — chunk-7.3 — explicitly
-opts into).
+publish the work done before the failure. That `Commit` is
+guaranteed to fit the slab budget even when the failed helper's
+error WAS `ErrTxTooLarge`: ops-phase admission continuously reserves
+the exact slab cost of the commit sequence (RPL segment assembly +
+the descriptor flush), so the engine's own commit work can never
+exceed the budget the operations were admitted under
+(`pager-slab.md §Slab Budget`, INV-COMMIT-HEADROOM).
 
 **Atomicity guarantee.** Every write-helper is **all-or-nothing in the
 bitmap** for every in-spec return (named errors, including caller-

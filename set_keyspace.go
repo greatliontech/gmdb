@@ -145,8 +145,23 @@ func (tx *Tx) OpenSetKeyspace(name string, indexes ...*IndexDecl) (*SetKeyspace,
 		delete(tx.openSetKeyspaces, handle)
 		return nil, err
 	}
-	delete(tx.dirtyDescriptors, name)
+	if err := tx.ensureKeyspacePathLen(); err != nil {
+		delete(tx.openSetKeyspaces, handle)
+		return nil, err
+	}
+	if err := tx.measureRegPathLen(&sks.keyspaceCore); err != nil {
+		delete(tx.openSetKeyspaces, handle)
+		return nil, err
+	}
 	sks.indexes = pinned
+	tx.recalcFlushReserve()
+	if err := tx.checkReserveAffordable(); err != nil {
+		delete(tx.openSetKeyspaces, handle)
+		tx.recalcFlushReserve()
+		return nil, err
+	}
+	delete(tx.dirtyDescriptors, name)
+	tx.recalcFlushReserve()
 	return sks, nil
 }
 
@@ -192,7 +207,18 @@ func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error) {
 	sks := tx.cacheOpenSetKeyspace(handle, desc, tx.openCacheState(name))
 	sks.readOnly = true
 	sks.indexes = indexes
+	if err := tx.ensureKeyspacePathLen(); err != nil {
+		delete(tx.openSetKeyspaces, handle)
+		return nil, err
+	}
+	tx.recalcFlushReserve()
+	if err := tx.checkReserveAffordable(); err != nil {
+		delete(tx.openSetKeyspaces, handle)
+		tx.recalcFlushReserve()
+		return nil, err
+	}
 	delete(tx.dirtyDescriptors, name)
+	tx.recalcFlushReserve()
 	return sks, nil
 }
 
@@ -251,19 +277,16 @@ func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions, indexes .
 	}
 	tx.numKeyspaces++
 	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated)
-	if len(pinned) > 0 {
-		if err := tx.writeNewIndexRegistry(sks, pinned); err != nil {
-			// Restore pendingDeletes
-			// state if we cleared it above.
-			delete(tx.openSetKeyspaces, handle)
-			tx.numKeyspaces--
-			if pendingDelete {
-				tx.pendingDeletes[name] = struct{}{}
-			}
-			return nil, err
+	sks.indexes = pinned // before finalize: its reserve pricing reads core.indexes
+	if err := tx.finalizeCreatedKeyspace(name, &sks.keyspaceCore, pinned); err != nil {
+		// Restore pendingDeletes state if we cleared it above.
+		delete(tx.openSetKeyspaces, handle)
+		tx.numKeyspaces--
+		if pendingDelete {
+			tx.pendingDeletes[name] = struct{}{}
 		}
+		return nil, err
 	}
-	sks.indexes = pinned
 	return sks, nil
 }
 
@@ -316,16 +339,14 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 		}
 		tx.numKeyspaces++
 		sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated)
-		if len(pinned) > 0 {
-			if err := tx.writeNewIndexRegistry(sks, pinned); err != nil {
-				// Restore pending-delete (M-1 fix).
-				delete(tx.openSetKeyspaces, handle)
-				tx.numKeyspaces--
-				tx.pendingDeletes[name] = struct{}{}
-				return nil, err
-			}
+		sks.indexes = pinned // before finalize: its reserve pricing reads core.indexes
+		if err := tx.finalizeCreatedKeyspace(name, &sks.keyspaceCore, pinned); err != nil {
+			// Restore pending-delete state.
+			delete(tx.openSetKeyspaces, handle)
+			tx.numKeyspaces--
+			tx.pendingDeletes[name] = struct{}{}
+			return nil, err
 		}
-		sks.indexes = pinned
 		return sks, nil
 	}
 	desc, found, err := tx.lookupDescriptor(name)
@@ -345,8 +366,23 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 			delete(tx.openSetKeyspaces, handle)
 			return nil, err
 		}
-		delete(tx.dirtyDescriptors, name)
+		if err := tx.ensureKeyspacePathLen(); err != nil {
+			delete(tx.openSetKeyspaces, handle)
+			return nil, err
+		}
+		if err := tx.measureRegPathLen(&sks.keyspaceCore); err != nil {
+			delete(tx.openSetKeyspaces, handle)
+			return nil, err
+		}
 		sks.indexes = pinned
+		tx.recalcFlushReserve()
+		if err := tx.checkReserveAffordable(); err != nil {
+			delete(tx.openSetKeyspaces, handle)
+			tx.recalcFlushReserve()
+			return nil, err
+		}
+		delete(tx.dirtyDescriptors, name)
+		tx.recalcFlushReserve()
 		return sks, nil
 	}
 	desc = page.KeyspaceDescriptor{
@@ -355,14 +391,12 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 	}
 	tx.numKeyspaces++
 	sks := tx.cacheOpenSetKeyspace(handle, desc, keyspaceStateCreated)
-	if len(pinned) > 0 {
-		if err := tx.writeNewIndexRegistry(sks, pinned); err != nil {
-			delete(tx.openSetKeyspaces, handle)
-			tx.numKeyspaces--
-			return nil, err
-		}
+	sks.indexes = pinned // before finalize: its reserve pricing reads core.indexes
+	if err := tx.finalizeCreatedKeyspace(name, &sks.keyspaceCore, pinned); err != nil {
+		delete(tx.openSetKeyspaces, handle)
+		tx.numKeyspaces--
+		return nil, err
 	}
-	sks.indexes = pinned
 	return sks, nil
 }
 

@@ -111,6 +111,12 @@ func (tx *Tx) RetiredPagesLen() int { return len(tx.pgr.RetiredPages()) }
 // exercising per-op budget failures).
 func (tx *Tx) DirtyBytes() int { return tx.pgr.DirtyBytes() }
 
+// CommitReserveBytes reports the pager's live commit-time RPL
+// reserve. Ops-phase admission stops at
+// MaxTxBufferBytes − CommitReserveBytes; budget-edge tests compute
+// effective headroom against that limit.
+func (tx *Tx) CommitReserveBytes() int { return tx.pgr.CommitReserveBytes() }
+
 // SetBeginReadPreAcquireHookForTest installs (or clears, with nil) the
 // hook firing between BeginRead's first meta read and its reader-slot
 // acquire. Returns a restore func for defer.
@@ -185,4 +191,11 @@ func SetMaintPreReclaimHookForTest(hook func()) (restore func()) {
 	}
 	maintPreReclaimHookForTest.Store(&hook)
 	return func() { maintPreReclaimHookForTest.Store(nil) }
+}
+
+// RPLEntriesPerSegmentForTest exposes the per-segment RPL entry
+// capacity for the tx's page geometry — budget-edge tests use it to
+// land retired-page counts exactly on segment boundaries.
+func RPLEntriesPerSegmentForTest(tx *Tx) int {
+	return page.RPLEntriesPerSegment(tx.pgr.Config())
 }

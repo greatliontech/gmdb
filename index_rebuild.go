@@ -74,16 +74,107 @@ func (tx *Tx) resolveKeyspaceForIndexOp(name string) (owner descriptorOwner, cac
 // propagateNotCachedDescChange writes the adapter's mutated
 // descriptor back to tx.dirtyDescriptors when the adapter saw a
 // mark-dirty call. No-op for the cached path (cachedKS/cachedSKS
-// already carries the mutation in their .desc field).
-func (tx *Tx) propagateNotCachedDescChange(name string, owner descriptorOwner) {
+// already carries the mutation in their .desc field). The staged
+// entry joins the commit-flush reserve via recalcFlushReserve so the
+// flush write is always affordable at Commit.
+func (tx *Tx) propagateNotCachedDescChange(name string, owner descriptorOwner) error {
 	a, ok := owner.(*descAdapterValue)
 	if !ok || !a.dirty {
-		return
+		return nil
+	}
+	if err := tx.ensureKeyspacePathLen(); err != nil {
+		return err
 	}
 	if tx.dirtyDescriptors == nil {
 		tx.dirtyDescriptors = make(map[string]page.KeyspaceDescriptor)
 	}
 	tx.dirtyDescriptors[name] = a.desc
+	tx.recalcFlushReserve()
+	// Obligation-edge admission: unstage on rejection — the caller's
+	// savepoint machinery then unwinds the operation itself.
+	if err := tx.checkReserveAffordable(); err != nil {
+		delete(tx.dirtyDescriptors, name)
+		tx.recalcFlushReserve()
+		return err
+	}
+	return nil
+}
+
+// liveIndexRoot resolves the index data-tree root to free for a
+// registry-DDL operation: the cached handle's pinned root when one
+// exists — live same-tx growth updates pinned.root in memory and
+// syncs the registry only at flush, so the registry's Root lags it —
+// otherwise the registry entry's Root (an uncached keyspace has no
+// in-memory drift). Freeing the stale registry root orphans every
+// page the live tree gained this tx (reproduced: create indexed
+// keyspace, Put rows, Drop the index, Commit → BitmapLeak).
+func liveIndexRoot(cachedKS *Keyspace, cachedSKS *SetKeyspace, indexName string, registryRoot uint64) uint64 {
+	if cachedKS != nil {
+		if p, ok := cachedKS.indexes[indexName]; ok {
+			return p.root
+		}
+	}
+	if cachedSKS != nil {
+		if p, ok := cachedSKS.indexes[indexName]; ok {
+			return p.root
+		}
+	}
+	return registryRoot
+}
+
+// ownerFlushState snapshots the cached handle's flush state (state +
+// reserveCharged) for the registry-DDL unwind; zero-values when the
+// operation runs on the uncached adapter path.
+func ownerFlushState(cachedKS *Keyspace, cachedSKS *SetKeyspace) (keyspaceState, bool) {
+	switch {
+	case cachedKS != nil:
+		return cachedKS.state, cachedKS.reserveCharged
+	case cachedSKS != nil:
+		return cachedSKS.state, cachedSKS.reserveCharged
+	}
+	return keyspaceStateClean, false
+}
+
+// restoreOwnerFlushState reverts the cached handle's flush state to a
+// snapshot taken before a registry DDL operation and re-prices the
+// reserve. No-op on the adapter path.
+func restoreOwnerFlushState(tx *Tx, cachedKS *Keyspace, cachedSKS *SetKeyspace, st keyspaceState, charged bool) {
+	switch {
+	case cachedKS != nil:
+		cachedKS.state, cachedKS.reserveCharged = st, charged
+	case cachedSKS != nil:
+		cachedSKS.state, cachedSKS.reserveCharged = st, charged
+	default:
+		return
+	}
+	tx.recalcFlushReserve()
+}
+
+// remeasureRegistryDepth refreshes the cached registry path length on
+// the cached handle (if any) after registry DDL restructured the
+// sub-tree, then recomputes the commit-flush reserve. The uncached
+// (adapter) path has no handle and its staged entry is charged for
+// the descriptor write only — flushIndexRegistry runs only for open
+// handles — so there is nothing to re-measure there.
+func (tx *Tx) remeasureRegistryDepth(cachedKS *Keyspace, cachedSKS *SetKeyspace) error {
+	switch {
+	case cachedKS != nil:
+		if err := tx.measureRegPathLen(&cachedKS.keyspaceCore); err != nil {
+			return err
+		}
+	case cachedSKS != nil:
+		if err := tx.measureRegPathLen(&cachedSKS.keyspaceCore); err != nil {
+			return err
+		}
+	default:
+		return nil
+	}
+	tx.recalcFlushReserve()
+	// Obligation-edge admission: a deepened registry raises the
+	// reserve; rejection fails the operation inside its savepoint
+	// window (the cached regPathLen keeps the higher value — a safe
+	// overcharge for the reverted tree).
+	return tx.checkReserveAffordable()
 }
 
 // rebuildIndex implements TxIndexes.Rebuild: it drops and re-populates
@@ -134,11 +225,19 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	// loose-page reuse for the duration is not a cost concern.
 	ownerDesc := owner.descriptor()
 	prevRegRoot := ownerDesc.IndexRegistryRoot
+	prevState, prevCharged := ownerFlushState(cachedKS, cachedSKS)
 	sp := tx.pgr.BeginSavepoint()
 	defer func() {
 		if retErr != nil {
 			tx.pgr.RestoreSavepoint(sp)
 			ownerDesc.IndexRegistryRoot = prevRegRoot
+			// Revert the flush-state flip registryPut's markDirty
+			// made on the cached handle: the savepoint restored the
+			// pages, so the obligation it priced must not persist —
+			// in particular when this very error IS the obligation
+			// rejection (remeasureRegistryDepth's affordability
+			// check).
+			restoreOwnerFlushState(tx, cachedKS, cachedSKS, prevState, prevCharged)
 			return
 		}
 		tx.pgr.ReleaseSavepoint(sp)
@@ -166,12 +265,17 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		if err := tx.registryPut(owner, decl.Name, newEntry); err != nil {
 			return err
 		}
-		if existing.Root != 0 {
-			if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, existing.Root); err != nil {
+		if oldRoot := liveIndexRoot(cachedKS, cachedSKS, decl.Name, existing.Root); oldRoot != 0 {
+			if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, oldRoot); err != nil {
 				return fmt.Errorf("RebuildIndex %q.%q: free old subtree: %w", keyspace, decl.Name, mapBtreeErr(err))
 			}
 		}
-		tx.propagateNotCachedDescChange(keyspace, owner)
+		if err := tx.propagateNotCachedDescChange(keyspace, owner); err != nil {
+			return err
+		}
+		if err := tx.remeasureRegistryDepth(cachedKS, cachedSKS); err != nil {
+			return err
+		}
 		tx.syncRebuildToCachedPinned(cachedKS, cachedSKS, decl, 0, 0)
 		// Inv-IHS1: any in-flight *IndexHandle iter on this name walks the
 		// just-FreeSubtree'd old root. MarkStale every such cursor
@@ -327,13 +431,19 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		}
 	}
 	// Free the OLD index data tree only after the registry has
-	// been atomically advanced.
-	if existing.Root != 0 {
-		if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, existing.Root); err != nil {
+	// been atomically advanced. Freed at its LIVE root (see
+	// liveIndexRoot) — the registry's Root lags same-tx growth.
+	if oldRoot := liveIndexRoot(cachedKS, cachedSKS, decl.Name, existing.Root); oldRoot != 0 {
+		if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, oldRoot); err != nil {
 			return fmt.Errorf("RebuildIndex %q.%q: free old subtree: %w", keyspace, decl.Name, mapBtreeErr(err))
 		}
 	}
-	tx.propagateNotCachedDescChange(keyspace, owner)
+	if err := tx.propagateNotCachedDescChange(keyspace, owner); err != nil {
+		return err
+	}
+	if err := tx.remeasureRegistryDepth(cachedKS, cachedSKS); err != nil {
+		return err
+	}
 	tx.syncRebuildToCachedPinned(cachedKS, cachedSKS, decl, newRoot, newCount)
 	// Inv-IHS1: see the empty-parent branch above. The pinned root
 	// was just swapped to newRoot and the OLD tree FreeSubtree'd —
@@ -493,11 +603,15 @@ func (tx *Tx) dropIndex(keyspace, indexName string) (retErr error) {
 	// IndexRegistryRoot.
 	ownerDesc := owner.descriptor()
 	prevRegRoot := ownerDesc.IndexRegistryRoot
+	prevState, prevCharged := ownerFlushState(cachedKS, cachedSKS)
 	sp := tx.pgr.BeginSavepoint()
 	defer func() {
 		if retErr != nil {
 			tx.pgr.RestoreSavepoint(sp)
 			ownerDesc.IndexRegistryRoot = prevRegRoot
+			// See rebuildIndex's twin defer: revert the markDirty
+			// flip so a rejected obligation does not persist.
+			restoreOwnerFlushState(tx, cachedKS, cachedSKS, prevState, prevCharged)
 			return
 		}
 		tx.pgr.ReleaseSavepoint(sp)
@@ -521,12 +635,19 @@ func (tx *Tx) dropIndex(keyspace, indexName string) (retErr error) {
 			return err
 		}
 	}
-	if existing.Root != 0 {
-		if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, existing.Root); err != nil {
+	// Freed at the LIVE root (see liveIndexRoot) — the registry's
+	// Root lags same-tx growth.
+	if oldRoot := liveIndexRoot(cachedKS, cachedSKS, indexName, existing.Root); oldRoot != 0 {
+		if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, oldRoot); err != nil {
 			return fmt.Errorf("DropIndex %q.%q: free data subtree: %w", keyspace, indexName, mapBtreeErr(err))
 		}
 	}
-	tx.propagateNotCachedDescChange(keyspace, owner)
+	if err := tx.propagateNotCachedDescChange(keyspace, owner); err != nil {
+		return err
+	}
+	if err := tx.remeasureRegistryDepth(cachedKS, cachedSKS); err != nil {
+		return err
+	}
 	// Drop the pinned entry from the cached keyspace, if any.
 	if cachedKS != nil {
 		delete(cachedKS.indexes, indexName)

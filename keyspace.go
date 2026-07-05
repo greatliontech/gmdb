@@ -143,8 +143,32 @@ func (tx *Tx) OpenKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, error
 		delete(tx.openKeyspaces, handle)
 		return nil, err
 	}
-	delete(tx.dirtyDescriptors, name)
+	// Cache the flush-reserve pricing inputs before consuming the
+	// staged entry: on failure the handle is evicted and the staged
+	// state survives, like a validation failure.
+	if err := tx.ensureKeyspacePathLen(); err != nil {
+		delete(tx.openKeyspaces, handle)
+		return nil, err
+	}
+	if err := tx.measureRegPathLen(&ks.keyspaceCore); err != nil {
+		delete(tx.openKeyspaces, handle)
+		return nil, err
+	}
+	// Obligation-edge admission before consuming the staged entry:
+	// the recompute may raise the reserve (a transferred Dirty
+	// handle adds a registry charge the staged entry did not carry).
+	// The staged entry still being present makes the check
+	// conservative (momentary double-count); rejection evicts the
+	// handle and leaves the staged state untouched.
 	ks.indexes = pinned
+	tx.recalcFlushReserve()
+	if err := tx.checkReserveAffordable(); err != nil {
+		delete(tx.openKeyspaces, handle)
+		tx.recalcFlushReserve()
+		return nil, err
+	}
+	delete(tx.dirtyDescriptors, name)
+	tx.recalcFlushReserve()
 	return ks, nil
 }
 
@@ -192,7 +216,18 @@ func (tx *Tx) OpenKeyspaceReadOnly(name string) (*Keyspace, error) {
 	ks := tx.cacheOpenKeyspace(handle, desc, tx.openCacheState(name))
 	ks.readOnly = true
 	ks.indexes = indexes
+	if err := tx.ensureKeyspacePathLen(); err != nil {
+		delete(tx.openKeyspaces, handle)
+		return nil, err
+	}
+	tx.recalcFlushReserve()
+	if err := tx.checkReserveAffordable(); err != nil {
+		delete(tx.openKeyspaces, handle)
+		tx.recalcFlushReserve()
+		return nil, err
+	}
 	delete(tx.dirtyDescriptors, name)
+	tx.recalcFlushReserve()
 	return ks, nil
 }
 
@@ -245,22 +280,22 @@ func (tx *Tx) CreateKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, err
 	}
 	tx.numKeyspaces++
 	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated)
-	if len(pinned) > 0 {
-		if err := tx.writeNewIndexRegistry(ks, pinned); err != nil {
-			// Roll back the in-memory cache insertion. The
-			// numKeyspaces++ was eager; symmetric decrement here.
-			// If we cleared a pending-delete entry above (pendingDelete
-			// was true), restore it so the original on-disk descriptor
-			// still gets removed at Commit.
-			delete(tx.openKeyspaces, handle)
-			tx.numKeyspaces--
-			if pendingDelete {
-				tx.pendingDeletes[name] = struct{}{}
-			}
-			return nil, err
+	ks.indexes = pinned // before finalize: its reserve pricing reads core.indexes
+	if err := tx.finalizeCreatedKeyspace(name, &ks.keyspaceCore, pinned); err != nil {
+		// Roll back the in-memory cache insertion. The
+		// numKeyspaces++ was eager; symmetric decrement here.
+		// If we cleared a pending-delete entry above (pendingDelete
+		// was true), restore it so the original on-disk descriptor
+		// still gets removed by its eager delete's already-applied
+		// tree removal (the descriptor row is already gone; the
+		// pendingDeletes entry keeps the same-tx semantics).
+		delete(tx.openKeyspaces, handle)
+		tx.numKeyspaces--
+		if pendingDelete {
+			tx.pendingDeletes[name] = struct{}{}
 		}
+		return nil, err
 	}
-	ks.indexes = pinned
 	return ks, nil
 }
 
@@ -294,16 +329,14 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Ke
 		desc := page.KeyspaceDescriptor{Kind: page.KeyspaceKindKeyspace}
 		tx.numKeyspaces++
 		ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated)
-		if len(pinned) > 0 {
-			if err := tx.writeNewIndexRegistry(ks, pinned); err != nil {
-				// Restore pending-delete state (M-1 fix).
-				delete(tx.openKeyspaces, handle)
-				tx.numKeyspaces--
-				tx.pendingDeletes[name] = struct{}{}
-				return nil, err
-			}
+		ks.indexes = pinned // before finalize: its reserve pricing reads core.indexes
+		if err := tx.finalizeCreatedKeyspace(name, &ks.keyspaceCore, pinned); err != nil {
+			// Restore pending-delete state.
+			delete(tx.openKeyspaces, handle)
+			tx.numKeyspaces--
+			tx.pendingDeletes[name] = struct{}{}
+			return nil, err
 		}
-		ks.indexes = pinned
 		return ks, nil
 	}
 	desc, found, err := tx.lookupDescriptor(name)
@@ -319,21 +352,34 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Ke
 			delete(tx.openKeyspaces, handle)
 			return nil, err
 		}
-		delete(tx.dirtyDescriptors, name)
+		if err := tx.ensureKeyspacePathLen(); err != nil {
+			delete(tx.openKeyspaces, handle)
+			return nil, err
+		}
+		if err := tx.measureRegPathLen(&ks.keyspaceCore); err != nil {
+			delete(tx.openKeyspaces, handle)
+			return nil, err
+		}
 		ks.indexes = pinned
+		tx.recalcFlushReserve()
+		if err := tx.checkReserveAffordable(); err != nil {
+			delete(tx.openKeyspaces, handle)
+			tx.recalcFlushReserve()
+			return nil, err
+		}
+		delete(tx.dirtyDescriptors, name)
+		tx.recalcFlushReserve()
 		return ks, nil
 	}
 	desc = page.KeyspaceDescriptor{Kind: page.KeyspaceKindKeyspace}
 	tx.numKeyspaces++
 	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated)
-	if len(pinned) > 0 {
-		if err := tx.writeNewIndexRegistry(ks, pinned); err != nil {
-			delete(tx.openKeyspaces, handle)
-			tx.numKeyspaces--
-			return nil, err
-		}
+	ks.indexes = pinned // before finalize: its reserve pricing reads core.indexes
+	if err := tx.finalizeCreatedKeyspace(name, &ks.keyspaceCore, pinned); err != nil {
+		delete(tx.openKeyspaces, handle)
+		tx.numKeyspaces--
+		return nil, err
 	}
-	ks.indexes = pinned
 	return ks, nil
 }
 
@@ -488,13 +534,11 @@ func (tx *Tx) loadDescriptor(name string) (page.KeyspaceDescriptor, bool, error)
 }
 
 // storeDescriptor encodes desc and writes it directly into the
-// on-disk keyspace B+tree under name. Mutates tx.keyspaceRoot to the
-// new root. The deferred-flush refactor moved every
-// production caller to in-memory state + Tx.Commit's flushKeyspaces
-// walk; storeDescriptor remains as an internal helper that
-// keyspace-machinery tests (Kind-mismatch forging, Kind-reserved
-// forging) use to inject descriptors that the public surface cannot
-// produce.
+// keyspace B+tree under name. Mutates tx.keyspaceRoot to the new
+// root. The production caller is finalizeCreatedKeyspace's eager
+// descriptor insert; keyspace-machinery tests (Kind-mismatch
+// forging, Kind-reserved forging) also use it to inject descriptors
+// the public surface cannot produce.
 func (tx *Tx) storeDescriptor(name string, desc page.KeyspaceDescriptor) error {
 	buf := make([]byte, page.KeyspaceDescriptorSize)
 	page.EncodeKeyspaceDescriptor(buf, desc)
@@ -504,6 +548,61 @@ func (tx *Tx) storeDescriptor(name string, desc page.KeyspaceDescriptor) error {
 		return mapBtreeErr(err)
 	}
 	tx.keyspaceRoot = newRoot
+	return nil
+}
+
+// finalizeCreatedKeyspace writes a freshly-created keyspace's registry
+// entries (writeNewIndexRegistry) and eagerly INSERTS its descriptor
+// into the keyspace B+tree, all-or-nothing: a failure reverts every
+// page allocation, tx.keyspaceRoot, and the descriptor's registry
+// root (fresh creates start at 0). The eager insert keeps Tx.Commit's
+// flush write for this name a same-size update — the split-capable
+// insert is paid here under ops-phase admission, so the commit-flush
+// reserve's exact per-write pricing holds (recalcFlushReserve).
+// Callers run their own cache/counter rollback on error exactly as
+// before.
+func (tx *Tx) finalizeCreatedKeyspace(name string, core *keyspaceCore, pinned map[string]*pinnedIndex) error {
+	prevKSRoot := tx.keyspaceRoot
+	sp := tx.pgr.BeginSavepoint()
+	var err error
+	if len(pinned) > 0 {
+		err = tx.writeNewIndexRegistry(core, pinned)
+	}
+	if err == nil {
+		// The registry entries were just written with current values,
+		// so no flushIndexRegistry re-sync is needed — insert the
+		// descriptor (carrying the fresh IndexRegistryRoot) directly.
+		err = tx.storeDescriptor(name, core.desc)
+	}
+	if err == nil {
+		// The insert can deepen the keyspace tree; refresh the
+		// commit-flush pricing caches and the reserve.
+		err = tx.refreshKeyspacePathLen()
+	}
+	if err == nil {
+		err = tx.measureRegPathLen(core)
+	}
+	if err == nil {
+		// Obligation-edge admission (INV-COMMIT-HEADROOM): the new
+		// Created handle's flush charge must fit alongside what the
+		// insert just consumed. Checked before releasing the
+		// savepoint so rejection unwinds the writes completely.
+		tx.recalcFlushReserve()
+		err = tx.checkReserveAffordable()
+	}
+	if err != nil {
+		tx.pgr.RestoreSavepoint(sp)
+		tx.keyspaceRoot = prevKSRoot
+		core.desc.IndexRegistryRoot = 0
+		// tx.ksPathLen keeps whichever value it holds: the pre-create
+		// measurement is exact for the reverted tree, and a mid-window
+		// refresh can only be one level high — a safe overcharge. The
+		// caller evicts the handle; the reserve re-lowers at the next
+		// recompute event.
+		return err
+	}
+	tx.pgr.ReleaseSavepoint(sp)
+	tx.recalcFlushReserve()
 	return nil
 }
 
@@ -1035,8 +1134,20 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 		if ks.desc.RestartGroupTarget == cfg.RestartGroupTarget {
 			return nil
 		}
+		if err := tx.ensureKeyspacePathLen(); err != nil {
+			return err
+		}
+		prev, prevState, prevCharged := ks.desc.RestartGroupTarget, ks.state, ks.reserveCharged
 		ks.desc.RestartGroupTarget = cfg.RestartGroupTarget
 		ks.markDirty()
+		// Obligation-edge admission: unwind the transition entirely
+		// on rejection (this branch mutates no pages).
+		if err := tx.checkReserveAffordable(); err != nil {
+			ks.desc.RestartGroupTarget = prev
+			ks.state, ks.reserveCharged = prevState, prevCharged
+			tx.recalcFlushReserve()
+			return err
+		}
 		return nil
 	}
 	// Kind=1 partner of the Kind=0 cached-handle branch above. Per
@@ -1053,8 +1164,18 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 		if sks.desc.RestartGroupTarget == cfg.RestartGroupTarget {
 			return nil
 		}
+		if err := tx.ensureKeyspacePathLen(); err != nil {
+			return err
+		}
+		prev, prevState, prevCharged := sks.desc.RestartGroupTarget, sks.state, sks.reserveCharged
 		sks.desc.RestartGroupTarget = cfg.RestartGroupTarget
 		sks.markDirty()
+		if err := tx.checkReserveAffordable(); err != nil {
+			sks.desc.RestartGroupTarget = prev
+			sks.state, sks.reserveCharged = prevState, prevCharged
+			tx.recalcFlushReserve()
+			return err
+		}
 		return nil
 	}
 	if desc, ok := tx.dirtyDescriptors[name]; ok {
@@ -1076,10 +1197,20 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 		return nil
 	}
 	desc.RestartGroupTarget = cfg.RestartGroupTarget
+	if err := tx.ensureKeyspacePathLen(); err != nil {
+		return err
+	}
 	if tx.dirtyDescriptors == nil {
 		tx.dirtyDescriptors = make(map[string]page.KeyspaceDescriptor)
 	}
 	tx.dirtyDescriptors[name] = desc
+	tx.recalcFlushReserve()
+	// Obligation-edge admission: unstage entirely on rejection.
+	if err := tx.checkReserveAffordable(); err != nil {
+		delete(tx.dirtyDescriptors, name)
+		tx.recalcFlushReserve()
+		return err
+	}
 	return nil
 }
 
@@ -1201,6 +1332,14 @@ func (c *Cursor) Current() (key, value []byte) {
 func (c *Cursor) Delete() error {
 	if !c.requireOpen(true) {
 		return c.closeErr
+	}
+	// Obligation-edge admission: this entry point mutates without
+	// crossing requireWritable, so it pre-charges the Clean→Dirty
+	// flush obligation itself (INV-COMMIT-HEADROOM). Not sticky in
+	// closeErr — a budget rejection is per-op, like any other
+	// ErrTxTooLarge.
+	if err := c.ks.admitDirtyingCharge(); err != nil {
+		return err
 	}
 	// Indexed-keyspace path: apply per-index
 	// maintenance BEFORE the row delete, using the cursor's
@@ -1473,10 +1612,12 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 	// nil, Release on success) mirrors RebuildIndex / DropIndex and
 	// is robust to future additions of early-return paths inside the
 	// retirement window.
+	prevKSRoot := tx.keyspaceRoot
 	sp := tx.pgr.BeginSavepoint()
 	defer func() {
 		if retErr != nil {
 			tx.pgr.RestoreSavepoint(sp)
+			tx.keyspaceRoot = prevKSRoot
 			return
 		}
 		tx.pgr.ReleaseSavepoint(sp)
@@ -1490,6 +1631,31 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 		if err := tx.retireIndexRegistry(name, desc.IndexRegistryRoot); err != nil {
 			return err
 		}
+	}
+
+	// Eagerly remove the descriptor row from the keyspace B+tree —
+	// the work flushKeyspaces' deferred-delete step used to do at
+	// Commit. Every create/open/staging path also writes eagerly now,
+	// so the tree always carries the row here; a miss is the same
+	// keyspace-B+tree-drift corruption the old commit-time check
+	// surfaced. Merge allocations are admitted under the ops-phase
+	// budget instead of competing with Commit's RPL reserve. Still
+	// inside the savepoint window: a failure restores the row along
+	// with the three FreeSubtree walks.
+	newRoot, err := btree.Delete(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, tx.db.opts.MergeThreshold, []byte(name))
+	if err != nil {
+		if errors.Is(err, btree.ErrNotFound) {
+			return fmt.Errorf("%w: DeleteKeyspace: keyspace %q missing from keyspace B+tree", ErrCorrupted, name)
+		}
+		return fmt.Errorf("DeleteKeyspace %q: descriptor delete: %w", name, mapBtreeErr(err))
+	}
+	tx.keyspaceRoot = newRoot
+	// The removal can shrink the keyspace tree; refresh the
+	// commit-flush pricing cache (still inside the savepoint window —
+	// a failure restores the tree, and the pre-delete cached value
+	// stands because refresh assigns only on success).
+	if err := tx.refreshKeyspacePathLen(); err != nil {
+		return err
 	}
 
 	// Invalidate the in-memory state.
@@ -1543,6 +1709,7 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 		tx.pendingDeletes[name] = struct{}{}
 	}
 	tx.numKeyspaces--
+	tx.recalcFlushReserve()
 	return nil
 }
 

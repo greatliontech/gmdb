@@ -119,7 +119,6 @@ func TestPeerCompactPoisonsStaleHandles(t *testing.T) {
 	}
 }
 
-
 // TestOpenRacingPeerCompactRetries pins the Open-time inode
 // verification: an Open whose data fd was acquired just before a
 // peer's Compact renamed the file would cache the post-bump

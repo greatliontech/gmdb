@@ -108,16 +108,24 @@ type Tx struct {
 	// openSetKeyspaces, dirtyDescriptors, pendingDeletes}.
 	dirtyDescriptors map[string]page.KeyspaceDescriptor
 
-	// pendingDeletes is the set of keyspace names whose persisted
-	// descriptor must be removed from the keyspace B+tree at Commit
-	// (via btree.Delete) — populated by DeleteKeyspace on a name
-	// that existed on disk pre-tx. A Created-this-tx-then-Deleted
-	// name is NOT added here (it was never persisted; the matching
-	// btree.Put never ran). A Delete-then-Create of the same name
-	// removes the name from pendingDeletes (the subsequent
-	// btree.Put at Commit cleanly overwrites the on-disk entry; no
-	// separate btree.Delete is needed).
+	// pendingDeletes is the set of keyspace names deleted in this tx
+	// whose descriptor existed on disk pre-tx. DeleteKeyspace removes
+	// the descriptor row from the keyspace B+tree EAGERLY (the tx's
+	// CoW view), so this map carries no commit-time work — it survives
+	// as the same-tx semantic overlay consulted by opens / creates /
+	// lookups. A Created-this-tx-then-Deleted name is NOT added here;
+	// a Delete-then-Create of the same name removes the entry.
 	pendingDeletes map[string]struct{}
+
+	// ksPathLen caches the keyspace B+tree's root-to-leaf page count
+	// for the commit-flush reserve (recalcFlushReserve): each flush
+	// write is a same-size descriptor upsert costing exactly one CoW
+	// page per path level. Measured lazily on the first flush
+	// obligation (ensureKeyspacePathLen) and refreshed by the eager
+	// keyspace DDL (create insert / delete removal), the only
+	// operations that change the tree's structure — same-size updates
+	// cannot split or merge. 0 = not yet measured.
+	ksPathLen int
 
 	// deadKeyspaces holds every *Keyspace handle invalidated by a
 	// same-tx DeleteKeyspace, including those whose name has since
@@ -330,11 +338,18 @@ func (tx *Tx) Commit() error {
 	tx.closed = true
 	tx.endTime = time.Now() // TxStats.Duration: tx open Begin → Commit
 	tx.pgr.SetCurrentTxnID(tx.newTxnID)
+	// Enter the pager's commit phase before the descriptor flush: the
+	// flush's allocations are exactly what the external commit
+	// reserve was maintained for (recalcFlushReserve), so they draw
+	// from the reserved space. pager.Commit manages the flag for its
+	// own steps; AbortTx/BeginTx reset it on the failure paths.
+	tx.pgr.SetCommitPhase(true)
 	if err := tx.flushKeyspaces(); err != nil {
 		// Flush failed before pager.Commit ran — AbortTx is sufficient.
 		// No on-disk pwrite has happened yet (pager.Commit's step-1
 		// runs later), so no DB-wide poisoning. The caller can retry
 		// in a fresh tx.
+		tx.pgr.SetCommitPhase(false)
 		tx.pgr.AbortTx()
 		return err
 	}
@@ -511,55 +526,41 @@ func (tx *Tx) releaseGrant() {
 // flushKeyspaces applies the in-memory descriptor state to the
 // keyspace B+tree at Commit time. The walk:
 //
-//  1. For every name in pendingDeletes (alphabetical), issue
-//     btree.Delete on the keyspace B+tree.
-//  2. For every *Keyspace in openKeyspaces whose state is Created or
+//  1. For every *Keyspace in openKeyspaces whose state is Created or
 //     Dirty (alphabetical by name), encode the descriptor and issue
 //     btree.Put.
-//  3. For every name in dirtyDescriptors (alphabetical), encode and
+//  2. For every name in dirtyDescriptors (alphabetical), encode and
 //     issue btree.Put. No openKeyspaces / pendingDeletes filter is
 //     applied — the disjointness invariant on the tx field godocs
 //     guarantees no overlap (every open of a staged name moves the
 //     entry into the handle; DeleteKeyspace supersedes it).
 //
-// Ordering across the three steps doesn't affect the final on-disk
-// state because the three sets are disjoint by construction (see
-// invariants on the tx field godocs). Alphabetical-within-step is
-// for deterministic test behavior + reproducible CoW page chains.
+// pendingDeletes needs no step: DeleteKeyspace removes the descriptor
+// row eagerly (the map survives purely as the same-tx semantic
+// overlay for opens/creates/lookups).
+//
+// Budget: every write here is a same-size upsert — descriptors are
+// fixed 40-byte values and registry entries only change their
+// fixed-width Root/Count fields post-open, while inserts and deletes
+// are performed eagerly by Create*/DeleteKeyspace — so no write can
+// split or merge, and each costs exactly one CoW page per tree path
+// level. That exact cost is held in the pager's commit reserve
+// (recalcFlushReserve maintains it at every obligation event), and
+// the caller runs this walk inside the pager's commit phase so the
+// writes draw from the reserved space (pager-slab.md §Slab Budget).
+// A transaction whose ops saw ErrTxTooLarge can therefore always
+// commit its applied work.
 //
 // On failure the caller (Tx.Commit) calls pager.AbortTx — every
-// allocation done by this flush (CoW'd keyspace-B+tree pages,
-// loose-pool reuse, file-extension HWM bump) rolls back via the
-// bitmap snapshot taken at Begin. No on-disk pwrite has happened
-// yet (pager.Commit's step-1 runs after this), so AbortTx is
-// strictly sufficient to restore pre-flush state.
+// mutation done by this flush rolls back via the bitmap snapshot
+// taken at Begin. No on-disk pwrite has happened yet (pager.Commit's
+// step-1 runs after this), so AbortTx is strictly sufficient to
+// restore pre-flush state.
 func (tx *Tx) flushKeyspaces() error {
-	if len(tx.pendingDeletes) == 0 && len(tx.dirtyDescriptors) == 0 && !tx.hasDirtyOpenKeyspaces() && !tx.hasDirtyOpenSetKeyspaces() {
+	if len(tx.dirtyDescriptors) == 0 && !tx.hasDirtyOpenKeyspaces() && !tx.hasDirtyOpenSetKeyspaces() {
 		return nil
 	}
 	cfg := tx.pgr.Config()
-	mergeThreshold := tx.db.opts.MergeThreshold
-
-	// Step 1: deletes.
-	if len(tx.pendingDeletes) > 0 {
-		names := sortedKeys(tx.pendingDeletes)
-		for _, name := range names {
-			newRoot, err := btree.Delete(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, mergeThreshold, []byte(name))
-			if err != nil {
-				if errors.Is(err, btree.ErrNotFound) {
-					// Internal invariant violation: pendingDeletes only
-					// holds names that were present on-disk at the time
-					// of DeleteKeyspace. ErrNotFound here means the
-					// keyspace-B+tree drifted from our in-memory view —
-					// surface as ErrCorrupted.
-					return fmt.Errorf("%w: flushKeyspaces: keyspace %q in pendingDeletes missing from on-disk keyspace B+tree",
-						ErrCorrupted, name)
-				}
-				return fmt.Errorf("flushKeyspaces: btree.Delete %q: %w", name, mapBtreeErr(err))
-			}
-			tx.keyspaceRoot = newRoot
-		}
-	}
 
 	// Step 2a: Kind=0 open keyspaces with Created or Dirty state.
 	if tx.hasDirtyOpenKeyspaces() {
@@ -571,8 +572,15 @@ func (tx *Tx) flushKeyspaces() error {
 			// to the registry sub-tree BEFORE encoding the
 			// descriptor — registryPut updates ks.desc.IndexRegistryRoot,
 			// and we want that final root in the flushed descriptor.
-			if err := tx.flushIndexRegistry(ks, ks.indexes); err != nil {
-				return fmt.Errorf("flushKeyspaces: index registry sync %q: %w", name, err)
+			// Read-only handles skip the sync: they cannot change
+			// root/count (the stored entries are already correct),
+			// and their registry paths were never pre-paid (the only
+			// dirty RO handle is a transferred staged entry, whose
+			// stager paid the descriptor path only).
+			if !ks.readOnly {
+				if err := tx.flushIndexRegistry(ks, ks.indexes); err != nil {
+					return fmt.Errorf("flushKeyspaces: index registry sync %q: %w", name, err)
+				}
 			}
 			page.EncodeKeyspaceDescriptor(buf, ks.desc)
 			newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
@@ -596,8 +604,10 @@ func (tx *Tx) flushKeyspaces() error {
 		buf := make([]byte, page.KeyspaceDescriptorSize)
 		for _, name := range names {
 			sks := tx.openSetKeyspaces[unique.Make(name)]
-			if err := tx.flushIndexRegistry(sks, sks.indexes); err != nil {
-				return fmt.Errorf("flushKeyspaces: index registry sync %q (SetKeyspace): %w", name, err)
+			if !sks.readOnly {
+				if err := tx.flushIndexRegistry(sks, sks.indexes); err != nil {
+					return fmt.Errorf("flushKeyspaces: index registry sync %q (SetKeyspace): %w", name, err)
+				}
 			}
 			page.EncodeKeyspaceDescriptor(buf, sks.desc)
 			newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
@@ -628,6 +638,119 @@ func (tx *Tx) flushKeyspaces() error {
 		}
 	}
 	return nil
+}
+
+// ensureKeyspacePathLen populates the ksPathLen cache if it has not
+// been measured this tx. Called from every error-returning site that
+// can create a flush obligation (opens, creates, staging writers,
+// DeleteKeyspace), so the arithmetic-only recalcFlushReserve — and
+// markDirty's hot-path transition — never perform I/O.
+func (tx *Tx) ensureKeyspacePathLen() error {
+	if tx.ksPathLen > 0 {
+		return nil
+	}
+	return tx.refreshKeyspacePathLen()
+}
+
+// refreshKeyspacePathLen re-measures the keyspace B+tree's path
+// length. Called after the eager keyspace DDL writes (create insert /
+// delete removal) — the only operations that can change the tree's
+// height; the same-size upserts everything else performs cannot.
+func (tx *Tx) refreshKeyspacePathLen() error {
+	if tx.keyspaceRoot == 0 {
+		// Empty tree: the next eager create insert allocates exactly
+		// the root leaf; one page is the correct flush-write cost.
+		tx.ksPathLen = 1
+		return nil
+	}
+	n, err := btree.PathLen(tx.pgr, tx.pgr.Config(), tx.keyspaceRoot)
+	if err != nil {
+		return mapBtreeErr(err)
+	}
+	if n < 1 {
+		n = 1
+	}
+	tx.ksPathLen = n
+	return nil
+}
+
+// measureRegPathLen (re)measures the registry sub-tree path length
+// feeding c's commit-flush registry charge. Called at open/create and
+// after registry DDL (Rebuild/Drop).
+func (tx *Tx) measureRegPathLen(c *keyspaceCore) error {
+	if c.desc.IndexRegistryRoot == 0 {
+		c.regPathLen = 0
+		return nil
+	}
+	n, err := btree.PathLen(tx.pgr, tx.pgr.Config(), c.desc.IndexRegistryRoot)
+	if err != nil {
+		return mapBtreeErr(err)
+	}
+	c.regPathLen = n
+	return nil
+}
+
+// checkReserveAffordable is the admission gate for OBLIGATION events
+// (INV-COMMIT-HEADROOM's obligation edge — the pager's allocation
+// admission covers the other edge): after an event raises the commit
+// reserve, the raiser calls this and unwinds the event on
+// ErrTxTooLarge, so `dirtyBytes + commitReserve ≤ MaxTxBufferBytes`
+// holds at every point, not just at allocations.
+func (tx *Tx) checkReserveAffordable() error {
+	if tx.pgr.DirtyBytes()+tx.pgr.CommitReserveBytes() > tx.pgr.MaxBytes() {
+		return ErrTxTooLarge
+	}
+	return nil
+}
+
+// recalcFlushReserve recomputes the pager's external commit reserve —
+// the exact slab cost of Tx.Commit's descriptor flush — and installs
+// it via SetExternalReserve so ops-phase admission always leaves the
+// flush affordable. Pure arithmetic over cached path lengths
+// (ksPathLen / per-handle regPathLen); no I/O, so it is safe on the
+// markDirty hot path. Called at every event that changes the flush
+// obligation set or a cached path length.
+//
+// The projection is an exact upper bound: every flush write is a
+// same-size upsert (no splits/merges — inserts and deletes are
+// eager), costing one CoW page per path level; the trailing term
+// over-covers the RPL segment growth the flush's own retires can
+// cause (at most one entry per flush-CoW'd page).
+func (tx *Tx) recalcFlushReserve() {
+	if !tx.writable || tx.pgr == nil {
+		return
+	}
+	pages := 0
+	for _, ks := range tx.openKeyspaces {
+		// reserveCharged counts a still-Clean handle whose mutator
+		// passed the requireWritable pre-charge: the obligation is
+		// admitted before the op's own allocations consume the
+		// headroom it needs (INV-COMMIT-HEADROOM obligation edge).
+		if ks.dead || (ks.state == keyspaceStateClean && !ks.reserveCharged) {
+			continue
+		}
+		pages += tx.ksPathLen
+		if !ks.readOnly && len(ks.indexes) > 0 {
+			pages += len(ks.indexes) * ks.regPathLen
+		}
+	}
+	for _, sks := range tx.openSetKeyspaces {
+		if sks.dead || (sks.state == keyspaceStateClean && !sks.reserveCharged) {
+			continue
+		}
+		pages += tx.ksPathLen
+		if !sks.readOnly && len(sks.indexes) > 0 {
+			pages += len(sks.indexes) * sks.regPathLen
+		}
+	}
+	pages += len(tx.dirtyDescriptors) * tx.ksPathLen
+	if pages > 0 {
+		cfg := tx.pgr.Config()
+		if capPerSeg := page.RPLEntriesPerSegment(cfg); capPerSeg > 0 {
+			pages += (pages + capPerSeg - 1) / capPerSeg
+		}
+	}
+	tx.pgr.SetExternalReserve(pages * int(tx.pgr.Config().PageSize))
 }
 
 // hasDirtyOpenKeyspaces reports whether any open *Keyspace handle has
