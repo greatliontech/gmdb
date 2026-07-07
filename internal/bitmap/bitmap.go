@@ -692,3 +692,9 @@ func (b *Bitmap) runForward(from, to uint64, n int) (uint64, bool) {
 func readDetailWord(detail []byte, i int) uint64 {
 	return le.Uint64(detail[i*8:])
 }
+
+// OpenSnapshotCount reports the number of open (un-Restored,
+// un-Discarded) Snapshots. Leak-detection introspection for tests:
+// every snapshot producer must resolve each Snapshot exactly once, and
+// a non-zero count at a transaction boundary is a leak.
+func (b *Bitmap) OpenSnapshotCount() int { return len(b.openSnapshots) }

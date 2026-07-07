@@ -403,3 +403,54 @@ func TestBufPoolRejectsWrongSize(t *testing.T) {
 		t.Errorf("Get returned len %d, want %d", len(*got), testPageSize)
 	}
 }
+
+// TestAbortRestoresSeededBaseline pins AbortTx's HighWaterMark restore
+// at the pager API level: a consumer that aborts and reads pager state
+// without re-Begin must see the seeded baseline, not the aborted tx's
+// file extension. (The root package masks this by re-seeding every
+// Begin via TxParams — the pager contract must hold regardless.)
+func TestAbortRestoresSeededBaseline(t *testing.T) {
+	p, bm, f := setupWriter(t, 16)
+	defer p.Close()
+	defer f.Close()
+
+	first := bm.FirstDataPage()
+	p.BeginTx(TxParams{HighWaterMark: first, MaxSize: 16})
+	// Empty bitmap → AllocPage falls through to file extension,
+	// advancing HighWaterMark past the seeded baseline.
+	if _, err := p.AllocPage(); err != nil {
+		t.Fatalf("AllocPage: %v", err)
+	}
+	if got := p.HighWaterMark(); got <= first {
+		t.Fatalf("fixture: HighWaterMark %d not advanced past %d", got, first)
+	}
+	p.AbortTx()
+	if got := p.HighWaterMark(); got != first {
+		t.Errorf("HighWaterMark after AbortTx = %d, want seeded baseline %d", got, first)
+	}
+}
+
+// TestReBeginDiscardsPriorTxSnapshot pins BeginTx's idempotent re-Begin
+// contract: a second BeginTx without Commit/Rollback discards the first
+// tx snapshot's bitmap tracking (exactly one open bitmap Snapshot at
+// any time), and AbortTx resolves the last one. A leaked Snapshot keeps
+// the bitmap's undo log alive across transaction boundaries.
+func TestReBeginDiscardsPriorTxSnapshot(t *testing.T) {
+	p, bm, f := setupWriter(t, 16)
+	defer p.Close()
+	defer f.Close()
+
+	params := TxParams{HighWaterMark: bm.FirstDataPage(), MaxSize: 16}
+	p.BeginTx(params)
+	if got := bm.OpenSnapshotCount(); got != 1 {
+		t.Fatalf("open snapshots after BeginTx = %d, want 1", got)
+	}
+	p.BeginTx(params)
+	if got := bm.OpenSnapshotCount(); got != 1 {
+		t.Errorf("open snapshots after re-Begin = %d, want 1 (prior snapshot discarded)", got)
+	}
+	p.AbortTx()
+	if got := bm.OpenSnapshotCount(); got != 0 {
+		t.Errorf("open snapshots after AbortTx = %d, want 0", got)
+	}
+}

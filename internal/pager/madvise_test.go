@@ -8,7 +8,7 @@ import (
 
 // TestColdTrackingRecordsAccessRange verifies the Options.ReclaimOnClose
 // accessed-page tracking: once enabled, Page / pageRaw fold every
-// touched id into [accessMin, accessMax], and AdviseColdAccessed issues
+// touched id into [cold.min, cold.max], and AdviseColdAccessed issues
 // the MADV_COLD over that range without error (advisory; tolerated where
 // the kernel lacks MADV_COLD).
 func TestColdTrackingRecordsAccessRange(t *testing.T) {
@@ -22,8 +22,8 @@ func TestColdTrackingRecordsAccessRange(t *testing.T) {
 
 	// Reads before EnableColdTracking are not recorded.
 	_ = p.pageRaw(3)
-	if p.trackCold {
-		t.Fatal("trackCold set before EnableColdTracking")
+	if p.cold.enabled {
+		t.Fatal("cold.enabled set before EnableColdTracking")
 	}
 
 	p.EnableColdTracking()
@@ -36,11 +36,11 @@ func TestColdTrackingRecordsAccessRange(t *testing.T) {
 		t.Fatalf("Page(3): %v", err)
 	}
 
-	if got := p.accessMin.Load(); got != 2 {
-		t.Errorf("accessMin = %d, want 2", got)
+	if got := p.cold.min.Load(); got != 2 {
+		t.Errorf("cold.min = %d, want 2", got)
 	}
-	if got := p.accessMax.Load(); got != 5 {
-		t.Errorf("accessMax = %d, want 5", got)
+	if got := p.cold.max.Load(); got != 5 {
+		t.Errorf("cold.max = %d, want 5", got)
 	}
 	if err := p.AdviseColdAccessed(); err != nil {
 		t.Errorf("AdviseColdAccessed over [2,5]: %v", err)
@@ -48,8 +48,8 @@ func TestColdTrackingRecordsAccessRange(t *testing.T) {
 }
 
 // TestColdTrackingNoAccessNoAdvise confirms that with tracking enabled
-// but no page read, AdviseColdAccessed is a no-op (accessMin stays
-// MaxUint64 > accessMax) rather than issuing a bogus full-mmap MADV_COLD.
+// but no page read, AdviseColdAccessed is a no-op (cold.min stays
+// MaxUint64 > cold.max) rather than issuing a bogus full-mmap MADV_COLD.
 func TestColdTrackingNoAccessNoAdvise(t *testing.T) {
 	f, _ := makeFile(t, 4)
 	defer f.Close()
@@ -60,8 +60,8 @@ func TestColdTrackingNoAccessNoAdvise(t *testing.T) {
 	defer p.Close()
 
 	p.EnableColdTracking()
-	if got := p.accessMin.Load(); got != ^uint64(0) {
-		t.Errorf("accessMin = %d, want MaxUint64 (no access)", got)
+	if got := p.cold.min.Load(); got != ^uint64(0) {
+		t.Errorf("cold.min = %d, want MaxUint64 (no access)", got)
 	}
 	if err := p.AdviseColdAccessed(); err != nil {
 		t.Errorf("AdviseColdAccessed with no access: %v", err)
@@ -85,5 +85,28 @@ func TestAdviseHugePagesAndPreloadTolerated(t *testing.T) {
 	}
 	if err := p.AdvisePreload(4); err != nil { // prefault [0,4)
 		t.Errorf("AdvisePreload: %v", err)
+	}
+}
+
+// TestColdTrackerRange pins the coldTracker state machine directly:
+// disabled and enabled-but-untouched trackers report no range (the
+// no-access case must never advise — the madvise shim's bounds guard
+// also defends, but the flag is the contract), and recorded accesses
+// fold into an exact [min, max].
+func TestColdTrackerRange(t *testing.T) {
+	var c coldTracker
+	if _, _, ok := c.accessedRange(); ok {
+		t.Fatal("accessedRange ok on a disabled tracker")
+	}
+	c.enable()
+	if _, _, ok := c.accessedRange(); ok {
+		t.Fatal("accessedRange ok with no access recorded")
+	}
+	c.record(7)
+	c.record(3)
+	c.record(9)
+	minID, maxID, ok := c.accessedRange()
+	if !ok || minID != 3 || maxID != 9 {
+		t.Errorf("accessedRange = (%d, %d, %v), want (3, 9, true)", minID, maxID, ok)
 	}
 }

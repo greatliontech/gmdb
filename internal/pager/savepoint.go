@@ -146,10 +146,8 @@ type savepointUndoEntry struct {
 // suspended for nested savepoints (savepointDepth > 0), so the field
 // is unreachable.
 type Savepoint struct {
-	kind          SavepointKind
-	bitmap        *bitmap.Snapshot
-	highWaterMark uint64
-	rplSegments   []RPLSegmentRef
+	kind SavepointKind
+	snapshotCore
 	// undoLogPos is the marker into Pager.savepointUndoLog at this
 	// savepoint's Begin time. Restore replays log[undoLogPos:end] in
 	// reverse to undo every observed mutation of pendingAllocs/
@@ -177,6 +175,39 @@ type Savepoint struct {
 	loosePopLog []loosePopEntry
 }
 
+// snapshotCore is the restorable state both snapshot flavours capture —
+// the top-level transaction snapshot (BeginTx / AbortTx / Commit) and
+// per-level Savepoints. The flavours share this one CAPTURE but
+// deliberately not one RESTORE policy: a savepoint restores
+// incrementally (undo-log replay covering only its window's mutations,
+// paid only while a savepoint is open), while top-level abort resets
+// wholesale (clear the tx-scoped maps, release every slab buffer —
+// abort drops everything, so nothing finer is needed). Making the top
+// level an implicit depth-0 savepoint would keep p.activeSavepoints
+// non-empty for the whole transaction, defeating recordSavepointUndo's
+// no-savepoint fast path and putting every ordinary write transaction's
+// map mutations on the undo log — the cost the fast path exists to
+// avoid (transactions.md §Nested Transactions, the Nesting-depth cost paragraph).
+type snapshotCore struct {
+	bitmap        *bitmap.Snapshot
+	highWaterMark uint64
+	rplSegments   []RPLSegmentRef
+}
+
+// captureCore snapshots the core restorable state: the bitmap's
+// undo-log marker (nil when no bitmap is attached), HighWaterMark, and
+// a clone of the in-memory RPL chain.
+func (p *Pager) captureCore() snapshotCore {
+	c := snapshotCore{
+		highWaterMark: p.highWaterMark,
+		rplSegments:   slices.Clone(p.rplSegments),
+	}
+	if p.bitmap != nil {
+		c.bitmap = p.bitmap.Snapshot()
+	}
+	return c
+}
+
 // captureSavepointState builds a Savepoint capture of the pager's
 // current tx-scoped state — shared between BeginSavepoint and
 // BeginShallowSavepoint. The kind field is set by the caller, which
@@ -198,18 +229,13 @@ type Savepoint struct {
 // (highWaterMark, retiredLen, detachedLen, dirtyBytes) are straight
 // value copies.
 func (p *Pager) captureSavepointState() *Savepoint {
-	sp := &Savepoint{
-		highWaterMark: p.highWaterMark,
-		rplSegments:   slices.Clone(p.rplSegments),
-		undoLogPos:    len(p.savepointUndoLog),
-		retiredLen:    len(p.retiredPages),
-		detachedLen:   len(p.detachedBufs),
-		dirtyBytes:    p.dirtyBytes,
+	return &Savepoint{
+		snapshotCore: p.captureCore(),
+		undoLogPos:   len(p.savepointUndoLog),
+		retiredLen:   len(p.retiredPages),
+		detachedLen:  len(p.detachedBufs),
+		dirtyBytes:   p.dirtyBytes,
 	}
-	if p.bitmap != nil {
-		sp.bitmap = p.bitmap.Snapshot()
-	}
-	return sp
 }
 
 // recordSavepointUndo appends one undo entry to p.savepointUndoLog when

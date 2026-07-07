@@ -36,11 +36,12 @@ gate) and the final close-out are fixed anchors per chunk.
   grant → poison/generation re-check → `Resync` preamble in `Begin` /
   `Checkpoint` / `Compact` (`db.go:717`, `checkpoint.go:66`,
   `compact.go:66`), deduplicating the poison-log path.
-- [ ] 6. Unify top-level tx abort with savepoint restore (implicit
-  depth-0 savepoint; `internal/pager/pager.go:459–557` vs
-  `internal/pager/savepoint.go:200–573`); group the loose `Pager`
-  tx-snapshot and cold-tracking fields into sub-structs; delete
-  `bitmapwrap.go`.
+- [x] 6. One snapshot capture: `snapshotCore` + `captureCore` shared
+  by the top-level tx snapshot (`Pager.txSnapshot`, replacing four
+  loose fields) and `Savepoint` (embeds it); restore policies
+  deliberately remain distinct (wholesale abort vs undo-log replay —
+  `snapshotCore`'s doc carries the why); `coldTracker` sub-struct;
+  `bitmapwrap.go` deleted.
 
 ## Phase B — recovery-model redesign (Spec-first)
 

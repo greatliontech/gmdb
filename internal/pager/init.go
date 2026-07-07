@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 
+	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -415,7 +416,7 @@ func (p *Pager) attachState(file *os.File, m page.Meta) error {
 	bitmapBytes := uint64(m.BitmapPages) * uint64(pageSize)
 	detail := make([]byte, bitmapBytes)
 	copy(detail, p.mmap[2*uint64(pageSize):2*uint64(pageSize)+bitmapBytes])
-	bm := newBitmapForOpen(detail, pageSize, m.BitmapPages, m.MaxSize)
+	bm := bitmap.New(detail, pageSize, m.BitmapPages, m.MaxSize)
 
 	// Rebuild the RPL in-memory chain against the NEW bitmap + file size
 	// (locals — not yet installed on the pager), walking head → tail via
@@ -524,13 +525,6 @@ func ReadLatestMeta(file *os.File, pageSize uint32) (page.Meta, error) {
 		return page.Meta{}, errBothMetasInvalid()
 	}
 	return decodeActiveMeta(meta0, meta1, active)
-}
-
-// newBitmapForOpen is a thin wrapper that returns the bitmap package's
-// constructed Bitmap. Co-located with the cross-package import in
-// bitmapwrap.go.
-func newBitmapForOpen(detail []byte, pageSize uint32, bitmapPages uint32, totalPages uint64) *bitmapForOpen {
-	return bitmapWrap(detail, pageSize, bitmapPages, totalPages)
 }
 
 // DiscoverPageSize returns the page size of the gmdb file by reading
@@ -646,7 +640,7 @@ func isVersionMismatchMeta(buf []byte) bool {
 // state — keeping attachState atomic. bm is the reclaimed-segment oracle
 // (free-space.md §Allocation Bitmap: set bit = free → stop at a reclaimed
 // tail); fileSize bounds every segment page id to the file-resident extent.
-func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmapForOpen, fileSize int64) ([]RPLSegmentRef, error) {
+func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmap.Bitmap, fileSize int64) ([]RPLSegmentRef, error) {
 	// Trustworthy ceiling for every segment page id: head, every followed
 	// OlderSegment, and the tail. pageRaw panics past the mmap reservation
 	// (MaxSize pages) and would SIGBUS in the [fileSize, reservation) gap,

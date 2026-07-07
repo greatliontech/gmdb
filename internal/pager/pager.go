@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
 	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
@@ -104,23 +103,9 @@ type Pager struct {
 	// write transaction by BeginTx.
 	externalReserve int
 
-	// Cold-tracking for Options.ReclaimOnClose (mmap-strategy.md §Read
-	// Transaction Cooldown). Enabled per read-tx pager via
-	// EnableColdTracking; Page / pageRaw then record the lowest/highest
-	// page IDs the transaction touches, and AdviseColdAccessed issues a
-	// single MADV_COLD over [accessMin, accessMax] at close. The
-	// counters are atomic so concurrent reads off one ReadTx are safe;
-	// trackCold is set once before any read (no concurrent mutation).
-	// The min/max pair is not updated jointly-atomically, but
-	// AdviseColdAccessed loads both only at close — after every read has
-	// quiesced (the held CAS) — so the final range it advises is exact.
-	// Off (trackCold == false) on every other pager — one branch per
-	// page read when disabled. accessMin is seeded to MaxUint64 so the
-	// first access wins the min CAS; accessMin > accessMax means "no
-	// page accessed" and suppresses the MADV_COLD.
-	trackCold bool
-	accessMin atomic.Uint64
-	accessMax atomic.Uint64
+	// cold tracks the accessed-page range for Options.ReclaimOnClose
+	// (mmap-strategy.md §Read Transaction Cooldown); see coldTracker.
+	cold coldTracker
 
 	// tc holds the per-write-transaction activity counters that back
 	// TxStats (see txstats.go). Reset by BeginTx, read via
@@ -239,20 +224,14 @@ type Pager struct {
 	// PageChecksum is disabled or before the first verified read.
 	verified []uint64
 
-	// bitmapSnapshot captures the bitmap's mutable state at the start
-	// of the in-progress write tx so AbortTx can restore it. Set by
-	// BeginTx, cleared by Commit success or by AbortTx. Nil between
-	// transactions.
-	bitmapSnapshot *bitmap.Snapshot
-
-	// hwmSnapshot / rplChainSnapshot capture the same state for the
-	// pager-side bookkeeping so rollback restores all tx-mutated state
-	// — not just the bitmap. Without this, file extension that
-	// advanced HighWaterMark and RPL reclamation that popped segments
-	// from the in-memory chain would persist across a rollback.
-	hwmSnapshot      uint64
-	rplChainSnapshot []RPLSegmentRef
-	haveTxSnapshot   bool
+	// txSnapshot captures the restorable core state (bitmap snapshot,
+	// HighWaterMark, RPL chain — snapshotCore) at the start of the
+	// in-progress write tx so AbortTx can restore it. Without it, file
+	// extension that advanced HighWaterMark and RPL reclamation that
+	// popped segments from the in-memory chain would persist across a
+	// rollback. Set by BeginTx, cleared by Commit success or by
+	// AbortTx. Nil between transactions.
+	txSnapshot *snapshotCore
 
 	// commitStep4HookForTest is a test-only injection point. When
 	// non-nil, Commit invokes it after step 3 has written the new
@@ -499,9 +478,9 @@ type TxParams struct {
 // bitmap.Discard before clobbering it (used by tests; production
 // callers don't re-Begin without Commit/Rollback). The Discard is
 // required because the bitmap tracks open Snapshots internally —
-// silently overwriting bitmapSnapshot without releasing it would leak
-// the prior Snapshot into openSnapshots and grow the undo log
-// unbounded.
+// silently overwriting txSnapshot without releasing its bitmap
+// snapshot would leak the prior Snapshot into openSnapshots and grow
+// the undo log unbounded.
 func (p *Pager) BeginTx(params TxParams) {
 	// Reset the per-tx TxStats counters and the checksum-verification
 	// cache unconditionally (read-only pagers included), matching the
@@ -532,13 +511,11 @@ func (p *Pager) BeginTx(params TxParams) {
 	if p.bitmap == nil {
 		return
 	}
-	if p.haveTxSnapshot {
-		p.bitmap.Discard(p.bitmapSnapshot)
+	if p.txSnapshot != nil {
+		p.bitmap.Discard(p.txSnapshot.bitmap)
 	}
-	p.bitmapSnapshot = p.bitmap.Snapshot()
-	p.hwmSnapshot = p.highWaterMark
-	p.rplChainSnapshot = slices.Clone(p.rplSegments)
-	p.haveTxSnapshot = true
+	core := p.captureCore()
+	p.txSnapshot = &core
 }
 
 // AbortTx restores the snapshotted state, releases slab buffers, and
@@ -558,14 +535,14 @@ func (p *Pager) AbortTx() {
 	if p.readOnly {
 		return
 	}
-	if p.haveTxSnapshot && p.bitmap != nil {
-		p.bitmap.Restore(p.bitmapSnapshot)
-		p.highWaterMark = p.hwmSnapshot
-		p.rplSegments = slices.Clone(p.rplChainSnapshot)
+	if s := p.txSnapshot; s != nil && p.bitmap != nil {
+		p.bitmap.Restore(s.bitmap)
+		p.highWaterMark = s.highWaterMark
+		// The snapshot is consumed (nil'd below), so its chain clone
+		// transfers ownership — no re-clone needed.
+		p.rplSegments = s.rplSegments
 	}
-	p.bitmapSnapshot = nil
-	p.rplChainSnapshot = nil
-	p.haveTxSnapshot = false
+	p.txSnapshot = nil
 	// TxStats: a rolled-back tx's slab peak is not representative of
 	// steady-state need (api-surface.md §Statistics), so a post-rollback
 	// Stats() reports SlabPeakBytes = 0. The other counters persist to
@@ -595,15 +572,12 @@ func (p *Pager) AbortTx() {
 // success path). Releases the bitmap's per-Snapshot undo-log tracking
 // via bitmap.Discard: with no Snapshot left open the bitmap truncates
 // its undo log to length 0, so the log never survives across a tx
-// boundary. Guard mirrors AbortTx's haveTxSnapshot && bitmap != nil
-// pattern.
+// boundary. Guard mirrors AbortTx's snapshot-and-bitmap pattern.
 func (p *Pager) discardTxSnapshot() {
-	if p.haveTxSnapshot && p.bitmap != nil {
-		p.bitmap.Discard(p.bitmapSnapshot)
+	if p.txSnapshot != nil && p.bitmap != nil {
+		p.bitmap.Discard(p.txSnapshot.bitmap)
 	}
-	p.bitmapSnapshot = nil
-	p.rplChainSnapshot = nil
-	p.haveTxSnapshot = false
+	p.txSnapshot = nil
 	// Defense-in-depth, symmetric with AbortTx: a leaked (un-Released,
 	// un-Restored) savepoint of either kind would otherwise survive past
 	// the commit boundary, and a subsequent loose-pop in the next tx
@@ -813,8 +787,8 @@ func (p *Pager) pageRaw(id uint64) []byte {
 	if end > uint64(len(p.mmap)) {
 		panic(fmt.Sprintf("pager: pageRaw(%d) past mmap reservation [%d, %d]", id, off, end))
 	}
-	if p.trackCold {
-		p.recordAccess(id)
+	if p.cold.enabled {
+		p.cold.record(id)
 	}
 	return p.mmap[off:end]
 }
@@ -840,41 +814,71 @@ func (p *Pager) AdvisePreload(throughPage uint64) error {
 	return madvisePopulateRead(p.mmap, length)
 }
 
+// coldTracker records the [min, max] page-id range a read transaction
+// touches (mmap-strategy.md §Read Transaction Cooldown) so
+// AdviseColdAccessed can issue a single MADV_COLD over it at close. The
+// counters are atomic so concurrent reads off one ReadTx are safe;
+// enabled is set once before any read (no concurrent mutation). The
+// min/max pair is not updated jointly-atomically, but the range is
+// loaded only at close — after every read has quiesced (the held CAS)
+// — so the final range advised is exact. Off (enabled == false) on
+// every pager except a ReclaimOnClose read-tx pager — one branch per
+// page read when disabled. min is seeded to MaxUint64 so the first
+// access wins the min CAS; min > max means "no page accessed".
+type coldTracker struct {
+	enabled bool
+	min     atomic.Uint64
+	max     atomic.Uint64
+}
+
+func (c *coldTracker) enable() {
+	c.min.Store(^uint64(0)) // MaxUint64: first access wins the min CAS
+	c.max.Store(0)
+	c.enabled = true
+}
+
+// record folds page id into the [min, max] range via two atomic CAS
+// loops — the "two atomic min/max updates per page read" of
+// mmap-strategy.md §Read Transaction Cooldown. Only reached when
+// enabled.
+func (c *coldTracker) record(id uint64) {
+	for {
+		cur := c.min.Load()
+		if id >= cur {
+			break
+		}
+		if c.min.CompareAndSwap(cur, id) {
+			break
+		}
+	}
+	for {
+		cur := c.max.Load()
+		if id <= cur {
+			break
+		}
+		if c.max.CompareAndSwap(cur, id) {
+			break
+		}
+	}
+}
+
+// accessedRange returns the tracked range; ok=false when tracking is
+// off or no page was accessed.
+func (c *coldTracker) accessedRange() (minID, maxID uint64, ok bool) {
+	if !c.enabled {
+		return 0, 0, false
+	}
+	minID = c.min.Load()
+	maxID = c.max.Load()
+	return minID, maxID, minID <= maxID
+}
+
 // EnableColdTracking turns on per-transaction accessed-page tracking for
 // Options.ReclaimOnClose (mmap-strategy.md §Read Transaction Cooldown).
 // Must be called before the first page read (the read-tx Begin path), on
 // a read-only pager only. Page / pageRaw then record the min/max page
 // IDs touched; AdviseColdAccessed issues the MADV_COLD on close.
-func (p *Pager) EnableColdTracking() {
-	p.accessMin.Store(^uint64(0)) // MaxUint64: first access wins the min CAS
-	p.accessMax.Store(0)
-	p.trackCold = true
-}
-
-// recordAccess folds page id into the [accessMin, accessMax] range via
-// two atomic CAS loops — the "two atomic min/max updates per page read"
-// of mmap-strategy.md §Read Transaction Cooldown. Only reached when
-// trackCold is set.
-func (p *Pager) recordAccess(id uint64) {
-	for {
-		cur := p.accessMin.Load()
-		if id >= cur {
-			break
-		}
-		if p.accessMin.CompareAndSwap(cur, id) {
-			break
-		}
-	}
-	for {
-		cur := p.accessMax.Load()
-		if id <= cur {
-			break
-		}
-		if p.accessMax.CompareAndSwap(cur, id) {
-			break
-		}
-	}
-}
+func (p *Pager) EnableColdTracking() { p.cold.enable() }
 
 // AdviseColdAccessed issues a single MADV_COLD over the page range this
 // transaction touched (mmap-strategy.md §Read Transaction Cooldown),
@@ -883,13 +887,9 @@ func (p *Pager) recordAccess(id uint64) {
 // Called by the read-tx close path BEFORE the mmap is unmapped. Silent
 // no-op on non-Linux and on kernels < 5.4.
 func (p *Pager) AdviseColdAccessed() error {
-	if !p.trackCold {
+	minID, maxID, ok := p.cold.accessedRange()
+	if !ok {
 		return nil
-	}
-	minID := p.accessMin.Load()
-	maxID := p.accessMax.Load()
-	if minID > maxID {
-		return nil // no page accessed this transaction
 	}
 	off := int(minID * uint64(p.cfg.PageSize))
 	length := int((maxID - minID + 1) * uint64(p.cfg.PageSize))
@@ -926,8 +926,8 @@ func (p *Pager) Page(id uint64) ([]byte, error) {
 		return nil, fmt.Errorf("%w: page id %d beyond file-resident extent (%d pages)",
 			ErrCorrupted, id, backedPages)
 	}
-	if p.trackCold {
-		p.recordAccess(id)
+	if p.cold.enabled {
+		p.cold.record(id)
 	}
 	off := id * uint64(p.cfg.PageSize)
 	buf := p.mmap[off : off+uint64(p.cfg.PageSize)]
