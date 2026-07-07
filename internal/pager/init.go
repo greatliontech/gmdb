@@ -291,22 +291,57 @@ func readAndSelectMeta(file *os.File) (m page.Meta, active int, noCheckpoint boo
 // selectActiveMeta decodes the two meta-page byte images, selects the active
 // meta (checkpoint-preferring per durability.md §Recovery), and validates it.
 // noCheckpoint reports the §Recovery step-3 fallback: the selected meta lacks
-// MetaFlagCheckpoint because no checkpoint-flagged meta exists. Shared by Open
-// (first load) and Resync (re-load after a peer commit).
+// MetaFlagCheckpoint because no checkpoint-flagged meta exists. Open/
+// OpenReadOnly only — Resync deliberately selects LATEST-COMMITTED instead
+// (durability.md §"Live visibility vs. crash recovery — distinct selections";
+// see Resync's doc).
 func selectActiveMeta(meta0Bytes, meta1Bytes []byte) (m page.Meta, active int, noCheckpoint bool, err error) {
 	active, noCheckpoint, ok := page.ActiveMetaCheckpointPreferring(meta0Bytes, meta1Bytes)
 	if !ok {
-		return page.Meta{}, 0, false, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
+		return page.Meta{}, 0, false, errBothMetasInvalid()
 	}
-	if active == 0 {
-		m = page.DecodeMeta(meta0Bytes)
-	} else {
-		m = page.DecodeMeta(meta1Bytes)
-	}
-	if err := page.ValidateMeta(m); err != nil {
-		return page.Meta{}, 0, false, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
+	m, err = decodeActiveMeta(meta0Bytes, meta1Bytes, active)
+	if err != nil {
+		return page.Meta{}, 0, false, err
 	}
 	return m, active, noCheckpoint, nil
+}
+
+// readMetaPair reads the two meta-page images at their fixed offsets
+// (0 and pageSize). pageSize must already be trusted (from a verified
+// meta or the immutable pager config) — page-size DISCOVERY on an
+// unknown file is readAndSelectMeta's probe, not this helper.
+func readMetaPair(file *os.File, pageSize uint32) (meta0, meta1 []byte, err error) {
+	meta0 = make([]byte, page.MetaPayloadSize)
+	if _, err := file.ReadAt(meta0, 0); err != nil {
+		return nil, nil, fmt.Errorf("pager: read meta0: %w", err)
+	}
+	meta1 = make([]byte, page.MetaPayloadSize)
+	if _, err := file.ReadAt(meta1, int64(pageSize)); err != nil {
+		return nil, nil, fmt.Errorf("pager: read meta1: %w", err)
+	}
+	return meta0, meta1, nil
+}
+
+// decodeActiveMeta decodes the selected slot of a meta pair and
+// validates it. Every selection path (checkpoint-preferring and
+// latest-committed alike) funnels through this one decode+validate.
+func decodeActiveMeta(meta0, meta1 []byte, active int) (page.Meta, error) {
+	b := meta0
+	if active == 1 {
+		b = meta1
+	}
+	m := page.DecodeMeta(b)
+	if err := page.ValidateMeta(m); err != nil {
+		return page.Meta{}, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
+	}
+	return m, nil
+}
+
+// errBothMetasInvalid is the shared selection-failure error: no valid
+// slot, or an equal-non-zero TxnID pair (commit-protocol violation).
+func errBothMetasInvalid() error {
+	return fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
 }
 
 // attachState (re)builds the pager's in-memory state from the on-disk image
@@ -446,28 +481,19 @@ func (p *Pager) attachState(file *os.File, m page.Meta) error {
 // without poisoning — the handle stays usable (a retry re-reads; Close +
 // re-Open invokes Open's own corruption recovery).
 func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m page.Meta, active int, lastCheckpointTxnID uint64, changed bool, err error) {
-	pageSize := p.cfg.PageSize
-	meta0 := make([]byte, page.MetaPayloadSize)
-	if _, err := file.ReadAt(meta0, 0); err != nil {
-		return page.Meta{}, 0, 0, false, fmt.Errorf("pager: resync read meta0: %w", err)
-	}
-	meta1 := make([]byte, page.MetaPayloadSize)
-	if _, err := file.ReadAt(meta1, int64(pageSize)); err != nil {
-		return page.Meta{}, 0, 0, false, fmt.Errorf("pager: resync read meta1: %w", err)
+	meta0, meta1, err := readMetaPair(file, p.cfg.PageSize)
+	if err != nil {
+		return page.Meta{}, 0, 0, false, err
 	}
 	active, ok := page.ActiveMeta(meta0, meta1)
 	if !ok {
-		return page.Meta{}, 0, 0, false, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
+		return page.Meta{}, 0, 0, false, errBothMetasInvalid()
 	}
-	if active == 0 {
-		m = page.DecodeMeta(meta0)
-	} else {
-		m = page.DecodeMeta(meta1)
+	m, err = decodeActiveMeta(meta0, meta1, active)
+	if err != nil {
+		return page.Meta{}, 0, 0, false, err
 	}
-	if err := page.ValidateMeta(m); err != nil {
-		return page.Meta{}, 0, 0, false, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
-	}
-	lastCheckpointTxnID = highestCheckpointTxnID(meta0, meta1)
+	lastCheckpointTxnID = page.HighestCheckpointTxnID(meta0, meta1)
 	if m.TxnID == knownTxnID {
 		return m, active, lastCheckpointTxnID, false, nil
 	}
@@ -475,25 +501,6 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m page.Meta, active in
 		return page.Meta{}, 0, 0, false, err
 	}
 	return m, active, lastCheckpointTxnID, true, nil
-}
-
-// highestCheckpointTxnID returns the greatest TxnID among the two meta-page
-// images that both verify (checksum) AND carry MetaFlagCheckpoint, or 0 if
-// neither qualifies. This is the TxnID a crash would recover to under the
-// checkpoint-preferring rule, hence the RPL reclamation lower bound for a
-// writer that has just adopted a peer's latest (possibly unflagged) commit.
-func highestCheckpointTxnID(meta0, meta1 []byte) uint64 {
-	var best uint64
-	for _, b := range [][]byte{meta0, meta1} {
-		if !page.VerifyMeta(b) {
-			continue
-		}
-		mm := page.DecodeMeta(b)
-		if mm.HasFlag(page.MetaFlagCheckpoint) && mm.TxnID > best {
-			best = mm.TxnID
-		}
-	}
-	return best
 }
 
 // ReadLatestMeta reads both on-disk meta pages and returns the latest
@@ -508,28 +515,15 @@ func highestCheckpointTxnID(meta0, meta1 []byte) uint64 {
 // the meta, so the selected meta's pages are always readable). pageSize is the
 // file's immutable page size (safely taken from any prior meta snapshot).
 func ReadLatestMeta(file *os.File, pageSize uint32) (page.Meta, error) {
-	meta0 := make([]byte, page.MetaPayloadSize)
-	if _, err := file.ReadAt(meta0, 0); err != nil {
-		return page.Meta{}, fmt.Errorf("pager: read meta0: %w", err)
-	}
-	meta1 := make([]byte, page.MetaPayloadSize)
-	if _, err := file.ReadAt(meta1, int64(pageSize)); err != nil {
-		return page.Meta{}, fmt.Errorf("pager: read meta1: %w", err)
+	meta0, meta1, err := readMetaPair(file, pageSize)
+	if err != nil {
+		return page.Meta{}, err
 	}
 	active, ok := page.ActiveMeta(meta0, meta1)
 	if !ok {
-		return page.Meta{}, fmt.Errorf("pager: both meta pages invalid or commit-protocol violation: %w", ErrCorrupted)
+		return page.Meta{}, errBothMetasInvalid()
 	}
-	var m page.Meta
-	if active == 0 {
-		m = page.DecodeMeta(meta0)
-	} else {
-		m = page.DecodeMeta(meta1)
-	}
-	if err := page.ValidateMeta(m); err != nil {
-		return page.Meta{}, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
-	}
-	return m, nil
+	return decodeActiveMeta(meta0, meta1, active)
 }
 
 // newBitmapForOpen is a thin wrapper that returns the bitmap package's

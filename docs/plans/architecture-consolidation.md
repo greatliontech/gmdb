@@ -16,7 +16,7 @@ gate) and the final close-out are fixed anchors per chunk.
   (footer-verify + decode) primitive also consumed by `reclaimRPL`
   (`internal/pager/freespace.go:472`), which walks the in-memory
   list per the spec.
-- [ ] 2. Collapse meta selection to one seam: deduplicate the
+- [x] 2. Collapse meta selection to one seam: deduplicate the
   tie-break cascade in `page.ActiveMeta` /
   `page.ActiveMetaCheckpointPreferring` (`internal/page/meta.go:195,
   276`), fold `highestCheckpointTxnID`

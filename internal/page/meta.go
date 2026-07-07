@@ -186,70 +186,14 @@ func VerifyMeta(buf []byte) bool {
 //     and return noCheckpoint=true so the caller can warn.
 //  4. Neither valid → ok=false.
 //
-// The promotion of the durability.md §Recovery rule; the
-// raw highest-TxnID selector (ActiveMeta) is preserved for tests and
-// callers who want the pre-checkpoint behaviour.
-//
-// Tie-break rules within (2): identical to ActiveMeta — equal
-// non-zero TxnIDs is a commit-protocol violation (ok=false).
+// This is the CRASH-RECOVERY selection (a fresh Open). The raw
+// highest-TxnID selector (ActiveMeta) is the LIVE selection — grant
+// handoff and reader visibility — per durability.md §"Live visibility
+// vs. crash recovery — distinct selections". Both are wrappers over
+// selectSlot, so their tie-break rules cannot drift: equal non-zero
+// TxnIDs is a commit-protocol violation (ok=false) in both.
 func ActiveMetaCheckpointPreferring(meta0, meta1 []byte) (active int, noCheckpoint bool, ok bool) {
-	ok0 := VerifyMeta(meta0)
-	ok1 := VerifyMeta(meta1)
-	switch {
-	case ok0 && ok1:
-		txn0 := le.Uint64(meta0[metaOffTxnID:])
-		txn1 := le.Uint64(meta1[metaOffTxnID:])
-		flags0 := le.Uint32(meta0[metaOffFlags:])
-		flags1 := le.Uint32(meta1[metaOffFlags:])
-		cp0 := flags0&MetaFlagCheckpoint != 0
-		cp1 := flags1&MetaFlagCheckpoint != 0
-		switch {
-		case cp0 && cp1:
-			// Both have Checkpoint; highest TxnID wins, tie-break
-			// matches ActiveMeta (zero-tie → 0; equal-non-zero →
-			// protocol violation).
-			switch {
-			case txn1 > txn0:
-				return 1, false, true
-			case txn0 > txn1:
-				return 0, false, true
-			case txn0 == 0:
-				return 0, false, true
-			default:
-				return 0, false, false
-			}
-		case cp0:
-			return 0, false, true
-		case cp1:
-			return 1, false, true
-		default:
-			// Neither checkpointed — fall back to highest-TxnID
-			// selection per durability.md step 3, but signal
-			// noCheckpoint so the caller logs a warning.
-			switch {
-			case txn1 > txn0:
-				return 1, true, true
-			case txn0 > txn1:
-				return 0, true, true
-			case txn0 == 0:
-				return 0, true, true
-			default:
-				return 0, true, false
-			}
-		}
-	case ok0:
-		// Only one valid meta — its Checkpoint flag is informational;
-		// we still surface noCheckpoint=true if it's clear so the
-		// caller can warn that recovery accepted a non-checkpoint
-		// meta.
-		flags0 := le.Uint32(meta0[metaOffFlags:])
-		return 0, flags0&MetaFlagCheckpoint == 0, true
-	case ok1:
-		flags1 := le.Uint32(meta1[metaOffFlags:])
-		return 1, flags1&MetaFlagCheckpoint == 0, true
-	default:
-		return 0, false, false
-	}
+	return selectSlot(meta0, meta1, true)
 }
 
 // ActiveMeta selects the active meta page given the two candidate
@@ -274,28 +218,91 @@ func ActiveMetaCheckpointPreferring(meta0, meta1 []byte) (active int, noCheckpoi
 // top by the SyncMode-aware caller; this function returns the
 // raw highest-valid-TxnID winner.
 func ActiveMeta(meta0, meta1 []byte) (active int, ok bool) {
+	active, _, ok = selectSlot(meta0, meta1, false)
+	return active, ok
+}
+
+// selectSlot is the single implementation behind ActiveMeta and
+// ActiveMetaCheckpointPreferring: one validity gate and one TxnID
+// tie-break (pickHighestTxnID), with the checkpoint-flag precedence of
+// durability.md §Recovery applied only when preferCheckpoint is set.
+// The two exported selections MUST NOT drift — they are the same rule
+// except that recovery prefers a checkpoint-flagged meta when exactly
+// one valid slot carries the flag (durability.md §"Live visibility vs.
+// crash recovery — distinct selections").
+//
+// noCheckpoint is meaningful only when preferCheckpoint: it reports
+// that the SELECTED meta lacks MetaFlagCheckpoint (the durability.md
+// §Recovery step-3 fallback, or a lone unflagged valid slot) so the
+// caller can warn that recovery accepted a non-checkpoint meta.
+func selectSlot(meta0, meta1 []byte, preferCheckpoint bool) (active int, noCheckpoint bool, ok bool) {
 	ok0 := VerifyMeta(meta0)
 	ok1 := VerifyMeta(meta1)
+	cp := func(b []byte) bool { return le.Uint32(b[metaOffFlags:])&MetaFlagCheckpoint != 0 }
 	switch {
 	case ok0 && ok1:
-		txn0 := le.Uint64(meta0[metaOffTxnID:])
-		txn1 := le.Uint64(meta1[metaOffTxnID:])
-		switch {
-		case txn1 > txn0:
-			return 1, true
-		case txn0 > txn1:
-			return 0, true
-		case txn0 == 0:
-			return 0, true
-		default:
-			// Equal non-zero TxnIDs — commit-protocol violation.
-			return 0, false
+		if preferCheckpoint {
+			cp0, cp1 := cp(meta0), cp(meta1)
+			switch {
+			case cp0 && !cp1:
+				return 0, false, true
+			case cp1 && !cp0:
+				return 1, false, true
+			default:
+				// Both or neither flagged — highest-TxnID tie-break;
+				// neither flagged is the §Recovery step-3 fallback.
+				active, ok = pickHighestTxnID(le.Uint64(meta0[metaOffTxnID:]), le.Uint64(meta1[metaOffTxnID:]))
+				return active, !cp0 && !cp1, ok
+			}
 		}
+		active, ok = pickHighestTxnID(le.Uint64(meta0[metaOffTxnID:]), le.Uint64(meta1[metaOffTxnID:]))
+		return active, false, ok
 	case ok0:
-		return 0, true
+		return 0, preferCheckpoint && !cp(meta0), true
 	case ok1:
+		return 1, preferCheckpoint && !cp(meta1), true
+	default:
+		return 0, false, false
+	}
+}
+
+// pickHighestTxnID is the dual-meta TxnID tie-break over two VALID
+// metas (file-layout.md §Meta Page, entailed dual-meta invariant):
+// higher wins; a tie at zero is the legitimate immediately-post-
+// initialisation state (meta 0 wins, both images byte-identical); an
+// equal NON-zero pair is a commit-protocol violation (the protocol
+// writes a strictly-greater TxnID per commit), so selection is
+// undefined and ok=false — the caller surfaces corruption rather than
+// guessing.
+func pickHighestTxnID(txn0, txn1 uint64) (active int, ok bool) {
+	switch {
+	case txn1 > txn0:
 		return 1, true
+	case txn0 > txn1:
+		return 0, true
+	case txn0 == 0:
+		return 0, true
 	default:
 		return 0, false
 	}
+}
+
+// HighestCheckpointTxnID returns the greatest TxnID among the two
+// meta-page images that verify (checksum) AND carry MetaFlagCheckpoint,
+// or 0 if neither qualifies. This is the TxnID a crash would recover to
+// under the checkpoint-preferring rule (durability.md §Recovery), hence
+// the RPL reclamation lower bound for a writer that has just adopted a
+// peer's latest — possibly unflagged — commit (free-space.md §RPL
+// Reclamation, cross-process re-derivation of C).
+func HighestCheckpointTxnID(meta0, meta1 []byte) uint64 {
+	var best uint64
+	for _, b := range [][]byte{meta0, meta1} {
+		if !VerifyMeta(b) {
+			continue
+		}
+		if m := DecodeMeta(b); m.HasFlag(MetaFlagCheckpoint) && m.TxnID > best {
+			best = m.TxnID
+		}
+	}
+	return best
 }
