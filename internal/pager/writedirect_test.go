@@ -192,7 +192,7 @@ func TestWriteDirectAbortReversesAllocation(t *testing.T) {
 
 	first := bm.FirstDataPage()
 	bm.Set(first + 5) // mark free so AllocPage takes the bitmap path
-	p.BeginTx()
+	p.BeginTx(TxParams{HighWaterMark: first, MaxSize: 16})
 
 	id, err := p.AllocPage()
 	if err != nil {
@@ -217,7 +217,7 @@ func TestWriteDirectAbortReversesAllocation(t *testing.T) {
 	}
 	// And it is handed out again on the next allocation (reusable).
 	bm.Set(first + 5)
-	p.BeginTx()
+	p.BeginTx(TxParams{HighWaterMark: first, MaxSize: 16})
 	reID, err := p.AllocPage()
 	if err != nil {
 		t.Fatalf("post-abort AllocPage: %v", err)
@@ -240,7 +240,13 @@ func TestWriteDirectSurvivesCommit(t *testing.T) {
 			p := db.Pager
 			// Match production fidelity: every commit is preceded by
 			// BeginTx (Commit's snapshot-discard path assumes it).
-			p.BeginTx()
+			p.BeginTx(TxParams{
+				HighWaterMark: db.Meta.HighWaterMark,
+				MaxSize:       db.Meta.MaxSize,
+				GrowStep:      db.Meta.GrowStep,
+				MinSize:       db.Meta.MinSize,
+				TxnID:         1,
+			})
 			id, err := p.AllocPage()
 			if err != nil {
 				t.Fatalf("AllocPage: %v", err)
@@ -258,7 +264,6 @@ func TestWriteDirectSurvivesCommit(t *testing.T) {
 				t.Fatal("WriteDirect page leaked into the slab")
 			}
 
-			p.SetCurrentTxnID(1)
 			if _, err := p.Commit(CommitParams{NewTxnID: 1, Flags: db.Meta.Flags}, db.Meta, db.ActiveMetaIdx); err != nil {
 				t.Fatalf("Commit: %v", err)
 			}

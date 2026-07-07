@@ -128,8 +128,9 @@ type Pager struct {
 	tc txCounters
 
 	// Freespace state machine. Populated by AttachBitmap +
-	// SetCommitState + SetRPLChain at the start of the write
-	// transaction; nil/empty on a read-only pager.
+	// SetCommitState + SetRPLChain at Open/Resync and re-seeded per
+	// write transaction by BeginTx(TxParams); nil/empty on a
+	// read-only pager.
 	bitmap           *bitmap.Bitmap
 	rplSegments      []RPLSegmentRef
 	highWaterMark    uint64
@@ -168,9 +169,9 @@ type Pager struct {
 	detachedBufs []*[]byte
 
 	// currentTxnID is the TxnID of the in-progress write transaction.
-	// Set by SetCurrentTxnID; consumed by commit-step-0's RPL segment
-	// builder. Zero on read-only pagers and between transactions on
-	// writable pagers.
+	// Seeded by BeginTx(TxParams) (re-seedable via SetCurrentTxnID);
+	// consumed by commit-step-0's RPL segment builder. Zero on
+	// read-only pagers and between transactions on writable pagers.
 	currentTxnID uint64
 
 	// savepointDepth counts active (unresolved) NESTED-kind savepoints
@@ -406,32 +407,31 @@ func (p *Pager) AttachBitmap(bm *bitmap.Bitmap) { p.bitmap = bm }
 // bitmap pages for pwrite.
 func (p *Pager) Bitmap() *bitmap.Bitmap { return p.bitmap }
 
-// SetCommitState seeds the pager's snapshot of meta-state at the start
-// of a write transaction:
+// SetCommitState installs the committed meta-state baseline outside a
+// write transaction — Open/Resync (attachState) after a rebuild, and
+// test fixtures that exercise allocation without a tx:
 //   - highWaterMark: first unallocated page ID from the active meta.
 //     File extension advances this; tail refund decrements it.
-//   - maxSizePages: MaxSize / PageSize from the active meta. Caps file
+//   - maxSizePages: MaxSize (in pages) from the active meta. Caps file
 //     growth; AllocPage returns ErrDBFull when extension would exceed
 //     this.
 //   - reclamationBound: min(oldestActiveReaderTxnID, lastCheckpointTxnID).
 //     RPL entries with TxnID strictly less than this bound are
-//     reclaimable. Chunk 1 has no cross-process reader scan and no
-//     SyncLazy support, so callers pass the previous TxnID + 1 (i.e.
-//     every prior commit is a checkpoint and there are no other
-//     processes).
+//     reclaimable.
+//
+// Per-write-tx seeding goes through BeginTx(TxParams), which
+// re-installs all three from the transaction's view.
 func (p *Pager) SetCommitState(highWaterMark, maxSizePages, reclamationBound uint64) {
 	p.highWaterMark = highWaterMark
 	p.maxSizePages = maxSizePages
 	p.reclamationBound = reclamationBound
 }
 
-// SetSizeParams seeds the file growth/shrink parameters from the active meta
-// (GrowStep, MinSize — both in pages). Separate from SetCommitState so the
-// many test callers of the latter keep the zero-value fallback (grow by exact
-// need; no MinSize floor). Called from Open/Resync (attachState) and per write
-// tx (Begin) so a future Tx.SetFileFormat that mutates these is picked up on
-// the next transaction. file-format.md §File Growth / §File Shrinkage.
-func (p *Pager) SetSizeParams(growStepPages, minSizePages uint64) {
+// setSizeParams seeds the file growth/shrink parameters from the active
+// meta (GrowStep, MinSize — both in pages). Called from Open/Resync
+// (attachState); per write tx the same fields arrive via
+// BeginTx(TxParams). file-format.md §File Growth / §File Shrinkage.
+func (p *Pager) setSizeParams(growStepPages, minSizePages uint64) {
 	p.growStepPages = growStepPages
 	p.minSizePages = minSizePages
 }
@@ -447,29 +447,89 @@ func (p *Pager) SetRPLChain(segments []RPLSegmentRef) {
 // integrity check.
 func (p *Pager) RPLChain() []RPLSegmentRef { return p.rplSegments }
 
-// BeginTx snapshots the pager's mutable state (bitmap, HighWaterMark,
-// RPL chain) so AbortTx can restore it. Called at the start of every
-// write transaction. Idempotent: a second call discards the first
-// snapshot via bitmap.Discard before clobbering it (used by tests;
-// production callers don't re-Begin without Commit/Rollback). The
-// Discard is required because the bitmap now tracks open Snapshots
-// internally — silently overwriting bitmapSnapshot without releasing
-// it would leak the prior Snapshot into openSnapshots and grow the
-// undo log unbounded.
-func (p *Pager) BeginTx() {
-	// Reset the per-tx TxStats counters at the write-tx boundary so each
-	// transaction's Stats() start from zero (runs unconditionally, like
-	// resetVerified below).
+// TxParams seeds one write transaction. It replaces the former
+// order-dependent setter sequence (SetCommitState → SetSizeParams →
+// BeginTx → SetCurrentTxnID → three callback setters): one struct
+// makes the seeding contract compiler-carried — a caller cannot
+// half-seed the pager or misorder the seeding relative to the tx
+// snapshot BeginTx takes.
+type TxParams struct {
+	// Committed baseline from the transaction's base meta.
+	// HighWaterMark and MaxSize gate allocation/extension; GrowStep
+	// and MinSize shape file growth/shrink (file-format.md §File
+	// Growth / §File Shrinkage) — passed per tx so a SetFileFormat
+	// commit is picked up on the next transaction.
+	HighWaterMark uint64
+	MaxSize       uint64
+	GrowStep      uint64
+	MinSize       uint64
+	// TxnID is the transaction's id: stamps RPL segments at commit
+	// (commit step 0) and feeds LaggingReaderInfo.Lag from the first
+	// user-path AllocPage.
+	TxnID uint64
+	// ReclamationBound derives min(oldestActiveReaderTxnID,
+	// lastCheckpointTxnID) (free-space.md §RPL Reclamation). BeginTx
+	// calls it once to seed the bound; ReclaimFreeSpace and the
+	// LaggingReaderWait retry path call it again to refresh. Any
+	// refresh value is safe by construction: it is re-derived from
+	// the live reader table so it never exceeds the true current
+	// bound, reclamation frees only segments strictly below it, and
+	// already-freed segments have left the in-memory chain, so a
+	// transient dip (a reader registering in the
+	// snapshot-read-to-slot-publish window can briefly lower the
+	// scan) only delays reclamation — it cannot un-reclaim or
+	// over-reclaim. nil ⇒ bound 0: nothing reclaims (fixtures/tests).
+	ReclamationBound func() uint64
+	// RPLCorrupt is invoked once per RPL segment quarantined during
+	// reclamation (free-space.md §RPL Reclamation), with the
+	// segment's page id. nil = no notification.
+	RPLCorrupt func(segPageID uint64)
+	// LaggingReader is consulted by AllocPage/AllocContiguous when
+	// the bitmap is exhausted and reclamation is blocked by the
+	// bound — at most once per call. nil = no callback; allocation
+	// falls through to file extension.
+	LaggingReader func(LaggingReaderInfo) LaggingReaderAction
+}
+
+// BeginTx seeds the pager for one write transaction from params, then
+// snapshots the mutable state (bitmap, HighWaterMark, RPL chain) so
+// AbortTx can restore it. Seeding precedes the snapshot: the snapshot
+// must capture the seeded baseline (AbortTx restores HighWaterMark to
+// it). Idempotent: a second call discards the first snapshot via
+// bitmap.Discard before clobbering it (used by tests; production
+// callers don't re-Begin without Commit/Rollback). The Discard is
+// required because the bitmap tracks open Snapshots internally —
+// silently overwriting bitmapSnapshot without releasing it would leak
+// the prior Snapshot into openSnapshots and grow the undo log
+// unbounded.
+func (p *Pager) BeginTx(params TxParams) {
+	// Reset the per-tx TxStats counters and the checksum-verification
+	// cache unconditionally (read-only pagers included), matching the
+	// pre-TxParams behavior; the seeding below is writer-only so
+	// currentTxnID and the callbacks stay zero on read-only pagers.
 	p.resetTxCounters()
-	// Reset the checksum-verification cache at every write-tx boundary:
-	// the previous commit may have rewritten mmap pages, so verifications
-	// from the prior tx no longer hold (checksums.md §Verification). Done before the early
-	// return so it runs regardless of bitmap-attachment ordering.
 	p.resetVerified()
 	// Reset the per-tx commit reserve contributions.
 	p.externalReserve = 0
 	p.inCommit = false
-	if p.readOnly || p.bitmap == nil {
+	if p.readOnly {
+		return
+	}
+	// Install the seeding before the tx snapshot (see doc above).
+	p.highWaterMark = params.HighWaterMark
+	p.maxSizePages = params.MaxSize
+	p.growStepPages = params.GrowStep
+	p.minSizePages = params.MinSize
+	p.currentTxnID = params.TxnID
+	p.refreshReclamationBound = params.ReclamationBound
+	p.rplCorruptCb = params.RPLCorrupt
+	p.laggingReader = params.LaggingReader
+	if params.ReclamationBound != nil {
+		p.reclamationBound = params.ReclamationBound()
+	} else {
+		p.reclamationBound = 0
+	}
+	if p.bitmap == nil {
 		return
 	}
 	if p.haveTxSnapshot {
@@ -493,7 +553,7 @@ func (p *Pager) BeginTx() {
 // every bulk-written page with no leak (no maintenance pass needed).
 //
 // After AbortTx returns, the pager is ready to start a fresh
-// transaction via BeginTx + SetCommitState.
+// transaction via BeginTx(TxParams).
 func (p *Pager) AbortTx() {
 	if p.readOnly {
 		return
@@ -619,14 +679,6 @@ func (p *Pager) SetCommitStep4HookForTest(fn func() error) {
 	p.commitStep4HookForTest = fn
 }
 
-// SetLaggingReaderCallback installs the LaggingReader
-// callback. nil clears. AllocPage / AllocContiguous invoke this when
-// bitmap-exhausted AND reclamation-blocked-by-bound. At most once per
-// AllocPage call.
-func (p *Pager) SetLaggingReaderCallback(cb func(LaggingReaderInfo) LaggingReaderAction) {
-	p.laggingReader = cb
-}
-
 // RPLCorruptCount returns the number of RPL segments quarantined this
 // session due to a decode failure during reclamation (free-space.md
 // §RPL Reclamation). Non-zero means reclamation skipped a corrupt
@@ -634,31 +686,13 @@ func (p *Pager) SetLaggingReaderCallback(cb func(LaggingReaderInfo) LaggingReade
 // /Repair structural walk reclaims them.
 func (p *Pager) RPLCorruptCount() uint64 { return p.rplCorruptCount }
 
-// SetRPLCorruptCallback installs a callback invoked once per RPL
-// segment quarantined during reclamation, with the segment's page id.
-// The root package wires it to its slog logger. nil clears it.
-func (p *Pager) SetRPLCorruptCallback(cb func(segPageID uint64)) {
-	p.rplCorruptCb = cb
-}
-
-// SetReclamationBoundRefresh installs the bound-refresh closure used
-// after LaggingReaderWait. nil clears (no refresh, fall through to
-// file extension). DB.Begin captures coord and supplies a closure
-// that recomputes min(coord.OldestReaderTxnID(), lastCheckpointTxnID)
-// — the same formula as the Begin-time bound; the checkpoint term is
-// load-bearing under SyncLazy (refreshing against prevMeta.TxnID
-// would reclaim segments the last checkpoint's tree references).
-func (p *Pager) SetReclamationBoundRefresh(refresh func() uint64) {
-	p.refreshReclamationBound = refresh
-}
-
 // ReclaimFreeSpace eagerly reclaims every RPL segment now below the
 // reclamation bound, returning their pages to the allocation bitmap, and
-// returns the number of pages reclaimed. It first refreshes the bound IF a
-// refresh hook is wired (SetReclamationBoundRefresh — only with a LaggingReader
-// configured); otherwise it uses the bound seeded at BeginTx
-// (min(oldestReader, lastCheckpointTxnID)), the same gate AllocPage's
-// lazy reclaim uses. Normally reclamation is lazy —
+// returns the number of pages reclaimed. It first refreshes the bound
+// via TxParams.ReclamationBound when one was supplied (production
+// always supplies it; any refresh value is safe by construction — see
+// TxParams.ReclamationBound); without one it uses the seeded bound,
+// the same gate AllocPage's lazy reclaim uses. Normally reclamation is lazy —
 // AllocPage triggers it only when the bitmap is exhausted. Incremental
 // compaction calls this at the start of its transaction so that (a) already-
 // reclaimable free space is available to relocate *into* before the first

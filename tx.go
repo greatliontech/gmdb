@@ -55,7 +55,7 @@ type Tx struct {
 	// applied to the new meta at Commit. nil ⇒ no change this tx. The change
 	// is persisted atomically with the commit and takes effect from the NEXT
 	// transaction (the committed meta carries it; the next Begin's
-	// SetSizeParams reloads the pager from it).
+	// BeginTx(TxParams) reloads the pager from it).
 	pendingFileFormat *pager.MetaFileFormat
 
 	// keyspaceRoot and numKeyspaces track the in-progress state of

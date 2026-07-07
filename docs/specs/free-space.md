@@ -430,14 +430,25 @@ recomputes the free count from the bitmap bits via
 `math/bits.OnesCount64` and reports any discrepancy as
 `CheckWarning`.
 
-### Oldest-reader caching
+### Reclamation-bound derivation points
 
-Scanning the reader table is O(MaxReaders). The writer caches
-(`tx.cachedOldestReader`) and combines with the last-checkpoint
-TxnID to form the reclamation bound. Refreshed lazily — only when
-the bitmap has no free pages and reclamation might unlock more.
-Reading a stale (higher) value is conservative — delays reclamation
-but is never incorrect.
+Scanning the reader table is O(MaxReaders), so the writer derives
+the bound `min(oldestActiveReaderTxnID, lastCheckpointTxnID)` at
+fixed points rather than per allocation: once at write-transaction
+start (seeding the transaction's bound), and re-derived on the two
+paths that want a fresher value — eager reclamation at the start of
+an incremental-compaction transaction, and the lagging-reader Wait
+retry. Every derivation runs under the write grant (the reader-table
+scan's LOCK_EX precondition).
+
+Any re-derived value is safe by construction: it is computed from
+the live reader table, so it never exceeds the true current bound;
+reclamation frees only segments strictly below the bound; and
+already-reclaimed segments have left the in-memory segment list, so
+a transiently lower re-derivation (a reader publishing its slot
+just after taking its meta snapshot can briefly lower the scan)
+only delays reclamation — it can neither un-reclaim nor
+over-reclaim.
 
 ### RPL in-memory segment list
 

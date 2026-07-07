@@ -786,51 +786,27 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	prevMeta := db.currentMeta
 	prevActive := db.activeMetaIdx
 	lastCheckpoint := db.lastCheckpointTxnID
-
-	// We hold flock(LOCK_EX) via the grant, satisfying
-	// reclamationBound's precondition; see its doc for why the bound
-	// uses lastCheckpointTxnID rather than prevMeta.TxnID.
-	bound := reclamationBound(coord, lastCheckpoint)
-	pgr.SetCommitState(prevMeta.HighWaterMark, prevMeta.MaxSize, bound)
-	pgr.SetSizeParams(prevMeta.GrowStep, prevMeta.MinSize)
-	pgr.BeginTx()
-	// Seed currentTxnID at tx-start so the LaggingReader
-	// callback's Lag = currentTxnID - reclamationBound is meaningful
-	// when AllocPage fires from the user path (Keyspace.Put →
-	// btree.Put → pw.AllocPage). Without this, currentTxnID stays
-	// 0 until Tx.AllocPage or Tx.Commit explicitly sets it — and the
-	// public Keyspace ops never go through Tx.AllocPage.
+	// TxnID seeded at tx-start so the LaggingReader callback's
+	// Lag = currentTxnID - reclamationBound is meaningful when
+	// AllocPage fires from the user path (Keyspace.Put → btree.Put →
+	// pw.AllocPage) — the public Keyspace ops never go through
+	// Tx.AllocPage's re-seed.
 	newTxnID := prevMeta.TxnID + 1
-	pgr.SetCurrentTxnID(newTxnID)
 
-	// LaggingReader wiring: pass the user's callback into the pager,
-	// plus a bound-refresh closure that re-derives reclamationBound
-	// after Wait — the SAME formula as the Begin-time bound above,
-	// checkpoint term included (see reclamationBound's doc for the
-	// SyncLazy corruption rationale).
-	//
-	// The wrapper checks coord.OldestReaderTxnID() before invoking
-	// the user callback — when no reader is active, OldestReaderTxnID
-	// returns lock.NoReaderTxnID and the RPL-blocked condition is a checkpoint-
-	// boundary effect (segments retired by prevMeta's commit pinned
-	// by `< bound` strict-inequality), not a lagging-reader case.
-	// Per lock-ordering.md §Lagging Reader Handling, the callback
-	// fires only when "a reader in the reader table is blocking
-	// reclamation." Skip the user callback in the no-reader case and
-	// return Wait so the pager falls through to file extension.
-	// Surface RPL-segment corruption: reclamation quarantines a torn
-	// segment and continues (free-space.md §RPL Reclamation), so the
-	// corruption would otherwise be invisible until an explicit Check().
-	// Log it (db.logger defaults to a discard handler) and DBStats
-	// carries the count for programmatic detection.
-	pgr.SetRPLCorruptCallback(func(segPageID uint64) {
-		db.logger.Warn("gmdb: corrupt RPL segment quarantined during reclamation; "+
-			"its pages leak until Check()/Repair reclaims them",
-			"segPageID", segPageID)
-	})
-
+	// LaggingReader wiring: the wrapper checks
+	// coord.OldestReaderTxnID() before invoking the user callback —
+	// when no reader is active, OldestReaderTxnID returns
+	// lock.NoReaderTxnID and the RPL-blocked condition is a
+	// checkpoint-boundary effect (segments retired by prevMeta's
+	// commit pinned by `< bound` strict-inequality), not a
+	// lagging-reader case. Per lock-ordering.md §Lagging Reader
+	// Handling, the callback fires only when "a reader in the reader
+	// table is blocking reclamation." Skip the user callback in the
+	// no-reader case and return Wait so the pager falls through to
+	// file extension.
+	var lagging func(pager.LaggingReaderInfo) pager.LaggingReaderAction
 	if userCallback := db.opts.LaggingReader; userCallback != nil {
-		pgr.SetLaggingReaderCallback(func(info pager.LaggingReaderInfo) pager.LaggingReaderAction {
+		lagging = func(info pager.LaggingReaderInfo) pager.LaggingReaderAction {
 			if coord.OldestReaderTxnID() == lock.NoReaderTxnID {
 				return pager.LaggingReaderWait
 			}
@@ -848,14 +824,34 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 			default:
 				return pager.LaggingReaderWait
 			}
-		})
-		pgr.SetReclamationBoundRefresh(func() uint64 {
-			return reclamationBound(coord, lastCheckpoint)
-		})
-	} else {
-		pgr.SetLaggingReaderCallback(nil)
-		pgr.SetReclamationBoundRefresh(nil)
+		}
 	}
+
+	// We hold flock(LOCK_EX) via the grant, satisfying
+	// reclamationBound's precondition (BeginTx seeds the bound
+	// synchronously; refreshes fire inside AllocPage, still under the
+	// grant); see reclamationBound's doc for why the bound uses
+	// lastCheckpointTxnID rather than prevMeta.TxnID. The RPLCorrupt
+	// callback surfaces quarantined-segment corruption (free-space.md
+	// §RPL Reclamation) which would otherwise be invisible until an
+	// explicit Check(): log it (db.logger defaults to a discard
+	// handler); DBStats carries the count for programmatic detection.
+	pgr.BeginTx(pager.TxParams{
+		HighWaterMark: prevMeta.HighWaterMark,
+		MaxSize:       prevMeta.MaxSize,
+		GrowStep:      prevMeta.GrowStep,
+		MinSize:       prevMeta.MinSize,
+		TxnID:         newTxnID,
+		ReclamationBound: func() uint64 {
+			return reclamationBound(coord, lastCheckpoint)
+		},
+		RPLCorrupt: func(segPageID uint64) {
+			db.logger.Warn("gmdb: corrupt RPL segment quarantined during reclamation; "+
+				"its pages leak until Check()/Repair reclaims them",
+				"segPageID", segPageID)
+		},
+		LaggingReader: lagging,
+	})
 
 	held := &atomic.Bool{}
 	held.Store(true)

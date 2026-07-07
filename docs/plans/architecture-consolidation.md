@@ -28,7 +28,7 @@ gate) and the final close-out are fixed anchors per chunk.
   `lastCheckpointTxnID` triple (6 update sites) and one bound helper
   owning `min(oldestReaderTxnID, lastCheckpointTxnID)` plus the
   no-reader sentinel (`db.go:809,853–875`, `check.go:174`).
-- [ ] 4. Collapse the pager write-tx seeding ritual into
+- [x] 4. Collapse the pager write-tx seeding ritual into
   `BeginTx(TxParams)` (today 7 order-dependent setters,
   `db.go:810–879`); inject the reclamation-bound source as a
   dependency, retiring `SetReclamationBoundRefresh`.

@@ -43,17 +43,29 @@ func setupBlockedReclamationWriter(t *testing.T) (*Pager, *bitmap.Bitmap) {
 	t.Cleanup(func() { p.Close() })
 	bm := bitmap.New(make([]byte, testPageSize), testPageSize, 1, 32)
 	p.AttachBitmap(bm)
-	// HWM at maxSizePages so file extension is also blocked.
-	p.SetCommitState(32, 32, 50)
 	p.SetRPLChain([]RPLSegmentRef{{PageID: 10, TxnID: 100, Count: 1}})
-	p.SetCurrentTxnID(101) // for Lag computation
 	return p, bm
+}
+
+// blockedTxParams is the seeding every blocked-reclamation test starts
+// from: HWM at maxSizePages so file extension is also blocked, bound 50
+// pinning the TxnID-100 segment, TxnID 101 for Lag computation. Tests
+// add their LaggingReader callback (and adjust the bound source) before
+// BeginTx.
+func blockedTxParams() TxParams {
+	return TxParams{
+		HighWaterMark:    32,
+		MaxSize:          32,
+		TxnID:            101,
+		ReclamationBound: func() uint64 { return 50 },
+	}
 }
 
 func TestAllocPageLaggingReaderAbortReturnsErrDBFull(t *testing.T) {
 	p, _ := setupBlockedReclamationWriter(t)
 	calls := 0
-	p.SetLaggingReaderCallback(func(info LaggingReaderInfo) LaggingReaderAction {
+	params := blockedTxParams()
+	params.LaggingReader = func(info LaggingReaderInfo) LaggingReaderAction {
 		calls++
 		if info.TxnID != 50 {
 			t.Errorf("info.TxnID = %d, want 50 (the reclamationBound)", info.TxnID)
@@ -62,7 +74,8 @@ func TestAllocPageLaggingReaderAbortReturnsErrDBFull(t *testing.T) {
 			t.Errorf("info.Lag = %d, want 51 (currentTxnID - bound)", info.Lag)
 		}
 		return LaggingReaderAbort
-	})
+	}
+	p.BeginTx(params)
 
 	_, err := p.AllocPage()
 	if !errors.Is(err, ErrDBFull) {
@@ -73,20 +86,23 @@ func TestAllocPageLaggingReaderAbortReturnsErrDBFull(t *testing.T) {
 	}
 }
 
-func TestAllocPageLaggingReaderWaitNoRefreshFallsThroughToErrDBFull(t *testing.T) {
+func TestAllocPageLaggingReaderWaitBoundUnchangedFallsThroughToErrDBFull(t *testing.T) {
 	p, _ := setupBlockedReclamationWriter(t)
 	calls := 0
-	p.SetLaggingReaderCallback(func(info LaggingReaderInfo) LaggingReaderAction {
+	params := blockedTxParams()
+	params.LaggingReader = func(info LaggingReaderInfo) LaggingReaderAction {
 		calls++
 		return LaggingReaderWait
-	})
-	// No refresh closure — Wait falls through to file extension,
+	}
+	// The bound source keeps returning 50 (the lagging reader has not
+	// advanced) — Wait's refresh re-derives the same bound, reclamation
+	// stays blocked, and allocation falls through to file extension,
 	// which is blocked (HWM at maxSizePages) → ErrDBFull.
-	p.SetReclamationBoundRefresh(nil)
+	p.BeginTx(params)
 
 	_, err := p.AllocPage()
 	if !errors.Is(err, ErrDBFull) {
-		t.Errorf("AllocPage with Wait + no-refresh: got %v, want ErrDBFull", err)
+		t.Errorf("AllocPage with Wait + unchanged bound: got %v, want ErrDBFull", err)
 	}
 	if calls != 1 {
 		t.Errorf("callback invoked %d times, want exactly 1 (at-most-once-per-AllocPage)", calls)
@@ -96,13 +112,18 @@ func TestAllocPageLaggingReaderWaitNoRefreshFallsThroughToErrDBFull(t *testing.T
 func TestAllocPageLaggingReaderWaitRefreshSucceeds(t *testing.T) {
 	p, _ := setupBlockedReclamationWriter(t)
 	calls := 0
-	p.SetLaggingReaderCallback(func(info LaggingReaderInfo) LaggingReaderAction {
+	params := blockedTxParams()
+	params.LaggingReader = func(info LaggingReaderInfo) LaggingReaderAction {
 		calls++
 		return LaggingReaderWait
-	})
-	// Refresh closure: the "reader" has now advanced past TxnID 100,
-	// so the bound moves up and the RPL becomes reclaimable.
-	p.SetReclamationBoundRefresh(func() uint64 { return 200 })
+	}
+	// The bound source seeds 50 at BeginTx; by the time Wait's refresh
+	// re-derives it, the "reader" has advanced past TxnID 100, so the
+	// bound moves up and the RPL becomes reclaimable.
+	bound := uint64(50)
+	params.ReclamationBound = func() uint64 { return bound }
+	p.BeginTx(params)
+	bound = 200
 
 	id, err := p.AllocPage()
 	if err != nil {

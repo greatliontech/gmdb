@@ -437,7 +437,7 @@ func (p *Pager) attachState(file *os.File, m page.Meta) error {
 	p.AttachBitmap(bm)
 	p.SetRPLChain(chain)
 	p.SetCommitState(m.HighWaterMark, m.MaxSize, m.TxnID)
-	p.SetSizeParams(m.GrowStep, m.MinSize)
+	p.setSizeParams(m.GrowStep, m.MinSize)
 	return nil
 }
 

@@ -616,10 +616,16 @@ func TestReclaimRPLQuarantinesCorruptSegment(t *testing.T) {
 		{PageID: corruptPageID, TxnID: corruptTxnID, Count: 1},
 		{PageID: validPageID, TxnID: validTxnID, Count: 1},
 	})
-	p.SetCommitState(22, 32, validTxnID+1) // bound past both → both eligible; HWM 22 covers pages 10..21
 
 	var cbFired []uint64
-	p.SetRPLCorruptCallback(func(seg uint64) { cbFired = append(cbFired, seg) })
+	p.BeginTx(TxParams{
+		// Bound past both segments → both eligible; HWM 22 covers
+		// pages 10..21.
+		HighWaterMark:    22,
+		MaxSize:          32,
+		ReclamationBound: func() uint64 { return validTxnID + 1 },
+		RPLCorrupt:       func(seg uint64) { cbFired = append(cbFired, seg) },
+	})
 
 	count := p.reclaimRPL()
 
