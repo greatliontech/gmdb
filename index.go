@@ -135,10 +135,10 @@ func (idx *IndexHandle) Stats() (IndexStats, error) {
 	if idx.dead {
 		return IndexStats{}, idx.indexNotFoundError()
 	}
-	tx := idx.coreTx()
-	if err := tx.requireOpen(false); err != nil {
+	if err := idx.requireLive(); err != nil {
 		return IndexStats{}, err
 	}
+	tx := idx.coreTx()
 	pr := tx.pgr
 	cfg := pr.Config()
 	ts, err := walkTreePageStats(pr, cfg, idx.pinned.root, tx.statsHWM())
@@ -182,10 +182,29 @@ func (idx *IndexHandle) keyspaceDead() bool {
 	return false
 }
 
+// requireLive surfaces the owning-transaction state guard shared by
+// every query surface (Stats + the Lookup / LookupKeys / Range /
+// Prefix iter closures + Get) and by the bare Err() poll. Once the
+// owning tx is closed the handle
+// must stop serving: for a handle obtained from a child tx's own
+// OpenKeyspace this fires the instant the child Commits or Rolls back
+// (the BeginChild contract in nested.go — every child handle errors
+// ErrTxClosed once the child ends), before the closure would otherwise
+// serve stale rows (post-commit) or descend savepoint-reverted pages
+// (post-rollback). It also carries requireOpen's parent-freeze
+// (ErrChildActive) and use-after-Close (ErrClosed) guards uniformly.
+// Callers run it AFTER the keyspaceDead / dead-handle checks so the
+// more specific ErrKeyspaceClosed / ErrIndexNotFound sentinels win.
+func (idx *IndexHandle) requireLive() error {
+	return idx.coreTx().requireOpen(false)
+}
+
 // Err returns the broader handle-invalid sentinel if the parent
 // keyspace was DeleteKeyspace'd (Inv-IHS3 — ErrKeyspaceClosed wins
 // over the sticky iter cause because re-position-to-recover is
-// impossible when the parent is gone), otherwise the first error
+// impossible when the parent is gone), then the owning-transaction
+// state sentinel (Inv-IHS4 — ErrTxClosed / ErrChildActive, likewise
+// unrecoverable by re-iterating), otherwise the first error
 // encountered during the last sequence returned by Lookup / Range
 // / Prefix / LookupKeys (Inv-IHS1 sticky cause), otherwise the
 // post-Drop dead-handle sentinel (Inv-IHS2 wrap), otherwise nil.
@@ -197,11 +216,19 @@ func (idx *IndexHandle) keyspaceDead() bool {
 //     polling Err() to ask "is the handle still usable?" sees the
 //     broadest truth, not a stale Inv-IHS1 cause from a prior
 //     bad-cols Lookup.
-//  2. idx.err sticky (Inv-IHS1 contract). On a
+//  2. requireLive → ErrTxClosed / ErrChildActive (Inv-IHS4). A
+//     closed owning tx (including a child's own handle after the
+//     child ends) or a parent frozen by an active child is a
+//     broader truth than a sticky iter cause — re-iterating cannot
+//     recover it — so it wins over idx.err on a bare Err() poll,
+//     keeping Err() symmetric with the query surfaces. Returns nil
+//     for a live, unfrozen tx, so the sticky/dead cases below are
+//     unaffected in the common path.
+//  3. idx.err sticky (Inv-IHS1 contract). On a
 //     live keyspace, a mid-iter Drop or sibling-mutation stamps
 //     idx.err = ErrCursorStale via mapCursorErr; Err() reports
 //     that ErrCursorStale until the next iter call resets it.
-//  3. idx.dead → wrapped ErrIndexNotFound. Bare-Err on a Dropped
+//  4. idx.dead → wrapped ErrIndexNotFound. Bare-Err on a Dropped
 //     handle (no intervening iter) reports the dead-handle
 //     sentinel even with no sticky idx.err.
 //
@@ -213,6 +240,9 @@ func (idx *IndexHandle) keyspaceDead() bool {
 func (idx *IndexHandle) Err() error {
 	if idx.keyspaceDead() {
 		return ErrKeyspaceClosed
+	}
+	if err := idx.requireLive(); err != nil {
+		return err
 	}
 	if idx.err != nil {
 		return idx.err
@@ -511,6 +541,12 @@ func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 			idx.err = idx.indexNotFoundError()
 			return
 		}
+		// Owning-tx state guard (mirrors Stats): a handle from a child's
+		// own OpenKeyspace must error ErrTxClosed once the child ends.
+		if err := idx.requireLive(); err != nil {
+			idx.err = err
+			return
+		}
 		if got, want := len(cols), len(idx.pinned.decl.Columns); got != want {
 			idx.err = fmt.Errorf("gmdb: index %q Lookup: got %d cols, want %d (exact match on all declared columns): %w",
 				idx.pinned.decl.Name, got, want, ErrInvalidOptions)
@@ -655,6 +691,12 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 			idx.err = idx.indexNotFoundError()
 			return
 		}
+		// Owning-tx state guard (mirrors Stats): a handle from a child's
+		// own OpenKeyspace must error ErrTxClosed once the child ends.
+		if err := idx.requireLive(); err != nil {
+			idx.err = err
+			return
+		}
 		// Chunk-7.9 Round-1 H-1: LookupKeys on a SetKeyspace index
 		// has no well-defined iter.Seq[[]byte] surface — the "PK"
 		// is a compound (setKey, setValue) pair per set-keyspace.md
@@ -756,6 +798,12 @@ func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 			idx.err = idx.indexNotFoundError()
 			return
 		}
+		// Owning-tx state guard (mirrors Stats): a handle from a child's
+		// own OpenKeyspace must error ErrTxClosed once the child ends.
+		if err := idx.requireLive(); err != nil {
+			idx.err = err
+			return
+		}
 		// Tuple-arity validation (matches Lookup / LookupKeys /
 		// Prefix): a bound with more columns than the index declares
 		// can never match its encoding and would silently yield an
@@ -838,6 +886,12 @@ func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] 
 			idx.err = idx.indexNotFoundError()
 			return
 		}
+		// Owning-tx state guard (mirrors Stats): a handle from a child's
+		// own OpenKeyspace must error ErrTxClosed once the child ends.
+		if err := idx.requireLive(); err != nil {
+			idx.err = err
+			return
+		}
 		if got, want := len(leadingCols), len(idx.pinned.decl.Columns); got > want {
 			idx.err = fmt.Errorf("gmdb: index %q Prefix: got %d cols, want <= %d (leading-cols prefix): %w",
 				idx.pinned.decl.Name, got, want, ErrInvalidOptions)
@@ -872,6 +926,11 @@ func (idx *IndexHandle) Get(cols ...[]byte) (pk, value []byte, err error) {
 	// so it returns the error directly rather than via idx.err.
 	if idx.dead {
 		return nil, nil, idx.indexNotFoundError()
+	}
+	// Owning-tx state guard (mirrors Stats): a handle from a child's
+	// own OpenKeyspace must error ErrTxClosed once the child ends.
+	if err := idx.requireLive(); err != nil {
+		return nil, nil, err
 	}
 	if !idx.pinned.decl.Unique {
 		return nil, nil, ErrIndexNotUnique

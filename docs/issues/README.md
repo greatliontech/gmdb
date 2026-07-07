@@ -67,7 +67,6 @@ findings each shared-fix row covers.
 | [rpl-head-exemption-reclaimed](rpl-head-exemption-reclaimed.md) | condition (recovery-model redesign or head-convention revisit) | **[M]** rebuildRPLChain hard-fails Open on a bad head, but RPLHeadPage carries forward across no-retire commits, so an older checkpoint's head can be legitimately reclaimed+reused — recovery after a crash-mid-commit becomes unopenable. Chunk-4 review finding. |
 | [dbcleanup-teardown-drain](dbcleanup-teardown-drain.md) | condition (AddCleanup execution model revisit) | **[L]** dbCleanupFn tears down coord/lockFile without the txInflight drain Close performs — safe only while the runtime runs cleanups sequentially. Chunk-11 review finding. |
 | [pagechecksum-default-drift](pagechecksum-default-drift.md) | condition (Options breaking-change window) | **[M]** checksums.md + godoc promise PageChecksum default-on; applyDefaults never sets the plain bool, so the effective default is off — spec-promised bitrot detection silently absent. Chunk-15 review finding. |
-| [child-index-handle-outlives-child](child-index-handle-outlives-child.md) | condition (iter-closure requireOpen guard) | **[M]** A child-created IndexHandle keeps serving lookups after child Commit (Err nil) and descends savepoint-reverted pages after child Rollback — iter closures lack the requireOpen probe Stats has. Chunk-18 review finding, reviewer-reproduced. |
 
 ## Open — full-codebase audit (2026-07-04)
 

@@ -565,7 +565,7 @@ An `*IndexHandle` handle returned by `ks.Index(name)` is bound to the
 parent keyspace for the lifetime of the transaction. Mutations
 that replace or free the index's data tree pages within the same
 transaction invalidate in-flight observers tied to that handle.
-Three distinct invalidation conditions, each with its canonical
+Four distinct invalidation conditions, each with its canonical
 sentinel — identical to the row-cursor contract that
 `transactions.md §Cursor State Machine` defines:
 
@@ -633,7 +633,31 @@ sentinel — identical to the row-cursor contract that
   `ErrCursorStale` — the "re-position to recover" semantic of
   `ErrCursorStale` does not apply when the parent is gone).
 
-Three invariants pin this contract:
+- **`ErrTxClosed` / `ErrChildActive` (owning transaction not open).**
+  Every query surface — `Lookup` / `LookupKeys` / `Range` / `Prefix`
+  / `Get` / `Stats` — probes the owning transaction's state
+  (`requireOpen`) after the dead-keyspace and dead-handle checks, and
+  the bare `Err()` poll probes it right after its dead-keyspace check
+  (before the sticky Inv-IHS1 cause — an unrecoverable lifecycle fact
+  wins over a re-iterable one). A handle whose transaction has closed
+  rejects with `ErrTxClosed`; a handle whose transaction is frozen by
+  an active child (the parent-freeze of `transactions.md §Nested
+  Transactions`) rejects with `ErrChildActive`. This is the general
+  handle-lifetime contract applied to `*IndexHandle`, and it covers a
+  handle obtained from a child transaction's OWN `OpenKeyspace`: once
+  the child commits or rolls back, the handle errors `ErrTxClosed`,
+  honoring the `transactions.md §Nested Transactions` **Handle
+  lifetime** clause ("every child handle returns `ErrTxClosed` once
+  the child commits or rolls back"). The post-rollback case is
+  load-bearing — the child's savepoint-reverted index pages must never
+  be descended: a freed page that re-parses as a leaf yields silently
+  wrong data, one that parses as a non-leaf yields `ErrCorrupted`. The
+  probe runs AFTER the dead-keyspace / dead-handle checks so the more
+  specific `ErrKeyspaceClosed` / `ErrIndexNotFound` sentinels win when
+  both apply.
+
+Five invariants pin this contract (Inv-IHS4 / Inv-IHS5 below the
+enforcement note):
 
 - **Inv-IHS1 (cursor-on-stale-tree).** A `*btree.Cursor` opened by
   an `*IndexHandle` iter closure is `MarkStale`'d (and its tracked rootID
@@ -704,6 +728,36 @@ section).
   merges; pinned by TestIndexHandleSeesChildCommit /
   TestIndexHandleDeadAfterChildDrop /
   TestSetIndexHandleSeesChildCommit.)
+
+- **Inv-IHS5 (owning-tx not open).** Every `*IndexHandle` query
+  surface (`Lookup` / `LookupKeys` / `Range` / `Prefix` / `Get` /
+  `Stats`) and the bare `Err()` poll reject with `ErrTxClosed` once
+  the owning transaction has closed, and with `ErrChildActive` while
+  the owning transaction is frozen by an active child. The
+  load-bearing case: a handle obtained from a child transaction's own
+  `OpenKeyspace` errors `ErrTxClosed` the instant the child commits or
+  rolls back — never serving the child's now-merged rows (post-commit)
+  and never descending its savepoint-reverted index pages
+  (post-rollback). Ordering differs by surface: the six query
+  surfaces probe AFTER both the Inv-IHS3 keyspace-dead and the
+  Inv-IHS2 dead-handle checks, so `ErrKeyspaceClosed` /
+  `ErrIndexNotFound` win when they apply; the bare `Err()` poll probes
+  after the keyspace-dead check but BEFORE the dead-handle check — its
+  documented broadest-truth-first ordering, where an unrecoverable
+  lifecycle fact wins over the re-`Index`-recoverable dead-handle
+  sentinel (extending the Inv-IHS2 Err-vs-`Stats` residual asymmetry).
+  So a handle Dropped inside a child and then observed after the child
+  resolves reports `ErrIndexNotFound` from `Stats` but `ErrTxClosed`
+  from a bare `Err()` — each correct for its surface.
+  Violation: a child-created handle's `Lookup` keeps yielding rows
+  with `Err() == nil` after `child.Commit()`, or descends
+  `FreeSubtree`'d pages after `child.Rollback()` (`ErrCorrupted`, or
+  silently wrong data if a freed page re-parses as a valid leaf).
+  (Enforced by TestChildIndexHandleErrsAfterChildCommit /
+  TestChildIndexHandleErrsAfterChildRollback — every surface plus the
+  bare `Err()` poll reports `ErrTxClosed` — and
+  TestParentIndexHandleFrozenByActiveChild for the `ErrChildActive`
+  arm.)
 
 ## Write Path: Atomic Index Maintenance
 

@@ -390,11 +390,15 @@ invalidates the parent's handle.
   touched lives at a fresh page ID, with a fresh slab buffer;
   dropping the buffer drops the modification.
 
-**Handle lifetime.** Keyspace / SetKeyspace / Cursor handles opened
-on a child are valid only for the child's lifetime — every child
-handle returns `ErrTxClosed` once the child commits or rolls back.
-After a child commits, a caller continues through a handle opened on
-the parent (re-opening by name if the parent never had it open).
+**Handle lifetime.** Keyspace / SetKeyspace / Cursor / IndexHandle
+handles opened on a child are valid only for the child's lifetime —
+every child handle returns `ErrTxClosed` once the child commits or
+rolls back. For `*IndexHandle` this is enforced on every query surface
+by the `requireOpen` probe (`indexing.md §Handle Invalidation`); the
+post-rollback case is load-bearing because the child's
+savepoint-reverted index pages must never be descended. After a child
+commits, a caller continues through a handle opened on the parent
+(re-opening by name if the parent never had it open).
 
 **Nesting depth.** Children can create their own children
 (arbitrary nesting). Each level captures its own savepoint.
