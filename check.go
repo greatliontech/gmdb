@@ -384,7 +384,7 @@ func (c *checker) run() {
 	}
 
 	// RPL chain → set of pages pending reclamation.
-	rplPages, ok := c.walkRPL(hwm)
+	rplPages, ok := c.walkRPL(firstData, hwm)
 	if !ok {
 		return
 	}
@@ -668,109 +668,96 @@ func (c *checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 		Message: fmt.Sprintf("tree walk from root %d: %v", root, err)})
 }
 
-// walkRPL walks the snapshot's RPL chain head→tail, decoding each
-// segment, detecting cycles, and returning the set of pages pending
-// reclamation (the segment pages themselves + every entry they list).
+// walkRPL walks the snapshot's RPL chain head→tail through the shared
+// pager.RPLChainWalk convention (the same implementation the Open-time
+// rebuild uses — free-space.md §RPL requires the two consumers to
+// agree), returning the set of pages pending reclamation (the segment
+// pages themselves + every entry they list). Truncation boundaries
+// (stale tail on a non-latest meta) end the walk silently except the
+// checksum boundary, which warns: a checksum-bad-but-decodable segment
+// would otherwise pass Check clean while reclamation quarantines it.
+// Hard walk errors surface as per-kind CheckError issues. firstData is
+// run()'s first-data-page boundary (the meta/bitmap region ends there).
 // Returns ok=false only when the caller stopped iterating.
-func (c *checker) walkRPL(hwm uint64) (bitset, bool) {
+func (c *checker) walkRPL(firstData, hwm uint64) (bitset, bool) {
 	pending := newBitset(hwm)
 	head := c.meta.RPLHeadPage
 	if head == 0 {
 		return pending, true
 	}
-	// Bound the walk by the authoritative RPLTailPage, NOT by OlderSegment==0:
-	// reclaimRPL drains tail segments without rewriting the new tail's
-	// OlderSegment, which then dangles at a reclaimed/reused page. RPLTailPage
-	// is recomputed on every commit, so it is the correct terminator; a head
-	// with a zero tail is corrupt meta.
-	tail := c.meta.RPLTailPage
-	if tail == 0 {
-		return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLTailMissing", PageID: head,
-			Message: fmt.Sprintf("RPL head %d set but tail page is 0", head)})
-	}
-	// Recovery may select a NON-latest meta (an older checkpoint, durability.md
-	// §Recovery) whose RPLTailPage is stale: reclamation advanced the live
-	// meta's tail and freed those segment pages without rewriting this older
-	// meta (the Open-time rebuild truncates the in-memory chain but does not
-	// persist a corrected meta until the next commit). So this snapshot's
-	// RPLHeadPage→…→tail walk can run into a reclaimed-and-reused segment page.
-	// Stop at the first reclaimed segment — free in the bitmap (set bit), or a
-	// non-head page that no longer decodes — mirroring the Open-time rebuild
-	// (free-space.md §RPL; internal/pager/init.go rebuildRPLChain). bm is the
-	// snapshot's allocation bitmap; if unavailable we fall back to the
-	// decode-failure boundary alone.
+	// bm is the snapshot's allocation bitmap — the reclaimed-segment
+	// oracle; if unavailable the walk falls back to the footer/decode
+	// boundary alone.
 	bm, bmOK := c.snapshotBitmap()
-	maxSegs := c.meta.RPLEntryCount + 1
-	visited := make(map[uint64]struct{})
-	var segs uint64
-	id := head
-	for {
-		if id >= hwm {
-			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentOutOfRange", PageID: id,
-				Message: fmt.Sprintf("RPL segment page %d >= HighWaterMark %d", id, hwm)})
-		}
-		if _, seen := visited[id]; seen {
-			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLChainCycle", PageID: id,
-				Message: fmt.Sprintf("RPL chain cycle at segment page %d", id)})
-		}
-		if segs > maxSegs {
-			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLChainTooLong", PageID: id,
-				Message: fmt.Sprintf("RPL chain exceeds entry-count bound %d (likely cycle)", maxSegs)})
-		}
-		// Reclaimed-segment boundary (see the bm comment above): a non-head
-		// segment page that is free in the bitmap was reclaimed from a stale
-		// tail — stop here. Never the head: the recovery target's own newest
-		// segment is never reclaimed (the reclamation bound never reaches the
-		// last checkpoint's own TxnID).
-		if id != head && bmOK && bm.IsSet(id) {
-			break
-		}
-		visited[id] = struct{}{}
-		segBuf := c.pgr.PageRaw(id)
-		// Footer verification before decode (checksums.md §Verification
-		// — RPL segments are read via the raw accessor here, like the
-		// pager's own walkers): a checksum-bad-but-decodable segment
-		// would otherwise pass Check clean while reclamation
-		// quarantines it, and its flipped entries would taint the
-		// pending accounting set. Head-vs-non-head mirrors the decode
-		// branch below.
-		if c.cfg.PageChecksum && !page.VerifyPageFooter(segBuf, c.cfg.PageSize) {
-			if id == head {
-				return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentChecksum", PageID: id,
-					Message: fmt.Sprintf("RPL head segment page %d fails checksum", id)})
+	walk := pager.RPLChainWalk{
+		ReadPage:   c.pgr.PageRaw,
+		Cfg:        c.cfg,
+		Head:       head,
+		Tail:       c.meta.RPLTailPage,
+		EntryCount: c.meta.RPLEntryCount,
+		LowBound:   firstData,
+		HighBound:  hwm,
+		IsFree: func(id uint64) (bool, bool) {
+			if !bmOK {
+				return false, false
 			}
-			if !c.emit(CheckIssue{Severity: CheckWarning, Code: "RPLSegmentChecksum", PageID: id,
-				Message: fmt.Sprintf("RPL segment page %d fails checksum; chain walk stopped before tail %d (pages behind the boundary surface as BitmapLeak until reclamation quarantines the segment)", id, tail)}) {
-				return pending, false
-			}
-			break
-		}
-		seg, ok := page.DecodeRPLSegment(segBuf, c.cfg)
-		if !ok {
-			if id == head {
-				return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLSegmentMalformed", PageID: id,
-					Message: fmt.Sprintf("RPL head segment page %d malformed", id)})
-			}
-			// Reclaimed-then-reused segment page (now non-segment data): the
-			// same stale-tail boundary as the bitmap check above.
-			break
-		}
+			return bm.IsSet(id), true
+		},
+	}
+	stop, werr := walk.Walk(func(id uint64, seg page.RPLSegment) bool {
 		pending.setIfInRange(id)
 		for _, pid := range seg.PageIDs {
 			pending.setIfInRange(pid)
 		}
-		segs++
-		if id == tail {
-			break // authoritative tail — do not follow the (possibly dangling) OlderSegment
+		return true
+	})
+	if werr != nil {
+		return pending, c.emit(rplWalkIssue(werr, hwm))
+	}
+	if stop.Reason == pager.RPLWalkFooterBoundary {
+		if !c.emit(CheckIssue{Severity: CheckWarning, Code: "RPLSegmentChecksum", PageID: stop.PageID,
+			Message: fmt.Sprintf("RPL segment page %d fails checksum; chain walk stopped before tail %d (pages behind the boundary surface as BitmapLeak until reclamation quarantines the segment)", stop.PageID, c.meta.RPLTailPage)}) {
+			return pending, false
 		}
-		next := seg.OlderSegment
-		if next == 0 {
-			return pending, c.emit(CheckIssue{Severity: CheckError, Code: "RPLChainEndedBeforeTail", PageID: id,
-				Message: fmt.Sprintf("RPL chain from head %d ended before tail %d", head, tail)})
-		}
-		id = next
 	}
 	return pending, true
+}
+
+// rplWalkIssue maps a hard chain-walk failure to Check's stable issue
+// codes. hwm is walkRPL's walk bound (the clamped HighWaterMark), named
+// in the out-of-range message.
+func rplWalkIssue(werr *pager.RPLWalkError, hwm uint64) CheckIssue {
+	iss := CheckIssue{Severity: CheckError, PageID: werr.PageID}
+	switch werr.Kind {
+	case pager.RPLWalkErrTailMissing:
+		iss.Code = "RPLTailMissing"
+		iss.Message = fmt.Sprintf("RPL head %d set but tail page is 0", werr.Head)
+	case pager.RPLWalkErrSegmentOutOfRange:
+		iss.Code = "RPLSegmentOutOfRange"
+		iss.Message = fmt.Sprintf("RPL segment page %d >= HighWaterMark %d", werr.PageID, hwm)
+	case pager.RPLWalkErrSegmentInMetaRegion:
+		iss.Code = "RPLSegmentInMetaRegion"
+		iss.Message = fmt.Sprintf("RPL segment page %d inside the meta/bitmap region (first data page %d)", werr.PageID, werr.Bound)
+	case pager.RPLWalkErrChainCycle:
+		iss.Code = "RPLChainCycle"
+		iss.Message = fmt.Sprintf("RPL chain cycle at segment page %d", werr.PageID)
+	case pager.RPLWalkErrChainTooLong:
+		iss.Code = "RPLChainTooLong"
+		iss.Message = fmt.Sprintf("RPL chain exceeds entry-count bound %d (likely cycle)", werr.Bound)
+	case pager.RPLWalkErrHeadChecksum:
+		iss.Code = "RPLSegmentChecksum"
+		iss.Message = fmt.Sprintf("RPL head segment page %d fails checksum", werr.PageID)
+	case pager.RPLWalkErrHeadMalformed:
+		iss.Code = "RPLSegmentMalformed"
+		iss.Message = fmt.Sprintf("RPL head segment page %d malformed", werr.PageID)
+	case pager.RPLWalkErrEndedBeforeTail:
+		iss.Code = "RPLChainEndedBeforeTail"
+		iss.Message = fmt.Sprintf("RPL chain from head %d ended before tail %d", werr.Head, werr.Tail)
+	default:
+		iss.Code = "RPLChainWalkFailed"
+		iss.Message = werr.Error()
+	}
+	return iss
 }
 
 // accounting compares the reachable + RPL-pending sets against the

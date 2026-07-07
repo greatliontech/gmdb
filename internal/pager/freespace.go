@@ -450,17 +450,18 @@ func (p *Pager) FreeLeakedPage(id uint64) error {
 // reclaims whole segments whose TxnID < reclamationBound. For each
 // reclaimed segment:
 //
-//  1. Verify the segment page's checksum footer (when PageChecksum is
-//     on — checksums.md covers RPL segments like every data page and
-//     this walker reads via pageRaw, which does NOT verify), then
-//     decode it, then bound every listed PageID against the bitmap's
-//     allocatable range (a decodable segment with a bit-flipped or
-//     forged entry would otherwise free a live tree page in-range, or
-//     panic in Bitmap.Set out-of-range — a crash on corrupt input,
-//     against integrity.md's error-not-crash contract). Any of the
-//     three failing quarantines the segment (below). In-range WRONG
-//     ids on a checksums-off database are inherently undetectable
-//     here — that is the trade the PageChecksum option states.
+//  1. Read the segment page via the shared per-segment convention
+//     (readRPLSegment: checksum-footer verification before decode —
+//     checksums.md covers RPL segments like every data page and this
+//     walker reads via pageRaw, which does NOT verify), then bound
+//     every listed PageID against the bitmap's allocatable range (a
+//     decodable segment with a bit-flipped or forged entry would
+//     otherwise free a live tree page in-range, or panic in Bitmap.Set
+//     out-of-range — a crash on corrupt input, against integrity.md's
+//     error-not-crash contract). Any of the three failing quarantines
+//     the segment (below). In-range WRONG ids on a checksums-off
+//     database are inherently undetectable here — that is the trade
+//     the PageChecksum option states.
 //  2. Set bitmap bits for every PageID entry in the segment.
 //  3. Set the bitmap bit for the segment page itself.
 //  4. Pop the segment from the in-memory list and update the LIFO hint
@@ -482,11 +483,7 @@ func (p *Pager) reclaimRPL() int {
 		// geometry shifted firstDataPage under the persisted chain.
 		ok := seg.PageID >= p.bitmap.FirstDataPage() && seg.PageID < p.bitmap.TotalPages()
 		if ok {
-			buf := p.pageRaw(seg.PageID)
-			ok = !p.cfg.PageChecksum || page.VerifyPageFooter(buf, p.cfg.PageSize)
-			if ok {
-				decoded, ok = page.DecodeRPLSegment(buf, p.cfg)
-			}
+			decoded, _, ok = readRPLSegment(p.pageRaw, p.cfg, seg.PageID)
 		}
 		if ok {
 			// Whole-segment validation BEFORE any Set — quarantine

@@ -8,12 +8,14 @@ gate) and the final close-out are fixed anchors per chunk.
 
 ## Phase A — commit/recovery/RPL groundwork (behavior-preserving)
 
-- [ ] 1. Unify the three RPL chain walkers — `rebuildRPLChain`
-  (`internal/pager/init.go:656`), `reclaimRPL`
-  (`internal/pager/freespace.go:472`), `checker.walkRPL`
-  (`check.go:675`) — behind one pager-owned segment walker carrying
-  the shared tail-terminated / footer-verify / reclaimed-boundary /
-  head-exemption policy; root Check consumes the pager walker.
+- [x] 1. Unify the RPL chain walkers: one pager-owned on-disk chain
+  walker carrying the shared tail-terminated / reclaimed-boundary /
+  head-exemption policy, consumed by `rebuildRPLChain`
+  (`internal/pager/init.go:656`) and `checker.walkRPL`
+  (`check.go:675`), plus a shared segment read/validate
+  (footer-verify + decode) primitive also consumed by `reclaimRPL`
+  (`internal/pager/freespace.go:472`), which walks the in-memory
+  list per the spec.
 - [ ] 2. Collapse meta selection to one seam: deduplicate the
   tie-break cascade in `page.ActiveMeta` /
   `page.ActiveMetaCheckpointPreferring` (`internal/page/meta.go:195,

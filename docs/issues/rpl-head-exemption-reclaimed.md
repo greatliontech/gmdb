@@ -1,8 +1,13 @@
 # The RPL chain rebuild's head exemption is unsound for carried-forward heads — crash-mid-commit recovery can permanently fail to open
 
-**Lands:** condition — with the recovery-model redesign
-(`recovery-model-highest-epoch`), or when the RPL chain-walk
-head-vs-non-head convention is next revisited.
+**Lands:** chunk 7 of `docs/plans/architecture-consolidation.md` — the
+recovery-model design chunk dispositions this issue (the redesign may
+retire the non-latest-meta recovery shape that makes it reachable, or
+the head convention is fixed there). Redeferred at the
+walker-unification chunk, which collapsed the three RPL walkers into
+one implementation (`internal/pager/rplwalk.go`) while deliberately
+preserving the head-exemption convention verbatim; the fix is now a
+one-point policy change.
 
 **Severity:** [M] — a database that crashes at the wrong moment
 becomes unopenable (hard error at Open), no data corruption. The
@@ -36,8 +41,9 @@ Sequence: segment S (Txn 90) → no-retire commits → checkpoint A
 reuses S's page → crash before the next meta publish → recovery
 selects A → the head exemption forces reading S → Open permanently
 fails (checksum error if torn, ErrCorrupted if cleanly rewritten as a
-non-segment page). The same premise appears in the Check RPL walker's
-comments (`check.go` walkRPL).
+non-segment page). Since the walker unification the premise lives in
+exactly one place: the head-exemption branch of
+`internal/pager/rplwalk.go` (shared by the Open rebuild and Check).
 
 ## Fix direction
 

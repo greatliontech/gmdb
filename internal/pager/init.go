@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
@@ -640,13 +641,11 @@ func isVersionMismatchMeta(buf []byte) bool {
 	return m.Magic == page.Magic && m.Version != page.FormatVersion
 }
 
-// rebuildRPLChain walks the on-disk RPL chain head → tail via
-// OlderSegment links, then reverses the result so index 0 is tail
-// (oldest). Defense in depth: refuses to walk a self-referential
-// segment (OlderSegment == own page ID) and bounds the walk by the
-// meta's RPLEntryCount divided by the minimum entries-per-segment
-// (with slack) to catch chain cycles or wild OlderSegment pointers
-// before they cause an infinite loop.
+// rebuildRPLChain walks the on-disk RPL chain head → tail through the
+// shared RPLChainWalk convention (rplwalk.go), then reverses the result
+// so index 0 is tail (oldest). Truncation boundaries (stale tail on a
+// non-latest meta) yield a shorter chain; hard walk errors surface as
+// ErrCorrupted / ErrBadPageChecksum at Open.
 //
 // bm and fileSize are passed explicitly (rather than read from p.bitmap /
 // p.fileSize) so attachState can rebuild against the NOT-yet-installed new
@@ -654,123 +653,47 @@ func isVersionMismatchMeta(buf []byte) bool {
 // (free-space.md §Allocation Bitmap: set bit = free → stop at a reclaimed
 // tail); fileSize bounds every segment page id to the file-resident extent.
 func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmapForOpen, fileSize int64) ([]RPLSegmentRef, error) {
-	if m.RPLHeadPage == 0 {
-		return nil, nil
-	}
-	// Upper bound on segment count: every segment holds ≥1 entry, so
-	// a valid chain has at most RPLEntryCount segments. The +1 slack
-	// covers the trivial empty-chain case (RPLEntryCount==0 with a
-	// stale RPLHeadPage from a partial pwrite would be one excess
-	// segment); cycles are caught by the visited-set, so the count
-	// bound is a belt-and-suspenders second line of defense.
-	// The chain is bounded by the authoritative tail pointer, NOT by
-	// OlderSegment == 0: reclaimRPL drains whole segments from the tail
-	// (oldest) without rewriting the new tail's on-disk OlderSegment, so that
-	// pointer dangles at a reclaimed (and possibly reused) page. Walking it
-	// would read a non-segment page as a segment. RPLTailPage is recomputed on
-	// every commit (buildNewMeta) from the surviving chain, so it is the
-	// correct terminator. head and tail are both zero or both non-zero
-	// (buildNewMeta); a head with no tail is corrupt meta.
-	tail := m.RPLTailPage
-	if tail == 0 {
-		return nil, fmt.Errorf("pager: RPL head %d set but tail is 0: %w", m.RPLHeadPage, ErrCorrupted)
-	}
-	maxSegs := m.RPLEntryCount + 1
-	visited := make(map[uint64]struct{}, maxSegs)
-	var headFirst []RPLSegmentRef
-	// Trustworthy ceiling for every segment page id, computed BEFORE the
-	// walk so it bounds head, every followed OlderSegment, and the tail.
-	// pageRaw panics past the mmap reservation (MaxSize pages) and would
-	// SIGBUS in the [fileSize, reservation) gap, so a corrupt meta whose
-	// RPLHeadPage / OlderSegment is out of range must surface as
-	// ErrCorrupted at Open, not crash. The bound is the file-resident
-	// extent capped by MaxSize — NOT meta.HighWaterMark (ValidateMeta does
-	// not enforce HighWaterMark <= MaxSize, so a forged meta can inflate it
-	// past the reservation) and NOT MaxSize alone (the file may be shorter
-	// than the reservation). This is Pager.Page's file-resident bound (checksums.md §Structural and Allocation Bounds), identical
-	// to checker.walkRPL's min(fileSize/PageSize, MaxSize) (the root gmdb
-	// package's check.go); the two sibling RPL walkers must agree a wild
-	// pointer is structured corruption, not a crash.
+	// Trustworthy ceiling for every segment page id: head, every followed
+	// OlderSegment, and the tail. pageRaw panics past the mmap reservation
+	// (MaxSize pages) and would SIGBUS in the [fileSize, reservation) gap,
+	// so a corrupt meta whose RPLHeadPage / OlderSegment is out of range
+	// must surface as ErrCorrupted at Open, not crash. The bound is the
+	// file-resident extent capped by MaxSize — NOT meta.HighWaterMark
+	// (ValidateMeta does not enforce HighWaterMark <= MaxSize, so a forged
+	// meta can inflate it past the reservation) and NOT MaxSize alone (the
+	// file may be shorter than the reservation). This is Pager.Page's
+	// file-resident bound (checksums.md §Structural and Allocation Bounds).
 	backedPages := min(uint64(fileSize)/uint64(p.cfg.PageSize), m.MaxSize)
-	id := m.RPLHeadPage
-	for {
-		if id >= backedPages {
-			return nil, fmt.Errorf("pager: RPL segment page %d beyond file-resident extent %d pages: %w", id, backedPages, ErrCorrupted)
-		}
-		if id < bm.FirstDataPage() {
-			// Below the meta/bitmap region — no segment can live
-			// there. Reachable when a corrupt/forged meta's geometry
-			// (BitmapPages) shifted firstDataPage above a persisted
-			// chain pointer; reclaimRPL would panic in Bitmap.Set on
-			// such an id, so it must not enter the chain.
-			return nil, fmt.Errorf("pager: RPL segment page %d inside the meta/bitmap region (firstDataPage=%d): %w", id, bm.FirstDataPage(), ErrCorrupted)
-		}
-		if _, seen := visited[id]; seen {
-			return nil, fmt.Errorf("pager: RPL chain cycle at page %d: %w", id, ErrCorrupted)
-		}
-		if uint64(len(headFirst)) > maxSegs {
-			return nil, fmt.Errorf("pager: RPL chain exceeds bound %d (likely cycle): %w", maxSegs, ErrCorrupted)
-		}
-		// Stop at a reclaimed segment. Recovery may select a NON-latest meta
-		// (an older checkpoint, durability.md §Recovery); reclamation drains +
-		// frees segment pages from the live tail and advances the live meta's
-		// RPLTailPage WITHOUT rewriting older metas, so an older meta's
-		// RPLHeadPage→OlderSegment walk can reach a segment whose page was
-		// reclaimed (and possibly reused). A reclaimed segment page is free in
-		// the bitmap (free-space.md §Allocation Bitmap: set bit = free), and
-		// its listed data pages are already free, so truncating the in-memory
-		// chain here is consistent with the bitmap. This never applies to the
-		// head: the recovery target's own newest segment is never reclaimed
-		// (the reclamation bound never reaches the last checkpoint's own
-		// TxnID). See free-space.md §RPL (recovery to a non-latest meta).
-		if id != m.RPLHeadPage && bm.IsSet(id) {
-			break
-		}
-		visited[id] = struct{}{}
-		buf := p.pageRaw(id)
-		// Footer verification before decode (checksums.md covers RPL
-		// segments; pageRaw does not verify). Head-vs-non-head
-		// follows the decode-failure branch's convention below: a
-		// checksum-bad HEAD is a hard error, a checksum-bad NON-head
-		// gets the reclaimed-then-reused stale-tail treatment
-		// (recovery to a non-latest meta can reach segments whose
-		// pages were reclaimed and rewritten with other content —
-		// validly-footered or torn).
-		if p.cfg.PageChecksum && !page.VerifyPageFooter(buf, p.cfg.PageSize) {
-			if id == m.RPLHeadPage {
-				return nil, fmt.Errorf("pager: RPL head segment at page %d fails checksum: %w", id, ErrBadPageChecksum)
-			}
-			break
-		}
-		seg, ok := page.DecodeRPLSegment(buf, p.cfg)
-		if !ok {
-			if id == m.RPLHeadPage {
-				return nil, fmt.Errorf("pager: RPL head segment at page %d malformed: %w", id, ErrCorrupted)
-			}
-			// A reclaimed-then-reused segment page (now holding non-segment
-			// data): same stale-tail boundary as the reclaimed-bit check above.
-			break
-		}
+	var headFirst []RPLSegmentRef
+	walk := RPLChainWalk{
+		ReadPage:   p.pageRaw,
+		Cfg:        p.cfg,
+		Head:       m.RPLHeadPage,
+		Tail:       m.RPLTailPage,
+		EntryCount: m.RPLEntryCount,
+		// Below the meta/bitmap region no segment can live; reclaimRPL
+		// would panic in Bitmap.Set on such an id, so it must not enter
+		// the chain.
+		LowBound:  bm.FirstDataPage(),
+		HighBound: backedPages,
+		IsFree:    func(id uint64) (bool, bool) { return bm.IsSet(id), true },
+	}
+	_, werr := walk.Walk(func(id uint64, seg page.RPLSegment) bool {
 		headFirst = append(headFirst, RPLSegmentRef{
 			PageID: id,
 			TxnID:  seg.TxnID,
 			Count:  uint32(len(seg.PageIDs)),
 		})
-		if id == tail {
-			break // authoritative tail — do not follow the (possibly dangling) OlderSegment
+		return true
+	})
+	if werr != nil {
+		sentinel := ErrCorrupted
+		if werr.Kind == RPLWalkErrHeadChecksum {
+			sentinel = ErrBadPageChecksum
 		}
-		next := seg.OlderSegment
-		if next == 0 {
-			return nil, fmt.Errorf("pager: RPL chain from head %d ended before tail %d: %w", m.RPLHeadPage, tail, ErrCorrupted)
-		}
-		if next == id {
-			return nil, fmt.Errorf("pager: RPL segment at page %d is self-referential: %w", id, ErrCorrupted)
-		}
-		id = next
+		return nil, fmt.Errorf("pager: %s: %w", werr.Error(), sentinel)
 	}
 	// Reverse: head-first → tail-first.
-	for i, j := 0, len(headFirst)-1; i < j; i, j = i+1, j-1 {
-		headFirst[i], headFirst[j] = headFirst[j], headFirst[i]
-	}
+	slices.Reverse(headFirst)
 	return headFirst, nil
 }

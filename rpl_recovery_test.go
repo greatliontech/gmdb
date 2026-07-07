@@ -2,8 +2,10 @@ package gmdb
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 )
 
@@ -75,13 +77,15 @@ func TestRPLChainSurvivesPartialReclaimAndReuse(t *testing.T) {
 	db2.Close()
 }
 
-// buildChecksummedRPLChain opens a checksummed DB at path, churns until
-// the committed meta carries an RPL chain of at least two segments
-// (head != tail), and returns the head and tail segment page ids.
-func buildChecksummedRPLChain(t *testing.T, ctx context.Context, path string) (head, tail uint64) {
+// buildRPLChain opens a DB at path (page checksums on unless
+// disableChecksum), churns until the committed meta carries an RPL
+// chain of at least two segments (head != tail), and returns the head
+// and tail segment page ids.
+func buildRPLChain(t *testing.T, ctx context.Context, path string, disableChecksum bool) (head, tail uint64) {
 	t.Helper()
 	db, err := Open(ctx, path, Options{
-		PageSize: 4096, MinSize: 16, MaxSize: 512, Maintenance: MaintenanceOptions{Disable: true},
+		PageSize: 4096, MinSize: 16, MaxSize: 512, DisablePageChecksum: disableChecksum,
+		Maintenance: MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -131,7 +135,7 @@ func buildChecksummedRPLChain(t *testing.T, ctx context.Context, path string) (h
 func TestOpenRejectsChecksumCorruptRPLHead(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	head, _ := buildChecksummedRPLChain(t, ctx, path)
+	head, _ := buildRPLChain(t, ctx, path, false)
 	corruptPageByte(t, path, head, 4096)
 	db, err := Open(ctx, path, Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 512, Maintenance: MaintenanceOptions{Disable: true},
@@ -153,7 +157,7 @@ func TestOpenRejectsChecksumCorruptRPLHead(t *testing.T) {
 func TestOpenTruncatesChainAtChecksumCorruptNonHeadSegment(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	_, tail := buildChecksummedRPLChain(t, ctx, path)
+	_, tail := buildRPLChain(t, ctx, path, false)
 	corruptPageByte(t, path, tail, 4096)
 	db, err := Open(ctx, path, Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 512, Maintenance: MaintenanceOptions{Disable: true},
@@ -197,7 +201,7 @@ func TestOpenTruncatesChainAtChecksumCorruptNonHeadSegment(t *testing.T) {
 func TestCheckReportsChecksumBadRPLSegment(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	_, tail := buildChecksummedRPLChain(t, ctx, path)
+	_, tail := buildRPLChain(t, ctx, path, false)
 	db, err := Open(ctx, path, Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 512, Maintenance: MaintenanceOptions{Disable: true},
 	})
@@ -225,5 +229,59 @@ func TestCheckReportsChecksumBadRPLSegment(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("checksum-bad RPL segment not reported")
+	}
+}
+
+// overwritePageU64 writes v little-endian at byte offset off within
+// page pageID, bypassing the open DB handle (Check reads the mmap and
+// sees the change).
+func overwritePageU64(t *testing.T, path string, pageID uint64, pageSize uint32, off int64, v uint64) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for overwrite: %v", err)
+	}
+	defer f.Close()
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	if _, err := f.WriteAt(b[:], int64(pageID)*int64(pageSize)+off); err != nil {
+		t.Fatalf("writeat: %v", err)
+	}
+}
+
+// TestCheckReportsRPLSegmentInMetaRegion pins the chain walk's
+// meta/bitmap-region guard on the Check side: a chain link below the
+// first data page is structural corruption (no segment can live
+// there), reported as RPLSegmentInMetaRegion rather than silently
+// truncating the chain. Checksums are disabled so the rewritten link
+// reaches the region check instead of failing footer verification
+// first; offset 16 is the segment's OlderSegment field.
+func TestCheckReportsRPLSegmentInMetaRegion(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	buildRPLChain(t, ctx, path, true)
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 512, DisablePageChecksum: true,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	m := db.Meta()
+	if m.RPLHeadPage == 0 || m.RPLHeadPage == m.RPLTailPage {
+		t.Fatalf("fixture: no multi-segment chain (head=%d tail=%d)", m.RPLHeadPage, m.RPLTailPage)
+	}
+	// Point the head's OlderSegment at meta page 1.
+	overwritePageU64(t, path, m.RPLHeadPage, 4096, 16, 1)
+
+	found := false
+	for iss := range db.Check() {
+		if iss.Code == "RPLSegmentInMetaRegion" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("chain link into the meta/bitmap region not reported")
 	}
 }
