@@ -132,9 +132,9 @@ func TestRPLChainWalkTraversal(t *testing.T) {
 	})
 	t.Run("multi segment head to tail", func(t *testing.T) {
 		f := newWalkFixture(true)
-		f.segment(10, 5, 0, 100)   // original tail
-		f.segment(11, 6, 10, 101)  // middle
-		f.segment(12, 7, 11, 102)  // head
+		f.segment(10, 5, 0, 100)  // original tail
+		f.segment(11, 6, 10, 101) // middle
+		f.segment(12, 7, 11, 102) // head
 		visited, stop, werr := run(t, f.chainWalk(12, 10, 3))
 		wantStop(t, werr, stop, RPLWalkTailReached, 10)
 		if !slices.Equal(visited, []uint64{12, 11, 10}) {

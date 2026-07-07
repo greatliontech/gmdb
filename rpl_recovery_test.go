@@ -285,3 +285,91 @@ func TestCheckReportsRPLSegmentInMetaRegion(t *testing.T) {
 		t.Errorf("chain link into the meta/bitmap region not reported")
 	}
 }
+
+// TestOpenWithoutCheckpointPinsReclamation pins Open's NoCheckpoint
+// handling (durability.md §Recovery step 3 + free-space.md §RPL
+// Reclamation): when no meta slot carries MetaFlagCheckpoint, there is
+// no recoverable checkpoint to bound against, so the reopened handle
+// pins RPL reclamation off — lastCheckpointTxnID = 0, hence bound
+// min(readers, 0) = 0 — until an explicit Checkpoint() re-establishes
+// it. White-box on lastCheckpointTxnID: the min() formula itself is
+// pinned by the lagging-reader and reader-pin tests, so field-zero ⇒
+// bound-zero. (A black-box RetiredPages probe cannot discriminate
+// here: reclamation is lazy — it fires only under bitmap pressure —
+// so retired-page counts track pressure timing, not the bound.)
+func TestOpenWithoutCheckpointPinsReclamation(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	opts := Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 512, SyncMode: SyncLazy,
+		Maintenance: MaintenanceOptions{Disable: true},
+	}
+	put := func(db *DB, round int) {
+		t.Helper()
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("Begin(%d): %v", round, err)
+		}
+		ks, err := tx.OpenKeyspace("k")
+		if err != nil {
+			if ks, err = tx.CreateKeyspace("k"); err != nil {
+				t.Fatalf("CreateKeyspace: %v", err)
+			}
+		}
+		if err := ks.Put(fmt.Appendf(nil, "r%03d", round), []byte("v")); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit(%d): %v", round, err)
+		}
+	}
+
+	// Two SyncLazy commits overwrite both slots with unflagged metas.
+	db, err := Open(ctx, path, opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	put(db, 0)
+	put(db, 1)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen: no checkpoint-flagged meta exists → reclamation pinned.
+	db, err = Open(ctx, path, opts)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	// Late-bound: db is reassigned below; close whichever handle is live
+	// (nil if the second Open failed mid-unwind).
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
+	if got := db.lastCheckpointTxnID; got != 0 {
+		t.Fatalf("lastCheckpointTxnID = %d after no-checkpoint Open, want 0 (reclamation pinned off)", got)
+	}
+
+	// Checkpoint() re-establishes the bound at the flagged meta's TxnID.
+	if err := db.Checkpoint(ctx); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if got, want := db.lastCheckpointTxnID, db.currentMeta.TxnID; got != want || got == 0 {
+		t.Fatalf("lastCheckpointTxnID = %d after Checkpoint, want currentMeta.TxnID %d (non-zero)", got, want)
+	}
+
+	// A reopen with the checkpoint on disk adopts its TxnID as the bound
+	// (the checkpoint-present arm of Open's adoption — recovery selects
+	// the flagged meta, so its TxnID is the last checkpoint).
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close before checkpointed reopen: %v", err)
+	}
+	db, err = Open(ctx, path, opts)
+	if err != nil {
+		t.Fatalf("reopen after Checkpoint: %v", err)
+	}
+	if got, want := db.lastCheckpointTxnID, db.currentMeta.TxnID; got != want || got == 0 {
+		t.Fatalf("lastCheckpointTxnID = %d after checkpointed reopen, want currentMeta.TxnID %d (non-zero)", got, want)
+	}
+}

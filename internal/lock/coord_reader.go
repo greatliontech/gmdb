@@ -130,7 +130,7 @@ func (c *Coord) ReleaseReader(idx uint32) {
 }
 
 // OldestReaderTxnID returns the minimum TxnID held by any live
-// reader, or math.MaxUint64 if no live readers occupy slots. Stale
+// reader, or NoReaderTxnID if no live readers occupy slots. Stale
 // slots (per the cross-process.md §Reader Table stale-detection
 // rules) are reclaimed in place as a side effect.
 //

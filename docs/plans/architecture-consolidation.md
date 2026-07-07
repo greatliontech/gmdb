@@ -23,7 +23,7 @@ gate) and the final close-out are fixed anchors per chunk.
   (`internal/pager/init.go:484`), and extract the shared
   read/decode/validate helper for `readAndSelectMeta` / `Resync` /
   `ReadLatestMeta` (`internal/pager/init.go:244,447,509`).
-- [ ] 3. Centralize root resync adoption and the reclamation bound:
+- [x] 3. Centralize root resync adoption and the reclamation bound:
   one adoption helper for the `currentMeta` / `activeMetaIdx` /
   `lastCheckpointTxnID` triple (6 update sites) and one bound helper
   owning `min(oldestReaderTxnID, lastCheckpointTxnID)` plus the

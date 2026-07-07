@@ -202,11 +202,17 @@ func (f *File) RaiseReaderSlotTxnID(idx uint32, txnID uint64) {
 	Store64(&slot.TxnID, txnID)
 }
 
+// NoReaderTxnID is OldestReaderTxnID's "no live reader occupies a
+// slot" result. Consumers compare against this constant rather than
+// re-declaring the sentinel value.
+const NoReaderTxnID = ^uint64(0)
+
 // OldestReaderTxnID scans the reader table and returns the minimum
-// TxnID across all live (non-stale) reader slots. Returns ^uint64(0)
-// when no live readers occupy slots — the writer's RPL reclamation
-// bound calculator then uses min(this, lastCheckpointTxnID) which
-// reduces to lastCheckpointTxnID when no readers are present.
+// TxnID across all live (non-stale) reader slots. Returns
+// NoReaderTxnID when no live readers occupy slots — the writer's RPL
+// reclamation bound calculator then uses min(this,
+// lastCheckpointTxnID) which reduces to lastCheckpointTxnID when no
+// readers are present.
 //
 // During the scan, slots in detectable stale states are reclaimed in
 // place (the stale-clear ordering of ClearStaleReaderSlot), or in the
@@ -246,7 +252,7 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 	if f.slots == nil {
 		panic("lock: OldestReaderTxnID on closed *File")
 	}
-	min := uint64(math.MaxUint64)
+	min := NoReaderTxnID
 	for i := range f.slots {
 		slot := &f.slots[i]
 		txnID := Load64(&slot.TxnID)

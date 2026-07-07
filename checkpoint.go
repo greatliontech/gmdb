@@ -127,9 +127,7 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 		db.mu.Unlock()
 		return fmt.Errorf("gmdb: checkpoint re-sync: %w", mapPagerErr(err))
 	} else if changed {
-		db.currentMeta = m
-		db.activeMetaIdx = active
-		db.lastCheckpointTxnID = lastCheckpoint
+		db.setMetaState(m, active, lastCheckpoint)
 	}
 	meta := db.currentMeta
 	activeIdx := db.activeMetaIdx
@@ -215,12 +213,12 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	// callers observe the now-checkpointed flag.
 	db.mu.Lock()
 	if db.currentMeta.TxnID == meta.TxnID {
-		db.currentMeta = meta
 		// The active meta is now checkpoint-flagged → it is the last
 		// checkpoint, so it bounds RPL reclamation (free-space.md §RPL
 		// Reclamation). We hold the write grant, so no commit advanced
-		// currentMeta past meta while we worked.
-		db.lastCheckpointTxnID = meta.TxnID
+		// currentMeta past meta while we worked; the slot index is
+		// unchanged (the flag pwrite targeted the same slot).
+		db.setMetaState(meta, db.activeMetaIdx, meta.TxnID)
 	}
 	db.mu.Unlock()
 	return nil

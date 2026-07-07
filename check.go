@@ -8,6 +8,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
@@ -169,10 +170,6 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue] {
 	}
 }
 
-// noReaderTxnID is coord.OldestReaderTxnID()'s "no live reader" sentinel
-// (math.MaxUint64). Mirrors the const in db.go's write-tx Begin path.
-const noReaderTxnID = ^uint64(0)
-
 // checkRepair is the exclusive Repair path (CheckOptions.Repair). It
 // opens a write transaction — acquiring the cross-process write lock, so
 // no other writer runs concurrently — verifies no read transaction is
@@ -208,7 +205,7 @@ func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 		db.mu.Lock()
 		coord := db.coord
 		db.mu.Unlock()
-		if coord == nil || coord.OldestReaderTxnID() != noReaderTxnID {
+		if coord == nil || coord.OldestReaderTxnID() != lock.NoReaderTxnID {
 			yield(CheckIssue{
 				Severity: CheckError,
 				Code:     "Repair.ReadersActive",
