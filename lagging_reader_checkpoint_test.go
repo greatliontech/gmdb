@@ -12,19 +12,19 @@ import (
 
 // TestSyncLazyLaggingReaderRefreshRespectsCheckpointBound pins the
 // reclamation-bound refresh formula (free-space.md §RPL Reclamation:
-// min(oldestReader, lastCheckpointTxnID) — checkpoint term included).
-// Under SyncLazy the previous meta's TxnID runs ahead of the last
-// checkpoint; a refresh derived from prevMeta.TxnID instead of
-// lastCheckpointTxnID reclaims RPL segments the checkpoint's tree
-// still references, so crash recovery — which selects the checkpoint
-// meta — walks reclaimed-and-reused pages. SyncDurable is immune
-// (checkpoint == prev), which is why the pre-existing lagging-reader
-// tests never caught it.
+// min(oldestReader, anchoredEpoch) — epoch term included).
+// Under SyncLazy the previous meta's TxnID runs ahead of the durable
+// epoch; a refresh derived from prevMeta.TxnID instead of the
+// anchored epoch reclaims RPL segments the durable epoch's tree
+// still references, so crash recovery — which adopts the durable
+// sub-record — walks reclaimed-and-reused pages. SyncDurable is
+// immune (durable epoch == prev TxnID), which is why the pre-existing
+// lagging-reader tests never caught it.
 //
 // The crash is simulated by byte-copying the database file (SyncLazy
 // commits are in the page cache; the copy sees them, but recovery
-// still selects the checkpoint meta because lazy metas carry no
-// checkpoint flag) and opening the copy.
+// still rolls back to the durable sub-record the lazy metas carry
+// forward) and opening the copy.
 func TestSyncLazyLaggingReaderRefreshRespectsCheckpointBound(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)

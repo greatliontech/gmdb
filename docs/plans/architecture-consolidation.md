@@ -59,7 +59,7 @@ gate) and the final close-out are fixed anchors per chunk.
   rpl-head fix designed (head exemption conditioned on epoch
   ownership via persisted `RPLHeadTxnID`), lands chunk 8;
   rpl-segment redeferred unchanged (mechanics untouched).
-- [ ] 8. Implement the amended contract (format-version bump, clean
+- [x] 8. Implement the amended contract (format-version bump, clean
   break): meta codec + `RPLHeadTxnID` + durable sub-record +
   `AnchoredDurableTxnID`; commit/Checkpoint sub-record and
   anchoring maintenance; recovery = durable projection + the

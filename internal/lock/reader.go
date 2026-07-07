@@ -210,9 +210,8 @@ const NoReaderTxnID = ^uint64(0)
 // OldestReaderTxnID scans the reader table and returns the minimum
 // TxnID across all live (non-stale) reader slots. Returns
 // NoReaderTxnID when no live readers occupy slots — the writer's RPL
-// reclamation bound calculator then uses min(this,
-// lastCheckpointTxnID) which reduces to lastCheckpointTxnID when no
-// readers are present.
+// reclamation bound calculator then uses min(this, anchoredEpoch)
+// which reduces to the anchored epoch when no readers are present.
 //
 // During the scan, slots in detectable stale states are reclaimed in
 // place (the stale-clear ordering of ClearStaleReaderSlot), or in the

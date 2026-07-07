@@ -341,9 +341,6 @@ without the ownership condition on the head exemption, a
 carried-forward head that was legitimately reclaimed and reused makes
 the database permanently unopenable (hard error at Open on a healthy
 file).
-Lands: chunk 8 of docs/plans/architecture-consolidation.md (the
-ownership condition and `RPLHeadTxnID`; the reclaimed-boundary walk is
-already enforced by the shared chain walker).
 
 Accepted trade: a genuine bitrot of a *live* (bitmap-clear) non-head segment
 also fails to decode and is treated as this boundary, so it degrades to a

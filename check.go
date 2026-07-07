@@ -687,13 +687,15 @@ func (c *checker) walkRPL(firstData, hwm uint64) (bitset, bool) {
 	// boundary alone.
 	bm, bmOK := c.snapshotBitmap()
 	walk := pager.RPLChainWalk{
-		ReadPage:   c.pgr.PageRaw,
-		Cfg:        c.cfg,
-		Head:       head,
-		Tail:       c.meta.RPLTailPage,
-		EntryCount: c.meta.RPLEntryCount,
-		LowBound:   firstData,
-		HighBound:  hwm,
+		ReadPage:     c.pgr.PageRaw,
+		Cfg:          c.cfg,
+		Head:         head,
+		HeadTxnID:    c.meta.RPLHeadTxnID,
+		Tail:         c.meta.RPLTailPage,
+		EntryCount:   c.meta.RPLEntryCount,
+		ReclaimEpoch: c.meta.Durable.TxnID,
+		LowBound:     firstData,
+		HighBound:    hwm,
 		IsFree: func(id uint64) (bool, bool) {
 			if !bmOK {
 				return false, false

@@ -8,46 +8,82 @@ import (
 
 // Meta-page Flags bit assignments. Per file-layout.md §Meta Page:
 //   - Bit 0 (PageChecksum) is immutable across the file's lifetime.
-//   - Bit 1 (Checkpoint)   is mutable per commit.
-//   - Bits 2..31 are reserved; Open() rejects unknown bits set.
+//   - Bits 1..31 are reserved and must be zero; Open() rejects unknown
+//     bits set. (Bit 1 previously held the retired Checkpoint flag —
+//     the durable sub-record supersedes it.)
 const (
 	MetaFlagPageChecksum uint32 = 1 << 0
-	MetaFlagCheckpoint   uint32 = 1 << 1
 
 	// MetaFlagKnownMask is the union of currently-defined meta flag bits.
 	// Open() must reject metas where (Flags &^ MetaFlagKnownMask) != 0.
-	MetaFlagKnownMask = MetaFlagPageChecksum | MetaFlagCheckpoint
+	MetaFlagKnownMask = MetaFlagPageChecksum
 )
 
 // MetaPayloadSize is the fixed on-disk byte length of the meta-page payload:
-// 4×4 + 4 (padding) + 16 (UUID) + 13×8 = 144 bytes. Fits in any supported
+// 4×4 + 4 (padding) + 16 (UUID) + 24×8 = 232 bytes. Fits in any supported
 // page size.
-const MetaPayloadSize = 144
+const MetaPayloadSize = 232
 
-// Meta-page field offsets within the 144-byte payload. Meta pages do not
+// Meta-page field offsets within the 232-byte payload. Meta pages do not
 // carry the common page header.
 const (
-	metaOffMagic           = 0
-	metaOffVersion         = 4
-	metaOffPageSize        = 8
-	metaOffFlags           = 12
-	metaOffBitmapPages     = 16
-	metaOffPadding         = 20
-	metaOffUUID            = 24
-	metaOffMinSize         = 40
-	metaOffMaxSize         = 48
-	metaOffGrowStep        = 56
-	metaOffShrinkThreshold = 64
-	metaOffHighWaterMark   = 72
-	metaOffRPLHeadPage     = 80
-	metaOffRPLTailPage     = 88
-	metaOffRPLEntryCount   = 96
-	metaOffNumFreePages    = 104
-	metaOffKeyspaceRoot    = 112
-	metaOffNumKeyspaces    = 120
-	metaOffTxnID           = 128
-	metaOffChecksum        = 136
+	metaOffMagic                = 0
+	metaOffVersion              = 4
+	metaOffPageSize             = 8
+	metaOffFlags                = 12
+	metaOffBitmapPages          = 16
+	metaOffPadding              = 20
+	metaOffUUID                 = 24
+	metaOffMinSize              = 40
+	metaOffMaxSize              = 48
+	metaOffGrowStep             = 56
+	metaOffShrinkThreshold      = 64
+	metaOffHighWaterMark        = 72
+	metaOffRPLHeadPage          = 80
+	metaOffRPLHeadTxnID         = 88
+	metaOffRPLTailPage          = 96
+	metaOffRPLEntryCount        = 104
+	metaOffNumFreePages         = 112
+	metaOffKeyspaceRoot         = 120
+	metaOffNumKeyspaces         = 128
+	metaOffTxnID                = 136
+	metaOffDurableTxnID         = 144
+	metaOffAnchoredDurableTxnID = 152
+	metaOffDurableHighWaterMark = 160
+	metaOffDurableRPLHeadPage   = 168
+	metaOffDurableRPLHeadTxnID  = 176
+	metaOffDurableRPLTailPage   = 184
+	metaOffDurableRPLEntryCount = 192
+	metaOffDurableNumFreePages  = 200
+	metaOffDurableKeyspaceRoot  = 208
+	metaOffDurableNumKeyspaces  = 216
+	metaOffChecksum             = 224
 )
+
+// DurableSubRecord is the durable epoch's state-bearing projection,
+// carried inside every meta (durability.md §Checkpoints and the
+// durable sub-record). Crash recovery adopts these fields, never the
+// carrying meta's live tree. On a self-durable meta
+// (TxnID == DurableSubRecord.TxnID) every field equals its live
+// counterpart.
+type DurableSubRecord struct {
+	// TxnID is the durable epoch — the newest transaction whose data
+	// pages are confirmed on stable storage.
+	TxnID uint64
+	// AnchoredTxnID is the newest DurableTxnID assertion whose
+	// carrying meta pwrite a COMPLETED fdatasync covered
+	// (durability.md §Anchoring). Bounds RPL reclamation; never a
+	// forward promise about an fsync still in flight.
+	AnchoredTxnID uint64
+	HighWaterMark uint64
+	RPLHeadPage   uint64
+	RPLHeadTxnID  uint64
+	RPLTailPage   uint64
+	RPLEntryCount uint64
+	NumFreePages  uint64
+	KeyspaceRoot  uint64
+	NumKeyspaces  uint64
+}
 
 // Meta is the decoded view of one meta page. Field order matches the on-disk
 // layout in file-layout.md §Meta Page.
@@ -64,13 +100,43 @@ type Meta struct {
 	ShrinkThreshold uint64
 	HighWaterMark   uint64
 	RPLHeadPage     uint64
-	RPLTailPage     uint64
-	RPLEntryCount   uint64
-	NumFreePages    uint64
-	KeyspaceRoot    uint64
-	NumKeyspaces    uint64
-	TxnID           uint64
-	Checksum        uint64
+	// RPLHeadTxnID is the TxnID of the segment RPLHeadPage names (0 on
+	// an empty chain). Persisted so the recovery chain walk can
+	// classify a head-segment read failure without trusting the —
+	// possibly reclaimed-and-reused — head page itself (free-space.md
+	// §Head classification requires the persisted head TxnID).
+	RPLHeadTxnID  uint64
+	RPLTailPage   uint64
+	RPLEntryCount uint64
+	NumFreePages  uint64
+	KeyspaceRoot  uint64
+	NumKeyspaces  uint64
+	TxnID         uint64
+	Durable       DurableSubRecord
+	Checksum      uint64
+}
+
+// SelfDurable reports whether the meta's own commit is the durable
+// epoch (its data was confirmed durable when it was written), i.e. the
+// live and durable projections coincide.
+func (m Meta) SelfDurable() bool { return m.Durable.TxnID == m.TxnID }
+
+// LiveSubRecord returns the meta's LIVE state in sub-record shape —
+// what a self-asserting commit or a Checkpoint bump writes as the new
+// durable sub-record (AnchoredTxnID is NOT derived here; the caller
+// supplies it per durability.md §Anchoring's no-forward-promise rule).
+func (m Meta) LiveSubRecord() DurableSubRecord {
+	return DurableSubRecord{
+		TxnID:         m.TxnID,
+		HighWaterMark: m.HighWaterMark,
+		RPLHeadPage:   m.RPLHeadPage,
+		RPLHeadTxnID:  m.RPLHeadTxnID,
+		RPLTailPage:   m.RPLTailPage,
+		RPLEntryCount: m.RPLEntryCount,
+		NumFreePages:  m.NumFreePages,
+		KeyspaceRoot:  m.KeyspaceRoot,
+		NumKeyspaces:  m.NumKeyspaces,
+	}
 }
 
 // HasFlag reports whether all bits in mask are set.
@@ -93,12 +159,23 @@ func DecodeMeta(buf []byte) Meta {
 	m.ShrinkThreshold = le.Uint64(buf[metaOffShrinkThreshold:])
 	m.HighWaterMark = le.Uint64(buf[metaOffHighWaterMark:])
 	m.RPLHeadPage = le.Uint64(buf[metaOffRPLHeadPage:])
+	m.RPLHeadTxnID = le.Uint64(buf[metaOffRPLHeadTxnID:])
 	m.RPLTailPage = le.Uint64(buf[metaOffRPLTailPage:])
 	m.RPLEntryCount = le.Uint64(buf[metaOffRPLEntryCount:])
 	m.NumFreePages = le.Uint64(buf[metaOffNumFreePages:])
 	m.KeyspaceRoot = le.Uint64(buf[metaOffKeyspaceRoot:])
 	m.NumKeyspaces = le.Uint64(buf[metaOffNumKeyspaces:])
 	m.TxnID = le.Uint64(buf[metaOffTxnID:])
+	m.Durable.TxnID = le.Uint64(buf[metaOffDurableTxnID:])
+	m.Durable.AnchoredTxnID = le.Uint64(buf[metaOffAnchoredDurableTxnID:])
+	m.Durable.HighWaterMark = le.Uint64(buf[metaOffDurableHighWaterMark:])
+	m.Durable.RPLHeadPage = le.Uint64(buf[metaOffDurableRPLHeadPage:])
+	m.Durable.RPLHeadTxnID = le.Uint64(buf[metaOffDurableRPLHeadTxnID:])
+	m.Durable.RPLTailPage = le.Uint64(buf[metaOffDurableRPLTailPage:])
+	m.Durable.RPLEntryCount = le.Uint64(buf[metaOffDurableRPLEntryCount:])
+	m.Durable.NumFreePages = le.Uint64(buf[metaOffDurableNumFreePages:])
+	m.Durable.KeyspaceRoot = le.Uint64(buf[metaOffDurableKeyspaceRoot:])
+	m.Durable.NumKeyspaces = le.Uint64(buf[metaOffDurableNumKeyspaces:])
 	m.Checksum = le.Uint64(buf[metaOffChecksum:])
 	return m
 }
@@ -122,12 +199,23 @@ func EncodeMeta(buf []byte, m *Meta) {
 	le.PutUint64(buf[metaOffShrinkThreshold:], m.ShrinkThreshold)
 	le.PutUint64(buf[metaOffHighWaterMark:], m.HighWaterMark)
 	le.PutUint64(buf[metaOffRPLHeadPage:], m.RPLHeadPage)
+	le.PutUint64(buf[metaOffRPLHeadTxnID:], m.RPLHeadTxnID)
 	le.PutUint64(buf[metaOffRPLTailPage:], m.RPLTailPage)
 	le.PutUint64(buf[metaOffRPLEntryCount:], m.RPLEntryCount)
 	le.PutUint64(buf[metaOffNumFreePages:], m.NumFreePages)
 	le.PutUint64(buf[metaOffKeyspaceRoot:], m.KeyspaceRoot)
 	le.PutUint64(buf[metaOffNumKeyspaces:], m.NumKeyspaces)
 	le.PutUint64(buf[metaOffTxnID:], m.TxnID)
+	le.PutUint64(buf[metaOffDurableTxnID:], m.Durable.TxnID)
+	le.PutUint64(buf[metaOffAnchoredDurableTxnID:], m.Durable.AnchoredTxnID)
+	le.PutUint64(buf[metaOffDurableHighWaterMark:], m.Durable.HighWaterMark)
+	le.PutUint64(buf[metaOffDurableRPLHeadPage:], m.Durable.RPLHeadPage)
+	le.PutUint64(buf[metaOffDurableRPLHeadTxnID:], m.Durable.RPLHeadTxnID)
+	le.PutUint64(buf[metaOffDurableRPLTailPage:], m.Durable.RPLTailPage)
+	le.PutUint64(buf[metaOffDurableRPLEntryCount:], m.Durable.RPLEntryCount)
+	le.PutUint64(buf[metaOffDurableNumFreePages:], m.Durable.NumFreePages)
+	le.PutUint64(buf[metaOffDurableKeyspaceRoot:], m.Durable.KeyspaceRoot)
+	le.PutUint64(buf[metaOffDurableNumKeyspaces:], m.Durable.NumKeyspaces)
 	m.Checksum = ComputeMetaChecksum(buf)
 	le.PutUint64(buf[metaOffChecksum:], m.Checksum)
 }
@@ -176,30 +264,13 @@ func VerifyMeta(buf []byte) bool {
 	return want == got
 }
 
-// ActiveMetaCheckpointPreferring implements durability.md §Recovery:
-//
-//  1. Discard metas with invalid xxhash64 checksum.
-//  2. Of the valid metas, select the one with the highest TxnID
-//     whose MetaFlagCheckpoint flag is **set**.
-//  3. If neither valid meta has Checkpoint set (SyncLazy-only DB
-//     never Checkpoint()'d), select the higher-TxnID valid meta
-//     and return noCheckpoint=true so the caller can warn.
-//  4. Neither valid → ok=false.
-//
-// This is the CRASH-RECOVERY selection (a fresh Open). The raw
-// highest-TxnID selector (ActiveMeta) is the LIVE selection — grant
-// handoff and reader visibility — per durability.md §"Live visibility
-// vs. crash recovery — distinct selections". Both are wrappers over
-// selectSlot, so their tie-break rules cannot drift: equal non-zero
-// TxnIDs is a commit-protocol violation (ok=false) in both.
-func ActiveMetaCheckpointPreferring(meta0, meta1 []byte) (active int, noCheckpoint bool, ok bool) {
-	return selectSlot(meta0, meta1, true)
-}
-
 // ActiveMeta selects the active meta page given the two candidate
-// payloads. Per file-layout.md §Meta Page and the entailed dual-meta
-// invariant: the active meta is the one with the highest TxnID whose
-// checksum is valid.
+// payloads — the ONE selection every consumer uses (durability.md
+// §One selection, two projections): live paths use the winner's live
+// fields, crash recovery adopts its durable sub-record. Per
+// file-layout.md §Meta Page and the entailed dual-meta invariant: the
+// active meta is the one with the highest TxnID whose checksum is
+// valid.
 //
 // Tie-break rules:
 //   - One meta valid, one not → the valid one wins.
@@ -213,56 +284,18 @@ func ActiveMetaCheckpointPreferring(meta0, meta1 []byte) (active int, noCheckpoi
 //     was violated; active-meta selection is undefined and the caller
 //     must surface this rather than guess.
 //   - Neither valid → ok=false.
-//
-// The checkpoint-flag precedence rule from durability.md is layered on
-// top by the SyncMode-aware caller; this function returns the
-// raw highest-valid-TxnID winner.
 func ActiveMeta(meta0, meta1 []byte) (active int, ok bool) {
-	active, _, ok = selectSlot(meta0, meta1, false)
-	return active, ok
-}
-
-// selectSlot is the single implementation behind ActiveMeta and
-// ActiveMetaCheckpointPreferring: one validity gate and one TxnID
-// tie-break (pickHighestTxnID), with the checkpoint-flag precedence of
-// durability.md §Recovery applied only when preferCheckpoint is set.
-// The two exported selections MUST NOT drift — they are the same rule
-// except that recovery prefers a checkpoint-flagged meta when exactly
-// one valid slot carries the flag (durability.md §"Live visibility vs.
-// crash recovery — distinct selections").
-//
-// noCheckpoint is meaningful only when preferCheckpoint: it reports
-// that the SELECTED meta lacks MetaFlagCheckpoint (the durability.md
-// §Recovery step-3 fallback, or a lone unflagged valid slot) so the
-// caller can warn that recovery accepted a non-checkpoint meta.
-func selectSlot(meta0, meta1 []byte, preferCheckpoint bool) (active int, noCheckpoint bool, ok bool) {
 	ok0 := VerifyMeta(meta0)
 	ok1 := VerifyMeta(meta1)
-	cp := func(b []byte) bool { return le.Uint32(b[metaOffFlags:])&MetaFlagCheckpoint != 0 }
 	switch {
 	case ok0 && ok1:
-		if preferCheckpoint {
-			cp0, cp1 := cp(meta0), cp(meta1)
-			switch {
-			case cp0 && !cp1:
-				return 0, false, true
-			case cp1 && !cp0:
-				return 1, false, true
-			default:
-				// Both or neither flagged — highest-TxnID tie-break;
-				// neither flagged is the §Recovery step-3 fallback.
-				active, ok = pickHighestTxnID(le.Uint64(meta0[metaOffTxnID:]), le.Uint64(meta1[metaOffTxnID:]))
-				return active, !cp0 && !cp1, ok
-			}
-		}
-		active, ok = pickHighestTxnID(le.Uint64(meta0[metaOffTxnID:]), le.Uint64(meta1[metaOffTxnID:]))
-		return active, false, ok
+		return pickHighestTxnID(le.Uint64(meta0[metaOffTxnID:]), le.Uint64(meta1[metaOffTxnID:]))
 	case ok0:
-		return 0, preferCheckpoint && !cp(meta0), true
+		return 0, true
 	case ok1:
-		return 1, preferCheckpoint && !cp(meta1), true
+		return 1, true
 	default:
-		return 0, false, false
+		return 0, false
 	}
 }
 
@@ -285,24 +318,4 @@ func pickHighestTxnID(txn0, txn1 uint64) (active int, ok bool) {
 	default:
 		return 0, false
 	}
-}
-
-// HighestCheckpointTxnID returns the greatest TxnID among the two
-// meta-page images that verify (checksum) AND carry MetaFlagCheckpoint,
-// or 0 if neither qualifies. This is the TxnID a crash would recover to
-// under the checkpoint-preferring rule (durability.md §Recovery), hence
-// the RPL reclamation lower bound for a writer that has just adopted a
-// peer's latest — possibly unflagged — commit (free-space.md §RPL
-// Reclamation, cross-process re-derivation of C).
-func HighestCheckpointTxnID(meta0, meta1 []byte) uint64 {
-	var best uint64
-	for _, b := range [][]byte{meta0, meta1} {
-		if !VerifyMeta(b) {
-			continue
-		}
-		if m := DecodeMeta(b); m.HasFlag(MetaFlagCheckpoint) && m.TxnID > best {
-			best = m.TxnID
-		}
-	}
-	return best
 }

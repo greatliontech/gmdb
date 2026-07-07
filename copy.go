@@ -137,12 +137,19 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	cm.RPLTailPage = 0
 	cm.RPLEntryCount = 0
 	cm.NumFreePages = bm.NumFree()
-	cm.Flags = (meta.Flags & page.MetaFlagPageChecksum) | page.MetaFlagCheckpoint
+	cm.Flags = meta.Flags & page.MetaFlagPageChecksum
 	// A copy starts its MVCC counter fresh. Both meta slots are written
 	// byte-identical at TxnID 0 — the documented post-initialisation
 	// tie-at-zero state (page.ActiveMeta), valid even with a populated
 	// KeyspaceRoot. (Equal NON-zero TxnIDs would be a protocol violation.)
 	cm.TxnID = 0
+	// Like Init's genesis metas, the copy is self-durable at epoch 0
+	// (the fsync below makes it so; a fresh RPLHeadTxnID rides the
+	// emptied chain). Carrying the SOURCE's sub-record would make a
+	// fresh Open of the copy "recover" into the source's geometry.
+	cm.RPLHeadTxnID = 0
+	cm.Durable = cm.LiveSubRecord()
+	cm.Durable.AnchoredTxnID = 0
 	metaBuf := make([]byte, meta.PageSize)
 	page.EncodeMeta(metaBuf, &cm)
 	for slot := int64(0); slot < 2; slot++ {
@@ -389,8 +396,12 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	cm.RPLTailPage = 0
 	cm.RPLEntryCount = 0
 	cm.NumFreePages = bm.NumFree()
-	cm.Flags = (meta.Flags & page.MetaFlagPageChecksum) | page.MetaFlagCheckpoint
+	cm.Flags = meta.Flags & page.MetaFlagPageChecksum
 	cm.TxnID = 0 // fresh MVCC counter; both slots at the post-init tie-at-zero state
+	// Self-durable at epoch 0, like Init and the verbatim copy above.
+	cm.RPLHeadTxnID = 0
+	cm.Durable = cm.LiveSubRecord()
+	cm.Durable.AnchoredTxnID = 0
 	metaBuf := make([]byte, meta.PageSize)
 	page.EncodeMeta(metaBuf, &cm)
 	for slot := int64(0); slot < 2; slot++ {

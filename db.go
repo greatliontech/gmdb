@@ -60,15 +60,7 @@ type DB struct {
 	mu            sync.Mutex
 	currentMeta   page.Meta
 	activeMetaIdx int
-	// lastCheckpointTxnID is the TxnID of the most recent checkpoint meta —
-	// the meta recovery would select (durability.md §Recovery). It bounds RPL
-	// reclamation per free-space.md §RPL Reclamation: min(oldestReaderTxnID,
-	// lastCheckpointTxnID). Reclaiming past the last checkpoint would free
-	// pages a still-recoverable meta's tree references. Updated to the new
-	// TxnID on a checkpoint commit (SyncDurable/SyncDataOnly) and Checkpoint();
-	// unchanged on SyncLazy commits. Guarded by db.mu.
-	lastCheckpointTxnID uint64
-	pgr                 *pager.Pager
+	pgr           *pager.Pager
 
 	// poisoned is set when a write tx's commit failed past the
 	// publication boundary (step-3 pwrite or step-4 fdatasync). The
@@ -292,14 +284,6 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		return nil, mapPagerErr(err)
 	}
 
-	// durability.md §Recovery step 3: recovery accepted a
-	// non-checkpoint meta because no checkpoint-flagged meta exists
-	// (SyncLazy-only DB never Checkpoint()'d). Warn — data
-	// integrity depends on whether the OS flushed pages in the
-	// right order, which is not guaranteed. Emitted via the
-	// Options.Logger (or discard) once it has been resolved.
-	openWarnNoCheckpoint := opened.NoCheckpoint
-
 	// Capture Options.Logger with the default
 	// (nil → discard handler) so per-DB logging routes to the
 	// caller's chosen sink — never to slog.Default(). Built before the
@@ -388,6 +372,67 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		return nil, mapLockErr(err)
 	}
 
+	// Recovery-commit gate + anchoring (durability.md §Recovery step 5,
+	// §Anchoring). Under a briefly-held write grant: reap stale reader
+	// slots (OldestReaderTxnID's side effect, LOCK_EX held), then
+	// evaluate author liveness via the persisted last-writer record —
+	// only the last writer's process can own unfsynced live commits,
+	// and it may be idle, so grant/reader occupancy alone cannot gate.
+	// No live author + no live readers ⇒ crash residue: publish the
+	// durable projection as a recovery commit (rollback happened) or
+	// anchor the already-self-durable meta (its assertion may have been
+	// read from a surviving page cache). Any liveness ⇒ live join: the
+	// selected live tree is a running database's state; adoption is
+	// transient and the first grant re-sync converges.
+	// pager.Open returned the writer UNATTACHED (which projection to
+	// attach is this gate's decision, taken against a grant-current
+	// re-read — the pre-grant snapshot can be stale by any number of
+	// peer commits that landed while AcquireWriter blocked).
+	openRecovered := false
+	if !opts.ReadOnly && coord != nil {
+		teardown := func() {
+			coord.Close()
+			_ = lockFile.Close()
+			_ = opened.Pager.Close()
+			_ = file.Close()
+			_ = root.Close()
+		}
+		grant, gerr := coord.AcquireWriter(ctx)
+		if gerr != nil {
+			teardown()
+			return nil, mapLockErr(gerr)
+		}
+		_ = coord.OldestReaderTxnID() // reap stale slots in place
+		if !coord.PrevLastWriterLive() && coord.CountActiveReaders() == 0 {
+			rm, ridx, recovered, rerr := opened.Pager.RecoverToDurable(file)
+			if rerr != nil {
+				grant.Release()
+				teardown()
+				return nil, mapPagerErr(rerr)
+			}
+			if recovered {
+				logger.Warn("gmdb: crash recovery rolled back to the durable epoch",
+					"path", path,
+					"durableEpoch", rm.Durable.AnchoredTxnID,
+					"recoveryTxnID", rm.TxnID)
+			}
+			opened.Meta, opened.ActiveMetaIdx = rm, ridx
+			openRecovered = recovered
+		} else {
+			// Live join (or live readers present): attach the latest
+			// valid meta's LIVE projection — a running database's
+			// current state must not be rolled back.
+			lm, lidx, lerr := opened.Pager.AttachLatest(file)
+			if lerr != nil {
+				grant.Release()
+				teardown()
+				return nil, mapPagerErr(lerr)
+			}
+			opened.Meta, opened.ActiveMetaIdx = lm, lidx
+		}
+		grant.Release()
+	}
+
 	db := &DB{
 		file:      file,
 		root:      root,
@@ -431,15 +476,6 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		// conservative, one Close + re-Open converges.
 	}
 
-	if openWarnNoCheckpoint {
-		// adoptOpened already pinned reclamation off (bound 0).
-		db.logger.Warn(
-			"gmdb: Open accepted non-checkpoint meta",
-			"path", path,
-			"txn_id", opened.Meta.TxnID,
-			"detail", "no checkpoint-flagged meta found; data integrity depends on OS flush ordering",
-		)
-	}
 	// DB-level leak-detection cleanup. The cleanup info captures
 	// resources by pointer (not via *DB) so a leaked-then-collected
 	// DB doesn't nil-deref when the cleanup fires. The shared
@@ -458,15 +494,15 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	})
 
 	// Start the background maintenance goroutine (background-maintenance.md)
-	// unless disabled. A recovery that accepted a non-checkpoint meta
-	// (opened.NoCheckpoint — an unclean prior shutdown) schedules the first
-	// pass immediately rather than waiting a full interval, to reclaim any
+	// unless disabled. A recovering Open (the recovery commit ran — state
+	// was rolled back to the durable epoch) schedules the first pass
+	// immediately rather than waiting a full interval, to reclaim any
 	// crash-leaked pages promptly.
 	if !opts.Maintenance.Disable && !opts.ReadOnly {
 		db.maint.ctx, db.maint.cancel = context.WithCancel(context.Background())
 		db.maint.done = make(chan struct{})
 		db.maint.started = true
-		go db.maintenanceLoop(db.maint.ctx, opened.NoCheckpoint)
+		go db.maintenanceLoop(db.maint.ctx, openRecovered)
 	}
 	return db, nil
 }
@@ -696,7 +732,6 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 
 	prevMeta := db.currentMeta
 	prevActive := db.activeMetaIdx
-	lastCheckpoint := db.lastCheckpointTxnID
 	// TxnID seeded at tx-start so the LaggingReader callback's
 	// Lag = currentTxnID - reclamationBound is meaningful when
 	// AllocPage fires from the user path (Keyspace.Put → btree.Put →
@@ -742,7 +777,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	// reclamationBound's precondition (BeginTx seeds the bound
 	// synchronously; refreshes fire inside AllocPage, still under the
 	// grant); see reclamationBound's doc for why the bound uses
-	// lastCheckpointTxnID rather than prevMeta.TxnID. The RPLCorrupt
+	// the anchored epoch rather than prevMeta.TxnID. The RPLCorrupt
 	// callback surfaces quarantined-segment corruption (free-space.md
 	// §RPL Reclamation) which would otherwise be invisible until an
 	// explicit Check(): log it (db.logger defaults to a discard
@@ -754,7 +789,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 		MinSize:       prevMeta.MinSize,
 		TxnID:         newTxnID,
 		ReclamationBound: func() uint64 {
-			return reclamationBound(coord, lastCheckpoint)
+			return reclamationBound(coord, pgr)
 		},
 		RPLCorrupt: func(segPageID uint64) {
 			db.logger.Warn("gmdb: corrupt RPL segment quarantined during reclamation; "+
@@ -870,8 +905,7 @@ func (db *DB) acquireWriteGrant(ctx context.Context) (*lock.Grant, *lock.Coord, 
 // the peer's newer commit, and allocates from a stale bitmap (page
 // aliasing) — cross-process.md §Writer acquisition flow. Cheap no-op
 // when the on-disk active TxnID is unchanged (the common single-writer
-// path), which also preserves the in-memory lastCheckpointTxnID
-// tracking. On a Resync error the pager is fully unmodified
+// path). On a Resync error the pager is fully unmodified
 // (attachState is atomic), so the handle stays usable — the caller
 // releases the grant and surfaces the error; no poison needed.
 //
@@ -887,59 +921,50 @@ func (db *DB) resyncOnGrantLocked() (*pager.Pager, *os.File, error) {
 	if pgr == nil || file == nil {
 		return nil, nil, ErrClosed
 	}
-	m, active, lastCheckpoint, changed, err := pgr.Resync(file, db.currentMeta.TxnID)
+	m, active, changed, err := pgr.Resync(file, db.currentMeta.TxnID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("gmdb: re-sync writer state on grant: %w", mapPagerErr(err))
 	}
 	if changed {
-		db.setMetaState(m, active, lastCheckpoint)
+		db.setMetaState(m, active)
 	}
 	return pgr, file, nil
 }
 
-// setMetaState installs the meta baseline triple. The three fields move
-// together — currentMeta and activeMetaIdx name the committed snapshot,
-// and lastCheckpointTxnID is the recovery bound derived from the same
-// on-disk observation — so every update site funnels through this one
-// assignment; a site updating a subset would desynchronize the RPL
-// reclamation bound from the snapshot it protects. Caller holds db.mu
-// (or has exclusive access: Open's construction, Compact's swap under
-// grant+db.mu).
-func (db *DB) setMetaState(m page.Meta, active int, lastCheckpointTxnID uint64) {
+// setMetaState installs the meta baseline pair — currentMeta and
+// activeMetaIdx name the committed snapshot — so every update site
+// funnels through this one assignment. The RPL reclamation bound no
+// longer rides here: it derives from the pager's anchored epoch
+// (durability.md §Anchoring), which the pager maintains at its fsync
+// sites. Caller holds db.mu (or has exclusive access: Open's
+// construction, Compact's swap under grant+db.mu).
+func (db *DB) setMetaState(m page.Meta, active int) {
 	db.currentMeta = m
 	db.activeMetaIdx = active
-	db.lastCheckpointTxnID = lastCheckpointTxnID
 }
 
 // adoptOpened installs the meta baseline from a fresh pager Open —
-// db.Open's construction and Compact's post-swap reopen. Recovery
-// selected the highest-TxnID checkpoint meta, so its TxnID is the last
-// checkpoint. If no checkpoint meta was found (NoCheckpoint), there is
-// no recoverable checkpoint to bound against, so reclamation is pinned
-// off (bound 0) until the next checkpoint re-establishes it.
+// db.Open's construction and Compact's post-swap reopen. The meta is
+// the LIVE projection; the recovery-commit gate (db.Open) has already
+// republished the durable projection when that was warranted.
 func (db *DB) adoptOpened(opened *pager.OpenedDB) {
-	lastCheckpoint := opened.Meta.TxnID
-	if opened.NoCheckpoint {
-		lastCheckpoint = 0
-	}
-	db.setMetaState(opened.Meta, opened.ActiveMetaIdx, lastCheckpoint)
+	db.setMetaState(opened.Meta, opened.ActiveMetaIdx)
 }
 
 // reclamationBound derives the RPL reclamation bound
-// min(oldestActiveReaderTxnID, lastCheckpointTxnID) per free-space.md
-// §RPL Reclamation. The caller MUST hold the cross-process write grant
-// — coord.OldestReaderTxnID's flock(LOCK_EX) precondition
+// min(oldestActiveReaderTxnID, anchoredEpoch) per free-space.md §RPL
+// Reclamation. The caller MUST hold the cross-process write grant —
+// coord.OldestReaderTxnID's flock(LOCK_EX) precondition
 // (cross-process.md §Writer's Page Reclamation). With no live readers
-// the scan returns lock.NoReaderTxnID, reducing the min to
-// lastCheckpoint. The bound MUST use lastCheckpointTxnID, NOT the
-// previous meta's TxnID: under SyncLazy the meta TxnID runs ahead of
-// the last checkpoint, and reclaiming past the checkpoint frees data
-// pages a still-recoverable checkpoint meta's tree references —
-// deterministic corruption after crash recovery selects that
-// checkpoint. Under SyncDurable/SyncDataOnly every commit is a
-// checkpoint, so the two coincide.
-func reclamationBound(coord *lock.Coord, lastCheckpoint uint64) uint64 {
-	return min(coord.OldestReaderTxnID(), lastCheckpoint)
+// the scan returns lock.NoReaderTxnID, reducing the min to the
+// anchored epoch. The bound MUST use the ANCHORED epoch — the newest
+// DurableTxnID assertion a completed fdatasync has covered
+// (durability.md §Anchoring), maintained by the pager at its fsync
+// sites — never a raw meta TxnID or an unanchored assertion:
+// reclaiming past what the disk records frees data pages the tree a
+// crash recovers to still references — deterministic corruption.
+func reclamationBound(coord *lock.Coord, pgr *pager.Pager) uint64 {
+	return min(coord.OldestReaderTxnID(), pgr.AnchoredEpoch())
 }
 
 // readPersistedPageSize discovers the file's PageSize via pager.DiscoverPageSize,

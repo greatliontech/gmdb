@@ -43,8 +43,8 @@ func TestFileSize(t *testing.T) {
 }
 
 func TestStructSizes(t *testing.T) {
-	if HeaderSize != 80 {
-		t.Errorf("HeaderSize = %d, want 80", HeaderSize)
+	if HeaderSize != 112 {
+		t.Errorf("HeaderSize = %d, want 112", HeaderSize)
 	}
 	if SlotSize != 48 {
 		t.Errorf("SlotSize = %d, want 48", SlotSize)
@@ -220,7 +220,13 @@ func TestOpenRejectsCorruptMaxReaders(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsSizeMismatch(t *testing.T) {
+func TestOpenRecreatesOnSizeMismatch(t *testing.T) {
+	// A plausible header (magic + MaxReaders in range) whose file size
+	// disagrees with the current layout is a lock file written by a
+	// binary with a different header layout (pre-v1 layout changes grow
+	// HeaderSize in place). The lock file is transient coordination
+	// state: Open treats it as stale — unlink + recreate — exactly like
+	// a UUID mismatch, rather than refusing to open an intact database.
 	root, base, fullPath := tmpLock(t)
 	uuid := [16]byte{0xAA}
 
@@ -234,9 +240,17 @@ func TestOpenRejectsSizeMismatch(t *testing.T) {
 		t.Fatalf("truncate: %v", err)
 	}
 
-	_, err = Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 8})
-	if !errors.Is(err, ErrCorrupted) {
-		t.Errorf("got %v, want ErrCorrupted", err)
+	f2, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("reopen after size mismatch: %v (want stale-recreate)", err)
+	}
+	defer f2.Close()
+	st, err := os.Stat(fullPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if st.Size() != FileSize(8) {
+		t.Errorf("recreated size = %d, want %d", st.Size(), FileSize(8))
 	}
 }
 

@@ -316,7 +316,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		// free" sentinel collides with a legitimate genesis snapshot of 0
 		// — clamp to 1 so the genesis snapshot is still pinnable.
 		// Reclamation safety is unaffected: the reclamation bound rule
-		// (min(oldestReader, lastCheckpointTxnID)) uses 1 here, and only
+		// (min(oldestReader, anchoredEpoch)) uses 1 here, and only
 		// RPL entries with TxnID < 1 (i.e. zero, which never appears in
 		// the RPL) become reclaimable — that's correct for a genesis
 		// snapshot which references no retired pages.

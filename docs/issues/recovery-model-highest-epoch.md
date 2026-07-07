@@ -1,6 +1,6 @@
 # Recovery model: replace checkpoint-preferring with highest-valid-epoch
 
-**Lands:** chunks 8–9 of `docs/plans/architecture-consolidation.md`.
+**Lands:** chunk 9 of `docs/plans/architecture-consolidation.md` (the chunk-8 portion — durable sub-record, one-selection recovery, the recovery commit, anchoring — landed; remaining: clean-shutdown Close checkpoint, maintenance first-pass trigger surface, stats/warn surfaces, recovery test nets).
 The Spec-first design this issue called for landed at chunk 7 (user
 selected the **durable sub-record** model: every meta carries its
 recovery target — `durability.md §Checkpoints and the durable

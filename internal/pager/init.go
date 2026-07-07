@@ -68,10 +68,6 @@ func Init(file *os.File, ip InitParams) error {
 	if ip.PageChecksum {
 		flags |= page.MetaFlagPageChecksum
 	}
-	// At init, the "no transactions yet" state is also the latest
-	// checkpoint. Set the Checkpoint flag so Open's durability-aware
-	// caller sees this meta as the recovery target.
-	flags |= page.MetaFlagCheckpoint
 
 	m := page.Meta{
 		Magic:           page.Magic,
@@ -86,6 +82,7 @@ func Init(file *os.File, ip InitParams) error {
 		ShrinkThreshold: ip.ShrinkThreshold,
 		HighWaterMark:   firstDataPage,
 		RPLHeadPage:     0,
+		RPLHeadTxnID:    0,
 		RPLTailPage:     0,
 		RPLEntryCount:   0,
 		NumFreePages:    0,
@@ -93,6 +90,13 @@ func Init(file *os.File, ip InitParams) error {
 		NumKeyspaces:    0,
 		TxnID:           0,
 	}
+	// Genesis metas are self-durable at epoch 0 (api-surface.md
+	// §Database Initialization): the fsync below makes the empty
+	// state the first durable epoch. AnchoredTxnID = 0 is harmless
+	// even if a crash beats the fsync — a bound of 0 reclaims
+	// nothing.
+	m.Durable = m.LiveSubRecord()
+	m.Durable.AnchoredTxnID = 0
 
 	pageSizeI := int64(ip.PageSize)
 	if err := file.Truncate(int64(filePages) * pageSizeI); err != nil {
@@ -127,31 +131,24 @@ type OpenParams struct {
 	MaxTxBufferBytes int      // slab budget for write transactions
 }
 
-// OpenedDB bundles the products of Open: the writer pager (ready for
-// write transactions), the active meta (snapshot), and the active-meta
-// index. The caller advances PrevActive on commit and re-snapshots Meta
-// from the post-commit return.
-//
-// NoCheckpoint surfaces the durability.md §Recovery step-3 case: the
-// active meta was selected despite NOT having MetaFlagCheckpoint set.
-// The root package's caller logs a warning via slog when this is true
-// — recovery accepted a non-checkpoint meta because no
-// checkpoint-flagged meta exists; data integrity depends on whether
-// the OS flushed pages in the right order (SyncLazy-only DB never
-// Checkpoint()'d).
+// OpenedDB bundles the products of Open: the UNATTACHED writer pager,
+// the selected meta, and its slot index. Meta/ActiveMetaIdx are the
+// pre-grant snapshot — enough for cfg/UUID needs — and are superseded
+// by the result of the attach call (RecoverToDurable or AttachLatest,
+// see Open) that the caller MUST make under the write grant before
+// using the pager. The caller advances PrevActive on commit and
+// re-snapshots Meta from the post-commit return.
 type OpenedDB struct {
 	Pager         *Pager
 	Meta          page.Meta
 	ActiveMetaIdx int
-	NoCheckpoint  bool
 }
 
 // Open reads the file's two meta pages, selects the active one,
-// validates its fields, mmaps the data file with a reservation of
-// `Meta.MaxSize * PageSize`, builds the in-memory bitmap by reading the
-// on-disk bitmap region, rebuilds the RPL in-memory segment list by
-// walking the on-disk chain, and returns a writer pager ready for the
-// first write transaction.
+// validates its fields, and mmaps the data file with a reservation of
+// `Meta.MaxSize * PageSize`. The returned writer pager is UNATTACHED —
+// no in-memory bitmap, RPL chain, or commit state; see the body
+// comment and OpenedDB for the mandatory second phase.
 //
 // The returned Pager's pool is op.Pool; it must outlive the pager.
 //
@@ -171,7 +168,7 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 	}
 	// 1–2) Discover PageSize, select + validate the active meta. Shared
 	// with OpenReadOnly (which then builds a reader pager instead).
-	m, active, noCheckpoint, pageSize, err := readAndSelectMeta(file)
+	m, active, pageSize, err := readAndSelectMeta(file)
 	if err != nil {
 		return nil, err
 	}
@@ -185,20 +182,49 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		return nil, err
 	}
 
-	// 4–6) Build the in-memory bitmap + RPL chain + commit state from the
-	// on-disk image. Shared with Resync via attachState (which documents the
-	// forged-BitmapPages corruption bounds it enforces).
-	if err := p.attachState(file, m); err != nil {
-		_ = p.Close()
-		return nil, err
-	}
-
+	// The writer pager is returned UNATTACHED: building the in-memory
+	// bitmap + RPL chain walks the selected meta's projection, and
+	// WHICH projection (live vs durable) is the recovery-commit gate's
+	// decision, which only the root package can take — under the write
+	// grant, against a grant-current re-read of the metas
+	// (durability.md §Recovery step 5). Walking the live projection
+	// here would also hard-fail on a crashed SyncLazy image whose
+	// unflushed post-epoch RPL head is exempt from boundary treatment
+	// — permanently failing an Open the durable projection recovers.
+	// The caller MUST call exactly one of RecoverToDurable (gate
+	// passed) or AttachLatest (live join / self-durable-no-gate) under
+	// the grant before using the pager; Meta/ActiveMetaIdx returned
+	// here are the pre-grant snapshot for cfg/UUID needs only and are
+	// superseded by that call's result.
 	return &OpenedDB{
 		Pager:         p,
 		Meta:          m,
 		ActiveMetaIdx: active,
-		NoCheckpoint:  noCheckpoint,
 	}, nil
+}
+
+// AttachLatest re-reads both meta slots under the caller's write
+// grant, selects the latest valid meta (the one selection), attaches
+// the pager to its LIVE projection, and returns it. The under-grant
+// re-read is load-bearing: the pre-grant Open snapshot can be stale by
+// any number of peer commits that landed while AcquireWriter blocked.
+func (p *Pager) AttachLatest(file *os.File) (page.Meta, int, error) {
+	meta0, meta1, err := readMetaPair(file, p.cfg.PageSize)
+	if err != nil {
+		return page.Meta{}, 0, err
+	}
+	active, ok := page.ActiveMeta(meta0, meta1)
+	if !ok {
+		return page.Meta{}, 0, errBothMetasInvalid()
+	}
+	m, err := decodeActiveMeta(meta0, meta1, active)
+	if err != nil {
+		return page.Meta{}, 0, err
+	}
+	if err := p.attachState(file, m); err != nil {
+		return page.Meta{}, 0, err
+	}
+	return m, active, nil
 }
 
 // OpenReadOnly opens a read-only pager over file for a read-only DB
@@ -215,7 +241,7 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 // root package's BeginRead). file may be opened O_RDONLY — nothing in
 // this path writes it.
 func OpenReadOnly(file *os.File, op OpenParams) (*OpenedDB, error) {
-	m, active, noCheckpoint, pageSize, err := readAndSelectMeta(file)
+	m, active, pageSize, err := readAndSelectMeta(file)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +255,6 @@ func OpenReadOnly(file *os.File, op OpenParams) (*OpenedDB, error) {
 		Pager:         p,
 		Meta:          m,
 		ActiveMetaIdx: active,
-		NoCheckpoint:  noCheckpoint,
 	}, nil
 }
 
@@ -239,14 +264,15 @@ func OpenReadOnly(file *os.File, op OpenParams) (*OpenedDB, error) {
 // the only thing that authorizes trust in any meta field, since
 // ValidPageSize alone can't catch a checksum-breaking flip that still
 // yields a syntactically valid value), and selects + validates the
-// active meta (checkpoint-preferring, durability.md §Recovery step 3;
-// noCheckpoint = the step-3 fallback where no checkpoint-flagged meta
-// exists — the caller logs a warning). Shared by Open (then NewWriter +
-// attachState) and OpenReadOnly (then NewReader).
-func readAndSelectMeta(file *os.File) (m page.Meta, active int, noCheckpoint bool, pageSize uint32, err error) {
+// active meta — the ONE selection every consumer uses (durability.md
+// §One selection, two projections; crash recovery differs only by
+// adopting the winner's durable sub-record, which is the CALLER's
+// step). Shared by Open (then NewWriter + attachState) and
+// OpenReadOnly (then NewReader).
+func readAndSelectMeta(file *os.File) (m page.Meta, active int, pageSize uint32, err error) {
 	meta0Bytes := make([]byte, page.MetaPayloadSize)
 	if _, err := file.ReadAt(meta0Bytes, 0); err != nil {
-		return page.Meta{}, 0, false, 0, fmt.Errorf("pager: read meta0: %w", err)
+		return page.Meta{}, 0, 0, fmt.Errorf("pager: read meta0: %w", err)
 	}
 	// An intact gmdb meta-0 of a different format version is reported
 	// distinctly from corruption (file-layout.md §Meta Page): the file
@@ -254,7 +280,7 @@ func readAndSelectMeta(file *os.File) (m page.Meta, active int, noCheckpoint boo
 	// the recovery machinery so a different-version file never
 	// masquerades as a torn/corrupt current-version file.
 	if isVersionMismatchMeta(meta0Bytes) {
-		return page.Meta{}, 0, false, 0, fmt.Errorf("pager: %w: meta0 version %d, want %d",
+		return page.Meta{}, 0, 0, fmt.Errorf("pager: %w: meta0 version %d, want %d",
 			ErrVersionMismatch, page.DecodeMeta(meta0Bytes).Version, page.FormatVersion)
 	}
 	var meta1Bytes []byte
@@ -264,48 +290,33 @@ func readAndSelectMeta(file *os.File) (m page.Meta, active int, noCheckpoint boo
 			// Checksum agrees with a value that the format rejects:
 			// the file was written by a different format version or
 			// the checksum collided. Either way, ErrCorrupted.
-			return page.Meta{}, 0, false, 0, fmt.Errorf("pager: meta0 verified but PageSize %d invalid: %w", pageSize, ErrCorrupted)
+			return page.Meta{}, 0, 0, fmt.Errorf("pager: meta0 verified but PageSize %d invalid: %w", pageSize, ErrCorrupted)
 		}
 	} else {
 		var perr error
 		pageSize, meta1Bytes, perr = probeMetaPageSize(file)
 		if perr != nil {
-			return page.Meta{}, 0, false, 0, fmt.Errorf("pager: meta1 probe read: %w", perr)
+			return page.Meta{}, 0, 0, fmt.Errorf("pager: meta1 probe read: %w", perr)
 		}
 		if pageSize == 0 {
-			return page.Meta{}, 0, false, 0, fmt.Errorf("pager: meta0 verify failed and meta1 probe found no recoverable meta: %w", ErrCorrupted)
+			return page.Meta{}, 0, 0, fmt.Errorf("pager: meta0 verify failed and meta1 probe found no recoverable meta: %w", ErrCorrupted)
 		}
 	}
 	if meta1Bytes == nil {
 		meta1Bytes = make([]byte, page.MetaPayloadSize)
 		if _, err := file.ReadAt(meta1Bytes, int64(pageSize)); err != nil {
-			return page.Meta{}, 0, false, 0, fmt.Errorf("pager: read meta1: %w", err)
+			return page.Meta{}, 0, 0, fmt.Errorf("pager: read meta1: %w", err)
 		}
 	}
-	m, active, noCheckpoint, err = selectActiveMeta(meta0Bytes, meta1Bytes)
-	if err != nil {
-		return page.Meta{}, 0, false, 0, err
-	}
-	return m, active, noCheckpoint, pageSize, nil
-}
-
-// selectActiveMeta decodes the two meta-page byte images, selects the active
-// meta (checkpoint-preferring per durability.md §Recovery), and validates it.
-// noCheckpoint reports the §Recovery step-3 fallback: the selected meta lacks
-// MetaFlagCheckpoint because no checkpoint-flagged meta exists. Open/
-// OpenReadOnly only — Resync deliberately selects LATEST-COMMITTED instead
-// (durability.md §"Live visibility vs. crash recovery — distinct selections";
-// see Resync's doc).
-func selectActiveMeta(meta0Bytes, meta1Bytes []byte) (m page.Meta, active int, noCheckpoint bool, err error) {
-	active, noCheckpoint, ok := page.ActiveMetaCheckpointPreferring(meta0Bytes, meta1Bytes)
+	active, ok := page.ActiveMeta(meta0Bytes, meta1Bytes)
 	if !ok {
-		return page.Meta{}, 0, false, errBothMetasInvalid()
+		return page.Meta{}, 0, 0, errBothMetasInvalid()
 	}
 	m, err = decodeActiveMeta(meta0Bytes, meta1Bytes, active)
 	if err != nil {
-		return page.Meta{}, 0, false, err
+		return page.Meta{}, 0, 0, err
 	}
-	return m, active, noCheckpoint, nil
+	return m, active, pageSize, nil
 }
 
 // readMetaPair reads the two meta-page images at their fixed offsets
@@ -325,8 +336,8 @@ func readMetaPair(file *os.File, pageSize uint32) (meta0, meta1 []byte, err erro
 }
 
 // decodeActiveMeta decodes the selected slot of a meta pair and
-// validates it. Every selection path (checkpoint-preferring and
-// latest-committed alike) funnels through this one decode+validate.
+// validates it. Every selection path funnels through this one
+// decode+validate.
 func decodeActiveMeta(meta0, meta1 []byte, active int) (page.Meta, error) {
 	b := meta0
 	if active == 1 {
@@ -431,13 +442,14 @@ func (p *Pager) attachState(file *os.File, m page.Meta) error {
 	// All fallible work is done — install every piece of state at once. None
 	// of these assignments can fail, so the pager moves from fully-old to
 	// fully-new with no observable partial state (the caller holds the write
-	// grant). The reclamation bound seeded here is the active meta's TxnID;
-	// the DB layer overrides it per-tx with min(oldestReader, lastCheckpoint)
-	// (free-space.md §RPL Reclamation).
+	// grant). The reclamation bound seeded here is the meta's persisted
+	// anchored epoch; the DB layer re-derives it per-tx as
+	// min(oldestReader, AnchoredEpoch) (free-space.md §RPL Reclamation).
 	p.fileSize = newFileSize
 	p.AttachBitmap(bm)
 	p.SetRPLChain(chain)
-	p.SetCommitState(m.HighWaterMark, m.MaxSize, m.TxnID)
+	p.advanceAnchoredEpoch(m.Durable.AnchoredTxnID)
+	p.SetCommitState(m.HighWaterMark, m.MaxSize, p.anchoredEpoch)
 	p.setSizeParams(m.GrowStep, m.MinSize)
 	return nil
 }
@@ -448,69 +460,169 @@ func (p *Pager) attachState(file *os.File, m page.Meta) error {
 // concurrent writer mutates the metas/bitmap/RPL and no tx is in flight (the
 // bitmap is replaced wholesale).
 //
-// Base-meta selection is LATEST-COMMITTED (page.ActiveMeta — highest valid
-// TxnID), NOT the checkpoint-preferring selection Open uses. Open is crash
-// recovery, where an uncheckpointed SyncLazy commit past the last checkpoint
-// may be torn and must be rolled back. A live grant handoff is not recovery:
-// the peer cleanly committed and released the flock, so its latest commit —
-// even an uncheckpointed SyncLazy one — is complete and visible (same-host
-// page cache), and rolling back to the last checkpoint would silently lose it
-// (a lost update, and inconsistent with the latest-committed snapshot
-// ReadLatestMeta hands to readers). This also matters single-process: with
-// checkpoint-preferring, a writer's own SyncLazy commit would be rolled back
-// on its next Begin.
+// Selection is the ONE rule shared with Open and readers (page.ActiveMeta,
+// highest valid TxnID); Resync uses its LIVE projection — a grant handoff is
+// not recovery: the peer cleanly committed and released the flock, so its
+// latest commit — even an unfsynced SyncLazy one — is complete and visible
+// (same-host page cache), and rolling back to the durable epoch would
+// silently lose it (durability.md §One selection, two projections).
 //
-// lastCheckpointTxnID is the highest checkpoint-flagged TxnID among the two
-// on-disk slots (0 if none) — exactly the meta a crash would recover to
-// (checkpoint-preferring), so it bounds RPL reclamation to protect that
-// recoverable tree (free-space.md §RPL Reclamation). The caller adopts it only
-// on changed=true; on changed=false it keeps its own in-memory tracking, which
-// can be tighter (it remembers a checkpoint that SyncLazy commits have since
-// overwritten in the slots).
+// Anchoring: the persisted AnchoredDurableTxnID of the adopted meta advances
+// the pager's in-process anchored epoch (monotone max — our own completed
+// fsyncs stay valid). The reclamation bound derives from AnchoredEpoch
+// (free-space.md §RPL Reclamation).
 //
 // knownTxnID is the caller's cached active-meta TxnID. When the on-disk latest
 // meta still carries it, no peer commit has landed: Resync returns
-// changed=false and rebuilds nothing, so the caller keeps its cached meta AND
-// its in-memory last-checkpoint tracking. Only a genuine peer advance triggers
+// changed=false and rebuilds nothing. Only a genuine peer advance triggers
 // the bitmap+RPL rebuild. The mmap is reused (MaxSize / PageSize immutable for
 // the file's life).
 //
 // On a corrupt on-disk image (both metas invalid, forged BitmapPages, corrupt
 // RPL chain) or a meta-read I/O error, Resync returns a wrapped error with the
 // pager left **fully unmodified** (attachState is atomic and the read/select
-// steps precede it), so the caller releases the grant and returns the error
+// steps precede it) — except the monotone anchored-epoch advance, which is
+// always safe — so the caller releases the grant and returns the error
 // without poisoning — the handle stays usable (a retry re-reads; Close +
 // re-Open invokes Open's own corruption recovery).
-func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m page.Meta, active int, lastCheckpointTxnID uint64, changed bool, err error) {
+func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m page.Meta, active int, changed bool, err error) {
 	meta0, meta1, err := readMetaPair(file, p.cfg.PageSize)
 	if err != nil {
-		return page.Meta{}, 0, 0, false, err
+		return page.Meta{}, 0, false, err
 	}
 	active, ok := page.ActiveMeta(meta0, meta1)
 	if !ok {
-		return page.Meta{}, 0, 0, false, errBothMetasInvalid()
+		return page.Meta{}, 0, false, errBothMetasInvalid()
 	}
 	m, err = decodeActiveMeta(meta0, meta1, active)
 	if err != nil {
-		return page.Meta{}, 0, 0, false, err
+		return page.Meta{}, 0, false, err
 	}
-	lastCheckpointTxnID = page.HighestCheckpointTxnID(meta0, meta1)
+	p.advanceAnchoredEpoch(m.Durable.AnchoredTxnID)
 	if m.TxnID == knownTxnID {
-		return m, active, lastCheckpointTxnID, false, nil
+		return m, active, false, nil
 	}
 	if err := p.attachState(file, m); err != nil {
-		return page.Meta{}, 0, 0, false, err
+		return page.Meta{}, 0, false, err
 	}
-	return m, active, lastCheckpointTxnID, true, nil
+	return m, active, true, nil
+}
+
+// RecoverToDurable runs the gated writable-Open recovery path
+// (durability.md §Recovery steps 1–5) UNDER the caller's write grant:
+// it re-reads both meta slots (the pre-grant Open snapshot can be
+// stale by any number of peer commits that landed while AcquireWriter
+// blocked — publishing from it would clobber an acked peer commit and
+// retreat the durable epoch), selects the latest valid meta, and:
+//
+//   - Self-durable: attaches the live (== durable) projection, then
+//     anchors the assertion by rewriting the meta to its own slot and
+//     fsyncing (the meta may have been read from a surviving page
+//     cache; §Anchoring), and returns it. recovered = false.
+//   - Otherwise: attaches the DURABLE projection (walking the RPL
+//     with the adopted epoch as the reclaim reference, so the epoch's
+//     own head keeps its hard-error exemption), then publishes the
+//     recovery commit at TxnID+1 to the non-selected slot and fsyncs.
+//     recovered = true.
+//
+// The recovery meta's live fields are the adopted durable state, so
+// its self-durable assertion (DurableTxnID = TxnID+1) is data-safe
+// even before the fsync completes: the tree it names IS the durable
+// epoch's. Its persisted AnchoredDurableTxnID is the ADOPTED epoch —
+// the assertion just read from disk — per §Anchoring's
+// no-forward-promise rule; the in-process anchored epoch advances to
+// TxnID+1 only after the fsync returns. Idempotent under crash: a
+// crash before the fsync leaves the old slots authoritative and
+// recovery re-runs. The caller MUST hold the write grant and have
+// passed the no-live-author gate.
+func (p *Pager) RecoverToDurable(file *os.File) (m page.Meta, active int, recovered bool, err error) {
+	meta0, meta1, err := readMetaPair(file, p.cfg.PageSize)
+	if err != nil {
+		return page.Meta{}, 0, false, err
+	}
+	selectedIdx, ok := page.ActiveMeta(meta0, meta1)
+	if !ok {
+		return page.Meta{}, 0, false, errBothMetasInvalid()
+	}
+	selected, err := decodeActiveMeta(meta0, meta1, selectedIdx)
+	if err != nil {
+		return page.Meta{}, 0, false, err
+	}
+	if selected.SelfDurable() {
+		if err := p.attachState(file, selected); err != nil {
+			return page.Meta{}, 0, false, err
+		}
+		// Anchor the assertion by re-writing the meta to its own slot
+		// and fsyncing. The pwrite is load-bearing, not redundant: the
+		// meta may live only in a surviving page cache, and a PRIOR
+		// failed fsync (this process's or a crashed retry's) both
+		// consumed the kernel's writeback error and marked the pages
+		// clean — a bare fdatasync would then succeed trivially,
+		// anchoring an assertion the disk never received, and
+		// reclamation would free segments a power loss still needs
+		// (durability.md §Anchoring). Re-dirtying the slot with the
+		// byte-identical meta makes trivial success impossible; a torn
+		// write of identical bytes is harmless and the other slot is
+		// untouched.
+		buf := make([]byte, p.cfg.PageSize)
+		page.EncodeMeta(buf, &selected)
+		if _, err := file.WriteAt(buf, int64(selectedIdx)*int64(p.cfg.PageSize)); err != nil {
+			return page.Meta{}, 0, false, fmt.Errorf("pager: anchor rewrite meta %d: %w", selectedIdx, err)
+		}
+		if err := fdatasync(file); err != nil {
+			return page.Meta{}, 0, false, fmt.Errorf("pager: anchor fdatasync: %w", err)
+		}
+		p.advanceAnchoredEpoch(selected.Durable.TxnID)
+		return selected, selectedIdx, false, nil
+	}
+
+	// Attach the durable projection FIRST, as a self-consistent meta at
+	// the adopted epoch (live fields = durable fields, sub-record =
+	// selected's): the RPL walk then runs with ReclaimEpoch = the
+	// adopted epoch, so the epoch's OWN head keeps its hard-error
+	// exemption (free-space.md §Head classification). Nothing has been
+	// written yet — an attach failure leaves the disk untouched.
+	d := selected.Durable
+	proj := selected // UUID, format fields, immutables carry over
+	proj.HighWaterMark = d.HighWaterMark
+	proj.RPLHeadPage = d.RPLHeadPage
+	proj.RPLHeadTxnID = d.RPLHeadTxnID
+	proj.RPLTailPage = d.RPLTailPage
+	proj.RPLEntryCount = d.RPLEntryCount
+	proj.NumFreePages = d.NumFreePages
+	proj.KeyspaceRoot = d.KeyspaceRoot
+	proj.NumKeyspaces = d.NumKeyspaces
+	proj.TxnID = d.TxnID
+	if err := p.attachState(file, proj); err != nil {
+		return page.Meta{}, 0, false, err
+	}
+
+	// Publish the recovery commit at selected.TxnID+1.
+	rm := proj
+	rm.TxnID = selected.TxnID + 1
+	rm.Durable = rm.LiveSubRecord()
+	rm.Durable.AnchoredTxnID = d.TxnID
+	buf := make([]byte, p.cfg.PageSize)
+	page.EncodeMeta(buf, &rm)
+	newIdx := 1 - selectedIdx
+	if _, err := file.WriteAt(buf, int64(newIdx)*int64(p.cfg.PageSize)); err != nil {
+		return page.Meta{}, 0, false, fmt.Errorf("pager: recovery commit write meta %d: %w", newIdx, err)
+	}
+	if err := fdatasync(file); err != nil {
+		return page.Meta{}, 0, false, fmt.Errorf("pager: recovery commit fdatasync: %w", err)
+	}
+	// The completed fsync anchors the recovery meta's own assertion;
+	// re-seed the commit state to the published meta's view.
+	p.advanceAnchoredEpoch(rm.Durable.TxnID)
+	p.SetCommitState(rm.HighWaterMark, rm.MaxSize, p.anchoredEpoch)
+	return rm, newIdx, true, nil
 }
 
 // ReadLatestMeta reads both on-disk meta pages and returns the latest
-// COMMITTED one — the highest valid TxnID, NOT checkpoint-preferring. A read
+// COMMITTED one — the one selection, used in its LIVE projection: a read
 // transaction wants the newest committed snapshot for visibility (it must
-// observe a peer's completed commit, cross-process.md §Reader Table), whereas
-// recovery/Open want the newest durable checkpoint; the two selections differ
-// only when the newest commit is an unflagged SyncLazy commit, where a reader
-// correctly prefers it. Lock-free: BeginRead holds no write grant, so a writer
+// observe a peer's completed commit, cross-process.md §Reader Table;
+// durability.md §One selection, two projections). Lock-free: BeginRead holds no write grant, so a writer
 // may be mid-commit on the inactive slot — a torn slot fails its checksum and
 // page.ActiveMeta selects the valid one (the commit writes data pages before
 // the meta, so the selected meta's pages are always readable). pageSize is the
@@ -654,11 +766,13 @@ func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmap.Bitmap, fileSize int64) (
 	backedPages := min(uint64(fileSize)/uint64(p.cfg.PageSize), m.MaxSize)
 	var headFirst []RPLSegmentRef
 	walk := RPLChainWalk{
-		ReadPage:   p.pageRaw,
-		Cfg:        p.cfg,
-		Head:       m.RPLHeadPage,
-		Tail:       m.RPLTailPage,
-		EntryCount: m.RPLEntryCount,
+		ReadPage:     p.pageRaw,
+		Cfg:          p.cfg,
+		Head:         m.RPLHeadPage,
+		HeadTxnID:    m.RPLHeadTxnID,
+		Tail:         m.RPLTailPage,
+		EntryCount:   m.RPLEntryCount,
+		ReclaimEpoch: m.Durable.TxnID,
 		// Below the meta/bitmap region no segment can live; reclaimRPL
 		// would panic in Bitmap.Set on such an id, so it must not enter
 		// the chain.

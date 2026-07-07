@@ -135,6 +135,15 @@ type Pager struct {
 	rplCorruptCount uint64
 	rplCorruptCb    func(segPageID uint64)
 
+	// anchoredEpoch is the newest DurableTxnID assertion this handle
+	// knows to be covered by a COMPLETED fdatasync (durability.md
+	// §Anchoring). Seeded at Open/Resync from the persisted
+	// AnchoredDurableTxnID (or the recovered epoch itself, which the
+	// recovering Open's own fsync anchors); advanced monotonically by
+	// commit steps 2/4 and Checkpoint's step 4. Bounds RPL
+	// reclamation; survives across write transactions on this handle.
+	anchoredEpoch uint64
+
 	pendingAllocs map[uint64]struct{}
 	pendingFrees  map[uint64]struct{}
 	retiredPages  []uint64
@@ -394,7 +403,7 @@ func (p *Pager) Bitmap() *bitmap.Bitmap { return p.bitmap }
 //   - maxSizePages: MaxSize (in pages) from the active meta. Caps file
 //     growth; AllocPage returns ErrDBFull when extension would exceed
 //     this.
-//   - reclamationBound: min(oldestActiveReaderTxnID, lastCheckpointTxnID).
+//   - reclamationBound: min(oldestActiveReaderTxnID, anchoredEpoch).
 //     RPL entries with TxnID strictly less than this bound are
 //     reclaimable.
 //
@@ -447,7 +456,7 @@ type TxParams struct {
 	// user-path AllocPage.
 	TxnID uint64
 	// ReclamationBound derives min(oldestActiveReaderTxnID,
-	// lastCheckpointTxnID) (free-space.md §RPL Reclamation). BeginTx
+	// anchoredEpoch) (free-space.md §RPL Reclamation). BeginTx
 	// calls it once to seed the bound; ReclaimFreeSpace and the
 	// LaggingReaderWait retry path call it again to refresh. Any
 	// refresh value is safe by construction: it is re-derived from
@@ -493,6 +502,13 @@ func (p *Pager) BeginTx(params TxParams) {
 	p.inCommit = false
 	if p.readOnly {
 		return
+	}
+	// Self-enforce the two-phase open contract (init.go Open): a
+	// writable pager must have been attached (RecoverToDurable /
+	// AttachLatest / attachState) before its first transaction —
+	// commits against a zero-value bitmap/HWM would corrupt the file.
+	if p.bitmap == nil {
+		panic("pager: BeginTx on an unattached writer (missing RecoverToDurable/AttachLatest after Open)")
 	}
 	// Install the seeding before the tx snapshot (see doc above).
 	p.highWaterMark = params.HighWaterMark

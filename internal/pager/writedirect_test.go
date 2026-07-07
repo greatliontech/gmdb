@@ -271,10 +271,7 @@ func TestWriteDirectSurvivesCommit(t *testing.T) {
 			// Re-open and verify durability + bitmap state.
 			_ = p.Close()
 			pool := NewBufPool(testPageSize)
-			db2, err := Open(f, OpenParams{Pool: pool, MaxTxBufferBytes: 16 << 20})
-			if err != nil {
-				t.Fatalf("re-Open: %v", err)
-			}
+			db2 := openAttachedForTest(t, f, OpenParams{Pool: pool, MaxTxBufferBytes: 16 << 20})
 			defer db2.Pager.Close()
 
 			got := db2.Pager.pageRaw(id)

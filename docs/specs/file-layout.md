@@ -103,8 +103,6 @@ Invariant: kind=clause-explicit;
   violation=A future engine version that introduces a new flag bit
     silently misinterprets pages written by an older engine that did
     not understand it — forward-compat trap.
-  Lands: chunk 8 of docs/plans/architecture-consolidation.md (bit 1
-    reserved; the current format still writes it).
 
 ## File regions
 

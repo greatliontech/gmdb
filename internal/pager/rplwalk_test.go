@@ -330,3 +330,72 @@ func TestRPLChainWalkErrors(t *testing.T) {
 		}
 	})
 }
+
+// TestRPLChainWalkHeadOwnership pins the head-classification rule
+// (free-space.md §Head classification requires the persisted head
+// TxnID): the head is exempt from boundary treatment iff
+// HeadTxnID >= ReclaimEpoch — from META state, never from decoding the
+// head page. A carried-forward head (HeadTxnID < ReclaimEpoch) that
+// was reclaimed and reused truncates like any stale tail; an owned
+// head that fails is a hard error. This is the fix for the
+// crash-mid-commit unopenable-database defect the old unconditional
+// exemption carried.
+func TestRPLChainWalkHeadOwnership(t *testing.T) {
+	t.Run("carried head reclaimed-bit truncates to empty", func(t *testing.T) {
+		f := newWalkFixture(true)
+		f.segment(12, 7, 10, 102) // head, TxnID 7
+		f.free[12] = true         // legitimately reclaimed carried head
+		w := f.chainWalk(12, 10, 2)
+		w.HeadTxnID = 7
+		w.ReclaimEpoch = 9 // epoch 9 carried this older head forward
+		visited, stop, werr := run(t, w)
+		wantStop(t, werr, stop, RPLWalkReclaimedBoundary, 12)
+		if len(visited) != 0 {
+			t.Fatalf("visited %v, want none (whole chain behind the boundary)", visited)
+		}
+	})
+	t.Run("carried head reused-page decode failure truncates", func(t *testing.T) {
+		f := newWalkFixture(true)
+		f.garbage(12) // reclaimed-and-reused with foreign valid-footer bytes
+		w := f.chainWalk(12, 10, 2)
+		w.HeadTxnID = 7
+		w.ReclaimEpoch = 9
+		visited, stop, werr := run(t, w)
+		wantStop(t, werr, stop, RPLWalkDecodeBoundary, 12)
+		if len(visited) != 0 {
+			t.Fatalf("visited %v, want none", visited)
+		}
+	})
+	t.Run("carried head torn-page footer failure truncates", func(t *testing.T) {
+		f := newWalkFixture(true)
+		f.segment(12, 7, 10, 102)
+		f.corrupt(12)
+		w := f.chainWalk(12, 10, 2)
+		w.HeadTxnID = 7
+		w.ReclaimEpoch = 9
+		_, stop, werr := run(t, w)
+		wantStop(t, werr, stop, RPLWalkFooterBoundary, 12)
+	})
+	t.Run("owned head failure stays a hard error", func(t *testing.T) {
+		f := newWalkFixture(true)
+		f.segment(10, 5, 0, 100)
+		f.segment(12, 9, 10, 102)
+		f.corrupt(12)
+		w := f.chainWalk(12, 10, 2)
+		w.HeadTxnID = 9
+		w.ReclaimEpoch = 9 // the epoch's own head — never reclaimable
+		_, _, werr := run(t, w)
+		wantErr(t, werr, RPLWalkErrHeadChecksum, 12)
+	})
+	t.Run("live post-epoch head is exempt", func(t *testing.T) {
+		f := newWalkFixture(true)
+		f.segment(10, 5, 0, 100)
+		f.segment(12, 11, 10, 102)
+		f.corrupt(12)
+		w := f.chainWalk(12, 10, 2)
+		w.HeadTxnID = 11
+		w.ReclaimEpoch = 9 // appended by an unfsynced later commit
+		_, _, werr := run(t, w)
+		wantErr(t, werr, RPLWalkErrHeadChecksum, 12)
+	})
+}

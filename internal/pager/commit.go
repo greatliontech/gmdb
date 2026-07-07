@@ -13,12 +13,12 @@ import (
 // pager doesn't import the root.
 //
 //   - SyncBoth: fdatasync at step 2 AND step 4. Maps from
-//     SyncDurable. Sets MetaFlagCheckpoint on the new meta.
+//     SyncDurable. Self-asserting sub-record on the new meta.
 //   - SyncDataOnly: fdatasync at step 2; skip step 4. Maps from
-//     SyncDataOnly. Sets MetaFlagCheckpoint (data is durable).
+//     SyncDataOnly. Self-asserting sub-record (data is durable).
 //   - SyncNone: skip both. Maps from SyncLazy.
-//     Caller decides MetaFlagCheckpoint via the Flags field
-//     (SyncLazy clears it).
+//     The pager composes the durable sub-record from the policy
+//     (SyncNone carries the previous meta's forward).
 type SyncPolicy uint8
 
 const (
@@ -34,14 +34,12 @@ const (
 //     to 1).
 //   - KeyspaceRoot / NumKeyspaces: root-state snapshot for the new
 //     meta. Supplied by the caller's current root state.
-//   - Flags: meta-page Flags for the new meta. The caller composes
-//     MetaFlagPageChecksum (from prev) and MetaFlagCheckpoint (per
-//     SyncMode policy). The pager does NOT auto-set Checkpoint based
-//     on Sync — that decision is the caller's, because durability.md
-//     ties Checkpoint to "data-pages on stable storage" which is the
-//     step-2 fsync (SyncBoth, SyncDataOnly) but not step-4 (meta
-//     fsync). Caller composes per the SyncMode table in
-//     durability.md.
+//   - Flags: meta-page Flags for the new meta (bit 0 PageChecksum,
+//     carried from prev; every other bit is reserved-zero). The
+//     durable sub-record is composed by the pager from Sync — a
+//     step-2-fsyncing commit is self-durable, a SyncNone commit
+//     carries prev's sub-record forward (durability.md §Checkpoints
+//     and the durable sub-record).
 //   - Sync: which fdatasync calls fire (see SyncPolicy doc).
 type CommitParams struct {
 	NewTxnID     uint64
@@ -118,12 +116,6 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 		return CommitResult{}, err
 	}
 
-	// Compose the new meta payload now (step 0 finalised HWM, RPL chain,
-	// bitmap state).
-	newMeta := p.buildNewMeta(cp, prev)
-	metaBuf := make([]byte, p.cfg.PageSize)
-	page.EncodeMeta(metaBuf, &newMeta)
-
 	newActive := 1 - prevActive
 
 	// Step 1 — pwrite data + RPL + bitmap pages.
@@ -136,17 +128,29 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 	// Step 2 — fdatasync per SyncPolicy. SyncBoth + SyncDataOnly
 	// fsync; SyncNone skips. Per durability.md §Durability Modes
 	// table, skipping step 2 in SyncLazy means data pages may not
-	// reach disk before the meta does — recovery's checkpoint-
-	// preferring meta selector compensates: a SyncLazy commit
-	// writes its meta with MetaFlagCheckpoint CLEAR, so recovery
-	// falls back to the last checkpoint-flagged meta whose data
-	// IS durable.
+	// reach disk before the meta does — recovery compensates by
+	// adopting the durable sub-record, which a SyncLazy commit
+	// carries forward unchanged, never its own possibly-torn tree.
 	if cp.Sync != SyncNone {
 		if err := fdatasync(p.file); err != nil {
 			p.AbortTx()
 			return CommitResult{}, fmt.Errorf("pager: step 2 fdatasync: %w", err)
 		}
+		// The completed step-2 fsync covers every previously-pwritten
+		// meta — in particular prev's durable assertion, which is now
+		// anchored (durability.md §Anchoring).
+		p.advanceAnchoredEpoch(prev.Durable.TxnID)
 	}
+
+	// Compose the new meta payload AFTER step 2 (durability.md
+	// §Anchoring, no-forward-promise: the persisted
+	// AnchoredDurableTxnID may name the step-2-anchored assertion —
+	// that fsync has completed — but never this commit's own step-4,
+	// which has not run yet). Step 0 finalised HWM, RPL chain, and
+	// bitmap state; steps 1–2 changed none of them.
+	newMeta := p.buildNewMeta(cp, prev)
+	metaBuf := make([]byte, p.cfg.PageSize)
+	page.EncodeMeta(metaBuf, &newMeta)
 
 	// Step 3 — pwrite the new meta to its slot. From this point on a
 	// crash leaves the new meta visible on Open; we are past the
@@ -174,17 +178,19 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 	}
 
 	// Step 4 — fdatasync (atomic commit point) per SyncPolicy.
-	// SyncBoth fsyncs; SyncDataOnly + SyncNone skip — but the
-	// MetaFlagCheckpoint composition in cp.Flags reflects that
-	// fact (caller has cleared the flag on SyncLazy;
-	// SyncDataOnly KEEPS the flag because data IS durable per
-	// step 2). Recovery's checkpoint-preferring selector reads
-	// the flag.
+	// SyncBoth fsyncs; SyncDataOnly + SyncNone skip. A SyncDataOnly
+	// meta is self-durable (its data hit disk at step 2) but its own
+	// assertion stays UNANCHORED until a later fsync covers the meta
+	// pwrite — recovery may lose the meta but never adopts
+	// under-protected state (durability.md §Anchoring).
 	if cp.Sync == SyncBoth {
 		if err := fdatasync(p.file); err != nil {
 			p.AbortTx()
 			return CommitResult{}, fmt.Errorf("pager: step 4 fdatasync meta: %w", err)
 		}
+		// The completed step-4 fsync anchors this commit's own
+		// assertion; persisted by the NEXT meta write.
+		p.advanceAnchoredEpoch(newMeta.Durable.TxnID)
 	}
 
 	// Success path: shrink, then clean up without restoring snapshot.
@@ -396,12 +402,14 @@ func (p *Pager) commitStep1() (int, error) {
 
 // buildNewMeta composes the new meta payload from CommitParams + the
 // previous meta's persistent file-format fields + the pager's freshly-
-// updated state.
+// updated state. Called after step 2 so the persisted anchored epoch
+// reflects only completed fsyncs (durability.md §Anchoring).
 func (p *Pager) buildNewMeta(cp CommitParams, prev page.Meta) page.Meta {
 	headID := p.headPageID()
-	var tailID uint64
-	if len(p.rplSegments) > 0 {
+	var tailID, headTxnID uint64
+	if n := len(p.rplSegments); n > 0 {
 		tailID = p.rplSegments[0].PageID
+		headTxnID = p.rplSegments[n-1].TxnID
 	}
 	var entryCount uint64
 	for _, s := range p.rplSegments {
@@ -416,7 +424,7 @@ func (p *Pager) buildNewMeta(cp CommitParams, prev page.Meta) page.Meta {
 		growStep = cp.SetFileFormat.GrowStep
 		shrinkThreshold = cp.SetFileFormat.ShrinkThreshold
 	}
-	return page.Meta{
+	m := page.Meta{
 		Magic:           page.Magic,
 		Version:         page.FormatVersion,
 		PageSize:        p.cfg.PageSize,
@@ -429,6 +437,7 @@ func (p *Pager) buildNewMeta(cp CommitParams, prev page.Meta) page.Meta {
 		ShrinkThreshold: shrinkThreshold,
 		HighWaterMark:   p.highWaterMark,
 		RPLHeadPage:     headID,
+		RPLHeadTxnID:    headTxnID,
 		RPLTailPage:     tailID,
 		RPLEntryCount:   entryCount,
 		NumFreePages:    p.bitmap.NumFree(),
@@ -436,12 +445,43 @@ func (p *Pager) buildNewMeta(cp CommitParams, prev page.Meta) page.Meta {
 		NumKeyspaces:    cp.NumKeyspaces,
 		TxnID:           cp.NewTxnID,
 	}
+	// Durable sub-record (durability.md §Checkpoints and the durable
+	// sub-record): a step-2-fsyncing commit is self-durable; a SyncNone
+	// commit carries prev's sub-record forward unchanged. The persisted
+	// anchored epoch is the pager's completed-fsync knowledge as of now
+	// (post-step-2) — never this commit's own step 4.
+	if cp.Sync != SyncNone {
+		m.Durable = m.LiveSubRecord()
+	} else {
+		m.Durable = prev.Durable
+	}
+	m.Durable.AnchoredTxnID = p.anchoredEpoch
+	return m
 }
 
 // SetCurrentTxnID seeds the in-progress TxnID. Required before Commit
 // when the tx has retired any pages — the RPL segment encoder uses this
 // to stamp the per-segment TxnID. Idempotent.
 func (p *Pager) SetCurrentTxnID(txnID uint64) { p.currentTxnID = txnID }
+
+// AnchoredEpoch returns the newest DurableTxnID assertion this handle
+// knows to be covered by a COMPLETED fdatasync (durability.md
+// §Anchoring). It bounds RPL reclamation: min(oldestReader,
+// AnchoredEpoch) never exceeds any epoch a crash could make recovery
+// adopt.
+func (p *Pager) AnchoredEpoch() uint64 { return p.anchoredEpoch }
+
+// AdvanceAnchoredEpoch records that a completed fdatasync covered the
+// meta carrying the epoch-e durable assertion. Monotone; called by the
+// commit pipeline (steps 2/4) and by the root package after
+// Checkpoint's step-4 fsync returns.
+func (p *Pager) AdvanceAnchoredEpoch(e uint64) { p.advanceAnchoredEpoch(e) }
+
+func (p *Pager) advanceAnchoredEpoch(e uint64) {
+	if e > p.anchoredEpoch {
+		p.anchoredEpoch = e
+	}
+}
 
 // maybeShrink truncates the file toward a GrowStep-aligned size at or above
 // HighWaterMark, floored at MinSize, when the trailing slack exceeds

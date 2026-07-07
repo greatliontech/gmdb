@@ -218,8 +218,6 @@ self-durable (`durability.md §Clean shutdown`) — a harmless extra
 first pass; and a crash that lost only the final meta pwrite
 recovers to a self-durable meta and does not trip it, in which case
 reclamation waits for the regular interval.)
-Lands: chunk 8 of docs/plans/architecture-consolidation.md (the
-signal's shape; the immediate first pass is already enforced).
 
 ### 2. Stale Reader Slot Cleanup
 

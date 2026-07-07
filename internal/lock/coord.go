@@ -100,6 +100,29 @@ type Coord struct {
 	// not a correctness mechanism.
 	readerSlotHint atomic.Uint32
 
+	// everWriter latches once this handle has held the write grant;
+	// the heartbeat goroutine then keeps the lock file's LastWriter
+	// record fresh for the handle's lifetime — while it still names
+	// this process (format.go LastWriter*, durability.md §Recovery
+	// step 5).
+	everWriter atomic.Bool
+
+	// prevLastWriter snapshots the LastWriter record as it stood
+	// IMMEDIATELY BEFORE this handle's most recent grant acquisition
+	// overwrote it — taken by the flock goroutine under the same
+	// LOCK_EX as the overwrite, so it cannot race a peer's write. The
+	// recovery-commit gate reads it (via PrevLastWriterLive) because
+	// the acquisition itself stamps OUR identity into the live record,
+	// destroying the evidence the gate needs. Written only by the
+	// flock goroutine; read by the grant holder (happens-after via the
+	// grant result channel).
+	prevLastWriter struct {
+		pid       uint64
+		startTime uint64
+		pidNS     uint64
+		heartbeat uint64
+	}
+
 	closeOnce sync.Once
 }
 
@@ -469,6 +492,24 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 	c.f.SetWriterStartTime(c.startTime)
 	c.f.SetWriterPIDNamespace(c.pidNS)
 	c.f.SetWriterHeartbeat(c.clock())
+	// LastWriter*: the persisted author identity (format.go). Written
+	// under the same LOCK_EX, NOT cleared at release — the
+	// recovery-commit gate consults it to distinguish a crashed
+	// database from a live one with an idle author (durability.md
+	// §Recovery step 5). The pre-overwrite record is snapshotted
+	// first (same LOCK_EX — race-free) because this very write stamps
+	// OUR identity, and the gate must classify the PREVIOUS author.
+	// The heartbeat goroutine refreshes LastWriterHeartbeat for this
+	// handle's lifetime once set (see heartbeat).
+	c.prevLastWriter.pid = c.f.LastWriterPID()
+	c.prevLastWriter.startTime = c.f.LastWriterStartTime()
+	c.prevLastWriter.pidNS = c.f.LastWriterPIDNamespace()
+	c.prevLastWriter.heartbeat = c.f.LastWriterHeartbeat()
+	c.f.SetLastWriterPID(c.pid)
+	c.f.SetLastWriterStartTime(c.startTime)
+	c.f.SetLastWriterPIDNamespace(c.pidNS)
+	c.f.SetLastWriterHeartbeat(c.clock())
+	c.everWriter.Store(true)
 	req.result <- nil
 
 	// Step 4: hold until release or stopCh, refreshing WriterHeartbeat
@@ -577,6 +618,18 @@ func (c *Coord) heartbeat() {
 				slot := c.f.Slot(idx)
 				Store64(&slot.Heartbeat, now)
 			}
+			// Keep the last-writer record fresh for this handle's
+			// LIFETIME once it has ever held the grant — but only
+			// while the record still names US (a later writer in
+			// another process overwrites it; refreshing then would
+			// falsify the new author's liveness signal). The
+			// check-then-set can race a peer's re-stamp by one tick;
+			// the stray refresh freshens the PEER's record —
+			// conservative (recovery deferred ≤ one interval), never
+			// a false-stale.
+			if c.everWriter.Load() && c.f.LastWriterPID() == c.pid && c.f.LastWriterPIDNamespace() == c.pidNS {
+				c.f.SetLastWriterHeartbeat(now)
+			}
 		}
 	}
 }
@@ -667,4 +720,36 @@ func (c *Coord) UnregisterReaderSlot(i uint32) {
 		}
 	}
 	c.activeSlotsMu.Unlock()
+}
+
+// PrevLastWriterLive reports whether the last-writer record AS IT
+// STOOD BEFORE this handle's most recent grant acquisition named a
+// live process (durability.md §Recovery step 5). The caller MUST hold
+// the grant that acquisition produced (the snapshot is published
+// happens-before the grant result). The live record itself is useless
+// to the gate — the acquisition stamped this handle's own identity
+// into it.
+//
+// A previous author that is THIS process (a same-process re-open after
+// Close) classifies live iff the process is, i.e. always — correct: an
+// in-process reopen is a live join, never crash recovery.
+func (c *Coord) PrevLastWriterLive() bool {
+	p := c.prevLastWriter
+	if p.pid == 0 {
+		return false
+	}
+	now := c.clock()
+	timeout := c.staleTimeoutNanos()
+	sameNS := p.pidNS != 0 && c.pidNS != 0 && p.pidNS == c.pidNS
+	if sameNS {
+		if !IsAlive(int(p.pid)) {
+			return false
+		}
+		actualStart, err := ProcessStartTime(int(p.pid))
+		if err != nil {
+			return now-p.heartbeat <= timeout
+		}
+		return actualStart == p.startTime
+	}
+	return now-p.heartbeat <= timeout
 }

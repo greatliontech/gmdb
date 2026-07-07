@@ -19,11 +19,16 @@ import (
 //     walk truncates at the first reclaimed segment: a page free in the
 //     bitmap, or a non-head page that fails footer verification or no
 //     longer decodes (reclaimed-then-reused).
-//   - The head is exempt from the reclaimed-boundary treatment: the
-//     recovery target's own newest segment is never legitimately
-//     reclaimed, so a head that fails its footer or decode is a hard
-//     error, not a stale boundary. This head-vs-non-head policy lives
-//     only here.
+//   - The head is exempt from the reclaimed-boundary treatment exactly
+//     when it cannot have been legitimately reclaimed: HeadTxnID >=
+//     ReclaimEpoch (the reclamation bound never exceeds the durable
+//     epoch and frees only strictly below it — free-space.md §Head
+//     classification requires the persisted head TxnID). An exempt head
+//     that fails its footer or decode is a hard error; a carried-forward
+//     head (HeadTxnID < ReclaimEpoch) gets the same stale-tail treatment
+//     as any non-head segment. The classification comes from the meta's
+//     persisted RPLHeadTxnID, never from decoding the — possibly
+//     reclaimed-and-reused — head page. This policy lives only here.
 //
 // Runtime reclamation (reclaimRPL) consumes the in-memory segment list,
 // not the on-disk links; it shares the per-segment read convention via
@@ -145,11 +150,18 @@ type RPLChainWalk struct {
 	// called, so a raw accessor that panics out of range is safe here.
 	ReadPage func(uint64) []byte
 	Cfg      page.Config
-	// Head, Tail, EntryCount come from the meta being walked
-	// (RPLHeadPage, RPLTailPage, RPLEntryCount).
+	// Head, HeadTxnID, Tail, EntryCount come from the projection being
+	// walked (RPLHeadPage, RPLHeadTxnID, RPLTailPage, RPLEntryCount —
+	// live fields for a live-projection walk, Durable* fields for the
+	// recovery walk).
 	Head       uint64
+	HeadTxnID  uint64
 	Tail       uint64
 	EntryCount uint64
+	// ReclaimEpoch is the projection's durable epoch (Durable.TxnID) —
+	// the ceiling reclamation's bound can never exceed. The head is
+	// exempt from boundary treatment iff HeadTxnID >= ReclaimEpoch.
+	ReclaimEpoch uint64
 	// LowBound is the first data page (meta/bitmap region ends there);
 	// HighBound is one past the last walkable page id. HighBound must be
 	// trustworthy against a forged meta — the file-resident extent
@@ -188,6 +200,10 @@ func (w RPLChainWalk) Walk(visit func(id uint64, seg page.RPLSegment) bool) (RPL
 	// allocation.
 	maxSegs := w.EntryCount + 1
 	visited := make(map[uint64]struct{}, min(maxSegs, 1024))
+	// Head-exemption classification from persisted meta state alone
+	// (see the file comment): an owned head cannot have been reclaimed;
+	// a carried-forward head can.
+	headExempt := w.HeadTxnID >= w.ReclaimEpoch
 	var segs uint64
 	id := w.Head
 	for {
@@ -203,9 +219,9 @@ func (w RPLChainWalk) Walk(visit func(id uint64, seg page.RPLSegment) bool) (RPL
 		if segs > maxSegs {
 			return RPLWalkStop{}, &RPLWalkError{Kind: RPLWalkErrChainTooLong, PageID: id, Head: w.Head, Tail: w.Tail, Bound: maxSegs}
 		}
-		// Reclaimed-segment boundary — never the head (see the file
-		// comment: the head-vs-non-head policy is pinned here).
-		if id != w.Head && w.IsFree != nil {
+		// Reclaimed-segment boundary — never an EXEMPT head (see the
+		// file comment: the head policy is pinned here).
+		if (id != w.Head || !headExempt) && w.IsFree != nil {
 			if free, ok := w.IsFree(id); ok && free {
 				return RPLWalkStop{Reason: RPLWalkReclaimedBoundary, PageID: id}, nil
 			}
@@ -213,13 +229,13 @@ func (w RPLChainWalk) Walk(visit func(id uint64, seg page.RPLSegment) bool) (RPL
 		visited[id] = struct{}{}
 		seg, footerOK, ok := readRPLSegment(w.ReadPage, w.Cfg, id)
 		if !footerOK {
-			if id == w.Head {
+			if id == w.Head && headExempt {
 				return RPLWalkStop{}, &RPLWalkError{Kind: RPLWalkErrHeadChecksum, PageID: id, Head: w.Head, Tail: w.Tail}
 			}
 			return RPLWalkStop{Reason: RPLWalkFooterBoundary, PageID: id}, nil
 		}
 		if !ok {
-			if id == w.Head {
+			if id == w.Head && headExempt {
 				return RPLWalkStop{}, &RPLWalkError{Kind: RPLWalkErrHeadMalformed, PageID: id, Head: w.Head, Tail: w.Tail}
 			}
 			return RPLWalkStop{Reason: RPLWalkDecodeBoundary, PageID: id}, nil

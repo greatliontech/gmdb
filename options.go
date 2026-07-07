@@ -26,20 +26,21 @@ import (
 //   - SyncDataOnly: fdatasync at step 2; skip step 4. Last txn may
 //     be lost on crash; DB stays consistent (falls back to previous
 //     meta). ~2× faster than SyncDurable.
-//   - SyncLazy: skip both syncs. Recovery rolls back to the last
-//     `Checkpoint()`. DB is always consistent (no corruption).
+//   - SyncLazy: skip both syncs. Crash recovery rolls back to the
+//     durable epoch (the last fsync point by any handle). DB is
+//     always consistent (no corruption).
 //
 // SyncMode is a per-process option, not persisted on disk —
 // different processes attached to the same database may use
-// different SyncModes. The on-disk checkpoint flag reflects
-// whichever mode the committer used (durability.md §Cross-process
-// SyncMode interleaving).
+// different SyncModes. The meta's durable sub-record reflects
+// whichever fsync-ing event happened last (durability.md
+// §Cross-process SyncMode interleaving).
 type SyncMode int
 
 const (
 	SyncDurable  SyncMode = iota // syncs data + meta. Full ACID. Default.
 	SyncDataOnly                 // syncs data; not meta. Last txn may be lost on crash.
-	SyncLazy                     // skips all syncs. Rolls back to last Checkpoint() on crash.
+	SyncLazy                     // skips all syncs. Rolls back to the durable epoch on crash.
 )
 
 // LaggingReaderInfo carries the diagnostic context the
@@ -175,8 +176,8 @@ type Options struct {
 
 	// SyncMode controls per-commit durability — see SyncMode
 	// constants. Zero value is SyncDurable (full ACID, the default).
-	// Per-process, not persisted; cross-process composition uses the
-	// on-disk MetaFlagCheckpoint to coordinate recovery.
+	// Per-process, not persisted; cross-process composition rides the
+	// meta's durable sub-record (durability.md).
 	SyncMode SyncMode
 
 	// RestartGroupTarget is the engine-wide default for the leaf

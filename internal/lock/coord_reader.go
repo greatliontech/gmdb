@@ -154,8 +154,13 @@ func (c *Coord) OldestReaderTxnID() uint64 {
 // non-zero (the "free" sentinel). The scan is a lock-free, per-slot
 // atomic load: it takes no flock and does NOT clear stale slots, so the
 // count can be off by ±N for N reader acquire/release transitions in
-// flight during the scan. It is a metrics/health signal only, never a
-// synchronization barrier (DBStats.ActiveReaders contract). Stale slots
+// flight during the scan. As a metrics/health signal
+// (DBStats.ActiveReaders) it is never a synchronization barrier. The
+// recovery-commit gate (durability.md §Recovery step 5) also consults
+// it — soundly: the gate holds flock(LOCK_EX) (no acquire/release can
+// race the scan) after a stale-slot reap, and counting a lingering
+// mid-acquire slot errs in the conservative direction (recovery is
+// merely deferred to a later Open). Stale slots
 // from crashed peers count until a writer or maintenance pass reaps
 // them.
 func (c *Coord) CountActiveReaders() int {

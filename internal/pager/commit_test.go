@@ -32,10 +32,7 @@ func initDB(t *testing.T, pageChecksum bool) (*os.File, *OpenedDB, func()) {
 		t.Fatalf("Init: %v", err)
 	}
 	pool := NewBufPool(testPageSize)
-	db, err := Open(f, OpenParams{Pool: pool, MaxTxBufferBytes: 16 << 20})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	db := openAttachedForTest(t, f, OpenParams{Pool: pool, MaxTxBufferBytes: 16 << 20})
 	cleanup := func() {
 		_ = db.Pager.Close()
 		_ = f.Close()
@@ -118,10 +115,7 @@ func TestCommitRoundTrip(t *testing.T) {
 			// Re-open and verify the page is durable.
 			_ = p.Close()
 			pool := NewBufPool(testPageSize)
-			db2, err := Open(f, OpenParams{Pool: pool, MaxTxBufferBytes: 16 << 20})
-			if err != nil {
-				t.Fatalf("re-Open: %v", err)
-			}
+			db2 := openAttachedForTest(t, f, OpenParams{Pool: pool, MaxTxBufferBytes: 16 << 20})
 			defer db2.Pager.Close()
 
 			if db2.Meta.TxnID != 1 {
@@ -207,10 +201,7 @@ func TestCommitRetiresPageToRPL(t *testing.T) {
 	// Re-open and verify RPL chain rebuilt correctly.
 	_ = p.Close()
 	pool := NewBufPool(testPageSize)
-	db3, err := Open(f, OpenParams{Pool: pool, MaxTxBufferBytes: 16 << 20})
-	if err != nil {
-		t.Fatalf("re-Open: %v", err)
-	}
+	db3 := openAttachedForTest(t, f, OpenParams{Pool: pool, MaxTxBufferBytes: 16 << 20})
 	defer db3.Pager.Close()
 	chain := db3.Pager.RPLChain()
 	if len(chain) != 1 {
@@ -306,4 +297,23 @@ func TestCommitStep0DropsFreedPagesFromWriteSet(t *testing.T) {
 	if hwm := p.highWaterMark; tail < hwm {
 		t.Errorf("tail page %d below post-refund HWM %d (fixture expected a refund)", tail, hwm)
 	}
+}
+
+// openAttachedForTest is the test-side composition of the two-phase
+// writable open: pager.Open (unattached) + AttachLatest. Production
+// callers route the attach decision through the recovery-commit gate
+// (db.Open) or hold the grant already (Compact); tests are
+// single-process with no gate to consult.
+func openAttachedForTest(t *testing.T, f *os.File, op OpenParams) *OpenedDB {
+	t.Helper()
+	od, err := Open(f, op)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	m, idx, err := od.Pager.AttachLatest(f)
+	if err != nil {
+		t.Fatalf("AttachLatest: %v", err)
+	}
+	od.Meta, od.ActiveMetaIdx = m, idx
+	return od
 }

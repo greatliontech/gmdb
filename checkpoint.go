@@ -14,15 +14,15 @@ import (
 var checkpointStepHookForTest atomic.Pointer[func(step int) error]
 
 // Checkpoint flushes all outstanding writes to stable storage and
-// stamps the active meta with MetaFlagCheckpoint so subsequent
-// recovery will accept it as a checkpoint per durability.md
-// §Recovery.
+// bumps the active meta's durable sub-record to its own live state, so
+// subsequent recovery adopts it (durability.md §Recovery).
 //
 // In SyncLazy mode this is the explicit-checkpoint hook: prior
 // SyncLazy commits skipped both step-2 and step-4 fsync, so recovery
-// would roll back to the last checkpoint-flagged meta on crash. A
-// successful Checkpoint() makes every commit at or before the active
-// meta's TxnID durable.
+// would roll back to the durable epoch on crash. A successful
+// Checkpoint() makes every commit at or before the active meta's
+// TxnID durable — and anchors the new epoch (durability.md
+// §Anchoring), advancing the RPL reclamation bound.
 //
 // In SyncDurable / SyncDataOnly, prior commits already issued the
 // step-2 fsync, so the data is durable; Checkpoint is still useful
@@ -39,11 +39,11 @@ var checkpointStepHookForTest atomic.Pointer[func(step int) error]
 //     wait).
 //  2. fdatasync the file to flush prior pwrites from the OS page
 //     cache.
-//  3. Read the active meta, set MetaFlagCheckpoint, recompute
-//     xxhash64, pwrite back to the same slot. The TxnID is unchanged
-//     — Checkpoint records that the already-committed state is
-//     durable, not a new transaction.
-//  4. fdatasync again so the flag set itself reaches stable storage.
+//  3. Read the active meta, bump its durable sub-record to its own
+//     live state, recompute xxhash64, pwrite back to the same slot.
+//     The TxnID is unchanged — Checkpoint records that the
+//     already-committed state is durable, not a new transaction.
+//  4. fdatasync again so the sub-record bump reaches stable storage.
 //  5. Release the write lock.
 //
 // Returns:
@@ -56,8 +56,8 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	// poison/close/generation re-checks). For Checkpoint specifically:
 	// the poison re-check closes the fsyncgate window (a concurrent
 	// commit's publication failure consumed the kernel's fsync error
-	// state; proceeding would stamp the checkpoint flag over
-	// non-durable data), and the generation check prevents flagging a
+	// state; proceeding would stamp a durable sub-record over
+	// non-durable data), and the generation check prevents bumping a
 	// meta on an unlinked inode no other process can see.
 	grant, _, err := db.acquireWriteGrant(ctx)
 	if err != nil {
@@ -73,7 +73,7 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	// matching TxnID and skips its own Resync) starts from a
 	// consistent pager.
 	db.mu.Lock()
-	_, file, err := db.resyncOnGrantLocked()
+	pgr, file, err := db.resyncOnGrantLocked()
 	if err != nil {
 		db.mu.Unlock()
 		return err
@@ -90,9 +90,9 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	//
 	//   - A failed fdatasync (steps 2/4) consumes the kernel's error
 	//     state while marking pages clean; a retried Checkpoint's
-	//     fsync then succeeds trivially and stamps MetaFlagCheckpoint
-	//     over data that never reached disk — recovery selects the
-	//     checkpoint and traverses unwritten pages.
+	//     fsync then succeeds trivially and stamps a durable
+	//     sub-record over data that never reached disk — recovery
+	//     adopts it and traverses unwritten pages.
 	//   - A torn step-3 WriteAt leaves the ONLY on-disk copy of the
 	//     active meta checksum-invalid while this handle keeps
 	//     serving it from memory; a peer's Resync then selects the
@@ -123,20 +123,25 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 		return failStep(2, err)
 	}
 
-	// Step 3 — set MetaFlagCheckpoint on the active meta, recompute
-	// checksum, pwrite back to the SAME slot. The single-meta-slot
-	// pwrite is atomic within one page per durability.md (an
-	// unaligned tear cannot affect a single contiguous sub-page
-	// region, and the xxhash64 checksum catches partial writes —
-	// recovery falls back to the other slot).
-	if meta.HasFlag(page.MetaFlagCheckpoint) {
-		// Already checkpointed — step 2's fdatasync is the only
-		// useful work. Skip the pwrite (idempotent) but DO issue
-		// step 4 to ensure the previously-written flag bit is on
+	// Step 3 — bump the active meta's durable sub-record to its own
+	// live state, set AnchoredDurableTxnID to the PRE-bump anchored
+	// value (step 2's completed fsync anchors the pre-bump assertion;
+	// the bump's own assertion is anchored by step 4 and persisted by
+	// the NEXT meta write — durability.md §Anchoring,
+	// no-forward-promise), recompute the checksum, pwrite back to the
+	// SAME slot. The single-meta-slot pwrite is atomic within one page
+	// per durability.md (an unaligned tear cannot affect a single
+	// contiguous sub-page region, and the xxhash64 checksum catches
+	// partial writes — recovery falls back to the other slot).
+	if meta.SelfDurable() {
+		// Already at its own durable epoch — step 2's fdatasync is
+		// the only useful work. Skip the pwrite (idempotent) but DO
+		// issue step 4 so the previously-written sub-record is on
 		// stable storage even if the prior commit was in
 		// SyncDataOnly (which skipped step 4).
 	} else {
-		meta.Flags |= page.MetaFlagCheckpoint
+		meta.Durable = meta.LiveSubRecord()
+		meta.Durable.AnchoredTxnID = pgr.AnchoredEpoch()
 		buf := make([]byte, pageSize)
 		page.EncodeMeta(buf, &meta)
 		off := int64(activeIdx) * int64(pageSize)
@@ -148,8 +153,8 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 		}
 	}
 
-	// Step 4 — fdatasync so the flag-set is durable. (Even if step
-	// 3 was skipped above, step 4 still flushes the OS page cache
+	// Step 4 — fdatasync so the sub-record bump is durable. (Even if
+	// step 3 was skipped above, step 4 still flushes the OS page cache
 	// for any in-flight meta pwrite — defense in depth for the
 	// SyncDataOnly case.)
 	if err := file.Sync(); err != nil {
@@ -158,17 +163,18 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 	if err := stepErr(4); err != nil {
 		return failStep(4, err)
 	}
+	// The completed step-4 fsync anchors the bump's own assertion
+	// (durability.md §Anchoring) — the bound may now trust it.
+	pgr.AdvanceAnchoredEpoch(meta.TxnID)
 
 	// Publish the updated meta to db.currentMeta so subsequent
-	// callers observe the now-checkpointed flag.
+	// callers observe the bumped sub-record.
 	db.mu.Lock()
 	if db.currentMeta.TxnID == meta.TxnID {
-		// The active meta is now checkpoint-flagged → it is the last
-		// checkpoint, so it bounds RPL reclamation (free-space.md §RPL
-		// Reclamation). We hold the write grant, so no commit advanced
-		// currentMeta past meta while we worked; the slot index is
-		// unchanged (the flag pwrite targeted the same slot).
-		db.setMetaState(meta, db.activeMetaIdx, meta.TxnID)
+		// We hold the write grant, so no commit advanced currentMeta
+		// past meta while we worked; the slot index is unchanged (the
+		// bump pwrite targeted the same slot).
+		db.setMetaState(meta, db.activeMetaIdx)
 	}
 	db.mu.Unlock()
 	return nil

@@ -307,8 +307,25 @@ func tryAdoptExisting(p OpenParams) (*File, error) {
 	}
 	expectedSize := FileSize(hdr.MaxReaders)
 	if st.Size() != expectedSize {
-		return nil, fmt.Errorf("lock: %q size %d != expected %d (MaxReaders=%d): %w",
-			p.Base, st.Size(), expectedSize, hdr.MaxReaders, ErrCorrupted)
+		// A plausible header (magic + MaxReaders in range) whose file
+		// size disagrees with the CURRENT layout is most likely a lock
+		// file written by a binary with a different header layout
+		// (pre-v1 format changes grow HeaderSize in place). The lock
+		// file is transient coordination state Open recreates — treat
+		// it as stale, exactly like a UUID mismatch, rather than
+		// refusing to open an intact database.
+		//
+		// Safety invariant: this recreate is sound only because a
+		// layout change ships with a data-format-incompatible change
+		// (the meta payload layout), so an old-binary peer can never
+		// be LIVE on the same data file — it cannot even open it. A
+		// future HeaderSize growth WITHOUT a data-format break would
+		// make this arm reachable with a live old-binary peer holding
+		// the unlinked inode: two lock files, two writers, split
+		// brain. Grow the header only alongside a data-format break,
+		// or replace this arm first (cross-process.md §Lock File
+		// Layout).
+		return nil, errStaleUUID
 	}
 	if hdr.UUID != p.DataUUID {
 		return nil, errStaleUUID
@@ -687,4 +704,66 @@ func baseName(p string) string {
 		}
 	}
 	return p
+}
+
+// LastWriter accessors — the persisted author identity (format.go
+// LastWriter*). Written by the flock goroutine at grant acquisition
+// under LOCK_EX; LastWriterHeartbeat additionally refreshed by the
+// author handle's heartbeat goroutine for its lifetime. NOT cleared at
+// grant release — persistence across release is the point.
+
+func (f *File) LastWriterPID() uint64 {
+	if f.header == nil {
+		panic("lock: LastWriterPID on closed *File")
+	}
+	return Load64(&f.header.LastWriterPID)
+}
+
+func (f *File) SetLastWriterPID(v uint64) {
+	if f.header == nil {
+		panic("lock: SetLastWriterPID on closed *File")
+	}
+	Store64(&f.header.LastWriterPID, v)
+}
+
+func (f *File) LastWriterStartTime() uint64 {
+	if f.header == nil {
+		panic("lock: LastWriterStartTime on closed *File")
+	}
+	return Load64(&f.header.LastWriterStartTime)
+}
+
+func (f *File) SetLastWriterStartTime(v uint64) {
+	if f.header == nil {
+		panic("lock: SetLastWriterStartTime on closed *File")
+	}
+	Store64(&f.header.LastWriterStartTime, v)
+}
+
+func (f *File) LastWriterPIDNamespace() uint64 {
+	if f.header == nil {
+		panic("lock: LastWriterPIDNamespace on closed *File")
+	}
+	return Load64(&f.header.LastWriterPIDNamespace)
+}
+
+func (f *File) SetLastWriterPIDNamespace(v uint64) {
+	if f.header == nil {
+		panic("lock: SetLastWriterPIDNamespace on closed *File")
+	}
+	Store64(&f.header.LastWriterPIDNamespace, v)
+}
+
+func (f *File) LastWriterHeartbeat() uint64 {
+	if f.header == nil {
+		panic("lock: LastWriterHeartbeat on closed *File")
+	}
+	return Load64(&f.header.LastWriterHeartbeat)
+}
+
+func (f *File) SetLastWriterHeartbeat(v uint64) {
+	if f.header == nil {
+		panic("lock: SetLastWriterHeartbeat on closed *File")
+	}
+	Store64(&f.header.LastWriterHeartbeat, v)
 }

@@ -11,7 +11,7 @@ const Magic uint64 = 0x6B636F6C62646D67
 
 // HeaderSize is the on-disk byte length of LockFileHeader. Frozen at
 // the value enforced by the compile-time size check in this file.
-const HeaderSize = 80
+const HeaderSize = 112
 
 // SlotSize is the on-disk byte length of one ReaderSlot, ditto.
 const SlotSize = 48
@@ -49,6 +49,21 @@ type LockFileHeader struct {
 	WriterPIDNamespace  uint64
 	WriterHeartbeat     uint64
 	LastMaintenanceTime uint64
+	// LastWriter* persist the identity of the most recent write-grant
+	// holder ACROSS grant release (the Writer* block above is zeroed on
+	// release). Only the last writer's process can hold unfsynced live
+	// commits in the shared page cache, so its liveness is the signal
+	// the recovery-commit gate needs to distinguish a crashed database
+	// from a live one with an idle author (durability.md §Recovery
+	// step 5). Written at every grant acquisition; LastWriterHeartbeat
+	// is refreshed by the author handle's heartbeat goroutine for the
+	// handle's LIFETIME (not just while the grant is held) and goes
+	// stale when the process dies — same classification rules as
+	// reader slots (cross-process.md §Reader Table).
+	LastWriterPID          uint64
+	LastWriterStartTime    uint64
+	LastWriterPIDNamespace uint64
+	LastWriterHeartbeat    uint64
 	// DataGeneration counts data-file replacements (Compact's
 	// rename-over). A handle caches the value at Open and re-checks it
 	// after every write-grant acquisition and reader-slot publish: a

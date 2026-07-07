@@ -148,6 +148,18 @@ func (db *DB) reopenAfterCompact(base string) error {
 		db.poisoned.Store(true)
 		return fmt.Errorf("gmdb: Compact reopen pager (handle poisoned — Close and re-Open): %w", mapPagerErr(err))
 	}
+	// Attach under the grant Compact already holds. The compacted copy
+	// is self-durable at TxnID 0 (copy.go), so the live projection is
+	// the durable one; no gate applies (this handle IS the live
+	// author).
+	if m, idx, aerr := opened.Pager.AttachLatest(newFile); aerr != nil {
+		_ = opened.Pager.Close()
+		_ = newFile.Close()
+		db.poisoned.Store(true)
+		return fmt.Errorf("gmdb: Compact reopen attach (handle poisoned — Close and re-Open): %w", mapPagerErr(aerr))
+	} else {
+		opened.Meta, opened.ActiveMetaIdx = m, idx
+	}
 
 	// Swap the live fields atomically vs. a concurrent Begin/BeginRead
 	// (which snapshot db.pgr/db.file/db.currentMeta under db.mu).
@@ -157,8 +169,7 @@ func (db *DB) reopenAfterCompact(base string) error {
 	db.file = newFile
 	db.pgr = opened.Pager
 	// Meta baseline mirrors Open (adoptOpened): a compacted file is
-	// fully durable with a checkpoint meta; the NoCheckpoint guard is
-	// robustness only.
+	// fully durable and self-durable at TxnID 0 (copy.go).
 	db.adoptOpened(opened)
 	db.mu.Unlock()
 

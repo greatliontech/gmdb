@@ -20,7 +20,7 @@ import (
 //
 //	(1) the reclamation bound used prevMeta.TxnID, which under SyncLazy runs
 //	    ahead of the last checkpoint, freeing data pages a still-recoverable
-//	    checkpoint's tree references. Fixed: bound = lastCheckpointTxnID
+//	    durable epoch's tree references. Fixed: the anchored-epoch bound
 //	    (db.go; free-space.md §RPL Reclamation).
 //	(2) recovery to a NON-latest meta walked its RPLHeadPage→tail chain into a
 //	    reclaimed-and-reused segment page (reclamation frees segment pages

@@ -353,28 +353,19 @@ func (tx *Tx) Commit() error {
 		tx.pgr.AbortTx()
 		return err
 	}
-	// Compose Flags + SyncPolicy per durability.md §Durability
-	// Modes. The PageChecksum bit is immutable across commits
-	// (carried forward from prev); the Checkpoint bit is computed
-	// per SyncMode policy:
-	//   - SyncDurable / SyncDataOnly: SET Checkpoint (data IS
-	//     durable post-step-2 fsync; meta MAY not be durable in
-	//     DataOnly mode but the previous meta is — recovery picks
-	//     whichever survives).
-	//   - SyncLazy: CLEAR Checkpoint (data MAY NOT be durable;
-	//     recovery's checkpoint-preferring selector will fall back
-	//     to the last checkpoint-flagged meta).
+	// SyncMode → pager SyncPolicy. Flags carry only the immutable
+	// PageChecksum bit; the durable sub-record — the recovery contract
+	// the retired checkpoint flag used to approximate — is composed by
+	// the pager from the policy (durability.md §Checkpoints and the
+	// durable sub-record).
 	flags := tx.prevMeta.Flags & page.MetaFlagPageChecksum
 	syncPolicy := pager.SyncBoth
 	switch tx.db.opts.SyncMode {
 	case SyncDurable:
-		flags |= page.MetaFlagCheckpoint
 		syncPolicy = pager.SyncBoth
 	case SyncDataOnly:
-		flags |= page.MetaFlagCheckpoint
 		syncPolicy = pager.SyncDataOnly
 	case SyncLazy:
-		// Checkpoint NOT set.
 		syncPolicy = pager.SyncNone
 	}
 	result, err := tx.pgr.Commit(pager.CommitParams{
@@ -412,16 +403,11 @@ func (tx *Tx) Commit() error {
 		return mapPagerErr(err)
 	}
 	tx.db.mu.Lock()
-	// A checkpoint commit (SyncDurable/SyncDataOnly set MetaFlagCheckpoint)
-	// advances the RPL reclamation bound (free-space.md §RPL Reclamation); a
-	// SyncLazy commit leaves the checkpoint flag clear and the
-	// bound unchanged, so reclamation never frees pages a recoverable
-	// checkpoint meta's tree references.
-	lastCheckpoint := tx.db.lastCheckpointTxnID
-	if result.Meta.HasFlag(page.MetaFlagCheckpoint) {
-		lastCheckpoint = result.Meta.TxnID
-	}
-	tx.db.setMetaState(result.Meta, result.ActiveMetaIdx, lastCheckpoint)
+	// The reclamation bound no longer rides the meta adoption: the
+	// pager advanced its anchored epoch at the commit's own fsyncs
+	// (durability.md §Anchoring), and the next Begin derives the bound
+	// from it.
+	tx.db.setMetaState(result.Meta, result.ActiveMetaIdx)
 	tx.db.mu.Unlock()
 	// The pager's commit-state seeding (HighWaterMark, MaxSize,
 	// reclamationBound) moved to the next write-tx Begin path

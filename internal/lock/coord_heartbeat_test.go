@@ -405,3 +405,48 @@ func TestHeartbeatDefaultClock(t *testing.T) {
 		t.Errorf("default clock produced 0 heartbeat")
 	}
 }
+
+// TestHeartbeatRefreshesLastWriterForHandleLifetime pins the idle-
+// author liveness signal (durability.md §Recovery step 5): after a
+// grant RELEASE, the author handle's heartbeat goroutine keeps
+// LastWriterHeartbeat fresh — that persistence past release is what
+// lets the recovery-commit gate see an idle live author. Also pins
+// the ownership guard: once a different process's identity occupies
+// the record, this handle stops refreshing it.
+func TestHeartbeatRefreshesLastWriterForHandleLifetime(t *testing.T) {
+	clk := newFakeClock(1_000_000_000)
+	c, f := newHeartbeatCoord(t, 5*time.Millisecond, clk.now)
+
+	g, err := c.AcquireWriter(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireWriter: %v", err)
+	}
+	g.Release()
+	// Release is served by the flock goroutine; the header clear is
+	// asynchronous from the caller's perspective.
+	if !pollUntil(2*time.Second, func() bool { return f.WriterPID() == 0 }) {
+		t.Fatalf("WriterPID = %d after release, want 0", f.WriterPID())
+	}
+	if got := f.LastWriterPID(); got != 101 {
+		t.Fatalf("LastWriterPID = %d after release, want 101 (persists)", got)
+	}
+
+	// Advance the clock; the heartbeat goroutine must refresh the
+	// released record on a subsequent tick.
+	clk.set(2_000_000_000)
+	if !pollUntil(2*time.Second, func() bool {
+		return f.LastWriterHeartbeat() == 2_000_000_000
+	}) {
+		t.Fatalf("LastWriterHeartbeat = %d, want refreshed to 2000000000 after release", f.LastWriterHeartbeat())
+	}
+
+	// A peer re-stamps the record; our refresher must stand down.
+	f.SetLastWriterPID(999)
+	f.SetLastWriterPIDNamespace(303)
+	f.SetLastWriterHeartbeat(2_000_000_000)
+	clk.set(3_000_000_000)
+	time.Sleep(30 * time.Millisecond) // several ticks
+	if got := f.LastWriterHeartbeat(); got != 2_000_000_000 {
+		t.Errorf("LastWriterHeartbeat = %d after peer re-stamp, want 2000000000 (no refresh of a peer's record)", got)
+	}
+}

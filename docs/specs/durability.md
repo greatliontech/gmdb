@@ -42,7 +42,6 @@ Invariant: kind=clause-explicit;
     the OS never flushed, surfacing as `ErrBadPageChecksum` or
     wrong values; adopting a stale slot when a newer valid one
     exists silently loses durable commits.
-  Lands: chunk 8 of docs/plans/architecture-consolidation.md.
 
 Invariant: kind=clause-explicit;
   property=`DurableTxnID` and `AnchoredDurableTxnID` are
@@ -59,7 +58,6 @@ Invariant: kind=clause-explicit;
     and the RPL reclamation bound (`free-space.md`) would trust a
     bound newer segments were already reclaimed against, freeing
     pages the recovered tree references.
-  Lands: chunk 8 of docs/plans/architecture-consolidation.md.
 
 Invariant: kind=clause-explicit;
   property=The RPL reclamation bound never exceeds the **anchored
@@ -75,7 +73,6 @@ Invariant: kind=clause-explicit;
     crash, recovery adopts the older on-disk epoch, and its tree
     references pages reclamation already handed out — silent
     corruption on a mode composition this spec guarantees.
-  Lands: chunk 8 of docs/plans/architecture-consolidation.md.
 
 Invariant: kind=entailed;
   property=`DB.Checkpoint()` makes prior `SyncLazy` commits
@@ -184,7 +181,15 @@ live writer may additionally use its own newer in-process
 anchoring knowledge (fsyncs it has observed complete). After a
 crash, anything read from disk is durable by definition, so a
 freshly-recovered handle treats the selected meta's `DurableTxnID`
-itself as anchored. The reclamation bound is
+itself as anchored — and because a PROCESS crash leaves the OS page
+cache intact (the read may not be a disk fact), the gated writable
+Open makes this unconditional by fsyncing once itself: the recovery
+commit's own fdatasync, or — when the selected meta is already
+self-durable — a rewrite of that meta to its own slot followed by
+fdatasync. The rewrite is load-bearing: a prior failed fsync both
+consumes the kernel's writeback error and marks the pages clean, so a
+bare fdatasync could succeed trivially, anchoring an assertion the
+disk never received. The reclamation bound is
 `min(oldestActiveReaderTxnID, anchoredEpoch)` (`free-space.md §RPL
 Reclamation`); recovery adoption is unaffected (it reads
 `DurableTxnID` from disk, where anchoring is a tautology).
@@ -207,7 +212,7 @@ poisoned state and re-Open converges. A checkpoint failure DURING
 Close follows Checkpoint's failure semantics except that poison is
 moot — the handle is closing; the failure is surfaced as Close's
 error. Read-only handles skip this step.
-Lands: chunk 8 of docs/plans/architecture-consolidation.md.
+Lands: chunk 9 of docs/plans/architecture-consolidation.md.
 
 ### `Checkpoint()` mechanics
 
@@ -343,16 +348,29 @@ On recovery (Open after crash):
    fsynced, or `Checkpoint()` ran), the two projections
    coincide and nothing is lost.
 4. Neither meta valid → the database is corrupt (`ErrCorrupted`).
+   A writable Open defers building its in-memory state until step
+   5's gate decides WHICH projection to attach: attaching the live
+   projection first would walk a possibly-unflushed post-epoch RPL
+   head — exempt from boundary treatment, hence a hard error — and
+   permanently fail an Open whose durable projection is intact.
 5. **Recovery commit** — writable Open only, when `DurableTxnID <
    TxnID` AND the open establishes the database has **no live
-   attachment**: the lock file was freshly created, or its writer
-   header and every reader slot classify as dead/stale
-   (`cross-process.md §Stale writer recovery` / §Reader Table).
-   A live attachment means the selected meta's live tree is a
+   author**: the lock file was freshly created, or its persisted
+   last-writer record and every reader slot classify as dead/stale
+   (`cross-process.md §Lock File Layout`, LastWriter*; §Reader
+   Table). The last-writer record — written at grant acquisition,
+   surviving grant release, heartbeated for the author handle's
+   lifetime — is the load-bearing signal: only the last writer's
+   process can own unfsynced live commits, and it may be IDLE
+   (holding no grant and no reader slots) while still serving
+   them. A live author means the selected meta's live tree is a
    running database's current state — a joining writer must NOT
-   roll it back (its in-memory durable adoption is transient; the
-   first grant re-sync adopts the live projection, exactly as a
-   join behaved before this design). When the gate passes: under
+   roll it back. The selection the recovery commit adopts and
+   publishes is (re)established UNDER the same grant — a pre-grant
+   snapshot can be stale by any number of peer commits that landed
+   while the grant acquisition blocked, and publishing from it
+   would overwrite an acknowledged peer commit and retreat the
+   durable epoch. When the gate passes: under
    the write grant, publish the adopted state as a fresh meta at
    `TxnID + 1` (live fields = the adopted durable state;
    `DurableTxnID = TxnID + 1`, which is data-safe unfsynced — its
@@ -382,8 +400,7 @@ access to a crashed, never-recovered database is best-effort by
 nature; a deployment needing clean read-only access after a crash
 opens one writable handle first (and re-opens read-only handles
 that predate it).
-Lands: chunk 8 of docs/plans/architecture-consolidation.md (the
-recovery commit; the window semantics are descriptive).
+
 
 Commits in `(DurableTxnID, TxnID]` — `SyncLazy` commits after the
 last fsync point — are lost by design: that is the `SyncLazy`

@@ -286,18 +286,14 @@ func TestCheckReportsRPLSegmentInMetaRegion(t *testing.T) {
 	}
 }
 
-// TestOpenWithoutCheckpointPinsReclamation pins Open's NoCheckpoint
-// handling (durability.md §Recovery step 3 + free-space.md §RPL
-// Reclamation): when no meta slot carries MetaFlagCheckpoint, there is
-// no recoverable checkpoint to bound against, so the reopened handle
-// pins RPL reclamation off — lastCheckpointTxnID = 0, hence bound
-// min(readers, 0) = 0 — until an explicit Checkpoint() re-establishes
-// it. White-box on lastCheckpointTxnID: the min() formula itself is
-// pinned by the lagging-reader and reader-pin tests, so field-zero ⇒
-// bound-zero. (A black-box RetiredPages probe cannot discriminate
-// here: reclamation is lazy — it fires only under bitmap pressure —
-// so retired-page counts track pressure timing, not the bound.)
-func TestOpenWithoutCheckpointPinsReclamation(t *testing.T) {
+// TestAnchoredEpochBoundsReclamation pins the anchored-epoch bound at
+// the handle level (durability.md §Anchoring + free-space.md §RPL
+// Reclamation): after SyncLazy commits the anchored epoch stays at the
+// last fsync point (genesis here), so the reclamation bound is pinned;
+// Checkpoint() advances it to the active TxnID. White-box on the
+// pager's AnchoredEpoch: the min() formula is pinned by the
+// lagging-reader and reader-pin tests, so epoch-pinned ⇒ bound-pinned.
+func TestAnchoredEpochBoundsReclamation(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
 	opts := Options{
@@ -324,52 +320,104 @@ func TestOpenWithoutCheckpointPinsReclamation(t *testing.T) {
 		}
 	}
 
-	// Two SyncLazy commits overwrite both slots with unflagged metas.
 	db, err := Open(ctx, path, opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	defer db.Close()
 	put(db, 0)
 	put(db, 1)
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	// Two SyncLazy commits: nothing fsynced since genesis — the
+	// anchored epoch (and hence the bound's epoch term) is still 0.
+	if got := db.PgrForTest().AnchoredEpoch(); got != 0 {
+		t.Fatalf("anchored epoch = %d after lazy commits, want 0 (reclamation pinned)", got)
 	}
 
-	// Reopen: no checkpoint-flagged meta exists → reclamation pinned.
-	db, err = Open(ctx, path, opts)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	// Late-bound: db is reassigned below; close whichever handle is live
-	// (nil if the second Open failed mid-unwind).
-	defer func() {
-		if db != nil {
-			_ = db.Close()
-		}
-	}()
-	if got := db.lastCheckpointTxnID; got != 0 {
-		t.Fatalf("lastCheckpointTxnID = %d after no-checkpoint Open, want 0 (reclamation pinned off)", got)
-	}
-
-	// Checkpoint() re-establishes the bound at the flagged meta's TxnID.
+	// Checkpoint() advances the durable epoch AND anchors it (its own
+	// step-4 fsync).
 	if err := db.Checkpoint(ctx); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
-	if got, want := db.lastCheckpointTxnID, db.currentMeta.TxnID; got != want || got == 0 {
-		t.Fatalf("lastCheckpointTxnID = %d after Checkpoint, want currentMeta.TxnID %d (non-zero)", got, want)
+	if got, want := db.PgrForTest().AnchoredEpoch(), db.currentMeta.TxnID; got != want || got == 0 {
+		t.Fatalf("anchored epoch = %d after Checkpoint, want currentMeta.TxnID %d (non-zero)", got, want)
+	}
+}
+
+// TestCrashedSyncLazyTornLiveHeadRecovers pins the recovery ordering
+// (durability.md §Recovery): a crashed SyncLazy image whose LIVE RPL
+// head was never flushed (meta pwrite survived, the step-1 segment
+// pwrite did not) must still open — the gated writable Open attaches
+// the DURABLE projection and never walks the torn live head. Walking
+// the live projection first would hard-fail Open permanently (the
+// post-epoch live head is exempt from boundary treatment), leaving an
+// intact durable epoch unreachable.
+func TestCrashedSyncLazyTornLiveHeadRecovers(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 512, SyncMode: SyncLazy,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// Delete-heavy commits so the live meta carries an RPL chain whose
+	// head belongs to a post-epoch (unfsynced) commit.
+	for round := range 6 {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("Begin(%d): %v", round, err)
+		}
+		ks, err := tx.OpenKeyspace("k")
+		if err != nil {
+			if ks, err = tx.CreateKeyspace("k"); err != nil {
+				t.Fatalf("CreateKeyspace: %v", err)
+			}
+		}
+		for i := range 20 {
+			if err := ks.Put(fmt.Appendf(nil, "r%03d-%03d", round, i), make([]byte, 200)); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}
+		if round > 0 {
+			for i := range 10 {
+				if err := ks.Delete(fmt.Appendf(nil, "r%03d-%03d", round-1, i)); err != nil {
+					t.Fatalf("Delete: %v", err)
+				}
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit(%d): %v", round, err)
+		}
+	}
+	m := db.Meta()
+	if m.RPLHeadPage == 0 || m.RPLHeadTxnID <= m.Durable.TxnID {
+		t.Fatalf("fixture: live head not post-epoch (head=%d headTxn=%d epoch=%d)",
+			m.RPLHeadPage, m.RPLHeadTxnID, m.Durable.TxnID)
+	}
+	liveHead := m.RPLHeadPage
+	db.Close()
+
+	// Crash shape: the live meta reached disk, its head segment did
+	// not (zero the page); the author is dead (lock file gone).
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for tear: %v", err)
+	}
+	if _, err := f.WriteAt(make([]byte, 4096), int64(liveHead)*4096); err != nil {
+		t.Fatalf("tear head: %v", err)
+	}
+	f.Close()
+	if err := os.Remove(path + ".lock"); err != nil {
+		t.Fatalf("rm lock: %v", err)
 	}
 
-	// A reopen with the checkpoint on disk adopts its TxnID as the bound
-	// (the checkpoint-present arm of Open's adoption — recovery selects
-	// the flagged meta, so its TxnID is the last checkpoint).
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close before checkpointed reopen: %v", err)
-	}
-	db, err = Open(ctx, path, opts)
+	db2, err := Open(ctx, path, Options{Maintenance: MaintenanceOptions{Disable: true}})
 	if err != nil {
-		t.Fatalf("reopen after Checkpoint: %v", err)
+		t.Fatalf("Open after torn-live-head crash: %v (durable epoch unreachable)", err)
 	}
-	if got, want := db.lastCheckpointTxnID, db.currentMeta.TxnID; got != want || got == 0 {
-		t.Fatalf("lastCheckpointTxnID = %d after checkpointed reopen, want currentMeta.TxnID %d (non-zero)", got, want)
+	defer db2.Close()
+	if got := db2.Meta(); !got.SelfDurable() {
+		t.Errorf("recovered meta not self-durable: D=%d TxnID=%d", got.Durable.TxnID, got.TxnID)
 	}
 }

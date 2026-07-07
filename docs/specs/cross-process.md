@@ -324,7 +324,7 @@ Invariant: kind=entailed;
 ```
 Lock File
 +----------------------------------------------+
-| Header (80 bytes)                            |
+| Header (112 bytes)                           |
 | Magic              | uint64                  |
 | MaxReaders         | uint32                  |
 | Padding            | 4 bytes                 |
@@ -334,6 +334,11 @@ Lock File
 | WriterPIDNamespace | uint64                  |
 | WriterHeartbeat    | uint64                  |
 | LastMaintenanceTime| uint64                  |
+| LastWriterPID      | uint64                  |
+| LastWriterStartTime| uint64                  |
+| LastWriterPIDNS    | uint64                  |
+| LastWriterHeartbeat| uint64                  |
+| DataGeneration     | uint64                  |
 +----------------------------------------------+
 | Reader Table                                 |
 | +-------+-----+-----+------+-------+-------+ |
@@ -366,6 +371,11 @@ type LockFileHeader struct {
     WriterPIDNamespace  uint64
     WriterHeartbeat     uint64
     LastMaintenanceTime uint64
+    LastWriterPID          uint64
+    LastWriterStartTime    uint64
+    LastWriterPIDNamespace uint64
+    LastWriterHeartbeat    uint64
+    DataGeneration      uint64
 }
 
 type ReaderSlot struct {
@@ -393,7 +403,7 @@ automatically when the UUID does not match the data file's). The
 data file itself is fully portable (little-endian, explicit
 encode/decode).
 
-### Header fields (80 bytes)
+### Header fields (112 bytes)
 
 - **Magic**: identifies the file as a gmdb lock file.
 - **MaxReaders**: number of reader slots, set at lock-file creation
@@ -415,6 +425,19 @@ encode/decode).
   completes (see `background-maintenance.md`).
 - **DataGeneration** (atomic): counts data-file replacements
   (Compact's rename-over). See §Data-file generation below.
+- **LastWriterPID / LastWriterStartTime / LastWriterPIDNamespace /
+  LastWriterHeartbeat** (atomic): the persisted identity of the most
+  recent write-grant holder. Written at every grant acquisition
+  under LOCK_EX and — unlike the Writer* block — NOT cleared at
+  release; the heartbeat goroutine of the author handle refreshes
+  `LastWriterHeartbeat` for the handle's LIFETIME while the record
+  still names its process. Only the last writer's process can hold
+  unfsynced live commits in the shared page cache, so this record is
+  the recovery-commit gate's author-liveness signal (`durability.md
+  §Recovery` step 5): recovery must not roll the database back while
+  the author lives, even if it is idle (no grant, no reader slots).
+  Classification mirrors the reader-slot rules (same-namespace
+  kill(0) + start-time; cross-namespace heartbeat staleness).
 
 ### Reader slot (48 bytes)
 

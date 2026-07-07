@@ -543,3 +543,66 @@ func TestReleaseHookConcurrentSetGet(t *testing.T) {
 	wg.Wait()
 	SetReleaseHookForTest(nil)
 }
+
+// TestPrevLastWriterLiveClassification pins the recovery-commit gate's
+// author-liveness classification (durability.md §Recovery step 5)
+// against forged pre-acquisition records — the production-common crash
+// shape where the lock file PERSISTS with a dead author's record (the
+// deleted-lock-file path only exercises the pid==0 fast path).
+func TestPrevLastWriterLiveClassification(t *testing.T) {
+	ourNS, _ := PIDNamespace()
+	now := uint64(1_000_000_000_000)
+	timeout := uint64(10_000_000_000) // 10s
+
+	mkCoord := func(prevPID, prevStart, prevNS, prevHB uint64) *Coord {
+		c := &Coord{pidNS: ourNS, clock: func() uint64 { return now }}
+		c.staleTimeout = time.Duration(timeout)
+		c.prevLastWriter.pid = prevPID
+		c.prevLastWriter.startTime = prevStart
+		c.prevLastWriter.pidNS = prevNS
+		c.prevLastWriter.heartbeat = prevHB
+		return c
+	}
+
+	t.Run("no record is not live", func(t *testing.T) {
+		if mkCoord(0, 0, 0, 0).PrevLastWriterLive() {
+			t.Error("pid 0 classified live")
+		}
+	})
+	t.Run("same-ns dead pid is not live", func(t *testing.T) {
+		// A PID far above pid_max cannot be alive.
+		if mkCoord(1<<30, 12345, ourNS, now).PrevLastWriterLive() {
+			t.Error("dead pid classified live (kill(0) path)")
+		}
+	})
+	t.Run("same-ns live pid with matching start time is live", func(t *testing.T) {
+		pid := uint64(os.Getpid())
+		start, err := ProcessStartTime(os.Getpid())
+		if err != nil {
+			t.Skipf("ProcessStartTime: %v", err)
+		}
+		if !mkCoord(pid, start, ourNS, 0).PrevLastWriterLive() {
+			t.Error("our own live process classified dead")
+		}
+	})
+	t.Run("same-ns recycled pid (start-time mismatch) is not live", func(t *testing.T) {
+		pid := uint64(os.Getpid())
+		start, err := ProcessStartTime(os.Getpid())
+		if err != nil {
+			t.Skipf("ProcessStartTime: %v", err)
+		}
+		if mkCoord(pid, start+999, ourNS, now).PrevLastWriterLive() {
+			t.Error("recycled pid classified live")
+		}
+	})
+	t.Run("cross-ns fresh heartbeat is live", func(t *testing.T) {
+		if !mkCoord(42, 1, ourNS+1, now-timeout/2).PrevLastWriterLive() {
+			t.Error("fresh cross-ns heartbeat classified dead")
+		}
+	})
+	t.Run("cross-ns stale heartbeat is not live", func(t *testing.T) {
+		if mkCoord(42, 1, ourNS+1, now-2*timeout).PrevLastWriterLive() {
+			t.Error("stale cross-ns heartbeat classified live")
+		}
+	})
+}
