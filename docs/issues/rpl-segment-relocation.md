@@ -7,13 +7,13 @@ relocation is folded into the commit pipeline.
 
 ## Problem
 
-Online incremental compaction (chunk 12.5b) relocates B+tree nodes
+Online incremental compaction (v0 chunk 12.5b) relocates B+tree nodes
 (`btree.RelocatePages`, 12.5b-1) and overflow chains (12.5b-2), but **not
 RPL segment pages**. An RPL segment page sitting in an evacuation region
 cannot be moved, so that region cannot be fully cleared into a contiguous
 free run while the segment lives there.
 
-## Why deferred (user-approved at 12.5b-2)
+## Why deferred (user-approved at v0 12.5b-2)
 
 RPL segment pages are owned and managed by the **commit pipeline**:
 `commitStep0`→`appendRPL` allocates them via `AllocPage`, links them via
@@ -32,7 +32,7 @@ That is a high corruption-risk surface for low value:
   retiring relocated originals) are allocated fresh each commit, so a
   consolidating allocator already self-places them low.
 
-So the 12.5b-3 orchestration treats RPL segment pages as **immovable**:
+So the v0 12.5b-3 orchestration treats RPL segment pages as **immovable**:
 its evacuation predicate excludes them. A region pinned by an RPL page is
 a self-resolving gap, not a permanent one.
 
@@ -46,6 +46,6 @@ a self-resolving gap, not a permanent one.
    shows RPL pages never materially block consolidation — close as
    obsolete.
 
-Surfaced during chunk-12.5b-2 implementation (the commit-pipeline
+Surfaced during v0 chunk-12.5b-2 implementation (the commit-pipeline
 entanglement was discovered reading `appendRPL`); deferral approved by
 the user.

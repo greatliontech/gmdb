@@ -6,8 +6,13 @@
 > docs/plans/audit-burndown-2026-07.md` recovers it). The standing
 > directive that drove it — "fix them all, bottoms up … full authority
 > over specs, docs, code, and commit cadence" — is discharged. The
-> remaining `docs/issues/` backlog is condition-triggered only; work
-> resumes per the issue-selection flow below.
+> remaining `docs/issues/` backlog is condition-triggered only.
+>
+> **(2026-07-07)** Superseded as the session driver: the active
+> roadmap is `docs/plans/architecture-consolidation.md` (commit/
+> recovery/RPL groundwork → recovery-model redesign → independent
+> collapses). The issue-selection flow below applies only to backlog
+> entries not pulled by that plan's chunk gates.
 
 You are continuing a multi-session burn-down of `docs/issues/` for gmdb,
 an embedded MVCC KV store in Go. **One issue per context reset.** Each
@@ -1755,10 +1760,10 @@ accuracy preserves wrong framing.
    cite search of authoritative spec (`docs/specs/*.md`) and production
    `.go`. Promote load-bearing rationale inline into kept-current
    artifacts (code comments, spec sections). Delete the
-   `docs/issues/README.md` row AND the issue file. The plan
-   (`docs/plans/v0-implementation.md`) is a roadmap; its historical
-   chunk-completion records cite the issue by name as past-tense fact
-   and stay as-is.
+   `docs/issues/README.md` row AND the issue file. The v0 plan was
+   deleted at its own close-out (`git log --all --
+   docs/plans/v0-implementation.md` recovers it); the active plan is
+   `docs/plans/architecture-consolidation.md`.
 7. **Conventional commit** (consult `.semrel.yaml`). Commit directly to
    `main` matching project convention. `fix:` / `feat:` / `test:` /
    `perf:` as appropriate.

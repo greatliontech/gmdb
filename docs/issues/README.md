@@ -7,13 +7,13 @@ walked at every chunk-start gate (`N.1`) during the chunk roadmap —
 entries whose `Lands:` resolved to the current chunk were folded,
 redeferred, or closed.
 
-**The v0 chunk roadmap is now complete** (see
-`docs/plans/v0-implementation.md`), so the chunk-start gates no longer
-fire. This index is now the **active v0 backlog**, worked as a
-proactive burn-down: each follow-up is pulled when chosen (its `Lands:`
-trigger records the original deferral rationale, not a blocker), and
-resolved as its own change set — diagnose → fix → regression test →
-adversarial review → promote-then-delete.
+The v0 chunk roadmap is complete and its plan was deleted at close-out
+(`git log --all -- docs/plans/v0-implementation.md` recovers it). The
+active plan is `docs/plans/architecture-consolidation.md`; its
+chunk-start gates (`N.1`) walk this index, and entries may also be
+pulled as a proactive burn-down — each resolved as its own change set:
+diagnose → fix → regression test → adversarial review →
+promote-then-delete.
 
 When an issue is resolved, the load-bearing rationale moves inline
 into the spec / code where it belongs (kept-current artifact), all
@@ -50,8 +50,9 @@ entries are removed from their table and preserved in git history
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [rpl-segment-relocation](rpl-segment-relocation.md) | condition (when RPL pages are shown to block consolidation, or when RPL relocation folds into the commit pipeline) | Online compaction (12.5b) relocates B+tree nodes + overflow chains but not RPL segment pages — they're managed by the commit pipeline (alloc/chain/reclaim) and rewriting them out-of-band races that machinery; they're transient (drain via reclamation, new ones self-place low). The 12.5b-3 orchestration treats them as immovable. User-approved deferral at 12.5b-2. |
-| [pager-test-helper-export](pager-test-helper-export.md) | when chunk 5.3+ adds a second cross-package writer-pager fixture caller | `setupWriter` is duplicated into `internal/btree/pager_integration_test.go` as `setupPagerWriter` for the chunk-5.2 PageWriter parity test. Acceptable for one caller; factor when the second caller arrives. |
+| [rpl-segment-relocation](rpl-segment-relocation.md) | condition (when RPL pages are shown to block consolidation, or when RPL relocation folds into the commit pipeline) | Online compaction (v0 chunk 12.5b) relocates B+tree nodes + overflow chains but not RPL segment pages — they're managed by the commit pipeline (alloc/chain/reclaim) and rewriting them out-of-band races that machinery; they're transient (drain via reclamation, new ones self-place low). The v0 12.5b-3 orchestration treats them as immovable. User-approved deferral at v0 12.5b-2. |
+| [plan-codename-residue](plan-codename-residue.md) | condition (own sweep change set, or per artifact as each listed spec/file is next amended) | **[M]** (artifact-homes, not factoring) ~80 retired-plan chunk-number references survive in specs and code/test comments (planning codenames in kept-current artifacts); both defining plans are deleted and the active plan reuses numbers 1–18, so bare "chunk N" now reads against the wrong plan. `indexing.md:619` also carries status narrative. 2026-07-07 close-out review finding M-3. |
+| [pager-test-helper-export](pager-test-helper-export.md) | when a second cross-package writer-pager fixture caller (beyond `internal/btree`'s `setupPagerWriter`) arrives | `setupWriter` is duplicated into `internal/btree/pager_integration_test.go` as `setupPagerWriter` for the chunk-5.2 PageWriter parity test. Acceptable for one caller; factor when the second caller arrives. |
 
 ## Open — completeness / correctness / algorithm audit (2026-05-30)
 
@@ -64,19 +65,6 @@ findings each shared-fix row covers.
 |------|-------|---------|
 | [recovery-model-highest-epoch](recovery-model-highest-epoch.md) | condition (commit/recovery/RPL redesign, or grove-backport rotation) | **design direction** Replace per-commit checkpoint-preferring recovery with a highest-valid-epoch rule + an on-disk `durableEpoch` marker, retiring the live-vs-recovery meta asymmetry, the `lastCheckpointTxnID` bound, and the genesis-rollback gotcha. Multi-process design questions; substantial Spec-first effort. Spun out of `sync-mode-surface-consolidation`. |
 | [cross-namespace-reader-heartbeat-liveness](cross-namespace-reader-heartbeat-liveness.md) | condition (when cross-process stale-detection is revisited) | **[L]** Cross-namespace (container) readers have no `kill()` fallback — a >10s heartbeat pause (docker pause, cgroup freeze, swap) evicts a live reader → reads reclaimed-and-reused pages. Document the data-integrity bound + reconsider the default. *Finding 21.* |
-| [rpl-head-exemption-reclaimed](rpl-head-exemption-reclaimed.md) | condition (recovery-model redesign or head-convention revisit) | **[M]** rebuildRPLChain hard-fails Open on a bad head, but RPLHeadPage carries forward across no-retire commits, so an older checkpoint's head can be legitimately reclaimed+reused — recovery after a crash-mid-commit becomes unopenable. Chunk-4 review finding. |
-| [dbcleanup-teardown-drain](dbcleanup-teardown-drain.md) | condition (AddCleanup execution model revisit) | **[L]** dbCleanupFn tears down coord/lockFile without the txInflight drain Close performs — safe only while the runtime runs cleanups sequentially. Chunk-11 review finding. |
+| [rpl-head-exemption-reclaimed](rpl-head-exemption-reclaimed.md) | condition (recovery-model redesign or head-convention revisit) | **[M]** rebuildRPLChain hard-fails Open on a bad head, but RPLHeadPage carries forward across no-retire commits, so an older checkpoint's head can be legitimately reclaimed+reused — recovery after a crash-mid-commit becomes unopenable. Audit-burndown (2026-07) chunk-4 review finding. |
+| [dbcleanup-teardown-drain](dbcleanup-teardown-drain.md) | condition (AddCleanup execution model revisit) | **[L]** dbCleanupFn tears down coord/lockFile without the txInflight drain Close performs — safe only while the runtime runs cleanups sequentially. Audit-burndown (2026-07) chunk-11 review finding. |
 
-## Open — full-codebase audit (2026-07-04)
-
-Filed from the 2026-07-04 audit (5 parallel subsystem auditors:
-durability/recovery, concurrency/locking, btree/pager/free-space,
-indexing/typed, bulkload/compaction/maintenance; several findings
-carry failing-on-HEAD reproducers noted in the issue files). Worked as
-an active burn-down in the chunk order of
-`docs/plans/audit-burndown-2026-07.md` under the user's 2026-07-04
-blanket authority (fix all, bottoms-up, spec amendments included).
-Rows in chunk order; severity tags are the audit's.
-
-| Slug | Lands | Summary |
-|------|-------|---------|

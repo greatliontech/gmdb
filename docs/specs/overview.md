@@ -21,9 +21,21 @@ spec opens with a scope statement, declares its load-bearing
 invariants explicitly, and is self-contained for a reader scoped to
 that file. Cross-references are by spec file + section heading.
 
-The implementation roadmap derived from these specs lives under
-`docs/plans/` — start with `docs/plans/v0-implementation.md`. Tracked
-follow-ups live under `docs/issues/`.
+Implementation roadmaps live under `docs/plans/`; tracked follow-ups
+live under `docs/issues/`.
+
+## Package boundaries
+
+The root `gmdb` package is the public API surface and the
+integration layer; implementation lives in `internal/*` sub-packages
+that depend strictly downward — exactly `btree → page`,
+`pager → page`, and `pager → bitmap`; `internal/lock` stands alone.
+`btree` never imports `pager`: it reaches storage only through its
+own `PageWriter` interface, satisfied by the pager. No upward or
+sibling imports. A change that appears to force an upward or sibling
+import has found a misplaced seam: redraw the boundary (surface it
+as a spec-amend candidate) rather than introducing an interface to
+break the cycle in place.
 
 ## Invariants
 

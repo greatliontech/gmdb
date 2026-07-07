@@ -12,7 +12,8 @@ before publishing) with a carried-forward head that the crashed
 successor's reclamation had already drained and reused.
 
 **Source:** 2026-07-05 adversarial review of the
-pager-rpl-footer-verification change set (chunk 4), finding H1
+pager-rpl-footer-verification change set (audit-burndown-2026-07
+chunk 4), finding H1
 (adjacent — reachable on the pre-existing decode path; the chunk's
 checksum path inherits the same convention).
 

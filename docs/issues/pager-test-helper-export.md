@@ -1,8 +1,8 @@
 # `setupWriter` test helper duplicated across packages
 
-**Lands:** when chunk 5.3+ adds a second cross-package test that needs
-a writer-pager fixture, or earlier if the two helpers drift in a
-non-trivial way.
+**Lands:** when a second cross-package test (beyond `internal/btree`'s
+`setupPagerWriter`) needs a writer-pager fixture, or earlier if the two
+helpers drift in a non-trivial way.
 
 ## Problem
 
