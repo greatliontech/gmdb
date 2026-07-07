@@ -3,7 +3,10 @@
 **Lands:** condition — when fragmentation profiling shows RPL segment
 pages materially block contiguous-run consolidation (an evacuation region
 stays pinned by an RPL page across many maintenance passes), or when RPL
-relocation is folded into the commit pipeline.
+relocation is folded into the commit pipeline. (Dispositioned unchanged
+at the recovery-model design: the durable-sub-record model alters
+neither RPL segment ownership nor reclamation mechanics, so this
+issue's calculus is untouched.)
 
 ## Problem
 

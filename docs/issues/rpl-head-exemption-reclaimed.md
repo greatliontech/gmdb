@@ -1,13 +1,17 @@
 # The RPL chain rebuild's head exemption is unsound for carried-forward heads — crash-mid-commit recovery can permanently fail to open
 
-**Lands:** chunk 7 of `docs/plans/architecture-consolidation.md` — the
-recovery-model design chunk dispositions this issue (the redesign may
-retire the non-latest-meta recovery shape that makes it reachable, or
-the head convention is fixed there). Redeferred at the
-walker-unification chunk, which collapsed the three RPL walkers into
-one implementation (`internal/pager/rplwalk.go`) while deliberately
-preserving the head-exemption convention verbatim; the fix is now a
-one-point policy change.
+**Lands:** chunk 8 of `docs/plans/architecture-consolidation.md`. The
+chunk-7 design settled the fix in the amended spec: the meta persists
+the head segment's TxnID (`RPLHeadTxnID`, live and durable —
+`file-layout.md §Meta Page`), and the head exemption applies ONLY when
+the head is owned by the recovered epoch (`RPLHeadTxnID ==
+DurableTxnID` — `free-space.md §Head classification requires the
+persisted head TxnID`); a carried-forward head gets the stale-tail
+treatment. This is exactly the "persist the head's TxnID trustworthily
+before reading the page" fix direction below. One-point change in the
+shared walker (`internal/pager/rplwalk.go`), implemented with the
+format change at chunk 8; this file resolves at that chunk's
+close-out.
 
 **Severity:** [M] — a database that crashes at the wrong moment
 becomes unopenable (hard error at Open), no data corruption. The

@@ -30,7 +30,7 @@ the safety properties stated and enforced in:
 - `cross-process.md` — reader-table and writer-header
   invariants, stale recovery.
 - `mmap-strategy.md` — `PROT_READ` enforcement.
-- `durability.md` — checkpoint flag + recovery rule.
+- `durability.md` — durable sub-record + recovery rule.
 - `indexing.md` — atomic row + index maintenance.
 - `checksums.md` — silent bitrot detection.
 
@@ -61,8 +61,9 @@ the other meta page. See `file-layout.md §Meta Page` and
 
 In `SyncDurable`, data + bitmap pwrites are fdatasync'd BEFORE
 the meta page write, and the meta is fdatasync'd AFTER. In other
-sync modes, ordering relies on CoW and the checkpoint flag (see
-`durability.md`). See `pager-slab.md §Commit Write Ordering`.
+sync modes, ordering relies on CoW and the durable sub-record
+(recovery adopts only fsync-covered state — see `durability.md`).
+See `pager-slab.md §Commit Write Ordering`.
 
 ## Reader isolation
 

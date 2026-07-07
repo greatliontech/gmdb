@@ -396,9 +396,14 @@ When `Open()` creates a new database:
    - `HighWaterMark = 2 + BitmapPages`
    - `KeyspaceRoot = 0` (empty)
    - `NumKeyspaces = 0`
-   - `RPLHeadPage = 0`, `RPLTailPage = 0`, `RPLEntryCount = 0`
+   - `RPLHeadPage = 0`, `RPLHeadTxnID = 0`, `RPLTailPage = 0`,
+     `RPLEntryCount = 0`
    - `NumFreePages = 0`
-   - Checkpoint flag set on both
+   - Durable sub-record self-durable on both: `DurableTxnID =
+     AnchoredDurableTxnID = 0`, every `Durable*` field equal to its
+     live counterpart (the fsync at step 5 makes genesis the first
+     durable epoch — `durability.md §Checkpoints and the durable
+     sub-record`)
    - File-format fields from `Options.FileFormat` (or defaults)
    - `UUID` via `crypto/rand`
 3. Initialize the bitmap region: all bits clear.
@@ -440,7 +445,7 @@ type SyncMode int
 const (
     SyncDurable    SyncMode = iota // syncs data + meta. Full ACID. Default.
     SyncDataOnly                   // syncs data; not meta. Last txn may be lost on crash.
-    SyncLazy                       // skips all syncs. Rolls back to last Checkpoint() on crash.
+    SyncLazy                       // skips all syncs. On crash, rolls back to the durable epoch (the last fsync point by any handle: a Checkpoint(), a SyncDurable/SyncDataOnly commit, or a clean Close).
 )
 
 // Options for opening a database.
@@ -659,12 +664,25 @@ const (
 // DB is a handle to an open database.
 type DB struct { ... }
 
+// Close tears the handle down after draining in-flight transactions.
+// On a writable, non-poisoned handle it first performs the Checkpoint
+// sequence under the write grant (durability.md §Clean shutdown), so
+// a clean Close never loses acknowledged commits regardless of
+// SyncMode; the checkpoint's failure surfaces as Close's error, and a
+// poisoned handle skips the checkpoint (re-Open converges). Acquiring
+// the grant can block behind a peer's writer or Compact — Close waits
+// (it takes no context); callers needing bounded shutdown should
+// Checkpoint(ctx) first and accept the crash-equivalent rollback on
+// timeout.
 func (db *DB) Close() error
 
-// Checkpoint flushes all outstanding writes to stable storage. In
-// SyncLazy mode this creates a checkpoint (database will roll back to
-// this point at most on crash). In SyncDurable/SyncDataOnly modes,
-// no-op (commits already sync).
+// Checkpoint flushes all outstanding writes to stable storage and
+// advances the durable epoch to the active meta's TxnID (crash
+// recovery rolls back no further than this point — durability.md
+// §Checkpoints and the durable sub-record). Primarily for SyncLazy;
+// in SyncDataOnly it additionally anchors the latest epoch assertion
+// (durability.md §Anchoring), and in SyncDurable it is a no-op
+// beyond an extra fsync (commits already sync end-to-end).
 //
 // Checkpoint acquires the write lock for its duration via the flock
 // goroutine's FIFO queue; it serializes with concurrent write

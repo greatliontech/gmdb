@@ -655,26 +655,26 @@ latency and bounded cancellation latency.
    allocates pages the peer's committed tree references) — see the
    Writer-grant freshness invariant.
 
-   **Selection rule — latest-committed, not checkpoint-preferring.**
-   The re-sync adopts the highest-valid-TxnID meta (`page.ActiveMeta`),
-   NOT the checkpoint-preferring meta `Open` uses. `Open` is crash
-   recovery, where an uncheckpointed `SyncLazy` commit past the last
-   checkpoint may be torn and must roll back. A live grant handoff is
-   not recovery: the peer cleanly committed and released the flock, so
-   its latest commit — even an uncheckpointed `SyncLazy` one — is
-   complete and page-cache-visible, and rolling back to the last
-   checkpoint would silently lose it (and contradict the
-   latest-committed snapshot reads observe — see Reader Table). The
-   reclamation lower bound is computed separately as the highest
-   *checkpoint-flagged* TxnID among the two slots (the meta a crash
-   would recover to — `free-space.md §RPL Reclamation`); on no peer
-   advance the handle keeps its own (possibly tighter) in-memory
-   last-checkpoint tracking.
+   **Selection and projections.** The re-sync adopts the
+   highest-valid-TxnID meta (`page.ActiveMeta`) — the one selection
+   rule shared with recovery and readers (`durability.md §One
+   selection, two projections`) — and uses its LIVE projection: the
+   peer cleanly committed and released the flock, so its latest
+   commit — even an unfsynced `SyncLazy` one — is complete and
+   page-cache-visible; rolling back to the durable epoch would
+   silently lose it (and contradict the latest-committed snapshot
+   reads observe — see Reader Table). The reclamation lower bound
+   comes from the same meta's `AnchoredDurableTxnID` — the newest
+   epoch assertion the disk is guaranteed to record, so never ahead
+   of any state a crash could make recovery adopt (`durability.md
+   §Anchoring`, `free-space.md §RPL Reclamation`) — optionally
+   tightened by the writer's own completed-fsync knowledge; no
+   separate flag scan exists.
 
 `Checkpoint()` performs the same re-sync after acquiring the grant,
-for the same reason: it re-flags the active meta in place, so it must
-re-flag the *current* on-disk meta in its *current* slot, never an
-older cached meta over a peer's newer one.
+for the same reason: it bumps the active meta's durable sub-record in
+place, so it must bump the *current* on-disk meta in its *current*
+slot, never an older cached meta over a peer's newer one.
 
 `Commit()` and `Rollback()` signal the flock goroutine to
 release.
@@ -770,10 +770,11 @@ operations use atomic memory ops visible across processes.
 the **latest committed** on-disk meta — both meta pages are re-read
 and the highest-valid-TxnID one is chosen (`page.ActiveMeta`) — NOT
 the handle's cached `currentMeta` (which a peer's commit leaves
-stale) and NOT the checkpoint-preferring recovery meta (a reader
-wants visibility of the newest commit, not the newest durable
-checkpoint; the two differ only for an unflagged `SyncLazy` commit,
-which a reader correctly observes). The read is lock-free — readers
+stale). The reader uses the selected meta's LIVE projection
+(a reader wants visibility of the newest commit, not the durable
+epoch's rollback target; the two differ only for an unfsynced
+`SyncLazy` commit, which a reader correctly observes —
+`durability.md §One selection, two projections`). The read is lock-free — readers
 hold no write grant — so a writer may be mid-commit on the inactive
 slot; a torn slot fails its checksum and the valid one is selected,
 and because a commit writes (and, per `SyncMode`, fsyncs) data pages
@@ -1221,4 +1222,4 @@ table to find the minimum active TxnID. Any RPL entries with
 `TxnID < min_active` are safe to reclaim — their bits are set
 in the bitmap. See `free-space.md §RPL Reclamation` for the
 full reclamation-bound rule, which combines this scan with the
-last-checkpoint TxnID.
+anchored epoch (`AnchoredDurableTxnID`).

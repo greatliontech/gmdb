@@ -1,6 +1,6 @@
 # gmdb architecture consolidation & recovery-model redesign
 
-Chunks 1–10 are governed by `docs/specs/durability.md`,
+Chunks 1–9 are governed by `docs/specs/durability.md`,
 `free-space.md`, `cross-process.md`, `file-layout.md`; chunks 11–18
 are behavior-preserving consolidation under the specs each touched
 area cites. Chunks in dependency order; sub-chunks `N.1` (triage
@@ -45,20 +45,34 @@ gate) and the final close-out are fixed anchors per chunk.
 
 ## Phase B — recovery-model redesign (Spec-first)
 
-- [ ] 7. Design: amend `durability.md`, `file-layout.md`,
-  `free-space.md`, `cross-process.md` to highest-valid-epoch recovery
-  with an on-disk `durableEpoch` marker; settle the multi-process
-  questions (cross-process visibility under deferred meta,
-  peer-visible durable-epoch marker); disposition
-  `docs/issues/rpl-head-exemption-reclaimed.md` and
-  `docs/issues/rpl-segment-relocation.md` inside the design.
-- [ ] 8. Implement `durableEpoch` + highest-epoch recovery; retire
-  checkpoint-preferring selection, the live-visibility-vs-recovery
-  meta-selection asymmetry, and the genesis-rollback special case.
-- [ ] 9. Retire/reshape the `lastCheckpointTxnID` reclamation-bound
-  machinery per the amended spec.
-- [ ] 10. Land the chunk-7 dispositions of the RPL head exemption and
-  RPL segment relocation.
+- [x] 7. Design (user-selected durable-sub-record model): amend
+  `durability.md`, `file-layout.md`, `free-space.md`,
+  `cross-process.md`, `transactions.md`, `background-maintenance.md`
+  — every meta carries its recovery target (the durable sub-record:
+  `DurableTxnID` + the epoch's state-bearing fields incl. the
+  persisted RPL head TxnID); recovery = one selection (highest valid
+  TxnID, shared with live paths) + the durable projection; the
+  checkpoint flag, checkpoint-preferring selection, and the
+  sustained-SyncLazy unsafe degradation retire; reclamation bound =
+  `min(oldestReader, anchoredEpoch)` (`AnchoredDurableTxnID`, the
+  newest fsync-covered assertion). Dispositions:
+  rpl-head fix designed (head exemption conditioned on epoch
+  ownership via persisted `RPLHeadTxnID`), lands chunk 8;
+  rpl-segment redeferred unchanged (mechanics untouched).
+- [ ] 8. Implement the amended contract (format-version bump, clean
+  break): meta codec + `RPLHeadTxnID` + durable sub-record +
+  `AnchoredDurableTxnID`; commit/Checkpoint sub-record and
+  anchoring maintenance; recovery = durable projection + the
+  recovery commit; head-exemption `RPLHeadTxnID >= DurableTxnID`
+  rule in the shared walker; retire `MetaFlagCheckpoint`,
+  `ActiveMetaCheckpointPreferring`, `HighestCheckpointTxnID`, the
+  `NoCheckpoint` plumbing, and the genesis special case.
+- [ ] 9. Root-side retirement + clean shutdown: delete
+  `db.lastCheckpointTxnID` (bound from the anchored epoch);
+  writable `Close()` performs the Checkpoint sequence; rewire
+  `reclamationBound`, `setMetaState`/`adoptOpened`, Checkpoint
+  publish, the maintenance first-pass trigger, and stats/warn
+  surfaces; update docs and the recovery test nets.
 
 ## Phase C — independent collapses
 

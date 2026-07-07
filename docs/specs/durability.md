@@ -1,20 +1,20 @@
 # Durability Modes
 
 Three sync modes (`SyncDurable`, `SyncDataOnly`, `SyncLazy`). The
-mode controls which `fdatasync()` calls fire during commit and how
-recovery selects the active meta page after a crash.
+mode controls which `fdatasync()` calls fire during commit and what
+state recovery adopts after a crash.
 
 Scope:
 - `Options.SyncMode` semantics.
-- Checkpoint flag on the meta page and `DB.Checkpoint()` mechanics.
-- Recovery rules (which meta is selected).
+- The durable sub-record on the meta page and `DB.Checkpoint()`
+  mechanics.
+- Recovery rules (which state is adopted).
 - Cross-process `SyncMode` interleaving.
 
 Depends on / interacts with:
 - `pager-slab.md` for commit step 2 / step 4 fdatasync placement.
-- `file-layout.md` for the meta page `Flags` field (bit 1 =
-  Checkpoint).
-- `free-space.md` for the checkpoint-bound used by RPL
+- `file-layout.md` for the meta page's durable sub-record fields.
+- `free-space.md` for the durable-epoch bound used by RPL
   reclamation in `SyncLazy`.
 - `api-surface.md` for `SyncMode` constants and `Checkpoint`.
 
@@ -32,35 +32,70 @@ Invariant: kind=clause-explicit;
     surprise.
 
 Invariant: kind=clause-explicit;
-  property=Recovery prefers the highest-`TxnID` valid meta whose
-    `Checkpoint` flag is set; non-checkpoint metas are never
-    preferred over checkpoint ones regardless of `TxnID`;
+  property=Recovery selects the highest-`TxnID` valid meta — the
+    same selection live operation uses — and adopts its **durable
+    sub-record** (the durable projection), never the selected
+    meta's live tree;
   from=this spec §Recovery;
-  violation=Selecting a non-checkpoint meta when a checkpoint
-    meta is available rolls forward to a tree whose data pages
-    may not be durable — readers can traverse into pages the
-    OS never flushed, surfacing as `ErrBadPageChecksum` or
-    wrong values.
+  violation=Adopting a live tree whose data pages were never
+    fsynced (a `SyncLazy` commit's) lets readers traverse pages
+    the OS never flushed, surfacing as `ErrBadPageChecksum` or
+    wrong values; adopting a stale slot when a newer valid one
+    exists silently loses durable commits.
+  Lands: chunk 8 of docs/plans/architecture-consolidation.md.
+
+Invariant: kind=clause-explicit;
+  property=`DurableTxnID` and `AnchoredDurableTxnID` are
+    monotonically non-decreasing across the commit sequence, and
+    `AnchoredDurableTxnID <= DurableTxnID`: every commit carries
+    the previous meta's sub-record forward unchanged, or replaces
+    `DurableTxnID` with its own (strictly newer) state when its
+    data is confirmed durable, and advances
+    `AnchoredDurableTxnID` only to an assertion a completed
+    fdatasync has covered (§Anchoring);
+  from=this spec §Checkpoints, §Anchoring;
+  violation=A sub-record that retreats lets the latest meta name
+    an older durable epoch than an earlier meta did — recovery
+    and the RPL reclamation bound (`free-space.md`) would trust a
+    bound newer segments were already reclaimed against, freeing
+    pages the recovered tree references.
+  Lands: chunk 8 of docs/plans/architecture-consolidation.md.
+
+Invariant: kind=clause-explicit;
+  property=The RPL reclamation bound never exceeds the **anchored
+    epoch** — the newest `DurableTxnID` assertion whose carrying
+    meta pwrite a completed fdatasync has covered (§Anchoring) —
+    so the bound never exceeds any epoch a crash at any instant
+    could make recovery adopt;
+  from=this spec §Anchoring + `free-space.md §RPL Reclamation`;
+  violation=Trusting an UNANCHORED assertion (a `SyncDataOnly`
+    commit's self-durable meta, pwritten after its data fsync but
+    itself never fsynced) lets reclamation free pages by a bound
+    the disk does not yet record: the OS drops that meta in a
+    crash, recovery adopts the older on-disk epoch, and its tree
+    references pages reclamation already handed out — silent
+    corruption on a mode composition this spec guarantees.
+  Lands: chunk 8 of docs/plans/architecture-consolidation.md.
 
 Invariant: kind=entailed;
   property=`DB.Checkpoint()` makes prior `SyncLazy` commits
-    durable: after Checkpoint returns success, every commit
-    whose `TxnID <= active meta TxnID at Checkpoint time` is on
-    stable storage, and the meta carries the checkpoint flag
-    set;
+    durable: after Checkpoint returns success, every commit whose
+    `TxnID <= active meta TxnID at Checkpoint time` is on stable
+    storage, and the active meta's durable sub-record names its
+    own live state (`DurableTxnID == TxnID`);
   from=entailed: §Checkpoints mechanics (fdatasync at step 2 +
-    flag-set + fdatasync at step 4);
+    sub-record bump + fdatasync at step 4);
   violation=A "successful" `Checkpoint` that fails to fdatasync
-    prior pwrites lets recovery accept the checkpoint meta and
-    traverse into not-yet-flushed pages — silent corruption.
+    prior pwrites lets recovery adopt a sub-record naming
+    not-yet-flushed pages — silent corruption.
 
 Invariant: kind=entailed;
   property=Multiple processes attached to the same database may
     use different `SyncMode`s; recovery composes correctly
-    because the on-disk checkpoint flag reflects the committer's
-    mode, and recovery selects the highest-`TxnID`
-    checkpoint-flagged meta regardless of which process wrote
-    it;
+    because the durable sub-record reflects the last fsync-ing
+    event by ANY process (carried forward by every committer),
+    and recovery adopts the highest-`TxnID` valid meta's
+    sub-record regardless of which process wrote it;
   from=entailed: §Cross-process SyncMode interleaving;
   violation=An assumption that all processes share a `SyncMode`
     fails under mixed deployments (e.g., a `SyncLazy` build of
@@ -77,27 +112,102 @@ structurally valid).
 | Mode | Data Sync | Meta Sync | On Crash | Performance |
 |------|-----------|-----------|----------|-------------|
 | `SyncDurable` (default) | `fdatasync()` | `fdatasync()` | No data loss. Full ACID. | Slowest |
-| `SyncDataOnly` | `fdatasync()` | skip | Last committed transaction may be lost. DB is consistent — falls back to previous meta page. | ~2× faster |
-| `SyncLazy` | skip | skip | Rolls back to the last **checkpoint**. DB is always consistent — no corruption. | Much faster |
+| `SyncDataOnly` | `fdatasync()` | skip | The commits since the last durable-epoch advance may be lost (in pure `SyncDataOnly` use: at most the last one). DB is consistent — falls back to the surviving meta's sub-record. | ~2× faster |
+| `SyncLazy` | skip | skip | Rolls back to the **durable epoch** (the last fsync point). DB is always consistent — no corruption. | Much faster |
 
-## Checkpoints
+## Checkpoints and the durable sub-record
 
 In `SyncLazy` mode, commits pwrite bitmap, data, and meta but
 skip all `fdatasync()` calls. The OS page cache holds the
 writes; order is not guaranteed.
 
-A **checkpoint** is a commit whose data pages have been
-confirmed on stable storage. Checkpoints occur when:
+The **durable epoch** is the newest `TxnID` whose data pages have
+been confirmed on stable storage. The epoch advances when:
 
 - `DB.Checkpoint()` is called explicitly (`fdatasync` of the
   data file).
 - A commit happens in `SyncDurable` or `SyncDataOnly` mode (these
   sync data pages as part of their normal commit path).
 
-Each meta page carries a **checkpoint flag** (`Flags` bit 1, see
-`file-layout.md`). Set when `fdatasync()` completes. In
-`SyncLazy`, commits write meta with the flag **clear**.
-`DB.Checkpoint()` re-writes meta with the flag **set**.
+Each meta page carries a **durable sub-record** (`file-layout.md
+§Meta Page`): the durable epoch's `TxnID` plus the state-bearing
+fields of that epoch's meta (keyspace root and count,
+HighWaterMark, RPL head/tail/entry-count/head-TxnID, free-page
+count) — everything recovery needs to adopt that epoch's tree.
+A commit whose own data is confirmed durable (SyncDurable /
+SyncDataOnly step-2 fsync) writes its meta with the sub-record
+naming ITSELF (`DurableTxnID == TxnID`). A `SyncLazy` commit
+carries the previous meta's sub-record forward unchanged.
+`DB.Checkpoint()` re-writes the active meta with the sub-record
+bumped to the meta's own live state. The file-format fields
+(`MinSize`, `GrowStep`, `ShrinkThreshold`) are deliberately NOT
+part of the sub-record: they are policy, safe to pair with any
+tree, and recovery adopts the selected meta's live values.
+
+### Anchoring — when an epoch assertion may bound reclamation
+
+A `DurableTxnID` assertion protects recovery only once it is
+itself on stable storage. A `SyncDataOnly` commit writes a
+self-durable meta (its data was fsynced at step 2) but never
+fsyncs that meta — until a later fdatasync covers the meta
+pwrite, a crash can drop the assertion while keeping everything
+reclamation did under it. The **anchored epoch**
+(`AnchoredDurableTxnID`) is therefore tracked alongside the
+sub-record: the newest `DurableTxnID` assertion whose carrying
+meta pwrite preceded a completed fdatasync of the file.
+
+- Every fdatasync that COMPLETES anchors every assertion pwritten
+  before it: a `SyncDurable` commit's step-4 anchors its own
+  assertion; `Checkpoint()`'s step-4 anchors its bump; a
+  `SyncDataOnly` commit's step-2 anchors everything already
+  pwritten (in pure `SyncDataOnly` use the anchored epoch trails
+  the durable epoch by exactly one commit).
+- A `SyncLazy` commit fsyncs nothing and anchors nothing.
+- **The persisted field never runs ahead of a completed fsync.**
+  `AnchoredDurableTxnID` as pwritten names only an assertion whose
+  covering fsync had ALREADY returned when the meta was written —
+  a `SyncDurable` commit persists the pre-commit anchored value
+  and advances its in-process knowledge to its own `TxnID` only
+  after step 4 returns (the next meta persists it). A
+  forward-promise ("the fsync I am about to run") is exploitable:
+  if that fsync FAILS, the handle poisons but the pwritten claim
+  stays live-visible in the shared page cache, and a peer's
+  re-sync would bound reclamation by an assertion the disk never
+  received while the kernel's consumed error lets the data
+  overwrites flush — the failed-fsync trap of §Checkpoint failure
+  semantics, laundered through the bound.
+
+Each meta persists `AnchoredDurableTxnID` — the anchored epoch as
+known (completed) by its writer — so a peer acquiring the grant can
+bound reclamation without a channel beyond the meta itself; the
+live writer may additionally use its own newer in-process
+anchoring knowledge (fsyncs it has observed complete). After a
+crash, anything read from disk is durable by definition, so a
+freshly-recovered handle treats the selected meta's `DurableTxnID`
+itself as anchored. The reclamation bound is
+`min(oldestActiveReaderTxnID, anchoredEpoch)` (`free-space.md §RPL
+Reclamation`); recovery adoption is unaffected (it reads
+`DurableTxnID` from disk, where anchoring is a tautology).
+
+### Clean shutdown
+
+`DB.Close()` on a writable handle performs the Checkpoint
+sequence (steps 1–4: grant, data fdatasync, sub-record bump in
+the active slot, meta fdatasync) before teardown, so a clean
+close never loses acknowledged commits regardless of `SyncMode` —
+a pure-`SyncLazy` application that never calls `Checkpoint()`
+still reopens with everything it committed. Rollback to an older
+durable epoch is reachable only through a real crash (or a
+failed/killed Close). An already-POISONED handle SKIPS the
+shutdown checkpoint: running it would be exactly the retried-fsync
+trap of §Checkpoint failure semantics (the retry succeeds
+trivially over kernel-consumed error state and stamps a durable
+sub-record on data that never reached storage); Close surfaces the
+poisoned state and re-Open converges. A checkpoint failure DURING
+Close follows Checkpoint's failure semantics except that poison is
+moot — the handle is closing; the failure is surfaced as Close's
+error. Read-only handles skip this step.
+Lands: chunk 8 of docs/plans/architecture-consolidation.md.
 
 ### `Checkpoint()` mechanics
 
@@ -113,20 +223,25 @@ Each meta page carries a **checkpoint flag** (`Flags` bit 1, see
    writer never writes through it, so there are no mmap dirty
    pages from gmdb; the fdatasync's job is purely to flush
    pwritten page-cache contents.)
-3. Read the currently active meta page; toggle its checkpoint
-   flag on; recompute the xxhash64 checksum over the full meta
-   payload (the flag change shifts the hash); `pwrite()` it
-   back to the same slot. The TxnID is unchanged — Checkpoint
-   records that the already-committed state is durable, not a
-   new transaction.
-4. `fdatasync(fd)` again so the flag set itself reaches stable
-   storage.
+3. Read the currently active meta page; set its durable
+   sub-record to the meta's own live state (`DurableTxnID =
+   TxnID`, durable fields copied from the live fields), and set
+   `AnchoredDurableTxnID` to the PRE-bump anchored value (step
+   2's completed fsync anchors the pre-bump meta's assertion;
+   the bump's own assertion is anchored by step 4 and persisted
+   by the NEXT meta write — §Anchoring's no-forward-promise
+   rule); recompute the xxhash64 checksum over the full meta
+   payload; `pwrite()` it back to the same slot. The TxnID is
+   unchanged — Checkpoint records that the already-committed
+   state is durable, not a new transaction.
+4. `fdatasync(fd)` again so the sub-record bump itself reaches
+   stable storage.
 5. Release the write lock.
 
 Steps 2 and 4 are both required: step 2 makes prior lazy commits
-durable; step 4 makes the flag-set durable so recovery can trust
-it. The single-meta-slot pwrite in step 3 is atomic because it
-stays within one page (an unaligned tear cannot affect a single
+durable; step 4 makes the sub-record bump durable so recovery can
+trust it. The single-meta-slot pwrite in step 3 is atomic because
+it stays within one page (an unaligned tear cannot affect a single
 contiguous sub-page region, and the xxhash64 checksum catches
 any partial write — recovery falls back to the other slot).
 
@@ -137,7 +252,7 @@ observe a torn/invalid checksum for that instant. This is
 harmless by construction: the reader's meta selection rejects
 the invalid slot on checksum and falls back to the OTHER slot —
 a valid, older meta — and reclamation never runs under a
-checkpoint-flag toggle (the TxnID is unchanged, so the snapshot
+sub-record bump (the TxnID is unchanged, so the snapshot
 the fallback pins is reclamation-protected exactly like any
 other reader of that meta). The anomaly is a transient
 one-instant stale read, never a wrong or unprotected snapshot.
@@ -156,9 +271,9 @@ publication contract:
 
 - A failed fdatasync consumes the kernel's per-fd error state while
   marking the pages clean; a retried Checkpoint's fdatasync then
-  succeeds trivially and stamps `MetaFlagCheckpoint` over data that
-  never reached stable storage — recovery selects the checkpoint
-  meta and traverses into unwritten pages (the exact violation
+  succeeds trivially and stamps a durable sub-record over data that
+  never reached stable storage — recovery adopts the sub-record
+  and traverses into unwritten pages (the exact violation
   §Durability Modes warns about).
 - A torn active-slot pwrite leaves the only on-disk copy of the
   active meta checksum-invalid while the process keeps serving it
@@ -216,47 +331,110 @@ On recovery (Open after crash):
 
 1. Read both meta pages. Discard any with invalid xxhash64
    checksum.
-2. Of the valid metas, select the one with the highest `TxnID`
-   whose checkpoint flag is **set**.
-3. If neither meta has the checkpoint flag set (the user never
-   called `Checkpoint()` and never used `SyncDurable` /
-   `SyncDataOnly`), select the higher-`TxnID` valid meta. Data
-   integrity depends on whether the OS flushed pages in the
-   right order — not guaranteed. `Open()` logs a warning via
-   `slog.Logger`.
-4. Non-checkpoint metas are never preferred over checkpoint
-   ones, regardless of `TxnID`.
+2. Of the valid metas, select the one with the highest `TxnID` —
+   the SAME selection every live path uses (`file-layout.md
+   §Meta Page`, active-meta paragraph and the equal-TxnID
+   invariant).
+3. Adopt the selected meta's **durable sub-record** as the
+   recovered state: keyspace root and count, HighWaterMark, RPL
+   pointers, and free-page count all come from the sub-record,
+   never from the selected meta's live fields. When the meta is
+   self-durable (`DurableTxnID == TxnID` — the last commit
+   fsynced, or `Checkpoint()` ran), the two projections
+   coincide and nothing is lost.
+4. Neither meta valid → the database is corrupt (`ErrCorrupted`).
+5. **Recovery commit** — writable Open only, when `DurableTxnID <
+   TxnID` AND the open establishes the database has **no live
+   attachment**: the lock file was freshly created, or its writer
+   header and every reader slot classify as dead/stale
+   (`cross-process.md §Stale writer recovery` / §Reader Table).
+   A live attachment means the selected meta's live tree is a
+   running database's current state — a joining writer must NOT
+   roll it back (its in-memory durable adoption is transient; the
+   first grant re-sync adopts the live projection, exactly as a
+   join behaved before this design). When the gate passes: under
+   the write grant, publish the adopted state as a fresh meta at
+   `TxnID + 1` (live fields = the adopted durable state;
+   `DurableTxnID = TxnID + 1`, which is data-safe unfsynced — its
+   tree IS the durable epoch's; `AnchoredDurableTxnID` = the
+   adopted epoch, the disk-proven value, per §Anchoring's
+   no-forward-promise rule) to the non-selected slot, then
+   `fdatasync` (after which the handle's in-process anchored
+   epoch is `TxnID + 1`). This out-selects the rejected live tree
+   for every subsequent selection and is idempotent under crash
+   (a crash before the fsync leaves the old slots authoritative;
+   recovery re-runs). Read-only opens cannot repair; see the
+   window note below.
 
-Recovery does not attempt to validate a non-checkpoint meta's
-tree. Accepting a partially-durable tree would risk surfacing
-`ErrCorrupted` on later reads when traversals reach unflushed
-pages. The checkpoint's tree is guaranteed intact because CoW
-never modifies existing pages.
+**The unrecovered window.** Between a crash and the first writable
+Open's recovery commit, the on-disk active slot still names the
+rejected live tree. A read-only handle attached in that window
+selects it and uses the live projection (`cross-process.md §Reader
+Table`) — its traversals can reach partially-flushed pages. This is
+bounded and detectable, not silent: page checksums (on by default)
+surface such pages as `ErrBadPageChecksum`. The on-disk condition
+ends at the first gated writable Open, but a read-only handle that
+attached DURING the window keeps its selected live projection for
+that handle's lifetime — and the rejected tree's pages are free in
+the adopted bitmap, so post-recovery writers may overwrite them
+under such a reader (checksum-detectable, never silent). Read-only
+access to a crashed, never-recovered database is best-effort by
+nature; a deployment needing clean read-only access after a crash
+opens one writable handle first (and re-opens read-only handles
+that predate it).
+Lands: chunk 8 of docs/plans/architecture-consolidation.md (the
+recovery commit; the window semantics are descriptive).
+
+Commits in `(DurableTxnID, TxnID]` — `SyncLazy` commits after the
+last fsync point — are lost by design: that is the `SyncLazy`
+trade. Recovery never adopts a tree that is not guaranteed
+durable; the sub-record's tree is intact because CoW never
+modifies existing pages and RPL reclamation never frees pages the
+durable epoch's tree references (`free-space.md §RPL
+Reclamation`). A database that was never made durable past
+initialization recovers to its (fsynced) genesis state — the
+honest expression of "nothing was ever made durable".
+
+The selected meta's live fields still matter to recovery for
+policy: the file-format fields (`MinSize`, `GrowStep`,
+`ShrinkThreshold`) are taken live per §Checkpoints and the
+durable sub-record. A `SetFileFormat` change committed after the
+durable epoch therefore SURVIVES recovery iff its meta occupies
+the selected slot — nondeterministic across the two-slot
+rotation, and safe either way (policy pairs with any tree;
+`MaxSize` is immutable and shrink floors at the adopted
+HighWaterMark).
 
 ## Cross-process SyncMode interleaving
 
 `SyncMode` is a per-process `Options` setting, not stored on
 disk. Different processes attached to the same database may run
-with different SyncModes. The on-disk checkpoint flag reflects
-whichever mode the *committer* used: a commit by a `SyncDurable`
-process sets the flag; a commit by a `SyncLazy` process clears
-it. Recovery selects the highest-`TxnID` **checkpoint-flagged**
-meta, so interleaving `SyncLazy` and `SyncDurable` writers
+with different SyncModes. The durable sub-record reflects
+whichever fsync-ing event happened last, regardless of process: a
+commit by a `SyncDurable` process writes a self-durable meta; a
+commit by a `SyncLazy` process carries the previous sub-record
+forward. Recovery adopts the highest-`TxnID` valid meta's
+sub-record, so interleaving `SyncLazy` and `SyncDurable` writers
 across processes works correctly — a crash rolls back to the
-most recent `SyncDurable`-or-`Checkpoint`-set meta, possibly
-losing intervening `SyncLazy` commits from any process. This is
-the same trade-off as `SyncLazy` within a single process; the
-multi-process composition is consistent with that.
+most recent fsync point, possibly losing intervening `SyncLazy`
+commits from any process. This is the same trade-off as
+`SyncLazy` within a single process; the multi-process composition
+is consistent with that.
 
-**Live visibility vs. crash recovery — distinct selections.** The
-checkpoint-preferring selection above governs *crash recovery* (a
-fresh `Open`). It does **not** govern *live* operation: a writer
-re-syncing on a grant handoff, and a reader beginning a transaction,
-both select the **latest committed** meta (`cross-process.md §Writer
-acquisition flow` / §Reader Table), so an uncheckpointed `SyncLazy`
-commit IS visible to other live handles and is built upon by the next
-writer — it is not silently rolled back during normal operation. The
-asymmetry is intentional and consistent with the `SyncLazy` contract:
-such a commit is *visible-while-live but not crash-durable*. The grant
-serializes writers, so a live handoff is never a torn read; only a
-real crash invokes the recovery rollback.
+**One selection, two projections.** Live operation and crash
+recovery select the SAME meta — the highest-`TxnID` valid slot.
+They differ only in which projection of it they use: a writer
+re-syncing on a grant handoff and a reader beginning a
+transaction use the **live projection** (the meta's own tree —
+`cross-process.md §Writer acquisition flow` / §Reader Table), so
+an unfsynced `SyncLazy` commit IS visible to other live handles
+and is built upon by the next writer; crash recovery uses the
+**durable projection** (the sub-record). A `SyncLazy` commit is
+therefore *visible-while-live but not crash-durable*, expressed
+by one selection rule rather than two. The grant serializes
+writers, so a live handoff is never a torn read; the durable
+projection is invoked by recovery (and by nothing else), and the
+recovery commit (§Recovery step 5) republishes it as the live
+state, so live operation never resumes atop a tree recovery
+rejected — modulo the unrecovered read-only window noted in
+§Recovery.

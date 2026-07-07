@@ -1,12 +1,15 @@
 # Recovery model: replace checkpoint-preferring with highest-valid-epoch
 
-**Lands:** condition — a substantial Spec-first redesign of the
-commit/recovery/RPL path; take it when gmdb reaches a "good enough"
-state and focus rotates to `grove` backporting (and looping back), or
-whenever the commit/recovery path is reopened for other reasons. NOT
-near-term. Spun out of `sync-mode-surface-consolidation` when that issue
-landed (dropping the phantom `SyncUnsafe`); this is the larger adjacent
-direction that issue explicitly carved out so it would not be lost.
+**Lands:** chunks 8–9 of `docs/plans/architecture-consolidation.md`.
+The Spec-first design this issue called for landed at chunk 7 (user
+selected the **durable sub-record** model: every meta carries its
+recovery target — `durability.md §Checkpoints and the durable
+sub-record`, `file-layout.md §Meta Page`). The multi-process question
+below is settled: grove's deferred-meta-write does not port because
+peers need eagerly-pwritten metas for live visibility, so the
+durability marker rides IN each meta instead of gating its write.
+This file resolves when the implementation lands (chunks 8–9);
+originally spun out of `sync-mode-surface-consolidation`.
 
 **Severity:** design direction (not a defect) — a simplification that
 retires three recurring complexity sources, gated on a multi-process

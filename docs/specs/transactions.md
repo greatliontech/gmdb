@@ -42,7 +42,7 @@ Invariant: kind=clause-explicit;
     releases the reader slot via `Commit()`, `Rollback()`, or
     `runtime.AddCleanup`. While the slot is held, RPL reclamation
     cannot advance past `min(TxnID across active readers,
-    lastCheckpointTxnID)`;
+    anchoredEpoch)` (`free-space.md §RPL Reclamation`);
   from=this spec §Read Transaction + `free-space.md §RPL Reclamation`;
   violation=Early slot release lets the writer reclaim pages a
     reader still references; late release blocks reclamation and

@@ -57,8 +57,9 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=entailed;
   property=Of the two meta pages, the **active** meta is the one with
-    the highest `TxnID` whose xxhash64 checksum is valid (with the
-    checkpoint-flag precedence rule in `durability.md`); the other
+    the highest `TxnID` whose xxhash64 checksum is valid (crash
+    recovery adopts its durable sub-record, `durability.md
+    §Recovery`); the other
     meta points to a strictly older consistent state;
   from=entailed: dual-meta + atomic-swap commit (this spec + 12);
   violation=A reader/writer that picks the wrong meta on Open sees a
@@ -95,12 +96,15 @@ Invariant: kind=entailed;
 
 Invariant: kind=clause-explicit;
   property=`Open()` rejects a database whose meta has any unknown
-    `Flags` bit set. Bit 0 (PageChecksum) is immutable; bit 1
-    (Checkpoint) is mutable;
+    `Flags` bit set. Bit 0 (PageChecksum) is immutable; bits 1–31
+    are reserved (bit 1 previously held the retired Checkpoint
+    flag and must be zero);
   from=this spec §Meta Page;
   violation=A future engine version that introduces a new flag bit
     silently misinterprets pages written by an older engine that did
     not understand it — forward-compat trap.
+  Lands: chunk 8 of docs/plans/architecture-consolidation.md (bit 1
+    reserved; the current format still writes it).
 
 ## File regions
 
@@ -217,42 +221,63 @@ header.
 
 ```
 Meta Page
-+------------------+
-| Magic            | uint32 - identifies file as gmdb
-| Version          | uint32 - format version
-| PageSize         | uint32 - page size in bytes
-| Flags            | uint32 - bit 0: PageChecksum (immutable); bit 1: Checkpoint (mutable); bits 2-31: reserved
-| BitmapPages      | uint32 - number of pages in the allocation bitmap
-| Padding          | 4 bytes
-| UUID             | [16]byte - database identity, generated at creation, immutable
-| MinSize          | uint64 - minimum database size in pages
-| MaxSize          | uint64 - maximum database size in pages
-| GrowStep         | uint64 - growth step in pages
-| ShrinkThreshold  | uint64 - shrink threshold in pages
-| HighWaterMark    | uint64 - first unallocated page ID
-| RPLHeadPage      | uint64 - page ID of the newest RPL segment (0 = empty)
-| RPLTailPage      | uint64 - page ID of the oldest RPL segment (0 = empty)
-| RPLEntryCount    | uint64 - total entries across all RPL segments
-| NumFreePages     | uint64 - total free pages (set bits in bitmap)
-| KeyspaceRoot     | uint64 - root page of keyspace B+tree
-| NumKeyspaces     | uint64 - keyspace-B+tree leaf count (incl Kind=2; see keyspaces.md §Invariants)
-| TxnID            | uint64 - transaction ID that wrote this meta
-| Checksum         | uint64 - xxhash64 of all preceding bytes
-+------------------+
++----------------------+
+| Magic                | uint32 - identifies file as gmdb
+| Version              | uint32 - format version
+| PageSize             | uint32 - page size in bytes
+| Flags                | uint32 - bit 0: PageChecksum (immutable); bits 1-31: reserved
+| BitmapPages          | uint32 - number of pages in the allocation bitmap
+| Padding              | 4 bytes
+| UUID                 | [16]byte - database identity, generated at creation, immutable
+| MinSize              | uint64 - minimum database size in pages
+| MaxSize              | uint64 - maximum database size in pages
+| GrowStep             | uint64 - growth step in pages
+| ShrinkThreshold      | uint64 - shrink threshold in pages
+| HighWaterMark        | uint64 - first unallocated page ID
+| RPLHeadPage          | uint64 - page ID of the newest RPL segment (0 = empty)
+| RPLHeadTxnID         | uint64 - TxnID of the newest RPL segment (0 = empty; see free-space.md §RPL)
+| RPLTailPage          | uint64 - page ID of the oldest RPL segment (0 = empty)
+| RPLEntryCount        | uint64 - total entries across all RPL segments
+| NumFreePages         | uint64 - total free pages (set bits in bitmap)
+| KeyspaceRoot         | uint64 - root page of keyspace B+tree
+| NumKeyspaces         | uint64 - keyspace-B+tree leaf count (incl Kind=2; see keyspaces.md §Invariants)
+| TxnID                | uint64 - transaction ID that wrote this meta
+| DurableTxnID         | uint64 - the durable epoch (durability.md §Checkpoints)
+| AnchoredDurableTxnID | uint64 - newest fsync-covered epoch assertion (durability.md §Anchoring)
+| DurableHighWaterMark | uint64 - the durable epoch's HighWaterMark
+| DurableRPLHeadPage   | uint64 - the durable epoch's RPL head page
+| DurableRPLHeadTxnID  | uint64 - the durable epoch's RPL head TxnID
+| DurableRPLTailPage   | uint64 - the durable epoch's RPL tail page
+| DurableRPLEntryCount | uint64 - the durable epoch's RPL entry count
+| DurableNumFreePages  | uint64 - the durable epoch's free-page count
+| DurableKeyspaceRoot  | uint64 - the durable epoch's keyspace root
+| DurableNumKeyspaces  | uint64 - the durable epoch's keyspace count
+| Checksum             | uint64 - xxhash64 of all preceding bytes
++----------------------+
 ```
 
-Total meta-page payload: 4×4 + 4 + 4 + 16 + 13×8 = 144 bytes. Fits
+Total meta-page payload: 4×4 + 4 + 4 + 16 + 24×8 = 232 bytes. Fits
 comfortably in any supported page size (min 4 KB).
+
+The `Durable*` block is the **durable sub-record**: the durable
+epoch's state-bearing fields, carried forward by every commit and
+replaced when a commit's own data is confirmed durable
+(`durability.md §Checkpoints and the durable sub-record`). Crash
+recovery adopts this projection, never the live fields. On a
+self-durable meta (`DurableTxnID == TxnID`) each `Durable*` field
+equals its live counterpart. `RPLHeadTxnID` (live and durable)
+persists the head segment's TxnID so the recovery chain walk can
+classify a head-segment read failure without trusting the — possibly
+reclaimed-and-reused — head page itself (`free-space.md §RPL`).
 
 `UUID` is a 128-bit random identifier generated at database creation
 time and copied identically to both meta pages. Used for backup
 validation and lock-file association. Immutable.
 
 `Flags` policy: `Open()` must reject databases where any unknown flag
-bit is set. Bit 0 (`PageChecksum`) is immutable. Bit 1 (`Checkpoint`)
-is mutable — set/cleared per commit depending on whether the
-commit's data pages have been confirmed on stable storage (see
-`durability.md`).
+bit is set. Bit 0 (`PageChecksum`) is immutable. Bit 1 (previously
+the mutable Checkpoint flag) is reserved and must be zero — the
+durable sub-record supersedes it.
 
 `ValidateMeta` enforces only format identity — `Magic`, `Version`,
 `PageSize`, and `Flags` (unknown bits rejected per above). The
@@ -272,10 +297,11 @@ The file-format fields (`MinSize`, `MaxSize`, `GrowStep`,
 `ShrinkThreshold`) persist across opens.
 
 The **active** meta page is the one with the highest `TxnID` whose
-checksum is valid (subject to the checkpoint-flag precedence rule of
-`durability.md`). A crash mid-write to the meta page leaves an
-invalid checksum and the database falls back to the other meta page,
-which points to the previous consistent state.
+checksum is valid — the one selection every consumer uses; crash
+recovery differs only by adopting the active meta's durable
+sub-record (`durability.md §Recovery`). A crash mid-write to the
+meta page leaves an invalid checksum and the database falls back to
+the other meta page, which points to the previous consistent state.
 
 ## Byte order
 

@@ -207,16 +207,19 @@ is what makes the set trustworthy — see the reclamation
 invariant above.
 
 **Trigger.** Every maintenance pass. Additionally, if `Open()`
-recovered from an unclean prior shutdown — signalled by accepting
-a non-checkpoint-flagged meta (`pager.Open`'s `NoCheckpoint`, the
-available recovery signal) — the first maintenance pass runs
-immediately rather than waiting for the interval, to reclaim any
-crash-leaked pages promptly. (This is an approximation of "a
-fallback meta was selected": a clean reopen can also see
-`NoCheckpoint` for a never-checkpointed SyncLazy database — a
-harmless extra first pass — and some crashes that left a
-checkpoint-flagged meta durable do not trip it, in which case
+recovered to a durable epoch older than the selected meta's own
+commit — `DurableTxnID < TxnID`, the available recovery signal for
+"unfsynced `SyncLazy` commits were rolled back" — the first
+maintenance pass runs immediately rather than waiting for the
+interval, to reclaim any crash-leaked pages promptly. (This is an
+approximation of "state was rolled back": a FAILED or killed Close
+trips it too — a clean Close checkpoints, making the final meta
+self-durable (`durability.md §Clean shutdown`) — a harmless extra
+first pass; and a crash that lost only the final meta pwrite
+recovers to a self-durable meta and does not trip it, in which case
 reclamation waits for the regular interval.)
+Lands: chunk 8 of docs/plans/architecture-consolidation.md (the
+signal's shape; the immediate first pass is already enforced).
 
 ### 2. Stale Reader Slot Cleanup
 

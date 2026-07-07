@@ -10,7 +10,7 @@ free pages.
 Scope:
 - Allocation bitmap: storage, two-level summary, bit operations.
 - Retired page log (RPL): segment page format, append at commit,
-  reclamation contract (including the checkpoint bound), in-memory
+  reclamation contract (including the durable-epoch bound), in-memory
   segment list.
 - LIFO allocation hint, loose pages, allocation priority, tail-page
   refund, and the commit-time free-space update step.
@@ -23,7 +23,7 @@ Depends on / interacts with:
   bitmap-page assembly and RPL append.
 - `cross-process.md` for the oldest-reader scan that bounds RPL
   reclamation.
-- `durability.md` for the checkpoint-bound rationale.
+- `durability.md` for the durable-epoch bound rationale.
 - `background-maintenance.md` for bitmap-leak reclamation and the
   recomputation of `NumFreePages`.
 
@@ -53,14 +53,17 @@ Invariant: kind=clause-explicit;
 Invariant: kind=clause-explicit;
   property=No page is reclaimed (bit set, RPL entry removed) before
     the **reclamation bound**: `min(oldestActiveReaderTxnID,
-    lastCheckpointTxnID)`. Only RPL entries whose `TxnID` is
+    anchoredEpoch)` — the anchored epoch being the newest
+    fsync-covered `DurableTxnID` assertion (`durability.md
+    §Anchoring`; never ahead of any epoch a crash could make
+    recovery adopt). Only RPL entries whose `TxnID` is
     strictly less than the bound move to the bitmap;
   from=this spec §RPL Reclamation;
   violation=Premature reclamation of a page held by an active
     reader's snapshot lets the writer rewrite it — the reader
-    observes a half-written page; or, on recovery to an older
-    checkpoint meta, the bitmap is inconsistent with the recovered
-    tree, surfacing as wrong tree traversal results.
+    observes a half-written page; or, after crash recovery adopts
+    the durable sub-record, the bitmap is inconsistent with the
+    recovered tree, surfacing as wrong tree traversal results.
 
 Invariant: kind=entailed;
   property=The on-disk bitmap, after a successful commit in
@@ -290,32 +293,57 @@ RPL validator) walks `RPLHeadPage → … → RPLTailPage` and stops *at*
 == 0` holds only for a chain whose original tail has never been
 reclaimed; it is not a safe walk terminator.
 
-**Recovery to a non-latest meta: `RPLTailPage` itself may be stale.**
-`RPLTailPage` is the authoritative boundary only for the *live* meta.
-Reclamation advances the live meta's `RPLTailPage` and frees the drained
-segment pages, but it does NOT rewrite older on-disk metas — so a meta
-that is no longer the latest (an older checkpoint that
-`durability.md §Recovery` selects under `SyncLazy`) carries a
-`RPLTailPage`, and a `RPLHeadPage → … → OlderSegment` path, that runs
-*into* segment pages reclamation has since freed (and possibly reused).
-The recovery rebuild therefore walks `RPLHeadPage` forward and stops at
-the **first reclaimed segment** — a segment page that is free in the
-bitmap (set bit), or an allocated page that no longer decodes as a
-segment (reclaimed-then-reused) — in addition to stopping at
-`RPLTailPage`. This is safe and consistent: the reclamation bound
-(`min(oldestActiveReaderTxnID, lastCheckpointTxnID)`) guarantees the
-recovered meta's *tree* pages are intact (a checkpoint's tree never
-references pages retired at or after it), and a reclaimed segment's
-listed data pages are already free in the bitmap, so truncating the
-in-memory chain at the reclaimed boundary yields an RPL consistent with
-the bitmap. The recovered meta's own newest (head) segment is never
-reclaimed, so a head that fails to decode is genuine corruption (a hard
-error), not a stale boundary. Both on-disk chain walkers apply this — the
-in-memory rebuild at Open and `Check`'s RPL validator — since either may run
-on a non-latest meta in the window between a truncating reopen and the next
+**Recovery to the durable epoch: the sub-record's RPL pointers may be
+stale.** `RPLTailPage` is the authoritative boundary only for the
+*live* meta. Reclamation advances the live meta's `RPLTailPage` and
+frees the drained segment pages, but the durable sub-record adopted by
+crash recovery names the RPL as of the durable epoch — reclamation
+since then (bound = `min(oldestReader, anchoredEpoch)`, anchored <=
+durable, so segments
+retired by transactions *before* the epoch are eligible) may have
+freed and reused segment pages the sub-record's `RPLHeadPage → … →
+OlderSegment` path runs into. The recovery rebuild therefore walks the
+head forward and stops at the **first reclaimed segment** — a segment
+page that is free in the bitmap (set bit), or a non-owned page that
+fails its checksum footer or no longer decodes as a segment
+(reclaimed-then-reused) — in addition to stopping at `RPLTailPage`.
+This is safe and consistent: the reclamation bound guarantees the
+recovered *tree* pages are intact (the durable epoch's tree never
+references pages retired before it), and a reclaimed segment's listed
+data pages are already free in the bitmap, so truncating the in-memory
+chain at the reclaimed boundary yields an RPL consistent with the
+bitmap.
+
+**Head classification requires the persisted head TxnID.** The head
+segment is exempt from the reclaimed-boundary treatment — a
+failing head is a hard error, not a stale tail — exactly when it
+cannot have been legitimately reclaimed: `RPLHeadTxnID >=
+DurableTxnID` of the projection being walked (the bound never exceeds
+the durable epoch, and reclamation frees only segments strictly below
+the bound). This covers the durable projection's own head
+(`DurableRPLHeadTxnID == DurableTxnID` — the epoch's commit appended
+it) and a live projection's post-epoch head (`RPLHeadTxnID >
+DurableTxnID` — appended by an unfsynced later commit, unreclaimable)
+uniformly. A **carried-forward** head (`RPLHeadTxnID <
+DurableTxnID` — the meta's commit retired nothing and re-pointed at an
+older segment) is reclaimable like any non-head segment and gets the
+same truncate-at-reclaimed treatment. The classification MUST come from the
+meta's persisted `RPLHeadTxnID`, never from decoding the head page:
+a reclaimed-and-reused head page's bytes are arbitrary, so its decoded
+TxnID cannot be trusted, and a torn head cannot be decoded at all.
+Both on-disk chain walkers apply all of this — the in-memory rebuild
+at Open and `Check`'s RPL validator — since either may run on a
+recovered state in the window between a truncating reopen and the next
 commit (which is the first write to persist a corrected `RPLTailPage`).
-Without this, recovering to an older checkpoint under `SyncLazy` fails at Open
-with a malformed-RPL-segment error — the DB becomes unopenable.
+Without the reclaimed-boundary rule, recovery to the durable epoch
+under `SyncLazy` fails at Open with a malformed-RPL-segment error;
+without the ownership condition on the head exemption, a
+carried-forward head that was legitimately reclaimed and reused makes
+the database permanently unopenable (hard error at Open on a healthy
+file).
+Lands: chunk 8 of docs/plans/architecture-consolidation.md (the
+ownership condition and `RPLHeadTxnID`; the reclaimed-boundary walk is
+already enforced by the shared chain walker).
 
 Accepted trade: a genuine bitrot of a *live* (bitmap-clear) non-head segment
 also fails to decode and is treated as this boundary, so it degrades to a
@@ -368,10 +396,16 @@ At the start of a write transaction (or lazily on first
 `pageAlloc()`), the writer reclaims RPL entries safe to reuse:
 
 1. Compute the **reclamation bound**:
-   `min(oldestActiveReaderTxnID, lastCheckpointTxnID)`. In
-   `SyncDurable`/`SyncDataOnly`, every commit is a checkpoint. In
-   `SyncLazy`, the checkpoint TxnID may be older than current,
-   restricting reclamation.
+   `min(oldestActiveReaderTxnID, anchoredEpoch)` — the anchored
+   epoch being the newest fsync-covered `DurableTxnID` assertion
+   (`durability.md §Anchoring`): the active meta's
+   `AnchoredDurableTxnID`, or the writer's own newer in-process
+   anchoring knowledge, or — on a freshly-recovered handle — the
+   recovered meta's `DurableTxnID` itself (disk reads are anchored
+   by definition). In `SyncDurable`, every commit anchors itself
+   (bound keeps pace). In `SyncDataOnly`, anchoring trails by one
+   commit. In `SyncLazy`, the anchored epoch advances only at
+   fsync events, restricting reclamation.
 2. Walk the in-memory segment list from **tail** (oldest first).
 3. For each segment with `TxnID < reclamationBound`: set bitmap
    bits for all PageIDs in the segment.
@@ -386,38 +420,38 @@ Reclamation is oldest-first so the RPL shrinks from the tail.
 Empty segments are immediately freed. Whole-segment consumption is
 mandatory (Invariants).
 
-**Why the bound is sufficient.** Suppose the last checkpoint is at
-`TxnID = C`. Reclamation at any later TxnID `T > C` uses
+**Why the bound is sufficient.** Suppose the bound's epoch term is
+`C` (an ANCHORED epoch: its assertion is on stable storage, so no
+crash can make recovery adopt an epoch older than `C` —
+`durability.md §Anchoring`). Reclamation at any later TxnID `T > C`
+uses
 `bound = min(oldestReader, C) <= C`, so it can only set bitmap bits
 for pages freed by transactions with `TxnID < C`. Those pages were
-freed *before* the checkpoint, so the checkpoint's tree does not
-reference them. If a crash forces recovery to fall back to the
-checkpoint meta `C`, the on-disk bitmap may show those pages as free
-(reclaimed between `C` and the crash) or as not-yet-reclaimed (still
-in the RPL at `C`) — either is consistent with `C`'s tree, because
-`C`'s tree never referenced them. Pages freed *after* `C`
-(`TxnID >= C`) are excluded by the bound, so the bitmap never gains
-spurious free-bits for pages the recovered tree might still
+freed *before* the durable epoch, so the epoch's tree (the durable
+sub-record's) does not reference them. If a crash forces recovery to
+adopt a sub-record at or after `C` (anchoring guarantees never
+before it), the on-disk bitmap may show those pages
+as free (reclaimed between `C` and the crash) or as not-yet-reclaimed
+(still in the RPL at `C`) — either is consistent with `C`'s tree,
+because `C`'s tree never referenced them. Pages freed *at or after*
+`C` (`TxnID >= C`) are excluded by the bound, so the bitmap never
+gains spurious free-bits for pages the recovered tree might still
 reference.
 
-**Cross-process re-derivation of `C`.** `lastCheckpointTxnID` is
-tracked in-memory as *this* handle commits and checkpoints — the most
-recent checkpoint this handle observed. When a writer acquires the
-grant and finds a peer process has advanced the on-disk state
-(`cross-process.md §Writer acquisition flow`), it re-derives `C` from
-disk: the highest checkpoint-flagged `TxnID` among the two meta slots,
-or `0` if neither is flagged. That is exactly the meta a crash would
-recover to under the checkpoint-preferring rule, so the sufficiency
-argument above holds unchanged. On the common path (no peer advance)
-the handle keeps its in-memory value, which can be *tighter* than the
-on-disk slots reveal — it remembers a checkpoint that later `SyncLazy`
-commits have since overwritten in the two slots — and is always safe
-(a lower-or-equal `C` only reclaims less).
+**Cross-process derivation of `C`.** The anchored epoch is
+self-describing on disk: a writer acquiring the grant after a peer's
+commits reads `AnchoredDurableTxnID` from the meta it just re-synced
+to (monotone per `durability.md §Invariants`, so the active meta's
+value is the newest persisted one), with no flag scan to reconcile.
+The live writer may hold newer in-process anchoring knowledge (its own
+completed step-4/Checkpoint fsyncs), which is always at least as
+conservative on disk — an assertion it anchored is on stable storage,
+so the sufficiency argument holds either way.
 
 **SyncLazy and partial bitmap flush.** In `SyncLazy` the bitmap
-pwrites for intermediate (post-checkpoint) transactions happen
+pwrites for transactions past the durable epoch happen
 without `fdatasync`. The OS may flush some pwrites and not others.
-On recovery to checkpoint `C` the on-disk bitmap can be in a
+On recovery to the durable epoch `C` the on-disk bitmap can be in a
 partial state: some pages freed by transactions in `(C, crash]` may
 have their bits set on disk; others may not. The argument above
 guarantees the *tree* is safe, but `NumFreePages` (last written at
@@ -433,7 +467,8 @@ recomputes the free count from the bitmap bits via
 ### Reclamation-bound derivation points
 
 Scanning the reader table is O(MaxReaders), so the writer derives
-the bound `min(oldestActiveReaderTxnID, lastCheckpointTxnID)` at
+the bound `min(oldestActiveReaderTxnID, anchoredEpoch)`
+(`durability.md §Anchoring`) at
 fixed points rather than per allocation: once at write-transaction
 start (seeding the transaction's bound), and re-derived on the two
 paths that want a fresher value — eager reclamation at the start of
