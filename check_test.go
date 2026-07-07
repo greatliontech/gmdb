@@ -147,7 +147,7 @@ func TestCheckDetectsBitmapLeak(t *testing.T) {
 func TestCheckDetectsBadChecksum(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	db, err := Open(ctx, path, Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 256})
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

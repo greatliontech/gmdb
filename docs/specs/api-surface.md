@@ -447,12 +447,15 @@ const (
 type Options struct {
     // PageSize in bytes. Only used when creating a new database.
     // Must be a power of 2 in [4096, 65536]. Default: 4096.
-    PageSize int
+    PageSize uint32
 
-    // PageChecksum enables xxhash64 footers on data pages. Stored as
-    // a flag in the meta page — immutable after creation. Default: true.
-    // Only used when creating; ignored when opening existing.
-    PageChecksum bool
+    // DisablePageChecksum turns OFF the xxhash64 footers that are
+    // otherwise written and verified on every data page. Stored as a
+    // flag in the meta page — immutable after creation. The zero value
+    // leaves checksums ENABLED (the spec default); opt out only on
+    // media with its own end-to-end integrity. Only used when
+    // creating; ignored when opening existing.
+    DisablePageChecksum bool
 
     // FileFormat controls database file size bounds and growth.
     // Only used when creating; modify via Tx.SetFileFormat() at runtime.

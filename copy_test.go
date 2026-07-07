@@ -321,7 +321,7 @@ func TestCopyToEmptyDatabase(t *testing.T) {
 func TestCopyToPageChecksum(t *testing.T) {
 	ctx := context.Background()
 	dst := tmpPath(t)
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 4096})
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -616,7 +616,7 @@ func TestCopyToCompactEmpty(t *testing.T) {
 func TestCopyToCompactPageChecksum(t *testing.T) {
 	ctx := context.Background()
 	dst := tmpPath(t)
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 4096})
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

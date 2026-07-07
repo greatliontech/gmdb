@@ -422,7 +422,7 @@ func TestOpenRecoversFromMetaZeroPageSizeCorruption(t *testing.T) {
 					t.Fatalf("zero PageSize bytes: %v", err)
 				}
 			},
-			opts: Options{PageSize: 4096, MinSize: 16, MaxSize: 128, PageChecksum: false},
+			opts: Options{PageSize: 4096, MinSize: 16, MaxSize: 128, DisablePageChecksum: true},
 		},
 		{
 			name: "valid_but_wrong_PageSize",
@@ -440,7 +440,7 @@ func TestOpenRecoversFromMetaZeroPageSizeCorruption(t *testing.T) {
 					t.Fatalf("flip PageSize bytes: %v", err)
 				}
 			},
-			opts: Options{PageSize: 8192, MinSize: 16, MaxSize: 128, PageChecksum: false},
+			opts: Options{PageSize: 8192, MinSize: 16, MaxSize: 128, DisablePageChecksum: true},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -492,10 +492,10 @@ func TestCorruptionSentinelOnOpen(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
 	db, err := Open(ctx, path, Options{
-		PageSize:     4096,
-		PageChecksum: false, // simplifies on-disk tampering (no footer to rewrite)
-		MinSize:      16,
-		MaxSize:      128,
+		PageSize:            4096,
+		DisablePageChecksum: true, // simplifies on-disk tampering (no footer to rewrite)
+		MinSize:             16,
+		MaxSize:             128,
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)

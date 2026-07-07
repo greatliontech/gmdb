@@ -16,7 +16,7 @@ import (
 func TestGetBitrotReturnsBadPageChecksum(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	db, err := Open(ctx, path, Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 256})
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestGetForgedOutOfRangeChildNoCrash(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
 	// Checksums OFF: isolate the file-resident bound from RV1.
-	db, err := Open(ctx, path, Options{PageSize: 4096, PageChecksum: false, MinSize: 16, MaxSize: 4096})
+	db, err := Open(ctx, path, Options{PageSize: 4096, DisablePageChecksum: true, MinSize: 16, MaxSize: 4096})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestGetForgedOutOfRangeChildNoCrash(t *testing.T) {
 func corruptRootChecksumDB(t *testing.T, ctx context.Context) string {
 	t.Helper()
 	path := tmpPath(t)
-	db, err := Open(ctx, path, Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 256})
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestCursorErrReportsBadPageChecksum(t *testing.T) {
 func forgeBranchDirDB(t *testing.T, ctx context.Context) string {
 	t.Helper()
 	path := tmpPath(t)
-	db, err := Open(ctx, path, Options{PageSize: 4096, PageChecksum: false, MinSize: 16, MaxSize: 4096})
+	db, err := Open(ctx, path, Options{PageSize: 4096, DisablePageChecksum: true, MinSize: 16, MaxSize: 4096})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

@@ -98,9 +98,15 @@ type Options struct {
 	// power of two in [4 KB, 64 KB]. Default 4096.
 	PageSize uint32
 
-	// PageChecksum enables the xxhash64 page-footer on every data
-	// page. Set at creation, immutable. Default true.
-	PageChecksum bool
+	// DisablePageChecksum turns OFF the xxhash64 page-footer that is
+	// otherwise written and verified on every data page. Set at
+	// creation, immutable for the life of the file. The zero value
+	// (false) leaves checksums ENABLED — the spec default (see
+	// checksums.md §Data Page Checksums): opt out only on a filesystem
+	// or controller with its own end-to-end integrity (ZFS, btrfs,
+	// ReFS) where the 0.2% page-space saving is worth losing bitrot
+	// detection.
+	DisablePageChecksum bool
 
 	// MinSize, MaxSize, GrowStep, ShrinkThreshold control file
 	// growth and shrinkage in pages. MaxSize is immutable after
@@ -299,8 +305,8 @@ type MaintenanceOptions struct {
 	Interval time.Duration
 
 	// ScrubBatchSize is the number of pages verified per checksum-
-	// scrubbing pass (only meaningful when PageChecksum is enabled).
-	// Default: 4096.
+	// scrubbing pass (only meaningful when page checksums are enabled,
+	// i.e. Options.DisablePageChecksum is false). Default: 4096.
 	ScrubBatchSize int
 
 	// CompactionThreshold is the contiguous-allocation failure rate above

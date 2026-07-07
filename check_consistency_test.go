@@ -20,8 +20,8 @@ func buildConsistencyFixture(t *testing.T) string {
 	path := tmpPath(t)
 	db, err := Open(ctx, path, Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 256,
-		PageChecksum: false, // explicit: surgery must not be masked by footers
-		Maintenance:  MaintenanceOptions{Disable: true},
+		DisablePageChecksum: true, // explicit: surgery must not be masked by footers
+		Maintenance:         MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -62,8 +62,8 @@ func checkCodes(t *testing.T, path string) map[string]int {
 	ctx := context.Background()
 	db, err := Open(ctx, path, Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 256,
-		PageChecksum: false, // explicit: surgery must not be masked by footers
-		Maintenance:  MaintenanceOptions{Disable: true},
+		DisablePageChecksum: true, // explicit: surgery must not be masked by footers
+		Maintenance:         MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -222,8 +222,8 @@ func TestCheckDetectsDescriptorTreeDisorder(t *testing.T) {
 	path := tmpPath(t)
 	db, err := Open(ctx, path, Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 256,
-		PageChecksum: false, // explicit: surgery must not be masked by footers
-		Maintenance:  MaintenanceOptions{Disable: true},
+		DisablePageChecksum: true, // explicit: surgery must not be masked by footers
+		Maintenance:         MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)

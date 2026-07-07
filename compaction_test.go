@@ -539,8 +539,7 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 	path := tmpPath(t)
 	db, err := Open(ctx, path, Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 1 << 20,
-		PageChecksum: true,
-		Maintenance:  MaintenanceOptions{Disable: true},
+		Maintenance: MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -593,8 +592,7 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 
 	db2, err := Open(ctx, path, Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 1 << 20,
-		PageChecksum: true,
-		Maintenance:  MaintenanceOptions{Disable: true},
+		Maintenance: MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("re-Open: %v", err)

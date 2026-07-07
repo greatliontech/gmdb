@@ -219,7 +219,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	if created {
 		ip := pager.InitParams{
 			PageSize:        opts.PageSize,
-			PageChecksum:    opts.PageChecksum,
+			PageChecksum:    !opts.DisablePageChecksum,
 			MinSize:         opts.MinSize,
 			MaxSize:         opts.MaxSize,
 			GrowStep:        opts.GrowStep,

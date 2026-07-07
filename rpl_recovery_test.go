@@ -81,8 +81,7 @@ func TestRPLChainSurvivesPartialReclaimAndReuse(t *testing.T) {
 func buildChecksummedRPLChain(t *testing.T, ctx context.Context, path string) (head, tail uint64) {
 	t.Helper()
 	db, err := Open(ctx, path, Options{
-		PageSize: 4096, MinSize: 16, MaxSize: 512, PageChecksum: true,
-		Maintenance: MaintenanceOptions{Disable: true},
+		PageSize: 4096, MinSize: 16, MaxSize: 512, Maintenance: MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -135,8 +134,7 @@ func TestOpenRejectsChecksumCorruptRPLHead(t *testing.T) {
 	head, _ := buildChecksummedRPLChain(t, ctx, path)
 	corruptPageByte(t, path, head, 4096)
 	db, err := Open(ctx, path, Options{
-		PageSize: 4096, MinSize: 16, MaxSize: 512, PageChecksum: true,
-		Maintenance: MaintenanceOptions{Disable: true},
+		PageSize: 4096, MinSize: 16, MaxSize: 512, Maintenance: MaintenanceOptions{Disable: true},
 	})
 	if err == nil {
 		db.Close()
@@ -158,8 +156,7 @@ func TestOpenTruncatesChainAtChecksumCorruptNonHeadSegment(t *testing.T) {
 	_, tail := buildChecksummedRPLChain(t, ctx, path)
 	corruptPageByte(t, path, tail, 4096)
 	db, err := Open(ctx, path, Options{
-		PageSize: 4096, MinSize: 16, MaxSize: 512, PageChecksum: true,
-		Maintenance: MaintenanceOptions{Disable: true},
+		PageSize: 4096, MinSize: 16, MaxSize: 512, Maintenance: MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("Open with checksum-corrupt non-head segment: %v", err)
@@ -202,8 +199,7 @@ func TestCheckReportsChecksumBadRPLSegment(t *testing.T) {
 	path := tmpPath(t)
 	_, tail := buildChecksummedRPLChain(t, ctx, path)
 	db, err := Open(ctx, path, Options{
-		PageSize: 4096, MinSize: 16, MaxSize: 512, PageChecksum: true,
-		Maintenance: MaintenanceOptions{Disable: true},
+		PageSize: 4096, MinSize: 16, MaxSize: 512, Maintenance: MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)

@@ -326,7 +326,7 @@ func writeKeyspaceForScrub(t *testing.T, path string, n int) (root uint64, pageS
 	t.Helper()
 	ctx := context.Background()
 	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true}})
+		Maintenance: MaintenanceOptions{Disable: true}})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -389,7 +389,7 @@ func TestMaintenanceScrubDetectsAndReportsBadChecksum(t *testing.T) {
 
 	logger, recs, mu := newCaptureLogger()
 	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+		Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
 	if err != nil {
 		t.Fatalf("re-Open: %v", err)
 	}
@@ -418,7 +418,7 @@ func TestMaintenanceScrubWiredIntoPass(t *testing.T) {
 
 	logger, recs, mu := newCaptureLogger()
 	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+		Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
 	if err != nil {
 		t.Fatalf("re-Open: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestMaintenanceScrubCleanDBNoWarnings(t *testing.T) {
 	ctx := context.Background()
 	logger, recs, mu := newCaptureLogger()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+		Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestMaintenanceScrubCleanDBNoWarnings(t *testing.T) {
 func TestMaintenanceScrubCursorAdvancesAndWraps(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		PageChecksum: true, Maintenance: MaintenanceOptions{Disable: true, ScrubBatchSize: 2}})
+		Maintenance: MaintenanceOptions{Disable: true, ScrubBatchSize: 2}})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -533,7 +533,7 @@ func TestMaintenanceScrubSkippedWithoutChecksum(t *testing.T) {
 	ctx := context.Background()
 	logger, recs, mu := newCaptureLogger()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
-		PageChecksum: false, Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+		DisablePageChecksum: true, Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

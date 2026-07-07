@@ -26,7 +26,7 @@ func secondByteExtract(_, value []byte) []IndexEntry {
 func setupIndexedDB(t *testing.T) *DB {
 	t.Helper()
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 128})
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -192,7 +192,7 @@ func coveringDecl(extract IndexExtractor) *IndexDecl {
 func setupCoveringDB(t *testing.T) *DB {
 	t.Helper()
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 128})
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -273,7 +273,7 @@ func setMemberDecl(extract IndexExtractor) *IndexDecl {
 func setupIndexedSetKeyspace(t *testing.T) *DB {
 	t.Helper()
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 128})
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestCheckIndexesSetKeyspaceDetectsDrift(t *testing.T) {
 // the nested-tree member-enumeration branch (vs the subpage branch).
 func TestCheckIndexesSetKeyspaceNestedTreeCleanPasses(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 256})
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -382,7 +382,7 @@ func twoColExtract(_, value []byte) []IndexEntry {
 func makeIndexedKeyspace(t *testing.T, decl *IndexDecl, rows [][2]string) *DB {
 	t.Helper()
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 128})
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -465,7 +465,7 @@ func TestCheckIndexesMultiColumnCleanPasses(t *testing.T) {
 func TestCheckIndexesSetKeyspaceForgedSubpageNoPanic(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	db, err := Open(ctx, path, Options{PageSize: 4096, PageChecksum: true, MinSize: 16, MaxSize: 128})
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

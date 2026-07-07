@@ -66,7 +66,6 @@ findings each shared-fix row covers.
 | [cross-namespace-reader-heartbeat-liveness](cross-namespace-reader-heartbeat-liveness.md) | condition (when cross-process stale-detection is revisited) | **[L]** Cross-namespace (container) readers have no `kill()` fallback — a >10s heartbeat pause (docker pause, cgroup freeze, swap) evicts a live reader → reads reclaimed-and-reused pages. Document the data-integrity bound + reconsider the default. *Finding 21.* |
 | [rpl-head-exemption-reclaimed](rpl-head-exemption-reclaimed.md) | condition (recovery-model redesign or head-convention revisit) | **[M]** rebuildRPLChain hard-fails Open on a bad head, but RPLHeadPage carries forward across no-retire commits, so an older checkpoint's head can be legitimately reclaimed+reused — recovery after a crash-mid-commit becomes unopenable. Chunk-4 review finding. |
 | [dbcleanup-teardown-drain](dbcleanup-teardown-drain.md) | condition (AddCleanup execution model revisit) | **[L]** dbCleanupFn tears down coord/lockFile without the txInflight drain Close performs — safe only while the runtime runs cleanups sequentially. Chunk-11 review finding. |
-| [pagechecksum-default-drift](pagechecksum-default-drift.md) | condition (Options breaking-change window) | **[M]** checksums.md + godoc promise PageChecksum default-on; applyDefaults never sets the plain bool, so the effective default is off — spec-promised bitrot detection silently absent. Chunk-15 review finding. |
 
 ## Open — full-codebase audit (2026-07-04)
 

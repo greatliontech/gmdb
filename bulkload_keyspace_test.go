@@ -43,7 +43,7 @@ func TestKeyspaceBulkLoadRoundTrip(t *testing.T) {
 		t.Run("csum="+boolStr(csum), func(t *testing.T) {
 			ctx := context.Background()
 			path := tmpPath(t)
-			opts := Options{PageSize: 4096, PageChecksum: csum, MinSize: 16, MaxSize: 16384}
+			opts := Options{PageSize: 4096, DisablePageChecksum: !csum, MinSize: 16, MaxSize: 16384}
 
 			kvs := genKVs(3000, 48) // multiple leaves + branch levels
 
@@ -122,7 +122,7 @@ func TestKeyspaceBulkLoadOverflowValues(t *testing.T) {
 		t.Run("csum="+boolStr(csum), func(t *testing.T) {
 			ctx := context.Background()
 			path := tmpPath(t)
-			opts := Options{PageSize: 4096, PageChecksum: csum, MinSize: 16, MaxSize: 16384}
+			opts := Options{PageSize: 4096, DisablePageChecksum: !csum, MinSize: 16, MaxSize: 16384}
 
 			// Mix of inline and overflow-sized values (1, 2, 3-page runs)
 			// in sorted key order.

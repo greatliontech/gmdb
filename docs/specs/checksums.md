@@ -35,6 +35,20 @@ Invariant: kind=clause-explicit;
     catch this.
 
 Invariant: kind=clause-explicit;
+  property=Data-page checksums are ON by default: a zero-value
+    `Options` (no `DisablePageChecksum` set) creates a database
+    whose meta carries `MetaFlagPageChecksum`, so every data page
+    is footer-protected. Only `Options.DisablePageChecksum = true`
+    clears the flag;
+  from=this spec §Default;
+  violation=`Open(ctx, path, Options{})` persists the flag clear,
+    so data pages carry no footer and the spec-promised bitrot
+    detection is silently absent — exactly the drift a plain
+    `PageChecksum bool` (zero value = off) invited. Enforced by
+    `TestPageChecksumDefaultOnMetaFlag` /
+    `TestPageChecksumDefaultOnDetectsBitrot`.
+
+Invariant: kind=clause-explicit;
   property=The `PageChecksum` flag (meta `Flags` bit 0) is set
     at creation and **immutable**. All data pages in a
     checksummed database carry the footer; no data pages in a
@@ -107,11 +121,13 @@ Data pages (branch, leaf, overflow, RPL segment) carry an 8-byte
 xxhash64 footer in the last 8 bytes of the page when checksums
 are enabled.
 
-Enabled via `Options.PageChecksum = true` at creation. Default:
-true. The setting is stored as a flag in the meta page's `Flags`
-field (bit 0) and is **immutable after creation** — all pages in
-a checksummed database have checksums; all pages in a
-non-checksummed database do not.
+Checksums are ON by default: a zero-value `Options` creates a
+checksummed database. Opt out with `Options.DisablePageChecksum =
+true` at creation (the flag turns the footer OFF; its zero value
+leaves checksums enabled). The setting is stored as a flag in the
+meta page's `Flags` field (bit 0) and is **immutable after
+creation** — all pages in a checksummed database have checksums; all
+pages in a non-checksummed database do not.
 
 The default is on. xxhash64 is fast enough in software (no
 hardware-acceleration requirement unlike CRC32C) that the cost is
@@ -183,8 +199,8 @@ chain walk all use the raw accessor), so each of those walkers
 verifies every segment's footer itself before decoding — when the page checksum is enabled;
 with checksums off they fall back to structural decode plus the
 bounds below, and an in-range wrong entry in a decodable segment
-is then inherently undetectable (the trade the `PageChecksum`
-option states). A checksum-bad segment is quarantined by
+is then inherently undetectable (the trade the
+`DisablePageChecksum` option states). A checksum-bad segment is quarantined by
 reclamation (bounded leak, reclamation continues past it); the
 Open walk rejects a checksum-bad head (the malformed-head
 convention) and treats a checksum-bad non-head as the stale-tail
@@ -281,8 +297,12 @@ footer is written into the last 8 bytes of the buffer.
 
 ## Default
 
-Checksums are **enabled by default** (`Options.PageChecksum =
-true`). Disable via `PageChecksum = false` at creation only when
-running on a filesystem with end-to-end checksums (ZFS, btrfs,
-ReFS) or storage controllers with built-in integrity — and the
-0.2% page-space saving is meaningful for the workload.
+Checksums are **enabled by default** — a zero-value `Options`
+creates a checksummed database. Opt out with
+`Options.DisablePageChecksum = true` at creation only when running
+on a filesystem with end-to-end checksums (ZFS, btrfs, ReFS) or
+storage controllers with built-in integrity — and the 0.2%
+page-space saving is meaningful for the workload. The flag is
+inverted (a `Disable…` bool) precisely so the zero value delivers
+the protective default; a plain `PageChecksum bool` would have made
+the unprotective state the default-constructed one.
