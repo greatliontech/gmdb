@@ -1420,3 +1420,55 @@ func TestTxCleanupFnDirectClosedFalseRunsRelease(t *testing.T) {
 	// is a no-op or idempotent per pager contract.
 	_ = tx.Rollback()
 }
+
+// TestWriteGrantClosedWhileWaiting pins the write-grant preamble's
+// post-grant close re-check: a caller that blocked in AcquireWriter
+// while Close began must get ErrClosed (and release the grant) rather
+// than proceed against a tearing-down handle — for Compact this check
+// is the only close gate before the reader-drain loop touches the
+// coord. Uses the started-then-sleep ordering of the repo's
+// poisoned-while-waiting test; the gate is flipped white-box so no real
+// teardown races the assertion.
+func TestWriteGrantClosedWhileWaiting(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 128,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// Teardown also covers failure paths: a Fatalf below could leave
+	// the gate wedged closed, so reopen it before Close.
+	t.Cleanup(func() {
+		db.closeGate.SwapClosed(false)
+		_ = db.Close()
+	})
+	tx, err := db.Begin(ctx) // hold the grant so the acquirer must wait
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+
+	acqErr := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		grant, _, err := db.acquireWriteGrant(ctx)
+		if grant != nil {
+			grant.Release()
+		}
+		acqErr <- err
+	}()
+	<-started
+	time.Sleep(50 * time.Millisecond) // let it pass the fast gates and block
+
+	// Close begins while the acquirer waits: mark the gate closed
+	// white-box (Close's first store), then release the grant.
+	db.closeGate.SwapClosed(true)
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if err := <-acqErr; !errors.Is(err, ErrClosed) {
+		t.Fatalf("acquireWriteGrant after close-while-waiting: %v, want ErrClosed", err)
+	}
+}

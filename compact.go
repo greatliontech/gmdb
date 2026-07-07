@@ -2,7 +2,6 @@ package gmdb
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
@@ -54,54 +52,19 @@ const compactDrainPoll = 2 * time.Millisecond
 // poisoned (subsequent ops return ErrPoisoned); Close and re-Open recovers
 // against the renamed file.
 func (db *DB) Compact() error {
-	if db.readOnly {
-		return ErrDatabaseReadOnly
-	}
-	if db.closeGate.IsClosed() {
-		return ErrClosed
-	}
-	if db.poisoned.Load() {
-		return ErrPoisoned
-	}
-	db.mu.Lock()
-	coord := db.coord
-	db.mu.Unlock()
-	if coord == nil {
-		return ErrClosed
-	}
-
-	// 1. Acquire the cross-process write lock. Blocks behind any in-flight
-	// writer (including the batch coordinator's tx) until it commits.
-	grant, err := coord.AcquireWriter(context.Background())
+	// 1. Shared write-grant preamble (fast gates, acquisition,
+	// post-grant poison/close/generation re-checks). Blocks behind any
+	// in-flight writer (including the batch coordinator's tx) until it
+	// commits. For Compact the generation check is fail-fast only:
+	// even without it the copy phase's own BeginRead fires the
+	// read-path generation check before anything is renamed (the
+	// peer-Compact test pins that outcome); the earlier exit just
+	// skips the reader-drain wait.
+	grant, coord, err := db.acquireWriteGrant(context.Background())
 	if err != nil {
-		if errors.Is(err, lock.ErrClosed) {
-			return ErrClosed
-		}
 		return err
 	}
 	defer grant.Release()
-
-	// Re-check after acquiring the grant — a concurrent commit could have
-	// poisoned the handle, or Close could have run while we waited.
-	if db.poisoned.Load() {
-		return ErrPoisoned
-	}
-	if db.closeGate.IsClosed() {
-		return ErrClosed
-	}
-	// Data-file generation check (cross-process.md §Data-file
-	// generation): a peer compacted while we waited for the grant —
-	// compacting the unlinked inode this handle still maps would fork
-	// the database. Fail-fast only: even without this check the copy
-	// phase's own BeginRead fires the read-path generation check
-	// before anything is renamed (the peer-Compact test pins that
-	// outcome); this earlier exit just skips the reader-drain wait.
-	if gen := coord.DataGeneration(); gen != db.dataGeneration.Load() {
-		db.poisoned.Store(true)
-		db.logger.Error("gmdb: data file replaced by a peer Compact; handle poisoned — Close and re-Open",
-			"cachedGeneration", db.dataGeneration.Load(), "currentGeneration", gen)
-		return ErrPoisoned
-	}
 
 	// 2. Drain in-process readers (bounded by CompactDrainTimeout).
 	deadline := time.Now().Add(db.opts.CompactDrainTimeout)

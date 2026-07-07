@@ -2,11 +2,9 @@ package gmdb
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync/atomic"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -54,81 +52,33 @@ var checkpointStepHookForTest atomic.Pointer[func(step int) error]
 //   - ErrPoisoned if the handle is poisoned.
 //   - Any pwrite/fdatasync error wrapped under "gmdb: checkpoint".
 func (db *DB) Checkpoint(ctx context.Context) error {
-	if db.readOnly {
-		return ErrDatabaseReadOnly
-	}
-	if db.closeGate.IsClosed() {
-		return ErrClosed
-	}
-	if db.poisoned.Load() {
-		return ErrPoisoned
-	}
-	db.mu.Lock()
-	coord := db.coord
-	file := db.file
-	pageSize := db.currentMeta.PageSize
-	db.mu.Unlock()
-	if coord == nil || file == nil {
-		return ErrClosed
-	}
-	grant, err := coord.AcquireWriter(ctx)
+	// Shared write-grant preamble (fast gates, acquisition, post-grant
+	// poison/close/generation re-checks). For Checkpoint specifically:
+	// the poison re-check closes the fsyncgate window (a concurrent
+	// commit's publication failure consumed the kernel's fsync error
+	// state; proceeding would stamp the checkpoint flag over
+	// non-durable data), and the generation check prevents flagging a
+	// meta on an unlinked inode no other process can see.
+	grant, _, err := db.acquireWriteGrant(ctx)
 	if err != nil {
-		if errors.Is(err, lock.ErrClosed) {
-			return ErrClosed
-		}
 		return err
 	}
 	defer grant.Release()
 
-	// Re-check poison under the grant — a concurrent commit could
-	// have poisoned the handle while we were waiting (its publication
-	// failure consumed the kernel's fsync error state; proceeding
-	// would stamp the checkpoint flag over non-durable data — the
-	// fsyncgate window this contract closes). Same shape as Begin's
-	// post-grant re-check.
-	if db.poisoned.Load() {
-		return ErrPoisoned
-	}
-	// Data-file generation check (cross-process.md §Data-file
-	// generation): flagging a meta on the unlinked inode would
-	// certify a file no other process can see.
-	if gen := coord.DataGeneration(); gen != db.dataGeneration.Load() {
-		db.poisoned.Store(true)
-		db.logger.Error("gmdb: data file replaced by a peer Compact; handle poisoned — Close and re-Open",
-			"cachedGeneration", db.dataGeneration.Load(), "currentGeneration", gen)
-		return ErrPoisoned
-	}
-
-	// Re-read pgr+file under the post-grant db.mu (Compact may have swapped
-	// them while we waited) and re-sync the writer's in-memory state to
-	// absorb any commit published while we waited — same-process OR a peer
-	// process. The pre-grant snapshot only catches same-process commits
-	// (they update db.currentMeta); a peer's commit leaves db.currentMeta
-	// stale. Re-flagging that stale meta in its stale slot (step 3 below)
-	// would overwrite the peer's newer meta with an older one — silent lost
-	// update (cross-process.md §Writer acquisition flow). Resync also
-	// rebuilds the writer pager's bitmap/RPL so the NEXT Begin (which sees a
-	// matching TxnID and skips its own Resync) starts from a consistent
-	// pager.
+	// Re-sync before flagging: a peer's commit while we waited leaves
+	// db.currentMeta stale, and re-flagging that stale meta in its
+	// stale slot (step 3 below) would overwrite the peer's newer meta
+	// with an older one — silent lost update. Resync also rebuilds the
+	// writer pager's bitmap/RPL so the NEXT Begin (which sees a
+	// matching TxnID and skips its own Resync) starts from a
+	// consistent pager.
 	db.mu.Lock()
-	if db.closeGate.IsClosed() {
+	_, file, err := db.resyncOnGrantLocked()
+	if err != nil {
 		db.mu.Unlock()
-		return ErrClosed
+		return err
 	}
-	pgr := db.pgr
-	file = db.file
-	if pgr == nil || file == nil {
-		db.mu.Unlock()
-		return ErrClosed
-	}
-	if m, active, lastCheckpoint, changed, err := pgr.Resync(file, db.currentMeta.TxnID); err != nil {
-		// Resync leaves the pager fully unmodified on error (attachState is
-		// atomic), so the handle stays usable — surface the error; no poison.
-		db.mu.Unlock()
-		return fmt.Errorf("gmdb: checkpoint re-sync: %w", mapPagerErr(err))
-	} else if changed {
-		db.setMetaState(m, active, lastCheckpoint)
-	}
+	pageSize := db.currentMeta.PageSize
 	meta := db.currentMeta
 	activeIdx := db.activeMetaIdx
 	db.mu.Unlock()

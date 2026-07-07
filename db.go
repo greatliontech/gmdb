@@ -662,125 +662,36 @@ func (db *DB) Close() error {
 //   - ErrPoisoned if a previous tx's commit poisoned the handle.
 //
 // Internal structure: two short db.mu critical sections bracket the
-// (potentially long-blocking) coord.AcquireWriter call. The first
-// snapshots db.coord + db.pgr (race-safe vs Close which nil's them
-// under db.mu); the second post-acquire critical section captures
-// prev meta + builds the Tx + registers leak-detection cleanup. db.mu
-// is NOT held across AcquireWriter — doing so would let Close
-// deadlock waiting for db.mu while the coord's stopCh is closed but
-// the flock goroutine still holds the result-channel send.
+// (potentially long-blocking) coord.AcquireWriter call. The first —
+// inside acquireWriteGrant — snapshots db.coord (race-safe vs Close,
+// which nil's it under db.mu; db.pgr is first read post-grant, where
+// resyncOnGrantLocked re-reads it under db.mu anyway because Compact
+// can swap it); the second post-acquire critical section resyncs,
+// captures prev meta, builds the Tx, and registers leak-detection
+// cleanup. db.mu is NOT held across AcquireWriter — doing so would
+// let Close deadlock waiting for db.mu while the coord's stopCh is
+// closed but the flock goroutine still holds the result-channel send.
 //
 // Read transactions use the distinct BeginRead (returning *ReadTx) so
 // the type system rejects write methods on a read snapshot at compile
 // time (api-surface.md §Database and Transaction API).
 func (db *DB) Begin(ctx context.Context) (*Tx, error) {
-	// A read-only handle has no writer pager and never takes the
-	// cross-process write lock — reject before any close/poison/lock
-	// work (api-surface.md §Options.ReadOnly). This also covers Update,
-	// which begins through here. Checked first: read-only is a
-	// permanent property of the handle, so the cause is unambiguous.
-	if db.readOnly {
-		return nil, ErrDatabaseReadOnly
-	}
-	// Fast-path close check. db.closeGate.IsClosed() is the
-	// spec-tier *closeGate gate (leak-detection.md §Close Ordering); a release-store at the
-	// top of Close makes this Load-true any time after Close begins.
-	// The subsequent snapshot under db.mu is still required: a Begin
-	// that interleaves between this Load and Close's CAS sees
-	// closed==false here but a nil coord after the snapshot — same
-	// ErrClosed result.
-	if db.closeGate.IsClosed() {
-		return nil, ErrClosed
-	}
-
-	// Poison check before acquiring the cross-process lock so a
-	// poisoned handle does not block legitimate concurrent callers
-	// across processes.
-	if db.poisoned.Load() {
-		return nil, ErrPoisoned
-	}
-
-	// Snapshot db.coord under db.mu so the read is synchronized with
-	// Close (which nil's it under db.mu). coord is stable for this Tx's
-	// lifetime. db.pgr is read here only for the fast pre-grant closed
-	// check — it is RE-READ under the post-grant db.mu below, because
-	// Compact swaps db.pgr (closing the old pager) while holding the
-	// write grant: a writer that captured the old pager before blocking
-	// in AcquireWriter must use the post-Compact pager, never the
-	// munmap'd old one.
-	db.mu.Lock()
-	coord := db.coord
-	pgr := db.pgr
-	db.mu.Unlock()
-	if coord == nil || pgr == nil {
-		return nil, ErrClosed
-	}
-
-	grant, err := coord.AcquireWriter(ctx)
+	// acquireWriteGrant runs the shared preamble; read-only rejection
+	// comes first there (api-surface.md §Options.ReadOnly — a
+	// permanent property, so the cause is unambiguous; this also
+	// covers Update, which begins through here).
+	grant, coord, err := db.acquireWriteGrant(ctx)
 	if err != nil {
-		if errors.Is(err, lock.ErrClosed) {
-			return nil, ErrClosed
-		}
 		return nil, err
-	}
-
-	// Re-check poison under the grant — a concurrent commit could
-	// have poisoned the handle while we were waiting.
-	if db.poisoned.Load() {
-		grant.Release()
-		return nil, ErrPoisoned
-	}
-	// Data-file generation check (cross-process.md §Data-file
-	// generation): a peer's Compact replaced the inode this handle
-	// maps — committing would write to the unlinked file, silently
-	// diverging from every other process.
-	if gen := coord.DataGeneration(); gen != db.dataGeneration.Load() {
-		db.poisoned.Store(true)
-		db.logger.Error("gmdb: data file replaced by a peer Compact; handle poisoned — Close and re-Open",
-			"cachedGeneration", db.dataGeneration.Load(), "currentGeneration", gen)
-		grant.Release()
-		return nil, ErrPoisoned
 	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	// Race-with-Close: if Close ran while we were waiting in
-	// AcquireWriter, db.closeGate is now closed. Release the grant
-	// we just got and surface ErrClosed rather than hand back a Tx
-	// against a torn-down pager.
-	if db.closeGate.IsClosed() {
+	pgr, _, err := db.resyncOnGrantLocked()
+	if err != nil {
 		grant.Release()
-		return nil, ErrClosed
-	}
-
-	// Re-read pgr under the post-grant db.mu: we hold the write grant, so
-	// any Compact that swapped db.pgr has fully completed (it swaps under
-	// grant+db.mu and releases the grant only after). This is the pager
-	// the Tx must use — the pre-grant capture may be the closed old one.
-	pgr = db.pgr
-	if pgr == nil {
-		grant.Release()
-		return nil, ErrClosed
-	}
-
-	// Re-sync the writer's in-memory state (meta, bitmap, RPL, fileSize)
-	// from disk before building the tx: a peer process holding the grant
-	// before us may have committed, leaving our Open-time view stale.
-	// Without this a serialized cross-process writer builds on a stale root
-	// (lost update), writes its meta over the slot holding the peer's newer
-	// commit, and allocates from a stale bitmap (page aliasing) —
-	// cross-process.md §Writer acquisition flow. Cheap no-op when the
-	// on-disk active TxnID is unchanged (the common single-writer path),
-	// which also preserves the in-memory lastCheckpointTxnID tracking.
-	if m, active, lastCheckpoint, changed, err := pgr.Resync(db.file, db.currentMeta.TxnID); err != nil {
-		// Resync leaves the pager fully unmodified on error (attachState is
-		// atomic), so the handle stays usable — release the grant and surface
-		// the error; no poison needed.
-		grant.Release()
-		return nil, fmt.Errorf("gmdb: re-sync writer state on grant: %w", mapPagerErr(err))
-	} else if changed {
-		db.setMetaState(m, active, lastCheckpoint)
+		return nil, err
 	}
 
 	prevMeta := db.currentMeta
@@ -883,6 +794,107 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 		originPCs: captureOriginPCs(),
 	})
 	return tx, nil
+}
+
+// acquireWriteGrant runs the write-grant preamble shared by Begin,
+// Checkpoint, and Compact: the fast readOnly/closed/poisoned gates, the
+// coord snapshot (race-safe vs Close, which nil's it under db.mu),
+// cross-process acquisition, and the post-grant re-checks — poison (a
+// concurrent commit's publication failure while we waited; proceeding
+// would build on state whose fsync error the kernel already consumed),
+// close (Close ran while we waited in AcquireWriter), and the data-file
+// generation check (cross-process.md §Data-file generation: a peer's
+// Compact replaced the inode this handle still maps — writing through
+// it would silently diverge from every other process; the handle
+// poisons itself). On success the caller owns the returned grant.
+// db.mu is NOT held across AcquireWriter — that would let Close
+// deadlock waiting for db.mu while the coord's flock goroutine holds
+// the result-channel send.
+//
+// Post-grant re-check order is poison → close → generation. The order
+// is unobservable: each check only picks which error a doomed caller
+// gets, and the un-stored poison flag in the
+// close-and-generation-both-true race is invisible (every entry point
+// fails the closed fast-gate before consulting it).
+func (db *DB) acquireWriteGrant(ctx context.Context) (*lock.Grant, *lock.Coord, error) {
+	if db.readOnly {
+		return nil, nil, ErrDatabaseReadOnly
+	}
+	if db.closeGate.IsClosed() {
+		return nil, nil, ErrClosed
+	}
+	// Poison check before acquiring the cross-process lock so a
+	// poisoned handle does not block legitimate concurrent callers
+	// across processes.
+	if db.poisoned.Load() {
+		return nil, nil, ErrPoisoned
+	}
+	db.mu.Lock()
+	coord := db.coord
+	db.mu.Unlock()
+	if coord == nil {
+		return nil, nil, ErrClosed
+	}
+	grant, err := coord.AcquireWriter(ctx)
+	if err != nil {
+		if errors.Is(err, lock.ErrClosed) {
+			return nil, nil, ErrClosed
+		}
+		return nil, nil, err
+	}
+	if db.poisoned.Load() {
+		grant.Release()
+		return nil, nil, ErrPoisoned
+	}
+	if db.closeGate.IsClosed() {
+		grant.Release()
+		return nil, nil, ErrClosed
+	}
+	if gen := coord.DataGeneration(); gen != db.dataGeneration.Load() {
+		db.poisoned.Store(true)
+		db.logger.Error("gmdb: data file replaced by a peer Compact; handle poisoned — Close and re-Open",
+			"cachedGeneration", db.dataGeneration.Load(), "currentGeneration", gen)
+		grant.Release()
+		return nil, nil, ErrPoisoned
+	}
+	return grant, coord, nil
+}
+
+// resyncOnGrantLocked re-reads pgr/file under db.mu (a Compact may have
+// swapped them while the caller waited for the grant — the pre-grant
+// captures may name the closed, munmap'd old pager) and re-syncs the
+// writer's in-memory state (meta, bitmap, RPL, fileSize) from disk: a
+// peer process holding the grant before us may have committed, leaving
+// our view stale. Without this a serialized cross-process writer builds
+// on a stale root (lost update), writes its meta over the slot holding
+// the peer's newer commit, and allocates from a stale bitmap (page
+// aliasing) — cross-process.md §Writer acquisition flow. Cheap no-op
+// when the on-disk active TxnID is unchanged (the common single-writer
+// path), which also preserves the in-memory lastCheckpointTxnID
+// tracking. On a Resync error the pager is fully unmodified
+// (attachState is atomic), so the handle stays usable — the caller
+// releases the grant and surfaces the error; no poison needed.
+//
+// Caller holds db.mu AND the write grant.
+func (db *DB) resyncOnGrantLocked() (*pager.Pager, *os.File, error) {
+	// Race-with-Close under the mu the caller holds: surface ErrClosed
+	// rather than resync against a torn-down pager.
+	if db.closeGate.IsClosed() {
+		return nil, nil, ErrClosed
+	}
+	pgr := db.pgr
+	file := db.file
+	if pgr == nil || file == nil {
+		return nil, nil, ErrClosed
+	}
+	m, active, lastCheckpoint, changed, err := pgr.Resync(file, db.currentMeta.TxnID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("gmdb: re-sync writer state on grant: %w", mapPagerErr(err))
+	}
+	if changed {
+		db.setMetaState(m, active, lastCheckpoint)
+	}
+	return pgr, file, nil
 }
 
 // setMetaState installs the meta baseline triple. The three fields move

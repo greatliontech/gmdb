@@ -32,7 +32,7 @@ gate) and the final close-out are fixed anchors per chunk.
   `BeginTx(TxParams)` (today 7 order-dependent setters,
   `db.go:810–879`); inject the reclamation-bound source as a
   dependency, retiring `SetReclamationBoundRefresh`.
-- [ ] 5. Extract a write-grant facade on `DB` for the triplicated
+- [x] 5. Extract a write-grant facade on `DB` for the triplicated
   grant → poison/generation re-check → `Resync` preamble in `Begin` /
   `Checkpoint` / `Compact` (`db.go:717`, `checkpoint.go:66`,
   `compact.go:66`), deduplicating the poison-log path.
