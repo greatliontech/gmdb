@@ -235,6 +235,12 @@ func ComputeMetaChecksum(buf []byte) uint64 {
 	return xxhash.Sum64(buf[:metaOffChecksum])
 }
 
+// MetaChecksumOffsetForTest exposes the byte offset of the meta checksum
+// slot (== the length of the checksummed prefix) so the crash-consistency
+// harness can synthesize torn meta writes that land within the checksummed
+// payload — the only tear that a valid old meta cannot absorb. Test-only.
+func MetaChecksumOffsetForTest() int { return metaOffChecksum }
+
 // ValidateMeta reports whether m is a well-formed meta-page payload as
 // observed after decoding from disk. Magic and Version are checked
 // against the package constants; PageSize must satisfy page.ValidPageSize;

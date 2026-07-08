@@ -198,3 +198,19 @@ func SetMaintPreReclaimHookForTest(hook func()) (restore func()) {
 func RPLEntriesPerSegmentForTest(tx *Tx) int {
 	return pager.RPLEntriesPerSegment(tx.pgr.Config())
 }
+
+// SetWriterFileOpsForTest installs a FileOps seam on the DB's stable
+// single-writer pager and returns a restore closure. The crash-consistency
+// harness wraps FileOpsForTest() in a recorder to log the write +
+// fdatasync trace produced by the workload's commits, then synthesizes
+// crash images from that trace.
+func (db *DB) SetWriterFileOpsForTest(fops pager.FileOps) (restore func()) {
+	return db.pgr.SetFileOpsForTest(fops)
+}
+
+// WriterFileOpsForTest returns the DB writer pager's current FileOps (the
+// production forward unless already swapped) so a harness recorder can
+// forward real I/O to it while logging.
+func (db *DB) WriterFileOpsForTest() pager.FileOps {
+	return db.pgr.FileOpsForTest()
+}

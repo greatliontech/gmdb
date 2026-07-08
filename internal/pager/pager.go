@@ -381,6 +381,12 @@ func (p *Pager) SetFileOpsForTest(fops FileOps) (restore func()) {
 	return func() { p.fops = prev }
 }
 
+// FileOpsForTest returns the pager's current FileOps — the production
+// osFileOps unless a test already swapped it. The crash-consistency
+// harness wraps it in a recorder that forwards real I/O while logging the
+// write + fdatasync trace. Test-support surface on an internal package.
+func (p *Pager) FileOpsForTest() FileOps { return p.fops }
+
 // NewWriter opens a writable pager over file. Same mmap setup as NewReader;
 // additionally allocates the dirty-page slab. pool must be a process-wide
 // BufPool sized to cfg.PageSize. maxBytes is Options.MaxTxBufferBytes; CoW
