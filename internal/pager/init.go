@@ -569,7 +569,7 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 		if _, err := file.WriteAt(buf, int64(selectedIdx)*int64(p.cfg.PageSize)); err != nil {
 			return Meta{}, 0, false, fmt.Errorf("pager: anchor rewrite meta %d: %w", selectedIdx, err)
 		}
-		if err := fdatasync(file); err != nil {
+		if err := openFsync(file, "anchor"); err != nil {
 			return Meta{}, 0, false, fmt.Errorf("pager: anchor fdatasync: %w", err)
 		}
 		p.advanceAnchoredEpoch(selected.Durable.TxnID)
@@ -608,7 +608,7 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 	if _, err := file.WriteAt(buf, int64(newIdx)*int64(p.cfg.PageSize)); err != nil {
 		return Meta{}, 0, false, fmt.Errorf("pager: recovery commit write meta %d: %w", newIdx, err)
 	}
-	if err := fdatasync(file); err != nil {
+	if err := openFsync(file, "recovery-commit"); err != nil {
 		return Meta{}, 0, false, fmt.Errorf("pager: recovery commit fdatasync: %w", err)
 	}
 	// The completed fsync anchors the recovery meta's own assertion;

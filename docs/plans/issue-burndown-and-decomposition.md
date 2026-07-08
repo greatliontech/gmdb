@@ -20,7 +20,7 @@ cross-namespace window; index move = clean codec extraction only.
   classification timeout (tunable, same-NS kill(0) unchanged) —
   spec amendment + `identityLive` + Options surface + tests;
   resolves `cross-namespace-reader-heartbeat-liveness`.
-- [ ] 5. Open-path fsync fault-injection seam + tests: pin the
+- [x] 5. Open-path fsync fault-injection seam + tests: pin the
   anchor rewrite (drop-the-rewrite mutation must die) and cover
   recovery-commit fsync failure; resolves `anchor-rewrite-fsync-pin`.
 - [ ] 6. Leaked-DB cleanup drain: `dbCleanupFn` performs Close's
