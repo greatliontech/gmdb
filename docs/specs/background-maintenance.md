@@ -349,12 +349,17 @@ evacuation**:
    free-page density). Walk every B+tree in the forest: the
    keyspace descriptor tree, each keyspace's data tree, its
    index registry sub-tree and index data trees, and any
-   set-keyspace nested trees. RPL segment pages are **excluded**
-   from relocation — they are owned by the commit pipeline
-   (allocated, chained, and reclaimed there), drain on their own
-   as reclamation advances, and new segments self-place low via
-   the allocator, so relocating them out-of-band would race that
-   machinery for no benefit.
+   set-keyspace nested trees. RPL segment pages are **never
+   relocated out-of-band** — they are owned by the commit pipeline
+   (allocated, chained, and reclaimed there), and mutating the
+   chain outside it would race that machinery. Instead, when the
+   walk finds RPL segment pages at or above the floor, the pass
+   REQUESTS an in-pipeline chain-prefix relocation, which its own
+   commit executes as part of step 1 (`free-space.md §RPL segment
+   relocation`): the full prefix from the deepest in-region segment
+   to the head, with every copy placed below the floor or the whole
+   request declined-and-reported for the pass (the decline and
+   placement rules live in that section).
 2. Relocate each allocated page at or above the floor: it is
    CoW'd to a fresh id, which the consolidating allocator draws
    from a low free hole; every owning parent, descriptor, and

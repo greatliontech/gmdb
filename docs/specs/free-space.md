@@ -350,6 +350,95 @@ from live bitrot without a per-segment discriminator is not possible, and a
 bounded, detectable leak is strictly safer than refusing to open an otherwise
 intact database.
 
+**RPL segment relocation (chain-prefix CoW).** Compaction can ask the
+commit pipeline to move RPL segment pages out of an evacuation
+region. Segments are immutable and singly linked newest → oldest, so
+moving a segment requires re-pointing its newer neighbor — a change
+that cascades to the head. The pipeline is the one place that
+cascade is safe and cheap: a commit writes a fresh head anyway, and
+the whole prefix can ride the same publication.
+
+Mechanism, executed entirely inside commit step 1 of the requesting
+transaction `T` (the compaction pass's own commit):
+
+1. From the in-memory segment list, take the deepest segment at or
+   above the evacuation floor; the prefix to copy is everything from
+   there to the head. A head-counted budget cannot work here: a
+   segment's head-distance is monotone non-decreasing (every commit
+   pushes a new head; only bound-gated tail reclamation shrinks it),
+   so anything "deeper than budget" would never relocate — precisely
+   under the lagging-reader case this mechanism exists for. The
+   prefix cost is instead bounded by the commit's existing work
+   budget; a prefix that exceeds it is not partially relocated —
+   the request is DECLINED for this pass and the pass reports the
+   region unsatisfiable (no false progress; see the decline rule
+   below).
+2. Copy each chain-prefix segment `[deepest … head]` byte-for-byte
+   into a freshly allocated page, deepest first, rewriting ONLY each
+   copy's `OlderSegment`: the deepest copy keeps its original link
+   (it points at an untouched older segment, or carries the stale
+   tail link verbatim); every newer copy points at its neighbor's
+   copy. `T`'s own new head segment then links to the head's copy.
+   Copy pages MUST allocate below the evacuation floor (the same
+   consolidating allocation the pass's other relocations draw from);
+   a copy that cannot be placed below the floor DECLINES the whole
+   relocation for this pass — a copy landing in-region would be
+   re-requested next pass, growing `RPLEntryCount` by k per cycle
+   while relocating nothing: wasted work with no termination
+   argument. Decline is trivial by construction: the request performs no
+   state change until read-only probing establishes a below-floor
+   home for every copy and the prefix fits the work budget — only
+   then do allocations land. The pass reports the region
+   unsatisfiable this pass.
+3. The old prefix pages are retired IN `T`'s new head segment — they
+   are pages freed by `T`, listed like any other retirement.
+4. The meta flip publishes everything at once: `RPLHeadPage` names
+   `T`'s head, whose chain runs through the copies; `RPLTailPage`
+   and `RPLEntryCount` follow the new chain exactly as with any
+   commit — a relocated tail's copy becomes the authoritative tail,
+   and the entry count grows by the k old prefix pages retired into
+   the head. No intermediate state is observable; a crash before
+   the flip leaves the old chain authoritative and every copy
+   unreferenced (leaked-then-reclaimed by `T`'s abort path like any
+   allocated-but-uncommitted page).
+
+Recovery interplay needs no new rules. A projection whose durable
+epoch precedes `T` still walks the OLD chain; its pages are protected
+by the reclamation bound: the old prefix pages were retired at `T`,
+so they reclaim only once `bound >= T` — and by `DurableTxnID`
+monotonicity across the commit sequence (the durable sub-record
+invariant), once an fsynced meta has asserted an epoch `>= T`, BOTH
+slots at every later instant hold `DurableTxnID >= T`, so whichever
+slot recovery selects (including the older-slot fallback after a
+torn head) carries the NEW chain in its sub-record. The head-exemption and
+reclaimed-boundary rules apply to the copies exactly as to any
+segment.
+
+Invariant: kind=entailed;
+  property=Relocation preserves the multiset of (TxnID, PageID)
+    retirement entries — segment pages change homes, entries never
+    appear, disappear, or duplicate;
+  from=entailed: the RPL is the MVCC ledger of freed pages —
+    conservation is what makes reclamation neither leak nor
+    double-free;
+  violation=A dropped entry leaks its page forever (never returns to
+    the bitmap); a duplicated entry double-frees — the page returns
+    to the bitmap while a snapshot still references it, and the next
+    allocation aliases live data.
+
+Invariant: kind=entailed;
+  property=Old prefix pages are retired in the relocating commit's
+    own head segment, never freed directly to the bitmap;
+  from=entailed: a projection older than the relocating commit still
+    walks the old chain;
+  violation=Direct-freeing an old prefix page lets the very next
+    allocation reuse it while the durable projection's chain walk
+    still visits it — the walk reads a foreign page and truncates,
+    leaking every older segment's entries (bounded but immediate,
+    where the bound-gated path makes it unreachable; even reuse AS a
+    valid new segment is contained — the per-segment TxnID reclaim
+    gate blocks the double-free escalation).
+
 **Runtime reclamation (`reclaimRPL`).** When the writer drains eligible
 segments back to the bitmap and a segment fails to decode (bitrot, a torn
 write), reclamation **quarantines** it rather than halting: the corrupt

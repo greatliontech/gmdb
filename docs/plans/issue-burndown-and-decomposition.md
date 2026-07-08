@@ -8,7 +8,7 @@ relocation = full design + implementation; cross-NS liveness = longer
 cross-namespace window; index move = clean codec extraction only.
 `N.1` triage and close-out gates fixed per chunk.
 
-- [ ] 2. RPL segment relocation — design (Spec-first): commit-pipeline
+- [x] 2. RPL segment relocation — design (Spec-first): commit-pipeline
   fold per the issue's option 1; settle the chain-pointer cascade
   (relocating a segment rewrites its newer neighbor's
   `OlderSegment`, cascading toward the head), the evacuation
