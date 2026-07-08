@@ -183,7 +183,7 @@ type RPLChainWalk struct {
 // raw, non-verifying accessor). Returns how the walk stopped, or a hard
 // error; exactly one of the two is meaningful (stop is zero-valued on
 // error).
-func (w RPLChainWalk) Walk(visit func(id uint64, seg page.RPLSegment) bool) (RPLWalkStop, *RPLWalkError) {
+func (w RPLChainWalk) Walk(visit func(id uint64, seg RPLSegment) bool) (RPLWalkStop, *RPLWalkError) {
 	if w.Head == 0 {
 		return RPLWalkStop{Reason: RPLWalkTailReached}, nil
 	}
@@ -264,11 +264,11 @@ func (w RPLChainWalk) Walk(visit func(id uint64, seg page.RPLSegment) bool) (RPL
 // footer check; ok reports the decode (meaningful only when footerOK).
 // The caller bounds id before calling: readPage may be a raw accessor
 // that panics out of range.
-func readRPLSegment(readPage func(uint64) []byte, cfg page.Config, id uint64) (seg page.RPLSegment, footerOK, ok bool) {
+func readRPLSegment(readPage func(uint64) []byte, cfg page.Config, id uint64) (seg RPLSegment, footerOK, ok bool) {
 	buf := readPage(id)
 	if cfg.PageChecksum && !page.VerifyPageFooter(buf, cfg.PageSize) {
-		return page.RPLSegment{}, false, false
+		return RPLSegment{}, false, false
 	}
-	seg, ok = page.DecodeRPLSegment(buf, cfg)
+	seg, ok = DecodeRPLSegment(buf, cfg)
 	return seg, true, ok
 }

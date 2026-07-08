@@ -1,12 +1,17 @@
-// Package page implements pure byte-slice encoders and decoders for every
-// gmdb on-disk binary format: the 8-byte page header, the meta page, the
-// RPL segment, the branch page (prefix-truncated separators), the leaf
-// page in two variants (compressed with variable-size restart groups +
-// prefix-compressed delta entries; uncompressed with full keys + a
-// positional offset table — selected per Config.RestartGroupTarget), the
-// overflow page header, the set-keyspace subpage, the 40-byte keyspace
-// descriptor (stored as the value for a keyspace's entry in the keyspace
-// B+tree per keyspaces.md §Keyspace Descriptor), and the xxhash64 footer.
+// Package page implements pure byte-slice encoders and decoders for the
+// B+tree NODE formats and the shared wire/header base every persisted
+// format builds on: the 8-byte page header + page-type registry, Config,
+// the xxhash64 footer, the branch page (prefix-truncated separators),
+// the leaf page in two variants (compressed with variable-size restart
+// groups + prefix-compressed delta entries; uncompressed with full keys
+// + a positional offset table — selected per Config.RestartGroupTarget),
+// the overflow page header, and the set-keyspace subpage.
+//
+// The pager-DOMAIN formats live with their owner: the meta page and the
+// RPL segment in internal/pager (which alone reads and writes them);
+// the keyspace-descriptor row format in the root package (a leaf VALUE
+// payload, not a page format). All build on this package's header,
+// Config, and footer base.
 //
 // The leaf surface is exposed via LeafReader (variant-dispatching read
 // path) and LeafBuilder (variant-dispatching write path); LeafIter

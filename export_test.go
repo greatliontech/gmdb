@@ -3,7 +3,6 @@ package gmdb
 import (
 	"context"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
@@ -19,7 +18,7 @@ import (
 // They were moved here from the production sources to close two
 // public-API-surface findings: raw pager primitives (AllocPage, CoW,
 // AllocSlab, FreePage, Page) leaking onto *Tx, and the internal
-// page.Meta storage type leaking through *DB / *ReadTx accessors. The
+// pager.Meta storage type leaking through *DB / *ReadTx accessors. The
 // public contract these are excluded from is docs/specs/api-surface.md
 // (ReadTx surface = Commit / Rollback only; public stats via DB.Stats).
 
@@ -90,10 +89,10 @@ func (rtx *ReadTx) Page(id uint64) ([]byte, error) {
 
 // Meta returns a copy of the snapshot meta, independent of any
 // subsequent commit. Production code reads the rtx.meta field directly.
-func (rtx *ReadTx) Meta() page.Meta { return rtx.meta }
+func (rtx *ReadTx) Meta() pager.Meta { return rtx.meta }
 
 // Meta returns a snapshot of the currently-active meta under db.mu.
-func (db *DB) Meta() page.Meta {
+func (db *DB) Meta() pager.Meta {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.currentMeta
@@ -197,5 +196,5 @@ func SetMaintPreReclaimHookForTest(hook func()) (restore func()) {
 // capacity for the tx's page geometry — budget-edge tests use it to
 // land retired-page counts exactly on segment boundaries.
 func RPLEntriesPerSegmentForTest(tx *Tx) int {
-	return page.RPLEntriesPerSegment(tx.pgr.Config())
+	return pager.RPLEntriesPerSegment(tx.pgr.Config())
 }

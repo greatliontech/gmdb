@@ -137,10 +137,11 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// mustValidate panics with the Validate error. Used at the package's
-// internal boundaries where Config reaching the function with an invalid
-// PageSize signals a caller bug.
-func (c Config) mustValidate() {
+// MustValidate panics with the Validate error. Used at format
+// boundaries — this package's own and the pager-domain formats built
+// on the shared base — where a Config reaching the function with an
+// invalid PageSize signals a caller bug.
+func (c Config) MustValidate() {
 	if err := c.Validate(); err != nil {
 		panic(err)
 	}

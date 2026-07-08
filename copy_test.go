@@ -4,11 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 	"os"
 	"sync/atomic"
 	"testing"
-
-	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // firstByteDecl indexes rows on the first byte of their value — a small
@@ -462,7 +461,7 @@ func TestCopyToConcurrentWriter(t *testing.T) {
 
 // metaOf opens path read-only-ish (a write tx, rolled back) and returns its
 // active meta — used to compare HighWaterMark / NumFreePages across copies.
-func metaOf(t *testing.T, path string) page.Meta {
+func metaOf(t *testing.T, path string) pager.Meta {
 	t.Helper()
 	ctx := context.Background()
 	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})

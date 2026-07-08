@@ -4,10 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 	"os"
 	"testing"
-
-	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // checksums.md §Data Page Checksums: data-page checksums are opt-out,
@@ -29,7 +28,7 @@ func TestPageChecksumDefaultOnMetaFlag(t *testing.T) {
 		t.Fatalf("Open default: %v", err)
 	}
 	t.Cleanup(func() { dbOn.Close() })
-	if !dbOn.Meta().HasFlag(page.MetaFlagPageChecksum) {
+	if !dbOn.Meta().HasFlag(pager.MetaFlagPageChecksum) {
 		t.Error("zero-value Options: MetaFlagPageChecksum clear, want set (checksums default ON)")
 	}
 
@@ -39,7 +38,7 @@ func TestPageChecksumDefaultOnMetaFlag(t *testing.T) {
 		t.Fatalf("Open disabled: %v", err)
 	}
 	t.Cleanup(func() { dbOff.Close() })
-	if dbOff.Meta().HasFlag(page.MetaFlagPageChecksum) {
+	if dbOff.Meta().HasFlag(pager.MetaFlagPageChecksum) {
 		t.Error("DisablePageChecksum=true: MetaFlagPageChecksum set, want clear (checksums OFF)")
 	}
 }

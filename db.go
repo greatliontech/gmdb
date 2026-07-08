@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
-	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
@@ -58,7 +57,7 @@ type DB struct {
 	// Pager state for the currently-active reader baseline. mu guards
 	// against concurrent Begin from multiple goroutines.
 	mu            sync.Mutex
-	currentMeta   page.Meta
+	currentMeta   pager.Meta
 	activeMetaIdx int
 	pgr           *pager.Pager
 
@@ -1024,7 +1023,7 @@ func (db *DB) shutdownCheckpoint() error {
 // (durability.md §Anchoring), which the pager maintains at its fsync
 // sites. Caller holds db.mu (or has exclusive access: Open's
 // construction, Compact's swap under grant+db.mu).
-func (db *DB) setMetaState(m page.Meta, active int) {
+func (db *DB) setMetaState(m pager.Meta, active int) {
 	db.currentMeta = m
 	db.activeMetaIdx = active
 }

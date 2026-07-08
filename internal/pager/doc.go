@@ -5,10 +5,13 @@
 // (grow/shrink via ftruncate), and the commit pipeline (pwrite ordering
 // dirty data → bitmap → fdatasync → meta → fdatasync per SyncMode).
 //
-// The pager owns the file handle and the mmap. It depends downward on
-// internal/page (for page-format encoders) and internal/bitmap (for the
-// allocation bitmap data structure). It does not depend on internal/btree
-// or any higher subsystem; the btree operates on top of the pager.
+// The pager owns the file handle and the mmap, and it owns its two
+// on-disk formats outright: the meta page (meta.go) and the RPL
+// segment (rplformat.go) — no other layer reads or writes them. It
+// depends downward on internal/page (the shared wire/header base and
+// the node formats) and internal/bitmap (the allocation bitmap data
+// structure). It does not depend on internal/btree or any higher
+// subsystem; the btree operates on top of the pager.
 //
 // Platform mmap/madvise syscall shims live in build-tagged siblings:
 // mmap_linux.go, mmap_darwin.go, mmap_freebsd.go. No platform-conditional

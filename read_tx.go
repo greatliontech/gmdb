@@ -60,7 +60,7 @@ type ReadTx struct {
 	// concurrent commit may have advanced it, but the reader's
 	// snapshot remains coherent because every page reachable from
 	// this meta is immutable per CoW).
-	meta page.Meta
+	meta pager.Meta
 
 	// readerSlot is the index in the lock-file reader table that
 	// this ReadTx owns. NoSlot once released.
@@ -404,7 +404,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 	// length"). Pooling of read-only pagers is the plan's
 	// optimization for high-read workloads; deferred until profiling
 	// motivates it.
-	cfg := page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)}
+	cfg := page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(pager.MetaFlagPageChecksum)}
 	reservation := int64(meta.MaxSize) * int64(meta.PageSize)
 	pgr, err := pager.NewReader(file, cfg, reservation)
 	if err != nil {

@@ -24,7 +24,7 @@ import "fmt"
 // first page in an overflow run: PageSize - HeaderSize - optional
 // footer.
 func OverflowFirstPageCapacity(cfg Config) int {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	return cfg.ContentEnd() - HeaderSize
 }
 
@@ -32,7 +32,7 @@ func OverflowFirstPageCapacity(cfg Config) int {
 // follower (non-first) page in an overflow run: PageSize - optional
 // footer. Follower pages carry no header.
 func OverflowFollowerCapacity(cfg Config) int {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	return cfg.ContentEnd()
 }
 
@@ -40,7 +40,7 @@ func OverflowFollowerCapacity(cfg Config) int {
 // required to store a value of `valLen` bytes. Used by the allocator
 // to size the contiguous run.
 func OverflowRunLength(cfg Config, valLen uint64) uint32 {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	first := uint64(OverflowFirstPageCapacity(cfg))
 	if valLen <= first {
 		return 1
@@ -61,7 +61,7 @@ func OverflowRunLength(cfg Config, valLen uint64) uint32 {
 // bound the returned count against the file-resident extent before
 // trusting TotalLen for any allocation.
 func OverflowRunLength64(cfg Config, valLen uint64) uint64 {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	first := uint64(OverflowFirstPageCapacity(cfg))
 	if valLen <= first {
 		return 1
@@ -81,7 +81,7 @@ func OverflowRunLength64(cfg Config, valLen uint64) uint64 {
 // length or if any page buffer is the wrong size — both are caller
 // bugs in the allocator.
 func EncodeOverflowRun(pages [][]byte, cfg Config, value []byte) error {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	want := int(OverflowRunLength(cfg, uint64(len(value))))
 	if len(pages) != want {
 		return fmt.Errorf("page: EncodeOverflowRun got %d pages, want %d for %d-byte value",
@@ -130,7 +130,7 @@ func DecodeOverflowFirstPage(buf []byte) (additional uint32, err error) {
 // capacity)). Caller error on a mismatched dst size surfaces as a
 // short read.
 func AssembleOverflowValue(pages [][]byte, cfg Config, dst []byte) (int, error) {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	if len(pages) == 0 {
 		return 0, fmt.Errorf("page: AssembleOverflowValue empty pages slice")
 	}

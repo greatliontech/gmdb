@@ -56,7 +56,7 @@ func NewLeafBuilder(buf []byte, cfg Config) *LeafBuilder {
 // Reset reinitializes the builder for reuse with a new buffer, preserving
 // the inline backing arrays so a pooled LeafBuilder doesn't re-allocate.
 func (b *LeafBuilder) Reset(buf []byte, cfg Config) {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	if len(buf) != int(cfg.PageSize) {
 		panic(fmt.Sprintf("page: LeafBuilder buf len %d != PageSize %d", len(buf), cfg.PageSize))
 	}

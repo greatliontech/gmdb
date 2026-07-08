@@ -115,7 +115,7 @@ func BranchCellCount(buf []byte) uint16 {
 // child-only rewrite is independent of the page-wide prefix and needs no
 // re-encode.
 func SetBranchCellChild(buf []byte, cfg Config, i uint16, child uint64) {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	n := BranchCellCount(buf)
 	if i >= n {
 		panic(fmt.Sprintf("page: SetBranchCellChild(%d) out of range [0, %d)", i, n))
@@ -135,7 +135,7 @@ func SetBranchCellChild(buf []byte, cfg Config, i uint16, child uint64) {
 // to modify. This is off the hot descent path — BranchSearch / BranchChildAt
 // read the page directly without reconstructing keys.
 func BranchCellAt(buf []byte, cfg Config, i uint16) BranchCell {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	n := BranchCellCount(buf)
 	if i >= n {
 		panic(fmt.Sprintf("page: BranchCellAt(%d) out of range [0, %d)", i, n))
@@ -187,7 +187,7 @@ func branchCellChild(buf []byte, i uint16) uint64 {
 // pages hold tens of cells at typical key sizes, and the splitter
 // path that consumes BranchFreeSpace is not in the read hot path.
 func BranchFreeSpace(buf []byte, cfg Config) int {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	n := int(BranchCellCount(buf))
 	dirEnd := branchHeaderEnd + n*branchDirEntrySize
 	low := cfg.ContentEnd() - branchPrefixLen(buf) // walking backward from the prefix region
@@ -205,7 +205,7 @@ func BranchFreeSpace(buf []byte, cfg Config) int {
 // child pointer and zero cells. Used at root creation and at branch
 // splits.
 func EncodeBranchEmpty(buf []byte, cfg Config, leftmost uint64) {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	if len(buf) != int(cfg.PageSize) {
 		panic(fmt.Sprintf("page: EncodeBranchEmpty buf len %d != PageSize %d", len(buf), cfg.PageSize))
 	}
@@ -235,7 +235,7 @@ func EncodeBranchEmpty(buf []byte, cfg Config, leftmost uint64) {
 // deterministic (page-formats.md §Leaf Split deterministic-encoding
 // invariant, for branch pages).
 func EncodeBranch(buf []byte, cfg Config, leftmost uint64, cells []BranchCell) error {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	if len(buf) != int(cfg.PageSize) {
 		return fmt.Errorf("page: EncodeBranch buf len %d != PageSize %d", len(buf), cfg.PageSize)
 	}
@@ -342,7 +342,7 @@ func BranchLogicalSize(cells []BranchCell) int {
 // split / merge consumers; hot-path search uses BranchSearch + BranchChildAt
 // to avoid materializing keys.
 func DecodeBranch(buf []byte, cfg Config) (leftmost uint64, cells []BranchCell) {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	n := BranchCellCount(buf)
 	leftmost = BranchLeftmostChild(buf)
 	if n == 0 {
@@ -378,7 +378,7 @@ func DecodeBranch(buf []byte, cfg Config) (leftmost uint64, cells []BranchCell) 
 // LEAST i with target[len(P):] < suffix[i]), so the target descends into that
 // separator's right child — separators are right-child lower bounds.
 func BranchSearch(buf []byte, cfg Config, target []byte) uint16 {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	n := int(BranchCellCount(buf))
 	if n == 0 {
 		return 0
@@ -511,7 +511,7 @@ func ValidateBranch(buf []byte, cfg Config) error {
 // Reads the child pointer directly (no separator-key reconstruction), so it
 // is allocation-free on the hot descent path.
 func BranchChildAt(buf []byte, cfg Config, i uint16) uint64 {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	if i == 0 {
 		return BranchLeftmostChild(buf)
 	}

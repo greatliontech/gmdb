@@ -29,7 +29,7 @@ func setupBlockedReclamationWriter(t *testing.T) (*Pager, *bitmap.Bitmap) {
 
 	cfg := page.Config{PageSize: testPageSize}
 	rplBuf := make([]byte, testPageSize)
-	page.EncodeRPLSegment(rplBuf, cfg, 100, 0, []uint64{12})
+	EncodeRPLSegment(rplBuf, cfg, 100, 0, []uint64{12})
 	if _, err := f.WriteAt(rplBuf, 10*testPageSize); err != nil {
 		t.Fatalf("write RPL seg: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestAllocPageLaggingReaderNilCallbackFallsThroughToFileExtension(t *testing
 	defer f.Close()
 	cfg := page.Config{PageSize: testPageSize}
 	rplBuf := make([]byte, testPageSize)
-	page.EncodeRPLSegment(rplBuf, cfg, 100, 0, []uint64{12})
+	EncodeRPLSegment(rplBuf, cfg, 100, 0, []uint64{12})
 	if _, err := f.WriteAt(rplBuf, 10*testPageSize); err != nil {
 		t.Fatal(err)
 	}

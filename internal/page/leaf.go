@@ -150,7 +150,7 @@ type LeafReader struct {
 // non-leaf type (programming error at the call site — callers gate via
 // IsLeafType or read the header themselves).
 func NewLeafReader(buf []byte, cfg Config) LeafReader {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	if len(buf) != int(cfg.PageSize) {
 		panic(fmt.Sprintf("page: NewLeafReader buf len %d != PageSize %d", len(buf), cfg.PageSize))
 	}

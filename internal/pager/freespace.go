@@ -2,8 +2,6 @@ package pager
 
 import (
 	"fmt"
-
-	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // AllocPage allocates a single page following the priority order in
@@ -399,7 +397,7 @@ func (p *Pager) FreePage(id uint64) error {
 	// in the commit phase: the descriptor flush's own retires are
 	// covered by the external reserve's RPL slack
 	// (Tx.recalcFlushReserve).
-	capPerSeg := page.RPLEntriesPerSegment(p.cfg)
+	capPerSeg := RPLEntriesPerSegment(p.cfg)
 	if !p.inCommit && capPerSeg > 0 && len(p.retiredPages)%capPerSeg == 0 {
 		// This retire opens a new segment: projected reserve grows by
 		// one page.
@@ -475,7 +473,7 @@ func (p *Pager) reclaimRPL() int {
 	var lastReclaimed uint64
 	for len(p.rplSegments) > 0 && p.rplSegments[0].TxnID < p.reclamationBound {
 		seg := p.rplSegments[0]
-		var decoded page.RPLSegment
+		var decoded RPLSegment
 		// The segment page id itself is bounded FIRST — before pageRaw
 		// (which panics past the mmap reservation) and before the Set
 		// at the end (which panics outside the allocatable range). A

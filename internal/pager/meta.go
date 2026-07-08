@@ -1,10 +1,17 @@
-package page
+package pager
 
 import (
+	"encoding/binary"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/page"
 
 	"github.com/cespare/xxhash/v2"
 )
+
+// le is the on-disk byte order for the pager-domain formats (meta,
+// RPL segment) — little-endian, matching the node formats in
+// internal/page.
+var le = binary.LittleEndian
 
 // Meta-page Flags bit assignments. Per file-layout.md §Meta Page:
 //   - Bit 0 (PageChecksum) is immutable across the file's lifetime.
@@ -230,7 +237,7 @@ func ComputeMetaChecksum(buf []byte) uint64 {
 
 // ValidateMeta reports whether m is a well-formed meta-page payload as
 // observed after decoding from disk. Magic and Version are checked
-// against the package constants; PageSize must satisfy ValidPageSize;
+// against the package constants; PageSize must satisfy page.ValidPageSize;
 // Flags must not carry any bits outside MetaFlagKnownMask
 // (file-layout.md §Meta Page: "Open() must reject databases where any
 // unknown flag bit is set").
@@ -240,17 +247,17 @@ func ComputeMetaChecksum(buf []byte) uint64 {
 // detect torn writes, then ValidateMeta on the decoded struct to detect
 // out-of-band fields.
 func ValidateMeta(m Meta) error {
-	if m.Magic != Magic {
-		return fmt.Errorf("page: meta Magic mismatch: got 0x%08x, want 0x%08x", m.Magic, Magic)
+	if m.Magic != page.Magic {
+		return fmt.Errorf("pager: meta Magic mismatch: got 0x%08x, want 0x%08x", m.Magic, page.Magic)
 	}
-	if m.Version != FormatVersion {
-		return fmt.Errorf("page: meta Version mismatch: got %d, want %d", m.Version, FormatVersion)
+	if m.Version != page.FormatVersion {
+		return fmt.Errorf("pager: meta Version mismatch: got %d, want %d", m.Version, page.FormatVersion)
 	}
-	if !ValidPageSize(m.PageSize) {
-		return fmt.Errorf("page: meta PageSize invalid: %d", m.PageSize)
+	if !page.ValidPageSize(m.PageSize) {
+		return fmt.Errorf("pager: meta PageSize invalid: %d", m.PageSize)
 	}
 	if unknown := m.Flags &^ MetaFlagKnownMask; unknown != 0 {
-		return fmt.Errorf("page: meta Flags has unknown bits set: 0x%x", unknown)
+		return fmt.Errorf("pager: meta Flags has unknown bits set: 0x%x", unknown)
 	}
 	return nil
 }

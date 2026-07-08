@@ -76,14 +76,14 @@ func (tx *Tx) compactForest(shouldRelocate func(uint64) bool, budget int) (int, 
 	//    the descriptors up front.
 	type ksEntry struct {
 		name []byte
-		desc page.KeyspaceDescriptor
+		desc keyspaceDescriptor
 	}
 	var roster []ksEntry
 	if err := btree.WalkKV(pw, baseCfg, tx.keyspaceRoot, hwm, func(k, v []byte) error {
-		if len(v) != page.KeyspaceDescriptorSize {
+		if len(v) != keyspaceDescriptorSize {
 			return fmt.Errorf("%w: keyspace %q descriptor size %d", btree.ErrCorrupted, string(k), len(v))
 		}
-		roster = append(roster, ksEntry{name: bytes.Clone(k), desc: page.DecodeKeyspaceDescriptor(v)})
+		roster = append(roster, ksEntry{name: bytes.Clone(k), desc: decodeKeyspaceDescriptor(v)})
 		return nil
 	}); err != nil {
 		return 0, mapCompactErr(err)
@@ -131,7 +131,7 @@ func (tx *Tx) compactForest(shouldRelocate func(uint64) bool, budget int) (int, 
 				return 0, err
 			}
 			if tx.dirtyDescriptors == nil {
-				tx.dirtyDescriptors = make(map[string]page.KeyspaceDescriptor)
+				tx.dirtyDescriptors = make(map[string]keyspaceDescriptor)
 			}
 			tx.dirtyDescriptors[string(ks.name)] = ks.desc
 			tx.recalcFlushReserve()

@@ -60,11 +60,11 @@ func TestInitOpenRoundTrip(t *testing.T) {
 			}
 			// Check checksum flag.
 			if csum {
-				if !db.Meta.HasFlag(page.MetaFlagPageChecksum) {
+				if !db.Meta.HasFlag(MetaFlagPageChecksum) {
 					t.Error("PageChecksum flag not set")
 				}
 			} else {
-				if db.Meta.HasFlag(page.MetaFlagPageChecksum) {
+				if db.Meta.HasFlag(MetaFlagPageChecksum) {
 					t.Error("PageChecksum flag set despite csum=false")
 				}
 			}

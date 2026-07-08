@@ -136,7 +136,7 @@ func (tx *Tx) OpenSetKeyspace(name string, indexes ...*IndexDecl) (*SetKeyspace,
 	if !found {
 		return nil, ErrNotFound
 	}
-	if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindSetKeyspace); err != nil {
+	if err := checkKeyspaceKind(desc.Kind, keyspaceKindSetKeyspace); err != nil {
 		return nil, err
 	}
 	// Defer dirtyDescriptors removal until validation succeeds.
@@ -197,7 +197,7 @@ func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error) {
 	if !found {
 		return nil, ErrNotFound
 	}
-	if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindSetKeyspace); err != nil {
+	if err := checkKeyspaceKind(desc.Kind, keyspaceKindSetKeyspace); err != nil {
 		return nil, err
 	}
 	indexes, err := tx.loadReadOnlyIndexes(desc)
@@ -271,8 +271,8 @@ func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions, indexes .
 	} else {
 		delete(tx.pendingDeletes, name)
 	}
-	desc := page.KeyspaceDescriptor{
-		Kind:           page.KeyspaceKindSetKeyspace,
+	desc := keyspaceDescriptor{
+		Kind:           keyspaceKindSetKeyspace,
 		FixedValueSize: fvs,
 	}
 	tx.numKeyspaces++
@@ -333,8 +333,8 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 	}
 	if _, deleted := tx.pendingDeletes[name]; deleted {
 		delete(tx.pendingDeletes, name)
-		desc := page.KeyspaceDescriptor{
-			Kind:           page.KeyspaceKindSetKeyspace,
+		desc := keyspaceDescriptor{
+			Kind:           keyspaceKindSetKeyspace,
 			FixedValueSize: fvs,
 		}
 		tx.numKeyspaces++
@@ -354,7 +354,7 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 		return nil, err
 	}
 	if found {
-		if err := checkKeyspaceKind(desc.Kind, page.KeyspaceKindSetKeyspace); err != nil {
+		if err := checkKeyspaceKind(desc.Kind, keyspaceKindSetKeyspace); err != nil {
 			return nil, err
 		}
 		if desc.FixedValueSize != fvs {
@@ -385,8 +385,8 @@ func (tx *Tx) CreateSetKeyspaceIfNotExists(name string, opts *SetKeyspaceOptions
 		tx.recalcFlushReserve()
 		return sks, nil
 	}
-	desc = page.KeyspaceDescriptor{
-		Kind:           page.KeyspaceKindSetKeyspace,
+	desc = keyspaceDescriptor{
+		Kind:           keyspaceKindSetKeyspace,
 		FixedValueSize: fvs,
 	}
 	tx.numKeyspaces++
@@ -425,7 +425,7 @@ func validateSetOpts(opts *SetKeyspaceOptions, cfg page.Config) (uint16, error) 
 // cacheOpenSetKeyspace constructs the *SetKeyspace and registers it
 // in the tx's per-name cache. All Open / Create paths route through
 // here.
-func (tx *Tx) cacheOpenSetKeyspace(handle uniqueNameHandle, desc page.KeyspaceDescriptor, state keyspaceState) *SetKeyspace {
+func (tx *Tx) cacheOpenSetKeyspace(handle uniqueNameHandle, desc keyspaceDescriptor, state keyspaceState) *SetKeyspace {
 	sks := &SetKeyspace{keyspaceCore: keyspaceCore{tx: tx, name: handle, desc: desc, state: state}}
 	if tx.openSetKeyspaces == nil {
 		tx.openSetKeyspaces = make(map[uniqueNameHandle]*SetKeyspace)

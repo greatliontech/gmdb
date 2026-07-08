@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // Convenience IndexDecl factory for tests.
@@ -1202,7 +1201,7 @@ func TestKind2DescriptorsHaveDistinctIndexRegistryRoots(t *testing.T) {
 	walkErr := btree.WalkKV(rtx.pgr, cfg, meta.KeyspaceRoot, meta.HighWaterMark, func(k, v []byte) error {
 		total++
 		name := string(k)
-		d := page.DecodeKeyspaceDescriptor(v)
+		d := decodeKeyspaceDescriptor(v)
 		if d.IndexRegistryRoot == 0 {
 			return nil
 		}

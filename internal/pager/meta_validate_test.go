@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // TestSelectionRejectsInvalidFieldsMeta pins the field-validation gate
@@ -40,13 +38,13 @@ func TestSelectionRejectsInvalidFieldsMeta(t *testing.T) {
 	// checksum, so selection succeeds (valid checksums, tie at TxnID 0
 	// → slot 0) and only ValidateMeta can reject.
 	forge := func(off int64) {
-		buf := make([]byte, page.MetaPayloadSize)
+		buf := make([]byte, MetaPayloadSize)
 		if _, err := f.ReadAt(buf, off); err != nil {
 			t.Fatalf("read meta at %d: %v", off, err)
 		}
-		m := page.DecodeMeta(buf)
+		m := DecodeMeta(buf)
 		m.Flags |= 1 << 31
-		page.EncodeMeta(buf, &m)
+		EncodeMeta(buf, &m)
 		if _, err := f.WriteAt(buf, off); err != nil {
 			t.Fatalf("write forged meta at %d: %v", off, err)
 		}

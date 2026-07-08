@@ -30,7 +30,7 @@ func newWalkFixture(checksum bool) *walkFixture {
 // are on) at id.
 func (f *walkFixture) segment(id, txnID, older uint64, entries ...uint64) {
 	buf := make([]byte, f.cfg.PageSize)
-	page.EncodeRPLSegment(buf, f.cfg, txnID, older, entries)
+	EncodeRPLSegment(buf, f.cfg, txnID, older, entries)
 	if f.cfg.PageChecksum {
 		page.WritePageFooter(buf, f.cfg.PageSize)
 	}
@@ -51,7 +51,7 @@ func (f *walkFixture) garbage(id uint64) {
 // corrupt flips a payload byte after the footer was computed, so the
 // footer no longer verifies.
 func (f *walkFixture) corrupt(id uint64) {
-	f.pages[id][page.RPLHeaderSize] ^= 0xFF
+	f.pages[id][RPLHeaderSize] ^= 0xFF
 }
 
 func (f *walkFixture) readPage(id uint64) []byte {
@@ -80,7 +80,7 @@ func (f *walkFixture) chainWalk(head, tail, entryCount uint64) RPLChainWalk {
 func run(t *testing.T, w RPLChainWalk) ([]uint64, RPLWalkStop, *RPLWalkError) {
 	t.Helper()
 	var visited []uint64
-	stop, werr := w.Walk(func(id uint64, seg page.RPLSegment) bool {
+	stop, werr := w.Walk(func(id uint64, seg RPLSegment) bool {
 		visited = append(visited, id)
 		return true
 	})
@@ -158,7 +158,7 @@ func TestRPLChainWalkTraversal(t *testing.T) {
 		f.segment(10, 5, 0, 100)
 		f.segment(11, 6, 10, 101)
 		w := f.chainWalk(11, 10, 2)
-		stop, werr := w.Walk(func(id uint64, seg page.RPLSegment) bool { return false })
+		stop, werr := w.Walk(func(id uint64, seg RPLSegment) bool { return false })
 		wantStop(t, werr, stop, RPLWalkCallerStopped, 11)
 	})
 }

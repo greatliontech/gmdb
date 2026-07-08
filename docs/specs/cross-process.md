@@ -680,7 +680,7 @@ latency and bounded cancellation latency.
    Writer-grant freshness invariant.
 
    **Selection and projections.** The re-sync adopts the
-   highest-valid-TxnID meta (`page.ActiveMeta`) — the one selection
+   highest-valid-TxnID meta (`pager.ActiveMeta`) — the one selection
    rule shared with recovery and readers (`durability.md §One
    selection, two projections`) — and uses its LIVE projection: the
    peer cleanly committed and released the flock, so its latest
@@ -792,7 +792,7 @@ operations use atomic memory ops visible across processes.
 
 **Snapshot selection.** A read transaction (`BeginRead`) snapshots
 the **latest committed** on-disk meta — both meta pages are re-read
-and the highest-valid-TxnID one is chosen (`page.ActiveMeta`) — NOT
+and the highest-valid-TxnID one is chosen (`pager.ActiveMeta`) — NOT
 the handle's cached `currentMeta` (which a peer's commit leaves
 stale). The reader uses the selected meta's LIVE projection
 (a reader wants visibility of the newest commit, not the durable

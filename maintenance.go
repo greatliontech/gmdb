@@ -3,6 +3,7 @@ package gmdb
 import (
 	"context"
 	"errors"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 	"sync/atomic"
 	"time"
 
@@ -169,7 +170,7 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 	}
 	defer rtx.Rollback()
 	meta := rtx.meta
-	if !meta.HasFlag(page.MetaFlagPageChecksum) {
+	if !meta.HasFlag(pager.MetaFlagPageChecksum) {
 		return // checksums disabled — no footers to verify
 	}
 	pageSize := meta.PageSize
@@ -264,7 +265,7 @@ func (db *DB) maintReclaimLeaks(ctx context.Context) (freed int, discarded bool)
 	meta := rtx.meta
 	c := &checker{
 		pgr:    rtx.pgr,
-		cfg:    page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)},
+		cfg:    page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(pager.MetaFlagPageChecksum)},
 		meta:   meta,
 		yield:  func(CheckIssue) bool { return true }, // detection only — discard issues
 		repair: true,                                  // collect c.leaked instead of emitting

@@ -6,7 +6,6 @@ import (
 	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // pinnedIndex carries the per-index state that survives the open-time
@@ -101,7 +100,7 @@ func buildPinnedIndexMap(decls []*IndexDecl) (map[string]*pinnedIndex, error) {
 // and the read-only write guard rejects every mutation before index
 // maintenance could need it. Returns nil for a keyspace with no
 // registry.
-func (tx *Tx) loadReadOnlyIndexes(desc page.KeyspaceDescriptor) (map[string]*pinnedIndex, error) {
+func (tx *Tx) loadReadOnlyIndexes(desc keyspaceDescriptor) (map[string]*pinnedIndex, error) {
 	if desc.IndexRegistryRoot == 0 {
 		return nil, nil
 	}

@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // Chunk-5.4 tests promote four invariants over the keyspace surface:
@@ -302,10 +301,10 @@ func TestListKeyspacesFiltersKindIndexInternal(t *testing.T) {
 	}
 	// Engine-internal index keyspace forged at the codec level —
 	// CreateKeyspace cannot produce Kind=2 (Kind is set internally
-	// to KeyspaceKindKeyspace), so we write the descriptor directly
+	// to keyspaceKindKeyspace), so we write the descriptor directly
 	// via the same internal storeDescriptor path with a hand-built
 	// Kind=2 descriptor.
-	forged := page.KeyspaceDescriptor{Kind: page.KeyspaceKindIndexInternal}
+	forged := keyspaceDescriptor{Kind: keyspaceKindIndexInternal}
 	if err := tx.storeDescriptor("__idx_internal", forged); err != nil {
 		t.Fatalf("storeDescriptor Kind=2: %v", err)
 	}
@@ -340,7 +339,7 @@ func TestOpenKeyspaceRejectsForgedKindMismatch(t *testing.T) {
 
 	// Forge a Kind=1 (SetKeyspace) descriptor — chunk 6 lands the
 	// CreateSetKeyspace API, but the codec accepts Kind=1 today.
-	forged := page.KeyspaceDescriptor{Kind: page.KeyspaceKindSetKeyspace}
+	forged := keyspaceDescriptor{Kind: keyspaceKindSetKeyspace}
 	if err := tx.storeDescriptor("sks", forged); err != nil {
 		t.Fatalf("storeDescriptor Kind=1: %v", err)
 	}
@@ -367,7 +366,7 @@ func TestOpenKeyspaceRejectsForgedKindReserved(t *testing.T) {
 	}
 	defer tx.Rollback()
 
-	forged := page.KeyspaceDescriptor{Kind: page.KeyspaceKindIndexInternal}
+	forged := keyspaceDescriptor{Kind: keyspaceKindIndexInternal}
 	if err := tx.storeDescriptor("__idx", forged); err != nil {
 		t.Fatalf("storeDescriptor Kind=2: %v", err)
 	}
@@ -381,7 +380,7 @@ func TestOpenKeyspaceRejectsForgedKindReserved(t *testing.T) {
 // TestOpenKeyspaceRejectsForgedUnknownKind promotes invariant #2 at
 // the API level: a Kind byte forged out of {0,1,2} on disk results in
 // OpenKeyspace returning a wrapped ErrCorrupted (via
-// ValidateKeyspaceDescriptor → ErrCorrupted route).
+// validateKeyspaceDescriptor → ErrCorrupted route).
 func TestOpenKeyspaceRejectsForgedUnknownKind(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -402,8 +401,8 @@ func TestOpenKeyspaceRejectsForgedUnknownKind(t *testing.T) {
 	if _, err := tx.CreateKeyspace("anchor"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	buf := make([]byte, page.KeyspaceDescriptorSize)
-	page.EncodeKeyspaceDescriptor(buf, page.KeyspaceDescriptor{Kind: page.KeyspaceKindKeyspace})
+	buf := make([]byte, keyspaceDescriptorSize)
+	encodeKeyspaceDescriptor(buf, keyspaceDescriptor{Kind: keyspaceKindKeyspace})
 	buf[16] = 3 // forge Kind byte to an unknown value
 	cfg := tx.pgr.Config()
 	newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte("bad"), buf)
@@ -439,9 +438,9 @@ func TestOpenKeyspaceRejectsForgedFixedValueSizeOnKind0(t *testing.T) {
 	if _, err := tx.CreateKeyspace("anchor"); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	buf := make([]byte, page.KeyspaceDescriptorSize)
-	page.EncodeKeyspaceDescriptor(buf, page.KeyspaceDescriptor{
-		Kind:           page.KeyspaceKindKeyspace,
+	buf := make([]byte, keyspaceDescriptorSize)
+	encodeKeyspaceDescriptor(buf, keyspaceDescriptor{
+		Kind:           keyspaceKindKeyspace,
 		FixedValueSize: 8, // illegal on Kind=0
 	})
 	cfg := tx.pgr.Config()

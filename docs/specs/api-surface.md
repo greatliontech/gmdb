@@ -803,7 +803,7 @@ type ReadTx struct { ... }
 // Raw page bytes and the decoded internal meta are NOT exposed: page
 // access is the cursor / B+tree layer's concern (a public Page(id)
 // invites a HighWaterMark-out-of-range SIGBUS — mmap-strategy.md
-// §Sparse Reservation), and page.Meta is an internal storage struct.
+// §Sparse Reservation), and pager.Meta is an internal storage struct.
 // The snapshot identity callers need is the curated TxnID (uint64);
 // DB.Stats (§Statistics) covers DB-level numbers.
 func (rtx *ReadTx) OpenKeyspaceReadOnly(name string) (*Keyspace, error)

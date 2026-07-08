@@ -65,7 +65,7 @@ func TestDeleteKeyspaceRejectsKindIndexInternal(t *testing.T) {
 	defer db.Close()
 	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
-	forged := page.KeyspaceDescriptor{Kind: page.KeyspaceKindIndexInternal}
+	forged := keyspaceDescriptor{Kind: keyspaceKindIndexInternal}
 	if err := tx.storeDescriptor("__idx", forged); err != nil {
 		t.Fatalf("storeDescriptor Kind=2: %v", err)
 	}

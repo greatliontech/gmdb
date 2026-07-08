@@ -1,15 +1,16 @@
-package page
+package pager
 
 import (
 	"bytes"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/page"
 	"testing"
 )
 
 func sampleMeta(txnID uint64) Meta {
 	return Meta{
-		Magic:           Magic,
-		Version:         FormatVersion,
+		Magic:           page.Magic,
+		Version:         page.FormatVersion,
 		PageSize:        4096,
 		Flags:           MetaFlagPageChecksum,
 		BitmapPages:     1,
@@ -145,10 +146,10 @@ func TestValidateMeta(t *testing.T) {
 	bad := good
 	bad.Magic = 0xCAFEBABE
 	if err := ValidateMeta(bad); err == nil {
-		t.Error("Validate accepted wrong Magic")
+		t.Error("Validate accepted wrong page.Magic")
 	}
 	bad = good
-	bad.Version = FormatVersion + 1
+	bad.Version = page.FormatVersion + 1
 	if err := ValidateMeta(bad); err == nil {
 		t.Error("Validate accepted wrong Version")
 	}
@@ -168,8 +169,8 @@ func TestEncodeMetaGoldenBytes(t *testing.T) {
 	// Hand-derived golden bytes: a meta with chosen fields encoded into
 	// exactly MetaPayloadSize bytes, checksum included.
 	m := Meta{
-		Magic:           Magic,
-		Version:         FormatVersion,
+		Magic:           page.Magic,
+		Version:         page.FormatVersion,
 		PageSize:        4096,
 		Flags:           MetaFlagPageChecksum,
 		BitmapPages:     1,
@@ -203,10 +204,10 @@ func TestEncodeMetaGoldenBytes(t *testing.T) {
 	buf := make([]byte, MetaPayloadSize)
 	EncodeMeta(buf, &m)
 	// Assert key field positions directly against the LE encoding.
-	if le.Uint32(buf[0:]) != Magic {
-		t.Errorf("Magic @0 = 0x%x", le.Uint32(buf[0:]))
+	if le.Uint32(buf[0:]) != page.Magic {
+		t.Errorf("page.Magic @0 = 0x%x", le.Uint32(buf[0:]))
 	}
-	if le.Uint32(buf[4:]) != FormatVersion {
+	if le.Uint32(buf[4:]) != page.FormatVersion {
 		t.Errorf("Version @4 = %d", le.Uint32(buf[4:]))
 	}
 	if le.Uint32(buf[8:]) != 4096 {

@@ -727,7 +727,7 @@ func (p *Pager) rplReserveBytes() int {
 	if n == 0 {
 		return 0
 	}
-	capPerSeg := page.RPLEntriesPerSegment(p.cfg)
+	capPerSeg := RPLEntriesPerSegment(p.cfg)
 	if capPerSeg <= 0 {
 		// Commit will reject this geometry loudly (appendRPL errors);
 		// no reserve can make it committable.

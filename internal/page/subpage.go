@@ -517,7 +517,7 @@ func writeSubpageEntry(buf, value []byte, fixedValueSize uint16) {
 // exceed this value after a new insert must be promoted by the
 // caller per the 4-step algorithm in §Subpage Promotion Threshold.
 func SubpagePromotionThreshold(cfg Config) int {
-	cfg.mustValidate()
+	cfg.MustValidate()
 	usable := cfg.ContentEnd() - HeaderSize - 4 - 4
 	if usable < 0 {
 		return 0

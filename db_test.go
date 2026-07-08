@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 	"io"
 	"os"
 	"path/filepath"
@@ -205,13 +206,13 @@ func TestOpenRejectsDifferentFormatVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open file: %v", err)
 	}
-	buf := make([]byte, page.MetaPayloadSize)
+	buf := make([]byte, pager.MetaPayloadSize)
 	if _, err := f.ReadAt(buf, 0); err != nil {
 		t.Fatalf("read meta0: %v", err)
 	}
-	m := page.DecodeMeta(buf)
+	m := pager.DecodeMeta(buf)
 	m.Version = page.FormatVersion + 1
-	page.EncodeMeta(buf, &m)
+	pager.EncodeMeta(buf, &m)
 	if _, err := f.WriteAt(buf, 0); err != nil {
 		t.Fatalf("write forged meta0: %v", err)
 	}
@@ -618,13 +619,13 @@ func TestOpenRejectsOutOfRangeRPLHeadWithoutPanic(t *testing.T) {
 			if _, err := f.ReadAt(buf, activeOff); err != nil {
 				t.Fatalf("read active meta: %v", err)
 			}
-			m := page.DecodeMeta(buf)
+			m := pager.DecodeMeta(buf)
 			m.RPLHeadPage = tc.head
 			m.RPLTailPage = tc.head
 			if tc.hwmIfNonZ != 0 {
 				m.HighWaterMark = tc.hwmIfNonZ
 			}
-			page.EncodeMeta(buf, &m)
+			pager.EncodeMeta(buf, &m)
 			if _, err := f.WriteAt(buf, activeOff); err != nil {
 				t.Fatalf("write corrupted meta: %v", err)
 			}
@@ -713,9 +714,9 @@ func TestOpenRejectsCorruptBitmapPagesWithoutPanic(t *testing.T) {
 			if _, err := f.ReadAt(buf, activeOff); err != nil {
 				t.Fatalf("read active meta: %v", err)
 			}
-			m := page.DecodeMeta(buf)
+			m := pager.DecodeMeta(buf)
 			m.BitmapPages = tc.bitmapPages
-			page.EncodeMeta(buf, &m)
+			pager.EncodeMeta(buf, &m)
 			if _, err := f.WriteAt(buf, activeOff); err != nil {
 				t.Fatalf("write corrupted meta: %v", err)
 			}

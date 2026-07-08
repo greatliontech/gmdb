@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 	"os"
 	"path/filepath"
 
@@ -56,7 +57,7 @@ func (db *DB) CopyTo(path string, compact bool) error {
 // for the public CopyTo; the source's for Compact's in-place rebuild).
 func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	meta := rtx.meta
-	cfg := page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)}
+	cfg := page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(pager.MetaFlagPageChecksum)}
 	hwm := meta.HighWaterMark
 	firstData := uint64(2) + uint64(meta.BitmapPages)
 
@@ -137,10 +138,10 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	cm.RPLTailPage = 0
 	cm.RPLEntryCount = 0
 	cm.NumFreePages = bm.NumFree()
-	cm.Flags = meta.Flags & page.MetaFlagPageChecksum
+	cm.Flags = meta.Flags & pager.MetaFlagPageChecksum
 	// A copy starts its MVCC counter fresh. Both meta slots are written
 	// byte-identical at TxnID 0 — the documented post-initialisation
-	// tie-at-zero state (page.ActiveMeta), valid even with a populated
+	// tie-at-zero state (pager.ActiveMeta), valid even with a populated
 	// KeyspaceRoot. (Equal NON-zero TxnIDs would be a protocol violation.)
 	cm.TxnID = 0
 	// Like Init's genesis metas, the copy is self-durable at epoch 0
@@ -151,7 +152,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	cm.Durable = cm.LiveSubRecord()
 	cm.Durable.AnchoredTxnID = 0
 	metaBuf := make([]byte, meta.PageSize)
-	page.EncodeMeta(metaBuf, &cm)
+	pager.EncodeMeta(metaBuf, &cm)
 	for slot := int64(0); slot < 2; slot++ {
 		if _, err := f.WriteAt(metaBuf, slot*pageSize); err != nil {
 			return fmt.Errorf("gmdb: CopyTo write meta %d: %w", slot, err)
@@ -178,7 +179,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 // recurses), index registry sub-tree, and index data trees. Mirrors the
 // Check structural walk, but records ids only. A walk failure
 // (corrupt/forged tree) is returned to the caller.
-func collectReachable(rtx *ReadTx, cfg page.Config, meta page.Meta, hwm, firstData uint64) (bitset, error) {
+func collectReachable(rtx *ReadTx, cfg page.Config, meta pager.Meta, hwm, firstData uint64) (bitset, error) {
 	reachable := newBitset(hwm)
 	pr := rawPageReader{p: rtx.pgr}
 	collect := func(root uint64) error {
@@ -192,10 +193,10 @@ func collectReachable(rtx *ReadTx, cfg page.Config, meta page.Meta, hwm, firstDa
 	}
 	err := btree.WalkKV(pr, cfg, meta.KeyspaceRoot, hwm, func(k, v []byte) error {
 		name := string(k)
-		if len(v) != page.KeyspaceDescriptorSize {
+		if len(v) != keyspaceDescriptorSize {
 			return fmt.Errorf("%w: keyspace %q descriptor size %d", btree.ErrCorrupted, name, len(v))
 		}
-		desc := page.DecodeKeyspaceDescriptor(v)
+		desc := decodeKeyspaceDescriptor(v)
 		if err := collect(desc.Root); err != nil {
 			return fmt.Errorf("keyspace %q data tree: %w", name, err)
 		}
@@ -290,7 +291,7 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	w := &freshFileWriter{
 		f:        f,
 		pageSize: pageSize,
-		checksum: meta.HasFlag(page.MetaFlagPageChecksum),
+		checksum: meta.HasFlag(pager.MetaFlagPageChecksum),
 		next:     firstData,
 		maxPages: meta.MaxSize,
 	}
@@ -306,10 +307,10 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	var descs []descEntry
 	walkErr := btree.WalkKV(pr, baseCfg, meta.KeyspaceRoot, hwm, func(k, v []byte) error {
 		name := string(k)
-		if len(v) != page.KeyspaceDescriptorSize {
+		if len(v) != keyspaceDescriptorSize {
 			return fmt.Errorf("%w: keyspace %q descriptor size %d", btree.ErrCorrupted, name, len(v))
 		}
-		desc := page.DecodeKeyspaceDescriptor(v)
+		desc := decodeKeyspaceDescriptor(v)
 		cfg := baseCfg
 		if desc.RestartGroupTarget != 0 {
 			cfg.RestartGroupTarget = desc.RestartGroupTarget
@@ -317,13 +318,13 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 		nd := desc // rewrite Root + IndexRegistryRoot below
 
 		switch desc.Kind {
-		case page.KeyspaceKindKeyspace:
+		case keyspaceKindKeyspace:
 			root, err := rebuildKVTree(w, pr, cfg, desc.Root, hwm)
 			if err != nil {
 				return fmt.Errorf("keyspace %q data tree: %w", name, err)
 			}
 			nd.Root = root
-		case page.KeyspaceKindSetKeyspace:
+		case keyspaceKindSetKeyspace:
 			root, err := rebuildSetTree(w, pr, cfg, desc.Root, desc.FixedValueSize, hwm)
 			if err != nil {
 				return fmt.Errorf("set keyspace %q data tree: %w", name, err)
@@ -347,8 +348,8 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 			nd.IndexRegistryRoot = regRoot
 		}
 
-		encBuf := make([]byte, page.KeyspaceDescriptorSize)
-		page.EncodeKeyspaceDescriptor(encBuf, nd)
+		encBuf := make([]byte, keyspaceDescriptorSize)
+		encodeKeyspaceDescriptor(encBuf, nd)
 		descs = append(descs, descEntry{name: append([]byte(nil), k...), enc: encBuf})
 		return nil
 	})
@@ -396,14 +397,14 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	cm.RPLTailPage = 0
 	cm.RPLEntryCount = 0
 	cm.NumFreePages = bm.NumFree()
-	cm.Flags = meta.Flags & page.MetaFlagPageChecksum
+	cm.Flags = meta.Flags & pager.MetaFlagPageChecksum
 	cm.TxnID = 0 // fresh MVCC counter; both slots at the post-init tie-at-zero state
 	// Self-durable at epoch 0, like Init and the verbatim copy above.
 	cm.RPLHeadTxnID = 0
 	cm.Durable = cm.LiveSubRecord()
 	cm.Durable.AnchoredTxnID = 0
 	metaBuf := make([]byte, meta.PageSize)
-	page.EncodeMeta(metaBuf, &cm)
+	pager.EncodeMeta(metaBuf, &cm)
 	for slot := int64(0); slot < 2; slot++ {
 		if _, err := f.WriteAt(metaBuf, slot*pageSize); err != nil {
 			return fmt.Errorf("gmdb: CopyTo(compact) write meta %d: %w", slot, err)

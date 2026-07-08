@@ -66,10 +66,10 @@ func Init(file *os.File, ip InitParams) error {
 
 	flags := uint32(0)
 	if ip.PageChecksum {
-		flags |= page.MetaFlagPageChecksum
+		flags |= MetaFlagPageChecksum
 	}
 
-	m := page.Meta{
+	m := Meta{
 		Magic:           page.Magic,
 		Version:         page.FormatVersion,
 		PageSize:        ip.PageSize,
@@ -107,7 +107,7 @@ func Init(file *os.File, ip InitParams) error {
 	// meta payload is the first MetaPayloadSize bytes and the rest of
 	// the page is zero-filled.
 	metaBuf := make([]byte, ip.PageSize)
-	page.EncodeMeta(metaBuf, &m)
+	EncodeMeta(metaBuf, &m)
 	for slot := 0; slot < 2; slot++ {
 		off := int64(slot) * pageSizeI
 		if _, err := file.WriteAt(metaBuf, off); err != nil {
@@ -140,7 +140,7 @@ type OpenParams struct {
 // re-snapshots Meta from the post-commit return.
 type OpenedDB struct {
 	Pager         *Pager
-	Meta          page.Meta
+	Meta          Meta
 	ActiveMetaIdx int
 }
 
@@ -173,7 +173,7 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		return nil, err
 	}
 
-	cfg := page.Config{PageSize: pageSize, PageChecksum: m.HasFlag(page.MetaFlagPageChecksum)}
+	cfg := page.Config{PageSize: pageSize, PageChecksum: m.HasFlag(MetaFlagPageChecksum)}
 
 	// 3) Reservation = MaxSize * PageSize, mmap, mprotect.
 	reservation := int64(m.MaxSize) * int64(pageSize)
@@ -208,21 +208,21 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 // the pager to its LIVE projection, and returns it. The under-grant
 // re-read is load-bearing: the pre-grant Open snapshot can be stale by
 // any number of peer commits that landed while AcquireWriter blocked.
-func (p *Pager) AttachLatest(file *os.File) (page.Meta, int, error) {
+func (p *Pager) AttachLatest(file *os.File) (Meta, int, error) {
 	meta0, meta1, err := readMetaPair(file, p.cfg.PageSize)
 	if err != nil {
-		return page.Meta{}, 0, err
+		return Meta{}, 0, err
 	}
-	active, ok := page.ActiveMeta(meta0, meta1)
+	active, ok := ActiveMeta(meta0, meta1)
 	if !ok {
-		return page.Meta{}, 0, errBothMetasInvalid()
+		return Meta{}, 0, errBothMetasInvalid()
 	}
 	m, err := decodeActiveMeta(meta0, meta1, active)
 	if err != nil {
-		return page.Meta{}, 0, err
+		return Meta{}, 0, err
 	}
 	if err := p.attachState(file, m); err != nil {
-		return page.Meta{}, 0, err
+		return Meta{}, 0, err
 	}
 	return m, active, nil
 }
@@ -245,7 +245,7 @@ func OpenReadOnly(file *os.File, op OpenParams) (*OpenedDB, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg := page.Config{PageSize: pageSize, PageChecksum: m.HasFlag(page.MetaFlagPageChecksum)}
+	cfg := page.Config{PageSize: pageSize, PageChecksum: m.HasFlag(MetaFlagPageChecksum)}
 	reservation := int64(m.MaxSize) * int64(pageSize)
 	p, err := NewReader(file, cfg, reservation)
 	if err != nil {
@@ -269,10 +269,10 @@ func OpenReadOnly(file *os.File, op OpenParams) (*OpenedDB, error) {
 // adopting the winner's durable sub-record, which is the CALLER's
 // step). Shared by Open (then NewWriter + attachState) and
 // OpenReadOnly (then NewReader).
-func readAndSelectMeta(file *os.File) (m page.Meta, active int, pageSize uint32, err error) {
-	meta0Bytes := make([]byte, page.MetaPayloadSize)
+func readAndSelectMeta(file *os.File) (m Meta, active int, pageSize uint32, err error) {
+	meta0Bytes := make([]byte, MetaPayloadSize)
 	if _, err := file.ReadAt(meta0Bytes, 0); err != nil {
-		return page.Meta{}, 0, 0, fmt.Errorf("pager: read meta0: %w", err)
+		return Meta{}, 0, 0, fmt.Errorf("pager: read meta0: %w", err)
 	}
 	// An intact gmdb meta-0 of a different format version is reported
 	// distinctly from corruption (file-layout.md §Meta Page): the file
@@ -280,41 +280,41 @@ func readAndSelectMeta(file *os.File) (m page.Meta, active int, pageSize uint32,
 	// the recovery machinery so a different-version file never
 	// masquerades as a torn/corrupt current-version file.
 	if isVersionMismatchMeta(meta0Bytes) {
-		return page.Meta{}, 0, 0, fmt.Errorf("pager: %w: meta0 version %d, want %d",
-			ErrVersionMismatch, page.DecodeMeta(meta0Bytes).Version, page.FormatVersion)
+		return Meta{}, 0, 0, fmt.Errorf("pager: %w: meta0 version %d, want %d",
+			ErrVersionMismatch, DecodeMeta(meta0Bytes).Version, page.FormatVersion)
 	}
 	var meta1Bytes []byte
 	if isGmdbMeta(meta0Bytes) {
-		pageSize = page.DecodeMeta(meta0Bytes).PageSize
+		pageSize = DecodeMeta(meta0Bytes).PageSize
 		if !page.ValidPageSize(pageSize) {
 			// Checksum agrees with a value that the format rejects:
 			// the file was written by a different format version or
 			// the checksum collided. Either way, ErrCorrupted.
-			return page.Meta{}, 0, 0, fmt.Errorf("pager: meta0 verified but PageSize %d invalid: %w", pageSize, ErrCorrupted)
+			return Meta{}, 0, 0, fmt.Errorf("pager: meta0 verified but PageSize %d invalid: %w", pageSize, ErrCorrupted)
 		}
 	} else {
 		var perr error
 		pageSize, meta1Bytes, perr = probeMetaPageSize(file)
 		if perr != nil {
-			return page.Meta{}, 0, 0, fmt.Errorf("pager: meta1 probe read: %w", perr)
+			return Meta{}, 0, 0, fmt.Errorf("pager: meta1 probe read: %w", perr)
 		}
 		if pageSize == 0 {
-			return page.Meta{}, 0, 0, fmt.Errorf("pager: meta0 verify failed and meta1 probe found no recoverable meta: %w", ErrCorrupted)
+			return Meta{}, 0, 0, fmt.Errorf("pager: meta0 verify failed and meta1 probe found no recoverable meta: %w", ErrCorrupted)
 		}
 	}
 	if meta1Bytes == nil {
-		meta1Bytes = make([]byte, page.MetaPayloadSize)
+		meta1Bytes = make([]byte, MetaPayloadSize)
 		if _, err := file.ReadAt(meta1Bytes, int64(pageSize)); err != nil {
-			return page.Meta{}, 0, 0, fmt.Errorf("pager: read meta1: %w", err)
+			return Meta{}, 0, 0, fmt.Errorf("pager: read meta1: %w", err)
 		}
 	}
-	active, ok := page.ActiveMeta(meta0Bytes, meta1Bytes)
+	active, ok := ActiveMeta(meta0Bytes, meta1Bytes)
 	if !ok {
-		return page.Meta{}, 0, 0, errBothMetasInvalid()
+		return Meta{}, 0, 0, errBothMetasInvalid()
 	}
 	m, err = decodeActiveMeta(meta0Bytes, meta1Bytes, active)
 	if err != nil {
-		return page.Meta{}, 0, 0, err
+		return Meta{}, 0, 0, err
 	}
 	return m, active, pageSize, nil
 }
@@ -324,11 +324,11 @@ func readAndSelectMeta(file *os.File) (m page.Meta, active int, pageSize uint32,
 // meta or the immutable pager config) — page-size DISCOVERY on an
 // unknown file is readAndSelectMeta's probe, not this helper.
 func readMetaPair(file *os.File, pageSize uint32) (meta0, meta1 []byte, err error) {
-	meta0 = make([]byte, page.MetaPayloadSize)
+	meta0 = make([]byte, MetaPayloadSize)
 	if _, err := file.ReadAt(meta0, 0); err != nil {
 		return nil, nil, fmt.Errorf("pager: read meta0: %w", err)
 	}
-	meta1 = make([]byte, page.MetaPayloadSize)
+	meta1 = make([]byte, MetaPayloadSize)
 	if _, err := file.ReadAt(meta1, int64(pageSize)); err != nil {
 		return nil, nil, fmt.Errorf("pager: read meta1: %w", err)
 	}
@@ -338,14 +338,14 @@ func readMetaPair(file *os.File, pageSize uint32) (meta0, meta1 []byte, err erro
 // decodeActiveMeta decodes the selected slot of a meta pair and
 // validates it. Every selection path funnels through this one
 // decode+validate.
-func decodeActiveMeta(meta0, meta1 []byte, active int) (page.Meta, error) {
+func decodeActiveMeta(meta0, meta1 []byte, active int) (Meta, error) {
 	b := meta0
 	if active == 1 {
 		b = meta1
 	}
-	m := page.DecodeMeta(b)
-	if err := page.ValidateMeta(m); err != nil {
-		return page.Meta{}, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
+	m := DecodeMeta(b)
+	if err := ValidateMeta(m); err != nil {
+		return Meta{}, fmt.Errorf("pager: %w: %w", ErrCorrupted, err)
 	}
 	return m, nil
 }
@@ -377,7 +377,7 @@ func errBothMetasInvalid() error {
 // established). The bitmap region lives in low pages [2, 2+BitmapPages) which
 // maybeShrink never truncates, so the bitmap copy below is always within the
 // backed extent.
-func (p *Pager) attachState(file *os.File, m page.Meta) error {
+func (p *Pager) attachState(file *os.File, m Meta) error {
 	st, err := file.Stat()
 	if err != nil {
 		return fmt.Errorf("pager: stat: %w", err)
@@ -460,7 +460,7 @@ func (p *Pager) attachState(file *os.File, m page.Meta) error {
 // concurrent writer mutates the metas/bitmap/RPL and no tx is in flight (the
 // bitmap is replaced wholesale).
 //
-// Selection is the ONE rule shared with Open and readers (page.ActiveMeta,
+// Selection is the ONE rule shared with Open and readers (ActiveMeta,
 // highest valid TxnID); Resync uses its LIVE projection — a grant handoff is
 // not recovery: the peer cleanly committed and released the flock, so its
 // latest commit — even an unfsynced SyncLazy one — is complete and visible
@@ -485,25 +485,25 @@ func (p *Pager) attachState(file *os.File, m page.Meta) error {
 // always safe — so the caller releases the grant and returns the error
 // without poisoning — the handle stays usable (a retry re-reads; Close +
 // re-Open invokes Open's own corruption recovery).
-func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m page.Meta, active int, changed bool, err error) {
+func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m Meta, active int, changed bool, err error) {
 	meta0, meta1, err := readMetaPair(file, p.cfg.PageSize)
 	if err != nil {
-		return page.Meta{}, 0, false, err
+		return Meta{}, 0, false, err
 	}
-	active, ok := page.ActiveMeta(meta0, meta1)
+	active, ok := ActiveMeta(meta0, meta1)
 	if !ok {
-		return page.Meta{}, 0, false, errBothMetasInvalid()
+		return Meta{}, 0, false, errBothMetasInvalid()
 	}
 	m, err = decodeActiveMeta(meta0, meta1, active)
 	if err != nil {
-		return page.Meta{}, 0, false, err
+		return Meta{}, 0, false, err
 	}
 	p.advanceAnchoredEpoch(m.Durable.AnchoredTxnID)
 	if m.TxnID == knownTxnID {
 		return m, active, false, nil
 	}
 	if err := p.attachState(file, m); err != nil {
-		return page.Meta{}, 0, false, err
+		return Meta{}, 0, false, err
 	}
 	return m, active, true, nil
 }
@@ -535,22 +535,22 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m page.Meta, active in
 // crash before the fsync leaves the old slots authoritative and
 // recovery re-runs. The caller MUST hold the write grant and have
 // passed the no-live-author gate.
-func (p *Pager) RecoverToDurable(file *os.File) (m page.Meta, active int, recovered bool, err error) {
+func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered bool, err error) {
 	meta0, meta1, err := readMetaPair(file, p.cfg.PageSize)
 	if err != nil {
-		return page.Meta{}, 0, false, err
+		return Meta{}, 0, false, err
 	}
-	selectedIdx, ok := page.ActiveMeta(meta0, meta1)
+	selectedIdx, ok := ActiveMeta(meta0, meta1)
 	if !ok {
-		return page.Meta{}, 0, false, errBothMetasInvalid()
+		return Meta{}, 0, false, errBothMetasInvalid()
 	}
 	selected, err := decodeActiveMeta(meta0, meta1, selectedIdx)
 	if err != nil {
-		return page.Meta{}, 0, false, err
+		return Meta{}, 0, false, err
 	}
 	if selected.SelfDurable() {
 		if err := p.attachState(file, selected); err != nil {
-			return page.Meta{}, 0, false, err
+			return Meta{}, 0, false, err
 		}
 		// Anchor the assertion by re-writing the meta to its own slot
 		// and fsyncing. The pwrite is load-bearing, not redundant: the
@@ -565,12 +565,12 @@ func (p *Pager) RecoverToDurable(file *os.File) (m page.Meta, active int, recove
 		// write of identical bytes is harmless and the other slot is
 		// untouched.
 		buf := make([]byte, p.cfg.PageSize)
-		page.EncodeMeta(buf, &selected)
+		EncodeMeta(buf, &selected)
 		if _, err := file.WriteAt(buf, int64(selectedIdx)*int64(p.cfg.PageSize)); err != nil {
-			return page.Meta{}, 0, false, fmt.Errorf("pager: anchor rewrite meta %d: %w", selectedIdx, err)
+			return Meta{}, 0, false, fmt.Errorf("pager: anchor rewrite meta %d: %w", selectedIdx, err)
 		}
 		if err := fdatasync(file); err != nil {
-			return page.Meta{}, 0, false, fmt.Errorf("pager: anchor fdatasync: %w", err)
+			return Meta{}, 0, false, fmt.Errorf("pager: anchor fdatasync: %w", err)
 		}
 		p.advanceAnchoredEpoch(selected.Durable.TxnID)
 		return selected, selectedIdx, false, nil
@@ -594,7 +594,7 @@ func (p *Pager) RecoverToDurable(file *os.File) (m page.Meta, active int, recove
 	proj.NumKeyspaces = d.NumKeyspaces
 	proj.TxnID = d.TxnID
 	if err := p.attachState(file, proj); err != nil {
-		return page.Meta{}, 0, false, err
+		return Meta{}, 0, false, err
 	}
 
 	// Publish the recovery commit at selected.TxnID+1.
@@ -603,13 +603,13 @@ func (p *Pager) RecoverToDurable(file *os.File) (m page.Meta, active int, recove
 	rm.Durable = rm.LiveSubRecord()
 	rm.Durable.AnchoredTxnID = d.TxnID
 	buf := make([]byte, p.cfg.PageSize)
-	page.EncodeMeta(buf, &rm)
+	EncodeMeta(buf, &rm)
 	newIdx := 1 - selectedIdx
 	if _, err := file.WriteAt(buf, int64(newIdx)*int64(p.cfg.PageSize)); err != nil {
-		return page.Meta{}, 0, false, fmt.Errorf("pager: recovery commit write meta %d: %w", newIdx, err)
+		return Meta{}, 0, false, fmt.Errorf("pager: recovery commit write meta %d: %w", newIdx, err)
 	}
 	if err := fdatasync(file); err != nil {
-		return page.Meta{}, 0, false, fmt.Errorf("pager: recovery commit fdatasync: %w", err)
+		return Meta{}, 0, false, fmt.Errorf("pager: recovery commit fdatasync: %w", err)
 	}
 	// The completed fsync anchors the recovery meta's own assertion;
 	// re-seed the commit state to the published meta's view.
@@ -624,17 +624,17 @@ func (p *Pager) RecoverToDurable(file *os.File) (m page.Meta, active int, recove
 // observe a peer's completed commit, cross-process.md §Reader Table;
 // durability.md §One selection, two projections). Lock-free: BeginRead holds no write grant, so a writer
 // may be mid-commit on the inactive slot — a torn slot fails its checksum and
-// page.ActiveMeta selects the valid one (the commit writes data pages before
+// ActiveMeta selects the valid one (the commit writes data pages before
 // the meta, so the selected meta's pages are always readable). pageSize is the
 // file's immutable page size (safely taken from any prior meta snapshot).
-func ReadLatestMeta(file *os.File, pageSize uint32) (page.Meta, error) {
+func ReadLatestMeta(file *os.File, pageSize uint32) (Meta, error) {
 	meta0, meta1, err := readMetaPair(file, pageSize)
 	if err != nil {
-		return page.Meta{}, err
+		return Meta{}, err
 	}
-	active, ok := page.ActiveMeta(meta0, meta1)
+	active, ok := ActiveMeta(meta0, meta1)
 	if !ok {
-		return page.Meta{}, errBothMetasInvalid()
+		return Meta{}, errBothMetasInvalid()
 	}
 	return decodeActiveMeta(meta0, meta1, active)
 }
@@ -649,16 +649,16 @@ func ReadLatestMeta(file *os.File, pageSize uint32) (page.Meta, error) {
 // meta. Propagates non-EOF read errors (EIO, permission, etc.) verbatim
 // so the caller can distinguish a genuine I/O failure from a probe miss.
 func DiscoverPageSize(file *os.File) (uint32, error) {
-	meta0 := make([]byte, page.MetaPayloadSize)
+	meta0 := make([]byte, MetaPayloadSize)
 	if _, err := file.ReadAt(meta0, 0); err != nil {
 		return 0, fmt.Errorf("pager: read meta0: %w", err)
 	}
 	if isVersionMismatchMeta(meta0) {
 		return 0, fmt.Errorf("pager: %w: meta0 version %d, want %d",
-			ErrVersionMismatch, page.DecodeMeta(meta0).Version, page.FormatVersion)
+			ErrVersionMismatch, DecodeMeta(meta0).Version, page.FormatVersion)
 	}
 	if isGmdbMeta(meta0) {
-		ps := page.DecodeMeta(meta0).PageSize
+		ps := DecodeMeta(meta0).PageSize
 		if page.ValidPageSize(ps) {
 			return ps, nil
 		}
@@ -694,7 +694,7 @@ func DiscoverPageSize(file *os.File) (uint32, error) {
 // recoverable PageSize."
 func probeMetaPageSize(file *os.File) (uint32, []byte, error) {
 	for ps := page.MinPageSize; ps <= page.MaxPageSize; ps *= 2 {
-		buf := make([]byte, page.MetaPayloadSize)
+		buf := make([]byte, MetaPayloadSize)
 		if _, err := file.ReadAt(buf, int64(ps)); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				continue
@@ -704,7 +704,7 @@ func probeMetaPageSize(file *os.File) (uint32, []byte, error) {
 		if !isGmdbMeta(buf) {
 			continue
 		}
-		if page.DecodeMeta(buf).PageSize == ps {
+		if DecodeMeta(buf).PageSize == ps {
 			return ps, buf, nil
 		}
 	}
@@ -716,10 +716,10 @@ func probeMetaPageSize(file *os.File) (uint32, []byte, error) {
 // constants. Used by DiscoverPageSize and probeMetaPageSize as a
 // single point of trust for "this 144-byte slice is one of our metas."
 func isGmdbMeta(buf []byte) bool {
-	if !page.VerifyMeta(buf) {
+	if !VerifyMeta(buf) {
 		return false
 	}
-	m := page.DecodeMeta(buf)
+	m := DecodeMeta(buf)
 	return m.Magic == page.Magic && m.Version == page.FormatVersion
 }
 
@@ -734,10 +734,10 @@ func isGmdbMeta(buf []byte) bool {
 // different-version file from bitrot that merely corrupted the Version
 // field — the latter has no valid checksum and is ErrCorrupted.
 func isVersionMismatchMeta(buf []byte) bool {
-	if !page.VerifyMeta(buf) {
+	if !VerifyMeta(buf) {
 		return false
 	}
-	m := page.DecodeMeta(buf)
+	m := DecodeMeta(buf)
 	return m.Magic == page.Magic && m.Version != page.FormatVersion
 }
 
@@ -752,7 +752,7 @@ func isVersionMismatchMeta(buf []byte) bool {
 // state — keeping attachState atomic. bm is the reclaimed-segment oracle
 // (free-space.md §Allocation Bitmap: set bit = free → stop at a reclaimed
 // tail); fileSize bounds every segment page id to the file-resident extent.
-func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmap.Bitmap, fileSize int64) ([]RPLSegmentRef, error) {
+func rebuildRPLChain(p *Pager, m Meta, bm *bitmap.Bitmap, fileSize int64) ([]RPLSegmentRef, error) {
 	// Trustworthy ceiling for every segment page id: head, every followed
 	// OlderSegment, and the tail. pageRaw panics past the mmap reservation
 	// (MaxSize pages) and would SIGBUS in the [fileSize, reservation) gap,
@@ -780,7 +780,7 @@ func rebuildRPLChain(p *Pager, m page.Meta, bm *bitmap.Bitmap, fileSize int64) (
 		HighBound: backedPages,
 		IsFree:    func(id uint64) (bool, bool) { return bm.IsSet(id), true },
 	}
-	_, werr := walk.Walk(func(id uint64, seg page.RPLSegment) bool {
+	_, werr := walk.Walk(func(id uint64, seg RPLSegment) bool {
 		headFirst = append(headFirst, RPLSegmentRef{
 			PageID: id,
 			TxnID:  seg.TxnID,

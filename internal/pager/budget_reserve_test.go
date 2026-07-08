@@ -49,7 +49,7 @@ func TestRetireBudgetGuard(t *testing.T) {
 	defer f.Close()
 
 	cfg := page.Config{PageSize: testPageSize}
-	capPerSeg := page.RPLEntriesPerSegment(cfg)
+	capPerSeg := RPLEntriesPerSegment(cfg)
 	if capPerSeg <= 0 {
 		t.Fatalf("RPLEntriesPerSegment = %d", capPerSeg)
 	}

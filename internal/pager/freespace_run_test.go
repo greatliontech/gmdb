@@ -209,7 +209,7 @@ func TestAllocContiguousAfterRPLReclamation(t *testing.T) {
 	first := bm.FirstDataPage()
 	rplPage := first + 20
 	rplBuf := make([]byte, testPageSize)
-	page.EncodeRPLSegment(rplBuf, cfg, 100, 0, []uint64{first + 5, first + 6, first + 7})
+	EncodeRPLSegment(rplBuf, cfg, 100, 0, []uint64{first + 5, first + 6, first + 7})
 	if _, err := f.WriteAt(rplBuf, int64(rplPage)*testPageSize); err != nil {
 		t.Fatalf("write RPL seg: %v", err)
 	}

@@ -38,13 +38,13 @@ func TestOpenVersionMismatch(t *testing.T) {
 	// Forge meta-0 to a future format version, recomputing the checksum
 	// so it stays intact (verifies) — a valid gmdb meta this binary
 	// cannot read, distinct from corruption.
-	buf := make([]byte, page.MetaPayloadSize)
+	buf := make([]byte, MetaPayloadSize)
 	if _, err := f.ReadAt(buf, 0); err != nil {
 		t.Fatalf("read meta0: %v", err)
 	}
-	m := page.DecodeMeta(buf)
+	m := DecodeMeta(buf)
 	m.Version = page.FormatVersion + 1
-	page.EncodeMeta(buf, &m)
+	EncodeMeta(buf, &m)
 	if _, err := f.WriteAt(buf, 0); err != nil {
 		t.Fatalf("write forged meta0: %v", err)
 	}

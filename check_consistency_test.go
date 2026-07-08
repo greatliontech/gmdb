@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 	"os"
 	"testing"
 
@@ -139,11 +140,11 @@ func TestCheckDetectsOrderingAndCountCorruption(t *testing.T) {
 			// keyspace-tree root leaf via the meta, find the entry,
 			// and bump the descriptor's Count field (offset 8, after
 			// Root) at its exact file offset.
-			active, ok := page.ActiveMeta(data[:4096], data[4096:8192])
+			active, ok := pager.ActiveMeta(data[:4096], data[4096:8192])
 			if !ok {
 				t.Fatalf("no valid meta")
 			}
-			m := page.DecodeMeta(data[active*4096 : (active+1)*4096])
+			m := pager.DecodeMeta(data[active*4096 : (active+1)*4096])
 			cfg := page.Config{PageSize: 4096}
 			pageStart := int(m.KeyspaceRoot) * 4096
 			pageBuf := data[pageStart : pageStart+4096]
@@ -190,14 +191,14 @@ func TestCheckDetectsOrderingAndCountCorruption(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		active, ok := page.ActiveMeta(data[:4096], data[4096:8192])
+		active, ok := pager.ActiveMeta(data[:4096], data[4096:8192])
 		if !ok {
 			t.Fatalf("no valid meta")
 		}
-		m := page.DecodeMeta(data[active*4096 : (active+1)*4096])
+		m := pager.DecodeMeta(data[active*4096 : (active+1)*4096])
 		m.NumKeyspaces++
 		buf := make([]byte, 4096)
-		page.EncodeMeta(buf, &m)
+		pager.EncodeMeta(buf, &m)
 		copy(data[active*4096:], buf)
 		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatalf("write: %v", err)
@@ -246,11 +247,11 @@ func TestCheckDetectsDescriptorTreeDisorder(t *testing.T) {
 		// Locate keyspace "aaa"'s key bytes inside the descriptor
 		// tree's root leaf and flip the first byte high — an
 		// intra-leaf order violation in the keyspace tree itself.
-		active, ok := page.ActiveMeta(data[:4096], data[4096:8192])
+		active, ok := pager.ActiveMeta(data[:4096], data[4096:8192])
 		if !ok {
 			t.Fatalf("no valid meta")
 		}
-		m := page.DecodeMeta(data[active*4096 : (active+1)*4096])
+		m := pager.DecodeMeta(data[active*4096 : (active+1)*4096])
 		pageStart := int(m.KeyspaceRoot) * 4096
 		pageBuf := data[pageStart : pageStart+4096]
 		i := bytes.Index(pageBuf, []byte("aaa"))

@@ -254,7 +254,7 @@ func TestReclaimRPL(t *testing.T) {
 	cfg := page.Config{PageSize: testPageSize}
 	rplBuf := make([]byte, testPageSize)
 	pageIDs := []uint64{20, 21, 22, 23}
-	page.EncodeRPLSegment(rplBuf, cfg, 5, 0, pageIDs)
+	EncodeRPLSegment(rplBuf, cfg, 5, 0, pageIDs)
 	if _, err := f.WriteAt(rplBuf, 10*testPageSize); err != nil {
 		t.Fatalf("write RPL seg: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestReclaimRPLRespectsBound(t *testing.T) {
 
 	cfg := page.Config{PageSize: testPageSize}
 	rplBuf := make([]byte, testPageSize)
-	page.EncodeRPLSegment(rplBuf, cfg, 100, 0, []uint64{20})
+	EncodeRPLSegment(rplBuf, cfg, 100, 0, []uint64{20})
 	if _, err := f.WriteAt(rplBuf, 10*testPageSize); err != nil {
 		t.Fatalf("write RPL seg: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestRPLChainOrientationMultiSegment(t *testing.T) {
 	}
 	for _, seg := range segments {
 		buf := make([]byte, testPageSize)
-		page.EncodeRPLSegment(buf, cfg, seg.txnID, 0, []uint64{seg.payload})
+		EncodeRPLSegment(buf, cfg, seg.txnID, 0, []uint64{seg.payload})
 		if _, err := f.WriteAt(buf, int64(seg.pageID)*int64(testPageSize)); err != nil {
 			t.Fatalf("write seg page %d: %v", seg.pageID, err)
 		}
@@ -596,7 +596,7 @@ func TestReclaimRPLQuarantinesCorruptSegment(t *testing.T) {
 		t.Fatalf("write corrupt seg: %v", err)
 	}
 	good := make([]byte, testPageSize)
-	page.EncodeRPLSegment(good, cfg, validTxnID, 0, []uint64{validPayload})
+	EncodeRPLSegment(good, cfg, validTxnID, 0, []uint64{validPayload})
 	if _, err := f.WriteAt(good, int64(validPageID)*int64(testPageSize)); err != nil {
 		t.Fatalf("write valid seg: %v", err)
 	}
@@ -670,16 +670,16 @@ func TestReclaimRPLQuarantinesChecksumMismatch(t *testing.T) {
 		goodPayload  = 22
 	)
 	bad := make([]byte, testPageSize)
-	page.EncodeRPLSegment(bad, cfg, 100, 0, []uint64{truePayload})
+	EncodeRPLSegment(bad, cfg, 100, 0, []uint64{truePayload})
 	page.WritePageFooter(bad, testPageSize)
 	// Flip the low byte of entry 0: 21 -> 20. Decode stays valid;
 	// only the footer knows.
-	bad[page.RPLHeaderSize] = wrongPayload
+	bad[RPLHeaderSize] = wrongPayload
 	if _, err := f.WriteAt(bad, int64(badPageID)*int64(testPageSize)); err != nil {
 		t.Fatalf("write bad seg: %v", err)
 	}
 	good := make([]byte, testPageSize)
-	page.EncodeRPLSegment(good, cfg, 200, 0, []uint64{goodPayload})
+	EncodeRPLSegment(good, cfg, 200, 0, []uint64{goodPayload})
 	page.WritePageFooter(good, testPageSize)
 	if _, err := f.WriteAt(good, int64(goodPageID)*int64(testPageSize)); err != nil {
 		t.Fatalf("write good seg: %v", err)
@@ -740,7 +740,7 @@ func TestReclaimRPLQuarantinesOutOfRangeEntry(t *testing.T) {
 			defer f.Close()
 			const segPageID = 10
 			seg := make([]byte, testPageSize)
-			page.EncodeRPLSegment(seg, cfg, 100, 0, tc.ids)
+			EncodeRPLSegment(seg, cfg, 100, 0, tc.ids)
 			if _, err := f.WriteAt(seg, int64(segPageID)*int64(testPageSize)); err != nil {
 				t.Fatalf("write seg: %v", err)
 			}

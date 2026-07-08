@@ -7,7 +7,6 @@ import (
 	"math"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // indexRegistryEntry is the in-memory form of one row in a keyspace's
@@ -251,7 +250,7 @@ func decodeRegistryEntry(data []byte) (*indexRegistryEntry, error) {
 // keyspace's descriptor, AND transition the owning handle's
 // flush-state so the flushKeyspaces walk persists the
 // mutation at Commit. registryPut / registryDelete take this
-// interface (not a raw *page.KeyspaceDescriptor) so that calling
+// interface (not a raw *keyspaceDescriptor) so that calling
 // the helper without also marking the parent dirty is structurally
 // impossible — closes the silent-data-loss path that
 // adversarial review surfaced.
@@ -261,7 +260,7 @@ func decodeRegistryEntry(data []byte) (*indexRegistryEntry, error) {
 // Created) so the descriptor still flushes via the Created arm of
 // flushKeyspaces.
 type descriptorOwner interface {
-	descriptor() *page.KeyspaceDescriptor
+	descriptor() *keyspaceDescriptor
 	markDirty()
 }
 

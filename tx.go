@@ -13,7 +13,6 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/lock"
-	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
@@ -37,7 +36,7 @@ type Tx struct {
 	// re-reading db.pgr.
 	pgr *pager.Pager
 
-	prevMeta   page.Meta
+	prevMeta   pager.Meta
 	prevActive int
 	newTxnID   uint64
 	writable   bool
@@ -106,7 +105,7 @@ type Tx struct {
 	// entry); DeleteKeyspace supersedes an entry into pendingDeletes.
 	// Invariant: a name is in at most one of {openKeyspaces,
 	// openSetKeyspaces, dirtyDescriptors, pendingDeletes}.
-	dirtyDescriptors map[string]page.KeyspaceDescriptor
+	dirtyDescriptors map[string]keyspaceDescriptor
 
 	// pendingDeletes is the set of keyspace names deleted in this tx
 	// whose descriptor existed on disk pre-tx. DeleteKeyspace removes
@@ -358,7 +357,7 @@ func (tx *Tx) Commit() error {
 	// the retired checkpoint flag used to approximate — is composed by
 	// the pager from the policy (durability.md §Checkpoints and the
 	// durable sub-record).
-	flags := tx.prevMeta.Flags & page.MetaFlagPageChecksum
+	flags := tx.prevMeta.Flags & pager.MetaFlagPageChecksum
 	syncPolicy := pager.SyncBoth
 	switch tx.db.opts.SyncMode {
 	case SyncDurable:
@@ -551,7 +550,7 @@ func (tx *Tx) flushKeyspaces() error {
 	// Step 2a: Kind=0 open keyspaces with Created or Dirty state.
 	if tx.hasDirtyOpenKeyspaces() {
 		names := dirtyOpenNamesSorted(tx.openKeyspaces)
-		buf := make([]byte, page.KeyspaceDescriptorSize)
+		buf := make([]byte, keyspaceDescriptorSize)
 		for _, name := range names {
 			ks := tx.openKeyspaces[unique.Make(name)]
 			// Sync the in-memory pinnedIndex root/count back
@@ -568,7 +567,7 @@ func (tx *Tx) flushKeyspaces() error {
 					return fmt.Errorf("flushKeyspaces: index registry sync %q: %w", name, err)
 				}
 			}
-			page.EncodeKeyspaceDescriptor(buf, ks.desc)
+			encodeKeyspaceDescriptor(buf, ks.desc)
 			newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
 			if err != nil {
 				return fmt.Errorf("flushKeyspaces: btree.Put %q: %w", name, mapBtreeErr(err))
@@ -580,14 +579,14 @@ func (tx *Tx) flushKeyspaces() error {
 
 	// Step 2b: Kind=1 open set-keyspaces with Created or Dirty state.
 	// Symmetric to 2a — the descriptor encoding is kind-agnostic
-	// (EncodeKeyspaceDescriptor writes the full struct including
+	// (encodeKeyspaceDescriptor writes the full struct including
 	// Kind + FixedValueSize), so the only difference is the source
 	// map and the *SetKeyspace handle type. Sync the
 	// SetKeyspace pinnedIndex root/count back to the registry
 	// sub-tree BEFORE encoding the descriptor, mirroring Step 2a.
 	if tx.hasDirtyOpenSetKeyspaces() {
 		names := dirtySetOpenNamesSorted(tx.openSetKeyspaces)
-		buf := make([]byte, page.KeyspaceDescriptorSize)
+		buf := make([]byte, keyspaceDescriptorSize)
 		for _, name := range names {
 			sks := tx.openSetKeyspaces[unique.Make(name)]
 			if !sks.readOnly {
@@ -595,7 +594,7 @@ func (tx *Tx) flushKeyspaces() error {
 					return fmt.Errorf("flushKeyspaces: index registry sync %q (SetKeyspace): %w", name, err)
 				}
 			}
-			page.EncodeKeyspaceDescriptor(buf, sks.desc)
+			encodeKeyspaceDescriptor(buf, sks.desc)
 			newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
 			if err != nil {
 				return fmt.Errorf("flushKeyspaces: btree.Put %q (SetKeyspace): %w", name, mapBtreeErr(err))
@@ -612,10 +611,10 @@ func (tx *Tx) flushKeyspaces() error {
 			names = append(names, name)
 		}
 		sort.Strings(names)
-		buf := make([]byte, page.KeyspaceDescriptorSize)
+		buf := make([]byte, keyspaceDescriptorSize)
 		for _, name := range names {
 			desc := tx.dirtyDescriptors[name]
-			page.EncodeKeyspaceDescriptor(buf, desc)
+			encodeKeyspaceDescriptor(buf, desc)
 			newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
 			if err != nil {
 				return fmt.Errorf("flushKeyspaces: btree.Put (dirty descriptor) %q: %w", name, mapBtreeErr(err))
@@ -732,7 +731,7 @@ func (tx *Tx) recalcFlushReserve() {
 	pages += len(tx.dirtyDescriptors) * tx.ksPathLen
 	if pages > 0 {
 		cfg := tx.pgr.Config()
-		if capPerSeg := page.RPLEntriesPerSegment(cfg); capPerSeg > 0 {
+		if capPerSeg := pager.RPLEntriesPerSegment(cfg); capPerSeg > 0 {
 			pages += (pages + capPerSeg - 1) / capPerSeg
 		}
 	}

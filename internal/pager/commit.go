@@ -65,7 +65,7 @@ type MetaFileFormat struct {
 
 // CommitResult bundles the post-commit meta state for the caller.
 type CommitResult struct {
-	Meta          page.Meta
+	Meta          Meta
 	ActiveMetaIdx int
 }
 
@@ -88,7 +88,7 @@ type CommitResult struct {
 // Callers must call BeginTx before each commit attempt so the snapshot
 // exists. Without a snapshot, AbortTx is a no-op on the bitmap and
 // in-memory divergence may persist until the next Open.
-func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitResult, error) {
+func (p *Pager) Commit(cp CommitParams, prev Meta, prevActive int) (CommitResult, error) {
 	if p.readOnly {
 		return CommitResult{}, ErrReadOnly
 	}
@@ -150,7 +150,7 @@ func (p *Pager) Commit(cp CommitParams, prev page.Meta, prevActive int) (CommitR
 	// bitmap state; steps 1–2 changed none of them.
 	newMeta := p.buildNewMeta(cp, prev)
 	metaBuf := make([]byte, p.cfg.PageSize)
-	page.EncodeMeta(metaBuf, &newMeta)
+	EncodeMeta(metaBuf, &newMeta)
 
 	// Step 3 — pwrite the new meta to its slot. From this point on a
 	// crash leaves the new meta visible on Open; we are past the
@@ -298,7 +298,7 @@ func (p *Pager) commitStep0() error {
 // `OlderSegment` links that never point to a page reclaimed in
 // phase 1.
 func (p *Pager) appendRPL() error {
-	capPerSeg := page.RPLEntriesPerSegment(p.cfg)
+	capPerSeg := RPLEntriesPerSegment(p.cfg)
 	if capPerSeg <= 0 {
 		return fmt.Errorf("pager: RPL segment capacity is %d", capPerSeg)
 	}
@@ -350,7 +350,7 @@ func (p *Pager) appendRPL() error {
 		if older == segPageID {
 			return fmt.Errorf("pager: RPL segment self-reference at page %d: %w", segPageID, ErrCorrupted)
 		}
-		page.EncodeRPLSegment(buf, p.cfg, p.currentTxnID, older, segIDs)
+		EncodeRPLSegment(buf, p.cfg, p.currentTxnID, older, segIDs)
 		newSegs[i] = RPLSegmentRef{
 			PageID: segPageID,
 			TxnID:  p.currentTxnID,
@@ -404,7 +404,7 @@ func (p *Pager) commitStep1() (int, error) {
 // previous meta's persistent file-format fields + the pager's freshly-
 // updated state. Called after step 2 so the persisted anchored epoch
 // reflects only completed fsyncs (durability.md §Anchoring).
-func (p *Pager) buildNewMeta(cp CommitParams, prev page.Meta) page.Meta {
+func (p *Pager) buildNewMeta(cp CommitParams, prev Meta) Meta {
 	headID := p.headPageID()
 	var tailID, headTxnID uint64
 	if n := len(p.rplSegments); n > 0 {
@@ -424,7 +424,7 @@ func (p *Pager) buildNewMeta(cp CommitParams, prev page.Meta) page.Meta {
 		growStep = cp.SetFileFormat.GrowStep
 		shrinkThreshold = cp.SetFileFormat.ShrinkThreshold
 	}
-	m := page.Meta{
+	m := Meta{
 		Magic:           page.Magic,
 		Version:         page.FormatVersion,
 		PageSize:        p.cfg.PageSize,

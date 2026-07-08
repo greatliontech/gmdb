@@ -1,12 +1,16 @@
-package page
+package pager
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/thegrumpylion/gmdb/internal/page"
+)
 
 // Retired Page Log segment-page layout, per free-space.md §Retired Page Log.
 //
 // Layout:
 //
-//	  0..7:   Common 8-byte page header (Type = TypeRPLSegment, Count = N entries)
+//	  0..7:   Common 8-byte page header (Type = page.TypeRPLSegment, Count = N entries)
 //	  8..15:  TxnID         uint64  — transaction that retired these pages
 //	 16..23:  OlderSegment  uint64  — page ID of the next older segment (0 only
 //	          on a never-reclaimed original tail; the authoritative tail is
@@ -32,11 +36,11 @@ const (
 //
 // Panics if cfg is invalid (per the package's "Config must be Validated
 // at boundaries" rule).
-func RPLEntriesPerSegment(cfg Config) int {
-	cfg.mustValidate()
+func RPLEntriesPerSegment(cfg page.Config) int {
+	cfg.MustValidate()
 	usable := int(cfg.PageSize) - RPLHeaderSize
 	if cfg.PageChecksum {
-		usable -= FooterSize
+		usable -= page.FooterSize
 	}
 	return usable / 8
 }
@@ -63,13 +67,13 @@ func (s RPLSegment) EntryCount() int { return len(s.PageIDs) }
 // segment pages via a raw (non-verifying) accessor must verify the
 // footer itself (VerifyPageFooter, when PageChecksum is enabled)
 // before trusting the decoded view, per checksums.md §Verification.
-func DecodeRPLSegment(buf []byte, cfg Config) (RPLSegment, bool) {
-	cfg.mustValidate()
+func DecodeRPLSegment(buf []byte, cfg page.Config) (RPLSegment, bool) {
+	cfg.MustValidate()
 	if len(buf) < int(cfg.PageSize) {
 		return RPLSegment{}, false
 	}
-	typ, _, count, _ := ReadHeader(buf)
-	if typ != TypeRPLSegment {
+	typ, _, count, _ := page.ReadHeader(buf)
+	if typ != page.TypeRPLSegment {
 		return RPLSegment{}, false
 	}
 	if int(count) > RPLEntriesPerSegment(cfg) {
@@ -85,7 +89,7 @@ func DecodeRPLSegment(buf []byte, cfg Config) (RPLSegment, bool) {
 }
 
 // EncodeRPLSegment writes an RPL segment into buf. The caller is
-// responsible for writing the xxhash64 footer (via WritePageFooter) when
+// responsible for writing the xxhash64 footer (via page.WritePageFooter) when
 // PageChecksum is enabled, after EncodeRPLSegment returns. Padding and
 // the unused entry tail (between the last entry and ContentEnd) are
 // zeroed.
@@ -94,8 +98,8 @@ func DecodeRPLSegment(buf []byte, cfg Config) (RPLSegment, bool) {
 // len(pageIDs) > RPLEntriesPerSegment(cfg). All three are programming
 // errors — wrong-size buf in particular would land mid-write without
 // the upfront bounds check.
-func EncodeRPLSegment(buf []byte, cfg Config, txnID, olderSegment uint64, pageIDs []uint64) {
-	cfg.mustValidate()
+func EncodeRPLSegment(buf []byte, cfg page.Config, txnID, olderSegment uint64, pageIDs []uint64) {
+	cfg.MustValidate()
 	if len(buf) < int(cfg.PageSize) {
 		panic(fmt.Sprintf("page: EncodeRPLSegment buf len %d < PageSize %d", len(buf), cfg.PageSize))
 	}
@@ -103,7 +107,7 @@ func EncodeRPLSegment(buf []byte, cfg Config, txnID, olderSegment uint64, pageID
 		panic(fmt.Sprintf("page: RPL segment overflow: %d entries > capacity %d", len(pageIDs), max))
 	}
 	count := uint16(len(pageIDs))
-	WriteHeader(buf, TypeRPLSegment, count, 0)
+	page.WriteHeader(buf, page.TypeRPLSegment, count, 0)
 	le.PutUint64(buf[rplOffTxnID:], txnID)
 	le.PutUint64(buf[rplOffOlderSegment:], olderSegment)
 	for i, id := range pageIDs {

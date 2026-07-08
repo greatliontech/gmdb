@@ -3,9 +3,8 @@ package gmdb
 import (
 	"context"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 	"sync/atomic"
-
-	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // checkpointStepHookForTest injects a failure after Checkpoint's
@@ -152,7 +151,7 @@ func (db *DB) checkpointUnderGrant() error {
 		meta.Durable = meta.LiveSubRecord()
 		meta.Durable.AnchoredTxnID = pgr.AnchoredEpoch()
 		buf := make([]byte, pageSize)
-		page.EncodeMeta(buf, &meta)
+		pager.EncodeMeta(buf, &meta)
 		off := int64(activeIdx) * int64(pageSize)
 		if _, err := file.WriteAt(buf, off); err != nil {
 			return failStep(3, err)

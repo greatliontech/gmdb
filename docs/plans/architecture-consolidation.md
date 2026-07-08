@@ -103,6 +103,6 @@ gate) and the final close-out are fixed anchors per chunk.
   and `SetCursor`'s outer half; collapse the `txCounters` →
   `TxStatsSnapshot` field-copy boilerplate
   (`internal/pager/txstats.go:92`).
-- [ ] 18. page: split node formats (leaf/branch/subpage/overflow)
+- [x] 18. page: split node formats (leaf/branch/subpage/overflow)
   from pager-domain formats (`meta.go`, `rpl.go`,
   `keyspace_descriptor.go`) over a shared wire/header base.

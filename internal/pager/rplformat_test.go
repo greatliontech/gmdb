@@ -1,20 +1,21 @@
-package page
+package pager
 
 import (
+	"github.com/thegrumpylion/gmdb/internal/page"
 	"reflect"
 	"testing"
 )
 
 func TestRPLEntriesPerSegment(t *testing.T) {
 	cases := []struct {
-		cfg  Config
+		cfg  page.Config
 		want int
 	}{
-		{Config{PageSize: 4096, PageChecksum: false}, 509},
-		{Config{PageSize: 4096, PageChecksum: true}, 508},
-		{Config{PageSize: 8192, PageChecksum: false}, 1021},
-		{Config{PageSize: 8192, PageChecksum: true}, 1020},
-		{Config{PageSize: 65536, PageChecksum: true}, 8188},
+		{page.Config{PageSize: 4096, PageChecksum: false}, 509},
+		{page.Config{PageSize: 4096, PageChecksum: true}, 508},
+		{page.Config{PageSize: 8192, PageChecksum: false}, 1021},
+		{page.Config{PageSize: 8192, PageChecksum: true}, 1020},
+		{page.Config{PageSize: 65536, PageChecksum: true}, 8188},
 	}
 	for _, c := range cases {
 		if got := RPLEntriesPerSegment(c.cfg); got != c.want {
@@ -24,20 +25,20 @@ func TestRPLEntriesPerSegment(t *testing.T) {
 }
 
 func TestRPLSegmentRoundTrip(t *testing.T) {
-	cfg := Config{PageSize: 4096, PageChecksum: true}
+	cfg := page.Config{PageSize: 4096, PageChecksum: true}
 	buf := make([]byte, cfg.PageSize)
 
 	ids := []uint64{3, 5, 7, 11, 13, 17, 19, 23}
 	EncodeRPLSegment(buf, cfg, 42, 100, ids)
-	WritePageFooter(buf, cfg.PageSize)
-	if !VerifyPageFooter(buf, cfg.PageSize) {
+	page.WritePageFooter(buf, cfg.PageSize)
+	if !page.VerifyPageFooter(buf, cfg.PageSize) {
 		t.Fatal("footer verify failed")
 	}
 
 	// Page header should report Count and Type.
-	typ, _, count, _ := ReadHeader(buf)
-	if typ != TypeRPLSegment {
-		t.Errorf("Type = %d, want %d", typ, TypeRPLSegment)
+	typ, _, count, _ := page.ReadHeader(buf)
+	if typ != page.TypeRPLSegment {
+		t.Errorf("Type = %d, want %d", typ, page.TypeRPLSegment)
 	}
 	if count != uint16(len(ids)) {
 		t.Errorf("Count = %d, want %d", count, len(ids))
@@ -54,11 +55,11 @@ func TestRPLSegmentRoundTrip(t *testing.T) {
 }
 
 func TestRPLSegmentEmpty(t *testing.T) {
-	cfg := Config{PageSize: 4096, PageChecksum: true}
+	cfg := page.Config{PageSize: 4096, PageChecksum: true}
 	buf := make([]byte, cfg.PageSize)
 	EncodeRPLSegment(buf, cfg, 1, 0, nil)
-	WritePageFooter(buf, cfg.PageSize)
-	if !VerifyPageFooter(buf, cfg.PageSize) {
+	page.WritePageFooter(buf, cfg.PageSize)
+	if !page.VerifyPageFooter(buf, cfg.PageSize) {
 		t.Fatal("footer verify failed for empty segment")
 	}
 	got, ok := DecodeRPLSegment(buf, cfg)
@@ -71,29 +72,30 @@ func TestRPLSegmentEmpty(t *testing.T) {
 }
 
 func TestRPLSegmentDecodeRejectsWrongType(t *testing.T) {
-	cfg := Config{PageSize: 4096, PageChecksum: true}
+	cfg := page.Config{PageSize: 4096, PageChecksum: true}
 	buf := make([]byte, cfg.PageSize)
 	EncodeRPLSegment(buf, cfg, 1, 0, []uint64{42})
 	// Corrupt the Type byte: pretend it's a leaf page.
-	buf[0] = TypeLeaf
+	buf[0] = page.TypeLeaf
 	if _, ok := DecodeRPLSegment(buf, cfg); ok {
 		t.Fatal("Decode accepted wrong page type")
 	}
 }
 
 func TestRPLSegmentDecodeRejectsOversizedCount(t *testing.T) {
-	cfg := Config{PageSize: 4096, PageChecksum: false}
+	cfg := page.Config{PageSize: 4096, PageChecksum: false}
 	buf := make([]byte, cfg.PageSize)
 	EncodeRPLSegment(buf, cfg, 1, 0, []uint64{42})
-	// Tamper the page-header Count to claim more entries than fit.
-	le.PutUint16(buf[offCount:], uint16(RPLEntriesPerSegment(cfg)+1))
+	// Tamper the page-header Count to claim more entries than fit
+	// (re-write the header with the forged count; type/flags kept).
+	page.WriteHeader(buf, page.TypeRPLSegment, uint16(RPLEntriesPerSegment(cfg)+1), 0)
 	if _, ok := DecodeRPLSegment(buf, cfg); ok {
 		t.Fatal("Decode accepted out-of-range count")
 	}
 }
 
 func TestRPLSegmentDecodeRejectsShortBuf(t *testing.T) {
-	cfg := Config{PageSize: 4096}
+	cfg := page.Config{PageSize: 4096}
 	short := make([]byte, 1024)
 	if _, ok := DecodeRPLSegment(short, cfg); ok {
 		t.Fatal("Decode accepted short buffer")
@@ -101,7 +103,7 @@ func TestRPLSegmentDecodeRejectsShortBuf(t *testing.T) {
 }
 
 func TestEncodeRPLSegmentPanicsOnShortBuf(t *testing.T) {
-	cfg := Config{PageSize: 4096}
+	cfg := page.Config{PageSize: 4096}
 	short := make([]byte, 1024)
 	defer func() {
 		if r := recover(); r == nil {
@@ -112,7 +114,7 @@ func TestEncodeRPLSegmentPanicsOnShortBuf(t *testing.T) {
 }
 
 func TestRPLSegmentTailZeroed(t *testing.T) {
-	cfg := Config{PageSize: 4096, PageChecksum: false}
+	cfg := page.Config{PageSize: 4096, PageChecksum: false}
 	buf := make([]byte, cfg.PageSize)
 	// Pre-fill with garbage so we can verify EncodeRPLSegment zeroes the tail.
 	for i := range buf {
@@ -128,7 +130,7 @@ func TestRPLSegmentTailZeroed(t *testing.T) {
 }
 
 func TestRPLSegmentOverflowPanics(t *testing.T) {
-	cfg := Config{PageSize: 4096, PageChecksum: true}
+	cfg := page.Config{PageSize: 4096, PageChecksum: true}
 	buf := make([]byte, cfg.PageSize)
 	tooMany := make([]uint64, RPLEntriesPerSegment(cfg)+1)
 	defer func() {

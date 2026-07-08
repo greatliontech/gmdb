@@ -161,7 +161,7 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue] {
 		meta := rtx.meta
 		c := &checker{
 			pgr:   rtx.pgr,
-			cfg:   page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)},
+			cfg:   page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(pager.MetaFlagPageChecksum)},
 			meta:  meta,
 			yield: yield,
 			opts:  opts,
@@ -215,7 +215,7 @@ func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 		meta := tx.prevMeta
 		c := &checker{
 			pgr:    tx.pgr,
-			cfg:    page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(page.MetaFlagPageChecksum)},
+			cfg:    page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(pager.MetaFlagPageChecksum)},
 			meta:   meta,
 			yield:  yield,
 			opts:   opts,
@@ -275,7 +275,7 @@ var errCheckStop = errors.New("check: iteration stopped by caller")
 type checker struct {
 	pgr   *pager.Pager
 	cfg   page.Config
-	meta  page.Meta
+	meta  pager.Meta
 	yield func(CheckIssue) bool
 	opts  *CheckOptions
 
@@ -304,7 +304,7 @@ type checker struct {
 // data-tree root of each registered index — gathered during the
 // structural walk so the index pass needs no second descriptor read.
 type ksInventory struct {
-	kind           uint8  // page.KeyspaceKind* — selects the index codec
+	kind           uint8  // keyspaceKind* — selects the index codec
 	fixedValueSize uint16 // SetKeyspace subpage member width (0 ⇒ variable)
 	dataRoot       uint64
 	indexRoots     map[string]uint64 // index name → index data-tree root
@@ -360,7 +360,7 @@ func (c *checker) run() {
 		c.inv = make(map[string]*ksInventory)
 	}
 
-	if err := page.ValidateMeta(c.meta); err != nil {
+	if err := pager.ValidateMeta(c.meta); err != nil {
 		if !c.emit(CheckIssue{Severity: CheckError, Code: "MetaInvalid",
 			Message: fmt.Sprintf("active meta invalid: %v", err)}) {
 			return
@@ -413,15 +413,15 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 	err := btree.WalkKV(rawPageReader{c.pgr}, c.cfg, c.meta.KeyspaceRoot, hwm, func(k, v []byte) error {
 		name := string(k)
 		keyspaceCount++
-		if len(v) != page.KeyspaceDescriptorSize {
-			if !c.emit(CheckIssue{Severity: CheckError, Code: "KeyspaceDescriptorSize", Keyspace: name,
-				Message: fmt.Sprintf("descriptor value length %d != %d", len(v), page.KeyspaceDescriptorSize)}) {
+		if len(v) != keyspaceDescriptorSize {
+			if !c.emit(CheckIssue{Severity: CheckError, Code: "keyspaceDescriptorSize", Keyspace: name,
+				Message: fmt.Sprintf("descriptor value length %d != %d", len(v), keyspaceDescriptorSize)}) {
 				return errCheckStop
 			}
 			return nil
 		}
-		desc := page.DecodeKeyspaceDescriptor(v)
-		if verr := page.ValidateKeyspaceDescriptor(v, desc); verr != nil {
+		desc := decodeKeyspaceDescriptor(v)
+		if verr := validateKeyspaceDescriptor(v, desc); verr != nil {
 			if !c.emit(CheckIssue{Severity: CheckError, Code: "KeyspaceDescriptorInvalid", Keyspace: name,
 				Message: verr.Error()}) {
 				return errCheckStop
@@ -443,7 +443,7 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 			return errCheckStop
 		} else if !structural {
 			want, unit := entries, "entries"
-			if desc.Kind == page.KeyspaceKindSetKeyspace {
+			if desc.Kind == keyspaceKindSetKeyspace {
 				want, unit = values, "values"
 			}
 			if desc.Count != want {
@@ -459,7 +459,7 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 		// api-surface.md §Check's "verifies … set keyspace subpage …
 		// integrity" claim (nested-tree integrity IS covered by the
 		// reachability walk, which recurses nested subtrees).
-		if desc.Kind == page.KeyspaceKindSetKeyspace {
+		if desc.Kind == keyspaceKindSetKeyspace {
 			if !c.checkSetKeyspaceSubpages(name, desc.Root, desc.FixedValueSize, hwm) {
 				return errCheckStop
 			}
@@ -558,7 +558,7 @@ func (c *checker) checkSetKeyspaceSubpages(ks string, dataRoot uint64, fvs uint1
 // walkRegistry walks a keyspace's index registry sub-tree (registry
 // pages) and, for each registry entry, the index's data tree. Uses the
 // guarded WalkKV for the same reason as walkKeyspaces.
-func (c *checker) walkRegistry(ks string, desc page.KeyspaceDescriptor, firstData, hwm uint64) bool {
+func (c *checker) walkRegistry(ks string, desc keyspaceDescriptor, firstData, hwm uint64) bool {
 	if !c.walkTree(ks, "", desc.IndexRegistryRoot, firstData, hwm) {
 		return false
 	}
@@ -701,7 +701,7 @@ func (c *checker) walkRPL(firstData, hwm uint64) (bitset, bool) {
 			return bm.IsSet(id), true
 		},
 	}
-	stop, werr := walk.Walk(func(id uint64, seg page.RPLSegment) bool {
+	stop, werr := walk.Walk(func(id uint64, seg pager.RPLSegment) bool {
 		pending.setIfInRange(id)
 		for _, pid := range seg.PageIDs {
 			pending.setIfInRange(pid)
@@ -890,9 +890,9 @@ func (c *checker) verifyIndexEquivalence(ks string, info *ksInventory, decl *Ind
 		structErr  error
 	)
 	switch info.kind {
-	case page.KeyspaceKindKeyspace:
+	case keyspaceKindKeyspace:
 		expected, extractErr, structErr = c.expectedKeyspaceIndex(decl, info.dataRoot, hwm, hasCovering)
-	case page.KeyspaceKindSetKeyspace:
+	case keyspaceKindSetKeyspace:
 		expected, extractErr, structErr = c.expectedSetKeyspaceIndex(decl, info.dataRoot, info.fixedValueSize, hwm, hasCovering)
 	default:
 		return c.emit(CheckIssue{Severity: CheckWarning, Code: "CheckIndexes.KeyspaceKindUnsupported", Keyspace: ks, Index: decl.Name,
