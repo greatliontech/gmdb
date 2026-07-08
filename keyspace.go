@@ -990,7 +990,7 @@ func (ks *Keyspace) deleteRangeIndexed(start, end []byte) (uint64, error) {
 // cursor doesn't receive markStale from sibling mutations — fine
 // when the cursor itself is the only mutator during its lifetime.
 func newInternalCursor(ks *Keyspace) *Cursor {
-	return &Cursor{inner: ks.newRootCursor(), tx: ks.tx, ks: ks}
+	return &Cursor{cursorGuard: cursorGuard{tx: ks.tx}, inner: ks.newRootCursor(), ks: ks}
 }
 
 // Cursor returns a new cursor for iterating over this keyspace's
@@ -1010,7 +1010,7 @@ func newInternalCursor(ks *Keyspace) *Cursor {
 // ErrCursorStale. The caller re-positions via First / Last / Seek /
 // SeekGE and continues.
 func (ks *Keyspace) Cursor() *Cursor {
-	c := &Cursor{inner: ks.newRootCursor(), tx: ks.tx, ks: ks}
+	c := &Cursor{cursorGuard: cursorGuard{tx: ks.tx}, inner: ks.newRootCursor(), ks: ks}
 	// Only register cursors on live handles. A dead keyspace's cursors
 	// are rejected by requireOpen anyway (ErrKeyspaceClosed); appending
 	// them would let a pathological caller (`for { ks.Cursor() }` after
@@ -1231,36 +1231,51 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 // against reads of pool-recycled slab buffers or post-Close munmap'd
 // mmap pages.
 type Cursor struct {
-	inner    *btree.Cursor
+	cursorGuard
+	inner *btree.Cursor
+	ks    *Keyspace
+}
+
+// cursorGuard is the tx-guarded cursor core shared by Cursor and
+// SetCursor: the sticky closeErr plus the open/dead/read-only gate.
+// The keyspace-handle state (dead, readOnly) is passed at CALL time —
+// the two cursor types carry different handle types with the same
+// pair of lifecycle fields.
+type cursorGuard struct {
 	tx       *Tx
-	ks       *Keyspace
 	closeErr error
 }
 
-func (c *Cursor) requireOpen(needsWrite bool) bool {
-	if c.closeErr != nil {
+// require gates a cursor operation: sticky closeErr, transaction
+// state, dead-keyspace, and (for writes) read-only checks.
+// ErrChildActive is transient — the parent-freeze lifts when the
+// active child resolves (transactions.md §Nested Transactions) — so
+// it never sticks in closeErr, or a parent cursor merely touched
+// during the freeze would stay dead afterward. Terminal errors
+// (ErrTxClosed / ErrReadOnly / ErrClosed) stick.
+func (g *cursorGuard) require(needsWrite, ksDead, ksReadOnly bool) bool {
+	if g.closeErr != nil {
 		return false
 	}
-	if err := c.tx.requireOpen(needsWrite); err != nil {
-		// ErrChildActive is transient — the parent-freeze lifts when the
-		// active child resolves (transactions.md §Nested Transactions).
-		// Do NOT stick it in closeErr, or a parent cursor merely touched
-		// during the freeze would stay dead afterward. Terminal errors
-		// (ErrTxClosed / ErrReadOnly / ErrClosed) still stick.
+	if err := g.tx.requireOpen(needsWrite); err != nil {
 		if !errors.Is(err, ErrChildActive) {
-			c.closeErr = err
+			g.closeErr = err
 		}
 		return false
 	}
-	if c.ks.dead {
-		c.closeErr = ErrKeyspaceClosed
+	if ksDead {
+		g.closeErr = ErrKeyspaceClosed
 		return false
 	}
-	if needsWrite && c.ks.readOnly {
-		c.closeErr = ErrReadOnly
+	if needsWrite && ksReadOnly {
+		g.closeErr = ErrReadOnly
 		return false
 	}
 	return true
+}
+
+func (c *Cursor) requireOpen(needsWrite bool) bool {
+	return c.require(needsWrite, c.ks.dead, c.ks.readOnly)
 }
 
 // First positions the cursor at the leftmost entry. Returns

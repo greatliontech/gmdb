@@ -1,35 +1,20 @@
 package pager
 
-// txCounters holds the per-write-transaction activity counters that back
-// the root package's TxStats (api-surface.md §Statistics). Reset at each
-// BeginTx; read live via TxStatsSnapshot. Single-threaded with the
+// TxStatsSnapshot is the per-write-transaction activity counter set,
+// consumed by the root package to build gmdb.TxStats (api-surface.md
+// §Statistics) and used directly as the pager's live counter storage
+// (p.tc) — one struct, no field-copy translation layer. Reset at each
+// BeginTx; read via TxStatsSnapshot(). Single-threaded with the
 // writer (one write tx at a time, owned by one goroutine), so plain
 // non-atomic fields suffice.
 //
-// The pager owns the storage-level counters directly (cow / loose /
-// reclaimed / written / slabPeak). The structural and logical counters
-// (splits / merges from the btree, gets / puts / deletes from the
-// keyspace layer, index entry/probe counts from index maintenance) are
-// driven through the exported Record* / Add* methods by those layers,
-// which all reach the same per-tx *Pager.
-type txCounters struct {
-	cow         uint64
-	loose       uint64
-	reclaimed   uint64
-	written     uint64
-	splits      uint64
-	merges      uint64
-	gets        uint64
-	puts        uint64
-	deletes     uint64
-	idxInserted uint64
-	idxDeleted  uint64
-	idxProbes   uint64
-	slabPeak    int
-}
-
-// TxStatsSnapshot is the pager-side view of one write transaction's
-// counters, consumed by the root package to build gmdb.TxStats.
+// The pager owns the storage-level counters directly (CowPages /
+// LoosePages / ReclaimedPages / WrittenPages / SlabPeakBytes). The
+// structural and logical counters (splits / merges from the btree,
+// gets / puts / deletes from the keyspace layer, index entry/probe
+// counts from index maintenance) are driven through the exported
+// Record* / Add* methods by those layers, which all reach the same
+// per-tx *Pager.
 type TxStatsSnapshot struct {
 	CowPages       uint64
 	LoosePages     uint64
@@ -48,14 +33,14 @@ type TxStatsSnapshot struct {
 
 // resetTxCounters zeroes the per-tx counters. Called from BeginTx so
 // each write transaction starts from zero.
-func (p *Pager) resetTxCounters() { p.tc = txCounters{} }
+func (p *Pager) resetTxCounters() { p.tc = TxStatsSnapshot{} }
 
 // bumpSlabPeak records a new slab-usage high-water mark. Called after
 // every dirtyBytes increase (CoW / AllocSlab / AllocSlabRun); a later
 // Discard that lowers dirtyBytes never lowers the recorded peak.
 func (p *Pager) bumpSlabPeak() {
-	if p.dirtyBytes > p.tc.slabPeak {
-		p.tc.slabPeak = p.dirtyBytes
+	if int64(p.dirtyBytes) > p.tc.SlabPeakBytes {
+		p.tc.SlabPeakBytes = int64(p.dirtyBytes)
 	}
 }
 
@@ -63,46 +48,30 @@ func (p *Pager) bumpSlabPeak() {
 // TxStats.SlabPeakBytes reports 0 after a Rollback because the
 // rolled-back work is not representative of steady-state need
 // (api-surface.md §Statistics TxStats.SlabPeakBytes).
-func (p *Pager) zeroSlabPeak() { p.tc.slabPeak = 0 }
+func (p *Pager) zeroSlabPeak() { p.tc.SlabPeakBytes = 0 }
 
 // setWrittenPages records the number of pages pwritten at commit (data +
 // RPL + bitmap from the slab, plus the meta page). Called by Commit.
-func (p *Pager) setWrittenPages(n uint64) { p.tc.written = n }
+func (p *Pager) setWrittenPages(n uint64) { p.tc.WrittenPages = n }
 
 // RecordSplit / RecordMerge are driven by the btree's split / merge
 // paths via the SplitMergeRecorder optional interface (*Pager satisfies
 // it; test PageWriters that don't care simply omit it).
-func (p *Pager) RecordSplit() { p.tc.splits++ }
-func (p *Pager) RecordMerge() { p.tc.merges++ }
+func (p *Pager) RecordSplit() { p.tc.Splits++ }
+func (p *Pager) RecordMerge() { p.tc.Merges++ }
 
 // RecordGet / RecordPut / RecordDelete are driven by the keyspace-layer
 // data ops (one per public Get / Put / Delete call).
-func (p *Pager) RecordGet()    { p.tc.gets++ }
-func (p *Pager) RecordPut()    { p.tc.puts++ }
-func (p *Pager) RecordDelete() { p.tc.deletes++ }
+func (p *Pager) RecordGet()    { p.tc.Gets++ }
+func (p *Pager) RecordPut()    { p.tc.Puts++ }
+func (p *Pager) RecordDelete() { p.tc.Deletes++ }
 
 // AddIndexInserted / AddIndexDeleted / RecordIndexProbe are driven by
 // index maintenance: the count of index entries inserted / deleted by a
 // row mutation and each unique-constraint probe.
-func (p *Pager) AddIndexInserted(n uint64) { p.tc.idxInserted += n }
-func (p *Pager) AddIndexDeleted(n uint64)  { p.tc.idxDeleted += n }
-func (p *Pager) RecordIndexProbe()         { p.tc.idxProbes++ }
+func (p *Pager) AddIndexInserted(n uint64) { p.tc.IndexInserted += n }
+func (p *Pager) AddIndexDeleted(n uint64)  { p.tc.IndexDeleted += n }
+func (p *Pager) RecordIndexProbe()         { p.tc.IndexProbes++ }
 
-// TxStatsSnapshot returns the current per-tx counter values.
-func (p *Pager) TxStatsSnapshot() TxStatsSnapshot {
-	return TxStatsSnapshot{
-		CowPages:       p.tc.cow,
-		LoosePages:     p.tc.loose,
-		ReclaimedPages: p.tc.reclaimed,
-		WrittenPages:   p.tc.written,
-		Splits:         p.tc.splits,
-		Merges:         p.tc.merges,
-		Gets:           p.tc.gets,
-		Puts:           p.tc.puts,
-		Deletes:        p.tc.deletes,
-		IndexInserted:  p.tc.idxInserted,
-		IndexDeleted:   p.tc.idxDeleted,
-		IndexProbes:    p.tc.idxProbes,
-		SlabPeakBytes:  int64(p.tc.slabPeak),
-	}
-}
+// TxStatsSnapshot returns a copy of the current per-tx counter values.
+func (p *Pager) TxStatsSnapshot() TxStatsSnapshot { return p.tc }

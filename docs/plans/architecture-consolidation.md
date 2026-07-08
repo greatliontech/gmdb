@@ -99,7 +99,7 @@ gate) and the final close-out are fixed anchors per chunk.
 - [x] 16. root: resolve the `compact.go` (rebuild-and-swap) vs
   `compaction.go` (online incremental relocation) naming collision;
   extract the repeated coord-snapshot idiom.
-- [ ] 17. root: shared tx-guarded cursor core embedded by `Cursor`
+- [x] 17. root: shared tx-guarded cursor core embedded by `Cursor`
   and `SetCursor`'s outer half; collapse the `txCounters` →
   `TxStatsSnapshot` field-copy boilerplate
   (`internal/pager/txstats.go:92`).

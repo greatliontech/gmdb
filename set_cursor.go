@@ -54,9 +54,8 @@ import (
 // tx.Rollback() the cursor returns (nil, nil) and Err() reports
 // ErrTxClosed.
 type SetCursor struct {
-	ks       *SetKeyspace
-	tx       *Tx
-	closeErr error
+	cursorGuard
+	ks *SetKeyspace
 
 	// outerCursor traverses the parent SetKeyspace's B+tree. Its
 	// Next/Prev/Seek/SeekGE operations are the source-of-truth for
@@ -138,16 +137,16 @@ type SetCursor struct {
 // internal loop.
 func newInternalSetCursor(ks *SetKeyspace) *SetCursor {
 	return &SetCursor{
+		cursorGuard: cursorGuard{tx: ks.tx},
 		ks:          ks,
-		tx:          ks.tx,
 		outerCursor: ks.newRootCursor(),
 	}
 }
 
 func (ks *SetKeyspace) Cursor() *SetCursor {
 	c := &SetCursor{
+		cursorGuard: cursorGuard{tx: ks.tx},
 		ks:          ks,
-		tx:          ks.tx,
 		outerCursor: ks.newRootCursor(),
 	}
 	// Only register cursors on live handles. A dead keyspace's
@@ -177,34 +176,14 @@ func (ks *SetKeyspace) unregisterSetCursor(c *SetCursor) {
 	}
 }
 
-// requireOpen short-circuits closed-state and dead-keyspace checks.
-// Used by RE-POSITIONING ops (First / Last / Seek / SeekGE) which
-// recover from a stale state and so should be permitted to run
-// even when c.stale is true. Sets closeErr (permanent) on
-// tx-closed / keyspace-closed; never sets it for stale (transient).
+// requireOpen short-circuits closed-state and dead-keyspace checks
+// (the shared cursorGuard core). Used by RE-POSITIONING ops (First /
+// Last / Seek / SeekGE) which recover from a stale state and so
+// should be permitted to run even when c.stale is true. Sets closeErr
+// (permanent) on tx-closed / keyspace-closed; never for stale
+// (transient).
 func (c *SetCursor) requireOpen(needsWrite bool) bool {
-	if c.closeErr != nil {
-		return false
-	}
-	if err := c.tx.requireOpen(needsWrite); err != nil {
-		// ErrChildActive is transient — the parent-freeze lifts when the
-		// active child resolves (transactions.md §Nested Transactions).
-		// Do NOT stick it; terminal errors (ErrTxClosed / ErrReadOnly /
-		// ErrClosed) still stick.
-		if !errors.Is(err, ErrChildActive) {
-			c.closeErr = err
-		}
-		return false
-	}
-	if c.ks.dead {
-		c.closeErr = ErrKeyspaceClosed
-		return false
-	}
-	if needsWrite && c.ks.readOnly {
-		c.closeErr = ErrReadOnly
-		return false
-	}
-	return true
+	return c.require(needsWrite, c.ks.dead, c.ks.readOnly)
 }
 
 // requireFresh = requireOpen + stale check. Used by

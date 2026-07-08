@@ -108,9 +108,10 @@ type Pager struct {
 	cold coldTracker
 
 	// tc holds the per-write-transaction activity counters that back
-	// TxStats (see txstats.go). Reset by BeginTx, read via
+	// TxStats (see txstats.go — the storage IS the snapshot struct;
+	// no translation layer). Reset by BeginTx, read via
 	// TxStatsSnapshot. Unused on a read-only pager.
-	tc txCounters
+	tc TxStatsSnapshot
 
 	// Freespace state machine. Populated by AttachBitmap +
 	// SetCommitState + SetRPLChain at Open/Resync and re-seeded per
@@ -1025,7 +1026,7 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 	copy(*buf, src)
 	p.dirty[dstID] = buf
 	p.dirtyBytes += int(p.cfg.PageSize)
-	p.tc.cow++
+	p.tc.CowPages++
 	p.bumpSlabPeak()
 	// Reaching this branch means dirty[dstID] was absent (the
 	// idempotent shortcut above returned otherwise), so the dirty-add
