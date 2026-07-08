@@ -86,7 +86,7 @@ func (db *DB) Compact() error {
 		return err
 	}
 	srcUUID := rtx.meta.UUID
-	cerr := copyCompact(rtx, tmpPath, srcUUID)
+	cerr := publicChecksumErr(copyCompact(rtx, tmpPath, srcUUID))
 	_ = rtx.Rollback()
 	if cerr != nil {
 		return fmt.Errorf("gmdb: Compact copy: %w", cerr)

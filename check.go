@@ -21,6 +21,16 @@ type rawPageReader struct{ p *pager.Pager }
 
 func (r rawPageReader) Page(id uint64) ([]byte, error) { return r.p.PageRaw(id), nil }
 
+// verifyingPageReader is the conforming btree.PageReader (footer-verified
+// on first access per the interface contract): a bad checksum yields
+// ErrBadPageChecksum and aborts the walk. Used where source bytes are
+// re-encoded (the compact rebuild in copy.go) and an unverified read would
+// launder detectable bitrot into a fresh valid footer — the inverse of
+// rawPageReader's report-don't-abort role in Check.
+type verifyingPageReader struct{ p *pager.Pager }
+
+func (r verifyingPageReader) Page(id uint64) ([]byte, error) { return r.p.Page(id) }
+
 // CheckSeverity grades a CheckIssue.
 type CheckSeverity int
 

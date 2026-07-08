@@ -3,8 +3,8 @@ package gmdb
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/pager"
 	"os"
 	"path/filepath"
 
@@ -12,7 +12,19 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 )
+
+// publicChecksumErr maps the internal pager checksum sentinel — surfaced by
+// the compact rebuild's verifying reader on a bitrotted source page — to the
+// public gmdb.ErrBadPageChecksum, matching the read-path boundary
+// (keyspace.go, tx.go, incremental_compaction.go). Other errors pass through.
+func publicChecksumErr(err error) error {
+	if err != nil && errors.Is(err, pager.ErrBadPageChecksum) {
+		return fmt.Errorf("%w: %w", ErrBadPageChecksum, err)
+	}
+	return err
+}
 
 // CopyTo writes a consistent copy of the database to path, taken from a
 // read snapshot — concurrent writers are NOT blocked (api-surface.md
@@ -47,7 +59,7 @@ func (db *DB) CopyTo(path string, compact bool) error {
 		return fmt.Errorf("gmdb: CopyTo generate UUID: %w", err)
 	}
 	if compact {
-		return copyCompact(rtx, path, uuid)
+		return publicChecksumErr(copyCompact(rtx, path, uuid))
 	}
 	return copyVerbatim(rtx, path, uuid)
 }
@@ -275,7 +287,16 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	hwm := meta.HighWaterMark
 	firstData := uint64(2) + uint64(meta.BitmapPages)
 	pageSize := int64(meta.PageSize)
-	pr := rawPageReader{p: rtx.pgr}
+	// Verifying reader (checksums.md §Verification): the compact rebuild
+	// DECODES source pages and re-encodes them into fresh pages with a new
+	// footer, so an unverified read would launder a bitrotted-but-decodable
+	// source page into a valid-checksummed copy — converting a detectable
+	// ErrBadPageChecksum into a permanent silent wrong value. Verifying here
+	// makes a bad footer abort the rebuild; the !committed defer removes the
+	// half-built file, so the corruption stays detectable on the original.
+	// (The verbatim CopyTo path keeps rawPageReader: it copies footers
+	// byte-for-byte, so corruption survives detectably without a re-encode.)
+	pr := verifyingPageReader{p: rtx.pgr}
 
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -430,7 +451,7 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 // an index data tree) bottom-up from its existing sorted entries, writing
 // into w. Overflow values are re-streamed (bulkLeafEntry re-promotes the
 // assembled value to a fresh overflow chain). Returns the new root id.
-func rebuildKVTree(w *freshFileWriter, pr rawPageReader, cfg page.Config, root, hwm uint64) (uint64, error) {
+func rebuildKVTree(w *freshFileWriter, pr btree.PageReader, cfg page.Config, root, hwm uint64) (uint64, error) {
 	if root == 0 {
 		return 0, nil
 	}
@@ -453,7 +474,7 @@ func rebuildKVTree(w *freshFileWriter, pr rawPageReader, cfg page.Config, root, 
 // registry entry's index data tree is rebuilt (rebuildKVTree), the entry's
 // Root is rewritten to the new tree, and the re-encoded entry is added to a
 // fresh registry tree. Returns the new registry root id.
-func rebuildRegistry(w *freshFileWriter, pr rawPageReader, cfg page.Config, regRoot, hwm uint64) (uint64, error) {
+func rebuildRegistry(w *freshFileWriter, pr btree.PageReader, cfg page.Config, regRoot, hwm uint64) (uint64, error) {
 	if regRoot == 0 {
 		return 0, nil
 	}
@@ -493,7 +514,7 @@ func rebuildRegistry(w *freshFileWriter, pr rawPageReader, cfg page.Config, regR
 // arrive in sorted order from the source (subpage members and nested-tree
 // keys are both stored sorted), satisfying the builder's ascending-key
 // precondition. Returns the new outer root id.
-func rebuildSetTree(w *freshFileWriter, pr rawPageReader, cfg page.Config, root uint64, fvs uint16, hwm uint64) (uint64, error) {
+func rebuildSetTree(w *freshFileWriter, pr btree.PageReader, cfg page.Config, root uint64, fvs uint16, hwm uint64) (uint64, error) {
 	if root == 0 {
 		return 0, nil
 	}

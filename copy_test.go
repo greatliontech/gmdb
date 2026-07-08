@@ -3,6 +3,7 @@ package gmdb
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 	"os"
@@ -728,4 +729,94 @@ func TestCopyToCompactDefragments(t *testing.T) {
 	if _, err := rks.Get(fmt.Appendf(nil, "key%06d", 1500)); err == nil {
 		t.Errorf("deleted key%06d present in compact copy", 1500)
 	}
+}
+
+// TestCompactAbortsOnBitrotRatherThanLaundering pins checksums.md
+// §Verification for the compact rebuild path. CopyTo(compact=true) DECODES
+// each source page and re-encodes it into a fresh page with a new footer.
+// An unverified read would therefore launder a bitrotted-but-decodable
+// source page into a copy carrying a fresh VALID footer — converting a
+// detectable ErrBadPageChecksum into a permanent silent wrong value that
+// Check() reports clean. The rebuild must instead verify each source
+// footer and ABORT on mismatch (the half-built copy is removed by the
+// !committed defer), leaving the original detectably corrupt.
+func TestCompactAbortsOnBitrotRatherThanLaundering(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	dst := tmpPath(t)
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tx, _ := db.Begin(ctx)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range 800 { // multi-level tree
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "val%05d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	rtx, _ := db.Begin(ctx)
+	rks, _ := rtx.OpenKeyspace("k")
+	root := rks.desc.Root
+	rtx.Rollback()
+	if root == 0 {
+		t.Fatal("data-tree root is 0")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Flip a byte inside the data-tree root page's footer: the page still
+	// decodes structurally, but its xxhash64 footer no longer matches — the
+	// exact silent-bitrot class checksums exist to catch.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	off := int64(root)*4096 + 4096 - 4
+	one := make([]byte, 1)
+	if _, err := f.ReadAt(one, off); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	one[0] ^= 0xFF
+	if _, err := f.WriteAt(one, off); err != nil {
+		t.Fatalf("corrupt write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close after corruption: %v", err)
+	}
+
+	db2, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+
+	// Precondition: the corruption is detectable on the normal read path.
+	rtx2, _ := db2.Begin(ctx)
+	rks2, _ := rtx2.OpenKeyspace("k")
+	if _, err := rks2.Get([]byte("key00000")); !errors.Is(err, ErrBadPageChecksum) {
+		t.Fatalf("Get on bitrotted DB = %v, want ErrBadPageChecksum", err)
+	}
+	rtx2.Rollback()
+
+	// The fix: compaction must ABORT on the bad footer, not launder it.
+	err = db2.CopyTo(dst, true)
+	if !errors.Is(err, ErrBadPageChecksum) {
+		t.Fatalf("CopyTo(compact) over bitrot = %v, want ErrBadPageChecksum (launder guard)", err)
+	}
+	// The half-built copy is rolled back — no laundered file survives.
+	if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+		t.Errorf("compact copy %q exists after aborted compaction (stat err=%v)", dst, statErr)
+	}
+	// The original is untouched and still detectably corrupt.
+	rtx3, _ := db2.Begin(ctx)
+	rks3, _ := rtx3.OpenKeyspace("k")
+	if _, err := rks3.Get([]byte("key00000")); !errors.Is(err, ErrBadPageChecksum) {
+		t.Errorf("original after aborted compaction = %v, want still ErrBadPageChecksum", err)
+	}
+	rtx3.Rollback()
 }
