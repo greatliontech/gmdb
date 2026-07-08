@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -70,6 +71,61 @@ func (r *crashRecorder) mark() {
 	r.mu.Lock()
 	r.marks = append(r.marks, len(r.ops))
 	r.mu.Unlock()
+}
+
+// opCount returns the number of ops recorded so far (a durable boundary
+// marker for the SyncLazy tests, captured right after a Checkpoint).
+func (r *crashRecorder) opCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.ops)
+}
+
+// applyOp mutates img by one op (write or truncate), growing as needed.
+func applyOp(img []byte, op crashOp) []byte {
+	switch op.kind {
+	case crashOpWrite:
+		end := op.off + int64(len(op.data))
+		if int64(len(img)) < end {
+			img = append(img, make([]byte, end-int64(len(img)))...)
+		}
+		copy(img[op.off:end], op.data)
+	case crashOpTruncate:
+		switch {
+		case op.size < int64(len(img)):
+			img = img[:op.size]
+		case op.size > int64(len(img)):
+			img = append(img, make([]byte, op.size-int64(len(img)))...)
+		}
+	}
+	return img
+}
+
+// synthImageSubset applies ops[:baseN] fully (the durable prefix), then the
+// post-baseN ops named by order (index into ops[baseN:]) in that order —
+// modeling a crash that persisted only an arbitrary SUBSET of the unsynced
+// writes, in arbitrary writeback ORDER. Truncate ops in the tail are always
+// applied (a file-size change is not a page write the harness reorders).
+func synthImageSubset(initial []byte, ops []crashOp, baseN int, order []int) []byte {
+	img := make([]byte, len(initial))
+	copy(img, initial)
+	for _, op := range ops[:baseN] {
+		img = applyOp(img, op)
+	}
+	// Truncates in the tail carry the file size; apply them in original
+	// order first so the image is large enough for any tail write.
+	for _, op := range ops[baseN:] {
+		if op.kind == crashOpTruncate {
+			img = applyOp(img, op)
+		}
+	}
+	for _, idx := range order {
+		op := ops[baseN+idx]
+		if op.kind == crashOpWrite {
+			img = applyOp(img, op)
+		}
+	}
+	return img
 }
 
 // synthImage applies ops[:n] to a copy of initial — the on-disk bytes a
@@ -320,4 +376,201 @@ func TestCrashMidInflightCommitPreservesDurableEpoch(t *testing.T) {
 		copy(img[op.off:end], op.data[:tear]) // persist only the first `tear` bytes of the new meta
 		verifyDurableCrashImage(t, opts, img, fmt.Sprintf("torn-meta-%d", tear), durableKeys, durableKeys)
 	}
+}
+
+// lazyWorkload runs durableCommits SyncLazy commits, a Checkpoint (the only
+// durable-epoch advance), then lazyCommits more SyncLazy commits — none of
+// which fsync. It returns the recorder, the pre-workload image, the
+// op-count at the checkpoint (the durable boundary), and the key counts.
+// The recorder is uninstalled before Close so the shutdown checkpoint's
+// writes are NOT recorded — the synthesized images reflect only the
+// crash-relevant trace (batch 1 + checkpoint + batch 2).
+func lazyWorkload(t *testing.T, opts Options, durableCommits, lazyCommits, perCommit int) (rec *crashRecorder, initial []byte, durableN, durableKeys, totalKeys int) {
+	t.Helper()
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	rec = &crashRecorder{inner: db.WriterFileOpsForTest()}
+	restore := db.SetWriterFileOpsForTest(rec)
+	initial, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read initial image: %v", err)
+	}
+
+	commit := func(c int) {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("Begin c=%d: %v", c, err)
+		}
+		var ks *Keyspace
+		if c == 0 {
+			ks, err = tx.CreateKeyspace("k")
+		} else {
+			ks, err = tx.OpenKeyspace("k")
+		}
+		if err != nil {
+			t.Fatalf("keyspace c=%d: %v", c, err)
+		}
+		for i := c * perCommit; i < (c+1)*perCommit; i++ {
+			if err := ks.Put(crashKey(i), crashVal(i)); err != nil {
+				t.Fatalf("Put %d: %v", i, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit c=%d: %v", c, err)
+		}
+	}
+
+	for c := 0; c < durableCommits; c++ {
+		commit(c)
+	}
+	if err := db.Checkpoint(ctx); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	durableN = rec.opCount()
+	durableKeys = durableCommits * perCommit
+	for c := durableCommits; c < durableCommits+lazyCommits; c++ {
+		commit(c)
+	}
+	totalKeys = (durableCommits + lazyCommits) * perCommit
+
+	restore()
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return rec, initial, durableN, durableKeys, totalKeys
+}
+
+// TestCrashSyncLazyRollsBackToDurableEpoch pins the SyncLazy recovery
+// invariant (durability.md §Recovery, "recovery adopts the durable
+// sub-record, never the selected meta's live tree"): after a Checkpoint,
+// further SyncLazy commits pwrite a NEW meta with a higher TxnID but carry
+// the checkpoint's durable sub-record forward unchanged. A crash — even
+// with ALL those lazy writes fully on disk (unsynced) — must roll back to
+// the checkpoint epoch: durable keys present, lazy keys absent, Check
+// clean. Losing the lazy commits is the SyncLazy trade; corrupting or
+// half-adopting them would be the bug.
+func TestCrashSyncLazyRollsBackToDurableEpoch(t *testing.T) {
+	opts := Options{PageSize: 4096, MinSize: 16, MaxSize: 512, SyncMode: SyncLazy, Maintenance: MaintenanceOptions{Disable: true}}
+	rec, initial, durableN, durableKeys, _ := lazyWorkload(t, opts, 3, 3, 40)
+	fullN := len(rec.ops)
+
+	// Every ordered prefix from the checkpoint boundary onward — including
+	// the fully-written lazy tail — rolls back to the durable epoch.
+	for _, n := range []int{durableN, (durableN + fullN) / 2, fullN} {
+		img := synthImage(initial, rec.ops, n)
+		verifyDurableCrashImage(t, opts, img, fmt.Sprintf("lazy-prefix-%d", n), durableKeys, durableKeys)
+	}
+}
+
+// TestCrashSyncLazyArbitrarySubsetPreservesDurableEpoch is the adversarial
+// fidelity test: real writeback persists an arbitrary SUBSET of the
+// unsynced writes in arbitrary ORDER, not just ordered prefixes. For any
+// such subset of the post-checkpoint lazy writes, recovery must still land
+// exactly on the durable (checkpoint) epoch — durable keys intact, lazy
+// keys absent, no corruption or silently-wrong value. Seeded for
+// reproducibility.
+func TestCrashSyncLazyArbitrarySubsetPreservesDurableEpoch(t *testing.T) {
+	opts := Options{PageSize: 4096, MinSize: 16, MaxSize: 512, SyncMode: SyncLazy, Maintenance: MaintenanceOptions{Disable: true}}
+	rec, initial, durableN, durableKeys, _ := lazyWorkload(t, opts, 3, 3, 40)
+	tail := len(rec.ops) - durableN
+	if tail <= 0 {
+		t.Fatalf("no post-checkpoint writes recorded (tail=%d) — the subset test would be vacuous", tail)
+	}
+	rng := rand.New(rand.NewSource(0x1234567890abcdef))
+	for trial := 0; trial < 40; trial++ {
+		var order []int
+		for i := 0; i < tail; i++ {
+			if rng.Intn(2) == 0 {
+				order = append(order, i)
+			}
+		}
+		rng.Shuffle(len(order), func(a, b int) { order[a], order[b] = order[b], order[a] })
+		img := synthImageSubset(initial, rec.ops, durableN, order)
+		verifyDurableCrashImage(t, opts, img, fmt.Sprintf("subset-%d", trial), durableKeys, durableKeys)
+	}
+}
+
+// TestCrashSyncDataOnlyTornLastMetaFallsBack pins the SyncDataOnly bound
+// ("at most the last commit lost"; durability.md §Durability Modes): each
+// commit fsyncs its data (step 2) but not its meta (step 4), so a crash may
+// lose the last commit's meta — recovery then falls back to the PREVIOUS
+// commit, whose data is durable and whose meta was anchored by the last
+// commit's step-2 fsync. The full image (last meta present, self-durable)
+// recovers everything; a torn last meta recovers to the penultimate commit.
+func TestCrashSyncDataOnlyTornLastMetaFallsBack(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	opts := Options{PageSize: 4096, MinSize: 16, MaxSize: 512, SyncMode: SyncDataOnly, Maintenance: MaintenanceOptions{Disable: true}}
+	db, err := Open(ctx, path, opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	rec := &crashRecorder{inner: db.WriterFileOpsForTest()}
+	restore := db.SetWriterFileOpsForTest(rec)
+	initial, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read initial image: %v", err)
+	}
+
+	const commits = 5
+	const perCommit = 40
+	for c := 0; c < commits; c++ {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("Begin c=%d: %v", c, err)
+		}
+		var ks *Keyspace
+		if c == 0 {
+			ks, err = tx.CreateKeyspace("k")
+		} else {
+			ks, err = tx.OpenKeyspace("k")
+		}
+		if err != nil {
+			t.Fatalf("keyspace c=%d: %v", c, err)
+		}
+		for i := c * perCommit; i < (c+1)*perCommit; i++ {
+			if err := ks.Put(crashKey(i), crashVal(i)); err != nil {
+				t.Fatalf("Put %d: %v", i, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit c=%d: %v", c, err)
+		}
+		rec.mark()
+	}
+	restore()
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Full image: the last commit's meta is present (unsynced) but
+	// self-durable (its data was fsynced at step 2), so recovery adopts it.
+	verifyDurableCrashImage(t, opts, synthImage(initial, rec.ops, len(rec.ops)), "sdo-full", commits*perCommit, -1)
+
+	// Torn last-commit meta: land only within its checksummed payload →
+	// invalid → recovery falls back to the penultimate commit.
+	metaOff := pager.MetaChecksumOffsetForTest()
+	pageSize := int64(4096)
+	lastMeta := -1
+	for j := rec.marks[commits-2]; j < len(rec.ops); j++ {
+		if rec.ops[j].kind == crashOpWrite && rec.ops[j].off < 2*pageSize {
+			lastMeta = j
+		}
+	}
+	if lastMeta < 0 {
+		t.Fatal("no last-commit meta write found")
+	}
+	op := rec.ops[lastMeta]
+	img := synthImage(initial, rec.ops, lastMeta)
+	end := op.off + int64(metaOff/2)
+	if int64(len(img)) < end {
+		img = append(img, make([]byte, end-int64(len(img)))...)
+	}
+	copy(img[op.off:end], op.data[:metaOff/2])
+	penultimate := (commits - 1) * perCommit
+	verifyDurableCrashImage(t, opts, img, "sdo-torn-last-meta", penultimate, penultimate)
 }
