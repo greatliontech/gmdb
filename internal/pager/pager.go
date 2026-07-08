@@ -74,8 +74,13 @@ var (
 // same Pager are not allowed (the writer is single-threaded by design, and
 // read pagers are owned by exactly one read tx).
 type Pager struct {
-	cfg      page.Config
-	file     *os.File
+	cfg  page.Config
+	file *os.File
+	// fops routes the durability-critical pwrite / read / truncate /
+	// fdatasync calls (never the mmap, which stays on file). Defaults to
+	// osFileOps{file} — a transparent forward — and is swapped by
+	// SetFileOpsForTest to inject faults or record the write log.
+	fops     FileOps
 	mmap     []byte
 	fileSize int64
 	closed   bool
@@ -358,10 +363,22 @@ func NewReader(file *os.File, cfg page.Config, reservationBytes int64) (*Pager, 
 	return &Pager{
 		cfg:      cfg,
 		file:     file,
+		fops:     osFileOps{f: file},
 		mmap:     mapping,
 		fileSize: st.Size(),
 		readOnly: true,
 	}, nil
+}
+
+// SetFileOpsForTest swaps the pager's FileOps seam and returns a restore
+// closure. Test-only: production always uses the osFileOps installed at
+// construction. The pager is single-threaded, so the swap needs no
+// synchronisation; callers install the fault/recording FileOps before
+// driving the transaction under test.
+func (p *Pager) SetFileOpsForTest(fops FileOps) (restore func()) {
+	prev := p.fops
+	p.fops = fops
+	return func() { p.fops = prev }
 }
 
 // NewWriter opens a writable pager over file. Same mmap setup as NewReader;
@@ -1190,7 +1207,7 @@ func (p *Pager) WriteDirect(id uint64, buf []byte) error {
 		page.WritePageFooter(buf, p.cfg.PageSize)
 	}
 	off := int64(id) * int64(p.cfg.PageSize)
-	if _, err := p.file.WriteAt(buf, off); err != nil {
+	if _, err := p.fops.WriteAt(buf, off); err != nil {
 		return fmt.Errorf("pager: WriteDirect pwrite page %d: %w", id, err)
 	}
 	return nil

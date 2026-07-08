@@ -307,7 +307,7 @@ func (p *Pager) ensureFileCovers(pages uint64) error {
 	}
 	targetPages = max(targetPages, pages) // never under-cover the allocated page
 	target := int64(targetPages) * int64(p.cfg.PageSize)
-	if err := p.file.Truncate(target); err != nil {
+	if err := p.fops.Truncate(target); err != nil {
 		return fmt.Errorf("pager: ftruncate to %d: %w", target, err)
 	}
 	p.fileSize = target

@@ -132,7 +132,7 @@ func (p *Pager) Commit(cp CommitParams, prev Meta, prevActive int) (CommitResult
 	// adopting the durable sub-record, which a SyncLazy commit
 	// carries forward unchanged, never its own possibly-torn tree.
 	if cp.Sync != SyncNone {
-		if err := fdatasync(p.file); err != nil {
+		if err := p.fops.Fdatasync(); err != nil {
 			p.AbortTx()
 			return CommitResult{}, fmt.Errorf("pager: step 2 fdatasync: %w", err)
 		}
@@ -161,7 +161,7 @@ func (p *Pager) Commit(cp CommitParams, prev Meta, prevActive int) (CommitResult
 	// correctly picks whichever meta has the higher TxnID, including
 	// the new one if step 3 partially completed.
 	off := int64(newActive) * int64(p.cfg.PageSize)
-	if _, err := p.file.WriteAt(metaBuf, off); err != nil {
+	if _, err := p.fops.WriteAt(metaBuf, off); err != nil {
 		p.AbortTx()
 		return CommitResult{}, fmt.Errorf("pager: step 3 write meta %d: %w", newActive, err)
 	}
@@ -184,7 +184,7 @@ func (p *Pager) Commit(cp CommitParams, prev Meta, prevActive int) (CommitResult
 	// pwrite — recovery may lose the meta but never adopts
 	// under-protected state (durability.md §Anchoring).
 	if cp.Sync == SyncBoth {
-		if err := fdatasync(p.file); err != nil {
+		if err := p.fops.Fdatasync(); err != nil {
 			p.AbortTx()
 			return CommitResult{}, fmt.Errorf("pager: step 4 fdatasync meta: %w", err)
 		}
@@ -394,14 +394,14 @@ func (p *Pager) commitStep1() (int, error) {
 			page.WritePageFooter(*buf, p.cfg.PageSize)
 		}
 		off := int64(id) * int64(pageSize)
-		if _, err := p.file.WriteAt(*buf, off); err != nil {
+		if _, err := p.fops.WriteAt(*buf, off); err != nil {
 			return written, fmt.Errorf("pwrite page %d: %w", id, err)
 		}
 		written++
 	}
 	for _, idx := range p.bitmap.DirtyPages() {
 		off := int64(2+uint64(idx)) * int64(pageSize)
-		if _, err := p.file.WriteAt(p.bitmap.PageBytes(idx), off); err != nil {
+		if _, err := p.fops.WriteAt(p.bitmap.PageBytes(idx), off); err != nil {
 			return written, fmt.Errorf("pwrite bitmap page %d: %w", idx, err)
 		}
 		written++
@@ -513,7 +513,7 @@ func (p *Pager) maybeShrink(shrinkThreshold uint64) error {
 	if p.fileSize-target < int64(shrinkThreshold)*int64(p.cfg.PageSize) {
 		return nil // trailing slack below threshold — avoid ftruncate thrash
 	}
-	if err := p.file.Truncate(target); err != nil {
+	if err := p.fops.Truncate(target); err != nil {
 		return err
 	}
 	p.fileSize = target
