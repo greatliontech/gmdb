@@ -61,5 +61,4 @@ findings each shared-fix row covers.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [dbcleanup-teardown-drain](dbcleanup-teardown-drain.md) | condition (AddCleanup execution model revisit) | **[L]** dbCleanupFn tears down coord/lockFile without the txInflight drain Close performs — safe only while the runtime runs cleanups sequentially. Audit-burndown (2026-07) chunk-11 review finding. |
 

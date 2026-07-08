@@ -545,6 +545,19 @@ func dbCleanupFn(info dbCleanupInfo) {
 		"gmdb: DB handle leaked without Close",
 		"origin", formatStack(info.originPCs),
 	)
+	// Drain in-flight Tx cleanup windows before teardown — the same
+	// step Close performs (leak-detection.md §Close Ordering). The
+	// SwapClosed above already release-stored closed=true; the drain
+	// waits out any cleanup that passed the gate BEFORE that store
+	// and may still be touching the lock-file mmap (a leaked-ReadTx
+	// cleanup's slot release). Today's runtime executes cleanups
+	// sequentially on one goroutine, which made this unreachable —
+	// but the API does not guarantee it, and a concurrent-cleanups
+	// runtime would otherwise race this teardown's unmap (SIGSEGV).
+	// BeginClose is idempotent over the prior swap and, on the
+	// sequential runtime, returns immediately (no cleanup can be
+	// mid-window while we run).
+	info.gate.BeginClose()
 	if info.coord != nil {
 		_ = info.coord.Close()
 	}
