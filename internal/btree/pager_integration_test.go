@@ -4,12 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
-	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/thegrumpylion/gmdb/internal/pagertest"
 )
 
 // Inv-3: PageWriter parity — the overflow chain
@@ -25,42 +24,19 @@ import (
 
 const pagerTestPageSize = 4096
 
+// setupPagerWriter builds the shared cross-package writer-pager
+// fixture (internal/pagertest) in the exhaustion-testing shape and
+// wraps it in this package's pagerWriter adapter. See
+// TestSetupPagerWriterExhaustsToDBFull for the HWM-at-top rationale
+// the shared fixture encodes.
 func setupPagerWriter(t *testing.T, pages int) (pagerWriter, *bitmap.Bitmap, *os.File) {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "db.gmdb")
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	if err := f.Truncate(int64(pages) * int64(pagerTestPageSize)); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
-	pool := pager.NewBufPool(pagerTestPageSize)
-	cfg := page.Config{PageSize: pagerTestPageSize, RestartGroupTarget: 16}
-	p, err := pager.NewWriter(f, cfg, int64(pages)*int64(pagerTestPageSize), pool, 16<<20)
-	if err != nil {
-		t.Fatalf("NewWriter: %v", err)
-	}
-	bm := bitmap.New(make([]byte, pagerTestPageSize), pagerTestPageSize, 1, uint64(pages))
-	p.AttachBitmap(bm)
-	// HWM = pages (the full file), NOT firstDataPage: every data page is
-	// marked free below, so the HWM must sit at the top of the space for
-	// the fixture to stay internally consistent. With HWM at
-	// firstDataPage the free bits would sit *above* the HWM — a state a
-	// real pager never reaches — and exhausting the bitmap would fall to
-	// file extension (freespace.go AllocPage step 5), which re-hands-out
-	// firstDataPage (a duplicate of the first bitmap allocation) instead
-	// of ErrDBFull. HWM = pages makes AllocPage return ErrDBFull at
-	// capacity. See TestSetupPagerWriterExhaustsToDBFull.
-	p.SetCommitState(uint64(pages), uint64(pages), 0)
-	// Mark every data page free so the bitmap path can satisfy
-	// AllocPage / AllocContiguous without falling through to HWM
-	// extension. (Real pagers seed this from the on-disk bitmap; the
-	// test does it explicitly.)
-	for id := bm.FirstDataPage(); id < uint64(pages); id++ {
-		bm.Set(id)
-	}
+	p, bm, f := pagertest.SetupWriter(t, pagertest.Params{
+		Pages:              pages,
+		PageSize:           pagerTestPageSize,
+		RestartGroupTarget: 16,
+		MarkAllFree:        true,
+	})
 	return pagerWriter{p}, bm, f
 }
 

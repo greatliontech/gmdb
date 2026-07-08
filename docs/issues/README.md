@@ -50,7 +50,6 @@ entries are removed from their table and preserved in git history
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [pager-test-helper-export](pager-test-helper-export.md) | when a second cross-package writer-pager fixture caller (beyond `internal/btree`'s `setupPagerWriter`) arrives | `setupWriter` is duplicated into `internal/btree/pager_integration_test.go` as `setupPagerWriter` for the chunk-5.2 PageWriter parity test. Acceptable for one caller; factor when the second caller arrives. |
 
 ## Open — completeness / correctness / algorithm audit (2026-05-30)
 
@@ -62,3 +61,5 @@ findings each shared-fix row covers.
 | Slug | Lands | Summary |
 |------|-------|---------|
 
+*None open — resolved issues live in git history
+(`git log --all -- docs/issues/<slug>.md`).*

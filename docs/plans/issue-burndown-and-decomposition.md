@@ -33,7 +33,7 @@ cross-namespace window; index move = clean codec extraction only.
   surface-coupled, a deviation from the audit's list); no API
   change (the full `internal/index` is an anti-extraction; no
   other split/merge warranted).
-- [ ] 8. Shared writer-pager test fixture consumable across packages;
+- [x] 8. Shared writer-pager test fixture consumable across packages;
   kill the `internal/btree` duplicate; resolves
   `pager-test-helper-export`; plan close-out.
 - [x] 1. Codename-residue sweep (polish tier; landed first while the
