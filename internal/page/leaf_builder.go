@@ -183,7 +183,7 @@ func (b *LeafBuilder) addEntry(key []byte, flags uint8, value []byte, ovflPage, 
 	return ok
 }
 
-// addUCEntry writes an uncompressed entry via the shared writeUCEntry encoder
+// addUCEntry writes an uncompressed entry via the shared writeFullKeyEntry encoder
 // (single source of truth for the uncompressed byte layout, shared with the
 // uncompressed in-place splice helpers).
 func (b *LeafBuilder) addUCEntry(key []byte, flags uint8, value []byte, ovflPage, totalLen uint64) bool {
@@ -192,25 +192,28 @@ func (b *LeafBuilder) addUCEntry(key []byte, flags uint8, value []byte, ovflPage
 	if b.dataPos+entrySize+newTableSize > b.cfg.ContentEnd() {
 		return false
 	}
-	newPos := writeUCEntry(b.buf, b.dataPos, flags, key, value, ovflPage, totalLen)
+	newPos := writeFullKeyEntry(b.buf, b.dataPos, flags, key, value, ovflPage, totalLen)
 	b.ucOffsets = append(b.ucOffsets, uint16(b.dataPos))
 	b.dataPos = newPos
 	b.count++
 	return true
 }
 
-// writeUCEntry writes one uncompressed-leaf entry at off and returns the offset
-// just past it. Byte layout per page-formats.md §Uncompressed Leaf — gmdb's
-// [Flags][KeyLen][ValueLen][Key][Value] order (ValueLen before the key), with
-// the 16-byte trailer form for overflow / nested-tree cells (no ValueLen). An
-// uncompressed entry coincides with a compressed restart entry today, but each
-// format owns its writer so they evolve independently. ovflPage / totalLen are
-// the generic trailer pair — (OverflowPage, TotalLen) for overflow, (NestedRoot,
-// NestedCount) for nested-tree (mirrors LeafBuilder.AddEntry's dispatch).
+// writeFullKeyEntry writes one full-key entry at off and returns the
+// offset just past it. The uncompressed entry and the compressed
+// RESTART entry share this exact wire layout (page-formats.md
+// §Uncompressed Leaf: "identical to the compressed variant") — gmdb's
+// [Flags][KeyLen][ValueLen][Key][Value] order (ValueLen before the
+// key), with the 16-byte trailer form for overflow / nested-tree
+// cells (no ValueLen prefix). ovflPage / totalLen are the generic
+// trailer pair — (OverflowPage, TotalLen) for overflow, (NestedRoot,
+// NestedCount) for nested-tree (mirrors LeafBuilder.AddEntry's
+// dispatch).
 //
-// Shared by LeafBuilder.addUCEntry and the uncompressed in-place splice helpers
-// so both encoders are byte-identical; do not duplicate the layout.
-func writeUCEntry(buf []byte, off int, flags uint8, key, value []byte, ovflPage, totalLen uint64) int {
+// The ONE encoder for both variants, shared by LeafBuilder and the
+// in-place splice helpers; do not duplicate the layout. (Only DELTA
+// entries have a distinct layout — writeDeltaEntry.)
+func writeFullKeyEntry(buf []byte, off int, flags uint8, key, value []byte, ovflPage, totalLen uint64) int {
 	buf[off] = flags
 	off++
 	le.PutUint16(buf[off:], uint16(len(key)))
@@ -300,7 +303,7 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 	// §Leaf Split deterministic-encoding invariant).
 	var off int
 	if isRestart {
-		off = writeCompressedRestartEntry(b.buf, b.dataPos, flags, key, value, ovflPage, totalLen)
+		off = writeFullKeyEntry(b.buf, b.dataPos, flags, key, value, ovflPage, totalLen)
 	} else {
 		off = writeCompressedDeltaEntry(b.buf, b.dataPos, flags, sharedLen, unsharedKey, value, ovflPage, totalLen)
 	}
@@ -312,47 +315,13 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 	return true
 }
 
-// writeCompressedRestartEntry writes a restart (full-key) compressed entry
-// at off and returns the offset just past it. Byte layout per
-// page-formats.md §Compressed Leaf restart entry — gmdb's
-// [Flags][KeyLen][ValueLen][Key][Value] order (ValueLen before the key),
-// with the 16-byte trailer form for overflow / nested-tree cells (no
-// ValueLen prefix). ovflPage / totalLen are the generic trailer pair —
-// (OverflowPage, TotalLen) for overflow cells, (NestedRoot, NestedCount)
-// for nested-tree cells (mirrors LeafBuilder.AddEntry's dispatch).
-//
-// Shared by LeafBuilder.addCompressedEntry and the in-place splice helpers
-// so both encoders are byte-identical; do not duplicate the layout.
-func writeCompressedRestartEntry(buf []byte, off int, flags uint8, key, value []byte, ovflPage, totalLen uint64) int {
-	buf[off] = flags
-	off++
-	le.PutUint16(buf[off:], uint16(len(key)))
-	off += 2
-	if cellHasTrailerOnly(flags) {
-		copy(buf[off:], key)
-		off += len(key)
-		le.PutUint64(buf[off:], ovflPage)
-		off += 8
-		le.PutUint64(buf[off:], totalLen)
-		off += 8
-		return off
-	}
-	le.PutUint32(buf[off:], uint32(len(value)))
-	off += 4
-	copy(buf[off:], key)
-	off += len(key)
-	copy(buf[off:], value)
-	off += len(value)
-	return off
-}
-
 // writeCompressedDeltaEntry writes a delta (prefix-compressed) compressed
 // entry at off and returns the offset just past it. Byte layout per
 // page-formats.md §Compressed Leaf delta entry — gmdb's
 // [Flags][SharedLen][UnsharedLen][ValueLen][UnsharedKey][Value] order
 // (ValueLen before the unshared key), with the 16-byte trailer form for
 // overflow / nested-tree cells. ovflPage / totalLen are the generic
-// trailer pair as in writeCompressedRestartEntry.
+// trailer pair as in writeFullKeyEntry.
 //
 // Shared by LeafBuilder.addCompressedEntry and the in-place splice helpers.
 func writeCompressedDeltaEntry(buf []byte, off int, flags uint8, sharedLen int, unsharedKey, value []byte, ovflPage, totalLen uint64) int {

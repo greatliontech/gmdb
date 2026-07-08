@@ -274,7 +274,7 @@ func (r LeafReader) EntryAt(idx int, keyBuf []byte) (LeafEntry, []byte) {
 		panic(fmt.Sprintf("page: LeafReader.EntryAt %d out of range [0, %d)", idx, r.count))
 	}
 	if !r.compressed {
-		e, _ := r.ucDecodeEntry(r.ucOffset(idx))
+		e, _ := r.decodeFullKeyEntry(r.ucOffset(idx))
 		return e, keyBuf
 	}
 	return r.compressedEntryAt(idx, keyBuf)
@@ -387,11 +387,11 @@ func (r LeafReader) FreeSpace() int {
 // or Check()) should call Validate to surface corruption before
 // invoking the read paths (SearchLeaf, Iter, EntryAt), which assume
 // structural validity and either panic or decode garbage on malformed
-// input. The internal decoder helpers (decodeRestartEntry,
-// decodeDeltaEntry, ucDecodeEntry) are NOT bounds-checked because
+// input. The internal decoder helpers (decodeFullKeyEntry,
+// decodeDeltaEntry) are NOT bounds-checked because
 // they're on the hot lookup path; Validate's own walk uses checked
-// sibling helpers (validateRestartEntry, validateDeltaEntry,
-// validateUCEntry) defined below.
+// sibling helpers (validateFullKeyEntry, validateDeltaEntry)
+// defined below.
 func (r LeafReader) Validate() error {
 	contentEnd := r.cfg.ContentEnd()
 	if r.dataEnd < leafEntryStart || r.dataEnd > contentEnd {
@@ -463,7 +463,7 @@ func (r LeafReader) Validate() error {
 			if off != expected {
 				return fmt.Errorf("%w: uncompressed leaf offset[%d]=%d != entry stream position %d", ErrCorrupted, i, off, expected)
 			}
-			next, err := r.validateUCEntry(off)
+			next, _, err := r.validateFullKeyEntry(off)
 			if err != nil {
 				return fmt.Errorf("%w: uncompressed leaf entry %d: %w", ErrCorrupted, i, err)
 			}
@@ -489,7 +489,7 @@ func (r LeafReader) Validate() error {
 			var next int
 			var err error
 			if i == 0 {
-				next, prevKeyLen, err = r.validateRestartEntry(off)
+				next, prevKeyLen, err = r.validateFullKeyEntry(off)
 			} else {
 				next, prevKeyLen, err = r.validateDeltaEntry(off, prevKeyLen)
 			}
@@ -504,6 +504,52 @@ func (r LeafReader) Validate() error {
 		return fmt.Errorf("%w: compressed leaf entry stream ends at %d, DataEnd %d", ErrCorrupted, expected, r.dataEnd)
 	}
 	return nil
+}
+
+// decodeFullKeyEntry decodes a full-key entry at the given byte
+// offset — the ONE decoder for the uncompressed entry and the
+// compressed RESTART entry, which share this exact wire layout
+// (page-formats.md §Uncompressed Leaf; only DELTA entries differ —
+// decodeDeltaEntry). Returns the entry and the offset of the next
+// entry's first byte. Key and Value (for inline values) borrow from
+// the page buffer. NOT bounds-checked (see the Validate contract
+// above): callers run only on validated pages.
+func (r LeafReader) decodeFullKeyEntry(off int) (LeafEntry, int) {
+	var e LeafEntry
+	e.Flags = r.buf[off]
+	off++
+	keyLen := int(le.Uint16(r.buf[off:]))
+	off += 2
+	if e.Flags&CellFlagOverflow != 0 {
+		// [Flags][KeyLen][Key][OvflPage uint64][TotalLen uint64]
+		e.Key = r.buf[off : off+keyLen]
+		off += keyLen
+		e.OverflowPage = le.Uint64(r.buf[off:])
+		off += 8
+		e.TotalLen = le.Uint64(r.buf[off:])
+		off += 8
+		return e, off
+	}
+	if e.IsNestedTree() {
+		// [Flags][KeyLen][Key][Root uint64][Count uint64] — same wire
+		// shape as overflow; different decoded-view fields. Per
+		// set-keyspace.md §Nested B+tree Reference Cell.
+		e.Key = r.buf[off : off+keyLen]
+		off += keyLen
+		e.NestedRoot = le.Uint64(r.buf[off:])
+		off += 8
+		e.NestedCount = le.Uint64(r.buf[off:])
+		off += 8
+		return e, off
+	}
+	// [Flags][KeyLen][ValueLen][Key][Value]
+	valLen := int(le.Uint32(r.buf[off:]))
+	off += 4
+	e.Key = r.buf[off : off+keyLen]
+	off += keyLen
+	e.Value = r.buf[off : off+valLen]
+	off += valLen
+	return e, off
 }
 
 // validateCellFlagsCombo rejects flag combinations that have no defined
@@ -537,12 +583,14 @@ func validateCellFlagsCombo(flags uint8) error {
 	return nil
 }
 
-// validateRestartEntry checks a restart entry at off and returns the
+// validateFullKeyEntry checks a full-key entry — the shared wire
+// layout of the uncompressed entry and the compressed restart entry
+// (see decodeFullKeyEntry) — at off and returns the
 // offset of the next entry plus the entry's full-key length (the
 // group's delta chain reconstructs keys from it). Returns a non-nil
 // error (without ErrCorrupted wrap — the caller wraps with structural
 // context) on any bounds violation or unknown CellFlags.
-func (r LeafReader) validateRestartEntry(off int) (next, keyLen int, err error) {
+func (r LeafReader) validateFullKeyEntry(off int) (next, keyLen int, err error) {
 	if err := r.ensureBytes(off, 1); err != nil {
 		return 0, 0, err
 	}
@@ -564,7 +612,7 @@ func (r LeafReader) validateRestartEntry(off int) (next, keyLen int, err error) 
 		// NestedTree: [Flags][KeyLen][Key][Root u64][Count u64].
 		// Identical wire shape; the trailer is always 16 bytes.
 		if err := r.ensureBytes(off, keyLen+16); err != nil {
-			return 0, 0, fmt.Errorf("restart trailer body: %w", err)
+			return 0, 0, fmt.Errorf("full-key trailer body: %w", err)
 		}
 		return off + keyLen + 16, keyLen, nil
 	}
@@ -575,12 +623,12 @@ func (r LeafReader) validateRestartEntry(off int) (next, keyLen int, err error) 
 	valLen := int(le.Uint32(r.buf[off:]))
 	off += 4
 	if err := r.ensureBytes(off, keyLen+valLen); err != nil {
-		return 0, 0, fmt.Errorf("restart inline body keyLen=%d valLen=%d: %w", keyLen, valLen, err)
+		return 0, 0, fmt.Errorf("full-key inline body keyLen=%d valLen=%d: %w", keyLen, valLen, err)
 	}
 	return off + keyLen + valLen, keyLen, nil
 }
 
-// validateDeltaEntry mirrors validateRestartEntry for delta entries.
+// validateDeltaEntry mirrors validateFullKeyEntry for delta entries.
 // prevKeyLen is the previous entry's full-key length; SharedLen must
 // not exceed it, or decodeDeltaEntry's `prevKey[:sharedLen]` either
 // panics (keyBuf-backed prevKey) or silently prepends adjacent page
@@ -630,46 +678,6 @@ func (r LeafReader) validateDeltaEntry(off, prevKeyLen int) (next, keyLen int, e
 		return 0, 0, fmt.Errorf("delta inline body unsharedLen=%d valLen=%d: %w", unsharedLen, valLen, err)
 	}
 	return off + unsharedLen + valLen, keyLen, nil
-}
-
-// validateUCEntry checks an uncompressed entry at off and returns the
-// offset of the next entry in the stream. Returns a non-nil error
-// (without ErrCorrupted wrap) on any bounds violation or unknown
-// CellFlags.
-func (r LeafReader) validateUCEntry(off int) (int, error) {
-	if err := r.ensureBytes(off, 1); err != nil {
-		return 0, err
-	}
-	flags := r.buf[off]
-	if flags&^cellFlagKnownMask != 0 {
-		return 0, fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
-	}
-	if err := validateCellFlagsCombo(flags); err != nil {
-		return 0, err
-	}
-	off++
-	if err := r.ensureBytes(off, 2); err != nil {
-		return 0, err
-	}
-	keyLen := int(le.Uint16(r.buf[off:]))
-	off += 2
-	if cellHasTrailerOnly(flags) {
-		// Overflow OR NestedTree — both have a 16-byte trailer after
-		// the key, no ValueLen prefix.
-		if err := r.ensureBytes(off, keyLen+16); err != nil {
-			return 0, fmt.Errorf("uc trailer body: %w", err)
-		}
-		return off + keyLen + 16, nil
-	}
-	if err := r.ensureBytes(off, 4); err != nil {
-		return 0, err
-	}
-	valLen := int(le.Uint32(r.buf[off:]))
-	off += 4
-	if err := r.ensureBytes(off, keyLen+valLen); err != nil {
-		return 0, fmt.Errorf("uc inline body keyLen=%d valLen=%d: %w", keyLen, valLen, err)
-	}
-	return off + keyLen + valLen, nil
 }
 
 // ensureBytes verifies r.buf[off : off+n] is within the entry-data

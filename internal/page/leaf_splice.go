@@ -161,7 +161,7 @@ func tryAppendCompressed(buf []byte, cfg Config, e LeafEntry, prevKey []byte) bo
 	// Write the new entry at the old DataEnd (the start of free space).
 	var wp int
 	if isRestart {
-		wp = writeCompressedRestartEntry(buf, dataEnd, e.Flags, e.Key, e.Value, ovflPage, totalLen)
+		wp = writeFullKeyEntry(buf, dataEnd, e.Flags, e.Key, e.Value, ovflPage, totalLen)
 	} else {
 		wp = writeCompressedDeltaEntry(buf, dataEnd, e.Flags, shared, e.Key[shared:], e.Value, ovflPage, totalLen)
 	}
@@ -220,7 +220,7 @@ func ucTryAppend(buf []byte, cfg Config, e LeafEntry) bool {
 	// (gmdb's ValueLen-before-key order; entryTrailer supplies the trailer u64s
 	// for overflow / nested cells, ignored for inline / subpage).
 	t0, t1 := entryTrailer(e)
-	newDataEnd := writeUCEntry(buf, dataEnd, e.Flags, e.Key, e.Value, t0, t1)
+	newDataEnd := writeFullKeyEntry(buf, dataEnd, e.Flags, e.Key, e.Value, t0, t1)
 
 	// Grow the offset table by one slot. The table grows backward from
 	// ContentEnd, so adding a slot shifts the existing `count` offsets one slot
@@ -342,7 +342,7 @@ func tryInsertAtCompressed(buf []byte, cfg Config, insertIdx int, e LeafEntry) b
 		entryStart := walkOff
 		var ent LeafEntry
 		if i == 0 {
-			ent, walkOff = r.decodeRestartEntry(walkOff)
+			ent, walkOff = r.decodeFullKeyEntry(walkOff)
 		} else {
 			ent, walkOff, keyBuf = r.decodeDeltaEntry(walkOff, prevKey, keyBuf)
 		}
@@ -401,7 +401,7 @@ func tryInsertAtCompressed(buf []byte, cfg Config, insertIdx int, e LeafEntry) b
 	newT0, newT1 := entryTrailer(e)
 	var off int
 	if p == 0 {
-		off = writeCompressedRestartEntry(buf, spliceOff, e.Flags, e.Key, e.Value, newT0, newT1)
+		off = writeFullKeyEntry(buf, spliceOff, e.Flags, e.Key, e.Value, newT0, newT1)
 	} else {
 		off = writeCompressedDeltaEntry(buf, spliceOff, e.Flags, newShared, e.Key[newShared:], e.Value, newT0, newT1)
 	}
@@ -462,7 +462,7 @@ func ucTryInsertAt(buf []byte, cfg Config, insertIdx int, e LeafEntry) bool {
 	gapOff := int(le.Uint16(buf[oldTableStart+insertIdx*ucOffsetEntrySize:]))
 	copy(buf[gapOff+entrySize:dataEnd+entrySize], buf[gapOff:dataEnd])
 	t0, t1 := entryTrailer(e)
-	writeUCEntry(buf, gapOff, e.Flags, e.Key, e.Value, t0, t1)
+	writeFullKeyEntry(buf, gapOff, e.Flags, e.Key, e.Value, t0, t1)
 
 	// Offset-table surgery (count → count+1; the table grows one slot toward
 	// DataEnd). The three regions are disjoint by construction:
@@ -645,7 +645,7 @@ func tryDeleteAtCompressed(buf []byte, cfg Config, deleteIdx int) bool {
 		entryStart := walkOff
 		var ent LeafEntry
 		if i == 0 {
-			ent, walkOff = r.decodeRestartEntry(walkOff)
+			ent, walkOff = r.decodeFullKeyEntry(walkOff)
 		} else {
 			ent, walkOff, keyBuf = r.decodeDeltaEntry(walkOff, prevKey, keyBuf)
 		}
@@ -705,7 +705,7 @@ func tryDeleteAtCompressed(buf []byte, cfg Config, deleteIdx int) bool {
 	// Go-cloned (succKey / succVal), independent of the bytes just shifted.
 	if hasSucc {
 		if p == 0 {
-			writeCompressedRestartEntry(buf, spliceOff, succFlags, succKey, succVal, succT0, succT1)
+			writeFullKeyEntry(buf, spliceOff, succFlags, succKey, succVal, succT0, succT1)
 		} else {
 			writeCompressedDeltaEntry(buf, spliceOff, succFlags, newShared, succKey[newShared:], succVal, succT0, succT1)
 		}

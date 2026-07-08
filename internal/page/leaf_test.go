@@ -636,7 +636,7 @@ func TestLeafReader_Validate_TotalOverInput(t *testing.T) {
 			t.Fatalf("fixture: group 0 has %d entries; need >= 2 for a real delta", gc)
 		}
 		restartOff := r.rt.Offset(0)
-		re, deltaOff := r.decodeRestartEntry(restartOff)
+		re, deltaOff := r.decodeFullKeyEntry(restartOff)
 		return buf, deltaOff, re.Key
 	}
 

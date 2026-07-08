@@ -163,7 +163,7 @@ func (it *LeafIter) Next() (LeafEntry, bool) {
 		return LeafEntry{}, false
 	}
 	if !it.compressed {
-		e, off := it.r.ucDecodeEntry(it.off)
+		e, off := it.r.decodeFullKeyEntry(it.off)
 		it.off = off
 		it.idx++
 		return e, true
@@ -178,7 +178,7 @@ func (it *LeafIter) Next() (LeafEntry, bool) {
 	}
 	var e LeafEntry
 	if it.idx == it.nextRestart {
-		e, it.off = it.r.decodeRestartEntry(it.off)
+		e, it.off = it.r.decodeFullKeyEntry(it.off)
 		it.prevKey = e.Key
 		it.nextRestart += it.r.rt.GroupEntryCount(it.groupIdx)
 		it.groupIdx++
@@ -200,7 +200,7 @@ func (it *LeafIter) At(idx int) (LeafEntry, bool) {
 		return LeafEntry{}, false
 	}
 	if !it.compressed {
-		e, _ := it.r.ucDecodeEntry(it.r.ucOffset(idx))
+		e, _ := it.r.decodeFullKeyEntry(it.r.ucOffset(idx))
 		it.idx = idx + 1
 		return e, true
 	}
@@ -255,7 +255,7 @@ func (it *LeafIter) Prev() (LeafEntry, bool) {
 		return LeafEntry{}, false
 	}
 	if !it.compressed {
-		e, _ := it.r.ucDecodeEntry(it.r.ucOffset(target))
+		e, _ := it.r.decodeFullKeyEntry(it.r.ucOffset(target))
 		it.idx = target + 1
 		return e, true
 	}

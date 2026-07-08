@@ -86,7 +86,7 @@ gate) and the final close-out are fixed anchors per chunk.
   (full unification rejected — distinct overflow-chain ownership
   contracts; see `descendToLeafForKey`); shared root-collapse for
   `Delete` / `DeleteRange`; merge `pathFrame` / `cursorFrame`.
-- [ ] 14. page: leaf codec dedup — shared full-key entry decoder
+- [x] 14. page: leaf codec dedup — shared full-key entry decoder
   (`decodeRestartEntry` ≡ `ucDecodeEntry`), shared entry writer
   (`writeUCEntry` ≡ `writeCompressedRestartEntry`; the
   evolve-independently hedge is dropped), unified restart/uc

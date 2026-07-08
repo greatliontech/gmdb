@@ -25,47 +25,6 @@ import "bytes"
 // framing (variable-group restart table, no per-page RestartInterval
 // field) changed.
 
-// decodeRestartEntry decodes a restart entry (full key) at the given byte
-// offset. Returns the entry and the byte offset of the next entry. Key is
-// borrowed from the page buffer.
-func (r LeafReader) decodeRestartEntry(off int) (LeafEntry, int) {
-	var e LeafEntry
-	e.Flags = r.buf[off]
-	off++
-	keyLen := int(le.Uint16(r.buf[off:]))
-	off += 2
-	if e.Flags&CellFlagOverflow != 0 {
-		// [Flags][KeyLen][Key][OvflPage uint64][TotalLen uint64]
-		e.Key = r.buf[off : off+keyLen]
-		off += keyLen
-		e.OverflowPage = le.Uint64(r.buf[off:])
-		off += 8
-		e.TotalLen = le.Uint64(r.buf[off:])
-		off += 8
-		return e, off
-	}
-	if e.IsNestedTree() {
-		// [Flags][KeyLen][Key][Root uint64][Count uint64] — same wire
-		// shape as overflow; different decoded-view fields. Per
-		// set-keyspace.md §Nested B+tree Reference Cell.
-		e.Key = r.buf[off : off+keyLen]
-		off += keyLen
-		e.NestedRoot = le.Uint64(r.buf[off:])
-		off += 8
-		e.NestedCount = le.Uint64(r.buf[off:])
-		off += 8
-		return e, off
-	}
-	// [Flags][KeyLen][ValueLen][Key][Value]
-	valLen := int(le.Uint32(r.buf[off:]))
-	off += 4
-	e.Key = r.buf[off : off+keyLen]
-	off += keyLen
-	e.Value = r.buf[off : off+valLen]
-	off += valLen
-	return e, off
-}
-
 // decodeDeltaEntry decodes a delta entry at the given byte offset, using
 // prevKey to reconstruct the full key. keyBuf is the in-place
 // reconstruction buffer — truncated to SharedLen and appended with
@@ -139,7 +98,7 @@ func (r LeafReader) compressedLastKey(keyBuf []byte) ([]byte, []byte) {
 	gc := r.rt.GroupEntryCount(lastGroup)
 	off := r.rt.Offset(lastGroup)
 
-	re, off := r.decodeRestartEntry(off)
+	re, off := r.decodeFullKeyEntry(off)
 	prevKey := re.Key
 	if gc == 1 {
 		return prevKey, keyBuf
@@ -171,7 +130,7 @@ func (r LeafReader) compressedSearchLeaf(target []byte) (index int, entry LeafEn
 	for lo < hi {
 		mid := lo + (hi-lo)/2
 		off := r.rt.Offset(mid)
-		e, _ := r.decodeRestartEntry(off)
+		e, _ := r.decodeFullKeyEntry(off)
 		cmp := bytes.Compare(e.Key, target)
 		switch {
 		case cmp < 0:
@@ -198,7 +157,7 @@ func (r LeafReader) compressedSearchLeaf(target []byte) (index int, entry LeafEn
 	gc := r.rt.GroupEntryCount(group)
 	endIdx := startIdx + gc
 
-	re, off := r.decodeRestartEntry(off)
+	re, off := r.decodeFullKeyEntry(off)
 	// restart key is strictly < target here (phase 1 would have returned
 	// on equality, and binary search wouldn't have descended here on
 	// strictly-greater).
@@ -240,7 +199,7 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 	for lo < hi {
 		mid := lo + (hi-lo)/2
 		off := r.rt.Offset(mid)
-		e, afterValOff := r.decodeRestartEntry(off)
+		e, afterValOff := r.decodeFullKeyEntry(off)
 		cmp := bytes.Compare(e.Key, target)
 		switch {
 		case cmp < 0:
@@ -291,7 +250,7 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 	nextRestart := startIdx + gc
 	endIdx := startIdx + gc
 
-	re, off := r.decodeRestartEntry(off)
+	re, off := r.decodeFullKeyEntry(off)
 
 	// Cmp restart key vs target — if restart key > target we'd have
 	// stopped in phase 1; equality is a phase-1 case. So restart key
@@ -373,7 +332,7 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 func (r LeafReader) iterFromGroupRestart(groupIdx int, keyBuf, bufKeys []byte, bufEnts []LeafEntry) (int, LeafEntry, bool, LeafIter) {
 	groupStart := r.rt.GroupStartIndex(groupIdx)
 	gc := r.rt.GroupEntryCount(groupIdx)
-	e, afterValOff := r.decodeRestartEntry(r.rt.Offset(groupIdx))
+	e, afterValOff := r.decodeFullKeyEntry(r.rt.Offset(groupIdx))
 	it := LeafIter{
 		r:           r,
 		idx:         groupStart + 1,
@@ -400,7 +359,7 @@ func (r LeafReader) compressedEntryAt(idx int, keyBuf []byte) (LeafEntry, []byte
 		gc := r.rt.GroupEntryCount(g)
 		if accum+gc > idx {
 			off := r.rt.Offset(g)
-			e, off := r.decodeRestartEntry(off)
+			e, off := r.decodeFullKeyEntry(off)
 			if accum == idx {
 				return e, keyBuf
 			}

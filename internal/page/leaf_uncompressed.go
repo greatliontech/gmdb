@@ -33,47 +33,6 @@ func (r LeafReader) ucOffset(idx int) int {
 	return int(le.Uint16(r.buf[r.ucTableOff+idx*ucOffsetEntrySize:]))
 }
 
-// ucDecodeEntry decodes the entry at byte offset off. Returns the entry
-// and the offset of the next entry's first byte. Key and Value (for
-// inline values) borrow from the page buffer.
-func (r LeafReader) ucDecodeEntry(off int) (LeafEntry, int) {
-	var e LeafEntry
-	e.Flags = r.buf[off]
-	off++
-	keyLen := int(le.Uint16(r.buf[off:]))
-	off += 2
-	if e.Flags&CellFlagOverflow != 0 {
-		// [Flags][KeyLen][Key][OvflPage u64][TotalLen u64]
-		e.Key = r.buf[off : off+keyLen]
-		off += keyLen
-		e.OverflowPage = le.Uint64(r.buf[off:])
-		off += 8
-		e.TotalLen = le.Uint64(r.buf[off:])
-		off += 8
-		return e, off
-	}
-	if e.IsNestedTree() {
-		// [Flags][KeyLen][Key][Root u64][Count u64] — same wire shape
-		// as overflow; different decoded-view fields. Per
-		// set-keyspace.md §Nested B+tree Reference Cell.
-		e.Key = r.buf[off : off+keyLen]
-		off += keyLen
-		e.NestedRoot = le.Uint64(r.buf[off:])
-		off += 8
-		e.NestedCount = le.Uint64(r.buf[off:])
-		off += 8
-		return e, off
-	}
-	// [Flags][KeyLen][ValueLen][Key][Value]
-	valLen := int(le.Uint32(r.buf[off:]))
-	off += 4
-	e.Key = r.buf[off : off+keyLen]
-	off += keyLen
-	e.Value = r.buf[off : off+valLen]
-	off += valLen
-	return e, off
-}
-
 // ucSearchLeaf performs O(log N) binary search over the positional offset
 // table. Returns the entry's index (or the insertion point on miss), the
 // entry value-side fields (Key cleared on found — caller has target),
@@ -82,7 +41,7 @@ func (r LeafReader) ucSearchLeaf(target []byte) (int, LeafEntry, bool) {
 	lo, hi := 0, r.count
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		e, _ := r.ucDecodeEntry(r.ucOffset(mid))
+		e, _ := r.decodeFullKeyEntry(r.ucOffset(mid))
 		cmp := bytes.Compare(e.Key, target)
 		switch {
 		case cmp < 0:
@@ -105,7 +64,7 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 	lo, hi := 0, r.count
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		e, _ := r.ucDecodeEntry(r.ucOffset(mid))
+		e, _ := r.decodeFullKeyEntry(r.ucOffset(mid))
 		cmp := bytes.Compare(e.Key, target)
 		switch {
 		case cmp < 0:
@@ -147,7 +106,7 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 	}
 	// successor at lo
 	sucOff := r.ucOffset(lo)
-	e, nextOff := r.ucDecodeEntry(sucOff)
+	e, nextOff := r.decodeFullKeyEntry(sucOff)
 	it := LeafIter{
 		r:          r,
 		idx:        lo + 1,
