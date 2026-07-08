@@ -473,8 +473,8 @@ func TestCommitReserveCoversFlushRetireSegmentCrossing(t *testing.T) {
 }
 
 // TestConfigStagingAfterCapFillCommits pins the obligation-edge
-// admission on the public surface (the round-1 reviewer's
-// reproducer): fill a keyspace to ErrTxTooLarge with a deep keyspace
+// admission on the public surface: fill a keyspace to
+// ErrTxTooLarge with a deep keyspace
 // B+tree (many sibling keyspaces), then stage a batch of
 // SetKeyspaceConfig changes on uncached names. Each staging call
 // must either be admitted — reserve still affordable — or fail

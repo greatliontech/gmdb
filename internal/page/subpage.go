@@ -66,8 +66,8 @@ var ErrSubpageCorrupted = errors.New("page: subpage structural corruption")
 
 // ErrSubpageValueSize is returned by Insert / EncodeSubpage when a
 // caller-supplied value's length disagrees with the keyspace's
-// declared fixedValueSize (set-keyspace.md §Invariants). The SetKeyspace surface at chunk
-// 6.6 maps this to the public gmdb.ErrValueSizeMismatch sentinel.
+// declared fixedValueSize (set-keyspace.md §Invariants). The SetKeyspace surface
+// maps this to the public gmdb.ErrValueSizeMismatch sentinel.
 var ErrSubpageValueSize = errors.New("page: subpage value-size mismatch")
 
 // SubpageReader provides bounded read access over a single subpage.
@@ -426,8 +426,8 @@ func (r SubpageReader) Insert(value []byte) ([]byte, bool, error) {
 //   - (newBuf, true, nil) on a successful delete. newBuf is a freshly
 //     allocated slice of length r.SizeBytes() - entrySize(removed).
 //     For Count=1 deletions, newBuf is a Count=0 / DataSize=0
-//     subpage (a 4-byte header); the SetKeyspace surface at chunk
-//     6.5 owns the empty-set ban — empty subpages must not persist
+//     subpage (a 4-byte header); the SetKeyspace surface
+//     owns the empty-set ban — empty subpages must not persist
 //     and the surface removes the parent cell instead of storing
 //     the 4-byte header.
 //   - (_, false, ErrSubpageValueSize) for a fixed-size subpage when

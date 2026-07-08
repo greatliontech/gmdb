@@ -9,7 +9,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// initDB creates a fresh database file with chunk-1-friendly defaults and
+// initDB creates a fresh database file with test-friendly defaults and
 // returns it (opened via Open + ready for tx work).
 func initDB(t *testing.T, pageChecksum bool) (*os.File, *OpenedDB, func()) {
 	t.Helper()

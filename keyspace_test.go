@@ -9,7 +9,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/btree"
 )
 
-// Chunk-5.4 tests promote four invariants over the keyspace surface:
+// These tests promote four invariants over the keyspace surface:
 //
 //   Inv-A (clause-explicit): OpenKeyspace missing → ErrNotFound;
 //          CreateKeyspace duplicate → ErrKeyExists.
@@ -337,8 +337,8 @@ func TestOpenKeyspaceRejectsForgedKindMismatch(t *testing.T) {
 	}
 	defer tx.Rollback()
 
-	// Forge a Kind=1 (SetKeyspace) descriptor — chunk 6 lands the
-	// CreateSetKeyspace API, but the codec accepts Kind=1 today.
+	// Forge a Kind=1 (SetKeyspace) descriptor at the codec level,
+	// bypassing the CreateSetKeyspace API.
 	forged := keyspaceDescriptor{Kind: keyspaceKindSetKeyspace}
 	if err := tx.storeDescriptor("sks", forged); err != nil {
 		t.Fatalf("storeDescriptor Kind=1: %v", err)

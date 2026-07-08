@@ -273,7 +273,7 @@ if errors.Is(err, gmdb.ErrPoisoned) {
 
 `Close` works normally on a poisoned handle (releases the mmap,
 closes the file). Recovery is unconditionally Close + re-Open;
-there is no in-process repair API in v0 (a future chunk-11
+there is no in-process repair API in v0 (a future repair surface
 `Check()`-driven repair may offer one).
 
 A poisoned handle's `Begin` returns `ErrPoisoned` without
@@ -771,7 +771,7 @@ type Tx struct { ... }
 // Commit publishes the transaction's changes atomically via the meta
 // swap.
 //
-// Descriptor flush is deferred to Commit (chunk-5.6 design).
+// Descriptor flush is deferred to Commit (the deferred-flush design).
 // Same-tx Keyspace.Put / Keyspace.Delete / Cursor.Delete /
 // SetKeyspaceConfig / CreateKeyspace* / DeleteKeyspace mutate the
 // keyspace descriptors only in memory; the on-disk keyspace B+tree
@@ -940,7 +940,7 @@ func (tx *Tx) ListKeyspaces() ([]string, error)
 // RestartGroupTarget uses 0 as the "leave unchanged" sentinel
 // (distinct from the descriptor's 0 = engine-default semantic).
 // Returns ErrNotFound when name does not resolve to an existing
-// keyspace (chunk-5.5 lock-in matching Tx.DeleteKeyspace and the
+// keyspace (matching Tx.DeleteKeyspace and the
 // Delete-on-miss invariant family). Only valid on a write
 // transaction.
 func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error
@@ -1053,10 +1053,10 @@ func (ks *Keyspace) Delete(key []byte) error
 //     nil and []byte{} is intentional: nil expresses "open"; the
 //     zero-length byte slice is an invalid key.
 //
-// **Atomicity contract.** Dispatches by index presence (chunk-7.10
+// **Atomicity contract.** Dispatches by index presence (the
 // indexed-keyspace fallback per range-delete.md §Indexed-keyspace
 // fallback):
-//   - **Un-indexed**: btree.DeleteRange (the chunk-5.7 atomic
+//   - **Un-indexed**: btree.DeleteRange (the single-descent atomic
 //     three-phase walker). **Atomic on error**: returns (0, err)
 //     with no observable mutations — desc.Root, desc.Count, and
 //     the dirty/cursor-stale state are touched only on the
@@ -1064,13 +1064,13 @@ func (ks *Keyspace) Delete(key []byte) error
 //     call observe the pre-call state; tx-level Rollback restores
 //     the on-disk pager bitmap per pager-slab.md.
 //   - **Indexed**: per-row cursor walk + Cursor.Delete per row
-//     (chunk-7.6 atomic index maintenance clears index entries
+//     (atomic index maintenance clears index entries
 //     before removing the row). **Per-row atomic on error**:
 //     returns (deleted_so_far, err); iterations 0..i-1 have
 //     completed and are in-memory visible; the failing iteration
 //     and remainder are untouched. Each successful per-row delete
-//     satisfies chunk-5.1's keyed-removal invariants and
-//     chunk-7.1's atomic-Put/Delete invariant individually; the
+//     satisfies the keyed-removal invariants and
+//     the atomic-Put/Delete invariant individually; the
 //     in-memory + on-disk state is consistent-but-partial. The
 //     only safe recovery is Tx.Rollback() (which restores via
 //     the pager bitmap snapshot).
@@ -1129,7 +1129,7 @@ func (ks *SetKeyspace) HasValue(key, value []byte) (bool, error)
 // Put + HasValue pattern callers would otherwise need for pub/sub
 // broadcasts, ref-counted indexes, idempotent retries — all of which
 // need to know "did this call cause the set to grow" without the
-// TOCTOU window of HasValue-then-Put. (Chunk-6.1 user-locked decision;
+// TOCTOU window of HasValue-then-Put. (User-locked decision;
 // the typed mirror TypedSetKeyspaceHandle.Put propagates the bool.)
 func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error)
 
@@ -1150,16 +1150,16 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
 // open-boundary; non-nil zero-length is rejected with
 // ErrKeyEmpty.
 //
-// **Atomicity contract (mirrors Keyspace.DeleteRange's chunk-7.10
+// **Atomicity contract (mirrors Keyspace.DeleteRange's
 // indexed/un-indexed split).** Dispatches by index presence:
-//   - **Un-indexed**: btree.DeleteRange (the chunk-5.7 atomic
+//   - **Un-indexed**: btree.DeleteRange (the single-descent atomic
 //     three-phase walker) with a SetKeyspace-aware per-cell free
 //     callback that handles subpage / nested-tree / overflow
 //     cells. **Atomic on error**: returns (0, err) with no
 //     observable mutations — tx-level Rollback restores via the
 //     pager bitmap snapshot per pager-slab.md.
 //   - **Indexed**: per-row cursor walk + ks.Delete(k) per row
-//     (chunk-7.9's per-(setKey, setValue) index maintenance
+//     (the per-(setKey, setValue) index maintenance
 //     clears index entries via the extractor). **Per-row atomic
 //     on error**: returns
 //     (deleted_so_far, err); iterations 0..i-1 have completed
@@ -1231,7 +1231,7 @@ type IndexHandle struct { /* unexported */ }
 // tuple. The number of supplied cols MUST equal the index's
 // declared column count; supplying fewer or more sets idx.Err()
 // to a wrapped ErrInvalidOptions and yields nothing — use Prefix
-// for partial-cols semantics (chunk-7.7 user-locked enforcement).
+// for partial-cols semantics (user-locked exact-cols enforcement).
 //
 // value is the on-disk encoded covering tuple when the index
 // declares Covering — decode via DecodeCoveringTuple to recover
@@ -1268,7 +1268,7 @@ func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
 
 // LookupKeys returns matching primary keys without back-lookup or
 // covering decode. Iteration cost is O(matches) leaf scans only.
-// The same exact-cols validation as Lookup applies (chunk-7.7
+// The same exact-cols validation as Lookup applies (user-locked
 // user-locked). Same Inv-IHS3 / Inv-IHS2 dead-handle contract as
 // Lookup: post-DeleteKeyspace → idx.Err() = ErrKeyspaceClosed;
 // post-DropIndex → idx.Err() = ErrIndexNotFound wrap.

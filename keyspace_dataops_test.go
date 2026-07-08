@@ -10,7 +10,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// Chunk-5.5 tests promote four data-op invariants:
+// These tests promote four data-op invariants:
 //
 //   Inv-A:  Put-then-Get round-trips the value.
 //   Inv-B:  descriptor CoW → meta.KeyspaceRoot across commit;
@@ -67,7 +67,7 @@ func TestKeyspaceGetMissingReturnsErrNotFound(t *testing.T) {
 	}
 }
 
-// TestKeyspaceDeleteMissingReturnsErrNotFound promotes the chunk-5.1
+// TestKeyspaceDeleteMissingReturnsErrNotFound promotes the
 // Delete-on-miss invariant at the Keyspace.Delete surface.
 func TestKeyspaceDeleteMissingReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
@@ -199,7 +199,7 @@ func TestCursorMarkStaleAfterSiblingPut(t *testing.T) {
 		t.Errorf("Err on stale cursor = %v, want ErrCursorStale", c.Err())
 	}
 	// Re-position recovers — and observes the sibling-Put'd "c".
-	// Chunk-5.7 adjacent-fix: prior to the cursor.SetRootID +
+	// Prior to the cursor.SetRootID +
 	// markCursorsStale-refresh pair, the re-position would have
 	// descended from the now-retired old root and silently read
 	// stale (or corrupted post-loose-pop) data.
@@ -237,11 +237,11 @@ func TestSetKeyspaceConfigUpdatesRestartGroupTarget(t *testing.T) {
 	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{RestartGroupTarget: 32}); err != nil {
 		t.Fatalf("SetKeyspaceConfig: %v", err)
 	}
-	// Lookup via the in-memory-aware path — the chunk-5.6 deferred-
-	// flush refactor moves descriptor persistence to Commit time, so
+	// Lookup via the in-memory-aware path — the deferred-flush
+	// machinery moves descriptor persistence to Commit time, so
 	// loadDescriptor (disk-only) returns the pre-config state until
 	// the flush walk runs. lookupDescriptor consults openKeyspaces
-	// and dirtyDescriptors first per the chunk-5.6 contract.
+	// and dirtyDescriptors first per the deferred-flush contract.
 	desc, found, err := tx.lookupDescriptor("ks")
 	if err != nil || !found {
 		t.Fatalf("lookupDescriptor: found=%v err=%v", found, err)

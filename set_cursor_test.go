@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// Chunk-6.7 SetCursor tests. Promotes the entailed invariant E4
+// SetCursor tests. Promotes the entailed invariant E4
 // (NextValue does not cross key boundaries) and pins the
 // core/value navigation contract per api-surface.md §SetCursor API
 // + keyspaces.md §Iteration Semantics.
@@ -509,7 +509,7 @@ func TestSetCursorDeadOnDeleteKeyspace(t *testing.T) {
 	}
 }
 
-// --- Fixed-size SetKeyspace cursor (L-2 coverage) ---
+// --- Fixed-size SetKeyspace cursor ---
 
 func TestSetCursorFixedSizeIteration(t *testing.T) {
 	// Materialization path uses ks.desc.FixedValueSize when
@@ -546,7 +546,7 @@ func TestSetCursorFixedSizeIteration(t *testing.T) {
 	}
 }
 
-// --- SetCursor.Delete on a nested-tree cell (L-2 coverage) ---
+// --- SetCursor.Delete on a nested-tree cell ---
 
 func TestSetCursorDeleteOnNestedTreeAdvances(t *testing.T) {
 	// Exercise SetCursor.Delete on a promoted (nested-tree) cell —
@@ -588,7 +588,7 @@ func TestSetCursorDeleteOnNestedTreeAdvances(t *testing.T) {
 	}
 }
 
-// --- Stale-then-recover (L-2 coverage) ---
+// --- Stale-then-recover ---
 
 func TestSetCursorStaleClearsOnReposition(t *testing.T) {
 	// After a sibling-Put marks the cursor stale, a re-position
@@ -755,7 +755,7 @@ func TestSetCursorNestedE4Transitions(t *testing.T) {
 // TestSetCursorEmptyMemberNotSkipped pins the empty-member walk: an
 // empty ([]byte{}) member is a REAL position (api-surface.md §Nil
 // and Empty Semantics), returned as a non-nil empty slice — the
-// review demonstrated a nil-sentinel dispatch silently skipping it
+// a nil-sentinel dispatch would silently skip it
 // and crossing keys early on the reverse walk.
 func TestSetCursorEmptyMemberNotSkipped(t *testing.T) {
 	ctx := context.Background()
@@ -800,7 +800,7 @@ func TestSetCursorEmptyMemberNotSkipped(t *testing.T) {
 // TestSetCursorEmptyMemberInNestedTree pins the empty member in the
 // NESTED regime, where the btree cursor's nil-collapse on an
 // empty-key HIT (Seek returning nil curKey) broke both new Seek call
-// sites — review round 2: Delete at the "" member landed
+// sites: Delete at the "" member landed
 // end-of-iteration with 200 members remaining, and SeekValue("")
 // destroyed the position on a hit.
 func TestSetCursorEmptyMemberInNestedTree(t *testing.T) {
@@ -867,7 +867,7 @@ func TestSetCursorEmptyMemberInNestedTree(t *testing.T) {
 // TestSetCursorDeleteFailureLeavesPositionIntact pins the retry
 // contract on the nested path: a FAILED Delete must leave the value
 // position unchanged — the successor peek must not move the live
-// inner cursor (the review demonstrated a moved cursor silently
+// inner cursor (a moved cursor silently
 // skipping a member on the next NextValue after a failed indexed
 // delete).
 func TestSetCursorDeleteFailureLeavesPositionIntact(t *testing.T) {

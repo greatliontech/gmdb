@@ -8,7 +8,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// Chunk-5.7 btree-layer tests for DeleteRange. The higher-level
+// Btree-layer tests for DeleteRange. The higher-level
 // gmdb-package tests in delete_range_test.go pin the public surface
 // against the deferred-flush descriptor machinery; these tests pin
 // the btree-layer invariants directly against an in-memory pager.
@@ -208,10 +208,10 @@ func TestBtreeDeleteRangeAllKeys(t *testing.T) {
 // page in the interior subtrees enters loosePages/retiredPages while
 // the boundary leaves remain well-formed.
 //
-// Workload sized to fit the chunk-4.7 16 MB tx-slab budget set by
+// Workload sized to fit the 16 MB tx-slab budget set by
 // setupPagerWriter: 1200 keys × 100-byte values → ~30 leaves at 4 KB
 // pages with one branch level (depth 2). The internal slab-reuse
-// machinery (chunk-5.4 loose-pop) keeps the working set bounded.
+// machinery (the loose-pop pool) keeps the working set bounded.
 func TestBtreeDeleteRangeMultiLevelInteriorRetire(t *testing.T) {
 	pw, _, f := setupPagerWriter(t, 1024)
 	defer pw.Close()
@@ -617,10 +617,10 @@ func TestBtreeDeleteRangePreservesFillFloor(t *testing.T) {
 // case-C uses useLeft=true). The cousin step's `mergeOrRedistribute-
 // Branches(Q, R_degenerate, sep_QR)` lands the deep child at a
 // NON-leftmost position of the merge result (specifically at
-// mergedID.cells[len(Q.cells)].Child), which the Round 2 review
-// flagged as the path the original leftmost-only spine walk missed.
+// mergedID.cells[len(Q.cells)].Child) — the path the original
+// leftmost-only spine walk missed.
 // Pins the all-children scan + useLeft=true case-C cousin
-// propagation (Round 2 H-1 fix).
+// propagation.
 func TestBtreeDeleteRangePreservesFillFloorUseLeftCousin(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)

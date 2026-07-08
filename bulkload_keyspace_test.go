@@ -351,8 +351,8 @@ func TestKeyspaceBulkLoadEmptyStream(t *testing.T) {
 
 // Indexed Keyspace.BulkLoad is covered comprehensively in
 // bulkload_indexed_test.go (round-trip, Put-parity, unique-violation,
-// spill, abort-leaves-pre-state). The chunk-8.4 interim "indexed ⇒ error"
-// stub it asserted was deliberately replaced by the real path in 8.6.
+// spill, abort-leaves-pre-state). The interim "indexed ⇒ error"
+// stub it asserted was deliberately replaced by the real path.
 
 // TestKeyspaceBulkLoadReusedKeyBuffer verifies the iter.Seq2 contract: a
 // yield that reuses a single key (and value) buffer across iterations must

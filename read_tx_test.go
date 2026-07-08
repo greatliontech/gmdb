@@ -497,7 +497,7 @@ func TestLeakedReadTxReleasesSlotViaCleanup(t *testing.T) {
 func TestReaderPinsRPLAgainstReclamation(t *testing.T) {
 	// Project invariant 1 (clause-explicit, transactions.md): an
 	// active reader at TxnID T pins every page retired at TxnID
-	// > T against RPL reclamation. The chunk-3.4 wiring of the
+	// > T against RPL reclamation. The wiring of the
 	// reclamation bound (min(oldestReaderTxnID, anchoredEpoch))
 	// is the mechanism. Pin the contract: open writer, alloc + free
 	// page A across two commits so A lands in the RPL at TxnID=2;

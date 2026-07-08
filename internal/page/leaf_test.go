@@ -595,8 +595,8 @@ func TestLeafReader_Validate_RejectsCompressedCellFlags(t *testing.T) {
 // TestLeafReader_Validate_TotalOverInput is the load-bearing
 // "Validate is total over arbitrary input" probe — for each forged
 // length field, Validate must return ErrCorrupted, NOT panic with a
-// slice-out-of-range. The corresponding panics in the prior
-// (decoder-using) implementation were the Round-2 H finding; this
+// slice-out-of-range. The prior
+// (decoder-using) implementation panicked on these inputs; this
 // test pins the regression boundary.
 func TestLeafReader_Validate_TotalOverInput(t *testing.T) {
 	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
@@ -671,8 +671,8 @@ func TestLeafReader_Validate_TotalOverInput(t *testing.T) {
 	// broken (the two bytes left behind at `from` are exactly what a
 	// streaming reader would decode). Forgeries that land mid-entry
 	// get rejected by the CellFlags/bounds checks instead and would
-	// leave the contiguity guard untested (a surviving mutation in
-	// review round 1 caught precisely that).
+	// leave the contiguity guard untested (a surviving mutation
+	// caught precisely that).
 	shiftStream := func(t *testing.T, buf []byte, from int) {
 		t.Helper()
 		r := NewLeafReader(buf, cfg)

@@ -421,7 +421,7 @@ func TestCursorDeleteCowMergeCascadeTolerance(t *testing.T) {
 }
 
 func TestCursorOverflowEntryNavigation(t *testing.T) {
-	// Chunk-4.7 contract (replaces the chunk-4.3 sentinel test):
+	// Contract (replaces the earlier sentinel test):
 	// the cursor eagerly assembles overflow-entry values on
 	// adoptEntry, returning the assembled bytes via Current /
 	// Next / Prev. Pin: a leaf with mixed inline + overflow
@@ -481,7 +481,7 @@ func TestCursorOverflowEntryNavigation(t *testing.T) {
 }
 
 func TestCursorSeekGEExactMatchOverflowAssemblesValue(t *testing.T) {
-	// Regression for chunk-4.7 round-1 H1: SeekGE's exact-match
+	// Regression: SeekGE's exact-match
 	// path previously did `c.curValue = entry.Value` directly,
 	// bypassing valueFor — so an exact match on an overflow
 	// entry returned (key, nil) instead of (key, assembled).
@@ -532,13 +532,13 @@ func TestCursorEmptyTreeAllOpsReturnEnd(t *testing.T) {
 }
 
 func TestCursorMarkStaleSurfacesErrCursorStaleOnNonPositioningOps(t *testing.T) {
-	// Scaffolding for chunk-5+ external-mutation invalidation. The
+	// External-mutation invalidation. The
 	// cursor's non-positioning methods (Next / Prev / Current /
 	// Delete) detect c.gen != c.posGen and surface ErrCursorStale;
 	// positioning methods (First / Last / Seek / SeekGE) reset
-	// posGen and recover. At chunk-4.6δ no internal caller bumps
+	// posGen and recover. Within this package no internal caller bumps
 	// gen externally; pinning the behavior here ensures the
-	// chunk-5 keyspace integration finds the contract uniform
+	// keyspace layer's MarkStale integration finds the contract uniform
 	// across Next / Prev / Current / Delete.
 	cfg := page.Config{PageSize: 4096}
 	root, pw := buildTree(t, cfg, [][2]string{{"a", "A"}, {"b", "B"}, {"c", "C"}})

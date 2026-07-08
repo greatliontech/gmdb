@@ -1,14 +1,14 @@
 package btree
 
-// Chunk-6.5 demotion + per-key bulk-free tests.
+// Demotion + per-key bulk-free tests.
 //
 // Demotion: DemoteNestedTreeIfFits inspects a nested-tree root and,
 // when the root is a single leaf whose values fit as a subpage,
 // returns (subpageBytes, true, nil) and FreePage's the leaf.
 //
 // Per-key bulk-free: covered by FreeSubtree directly — extending
-// FreeSubtree to recurse into nested-tree cells closes the chunk-5.6
-// inheritance gap. The "per-key" semantics live at chunk-6.6 SetKeyspace
+// FreeSubtree to recurse into nested-tree cells closes the
+// bulk-retire inheritance gap. The "per-key" semantics live at the SetKeyspace
 // surface (caller looks up the cell, calls FreeSubtree(NestedRoot),
 // then removes the cell from the parent leaf). At this layer the
 // test pins (a) the extended count semantic and (b) every nested
@@ -298,7 +298,7 @@ func TestFreeSubtreeNestedTreeCellRecursesAndCounts(t *testing.T) {
 	// A Kind=1 data leaf with a nested-tree cell: FreeSubtree
 	// recursively retires the nested tree and adds the nested
 	// leaf's count to the parent count. Pins the closure of the
-	// chunk-5.6 inheritance gap (SetKeyspace nested-tree pages
+	// bulk-retire inheritance gap (SetKeyspace nested-tree pages
 	// reachable from a Kind=1 leaf must be freed when the parent
 	// keyspace is bulk-freed).
 	pw, _, f := setupPagerWriter(t, 128)
@@ -432,7 +432,7 @@ func TestFreeSubtreeSubpageCellCountFixedSize(t *testing.T) {
 
 func TestFreeSubtreeKind0Unchanged(t *testing.T) {
 	// Regression: for Kind=0 trees (no MultiValue cells), the
-	// extended FreeSubtree returns the same count as the chunk-5.6
+	// extended FreeSubtree returns the same count as the original
 	// implementation (= number of leaf entries).
 	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16}
 	fake := newFakeWriter(t, cfg.PageSize)

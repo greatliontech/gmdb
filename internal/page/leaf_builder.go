@@ -94,8 +94,8 @@ func (b *LeafBuilder) AddOverflow(key []byte, ovflPage, totalLen uint64) bool {
 // raw subpage bytes (header + entries, per set-keyspace.md §Subpage
 // Format) produced by internal/page.SubpageReader / EncodeSubpage /
 // Insert / Delete. The leaf carries the bytes opaque-through;
-// per-subpage validation lives at the SetKeyspace surface (chunk
-// 6.6) which has the keyspace's FixedValueSize.
+// per-subpage validation lives at the SetKeyspace surface,
+// which has the keyspace's FixedValueSize.
 //
 // On-disk encoding is the same shape as AddInline (the cell flag is
 // the only byte that differs): [Flags][KeyLen][ValueLen][Key][Subpage].

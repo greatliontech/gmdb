@@ -9,8 +9,8 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// Chunk-5.2 tests pin three invariants over AllocContiguous / AllocSlabRun /
-// FreeRun on a real *pager.Pager (fakeWriter's chunk-4.7 contract translated
+// These tests pin three invariants over AllocContiguous / AllocSlabRun /
+// FreeRun on a real *pager.Pager (fakeWriter's PageWriter contract translated
 // to the real implementation):
 //
 //   Inv-1 (atomicity): AllocContiguous(n) either reserves all n pages
@@ -20,7 +20,7 @@ import (
 //          by FreeRun(firstID, n) (without intervening AllocSlabRun) restores
 //          the bitmap bits and drops pendingAllocs without retiring same-tx
 //          pages to retiredPages.
-//   Inv-3 (PageWriter parity): the chunk-4.7 overflow-chain rollback shape —
+//   Inv-3 (PageWriter parity): the overflow-chain rollback shape —
 //          AllocContiguous then FreeRun on AllocSlabRun budget error —
 //          succeeds on *pager.Pager identically to fakeWriter.
 
@@ -107,7 +107,7 @@ func TestAllocContiguousErrDBFull(t *testing.T) {
 // TestAllocContiguousFreeRunRoundTrip promotes Inv-2: alloc + immediate
 // FreeRun (no AllocSlabRun) restores the bitmap + drops pendingAllocs and
 // does NOT retire same-tx pages. Demonstrated-fault anchor for the
-// chunk-5.2 FreePage extension that handles the
+// FreePage extension that handles the
 // allocated-but-never-written case.
 func TestAllocContiguousFreeRunRoundTrip(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
@@ -149,7 +149,7 @@ func TestAllocContiguousFreeRunRoundTrip(t *testing.T) {
 // TestAllocContiguousHWMExtensionThenFreeRun pins the HWM-extension
 // branch of Inv-2. AllocContiguous via HWM extension does not call
 // bitmap.Clear (the bits past HWM are already clear); FreeRun on those
-// same-tx allocated-but-never-written pages routes through the chunk-5.2
+// same-tx allocated-but-never-written pages routes through the
 // FreePage extension and bitmap.Set'es each bit. Post-state: numFree
 // grew by n, HWM unchanged, pendingAllocs empty. The pages are now
 // allocator-reachable as bitmap-free + HWM-covered (TailRefund per
@@ -477,7 +477,7 @@ func TestFreeRunReadOnlyErrors(t *testing.T) {
 	}
 }
 
-// TestLoosePoolPopDetachesStaleBuffer pins the chunk-5.4 fix to the
+// TestLoosePoolPopDetachesStaleBuffer pins the stale-buffer detach in the
 // AllocPage loose-pop branch: when a previously-CoW'd page is freed
 // (becomes loose) and then re-popped by AllocPage, the stale buffer
 // in p.dirty must be detached so a subsequent CoW(srcID, popped) on
@@ -521,8 +521,8 @@ func TestLoosePoolPopDetachesStaleBuffer(t *testing.T) {
 		t.Fatalf("page %d not in loosePages after FreePage", p1)
 	}
 
-	// Step 3: AllocPage pops P1 from loose. With the chunk-5.4 fix,
-	// the stale buffer is detached from p.dirty.
+	// Step 3: AllocPage pops P1 from loose. With the detach in
+	// place, the stale buffer is removed from p.dirty.
 	p2, err := p.AllocPage()
 	if err != nil {
 		t.Fatalf("AllocPage #2 (loose-pop): %v", err)
@@ -539,7 +539,7 @@ func TestLoosePoolPopDetachesStaleBuffer(t *testing.T) {
 	}
 
 	// Step 4: AllocSlab to install a fresh zero-filled buffer at p2.
-	// Without the chunk-5.4 fix, AllocSlab's idempotent shortcut
+	// Without the detach, AllocSlab's idempotent shortcut
 	// would return the 0xAA-filled stale buffer; with the fix, it
 	// allocates fresh and returns a zero-filled buffer.
 	buf2, err := p.AllocSlab(p2)
@@ -549,7 +549,7 @@ func TestLoosePoolPopDetachesStaleBuffer(t *testing.T) {
 	for i, b := range buf2 {
 		if b != 0 {
 			t.Fatalf("loose-popped page AllocSlab returned stale (non-zero) "+
-				"buffer at idx %d = 0x%02x — chunk-5.4 detach not effective",
+				"buffer at idx %d = 0x%02x — stale-buffer detach not effective",
 				i, b)
 		}
 	}
@@ -564,8 +564,8 @@ func TestLoosePoolPopDetachesStaleBuffer(t *testing.T) {
 }
 
 // TestLoosePoolPopDetachesStaleBufferCoW is the CoW-path counterpart
-// to TestLoosePoolPopDetachesStaleBuffer. The chunk-5.4 demonstrated
-// fault routed through CoW (chunk-4 btree's leaf-CoW pattern); this
+// to TestLoosePoolPopDetachesStaleBuffer. The original demonstrated
+// fault routed through CoW (the btree leaf-CoW pattern); this
 // test exercises that path directly.
 func TestLoosePoolPopDetachesStaleBufferCoW(t *testing.T) {
 	// makeFile pre-fills pages with a deterministic byte pattern so
@@ -618,7 +618,7 @@ func TestLoosePoolPopDetachesStaleBufferCoW(t *testing.T) {
 	}
 
 	// Step 4: CoW from a DIFFERENT source (page 1). Without the
-	// chunk-5.4 fix, CoW's idempotent shortcut would return the
+	// detach, CoW's idempotent shortcut would return the
 	// stale buf1 (page 0's content); with the fix, buf2 contains
 	// page 1's content.
 	buf2, err := p.CoW(1, p2)
@@ -642,8 +642,8 @@ func TestLoosePoolPopDetachesStaleBufferCoW(t *testing.T) {
 }
 
 // TestFreePageAllocatedButNeverWrittenRestoresBitmap pins the
-// chunk-5.2 FreePage extension at the single-page level. The chunk-4.7
-// overflow rollback path can theoretically reach this state for a
+// FreePage extension at the single-page level. The
+// overflow-chain rollback path can theoretically reach this state for a
 // single-page run too if a caller AllocPage's then FreePage's without
 // CoW / AllocSlab — observable here.
 func TestFreePageAllocatedButNeverWrittenRestoresBitmap(t *testing.T) {

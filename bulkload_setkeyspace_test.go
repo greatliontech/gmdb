@@ -322,8 +322,8 @@ func TestSetKeyspaceBulkLoadErrors(t *testing.T) {
 		}
 	})
 	// Indexed SetKeyspace.BulkLoad is covered in bulkload_indexed_test.go;
-	// the chunk-8.5 interim "indexed ⇒ error" stub asserted here was
-	// deliberately replaced by the real path in 8.6.
+	// the interim "indexed ⇒ error" stub asserted here was
+	// deliberately replaced by the real path.
 }
 
 // TestSetKeyspaceBulkLoadMatchesPut cross-checks a BulkLoad-built SetKeyspace
@@ -385,7 +385,7 @@ func TestSetKeyspaceBulkLoadMatchesPut(t *testing.T) {
 	}
 }
 
-// TestSetKeyspaceBulkLoadStorageShapeMatchesPut locks the M-1 fix: a single
+// TestSetKeyspaceBulkLoadStorageShapeMatchesPut locks the storage-shape parity fix: a single
 // value over the promotion threshold stays a SUBPAGE (as Put's genesis path
 // does), and a key only promotes to a nested tree once a second value pushes
 // it past the threshold.

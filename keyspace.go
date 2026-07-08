@@ -1505,10 +1505,11 @@ func (c *Cursor) Err() error {
 }
 
 // DeleteKeyspace removes a keyspace and bulk-frees its data B+tree
-// per api-surface.md §Keyspace API. Chunk-5.6 implements the first
-// of the three subtree-retirement steps documented in the spec:
+// per api-surface.md §Keyspace API. All three subtree-retirement
+// steps documented in the spec are performed (steps 2–3 apply when
+// the keyspace has indexes):
 //
-//  1. The keyspace's own B+tree (this implementation).
+//  1. The keyspace's own B+tree.
 //  2. Engine-internal index keyspaces.
 //  3. The per-keyspace index registry sub-tree.
 //

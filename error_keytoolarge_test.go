@@ -201,7 +201,7 @@ func TestKeyTooLargeDeterministicAtBound(t *testing.T) {
 		t.Errorf("gap-key Put: got %v, want ErrKeyTooLarge (deterministic at the entry gate)", e)
 	}
 
-	// SetKeyspace top-level key (PutEntry path — H-shape from review:
+	// SetKeyspace top-level key (PutEntry path — the demonstrated fault:
 	// an ungated set key was accepted by Put and then failed CopyTo's
 	// gated rebuild) and set MEMBERS (bulk path) obey the same bound.
 	if e := db.Update(ctx, func(tx *Tx) error {

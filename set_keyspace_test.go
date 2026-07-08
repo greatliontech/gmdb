@@ -11,7 +11,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// Chunk-6.6 SetKeyspace surface tests. Promote the chunk-6.1 invariants:
+// SetKeyspace surface tests. Promote the following invariants:
 //
 //   keyspaces.md #2 / #3 / #5 (Kind=1 parts):
 //     - Kind is immutable + recognized as {0,1,2}.
@@ -130,7 +130,7 @@ func TestCreateSetKeyspaceIfNotExistsMatchesOnReopen(t *testing.T) {
 }
 
 func TestCreateSetKeyspaceIfNotExistsMismatchedFixedValueSize(t *testing.T) {
-	// chunk-6.1 user-locked: CreateSetKeyspaceIfNotExists must
+	// User-locked: CreateSetKeyspaceIfNotExists must
 	// reject opts that disagree with the existing FixedValueSize
 	// (immutability per keyspaces.md inv #5).
 	ctx := context.Background()
@@ -284,7 +284,7 @@ func TestSetKeyspacePutDuplicate(t *testing.T) {
 		t.Fatalf("Put duplicate: %v", err)
 	}
 	if added {
-		t.Errorf("Put duplicate: added=true, want false (chunk-6.1 locked contract)")
+		t.Errorf("Put duplicate: added=true, want false (locked contract)")
 	}
 	count, _ := sks.CountValues([]byte("topic"))
 	if count != 1 {
@@ -455,7 +455,7 @@ func getEntryForTestKey(sks *SetKeyspace, cfg page.Config, key []byte) (page.Lea
 // --- Delete (whole-key) ---
 
 func TestSetKeyspaceDeleteMissingReturnsErrNotFound(t *testing.T) {
-	// chunk-5.1 Delete-on-miss invariant — Kind=1 portion.
+	// Delete-on-miss invariant — Kind=1 portion.
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 	defer db.Close()
@@ -493,7 +493,7 @@ func TestSetKeyspaceDeleteSubpageCell(t *testing.T) {
 
 func TestSetKeyspaceDeleteNestedTreeCellBulkFrees(t *testing.T) {
 	// Delete on a key with a promoted nested tree: bulk-free via
-	// FreeSubtree (chunk 6.5). Verify desc.Count drops to 0 after
+	// FreeSubtree. Verify desc.Count drops to 0 after
 	// the only key is deleted.
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -727,7 +727,7 @@ func TestDeleteKeyspaceMarksSetKeyspaceHandleDead(t *testing.T) {
 	}
 }
 
-// --- DeleteValue fixed-size rejection (M-4 regression) ---
+// --- DeleteValue fixed-size rejection ---
 
 func TestSetKeyspaceDeleteValueFixedValueSizeMismatch(t *testing.T) {
 	// Inv-3 symmetric coverage with Put: DeleteValue on a
@@ -745,7 +745,7 @@ func TestSetKeyspaceDeleteValueFixedValueSizeMismatch(t *testing.T) {
 	}
 }
 
-// --- DeleteValue from nested tree with newCount=0 (M-3 regression) ---
+// --- DeleteValue from nested tree with newCount=0 ---
 
 func TestSetKeyspaceDeleteValueNestedTreeDropsOnZeroCount(t *testing.T) {
 	// Edge case: a nested tree contains a single value whose
@@ -823,10 +823,10 @@ func TestSetKeyspaceDeleteValueNestedTreeDropsOnZeroCount(t *testing.T) {
 	}
 }
 
-// --- Commit-reopen with nested-tree cell (L-2 coverage) ---
+// --- Commit-reopen with nested-tree cell ---
 
 func TestSetKeyspaceCommitReopenWithPromotedNestedTree(t *testing.T) {
-	// L-2 close: pin that the nested-tree-ref cell + its subtree
+	// Pin that the nested-tree-ref cell + its subtree
 	// survive descriptor-flush + meta-swap.
 	ctx := context.Background()
 	path := tmpPath(t)
@@ -890,10 +890,10 @@ func TestSetKeyspaceCommitReopenWithPromotedNestedTree(t *testing.T) {
 	}
 }
 
-// --- SetKeyspaceConfig on a same-tx-created SetKeyspace (H-1 regression) ---
+// --- SetKeyspaceConfig on a same-tx-created SetKeyspace ---
 
 func TestSetKeyspaceConfigUpdatesSameTxCreatedSetKeyspace(t *testing.T) {
-	// H-1 regression: SetKeyspaceConfig on a same-tx CreateSetKeyspace
+	// Regression: SetKeyspaceConfig on a same-tx CreateSetKeyspace
 	// (before flush) must update the cached *SetKeyspace's
 	// RestartGroupTarget rather than returning ErrNotFound.
 	ctx := context.Background()
@@ -942,7 +942,7 @@ func TestSetKeyspaceDeleteRangeEmptyBoundsRejected(t *testing.T) {
 	defer tx.Rollback()
 
 	sks, _ := tx.CreateSetKeyspace("k", nil)
-	// Non-nil zero-length is invalid (matches chunk-5.7 keyspace.DeleteRange).
+	// Non-nil zero-length is invalid (matches keyspace.DeleteRange).
 	if _, err := sks.DeleteRange([]byte{}, nil); !errors.Is(err, ErrKeyEmpty) {
 		t.Errorf("DeleteRange([],nil): err=%v, want ErrKeyEmpty", err)
 	}
@@ -1155,7 +1155,7 @@ func TestSetKeyspaceDeleteRangeMissingKeysAreNoop(t *testing.T) {
 	}
 }
 
-// Note on read-only-tx rejection: chunk-5.7's
+// Note on read-only-tx rejection:
 // TestKeyspaceDeleteRangeReadOnlyTxReturnsErrReadOnly actually
 // pins "Begin(ctx, false) returns ErrReadOnly" — db.Begin rejects
 // non-writable callers before any Tx is constructed (db.go:468-470),

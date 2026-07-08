@@ -7,12 +7,12 @@ import (
 	"testing"
 )
 
-// --- Chunk 7.10: SetKeyspace.DeleteKeyspace three-subtree retirement
+// --- SetKeyspace.DeleteKeyspace three-subtree retirement
 
 // TestDeleteSetKeyspaceWithIndexesRetiresAllSubtrees verifies that
 // DeleteKeyspace on a SetKeyspace with declared indexes
 // successfully retires the three sub-trees (data, per-index
-// Kind=2, registry) — chunk-7.8's kind-agnostic retirement is
+// Kind=2, registry) — the kind-agnostic retirement is
 // asserted to work for Kind=1.
 func TestDeleteSetKeyspaceWithIndexesRetiresAllSubtrees(t *testing.T) {
 	ctx := context.Background()
@@ -51,10 +51,10 @@ func TestDeleteSetKeyspaceWithIndexesRetiresAllSubtrees(t *testing.T) {
 	}
 }
 
-// --- Chunk 7.10: SetKeyspace RebuildIndex with same-tx Puts ------
+// --- SetKeyspace RebuildIndex with same-tx Puts ------
 
 // TestRebuildIndexOnSetKeyspaceSeesSameTxPuts verifies that the
-// chunk-7.10 SetKeyspace rebuild's SetCursor walk sees same-tx
+// SetKeyspace rebuild's SetCursor walk sees same-tx
 // Put rows (matches indexing.md §Rebuild mechanics dirty-state
 // contract).
 func TestRebuildIndexOnSetKeyspaceSeesSameTxPuts(t *testing.T) {
@@ -93,7 +93,7 @@ func TestRebuildIndexOnSetKeyspaceSeesSameTxPuts(t *testing.T) {
 }
 
 // TestRebuildIndexOnSetKeyspaceUniqueViolation verifies that the
-// chunk-7.10 SetKeyspace rebuild aborts cleanly on a unique
+// SetKeyspace rebuild aborts cleanly on a unique
 // violation produced by the new extractor.
 func TestRebuildIndexOnSetKeyspaceUniqueViolation(t *testing.T) {
 	ctx := context.Background()
@@ -134,10 +134,10 @@ func TestRebuildIndexOnSetKeyspaceUniqueViolation(t *testing.T) {
 	}
 }
 
-// --- Chunk 7.10: indexed Keyspace.DeleteRange fallback -----------
+// --- Indexed Keyspace.DeleteRange fallback -----------
 
 // TestKeyspaceIndexedDeleteRangeClearsIndexEntries verifies the
-// chunk-7.10 Keyspace.DeleteRange indexed fallback: each row's
+// Keyspace.DeleteRange indexed fallback: each row's
 // index entries are deleted alongside the row.
 func TestKeyspaceIndexedDeleteRangeClearsIndexEntries(t *testing.T) {
 	ctx := context.Background()
@@ -217,12 +217,12 @@ func TestKeyspaceIndexedDeleteRangeOpenBounds(t *testing.T) {
 	}
 }
 
-// --- Chunk 7.10: indexed SetKeyspace.DeleteRange fallback --------
+// --- Indexed SetKeyspace.DeleteRange fallback --------
 
 // TestSetKeyspaceIndexedDeleteRangeClearsIndexEntries verifies
 // that SetKeyspace.DeleteRange on an indexed keyspace transparently
-// uses the chunk-7.9 per-(setKey, setValue) bulk-key delete walk
-// (inherited via the chunk-6.8 per-key Delete loop).
+// uses the per-(setKey, setValue) bulk-key delete walk
+// (inherited via the per-key Delete loop).
 func TestSetKeyspaceIndexedDeleteRangeClearsIndexEntries(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})

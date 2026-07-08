@@ -288,8 +288,8 @@ func (p *Pager) commitStep0() error {
 // p.dirty, and appends new entries to the in-memory chain so the head
 // pointer reflects the newest segment.
 //
-// Allocation and encoding are split into two phases to close the
-// self-reference race the round-1 review caught: phase 1 reserves all
+// Allocation and encoding are split into two phases to close a
+// self-reference race: phase 1 reserves all
 // segment page IDs (allocator may trigger RPL reclamation, which
 // drains oldest segments from the chain tail per the SetRPLChain
 // convention and in the full-drain limit empties the chain, after

@@ -93,7 +93,7 @@ func TestCreateKeyspaceWithMultipleIndexesAllRegistered(t *testing.T) {
 }
 
 // TestCreateKeyspaceWithDuplicateIndexNameReturnsErrIndexExists
-// verifies the chunk-7.2 validateIndexDecls integration: two decls
+// verifies the validateIndexDecls integration: two decls
 // with the same Name → ErrIndexExists.
 func TestCreateKeyspaceWithDuplicateIndexNameReturnsErrIndexExists(t *testing.T) {
 	ctx := context.Background()
@@ -512,7 +512,7 @@ func TestOpenKeyspaceSameTxReopenDifferentVersionReturnsErrAlreadyOpen(t *testin
 }
 
 // TestOpenKeyspaceSameTxReopenDifferentExtractFirstWins verifies
-// the chunk-7.5 first-Extract-wins rule: two OpenKeyspace calls
+// the first-Extract-wins rule: two OpenKeyspace calls
 // with structurally identical IndexDecls but different Extract
 // functions yield the SAME *Keyspace handle (Extract from the
 // first call wins).
@@ -582,7 +582,7 @@ func TestOpenKeyspaceSameTxReopenDifferentExtractFirstWins(t *testing.T) {
 }
 
 // TestMixingOpenKeyspaceAndOpenKeyspaceReadOnlyReturnsErrAlreadyOpen
-// verifies the chunk-7.5 mixed-read+write same-tx-open rejection.
+// verifies the mixed-read+write same-tx-open rejection.
 func TestMixingOpenKeyspaceAndOpenKeyspaceReadOnlyReturnsErrAlreadyOpen(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
@@ -643,7 +643,7 @@ func TestMixingOpenKeyspaceAndOpenKeyspaceReadOnlyReturnsErrAlreadyOpen(t *testi
 // --- SetKeyspace mirror -----------------------------------------
 
 // TestCreateSetKeyspaceWithIndexesAllocatesRegistry verifies the
-// SetKeyspace-side mirror of chunk-7.5's CreateKeyspace-with-indexes.
+// SetKeyspace-side mirror of CreateKeyspace-with-indexes.
 func TestCreateSetKeyspaceWithIndexesAllocatesRegistry(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -710,10 +710,10 @@ func TestOpenSetKeyspaceMissingDeclReturnsErrIndexExtractorRequired(t *testing.T
 
 // --- Kind=2 reachability via real registry creation -------------
 
-// --- Rollback-state-preservation regression tests (M-1, M-2) -----
+// --- Rollback-state-preservation regression tests ------------------
 
-// TestCreateKeyspaceWriteFailureRestoresPendingDelete is the M-1
-// chunk-7.5 regression: a Tx that DeleteKeyspace's an existing
+// TestCreateKeyspaceWriteFailureRestoresPendingDelete is a
+// regression test: a Tx that DeleteKeyspace's an existing
 // keyspace, then CreateKeyspace's the same name with a decl whose
 // registry write fails, must leave tx.pendingDeletes[name] intact
 // so the original on-disk descriptor still gets removed at Commit
@@ -766,18 +766,18 @@ func TestCreateKeyspaceWriteFailureRestoresPendingDelete(t *testing.T) {
 	if err == nil {
 		t.Fatalf("CreateKeyspace expected to fail (oversized Version), got nil")
 	}
-	// M-1 fix: pendingDeletes['users'] must still be present so
+	// pendingDeletes['users'] must still be present so
 	// the original on-disk descriptor gets removed at Commit.
 	if _, ok := tx.pendingDeletes["users"]; !ok {
-		t.Fatalf("after failed CreateKeyspace: pendingDeletes['users'] dropped — M-1 regression")
+		t.Fatalf("after failed CreateKeyspace: pendingDeletes['users'] dropped — pending-delete regression")
 	}
 	// numKeyspaces decrement-then-increment-then-rollback math must
 	// also be clean; the DeleteKeyspace ↓ + Create ↑ + Rollback ↓
 	// sequence leaves numKeyspaces at original - 1.
 }
 
-// TestOpenKeyspaceFingerprintFailurePreservesDirtyDescriptor is the
-// M-2 chunk-7.5 regression: a Tx that SetKeyspaceConfig's a not-
+// TestOpenKeyspaceFingerprintFailurePreservesDirtyDescriptor is a
+// regression test: a Tx that SetKeyspaceConfig's a not-
 // yet-opened name (creates a dirtyDescriptors entry), then attempts
 // OpenKeyspace with a drifted IndexDecl, must leave the dirtyDescriptor
 // entry intact so the SetKeyspaceConfig mutation still flushes at
@@ -828,13 +828,13 @@ func TestOpenKeyspaceFingerprintFailurePreservesDirtyDescriptor(t *testing.T) {
 		t.Fatalf("expected fingerprint mismatch, got %v", err)
 	}
 	if _, ok := tx.dirtyDescriptors["users"]; !ok {
-		t.Fatalf("after failed OpenKeyspace: dirtyDescriptors['users'] dropped — M-2 regression")
+		t.Fatalf("after failed OpenKeyspace: dirtyDescriptors['users'] dropped — dirty-descriptor regression")
 	}
 }
 
 // TestCreateSetKeyspaceWriteFailureRestoresPendingDelete is the
 // SetKeyspace mirror of TestCreateKeyspaceWriteFailureRestoresPendingDelete
-// (M-1 regression for the set_keyspace.go path).
+// (the same pending-delete regression on the set_keyspace.go path).
 func TestCreateSetKeyspaceWriteFailureRestoresPendingDelete(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
@@ -878,14 +878,14 @@ func TestCreateSetKeyspaceWriteFailureRestoresPendingDelete(t *testing.T) {
 		t.Fatalf("CreateSetKeyspace expected to fail (oversized Version), got nil")
 	}
 	if _, ok := tx.pendingDeletes["subs"]; !ok {
-		t.Fatalf("after failed CreateSetKeyspace: pendingDeletes['subs'] dropped — M-1 SetKeyspace regression")
+		t.Fatalf("after failed CreateSetKeyspace: pendingDeletes['subs'] dropped — SetKeyspace pending-delete regression")
 	}
 }
 
 // TestOpenSetKeyspaceFingerprintFailurePreservesDirtyDescriptor is
 // the SetKeyspace mirror of
-// TestOpenKeyspaceFingerprintFailurePreservesDirtyDescriptor (M-2
-// regression for the set_keyspace.go path).
+// TestOpenKeyspaceFingerprintFailurePreservesDirtyDescriptor (the
+// same dirty-descriptor regression on the set_keyspace.go path).
 func TestOpenSetKeyspaceFingerprintFailurePreservesDirtyDescriptor(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
@@ -928,14 +928,14 @@ func TestOpenSetKeyspaceFingerprintFailurePreservesDirtyDescriptor(t *testing.T)
 		t.Fatalf("expected fingerprint mismatch, got %v", err)
 	}
 	if _, ok := tx.dirtyDescriptors["subs"]; !ok {
-		t.Fatalf("after failed OpenSetKeyspace: dirtyDescriptors['subs'] dropped — M-2 SetKeyspace regression")
+		t.Fatalf("after failed OpenSetKeyspace: dirtyDescriptors['subs'] dropped — SetKeyspace dirty-descriptor regression")
 	}
 }
 
-// --- Read-only handle rejection (H-1 from chunk-7.5 review) ------
+// --- Read-only handle rejection ----------------------------------
 
-// TestOpenKeyspaceReadOnlyHandleRejectsPut verifies the chunk-7.5
-// H-1 fix: a *Keyspace handle returned from OpenKeyspaceReadOnly
+// TestOpenKeyspaceReadOnlyHandleRejectsPut verifies that
+// a *Keyspace handle returned from OpenKeyspaceReadOnly
 // rejects all mutating operations with ErrReadOnly, even on a
 // writable Tx. Per api-surface.md §Keyspace API +
 // indexing.md §Open Semantics.
@@ -988,7 +988,8 @@ func TestOpenKeyspaceReadOnlyHandleRejectsPut(t *testing.T) {
 	}
 }
 
-// TestOpenSetKeyspaceReadOnlyHandleRejectsPut mirrors H-1 fix for
+// TestOpenSetKeyspaceReadOnlyHandleRejectsPut mirrors
+// TestOpenKeyspaceReadOnlyHandleRejectsPut for
 // the SetKeyspace surface.
 func TestOpenSetKeyspaceReadOnlyHandleRejectsPut(t *testing.T) {
 	ctx := context.Background()
@@ -1043,7 +1044,7 @@ func TestOpenSetKeyspaceReadOnlyHandleRejectsPut(t *testing.T) {
 }
 
 // TestCreateKeyspaceWithIndexDoesNotPolluteListKeyspaces verifies
-// the chunk-7.1 indexing.md entailed invariant on Kind=2 one-parent-
+// the indexing.md entailed invariant on Kind=2 one-parent-
 // reachability uniqueness: indexes are stored in the parent's
 // registry sub-tree (a child B+tree), NOT as Kind=2 entries in the
 // top-level keyspace B+tree. ListKeyspaces shows only the parent
@@ -1131,7 +1132,7 @@ func TestWriteNewIndexRegistryAtomicOnPartialFailure(t *testing.T) {
 }
 
 // TestKind2DescriptorsHaveDistinctIndexRegistryRoots enforces the
-// "exactly one parent" half of the chunk-7.1 indexing.md entailed
+// "exactly one parent" half of the indexing.md entailed
 // invariant: every engine-internal Kind=2 keyspace descriptor is
 // reachable via exactly one user keyspace's index-registry sub-tree —
 // never via two distinct parents. Per-keyspace IndexRegistryRoot
@@ -1147,7 +1148,7 @@ func TestWriteNewIndexRegistryAtomicOnPartialFailure(t *testing.T) {
 // IndexRegistryRoot copies (DeleteKeyspace's three-subtree retirement,
 // RebuildIndex/DropIndex's registry-root rewrites) would violate the
 // same proxy — caught here once a fixture exercises those ops, and
-// across all on-disk descriptors by the chunk-11 Check(CheckIndexes)
+// across all on-disk descriptors by the Check(CheckIndexes)
 // full walk.
 //
 // The companion TestCreateKeyspaceWithIndexDoesNotPolluteListKeyspaces

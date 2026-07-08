@@ -599,7 +599,7 @@ func TestSubpagePromotionThresholdValues(t *testing.T) {
 	// Pin: threshold = (ContentEnd - HeaderSize - 4 - 4) / 2 per
 	// set-keyspace.md §Subpage Promotion Threshold (conservative
 	// usable-space derivation). Hand-compute for the typical
-	// configurations exercised by chunk-6 tests so a future change to
+	// configurations exercised by the subpage tests so a future change to
 	// the threshold formula trips this guard.
 	cases := []struct {
 		name       string
@@ -697,8 +697,8 @@ func TestDeleteProducesIndependentBuffer(t *testing.T) {
 	}
 }
 
-// Regression test for M-1 (introduced overflow guard on Insert).
-// A misbehaving caller — one that has bypassed the 6.4 50%-of-leaf
+// Regression test for the overflow guard on Insert.
+// A misbehaving caller — one that has bypassed the 50%-of-leaf
 // promotion-threshold check, or has constructed a hostile
 // SubpageReader directly — must not be able to push Count or
 // DataSize past the uint16 cap; the codec's contract requires

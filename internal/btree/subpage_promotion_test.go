@@ -1,10 +1,10 @@
 package btree
 
-// Chunk-6.4 promotion tests. PromoteSubpageToNestedTree is exercised
+// Promotion tests. PromoteSubpageToNestedTree is exercised
 // against a real *pager.Pager fixture so the 4-step algorithm —
 // alloc nested-root leaf + copy subpage entries + insert new value —
-// runs over the same PageWriter surface the chunk-6.6 SetKeyspace
-// surface will use.
+// runs over the same PageWriter surface the SetKeyspace
+// surface uses.
 
 import (
 	"bytes"
@@ -283,7 +283,7 @@ func TestPromoteSubpageMatchesEncoderOutput(t *testing.T) {
 	// Round-trip pin: the cell the caller would write via
 	// LeafBuilder.AddNestedTreeRef(key, root, count) decodes back
 	// with matching (NestedRoot, NestedCount) fields. This is the
-	// chunk-6.6 caller contract — PromoteSubpageToNestedTree
+	// SetKeyspace caller contract — PromoteSubpageToNestedTree
 	// returns the (root, count) the cell builder needs.
 	pw, _, f := setupPagerWriter(t, 128)
 	defer pw.Close()
@@ -369,7 +369,7 @@ func TestPromoteSubpageAtomicityAllocSlabFailure(t *testing.T) {
 	// returning newLeafID=1; then ZeroPage(call=1) fails. The
 	// function must return (0, 0, err) AND FreePage(1) before
 	// returning so the caller's bookkeeping observes no leaked
-	// page. (Per the chunk-6.3 contract + E3, the post-call state
+	// page. (Per the subpage-cell contract + E3, the post-call state
 	// is "as-if-no-promotion-happened" within the tx.)
 	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16}
 	fake := newFakeWriter(t, cfg.PageSize)

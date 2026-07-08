@@ -8,14 +8,14 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// Chunk-5.6 tests for the bulk-subtree retire path. Promote the
-// chunk-5.6 invariant Inv-B (every page reachable from rootID enters
+// Tests for the bulk-subtree retire path. Promote the
+// invariant Inv-B (every page reachable from rootID enters
 // retiredPages or loosePages) at the btree-layer interface — the
 // higher-level gmdb.TestDeleteKeyspaceBulkFreesDataSubtree promotes
 // the same invariant against the public DeleteKeyspace surface.
 
 // TestFreeSubtreeEmpty asserts a rootID==0 input is a no-op (no
-// FreePage call, no FreeRun call). The chunk-5.6 plumbing relies on
+// FreePage call, no FreeRun call). The DeleteKeyspace plumbing relies on
 // this for the "Created-this-tx Keyspace with desc.Root==0 then
 // DeleteKeyspace" path.
 func TestFreeSubtreeEmpty(t *testing.T) {
@@ -32,7 +32,7 @@ func TestFreeSubtreeEmpty(t *testing.T) {
 
 // TestFreeSubtreeSingleLeaf builds a one-leaf tree, runs FreeSubtree,
 // and asserts the leaf landed in loose (same-tx allocation) per
-// chunk-5.2 FreePage semantics.
+// FreePage semantics.
 func TestFreeSubtreeSingleLeaf(t *testing.T) {
 	pw, _, f := setupPagerWriter(t, 16)
 	defer pw.Close()
@@ -160,7 +160,7 @@ func TestFreeSubtreeWithOverflow(t *testing.T) {
 // collectSubtreePages walks the subtree rooted at rootID and returns
 // the set of every reachable page ID. Mirrors FreeSubtree's traversal
 // so the test's reachability set matches what FreeSubtree should
-// retire. Used by the chunk-5.6 invariant Inv-B tests in this file.
+// retire. Used by the invariant Inv-B tests in this file.
 func collectSubtreePages(t *testing.T, pr PageReader, cfg page.Config, rootID uint64) map[uint64]struct{} {
 	t.Helper()
 	out := make(map[uint64]struct{})

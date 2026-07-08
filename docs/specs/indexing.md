@@ -280,7 +280,7 @@ structurally different indexes — a collision. The boundary between
 trailing bytes can mimic a uvarint length. Uniform uvarint-
 prefixing is the minimal injective encoding consistent with the
 §Drift Guard "exclusively `uvarint` length prefixes" clause-
-explicit invariant. (Chunk-7.2 spec amendment; the original
+explicit invariant. (Spec amendment; the original
 grammar omitted the `Name` prefix.)
 
 The schema hash + the user-supplied `Version` string are stored
@@ -615,8 +615,8 @@ sentinel — identical to the row-cursor contract that
   sentinel because the WHOLE keyspace is gone, not just this
   index. Closes the
   `transactions.md §Cursor invalidation by DeleteKeyspace` clause
-  for `*IndexHandle` handles (the clause names them but the row-cursor
-  fix that landed at chunk 5.6 did not enforce it on the iter
+  for `*IndexHandle` handles (the clause names them but the
+  row-cursor invalidation fix did not enforce it on the iter
   surface). Dead-check ordering is "parent first":
   `Stats` / `Lookup` / etc. probe the parent ks/sks `dead` flag
   before the handle's own `dead`, so a handle whose index was
@@ -701,11 +701,11 @@ enforcement note):
   yields stale entries from the just-`FreeSubtree`'d pages with
   no MarkStale signal. Closes the
   `transactions.md §Cursor invalidation by DeleteKeyspace` clause
-  for `*IndexHandle` handles (the clause names them but the row-cursor
-  fix that landed at chunk 5.6 did not enforce it on the iter
+  for `*IndexHandle` handles (the clause names them but the
+  row-cursor invalidation fix did not enforce it on the iter
   surface).
 
-Per the chunk-5.6 row-cursor invalidation pattern these
+Per the row-cursor invalidation pattern these
 invariants are spec-tier *and* enforced (regression tests
 `TestIndexHandleStatsAfterDropReturnsErrIndexNotFound`,
 `TestIndexHandleStatsAfterDeleteKeyspaceReturnsErrKeyspaceClosed`,

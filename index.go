@@ -679,7 +679,7 @@ func (idx *IndexHandle) mapCursorErr(err error) error {
 // vanished. Use Check() for row/index consistency verification.
 func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
-		// Per-sequence Err reset (M-2 fix).
+		// Per-sequence Err reset.
 		idx.err = nil
 		// Dead-keyspace check (Inv-IHS3) — see Lookup for rationale.
 		if idx.keyspaceDead() {
@@ -697,7 +697,7 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 			idx.err = err
 			return
 		}
-		// Chunk-7.9 Round-1 H-1: LookupKeys on a SetKeyspace index
+		// LookupKeys on a SetKeyspace index
 		// has no well-defined iter.Seq[[]byte] surface — the "PK"
 		// is a compound (setKey, setValue) pair per set-keyspace.md
 		// §Indexes on SetKeyspaces. Returning the raw compound bytes
@@ -786,7 +786,7 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 // stored bytes via back-lookup. See indexing.md §Covering Indexes.
 func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
-		// Per-sequence Err reset (M-2 fix).
+		// Per-sequence Err reset.
 		idx.err = nil
 		// Dead-keyspace check (Inv-IHS3) — see Lookup for rationale.
 		if idx.keyspaceDead() {
@@ -874,7 +874,7 @@ func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 // bytes via back-lookup otherwise.
 func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
-		// Per-sequence Err reset (M-2 fix).
+		// Per-sequence Err reset.
 		idx.err = nil
 		// Dead-keyspace check (Inv-IHS3) — see Lookup for rationale.
 		if idx.keyspaceDead() {
@@ -914,7 +914,7 @@ func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] 
 // non-empty (decode via DecodeCoveringTuple), row bytes via
 // back-lookup otherwise.
 func (idx *IndexHandle) Get(cols ...[]byte) (pk, value []byte, err error) {
-	// Per-sequence Err reset (M-2 fix; Get isn't strictly a sequence,
+	// Per-sequence Err reset (Get isn't strictly a sequence,
 	// but the handle's Err() is shared and a stale prior error
 	// should not surface to a fresh Get).
 	idx.err = nil

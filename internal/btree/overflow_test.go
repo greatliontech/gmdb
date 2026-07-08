@@ -20,8 +20,8 @@ func (b boundedReader) Page(id uint64) ([]byte, error) {
 	return make([]byte, 4096), nil
 }
 
-// TestReadOverflowValueForgedTotalLenNoOOM (Inv-RV4 / chunk-11.2 round-3
-// H-1): a forged overflow TotalLen implying a multi-terabyte run must NOT
+// TestReadOverflowValueForgedTotalLenNoOOM (Inv-RV4):
+// a forged overflow TotalLen implying a multi-terabyte run must NOT
 // drive make([]byte, TotalLen). readOverflowValue computes the run length
 // in uint64 and reads pages one at a time, so the run walks past the
 // file-resident bound and aborts with ErrCorrupted long before the

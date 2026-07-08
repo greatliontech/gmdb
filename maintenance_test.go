@@ -213,7 +213,7 @@ func TestMaintenanceCleanClose(t *testing.T) {
 	}
 }
 
-// TestMaintenanceValidatesOptions (regression for review M-2): a negative
+// TestMaintenanceValidatesOptions: a negative
 // Interval is rejected at Open rather than panicking time.NewTicker inside
 // the goroutine.
 func TestMaintenanceValidatesOptions(t *testing.T) {

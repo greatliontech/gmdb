@@ -677,8 +677,7 @@ Distinguishing end-of-iteration from unpositioned: end-of-iteration's
   ```
   `Current()` reads the post-delete successor in-place — `Next()`
   would advance PAST the successor and skip alternating entries
-  (since `Delete()` already advanced the cursor). (Chunk-7.10
-  spec clarification.)
+  (since `Delete()` already advanced the cursor).
 - Possible errors: `ErrReadOnly` (cursor on a read-only txn or
   read-only keyspace), `ErrCursorUnpositioned`, `ErrTxClosed`.
 
@@ -697,8 +696,7 @@ Distinguishing end-of-iteration from unpositioned: end-of-iteration's
   canonical drain pattern uses `Current()` after `Delete()`, NOT
   `Next()`: `Delete()` already advanced the cursor to the
   post-delete successor (next-value-in-key or first-of-next-key),
-  and `Next()` would advance PAST it (chunk-7.10 spec
-  clarification).
+  and `Next()` would advance PAST it.
 - Same error set as `Cursor.Delete()`.
 
 ### Cursor invalidation by `DeleteKeyspace`

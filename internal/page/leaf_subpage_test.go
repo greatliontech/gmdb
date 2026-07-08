@@ -1,14 +1,14 @@
 package page
 
-// Leaf integration tests for SetKeyspace subpage cells (chunk 6.3).
+// Leaf integration tests for SetKeyspace subpage cells.
 // Subpage cells carry CellFlagMultiValue && !CellFlagNestedTree —
 // per set-keyspace.md §Subpage Format — and use the same on-disk
 // shape as a plain inline cell (`[Flags][KeyLen][ValueLen][Key][Value]`)
-// with the value half holding raw subpage bytes. Chunk 4's
+// with the value half holding raw subpage bytes.
 // LeafBuilder.AddEntry must preserve the CellFlagMultiValue bit so
 // every leaf rebuild path (split, merge, delete-then-rebuild,
 // in-place-then-rebuild) carries the flag through; otherwise the
-// chunk-6.6 SetKeyspace surface would observe its cells silently
+// SetKeyspace surface would observe its cells silently
 // demoted to plain inline cells the next time the parent leaf got
 // rewritten.
 
@@ -131,9 +131,9 @@ func TestLeafBuilderAddSubpageDelta(t *testing.T) {
 }
 
 func TestLeafBuilderAddEntryPreservesMultiValue(t *testing.T) {
-	// Simulates the chunk-4 leaf rebuild path: decode → modify list →
+	// Simulates the btree leaf rebuild path: decode → modify list →
 	// re-encode via AddEntry. The MultiValue flag MUST round-trip;
-	// before the chunk-6.3 fix, AddEntry dropped non-Overflow flags
+	// before the fix, AddEntry dropped non-Overflow flags
 	// and demoted subpage cells to plain inline cells.
 	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
 	sp := makeSubpage(t, [][]byte{[]byte("alpha"), []byte("beta")}, 0)
@@ -146,7 +146,7 @@ func TestLeafBuilderAddEntryPreservesMultiValue(t *testing.T) {
 	b.AddInline([]byte("ccc"), []byte("plain-c"))
 	b.Finish()
 
-	// Decode all entries via LeafIter (mirrors chunk-4 rebuild paths).
+	// Decode all entries via LeafIter (mirrors the btree rebuild paths).
 	r := NewLeafReader(src, cfg)
 	it := r.IterForReuse(nil, nil, nil)
 	var entries []LeafEntry
@@ -161,7 +161,7 @@ func TestLeafBuilderAddEntryPreservesMultiValue(t *testing.T) {
 		entries = append(entries, dup)
 	}
 
-	// Rebuild via AddEntry (the chunk-4 rebuild contract).
+	// Rebuild via AddEntry (the rebuild contract).
 	dst := make([]byte, cfg.PageSize)
 	b2 := NewLeafBuilder(dst, cfg)
 	for _, e := range entries {
@@ -182,7 +182,7 @@ func TestLeafBuilderAddEntryPreservesMultiValue(t *testing.T) {
 		t.Errorf("rebuilt entry 0 Flags=0x%x, want 0 (plain inline)", got0.Flags)
 	}
 	if got1.Flags&CellFlagMultiValue == 0 {
-		t.Errorf("rebuilt entry 1 Flags=0x%x, MultiValue MISSING after rebuild (chunk 6.3 regression)", got1.Flags)
+		t.Errorf("rebuilt entry 1 Flags=0x%x, MultiValue MISSING after rebuild (flag-preservation regression)", got1.Flags)
 	}
 	if got1.Flags&CellFlagNestedTree != 0 {
 		t.Errorf("rebuilt entry 1 Flags=0x%x, NestedTree LEAKED on rebuild", got1.Flags)
@@ -195,9 +195,9 @@ func TestLeafBuilderAddEntryPreservesMultiValue(t *testing.T) {
 	}
 }
 
-// Chunk-6.3 had a TestLeafBuilderAddEntryPanicsOnNestedTree that
-// asserted AddEntry panicked on NestedTree cells; chunk 6.4 retires
-// the panic by wiring the actual encoding. The round-trip is now
+// An earlier TestLeafBuilderAddEntryPanicsOnNestedTree
+// asserted AddEntry panicked on NestedTree cells; wiring
+// the actual encoding retired the panic. The round-trip is now
 // covered by TestLeafBuilderAddNestedTreeRefRoundTrip below.
 
 func TestLeafBuilderAddNestedTreeRefRoundTripUncompressed(t *testing.T) {
@@ -329,7 +329,7 @@ func TestLeafValidateAcceptsNestedTreeCells(t *testing.T) {
 
 func TestLeafBuilderAddEntryPanicsOnOverflowMultiValue(t *testing.T) {
 	// CellFlagOverflow | CellFlagMultiValue is declared mutually
-	// exclusive by page-formats.md §CellFlags but the chunk-4
+	// exclusive by page-formats.md §CellFlags but the
 	// AddOverflow + AddSubpage paths each encode only one of the
 	// two flag bits, so the combination has no defined on-disk
 	// encoding. AddEntry rejects it explicitly so a caller's flag-
@@ -358,7 +358,7 @@ func TestLeafBuilderAddEntryPanicsOnOverflowMultiValue(t *testing.T) {
 
 func TestLeafSplitPreservesSubpageCells(t *testing.T) {
 	// End-to-end: build a leaf full of mixed plain + subpage cells,
-	// simulate a chunk-4 split by decoding all entries and rebuilding
+	// simulate a leaf split by decoding all entries and rebuilding
 	// two leaves (left half / right half), then verify every subpage
 	// cell survives with its Flags + bytes intact.
 	cfg := Config{PageSize: 4096, RestartGroupTarget: 8}
@@ -459,7 +459,7 @@ func TestLeafSplitPreservesSubpageCells(t *testing.T) {
 }
 
 func TestLeafValidateRejectsIllegalFlagCombos(t *testing.T) {
-	// Validate is the trust boundary the chunk-4 rebuild paths depend
+	// Validate is the trust boundary the btree rebuild paths depend
 	// on — every decoded LeafEntry feeding LeafBuilder.AddEntry must
 	// carry a flag combination the builder has an encoding for, OR
 	// Validate must surface ErrCorrupted at the boundary so callers
@@ -547,9 +547,9 @@ func TestLeafValidateAcceptsSubpageCells(t *testing.T) {
 }
 
 func TestLeafIterPreservesSubpageFlagAcrossNext(t *testing.T) {
-	// LeafIter is the chunk-4 cursor's leaf-walking primitive. The
+	// LeafIter is the btree cursor's leaf-walking primitive. The
 	// MultiValue flag must survive forward streaming (compressed
-	// delta-decode) so the chunk-6.7 SetCursor can dispatch on
+	// delta-decode) so the SetCursor can dispatch on
 	// CellFlags to know whether the cell is a subpage or a regular
 	// inline cell.
 	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}

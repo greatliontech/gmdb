@@ -252,7 +252,7 @@ func TestRegistryGetEmpty(t *testing.T) {
 
 // TestRegistryPutThenGet verifies a Put → Get returns the same
 // entry, and that desc.IndexRegistryRoot is non-zero after the
-// first Put (allocation on first index, per chunk-7.1 entailed
+// first Put (allocation on first index, per the indexing.md entailed
 // invariant on empty-registry canonical-at-zero).
 func TestRegistryPutThenGet(t *testing.T) {
 	ctx := context.Background()
@@ -325,7 +325,7 @@ func TestRegistryPutReplace(t *testing.T) {
 	}
 }
 
-// TestRegistryDeleteLastResetsRootToZero verifies the chunk-7.1
+// TestRegistryDeleteLastResetsRootToZero verifies the
 // indexing.md entailed invariant: DropIndex removing the last
 // declared index resets desc.IndexRegistryRoot to 0. The btree
 // layer guarantees Delete returns newRoot=0 on empty-tree shrink;
@@ -369,7 +369,7 @@ func TestRegistryDeleteLastResetsRootToZero(t *testing.T) {
 
 // TestRegistryDeleteMissingReturnsErrIndexNotFound verifies that
 // deleting a non-existent name returns ErrIndexNotFound. Matches
-// the chunk-7.1 api-surface.md Tx.DropIndex godoc sentinel.
+// the api-surface.md Tx.DropIndex godoc sentinel.
 func TestRegistryDeleteMissingReturnsErrIndexNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -472,7 +472,7 @@ func TestRegistryListEmpty(t *testing.T) {
 // TestRegistryPersistsAcrossCommit verifies the registry sub-tree
 // + its root in the parent descriptor persist across a Commit +
 // re-Open. Confirms the dirty-flush integration: marking the
-// *Keyspace state Dirty (here via the chunk-5.6 keyspaceStateCreated
+// *Keyspace state Dirty (here via the keyspaceStateCreated
 // from CreateKeyspace; registryPut doesn't need to re-mark) carries
 // the updated IndexRegistryRoot to disk via flushKeyspaces.
 func TestRegistryPersistsAcrossCommit(t *testing.T) {
@@ -520,7 +520,7 @@ func TestRegistryPersistsAcrossCommit(t *testing.T) {
 		defer tx.Rollback()
 		// Same backdoor as TestRegistryPutOnReopenedKeyspacePersists:
 		// registryPut wrote with ad-hoc SchemaHash; use the
-		// read-only path to skip chunk-7.5 fingerprint validation.
+		// read-only path to skip open-time fingerprint validation.
 		ks, err := tx.OpenKeyspaceReadOnly("users")
 		if err != nil {
 			t.Fatalf("OpenKeyspaceReadOnly: %v", err)
@@ -538,10 +538,10 @@ func TestRegistryPersistsAcrossCommit(t *testing.T) {
 	}
 }
 
-// TestRegistryPutOnReopenedKeyspacePersists verifies the chunk-7.3
-// H-1 fix: registryPut on a keyspace opened in a SECOND tx (state
+// TestRegistryPutOnReopenedKeyspacePersists verifies that
+// registryPut on a keyspace opened in a SECOND tx (state
 // is Clean, not Created) still transitions the owner's flush
-// state and persists the registry mutation. Before the H-1 fix,
+// state and persists the registry mutation. Before the fix,
 // registryPut mutated desc.IndexRegistryRoot in place but never
 // touched ks.state — flushKeyspaces' state-driven walk skipped
 // the Clean keyspace at Commit, the descriptor was never re-
@@ -579,7 +579,7 @@ func TestRegistryPutOnReopenedKeyspacePersists(t *testing.T) {
 	}
 
 	// Tx 2: re-open keyspace (state=Clean) + registryPut + Commit.
-	// This is the path that exposed the H-1 silent data loss.
+	// This is the path that exposed the silent data loss.
 	{
 		db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
 		if err != nil {
@@ -594,14 +594,14 @@ func TestRegistryPutOnReopenedKeyspacePersists(t *testing.T) {
 			t.Fatalf("OpenKeyspace: %v", err)
 		}
 		if ks.state != keyspaceStateClean {
-			t.Fatalf("OpenKeyspace returned state %d, want Clean (the H-1 trigger condition)", ks.state)
+			t.Fatalf("OpenKeyspace returned state %d, want Clean (the trigger condition)", ks.state)
 		}
 		if err := tx.registryPut(ks, "by_owner", entry); err != nil {
 			t.Fatalf("registryPut: %v", err)
 		}
-		// H-1 fix: registryPut MUST have transitioned state.
+		// registryPut MUST have transitioned state.
 		if ks.state == keyspaceStateClean {
-			t.Fatalf("registryPut on Clean keyspace did not transition state — H-1 regression")
+			t.Fatalf("registryPut on Clean keyspace did not transition state — flush-state regression")
 		}
 		if err := tx.Commit(); err != nil {
 			t.Fatalf("Commit #2: %v", err)
@@ -621,7 +621,7 @@ func TestRegistryPutOnReopenedKeyspacePersists(t *testing.T) {
 			t.Fatalf("Begin #3: %v", err)
 		}
 		defer tx.Rollback()
-		// Use OpenKeyspaceReadOnly to bypass chunk-7.5's open-time
+		// Use OpenKeyspaceReadOnly to bypass the open-time
 		// IndexDecl validation. The test backdoor-wrote a registry
 		// entry via registryPut with ad-hoc SchemaHash that doesn't
 		// match any real IndexDecl; the public OpenKeyspace path
@@ -632,7 +632,7 @@ func TestRegistryPutOnReopenedKeyspacePersists(t *testing.T) {
 			t.Fatalf("OpenKeyspaceReadOnly #3: %v", err)
 		}
 		if ks.desc.IndexRegistryRoot == 0 {
-			t.Fatalf("Tx 2 registryPut lost across Commit — H-1 regression")
+			t.Fatalf("Tx 2 registryPut lost across Commit")
 		}
 		got, err := tx.registryGet(ks, "by_owner")
 		if err != nil {
@@ -644,10 +644,10 @@ func TestRegistryPutOnReopenedKeyspacePersists(t *testing.T) {
 	}
 }
 
-// TestRegistryPutEmptyNameReturnsErrKeyEmpty verifies the chunk-7.3
-// M-2 fix: registryPut("", ...) returns ErrKeyEmpty at the helper
+// TestRegistryPutEmptyNameReturnsErrKeyEmpty verifies that
+// registryPut("", ...) returns ErrKeyEmpty at the helper
 // boundary. Defense-in-depth against internal callers that bypass
-// chunk-7.2 validateIndexDecls.
+// validateIndexDecls.
 func TestRegistryPutEmptyNameReturnsErrKeyEmpty(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})

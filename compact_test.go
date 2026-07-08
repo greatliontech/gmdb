@@ -203,7 +203,7 @@ func TestCompactReadersActive(t *testing.T) {
 	}
 }
 
-// TestCompactConcurrentWriterNoCrash (regression for the round-1 H1): a
+// TestCompactConcurrentWriterNoCrash: a
 // write Begin that captures the pager then blocks in AcquireWriter behind
 // Compact's grant must use the POST-Compact pager, never the closed old
 // one. Without the post-grant pager re-read, the racing Put panics on the
@@ -278,7 +278,7 @@ func TestCompactConcurrentWriterNoCrash(t *testing.T) {
 	}
 }
 
-// TestCompactPreservesFileMode (regression for the round-1 H2): the
+// TestCompactPreservesFileMode: the
 // compacted file must keep the source DB's 0600 mode, not widen to 0644.
 func TestCompactPreservesFileMode(t *testing.T) {
 	ctx := context.Background()
@@ -309,7 +309,7 @@ func TestCompactPreservesFileMode(t *testing.T) {
 	}
 }
 
-// TestPoisonedHandleRejectsReads (regression for the round-2 M): a
+// TestPoisonedHandleRejectsReads: a
 // poisoned handle (e.g. after a failed Compact reopen, which maps a stale
 // unlinked inode) must reject BeginRead — not just writes — so reads
 // cannot silently observe pre-Compact data. (Poison is set directly here;

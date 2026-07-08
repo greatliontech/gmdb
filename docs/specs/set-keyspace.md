@@ -130,7 +130,7 @@ Invariant: kind=entailed;
   violation=`ks.Stats().Entries` diverges from the actual stored
     pair count; iteration counts and `Stats()` disagree on the same
     transaction snapshot, breaking audit, capacity planning, and the
-    `chunk-5.7 DeleteRange` defense-in-depth check that compares
+    `DeleteRange` defense-in-depth check that compares
     returned-count vs desc.Count.
 
 Invariant: kind=entailed;

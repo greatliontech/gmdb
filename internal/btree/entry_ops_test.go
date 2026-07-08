@@ -127,7 +127,7 @@ func TestPutEntryInsertSubpage(t *testing.T) {
 }
 
 func TestPutEntryReplaceSubpageToNestedTree(t *testing.T) {
-	// Simulates the chunk-6.6 SetKeyspace.Put promotion path:
+	// Simulates the SetKeyspace.Put promotion path:
 	// the cell was a subpage; after promotion the cell becomes a
 	// nested-tree-ref. PutEntry replaces the cell and returns
 	// the displaced subpage entry to the caller.

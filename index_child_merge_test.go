@@ -256,7 +256,7 @@ func TestIndexHandleAfterChildRollback(t *testing.T) {
 }
 
 // TestParentCursorsInvalidatedByChildDeleteKeyspace pins the merge's
-// deleted-keyspace branch (the review-demonstrated adjacent fault): a
+// deleted-keyspace branch: a
 // parent row cursor and index iter in flight when a child
 // DeleteKeyspace commits must terminate via the staleness/dead
 // machinery — never keep yielding from the FreeSubtree'd trees.
@@ -290,7 +290,7 @@ func TestParentCursorsInvalidatedByChildDeleteKeyspace(t *testing.T) {
 			// Post-delete writes in the child (reuse of the freed
 			// pages is suspended under the savepoint, so without
 			// the fix the fault manifests as silent stale yields
-			// from the intact freed tree — 199 rows in the review's
+			// from the intact freed tree — 199 rows in this
 			// reproducer — not reused-page garbage).
 			nks, err := child.CreateKeyspace("t2")
 			if err != nil {

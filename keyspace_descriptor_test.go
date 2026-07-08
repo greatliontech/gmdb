@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// Chunk-5.3 tests promote four spec-tier invariants from keyspaces.md
+// These tests promote four spec-tier invariants from keyspaces.md
 // to enforcement at the codec layer:
 //
 //   #1 (40-byte fixed format + field order/sizes) →
@@ -20,9 +20,9 @@ import (
 //   Reserved-bytes-zero clause-explicit →
 //      TestKeyspaceDescriptorValidateRejectsNonZeroReserved.
 //
-// The codec is the first code able to violate these invariants; per the
-// chunk-5.1 enforcement schedule, the codec round-trip and validate
-// rejections are the load-bearing promotions. The chunk-5.4 API surface
+// The codec is the first code able to violate these invariants; the
+// codec round-trip and validate
+// rejections are the load-bearing promotions. The keyspace API surface
 // inherits via callsite use of these primitives.
 
 func TestKeyspaceDescriptorSize(t *testing.T) {
@@ -143,7 +143,7 @@ func TestKeyspaceDescriptorEncodeOverwritesReservedBytes(t *testing.T) {
 // (Kind ∈ {0, 1, 2}).
 func TestKeyspaceDescriptorValidateRejectsUnknownKind(t *testing.T) {
 	// Forge a descriptor with Kind = 3 (out of {0,1,2}) at the codec
-	// level. CreateKeyspace's API surface (chunk 5.4) does not expose
+	// level. CreateKeyspace's API surface does not expose
 	// a Kind setter, so the violation path is on-disk corruption +
 	// reload, which is exactly the §Invariants violation case.
 	buf := make([]byte, keyspaceDescriptorSize)

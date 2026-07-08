@@ -173,7 +173,7 @@ Invariant: kind=entailed;
     tuple whose encoded form prefix-matches a shorter-encoded
     same-arity tuple — the cursor mis-classifies adjacency,
     yielding wrong matches for `Range(start, end)` and false
-    duplicates for unique-index probes. (Chunk-7.4 spec amendment;
+    duplicates for unique-index probes. (Spec amendment;
     enforced by `TestEncodedTuplePrefixFreenessSameNColsProperty`
     in `index_key_codec_test.go`.)
 
@@ -620,7 +620,7 @@ Uncompressed leaves don't need the streaming/buffered distinction:
 This unifies what the original spec called the "key reconstruction
 buffer" and the "group cache" behind a single iterator interface,
 so all leaf-walking callers — `btree.Cursor`, `btree.Get` (via
-`SearchLeaf`), and the chunk-5 range-delete scanner — share decode
+`SearchLeaf`), and the range-delete scanner — share decode
 infrastructure.
 
 ### Leaf Density

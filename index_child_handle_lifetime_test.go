@@ -15,7 +15,7 @@ import (
 // Commit the handle kept serving lookups (Err()==nil) and after a
 // child Rollback it descended savepoint-reverted pages
 // (ErrCorrupted, or silently wrong data if the freed page parsed as a
-// valid leaf). Regression for the chunk-18 adversarial-review finding.
+// valid leaf).
 
 func childHandleLifetimeFixture(t *testing.T) (*Tx, func() *IndexDecl) {
 	t.Helper()

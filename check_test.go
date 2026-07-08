@@ -249,7 +249,7 @@ func TestCheckEarlyBreakReleasesReaderSlot(t *testing.T) {
 	}
 }
 
-// TestCheckForgedBranchNoPanic (Inv-C1, pins the 11.2 review H-1 fix): a
+// TestCheckForgedBranchNoPanic (Inv-C1, pins the forged-branch validation fix): a
 // corrupt branch page in a real on-disk keyspace tree is reported as a
 // structural issue, NOT panicked on — Check enumerates via the guarded
 // WalkKV, never the unguarded read cursor.
@@ -301,7 +301,7 @@ func TestCheckForgedBranchNoPanic(t *testing.T) {
 	}
 }
 
-// TestCheckFatalIsLast (pins the 11.2 round-2 H-1 fix): when enumeration
+// TestCheckFatalIsLast (pins the fatal-issue ordering fix): when enumeration
 // of the top-level keyspace tree fails fatally, the CheckFatal is the
 // LAST issue yielded — no spurious accounting warnings follow it.
 func TestCheckFatalIsLast(t *testing.T) {
@@ -354,7 +354,7 @@ func TestCheckFatalIsLast(t *testing.T) {
 	}
 }
 
-// TestCheckStructuralDetectsForgedSubpage (chunk-11.7a): plain Check (no
+// TestCheckStructuralDetectsForgedSubpage: plain Check (no
 // CheckIndexes) must report a forged SetKeyspace subpage as SubpageCorrupt
 // — the structural walk now validates subpage internals, honouring
 // api-surface.md §Check's subpage-integrity claim. PageChecksum is off so

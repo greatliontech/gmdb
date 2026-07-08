@@ -12,7 +12,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
-// Chunk-5.2 Inv-3: PageWriter parity — the chunk-4.7 overflow chain
+// Inv-3: PageWriter parity — the overflow chain
 // semantics (Put-replace / Delete free the chain) hold over a real
 // *pager.Pager implementation of the PageWriter interface, not just
 // fakeWriter. setupPagerWriter is a sibling of
@@ -168,7 +168,7 @@ func TestPagerOverflowPutGetDelete(t *testing.T) {
 	}
 }
 
-// TestPagerOverflowReplaceFreesOldChain pins the chunk-4.7 Put-replace
+// TestPagerOverflowReplaceFreesOldChain pins the Put-replace
 // invariant on *pager.Pager: replacing an overflow value with a new
 // overflow value frees the prior chain.
 func TestPagerOverflowReplaceFreesOldChain(t *testing.T) {
@@ -194,7 +194,7 @@ func TestPagerOverflowReplaceFreesOldChain(t *testing.T) {
 
 	// Heuristic sanity bound — a regression that leaks the old chain
 	// would more than double pendingAllocs (old chain pages retained +
-	// new chain allocated). The tight invariant (chunk-4.7 slab
+	// new chain allocated). The tight invariant (slab
 	// partition: allocated = reachable ⊕ freed, with overflow-chain
 	// reachability) is already enforced by fakeWriter assertions in
 	// put_test.go; this integration test's job is parity, so the

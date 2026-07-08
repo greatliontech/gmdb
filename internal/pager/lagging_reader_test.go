@@ -8,7 +8,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// Chunk-5.5 LaggingReader callback tests promote Inv-F:
+// LaggingReader callback tests promote Inv-F:
 // the callback fires at most once per AllocPage call when bitmap is
 // exhausted AND the RPL is non-empty AND reclamation is blocked by the
 // bound. Wait → one refresh+retry-bitmap; Abort → ErrDBFull.

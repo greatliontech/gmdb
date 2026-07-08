@@ -302,7 +302,7 @@ keyspaces.
 ## Set Keyspace Range Delete
 
 `SetKeyspace.DeleteRange(start, end)` dispatches by index
-presence, mirroring `Keyspace.DeleteRange`'s chunk-7.10 split:
+presence, mirroring `Keyspace.DeleteRange`'s indexed/un-indexed split:
 
 - **Un-indexed (Kind=1, no declared indexes)**: dispatches to
   `btree.DeleteRange` (the §Algorithm three-phase walker) with a
@@ -326,7 +326,7 @@ presence, mirroring `Keyspace.DeleteRange`'s chunk-7.10 split:
   O(P + depth²) per §Complexity.
 
 - **Indexed (Kind=1 with declared indexes)**: per-row cursor walk
-  + `SetKeyspace.Delete(k)`, where each call invokes chunk-7.9's
+  + `SetKeyspace.Delete(k)`, where each call invokes the
   `applyIndexMaintenanceOnBulkKeyDelete` to clear index entries
   per (setKey, setValue) pair via the extractor. Cost is
   `O(K × M × (indexes + extractor))` where K = keys in range, M =
@@ -361,18 +361,18 @@ below for the worked example.
 This is the same cost a SQL engine pays for `DELETE … WHERE … IN
 range` with secondary indexes. Predictable and correct.
 
-**Partial-progress on error (chunk-7.10 spec amendment).** Unlike
+**Partial-progress on error (spec amendment).** Unlike
 non-indexed `Keyspace.DeleteRange` — whose underlying
 `btree.DeleteRange` is atomic and returns `(0, err)` with no
 visible state change on failure — the indexed-keyspace cursor-
 walk is per-row atomic, not per-call atomic. On a per-row failure
 at iteration `i`, iterations `0..i-1` have already completed: each
 of those rows is removed from the parent keyspace AND each of
-their index entries has been cleared via the chunk-7.6 atomic
+their index entries has been cleared via the atomic
 `Cursor.Delete` maintenance. `DeleteRange` returns
 `(deleted_so_far, err)` so the caller sees the real scope of
 state change. Each successful per-row delete satisfies the
-chunk-5.1 keyed-removal invariants and the chunk-7.1 atomic-Put/
+keyed-removal invariants and the atomic-Put/
 Delete invariant individually; the in-memory + on-disk state is
 consistent-but-partial. The only safe recovery is `Tx.Rollback()`
 (which restores via the pager bitmap snapshot per
@@ -405,7 +405,7 @@ Note the use of `c.Current()` (not `c.Next()`) inside the loop:
 `Cursor.Delete()` already advances the cursor to the post-delete
 successor per `transactions.md §Cursor.Delete() post-delete state`,
 so `Current()` reads it directly. `Next()` would step PAST the
-successor and skip alternating entries. (Chunk-7.10 spec
+successor and skip alternating entries. (Spec
 amendment — earlier revisions of this example used `Next()`.)
 
 One-at-a-time path. `DeleteRange` should be preferred for contiguous

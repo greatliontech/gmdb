@@ -549,7 +549,7 @@ func TestRelocatePagesNestedTreeBudgetBound(t *testing.T) {
 // the chain). Pins that the AddEntry-dispatch re-encode round-trips ALL cell
 // types verbatim (not just the overflow ref it rewrote): inline value,
 // subpage bytes, and the untouched nested-tree ref (NestedRoot + NestedCount)
-// must all survive. This is the 12.5b-2 review's deferred mixed-cell coverage.
+// must all survive.
 func TestRelocateLeafReEncodePreservesAllCellTypes(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)

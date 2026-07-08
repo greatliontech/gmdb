@@ -254,7 +254,7 @@ func (t *TypedSetKeyspaceHandle[K, V]) HasValue(key K, value V) (bool, error)
 // Mirrors SetKeyspace.Put — see api-surface.md §SetKeyspace API for
 // the load-bearing rationale (membership probe is already paid by
 // the insert path, surfacing the bool collapses Put + HasValue retry
-// patterns without a TOCTOU window). Chunk-6.1 user-locked decision.
+// patterns without a TOCTOU window). User-locked decision.
 func (t *TypedSetKeyspaceHandle[K, V]) Put(key K, value V) (added bool, err error)
 
 // Delete returns ErrNotFound when the key does not exist (per

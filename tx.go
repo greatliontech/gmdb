@@ -790,17 +790,6 @@ func dirtySetOpenNamesSorted(m map[uniqueNameHandle]*SetKeyspace) []string {
 	return out
 }
 
-// sortedKeys returns the keys of m sorted. Used by the flush walk
-// for deterministic apply order across pendingDeletes.
-func sortedKeys(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // mapPagerErr translates pager package sentinels to the root package's
 // public sentinels. Other errors pass through verbatim.
 //

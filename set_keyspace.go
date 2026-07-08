@@ -237,7 +237,7 @@ func (tx *Tx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error) {
 // cleared and a fresh *SetKeyspace is returned. Any previously-
 // opened handle for the same name stays dead.
 //
-// Chunk-6.6 caveat: opts == nil is treated as
+// Caveat: opts == nil is treated as
 // SetKeyspaceOptions{FixedValueSize: 0} (variable-size values).
 func (tx *Tx) CreateSetKeyspace(name string, opts *SetKeyspaceOptions, indexes ...*IndexDecl) (*SetKeyspace, error) {
 	if err := tx.requireOpen(true); err != nil {

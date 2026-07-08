@@ -658,8 +658,7 @@ func (c *SetCursor) Err() error {
 // boundary: api-surface.md §Nil and Empty Semantics — cursors return
 // (key, []byte{}) for empty values, and the public ops dispatch on
 // the ok flag, never on slice nil-ness (an empty member is a real
-// position — a nil-sentinel dispatch skipped it, demonstrated in
-// review).
+// position — a nil-sentinel dispatch would silently skip it).
 func nonNilValue(v []byte) []byte {
 	if v == nil {
 		return []byte{}
@@ -855,8 +854,8 @@ func (c *SetCursor) valCount() uint64 {
 // probe. Nested mode probes with a THROWAWAY cursor: the live inner
 // cursor must not move, because a failed DeleteValue leaves this
 // cursor un-staled and the documented retry contract promises its
-// position unchanged (a moved inner cursor would skip a member —
-// demonstrated in review).
+// position unchanged (a moved inner cursor would silently skip a
+// member).
 func (c *SetCursor) valPeekSuccessor() []byte {
 	if !c.nestedActive {
 		if c.innerIdx+1 < len(c.values) {

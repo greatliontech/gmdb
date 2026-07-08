@@ -449,9 +449,9 @@ func TestDeleteFreesEveryRetiredPage(t *testing.T) {
 }
 
 func TestDeleteOverflowEntryFreesChain(t *testing.T) {
-	// Chunk-4.7 contract: Delete of an overflow-flagged leaf entry
+	// Contract: Delete of an overflow-flagged leaf entry
 	// frees the associated chain in the same write tx. Pinned via
-	// the slab-partition invariant (chunk-4.7 extension walks
+	// the slab-partition invariant (checkSlabPartition walks
 	// overflow chains as reachable). Both shapes covered:
 	//   (a) Delete that empties the leaf (newID=0 path) — the
 	//       chain must still be freed.
@@ -506,7 +506,7 @@ func TestDeleteOverflowEntryFreesChain(t *testing.T) {
 }
 
 func TestMergeRedistributePreservesOverflowEntries(t *testing.T) {
-	// Chunk-4.7 contract via merge/redistribute: an overflow leaf
+	// Contract via merge/redistribute: an overflow leaf
 	// entry moved between leaves during a merge or redistribute
 	// keeps its OverflowPage / TotalLen — the chain is NOT
 	// re-allocated, it just changes which leaf entry references
@@ -578,7 +578,7 @@ func TestMergeRedistributePreservesOverflowEntries(t *testing.T) {
 }
 
 func TestCursorDeleteOverflowEntryFreesChain(t *testing.T) {
-	// Chunk-4.7 contract via the cursor: Cursor.Delete delegates
+	// Contract via the cursor: Cursor.Delete delegates
 	// to btree.Delete; an overflow entry's chain must be freed
 	// the same way as a direct btree.Delete.
 	cfg := page.Config{PageSize: 4096}
@@ -815,7 +815,7 @@ func checkSlabPartition(t *testing.T, pw *fakeWriter, cfg page.Config, root uint
 	}
 }
 
-// TestMergeBranchesForgedSiblingNoPanic (M-1, btree-branch-page-validation):
+// TestMergeBranchesForgedSiblingNoPanic:
 // mergeOrRedistributeBranches reads BOTH siblings fresh — the merge sibling
 // is the adjacent slot, NOT on the descent path that was validated on the
 // way down. A forged sibling-branch directory must therefore surface as

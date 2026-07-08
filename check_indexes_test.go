@@ -250,7 +250,7 @@ func TestCheckIndexesDetectsCoveringDrift(t *testing.T) {
 	}
 }
 
-// --- SetKeyspace index verification (M-1) -------------------------
+// --- SetKeyspace index verification --------------------------------
 
 // setKeyspaceSecondByteExtract indexes the member's SECOND byte — drift
 // against setKeyspaceFirstByteExtract.
@@ -296,7 +296,7 @@ func setupIndexedSetKeyspace(t *testing.T) *DB {
 	return db
 }
 
-// TestCheckIndexesSetKeyspaceCleanPasses (M-1): an indexed SetKeyspace
+// TestCheckIndexesSetKeyspaceCleanPasses: an indexed SetKeyspace
 // verified with its own extractor produces no drift AND none of the
 // corruption-flavored warnings (RowsUnreadable / KeyspaceKindUnsupported)
 // the pre-fix key-only path emitted on healthy set data.
@@ -314,7 +314,7 @@ func TestCheckIndexesSetKeyspaceCleanPasses(t *testing.T) {
 	}
 }
 
-// TestCheckIndexesSetKeyspaceDetectsDrift (M-1): a drifted extractor on an
+// TestCheckIndexesSetKeyspaceDetectsDrift: a drifted extractor on an
 // indexed SetKeyspace yields FingerprintDrift via the SetKeyspace codec.
 func TestCheckIndexesSetKeyspaceDetectsDrift(t *testing.T) {
 	db := setupIndexedSetKeyspace(t)
@@ -328,7 +328,7 @@ func TestCheckIndexesSetKeyspaceDetectsDrift(t *testing.T) {
 	}
 }
 
-// TestCheckIndexesSetKeyspaceNestedTreeCleanPasses (M-1): a set key with
+// TestCheckIndexesSetKeyspaceNestedTreeCleanPasses: a set key with
 // enough members to spill into a nested B+tree verifies clean — exercises
 // the nested-tree member-enumeration branch (vs the subpage branch).
 func TestCheckIndexesSetKeyspaceNestedTreeCleanPasses(t *testing.T) {
@@ -457,11 +457,11 @@ func TestCheckIndexesMultiColumnCleanPasses(t *testing.T) {
 	assertNoDrift(t, db, "multicol", v)
 }
 
-// TestCheckIndexesSetKeyspaceForgedSubpageNoPanic (H-1 regression): a
+// TestCheckIndexesSetKeyspaceForgedSubpageNoPanic (forged-page regression): a
 // forged SetKeyspace subpage (bad internal Count) must surface as a
 // CheckIndexes.RowsUnreadable warning, never a panic — the SetKeyspace
 // index pass validates the raw subpage before decoding it, upholding the
-// chunk-11 "Check never panics on a forged page" contract.
+// "Check never panics on a forged page" contract.
 func TestCheckIndexesSetKeyspaceForgedSubpageNoPanic(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)

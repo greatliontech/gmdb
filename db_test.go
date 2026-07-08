@@ -100,7 +100,7 @@ func TestWriteTxRoundTrip(t *testing.T) {
 		t.Errorf("post-commit TxnID = %d, want 1", db.Meta().TxnID)
 	}
 
-	// Read back via a new write tx (chunk 1 has no read tx surface).
+	// Read back via a new write tx.
 	err = db.Update(ctx, func(tx *Tx) error {
 		buf, err := tx.Page(allocatedID)
 		if err != nil {
@@ -247,7 +247,7 @@ func TestInvalidOptions(t *testing.T) {
 		{PageSize: 4096, MinSize: 100, MaxSize: 50},
 		{PageSize: 4096, MaxSize: 64, MaxTxBufferBytes: -1},
 		// MaxReaders above MaxMaxReaders fails validate() before
-		// the data file is touched (chunk 2.7 pre-check).
+		// the data file is touched.
 		{PageSize: 4096, MaxSize: 64, MaxReaders: lock.MaxMaxReaders + 1},
 	}
 	for i, opts := range bad {
@@ -258,7 +258,7 @@ func TestInvalidOptions(t *testing.T) {
 }
 
 func TestRollbackRestoresBitmap(t *testing.T) {
-	// Regression test for the round-1 H finding: AllocPage mutates the
+	// Regression test: AllocPage mutates the
 	// in-memory bitmap (Clear), and Rollback used to clear only the
 	// dirty-set without restoring the bit values. The result was a
 	// pager whose in-memory bitmap claimed allocations that were never
@@ -396,7 +396,7 @@ func TestRecoveryAfterMetaCorruption(t *testing.T) {
 func TestOpenRecoversFromMetaZeroPageSizeCorruption(t *testing.T) {
 	// Dual-meta atomicity (file-layout.md §Invariants): if at least one
 	// meta verifies, Open succeeds via that meta. Discovery of PageSize
-	// must therefore be robust to a corrupted meta-0 — the chunk-1
+	// must therefore be robust to a corrupted meta-0 — the
 	// mechanism is the probe in pager.DiscoverPageSize. Two reachable
 	// byte-flip shapes the probe must recover from:
 	//   (A) zero the PageSize bytes (ValidPageSize false)
@@ -952,8 +952,8 @@ func TestMultipleCommits(t *testing.T) {
 }
 
 func TestLockFileCreatedOnOpen(t *testing.T) {
-	// The lock file is opened/created during Open per chunk 2.7
-	// wiring. Pins three properties:
+	// The lock file is opened/created during Open.
+	// Pins three properties:
 	//   1. The lock file appears on disk at <path>.lock.
 	//   2. Its on-disk size matches lock.FileSize(MaxReaders) — the
 	//      cross-process.md mmap-size invariant.
@@ -991,8 +991,7 @@ func TestLockFileCreatedOnOpen(t *testing.T) {
 }
 
 func TestBeginRespectsCtxCancellation(t *testing.T) {
-	// 2.7 behavior change: Begin now honors ctx (chunk 1 ignored it).
-	// Cancelling ctx while waiting for the write grant returns
+	// Begin honors ctx: cancelling it while waiting for the write grant returns
 	// context.Cause(ctx); no goroutine leak, no held grant.
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
@@ -1088,8 +1087,8 @@ func TestCloseDuringBlockedBegin(t *testing.T) {
 	// must return promptly, and Close must complete without deadlock.
 	//
 	// The held tx is deliberately orphaned (not Rollback'd) — the
-	// Rollback-vs-Close race is chunk-2.8 territory (db.closed
-	// promotion). What 2.7 strictly guarantees here is: Close drains
+	// Rollback-vs-Close race is covered separately (db.closed
+	// promotion). What is strictly guaranteed here is: Close drains
 	// the Coord's flock goroutine even with a grant outstanding (the
 	// stopCh path clears header + unlocks), and a blocked Begin sees
 	// stopCh fire and returns ErrClosed.
@@ -1138,7 +1137,7 @@ func TestCloseSetsDBClosedFlag(t *testing.T) {
 	// sets *db.closed = true (release-store) BEFORE unmapping or
 	// stopping goroutines. We pin this by reading db.closed AFTER
 	// Close returns — true. Combined with TestBeginAfterCloseReturns
-	// ErrClosed (chunk 2.7), this verifies the flag is observable to
+	// ErrClosed, this verifies the flag is observable to
 	// any concurrent caller.
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
@@ -1257,7 +1256,7 @@ func TestTxLeakAfterCloseNoCrash(t *testing.T) {
 }
 
 func TestDBClosedFlagSharedByPointer(t *testing.T) {
-	// Spec-tier invariant (leak-detection.md, chunk-3.3 promotion):
+	// Spec-tier invariant (leak-detection.md):
 	// the close coordination state is a *closeGate shared by
 	// pointer between DB, every txCleanupInfo, every
 	// readTxCleanupInfo, and dbCleanupInfo. We pin this by

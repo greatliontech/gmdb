@@ -252,8 +252,8 @@ func decodeRegistryEntry(data []byte) (*indexRegistryEntry, error) {
 // mutation at Commit. registryPut / registryDelete take this
 // interface (not a raw *keyspaceDescriptor) so that calling
 // the helper without also marking the parent dirty is structurally
-// impossible — closes the silent-data-loss path that
-// adversarial review surfaced.
+// impossible — closes a silent-data-loss path (registry mutation
+// without the parent dirty-mark never reaches Commit's flush).
 //
 // *Keyspace.markDirty (keyspace.go) and *SetKeyspace.markDirty
 // (set_keyspace.go) both preserve a Created state (Created stays

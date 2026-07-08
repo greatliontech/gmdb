@@ -37,10 +37,10 @@ func (f *fakeReader) put(id uint64, buf []byte) {
 	f.pages[id] = buf
 }
 
-// makeLeaf builds a leaf page with the given entries via the chunk-
-// 4.6β LeafBuilder. cfg.RestartGroupTarget selects the variant
-// (0/≥2 → compressed; 1 → uncompressed). The interval parameter
-// from the chunk-4.2 API is gone — the builder owns group sizing.
+// makeLeaf builds a leaf page with the given entries via
+// LeafBuilder. cfg.RestartGroupTarget selects the variant
+// (0/≥2 → compressed; 1 → uncompressed). There is no interval
+// parameter — the builder owns group sizing.
 func makeLeaf(t *testing.T, cfg page.Config, entries []page.LeafEntry) []byte {
 	t.Helper()
 	buf := make([]byte, cfg.PageSize)
@@ -355,7 +355,7 @@ func TestHasMembership(t *testing.T) {
 }
 
 func TestGetOverflowEntryAssemblesValueChain(t *testing.T) {
-	// Chunk-4.7 contract (replaces the chunk-4.3 sentinel test):
+	// Contract (replaces the earlier sentinel test):
 	// matching an overflow-flagged leaf entry assembles the
 	// chain bytes into a heap-allocated value slice. Pin: round-
 	// trip a known value across a 1+N-page chain.

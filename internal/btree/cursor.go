@@ -362,10 +362,10 @@ func (c *Cursor) Prev() (key, value []byte) {
 // Current. The caller must re-position via First / Last / Seek /
 // SeekGE before retrying. (curKey may alias storage the external
 // mutation has freed; proceeding with bytes.Clone(c.curKey) could
-// stage a delete against garbage. This check is
-// scaffolding — only Cursor.Delete itself bumps gen and it
-// self-re-Seeks, so the path is unreachable from internal use.
-// Chunk-5+ keyspace wiring will exercise it.)
+// stage a delete against garbage. Within this package only
+// Cursor.Delete itself bumps gen and it self-re-Seeks, so the
+// path is unreachable from internal use; the keyspace layer's
+// MarkStale calls exercise it.)
 //
 // Per the spec the successor returned by the internal SeekGE is
 // strictly greater than deletedKey (deletedKey is gone), so the

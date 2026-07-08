@@ -131,7 +131,7 @@ func TestSchemaHashColumnVsCoveringDisambiguated(t *testing.T) {
 
 // TestSchemaHashNamePrefixPreventsCollision verifies the specific
 // collision case that motivates uvarint-prefixing index.Name in the
-// chunk-7.2 spec amendment. Without the Name prefix:
+// schema-hash input. Without the Name prefix:
 //
 //	A: Name="ab",     Columns=[{Name:""}], Covering=[{Name:""}], Unique=true
 //	B: Name="ab\x01", Columns=[],          Covering=[{Name:""}], Unique=true
@@ -139,8 +139,7 @@ func TestSchemaHashColumnVsCoveringDisambiguated(t *testing.T) {
 // both encode to `61 62 01 00 01 00 01`. With the prefix, A leads
 // with `uvarint(2) || "ab"` = `02 61 62`, while B leads with
 // `uvarint(3) || "ab\x01"` = `03 61 62 01` — the streams diverge at
-// byte 0, so the hashes differ. Per indexing.md §Drift Guard
-// (chunk-7.2 amendment).
+// byte 0, so the hashes differ. Per indexing.md §Drift Guard.
 func TestSchemaHashNamePrefixPreventsCollision(t *testing.T) {
 	a := &IndexDecl{
 		Name:     "ab",
@@ -161,7 +160,7 @@ func TestSchemaHashNamePrefixPreventsCollision(t *testing.T) {
 
 // TestValidateIndexDeclsEmpty verifies that an empty IndexDecl slice
 // is accepted (a keyspace with no indexes is the default — every
-// existing chunk-5/6 test passes this).
+// index-free keyspace test passes this).
 func TestValidateIndexDeclsEmpty(t *testing.T) {
 	if err := validateIndexDecls(nil); err != nil {
 		t.Fatalf("nil slice rejected: %v", err)
@@ -222,7 +221,7 @@ func TestValidateIndexDeclsRejectsNilEntry(t *testing.T) {
 // TestValidateIndexDeclsRejectsEmptyName verifies that an empty
 // IndexDecl.Name is rejected with ErrKeyEmpty. The Name is keyed
 // in the registry and in the schema-hash inputs — empty is
-// unrepresentable. The sentinel matches the chunk-7.1
+// unrepresentable. The sentinel matches the
 // api-surface.md Tx.RebuildIndex godoc ("ErrKeyEmpty if … decl.Name
 // is empty") so callers see the same error at every variadic-
 // IndexDecl call site.
@@ -236,7 +235,7 @@ func TestValidateIndexDeclsRejectsEmptyName(t *testing.T) {
 	}
 }
 
-// TestValidateIndexDeclsRejectsZeroColumns verifies the chunk-7.10
+// TestValidateIndexDeclsRejectsZeroColumns verifies the
 // rejection rule: a zero-column IndexDecl is rejected with
 // ErrInvalidOptions at the variadic-IndexDecl entry points. The
 // non-unique decoder (extractSetKeyspaceCompoundPKFromIndexKey +

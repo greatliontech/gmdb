@@ -8,7 +8,7 @@ import (
 
 // --- Tx.RebuildIndex --------------------------------------------
 
-// TestRebuildIndexBasicReplacesExtractor verifies the chunk-7.1
+// TestRebuildIndexBasicReplacesExtractor verifies the
 // RebuildIndex contract: re-running an extractor over existing rows
 // produces fresh index entries; the registry entry's SchemaHash +
 // Version reflect the new decl.
@@ -94,7 +94,7 @@ func TestRebuildIndexNilDeclReturnsErrInvalidOptions(t *testing.T) {
 }
 
 // TestRebuildIndexNilExtractReturnsErrIndexExtractorRequired
-// verifies the chunk-7.1 spec contract: decl.Extract MUST be
+// verifies the spec contract: decl.Extract MUST be
 // non-nil per indexing.md §Rebuild.
 func TestRebuildIndexNilExtractReturnsErrIndexExtractorRequired(t *testing.T) {
 	ctx := context.Background()
@@ -121,7 +121,7 @@ func TestRebuildIndexNilExtractReturnsErrIndexExtractorRequired(t *testing.T) {
 }
 
 // TestRebuildIndexMissingKeyspaceReturnsErrNotFound verifies the
-// chunk-7.1 user-locked decision: keyspace-management dimension →
+// user-locked decision: keyspace-management dimension →
 // ErrNotFound.
 func TestRebuildIndexMissingKeyspaceReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
@@ -141,7 +141,7 @@ func TestRebuildIndexMissingKeyspaceReturnsErrNotFound(t *testing.T) {
 }
 
 // TestRebuildIndexMissingIndexNameReturnsErrIndexNotFound verifies
-// the chunk-7.1 user-locked decision: index-management dimension →
+// the user-locked decision: index-management dimension →
 // ErrIndexNotFound.
 func TestRebuildIndexMissingIndexNameReturnsErrIndexNotFound(t *testing.T) {
 	ctx := context.Background()
@@ -245,7 +245,7 @@ func TestRebuildIndexEmptyKeyspaceProducesEmptyIndex(t *testing.T) {
 
 // --- Tx.DropIndex -----------------------------------------------
 
-// TestDropIndexRemovesEntry verifies the chunk-7.8 DropIndex
+// TestDropIndexRemovesEntry verifies the DropIndex
 // happy path: registry entry removed, pinned set updated.
 func TestDropIndexRemovesEntry(t *testing.T) {
 	ctx := context.Background()
@@ -278,7 +278,7 @@ func TestDropIndexRemovesEntry(t *testing.T) {
 	}
 }
 
-// TestDropIndexLastResetsIndexRegistryRoot verifies the chunk-7.1
+// TestDropIndexLastResetsIndexRegistryRoot verifies the
 // indexing.md entailed invariant on empty-registry canonical-at-
 // zero: DropIndex of the last declared index resets
 // desc.IndexRegistryRoot to 0.
@@ -344,14 +344,14 @@ func TestDropIndexMissingIndexNameReturnsErrIndexNotFound(t *testing.T) {
 	}
 }
 
-// --- Chunk 7.10: SetKeyspace Rebuild/Drop -------------------------
+// --- SetKeyspace Rebuild/Drop -------------------------------------
 //
-// These tests previously verified the chunk-7.8 H-1 gate that
+// These tests previously verified an interim gate that
 // rejected SetKeyspace Rebuild/Drop with ErrInvalidOptions. The
-// gate was removed at chunk-7.10; the tests now assert the
+// gate was removed; the tests now assert the
 // positive behavior (Rebuild/Drop succeed on SetKeyspace).
 
-// TestRebuildIndexOnSetKeyspaceSucceeds verifies the chunk-7.10
+// TestRebuildIndexOnSetKeyspaceSucceeds verifies the
 // SetKeyspace RebuildIndex path: per-(setKey, setValue) extractor
 // invocation via SetCursor; compound-PK index entry encoding.
 func TestRebuildIndexOnSetKeyspaceSucceeds(t *testing.T) {
@@ -388,8 +388,8 @@ func TestRebuildIndexOnSetKeyspaceSucceeds(t *testing.T) {
 	}
 }
 
-// TestDropIndexOnSetKeyspaceSucceeds verifies the chunk-7.10
-// SetKeyspace DropIndex path inherits the chunk-7.8 generic logic.
+// TestDropIndexOnSetKeyspaceSucceeds verifies the
+// SetKeyspace DropIndex path inherits the generic DropIndex logic.
 func TestDropIndexOnSetKeyspaceSucceeds(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -420,9 +420,9 @@ func TestDropIndexOnSetKeyspaceSucceeds(t *testing.T) {
 	}
 }
 
-// --- L-2: rebuild visibility against same-tx Puts ----------------
+// --- Rebuild visibility against same-tx Puts ---------------------
 
-// TestRebuildIndexSeesSameTxPuts verifies the chunk-7.8 spec
+// TestRebuildIndexSeesSameTxPuts verifies the spec
 // contract from indexing.md §Rebuild mechanics: "The internal
 // cursor sees the current write transaction's dirty state — rows
 // Put earlier in the same transaction are included in the rebuilt
@@ -465,7 +465,7 @@ func TestRebuildIndexSeesSameTxPuts(t *testing.T) {
 	}
 }
 
-// --- L-3: DropIndex same-tx visibility ---------------------------
+// --- DropIndex same-tx visibility --------------------------------
 
 // TestDropIndexThenReopenWithSameDeclErrIndexUnknown verifies
 // indexing.md §Removing an Index: "Future OpenKeyspace calls must
@@ -519,9 +519,9 @@ func TestDropIndexThenReopenWithSameDeclErrIndexUnknown(t *testing.T) {
 	}
 }
 
-// --- L-4: not-cached path coverage --------------------------------
+// --- Not-cached path coverage --------------------------------------
 
-// TestRebuildIndexNotCachedPathPersists verifies the chunk-7.8
+// TestRebuildIndexNotCachedPathPersists verifies the
 // not-cached RebuildIndex path: a fresh tx that has NEVER
 // OpenKeyspace'd "items" can still RebuildIndex it (the spec's
 // recovery-after-FingerprintMismatch loop pattern, where
@@ -593,7 +593,7 @@ func TestRebuildIndexNotCachedPathPersists(t *testing.T) {
 	}
 }
 
-// TestDropIndexNotCachedPathPersists mirrors the L-4 not-cached
+// TestDropIndexNotCachedPathPersists mirrors the not-cached
 // path for DropIndex.
 func TestDropIndexNotCachedPathPersists(t *testing.T) {
 	ctx := context.Background()
@@ -646,7 +646,7 @@ func TestDropIndexNotCachedPathPersists(t *testing.T) {
 // --- DeleteKeyspace three-subtree retirement --------------------
 
 // TestDeleteKeyspaceWithIndexesRetiresAllSubtrees verifies the
-// chunk-7.8 three-subtree retirement: DeleteKeyspace on an
+// three-subtree retirement: DeleteKeyspace on an
 // indexed keyspace successfully retires (1) data subtree,
 // (2) per-index Kind=2 data trees, (3) registry sub-tree, all
 // in one atomic CoW tx.
@@ -675,9 +675,9 @@ func TestDeleteKeyspaceWithIndexesRetiresAllSubtrees(t *testing.T) {
 		t.Fatalf("IndexRegistryRoot 0 after CreateKeyspace with index")
 	}
 	// DeleteKeyspace previously failed with ErrCorrupted under
-	// chunk-5.6's defensive gate; chunk-7.8 must succeed.
+	// a defensive indexed-keyspace gate; it must now succeed.
 	if err := tx.DeleteKeyspace("items"); err != nil {
-		t.Fatalf("DeleteKeyspace with indexes: %v (chunk-5.6 defensive gate not replaced)", err)
+		t.Fatalf("DeleteKeyspace with indexes: %v (defensive gate not replaced)", err)
 	}
 	// The keyspace must be invisible to subsequent ListKeyspaces.
 	names, err := tx.ListKeyspaces()
@@ -779,13 +779,13 @@ func assertNoBitmapCorruption(t *testing.T, db *DB, site string) {
 	}
 }
 
-// TestRebuildIndexAtomicOnPartialFailure pins the chunk-7.8 DDL
+// TestRebuildIndexAtomicOnPartialFailure pins the DDL
 // write-helper atomicity contract (transactions.md §Write-helper error
 // contract): a mid-rebuild failure must not orphan any pages on
 // Tx.Commit (the rest-of-tx-continues path). The failure is injected
 // after the publish-then-retire registryPut succeeded (the registry
 // now points at the freshly-built newRoot) but before the OLD index
-// data tree is freed — the H-2 ordering's worst-case window, where
+// data tree is freed — that ordering's worst-case window, where
 // without the savepoint wrap newRoot's pages would be orphaned (the
 // restored descriptor must NOT keep pointing at them) and the OLD
 // tree would remain partially live. Check() must report no bitmap-

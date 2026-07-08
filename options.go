@@ -1,10 +1,8 @@
 // Package gmdb is a memory-mapped, multi-process, embedded key-value
 // database for Go 1.24+.
 //
-// This file scopes Options to: page
-// size, checksum, file-size bounds, and the slab budget. The full
-// option set in api-surface.md lands incrementally as later chunks
-// require it (SyncMode, MaxReaders, RestartGroupTarget, etc.).
+// This file holds Options and its validation; the option surface
+// follows api-surface.md §Options.
 package gmdb
 
 import (

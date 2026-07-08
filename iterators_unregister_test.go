@@ -80,8 +80,8 @@ func TestIteratorsUnregisterCursors(t *testing.T) {
 	// sequence (a staled cursor's Next returns nil; recovery is a
 	// fresh iterator). seen == 1 is the deterministic pin: an
 	// UNREGISTERED cursor would silently keep walking the retired
-	// pre-mutation tree and see every key (a surviving mutation in
-	// review round 1 demonstrated exactly that).
+	// pre-mutation tree and see every key (a surviving mutation
+	// demonstrated exactly that).
 	seen := 0
 	for k := range ks.All() {
 		seen++

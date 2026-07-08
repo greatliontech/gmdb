@@ -23,7 +23,7 @@ func setKeyspaceFirstByteExtract(_, setValue []byte) []IndexEntry {
 
 // --- Compound-PK codec roundtrip ----------------------------------
 
-// TestEncodeSetKeyspaceCompoundPKRoundtrip verifies the chunk-7.9
+// TestEncodeSetKeyspaceCompoundPKRoundtrip verifies the
 // compound PK codec roundtrips through encode + decode.
 func TestEncodeSetKeyspaceCompoundPKRoundtrip(t *testing.T) {
 	cases := []struct {
@@ -53,13 +53,13 @@ func TestEncodeSetKeyspaceCompoundPKRoundtrip(t *testing.T) {
 	}
 }
 
-// TestSetKeyspaceCompoundPKSeparatorPrefixFree verifies the chunk-
-// 7.1 / set-keyspace.md Inv-6 invariant: the 0x00 0x01 separator
+// TestSetKeyspaceCompoundPKSeparatorPrefixFree verifies the
+// set-keyspace.md Inv-6 invariant: the 0x00 0x01 separator
 // is lex-distinct from the column terminator 0x00 0x00 and the
 // escape sequence 0x00 0xFF. Inside the escaped halves, every
 // 0x00 is escaped to 0x00 0xFF, so the only 0x00 0x01 in the
 // compound PK is the separator. (Spec-tier invariant promoted to
-// enforced tests per the chunk-7.1 schedule.)
+// enforced tests.)
 func TestSetKeyspaceCompoundPKSeparatorPrefixFree(t *testing.T) {
 	// Pathological input: setKey contains a literal 0x00, setValue
 	// contains 0xFF + 0x01. These bytes would NOT collide with the
@@ -91,8 +91,8 @@ func TestSetKeyspaceCompoundPKSeparatorPrefixFree(t *testing.T) {
 	}
 }
 
-// TestEncodeSetKeyspaceIndexKeyNonUniqueShape verifies the chunk-
-// 7.9 non-unique key shape: encodeIndexKey(cols) || compoundPK || 0x00 0x00.
+// TestEncodeSetKeyspaceIndexKeyNonUniqueShape verifies the
+// non-unique key shape: encodeIndexKey(cols) || compoundPK || 0x00 0x00.
 func TestEncodeSetKeyspaceIndexKeyNonUniqueShape(t *testing.T) {
 	cols := [][]byte{{0x42}}
 	sk := []byte("user1")
@@ -124,7 +124,7 @@ func TestEncodeSetKeyspaceIndexKeyUniqueShape(t *testing.T) {
 
 // --- SetKeyspace indexed Put -------------------------------------
 
-// TestSetKeyspaceIndexedPutAddsIndexEntries verifies the chunk-7.9
+// TestSetKeyspaceIndexedPutAddsIndexEntries verifies the
 // atomic Put: each added (key, value) pair invokes the extractor
 // and writes index entries.
 func TestSetKeyspaceIndexedPutAddsIndexEntries(t *testing.T) {
@@ -256,8 +256,8 @@ func TestSetKeyspaceIndexedDeleteValueRemovesIndexEntry(t *testing.T) {
 
 // --- SetKeyspace indexed bulk-key Delete -------------------------
 
-// TestSetKeyspaceIndexedDeleteWalksAllMembers verifies the chunk-
-// 7.9 indexed bulk-key delete: every set member's index entries
+// TestSetKeyspaceIndexedDeleteWalksAllMembers verifies the
+// indexed bulk-key delete: every set member's index entries
 // are removed before the row's leaf cell is dropped. Per
 // indexing.md §Indexes on SetKeyspaces "Bulk-free of a key's
 // nested B+tree (via Delete(key)) reverts to a per-member walk
@@ -298,7 +298,7 @@ func TestSetKeyspaceIndexedDeleteWalksAllMembers(t *testing.T) {
 // --- SetKeyspace.Index handle Lookup -----------------------------
 
 // TestSetKeyspaceIndexLookupReturnsSetKeyValuePair verifies the
-// chunk-7.9 Lookup contract: yields (setKey, setValue) pairs
+// SetKeyspace Lookup contract: yields (setKey, setValue) pairs
 // (NOT (rowKey, rowValue) as for Keyspace).
 func TestSetKeyspaceIndexLookupReturnsSetKeyValuePair(t *testing.T) {
 	ctx := context.Background()
@@ -387,10 +387,10 @@ func TestSetKeyspaceIndexGetUniqueReturnsSetKeyValue(t *testing.T) {
 	}
 }
 
-// --- Regression: Round-1 H-1 (LookupKeys broken on SetKeyspace) --
+// --- Regression: LookupKeys broken on SetKeyspace ----------------
 
-// TestSetKeyspaceIndexLookupKeysRejected verifies the chunk-7.9
-// H-1 fix: LookupKeys on a SetKeyspace *IndexHandle sets
+// TestSetKeyspaceIndexLookupKeysRejected verifies that
+// LookupKeys on a SetKeyspace *IndexHandle sets
 // idx.Err() to a wrapped ErrInvalidOptions and yields nothing.
 // LookupKeys' iter.Seq[[]byte] surface cannot represent the
 // compound (setKey, setValue) PK; callers use Lookup
@@ -426,10 +426,10 @@ func TestSetKeyspaceIndexLookupKeysRejected(t *testing.T) {
 	}
 }
 
-// --- L-4: Range + Prefix coverage on SetKeyspace -----------------
+// --- Range + Prefix coverage on SetKeyspace ----------------------
 
 // TestSetKeyspaceIndexRangeYieldsSetKeyValuePairs verifies the
-// chunk-7.9 Range surface on a SetKeyspace yields (setKey,
+// Range surface on a SetKeyspace yields (setKey,
 // setValue) pairs in encoded-key order.
 func TestSetKeyspaceIndexRangeYieldsSetKeyValuePairs(t *testing.T) {
 	ctx := context.Background()
@@ -469,7 +469,7 @@ func TestSetKeyspaceIndexRangeYieldsSetKeyValuePairs(t *testing.T) {
 }
 
 // TestSetKeyspaceIndexPrefixYieldsSetKeyValuePairs verifies the
-// chunk-7.9 Prefix surface on a SetKeyspace.
+// Prefix surface on a SetKeyspace.
 func TestSetKeyspaceIndexPrefixYieldsSetKeyValuePairs(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -525,11 +525,11 @@ func TestSetKeyspaceIndexPrefixYieldsSetKeyValuePairs(t *testing.T) {
 	}
 }
 
-// --- L-5: nested-tree promotion path coverage --------------------
+// --- Nested-tree promotion path coverage -------------------------
 
 // TestSetKeyspaceIndexedBulkDeleteAcrossNestedTree verifies the
-// chunk-7.9 bulk-key Delete walks every member when the key's set
-// has been promoted to a nested B+tree (per chunk-6.4 promotion
+// bulk-key Delete walks every member when the key's set
+// has been promoted to a nested B+tree (per set-keyspace.md promotion
 // rules). Forces enough Puts to cross the subpage→nested-tree
 // promotion threshold.
 func TestSetKeyspaceIndexedBulkDeleteAcrossNestedTree(t *testing.T) {
@@ -556,7 +556,7 @@ func TestSetKeyspaceIndexedBulkDeleteAcrossNestedTree(t *testing.T) {
 		t.Fatalf("CreateSetKeyspace: %v", err)
 	}
 	// Put enough distinct values under one key to cross the
-	// subpage→nested-tree promotion threshold. chunk-6.4's
+	// subpage→nested-tree promotion threshold. The
 	// threshold is 50% of the page's usable space (~2020 bytes
 	// at PageSize=4096); use 64-byte values so ~32 entries
 	// reaches the threshold. 600 entries comfortably crosses.
@@ -591,7 +591,7 @@ func TestSetKeyspaceIndexedBulkDeleteAcrossNestedTree(t *testing.T) {
 		t.Fatalf("Delete (nested-tree path): %v", err)
 	}
 	if got := sks.indexes["by_value"].count; got != 0 {
-		t.Errorf("post-Delete count: got %d want 0 (chunk-7.9 bulk-key-delete nested-tree walk)", got)
+		t.Errorf("post-Delete count: got %d want 0 (bulk-key-delete nested-tree walk)", got)
 	}
 }
 
@@ -599,7 +599,7 @@ func TestSetKeyspaceIndexedBulkDeleteAcrossNestedTree(t *testing.T) {
 
 // TestSetKeyspaceIndexedPersistsAcrossCommit verifies that the
 // SetKeyspace pinned index state survives Commit + re-Open
-// (chunk-7.9 flushIndexRegistry Step 2b integration).
+// (flushIndexRegistry Step 2b integration).
 func TestSetKeyspaceIndexedPersistsAcrossCommit(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
@@ -885,8 +885,8 @@ func TestApplyIndexMaintenanceAtomicOnSetKeyspaceBulkKeyDelete(t *testing.T) {
 // failure; the outer rowSnap restore must un-mutate.
 //
 // Historical context (kept-current anchor: this test's neuter clause
-// + the chunk-7.6 H-2 → chunk-7.9 evolution chain via `git log`): the
-// wrapper-internal snapshot the chunk-7.6 era added was a belt over
+// + `git log` on this file): the
+// wrapper-internal snapshot an earlier design added was a belt over
 // these braces and was removed when the wrapper layer was deleted.
 // This test is the regression backstop against future removal of
 // the outer SetKeyspace.Delete restoreIndexes call.

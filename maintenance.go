@@ -106,7 +106,6 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 	// reading. No write transaction is taken — clearing a slot is a
 	// lock-file mmap store, independent of the data file. Errors (ctx
 	// cancel on Close, coord closed) are benign: the next pass retries.
-	// (Task 4 added in a later sub-chunk.)
 	if err := coord.ReapStaleReaderSlots(ctx); err != nil &&
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
 		!errors.Is(err, lock.ErrClosed) {

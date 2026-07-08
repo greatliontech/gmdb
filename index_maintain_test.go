@@ -8,7 +8,7 @@ import (
 )
 
 // Test extractor that splits a CSV value `a,b` into one IndexEntry
-// per column for a single-column index. Used by many chunk-7.6
+// per column for a single-column index. Used by many
 // tests to exercise the Put / Delete index-maintenance paths.
 func splitCSVExtract(_, value []byte) []IndexEntry {
 	if len(value) == 0 {
@@ -40,8 +40,7 @@ func firstByteExtract(_, value []byte) []IndexEntry {
 // TestIndexedPutWritesIndexEntries verifies that Put on an indexed
 // keyspace writes index entries reachable via the index data tree.
 // Probe the entries by computing the expected encoded index key
-// and walking the tree directly (chunk 7.7 will wire the Lookup
-// API; chunk 7.6 only writes).
+// and walking the tree directly, independent of the Lookup API.
 func TestIndexedPutWritesIndexEntries(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -350,8 +349,8 @@ func TestIndexedDeleteClearsIndexEntries(t *testing.T) {
 
 // TestIndexedDeleteMissingReturnsErrNotFound verifies that Delete
 // on a key that doesn't exist returns ErrNotFound without
-// mutating any index (chunk-5.1 Delete-on-miss invariant + the
-// chunk-7.6 indexed-keyspace contract).
+// mutating any index (the Delete-on-miss invariant + the
+// indexed-keyspace contract).
 func TestIndexedDeleteMissingReturnsErrNotFound(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -380,7 +379,7 @@ func TestIndexedDeleteMissingReturnsErrNotFound(t *testing.T) {
 
 // TestIndexedCursorDeleteClearsIndexEntries verifies that
 // Cursor.Delete on an indexed keyspace deletes the row's index
-// entries too (the chunk-7.6 cursor-delete wire-in).
+// entries too.
 func TestIndexedCursorDeleteClearsIndexEntries(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -417,10 +416,10 @@ func TestIndexedCursorDeleteClearsIndexEntries(t *testing.T) {
 	}
 }
 
-// --- Regression: Round-1 H-1 (stale Cursor.Delete on indexed ks) -
+// --- Regression: stale Cursor.Delete on an indexed keyspace ------
 
-// TestIndexedCursorDeleteOnStaleCursorReturnsErrCursorStale is the
-// chunk-7.6 Round-1 H-1 regression: a stale indexed cursor must
+// TestIndexedCursorDeleteOnStaleCursorReturnsErrCursorStale is a
+// regression test: a stale indexed cursor must
 // return ErrCursorStale, not ErrCursorUnpositioned, matching the
 // non-indexed path and transactions.md §Cursor State Machine. The
 // indexed-path code translates Current() returning nil through
@@ -455,17 +454,17 @@ func TestIndexedCursorDeleteOnStaleCursorReturnsErrCursorStale(t *testing.T) {
 		t.Fatalf("Put b: %v", err)
 	}
 	// Now c is stale. Delete must return ErrCursorStale, not
-	// ErrCursorUnpositioned (the Round-1 H-1 regression).
+	// ErrCursorUnpositioned (the stale-delete regression).
 	err = c.Delete()
 	if !errors.Is(err, ErrCursorStale) {
 		t.Errorf("stale Cursor.Delete on indexed ks: got %v want ErrCursorStale", err)
 	}
 }
 
-// --- Regression: Round-1 H-2 (atomicity snapshot/restore on failure)
+// --- Regression: atomicity snapshot/restore on failure ------------
 
 // TestIndexedPutPinnedStateRevertsOnCandidateCollision verifies the
-// chunk-7.6 H-2 atomicity fix: when applyIndexMaintenanceOnPut
+// atomicity fix: when applyIndexMaintenanceOnPut
 // fails on a candidate-set unique collision, the pinnedIndex
 // (root, count) is restored to the pre-call snapshot. Without
 // the fix, a later flushIndexRegistry would commit half-mutated
@@ -522,12 +521,12 @@ func TestIndexedPutPinnedStateRevertsOnCandidateCollision(t *testing.T) {
 	if !errors.Is(err, ErrIndexUniqueViolation) {
 		t.Fatalf("expected ErrIndexUniqueViolation, got %v", err)
 	}
-	// H-2 fix: pinned state must equal the pre-call snapshot.
+	// The pinned state must equal the pre-call snapshot.
 	if got := ks.indexes["by_color"].count; got != 1 {
-		t.Errorf("post-failed-Put count: got %d want 1 — H-2 revert regression", got)
+		t.Errorf("post-failed-Put count: got %d want 1 — snapshot-revert regression", got)
 	}
 	if got := ks.indexes["by_color"].root; got != prevRoot {
-		t.Errorf("post-failed-Put root: got %d want %d — H-2 revert regression", got, prevRoot)
+		t.Errorf("post-failed-Put root: got %d want %d — snapshot-revert regression", got, prevRoot)
 	}
 }
 
@@ -662,8 +661,9 @@ func TestKeyspaceIndexHandleUnknownNameReturnsErrIndexNotFound(t *testing.T) {
 // Pager.BeginShallowSavepoint / RestoreSavepoint(on error) /
 // ReleaseSavepoint(on success) wrap that satisfies the per-row
 // portion of transactions.md §Write-helper error contract (the
-// chunk-7.6 / 7.9 sites; the chunk-7.5 sibling writeNewIndexRegistry
-// and the chunk-7.8 cold-path DDL siblings use the nested-kind
+// per-row Put / Delete maintenance sites; the sibling
+// writeNewIndexRegistry and the cold-path DDL siblings
+// (RebuildIndex / DropIndex) use the nested-kind
 // savepoint per the same contract). Each:
 //
 //   1. Creates an indexed Keyspace / SetKeyspace with ≥2 indexes
@@ -894,7 +894,7 @@ func TestApplyIndexMaintenanceAtomicOnCursorDelete(t *testing.T) {
 // `Keyspace.Put`'s restoreIndexes(rowSnap) call on the helper-error
 // branch returns pinned.{root, count} to the pre-call state.
 //
-// Pins the chunk-7.6 H-2 atomicity invariant across the consolidation
+// Pins the row-level atomicity invariant across the consolidation
 // from helper-layer-snapshot to caller-layer-only. Sister to
 // TestIndexedPutPinnedStateRevertsOnCandidateCollision, which
 // exercises only the no-mutation path (candidate-set collision before

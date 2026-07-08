@@ -8,12 +8,12 @@ import (
 	"testing"
 )
 
-// Chunk-5.7 public-surface tests for Keyspace.DeleteRange. The
+// Public-surface tests for Keyspace.DeleteRange. The
 // btree-layer tests in internal/btree/range_delete_test.go pin the
 // algorithm invariants directly; these tests pin the public surface
-// against the chunk-5.6 deferred-flush machinery.
+// against the deferred-flush machinery.
 
-// TestKeyspaceDeleteRangeEmptyRange pins the chunk-5.1 user-locked
+// TestKeyspaceDeleteRangeEmptyRange pins the user-locked
 // "DeleteRange returns (0, nil) for an empty range" decision.
 func TestKeyspaceDeleteRangeEmptyRange(t *testing.T) {
 	ctx := context.Background()
@@ -178,8 +178,9 @@ func TestKeyspaceDeleteRangePersistsAcrossCommit(t *testing.T) {
 }
 
 // TestKeyspaceDeleteRangeKeyspaceClosedAfterDeleteKeyspace promotes
-// chunk-5.6 Inv-D for the new DeleteRange surface: an invalidated
-// handle returns ErrKeyspaceClosed.
+// the DeleteKeyspace handle-invalidation invariant (Inv-D in
+// delete_keyspace_test.go) for the DeleteRange surface: an
+// invalidated handle returns ErrKeyspaceClosed.
 func TestKeyspaceDeleteRangeKeyspaceClosedAfterDeleteKeyspace(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -261,11 +262,11 @@ func TestKeyspaceDeleteRangeNoOpDoesNotMarkCursorsStale(t *testing.T) {
 	}
 }
 
-// TestKeyspaceDeleteRangeRejectsEmptyByteBoundary pins the chunk-5.7
-// L-2 fix: `nil` boundaries are open per range-delete.md invariant
+// TestKeyspaceDeleteRangeRejectsEmptyByteBoundary pins boundary
+// validation: `nil` boundaries are open per range-delete.md invariant
 // #1, but a non-nil zero-length boundary is rejected with
 // ErrKeyEmpty (consistent with every other name-taking API per the
-// chunk-5.1 user-locked empty-key policy).
+// user-locked empty-key policy).
 func TestKeyspaceDeleteRangeRejectsEmptyByteBoundary(t *testing.T) {
 	ctx := context.Background()
 	db, _ := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})

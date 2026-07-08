@@ -155,8 +155,8 @@ func (p *Pager) AllocPage() (uint64, error) {
 		// Defensive symmetry with the bitmap-path branch below. The
 		// commit pipeline is the only writer of pendingFrees and runs
 		// strictly after all tx-body AllocPage calls, so this delete
-		// is unreachable today — kept for uniformity with the chunk-
-		// 5.2 FreePage contract (allocation removes a pending-free
+		// is unreachable today — kept for uniformity with the
+		// FreePage contract (allocation removes a pending-free
 		// scheduling) and to make a future commit-step rearrangement
 		// safe by construction.
 		_, wasInPendingFrees := p.pendingFrees[id]

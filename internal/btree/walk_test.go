@@ -122,7 +122,7 @@ func TestWalkRejectsForgedBranchDirectory(t *testing.T) {
 	}
 }
 
-// TestWalkKVEnumeratesOverflowAndPlain (M-2): WalkKV yields every
+// TestWalkKVEnumeratesOverflowAndPlain: WalkKV yields every
 // (key,value) in ascending order, assembling overflow values correctly.
 func TestWalkKVEnumeratesOverflowAndPlain(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}

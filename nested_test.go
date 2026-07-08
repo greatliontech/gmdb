@@ -433,7 +433,7 @@ func TestChildCreatesKeyspace(t *testing.T) {
 	}
 }
 
-// TestChildMutatesIndexedKeyspace (L-2 coverage): a child that performs
+// TestChildMutatesIndexedKeyspace: a child that performs
 // index maintenance (Put on an indexed keyspace) merges its pinned-index
 // root/count into the parent; the index is queryable through the parent
 // handle and survives the top-level Commit + re-open.
@@ -511,7 +511,7 @@ func TestChildMutatesIndexedKeyspace(t *testing.T) {
 	}
 }
 
-// TestChildCreatesIndexedKeyspace (L-3 coverage): a child that *creates*
+// TestChildCreatesIndexedKeyspace: a child that *creates*
 // an indexed keyspace exercises the fresh-parent-handle merge branch that
 // carries pinned-index state (indexes: cks.indexes). The index must flush
 // via the parent's installed handle at the top-level Commit and survive a

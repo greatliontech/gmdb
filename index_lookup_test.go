@@ -99,7 +99,7 @@ func TestIndexLookupUniqueNoMatchEmptySeq(t *testing.T) {
 // TestIndexLookupNonUniqueReturnsAllMatches verifies that Lookup
 // on a non-unique index returns every row whose extractor produced
 // the matching column tuple. The PK is appended to the index key
-// per the chunk-7.6 non-unique encoding.
+// per the non-unique index-key encoding.
 func TestIndexLookupNonUniqueReturnsAllMatches(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -446,10 +446,10 @@ func TestIndexGetOnNonUniqueReturnsErrIndexNotUnique(t *testing.T) {
 	}
 }
 
-// --- Regression: Round-1 H-1 (partial-cols validation) ------------
+// --- Regression: partial-cols validation ---------------------------
 
-// TestIndexLookupPartialColsReturnsErrInvalidOptions verifies the
-// chunk-7.7 Round-1 H-1 fix: Lookup with fewer columns than the
+// TestIndexLookupPartialColsReturnsErrInvalidOptions verifies
+// that Lookup with fewer columns than the
 // index declares sets idx.Err() to a wrapped ErrInvalidOptions
 // and yields nothing. Use Prefix for partial-cols semantics.
 func TestIndexLookupPartialColsReturnsErrInvalidOptions(t *testing.T) {
@@ -498,7 +498,7 @@ func TestIndexLookupPartialColsReturnsErrInvalidOptions(t *testing.T) {
 		t.Errorf("idx.Err: got %v want ErrInvalidOptions wrap", idx.Err())
 	}
 
-	// Zero cols (H-2 footgun) — same outcome.
+	// Zero cols — same outcome.
 	n = 0
 	for range idx.Lookup() {
 		n++
@@ -511,7 +511,8 @@ func TestIndexLookupPartialColsReturnsErrInvalidOptions(t *testing.T) {
 	}
 }
 
-// TestIndexGetPartialColsReturnsErrInvalidOptions mirrors H-1 for Get.
+// TestIndexGetPartialColsReturnsErrInvalidOptions mirrors the
+// partial-cols rejection for Get.
 func TestIndexGetPartialColsReturnsErrInvalidOptions(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -546,10 +547,10 @@ func TestIndexGetPartialColsReturnsErrInvalidOptions(t *testing.T) {
 	}
 }
 
-// --- Regression: Round-1 M-2 (per-sequence Err reset) -------------
+// --- Regression: per-sequence Err reset ----------------------------
 
-// TestIndexLookupResetsErrOnNewSequence verifies the chunk-7.7
-// M-2 fix: a fresh Lookup/Range/Prefix call resets idx.Err()
+// TestIndexLookupResetsErrOnNewSequence verifies that
+// a fresh Lookup/Range/Prefix call resets idx.Err()
 // (per api-surface.md "first error encountered during the **last**
 // sequence's iteration").
 func TestIndexLookupResetsErrOnNewSequence(t *testing.T) {
@@ -593,9 +594,9 @@ func TestIndexLookupResetsErrOnNewSequence(t *testing.T) {
 	}
 }
 
-// --- Regression: Round-1 M-3 (covering write path) ---------------
+// --- Regression: covering write path -------------------------------
 
-// TestIndexedPutWritesCoveringBytes verifies that chunk-7.7's
+// TestIndexedPutWritesCoveringBytes verifies that the
 // extended index entry value format encodes the IndexEntry.Cover
 // bytes when the IndexDecl declares Covering. Unique value =
 // uvarint(len(pk)) || pk || encoded_covering. The test reads the
@@ -1158,7 +1159,7 @@ func TestByteAPICoveringNilCoverReturnsEmpty(t *testing.T) {
 	}
 }
 
-// --- Regression: Round-1 M-4 (decodeUniqueIndexValue errors) -----
+// --- Regression: decodeUniqueIndexValue errors ---------------------
 
 // TestDecodeUniqueIndexValueRejectsEmpty verifies the malformed-
 // input branch.

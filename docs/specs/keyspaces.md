@@ -150,8 +150,8 @@ Invariant: kind=clause-explicit;
     leaking the divergence into operational dashboards and
     `Check()` reports.
 
-(Chunk-7.1 user-locked decision; locks the chunk-5.4
-implementation as spec-correct.)
+(User-locked decision; ratifies the implemented shape as
+spec-correct.)
 
 ## Keyspace Descriptor
 

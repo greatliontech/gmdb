@@ -174,7 +174,7 @@ func TestPutMultipleSingleLeafGetAllBack(t *testing.T) {
 
 // TestPutDeleteGetUncompressedLeafVariant exercises the uncompressed
 // leaf variant (cfg.RestartGroupTarget = 1) end-to-end through Put,
-// Get, and Delete. The chunk-4.6γ btree port is variant-agnostic
+// Get, and Delete. The btree layer is variant-agnostic
 // past LeafReader / LeafBuilder; this pins that the uncompressed
 // dispatch is actually wired through the mutation paths and not
 // accidentally compressed-only.
@@ -608,10 +608,10 @@ func TestPutContentsInvariantUnderInsertOrder(t *testing.T) {
 }
 
 func TestPutPromotesLargeValueToOverflow(t *testing.T) {
-	// Chunk-4.7 contract: a value exceeding inline single-entry
+	// Contract: a value exceeding inline single-entry
 	// leaf capacity is automatically promoted to an overflow
 	// chain (limits.md §Maximum Value Size). Round-trip via Get
-	// must return the assembled value. Replaces the chunk-4.4
+	// must return the assembled value. Replaces the earlier
 	// "reject oversize value" test — values no longer have a
 	// hard upper bound short of disk space.
 	cfg := page.Config{PageSize: 4096}
@@ -656,7 +656,7 @@ func TestPutPromotesLargeValueToOverflow(t *testing.T) {
 }
 
 func TestPutOverflowReplaceFreesOldChain(t *testing.T) {
-	// Spec-tier invariant (chunk-4.7): a same-key Put-replace
+	// Spec-tier invariant: a same-key Put-replace
 	// where the displaced entry was overflow must free the prior
 	// chain in the same write tx. The failure class is "chain
 	// orphan after replace": the leaf's new entry references a
@@ -664,7 +664,7 @@ func TestPutOverflowReplaceFreesOldChain(t *testing.T) {
 	// bitmap-allocated but unreachable from any live leaf entry.
 	//
 	// Pinned via the slab-partition invariant — checkSlabPartition
-	// (chunk-4.7 extension) walks overflow chains as reachable;
+	// walks overflow chains as reachable;
 	// a freed chain stays out of `reachable`, an orphan would
 	// trip the "allocated but neither reachable nor freed" arm.
 	cfg := page.Config{PageSize: 4096}
@@ -727,7 +727,7 @@ func TestPutOverflowReplaceFreesOldChain(t *testing.T) {
 }
 
 func TestPutRejectsOversizeKey(t *testing.T) {
-	// Chunk-4.7 contract: ErrKeyTooLarge fires only on keys too
+	// Contract: ErrKeyTooLarge fires only on keys too
 	// large for the overflow-reference leaf entry (a small fixed
 	// header per limits.md §Maximum Key Size). At 4 KB pages the
 	// overflow-reference entry overhead is 19 bytes plus the
@@ -800,9 +800,9 @@ func collectReachable(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, 
 		// Walk overflow chains owned by any overflow leaf entries:
 		// each chain page is reachable via the leaf entry's
 		// OverflowPage + i for i in [0, OverflowRunLength). The
-		// slab-partition invariant (chunk-4.7 extension) requires
+		// slab-partition invariant requires
 		// overflow chains to be reachable from a live leaf entry
-		// — orphan chains are the chunk-4.7 chain-orphan failure
+		// — orphan chains are the chain-orphan failure
 		// class (chain bitmap-allocated but no leaf entry
 		// references it; pinned by
 		// TestPutOverflowReplaceFreesOldChain +

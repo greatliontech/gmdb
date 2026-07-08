@@ -242,7 +242,7 @@ func sortedIndexNames(indexes map[string]*pinnedIndex) []string {
 // sub-tree.
 //
 // No-op when ks has no indexes or none have been mutated since
-// open. (Chunk 7.6 syncs all entries unconditionally — a perf
+// open. (All entries are synced unconditionally — a perf
 // optimization to track per-pinnedIndex dirty bits is deferred.)
 func (tx *Tx) flushIndexRegistry(owner descriptorOwner, indexes map[string]*pinnedIndex) error {
 	if len(indexes) == 0 {

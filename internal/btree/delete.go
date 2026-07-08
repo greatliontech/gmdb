@@ -247,7 +247,7 @@ func rebuildLeafAfterDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8
 	// Post-build cleanup ordering: chain-free first (still
 	// reachable via the OLD leaf which has not been retired yet),
 	// then the OLD leaf. On either failure roll back the newly-
-	// allocated leaf so the chunk's "any pages allocated during
+	// allocated leaf so the "any pages allocated during
 	// this Delete are freed on error" contract holds.
 	if err := freeOverflowChainIfPresent(pw, cfg, removed); err != nil {
 		_ = pw.FreePage(newID)
@@ -693,9 +693,6 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	// when its encoded fill is fine forces the next level to run
 	// case-C (merge with sibling), which gives the deep the new
 	// siblings it needs via the merge result + cousinRebalanceBranch.
-	// (Root cause of the iterative review-round corner-case spiral —
-	// addresses Round 3 M-1 + the producer-1 cells>0 reachability
-	// the round-2 wrapper propagation didn't close.)
 	parentUnderflow := branchUnderflow(cfg, cells, mergeThreshold)
 	if deepUnderflowChildOut != 0 {
 		parentUnderflow = true
@@ -914,7 +911,7 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 	// this branch). A no-op returns branchID unchanged, avoiding
 	// AllocPage + AllocSlab + FreePage churn that would otherwise
 	// inflate the pager's pending alloc/free lists with no semantic
-	// effect (review M-1).
+	// effect.
 	prevLen := len(cells)
 	prevLeftmost := leftmost
 	finalPos, finalID, finalUnderflow, err := rebalanceChildAtPos(pw, cfg, mergeThreshold, &leftmost, &cells, deepPos, deepID)
@@ -924,7 +921,7 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 	if len(cells) == prevLen && leftmost == prevLeftmost && !finalUnderflow {
 		return branchID, branchUnderflow(cfg, cells, mergeThreshold), 0, nil
 	}
-	// Cascade-absorption spine walk (review H-3). When the
+	// Cascade-absorption spine walk. When the
 	// rebalanceChildAtPos pass merged a degenerate wrapper branch
 	// (carrying a sub-MT descendant as its sole child) into a
 	// healthy sibling-rich result, the merge result's leftmost is
@@ -1026,7 +1023,7 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 				// Propagate newScan (the wrapper — a direct child of
 				// OUR returned branch) so the caller's cousin at the
 				// next level above finds it as a direct child of the
-				// next-level merge result. (Review Round 2 H-1.)
+				// next-level merge result.
 				residual = newScan
 				break
 			}

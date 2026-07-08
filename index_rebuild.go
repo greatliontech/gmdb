@@ -246,7 +246,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	cfg := tx.pgr.Config()
 	if desc.Root == 0 {
 		// Empty parent → rebuilt index is empty. Publish-then-retire
-		// (H-2 ordering): write the registry entry first, then free
+		// (registry-first ordering): write the registry entry first, then free
 		// the old data tree.
 		newEntry := &indexRegistryEntry{
 			SchemaHash:  schemaHash(decl),
@@ -363,8 +363,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		// transient handle is NOT registered in tx.openSetKeyspaces
 		// so the spec's recovery-after-fingerprint-mismatch pattern
 		// (RebuildIndex on a not-cached keyspace) works unchanged.
-		// readOnly=true on the transient since we only read (chunk-
-		// 7.10 Round-1 L-1).
+		// readOnly=true on the transient since we only read.
 		sks := cachedSKS
 		if sks == nil {
 			sks = &SetKeyspace{keyspaceCore: keyspaceCore{tx: tx, name: unique.Make(keyspace), desc: desc, readOnly: true}}

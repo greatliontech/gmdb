@@ -208,8 +208,8 @@ func corruptRootChecksumDB(t *testing.T, ctx context.Context) string {
 // iterating a bitrotted keyspace via the public Cursor surfaces the
 // corruption through Cursor.Err() as the public ErrBadPageChecksum
 // sentinel — not a raw pager error that errors.Is can't recognise. This
-// pins the 11.3b round-1 H-1 fix (Cursor.Err / SetCursor.Err must route
-// the pager sentinels through mapBtreeErr).
+// pins that Cursor.Err / SetCursor.Err route
+// the pager sentinels through mapBtreeErr.
 func TestCursorErrReportsBadPageChecksum(t *testing.T) {
 	ctx := context.Background()
 	path := corruptRootChecksumDB(t, ctx)

@@ -221,7 +221,7 @@ func TestIndexHandleInFlightRebuildSurfacesCursorStale(t *testing.T) {
 }
 
 // TestIndexHandleInFlightSiblingPutSurfacesCursorStale exercises Inv-
-// IHS1 for the chunk-7.6 atomic Put path. applyIndexMaintenanceOnPut
+// IHS1 for the atomic Put path. applyIndexMaintenanceOnPut
 // runs btree.Put on the index trees → CoWs pages reachable from the
 // iter's cursor → the cursor's leaf-page refs become stale.
 func TestIndexHandleInFlightSiblingPutSurfacesCursorStale(t *testing.T) {
@@ -405,7 +405,7 @@ func TestIndexHandleAfterRebuildRePositionWorks(t *testing.T) {
 }
 
 // TestIndexHandleInFlightCursorDeleteSurfacesCursorStale exercises
-// Inv-IHS1 for the chunk-7.6 indexed Cursor.Delete path on a
+// Inv-IHS1 for the indexed Cursor.Delete path on a
 // Keyspace. Cursor.Delete on an indexed keyspace runs
 // applyIndexMaintenanceOnDelete → mutates index trees; the
 // open-coded markIndexHandlesStale call in keyspace.go's
@@ -628,15 +628,15 @@ func TestIndexHandleBareErrAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testin
 	}
 }
 
-// TestStatsPreservesInFlightStaleSignal pins Round-3 H-1's
+// TestStatsPreservesInFlightStaleSignal pins the
 // regression boundary: Stats must NOT clear idx.err. A user who
 // observes a mid-iter sibling-mutation sentinel via idx.Err()
 // must continue observing it across an unrelated Stats() call —
-// the Inv-IHS1 sticky-cause contract from chunk-7.6 / 5.6 says
-// the iter cause survives until a fresh iter call resets it. A
-// prior Round-2 cut reset idx.err at Stats entry to close Round-1
-// L-1; that overshot the fix (Stats's keyspaceDead-first ordering
-// already closes L-1 without the reset) and silently destroyed
+// the Inv-IHS1 sticky-cause contract says
+// the iter cause survives until a fresh iter call resets it.
+// A prior fix reset idx.err at Stats entry; that overshot
+// (Stats's keyspaceDead-first ordering already made the reset
+// unnecessary) and silently destroyed
 // the stale signal on every Stats call. This test pins the fix.
 func TestStatsPreservesInFlightStaleSignal(t *testing.T) {
 	ctx := context.Background()
@@ -674,7 +674,7 @@ func TestStatsPreservesInFlightStaleSignal(t *testing.T) {
 		t.Fatalf("pre-Stats idx.Err() = %v, want ErrCursorStale (setup)", idx.Err())
 	}
 	// Unrelated Stats call on a live keyspace. Inv-IHS1's contract:
-	// the stale signal survives. Round-2 H-1 violated this.
+	// the stale signal survives (a prior Stats-entry reset violated this).
 	stats, statsErr := idx.Stats()
 	if statsErr != nil {
 		t.Errorf("Stats on live ks: err = %v, want nil", statsErr)
@@ -687,12 +687,12 @@ func TestStatsPreservesInFlightStaleSignal(t *testing.T) {
 	}
 }
 
-// TestErrSymmetricWithStatsAfterDeleteKeyspace pins Round-3 M-1:
+// TestErrSymmetricWithStatsAfterDeleteKeyspace pins Err/Stats symmetry:
 // the (bad-cols Lookup → DeleteKeyspace → bare Err) sequence must
 // report ErrKeyspaceClosed on idx.Err() — symmetric with what
-// idx.Stats() reports for the same state. Round-2's idx.err-first
+// idx.Stats() reports for the same state. An idx.err-first
 // ordering would have returned the sticky ErrInvalidOptions wrap
-// from the bad-cols Lookup, contradicting Stats. Round-3's
+// from the bad-cols Lookup, contradicting Stats. The
 // keyspaceDead-first ordering closes the asymmetry on the
 // Inv-IHS3 side while preserving Inv-IHS2's mid-iter Drop
 // ErrCursorStale contract (verified by the pre-existing
@@ -732,7 +732,7 @@ func TestErrSymmetricWithStatsAfterDeleteKeyspace(t *testing.T) {
 	if _, err := idx.Stats(); !errors.Is(err, ErrKeyspaceClosed) {
 		t.Errorf("Stats after bad Lookup + DeleteKeyspace: err = %v, want ErrKeyspaceClosed", err)
 	}
-	// Err must report the same broader truth (Round-3 M-1 fix:
+	// Err must report the same broader truth (the symmetry fix:
 	// keyspaceDead-first ordering).
 	if err := idx.Err(); !errors.Is(err, ErrKeyspaceClosed) {
 		t.Errorf("Err after bad Lookup + DeleteKeyspace: %v, want ErrKeyspaceClosed (symmetric with Stats)", err)

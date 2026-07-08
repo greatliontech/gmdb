@@ -198,8 +198,8 @@ func TestDecodeIndexKeyRejectsUnterminatedKey(t *testing.T) {
 // TestDecodeIndexKeyRejects0x00x01Separator verifies that the
 // SetKeyspace separator 0x00 0x01 (lex-distinct from 0x00 0x00 and
 // 0x00 0xFF) is rejected by the strict decoder — confirms the codec
-// is purely the chunk-7.4 NUL-escape grammar and not lenient.
-// SetKeyspace compound-PK decoding at chunk 7.9 handles 0x00 0x01
+// is purely the NUL-escape grammar and not lenient.
+// SetKeyspace compound-PK decoding handles 0x00 0x01
 // ad-hoc.
 func TestDecodeIndexKeyRejects0x00x01Separator(t *testing.T) {
 	// A literal 0x00 0x01 mid-column — must reject.

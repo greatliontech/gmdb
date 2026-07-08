@@ -10,11 +10,11 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// Regression tests for the chunk-6.8 → walker migration of
+// Regression tests for the per-key-loop → walker migration of
 // SetKeyspace.DeleteRange. The un-indexed path now dispatches to
-// btree.DeleteRange (the chunk-5.7 atomic three-phase walker) with
+// btree.DeleteRange (the atomic three-phase walker) with
 // setKeyspaceCellFree as the per-cell-free callback; the indexed
-// path keeps the chunk-7.10 per-row dispatch via deleteRangePerKey.
+// path keeps the per-row dispatch via deleteRangePerKey.
 //
 // Each test below targets one neuter-able line in
 // set_keyspace.go's DeleteRange machinery — the higher-level
@@ -23,7 +23,7 @@ import (
 // DeleteRangeClearsIndexEntries) cover the success-path output;
 // these pin the structural correctness of the cell-type-aware
 // retire (no bitmap leak) via assertNoBitmapCorruption (the same
-// four-code check the chunk-7.8 atomicity tests use).
+// four-code check the DDL atomicity tests use).
 
 // TestSetKeyspaceDeleteRangeUnindexedNoLeakWithNestedTreeAtBoundary
 // pins the setKeyspaceCellFree nested-tree branch in set_keyspace.go:
@@ -101,7 +101,7 @@ func TestSetKeyspaceDeleteRangeUnindexedNoLeakWithNestedTreeAtBoundary(t *testin
 
 // TestSetKeyspaceDeleteRangeUnindexedNoLeakInteriorSubtreeRetire
 // pins the interior-subtree retire path through FreeSubtree (the
-// chunk-5.7 walker's Phase 2). The deleted range spans the WHOLE
+// three-phase walker's Phase 2). The deleted range spans the WHOLE
 // parent tree, so the un-indexed walker's Phase 2 retires every
 // subtree via FreeSubtree (which itself handles SetKeyspace cell
 // types — subpage / nested-tree — via freeSubtreeAt). Pins that
@@ -154,7 +154,7 @@ func TestSetKeyspaceDeleteRangeUnindexedNoLeakInteriorSubtreeRetire(t *testing.T
 	// FreeSubtree at strictly-interior positions actually fires under
 	// the full-range delete below (without this, leftIdx==rightIdx
 	// or the single-child case would bypass Phase 2 entirely and the
-	// test would pass for the wrong reason — review M-1).
+	// test would pass for the wrong reason).
 	if buf, perr := tx.pgr.Page(sks.desc.Root); perr == nil {
 		typ, _, cellCount, _ := page.ReadHeader(buf)
 		if typ != page.TypeBranch {
@@ -193,13 +193,13 @@ func TestSetKeyspaceDeleteRangeUnindexedNoLeakInteriorSubtreeRetire(t *testing.T
 }
 
 // TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance
-// pins the chunk-7.10 indexed-keyspace fallback dispatch in
+// pins the indexed-keyspace fallback dispatch in
 // SetKeyspace.DeleteRange: when len(ks.indexes) > 0, deleteRangePerKey
 // runs (per-row Delete + applyIndexMaintenanceOnBulkKeyDelete),
 // not the walker (which would bypass index maintenance and leave
 // stale index entries pointing at retired rows). The check is
 // the index count post-DeleteRange — TestSetKeyspaceIndexed
-// DeleteRangeClearsIndexEntries (index_chunk710_test.go) covers
+// DeleteRangeClearsIndexEntries (index_setkeyspace_lifecycle_test.go) covers
 // the index-count side; this test pins the no-leak side under the
 // same dispatch.
 func TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance(t *testing.T) {
@@ -269,14 +269,14 @@ func TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance(t *test
 // TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker pins the
 // set-keyspace.md §Invariants entailed dispatch-direction clause:
 // un-indexed SetKeyspace.DeleteRange MUST route through
-// btree.DeleteRange (the chunk-5.7 atomic walker), not through the
+// btree.DeleteRange (the atomic three-phase walker), not through the
 // per-row deleteRangePerKey path. Verified via the btree-level
 // SetDeleteRangeCalledHookForTest instrumentation: the hook fires
 // at btree.DeleteRange entry. If a future refactor silently routes
 // un-indexed traffic to deleteRangePerKey, the hook never fires
 // and this test fails — preventing the atomicity contract from
 // silently weakening from atomic to per-row (the failure mode
-// flagged in R2 review M-1; spec §Invariants violation= clause).
+// named by the spec §Invariants violation= clause).
 func TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker(t *testing.T) {
 	var called atomic.Bool
 	hook := func() { called.Store(true) }
@@ -307,7 +307,7 @@ func TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker(t *testing.T) {
 	// Pin count too — the hook fires before rootID/empty-range
 	// short-circuit, so asserting only !called.Load() would pass
 	// for the wrong reason on a future refactor that calls
-	// btree.DeleteRange with a no-op range (review R3 M-2).
+	// btree.DeleteRange with a no-op range.
 	if n != 2 {
 		t.Errorf("DeleteRange count=%d, want 2 (b + c)", n)
 	}
@@ -321,7 +321,7 @@ func TestSetKeyspaceDeleteRangeUnindexedDispatchesToWalker(t *testing.T) {
 // TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker is the
 // negative counterpart of the test above: indexed
 // SetKeyspace.DeleteRange MUST NOT route through btree.DeleteRange
-// (the walker bypasses the chunk-7.9 per-(setKey, setValue) index
+// (the walker bypasses the per-(setKey, setValue) index
 // maintenance and leaves stale index entries). The hook MUST NOT
 // fire under the indexed dispatch.
 func TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker(t *testing.T) {
@@ -360,7 +360,7 @@ func TestSetKeyspaceDeleteRangeIndexedDoesNotDispatchToWalker(t *testing.T) {
 	}
 	if called.Load() {
 		t.Fatalf("indexed SetKeyspace.DeleteRange invoked btree.DeleteRange — " +
-			"the walker bypasses chunk-7.9 per-(setKey,setValue) index maintenance, " +
+			"the walker bypasses per-(setKey,setValue) index maintenance, " +
 			"which would leave stale index entries pointing at retired rows")
 	}
 }

@@ -688,7 +688,7 @@ func finalizeIndexBuild(pw bulkPageWriter, cfg page.Config, ksName string, names
 
 // retireBulkOldRoots frees the pre-BulkLoad row root and each index's prior
 // data root. Called AFTER the new roots are published (publish-then-retire,
-// mirroring RebuildIndex's H-2 ordering) so a FreeSubtree failure leaks the
+// mirroring RebuildIndex's registry-first ordering) so a FreeSubtree failure leaks the
 // old pages (Rollback-recoverable) but never leaves a published root
 // pointing at freed pages. For a BulkLoad-eligible (empty) keyspace every
 // old root is 0, so this is defensive — FreeSubtree(0) is a no-op.

@@ -255,10 +255,10 @@ func TestOpenRecreatesOnSizeMismatch(t *testing.T) {
 }
 
 func TestOpenRejectsUndersizedFile(t *testing.T) {
-	// With the H1-fixed lifecycle (flock-during-init), a partially-
+	// With the flock-during-init lifecycle, a partially-
 	// initialised file can only come from external tampering or a
 	// crashed creator — never from a live concurrent creator. The
-	// chunk-2 surface treats both as ErrCorrupted (no auto-recover)
+	// lock surface treats both as ErrCorrupted (no auto-recover)
 	// rather than silently unlinking, since auto-unlink could
 	// destroy a legitimate user's mid-init progress in a future
 	// design where init takes longer.
@@ -430,7 +430,7 @@ func TestPostCloseAccessorsPanic(t *testing.T) {
 }
 
 func TestConcurrentOpenRaceWithCrossMmapVisibility(t *testing.T) {
-	// Regression for the H1 fix in the chunk-2 lifecycle: N goroutines
+	// Regression for the flock-during-init lifecycle fix: N goroutines
 	// race the same lock-file path. Exactly one wins the
 	// O_CREATE|O_EXCL race and inits under flock(LOCK_EX); the others
 	// take flock(LOCK_SH) and block on the initialiser's lock until

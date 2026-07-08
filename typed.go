@@ -19,7 +19,7 @@ import (
 //
 // The interface is intentionally SEALED — indexDecl is unexported, so
 // only types in this package implement it (in practice only
-// *TypedIndex[K, V, IK], landed in the typed-index sub-chunk). The
+// *TypedIndex[K, V, IK]). The
 // engine relies on every supplied *IndexDecl having been constructed
 // through the typed-index path, which guarantees encoder-ID
 // consistency, deterministic schema-hash, and well-formed extractor

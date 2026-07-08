@@ -1067,7 +1067,7 @@ func reclamationBound(coord *lock.Coord, pgr *pager.Pager) uint64 {
 // of an O_CREATE|O_EXCL race waits for the winner to finish Init. The
 // retry catches the partial-initialisation window only; a permanent
 // corruption falls through to the wrapped ErrCorrupted from
-// DiscoverPageSize after the final attempt. Chunk-2's lock file
+// DiscoverPageSize after the final attempt. The lock file
 // resolves the race window structurally; the retry remains here as a
 // defensive measure.
 func readPersistedPageSize(ctx context.Context, file *os.File, raceWindow bool) (uint32, error) {

@@ -883,7 +883,7 @@ func reuseBufSeq(pairs []kv) func(func([]byte, []byte) bool) {
 // TestKeyspaceBulkLoadIndexedReusedKeyBuffer verifies the index side honours
 // the iter.Seq2 buffer-reuse contract: a yield reusing one key + one value
 // buffer across iterations must still produce correct index entries, even
-// across a spill+merge round-trip (M-2). The extractor's Cols/Cover may
+// across a spill+merge round-trip. The extractor's Cols/Cover may
 // alias the reused buffers, so the emit helpers must copy before retaining.
 func TestKeyspaceBulkLoadIndexedReusedKeyBuffer(t *testing.T) {
 	ctx := context.Background()

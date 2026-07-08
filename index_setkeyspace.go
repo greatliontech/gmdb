@@ -1,7 +1,6 @@
 package gmdb
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 
@@ -167,14 +166,6 @@ func extractSetKeyspaceCompoundPKFromIndexKey(indexKey []byte, numColumns int) (
 	}
 	return nil, fmt.Errorf("%w: index key has %d real terminators, want %d+1",
 		errCompoundPKMalformed, terminators, numColumns)
-}
-
-// compoundPKHasPrefix reports whether a SetKeyspace index key
-// begins with the supplied encodeIndexKey-encoded column prefix.
-// Equivalent to bytes.HasPrefix but factored for readability at
-// call sites (clarifies that the prefix is column-tuple bytes).
-func compoundPKHasPrefix(indexKey, encodedColPrefix []byte) bool {
-	return bytes.HasPrefix(indexKey, encodedColPrefix)
 }
 
 // setKeyspaceExtractEntries runs the extractor on (setKey,
