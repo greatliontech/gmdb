@@ -606,3 +606,25 @@ func TestPrevLastWriterLiveClassification(t *testing.T) {
 		}
 	})
 }
+
+// TestPrevLastWriterLiveFutureHeartbeatIsLive pins the shared
+// classifier's future-stamp guard on the recovery-commit gate's path:
+// the author's heartbeat goroutine can stamp LastWriterHeartbeat
+// concurrently with the gate's own clock read (no happens-before
+// between the two reads), so a stamp fractionally in the FUTURE is a
+// live author — an unguarded unsigned subtraction would underflow to
+// ~2^64, classify the author dead, and let the gate roll back a live
+// database.
+func TestPrevLastWriterLiveFutureHeartbeatIsLive(t *testing.T) {
+	ourNS, _ := PIDNamespace()
+	now := uint64(1_000_000_000_000)
+	c := &Coord{pidNS: ourNS, clock: func() uint64 { return now }}
+	c.staleTimeout = time.Duration(10_000_000_000)
+	c.prevLastWriter.pid = 42
+	c.prevLastWriter.startTime = 1
+	c.prevLastWriter.pidNS = ourNS + 1   // cross-namespace: heartbeat path
+	c.prevLastWriter.heartbeat = now + 1 // stamped fractionally ahead
+	if !c.PrevLastWriterLive() {
+		t.Fatal("future heartbeat stamp classified dead (unsigned underflow)")
+	}
+}

@@ -116,8 +116,9 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=Every stale-detection age comparison (`now - Heartbeat`
-    and `now - HintEpoch`, in the reader-table scan AND the
-    writer-recovery check) treats a stamp in the FUTURE
+    and `now - HintEpoch`, in the reader-table scan, the
+    writer-recovery check, AND the recovery-commit gate's
+    last-writer classification) treats a stamp in the FUTURE
     (`stamp > now`) as fresh/live, never stale — i.e. clears only
     when `stamp <= now AND now - stamp > StaleTimeout`. The
     monotonic-clock stamps are unsigned, so a naive `now - stamp >

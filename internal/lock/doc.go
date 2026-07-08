@@ -17,7 +17,7 @@
 // model. See cross-process.md §Atomic Operations Convention.
 //
 // Layout. The on-disk layout is the structs.HostLayout shape of
-// LockFileHeader (72 bytes) followed by MaxReaders contiguous
+// LockFileHeader (HeaderSize bytes) followed by MaxReaders contiguous
 // ReaderSlot entries (48 bytes each). The mmap reservation equals
 // HeaderSize + SlotSize×MaxReaders exactly — per cross-process.md
 // the size is fixed at lock-file creation and never resized.

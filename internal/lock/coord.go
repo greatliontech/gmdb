@@ -770,21 +770,6 @@ func (c *Coord) WriterHeld() bool {
 // in-process reopen is a live join, never crash recovery.
 func (c *Coord) PrevLastWriterLive() bool {
 	p := c.prevLastWriter
-	if p.pid == 0 {
-		return false
-	}
-	now := c.clock()
-	timeout := c.staleTimeoutNanos()
-	sameNS := p.pidNS != 0 && c.pidNS != 0 && p.pidNS == c.pidNS
-	if sameNS {
-		if !IsAlive(int(p.pid)) {
-			return false
-		}
-		actualStart, err := ProcessStartTime(int(p.pid))
-		if err != nil {
-			return now-p.heartbeat <= timeout
-		}
-		return actualStart == p.startTime
-	}
-	return now-p.heartbeat <= timeout
+	return identityLive(p.pid, p.startTime, p.pidNS, p.heartbeat,
+		c.pidNS, c.clock(), c.staleTimeoutNanos(), false)
 }

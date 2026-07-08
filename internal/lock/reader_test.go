@@ -921,3 +921,31 @@ func TestRaiseReaderSlotTxnIDGuards(t *testing.T) {
 	_ = closed.Close()
 	mustPanic("closed file", func() { closed.RaiseReaderSlotTxnID(0, 1) })
 }
+
+// TestOldestReaderTxnIDReleaseInFlightNotCleared pins the
+// zeroHeartbeatFresh semantics of the shared identity classification
+// on the reader-scan path: a slot observed with pid != 0 but
+// Heartbeat == 0 is a release in flight (the owner zeroes PID first,
+// Heartbeat second; a scan can land between the loads), and clearing
+// it could stomp a third reader's fresh CAS — the phantom eviction
+// the §Reader Table clear ordering exists to prevent. The scan must
+// treat it live: keep the slot and count its TxnID.
+func TestOldestReaderTxnIDReleaseInFlightNotCleared(t *testing.T) {
+	f := openTestFile(t, 1)
+	now := uint64(time.Now().UnixNano())
+	// Foreign namespace so classification takes the heartbeat path
+	// (same-namespace would kill(0) the fake PID).
+	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, now); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Manufacture the mid-release observation: Heartbeat zeroed, PID
+	// still visible to the scan's load ordering.
+	Store64(&f.Slot(0).Heartbeat, 0)
+	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout))
+	if got != 7 {
+		t.Errorf("release-in-flight slot: got %d, want 7 (live)", got)
+	}
+	if Load64(&f.Slot(0).TxnID) != 7 {
+		t.Error("release-in-flight slot was cleared (phantom-eviction hazard)")
+	}
+}

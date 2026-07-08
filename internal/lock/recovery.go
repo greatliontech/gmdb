@@ -38,45 +38,70 @@ const DefaultStaleTimeout = 10 * time.Second
 func IsStaleWriter(f *File, ourPIDNamespace uint64, nowNanos uint64, staleTimeoutNanos uint64) bool {
 	pid := f.WriterPID()
 	if pid == 0 {
+		// No writer recorded — nothing to recover (NOT "stale").
 		return false
 	}
-	wNS := f.WriterPIDNamespace()
-	sameNS := wNS != 0 && ourPIDNamespace != 0 && wNS == ourPIDNamespace
-	if sameNS {
-		if !IsAlive(int(pid)) {
-			return true
-		}
-		// Alive: PID-reuse check via ProcessStartTime.
-		actualStart, err := ProcessStartTime(int(pid))
-		if err != nil {
-			// Process exists but we can't read its start time
-			// (race with exit, or platform unsupported). Fall back
-			// to heartbeat-based liveness, which is the
-			// conservative-safer route (false positives → no
-			// recovery, just block on flock until live writer
-			// releases).
-			return staleByHeartbeat(f, nowNanos, staleTimeoutNanos)
-		}
-		recordedStart := f.WriterStartTime()
-		// Match within the timestamp resolution: equality. The
-		// resolution caveat (cross-process.md §Process Start Time)
-		// permits same-tick collisions that benignly classify as
-		// "match" — caught by the heartbeat path on actual reuse.
-		if actualStart != recordedStart {
-			return true
-		}
-		return false
-	}
-	return staleByHeartbeat(f, nowNanos, staleTimeoutNanos)
+	// The start-time equality inside the shared classifier matches
+	// within the timestamp resolution (cross-process.md §Process
+	// Start Time): same-tick collisions benignly classify as live —
+	// caught by the heartbeat path on actual reuse. The unreadable-
+	// start-time fallback is conservative-safer: false-live means no
+	// recovery, just blocking on flock until a live writer releases.
+	return !identityLive(pid, f.WriterStartTime(), f.WriterPIDNamespace(),
+		f.WriterHeartbeat(), ourPIDNamespace, nowNanos, staleTimeoutNanos, false)
 }
 
-// staleByHeartbeat is the cross-namespace (or namespace-unknown)
-// liveness check: a heartbeat older than staleTimeoutNanos ago is
-// stale. A WriterHeartbeat of 0 (never published) is stale only if
-// the timeout has elapsed since 0, which on any non-trivial clock
-// reading is immediately true — captured by the same comparison.
-func staleByHeartbeat(f *File, nowNanos uint64, staleTimeoutNanos uint64) bool {
-	return heartbeatStale(nowNanos, f.WriterHeartbeat(), staleTimeoutNanos)
+// identityLive reports whether a persisted process identity —
+// pid/startTime/pidNS plus a heartbeat stamp — names a live process:
+// the ONE classification rule shared by the reader-slot scan,
+// stale-writer recovery, and the recovery-commit gate's last-writer
+// record (cross-process.md §Reader Table stale detection).
+// Same-namespace uses kill(0) + start-time PID-reuse detection,
+// falling back to the heartbeat when the start time is unreadable
+// (conservative toward LIVE — a false-live merely defers recovery);
+// cross-namespace or namespace-unknown uses heartbeat freshness alone
+// (heartbeatStale — future stamps are fresh, never underflow).
+//
+// pid == 0 classifies dead ("no identity recorded"); callers for whom
+// zero identity means something else (IsStaleWriter's "no writer to
+// recover", the reader scan's mid-acquire protocol) gate before
+// calling.
+//
+// zeroHeartbeatFresh selects the heartbeat==0 semantics, a real
+// protocol distinction between the consumers: the reader scan passes
+// TRUE — a slot observed with pid != 0 but heartbeat == 0 is a
+// release in flight (PID zeroes first, Heartbeat second), and
+// clearing it could stomp a third reader's fresh CAS (the phantom
+// eviction §Reader Table's clear ordering exists to prevent); writer
+// and last-writer records pass FALSE — their four fields are
+// published atomically under LOCK_EX, so pid != 0 with heartbeat == 0
+// immediately stale — a torn cross-namespace header, or a crashed
+// peer, must never block recovery (both consumers evaluate under
+// LOCK_EX, so a live mid-publish writer is unobservable there).
+func identityLive(pid, startTime, pidNS, heartbeat, ourNS, nowNanos, timeoutNanos uint64, zeroHeartbeatFresh bool) bool {
+	if pid == 0 {
+		return false
+	}
+	hbLive := func() bool {
+		if heartbeat == 0 {
+			return zeroHeartbeatFresh
+		}
+		return !heartbeatStale(nowNanos, heartbeat, timeoutNanos)
+	}
+	sameNS := pidNS != 0 && ourNS != 0 && pidNS == ourNS
+	if sameNS {
+		if !IsAlive(int(pid)) {
+			return false
+		}
+		actual, err := ProcessStartTime(int(pid))
+		if err != nil {
+			// Alive but unreadable start time (exit race / platform
+			// gap): heartbeat fallback.
+			return hbLive()
+		}
+		return actual == startTime
+	}
+	return hbLive()
 }
 
 // heartbeatStale reports whether a monotonic-clock stamp — a reader/writer

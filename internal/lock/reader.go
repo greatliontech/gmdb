@@ -118,7 +118,15 @@ func (f *File) ReleaseReaderSlot(idx uint32) {
 	if idx >= uint32(len(f.slots)) {
 		panic("lock: ReleaseReaderSlot index out of range")
 	}
-	slot := &f.slots[idx]
+	clearReaderSlot(&f.slots[idx])
+}
+
+// clearReaderSlot is the one four-store slot-clear body shared by the
+// owner release and the writer-side stale clear. The store ORDER is
+// the load-bearing part (PID → Heartbeat → HintEpoch → TxnID) and is
+// identical for both — each caller's doc carries its own rationale
+// for why that order matters on its path.
+func clearReaderSlot(slot *ReaderSlot) {
 	Store64(&slot.PID, 0)
 	Store64(&slot.Heartbeat, 0)
 	Store64(&slot.HintEpoch, 0)
@@ -168,11 +176,7 @@ func (f *File) ClearStaleReaderSlot(idx uint32) {
 	if idx >= uint32(len(f.slots)) {
 		panic("lock: ClearStaleReaderSlot index out of range")
 	}
-	slot := &f.slots[idx]
-	Store64(&slot.PID, 0)
-	Store64(&slot.Heartbeat, 0)
-	Store64(&slot.HintEpoch, 0)
-	Store64(&slot.TxnID, 0)
+	clearReaderSlot(&f.slots[idx])
 }
 
 // RaiseReaderSlotTxnID overwrites an OWNED slot's pinned TxnID with a
@@ -310,41 +314,12 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 			}
 			continue
 		}
-		// pid != 0 paths.
-		slotNS := Load64(&slot.PIDNamespace)
-		sameNS := slotNS != 0 && ourPIDNS != 0 && slotNS == ourPIDNS
-		if sameNS {
-			if !IsAlive(int(pid)) {
-				f.ClearStaleReaderSlot(uint32(i))
-				continue
-			}
-			// Alive in this namespace; PID-reuse check via start time.
-			actualPST, err := ProcessStartTime(int(pid))
-			if err != nil {
-				// Process exists but start time unreadable; fall
-				// back to heartbeat path (conservative).
-				if hb != 0 && heartbeatStale(nowNanos, hb, staleTimeoutNanos) {
-					f.ClearStaleReaderSlot(uint32(i))
-					continue
-				}
-				if txnID < min {
-					min = txnID
-				}
-				continue
-			}
-			recorded := Load64(&slot.ProcessStartTime)
-			if recorded != actualPST {
-				// PID recycled to a different process lifetime.
-				f.ClearStaleReaderSlot(uint32(i))
-				continue
-			}
-			if txnID < min {
-				min = txnID
-			}
-			continue
-		}
-		// Case 2: cross-namespace or namespace-unknown. Heartbeat-only.
-		if hb != 0 && heartbeatStale(nowNanos, hb, staleTimeoutNanos) {
+		// pid != 0: the shared identity classification
+		// (zeroHeartbeatFresh — a pid!=0/heartbeat==0 slot is a
+		// release in flight; clearing it could stomp a third
+		// reader's fresh CAS).
+		if !identityLive(pid, Load64(&slot.ProcessStartTime), Load64(&slot.PIDNamespace),
+			hb, ourPIDNS, nowNanos, staleTimeoutNanos, true) {
 			f.ClearStaleReaderSlot(uint32(i))
 			continue
 		}

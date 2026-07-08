@@ -91,7 +91,7 @@ gate) and the final close-out are fixed anchors per chunk.
   (`writeUCEntry` ≡ `writeCompressedRestartEntry`; the
   evolve-independently hedge is dropped), unified restart/uc
   validators (`internal/page/leaf.go:545,639`).
-- [ ] 15. lock: shared reader-slot clear body (`ReleaseReaderSlot` ≡
+- [x] 15. lock: shared reader-slot clear body (`ReleaseReaderSlot` ≡
   `ClearStaleReaderSlot`, `internal/lock/reader.go:114,164`); shared
   PID/namespace liveness classification (`recovery.go:38` vs
   `reader.go:308`); doc fixes (stale header size in `doc.go`,

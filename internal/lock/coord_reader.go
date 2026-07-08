@@ -17,17 +17,6 @@ func (c *Coord) staleTimeoutNanos() uint64 {
 	return uint64(c.staleTimeout / time.Nanosecond)
 }
 
-// readerSlotHint is the process-local scan-start offset for
-// AcquireReader. Updated on each successful acquire (cross-process.md
-// §Reader Table — "Under steady-state load, the hint points to a
-// recently-freed slot"). atomic.Uint32 because multiple goroutines
-// in the same process can be acquiring concurrently.
-//
-// Field placement on Coord rather than DB: Coord owns the
-// AcquireReader call path; placing the hint here keeps the
-// per-DB state cohesive with its consumer. The DB has no need
-// to know slot-allocation details.
-
 // AcquireReader is the Coord-mediated reader-slot acquisition path.
 // Composes File.AcquireReaderSlot with the bookkeeping the heartbeat
 // goroutine needs (active-slot list registration) and the per-Coord
