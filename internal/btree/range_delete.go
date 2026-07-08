@@ -548,7 +548,7 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 		// survivors[0].child) is NOT a direct child of survivors[0].
 		// child, so propagating it directly would leave it outside
 		// cousinRebalanceBranch's direct-child search range at the
-		// next level (review Round 2 H-1).
+		// next level.
 		return newBranchID, deletedCount, true, survivors[0].child, nil
 	}
 	// Even when this level returns a healthy multi-child branch, a
@@ -556,7 +556,7 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	// with slot.underflow == false). Heal in-place via
 	// cousinRebalanceBranch on the survivor's own child — the deep
 	// page is a direct child of survivor.child by the producer's
-	// contract (review Round 2 H-2).
+	// contract.
 	for j := range survivors {
 		if survivors[j].deepUnderflow == 0 {
 			continue
@@ -679,37 +679,12 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 		sepKeyIdx := (*survivors)[rightJ].origIdx - 1
 		separator := origCellKeys[sepKeyIdx]
 
-		// Dispatch to leaves or branches.
-		leftBuf, err := pw.Page(leftPairID)
-		if err != nil {
-			return err
-		}
-		rightBuf, err := pw.Page(rightPairID)
-		if err != nil {
-			return err
-		}
-		leftTyp, _, _, _ := page.ReadHeader(leftBuf)
-		rightTyp, _, _, _ := page.ReadHeader(rightBuf)
-		leftIsLeaf := page.IsLeafType(leftTyp)
-		rightIsLeaf := page.IsLeafType(rightTyp)
-		if leftIsLeaf != rightIsLeaf {
-			return fmt.Errorf("%w: rebalance sibling page types differ left=%d right=%d",
-				ErrCorrupted, leftTyp, rightTyp)
-		}
-
 		// Capture deepUnderflow signals from BOTH sides before the
 		// merge (the helpers free the inputs, so the slot info we
 		// keep is what we need to thread into the cousin step).
 		leftDeep := (*survivors)[leftJ].deepUnderflow
 		rightDeep := (*survivors)[rightJ].deepUnderflow
 
-		var (
-			isMerge      bool
-			mergedID     uint64
-			newLeftID    uint64
-			newRightID   uint64
-			newSeparator []byte
-		)
 		// parentFits candidate: the parent branch is later rebuilt from
 		// the CURRENT survivor boundaries (deleteRangeFromBranch's
 		// newCells loop) — separator keys at origCellKeys[origIdx-1]
@@ -729,17 +704,13 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 			}
 			return page.BranchEncodedSize(cfg, cand) <= cfg.ContentEnd()
 		}
-		if leftIsLeaf {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID, parentFits)
-		} else {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
-		}
+		pair, err := mergeOrRedistributePair(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
 		if err != nil {
 			return err
 		}
-		if isMerge {
-			recordMerge(pw) // two siblings combined into one (TxStats.Merges)
-		}
+		isMerge, mergedID := pair.isMerge, pair.mergedID
+		newLeftID, newRightID, newSeparator := pair.newLeftID, pair.newRightID, pair.newSeparator
+		leftIsLeaf := pair.leftIsLeaf
 
 		if !isMerge && newLeftID == 0 {
 			// DECLINE: the redistribute could not restore the fill-floor
@@ -766,7 +737,7 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 			// via rebalanceChildAtPos, which absorbs the other deep
 			// when both inputs were degenerate (their two leftmost
 			// children are adjacent in the merge result by
-			// construction — see review H-1). Looping over both
+			// construction). Looping over both
 			// deeps was wrong: a residual from the first iteration
 			// makes the second deep no longer reachable as a direct
 			// child of the resulting branch.
@@ -854,7 +825,7 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 			// Re-check each redistribute output's encoded fill via
 			// pw.Page — the cousin step may have absorbed a child into
 			// a sibling, shrinking the output below MT. Hardcoding
-			// underflow=false misses this (review Round 2 M-1).
+			// underflow=false misses this.
 			leftUf, lerr := pageUnderflow(pw, cfg, finalLeft, mergeThreshold)
 			if lerr != nil {
 				return lerr
@@ -873,7 +844,7 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 			origCellKeys[sepKeyIdx] = newSeparator
 			// Rewind j so the for-loop's j++ re-checks the redistribute
 			// output that's still below MT for another merge round
-			// against its next adjacent survivor (review Round 2 M-1).
+			// against its next adjacent survivor.
 			// Both ordering cases collapse to: the "tracked" output
 			// (= curID's side) sits at leftJ if siblingPos>j (right
 			// sibling used) or rightJ if siblingPos<j (left sibling used).

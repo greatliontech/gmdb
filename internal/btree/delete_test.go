@@ -1308,3 +1308,36 @@ func TestMergeOrRedistributeBranchesParentFitDecline(t *testing.T) {
 		t.Errorf("fits=false: %d pages exist after decline, want the 2 inputs", len(pw.pages))
 	}
 }
+
+// TestMergePairRejectsMixedSiblingTypes pins the shared pair
+// dispatch's same-level guard: all children of a branch live at the
+// same depth, so a leaf paired with a branch is structural corruption
+// and must surface ErrCorrupted — never dispatch into a helper that
+// would misread the other page's layout.
+func TestMergePairRejectsMixedSiblingTypes(t *testing.T) {
+	pw := newFakeWriter(t, 4096)
+	cfg := page.Config{PageSize: 4096}
+
+	leafBuf, err := pw.ZeroPage(5)
+	if err != nil {
+		t.Fatalf("ZeroPage(5): %v", err)
+	}
+	lb := page.NewLeafBuilder(leafBuf, cfg)
+	if !lb.AddEntry(page.LeafEntry{Key: []byte("a"), Value: []byte("v")}) {
+		t.Fatal("AddEntry overflow")
+	}
+	lb.Finish()
+
+	branchBuf, err := pw.ZeroPage(6)
+	if err != nil {
+		t.Fatalf("ZeroPage(6): %v", err)
+	}
+	if err := page.EncodeBranch(branchBuf, cfg, 100, []page.BranchCell{{Key: []byte("m"), Child: 101}}); err != nil {
+		t.Fatalf("EncodeBranch: %v", err)
+	}
+
+	_, err = mergeOrRedistributePair(pw, cfg, 30, 5, 6, []byte("m"), func([]byte) bool { return true })
+	if !errors.Is(err, ErrCorrupted) {
+		t.Fatalf("mixed-type pair: err = %v, want ErrCorrupted", err)
+	}
+}

@@ -523,53 +523,16 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	}
 	separator := cells[separatorIdx].Key
 
-	// Sibling types must match — all children of a branch live at
-	// the same depth per the B+tree balance invariant. A mismatch
-	// is structural corruption. Leaf-vs-leaf is the only valid
-	// leaf pairing; the dispatcher tolerates either compressed or
-	// uncompressed variant on either side (the leaf
-	// format permits per-leaf variant choice — merge/redistribute
-	// just rebuilds via cfg.RestartGroupTarget).
-	leftSrc, err := pw.Page(leftPairID)
-	if err != nil {
-		return 0, false, 0, err
-	}
-	rightSrc, err := pw.Page(rightPairID)
-	if err != nil {
-		return 0, false, 0, err
-	}
-	leftTyp, _, _, _ := page.ReadHeader(leftSrc)
-	rightTyp, _, _, _ := page.ReadHeader(rightSrc)
-	leftIsLeaf := page.IsLeafType(leftTyp)
-	rightIsLeaf := page.IsLeafType(rightTyp)
-	if leftIsLeaf != rightIsLeaf {
-		return 0, false, 0, fmt.Errorf("%w: sibling page types differ left=%d right=%d", ErrCorrupted, leftTyp, rightTyp)
-	}
-
-	var (
-		isMerge      bool
-		mergedID     uint64
-		newLeftID    uint64
-		newRightID   uint64
-		newSeparator []byte
-	)
 	parentFits := func(newSep []byte) bool {
 		return parentFitsSeparator(cfg, cells, separatorIdx, newSep)
 	}
-	switch {
-	case leftIsLeaf:
-		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID, parentFits)
-	case leftTyp == page.TypeBranch && rightTyp == page.TypeBranch:
-		isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
-	default:
-		return 0, false, 0, fmt.Errorf("%w: sibling page %d unexpected type %d", ErrCorrupted, leftPairID, leftTyp)
-	}
+	pair, err := mergeOrRedistributePair(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
 	if err != nil {
 		return 0, false, 0, err
 	}
-	if isMerge {
-		recordMerge(pw) // two siblings combined into one (TxStats.Merges)
-	}
+	isMerge, mergedID := pair.isMerge, pair.mergedID
+	newLeftID, newRightID, newSeparator := pair.newLeftID, pair.newRightID, pair.newSeparator
+	leftIsLeaf := pair.leftIsLeaf
 
 	// Project the helper's result back into the parent's child array.
 	posLeftPair, posRightPair := int(descentIdx), siblingPos
@@ -665,8 +628,7 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 			// so the receiving cousinRebalanceBranch finds it as a
 			// direct child. Propagating `residual` directly would
 			// leave it buried under newMergedID at merge_GP — outside
-			// cousinRebalanceBranch's direct-child search range
-			// (review Round 2 H-1).
+			// cousinRebalanceBranch's direct-child search range.
 			deepUnderflowChildOut = newMergedID
 		}
 	}
@@ -691,7 +653,7 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		// invariant holds: at the next level above, finalID stays at
 		// a direct-child position of merge_GP by the case-C merge
 		// geometry. The earlier `&& len(cells) == 0` gate silently
-		// dropped the cells>0 exit (review Round 3 M-1).
+		// dropped the cells>0 exit.
 		//
 		// When BOTH this step's finalID AND the cousin step's
 		// newMergedID would propagate, last-non-zero wins: the next
@@ -827,34 +789,15 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 			posLeftPair, posRightPair = curPos, siblingPos
 		}
 		separator := (*cells)[separatorIdx].Key
-		// Dispatch by type.
-		leftSrc, err := pw.Page(leftPairID)
-		if err != nil {
-			return 0, 0, false, err
-		}
-		leftTyp, _, _, _ := page.ReadHeader(leftSrc)
-		leftIsLeaf := page.IsLeafType(leftTyp)
-		var (
-			isMerge      bool
-			mergedID     uint64
-			newLeftID    uint64
-			newRightID   uint64
-			newSeparator []byte
-		)
 		parentFits := func(newSep []byte) bool {
 			return parentFitsSeparator(cfg, *cells, separatorIdx, newSep)
 		}
-		if leftIsLeaf {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID, parentFits)
-		} else {
-			isMerge, mergedID, newLeftID, newRightID, newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
-		}
+		pair, err := mergeOrRedistributePair(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
 		if err != nil {
 			return 0, 0, false, err
 		}
-		if isMerge {
-			recordMerge(pw) // two siblings combined into one (TxStats.Merges)
-		}
+		isMerge, mergedID := pair.isMerge, pair.mergedID
+		newLeftID, newRightID, newSeparator := pair.newLeftID, pair.newRightID, pair.newSeparator
 		switch {
 		case isMerge:
 			if posLeftPair == 0 {
@@ -994,7 +937,7 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 		// have buried a sub-MT descendant a cousin pass must reach.
 		residual = finalID
 	} else {
-		// Post-rebalance descendant scan (Round 2 review H-1 + H-3).
+		// Post-rebalance descendant scan.
 		// The rebalance may have absorbed a wrapper-branch into a
 		// merge result whose sub-MT descendant ended up at a
 		// non-leftmost position (e.g. when the in-rebalance merge
@@ -1096,6 +1039,71 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 		return 0, false, 0, fmt.Errorf("btree: cousinRebalanceBranch free old %d: %w", branchID, err)
 	}
 	return newBranchID, branchUnderflow(cfg, cells, mergeThreshold), residual, nil
+}
+
+// pairOutcome is mergeOrRedistributePair's result. Exactly one of
+// three shapes:
+//   - merge:        isMerge=true, mergedID set (newLeft/newRight zero)
+//   - redistribute: isMerge=false, newLeftID/newRightID/newSeparator set
+//   - DECLINE:      isMerge=false, newLeftID=0 — the helper changed
+//     nothing (the redistribute could not restore the fill floor for
+//     both halves, or the parent cannot fit the recomputed separator);
+//     the caller's own decline policy applies.
+type pairOutcome struct {
+	isMerge      bool
+	mergedID     uint64
+	newLeftID    uint64
+	newRightID   uint64
+	newSeparator []byte
+	// leftIsLeaf reports the pair's level — callers gate their
+	// branch-only cousin-rebalance steps on it.
+	leftIsLeaf bool
+}
+
+// mergeOrRedistributePair is the one merge/redistribute pair dispatch:
+// read both sibling pages, validate the same-level pairing (all
+// children of a branch live at the same depth — a leaf/branch mix is
+// structural corruption), dispatch to the leaf or branch helper, and
+// record the merge stat. leftPairID must hold the smaller keys;
+// separator is the parent cell key between the pair; parentFits
+// reports whether the parent can encode a candidate replacement
+// separator (redistribute-only concern).
+//
+// Every rebalance site (single-key delete recursion, the sibling-walk
+// loop, and range-delete's survivor pass) funnels through here so the
+// pairing rules cannot drift between them.
+func mergeOrRedistributePair(pw PageWriter, cfg page.Config, mergeThreshold uint8, leftPairID, rightPairID uint64, separator []byte, parentFits func([]byte) bool) (pairOutcome, error) {
+	leftSrc, err := pw.Page(leftPairID)
+	if err != nil {
+		return pairOutcome{}, err
+	}
+	rightSrc, err := pw.Page(rightPairID)
+	if err != nil {
+		return pairOutcome{}, err
+	}
+	leftTyp, _, _, _ := page.ReadHeader(leftSrc)
+	rightTyp, _, _, _ := page.ReadHeader(rightSrc)
+	leftIsLeaf := page.IsLeafType(leftTyp)
+	rightIsLeaf := page.IsLeafType(rightTyp)
+	if leftIsLeaf != rightIsLeaf {
+		return pairOutcome{}, fmt.Errorf("%w: sibling page types differ left=%d right=%d", ErrCorrupted, leftTyp, rightTyp)
+	}
+	out := pairOutcome{leftIsLeaf: leftIsLeaf}
+	switch {
+	case leftIsLeaf:
+		out.isMerge, out.mergedID, out.newLeftID, out.newRightID, out.newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID, parentFits)
+	case leftTyp == page.TypeBranch && rightTyp == page.TypeBranch:
+		out.isMerge, out.mergedID, out.newLeftID, out.newRightID, out.newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
+	default:
+		return pairOutcome{}, fmt.Errorf("%w: sibling page %d unexpected type %d", ErrCorrupted, leftPairID, leftTyp)
+	}
+	if err != nil {
+		return pairOutcome{}, err
+	}
+	if out.isMerge {
+		recordMerge(pw) // two siblings combined into one (TxStats.Merges)
+	}
+	return out, nil
 }
 
 // mergeOrRedistributeLeaves combines (or rebalances) two sibling
