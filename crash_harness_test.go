@@ -101,31 +101,54 @@ func applyOp(img []byte, op crashOp) []byte {
 	return img
 }
 
-// synthImageSubset applies ops[:baseN] fully (the durable prefix), then the
-// post-baseN ops named by order (index into ops[baseN:]) in that order —
-// modeling a crash that persisted only an arbitrary SUBSET of the unsynced
-// writes, in arbitrary writeback ORDER. Truncate ops in the tail are always
-// applied (a file-size change is not a page write the harness reorders).
-func synthImageSubset(initial []byte, ops []crashOp, baseN int, order []int) []byte {
+// tailApply names a post-baseN tail write to persist and how many of its
+// leading bytes survived: nBytes == len(data) is a whole write, a smaller
+// value is an intra-page TEAR (a partial-prefix write a crash left behind).
+type tailApply struct {
+	idx    int
+	nBytes int
+}
+
+// synthImageSubsetTorn applies ops[:baseN] fully (the durable prefix), all
+// tail truncates (a file-size change is not a page write the harness
+// reorders), then the tail writes named by applies in that order — each
+// persisting only its first nBytes, so a torn (partial) page write is
+// expressible. Models a crash that persisted an arbitrary SUBSET of the
+// unsynced writes, in arbitrary ORDER, some TORN mid-page.
+func synthImageSubsetTorn(initial []byte, ops []crashOp, baseN int, applies []tailApply) []byte {
 	img := make([]byte, len(initial))
 	copy(img, initial)
 	for _, op := range ops[:baseN] {
 		img = applyOp(img, op)
 	}
-	// Truncates in the tail carry the file size; apply them in original
-	// order first so the image is large enough for any tail write.
 	for _, op := range ops[baseN:] {
 		if op.kind == crashOpTruncate {
 			img = applyOp(img, op)
 		}
 	}
-	for _, idx := range order {
-		op := ops[baseN+idx]
-		if op.kind == crashOpWrite {
-			img = applyOp(img, op)
+	for _, a := range applies {
+		op := ops[baseN+a.idx]
+		if op.kind != crashOpWrite {
+			continue
 		}
+		n := min(a.nBytes, len(op.data))
+		end := op.off + int64(n)
+		if int64(len(img)) < end {
+			img = append(img, make([]byte, end-int64(len(img)))...)
+		}
+		copy(img[op.off:end], op.data[:n])
 	}
 	return img
+}
+
+// synthImageSubset applies a whole-write subset in the given order — the
+// no-tear special case of synthImageSubsetTorn.
+func synthImageSubset(initial []byte, ops []crashOp, baseN int, order []int) []byte {
+	applies := make([]tailApply, len(order))
+	for i, idx := range order {
+		applies[i] = tailApply{idx: idx, nBytes: len(ops[baseN+idx].data)}
+	}
+	return synthImageSubsetTorn(initial, ops, baseN, applies)
 }
 
 // synthImage applies ops[:n] to a copy of initial — the on-disk bytes a
@@ -385,7 +408,7 @@ func TestCrashMidInflightCommitPreservesDurableEpoch(t *testing.T) {
 // The recorder is uninstalled before Close so the shutdown checkpoint's
 // writes are NOT recorded — the synthesized images reflect only the
 // crash-relevant trace (batch 1 + checkpoint + batch 2).
-func lazyWorkload(t *testing.T, opts Options, durableCommits, lazyCommits, perCommit int) (rec *crashRecorder, initial []byte, durableN, durableKeys, totalKeys int) {
+func lazyWorkload(t *testing.T, opts Options, durableCommits, lazyCommits, perCommit int) (rec *crashRecorder, initial []byte, durableN, durableKeys, totalKeys int, firstDataOff int64) {
 	t.Helper()
 	ctx := context.Background()
 	path := tmpPath(t)
@@ -393,6 +416,7 @@ func lazyWorkload(t *testing.T, opts Options, durableCommits, lazyCommits, perCo
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	firstDataOff = int64(db.FirstDataPageForTest()) * int64(opts.PageSize)
 	rec = &crashRecorder{inner: db.WriterFileOpsForTest()}
 	restore := db.SetWriterFileOpsForTest(rec)
 	initial, err = os.ReadFile(path)
@@ -441,7 +465,7 @@ func lazyWorkload(t *testing.T, opts Options, durableCommits, lazyCommits, perCo
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	return rec, initial, durableN, durableKeys, totalKeys
+	return rec, initial, durableN, durableKeys, totalKeys, firstDataOff
 }
 
 // TestCrashSyncLazyRollsBackToDurableEpoch pins the SyncLazy recovery
@@ -455,7 +479,7 @@ func lazyWorkload(t *testing.T, opts Options, durableCommits, lazyCommits, perCo
 // half-adopting them would be the bug.
 func TestCrashSyncLazyRollsBackToDurableEpoch(t *testing.T) {
 	opts := Options{PageSize: 4096, MinSize: 16, MaxSize: 512, SyncMode: SyncLazy, Maintenance: MaintenanceOptions{Disable: true}}
-	rec, initial, durableN, durableKeys, _ := lazyWorkload(t, opts, 3, 3, 40)
+	rec, initial, durableN, durableKeys, _, _ := lazyWorkload(t, opts, 3, 3, 40)
 	fullN := len(rec.ops)
 
 	// Every ordered prefix from the checkpoint boundary onward — including
@@ -475,7 +499,7 @@ func TestCrashSyncLazyRollsBackToDurableEpoch(t *testing.T) {
 // reproducibility.
 func TestCrashSyncLazyArbitrarySubsetPreservesDurableEpoch(t *testing.T) {
 	opts := Options{PageSize: 4096, MinSize: 16, MaxSize: 512, SyncMode: SyncLazy, Maintenance: MaintenanceOptions{Disable: true}}
-	rec, initial, durableN, durableKeys, _ := lazyWorkload(t, opts, 3, 3, 40)
+	rec, initial, durableN, durableKeys, _, _ := lazyWorkload(t, opts, 3, 3, 40)
 	tail := len(rec.ops) - durableN
 	if tail <= 0 {
 		t.Fatalf("no post-checkpoint writes recorded (tail=%d) — the subset test would be vacuous", tail)
@@ -573,4 +597,56 @@ func TestCrashSyncDataOnlyTornLastMetaFallsBack(t *testing.T) {
 	copy(img[op.off:end], op.data[:metaOff/2])
 	penultimate := (commits - 1) * perCommit
 	verifyDurableCrashImage(t, opts, img, "sdo-torn-last-meta", penultimate, penultimate)
+}
+
+// TestCrashSyncLazyIntraPageDataTearPreservesDurableEpoch adds intra-page
+// TEAR fidelity: a real crash can persist a partial prefix of a page write,
+// not just whole-or-nothing. Post-checkpoint SyncLazy commits CoW into FREE
+// pages (never the checkpoint tree's live pages), so a torn data page lands
+// where recovery-to-the-durable-epoch never traverses — recovery must still
+// land exactly on the checkpoint epoch. Sweeps seeded random subsets where
+// each included data-page write is whole or torn at a random offset.
+func TestCrashSyncLazyIntraPageDataTearPreservesDurableEpoch(t *testing.T) {
+	opts := Options{PageSize: 4096, MinSize: 16, MaxSize: 512, SyncMode: SyncLazy, Maintenance: MaintenanceOptions{Disable: true}}
+	rec, initial, durableN, durableKeys, _, firstDataOff := lazyWorkload(t, opts, 3, 3, 40)
+	tail := len(rec.ops) - durableN
+	if tail <= 0 {
+		t.Fatalf("no post-checkpoint writes (tail=%d)", tail)
+	}
+	dataWrites := 0
+	for j := durableN; j < len(rec.ops); j++ {
+		if rec.ops[j].kind == crashOpWrite && rec.ops[j].off >= firstDataOff {
+			dataWrites++
+		}
+	}
+	if dataWrites == 0 {
+		t.Fatal("no post-checkpoint data-page writes to tear — test would be vacuous")
+	}
+
+	rng := rand.New(rand.NewSource(0x0badc0ffee))
+	tornTotal := 0
+	for trial := 0; trial < 40; trial++ {
+		var applies []tailApply
+		for i := 0; i < tail; i++ {
+			if rng.Intn(2) != 0 {
+				continue // excluded from this crash image
+			}
+			op := rec.ops[durableN+i]
+			n := len(op.data)
+			// Tear only data-page writes (meta/bitmap kept whole here — meta
+			// tears are covered by the torn-meta tests).
+			if op.kind == crashOpWrite && op.off >= firstDataOff && len(op.data) > 1 && rng.Intn(2) == 0 {
+				n = 1 + rng.Intn(len(op.data)-1)
+				tornTotal++
+			}
+			applies = append(applies, tailApply{idx: i, nBytes: n})
+		}
+		rng.Shuffle(len(applies), func(a, b int) { applies[a], applies[b] = applies[b], applies[a] })
+		img := synthImageSubsetTorn(initial, rec.ops, durableN, applies)
+		verifyDurableCrashImage(t, opts, img, fmt.Sprintf("data-tear-%d", trial), durableKeys, durableKeys)
+	}
+	if tornTotal == 0 {
+		t.Fatal("no data page was actually torn across all trials — the tear path was not exercised")
+	}
+	t.Logf("intra-page data tears exercised: %d across 40 trials", tornTotal)
 }

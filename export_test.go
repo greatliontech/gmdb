@@ -214,3 +214,10 @@ func (db *DB) SetWriterFileOpsForTest(fops pager.FileOps) (restore func()) {
 func (db *DB) WriterFileOpsForTest() pager.FileOps {
 	return db.pgr.FileOpsForTest()
 }
+
+// FirstDataPageForTest returns the id of the first data page (past the two
+// meta slots and the bitmap region) for the DB's current geometry — the
+// crash harness uses it to target intra-page tears at data pages only.
+func (db *DB) FirstDataPageForTest() uint64 {
+	return 2 + uint64(db.currentMeta.BitmapPages)
+}
