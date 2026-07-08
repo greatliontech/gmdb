@@ -2,9 +2,7 @@ package pager
 
 import (
 	"errors"
-	"os"
 	"testing"
-	"time"
 )
 
 // buildLazyImage produces an opened DB whose on-disk state is NOT
@@ -43,24 +41,24 @@ func buildLazyImage(t *testing.T) (*OpenedDB, func()) {
 // recovery-commit fsync failure path (durability.md §Recovery step 5,
 // idempotent-under-crash): a failing fsync surfaces the error with
 // nothing anchored; a retried RecoverToDurable re-runs the whole
-// sequence and succeeds.
+// sequence and succeeds. The fault is injected through the FileOps seam
+// (this DB's on-disk state takes the recovery-commit arm, whose single
+// fdatasync is the one the failing FileOps traps).
 func TestRecoveryCommitFsyncFailurePropagatesAndRetries(t *testing.T) {
 	db, cleanup := buildLazyImage(t)
 	defer cleanup()
 	p := db.Pager
 	file := p.file
 
-	injected := errors.New("injected recovery-commit fsync failure")
-	restore := SetOpenFsyncHookForTest(func(op string) error {
-		if op == "recovery-commit" {
-			return injected
-		}
-		return nil
-	})
+	fops := &countingFaultOps{inner: osFileOps{f: file}, failSync: true}
+	restore := p.SetFileOpsForTest(fops)
 	_, _, _, err := p.RecoverToDurable(file)
 	restore()
-	if !errors.Is(err, injected) {
-		t.Fatalf("RecoverToDurable error = %v, want the injected failure", err)
+	if !errors.Is(err, errInjectedIO) {
+		t.Fatalf("RecoverToDurable error = %v, want the injected fsync failure", err)
+	}
+	if fops.syncCalls.Load() == 0 {
+		t.Fatal("seam not exercised: recovery-commit fdatasync never reached the fault ops")
 	}
 	if got := p.AnchoredEpoch(); got != 0 {
 		t.Fatalf("anchored epoch = %d after failed fsync, want 0 (nothing anchored)", got)
@@ -89,25 +87,24 @@ func TestRecoveryCommitFsyncFailurePropagatesAndRetries(t *testing.T) {
 // TestAnchorFsyncFailurePropagates pins the self-durable arm's anchor
 // fsync failure: the error surfaces and the anchored epoch does not
 // advance — a failed fsync must never anchor the assertion it was
-// supposed to make disk-fast (durability.md §Anchoring).
+// supposed to make disk-fast (durability.md §Anchoring). Genesis is
+// self-durable, so RecoverToDurable takes the anchor arm and its single
+// fdatasync is the one the failing FileOps traps.
 func TestAnchorFsyncFailurePropagates(t *testing.T) {
 	f, db, cleanup := initDB(t, false)
 	_ = f
 	defer cleanup()
 	p := db.Pager
-	// Genesis is self-durable at epoch 0 — the gated path takes the
-	// anchor arm.
-	injected := errors.New("injected anchor fsync failure")
-	restore := SetOpenFsyncHookForTest(func(op string) error {
-		if op == "anchor" {
-			return injected
-		}
-		return nil
-	})
+
+	fops := &countingFaultOps{inner: osFileOps{f: p.file}, failSync: true}
+	restore := p.SetFileOpsForTest(fops)
 	_, _, _, err := p.RecoverToDurable(p.file)
 	restore()
-	if !errors.Is(err, injected) {
-		t.Fatalf("RecoverToDurable error = %v, want the injected failure", err)
+	if !errors.Is(err, errInjectedIO) {
+		t.Fatalf("RecoverToDurable error = %v, want the injected fsync failure", err)
+	}
+	if fops.syncCalls.Load() == 0 {
+		t.Fatal("seam not exercised: anchor fdatasync never reached the fault ops")
 	}
 
 	// Retry succeeds and anchors epoch 0's assertion.
@@ -120,32 +117,41 @@ func TestAnchorFsyncFailurePropagates(t *testing.T) {
 	}
 }
 
-// TestAnchorArmRewritesTheSlot is the mtime-sentinel pin of the anchor
-// REWRITE (durability.md §Anchoring: the byte-identical meta pwrite
-// before the anchor fsync is load-bearing — a prior failed fsync both
-// consumes the kernel error and marks pages clean, so a bare fdatasync
-// would anchor an assertion the disk never received). The rewrite has
-// no data-observable effect (identical bytes), but POSIX mandates
-// write(2) marks st_mtime for update while fdatasync does not: reset
-// mtime to a sentinel epoch, run the self-durable arm, and a changed
-// mtime proves the write executed.
+// TestAnchorArmRewritesTheSlot pins the anchor REWRITE (durability.md
+// §Anchoring: the byte-identical meta pwrite before the anchor fsync is
+// load-bearing — a prior failed fsync both consumes the kernel error and
+// marks pages clean, so a bare fdatasync would anchor an assertion the
+// disk never received). The rewrite has no data-observable effect
+// (identical bytes), but the FileOps seam witnesses the pwrite directly:
+// a recording FileOps must see a write to the selected (self-durable)
+// meta slot during the anchor arm. (This supersedes the earlier
+// mtime-sentinel proxy — the seam observes the syscall itself.)
 func TestAnchorArmRewritesTheSlot(t *testing.T) {
 	f, db, cleanup := initDB(t, false)
+	_ = f
 	defer cleanup()
 	p := db.Pager
+	ps := int64(testPageSize)
+	selectedSlot := int64(db.ActiveMetaIdx) // genesis self-durable slot
 
-	sentinel := time.Unix(1000000, 0)
-	if err := os.Chtimes(f.Name(), sentinel, sentinel); err != nil {
-		t.Fatalf("Chtimes: %v", err)
-	}
-	if _, _, recovered, err := p.RecoverToDurable(p.file); err != nil || recovered {
+	rec := &recordingOps{inner: osFileOps{f: p.file}}
+	restore := p.SetFileOpsForTest(rec)
+	_, _, recovered, err := p.RecoverToDurable(p.file)
+	restore()
+	if err != nil || recovered {
 		t.Fatalf("RecoverToDurable: recovered=%v err=%v, want anchor arm", recovered, err)
 	}
-	st, err := os.Stat(f.Name())
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
+
+	var sawRewrite bool
+	for _, off := range rec.writes {
+		if off/ps == selectedSlot {
+			sawRewrite = true
+		}
 	}
-	if st.ModTime().Equal(sentinel) {
-		t.Fatal("mtime unchanged across the anchor arm — the load-bearing slot rewrite did not execute")
+	if !sawRewrite {
+		t.Fatalf("anchor arm did not rewrite the selected meta slot %d — the load-bearing rewrite pwrite did not execute", selectedSlot)
+	}
+	if rec.syncs == 0 {
+		t.Fatal("anchor arm did not fdatasync through the seam")
 	}
 }
