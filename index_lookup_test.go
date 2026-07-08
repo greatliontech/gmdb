@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"sort"
 	"strings"
 	"testing"
@@ -638,7 +639,7 @@ func TestIndexedPutWritesCoveringBytes(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 	// Decode the index entry value directly.
-	encodedIndexKey := encodeIndexKey([][]byte{{0x42}})
+	encodedIndexKey := indexing.EncodeKey([][]byte{{0x42}})
 	p := ks.indexes["by_color"]
 	val, found, err := btree.Get(ks.tx.pgr, ks.tx.pgr.Config(), p.root, encodedIndexKey)
 	if err != nil {
@@ -654,7 +655,7 @@ func TestIndexedPutWritesCoveringBytes(t *testing.T) {
 	if string(pk) != "k1" {
 		t.Errorf("decoded pk: got %q want k1", pk)
 	}
-	// Decoded covering should be encodeIndexKey([{0xAB}]) =
+	// Decoded covering should be indexing.EncodeKey([{0xAB}]) =
 	// 0xAB 0x00 0x00.
 	wantCov := []byte{0xAB, 0x00, 0x00}
 	if !bytes.Equal(encodedCov, wantCov) {
@@ -730,7 +731,7 @@ func TestByteAPIUniqueCoveringLookupReturnsCovering(t *testing.T) {
 		t.Errorf("pk: got %q want k1", gotPK)
 	}
 	// The byte-API contract: returned value is the encoded covering
-	// tuple. Cover=[[0xAB]] ⇒ encodeIndexKey([[0xAB]]) = 0xAB 0x00 0x00.
+	// tuple. Cover=[[0xAB]] ⇒ indexing.EncodeKey([[0xAB]]) = 0xAB 0x00 0x00.
 	wantEncoded := []byte{0xAB, 0x00, 0x00}
 	if !bytes.Equal(gotVal, wantEncoded) {
 		t.Errorf("Lookup value: got %x want %x (expected encoded covering tuple; got the row value via back-lookup?)",
@@ -810,10 +811,10 @@ func TestByteAPIUniqueCoveringMultiColumnRoundTrip(t *testing.T) {
 		t.Fatal("Lookup yielded no rows")
 	}
 	// Belt-and-suspenders: assert the raw blob equals
-	// encodeIndexKey(want) before decoding. A hypothetical bug
+	// indexing.EncodeKey(want) before decoding. A hypothetical bug
 	// returning wrong bytes that happen to decode correctly would
 	// pass the per-column assertion below but fail this one.
-	expectedBlob := encodeIndexKey(want)
+	expectedBlob := indexing.EncodeKey(want)
 	if !bytes.Equal(gotVal, expectedBlob) {
 		t.Errorf("raw covering blob: got %x want %x", gotVal, expectedBlob)
 	}

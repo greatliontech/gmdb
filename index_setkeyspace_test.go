@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"sort"
 	"testing"
 
@@ -92,14 +93,14 @@ func TestSetKeyspaceCompoundPKSeparatorPrefixFree(t *testing.T) {
 }
 
 // TestEncodeSetKeyspaceIndexKeyNonUniqueShape verifies the
-// non-unique key shape: encodeIndexKey(cols) || compoundPK || 0x00 0x00.
+// non-unique key shape: indexing.EncodeKey(cols) || compoundPK || 0x00 0x00.
 func TestEncodeSetKeyspaceIndexKeyNonUniqueShape(t *testing.T) {
 	cols := [][]byte{{0x42}}
 	sk := []byte("user1")
 	sv := []byte("topic_a")
 	got := encodeSetKeyspaceIndexKey(cols, sk, sv, false)
-	// Expected: encodeIndexKey([{0x42}]) + compoundPK + 00 00
-	wantPrefix := encodeIndexKey(cols)
+	// Expected: indexing.EncodeKey([{0x42}]) + compoundPK + 00 00
+	wantPrefix := indexing.EncodeKey(cols)
 	wantCompound := encodeSetKeyspaceCompoundPK(sk, sv)
 	want := make([]byte, 0, len(wantPrefix)+len(wantCompound)+2)
 	want = append(want, wantPrefix...)
@@ -111,12 +112,12 @@ func TestEncodeSetKeyspaceIndexKeyNonUniqueShape(t *testing.T) {
 }
 
 // TestEncodeSetKeyspaceIndexKeyUniqueShape verifies that for
-// unique indexes, the key is just encodeIndexKey(cols) — compound
+// unique indexes, the key is just indexing.EncodeKey(cols) — compound
 // PK lives in the value.
 func TestEncodeSetKeyspaceIndexKeyUniqueShape(t *testing.T) {
 	cols := [][]byte{{0x42}}
 	got := encodeSetKeyspaceIndexKey(cols, []byte("any"), []byte("any"), true)
-	want := encodeIndexKey(cols)
+	want := indexing.EncodeKey(cols)
 	if !bytes.Equal(got, want) {
 		t.Errorf("unique key shape: got %x want %x", got, want)
 	}

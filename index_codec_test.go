@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"strings"
 	"testing"
 )
@@ -15,7 +16,7 @@ import (
 // encodes + decodes byte-identical. Covers SchemaHash, Unique=true,
 // Root, Count, UserVersion, multiple Columns, multiple Covering.
 func TestRegistryEntryRoundtripFull(t *testing.T) {
-	want := &indexRegistryEntry{
+	want := &indexing.RegistryEntry{
 		SchemaHash:  0xdeadbeefcafebabe,
 		Unique:      true,
 		Root:        42,
@@ -24,11 +25,11 @@ func TestRegistryEntryRoundtripFull(t *testing.T) {
 		Columns:     []string{"owner", "repo", "branch"},
 		Covering:    []string{"size", "mtime"},
 	}
-	encoded, err := encodeRegistryEntry(want)
+	encoded, err := indexing.EncodeRegistryEntry(want)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	got, err := decodeRegistryEntry(encoded)
+	got, err := indexing.DecodeRegistryEntry(encoded)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -60,16 +61,16 @@ func TestRegistryEntryRoundtripFull(t *testing.T) {
 // SchemaHash/Root/Count. The encoded form is exactly the
 // fixed-prefix (32 B) + three uint16 zero counters = 38 B.
 func TestRegistryEntryRoundtripMinimal(t *testing.T) {
-	want := &indexRegistryEntry{}
-	encoded, err := encodeRegistryEntry(want)
+	want := &indexing.RegistryEntry{}
+	encoded, err := indexing.EncodeRegistryEntry(want)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if len(encoded) != indexRegistryEntryFixedPrefixSize+2+2+2 {
+	if len(encoded) != indexing.RegistryEntryFixedPrefixSize+2+2+2 {
 		t.Fatalf("minimal encoded length: got %d want %d",
-			len(encoded), indexRegistryEntryFixedPrefixSize+6)
+			len(encoded), indexing.RegistryEntryFixedPrefixSize+6)
 	}
-	got, err := decodeRegistryEntry(encoded)
+	got, err := indexing.DecodeRegistryEntry(encoded)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -92,13 +93,13 @@ func TestRegistryEntryRoundtripMinimal(t *testing.T) {
 // SchemaHash at 0, Unique at 8, Padding at 9..15, Root at 16,
 // Count at 24. Critical for cross-implementation compatibility.
 func TestRegistryEntryFixedFieldsAtSpecOffsets(t *testing.T) {
-	e := &indexRegistryEntry{
+	e := &indexing.RegistryEntry{
 		SchemaHash: 0x1122334455667788,
 		Unique:     true,
 		Root:       0xAABBCCDDEEFF1122,
 		Count:      0x99AABBCCDDEEFF00,
 	}
-	enc, err := encodeRegistryEntry(e)
+	enc, err := indexing.EncodeRegistryEntry(e)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -121,33 +122,11 @@ func TestRegistryEntryFixedFieldsAtSpecOffsets(t *testing.T) {
 	}
 }
 
-// TestRegistryEntryRejectsOversizedUserVersion verifies the encoder
-// rejects a UserVersion exceeding uint16. Necessary because the
-// on-disk format uses uint16 length prefixes — silent truncation
-// would corrupt the encoded entry.
-func TestRegistryEntryRejectsOversizedUserVersion(t *testing.T) {
-	e := &indexRegistryEntry{UserVersion: strings.Repeat("x", 70000)}
-	_, err := encodeRegistryEntry(e)
-	if !errors.Is(err, ErrInvalidOptions) {
-		t.Fatalf("expected ErrInvalidOptions for oversized UserVersion, got %v", err)
-	}
-}
-
-// TestRegistryEntryRejectsOversizedColumnName verifies the encoder
-// rejects a column name exceeding uint16.
-func TestRegistryEntryRejectsOversizedColumnName(t *testing.T) {
-	e := &indexRegistryEntry{Columns: []string{strings.Repeat("x", 70000)}}
-	_, err := encodeRegistryEntry(e)
-	if !errors.Is(err, ErrInvalidOptions) {
-		t.Fatalf("expected ErrInvalidOptions for oversized column name, got %v", err)
-	}
-}
-
 // TestDecodeRegistryEntryRejectsTruncatedPrefix verifies the
 // decoder rejects a value shorter than the fixed prefix.
 func TestDecodeRegistryEntryRejectsTruncatedPrefix(t *testing.T) {
-	_, err := decodeRegistryEntry(make([]byte, 16))
-	if !errors.Is(err, errRegistryEntryShort) {
+	_, err := indexing.DecodeRegistryEntry(make([]byte, 16))
+	if !errors.Is(err, indexing.ErrRegistryEntryShort) {
 		t.Fatalf("expected truncated-prefix error, got %v", err)
 	}
 }
@@ -156,15 +135,15 @@ func TestDecodeRegistryEntryRejectsTruncatedPrefix(t *testing.T) {
 // an entry promising 3 columns but cut off mid-name returns a
 // short-entry error.
 func TestDecodeRegistryEntryRejectsTruncatedColumnList(t *testing.T) {
-	e := &indexRegistryEntry{Columns: []string{"owner", "repo", "branch"}}
-	enc, err := encodeRegistryEntry(e)
+	e := &indexing.RegistryEntry{Columns: []string{"owner", "repo", "branch"}}
+	enc, err := indexing.EncodeRegistryEntry(e)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 	// Truncate to half — past the column-count field, mid-list.
 	truncated := enc[:len(enc)/2]
-	_, err = decodeRegistryEntry(truncated)
-	if !errors.Is(err, errRegistryEntryShort) {
+	_, err = indexing.DecodeRegistryEntry(truncated)
+	if !errors.Is(err, indexing.ErrRegistryEntryShort) {
 		t.Fatalf("expected truncated-list error, got %v", err)
 	}
 }
@@ -175,14 +154,14 @@ func TestDecodeRegistryEntryRejectsTruncatedColumnList(t *testing.T) {
 // last covering name), so any trailing bytes signal a malformed
 // on-disk record.
 func TestDecodeRegistryEntryRejectsTrailingBytes(t *testing.T) {
-	e := &indexRegistryEntry{Columns: []string{"owner"}}
-	enc, err := encodeRegistryEntry(e)
+	e := &indexing.RegistryEntry{Columns: []string{"owner"}}
+	enc, err := indexing.EncodeRegistryEntry(e)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 	enc = append(enc, 0x99) // trailing junk
-	_, err = decodeRegistryEntry(enc)
-	if !errors.Is(err, errRegistryEntryShort) {
+	_, err = indexing.DecodeRegistryEntry(enc)
+	if !errors.Is(err, indexing.ErrRegistryEntryShort) {
 		t.Fatalf("expected trailing-bytes error, got %v", err)
 	}
 }
@@ -194,12 +173,12 @@ func TestDecodeRegistryEntryRejectsTrailingBytes(t *testing.T) {
 // IndexDecl.Name but column.Name == "" is currently legal at the
 // codec layer; the 7.5 wiring may add stricter validation).
 func TestRegistryEntryRoundtripEmptyStrings(t *testing.T) {
-	want := &indexRegistryEntry{Columns: []string{""}}
-	enc, err := encodeRegistryEntry(want)
+	want := &indexing.RegistryEntry{Columns: []string{""}}
+	enc, err := indexing.EncodeRegistryEntry(want)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	got, err := decodeRegistryEntry(enc)
+	got, err := indexing.DecodeRegistryEntry(enc)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -210,8 +189,8 @@ func TestRegistryEntryRoundtripEmptyStrings(t *testing.T) {
 
 // --- Registry CRUD tests via tx helpers ---------------------------
 
-func makeTestEntry(name string, root, count uint64) *indexRegistryEntry {
-	return &indexRegistryEntry{
+func makeTestEntry(name string, root, count uint64) *indexing.RegistryEntry {
+	return &indexing.RegistryEntry{
 		SchemaHash:  uint64(len(name)) * 0x100,
 		Unique:      false,
 		Root:        root,
@@ -684,7 +663,7 @@ func TestRegistryPutEmptyNameReturnsErrKeyEmpty(t *testing.T) {
 // encode → compare). Catches any decoder field-skip / re-encoder
 // reordering bug.
 func TestRegistryEncodeDecodeBytesEqual(t *testing.T) {
-	want := &indexRegistryEntry{
+	want := &indexing.RegistryEntry{
 		SchemaHash:  0x1234,
 		Unique:      true,
 		Root:        77,
@@ -693,15 +672,15 @@ func TestRegistryEncodeDecodeBytesEqual(t *testing.T) {
 		Columns:     []string{"a", "bb", "ccc"},
 		Covering:    []string{"d"},
 	}
-	first, err := encodeRegistryEntry(want)
+	first, err := indexing.EncodeRegistryEntry(want)
 	if err != nil {
 		t.Fatalf("encode 1: %v", err)
 	}
-	got, err := decodeRegistryEntry(first)
+	got, err := indexing.DecodeRegistryEntry(first)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	second, err := encodeRegistryEntry(got)
+	second, err := indexing.EncodeRegistryEntry(got)
 	if err != nil {
 		t.Fatalf("encode 2: %v", err)
 	}
@@ -724,11 +703,11 @@ func stringSlicesEqual(a, b []string) bool {
 
 // TestDecodeRegistryEntryRejectsForgedColumnCount (Inv-RV4): a forged
 // ColumnCount on a truncated on-disk registry entry is rejected as
-// errRegistryEntryShort without panicking or pre-allocating a
+// indexing.ErrRegistryEntryShort without panicking or pre-allocating a
 // count-sized slice — decodeRegistryEntry bounds colCount*2 against the
 // remaining bytes before make([]string, colCount).
 func TestDecodeRegistryEntryRejectsForgedColumnCount(t *testing.T) {
-	data, err := encodeRegistryEntry(&indexRegistryEntry{
+	data, err := indexing.EncodeRegistryEntry(&indexing.RegistryEntry{
 		SchemaHash: 1, Root: 2, Count: 3, Columns: []string{"a"},
 	})
 	if err != nil {
@@ -738,8 +717,8 @@ func TestDecodeRegistryEntryRejectsForgedColumnCount(t *testing.T) {
 	// empty UserVersionLen). Forge it to 0xFFFF; the entry stays the same
 	// (now-truncated) length.
 	binary.LittleEndian.PutUint16(data[34:], 0xFFFF)
-	if _, err := decodeRegistryEntry(data); !errors.Is(err, errRegistryEntryShort) {
-		t.Fatalf("decodeRegistryEntry(forged ColumnCount) = %v, want errRegistryEntryShort", err)
+	if _, err := indexing.DecodeRegistryEntry(data); !errors.Is(err, indexing.ErrRegistryEntryShort) {
+		t.Fatalf("indexing.DecodeRegistryEntry(forged ColumnCount) = %v, want indexing.ErrRegistryEntryShort", err)
 	}
 }
 
@@ -747,7 +726,7 @@ func TestDecodeRegistryEntryRejectsForgedColumnCount(t *testing.T) {
 // symmetric pre-check for CoveringCount — a forged CoveringCount on a
 // truncated entry is rejected before make([]string, covCount).
 func TestDecodeRegistryEntryRejectsForgedCoveringCount(t *testing.T) {
-	data, err := encodeRegistryEntry(&indexRegistryEntry{
+	data, err := indexing.EncodeRegistryEntry(&indexing.RegistryEntry{
 		SchemaHash: 1, Root: 2, Count: 3, Columns: []string{"a"},
 	})
 	if err != nil {
@@ -756,7 +735,36 @@ func TestDecodeRegistryEntryRejectsForgedCoveringCount(t *testing.T) {
 	// CoveringCount is the u16 immediately after the single 1-byte column
 	// "a": 32 prefix + 2 uvLen + 2 colCount + 2 nameLen + 1 name = offset 39.
 	binary.LittleEndian.PutUint16(data[39:], 0xFFFF)
-	if _, err := decodeRegistryEntry(data); !errors.Is(err, errRegistryEntryShort) {
-		t.Fatalf("decodeRegistryEntry(forged CoveringCount) = %v, want errRegistryEntryShort", err)
+	if _, err := indexing.DecodeRegistryEntry(data); !errors.Is(err, indexing.ErrRegistryEntryShort) {
+		t.Fatalf("indexing.DecodeRegistryEntry(forged CoveringCount) = %v, want indexing.ErrRegistryEntryShort", err)
+	}
+}
+
+// TestOversizedIndexDeclSurfacesErrInvalidOptions pins the Tx-boundary
+// error mapping: an oversized IndexDecl field flows through the public
+// declare path into the registry encoder, whose codec-level
+// field-bound failure must surface as the public ErrInvalidOptions
+// (the fields came from user input at this boundary).
+func TestOversizedIndexDeclSurfacesErrInvalidOptions(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	decl := &IndexDecl{
+		Name:    "oversized",
+		Version: strings.Repeat("x", 70000),
+		Columns: []IndexColumn{{Name: "c"}},
+		Extract: func(_, _ []byte) []IndexEntry { return nil },
+	}
+	_, err = tx.CreateKeyspace("k", decl)
+	if !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("oversized decl through the public path: err = %v, want ErrInvalidOptions", err)
 	}
 }

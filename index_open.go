@@ -2,6 +2,7 @@ package gmdb
 
 import (
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"sort"
 	"sync/atomic"
 
@@ -108,7 +109,7 @@ func (tx *Tx) loadReadOnlyIndexes(desc keyspaceDescriptor) (map[string]*pinnedIn
 	hwm := tx.statsHWM()
 	out := make(map[string]*pinnedIndex)
 	err := btree.WalkKV(tx.pgr, cfg, desc.IndexRegistryRoot, hwm, func(k, v []byte) error {
-		e, derr := decodeRegistryEntry(v)
+		e, derr := indexing.DecodeRegistryEntry(v)
 		if derr != nil {
 			return fmt.Errorf("%w: read-only index load %q: %w", ErrCorrupted, k, derr)
 		}
@@ -276,7 +277,7 @@ func (tx *Tx) writeNewIndexRegistry(
 	var loopErr error
 	for i, name := range names {
 		p := pinned[name]
-		entry := &indexRegistryEntry{
+		entry := &indexing.RegistryEntry{
 			SchemaHash:  p.schemaHash,
 			Unique:      p.decl.Unique,
 			Root:        0, // empty index data tree

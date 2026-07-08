@@ -241,7 +241,7 @@ func TestValidateIndexDeclsRejectsEmptyName(t *testing.T) {
 // non-unique decoder (extractSetKeyspaceCompoundPKFromIndexKey +
 // extractPKAndValue) needs at least one column terminator to bound
 // the PK component; a zero-column index would surface
-// errIndexKeyMalformed at decode time. Rejecting at construction
+// indexing.ErrKeyMalformed at decode time. Rejecting at construction
 // gives a clear sentinel.
 func TestValidateIndexDeclsRejectsZeroColumns(t *testing.T) {
 	decls := []*IndexDecl{

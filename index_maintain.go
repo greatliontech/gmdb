@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"sort"
 	"sync/atomic"
 )
@@ -14,12 +15,12 @@ import (
 //
 // On-disk index-entry shape per indexing.md §Storage Layout:
 //
-//	Unique index:     key = encodeIndexKey(cols)
+//	Unique index:     key = indexing.EncodeKey(cols)
 //	                  value = uvarint(len(pk)) || pk_bytes || encoded_covering
-//	Non-unique index: key = encodeIndexKey(cols || pk)
+//	Non-unique index: key = indexing.EncodeKey(cols || pk)
 //	                  value = encoded_covering (empty if no Covering)
 //
-// encoded_covering = encodeIndexKey(coverColumns) when the
+// encoded_covering = indexing.EncodeKey(coverColumns) when the
 // IndexDecl declares Covering; otherwise empty bytes.
 // The uvarint(len(pk)) length prefix on the unique value
 // delimits the PK from the optional covering blob — without it,
@@ -33,14 +34,14 @@ import (
 // compound `escape(setKey) || 0x00 0x01 || escape(setValue)`.
 func indexEntryKey(entry IndexEntry, pk []byte, unique bool) []byte {
 	if unique {
-		return encodeIndexKey(entry.Cols)
+		return indexing.EncodeKey(entry.Cols)
 	}
 	// Append the PK as an extra "column" so it gets escaped +
 	// terminated by encodeIndexKey, matching the spec grammar.
 	withPK := make([][]byte, 0, len(entry.Cols)+1)
 	withPK = append(withPK, entry.Cols...)
 	withPK = append(withPK, pk)
-	return encodeIndexKey(withPK)
+	return indexing.EncodeKey(withPK)
 }
 
 // indexEntryValue returns the on-disk index-tree value for entry on
@@ -49,13 +50,13 @@ func indexEntryKey(entry IndexEntry, pk []byte, unique bool) []byte {
 //	Unique:     uvarint(len(pk)) || pk_bytes || encoded_covering
 //	Non-unique: encoded_covering
 //
-// encoded_covering = encodeIndexKey(entry.Cover) when the IndexDecl
+// encoded_covering = indexing.EncodeKey(entry.Cover) when the IndexDecl
 // declares Covering and the extractor produced Cover bytes;
 // otherwise empty.
 func indexEntryValue(entry IndexEntry, pk []byte, unique bool, hasCovering bool) []byte {
 	var covering []byte
 	if hasCovering && len(entry.Cover) > 0 {
-		covering = encodeIndexKey(entry.Cover)
+		covering = indexing.EncodeKey(entry.Cover)
 	}
 	if unique {
 		// uvarint(len(pk)) + pk + covering
@@ -251,7 +252,7 @@ func (tx *Tx) flushIndexRegistry(owner descriptorOwner, indexes map[string]*pinn
 	names := sortedIndexNames(indexes)
 	for _, name := range names {
 		p := indexes[name]
-		entry := &indexRegistryEntry{
+		entry := &indexing.RegistryEntry{
 			SchemaHash:  p.schemaHash,
 			Unique:      p.decl.Unique,
 			Root:        p.root,

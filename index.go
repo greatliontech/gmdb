@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"iter"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
@@ -416,7 +417,7 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 	} else {
 		// Non-unique: PK is the last component of the encoded key; the
 		// entry value IS the covering blob.
-		cols, decErr := decodeIndexKey(indexKey)
+		cols, decErr := indexing.DecodeKey(indexKey)
 		if decErr != nil {
 			return nil, nil, false, fmt.Errorf("%w: index %q: %w", ErrCorrupted, idx.pinned.decl.Name, decErr)
 		}
@@ -439,7 +440,7 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 	// sentinel). The byte-API path below handles arbitrary covering
 	// projections; default (no Covering declared) is back-lookup.
 	if idx.coverValue {
-		coverCols, decErr := decodeIndexKey(encodedCovering)
+		coverCols, decErr := indexing.DecodeKey(encodedCovering)
 		if decErr != nil {
 			return nil, nil, false, fmt.Errorf("%w: index %q covering: %w", ErrCorrupted, idx.pinned.decl.Name, decErr)
 		}
@@ -557,7 +558,7 @@ func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 		}
 		colSlices := make([][]byte, len(cols))
 		copy(colSlices, cols)
-		encoded := encodeIndexKey(colSlices)
+		encoded := indexing.EncodeKey(colSlices)
 		tx := idx.rowTx()
 		cfg := tx.pgr.Config()
 		if idx.pinned.decl.Unique {
@@ -581,7 +582,7 @@ func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 			return
 		}
 		// Non-unique: scan the prefix `encoded` (each on-disk key is
-		// encoded || escapeColumn(pk) || 0x00 0x00). Stop when the
+		// encoded || indexing.EscapeColumn(pk) || 0x00 0x00). Stop when the
 		// cursor key no longer has encoded as a prefix.
 		idx.iteratePrefix(encoded, yield)
 	}
@@ -721,7 +722,7 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 		}
 		colSlices := make([][]byte, len(cols))
 		copy(colSlices, cols)
-		encoded := encodeIndexKey(colSlices)
+		encoded := indexing.EncodeKey(colSlices)
 		tx := idx.rowTx()
 		cfg := tx.pgr.Config()
 		mergeThreshold := tx.db.opts.MergeThreshold
@@ -755,7 +756,7 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 			}
 			keyCopy := make([]byte, len(k))
 			copy(keyCopy, k)
-			cols, decErr := decodeIndexKey(keyCopy)
+			cols, decErr := indexing.DecodeKey(keyCopy)
 			if decErr != nil {
 				idx.err = fmt.Errorf("%w: index %q: %w", ErrCorrupted, idx.pinned.decl.Name, decErr)
 				return
@@ -824,10 +825,10 @@ func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 		}
 		var startKey, endKey []byte
 		if start != nil {
-			startKey = encodeIndexKey(start)
+			startKey = indexing.EncodeKey(start)
 		}
 		if end != nil {
-			endKey = encodeIndexKey(end)
+			endKey = indexing.EncodeKey(end)
 		}
 		tx := idx.rowTx()
 		cfg := tx.pgr.Config()
@@ -902,7 +903,7 @@ func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] 
 		}
 		prefixSlices := make([][]byte, len(leadingCols))
 		copy(prefixSlices, leadingCols)
-		encoded := encodeIndexKey(prefixSlices)
+		encoded := indexing.EncodeKey(prefixSlices)
 		idx.iteratePrefix(encoded, yield)
 	}
 }
@@ -944,7 +945,7 @@ func (idx *IndexHandle) Get(cols ...[]byte) (pk, value []byte, err error) {
 	}
 	colSlices := make([][]byte, len(cols))
 	copy(colSlices, cols)
-	encoded := encodeIndexKey(colSlices)
+	encoded := indexing.EncodeKey(colSlices)
 	tx := idx.rowTx()
 	cfg := tx.pgr.Config()
 	val, found, getErr := btree.Get(tx.pgr, cfg, idx.pinned.root, encoded)

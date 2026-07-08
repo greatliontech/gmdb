@@ -1,4 +1,4 @@
-package gmdb
+package indexing
 
 import (
 	"bytes"
@@ -15,14 +15,14 @@ import (
 // bytes passes through unchanged (but freshly allocated).
 func TestEscapeColumnPassthrough(t *testing.T) {
 	in := []byte("hello world")
-	out := escapeColumn(in)
+	out := EscapeColumn(in)
 	if !bytes.Equal(out, in) {
 		t.Fatalf("passthrough mismatch: got %x want %x", out, in)
 	}
 	// Confirm fresh allocation: mutate out, in should be unchanged.
 	out[0] = 'X'
 	if in[0] != 'h' {
-		t.Errorf("escapeColumn aliased input slice")
+		t.Errorf("EscapeColumn aliased input slice")
 	}
 }
 
@@ -30,7 +30,7 @@ func TestEscapeColumnPassthrough(t *testing.T) {
 func TestEscapeColumnEscapesZeros(t *testing.T) {
 	in := []byte{0x00, 0x41, 0x00, 0x42, 0x00}
 	want := []byte{0x00, 0xFF, 0x41, 0x00, 0xFF, 0x42, 0x00, 0xFF}
-	got := escapeColumn(in)
+	got := EscapeColumn(in)
 	if !bytes.Equal(got, want) {
 		t.Errorf("escape: got %x want %x", got, want)
 	}
@@ -38,11 +38,11 @@ func TestEscapeColumnEscapesZeros(t *testing.T) {
 
 // TestEscapeColumnEmpty verifies an empty input encodes to empty.
 func TestEscapeColumnEmpty(t *testing.T) {
-	got := escapeColumn(nil)
+	got := EscapeColumn(nil)
 	if len(got) != 0 {
 		t.Errorf("empty input → non-empty output %x", got)
 	}
-	got = escapeColumn([]byte{})
+	got = EscapeColumn([]byte{})
 	if len(got) != 0 {
 		t.Errorf("empty slice → non-empty output %x", got)
 	}
@@ -63,8 +63,8 @@ func TestUnescapeColumnRoundtrip(t *testing.T) {
 		{0x00, 0x01, 0xFE, 0xFF}, // includes the lex-distinct 0x01
 	}
 	for i, in := range cases {
-		esc := escapeColumn(in)
-		got, err := unescapeColumn(esc)
+		esc := EscapeColumn(in)
+		got, err := UnescapeColumn(esc)
 		if err != nil {
 			t.Errorf("case %d: unescape %x: %v", i, esc, err)
 			continue
@@ -81,21 +81,21 @@ func TestUnescapeColumnRoundtrip(t *testing.T) {
 
 // TestUnescapeColumnRejectsLone00 verifies that a 0x00 not followed
 // by 0xFF in the (already-extracted) escaped column body returns
-// errIndexKeyMalformed.
+// ErrKeyMalformed.
 func TestUnescapeColumnRejectsLone00(t *testing.T) {
 	// 0x00 followed by 0x41 — invalid in column body.
-	_, err := unescapeColumn([]byte{0x00, 0x41})
-	if !errors.Is(err, errIndexKeyMalformed) {
-		t.Errorf("expected errIndexKeyMalformed, got %v", err)
+	_, err := UnescapeColumn([]byte{0x00, 0x41})
+	if !errors.Is(err, ErrKeyMalformed) {
+		t.Errorf("expected ErrKeyMalformed, got %v", err)
 	}
 }
 
 // TestUnescapeColumnRejectsTrailing00 verifies that a 0x00 as the
 // last byte (no following byte) is malformed.
 func TestUnescapeColumnRejectsTrailing00(t *testing.T) {
-	_, err := unescapeColumn([]byte{0x41, 0x00})
-	if !errors.Is(err, errIndexKeyMalformed) {
-		t.Errorf("expected errIndexKeyMalformed, got %v", err)
+	_, err := UnescapeColumn([]byte{0x41, 0x00})
+	if !errors.Is(err, ErrKeyMalformed) {
+		t.Errorf("expected ErrKeyMalformed, got %v", err)
 	}
 }
 
@@ -104,7 +104,7 @@ func TestUnescapeColumnRejectsTrailing00(t *testing.T) {
 // TestEncodeIndexKeySingleColumn verifies the simplest case: one
 // column → escaped + 0x00 0x00 terminator.
 func TestEncodeIndexKeySingleColumn(t *testing.T) {
-	got := encodeIndexKey([][]byte{[]byte("owner")})
+	got := EncodeKey([][]byte{[]byte("owner")})
 	want := []byte{0x6F, 0x77, 0x6E, 0x65, 0x72, 0x00, 0x00}
 	if !bytes.Equal(got, want) {
 		t.Errorf("got %x want %x", got, want)
@@ -115,7 +115,7 @@ func TestEncodeIndexKeySingleColumn(t *testing.T) {
 // a bare 0x00 0x00 terminator. Per the spec worked example T1 (Col
 // A empty, Col B [0x00]): encoded `00 00  00 FF 00 00`.
 func TestEncodeIndexKeyEmptyColumn(t *testing.T) {
-	got := encodeIndexKey([][]byte{{}, {0x00}})
+	got := EncodeKey([][]byte{{}, {0x00}})
 	want := []byte{0x00, 0x00, 0x00, 0xFF, 0x00, 0x00}
 	if !bytes.Equal(got, want) {
 		t.Errorf("got %x want %x", got, want)
@@ -127,9 +127,9 @@ func TestEncodeIndexKeyEmptyColumn(t *testing.T) {
 // encode to the spec-cited byte sequences and that they sort
 // lex-correctly (T1 < T2 < T3).
 func TestEncodeIndexKeySpecWorkedExamples(t *testing.T) {
-	t1 := encodeIndexKey([][]byte{{}, {0x00}})
-	t2 := encodeIndexKey([][]byte{{0x00}, {}})
-	t3 := encodeIndexKey([][]byte{{0x00, 0xFF}, {0x00}})
+	t1 := EncodeKey([][]byte{{}, {0x00}})
+	t2 := EncodeKey([][]byte{{0x00}, {}})
+	t3 := EncodeKey([][]byte{{0x00, 0xFF}, {0x00}})
 
 	wantT1 := []byte{0x00, 0x00, 0x00, 0xFF, 0x00, 0x00}
 	wantT2 := []byte{0x00, 0xFF, 0x00, 0x00, 0x00, 0x00}
@@ -164,8 +164,8 @@ func TestDecodeIndexKeyRoundtrip(t *testing.T) {
 		{[]byte("multi"), []byte("column"), []byte("tuple")},
 	}
 	for i, cols := range cases {
-		enc := encodeIndexKey(cols)
-		dec, err := decodeIndexKey(enc)
+		enc := EncodeKey(cols)
+		dec, err := DecodeKey(enc)
 		if err != nil {
 			t.Errorf("case %d: decode %x: %v", i, enc, err)
 			continue
@@ -189,8 +189,8 @@ func TestDecodeIndexKeyRoundtrip(t *testing.T) {
 // without a trailing 0x00 0x00 is malformed.
 func TestDecodeIndexKeyRejectsUnterminatedKey(t *testing.T) {
 	// "owner" with no terminator — last column not terminated.
-	_, err := decodeIndexKey([]byte{0x6F, 0x77, 0x6E, 0x65, 0x72})
-	if !errors.Is(err, errIndexKeyMalformed) {
+	_, err := DecodeKey([]byte{0x6F, 0x77, 0x6E, 0x65, 0x72})
+	if !errors.Is(err, ErrKeyMalformed) {
 		t.Errorf("expected malformed, got %v", err)
 	}
 }
@@ -203,8 +203,8 @@ func TestDecodeIndexKeyRejectsUnterminatedKey(t *testing.T) {
 // ad-hoc.
 func TestDecodeIndexKeyRejects0x00x01Separator(t *testing.T) {
 	// A literal 0x00 0x01 mid-column — must reject.
-	_, err := decodeIndexKey([]byte{0x6F, 0x00, 0x01, 0x77, 0x00, 0x00})
-	if !errors.Is(err, errIndexKeyMalformed) {
+	_, err := DecodeKey([]byte{0x6F, 0x00, 0x01, 0x77, 0x00, 0x00})
+	if !errors.Is(err, ErrKeyMalformed) {
 		t.Errorf("expected malformed on 0x00 0x01 sequence, got %v", err)
 	}
 }
@@ -212,14 +212,14 @@ func TestDecodeIndexKeyRejects0x00x01Separator(t *testing.T) {
 // TestDecodeIndexKeyEmpty verifies decoding the empty key returns
 // no columns.
 func TestDecodeIndexKeyEmpty(t *testing.T) {
-	got, err := decodeIndexKey(nil)
+	got, err := DecodeKey(nil)
 	if err != nil {
 		t.Errorf("nil: %v", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("nil: got %v want empty", got)
 	}
-	got, err = decodeIndexKey([]byte{})
+	got, err = DecodeKey([]byte{})
 	if err != nil {
 		t.Errorf("empty: %v", err)
 	}
@@ -255,8 +255,8 @@ func TestEncodedColumnPrefixFreeness(t *testing.T) {
 		if bytes.Equal(p[0], p[1]) {
 			t.Fatalf("pair %d: test-data error — equal byte slices %x", i, p[0])
 		}
-		encA := encodeIndexKey([][]byte{p[0]})
-		encB := encodeIndexKey([][]byte{p[1]})
+		encA := EncodeKey([][]byte{p[0]})
+		encB := EncodeKey([][]byte{p[1]})
 		if bytes.HasPrefix(encA, encB) {
 			t.Errorf("pair %d: enc(%x) has prefix enc(%x); raw=%x prefix=%x",
 				i, p[0], p[1], encA, encB)
@@ -311,7 +311,7 @@ func TestEncodedTuplePrefixFreenessSameColumnCount(t *testing.T) {
 	for nCols, tuples := range groups {
 		encs := make([][]byte, len(tuples))
 		for i, tup := range tuples {
-			encs[i] = encodeIndexKey(tup)
+			encs[i] = EncodeKey(tup)
 		}
 		for i := range encs {
 			for j := range encs {
@@ -330,8 +330,8 @@ func TestEncodedTuplePrefixFreenessSameColumnCount(t *testing.T) {
 
 // TestEncodedColumnPrefixFreenessProperty fuzz-tests prefix-
 // freeness across many random column-pair inputs. The property
-// is: for distinct columns A != B, neither encodeIndexKey([A]) nor
-// encodeIndexKey([B]) is a prefix of the other.
+// is: for distinct columns A != B, neither EncodeKey([A]) nor
+// EncodeKey([B]) is a prefix of the other.
 func TestEncodedColumnPrefixFreenessProperty(t *testing.T) {
 	r := rand.New(rand.NewPCG(0xDEAD, 0xBEEF))
 	const iterations = 2000
@@ -341,8 +341,8 @@ func TestEncodedColumnPrefixFreenessProperty(t *testing.T) {
 		if bytes.Equal(a, b) {
 			continue
 		}
-		encA := encodeIndexKey([][]byte{a})
-		encB := encodeIndexKey([][]byte{b})
+		encA := EncodeKey([][]byte{a})
+		encB := EncodeKey([][]byte{b})
 		if bytes.HasPrefix(encA, encB) {
 			t.Fatalf("iter %d: enc(%x) has prefix enc(%x); encA=%x encB=%x",
 				it, a, b, encA, encB)
@@ -381,8 +381,8 @@ func TestEncodedTuplePrefixFreenessSameNColsProperty(t *testing.T) {
 		if eq {
 			continue
 		}
-		encA := encodeIndexKey(a)
-		encB := encodeIndexKey(b)
+		encA := EncodeKey(a)
+		encB := EncodeKey(b)
 		if bytes.HasPrefix(encA, encB) {
 			t.Fatalf("iter %d nCols=%d: enc(%v) has prefix enc(%v); encA=%x encB=%x",
 				it, nCols, byteSliceSliceString(a), byteSliceSliceString(b), encA, encB)
@@ -409,8 +409,8 @@ func TestEncodedKeyLexOrderingPreserved(t *testing.T) {
 			tupA[i] = randBytes(r, 0, 16)
 			tupB[i] = randBytes(r, 0, 16)
 		}
-		encA := encodeIndexKey(tupA)
-		encB := encodeIndexKey(tupB)
+		encA := EncodeKey(tupA)
+		encB := EncodeKey(tupB)
 		lexA := lexCompareTuples(tupA, tupB)
 		lexEnc := bytes.Compare(encA, encB)
 		if sign(lexA) != sign(lexEnc) {
@@ -446,7 +446,7 @@ func TestEncodedKeySortsLikeTuples(t *testing.T) {
 	}
 	pairs := make([]pair, len(tuples))
 	for i, t := range tuples {
-		pairs[i] = pair{tup: t, enc: encodeIndexKey(t)}
+		pairs[i] = pair{tup: t, enc: EncodeKey(t)}
 	}
 	sort.Slice(pairs, func(i, j int) bool {
 		return bytes.Compare(pairs[i].enc, pairs[j].enc) < 0

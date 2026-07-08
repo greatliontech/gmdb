@@ -3,7 +3,6 @@ package gmdb
 import (
 	"encoding/binary"
 	"fmt"
-
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -217,7 +216,7 @@ func validateIndexDecls(decls []*IndexDecl) error {
 		// decoder (extractSetKeyspaceCompoundPKFromIndexKey +
 		// extractPKAndValue) needs at least one column terminator
 		// to bound the PK component; a zero-column index would
-		// surface errIndexKeyMalformed at decode time. Reject at
+		// surface indexing.ErrKeyMalformed at decode time. Reject at
 		// construction with a clear sentinel.
 		if len(d.Columns) == 0 {
 			return fmt.Errorf("gmdb: IndexDecl %q has zero columns (index must declare at least one column): %w",

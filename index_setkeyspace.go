@@ -3,6 +3,7 @@ package gmdb
 import (
 	"errors"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -26,10 +27,10 @@ import (
 //
 // The full SetKeyspace non-unique index key is:
 //
-//	indexKey := encodeIndexKey(cols) || escapedPK || 0x00 0x00
+//	indexKey := indexing.EncodeKey(cols) || escapedPK || 0x00 0x00
 //
 // For unique indexes the PK is in the value, not the key:
-// indexKey := encodeIndexKey(cols), exactly as for Keyspace
+// indexKey := indexing.EncodeKey(cols), exactly as for Keyspace
 // indexes. The unique value format remains uvarint(len(pk)) ||
 // pk_bytes || encoded_covering — where pk_bytes is the FULL
 // compound PK above.
@@ -46,8 +47,8 @@ var errCompoundPKMalformed = errors.New("SetKeyspace compound PK malformed")
 // pattern (because escapeColumn turns every 0x00 in its input
 // into 0x00 0xFF).
 func encodeSetKeyspaceCompoundPK(setKey, setValue []byte) []byte {
-	escapedKey := escapeColumn(setKey)
-	escapedValue := escapeColumn(setValue)
+	escapedKey := indexing.EscapeColumn(setKey)
+	escapedValue := indexing.EscapeColumn(setValue)
 	out := make([]byte, 0, len(escapedKey)+2+len(escapedValue))
 	out = append(out, escapedKey...)
 	out = append(out, 0x00, 0x01)
@@ -70,11 +71,11 @@ func decodeSetKeyspaceCompoundPK(encoded []byte) (setKey, setValue []byte, err e
 	for i := 0; i < len(encoded)-1; i++ {
 		if encoded[i] == 0x00 && encoded[i+1] == 0x01 {
 			// Found separator at offset i.
-			setKey, err = unescapeColumn(encoded[:i])
+			setKey, err = indexing.UnescapeColumn(encoded[:i])
 			if err != nil {
 				return nil, nil, fmt.Errorf("%w: setKey half: %w", errCompoundPKMalformed, err)
 			}
-			setValue, err = unescapeColumn(encoded[i+2:])
+			setValue, err = indexing.UnescapeColumn(encoded[i+2:])
 			if err != nil {
 				return nil, nil, fmt.Errorf("%w: setValue half: %w", errCompoundPKMalformed, err)
 			}
@@ -92,17 +93,17 @@ func decodeSetKeyspaceCompoundPK(encoded []byte) (setKey, setValue []byte, err e
 
 // encodeSetKeyspaceIndexKey assembles the full on-disk index key
 // for a SetKeyspace non-unique index. For unique SetKeyspace
-// indexes, the key is just encodeIndexKey(cols) — the compound
+// indexes, the key is just indexing.EncodeKey(cols) — the compound
 // PK goes in the value (uvarint-prefixed pk_bytes).
 //
 // For non-unique:
 //
-//	indexKey := encodeIndexKey(cols) || encodeSetKeyspaceCompoundPK(setKey, setValue) || 0x00 0x00
+//	indexKey := indexing.EncodeKey(cols) || encodeSetKeyspaceCompoundPK(setKey, setValue) || 0x00 0x00
 //
 // The trailing 0x00 0x00 terminates the PK component, matching
 // the spec grammar.
 func encodeSetKeyspaceIndexKey(cols [][]byte, setKey, setValue []byte, unique bool) []byte {
-	colBytes := encodeIndexKey(cols)
+	colBytes := indexing.EncodeKey(cols)
 	if unique {
 		return colBytes
 	}

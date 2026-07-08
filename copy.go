@@ -10,6 +10,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -207,7 +208,7 @@ func collectReachable(rtx *ReadTx, cfg page.Config, meta pager.Meta, hwm, firstD
 			return fmt.Errorf("keyspace %q index registry: %w", name, err)
 		}
 		return btree.WalkKV(pr, cfg, desc.IndexRegistryRoot, hwm, func(ik, iv []byte) error {
-			entry, derr := decodeRegistryEntry(iv)
+			entry, derr := indexing.DecodeRegistryEntry(iv)
 			if derr != nil {
 				return fmt.Errorf("keyspace %q index %q registry entry: %w", name, string(ik), derr)
 			}
@@ -458,7 +459,7 @@ func rebuildRegistry(w *freshFileWriter, pr rawPageReader, cfg page.Config, regR
 	}
 	b := newBulkBuilder(w, cfg)
 	err := btree.WalkKV(pr, cfg, regRoot, hwm, func(k, v []byte) error {
-		entry, derr := decodeRegistryEntry(v)
+		entry, derr := indexing.DecodeRegistryEntry(v)
 		if derr != nil {
 			return fmt.Errorf("index %q registry entry: %w", string(k), derr)
 		}
@@ -467,7 +468,12 @@ func rebuildRegistry(w *freshFileWriter, pr rawPageReader, cfg page.Config, regR
 			return fmt.Errorf("index %q data tree: %w", string(k), rerr)
 		}
 		entry.Root = newRoot
-		nv, eerr := encodeRegistryEntry(entry)
+		// Decode→mutate(Root/Count)→re-encode round-trip: the
+		// uint16-bounded fields came off disk within bound and are
+		// not mutated, so ErrFieldTooLarge is unreachable; if ever
+		// reached (memory corruption) the raw internal error is the
+		// right class — no ErrInvalidOptions mapping here.
+		nv, eerr := indexing.EncodeRegistryEntry(entry)
 		if eerr != nil {
 			return fmt.Errorf("index %q re-encode: %w", string(k), eerr)
 		}

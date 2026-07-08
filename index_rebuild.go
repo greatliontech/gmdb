@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"sync/atomic"
 	"unique"
 
@@ -248,7 +249,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		// Empty parent → rebuilt index is empty. Publish-then-retire
 		// (registry-first ordering): write the registry entry first, then free
 		// the old data tree.
-		newEntry := &indexRegistryEntry{
+		newEntry := &indexing.RegistryEntry{
 			SchemaHash:  schemaHash(decl),
 			Unique:      decl.Unique,
 			Root:        0,
@@ -403,7 +404,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	// a FreeSubtree failure after that point leaks the old tree
 	// (recoverable via Rollback) but cannot leave the registry
 	// pointing at freed pages.
-	newEntry := &indexRegistryEntry{
+	newEntry := &indexing.RegistryEntry{
 		SchemaHash:  schemaHash(decl),
 		Unique:      decl.Unique,
 		Root:        newRoot,
@@ -530,7 +531,7 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 		// Copy v because the next cursor op may invalidate.
 		valCopy := make([]byte, len(v))
 		copy(valCopy, v)
-		entry, err := decodeRegistryEntry(valCopy)
+		entry, err := indexing.DecodeRegistryEntry(valCopy)
 		if err != nil {
 			return fmt.Errorf("%w: DeleteKeyspace %q: registry entry %q decode: %w",
 				ErrCorrupted, keyspaceName, string(k), err)

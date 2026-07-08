@@ -8,6 +8,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
@@ -567,7 +568,7 @@ func (c *checker) walkRegistry(ks string, desc keyspaceDescriptor, firstData, hw
 	}
 	err := btree.WalkKV(rawPageReader{c.pgr}, c.cfg, desc.IndexRegistryRoot, hwm, func(k, v []byte) error {
 		idxName := string(k)
-		entry, derr := decodeRegistryEntry(v)
+		entry, derr := indexing.DecodeRegistryEntry(v)
 		if derr != nil {
 			if !c.emit(CheckIssue{Severity: CheckError, Code: "RegistryEntryInvalid", Keyspace: ks, Index: idxName,
 				Message: fmt.Sprintf("registry entry decode: %v", derr)}) {

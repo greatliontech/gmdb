@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
@@ -173,11 +174,11 @@ func (tx *Tx) compactIndexRegistry(regRoot uint64, shouldRelocate func(uint64) b
 	// Snapshot the registry entries (name + decoded entry) before mutating.
 	type idxEntry struct {
 		name  []byte
-		entry *indexRegistryEntry
+		entry *indexing.RegistryEntry
 	}
 	var entries []idxEntry
 	if err := btree.WalkKV(pw, cfg, regRoot, hwm, func(k, v []byte) error {
-		e, derr := decodeRegistryEntry(v)
+		e, derr := indexing.DecodeRegistryEntry(v)
 		if derr != nil {
 			return fmt.Errorf("%w: index %q registry entry: %v", btree.ErrCorrupted, string(k), derr)
 		}
@@ -203,7 +204,12 @@ func (tx *Tx) compactIndexRegistry(regRoot uint64, shouldRelocate func(uint64) b
 		moved += m
 		if nr != ie.entry.Root {
 			ie.entry.Root = nr
-			nv, eerr := encodeRegistryEntry(ie.entry)
+			// Decode→mutate(Root/Count)→re-encode round-trip: the
+			// uint16-bounded fields came off disk within bound and are
+			// not mutated, so ErrFieldTooLarge is unreachable; if ever
+			// reached (memory corruption) the raw internal error is the
+			// right class — no ErrInvalidOptions mapping here.
+			nv, eerr := indexing.EncodeRegistryEntry(ie.entry)
 			if eerr != nil {
 				// Unreachable in-spec (we re-encode an entry we just decoded,
 				// changing only the scalar Root), but keep the contract that

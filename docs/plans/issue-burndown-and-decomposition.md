@@ -26,11 +26,13 @@ cross-namespace window; index move = clean codec extraction only.
 - [x] 6. Leaked-DB cleanup drain: `dbCleanupFn` performs Close's
   inflight drain before coord/lockFile teardown; resolves
   `dbcleanup-teardown-drain`.
-- [ ] 7. `internal/idxcodec`: extract the pure index codec
-  (escape/encode/decode index keys, schema hash, registry-entry
-  codec; `DecodeCoveringTuple` stays as a root wrapper); no API
-  change (per the composition audit: the full `internal/index` is
-  an anti-extraction; no other split/merge warranted).
+- [x] 7. `internal/indexing`: extract the pure index codec
+  (escape/encode/decode index keys, registry-entry codec;
+  `DecodeCoveringTuple` stays as a root wrapper; `schemaHash`
+  stays in root — its `IndexDecl` parameter makes it
+  surface-coupled, a deviation from the audit's list); no API
+  change (the full `internal/index` is an anti-extraction; no
+  other split/merge warranted).
 - [ ] 8. Shared writer-pager test fixture consumable across packages;
   kill the `internal/btree` duplicate; resolves
   `pager-test-helper-export`; plan close-out.
