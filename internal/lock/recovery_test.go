@@ -32,7 +32,7 @@ func staleWriterFile(t *testing.T, pid, startTime, pidNS, heartbeat uint64) *Fil
 
 func TestIsStaleWriterNoWriter(t *testing.T) {
 	f := staleWriterFile(t, 0, 0, 0, 0)
-	if IsStaleWriter(f, 100, 0, uint64(DefaultStaleTimeout.Nanoseconds())) {
+	if IsStaleWriter(f, 100, 0, uint64(DefaultStaleTimeout.Nanoseconds()), uint64(DefaultStaleTimeout.Nanoseconds())) {
 		t.Errorf("IsStaleWriter with WriterPID=0 = true; want false")
 	}
 }
@@ -41,7 +41,7 @@ func TestIsStaleWriterSameNSDead(t *testing.T) {
 	// Impossibly-high PID — kill(0x7FFFFFFF, 0) returns ESRCH on
 	// every realistic Linux kernel.
 	f := staleWriterFile(t, 0x7FFFFFFF, 12345, 42 /*ns*/, 100)
-	if !IsStaleWriter(f, 42, 9999, uint64(DefaultStaleTimeout.Nanoseconds())) {
+	if !IsStaleWriter(f, 42, 9999, uint64(DefaultStaleTimeout.Nanoseconds()), uint64(DefaultStaleTimeout.Nanoseconds())) {
 		t.Errorf("IsStaleWriter for dead same-NS writer = false; want true")
 	}
 }
@@ -57,7 +57,7 @@ func TestIsStaleWriterSameNSAliveSameStart(t *testing.T) {
 		t.Skip("PIDNamespace returned 0; same-NS path unexercisable in this environment")
 	}
 	f := staleWriterFile(t, uint64(os.Getpid()), ownStart, ownNS, 100)
-	if IsStaleWriter(f, ownNS, 9999, uint64(DefaultStaleTimeout.Nanoseconds())) {
+	if IsStaleWriter(f, ownNS, 9999, uint64(DefaultStaleTimeout.Nanoseconds()), uint64(DefaultStaleTimeout.Nanoseconds())) {
 		t.Errorf("IsStaleWriter for live same-NS writer = true; want false")
 	}
 }
@@ -75,7 +75,7 @@ func TestIsStaleWriterSameNSAliveDifferentStart(t *testing.T) {
 	// Seed start = ownStart ± 1 so it provably differs.
 	fakeStart := ownStart + 1
 	f := staleWriterFile(t, uint64(os.Getpid()), fakeStart, ownNS, 100)
-	if !IsStaleWriter(f, ownNS, 9999, uint64(DefaultStaleTimeout.Nanoseconds())) {
+	if !IsStaleWriter(f, ownNS, 9999, uint64(DefaultStaleTimeout.Nanoseconds()), uint64(DefaultStaleTimeout.Nanoseconds())) {
 		t.Errorf("IsStaleWriter for live but PID-recycled writer = false; want true")
 	}
 }
@@ -86,7 +86,7 @@ func TestIsStaleWriterCrossNSFreshHeartbeat(t *testing.T) {
 	now := uint64(100_000_000_000)    // 100 s monotonic
 	hb := now - uint64(1_000_000_000) // 1 s ago — fresh vs 10 s timeout
 	f := staleWriterFile(t, 12345, 999, 1, hb)
-	if IsStaleWriter(f, 2, now, uint64(DefaultStaleTimeout.Nanoseconds())) {
+	if IsStaleWriter(f, 2, now, uint64(DefaultStaleTimeout.Nanoseconds()), uint64(DefaultStaleTimeout.Nanoseconds())) {
 		t.Errorf("IsStaleWriter for cross-NS fresh heartbeat = true; want false")
 	}
 }
@@ -96,7 +96,7 @@ func TestIsStaleWriterCrossNSStaleHeartbeat(t *testing.T) {
 	now := uint64(100_000_000_000)
 	hb := now - uint64(20_000_000_000) // 20 s ago > 10 s timeout
 	f := staleWriterFile(t, 12345, 999, 1, hb)
-	if !IsStaleWriter(f, 2, now, uint64(DefaultStaleTimeout.Nanoseconds())) {
+	if !IsStaleWriter(f, 2, now, uint64(DefaultStaleTimeout.Nanoseconds()), uint64(DefaultStaleTimeout.Nanoseconds())) {
 		t.Errorf("IsStaleWriter for cross-NS stale heartbeat = false; want true")
 	}
 }
@@ -110,13 +110,13 @@ func TestIsStaleWriterEitherNSZero(t *testing.T) {
 
 	t.Run("wNS=0 fresh hb", func(t *testing.T) {
 		f := staleWriterFile(t, 1, 1, 0 /*wNS*/, now-1_000_000_000)
-		if IsStaleWriter(f, 1 /*ours*/, now, timeout) {
+		if IsStaleWriter(f, 1 /*ours*/, now, timeout, timeout) {
 			t.Errorf("classified stale; want alive (heartbeat fresh)")
 		}
 	})
 	t.Run("ours=0 stale hb", func(t *testing.T) {
 		f := staleWriterFile(t, 1, 1, 1 /*wNS*/, now-15_000_000_000)
-		if !IsStaleWriter(f, 0 /*ours*/, now, timeout) {
+		if !IsStaleWriter(f, 0 /*ours*/, now, timeout, timeout) {
 			t.Errorf("classified alive; want stale (heartbeat aged out)")
 		}
 	})
@@ -128,7 +128,7 @@ func TestIsStaleWriterFutureHeartbeatTreatedFresh(t *testing.T) {
 	// surface from clock skew if shared storage were ever
 	// supported). Treat as fresh — conservative-safer.
 	f := staleWriterFile(t, 1, 1, 0, 9_000_000_000)
-	if IsStaleWriter(f, 0, 5_000_000_000, uint64(DefaultStaleTimeout.Nanoseconds())) {
+	if IsStaleWriter(f, 0, 5_000_000_000, uint64(DefaultStaleTimeout.Nanoseconds()), uint64(DefaultStaleTimeout.Nanoseconds())) {
 		t.Errorf("future heartbeat classified stale; want fresh (conservative)")
 	}
 }
@@ -557,6 +557,7 @@ func TestPrevLastWriterLiveClassification(t *testing.T) {
 	mkCoord := func(prevPID, prevStart, prevNS, prevHB uint64) *Coord {
 		c := &Coord{pidNS: ourNS, clock: func() uint64 { return now }}
 		c.staleTimeout = time.Duration(timeout)
+		c.crossNSTimeout = time.Duration(timeout)
 		c.prevLastWriter.pid = prevPID
 		c.prevLastWriter.startTime = prevStart
 		c.prevLastWriter.pidNS = prevNS
@@ -620,11 +621,68 @@ func TestPrevLastWriterLiveFutureHeartbeatIsLive(t *testing.T) {
 	now := uint64(1_000_000_000_000)
 	c := &Coord{pidNS: ourNS, clock: func() uint64 { return now }}
 	c.staleTimeout = time.Duration(10_000_000_000)
+	c.crossNSTimeout = time.Duration(10_000_000_000)
 	c.prevLastWriter.pid = 42
 	c.prevLastWriter.startTime = 1
 	c.prevLastWriter.pidNS = ourNS + 1   // cross-namespace: heartbeat path
 	c.prevLastWriter.heartbeat = now + 1 // stamped fractionally ahead
 	if !c.PrevLastWriterLive() {
 		t.Fatal("future heartbeat stamp classified dead (unsigned underflow)")
+	}
+}
+
+// TestCrossNamespaceWindowSplit pins the two-window classification
+// (cross-process.md §Stale-reader detection, cross-namespace window):
+// a cross-namespace identity whose heartbeat has aged past
+// StaleTimeout but not CrossNamespaceStaleTimeout is LIVE (a frozen
+// container's reads survive the same-host jitter window); past the
+// cross-NS window it is dead. Same-namespace identities are governed
+// by kill(0) + start time and never consult the cross-NS window.
+func TestCrossNamespaceWindowSplit(t *testing.T) {
+	ourNS, _ := PIDNamespace()
+	now := uint64(1_000_000_000_000)
+	short := uint64(10_000_000_000) // 10s
+	long := uint64(60_000_000_000)  // 60s
+
+	mk := func(hbAge uint64) *Coord {
+		c := &Coord{pidNS: ourNS, clock: func() uint64 { return now }}
+		c.staleTimeout = time.Duration(short)
+		c.crossNSTimeout = time.Duration(long)
+		c.prevLastWriter.pid = 42
+		c.prevLastWriter.startTime = 1
+		c.prevLastWriter.pidNS = ourNS + 1 // cross-namespace
+		c.prevLastWriter.heartbeat = now - hbAge
+		return c
+	}
+	if !mk(short * 3).PrevLastWriterLive() {
+		t.Error("cross-NS identity aged past StaleTimeout but inside the cross-NS window classified dead (frozen container evicted early)")
+	}
+	if mk(long * 2).PrevLastWriterLive() {
+		t.Error("cross-NS identity aged past the cross-NS window classified live")
+	}
+}
+
+// TestCrossNamespaceWindowGovernsReaderSlots pins the reader-scan
+// side of the split window: a cross-NS slot older than StaleTimeout
+// but inside the cross-NS window is retained (its TxnID counts toward
+// the bound); past it, evicted.
+func TestCrossNamespaceWindowGovernsReaderSlots(t *testing.T) {
+	now := uint64(1_000_000_000_000)
+	short := uint64(10_000_000_000)
+	long := uint64(60_000_000_000)
+
+	read := func(hbAge uint64) uint64 {
+		f := openTestFile(t, 1)
+		s := f.Slot(0)
+		Store64(&s.TxnID, 42)
+		Store64(&s.PID, 9999)
+		Store64(&s.Heartbeat, now-hbAge)
+		return f.OldestReaderTxnID(99, now, short, long)
+	}
+	if got := read(short * 3); got != 42 {
+		t.Errorf("slot inside the cross-NS window: got %d, want 42 (retained)", got)
+	}
+	if got := read(long * 2); got == 42 {
+		t.Error("slot past the cross-NS window retained")
 	}
 }

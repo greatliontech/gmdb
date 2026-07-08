@@ -339,9 +339,10 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 			// by applyDefaults, and validated — StaleTimeout > Heartbeat-
 			// Interval). See cross-process.md §Heartbeat Goroutine / §Write
 			// Lock and the Options godoc.
-			RetryInterval:     opts.LockRetryInterval,
-			HeartbeatInterval: opts.HeartbeatInterval,
-			StaleTimeout:      opts.StaleTimeout,
+			RetryInterval:              opts.LockRetryInterval,
+			HeartbeatInterval:          opts.HeartbeatInterval,
+			StaleTimeout:               opts.StaleTimeout,
+			CrossNamespaceStaleTimeout: opts.CrossNamespaceStaleTimeout,
 			// A read-only handle never takes LOCK_EX: the flock-grant
 			// goroutine is skipped, but the heartbeat goroutine and the
 			// reader-slot path still run so read transactions pin their

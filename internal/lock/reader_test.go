@@ -182,7 +182,7 @@ func TestClearStaleReaderSlotOrdering(t *testing.T) {
 
 func TestOldestReaderTxnIDEmpty(t *testing.T) {
 	f := openTestFile(t, 4)
-	got := f.OldestReaderTxnID(99, 0, uint64(DefaultStaleTimeout))
+	got := f.OldestReaderTxnID(99, 0, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
 	if got != math.MaxUint64 {
 		t.Errorf("empty table OldestReaderTxnID = %d, want MaxUint64", got)
 	}
@@ -205,7 +205,7 @@ func TestOldestReaderTxnIDMinOfMany(t *testing.T) {
 		}
 		_ = idx
 	}
-	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout))
+	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
 	if got != 10 {
 		t.Errorf("OldestReaderTxnID = %d, want 10", got)
 	}
@@ -236,7 +236,7 @@ func TestOldestReaderTxnIDClearsStaleHeartbeat(t *testing.T) {
 	// such PID) — and on the cross-namespace path that triggers
 	// the heartbeat fallback. Since slot 1 has a fresh heartbeat,
 	// it stays.
-	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout))
+	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
 	if got != 11 {
 		t.Errorf("after stale clear, OldestReaderTxnID = %d, want 11", got)
 	}
@@ -256,7 +256,7 @@ func TestOldestReaderTxnIDCase0aFreshHBSkipsClear(t *testing.T) {
 	stale := uint64(time.Second)
 	Store64(&slot.TxnID, 42)
 	Store64(&slot.Heartbeat, now-stale/2) // fresh
-	got := f.OldestReaderTxnID(99, now, stale)
+	got := f.OldestReaderTxnID(99, now, stale, stale)
 	if got != 42 {
 		t.Errorf("case 0a: got %d, want 42 (live mid-publish)", got)
 	}
@@ -282,7 +282,7 @@ func TestOldestReaderTxnIDCase0bStaleHBClears(t *testing.T) {
 	now := 10 * stale
 	Store64(&slot.TxnID, 42)
 	Store64(&slot.Heartbeat, now-2*stale) // aged out: now-hb = 2*stale > stale
-	got := f.OldestReaderTxnID(99, now, stale)
+	got := f.OldestReaderTxnID(99, now, stale, stale)
 	if got != math.MaxUint64 {
 		t.Errorf("case 0b: got %d, want MaxUint64 (slot cleared)", got)
 	}
@@ -306,7 +306,7 @@ func TestOldestReaderTxnIDCase0aFutureHBSkipsClear(t *testing.T) {
 	stale := uint64(time.Second)
 	Store64(&slot.TxnID, 42)
 	Store64(&slot.Heartbeat, now+stale) // FUTURE — reader's clock read raced ahead of the scan
-	got := f.OldestReaderTxnID(99, now, stale)
+	got := f.OldestReaderTxnID(99, now, stale, stale)
 	if got != 42 {
 		t.Errorf("case 0a future HB: got %d, want 42 (live mid-publish, not evicted)", got)
 	}
@@ -326,7 +326,7 @@ func TestOldestReaderTxnIDCase0cFutureEpochSkipsClear(t *testing.T) {
 	stale := uint64(time.Second)
 	Store64(&slot.TxnID, 9)
 	Store64(&slot.HintEpoch, now+stale) // FUTURE epoch
-	got := f.OldestReaderTxnID(99, now, stale)
+	got := f.OldestReaderTxnID(99, now, stale, stale)
 	if got != 9 {
 		t.Errorf("case 0c future epoch: got %d, want 9 (orphan timer not elapsed)", got)
 	}
@@ -348,7 +348,7 @@ func TestOldestReaderTxnIDCase2FutureHBSkipsClear(t *testing.T) {
 	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, future); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout))
+	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
 	if got != 7 {
 		t.Errorf("case 2 future HB: got %d, want 7 (live, not evicted)", got)
 	}
@@ -369,7 +369,7 @@ func TestOldestReaderTxnIDHintEpochAnchor(t *testing.T) {
 	// First scan: anchors HintEpoch.
 	t0 := uint64(1_000_000_000)
 	staleNs := uint64(time.Second)
-	got := f.OldestReaderTxnID(99, t0, staleNs)
+	got := f.OldestReaderTxnID(99, t0, staleNs, staleNs)
 	// Skip — slot remains observably non-free, treated as live for
 	// reclamation safety (TxnID=9 enters min).
 	if got != 9 {
@@ -382,7 +382,7 @@ func TestOldestReaderTxnIDHintEpochAnchor(t *testing.T) {
 		t.Errorf("first scan must NOT clear slot; TxnID = %d", Load64(&slot.TxnID))
 	}
 	// Second scan within timeout: still skip.
-	got = f.OldestReaderTxnID(99, t0+staleNs/2, staleNs)
+	got = f.OldestReaderTxnID(99, t0+staleNs/2, staleNs, staleNs)
 	if got != 9 {
 		t.Errorf("second scan (in-window): got %d, want 9", got)
 	}
@@ -390,7 +390,7 @@ func TestOldestReaderTxnIDHintEpochAnchor(t *testing.T) {
 		t.Errorf("in-window scan cleared slot")
 	}
 	// Third scan past timeout: clear.
-	got = f.OldestReaderTxnID(99, t0+2*staleNs, staleNs)
+	got = f.OldestReaderTxnID(99, t0+2*staleNs, staleNs, staleNs)
 	if Load64(&slot.TxnID) != 0 {
 		t.Errorf("post-timeout scan must clear; TxnID = %d", Load64(&slot.TxnID))
 	}
@@ -422,7 +422,7 @@ func TestOldestReaderTxnIDSameNamespaceLiveSkipsClear(t *testing.T) {
 	if _, err := f.AcquireReaderSlot(0, 77, myPID, myPST, myNS, now); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout))
+	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
 	if got != 77 {
 		t.Errorf("same-NS live slot dropped: got %d, want 77", got)
 	}
@@ -450,7 +450,7 @@ func TestOldestReaderTxnIDSameNamespacePSTMismatchClears(t *testing.T) {
 	if _, err := f.AcquireReaderSlot(0, 33, myPID, myPST+1, myNS, now); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout))
+	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
 	if Load64(&f.Slot(0).TxnID) != 0 {
 		t.Errorf("PST-mismatch slot not cleared")
 	}
@@ -495,7 +495,7 @@ func TestOldestReaderTxnIDSameNamespaceDeadPIDClears(t *testing.T) {
 	if _, err := f.AcquireReaderSlot(0, 55, pid, pst, myNS, now); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout))
+	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
 	if Load64(&f.Slot(0).TxnID) != 0 {
 		t.Errorf("dead-PID slot not cleared")
 	}
@@ -678,10 +678,12 @@ func TestCoordOldestReaderTxnIDLiveWithFlock(t *testing.T) {
 }
 
 func TestCoordStaleTimeoutThreadsToOldestReaderTxnID(t *testing.T) {
-	// The configured CoordOptions.StaleTimeout — not the hard-coded
-	// DefaultStaleTimeout — governs reader-slot stale eviction in
-	// OldestReaderTxnID (the stale-detection window is caller-tunable
-	// via Options.StaleTimeout). Manufacture one cross-namespace reader slot
+	// The configured CoordOptions windows — not hard-coded defaults —
+	// govern reader-slot stale eviction in OldestReaderTxnID. A
+	// CROSS-namespace slot is governed by CrossNamespaceStaleTimeout
+	// (cross-process.md §Stale-reader detection, cross-namespace
+	// window); both are set to the straddling value so the test pins
+	// the threading. Manufacture one cross-namespace reader slot
 	// whose heartbeat lags the scan clock by `age`, then read it back
 	// under two coords whose StaleTimeouts straddle `age`: the short
 	// window evicts the slot (no live reader ⇒ MaxUint64 sentinel); the
@@ -700,11 +702,12 @@ func TestCoordStaleTimeoutThreadsToOldestReaderTxnID(t *testing.T) {
 		Store64(&s.PID, 9999)
 		Store64(&s.Heartbeat, aged)
 		c := NewCoord(f, CoordOptions{
-			PID:           1,
-			PIDNamespace:  0,
-			RetryInterval: 10 * time.Millisecond,
-			StaleTimeout:  stale,
-			Clock:         func() uint64 { return now },
+			PID:                        1,
+			PIDNamespace:               0,
+			RetryInterval:              10 * time.Millisecond,
+			StaleTimeout:               stale,
+			CrossNamespaceStaleTimeout: stale,
+			Clock:                      func() uint64 { return now },
 		})
 		t.Cleanup(func() { _ = c.Close() })
 		// OldestReaderTxnID's documented precondition: caller holds
@@ -844,7 +847,7 @@ func TestClearedSlotDoesNotEvictMidPublishAcquirer(t *testing.T) {
 		// A concurrent writer scan must treat the slot as a live
 		// mid-publish acquirer: TxnID stays, enters the min, and the
 		// orphan epoch gets anchored — never an immediate clear.
-		got := f.OldestReaderTxnID(ourNS, now, staleTimeout)
+		got := f.OldestReaderTxnID(ourNS, now, staleTimeout, staleTimeout)
 		if got != 77 {
 			t.Errorf("OldestReaderTxnID = %d, want 77 (mid-publish acquirer must pin the bound)", got)
 		}
@@ -941,7 +944,7 @@ func TestOldestReaderTxnIDReleaseInFlightNotCleared(t *testing.T) {
 	// Manufacture the mid-release observation: Heartbeat zeroed, PID
 	// still visible to the scan's load ordering.
 	Store64(&f.Slot(0).Heartbeat, 0)
-	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout))
+	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
 	if got != 7 {
 		t.Errorf("release-in-flight slot: got %d, want 7 (live)", got)
 	}

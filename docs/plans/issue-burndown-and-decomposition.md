@@ -16,7 +16,7 @@ cross-namespace window; index move = clean codec extraction only.
   `free-space.md` + `background-maintenance.md`.
 - [x] 3. RPL segment relocation — implementation + tests; resolves
   `rpl-segment-relocation`.
-- [ ] 4. Cross-namespace reader liveness window: longer cross-NS
+- [x] 4. Cross-namespace reader liveness window: longer cross-NS
   classification timeout (tunable, same-NS kill(0) unchanged) —
   spec amendment + `identityLive` + Options surface + tests;
   resolves `cross-namespace-reader-heartbeat-liveness`.

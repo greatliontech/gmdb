@@ -97,13 +97,15 @@ func TestCoordReapStaleReaderSlotsClearsStaleKeepsLive(t *testing.T) {
 		_ = f.Close()
 	})
 
-	stale := c.staleTimeoutNanos()
 	// Slot 0: stale — cross-NS (NS=0 ⇒ heartbeat path), heartbeat aged
-	// past StaleTimeout. Raw stores: a deliberate manufactured pre-state.
+	// past the CROSS-NAMESPACE window (the operative one for a
+	// namespace-unknown slot per cross-process.md §Stale-reader
+	// detection). Raw stores: a deliberate manufactured pre-state.
+	crossNS := c.crossNSTimeoutNanos()
 	s0 := f.Slot(0)
 	Store64(&s0.TxnID, 7)
 	Store64(&s0.PID, 9999)
-	Store64(&s0.Heartbeat, now-2*stale)
+	Store64(&s0.Heartbeat, now-2*crossNS)
 	// Slot 1: live — cross-NS, fresh heartbeat.
 	s1 := f.Slot(1)
 	Store64(&s1.TxnID, 11)

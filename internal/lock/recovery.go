@@ -35,7 +35,14 @@ const DefaultStaleTimeout = 10 * time.Second
 // as cross-process.md (CLOCK_BOOTTIME on Linux, CLOCK_MONOTONIC
 // elsewhere — see clock_linux.go / clock_other.go). The flock
 // goroutine uses Coord.clock() for both.
-func IsStaleWriter(f *File, ourPIDNamespace uint64, nowNanos uint64, staleTimeoutNanos uint64) bool {
+// NOTE: production stale-writer recovery does NOT consult this
+// classifier — the flock goroutine's acquisition path recovers any
+// nonzero writer header unconditionally under LOCK_EX (the
+// clear-before-unlock invariant makes it definitionally stale).
+// IsStaleWriter serves tests and diagnostics; the cross-namespace
+// window here follows the shared classification for consistency, not
+// because it gates recovery.
+func IsStaleWriter(f *File, ourPIDNamespace uint64, nowNanos, staleTimeoutNanos, crossNSTimeoutNanos uint64) bool {
 	pid := f.WriterPID()
 	if pid == 0 {
 		// No writer recorded — nothing to recover (NOT "stale").
@@ -48,7 +55,7 @@ func IsStaleWriter(f *File, ourPIDNamespace uint64, nowNanos uint64, staleTimeou
 	// start-time fallback is conservative-safer: false-live means no
 	// recovery, just blocking on flock until a live writer releases.
 	return !identityLive(pid, f.WriterStartTime(), f.WriterPIDNamespace(),
-		f.WriterHeartbeat(), ourPIDNamespace, nowNanos, staleTimeoutNanos, false)
+		f.WriterHeartbeat(), ourPIDNamespace, nowNanos, staleTimeoutNanos, crossNSTimeoutNanos, false)
 }
 
 // identityLive reports whether a persisted process identity —
@@ -67,6 +74,14 @@ func IsStaleWriter(f *File, ourPIDNamespace uint64, nowNanos uint64, staleTimeou
 // recover", the reader scan's mid-acquire protocol) gate before
 // calling.
 //
+// timeoutNanos governs the same-namespace heartbeat FALLBACK (start
+// time unreadable on a kill(0)-alive process); crossNSTimeoutNanos —
+// validated >= timeoutNanos at the Options boundary — governs every
+// cross-namespace (or namespace-unknown) classification, where the
+// heartbeat is the ONLY signal and a paused/frozen container stops
+// heartbeating while its reads stay live (cross-process.md
+// §Stale-reader detection, cross-namespace window).
+//
 // zeroHeartbeatFresh selects the heartbeat==0 semantics, a real
 // protocol distinction between the consumers: the reader scan passes
 // TRUE — a slot observed with pid != 0 but heartbeat == 0 is a
@@ -78,15 +93,15 @@ func IsStaleWriter(f *File, ourPIDNamespace uint64, nowNanos uint64, staleTimeou
 // immediately stale — a torn cross-namespace header, or a crashed
 // peer, must never block recovery (both consumers evaluate under
 // LOCK_EX, so a live mid-publish writer is unobservable there).
-func identityLive(pid, startTime, pidNS, heartbeat, ourNS, nowNanos, timeoutNanos uint64, zeroHeartbeatFresh bool) bool {
+func identityLive(pid, startTime, pidNS, heartbeat, ourNS, nowNanos, timeoutNanos, crossNSTimeoutNanos uint64, zeroHeartbeatFresh bool) bool {
 	if pid == 0 {
 		return false
 	}
-	hbLive := func() bool {
+	hbLive := func(window uint64) bool {
 		if heartbeat == 0 {
 			return zeroHeartbeatFresh
 		}
-		return !heartbeatStale(nowNanos, heartbeat, timeoutNanos)
+		return !heartbeatStale(nowNanos, heartbeat, window)
 	}
 	sameNS := pidNS != 0 && ourNS != 0 && pidNS == ourNS
 	if sameNS {
@@ -96,12 +111,12 @@ func identityLive(pid, startTime, pidNS, heartbeat, ourNS, nowNanos, timeoutNano
 		actual, err := ProcessStartTime(int(pid))
 		if err != nil {
 			// Alive but unreadable start time (exit race / platform
-			// gap): heartbeat fallback.
-			return hbLive()
+			// gap): heartbeat fallback — same-NS, short window.
+			return hbLive(timeoutNanos)
 		}
 		return actual == startTime
 	}
-	return hbLive()
+	return hbLive(crossNSTimeoutNanos)
 }
 
 // heartbeatStale reports whether a monotonic-clock stamp — a reader/writer

@@ -62,6 +62,5 @@ findings each shared-fix row covers.
 | Slug | Lands | Summary |
 |------|-------|---------|
 | [anchor-rewrite-fsync-pin](anchor-rewrite-fsync-pin.md) | condition: an Open-path fsync fault-injection seam lands | **[test-pin]** The gated Open self-durable arm's anchor rewrite (durability.md §Anchoring, consumed-error trap) is spec+comment-encoded but has no killing mutation test; pin it when a fault seam exists. |
-| [cross-namespace-reader-heartbeat-liveness](cross-namespace-reader-heartbeat-liveness.md) | condition (when cross-process stale-detection is revisited) | **[L]** Cross-namespace (container) readers have no `kill()` fallback — a >10s heartbeat pause (docker pause, cgroup freeze, swap) evicts a live reader → reads reclaimed-and-reused pages. Document the data-integrity bound + reconsider the default. *Finding 21.* |
 | [dbcleanup-teardown-drain](dbcleanup-teardown-drain.md) | condition (AddCleanup execution model revisit) | **[L]** dbCleanupFn tears down coord/lockFile without the txInflight drain Close performs — safe only while the runtime runs cleanups sequentially. Audit-burndown (2026-07) chunk-11 review finding. |
 

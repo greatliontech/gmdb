@@ -251,7 +251,7 @@ const NoReaderTxnID = ^uint64(0)
 //  2. PID != 0 AND PIDNamespace != ourPIDNS (or either zero):
 //     now - Heartbeat > staleTimeout: stale, clear. Else live,
 //     include in min.
-func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutNanos uint64) uint64 {
+func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutNanos, crossNSTimeoutNanos uint64) uint64 {
 	if f.slots == nil {
 		panic("lock: OldestReaderTxnID on closed *File")
 	}
@@ -319,7 +319,7 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 		// release in flight; clearing it could stomp a third
 		// reader's fresh CAS).
 		if !identityLive(pid, Load64(&slot.ProcessStartTime), Load64(&slot.PIDNamespace),
-			hb, ourPIDNS, nowNanos, staleTimeoutNanos, true) {
+			hb, ourPIDNS, nowNanos, staleTimeoutNanos, crossNSTimeoutNanos, true) {
 			f.ClearStaleReaderSlot(uint32(i))
 			continue
 		}

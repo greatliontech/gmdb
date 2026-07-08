@@ -290,12 +290,15 @@ func TestMaintenanceReapsStaleReaderSlot(t *testing.T) {
 	defer db.Close()
 
 	now := db.coord.Clock()
-	staleNanos := uint64(lock.DefaultStaleTimeout)
+	// A cross-namespace (NS=0 ⇒ heartbeat-path) slot is governed by
+	// the CROSS-NAMESPACE window — 6 × StaleTimeout at defaults
+	// (cross-process.md §Stale-reader detection).
+	staleNanos := uint64(6 * lock.DefaultStaleTimeout)
 	if now <= 2*staleNanos {
-		t.Skip("machine uptime < 2×StaleTimeout; cannot forge an aged heartbeat deterministically")
+		t.Skip("machine uptime < 2×CrossNamespaceStaleTimeout; cannot forge an aged heartbeat deterministically")
 	}
 	// Forge slot 0 stale: cross-namespace (NS=0 ⇒ heartbeat path),
-	// heartbeat aged well past StaleTimeout. Slot 1 live: cross-NS, fresh
+	// heartbeat aged well past the cross-NS window. Slot 1 live: cross-NS, fresh
 	// heartbeat. Raw stores — a deliberate manufactured pre-state. (The
 	// detection read-tx in Task 1 acquires a *different* free slot since
 	// these carry non-zero TxnIDs, so it does not disturb them.)

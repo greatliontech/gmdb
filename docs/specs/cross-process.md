@@ -891,6 +891,33 @@ against the previous (now-exited) owner's PID.
 
 ### Stale-reader detection
 
+**Cross-namespace liveness uses a longer window.** Same-namespace
+classification rests on `kill(0)` + process-start-time — immune to
+scheduling. Cross-namespace (container) identities have ONLY the
+heartbeat, and a paused or frozen container (`docker pause`, cgroup
+freeze, heavy swap) stops heartbeating while its process — and its
+snapshot reads — stay live; evicting it on the same window tuned for
+same-host jitter reclaims pages under a reader that resumes. Every
+cross-namespace (or namespace-unknown) heartbeat classification —
+the reader-table scan, stale-writer recovery, and the recovery-commit
+gate's last-writer record — therefore uses
+`CrossNamespaceStaleTimeout` (default 6 × `StaleTimeout`, i.e. 60 s
+at defaults; independently tunable, validated `>= StaleTimeout`).
+The trade is explicit: a genuinely dead container pins RPL
+reclamation, and a dead container AUTHOR delays the recovery-commit
+gate, for the longer window instead of the shorter one.
+(Stale-WRITER recovery is unaffected: it is flock-gated and
+window-free — the kernel releases a dead holder's flock, a frozen
+holder still holds it and blocks acquisition at the flock itself,
+and any nonzero writer header observed under LOCK_EX is by the
+clear-before-unlock invariant definitionally stale.) The
+mid-acquire orphan timer (`HintEpoch`, case 0c) is NOT
+identity-based liveness and keeps `StaleTimeout` — it ages an
+anonymous stuck CAS, not a heartbeating peer. Per-process tuning
+cannot bound a PEER's freeze duration; the longer window is a
+documented bound, not a guarantee — the residual gap is inherent to
+heartbeat-based liveness.
+
 During the writer's reader-table scan (to find min active TxnID),
 if a slot has non-zero `TxnID`, classify it by inspecting `PID`
 and `Heartbeat`:

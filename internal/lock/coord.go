@@ -80,6 +80,7 @@ type Coord struct {
 
 	heartbeatInterval time.Duration
 	staleTimeout      time.Duration
+	crossNSTimeout    time.Duration
 	clock             func() uint64
 	heartbeatDoneCh   chan struct{}
 
@@ -240,6 +241,15 @@ type CoordOptions struct {
 	// (gmdb.Options.validate) enforces StaleTimeout > HeartbeatInterval.
 	StaleTimeout time.Duration
 
+	// CrossNamespaceStaleTimeout governs every cross-namespace (or
+	// namespace-unknown) heartbeat classification — where the
+	// heartbeat is the ONLY liveness signal and a paused/frozen
+	// container stops heartbeating while its reads stay live
+	// (cross-process.md §Stale-reader detection, cross-namespace
+	// window). Zero ⇒ 6 × the effective StaleTimeout. The caller
+	// (gmdb.Options.validate) enforces >= StaleTimeout.
+	CrossNamespaceStaleTimeout time.Duration
+
 	// Clock returns the monotonic clock value in nanoseconds. Nil ⇒
 	// the per-platform default (CLOCK_BOOTTIME on Linux,
 	// CLOCK_MONOTONIC elsewhere). Tests inject deterministic clocks
@@ -271,6 +281,10 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 	if staleTimeout <= 0 {
 		staleTimeout = DefaultStaleTimeout
 	}
+	crossNSTimeout := opts.CrossNamespaceStaleTimeout
+	if crossNSTimeout <= 0 {
+		crossNSTimeout = 6 * staleTimeout
+	}
 	clock := opts.Clock
 	if clock == nil {
 		clock = nowMonotonic
@@ -286,6 +300,7 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 		retryInterval:     retry,
 		heartbeatInterval: hbInterval,
 		staleTimeout:      staleTimeout,
+		crossNSTimeout:    crossNSTimeout,
 		clock:             clock,
 		heartbeatDoneCh:   make(chan struct{}),
 		readOnly:          opts.ReadOnly,
@@ -771,5 +786,5 @@ func (c *Coord) WriterHeld() bool {
 func (c *Coord) PrevLastWriterLive() bool {
 	p := c.prevLastWriter
 	return identityLive(p.pid, p.startTime, p.pidNS, p.heartbeat,
-		c.pidNS, c.clock(), c.staleTimeoutNanos(), false)
+		c.pidNS, c.clock(), c.staleTimeoutNanos(), c.crossNSTimeoutNanos(), false)
 }

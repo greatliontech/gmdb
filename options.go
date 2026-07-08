@@ -261,6 +261,19 @@ type Options struct {
 	// with ErrInvalidOptions. Zero ⇒ default. Default: 10s.
 	StaleTimeout time.Duration
 
+	// CrossNamespaceStaleTimeout governs every CROSS-namespace (or
+	// namespace-unknown) liveness classification — container peers,
+	// where the heartbeat is the only signal and a paused or frozen
+	// container (docker pause, cgroup freeze, heavy swap) stops
+	// heartbeating while its reads stay live (cross-process.md
+	// §Stale-reader detection, cross-namespace window). Same-namespace
+	// peers are classified by kill(0) + process start time and are
+	// unaffected. Zero ⇒ 6 × the effective StaleTimeout (60 s at
+	// defaults). Must be >= StaleTimeout. The trade: a genuinely dead
+	// container pins RPL reclamation for this window instead of
+	// StaleTimeout.
+	CrossNamespaceStaleTimeout time.Duration
+
 	// HeartbeatInterval is how often the per-DB heartbeat goroutine
 	// refreshes WriterHeartbeat (while this process holds the write
 	// lock) and the Heartbeat field of every active reader slot
@@ -350,6 +363,7 @@ func (o Options) applyDefaults() Options {
 	// here lets validate() check the StaleTimeout > HeartbeatInterval
 	// relation against effective values rather than raw zeros.
 	o.StaleTimeout = cmp.Or(o.StaleTimeout, lock.DefaultStaleTimeout)
+	o.CrossNamespaceStaleTimeout = cmp.Or(o.CrossNamespaceStaleTimeout, 6*o.StaleTimeout)
 	o.HeartbeatInterval = cmp.Or(o.HeartbeatInterval, lock.DefaultHeartbeatInterval)
 	o.LockRetryInterval = cmp.Or(o.LockRetryInterval, lock.DefaultRetryInterval)
 	o.CompactDrainTimeout = cmp.Or(o.CompactDrainTimeout, defaultCompactDrainTimeout)
@@ -433,6 +447,13 @@ func (o Options) validate() error {
 	// at Open; the godoc recommends a window several times larger.
 	if o.StaleTimeout <= o.HeartbeatInterval {
 		return errStaleTimeoutTooSmall
+	}
+	// The cross-namespace window can never be TIGHTER than the general
+	// one — it exists to widen the heartbeat-only classification for
+	// freezable container peers (cross-process.md §Stale-reader
+	// detection, cross-namespace window).
+	if o.CrossNamespaceStaleTimeout < o.StaleTimeout {
+		return errCrossNSStaleTimeoutTooSmall
 	}
 	// Maintenance: validated after applyDefaults (a zero Interval /
 	// ScrubBatchSize / CompactionBatchSize / CompactionThreshold is already

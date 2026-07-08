@@ -17,6 +17,13 @@ func (c *Coord) staleTimeoutNanos() uint64 {
 	return uint64(c.staleTimeout / time.Nanosecond)
 }
 
+// crossNSTimeoutNanos is the cross-namespace classification window
+// (cross-process.md §Stale-reader detection, cross-namespace window)
+// in the uint64 nanoseconds the classification helpers expect.
+func (c *Coord) crossNSTimeoutNanos() uint64 {
+	return uint64(c.crossNSTimeout / time.Nanosecond)
+}
+
 // AcquireReader is the Coord-mediated reader-slot acquisition path.
 // Composes File.AcquireReaderSlot with the bookkeeping the heartbeat
 // goroutine needs (active-slot list registration) and the per-Coord
@@ -134,7 +141,7 @@ func (c *Coord) ReleaseReader(idx uint32) {
 // invariant is enforced by call-site discipline. Tests that exercise
 // stale-clearing acquire flock first.
 func (c *Coord) OldestReaderTxnID() uint64 {
-	return c.f.OldestReaderTxnID(c.pidNS, c.clock(), c.staleTimeoutNanos())
+	return c.f.OldestReaderTxnID(c.pidNS, c.clock(), c.staleTimeoutNanos(), c.crossNSTimeoutNanos())
 }
 
 // CountActiveReaders returns the number of occupied reader slots across
