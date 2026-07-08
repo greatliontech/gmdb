@@ -76,10 +76,10 @@ gate) and the final close-out are fixed anchors per chunk.
 
 ## Phase C — independent collapses
 
-- [ ] 11. btree: extract the shared merge/redistribute pair dispatch
+- [x] 11. btree: extract the shared merge/redistribute pair dispatch
   (3 copies: `internal/btree/delete.go:491–704,799–901`,
   `internal/btree/range_delete.go:659–892`).
-- [ ] 12. btree: descent-skeleton unification — shared per-level
+- [x] 12. btree: descent-skeleton unification — shared per-level
   branch-descend helper; collapse `walk.go`'s three walkers and
   `cursor.go`'s five `descend*` variants.
 - [ ] 13. btree: unify `PutEntry` (`entry_ops.go:110`) with

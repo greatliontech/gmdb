@@ -633,3 +633,73 @@ func reverse(pairs [][2]string) [][2]string {
 	}
 	return out
 }
+
+// TestCursorDescentRejectsCorruptLeaf pins the descent skeleton's leaf
+// validation: a structurally corrupt leaf surfaces ErrCorrupted via
+// Cursor.Err instead of iterating garbage bytes.
+func TestCursorDescentRejectsCorruptLeaf(t *testing.T) {
+	pw := newFakeWriter(t, 4096)
+	cfg := page.Config{PageSize: 4096}
+
+	// Root branch → child 5 claims to be a leaf but its cell directory
+	// is garbage.
+	leafBuf, err := pw.ZeroPage(5)
+	if err != nil {
+		t.Fatalf("ZeroPage(5): %v", err)
+	}
+	page.WriteHeader(leafBuf, page.TypeLeaf, 3, 0)
+	for i := page.HeaderSize; i < len(leafBuf); i++ {
+		leafBuf[i] = 0xFF
+	}
+	rootBuf, err := pw.ZeroPage(4)
+	if err != nil {
+		t.Fatalf("ZeroPage(4): %v", err)
+	}
+	if err := page.EncodeBranch(rootBuf, cfg, 5, nil); err != nil {
+		t.Fatalf("EncodeBranch: %v", err)
+	}
+
+	c := NewCursor(pw, cfg, 4, DefaultMergeThreshold)
+	if k, _ := c.First(); k != nil {
+		t.Fatalf("First on corrupt leaf returned key %q", k)
+	}
+	if err := c.Err(); !errors.Is(err, ErrCorrupted) {
+		t.Fatalf("Err = %v, want ErrCorrupted", err)
+	}
+}
+
+// TestCursorLastOnEmptyBranch pins the rightmost-descent policy on a
+// zero-cell branch (leftmost child only): the descent must follow the
+// leftmost pointer — the only child — not index cells[-1].
+func TestCursorLastOnEmptyBranch(t *testing.T) {
+	pw := newFakeWriter(t, 4096)
+	cfg := page.Config{PageSize: 4096}
+
+	leafBuf, err := pw.ZeroPage(5)
+	if err != nil {
+		t.Fatalf("ZeroPage(5): %v", err)
+	}
+	lb := page.NewLeafBuilder(leafBuf, cfg)
+	if !lb.AddEntry(page.LeafEntry{Key: []byte("a"), Value: []byte("1")}) ||
+		!lb.AddEntry(page.LeafEntry{Key: []byte("b"), Value: []byte("2")}) {
+		t.Fatal("AddEntry overflow")
+	}
+	lb.Finish()
+
+	rootBuf, err := pw.ZeroPage(4)
+	if err != nil {
+		t.Fatalf("ZeroPage(4): %v", err)
+	}
+	if err := page.EncodeBranch(rootBuf, cfg, 5, nil); err != nil {
+		t.Fatalf("EncodeBranch: %v", err)
+	}
+
+	c := NewCursor(pw, cfg, 4, DefaultMergeThreshold)
+	k, v := c.Last()
+	if err := c.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	if string(k) != "b" || string(v) != "2" {
+		t.Fatalf("Last = (%q,%q), want (b,2)", k, v)
+	}
+}

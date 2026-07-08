@@ -540,13 +540,26 @@ func (c *Cursor) adoptTargetKey(target []byte) {
 // (len 0 — no writes can go through it).
 var emptyPositionedKey = []byte{}
 
-// descendLeftmost walks from rootID down through leftmost child
-// pointers, populating c.path with branch frames (childIdx = 0
-// each) and a leaf frame. Initializes the leaf iter for forward
-// streaming. Returns ErrCorrupted on structural faults.
-func (c *Cursor) descendLeftmost(rootID uint64) error {
-	c.resetPath()
-	cur := rootID
+// branchPick chooses the child to follow at one branch level of a
+// cursor descent. It receives the validated branch buffer and returns
+// the frame's childIdx, the child page id, and a short label for the
+// null-child corruption message. The three policies — leftmost,
+// rightmost, key-search — are the only variation across the cursor's
+// descent paths; everything else (page read, type check, validation,
+// frame push, depth bound) is descendFrom's one skeleton.
+type branchPick func(buf []byte) (childIdx uint16, child uint64, label string)
+
+func pickLeftmost(buf []byte) (uint16, uint64, string) {
+	return 0, page.BranchLeftmostChild(buf), "leftmost"
+}
+
+// descendFrom appends path frames from cur down to a leaf, choosing
+// each branch's child via pick and finishing with onLeaf on the
+// validated leaf reader (which initializes c.iter per the caller's
+// positioning policy). Does NOT reset existing frames — the
+// leaf-transition callers extend a partial path; root-level descents
+// call resetPath first.
+func (c *Cursor) descendFrom(cur uint64, pick branchPick, onLeaf func(r page.LeafReader)) error {
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
 		buf, err := c.pr.Page(cur)
 		if err != nil {
@@ -559,7 +572,7 @@ func (c *Cursor) descendLeftmost(rootID uint64) error {
 				return fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
 			}
 			c.path = append(c.path, cursorFrame{pageID: cur})
-			c.iter = r.IterForReuse(c.keyBuf, c.bufKeys, c.bufEnts)
+			onLeaf(r)
 			return nil
 		}
 		if typ != page.TypeBranch {
@@ -568,14 +581,33 @@ func (c *Cursor) descendLeftmost(rootID uint64) error {
 		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
 			return err
 		}
-		child := page.BranchLeftmostChild(buf)
+		idx, child, label := pick(buf)
 		if child == 0 {
-			return fmt.Errorf("%w: null leftmost child in branch %d", ErrCorrupted, cur)
+			return fmt.Errorf("%w: null %s child in branch %d (index %d)", ErrCorrupted, label, cur, idx)
 		}
-		c.path = append(c.path, cursorFrame{pageID: cur, childIdx: 0})
+		c.path = append(c.path, cursorFrame{pageID: cur, childIdx: idx})
 		cur = child
 	}
 	return ErrTreeTooDeep
+}
+
+func pickRightmost(cfg page.Config) branchPick {
+	return func(buf []byte) (uint16, uint64, string) {
+		n := page.BranchCellCount(buf)
+		if n == 0 {
+			return n, page.BranchLeftmostChild(buf), "rightmost"
+		}
+		return n, page.BranchCellAt(buf, cfg, n-1).Child, "rightmost"
+	}
+}
+
+// descendLeftmost walks from rootID down through leftmost child
+// pointers, populating c.path with branch frames (childIdx = 0
+// each) and a leaf frame. Initializes the leaf iter for forward
+// streaming. Returns ErrCorrupted on structural faults.
+func (c *Cursor) descendLeftmost(rootID uint64) error {
+	c.resetPath()
+	return c.descendLeftmostFrom(rootID)
 }
 
 // descendRightmost walks rightmost-child pointers. The leaf iter
@@ -583,42 +615,7 @@ func (c *Cursor) descendLeftmost(rootID uint64) error {
 // last entry.
 func (c *Cursor) descendRightmost(rootID uint64) error {
 	c.resetPath()
-	cur := rootID
-	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf, err := c.pr.Page(cur)
-		if err != nil {
-			return err
-		}
-		typ, _, _, _ := page.ReadHeader(buf)
-		if page.IsLeafType(typ) {
-			r := page.NewLeafReader(buf, c.cfg)
-			if err := r.Validate(); err != nil {
-				return fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
-			}
-			c.path = append(c.path, cursorFrame{pageID: cur})
-			c.iter = r.IterAtForReuse(r.Count(), c.keyBuf, c.bufKeys, c.bufEnts)
-			return nil
-		}
-		if typ != page.TypeBranch {
-			return fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
-		}
-		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
-			return err
-		}
-		n := page.BranchCellCount(buf)
-		var child uint64
-		if n == 0 {
-			child = page.BranchLeftmostChild(buf)
-		} else {
-			child = page.BranchCellAt(buf, c.cfg, n-1).Child
-		}
-		if child == 0 {
-			return fmt.Errorf("%w: null rightmost child in branch %d", ErrCorrupted, cur)
-		}
-		c.path = append(c.path, cursorFrame{pageID: cur, childIdx: n})
-		cur = child
-	}
-	return ErrTreeTooDeep
+	return c.descendRightmostFrom(rootID)
 }
 
 // descendToKey walks rootID toward `target`, populating the path
@@ -630,37 +627,16 @@ func (c *Cursor) descendRightmost(rootID uint64) error {
 // §Leaf Lookup.
 func (c *Cursor) descendToKey(rootID uint64, target []byte) (idx int, entry page.LeafEntry, found bool, err error) {
 	c.resetPath()
-	cur := rootID
-	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf, err := c.pr.Page(cur)
-		if err != nil {
-			return 0, page.LeafEntry{}, false, err
-		}
-		typ, _, _, _ := page.ReadHeader(buf)
-		if page.IsLeafType(typ) {
-			r := page.NewLeafReader(buf, c.cfg)
-			if err := r.Validate(); err != nil {
-				return 0, page.LeafEntry{}, false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
-			}
-			c.path = append(c.path, cursorFrame{pageID: cur})
-			idx, entry, found, c.iter = r.SearchLeafIter(target, c.keyBuf, c.bufKeys, c.bufEnts)
-			return idx, entry, found, nil
-		}
-		if typ != page.TypeBranch {
-			return 0, page.LeafEntry{}, false, fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
-		}
-		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
-			return 0, page.LeafEntry{}, false, err
-		}
+	err = c.descendFrom(rootID, func(buf []byte) (uint16, uint64, string) {
 		i := page.BranchSearch(buf, c.cfg, target)
-		child := page.BranchChildAt(buf, c.cfg, i)
-		if child == 0 {
-			return 0, page.LeafEntry{}, false, fmt.Errorf("%w: null child in branch %d at descent %d", ErrCorrupted, cur, i)
-		}
-		c.path = append(c.path, cursorFrame{pageID: cur, childIdx: i})
-		cur = child
+		return i, page.BranchChildAt(buf, c.cfg, i), "searched"
+	}, func(r page.LeafReader) {
+		idx, entry, found, c.iter = r.SearchLeafIter(target, c.keyBuf, c.bufKeys, c.bufEnts)
+	})
+	if err != nil {
+		return 0, page.LeafEntry{}, false, err
 	}
-	return 0, page.LeafEntry{}, false, ErrTreeTooDeep
+	return idx, entry, found, nil
 }
 
 // firstInLeaf calls iter.Next() to position at the first entry of
@@ -799,73 +775,15 @@ func (c *Cursor) advanceToPrevLeaf() bool {
 // for forward streaming. Used by advanceToNextLeaf — does NOT
 // reset the existing path frames above the descent root.
 func (c *Cursor) descendLeftmostFrom(cur uint64) error {
-	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf, err := c.pr.Page(cur)
-		if err != nil {
-			return err
-		}
-		typ, _, _, _ := page.ReadHeader(buf)
-		if page.IsLeafType(typ) {
-			r := page.NewLeafReader(buf, c.cfg)
-			if err := r.Validate(); err != nil {
-				return fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
-			}
-			c.path = append(c.path, cursorFrame{pageID: cur})
-			c.iter = r.IterForReuse(c.keyBuf, c.bufKeys, c.bufEnts)
-			return nil
-		}
-		if typ != page.TypeBranch {
-			return fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
-		}
-		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
-			return err
-		}
-		child := page.BranchLeftmostChild(buf)
-		if child == 0 {
-			return fmt.Errorf("%w: null leftmost child in branch %d", ErrCorrupted, cur)
-		}
-		c.path = append(c.path, cursorFrame{pageID: cur, childIdx: 0})
-		cur = child
-	}
-	return ErrTreeTooDeep
+	return c.descendFrom(cur, pickLeftmost, func(r page.LeafReader) {
+		c.iter = r.IterForReuse(c.keyBuf, c.bufKeys, c.bufEnts)
+	})
 }
 
 // descendRightmostFrom is the symmetric helper for
 // advanceToPrevLeaf.
 func (c *Cursor) descendRightmostFrom(cur uint64) error {
-	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf, err := c.pr.Page(cur)
-		if err != nil {
-			return err
-		}
-		typ, _, _, _ := page.ReadHeader(buf)
-		if page.IsLeafType(typ) {
-			r := page.NewLeafReader(buf, c.cfg)
-			if err := r.Validate(); err != nil {
-				return fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
-			}
-			c.path = append(c.path, cursorFrame{pageID: cur})
-			c.iter = r.IterAtForReuse(r.Count(), c.keyBuf, c.bufKeys, c.bufEnts)
-			return nil
-		}
-		if typ != page.TypeBranch {
-			return fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
-		}
-		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
-			return err
-		}
-		n := page.BranchCellCount(buf)
-		var child uint64
-		if n == 0 {
-			child = page.BranchLeftmostChild(buf)
-		} else {
-			child = page.BranchCellAt(buf, c.cfg, n-1).Child
-		}
-		if child == 0 {
-			return fmt.Errorf("%w: null rightmost child in branch %d", ErrCorrupted, cur)
-		}
-		c.path = append(c.path, cursorFrame{pageID: cur, childIdx: n})
-		cur = child
-	}
-	return ErrTreeTooDeep
+	return c.descendFrom(cur, pickRightmost(c.cfg), func(r page.LeafReader) {
+		c.iter = r.IterAtForReuse(r.Count(), c.keyBuf, c.bufKeys, c.bufEnts)
+	})
 }
