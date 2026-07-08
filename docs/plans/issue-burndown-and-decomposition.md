@@ -14,7 +14,7 @@ cross-namespace window; index move = clean codec extraction only.
   `OlderSegment`, cascading toward the head), the evacuation
   trigger, and reclamation/recovery interplay; amend
   `free-space.md` + `background-maintenance.md`.
-- [ ] 3. RPL segment relocation — implementation + tests; resolves
+- [x] 3. RPL segment relocation — implementation + tests; resolves
   `rpl-segment-relocation`.
 - [ ] 4. Cross-namespace reader liveness window: longer cross-NS
   classification timeout (tunable, same-NS kill(0) unchanged) —

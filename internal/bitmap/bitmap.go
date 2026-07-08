@@ -226,6 +226,22 @@ func (b *Bitmap) FindFirst() (uint64, bool) {
 	return 0, false
 }
 
+// FindFirstBelowFrom returns the lowest free page id in
+// [max(from, firstDataPage), min(floor, totalPages)), or ok=false when
+// none exists. Read-only — the caller claims the page itself. Serves
+// the RPL chain-prefix relocation's probe-first contract
+// (free-space.md §RPL segment relocation): every copy's below-floor
+// home is established before any state changes, by advancing `from`
+// past each probed id.
+func (b *Bitmap) FindFirstBelowFrom(from, floor uint64) (uint64, bool) {
+	lo := max(from, b.firstDataPage)
+	hi := min(floor, b.totalPages)
+	if lo >= hi {
+		return 0, false
+	}
+	return b.scanForward(lo, hi)
+}
+
 // FindContiguous returns the starting page id of the lowest run of n
 // consecutive free pages at or after b.hint, wrapping once around. n must
 // be >= 1. Returns ok=false if no such run exists.

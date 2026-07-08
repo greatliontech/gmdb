@@ -50,7 +50,6 @@ entries are removed from their table and preserved in git history
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [rpl-segment-relocation](rpl-segment-relocation.md) | condition (when RPL pages are shown to block consolidation, or when RPL relocation folds into the commit pipeline) | Online compaction (v0 chunk 12.5b) relocates B+tree nodes + overflow chains but not RPL segment pages — they're managed by the commit pipeline (alloc/chain/reclaim) and rewriting them out-of-band races that machinery; they're transient (drain via reclamation, new ones self-place low). The v0 12.5b-3 orchestration treats them as immovable. User-approved deferral at v0 12.5b-2. |
 | [pager-test-helper-export](pager-test-helper-export.md) | when a second cross-package writer-pager fixture caller (beyond `internal/btree`'s `setupPagerWriter`) arrives | `setupWriter` is duplicated into `internal/btree/pager_integration_test.go` as `setupPagerWriter` for the chunk-5.2 PageWriter parity test. Acceptable for one caller; factor when the second caller arrives. |
 
 ## Open — completeness / correctness / algorithm audit (2026-05-30)

@@ -262,7 +262,16 @@ func (p *Pager) commitStep0() error {
 		}
 	}
 
-	// (c) Allocate RPL segment pages for the retired-pages list and
+	// (c) An armed RPL chain-prefix relocation runs BEFORE the append
+	// so the old prefix pages join this transaction's retirement list
+	// and ride its head segment (free-space.md §RPL segment
+	// relocation) — and before the retirement check below, since the
+	// relocation itself can be the only source of retirements.
+	if err := p.relocateRPLPrefix(); err != nil {
+		return err
+	}
+
+	// (c2) Allocate RPL segment pages for the retired-pages list and
 	// fill them with (TxnID, sorted PageIDs). Each segment goes into
 	// p.dirty via AllocSlab so step 1 pwrites it.
 	if len(p.retiredPages) > 0 {

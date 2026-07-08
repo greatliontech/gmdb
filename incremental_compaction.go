@@ -341,13 +341,35 @@ func (db *DB) compactionPass(ctx context.Context, budget int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if moved == 0 {
-		return 0, nil // nothing above the floor moved — defer rolls back
+	// RPL segment pages in the band cannot be relocated out-of-band —
+	// arm the in-pipeline chain-prefix relocation, which this commit
+	// executes or declines (free-space.md §RPL segment relocation).
+	// Arm only when a below-floor region EXISTS (floor > firstData):
+	// a density-sized band covering the whole data region has nowhere
+	// to relocate to, and the request would be a guaranteed decline
+	// plus a warn every pass.
+	rplInBand := 0
+	if floor > firstData {
+		rplInBand = tx.pgr.RPLSegmentsAtOrAbove(floor)
+	}
+	if rplInBand > 0 {
+		tx.pgr.RequestRPLRelocation(floor)
+	}
+	if moved == 0 && rplInBand == 0 {
+		return 0, nil // nothing above the floor to move — defer rolls back
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	committed = true
+	if rplInBand > 0 && tx.pgr.RPLRelocationDeclined() {
+		// Decline-and-report per the spec: no below-floor homes for
+		// every copy, or the prefix exceeded the commit budget. The
+		// region stays pinned this pass; a later pass re-requests
+		// against the then-current chain.
+		db.logger.Warn("gmdb: RPL chain-prefix relocation declined; evacuation region unsatisfiable this pass",
+			"floor", floor, "segmentsInBand", rplInBand)
+	}
 	return moved, nil
 }
 

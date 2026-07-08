@@ -653,3 +653,120 @@ func TestMaintCompactDisabledIsNoOp(t *testing.T) {
 		t.Errorf("maintCompact consumed the fragmentation stats despite DisableCompaction (guard not gating)")
 	}
 }
+
+// TestCompactionPassRelocatesRPLSegments pins the pass-level wiring
+// of the RPL chain-prefix relocation (free-space.md §RPL segment
+// relocation) in the scenario the mechanism exists for: a lagging
+// reader pins the reclamation bound, so in-band segments cannot drain
+// on their own and must be MOVED. The fixture builds a dense low
+// region with scattered holes (below-floor homes), holds a read
+// transaction, churns to stack RPL segments near the high-water mark,
+// then runs passes and asserts the pre-existing segments leave the
+// band while the reader is still live.
+func TestCompactionPassRelocatesRPLSegments(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 2048,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Dense fill, then scattered low deletes → holes below any
+	// sensible floor.
+	tx, _ := db.Begin(ctx)
+	ks, err := tx.CreateKeyspace("k")
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for i := range 600 {
+		if err := ks.Put(fmt.Appendf(nil, "key%06d", i), make([]byte, 256)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit fill: %v", err)
+	}
+	txd, _ := db.Begin(ctx)
+	ksd, _ := txd.OpenKeyspace("k")
+	for i := 0; i < 200; i += 2 {
+		if err := ksd.Delete(fmt.Appendf(nil, "key%06d", i)); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	}
+	if err := txd.Commit(); err != nil {
+		t.Fatalf("commit holes: %v", err)
+	}
+	// One reclaim pass returns the holes to the bitmap before the
+	// reader pins the bound.
+	if _, err := db.compactionPass(ctx, 64); err != nil {
+		t.Fatalf("pre-pass: %v", err)
+	}
+
+	// Lagging reader: pins the reclamation bound from here on.
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	defer rtx.Rollback()
+
+	// Churn under the pin: every commit's retirements stack RPL
+	// segments the bound cannot drain, at pages near the HWM.
+	for round := range 6 {
+		txc, _ := db.Begin(ctx)
+		ksc, _ := txc.OpenKeyspace("k")
+		for i := range 60 {
+			if err := ksc.Put(fmt.Appendf(nil, "churn%02d-%04d", round, i), make([]byte, 256)); err != nil {
+				t.Fatalf("churn put: %v", err)
+			}
+		}
+		if err := txc.Commit(); err != nil {
+			t.Fatalf("churn commit: %v", err)
+		}
+	}
+
+	db.mu.Lock()
+	pgr := db.pgr
+	db.mu.Unlock()
+	preChain := pgr.RPLChain()
+	if len(preChain) < 2 {
+		t.Fatalf("fixture: chain too short (%d)", len(preChain))
+	}
+	prePages := map[uint64]bool{}
+	for _, r := range preChain {
+		prePages[r.PageID] = true
+	}
+
+	relocatedSome := false
+	for pass := range 20 {
+		if _, err := db.compactionPass(ctx, 64); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		db.mu.Lock()
+		hwm := db.currentMeta.HighWaterMark
+		firstData := uint64(2) + uint64(db.currentMeta.BitmapPages)
+		db.mu.Unlock()
+		floor, ok := evacuationFloor(firstData, hwm, pgr.NumFreePages(), 64)
+		if !ok {
+			break
+		}
+		// Success: no PRE-EXISTING segment page remains at/above the
+		// floor (the passes' own fresh heads are self-healing and
+		// exempt from the assertion).
+		stuck := 0
+		for _, r := range pgr.RPLChain() {
+			if prePages[r.PageID] && r.PageID >= floor {
+				stuck++
+			}
+		}
+		if stuck == 0 {
+			relocatedSome = true
+			break
+		}
+	}
+	if !relocatedSome {
+		t.Fatal("pre-existing RPL segments never left the evacuation band across 20 passes (reader still pinning)")
+	}
+}

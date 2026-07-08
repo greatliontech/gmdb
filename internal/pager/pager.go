@@ -136,6 +136,13 @@ type Pager struct {
 	rplCorruptCount uint64
 	rplCorruptCb    func(segPageID uint64)
 
+	// rplRelocFloor arms a one-shot RPL chain-prefix relocation for
+	// the next commit (free-space.md §RPL segment relocation);
+	// rplRelocDeclined reports the outcome to the requesting
+	// compaction pass. See rplreloc.go.
+	rplRelocFloor    uint64
+	rplRelocDeclined bool
+
 	// anchoredEpoch is the newest DurableTxnID assertion this handle
 	// knows to be covered by a COMPLETED fdatasync (durability.md
 	// §Anchoring). Seeded at Open/Resync from the persisted
