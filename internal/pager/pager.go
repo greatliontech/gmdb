@@ -387,6 +387,20 @@ func (p *Pager) SetFileOpsForTest(fops FileOps) (restore func()) {
 // write + fdatasync trace. Test-support surface on an internal package.
 func (p *Pager) FileOpsForTest() FileOps { return p.fops }
 
+// SyncData issues the fdatasync durability barrier through the pager's
+// FileOps seam. DB-layer durability steps outside Commit — Checkpoint's
+// step-2/4 and the clean-shutdown checkpoint (durability.md §Checkpoints,
+// §Clean shutdown) — route their fdatasync here so it is recorded and
+// faulted uniformly with the commit path's barriers.
+func (p *Pager) SyncData() error { return p.fops.Fdatasync() }
+
+// WriteMetaPage pwrites a fully-formed meta page to slot offset off through
+// the FileOps seam — the DB-layer Checkpoint sub-record bump, routed
+// through the same seam as commit's step-3 meta pwrite.
+func (p *Pager) WriteMetaPage(buf []byte, off int64) (int, error) {
+	return p.fops.WriteAt(buf, off)
+}
+
 // NewWriter opens a writable pager over file. Same mmap setup as NewReader;
 // additionally allocates the dirty-page slab. pool must be a process-wide
 // BufPool sized to cfg.PageSize. maxBytes is Options.MaxTxBufferBytes; CoW

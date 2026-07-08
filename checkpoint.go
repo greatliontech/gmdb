@@ -81,7 +81,7 @@ func (db *DB) checkpointUnderGrant() error {
 	// matching TxnID and skips its own Resync) starts from a
 	// consistent pager.
 	db.mu.Lock()
-	pgr, file, err := db.resyncPagerLocked()
+	pgr, _, err := db.resyncPagerLocked()
 	if err != nil {
 		db.mu.Unlock()
 		return err
@@ -124,7 +124,7 @@ func (db *DB) checkpointUnderGrant() error {
 	}
 
 	// Step 2 — fdatasync to flush prior SyncLazy pwrites.
-	if err := file.Sync(); err != nil {
+	if err := pgr.SyncData(); err != nil {
 		return failStep(2, err)
 	}
 	if err := stepErr(2); err != nil {
@@ -153,7 +153,7 @@ func (db *DB) checkpointUnderGrant() error {
 		buf := make([]byte, pageSize)
 		pager.EncodeMeta(buf, &meta)
 		off := int64(activeIdx) * int64(pageSize)
-		if _, err := file.WriteAt(buf, off); err != nil {
+		if _, err := pgr.WriteMetaPage(buf, off); err != nil {
 			return failStep(3, err)
 		}
 		if err := stepErr(3); err != nil {
@@ -165,7 +165,7 @@ func (db *DB) checkpointUnderGrant() error {
 	// step 3 was skipped above, step 4 still flushes the OS page cache
 	// for any in-flight meta pwrite — defense in depth for the
 	// SyncDataOnly case.)
-	if err := file.Sync(); err != nil {
+	if err := pgr.SyncData(); err != nil {
 		return failStep(4, err)
 	}
 	if err := stepErr(4); err != nil {
