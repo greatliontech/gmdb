@@ -82,10 +82,10 @@ gate) and the final close-out are fixed anchors per chunk.
 - [x] 12. btree: descent-skeleton unification — shared per-level
   branch-descend helper; collapse `walk.go`'s three walkers and
   `cursor.go`'s five `descend*` variants.
-- [ ] 13. btree: unify `PutEntry` (`entry_ops.go:110`) with
-  `putReportCore` (`put.go:140`); shared root-collapse / final-heal
-  for `Delete` / `DeleteRange` (`delete.go:90–128` ≡
-  `range_delete.go:145–181`); merge `pathFrame` / `cursorFrame`.
+- [x] 13. btree: shared put descent for `PutEntry` / `putReportCore`
+  (full unification rejected — distinct overflow-chain ownership
+  contracts; see `descendToLeafForKey`); shared root-collapse for
+  `Delete` / `DeleteRange`; merge `pathFrame` / `cursorFrame`.
 - [ ] 14. page: leaf codec dedup — shared full-key entry decoder
   (`decodeRestartEntry` ≡ `ucDecodeEntry`), shared entry writer
   (`writeUCEntry` ≡ `writeCompressedRestartEntry`; the

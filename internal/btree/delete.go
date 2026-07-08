@@ -94,37 +94,9 @@ func Delete(pw PageWriter, cfg page.Config, rootID uint64, mergeThreshold uint8,
 		}
 		newRootID = nr
 	}
-	// Root collapse: a 0-cell root branch is a degenerate passthrough
-	// (1 child, 0 separators) — its sole leftmost child becomes the
-	// new root. Per delete this iterates at most once (each cascade
-	// level loses at most one cell), but the loop is defensive
-	// against future code that could chain multiple collapses.
-	//
-	// Safety against read-after-free: `child` is captured from buf
-	// BEFORE the FreePage call, and the loop variable `newRootID`
-	// is reassigned to that fresh `child` id at the end of each
-	// iteration. The freed id is never re-read; subsequent pw.Page
-	// calls target the new root from the previous iteration.
-	for {
-		buf, err := pw.Page(newRootID)
-		if err != nil {
-			return 0, err
-		}
-		typ, _, count, _ := page.ReadHeader(buf)
-		if typ != page.TypeBranch || count != 0 {
-			break
-		}
-		if err := validateBranchPage(buf, cfg, newRootID); err != nil {
-			return 0, err
-		}
-		child := page.BranchLeftmostChild(buf)
-		if child == 0 {
-			return 0, fmt.Errorf("%w: empty root branch %d has null leftmost child", ErrCorrupted, newRootID)
-		}
-		if err := pw.FreePage(newRootID); err != nil {
-			return 0, fmt.Errorf("btree: free collapsed root branch %d: %w", newRootID, err)
-		}
-		newRootID = child
+	newRootID, err = collapseDegenerateRoot(pw, cfg, newRootID)
+	if err != nil {
+		return 0, err
 	}
 	return newRootID, nil
 }
@@ -367,6 +339,47 @@ func deleteFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8, page
 		return 0, false, false, 0, err
 	}
 	return newID, underflow, true, deepUnderflowChild, nil
+}
+
+// collapseDegenerateRoot collapses a chain of 0-cell root branches —
+// degenerate passthroughs (1 child, 0 separators) — down to the first
+// non-degenerate page, freeing each collapsed branch. Shared by Delete
+// (at most one level per delete: each cascade level loses at most one
+// cell) and DeleteRange (which can retire an entire subtree up through
+// a chain of singleton branches). rootID == 0 (whole tree deleted)
+// passes through. The loop is bounded by MaxTreeDepth to defend
+// against a cyclic or corrupt root chain, mirroring freeSubtreeAt's
+// depth guard.
+//
+// Safety against read-after-free: `child` is captured from buf BEFORE
+// the FreePage call, and the loop variable is reassigned to that fresh
+// id at the end of each iteration. The freed id is never re-read.
+func collapseDegenerateRoot(pw PageWriter, cfg page.Config, rootID uint64) (uint64, error) {
+	for depth := 0; rootID != 0; depth++ {
+		if depth > MaxTreeDepth {
+			return 0, ErrTreeTooDeep
+		}
+		buf, err := pw.Page(rootID)
+		if err != nil {
+			return 0, err
+		}
+		typ, _, count, _ := page.ReadHeader(buf)
+		if typ != page.TypeBranch || count != 0 {
+			break
+		}
+		if err := validateBranchPage(buf, cfg, rootID); err != nil {
+			return 0, err
+		}
+		child := page.BranchLeftmostChild(buf)
+		if child == 0 {
+			return 0, fmt.Errorf("%w: empty root branch %d has null leftmost child", ErrCorrupted, rootID)
+		}
+		if err := pw.FreePage(rootID); err != nil {
+			return 0, fmt.Errorf("btree: free collapsed root branch %d: %w", rootID, err)
+		}
+		rootID = child
+	}
+	return rootID, nil
 }
 
 // patchBranchAfterChildDelete CoWs the branch at pageID and applies

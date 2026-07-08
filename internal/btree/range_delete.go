@@ -150,34 +150,9 @@ func DeleteRange(pw PageWriter, cfg page.Config, rootID uint64,
 		newID = nr
 	}
 
-	// Root collapse: a 0-cell branch root becomes the leftmost child.
-	// Iterates because DeleteRange can produce multi-level degenerate
-	// roots (an entire subtree retired up through a chain of singleton
-	// branches). Bounded by MaxTreeDepth to defend against a cyclic /
-	// corrupt root chain — mirrors freeSubtreeAt's depth guard.
-	for depth := 0; newID != 0; depth++ {
-		if depth > MaxTreeDepth {
-			return 0, 0, ErrTreeTooDeep
-		}
-		buf, err := pw.Page(newID)
-		if err != nil {
-			return 0, 0, err
-		}
-		typ, _, c, _ := page.ReadHeader(buf)
-		if typ != page.TypeBranch || c != 0 {
-			break
-		}
-		if err := validateBranchPage(buf, cfg, newID); err != nil {
-			return 0, 0, err
-		}
-		child := page.BranchLeftmostChild(buf)
-		if child == 0 {
-			return 0, 0, fmt.Errorf("%w: empty root branch %d has null leftmost child", ErrCorrupted, newID)
-		}
-		if err := pw.FreePage(newID); err != nil {
-			return 0, 0, fmt.Errorf("btree: free collapsed root branch %d: %w", newID, err)
-		}
-		newID = child
+	newID, err = collapseDegenerateRoot(pw, cfg, newID)
+	if err != nil {
+		return 0, 0, err
 	}
 	return count, newID, nil
 }

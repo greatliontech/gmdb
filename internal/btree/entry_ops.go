@@ -119,36 +119,12 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 		return id, page.LeafEntry{}, err
 	}
 
-	// Phase 1: descend, recording the path.
-	path := make([]pathFrame, 0, 8)
-	cur := rootID
-	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf, err := pw.Page(cur)
-		if err != nil {
-			return 0, page.LeafEntry{}, err
-		}
-		typ, _, _, _ := page.ReadHeader(buf)
-		if page.IsLeafType(typ) {
-			break
-		}
-		if typ != page.TypeBranch {
-			return 0, page.LeafEntry{}, fmt.Errorf("%w: page %d has unexpected type %d during PutEntry descent", ErrCorrupted, cur, typ)
-		}
-		if err := validateBranchPage(buf, cfg, cur); err != nil {
-			return 0, page.LeafEntry{}, err
-		}
-		i := page.BranchSearch(buf, cfg, e.Key)
-		next := page.BranchChildAt(buf, cfg, i)
-		if next == 0 {
-			return 0, page.LeafEntry{}, fmt.Errorf("%w: null child pointer in branch %d during PutEntry descent", ErrCorrupted, cur)
-		}
-		path = append(path, pathFrame{pageID: cur, descentIdx: i})
-		cur = next
+	// Phase 1: the shared descent (the pre-CoW leaf buffer is unused
+	// here — PutEntry decodes from its CoW copy).
+	path, leafID, _, err := descendToLeafForKey(pw, cfg, rootID, e.Key)
+	if err != nil {
+		return 0, page.LeafEntry{}, err
 	}
-	if len(path) > MaxTreeDepth {
-		return 0, page.LeafEntry{}, ErrTreeTooDeep
-	}
-	leafID := cur
 
 	// Phase 2: leaf mutation.
 	leftID, err := pw.AllocPage()

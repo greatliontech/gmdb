@@ -48,17 +48,6 @@ const (
 	csEndOfIteration
 )
 
-// cursorFrame records one level of the descent path. For branch
-// frames `iter` is unused; `childIdx` is the index into the
-// branch's (leftmost + cells) child array (0 = leftmost, 1..N =
-// cells[0..N-1].Child). For the leaf frame (always the last
-// element of c.path), `childIdx` is unused and `iter` carries the
-// active LeafIter.
-type cursorFrame struct {
-	pageID   uint64
-	childIdx uint16
-}
-
 // Cursor is a bidirectional cursor over a btree subtree rooted at
 // some pageID. Implements the state machine from transactions.md
 // §Cursor State Machine: Unpositioned → {Positioned,
@@ -120,7 +109,7 @@ type Cursor struct {
 	// Descent path. path[0] is the root; path[len-1] is the leaf
 	// frame whose pageID is the current leaf. For an empty tree
 	// (rootID == 0) or before any positioning, path is empty.
-	path []cursorFrame
+	path []pathFrame
 	iter page.LeafIter
 
 	// Scratch buffers reused across leaf transitions.
@@ -571,7 +560,7 @@ func (c *Cursor) descendFrom(cur uint64, pick branchPick, onLeaf func(r page.Lea
 			if err := r.Validate(); err != nil {
 				return fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
 			}
-			c.path = append(c.path, cursorFrame{pageID: cur})
+			c.path = append(c.path, pathFrame{pageID: cur})
 			onLeaf(r)
 			return nil
 		}
@@ -585,7 +574,7 @@ func (c *Cursor) descendFrom(cur uint64, pick branchPick, onLeaf func(r page.Lea
 		if child == 0 {
 			return fmt.Errorf("%w: null %s child in branch %d (index %d)", ErrCorrupted, label, cur, idx)
 		}
-		c.path = append(c.path, cursorFrame{pageID: cur, childIdx: idx})
+		c.path = append(c.path, pathFrame{pageID: cur, childIdx: idx})
 		cur = child
 	}
 	return ErrTreeTooDeep

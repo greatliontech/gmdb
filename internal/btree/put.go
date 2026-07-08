@@ -70,13 +70,52 @@ type PageWriter interface {
 // sentinel fires only on oversize KEYS, never on oversize values.
 var ErrKeyTooLarge = errors.New("btree: key too large for overflow-reference leaf entry")
 
-// pathFrame records one level of the descent path for the CoW-
-// propagation pass. pageID is the page descended through;
-// descentIdx is the BranchSearch return value used at that level
-// (so the ascend pass knows which child pointer to update).
+// pathFrame records one level of a descent path — shared by the put
+// ascend pass and the cursor. pageID is the page descended through;
+// childIdx is the index into the branch's (leftmost + cells) child
+// array taken at that level (0 = leftmost, 1..N = cells[0..N-1].Child;
+// for the put path it is the BranchSearch result the ascend pass uses
+// to know which child pointer to update). A cursor's leaf frame —
+// always the last element of its path — leaves childIdx unused.
 type pathFrame struct {
-	pageID     uint64
-	descentIdx uint16
+	pageID   uint64
+	childIdx uint16
+}
+
+// descendToLeafForKey performs the shared put-descent: walk from
+// rootID toward key, validating each branch and recording the path,
+// stopping at the first leaf-typed page. Returns the recorded path,
+// the leaf's page id, and the leaf's (pre-CoW) buffer. Both put
+// variants (putReportCore and PutEntry) start here; their leaf
+// mutation phases differ by contract (internal vs caller-managed
+// overflow-chain ownership) and deliberately stay separate.
+func descendToLeafForKey(pw PageWriter, cfg page.Config, rootID uint64, key []byte) (path []pathFrame, leafID uint64, leafBuf []byte, err error) {
+	path = make([]pathFrame, 0, 8)
+	cur := rootID
+	for depth := 0; depth <= MaxTreeDepth; depth++ {
+		buf, e := pw.Page(cur)
+		if e != nil {
+			return nil, 0, nil, e
+		}
+		typ, _, _, _ := page.ReadHeader(buf)
+		if page.IsLeafType(typ) {
+			return path, cur, buf, nil
+		}
+		if typ != page.TypeBranch {
+			return nil, 0, nil, fmt.Errorf("%w: page %d has unexpected type %d during put descent", ErrCorrupted, cur, typ)
+		}
+		if e := validateBranchPage(buf, cfg, cur); e != nil {
+			return nil, 0, nil, e
+		}
+		i := page.BranchSearch(buf, cfg, key)
+		next := page.BranchChildAt(buf, cfg, i)
+		if next == 0 {
+			return nil, 0, nil, fmt.Errorf("%w: null child pointer in branch %d during put descent", ErrCorrupted, cur)
+		}
+		path = append(path, pathFrame{pageID: cur, childIdx: i})
+		cur = next
+	}
+	return nil, 0, nil, ErrTreeTooDeep
 }
 
 // Put inserts or updates key=value in the tree rooted at rootID.
@@ -152,39 +191,12 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		return nr, false, e
 	}
 
-	// Phase 1: descend, recording the path. Retain the leaf buffer for the
+	// Phase 1: the shared descent. The leaf buffer is retained for the
 	// shared read (validate + search + last-key) below.
-	path := make([]pathFrame, 0, 8)
-	var leafBuf []byte
-	cur := rootID
-	for depth := 0; depth <= MaxTreeDepth; depth++ {
-		buf, e := pw.Page(cur)
-		if e != nil {
-			return 0, false, e
-		}
-		typ, _, _, _ := page.ReadHeader(buf)
-		if page.IsLeafType(typ) {
-			leafBuf = buf
-			break
-		}
-		if typ != page.TypeBranch {
-			return 0, false, fmt.Errorf("%w: page %d has unexpected type %d during Put descent", ErrCorrupted, cur, typ)
-		}
-		if e := validateBranchPage(buf, cfg, cur); e != nil {
-			return 0, false, e
-		}
-		i := page.BranchSearch(buf, cfg, key)
-		next := page.BranchChildAt(buf, cfg, i)
-		if next == 0 {
-			return 0, false, fmt.Errorf("%w: null child pointer in branch %d during Put descent", ErrCorrupted, cur)
-		}
-		path = append(path, pathFrame{pageID: cur, descentIdx: i})
-		cur = next
+	path, leafID, leafBuf, err := descendToLeafForKey(pw, cfg, rootID, key)
+	if err != nil {
+		return 0, false, err
 	}
-	if len(path) > MaxTreeDepth {
-		return 0, false, ErrTreeTooDeep
-	}
-	leafID := cur
 
 	// Read the original leaf once — validate, then locate the key. Shared by
 	// the InsertIfAbsent existence check, the append fast path, and the slow
@@ -625,12 +637,12 @@ func insertOrReplaceLeaf(entries []page.LeafEntry, newEntry page.LeafEntry) ([]p
 }
 
 // ascendNoSplit walks the path in reverse, CoWing each branch and
-// updating the child pointer at descentIdx from the old leafID to
+// updating the child pointer at childIdx from the old leafID to
 // newChildID (which propagates up: each level's CoW produces a new
 // pageID that becomes the next level's newChildID).
 //
 // For the no-split path, no separator is inserted — only the child
-// pointer at descentIdx is overwritten.
+// pointer at childIdx is overwritten.
 //
 // Returns the new rootID. For an empty path (root is the leaf
 // itself), returns newChildID directly.
@@ -647,8 +659,8 @@ func ascendNoSplit(pw PageWriter, cfg page.Config, path []pathFrame, newChildID 
 		if err != nil {
 			return 0, fmt.Errorf("btree: CoW branch %d: %w", f.pageID, err)
 		}
-		// Re-write the child pointer at descentIdx.
-		if err := branchReplaceChild(buf, cfg, f.descentIdx, cur); err != nil {
+		// Re-write the child pointer at childIdx.
+		if err := branchReplaceChild(buf, cfg, f.childIdx, cur); err != nil {
 			return 0, fmt.Errorf("btree: replace child in branch %d: %w", f.pageID, err)
 		}
 		if err := pw.FreePage(f.pageID); err != nil {
@@ -663,9 +675,9 @@ func ascendNoSplit(pw PageWriter, cfg page.Config, path []pathFrame, newChildID 
 // and propagating a (separator, rightChildID) pair upward.
 //
 // At each level, the existing branch is CoW'd. The child pointer
-// at descentIdx is updated from the old leaf/branch ID to leftID
+// at childIdx is updated from the old leaf/branch ID to leftID
 // (the existing-tree side of the split). The (sep, rightID) pair
-// is inserted at descentIdx+1.
+// is inserted at childIdx+1.
 //
 // If the resulting branch overflows, the branch splits in two:
 // the lower half stays as the CoW'd page, the upper half goes to
@@ -691,8 +703,8 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		if err != nil {
 			return 0, fmt.Errorf("btree: CoW branch %d (split): %w", f.pageID, err)
 		}
-		// Decode current branch, replace child at descentIdx
-		// with leftID, insert (sep, rightID) at descentIdx+1.
+		// Decode current branch, replace child at childIdx
+		// with leftID, insert (sep, rightID) at childIdx+1.
 		//
 		// Deep-copy cell Keys: DecodeBranch returns Keys that
 		// borrow from `buf`; we're about to re-encode INTO `buf`
@@ -705,8 +717,8 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		for i := range cells {
 			cells[i].Key = bytes.Clone(cells[i].Key)
 		}
-		// Build newCells = cells[:descentIdx] || (sep, rightID) ||
-		// cells[descentIdx:], then explicitly rewrite the
+		// Build newCells = cells[:childIdx] || (sep, rightID) ||
+		// cells[childIdx:], then explicitly rewrite the
 		// already-updated cell or the leftmost. Doing the Child
 		// update on newCells (rather than on the source `cells`
 		// slice) keeps the mutation independent of newCells's
@@ -714,13 +726,13 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		// cells field-by-field instead of via append won't
 		// silently drop the Child update.
 		newCells := make([]page.BranchCell, 0, len(cells)+1)
-		newCells = append(newCells, cells[:f.descentIdx]...)
+		newCells = append(newCells, cells[:f.childIdx]...)
 		newCells = append(newCells, page.BranchCell{Key: sep, Child: rightID})
-		newCells = append(newCells, cells[f.descentIdx:]...)
-		if f.descentIdx == 0 {
+		newCells = append(newCells, cells[f.childIdx:]...)
+		if f.childIdx == 0 {
 			leftmost = leftID
 		} else {
-			newCells[f.descentIdx-1].Child = leftID
+			newCells[f.childIdx-1].Child = leftID
 		}
 
 		// Try to encode in one branch.
