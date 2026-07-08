@@ -96,7 +96,7 @@ gate) and the final close-out are fixed anchors per chunk.
   PID/namespace liveness classification (`recovery.go:38` vs
   `reader.go:308`); doc fixes (stale header size in `doc.go`,
   orphaned `readerSlotHint` comment in `coord_reader.go:20`).
-- [ ] 16. root: resolve the `compact.go` (rebuild-and-swap) vs
+- [x] 16. root: resolve the `compact.go` (rebuild-and-swap) vs
   `compaction.go` (online incremental relocation) naming collision;
   extract the repeated coord-snapshot idiom.
 - [ ] 17. root: shared tx-guarded cursor core embedded by `Cursor`

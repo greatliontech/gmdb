@@ -201,10 +201,8 @@ func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 		// lock (no concurrent writers); require no live reader in any
 		// process. OldestReaderTxnID's LOCK_EX precondition is satisfied
 		// by the grant the write tx holds (same as db.Begin's bound
-		// computation). Snapshot coord under db.mu vs. Close.
-		db.mu.Lock()
-		coord := db.coord
-		db.mu.Unlock()
+		// computation). Snapshot coord vs. a concurrent Close.
+		coord := db.coordSnapshot()
 		if coord == nil || coord.OldestReaderTxnID() != lock.NoReaderTxnID {
 			yield(CheckIssue{
 				Severity: CheckError,

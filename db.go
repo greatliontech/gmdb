@@ -885,9 +885,7 @@ func (db *DB) acquireWriteGrant(ctx context.Context) (*lock.Grant, *lock.Coord, 
 	if db.poisoned.Load() {
 		return nil, nil, ErrPoisoned
 	}
-	db.mu.Lock()
-	coord := db.coord
-	db.mu.Unlock()
+	coord := db.coordSnapshot()
 	if coord == nil {
 		return nil, nil, ErrClosed
 	}
@@ -975,9 +973,7 @@ func (db *DB) shutdownCheckpoint() error {
 	if db.readOnly || db.poisoned.Load() {
 		return nil
 	}
-	db.mu.Lock()
-	coord := db.coord
-	db.mu.Unlock()
+	coord := db.coordSnapshot()
 	if coord == nil {
 		return nil
 	}
@@ -1039,6 +1035,16 @@ func (db *DB) setMetaState(m page.Meta, active int) {
 // republished the durable projection when that was warranted.
 func (db *DB) adoptOpened(opened *pager.OpenedDB) {
 	db.setMetaState(opened.Meta, opened.ActiveMetaIdx)
+}
+
+// coordSnapshot returns db.coord captured under db.mu — the race
+// protection against a concurrent Close, which nils the pointer under
+// the same mutex (sites that need more fields capture their own set
+// inline under one db.mu section). nil means closing/closed.
+func (db *DB) coordSnapshot() *lock.Coord {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.coord
 }
 
 // reclamationBound derives the RPL reclamation bound
