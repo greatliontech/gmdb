@@ -107,6 +107,16 @@ type Coord struct {
 	// step 5).
 	everWriter atomic.Bool
 
+	// writerHeld is true while an in-process caller holds the write
+	// grant (set/cleared by the flock goroutine around its hold
+	// loop). Consumers: Close's shutdown checkpoint, which must skip
+	// rather than deadlock when its own process's live transaction
+	// holds the grant (durability.md §Clean shutdown) — waiting on a
+	// CROSS-process holder is fine (bounded by the peer's commit
+	// window), but an in-process holder cannot release until after
+	// Close returns.
+	writerHeld atomic.Bool
+
 	// prevLastWriter snapshots the LastWriter record as it stood
 	// IMMEDIATELY BEFORE this handle's most recent grant acquisition
 	// overwrote it — taken by the flock goroutine under the same
@@ -155,15 +165,30 @@ type writerRequest struct {
 type Grant struct {
 	release chan<- struct{}
 	once    sync.Once
+	// coord backs the synchronous writerHeld clear in Release; see
+	// that method. Nil only in zero-value Grants (never issued).
+	coord *Coord
 }
 
 // Release signals the flock goroutine to clear the writer-header
 // fields and release flock(LOCK_UN). Idempotent.
+//
+// writerHeld is cleared HERE, synchronously, not in the flock
+// goroutine's hold-loop exit: Release returns before the goroutine
+// processes the channel close, and WriterHeld's consumer (Close's
+// shutdown checkpoint) runs immediately after a released grant — a
+// stale true would silently skip the shutdown checkpoint. The
+// goroutine's own exit paths (stopCh) clear it too, idempotently.
 func (g *Grant) Release() {
 	if g == nil {
 		return
 	}
-	g.once.Do(func() { close(g.release) })
+	g.once.Do(func() {
+		if g.coord != nil {
+			g.coord.writerHeld.Store(false)
+		}
+		close(g.release)
+	})
 }
 
 // CoordOptions configures NewCoord. The PID/ProcessStartTime/
@@ -342,7 +367,7 @@ func (c *Coord) AcquireWriter(ctx context.Context) (*Grant, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Grant{release: release}, nil
+		return &Grant{release: release, coord: c}, nil
 	case <-ctx.Done():
 		// ctx fired after submit. The goroutine may have already
 		// granted (and is now in step 4 holding flock). Drain to find
@@ -510,6 +535,7 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 	c.f.SetLastWriterPIDNamespace(c.pidNS)
 	c.f.SetLastWriterHeartbeat(c.clock())
 	c.everWriter.Store(true)
+	c.writerHeld.Store(true)
 	req.result <- nil
 
 	// Step 4: hold until release or stopCh, refreshing WriterHeartbeat
@@ -538,6 +564,7 @@ holdLoop:
 		}
 	}
 	hbTicker.Stop()
+	c.writerHeld.Store(false)
 
 	// Clear header BEFORE unlock — clause-explicit invariant
 	// (cross-process.md §Invariants): a peer that acquires LOCK_EX
@@ -720,6 +747,14 @@ func (c *Coord) UnregisterReaderSlot(i uint32) {
 		}
 	}
 	c.activeSlotsMu.Unlock()
+}
+
+// WriterHeld reports whether an in-process caller currently holds the
+// write grant. See the writerHeld field doc for the intended consumer
+// and its deadlock rationale; this is advisory (the state can change
+// the instant it is read) and must not be used as a lock.
+func (c *Coord) WriterHeld() bool {
+	return c.writerHeld.Load()
 }
 
 // PrevLastWriterLive reports whether the last-writer record AS IT

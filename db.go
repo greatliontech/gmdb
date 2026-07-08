@@ -578,18 +578,32 @@ func dbCleanupFn(info dbCleanupInfo) {
 //  3. Stop the maintenance goroutine and wait for exit.
 //  4. Drain in-flight Tx cleanup windows (closeGate.BeginClose spins
 //     on the txInflight counter).
-//  5. Capture and nil the resource pointers under db.mu.
-//  6. Drain the heartbeat + flock goroutines via Coord.Close (which
+//  5. The shutdown checkpoint (durability.md §Clean shutdown): a
+//     writable, non-poisoned handle checkpoints under the write
+//     grant so a clean close never loses acknowledged commits
+//     regardless of SyncMode. This step can BLOCK on a cross-process
+//     grant holder (bounded by the peer's commit window in healthy
+//     operation, unbounded if the peer is wedged — the same waiting
+//     semantics as Begin); an IN-process live write transaction
+//     instead skips the step with a warning (see shutdownCheckpoint).
+//     A checkpoint failure here becomes Close's return error;
+//     teardown proceeds regardless.
+//  6. Capture and nil the resource pointers under db.mu.
+//  7. Drain the heartbeat + flock goroutines via Coord.Close (which
 //     blocks on done-channels; the flock goroutine clears writer-
 //     header fields, unlocks a held writer, and fails pending
 //     acquisitions).
-//  7. Munmap the lock file, close the pager (data-file munmap), the
+//  8. Munmap the lock file, close the pager (data-file munmap), the
 //     data-file fd, and the *os.Root.
 //
 // Steps 1 → 4 ordering: the CAS is the public release-store; the
-// drain completes before any teardown. Steps 6 → 7 ordering: the
-// SIGSEGV path the spec exists to prevent
-// (final heartbeat tick on unmapped memory).
+// drain completes before any teardown. Step 5 sits after the stops
+// (they release grants it needs) and before the pointer capture (it
+// needs the live pager). Steps 7 → 8 ordering: the SIGSEGV path the
+// spec exists to prevent (final heartbeat tick on unmapped memory).
+//
+// Returns the shutdown checkpoint's error, if any (nil otherwise;
+// the CAS loser of a concurrent double-Close always returns nil).
 //
 // Not safe to call concurrently with active write or batch
 // transactions in the same process; per leak-detection.md
@@ -638,11 +652,19 @@ func (db *DB) Close() error {
 	// true from our CAS above) and drains.
 	db.closeGate.BeginClose()
 
-	// Capture resource pointers under db.mu so a concurrent Begin
-	// (which snapshots db.coord under db.mu) sees a consistent view
-	// — either pre-close (non-nil) or post-nil (nil). The captured
-	// locals are then used outside db.mu for the actual drain, which
-	// can take milliseconds.
+	// Step 5 — the shutdown checkpoint (durability.md §Clean
+	// shutdown). After the CAS + coordinator/maintenance stops +
+	// cleanup drain: no new Begin can start (gate closed) and any
+	// in-flight write tx completed before our grant acquisition, so
+	// every acknowledged commit is covered by the bump. Before the
+	// pointer capture: the pager and file must still be alive.
+	closeErr := db.shutdownCheckpoint()
+
+	// Step 6 — capture resource pointers under db.mu so a concurrent
+	// Begin (which snapshots db.coord under db.mu) sees a consistent
+	// view — either pre-close (non-nil) or post-nil (nil). The
+	// captured locals are then used outside db.mu for the actual
+	// drain, which can take milliseconds.
 	db.mu.Lock()
 	coord := db.coord
 	lockFile := db.lockFile
@@ -656,26 +678,25 @@ func (db *DB) Close() error {
 	db.root = nil
 	db.mu.Unlock()
 
-	// Step 6 — drain goroutines (step 5 was the pointer capture
-	// above). Coord.Close blocks until both the
+	// Step 7 — drain goroutines. Coord.Close blocks until both the
 	// flock goroutine and the heartbeat goroutine have exited; with
 	// a writer held at Close time, the stopCh path clears the
 	// writer-header fields and issues flock(LOCK_UN) before exit.
 	if coord != nil {
 		_ = coord.Close()
 	}
-	// Step 7 — munmap the lock file. Safe: closeGate.BeginClose
+	// Step 8 — munmap the lock file. Safe: closeGate.BeginClose
 	// drained Tx cleanups that might still write to lockFile's
 	// mmap; Coord.Close drained heartbeat + flock goroutines that
 	// also touch lockFile mmap.
 	if lockFile != nil {
 		_ = lockFile.Close()
 	}
-	// Step 7 (cont.) — release pager (munmaps data file).
+	// Step 8 (cont.) — release pager (munmaps data file).
 	if pgr != nil {
 		_ = pgr.Close()
 	}
-	// Step 7 (cont.) — close fds.
+	// Step 8 (cont.) — close fds.
 	if file != nil {
 		_ = file.Close()
 	}
@@ -685,7 +706,7 @@ func (db *DB) Close() error {
 
 	// Cancel the DB-level leak cleanup — we closed cleanly.
 	db.cleanup.Stop()
-	return nil
+	return closeErr
 }
 
 // Begin starts a write transaction. The call blocks until the
@@ -916,6 +937,15 @@ func (db *DB) resyncOnGrantLocked() (*pager.Pager, *os.File, error) {
 	if db.closeGate.IsClosed() {
 		return nil, nil, ErrClosed
 	}
+	return db.resyncPagerLocked()
+}
+
+// resyncPagerLocked is resyncOnGrantLocked without the close-gate
+// check — the shutdown checkpoint (durability.md §Clean shutdown)
+// runs after Close wins the close CAS but before teardown, when the
+// gate is closed yet the pager is still fully alive. Every other
+// caller routes through resyncOnGrantLocked.
+func (db *DB) resyncPagerLocked() (*pager.Pager, *os.File, error) {
 	pgr := db.pgr
 	file := db.file
 	if pgr == nil || file == nil {
@@ -929,6 +959,66 @@ func (db *DB) resyncOnGrantLocked() (*pager.Pager, *os.File, error) {
 		db.setMetaState(m, active)
 	}
 	return pgr, file, nil
+}
+
+// shutdownCheckpoint is Close's clean-shutdown step (durability.md
+// §Clean shutdown): a writable, non-poisoned handle checkpoints under
+// the grant before teardown, so a clean close never loses
+// acknowledged commits regardless of SyncMode. A poisoned handle
+// SKIPS it — running it would be exactly the retried-fsync trap of
+// §Checkpoint failure semantics. A generation mismatch (peer Compact
+// replaced the inode) also skips: our mapped file is unlinked and
+// invisible; there is nothing on it worth making durable. Failure is
+// returned as Close's error; teardown continues regardless (poison is
+// moot on a closing handle).
+func (db *DB) shutdownCheckpoint() error {
+	if db.readOnly || db.poisoned.Load() {
+		return nil
+	}
+	db.mu.Lock()
+	coord := db.coord
+	db.mu.Unlock()
+	if coord == nil {
+		return nil
+	}
+	// A live IN-PROCESS write tx holds the grant across this Close
+	// (the app closed mid-transaction) and cannot release until after
+	// Close returns — waiting would deadlock. Skip: an app closing
+	// mid-tx is not the clean close the §Clean shutdown guarantee
+	// addresses, and the leaked tx's own cleanup path warns. A
+	// cross-process holder is waited out below (bounded by the peer's
+	// commit window).
+	//
+	// Advisory-flag residual: a Begin racing this Close can hold the
+	// grant for a microsecond window while DOOMED to bounce at its
+	// own post-grant close check — WriterHeld then reads true and
+	// this Close skips a checkpoint it could have run. Conservative
+	// direction only (the skip equals the pre-shutdown-checkpoint
+	// Close semantics for that call), reachable only by racing Begin
+	// against Close, and irreducible without holding db.mu across
+	// grant acquisition (a documented deadlock).
+	if coord.WriterHeld() {
+		db.logger.Warn("gmdb: Close while an in-process grant holder is live; shutdown checkpoint skipped")
+		return nil
+	}
+	grant, err := coord.AcquireWriter(context.Background())
+	if err != nil {
+		if errors.Is(err, lock.ErrClosed) {
+			return nil
+		}
+		return fmt.Errorf("gmdb: shutdown checkpoint: %w", err)
+	}
+	defer grant.Release()
+	if db.poisoned.Load() {
+		return nil
+	}
+	if coord.DataGeneration() != db.dataGeneration.Load() {
+		return nil
+	}
+	if err := db.checkpointUnderGrant(); err != nil {
+		return fmt.Errorf("gmdb: shutdown checkpoint: %w", err)
+	}
+	return nil
 }
 
 // setMetaState installs the meta baseline pair — currentMeta and

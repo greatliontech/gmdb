@@ -26,8 +26,9 @@ type DBStats struct {
 
 	// RetiredPages is the count of page entries pinned in the committed
 	// RPL chain — freed by prior transactions but not yet reclaimed
-	// (gated by the oldest live reader / last checkpoint). In pages. 0
-	// on a read-only handle.
+	// (gated by the oldest live reader / the anchored durable epoch,
+	// free-space.md §RPL Reclamation). In pages. 0 on a read-only
+	// handle.
 	RetiredPages uint64
 
 	// FileSize is the current on-disk size of the data file, in BYTES

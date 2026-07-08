@@ -64,16 +64,25 @@ func (db *DB) Checkpoint(ctx context.Context) error {
 		return err
 	}
 	defer grant.Release()
+	return db.checkpointUnderGrant()
+}
 
-	// Re-sync before flagging: a peer's commit while we waited leaves
-	// db.currentMeta stale, and re-flagging that stale meta in its
+// checkpointUnderGrant runs Checkpoint steps 2–4 + the meta publish.
+// The caller MUST hold the write grant and have passed the poison and
+// generation gates (acquireWriteGrant, or Close's shutdown path which
+// runs its own reduced preamble — the close gate is deliberately NOT
+// consulted here, because the shutdown checkpoint runs after Close
+// wins the close CAS but before teardown).
+func (db *DB) checkpointUnderGrant() error {
+	// Re-sync before bumping: a peer's commit while we waited leaves
+	// db.currentMeta stale, and re-bumping that stale meta in its
 	// stale slot (step 3 below) would overwrite the peer's newer meta
 	// with an older one — silent lost update. Resync also rebuilds the
 	// writer pager's bitmap/RPL so the NEXT Begin (which sees a
 	// matching TxnID and skips its own Resync) starts from a
 	// consistent pager.
 	db.mu.Lock()
-	pgr, file, err := db.resyncOnGrantLocked()
+	pgr, file, err := db.resyncPagerLocked()
 	if err != nil {
 		db.mu.Unlock()
 		return err

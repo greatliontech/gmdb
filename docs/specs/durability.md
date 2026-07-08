@@ -203,16 +203,28 @@ close never loses acknowledged commits regardless of `SyncMode` —
 a pure-`SyncLazy` application that never calls `Checkpoint()`
 still reopens with everything it committed. Rollback to an older
 durable epoch is reachable only through a real crash (or a
-failed/killed Close). An already-POISONED handle SKIPS the
-shutdown checkpoint: running it would be exactly the retried-fsync
+failed/killed Close). A Close issued while the handle's own live
+write transaction still holds the grant SKIPS the shutdown
+checkpoint (waiting would deadlock: the transaction cannot release
+until after Close returns) — closing mid-transaction is not a
+clean close; a warning is logged. An already-POISONED handle SKIPS
+the shutdown checkpoint: running it would be exactly the retried-fsync
 trap of §Checkpoint failure semantics (the retry succeeds
 trivially over kernel-consumed error state and stamps a durable
-sub-record on data that never reached storage); Close surfaces the
-poisoned state and re-Open converges. A checkpoint failure DURING
-Close follows Checkpoint's failure semantics except that poison is
-moot — the handle is closing; the failure is surfaced as Close's
-error. Read-only handles skip this step.
-Lands: chunk 9 of docs/plans/architecture-consolidation.md.
+sub-record on data that never reached storage). The poisoned state
+was already surfaced as `ErrPoisoned` by the operation that
+poisoned; Close itself tears down normally and returns nil —
+re-Open converges. A handle whose data file a peer's `Compact` has
+replaced (generation mismatch) also SKIPS: its mapped inode is
+unlinked and invisible, and every acknowledged commit was
+serialized — under the grant — into the peer's fsynced compacted
+file; there is nothing on the old inode worth persisting. A
+checkpoint failure DURING Close follows Checkpoint's failure
+semantics except that poison is moot — the handle is closing; the
+failure is surfaced as Close's error. Read-only handles skip this
+step. (Pinned by `TestCleanCloseCheckpointsSyncLazy`,
+`TestPoisonedCloseSkipsShutdownCheckpoint`, and
+`TestCloseWithLiveWriteTxSkipsShutdownCheckpoint`.)
 
 ### `Checkpoint()` mechanics
 

@@ -3,8 +3,11 @@ package gmdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSyncModesAllAccepted(t *testing.T) {
@@ -188,12 +191,12 @@ func TestCheckpointAfterCloseReturnsErrClosed(t *testing.T) {
 //  1. Genesis (both metas self-durable at TxnID 0).
 //  2. One SyncDurable commit at TxnID=1 — self-durable epoch 1.
 //  3. One SyncLazy commit at TxnID=2 — carries epoch 1 forward.
-//  4. Close, delete the lock file (dead-author simulation: a
-//     same-process reopen would classify this process as a live
-//     author via the LastWriter record and correctly treat the open
-//     as a live join), re-Open. Recovery selects meta TxnID=2,
-//     adopts epoch 1's tree, and publishes the recovery commit at
-//     TxnID=3.
+//  4. Crash-copy the file while the DB is open (a clean Close now
+//     checkpoints per §Clean shutdown, so a Close-based fixture can
+//     no longer produce an unfsynced tail) and open the copy — no
+//     lock file exists for the copy, so the gate sees a dead author.
+//     Recovery selects meta TxnID=2, adopts epoch 1's tree, and
+//     publishes the recovery commit at TxnID=3.
 func TestRecoveryAdoptsDurableProjection(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
@@ -225,12 +228,10 @@ func TestRecoveryAdoptsDurableProjection(t *testing.T) {
 	if m := db.Meta(); m.TxnID != 2 || m.Durable.TxnID != 1 {
 		t.Fatalf("after W2: TxnID=%d Durable.TxnID=%d, want 2/1", m.TxnID, m.Durable.TxnID)
 	}
+	crashPath := crashCopy(t, path)
 	db.Close()
-	if err := os.Remove(path + ".lock"); err != nil {
-		t.Fatalf("remove lock file: %v", err)
-	}
 
-	db2, err := Open(ctx, path, Options{Maintenance: MaintenanceOptions{Disable: true}})
+	db2, err := Open(ctx, crashPath, Options{Maintenance: MaintenanceOptions{Disable: true}})
 	if err != nil {
 		t.Fatalf("re-Open: %v", err)
 	}
@@ -253,9 +254,11 @@ func TestRecoveryAdoptsDurableProjection(t *testing.T) {
 
 // TestLiveJoinDoesNotRollBack pins the recovery-commit gate's other
 // half (durability.md §Recovery step 5): while the last writer's
-// process is alive — even with the handle closed in-process and the
-// lock file intact — a writable Open is a live join and must NOT roll
-// back unfsynced SyncLazy commits.
+// process is alive — even idle, holding no grant and no reader slots
+// — a writable Open is a live join and must NOT roll back its
+// unfsynced SyncLazy commits. The author handle stays OPEN (a clean
+// Close checkpoints, erasing the unfsynced tail this test needs); the
+// joiner is a second handle in the same process.
 func TestLiveJoinDoesNotRollBack(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
@@ -267,20 +270,20 @@ func TestLiveJoinDoesNotRollBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	defer db.Close()
 	if err := db.Update(ctx, func(tx *Tx) error {
 		_, e := tx.AllocPage()
 		return e
 	}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	db.Close()
 
-	// Same process re-opens with the lock file intact: the LastWriter
-	// record names this (live) process, so the gate refuses and the
-	// live tree stands.
+	// The author is alive and idle: the LastWriter record names this
+	// (live) process, so the joiner's gate refuses and the live tree
+	// stands.
 	db2, err := Open(ctx, path, Options{Maintenance: MaintenanceOptions{Disable: true}})
 	if err != nil {
-		t.Fatalf("re-Open: %v", err)
+		t.Fatalf("join Open: %v", err)
 	}
 	defer db2.Close()
 	if m := db2.Meta(); m.TxnID != 1 || m.SelfDurable() {
@@ -304,13 +307,15 @@ func TestRecoverySingleValidSlotAdoptsItsSubRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	// SyncLazy commit puts the new (non-checkpoint) meta on disk.
+	// SyncLazy commit puts the carried-forward meta on disk (page
+	// cache); crash-copy while open — a clean Close would checkpoint.
 	if err := db.Update(ctx, func(tx *Tx) error {
 		_, e := tx.AllocPage()
 		return e
 	}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
+	path = crashCopy(t, path)
 	db.Close()
 
 	// Tamper meta-0 (the genesis-Checkpoint-set meta) so recovery
@@ -325,12 +330,9 @@ func TestRecoverySingleValidSlotAdoptsItsSubRecord(t *testing.T) {
 	}
 	f.Close()
 
-	// Dead-author simulation, then re-Open: meta-0 corrupt; meta-1
-	// valid (TxnID=1, Durable.TxnID=0). Recovery adopts epoch 0 and
-	// publishes the recovery commit at TxnID=2.
-	if err := os.Remove(path + ".lock"); err != nil {
-		t.Fatalf("remove lock file: %v", err)
-	}
+	// Re-Open the crash copy (no lock file — dead author): meta-0
+	// corrupt; meta-1 valid (TxnID=1, Durable.TxnID=0). Recovery
+	// adopts epoch 0 and publishes the recovery commit at TxnID=2.
 	db2, err := Open(ctx, path, Options{Maintenance: MaintenanceOptions{Disable: true}})
 	if err != nil {
 		t.Fatalf("re-Open with corrupt meta-0 + lazy meta-1: %v", err)
@@ -343,4 +345,187 @@ func TestRecoverySingleValidSlotAdoptsItsSubRecord(t *testing.T) {
 	if m.KeyspaceRoot != 0 {
 		t.Errorf("recovered KeyspaceRoot = %d, want 0 (genesis epoch adopted)", m.KeyspaceRoot)
 	}
+}
+
+// TestCleanCloseCheckpointsSyncLazy pins durability.md §Clean
+// shutdown: a writable non-poisoned Close performs the Checkpoint
+// sequence, so a pure-SyncLazy application that never calls
+// Checkpoint() reopens — even after author death — with everything it
+// committed. Without the shutdown checkpoint the dead-author reopen
+// would roll back to genesis.
+func TestCleanCloseCheckpointsSyncLazy(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64,
+		SyncMode:    SyncLazy,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Update(ctx, func(tx *Tx) error {
+		ks, e := tx.CreateKeyspace("k")
+		if e != nil {
+			return e
+		}
+		return ks.Put([]byte("key"), []byte("value"))
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	lastTxnID := db.Meta().TxnID
+	if db.Meta().SelfDurable() {
+		t.Fatal("fixture: SyncLazy commit unexpectedly self-durable")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := os.Remove(path + ".lock"); err != nil {
+		t.Fatalf("rm lock: %v", err)
+	}
+
+	db2, err := Open(ctx, path, Options{Maintenance: MaintenanceOptions{Disable: true}})
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer db2.Close()
+	m := db2.Meta()
+	// The clean Close made the final meta self-durable, so the gated
+	// reopen anchors it in place — same TxnID, no recovery commit.
+	if m.TxnID != lastTxnID || !m.SelfDurable() {
+		t.Fatalf("reopen: TxnID=%d SelfDurable=%v, want %d/true (clean close checkpointed)", m.TxnID, m.SelfDurable(), lastTxnID)
+	}
+	if err := db2.View(ctx, func(tx *ReadTx) error {
+		ks, e := tx.OpenKeyspaceReadOnly("k")
+		if e != nil {
+			return e
+		}
+		v, e := ks.Get([]byte("key"))
+		if e != nil {
+			return e
+		}
+		if string(v) != "value" {
+			t.Errorf("value = %q, want %q", v, "value")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View: %v", err)
+	}
+}
+
+// TestPoisonedCloseSkipsShutdownCheckpoint pins §Clean shutdown's
+// poison rule: a poisoned handle must NOT run the shutdown checkpoint
+// (the retried-fsync trap — it would stamp a durable sub-record over
+// data that may never have reached storage). Poison via the
+// checkpoint step hook, then Close; the dead-author reopen must roll
+// back to the durable epoch, proving no bump was stamped.
+func TestPoisonedCloseSkipsShutdownCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64,
+		SyncMode:    SyncLazy,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Update(ctx, func(tx *Tx) error {
+		_, e := tx.AllocPage()
+		return e
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	lazyTxnID := db.Meta().TxnID
+
+	// Poison through a failing Checkpoint step-2 (the sanctioned
+	// publication-failure path).
+	restore := SetCheckpointStepHookForTest(func(step int) error {
+		if step == 2 {
+			return fmt.Errorf("injected step-2 failure")
+		}
+		return nil
+	})
+	err = db.Checkpoint(ctx)
+	restore()
+	if err == nil {
+		t.Fatal("Checkpoint with injected failure returned nil")
+	}
+	if !db.poisoned.Load() {
+		t.Fatal("handle not poisoned after publication failure")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close on poisoned handle: %v (teardown must proceed)", err)
+	}
+	if err := os.Remove(path + ".lock"); err != nil {
+		t.Fatalf("rm lock: %v", err)
+	}
+	db2, err := Open(ctx, path, Options{Maintenance: MaintenanceOptions{Disable: true}})
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer db2.Close()
+	// The poisoned Close stamped nothing: recovery rolled the lazy
+	// commit back, publishing the recovery commit at lazyTxnID+1 over
+	// the genesis epoch — rather than finding a shutdown-checkpointed
+	// self-durable meta at lazyTxnID.
+	m := db2.Meta()
+	if m.TxnID == lazyTxnID && m.SelfDurable() {
+		t.Fatal("reopen found a self-durable meta at the lazy TxnID — poisoned Close ran the shutdown checkpoint")
+	}
+	if m.TxnID != lazyTxnID+1 || m.Durable.AnchoredTxnID != 0 {
+		t.Errorf("reopen: TxnID=%d A=%d, want %d/0 (recovery commit over genesis)", m.TxnID, m.Durable.AnchoredTxnID, lazyTxnID+1)
+	}
+}
+
+// TestCloseWithLiveWriteTxSkipsShutdownCheckpoint pins the deadlock
+// guard: Close while this handle's own write transaction holds the
+// grant must return promptly (skipping the shutdown checkpoint)
+// rather than block on a grant that cannot release until after Close
+// returns.
+func TestCloseWithLiveWriteTxSkipsShutdownCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64,
+		SyncMode:    SyncLazy,
+		Maintenance: MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- db.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close blocked on the live write transaction's grant")
+	}
+	_ = tx.Rollback()
+}
+
+// crashCopy byte-copies the open database file to a fresh path and
+// returns it — the crash-simulation idiom: the copy captures the OS
+// page cache's view (unfsynced SyncLazy commits included) with no
+// lock file, so a subsequent Open classifies a dead author. Copying
+// while the DB is open matters: a clean Close checkpoints
+// (durability.md §Clean shutdown) and would erase the unfsynced tail.
+func crashCopy(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("crashCopy read: %v", err)
+	}
+	copyPath := filepath.Join(t.TempDir(), "crash.gmdb")
+	if err := os.WriteFile(copyPath, data, 0o600); err != nil {
+		t.Fatalf("crashCopy write: %v", err)
+	}
+	return copyPath
 }

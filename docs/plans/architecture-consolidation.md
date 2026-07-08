@@ -67,7 +67,7 @@ gate) and the final close-out are fixed anchors per chunk.
   rule in the shared walker; retire `MetaFlagCheckpoint`,
   `ActiveMetaCheckpointPreferring`, `HighestCheckpointTxnID`, the
   `NoCheckpoint` plumbing, and the genesis special case.
-- [ ] 9. Root-side retirement + clean shutdown: delete
+- [x] 9. Root-side retirement + clean shutdown: delete
   `db.lastCheckpointTxnID` (bound from the anchored epoch);
   writable `Close()` performs the Checkpoint sequence; rewire
   `reclamationBound`, `setMetaState`/`adoptOpened`, Checkpoint

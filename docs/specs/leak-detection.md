@@ -69,7 +69,7 @@ Invariant: kind=clause-explicit;
     passed the gate could otherwise race `Close`'s subsequent
     `lockFile.Close` and SIGSEGV writing to the unmapped reader
     slot;
-  from=this spec §`Close()` Ordering + the chunk-3.3 read-tx
+  from=this spec §`Close()` Ordering + the read-tx leaked-handle
     slot-release path (the demonstrated fault — write-tx cleanup
     doesn't touch the lock-file mmap, so chunks 1–2 didn't
     surface the race);

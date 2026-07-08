@@ -396,11 +396,13 @@ func TestCrashedSyncLazyTornLiveHeadRecovers(t *testing.T) {
 			m.RPLHeadPage, m.RPLHeadTxnID, m.Durable.TxnID)
 	}
 	liveHead := m.RPLHeadPage
+	// Crash-copy while open (a clean Close checkpoints, erasing the
+	// unfsynced tail), then tear the copy's live head: the live meta
+	// reached the image, its head segment did not; the copy has no
+	// lock file, so the author classifies dead.
+	crashPath := crashCopy(t, path)
 	db.Close()
-
-	// Crash shape: the live meta reached disk, its head segment did
-	// not (zero the page); the author is dead (lock file gone).
-	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	f, err := os.OpenFile(crashPath, os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatalf("open for tear: %v", err)
 	}
@@ -408,11 +410,8 @@ func TestCrashedSyncLazyTornLiveHeadRecovers(t *testing.T) {
 		t.Fatalf("tear head: %v", err)
 	}
 	f.Close()
-	if err := os.Remove(path + ".lock"); err != nil {
-		t.Fatalf("rm lock: %v", err)
-	}
 
-	db2, err := Open(ctx, path, Options{Maintenance: MaintenanceOptions{Disable: true}})
+	db2, err := Open(ctx, crashPath, Options{Maintenance: MaintenanceOptions{Disable: true}})
 	if err != nil {
 		t.Fatalf("Open after torn-live-head crash: %v (durable epoch unreachable)", err)
 	}
