@@ -79,7 +79,6 @@ chunks (bottom-up by layer, grouped by function).
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| btree-readpath-validation-gaps | 4 | [M] unvalidated cousin-scan decode panics on corrupt page; [L] Cursor.Delete swallows reposition error |
 | subpage-promotion-single-leaf-cap | 5 | [H] promotion packs all members into one leaf: small-member sets hard-cap (~254 at fvs=8), reproduced |
 | fixed-size-nested-leaf-compaction | 6 | [L] spec'd compact fixed-size nested-leaf cells not implemented |
 | rpl-half-reclaimed-segment-double-free | 7 | [H] crash image re-includes a half-reclaimed RPL segment → later double-free of a re-allocated live page |
@@ -89,7 +88,7 @@ chunks (bottom-up by layer, grouped by function).
 | lockfile-stale-removal-race | 11 | [H] unguarded unlink-by-name on stale lock file → split brain, two writers |
 | lock-boot-epoch | 12 | [H] post-reboot future heartbeats + starttime collisions bypass the recovery gate; [L] lock file never deleted contra spec |
 | batch-goexit-deadlock | 13 | [H] closure Goexit kills coordinator, permanent deadlock; [L] cascade reserve re-price; [L] self-commit outcome doc |
-| child-tx-contract-gaps | 14 | [M] child SetFileFormat silently dropped; [L] View error join; [L] iterators silently empty on guard errors |
+| child-tx-contract-gaps | 14 | [M] child SetFileFormat silently dropped; [L] View error join; [L] iterators silently empty on guard errors; [L] SetCursor.Delete swallows re-seek corruption as end-of-iteration |
 | db-leak-detection-pinning | 15 | [M] daemon goroutines pin *DB — handle-leak detection unreachable; [L] LaggingReader reentrancy deadlock undocumented |
 | nested-keyspace-handle-resurrection | 16 | [M] child delete+recreate resurrects parent's dead handle (both kinds), reproduced |
 | index-ondelete-partial-state | 17 | [M] extractor panic mid-onDelete commits partial index state; [L] stale coverValue → false ErrCorrupted; [L] schemaHash doc grammar |

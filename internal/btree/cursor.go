@@ -399,7 +399,22 @@ func (c *Cursor) Delete() error {
 	}
 	c.rootID = newRoot
 	c.gen++
+	// The internal re-position walks the rebuilt tree; a structural
+	// failure first observed here — a corrupt page off the delete's
+	// own path, or the successor's overflow value failing assembly —
+	// is returned from Delete itself, not parked in Err() for the
+	// caller's NEXT call to trip over (transactions.md §Cursor.Delete
+	// post-delete state). INTERNAL contract: at this layer the
+	// deletion HAS been applied and c.rootID is the rebuilt root; the
+	// keyspace layer owns atomicity — on this error it restores its
+	// savepoint (un-applying the delete, deallocating the rebuilt
+	// root) and must then re-point this cursor at the pre-delete root
+	// and MarkStale it, or the spec'd re-position recovery would
+	// descend a deallocated id.
 	c.SeekGE(deletedKey)
+	if c.err != nil {
+		return fmt.Errorf("btree: cursor.Delete walking to the post-delete successor: %w", c.err)
+	}
 	return nil
 }
 

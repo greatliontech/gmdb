@@ -20,6 +20,23 @@ says fn's error is joined with the cleanup error; code returns `fnErr`
 alone, discarding a non-nil rollback error (slot-release/munmap
 failure).
 
+**[L] `SetCursor.Delete` swallows a structural failure during its
+successor re-seek as end-of-iteration.** `set_cursor.go:544-586`:
+after `ks.DeleteValue` commits (savepoint released — the deletion is
+applied and stays applied), a corrupt-page failure during the
+successor re-seek returns nil — spurious success — with the
+corruption parked in the outer cursor's `Err()` (`ck, _ :=
+c.outerCursor.SeekGE(next); if ck == nil { return nil }`). A
+checksums-off drain loop over a set silently terminates early — the
+transactions.md invariant's own "silent retention" scenario. No root
+desync (markSetCursorsStale refreshes roots before the re-seek); the
+plain-keyspace Cursor.Delete analogue was fixed by the read-path
+validation chunk (surface + roll back per transactions.md
+§Cursor.Delete post-delete state) — mirror that contract here,
+deciding whether SetCursor.Delete can roll back (its savepoint is
+already released) or must document applied-with-error. Filed from
+that chunk's change-set review (adjacent — reproduces on base).
+
 **[L] Iteration over a frozen or closed-tx keyspace yields a silently
 empty sequence.** `iterators.go` (all six closures):
 `cursorGuard.require` returns false for

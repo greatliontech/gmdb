@@ -103,7 +103,17 @@ Invariant: kind=entailed;
     `for k, _ := c.SeekGE(start); k != nil; k, _ = c.Current() {
     c.Delete() }` — `Current()` reads the post-delete successor
     in-place each iteration. `Next()` would advance PAST the
-    successor and skip alternating entries;
+    successor and skip alternating entries. A structural failure
+    first observed while walking to (or reading the value of) the
+    post-delete successor — a corrupt page off the delete's own
+    path — is returned by `Delete()` itself, never deferred to
+    `Err()` for a later call to trip over. On such an error the
+    deletion is ROLLED BACK (the keyspace layer's savepoint restore
+    un-applies the row delete and any index maintenance) and the
+    cursor is stale, re-pointed at the still-live pre-delete tree —
+    re-positioning via First/Last/Seek* resumes safely; the error
+    never leaves a cursor whose root was deallocated by its own
+    rollback;
   from=entailed: cursor state machine (this spec) + cursor stack
     tolerance (`page-formats.md` §Cursor Iteration);
   violation=Cursor desync after delete causes the delete-range loop
@@ -679,7 +689,12 @@ Distinguishing end-of-iteration from unpositioned: end-of-iteration's
   would advance PAST the successor and skip alternating entries
   (since `Delete()` already advanced the cursor).
 - Possible errors: `ErrReadOnly` (cursor on a read-only txn or
-  read-only keyspace), `ErrCursorUnpositioned`, `ErrTxClosed`.
+  read-only keyspace), `ErrCursorUnpositioned`, `ErrTxClosed`,
+  `ErrCursorStale` (external mutation since last positioning), and
+  `ErrCorrupted` / `ErrBadPageChecksum` when a structural failure is
+  first observed while re-positioning onto (or reading) the
+  post-delete successor — in which case the deletion was rolled
+  back and the cursor must be re-positioned before further use.
 
 ### `SetCursor.Delete()` post-delete state
 

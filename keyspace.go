@@ -1416,6 +1416,19 @@ func (c *Cursor) Delete() error {
 		// state indexes pointing at a still-existing row.
 		restoreIndexes(c.ks.indexes, rowSnap)
 		c.ks.tx.pgr.RestoreSavepoint(sp)
+		// The inner cursor may have APPLIED the deletion and adopted
+		// the rebuilt tree's root before failing (a structural error
+		// first observed during its internal re-position). The
+		// savepoint restore above just un-applied that mutation and
+		// returned its pages to the loose pool — so re-point the
+		// inner cursor at the still-live pre-delete root and stale it,
+		// or the spec'd recovery (re-position via First/Seek*) would
+		// descend from a deallocated id into stale or recycled pages.
+		// Public contract (transactions.md §Cursor.Delete post-delete
+		// state): a Keyspace Cursor.Delete error means the deletion
+		// did NOT happen.
+		c.inner.SetRootID(c.ks.desc.Root)
+		c.inner.MarkStale()
 		if errors.Is(err, btree.ErrCursorUnpositioned) {
 			return ErrCursorUnpositioned
 		}

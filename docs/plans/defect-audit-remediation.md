@@ -14,7 +14,7 @@ function. WIP = 1.
 - [x] 3. internal/btree: rebalance termination — leaf redistribute
       fill-floor decline, deep-underflow heal propagation
       (+ range-delete.md rider)
-- [ ] 4. internal/btree: read-path validation — cousin-scan first-read
+- [x] 4. internal/btree: read-path validation — cousin-scan first-read
       validation, Cursor.Delete reposition error surfacing
 - [ ] 5. internal/btree + set keyspace: subpage promotion multi-leaf
       build (+ set-keyspace.md rider)

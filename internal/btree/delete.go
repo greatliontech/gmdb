@@ -331,11 +331,23 @@ func pageUnderflow(pw PageReader, cfg page.Config, id uint64, mergeThreshold uin
 	if err != nil {
 		return false, err
 	}
+	// Validate before the unchecked decoders run — this helper is a
+	// first resolver for pages off the descent path (rescue grandchild
+	// scans, survivor re-checks), so a corrupt page must surface as
+	// ErrCorrupted, not a decode panic (btree.go validate-at-first-
+	// resolver contract; checksums may be disabled).
 	typ, _, _, _ := page.ReadHeader(buf)
 	switch {
 	case page.IsLeafType(typ):
+		r := page.NewLeafReader(buf, cfg)
+		if err := r.Validate(); err != nil {
+			return false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, id, err)
+		}
 		return leafUnderflow(buf, cfg, mergeThreshold), nil
 	case typ == page.TypeBranch:
+		if err := validateBranchPage(buf, cfg, id); err != nil {
+			return false, err
+		}
 		_, cells := page.DecodeBranch(buf, cfg)
 		return branchUnderflow(cfg, cells, mergeThreshold), nil
 	default:
@@ -794,6 +806,9 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 				if typ, _, _, _ := page.ReadHeader(cbuf); typ != page.TypeBranch {
 					continue
 				}
+				if verr := validateBranchPage(cbuf, cfg, id); verr != nil {
+					return 0, false, 0, verr
+				}
 				clm, ccells := page.DecodeBranch(cbuf, cfg)
 				subMT := uint64(0)
 				for gpos := 0; gpos <= len(ccells); gpos++ {
@@ -895,21 +910,14 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 	// matter; they bound only the decline path.
 	triedLeft, triedRight := false, false
 	for {
-		// Read current child to compute fill.
-		buf, err := pw.Page(curID)
+		// Read current child to compute fill — validated via
+		// pageUnderflow: curID can be a first-resolved on-disk page
+		// (the cousin cascade hands descendants from outside the
+		// validated descent path), and the unchecked decoders panic
+		// on corrupt input (checksums may be disabled).
+		underflow, err := pageUnderflow(pw, cfg, curID, mergeThreshold)
 		if err != nil {
 			return 0, 0, false, err
-		}
-		typ, _, _, _ := page.ReadHeader(buf)
-		var underflow bool
-		switch {
-		case page.IsLeafType(typ):
-			underflow = leafUnderflow(buf, cfg, mergeThreshold)
-		case typ == page.TypeBranch:
-			_, childCells := page.DecodeBranch(buf, cfg)
-			underflow = branchUnderflow(cfg, childCells, mergeThreshold)
-		default:
-			return 0, 0, false, fmt.Errorf("%w: page %d unexpected type %d during rebalanceChildAtPos", ErrCorrupted, curID, typ)
 		}
 		if !underflow {
 			return curPos, curID, false, nil
@@ -1027,6 +1035,9 @@ func deepHolderAfterRedistribute(pw PageWriter, cfg page.Config, leftID, rightID
 		typ, _, _, _ := page.ReadHeader(buf)
 		if typ != page.TypeBranch {
 			return 0, false, fmt.Errorf("%w: redistribute output %d unexpected type %d in deep-holder scan", ErrCorrupted, id, typ)
+		}
+		if err := validateBranchPage(buf, cfg, id); err != nil {
+			return 0, false, err
 		}
 		leftmost, cells := page.DecodeBranch(buf, cfg)
 		if leftmost == deepID {
@@ -1166,20 +1177,14 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 			}
 			subID, sfind := uint64(0), false
 			for _, candidate := range candidates {
-				cbuf, ferr := pw.Page(candidate)
+				// pageUnderflow validates before the unchecked
+				// decoders run: candidates are arbitrary on-disk
+				// grandchildren first-resolved off the descent path
+				// (btree.go validate-at-first-resolver contract;
+				// checksums may be disabled).
+				cuf, ferr := pageUnderflow(pw, cfg, candidate, mergeThreshold)
 				if ferr != nil {
 					return 0, false, 0, ferr
-				}
-				ctyp, _, _, _ := page.ReadHeader(cbuf)
-				var cuf bool
-				switch {
-				case page.IsLeafType(ctyp):
-					cuf = leafUnderflow(cbuf, cfg, mergeThreshold)
-				case ctyp == page.TypeBranch:
-					_, cc := page.DecodeBranch(cbuf, cfg)
-					cuf = branchUnderflow(cfg, cc, mergeThreshold)
-				default:
-					return 0, false, 0, fmt.Errorf("%w: page %d unexpected type %d during cousin descendant scan", ErrCorrupted, candidate, ctyp)
 				}
 				if cuf {
 					subID = candidate
