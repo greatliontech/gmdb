@@ -18,7 +18,7 @@ function. WIP = 1.
       validation, Cursor.Delete reposition error surfacing
 - [x] 5. internal/btree + set keyspace: subpage promotion multi-leaf
       build (+ set-keyspace.md rider)
-- [ ] 6. internal/btree + internal/page: compact fixed-size nested-leaf
+- [x] 6. internal/btree + internal/page: compact fixed-size nested-leaf
       cells per set-keyspace.md
 - [ ] 7. internal/pager: crash-coherent RPL reclamation — neutralize
       half-reclaimed segments at Open (+ free-space.md rider)

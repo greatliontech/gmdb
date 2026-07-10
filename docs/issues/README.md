@@ -79,7 +79,6 @@ chunks (bottom-up by layer, grouped by function).
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| fixed-size-nested-leaf-compaction | 6 | [L] spec'd compact fixed-size nested-leaf cells not implemented |
 | rpl-half-reclaimed-segment-double-free | 7 | [H] crash image re-includes a half-reclaimed RPL segment → later double-free of a re-allocated live page |
 | pager-file-resident-bounds | 8 | [M×2] stale writer fileSize → spurious ErrCorrupted; reader SIGBUS window after shrink; [L] Page() MaxSize clamp |
 | pager-commit-residue | 9 | [L×3] checkpoint under-anchor; armed rplRelocFloor survives abort; relocation probe undercounts segments |

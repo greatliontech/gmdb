@@ -214,6 +214,7 @@ func (b *LeafBuilder) addUCEntry(key []byte, flags uint8, value []byte, ovflPage
 // in-place splice helpers; do not duplicate the layout. (Only DELTA
 // entries have a distinct layout — writeDeltaEntry.)
 func writeFullKeyEntry(buf []byte, off int, flags uint8, key, value []byte, ovflPage, totalLen uint64) int {
+	flags = effectiveCellFlags(flags, value)
 	buf[off] = flags
 	off++
 	le.PutUint16(buf[off:], uint16(len(key)))
@@ -226,6 +227,10 @@ func writeFullKeyEntry(buf []byte, off int, flags uint8, key, value []byte, ovfl
 		le.PutUint64(buf[off:], totalLen)
 		off += 8
 		return off
+	}
+	if flags&CellFlagEmptyValue != 0 {
+		copy(buf[off:], key)
+		return off + len(key)
 	}
 	le.PutUint32(buf[off:], uint32(len(value)))
 	off += 4
@@ -325,6 +330,7 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 //
 // Shared by LeafBuilder.addCompressedEntry and the in-place splice helpers.
 func writeCompressedDeltaEntry(buf []byte, off int, flags uint8, sharedLen int, unsharedKey, value []byte, ovflPage, totalLen uint64) int {
+	flags = effectiveCellFlags(flags, value)
 	buf[off] = flags
 	off++
 	le.PutUint16(buf[off:], uint16(sharedLen))
@@ -339,6 +345,10 @@ func writeCompressedDeltaEntry(buf []byte, off int, flags uint8, sharedLen int, 
 		le.PutUint64(buf[off:], totalLen)
 		off += 8
 		return off
+	}
+	if flags&CellFlagEmptyValue != 0 {
+		copy(buf[off:], unsharedKey)
+		return off + len(unsharedKey)
 	}
 	le.PutUint32(buf[off:], uint32(len(value)))
 	off += 4
@@ -396,13 +406,36 @@ func (b *LeafBuilder) FreeSpace() int {
 	return b.cfg.ContentEnd() - b.dataPos - b.rgt.TableSize(0)
 }
 
+// effectiveCellFlags upgrades a plain inline cell with an empty value
+// to the compact empty-value form (page-formats.md §Leaf Page,
+// empty-value cell). Applied identically by the entry writers and the
+// size projection, so a projected size always matches the bytes
+// written. Flagged cells (trailer, subpage) keep their own forms.
+func effectiveCellFlags(flags uint8, value []byte) uint8 {
+	if flags == 0 && len(value) == 0 {
+		return CellFlagEmptyValue
+	}
+	if flags&CellFlagEmptyValue != 0 && len(value) != 0 {
+		// Writing value bytes under the no-value-half form would drop
+		// them silently — same misuse class as Overflow|MultiValue,
+		// same response.
+		panic(fmt.Sprintf("page: CellFlagEmptyValue with %d value bytes — the empty-value form carries no value half", len(value)))
+	}
+	return flags
+}
+
 // valuePartSize returns the on-page byte size of an entry's value half.
 // Both overflow references and nested-tree references use the 16-byte
 // trailer form (no ValueLen prefix) per page-formats.md §Leaf Page;
-// inline and subpage cells carry [ValueLen u32][bytes].
+// inline and subpage cells carry [ValueLen u32][bytes]; empty-value
+// cells carry nothing.
 func valuePartSize(flags uint8, value []byte) int {
+	flags = effectiveCellFlags(flags, value)
 	if cellHasTrailerOnly(flags) {
 		return 8 + 8 // u64 + u64 (OvflPage|Root + TotalLen|Count)
+	}
+	if flags&CellFlagEmptyValue != 0 {
+		return 0
 	}
 	return 4 + len(value) // ValueLen uint32 + value bytes
 }

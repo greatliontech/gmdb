@@ -406,7 +406,10 @@ values must be exactly that byte size. Enables:
 
 - No per-value length prefix in subpages (flat array).
 - Direct offset binary search (`entry[i]` at `i * valueSize`).
-- Compact nested B+tree leaves (no `ValueLen` field per cell).
+- Compact nested B+tree leaves (no `ValueLen` field per cell) — via
+  the general empty-value cell form (`page-formats.md` §Leaf Page,
+  CellFlags bit 3), which every nested tree gets regardless of
+  `FixedValueSize` since nested-tree member values are always empty.
 
 A `Put` with a value of the wrong size returns `ErrValueSizeMismatch`.
 

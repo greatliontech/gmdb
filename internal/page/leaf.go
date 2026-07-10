@@ -47,12 +47,22 @@ const (
 	CellFlagMultiValue uint8 = 1 << 1
 	CellFlagNestedTree uint8 = 1 << 2
 
+	// CellFlagEmptyValue marks the compact inline form for an empty
+	// value: [Flags][KeyLen][Key] (full-key) /
+	// [Flags][SharedLen][UnsharedLen][UnsharedKey] (delta) — no
+	// ValueLen field, no value bytes. The encoders emit it for every
+	// plain cell whose value is empty (nested-tree members, the
+	// set-of-keys pattern); decoders also accept the legacy
+	// zero-ValueLen inline form (page-formats.md §Leaf Page,
+	// empty-value cell).
+	CellFlagEmptyValue uint8 = 1 << 3
+
 	// cellFlagKnownMask is the union of currently-defined cell flag
 	// bits. The strict-reject rule from file-layout.md §Reserved-byte
 	// policy is enforced via LeafReader.Validate (not in the hot-path
 	// decoders, which assume well-formed input); see Validate's doc
 	// for the boundary discipline.
-	cellFlagKnownMask = CellFlagOverflow | CellFlagMultiValue | CellFlagNestedTree
+	cellFlagKnownMask = CellFlagOverflow | CellFlagMultiValue | CellFlagNestedTree | CellFlagEmptyValue
 )
 
 // ErrCorrupted is the leaf-decoder corruption sentinel. Wraps a
@@ -296,9 +306,7 @@ func (r LeafReader) LastKey(keyBuf []byte) ([]byte, []byte) {
 		off++
 		keyLen := int(le.Uint16(r.buf[off:]))
 		off += 2
-		if !cellHasTrailerOnly(flags) {
-			off += 4 // skip ValueLen uint32 — Key follows
-		}
+		off += cellPreKeySkip(flags)
 		return r.buf[off : off+keyLen], keyBuf
 	}
 	return r.compressedLastKey(keyBuf)
@@ -311,6 +319,19 @@ func (r LeafReader) LastKey(keyBuf []byte) ([]byte, []byte) {
 // re-derive the condition.
 func cellHasTrailerOnly(flags uint8) bool {
 	return flags&CellFlagOverflow != 0 || flags&CellFlagNestedTree != 0
+}
+
+// cellPreKeySkip returns the byte count between a full-key cell's
+// KeyLen field and its key bytes: 4 (ValueLen u32) for inline/subpage
+// cells, 0 for trailer-only and empty-value forms. The single
+// skip-math helper for the manual key readers (FirstKey / LastKey) —
+// hand-rolled `+= 4` here misread every empty-value cell as its key
+// shifted by four bytes.
+func cellPreKeySkip(flags uint8) int {
+	if cellHasTrailerOnly(flags) || flags&CellFlagEmptyValue != 0 {
+		return 0
+	}
+	return 4
 }
 
 // FirstKey returns the key of the first entry. Both variants store the
@@ -326,13 +347,10 @@ func (r LeafReader) FirstKey() []byte {
 	off++ // skip CellFlags
 	keyLen := int(le.Uint16(r.buf[off:]))
 	off += 2
-	// Trailer-only forms (overflow + nested-tree) elide the
-	// ValueLen u32 prefix and place the key immediately after KeyLen;
-	// inline cells (plain + subpage) carry ValueLen between KeyLen
-	// and Key.
-	if !cellHasTrailerOnly(flags) {
-		off += 4
-	}
+	// Trailer-only and empty-value forms place the key immediately
+	// after KeyLen; inline cells (plain + subpage) carry ValueLen
+	// between KeyLen and Key.
+	off += cellPreKeySkip(flags)
 	return r.buf[off : off+keyLen]
 }
 
@@ -542,6 +560,15 @@ func (r LeafReader) decodeFullKeyEntry(off int) (LeafEntry, int) {
 		off += 8
 		return e, off
 	}
+	if e.Flags&CellFlagEmptyValue != 0 {
+		// [Flags][KeyLen][Key] — compact empty-value form; the value
+		// half is absent. Value decodes to a non-nil zero-length
+		// slice, matching the legacy zero-ValueLen inline decode.
+		e.Key = r.buf[off : off+keyLen]
+		off += keyLen
+		e.Value = r.buf[off:off]
+		return e, off
+	}
 	// [Flags][KeyLen][ValueLen][Key][Value]
 	valLen := int(le.Uint32(r.buf[off:]))
 	off += 4
@@ -580,6 +607,9 @@ func validateCellFlagsCombo(flags uint8) error {
 	if flags&CellFlagNestedTree != 0 && flags&CellFlagMultiValue == 0 {
 		return fmt.Errorf("CellFlags 0x%x sets NestedTree without MultiValue (only valid when MultiValue is set)", flags)
 	}
+	if flags&CellFlagEmptyValue != 0 && flags&^CellFlagEmptyValue != 0 {
+		return fmt.Errorf("CellFlags 0x%x sets EmptyValue alongside other flags (EmptyValue is exclusive: trailer and subpage forms carry their own value halves)", flags)
+	}
 	return nil
 }
 
@@ -615,6 +645,13 @@ func (r LeafReader) validateFullKeyEntry(off int) (next, keyLen int, err error) 
 			return 0, 0, fmt.Errorf("full-key trailer body: %w", err)
 		}
 		return off + keyLen + 16, keyLen, nil
+	}
+	if flags&CellFlagEmptyValue != 0 {
+		// [Flags][KeyLen][Key] — no value half.
+		if err := r.ensureBytes(off, keyLen); err != nil {
+			return 0, 0, fmt.Errorf("full-key empty-value body: %w", err)
+		}
+		return off + keyLen, keyLen, nil
 	}
 	// [Flags][KeyLen][ValueLen][Key][Value]
 	if err := r.ensureBytes(off, 4); err != nil {
@@ -667,6 +704,13 @@ func (r LeafReader) validateDeltaEntry(off, prevKeyLen int) (next, keyLen int, e
 			return 0, 0, fmt.Errorf("delta trailer body: %w", err)
 		}
 		return off + unsharedLen + 16, keyLen, nil
+	}
+	if flags&CellFlagEmptyValue != 0 {
+		// [Flags][SharedLen][UnsharedLen][UnsharedKey] — no value half.
+		if err := r.ensureBytes(off, unsharedLen); err != nil {
+			return 0, 0, fmt.Errorf("delta empty-value body: %w", err)
+		}
+		return off + unsharedLen, keyLen, nil
 	}
 	// [Flags][SharedLen][UnsharedLen][ValueLen][UnsharedKey][Value]
 	if err := r.ensureBytes(off, 4); err != nil {

@@ -75,6 +75,15 @@ func (r LeafReader) decodeDeltaEntry(off int, prevKey, keyBuf []byte) (LeafEntry
 		off += 8
 		return e, off, keyBuf
 	}
+	if e.Flags&CellFlagEmptyValue != 0 {
+		// Compact empty-value delta: UnsharedKey only, no value half.
+		keyBuf = append(keyBuf[:0], prevKey[:sharedLen]...)
+		keyBuf = append(keyBuf, r.buf[off:off+unsharedLen]...)
+		e.Key = keyBuf
+		off += unsharedLen
+		e.Value = r.buf[off:off]
+		return e, off, keyBuf
+	}
 	// Inline: ValueLen comes BEFORE UnsharedKey, then Value at the tail.
 	valLen := int(le.Uint32(r.buf[off:]))
 	off += 4

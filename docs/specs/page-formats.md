@@ -355,10 +355,18 @@ CellFlags bit layout
 Bit 0:    Overflow    (0 = inline value, 1 = overflow reference)
 Bit 1:    MultiValue  (0 = single value, 1 = multi-value data — subpage or nested B+tree)
 Bit 2:    NestedTree  (only when Bit 1 set: 0 = subpage, 1 = nested B+tree)
-Bits 3-7: Reserved (must be 0)
+Bit 3:    EmptyValue  (compact inline form for an empty value: the
+          ValueLen field and value bytes are absent entirely)
+Bits 4-7: Reserved (must be 0)
 ```
 
 `Overflow` and `MultiValue` are mutually exclusive in practice.
+`EmptyValue` is exclusive with every other bit (the trailer and
+subpage forms carry their own value halves). Encoders emit
+`EmptyValue` for every plain cell whose value is empty — nested
+B+tree members and the set-of-keys pattern — saving the 4-byte
+`ValueLen` per cell; decoders also accept the legacy
+`ValueLen == 0` inline form, so mixed-form pages are valid.
 
 `ValueLen` is `uint32` (max ~4 GB for inline values; bounded in
 practice by leaf-page free space). Values exceeding leaf-page
@@ -490,6 +498,25 @@ Restart Overflow Reference
 +-----------+----------+-----------+----------+----------+
 ```
 
+#### Empty-value cell (restart / uncompressed and delta forms)
+
+```
+Empty-value entry (restart / uncompressed)
++-----------+----------+-----------+
+| CellFlags | KeyLen   | Key bytes |
+| uint8     | uint16   |           |
++-----------+----------+-----------+
+
+Empty-value entry (delta)
++-----------+-----------+-------------+---------------+
+| CellFlags | SharedLen | UnsharedLen | UnsharedKey   |
++-----------+-----------+-------------+---------------+
+```
+
+The value half is absent; the decoded value is empty. This is the
+storage form for nested B+tree members (whose values are always
+empty) and any plain put of an empty value.
+
 #### Overflow reference at a delta position
 
 ```
@@ -538,7 +565,12 @@ Entry (inline)
 ```
 
 (Overflow form: `ValueLen` replaced by `OvflPage uint64 + TotalLen
-uint64`, same as the compressed restart-entry overflow form.)
+uint64`, same as the compressed restart-entry overflow form.
+Empty-value form: `ValueLen` and value bytes absent entirely —
+`[CellFlags][KeyLen][Key]`, CellFlags bit 3; see the empty-value
+cell section above. The 9-byte per-entry overhead figure below is
+for non-empty inline values; empty-value cells cost 5 bytes
+including the offset-table slot.)
 
 Lookup is a single O(log N) binary search via the offset table. The
 uncompressed variant motivation is **operational simplicity**, not

@@ -385,8 +385,11 @@ func assertLeafDecodesTo(t *testing.T, buf []byte, cfg Config, expected []LeafEn
 		if !bytes.Equal(got.Key, want.Key) {
 			t.Fatalf("entry %d: key %q, want %q", i, got.Key, want.Key)
 		}
-		if got.Flags != want.Flags {
-			t.Fatalf("entry %d: flags 0x%x, want 0x%x", i, got.Flags, want.Flags)
+		// The writers canonicalize plain empty-value cells to the
+		// compact form (effectiveCellFlags) — the oracle must expect
+		// the canonical flags, not the input's.
+		if wantFlags := effectiveCellFlags(want.Flags, want.Value); got.Flags != wantFlags {
+			t.Fatalf("entry %d: flags 0x%x, want 0x%x", i, got.Flags, wantFlags)
 		}
 		switch {
 		case want.IsOverflow():
@@ -1245,6 +1248,13 @@ func randomSortedKeys(r *rand.Rand, n int) [][]byte {
 }
 
 func randomValue(r *rand.Rand) []byte {
+	// 1-in-4 explicitly empty: the compact empty-value cell form
+	// (page-formats.md CellFlags bit 3) is a first-class encoding and
+	// the grammar must generate it deliberately, not via the incidental
+	// IntN(48)==0 case (generator grammar keeps pace with the format).
+	if r.IntN(4) == 0 {
+		return nil
+	}
 	v := make([]byte, r.IntN(48))
 	for i := range v {
 		v[i] = byte(r.IntN(256))

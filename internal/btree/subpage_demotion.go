@@ -51,10 +51,10 @@ import (
 // (0 = variable). Used to compute the subpage encoding for the
 // demoted state (the on-disk subpage carries entries in the keyspace's
 // declared mode regardless of how the nested tree stored them — the
-// nested tree always uses full inline cells per
-// set-keyspace.md §Nested B+tree Reference Cell, but the
-// demoted-subpage entries must match the keyspace's fixed/variable
-// declaration).
+// nested tree stores members as plain inline or compact empty-value
+// cells (set-keyspace.md §Nested B+tree Reference Cell +
+// page-formats.md empty-value cell), but the demoted-subpage entries
+// must match the keyspace's fixed/variable declaration).
 //
 // Empty / null root (rootID == 0): the caller's post-delete state
 // should never carry a null root for a nested tree that this
@@ -116,12 +116,13 @@ func DemoteNestedTreeIfFits(
 		if !ok {
 			break
 		}
-		// Defensive: nested-tree leaves are plain inline cells per
-		// §Nested B+tree Reference Cell. A nested-tree leaf
+		// Defensive: nested-tree leaves hold members as plain inline
+		// or compact empty-value cells (§Nested B+tree Reference Cell
+		// + page-formats.md empty-value cell). A nested-tree leaf
 		// containing MultiValue or Overflow cells is structural
 		// corruption.
-		if e.Flags != 0 {
-			return nil, false, fmt.Errorf("%w: nested-tree leaf %d entry has unexpected CellFlags 0x%x (expected 0 — plain inline cell)",
+		if e.Flags&^page.CellFlagEmptyValue != 0 {
+			return nil, false, fmt.Errorf("%w: nested-tree leaf %d entry has unexpected CellFlags 0x%x (expected a plain inline or empty-value cell)",
 				ErrCorrupted, rootID, e.Flags)
 		}
 		// Copy the key bytes — they're borrowed from the leaf's
