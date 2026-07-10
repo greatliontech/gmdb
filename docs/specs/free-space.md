@@ -413,8 +413,20 @@ transaction `T` (the compaction pass's own commit):
    argument. Decline is trivial by construction: the request performs no
    state change until read-only probing establishes a below-floor
    home for every copy and the prefix fits the work budget — only
-   then do allocations land. The pass reports the region
-   unsatisfiable this pass.
+   then do allocations land. The probe obligations are: the slab
+   budget covering the k copy buffers PLUS the RPL segment pages
+   the k retirements will need, and page AVAILABILITY for that
+   segment append (bitmap free bits beyond the homes plus
+   file-extension headroom; the reclamation tier is deliberately
+   uncounted — a conservative undercount only ever declines a pass
+   the next pass's eager reclaim satisfies). The pass reports the
+   region unsatisfiable this pass. An application-configured
+   `LaggingReaderAbort` firing during the segment append is
+   FAILURE-scope, not a probe obligation: the application chose
+   fail-over-wait semantics for allocation under a lagging reader,
+   so the commit fails with `ErrDBFull`, rolls back cleanly, and
+   the next pass re-arms — the probe neither predicts nor consults
+   the callback.
 3. The old prefix pages are retired IN `T`'s new head segment — they
    are pages freed by `T`, listed like any other retirement.
 4. The meta flip publishes everything at once: `RPLHeadPage` names

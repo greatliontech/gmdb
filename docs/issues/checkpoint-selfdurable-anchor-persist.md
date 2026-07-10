@@ -1,9 +1,6 @@
 # Checkpoint leaves the persisted anchor trailing on self-durable metas
 
-Lands: when durability.md §Anchoring records whether an anchored
-assertion's sole durable carrier may be rewritten in place (spec
-decision on the carrier-loss gap), or a tear-safe persist channel is
-specified
+Lands: 23
 
 ## Finding
 
@@ -35,13 +32,11 @@ BOTH slots, so a torn rewrite of one never destroys it.
 
 ## Fix direction
 
-Spec decision (surfaced with the chunk): either durability.md
-§Anchoring accepts the trailing persisted anchor on self-durable
-metas as the contract — this issue then closes with a spec clause —
-or it specifies a tear-safe persist channel (e.g. peers trust an
-advanced anchor only through their own rewrite-plus-fsync, mirroring
-the guard recovery's gated Open already requires), and the persist
-lands with that mechanism. The in-process advance and the sole-
+DECIDED (user): durability.md §Anchoring gains a tear-safe persist
+channel — peers trust an advanced anchor only through their own
+rewrite-plus-fsync, mirroring the guard recovery's gated Open
+already requires — and the self-durable checkpoint persist lands
+with that mechanism (the active plan's tear-safe-anchor chunk). The in-process advance and the sole-
 carrier skip are pinned by `TestCheckpointSelfDurableAnchorsInProcessOnly`.
 
 ## Provenance
