@@ -29,7 +29,7 @@ type LeafIter struct {
 	idx        int // index of the next entry Next() will return
 	startIdx   int // lower bound (inclusive) for Prev / At
 	endIdx     int // upper bound (exclusive) for Next
-	off        int // current byte offset (forward-streaming only)
+	off        int // current byte offset (compressed forward-streaming only)
 	compressed bool
 
 	// Compressed forward-streaming fields.
@@ -53,15 +53,18 @@ type LeafIter struct {
 // from the iter via KeyBuf / BufKeys / BufEnts so the caller can reclaim
 // them on the next iter construction.
 func (r LeafReader) IterForReuse(keyBuf, bufKeys []byte, bufEnts []LeafEntry) LeafIter {
-	return LeafIter{
+	it := LeafIter{
 		r:          r,
 		endIdx:     r.count,
-		off:        leafEntryStart,
 		compressed: r.compressed,
 		keyBuf:     keyBuf,
 		bufKeys:    bufKeys[:0],
 		bufEnts:    bufEnts[:0],
 	}
+	if r.compressed {
+		it.off = leafEntryStart
+	}
+	return it
 }
 
 // IterAtForReuse returns an iterator positioned so the next Next() call
@@ -85,11 +88,13 @@ func (r LeafReader) IterAtForReuse(startIdx int, keyBuf, bufKeys []byte, bufEnts
 		}
 	}
 	if !r.compressed {
+		// Position is idx alone: uncompressed Next/Prev/At all resolve
+		// their byte offset from the positional offset table, so there
+		// is no stream state to seed.
 		return LeafIter{
 			r:          r,
 			idx:        startIdx,
 			endIdx:     r.count,
-			off:        r.ucOffset(startIdx),
 			compressed: false,
 			keyBuf:     keyBuf,
 			bufKeys:    bufKeys[:0],
@@ -163,8 +168,10 @@ func (it *LeafIter) Next() (LeafEntry, bool) {
 		return LeafEntry{}, false
 	}
 	if !it.compressed {
-		e, off := it.r.decodeFullKeyEntry(it.off)
-		it.off = off
+		// Table-driven (page-formats.md §Cursor Iteration): idx is the
+		// single source of position, so Prev/At repositioning can never
+		// desynchronize a separately-tracked stream offset.
+		e, _ := it.r.decodeFullKeyEntry(it.r.ucOffset(it.idx))
 		it.idx++
 		return e, true
 	}
@@ -232,8 +239,9 @@ func (it *LeafIter) At(idx int) (LeafEntry, bool) {
 //	Prev() → entry N-2 (it.idx = N-1)
 //
 // In a Prev-Next-Prev alternation, Prev re-issues *its own* prior
-// return (not Next's prior return): after `Prev() → N-1`,
-// `Next() → N-1` (because it.idx is now N), then `Prev() → N-2`.
+// return (not Next's prior return): after `Prev() → N-1`, `Next()`
+// returns the entry at the new position — `Next() → N` (it.idx is
+// N) — and a following `Prev()` yields `N-1` again.
 //
 // Backwards iteration is buffered on compressed pages — first Prev
 // transitions the iter to buffered mode for the containing group.

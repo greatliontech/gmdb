@@ -70,19 +70,17 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 		case cmp < 0:
 			lo = mid + 1
 		case cmp == 0:
+			// idx == count is a valid past-end position: Next's bounds
+			// check fires before any offset-table read, so no table
+			// slot is touched past the last entry.
 			it := LeafIter{
 				r:          r,
 				idx:        mid + 1,
 				endIdx:     r.count,
-				off:        r.ucOffset(mid + 1), // 0 if mid+1 == count; benign
 				compressed: false,
 				keyBuf:     keyBuf,
 				bufKeys:    bufKeys[:0],
 				bufEnts:    bufEnts[:0],
-			}
-			// At end-of-leaf we'd index past the offset table; guard.
-			if mid+1 >= r.count {
-				it.off = 0
 			}
 			ret := e
 			ret.Key = nil
@@ -105,13 +103,11 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 		return r.count, LeafEntry{}, false, it
 	}
 	// successor at lo
-	sucOff := r.ucOffset(lo)
-	e, nextOff := r.decodeFullKeyEntry(sucOff)
+	e, _ := r.decodeFullKeyEntry(r.ucOffset(lo))
 	it := LeafIter{
 		r:          r,
 		idx:        lo + 1,
 		endIdx:     r.count,
-		off:        nextOff,
 		compressed: false,
 		keyBuf:     keyBuf,
 		bufKeys:    bufKeys[:0],

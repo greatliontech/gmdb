@@ -46,6 +46,15 @@ are NOT in this batch.
   `min(2*RestartGroupTarget, 255)` group-growth cap from in-place
   inserts (`leaf_splice.go:317-320`) is observable on-disk state and
   belongs in the spec.
+- **page-formats.md contiguous-stream invariant (≈line 87)**: the
+  from-clause grounds the invariant in a variant-generic "streaming
+  iterator … never re-consult[s] the lookup tables mid-stream", but the
+  uncompressed iterator is table-driven on every op (per §Cursor
+  Iteration's own O(1)-via-table clause). The property stands (the
+  compressed streaming iterator, the compressed splice continuation
+  walks at leaf_splice.go:345/648, and write-side DataEnd placement
+  depend on it); reword the from/violation prose to name those actual
+  continuation consumers. Raised by the chunk-1 change-set review.
 - **cross-process.md**: the future-stamp invariant's darwin/freebsd
   rationale is factually wrong (both clocks are boot-relative,
   kernel-wide), and the spec presents macOS/FreeBSD as supported while

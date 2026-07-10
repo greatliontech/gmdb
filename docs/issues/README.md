@@ -79,7 +79,6 @@ chunks (bottom-up by layer, grouped by function).
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| uncompressed-leaf-read-path-defects | 1 | [H×2] RGT=1 read path: last-entry seek panic (checksums off); iterator Prev/At/Next desync returns wrong/fabricated entries |
 | btree-delete-rebuild-growth | 2 | [H] compressed-leaf delete rebuild can grow past capacity → false ErrCorrupted on valid deletes; [M] relocate re-encode, same family |
 | btree-rebalance-termination | 3 | [H] leaf redistribute lacks fill-floor decline → non-terminating delete loop; [M] deep-underflow heal dropped |
 | btree-readpath-validation-gaps | 4 | [M] unvalidated cousin-scan decode panics on corrupt page; [L] Cursor.Delete swallows reposition error |

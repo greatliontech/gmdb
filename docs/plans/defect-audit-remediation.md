@@ -6,7 +6,7 @@ chunk; the issue carries the defect detail, failure scenarios, fix
 direction, and spec-amend riders. Bottom-up by layer, grouped by
 function. WIP = 1.
 
-- [ ] 1. internal/page: uncompressed-leaf read path — exact-match-last
+- [x] 1. internal/page: uncompressed-leaf read path — exact-match-last
       seek panic, iterator Prev/At/Next desync, iterator doc contracts
 - [ ] 2. internal/btree: delete-side re-encode growth — split fallback
       for delete/range-delete rebuilds and relocate re-encode

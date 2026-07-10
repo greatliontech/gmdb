@@ -223,9 +223,9 @@ func (r LeafReader) GroupEntryCount(i int) int {
 // target already or don't need the key bytes back), and whether the key
 // was found. On miss, index is the insertion point (the index of the
 // smallest key strictly greater than target, or Count() if every entry is
-// less than target). Same robustness contract as the per-variant
-// decoders: total over input; errors flow through return-error variants
-// (TODO: an err-returning sibling could be added).
+// less than target). SearchLeaf uses the unchecked hot-path decoders and
+// assumes structural validity — first-resolve callers must gate the page
+// through Validate (see the Validate doc for the trust boundary).
 func (r LeafReader) SearchLeaf(target []byte) (index int, entry LeafEntry, found bool) {
 	if r.count == 0 {
 		return 0, LeafEntry{}, false
