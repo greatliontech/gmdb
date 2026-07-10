@@ -8,9 +8,9 @@ function. WIP = 1.
 
 - [x] 1. internal/page: uncompressed-leaf read path — exact-match-last
       seek panic, iterator Prev/At/Next desync, iterator doc contracts
-- [ ] 2. internal/btree: delete-side re-encode growth — split fallback
-      for delete/range-delete rebuilds and relocate re-encode
-      (+ page-formats.md rider)
+- [x] 2. internal/btree: delete-side re-encode growth — native-variant
+      splice fallback for delete/range-delete rebuilds, in-place ref
+      patch for relocate (+ page-formats.md rider)
 - [ ] 3. internal/btree: rebalance termination — leaf redistribute
       fill-floor decline, deep-underflow heal propagation
       (+ range-delete.md rider)

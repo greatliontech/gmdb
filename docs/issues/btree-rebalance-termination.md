@@ -23,6 +23,26 @@ OOM). Same non-termination via `DeleteRange` through
 `rebalanceSurvivors`. When the tracked side is the big half, the sub-MT
 half is instead silently stranded below a reachable floor.
 
+**[H] Leaf redistribute treats a no-feasible-two-page-partition result
+as corruption, but a variant-migrated combined set can genuinely need
+more than two pages.** `internal/btree/delete.go:1259-1262`
+(`mergeOrRedistributeLeaves` → `findLeafSplitIndex` ok=false →
+ErrCorrupted). The justifying comment ("a feasible two-page partition
+always exists — at minimum the original page boundary") rests on the
+removal-monotonicity assumption refuted by the delete-rebuild-growth
+chunk: after a mid-life RGT≥2→1 change, an old delta-heavy compressed
+leaf's entry set canonically inflates far past two pages, so an
+in-spec Delete that underflows its sibling → case-C pairing → merge
+overflows → redistribute finds no feasible split → deterministic
+ErrCorrupted on valid data; retries fail identically. Also violates
+range-delete.md fill-floor's "the delete itself always succeeds"
+clause. The sound shape is a DECLINE (below-floor accepted per "where
+reachable") — the same decline surface this chunk's fill-floor work
+builds; the redistribute plan must also avoid re-encoding old-variant
+inputs canonically when that inflates them (the splice-fallback
+lesson). Filed from the chunk-2 change-set review (adjacent —
+reproduces on base).
+
 **[M] `patchBranchAfterChildDelete` drops an in-flight
 `deepUnderflowChildIn` on case-C redistribute and decline outcomes.**
 `internal/btree/delete.go:620` gates the cousin heal on

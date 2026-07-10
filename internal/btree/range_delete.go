@@ -213,9 +213,11 @@ func deleteRangeFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	// safe and avoids a second allocation for the keep slice.
 	keep := entries[:0]
 	deleted := make([]page.LeafEntry, 0)
-	for _, e := range entries {
+	deletedIdxs := make([]int, 0)
+	for i, e := range entries {
 		if keyInRange(e.Key, start, end) {
 			deleted = append(deleted, e)
+			deletedIdxs = append(deletedIdxs, i)
 		} else {
 			keep = append(keep, e)
 		}
@@ -253,17 +255,38 @@ func deleteRangeFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 		return 0, 0, false, fmt.Errorf("btree: CoW leaf %d for DeleteRange: %w", pageID, err)
 	}
 	b := page.NewLeafBuilder(newBuf, cfg)
+	built := true
 	for _, e := range keep {
 		if !b.AddEntry(e) {
-			// Deletion strictly shrinks the entry set — a build that
-			// doesn't fit after removing entries would have failed at
-			// the original encode too. Treat as structural corruption.
-			_ = pw.FreePage(newID)
-			return 0, 0, false, fmt.Errorf("%w: leaf %d re-build after DeleteRange overflowed page",
-				ErrCorrupted, pageID)
+			built = false
+			break
 		}
 	}
-	b.Finish()
+	if built {
+		b.Finish()
+	} else {
+		// The keep-set is NOT removal-monotone under a canonical
+		// re-encode: restart-group re-alignment, or a variant
+		// migration after a mid-life RestartGroupTarget change, can
+		// grow the encoding past one page even though entries were
+		// removed. Fall back to native-variant splices of the
+		// original bytes — a splice delete always shrinks, so
+		// removing the in-range entries one by one (descending index,
+		// so earlier indices stay valid) always fits; the page keeps
+		// its on-disk variant (page-formats.md §Insert and Delete).
+		// Every splice has pre-delete count ≥ keep+1 ≥ 2, so the
+		// count<=1 decline is unreachable; a decline is structural
+		// corruption. srcBuf is the untouched original page; the
+		// builder dirtied only newBuf.
+		copy(newBuf, srcBuf)
+		for j := len(deletedIdxs) - 1; j >= 0; j-- {
+			if !page.TryDeleteAtNative(newBuf, cfg, deletedIdxs[j]) {
+				_ = pw.FreePage(newID)
+				return 0, 0, false, fmt.Errorf("%w: leaf %d native splice after DeleteRange re-build overflow declined at idx %d",
+					ErrCorrupted, pageID, deletedIdxs[j])
+			}
+		}
+	}
 	var totalCount uint64
 	for _, e := range deleted {
 		n, err := perCellFree(pw, cfg, e)

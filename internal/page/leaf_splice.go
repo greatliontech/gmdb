@@ -532,6 +532,38 @@ func TryDeleteAt(buf []byte, cfg Config, deleteIdx int) bool {
 	}
 }
 
+// TryDeleteAtNative is TryDeleteAt without the variant-migration
+// policy gate: it splices in the PAGE's own on-disk variant,
+// regardless of the configured one. Same caller contract (deleteIdx
+// must be a present entry's index) and the same count<=1 decline (no
+// emptied-page form).
+//
+// This is the delete path's removal-monotone fallback: a canonical
+// LeafBuilder re-encode of a keep-set can GROW past the page —
+// restart-group re-alignment loses per-entry prefix savings, and a
+// variant migration can inflate a delta-heavy page by far more than
+// one page — but a native-variant splice ALWAYS shrinks (see
+// tryDeleteAtCompressed's triangle-inequality bound and
+// ucTryDeleteAt), so deleting entries from a fitting page in its own
+// variant always fits. For count > 1 this function always returns
+// true on a structurally valid page; the page keeps its on-disk
+// variant (sanctioned — old pages keep their structure across
+// RestartGroupTarget config changes, page-formats.md).
+func TryDeleteAtNative(buf []byte, cfg Config, deleteIdx int) bool {
+	typ, _, count, _ := ReadHeader(buf)
+	if count <= 1 {
+		return false
+	}
+	switch typ {
+	case TypeLeaf:
+		return tryDeleteAtCompressed(buf, cfg, deleteIdx)
+	case TypeLeafUncompressed:
+		return ucTryDeleteAt(buf, cfg, deleteIdx)
+	default:
+		return false
+	}
+}
+
 // tryDeleteAtCompressed removes the entry at deleteIdx from a compressed leaf by
 // shrinking its containing restart group: it re-encodes at most the displaced
 // successor and shifts the trailing bytes left; every other entry keeps its

@@ -24,16 +24,16 @@ import (
 //
 // Overflow chains owned by a leaf are also relocated when their first page
 // is eligible: the runLen-page chain is copied to a fresh contiguous run
-// and the owning leaf entry's ref rewritten (which re-encodes the leaf —
-// keys unchanged, so still one page). Nested-tree subtrees (a SetKeyspace
-// member set promoted to its own B+tree, rooted at a leaf cell's
-// NestedRoot — set-keyspace.md §Nested B+tree Reference Cell) are
+// and the owning leaf entry's ref patched in place on the leaf's CoW copy
+// (page.LeafReader.PatchRefs — a fixed 8-byte trailer overwrite, size-
+// identical by construction; see relocateLeaf). Nested-tree subtrees (a
+// SetKeyspace member set promoted to its own B+tree, rooted at a leaf
+// cell's NestedRoot — set-keyspace.md §Nested B+tree Reference Cell) are
 // relocated recursively: the primitive descends into NestedRoot exactly
-// as into any other tree, and rewrites the owning leaf entry's NestedRoot
-// when the nested root's id changes (re-encoding the leaf — the NestedRoot
-// trailer is a fixed 8-byte field, so the cell keeps its size and the leaf
-// still fits one page). NestedCount rides through the re-encode unchanged,
-// preserving the keyspace Count-equality contract (set-keyspace.md E1).
+// as into any other tree, and patches the owning leaf entry's NestedRoot
+// the same way when the nested root's id changes. NestedCount rides
+// through the patch unchanged, preserving the keyspace Count-equality
+// contract (set-keyspace.md E1).
 // RPL segment pages are deliberately NOT relocated by this primitive —
 // they are managed (allocated, chained, reclaimed) by the commit pipeline,
 // and rewriting them out-of-band would race that machinery; RPL pages
@@ -153,15 +153,18 @@ func relocateNode(pw PageWriter, cfg page.Config, id uint64, shouldRelocate func
 //     changes the owning entry's NestedRoot is rewritten. NestedCount is
 //     carried through untouched, preserving set-keyspace.md E1.
 //
-// Either rewrite re-encodes the leaf. Because every rewritten field
-// (OverflowPage, NestedRoot) is a fixed 8-byte trailer and all keys are
-// unchanged, the re-encoded leaf is byte-for-byte the same size and still
-// fits one page (no split). The leaf is also relocated if the leaf page
-// itself is eligible. Chain pages (runLen each) and nested-subtree pages
-// are counted against budget/moved as they move; a leaf re-encoded solely
-// to carry updated refs is mandatory overhead, counted only when the leaf
-// itself is eligible. depth bounds the descent across the nesting boundary
-// (continued, not reset — matches freeSubtreeAt).
+// Either rewrite patches the CoW copy in place (page.LeafReader.PatchRefs):
+// the rewritten fields (OverflowPage, NestedRoot) are fixed 8-byte
+// trailers, so the patch is size-identical by construction and preserves
+// the page's existing group structure — load-bearing for pages whose
+// on-disk variant or grouping predates the current RestartGroupTarget
+// config, where a canonical re-encode could GROW past the page. The leaf
+// is also relocated if the leaf page itself is eligible. Chain pages
+// (runLen each) and nested-subtree pages are counted against budget/moved
+// as they move; a leaf copied solely to carry updated refs is mandatory
+// overhead, counted only when the leaf itself is eligible. depth bounds
+// the descent across the nesting boundary (continued, not reset — matches
+// freeSubtreeAt).
 func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldRelocate func(uint64) bool, budget, moved *int, depth int) (uint64, bool, error) {
 	entries, err := readLeafEntriesDeepCopy(buf, cfg, id)
 	if err != nil {
@@ -215,22 +218,20 @@ func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldR
 	if err != nil {
 		return 0, false, err
 	}
-	if refsRewritten {
-		// Re-encode with the updated overflow / nested-tree refs (keys and
-		// every other field unchanged ⇒ fits the same page, no split).
-		nbuf, err := pw.ZeroPage(nid)
-		if err != nil {
-			return 0, false, err
-		}
-		b := page.NewLeafBuilder(nbuf, cfg)
-		for i := range entries {
-			if !b.AddEntry(entries[i]) {
-				return 0, false, fmt.Errorf("%w: leaf %d overflowed its page when re-encoded during relocation", ErrCorrupted, id)
-			}
-		}
-		b.Finish()
-	} else if _, err := pw.CopyPage(id, nid); err != nil {
+	nbuf, err := pw.CopyPage(id, nid)
+	if err != nil {
 		return 0, false, err
+	}
+	if refsRewritten {
+		// Patch the updated overflow / nested-tree refs in place on the
+		// CoW copy — size-identical, group structure preserved (see the
+		// doc comment above). entries[k] carries the relocated values.
+		page.NewLeafReader(nbuf, cfg).PatchRefs(func(i int, e page.LeafEntry) uint64 {
+			if entries[i].IsOverflow() {
+				return entries[i].OverflowPage
+			}
+			return entries[i].NestedRoot
+		})
 	}
 	if err := pw.FreePage(id); err != nil {
 		return 0, false, err

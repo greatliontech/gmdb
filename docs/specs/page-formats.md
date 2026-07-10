@@ -666,6 +666,30 @@ not on every insert / delete. Uncompressed leaves rebuild only the
 offset table; the per-entry data shifts but no key re-encoding
 occurs.
 
+**Delete-side rebuild fallback.** A delete's keep-set is NOT
+removal-monotone under the canonical builder: re-packing the
+survivors re-aligns restart-group boundaries (each shifted boundary
+stores a full key where a delta sufficed), and the rebuild's variant
+migration (a page whose on-disk variant differs from the configured
+`RestartGroupTarget`) can inflate a delta-heavy page by far more
+than one page. When the canonical decode-and-rebuild of a delete's
+keep-set does not fit one page, the delete falls back to
+native-variant splices of the original page bytes
+(`TryDeleteAtNative`): a splice delete always shrinks (the
+compressed splice's shared-prefix triangle-inequality bound; the
+uncompressed sorted-array delete), so removing entries from a
+fitting page in its own variant always fits. The page keeps its
+on-disk variant and group structure — variant migration on the
+delete path is opportunistic, never load-bearing. Consequence, and
+the invariant the fallback restores: **the leaf keep-set rebuild
+never fails for encoding reasons and never splits the leaf**. The
+claim is deliberately scoped to the rebuild step: a delete may
+still grow a page when a fits-but-larger variant migration is
+taken, and a delete's merge/redistribute/root-collapse machinery
+changes tree shape by design (its own encoding-infeasibility
+handling is governed by `range-delete.md` §Invariants, not this
+clause).
+
 ### Leaf Split
 
 On overflow, the leaf is split into two halves at a *group boundary*

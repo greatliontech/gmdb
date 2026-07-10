@@ -159,7 +159,9 @@ func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID
 	// page whose on-disk variant differs from the configured one after a mid-life
 	// RGT change — the rare case); count<=1 (page would empty) is routed straight
 	// to the slow path by this gate. On a decline the speculative CoW is freed
-	// and the slow path runs (and migrates the variant).
+	// and the slow path runs (and migrates the variant when the
+	// migrated encoding fits — the rebuild's native-splice fallback keeps
+	// the old variant otherwise).
 	if r.Count() > 1 {
 		newID, err := pw.AllocPage()
 		if err != nil {
@@ -201,7 +203,7 @@ func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID
 	entries := leafEntriesDeepCopyFrom(r)
 	removed = entries[idx]
 	entries = append(entries[:idx], entries[idx+1:]...)
-	return rebuildLeafAfterDelete(pw, cfg, mergeThreshold, pageID, entries, removed)
+	return rebuildLeafAfterDelete(pw, cfg, mergeThreshold, pageID, srcBuf, idx, entries, removed)
 }
 
 // rebuildLeafAfterDelete handles the post-removal encode for a leaf:
@@ -210,7 +212,17 @@ func deleteFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID
 // CoW lands, frees the removed entry's overflow chain (if any) per
 // the Invariant: Delete of an overflow entry frees its chain in the
 // same write tx.
-func rebuildLeafAfterDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, entries []page.LeafEntry, removed page.LeafEntry) (uint64, bool, bool, error) {
+//
+// The keep-set is NOT removal-monotone under a canonical re-encode:
+// restart-group re-alignment, or a variant migration after a mid-life
+// RestartGroupTarget change, can grow the encoding past one page even
+// though an entry was removed. When the canonical build overflows,
+// the rebuild falls back to a native-variant splice of srcBuf's bytes
+// (page.TryDeleteAtNative at removedIdx) — a splice delete always
+// shrinks, so it always fits; the page keeps its on-disk variant and
+// migration is skipped for that page (page-formats.md §Insert and
+// Delete).
+func rebuildLeafAfterDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uint64, srcBuf []byte, removedIdx int, entries []page.LeafEntry, removed page.LeafEntry) (uint64, bool, bool, error) {
 	if len(entries) == 0 {
 		// Last entry removed → signal "subtree gone" via newID=0.
 		// The recursive parent removes the corresponding child slot.
@@ -234,16 +246,26 @@ func rebuildLeafAfterDelete(pw PageWriter, cfg page.Config, mergeThreshold uint8
 		return 0, false, false, fmt.Errorf("btree: CoW leaf %d for delete: %w", pageID, err)
 	}
 	b := page.NewLeafBuilder(newBuf, cfg)
+	built := true
 	for _, e := range entries {
 		if !b.AddEntry(e) {
-			// Deletion strictly shrinks the entry set — a build
-			// that doesn't fit after removing an entry would
-			// have failed at the original encode too. Treat as
-			// structural corruption.
-			return 0, false, false, fmt.Errorf("%w: leaf %d re-build after delete overflowed page", ErrCorrupted, pageID)
+			built = false
+			break
 		}
 	}
-	b.Finish()
+	if built {
+		b.Finish()
+	} else {
+		// Canonical keep-set re-encode grew past one page — native-
+		// variant splice fallback (see the function doc). srcBuf is
+		// the untouched original page; the builder dirtied only
+		// newBuf.
+		copy(newBuf, srcBuf)
+		if !page.TryDeleteAtNative(newBuf, cfg, removedIdx) {
+			_ = pw.FreePage(newID)
+			return 0, false, false, fmt.Errorf("%w: leaf %d native splice after re-build overflow declined", ErrCorrupted, pageID)
+		}
+	}
 	// Post-build cleanup ordering: chain-free first (still
 	// reachable via the OLD leaf which has not been retired yet),
 	// then the OLD leaf. On either failure roll back the newly-
