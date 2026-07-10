@@ -159,6 +159,31 @@ Invariant: kind=clause-explicit;
     then `ftruncate`s past it, SIGBUSes the reader on next access
     (the page is no longer mapped) — defeats reader isolation.
 
+Invariant: kind=entailed;
+  property=Every entry of every in-chain RPL segment has its
+    allocation-bitmap bit ALLOCATED, and chain TxnIDs are
+    non-increasing head→tail, bounded by the projection's recorded
+    head TxnID;
+  from=entailed: §Retired Page Log — the entry IS the deferred free
+    record, and oldest-first whole-segment reclamation fixes the
+    chain's time order; no single clause stated either property, yet
+    violating them makes the reclamation-bound sufficiency argument
+    unsound for pages re-allocated after recovery;
+  violation=A crash tears a reclamation pass between bitmap
+    writebacks: an in-chain entry's bit persists free while the
+    segment stays chained — the entry is re-allocated into the live
+    tree and freed a second time under its new owner when the
+    segment reclaims (double allocation, silent corruption). Or the
+    crashed commit's reuse of a reclaimed chain page plants a
+    validly-decoding NEWER segment at an adopted chain position —
+    the impostor's entries are the pages the crashed commit retired,
+    which are exactly the pages the ADOPTED tree still references;
+    once the bound passes the impostor's TxnID, reclamation frees
+    live pages of the adopted tree. (Enforced by attach-time re-arm +
+    the walk's authenticity boundary; pinned by
+    TestCrashTornReclamationRearmedAtOpen and
+    TestRPLChainWalkTimeTraveled* — §Crash-torn reclamation.)
+
 ## Allocation Bitmap
 
 A flat bitfield — one bit per page in the database. **Set bit** =
@@ -549,6 +574,39 @@ recomputes `NumFreePages` from the current bitmap. `Check()`
 recomputes the free count from the bitmap bits via
 `math/bits.OnesCount64` and reports any discrepancy as
 `CheckWarning`.
+
+**Crash-torn reclamation and the in-chain/allocated invariant.**
+Every entry of every in-chain segment has its bitmap bit ALLOCATED —
+the entry is the deferred free record, so a free bit on a pending
+entry is the double-allocation precursor (the entry can be
+re-allocated into the live tree and later freed a second time under
+its new owner when its segment reclaims). A crash can tear this
+invariant: one reclamation pass sets entry bits, segment-page bits,
+and re-clears immediately-reused bits across multiple bitmap pages
+and multiple segments, and an arbitrary subset of those writes can
+persist while recovery adopts a meta that still lists the segments.
+On attach, the writer restores the invariant by **re-arming**:
+every free bit found on a still-pending entry is cleared back to
+allocated (position-independent — any subset of any prefix of
+segments can be torn), and the touched bitmap pages are persisted
+out of band immediately (no fsync needed: the flip is conservative
+and the pass is idempotent across repeated crashed Opens). The
+entries are then freed again by a normal reclamation pass. A
+segment whose OWN page bit persisted free is instead truncated by
+the chain walk together with everything tailward of it — the
+fully-reclaimed interpretation, consistent because reclamation is
+oldest-first with whole-segment consumption; the truncated
+segments' not-yet-persisted entry bits become bounded allocated-
+but-unreferenced leaks, recovered by background maintenance's
+bitmap-leak pass exactly like the SyncLazy partial-flush leaks
+above. Chain content must also be AUTHENTIC: a crashed commit can
+reuse a just-reclaimed chain page for its own new RPL segment (the
+LIFO hint points reuse straight at it) — a validly-decoding
+impostor whose bitmap bit the reuse re-cleared. Only TIME exposes
+it: chain TxnIDs are non-increasing head→tail and never exceed the
+projection's recorded head TxnID, so the walk truncates at any
+segment newer than its predecessor (or the head record) exactly
+like the reclaimed boundary.
 
 ### Reclamation-bound derivation points
 

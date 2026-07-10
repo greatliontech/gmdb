@@ -2,6 +2,9 @@ package pager
 
 import (
 	"fmt"
+
+	"github.com/thegrumpylion/gmdb/internal/bitmap"
+	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // AllocPage allocates a single page following the priority order in
@@ -549,6 +552,58 @@ func (p *Pager) trimRPLChainTail(n int) {
 	}
 	copy(p.rplSegments, p.rplSegments[n:])
 	p.rplSegments = p.rplSegments[:len(p.rplSegments)-n]
+}
+
+// rearmCrashedReclamation restores the in-chain/allocated invariant a
+// crash can tear. Reclamation sets a segment's entry bits, the segment
+// page's own bit, and re-clears bits its transaction immediately
+// reuses — across multiple bitmap pages and multiple segments per
+// pass. A crash can persist an arbitrary subset of those writes while
+// recovery adopts a meta whose chain still lists a segment; the
+// rebuilt chain then carries entries the adopted bitmap already shows
+// free — Check's FreeAndPending state: such an entry can be
+// re-allocated into the live tree and later "reclaimed" a second time
+// under its new owner (double allocation, silent corruption).
+//
+// The state is unambiguous: an in-chain entry's bit stays allocated
+// until its segment is reclaimed, so a free bit on a pending entry can
+// only come from a crash-torn reclamation. Restore the invariant by
+// RE-ARMING: clear the bit back to allocated. The entry stays pending
+// and is freed again by a normal reclamation pass once its segment
+// ages past the bound — deferring the space is the position-
+// independent action (a crashed pass can leave ANY subset of ANY
+// prefix of segments torn; completing instead would require chain
+// surgery for non-tail segments). Segments whose OWN page bit
+// persisted free never reach here — the chain walk already truncates
+// at that reclaimed boundary, and everything tailward of it was
+// reclaimed earlier (oldest-first), a fully-consistent interpretation.
+//
+// Runs on attachState's LOCAL bitmap + chain (pre-install); the
+// caller persists the touched bitmap pages out of band immediately
+// (attachState — Check reads the on-disk bitmap), and the pass is
+// idempotent across repeated crashed Opens. Segments with
+// out-of-range ids are left for the runtime quarantine path
+// (reclaimRPL) untouched.
+func rearmCrashedReclamation(pageRaw func(uint64) []byte, cfg page.Config, bm *bitmap.Bitmap, chain []RPLSegmentRef) (rearmed []uint64) {
+	for _, seg := range chain {
+		if seg.PageID < bm.FirstDataPage() || seg.PageID >= bm.TotalPages() {
+			continue // runtime quarantine's job
+		}
+		decoded, _, ok := readRPLSegment(pageRaw, cfg, seg.PageID)
+		if !ok {
+			continue
+		}
+		for _, id := range decoded.PageIDs {
+			if id < bm.FirstDataPage() || id >= bm.TotalPages() {
+				continue
+			}
+			if bm.IsSet(id) {
+				bm.Clear(id)
+				rearmed = append(rearmed, id)
+			}
+		}
+	}
+	return rearmed
 }
 
 // TailRefund clears bitmap bits and decrements highWaterMark for tail

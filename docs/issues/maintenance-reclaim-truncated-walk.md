@@ -28,6 +28,23 @@ under its new owner → double-allocation, silent corruption. Variant:
 a reader pinned below the segment's TxnID still references P when
 maintenance frees it.
 
+**[L] Check reports FreeAndPending (CheckError) for segments the
+attach walk already truncated at a reclaimed boundary — a false
+corruption alarm on a healthy post-crash database.** Check's walkRPL
+runs without the bitmap oracle ("Check falls back to the footer/decode
+boundary alone"), so it counts as *pending* segments beyond the
+reclaimed boundary the writer's attach walk truncated (a segment whose
+own bit persisted free = fully reclaimed, the consistent
+interpretation; its entries are plain free pages). A user running
+Check right after a crash-recovery Open sees CheckError on a state the
+runtime handles correctly (the truncated segments are not in the live
+chain and cannot double-free). Found while building the
+crash-torn-reclamation regression (the writer-side re-arm fix). Fix
+shape: give Check's walk the same reclaimed-boundary semantics (it can
+read the on-disk bitmap it already loads for accounting), or classify
+the beyond-boundary pending set as reclaimed. Filed from the
+crash-coherence chunk's work (adjacent — reproduces on base).
+
 ## Fix direction
 
 Gate reclamation on the walk having reached the true tail

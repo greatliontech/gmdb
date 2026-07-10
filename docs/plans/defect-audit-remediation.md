@@ -20,7 +20,7 @@ function. WIP = 1.
       build (+ set-keyspace.md rider)
 - [x] 6. internal/btree + internal/page: compact fixed-size nested-leaf
       cells per set-keyspace.md
-- [ ] 7. internal/pager: crash-coherent RPL reclamation — neutralize
+- [x] 7. internal/pager: crash-coherent RPL reclamation — neutralize
       half-reclaimed segments at Open (+ free-space.md rider)
 - [ ] 8. internal/pager: file-resident bounds — writer fileSize
       tracking, reader shrink-stable bound, MaxSize clamp

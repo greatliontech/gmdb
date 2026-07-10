@@ -79,7 +79,6 @@ chunks (bottom-up by layer, grouped by function).
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| rpl-half-reclaimed-segment-double-free | 7 | [H] crash image re-includes a half-reclaimed RPL segment → later double-free of a re-allocated live page |
 | pager-file-resident-bounds | 8 | [M×2] stale writer fileSize → spurious ErrCorrupted; reader SIGBUS window after shrink; [L] Page() MaxSize clamp |
 | pager-commit-residue | 9 | [L×3] checkpoint under-anchor; armed rplRelocFloor survives abort; relocation probe undercounts segments |
 | reader-slot-clear-validation | 10 | [H] stale-reader clear without occupancy re-check evicts a live reader (use-after-reclaim); [M] frozen-reader ghost-store |
@@ -92,6 +91,6 @@ chunks (bottom-up by layer, grouped by function).
 | index-ondelete-partial-state | 17 | [M] extractor panic mid-onDelete commits partial index state; [L] stale coverValue → false ErrCorrupted; [L] schemaHash doc grammar |
 | bulkload-index-parity | 18 | [H] index bulk build skips key-size gate → un-updatable/un-compactable DB; [M] no overflow promotion for index values; [L] config parity |
 | copyto-hardening | 19 | [M×2] verbatim CopyTo SIGBUS on truncated source; torn destination on crash; [L] Check misses overflow-header corruption |
-| maintenance-reclaim-truncated-walk | 20 | [H] leak reclamation behind a truncated RPL walk double-frees pages still in the live chain |
+| maintenance-reclaim-truncated-walk | 20 | [H] leak reclamation behind a truncated RPL walk double-frees pages still in the live chain; [L] Check false-positive FreeAndPending beyond a reclaimed boundary |
 | compaction-consolidating-alloc | 21 | [M] relocations re-land in the evacuation band — no convergence; spec's consolidating allocator unimplemented |
 | spec-descriptive-drift | 22 | [L] batch: spec clauses describing mechanisms the code doesn't use; code-shape content in specs |

@@ -206,6 +206,10 @@ func (w RPLChainWalk) Walk(visit func(id uint64, seg RPLSegment) bool) (RPLWalkS
 	headExempt := w.HeadTxnID >= w.ReclaimEpoch
 	var segs uint64
 	id := w.Head
+	// Ceiling for the authenticity check below: the head's own TxnID
+	// (the newest the projection can legitimately contain). Seeded so
+	// the head itself is checked against it too.
+	prevTxnID := w.HeadTxnID
 	for {
 		if id >= w.HighBound {
 			return RPLWalkStop{}, &RPLWalkError{Kind: RPLWalkErrSegmentOutOfRange, PageID: id, Head: w.Head, Tail: w.Tail, Bound: w.HighBound}
@@ -240,6 +244,23 @@ func (w RPLChainWalk) Walk(visit func(id uint64, seg RPLSegment) bool) (RPLWalkS
 			}
 			return RPLWalkStop{Reason: RPLWalkDecodeBoundary, PageID: id}, nil
 		}
+		// Segment AUTHENTICITY: a crashed commit can reuse a page a
+		// just-finished reclamation freed — including a chain page the
+		// adopted (older) meta still names — for its OWN new RPL
+		// segment (the LIFO hint points reuse straight at it). The
+		// impostor decodes validly and its bitmap bit was re-cleared
+		// by the reuse, so no other boundary fires. It is detectable
+		// by TIME: chain TxnIDs are non-increasing head→tail and can
+		// never exceed the projection's head TxnID, so a segment newer
+		// than its predecessor (or the head) traveled from a later,
+		// unadopted commit. Treat it exactly like the reclaimed
+		// boundary — the true older content is gone, and oldest-first
+		// whole-segment reclamation means everything tailward of it
+		// was reclaimed by the same crashed pass.
+		if seg.TxnID > prevTxnID {
+			return RPLWalkStop{Reason: RPLWalkReclaimedBoundary, PageID: id}, nil
+		}
+		prevTxnID = seg.TxnID
 		if !visit(id, seg) {
 			return RPLWalkStop{Reason: RPLWalkCallerStopped, PageID: id}, nil
 		}

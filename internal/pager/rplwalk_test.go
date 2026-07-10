@@ -1,6 +1,7 @@
 package pager
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
@@ -16,6 +17,7 @@ type walkFixture struct {
 	cfg   page.Config
 	pages map[uint64][]byte
 	free  map[uint64]bool
+	txns  map[uint64]uint64
 }
 
 func newWalkFixture(checksum bool) *walkFixture {
@@ -35,6 +37,10 @@ func (f *walkFixture) segment(id, txnID, older uint64, entries ...uint64) {
 		page.WritePageFooter(buf, f.cfg.PageSize)
 	}
 	f.pages[id] = buf
+	if f.txns == nil {
+		f.txns = map[uint64]uint64{}
+	}
+	f.txns[id] = txnID
 }
 
 // garbage writes a page that carries a VALID footer (when checksums are
@@ -69,6 +75,10 @@ func (f *walkFixture) chainWalk(head, tail, entryCount uint64) RPLChainWalk {
 		Cfg:        f.cfg,
 		Head:       head,
 		Tail:       tail,
+		// Honest projections record the head segment's own TxnID in
+		// the meta (RPLHeadTxnID) — the authenticity ceiling. Garbage
+		// or absent heads keep 0; those walks fail earlier anyway.
+		HeadTxnID:  f.txns[head],
 		EntryCount: entryCount,
 		LowBound:   2,
 		HighBound:  1024,
@@ -398,4 +408,55 @@ func TestRPLChainWalkHeadOwnership(t *testing.T) {
 		_, _, werr := run(t, w)
 		wantErr(t, werr, RPLWalkErrHeadChecksum, 12)
 	})
+}
+
+// A crashed commit can reuse a just-reclaimed chain page for its OWN
+// new RPL segment; the adopted (older) meta still names the page, the
+// impostor decodes validly, and its bitmap bit was re-cleared by the
+// reuse — only TIME exposes it: chain TxnIDs are non-increasing
+// head→tail and bounded by the head's. The walk must truncate at the
+// impostor exactly like a reclaimed boundary (everything tailward was
+// reclaimed by the same crashed pass), never accept it or error.
+func TestRPLChainWalkTimeTraveledSegmentTruncates(t *testing.T) {
+	for _, checksum := range []bool{true, false} {
+		t.Run(fmt.Sprintf("checksum=%v", checksum), func(t *testing.T) {
+			f := newWalkFixture(checksum)
+			// Honest chain: head 30 (txn 9) → 20 (txn 8) → tail 10…
+			// but page 10 was reclaimed and reused by crashed txn 11:
+			// its content is now a NEWER segment.
+			f.segment(30, 9, 20, 300)
+			f.segment(20, 8, 10, 200)
+			f.segment(10, 11, 0, 100) // impostor: txn 11 > predecessor's 8
+			visited, stop, werr := run(t, f.chainWalk(30, 10, 3))
+			wantStop(t, werr, stop, RPLWalkReclaimedBoundary, 10)
+			if !slices.Equal(visited, []uint64{30, 20}) {
+				t.Fatalf("visited %v, want [30 20]", visited)
+			}
+
+			// Two crash generations: the surviving impostor (txn 11)
+			// now sits BELOW a newer head's ceiling (txn 15) — only
+			// per-step non-increase exposes it.
+			f2 := newWalkFixture(checksum)
+			f2.segment(31, 15, 21, 310)
+			f2.segment(21, 8, 11, 210)
+			f2.segment(11, 11, 0, 110) // impostor from an earlier crash
+			visited2, stop2, werr2 := run(t, f2.chainWalk(31, 11, 3))
+			wantStop(t, werr2, stop2, RPLWalkReclaimedBoundary, 11)
+			if !slices.Equal(visited2, []uint64{31, 21}) {
+				t.Fatalf("gen-2 visited %v, want [31 21]", visited2)
+			}
+		})
+	}
+}
+
+// Head-position impostor: the meta records the head's TxnID; on-disk
+// content newer than that record is the same reuse class.
+func TestRPLChainWalkTimeTraveledHeadTruncates(t *testing.T) {
+	f := newWalkFixture(true)
+	f.segment(30, 12, 20, 300) // content says txn 12…
+	f.segment(20, 8, 0, 200)
+	w := f.chainWalk(30, 20, 2)
+	w.HeadTxnID = 9 // …but the adopted meta recorded 9
+	_, stop, werr := run(t, w)
+	wantStop(t, werr, stop, RPLWalkReclaimedBoundary, 30)
 }

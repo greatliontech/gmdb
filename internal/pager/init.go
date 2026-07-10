@@ -438,6 +438,32 @@ func (p *Pager) attachState(file *os.File, m Meta) error {
 	if err != nil {
 		return fmt.Errorf("pager: rebuild RPL chain: %w", err)
 	}
+	// Neutralize the crash-torn half-reclaimed-segment state before the
+	// chain is installed: an in-chain entry the adopted bitmap already
+	// shows free would be re-allocated into the live tree and then
+	// double-freed when its segment reclaims (free-space.md §RPL
+	// reclamation, crash coherence). Persist the re-armed bitmap pages
+	// out of band (the pager's FileOps seam, as RecoverToDurable's
+	// meta rewrites do): Check reads the
+	// live ON-DISK bitmap, so an in-memory-only re-arm would leave a
+	// user-visible FreeAndPending error until the next commit. The
+	// flip is conservative (free → allocated), ordering-independent,
+	// and idempotent across repeated crashed Opens, so no fsync is
+	// required — a re-crash simply re-arms. (Read-only handles never
+	// reach attachState, so writing through the pager's FileOps seam
+	// here is always on a writable fd.)
+	if rearmed := rearmCrashedReclamation(p.pageRaw, p.cfg, bm, chain); len(rearmed) > 0 {
+		touched := map[uint32]struct{}{}
+		for _, id := range rearmed {
+			touched[uint32(id/8/uint64(pageSize))] = struct{}{}
+		}
+		for idx := range touched {
+			pageBytes := bm.PageBytes(idx)
+			if _, werr := p.fops.WriteAt(pageBytes, int64(2+int64(idx))*int64(pageSize)); werr != nil {
+				return fmt.Errorf("pager: persist re-armed bitmap page %d: %w", idx, werr)
+			}
+		}
+	}
 
 	// All fallible work is done — install every piece of state at once. None
 	// of these assignments can fail, so the pager moves from fully-old to
