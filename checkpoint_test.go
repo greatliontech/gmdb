@@ -1,6 +1,7 @@
 package gmdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
 func TestSyncModesAllAccepted(t *testing.T) {
@@ -164,6 +167,84 @@ func TestCheckpointBumpsSubRecord(t *testing.T) {
 	// — never the bump's own assertion (no-forward-promise).
 	if m.Durable.AnchoredTxnID != 0 {
 		t.Errorf("persisted AnchoredTxnID = %d, want 0 (pre-bump anchored)", m.Durable.AnchoredTxnID)
+	}
+}
+
+// Checkpoint's step-2 fdatasync anchors the pre-bump meta's own
+// durable assertion IN PROCESS (durability.md §Anchoring — the commit
+// path's step 2 makes the same advance), but a SELF-DURABLE meta is
+// the sole durable carrier of that assertion, so step 3 must NOT
+// rewrite it in place merely to persist the advance: a torn step-4
+// fsync could destroy the assertion on disk while the intact
+// page-cache copy keeps feeding peer reclamation bounds, and a later
+// crash would recover the other, older slot below pages a peer
+// already reused. Pure SyncDataOnly therefore keeps the persisted
+// anchor trailing by one, and the checkpoint leaves the meta slots
+// byte-identical.
+func TestCheckpointSelfDurableAnchorsInProcessOnly(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 64,
+		SyncMode: SyncDataOnly,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	for range 2 {
+		if err := db.Update(ctx, func(tx *Tx) error {
+			_, e := tx.AllocPage()
+			return e
+		}); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+	}
+	m := db.Meta()
+	if !m.SelfDurable() || m.Durable.AnchoredTxnID != m.TxnID-1 {
+		t.Fatalf("fixture: want a self-durable meta with the anchor trailing by one, got TxnID=%d Durable=%d Anchored=%d",
+			m.TxnID, m.Durable.TxnID, m.Durable.AnchoredTxnID)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+
+	// Observe the in-process anchored epoch between steps 2 and 4 via
+	// the step-4 hook (after Checkpoint returns, the step-4 advance to
+	// the meta's own TxnID masks the step-2 one).
+	var midAnchored uint64
+	restore := SetCheckpointStepHookForTest(func(step int) error {
+		if step == 4 {
+			midAnchored = db.PgrForTest().AnchoredEpoch()
+		}
+		return nil
+	})
+	defer restore()
+	if err := db.Checkpoint(ctx); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if midAnchored != m.TxnID {
+		t.Errorf("in-process anchored epoch after step 2 = %d, want %d (the pre-bump assertion, anchored by the completed fsync)",
+			midAnchored, m.TxnID)
+	}
+	// The sole durable carrier was NOT rewritten: both meta slots
+	// byte-identical, persisted anchor still trailing.
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if !bytes.Equal(before[:2*4096], after[:2*4096]) {
+		t.Error("checkpoint rewrote a self-durable meta slot in place — the assertion's sole durable carrier")
+	}
+	active, ok := pager.ActiveMeta(after[:4096], after[4096:8192])
+	if !ok {
+		t.Fatal("no valid meta slot")
+	}
+	dm := pager.DecodeMeta(after[active*4096 : (active+1)*4096])
+	if dm.Durable.AnchoredTxnID != m.TxnID-1 {
+		t.Errorf("on-disk AnchoredTxnID = %d, want %d (deliberately trailing — sole-carrier constraint)",
+			dm.Durable.AnchoredTxnID, m.TxnID-1)
 	}
 }
 

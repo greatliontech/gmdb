@@ -36,6 +36,23 @@ overwrite the new owner's published identity — and proceeds on an
 unpinned snapshot. Case 0c's aging is partially spec-accepted; the
 ghost-store corruption of the next owner is not.
 
+**[M] DB.Close munmaps the lock file while a straggling ReadTx
+release still dereferences it — data race, potential SIGSEGV on the
+unmapped slots array.** `db.go:706` (step 8 `lockFile.Close()` nils
+`f.mmap`/`f.slots`, `internal/lock/lock.go:506`) races
+`ReadTx.close` → `Coord.ReleaseReader` → `File.ReleaseReaderSlot`
+(`internal/lock/reader.go:115` reads `f.slots`). The step-8 comment
+claims `closeGate.BeginClose` drained Tx cleanups, but the drain does
+not cover a ReadTx that lost the BeginRead/Close race and is running
+its release path. Demonstrated: `-race` fires on
+`TestBeginReadCloseRaceReturnsErrClosed` on HEAD (timing-sensitive:
+1 hit in 20 standalone `-count` runs in one session, 0 in 30 in
+another; also observed under full-suite contention). Best case the racing release panics on the nil `slots`
+guard; worst case it stores through the stale mmap pointer after
+munmap — SIGSEGV, or a write landing in whatever the address space
+reuses. Found by the pager-commit-residue chunk's full-suite run
+(adjacent — reproduces on base).
+
 **[L] False soundness claim guarding the recovery gate.**
 `internal/lock/coord_reader.go:156-158` states the gate "holds
 flock(LOCK_EX) (no acquire/release can race the scan)" — false: reader

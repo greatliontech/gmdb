@@ -79,11 +79,23 @@ func (p *Pager) relocateRPLPrefix() error {
 	}
 	k := len(p.rplSegments) - j
 
-	// Probe 1 — slab budget: k copy buffers on top of current usage.
-	// Commit assembly runs with the raw cap (inCommit), so probe
-	// against maxBytes directly; a mid-copy AllocSlab failure would
-	// violate probe-first.
-	if p.dirtyBytes+k*int(p.cfg.PageSize) > p.maxBytes {
+	// Probe 1 — slab budget: k copy buffers PLUS the RPL segment
+	// pages appendRPL will allocate for the retirement list grown by
+	// the k old prefix pages (crossing a segment-capacity boundary
+	// costs extra segment slabs, and FreePage's per-retire admission
+	// check is skipped inCommit). Commit assembly runs with the raw
+	// cap (inCommit), so probe against maxBytes directly; probing
+	// only the copies would let appendRPL's AllocSlab fail AFTER
+	// relocation state changed — violating probe-first. Nothing
+	// retires between this probe and appendRPL (commitStep0 (c) →
+	// (c2)), so the projection is exact.
+	capPerSeg := RPLEntriesPerSegment(p.cfg)
+	if capPerSeg <= 0 {
+		p.rplRelocDeclined = true
+		return nil
+	}
+	segPages := (len(p.retiredPages) + k + capPerSeg - 1) / capPerSeg
+	if p.dirtyBytes+(k+segPages)*int(p.cfg.PageSize) > p.maxBytes {
 		p.rplRelocDeclined = true
 		return nil
 	}
@@ -100,6 +112,25 @@ func (p *Pager) relocateRPLPrefix() error {
 		}
 		homes = append(homes, id)
 		from = id + 1
+	}
+
+	// Probe 2b — page AVAILABILITY for the segment append: appendRPL
+	// allocates the segPages segment pages via AllocPage once the k
+	// homes are already claimed, so bitmap free bits beyond the homes
+	// plus file-extension headroom must cover them — otherwise
+	// AllocPage returns ErrDBFull AFTER relocation state changed, the
+	// same probe-first violation as the budget arm. The RPL
+	// reclamation tier could free more, but counting it would need
+	// writes; the conservative undercount can only decline a
+	// satisfiable pass (re-requested next pass), never the reverse.
+	// Runs after probe 2 so NumFree() >= k is established.
+	extHeadroom := uint64(0)
+	if p.maxSizePages > p.highWaterMark {
+		extHeadroom = p.maxSizePages - p.highWaterMark
+	}
+	if p.bitmap.NumFree()-uint64(k)+extHeadroom < uint64(segPages) {
+		p.rplRelocDeclined = true
+		return nil
 	}
 
 	// Probe 3 — every prefix segment still decodes, read-only. A

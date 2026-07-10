@@ -1,6 +1,7 @@
 package pager
 
 import (
+	"errors"
 	"sort"
 	"testing"
 
@@ -401,6 +402,264 @@ func TestRPLRelocationAbortRestoresChain(t *testing.T) {
 	for i, r := range after {
 		if r.PageID != beforePages[i] {
 			t.Errorf("segment %d not restored: %d, want %d", i, r.PageID, beforePages[i])
+		}
+	}
+}
+
+// TestRPLRelocationRequestClearedOnAbort pins one-shot ownership
+// across ABORT (free-space.md §RPL segment relocation: the request is
+// consumed — executed or declined — by the arming transaction's OWN
+// commit): a transaction that arms a request and rolls back before
+// committing must not leak it into the next, unrelated commit.
+func TestRPLRelocationRequestClearedOnAbort(t *testing.T) {
+	db, cleanup := buildChainForReloc(t, 3)
+	defer cleanup()
+	p := db.Pager
+
+	// Below-floor homes exist (reclaim the oldest segment), so a
+	// leaked request would EXECUTE rather than decline — the
+	// observable fault is unrequested relocation work.
+	{
+		txn := db.Meta.TxnID + 1
+		p.BeginTx(TxParams{
+			HighWaterMark: db.Meta.HighWaterMark, MaxSize: db.Meta.MaxSize,
+			GrowStep: db.Meta.GrowStep, MinSize: db.Meta.MinSize, TxnID: txn,
+			ReclamationBound: func() uint64 { return p.RPLChain()[0].TxnID + 1 },
+		})
+		if p.ReclaimFreeSpace() == 0 {
+			t.Fatal("fixture: reclamation freed nothing")
+		}
+		res, err := p.Commit(CommitParams{NewTxnID: txn, Flags: db.Meta.Flags, Sync: SyncNone}, db.Meta, db.ActiveMetaIdx)
+		if err != nil {
+			t.Fatalf("homes commit: %v", err)
+		}
+		db.Meta, db.ActiveMetaIdx = res.Meta, res.ActiveMetaIdx
+	}
+	chain := p.RPLChain()
+	floor := min(chain[len(chain)-1].PageID, chain[len(chain)-2].PageID)
+	if p.RPLSegmentsAtOrAbove(floor) < 2 {
+		t.Fatal("fixture: need >= 2 in-region segments")
+	}
+	beforePages := make([]uint64, len(chain))
+	for i, r := range chain {
+		beforePages[i] = r.PageID
+	}
+
+	// The compaction-shaped transaction arms, then fails before its
+	// commit (the reachable path: flushKeyspaces → ErrTxTooLarge →
+	// rollback).
+	txn := db.Meta.TxnID + 1
+	p.BeginTx(TxParams{
+		HighWaterMark: db.Meta.HighWaterMark, MaxSize: db.Meta.MaxSize,
+		GrowStep: db.Meta.GrowStep, MinSize: db.Meta.MinSize, TxnID: txn,
+		ReclamationBound: func() uint64 { return 0 },
+	})
+	p.RequestRPLRelocation(floor)
+	p.AbortTx()
+	// Per-site pin: the abort itself discards the request (the
+	// next-BeginTx clear is a second, independent barrier — each site
+	// is asserted separately so neither silently carries the other).
+	if p.rplRelocFloor != 0 {
+		t.Fatal("AbortTx left the relocation request armed")
+	}
+	p.rplRelocFloor = floor // re-arm past the abort clear to pin BeginTx's own barrier
+
+	// The next, unrelated commit must not relocate anything.
+	p.BeginTx(TxParams{
+		HighWaterMark: db.Meta.HighWaterMark, MaxSize: db.Meta.MaxSize,
+		GrowStep: db.Meta.GrowStep, MinSize: db.Meta.MinSize, TxnID: txn,
+		ReclamationBound: func() uint64 { return 0 },
+	})
+	if _, err := p.Commit(CommitParams{NewTxnID: txn, Flags: db.Meta.Flags, Sync: SyncNone}, db.Meta, db.ActiveMetaIdx); err != nil {
+		t.Fatalf("unrelated commit: %v", err)
+	}
+	after := p.RPLChain()
+	if len(after) != len(beforePages) {
+		t.Fatalf("chain length changed (%d -> %d): the aborted tx's request leaked into this commit", len(beforePages), len(after))
+	}
+	for i, r := range after {
+		if r.PageID != beforePages[i] {
+			t.Errorf("segment %d relocated (%d -> %d) by a commit that never armed a request", i, beforePages[i], r.PageID)
+		}
+	}
+}
+
+// TestRPLRelocationDeclinesWhenSegmentAppendExceedsBudget pins the
+// budget probe's projection of the RPL segment pages appendRPL needs
+// for the k old prefix pages the relocation retires: a budget that
+// fits the k copy buffers but not the segment append must DECLINE
+// (free-space.md §RPL segment relocation: no state change until the
+// prefix is known to fit the work budget) — never fail the commit
+// after relocation state changed.
+func TestRPLRelocationDeclinesWhenSegmentAppendExceedsBudget(t *testing.T) {
+	db, cleanup := buildChainForReloc(t, 3)
+	defer cleanup()
+	p := db.Pager
+	{
+		txn := db.Meta.TxnID + 1
+		p.BeginTx(TxParams{
+			HighWaterMark: db.Meta.HighWaterMark, MaxSize: db.Meta.MaxSize,
+			GrowStep: db.Meta.GrowStep, MinSize: db.Meta.MinSize, TxnID: txn,
+			ReclamationBound: func() uint64 { return p.RPLChain()[0].TxnID + 1 },
+		})
+		if p.ReclaimFreeSpace() == 0 {
+			t.Fatal("fixture: reclamation freed nothing")
+		}
+		res, err := p.Commit(CommitParams{NewTxnID: txn, Flags: db.Meta.Flags, Sync: SyncNone}, db.Meta, db.ActiveMetaIdx)
+		if err != nil {
+			t.Fatalf("homes commit: %v", err)
+		}
+		db.Meta, db.ActiveMetaIdx = res.Meta, res.ActiveMetaIdx
+	}
+	chain := p.RPLChain()
+	floor := min(chain[len(chain)-1].PageID, chain[len(chain)-2].PageID)
+	k := p.RPLSegmentsAtOrAbove(floor)
+	if k < 2 {
+		t.Fatal("fixture: need >= 2 in-region segments")
+	}
+	beforePages := make([]uint64, len(chain))
+	for i, r := range chain {
+		beforePages[i] = r.PageID
+	}
+
+	txn := db.Meta.TxnID + 1
+	p.BeginTx(TxParams{
+		HighWaterMark: db.Meta.HighWaterMark, MaxSize: db.Meta.MaxSize,
+		GrowStep: db.Meta.GrowStep, MinSize: db.Meta.MinSize, TxnID: txn,
+		ReclamationBound: func() uint64 { return 0 },
+	})
+	// Budget fits exactly the k copy buffers but NOT the one RPL
+	// segment page the k retirements need (no other retirements, so
+	// appendRPL allocates ceil(k/capPerSeg) = 1 extra slab).
+	p.maxBytes = p.dirtyBytes + int(testPageSize)*k
+	p.RequestRPLRelocation(floor)
+	res, err := p.Commit(CommitParams{NewTxnID: txn, Flags: db.Meta.Flags, Sync: SyncNone}, db.Meta, db.ActiveMetaIdx)
+	if err != nil {
+		t.Fatalf("commit must decline the relocation, not fail: %v", err)
+	}
+	if !p.RPLRelocationDeclined() {
+		t.Fatal("relocation not declined despite the segment append exceeding the budget")
+	}
+	after := p.RPLChain()
+	if len(after) != len(beforePages) {
+		t.Fatalf("chain length changed on decline: %d -> %d", len(beforePages), len(after))
+	}
+	for i, r := range after {
+		if r.PageID != beforePages[i] {
+			t.Errorf("segment %d moved on decline: %d -> %d", i, beforePages[i], r.PageID)
+		}
+	}
+	db.Meta, db.ActiveMetaIdx = res.Meta, res.ActiveMetaIdx
+
+	// Acceptance boundary: one segment page more of budget and the
+	// same request EXECUTES — a projection that overcounts (spurious
+	// declines) fails here.
+	txn++
+	p.BeginTx(TxParams{
+		HighWaterMark: db.Meta.HighWaterMark, MaxSize: db.Meta.MaxSize,
+		GrowStep: db.Meta.GrowStep, MinSize: db.Meta.MinSize, TxnID: txn,
+		ReclamationBound: func() uint64 { return 0 },
+	})
+	p.maxBytes = p.dirtyBytes + int(testPageSize)*(k+1)
+	p.RequestRPLRelocation(floor)
+	if _, err := p.Commit(CommitParams{NewTxnID: txn, Flags: db.Meta.Flags, Sync: SyncNone}, db.Meta, db.ActiveMetaIdx); err != nil {
+		t.Fatalf("boundary commit: %v", err)
+	}
+	if p.RPLRelocationDeclined() {
+		t.Fatal("relocation declined at the exact-fit boundary (projection overcounts)")
+	}
+}
+
+// TestRPLRelocationDeclinesWhenNoPageForSegmentAppend pins the
+// availability arm of the probe: when the only free pages are the k
+// below-floor homes and there is no file-extension headroom, the
+// request must DECLINE — otherwise appendRPL's segment-page AllocPage
+// returns ErrDBFull after relocation state changed (free-space.md
+// §RPL segment relocation: no state change until probing establishes
+// the request fits).
+func TestRPLRelocationDeclinesWhenNoPageForSegmentAppend(t *testing.T) {
+	db, cleanup := buildChainForReloc(t, 3)
+	defer cleanup()
+	p := db.Pager
+	{
+		txn := db.Meta.TxnID + 1
+		p.BeginTx(TxParams{
+			HighWaterMark: db.Meta.HighWaterMark, MaxSize: db.Meta.MaxSize,
+			GrowStep: db.Meta.GrowStep, MinSize: db.Meta.MinSize, TxnID: txn,
+			ReclamationBound: func() uint64 { return p.RPLChain()[0].TxnID + 1 },
+		})
+		if p.ReclaimFreeSpace() == 0 {
+			t.Fatal("fixture: reclamation freed nothing")
+		}
+		res, err := p.Commit(CommitParams{NewTxnID: txn, Flags: db.Meta.Flags, Sync: SyncNone}, db.Meta, db.ActiveMetaIdx)
+		if err != nil {
+			t.Fatalf("homes commit: %v", err)
+		}
+		db.Meta, db.ActiveMetaIdx = res.Meta, res.ActiveMetaIdx
+	}
+	chain := p.RPLChain()
+	floor := min(chain[len(chain)-1].PageID, chain[len(chain)-2].PageID)
+	k := p.RPLSegmentsAtOrAbove(floor)
+	if k < 2 {
+		t.Fatal("fixture: need >= 2 in-region segments")
+	}
+	beforePages := make([]uint64, len(chain))
+	for i, r := range chain {
+		beforePages[i] = r.PageID
+	}
+
+	// MaxSize pinned to the current HWM: no extension headroom.
+	txn := db.Meta.TxnID + 1
+	p.BeginTx(TxParams{
+		HighWaterMark: db.Meta.HighWaterMark, MaxSize: db.Meta.HighWaterMark,
+		GrowStep: db.Meta.GrowStep, MinSize: db.Meta.MinSize, TxnID: txn,
+		ReclamationBound: func() uint64 { return 0 },
+	})
+	// Consume every free page, then free back exactly k BELOW-FLOOR
+	// ids (a same-tx page never CoW'd takes FreePage's pendingAllocs
+	// branch: its bitmap bit is restored immediately, so the k bits
+	// are free at probe time) — the homes exist, but nothing is left
+	// for the segment append.
+	var grabbed []uint64
+	for {
+		id, err := p.AllocPage()
+		if err != nil {
+			if errors.Is(err, ErrDBFull) {
+				break
+			}
+			t.Fatalf("AllocPage: %v", err)
+		}
+		grabbed = append(grabbed, id)
+	}
+	freed := 0
+	for _, id := range grabbed {
+		if id < floor {
+			if err := p.FreePage(id); err != nil {
+				t.Fatalf("FreePage(%d): %v", id, err)
+			}
+			if freed++; freed == k {
+				break
+			}
+		}
+	}
+	if freed < k {
+		t.Fatalf("fixture: only %d below-floor pages available, need %d homes", freed, k)
+	}
+
+	p.RequestRPLRelocation(floor)
+	if _, err := p.Commit(CommitParams{NewTxnID: txn, Flags: db.Meta.Flags, Sync: SyncNone}, db.Meta, db.ActiveMetaIdx); err != nil {
+		t.Fatalf("commit must decline the relocation, not fail: %v", err)
+	}
+	if !p.RPLRelocationDeclined() {
+		t.Fatal("relocation not declined despite no page for the segment append")
+	}
+	after := p.RPLChain()
+	if len(after) != len(beforePages) {
+		t.Fatalf("chain length changed on decline: %d -> %d", len(beforePages), len(after))
+	}
+	for i, r := range after {
+		if r.PageID != beforePages[i] {
+			t.Errorf("segment %d moved on decline: %d -> %d", i, beforePages[i], r.PageID)
 		}
 	}
 }

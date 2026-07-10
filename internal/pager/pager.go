@@ -574,6 +574,10 @@ func (p *Pager) BeginTx(params TxParams) {
 	p.growStepPages = params.GrowStep
 	p.minSizePages = params.MinSize
 	p.currentTxnID = params.TxnID
+	// A relocation request never survives a tx boundary (one-shot,
+	// owned by the arming tx — see AbortTx); RequestRPLRelocation is
+	// always called after BeginTx, so this only clears leaks.
+	p.rplRelocFloor = 0
 	p.refreshReclamationBound = params.ReclamationBound
 	p.rplCorruptCb = params.RPLCorrupt
 	p.laggingReader = params.LaggingReader
@@ -628,6 +632,12 @@ func (p *Pager) AbortTx() {
 	clear(p.pendingFrees)
 	clear(p.loosePages)
 	p.retiredPages = p.retiredPages[:0]
+	// An armed RPL relocation request is owned by the arming
+	// transaction — consumed by ITS commit, executed or declined
+	// (free-space.md §RPL segment relocation). An abort discards it;
+	// leaking it would make the next unrelated commit perform
+	// unrequested chain-prefix relocation work.
+	p.rplRelocFloor = 0
 	p.currentTxnID = 0
 	// A top-level abort supersedes any open child savepoints. The root
 	// package's Rollback cascade resolves the open descendant chain

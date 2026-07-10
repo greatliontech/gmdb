@@ -24,7 +24,7 @@ function. WIP = 1.
       half-reclaimed segments at Open (+ free-space.md rider)
 - [x] 8. internal/pager: file-resident bounds — writer fileSize
       tracking, reader shrink-stable bound, MaxSize clamp
-- [ ] 9. internal/pager: commit residue — checkpoint anchor advance,
+- [x] 9. internal/pager: commit residue — checkpoint anchor advance,
       rplRelocFloor lifecycle, relocation probe segment projection
 - [ ] 10. internal/lock: validated stale-clear — occupancy re-check
       before clear, acquire-window heartbeat/publish hardening,

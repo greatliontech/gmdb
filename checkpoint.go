@@ -130,6 +130,13 @@ func (db *DB) checkpointUnderGrant() error {
 	if err := stepErr(2); err != nil {
 		return failStep(2, err)
 	}
+	// The completed step-2 fsync anchors the pre-bump meta's own
+	// durable assertion — its carrying pwrite preceded the fsync
+	// (durability.md §Anchoring; the commit path's step 2 makes the
+	// same advance). In-process knowledge only: whether step 3 may
+	// PERSIST it depends on which slot carries the assertion — see
+	// the sole-carrier constraint on the skip branch below.
+	pgr.AdvanceAnchoredEpoch(meta.Durable.TxnID)
 
 	// Step 3 — bump the active meta's durable sub-record to its own
 	// live state, set AnchoredDurableTxnID to the PRE-bump anchored
@@ -143,10 +150,24 @@ func (db *DB) checkpointUnderGrant() error {
 	// partial writes — recovery falls back to the other slot).
 	if meta.SelfDurable() {
 		// Already at its own durable epoch — step 2's fdatasync is
-		// the only useful work. Skip the pwrite (idempotent) but DO
-		// issue step 4 so the previously-written sub-record is on
-		// stable storage even if the prior commit was in
-		// SyncDataOnly (which skipped step 4).
+		// the only useful work. Skip the pwrite but DO issue step 4
+		// so the previously-written sub-record is on stable storage
+		// even if the prior commit was in SyncDataOnly (which skipped
+		// step 4). The skip is LOAD-BEARING, not just an idempotence
+		// elision: a self-durable meta is the SOLE durable carrier of
+		// its own assertion (the other slot's sub-record predates
+		// it), and pwriting it in place — even only to persist the
+		// step-2 anchor advance — risks a torn step-4 fsync (the
+		// kernel consumes the writeback error and marks the page
+		// clean) destroying the assertion on disk while the intact
+		// page-cache copy keeps feeding peer reclamation bounds:
+		// after a crash, recovery falls back to the other, OLDER
+		// slot, whose tree references pages the bound let a peer
+		// reuse. A non-self-durable bump has no such hazard — its
+		// sub-record is carried in BOTH slots. The persisted anchor
+		// therefore deliberately trails the in-process one in pure
+		// SyncDataOnly use (delayed peer reclamation, never
+		// unsafety).
 	} else {
 		meta.Durable = meta.LiveSubRecord()
 		meta.Durable.AnchoredTxnID = pgr.AnchoredEpoch()
