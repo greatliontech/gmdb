@@ -132,17 +132,24 @@ type File struct {
 //     until LOCK_EX is released. By the time LOCK_SH is granted,
 //     the file's header is fully published.
 //
-// UUID mismatch unlinks the stale file and retries; a Magic /
-// MaxReaders / size validation failure on a finalised file surfaces
+// A UUID mismatch — and a plausible header whose file size disagrees
+// with the current layout (an old-binary lock file; see the size-arm
+// comment) — classifies the file STALE: it is unlinked under the
+// identity guard (removeStaleGuarded) and the open retries. A Magic /
+// MaxReaders validation failure on a finalised file surfaces
 // ErrCorrupted without unlinking (the package does not auto-recover
 // externally-tampered or crashed-mid-init files).
 //
-// Retry budget. Adopter sees errPartialInit at most O(init-window)
-// times before the creator publishes. Init is bounded by one
-// Truncate + header WriteAt + one fdatasync — typically sub-ms on
-// SSD, up to ~100 ms on contended HDDs. The budget + capped
-// exponential backoff (1, 2, 4, 8, 16, 32, 64, 128, 256, 256 ms;
-// total ~800 ms) covers a slow disk while bounding caller latency.
+// Retry budget. Three arms consume the 10-attempt budget: adopters
+// inside the creator's init window (errPartialInit), contended stale
+// removals (errStaleContended — a live legacy coordinator can hold
+// the stale inode's flock across the whole budget), and post-verify
+// name re-binds (errPathChanged); all three back off. Successful
+// stale removals retry immediately. Init is bounded by one Truncate
+// + header WriteAt + one fdatasync — typically sub-ms on SSD, up to
+// ~100 ms on contended HDDs. The budget + capped exponential backoff
+// (1, 2, 4, 8, 16, 32, 64, 128, 256, 256 ms; total ~800 ms) covers a
+// slow disk while bounding caller latency.
 func Open(p OpenParams) (*File, error) {
 	if p.Root == nil {
 		return nil, fmt.Errorf("lock: Root must not be nil")
@@ -165,10 +172,28 @@ func Open(p OpenParams) (*File, error) {
 			return f, nil
 		}
 		if errors.Is(err, errStaleUUID) {
-			if rmErr := p.Root.Remove(p.Base); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-				return nil, fmt.Errorf("lock: remove stale %q: %w", p.Base, rmErr)
-			}
+			// The guarded removal already ran inside tryAdoptExisting
+			// (identity-verified, under flock on the validated inode —
+			// see removeStaleGuarded); retry immediately against the
+			// post-removal state.
 			lastErr = err
+			continue
+		}
+		if errors.Is(err, errStaleContended) || errors.Is(err, errPathChanged) {
+			// Contended removal guard (another remover or a legacy
+			// coordinator holds the stale inode's flock), or the name
+			// was re-bound between our open/create and the final
+			// identity verify. Back off — it de-syncs concurrent
+			// validators so a later attempt wins the guard or adopts
+			// whatever now lives at the path — then retry.
+			lastErr = err
+			time.Sleep(backoff)
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
 			continue
 		}
 		if errors.Is(err, errPartialInit) {
@@ -230,15 +255,20 @@ func Open(p OpenParams) (*File, error) {
 // adopter that lands inside this window observes size==0 and/or
 // Magic==0; rather than returning terminal ErrCorrupted, it
 // surfaces errPartialInit so the lifecycle loop in Open retries
-// with backoff. Genuinely corrupt files (size != FileSize, Magic
-// non-zero but wrong, MaxReaders out of range) still surface
-// ErrCorrupted without retry.
+// with backoff. Genuinely corrupt files (Magic non-zero but wrong,
+// MaxReaders out of range) still surface ErrCorrupted without retry;
+// a size mismatch on a PLAUSIBLE header is classified stale (an
+// old-binary layout — see the size-arm comment) and routes through
+// the identity-guarded removal, exactly like a UUID mismatch.
 //
 // Returns os.ErrNotExist (propagated from Root.OpenFile) when the
-// file doesn't exist; errStaleUUID when the header verifies but the
-// UUID doesn't match p.DataUUID; errPartialInit on the creator
-// publish window; ErrCorrupted (wrapped) for true Magic / MaxReaders
-// / size mismatches.
+// file doesn't exist; errStaleUUID when a stale file (UUID or
+// layout-size mismatch) was removed — or found already gone /
+// re-bound — under the guard; errStaleContended when the guard lost
+// the flock conversion; errPathChanged when the post-validation
+// identity verify failed; errPartialInit on the creator publish
+// window; ErrCorrupted (wrapped) for true Magic / MaxReaders
+// mismatches.
 func tryAdoptExisting(p OpenParams) (*File, error) {
 	f, err := p.Root.OpenFile(p.Base, os.O_RDWR, 0o600)
 	if err != nil {
@@ -334,15 +364,26 @@ func tryAdoptExisting(p OpenParams) (*File, error) {
 		// brain. Grow the header only alongside a data-format break,
 		// or replace this arm first (cross-process.md §Lock File
 		// Layout).
-		return nil, errStaleUUID
+		return nil, removeStaleGuarded(p, f)
 	}
 	if hdr.UUID != p.DataUUID {
-		return nil, errStaleUUID
+		return nil, removeStaleGuarded(p, f)
 	}
 
 	// Success: the *File takes ownership of the fd; do not close it
 	// on exit. The deferred LOCK_UN still runs (correct — the *File
 	// doesn't need flock for steady-state use).
+	//
+	// Final identity verify (cross-process.md §Lock File Lifecycle):
+	// the validated fd must still be what the NAME points at, or we
+	// would coordinate on an unlinked inode — invisible to every
+	// later opener — while a different lock file governs the data
+	// file (split brain). Reachable only through an unguarded
+	// remover (an old binary's stale-removal, external tampering);
+	// this binary's own removals are identity-guarded.
+	if err := verifyPathIdentity(p, f); err != nil {
+		return nil, err
+	}
 	out, err := mmapAndOverlay(f, hdr.MaxReaders, expectedSize)
 	if err != nil {
 		return nil, err
@@ -402,8 +443,16 @@ func createAndInit(p OpenParams) (*File, error) {
 			// repeatedly spin against a stuck Magic==0 / undersized
 			// file (the budget-exhaustion path eventually surfaces
 			// ErrCorrupted, but spinning ~800 ms per Open is a
-			// real latency cost).
-			_ = p.Root.Remove(p.Base)
+			// real latency cost). Identity-guarded like every other
+			// by-name unlink: never remove a file this fd doesn't
+			// name (no in-repo path re-binds the name here, but an
+			// unguarded remove is exactly the split-brain shape this
+			// file exists to prevent).
+			if fInfo, ferr := f.Stat(); ferr == nil {
+				if pInfo, perr := p.Root.Stat(p.Base); perr == nil && os.SameFile(fInfo, pInfo) {
+					_ = p.Root.Remove(p.Base)
+				}
+			}
 		}
 	}()
 
@@ -422,6 +471,10 @@ func createAndInit(p OpenParams) (*File, error) {
 		return nil, initErr
 	}
 
+	// Final identity verify — same rationale as the adopt path's.
+	if err := verifyPathIdentity(p, f); err != nil {
+		return nil, err
+	}
 	out, err := mmapAndOverlay(f, p.MaxReaders, FileSize(p.MaxReaders))
 	if err != nil {
 		return nil, err
@@ -429,6 +482,109 @@ func createAndInit(p OpenParams) (*File, error) {
 	closeOnExit = false
 	removeOnExit = false
 	return out, nil
+}
+
+// errPathChanged signals that the lock-file NAME was re-bound to a
+// different inode between this attempt's open/create and its final
+// identity verify. The Open loop retries against the current binding.
+var errPathChanged = errors.New("lock: path re-bound during open")
+
+// errStaleContended signals that a stale file's removal guard lost
+// the flock conversion (another remover, or a live legacy coordinator
+// of the abandoned database, holds the stale inode's flock). The Open
+// loop backs off before retrying.
+var errStaleContended = errors.New("lock: stale lock file removal contended")
+
+// verifyPathIdentity reports errPathChanged unless the fd still names
+// the path's inode.
+func verifyPathIdentity(p OpenParams, f *os.File) error {
+	fInfo, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("lock: fstat %q: %w", p.Base, err)
+	}
+	pInfo, err := p.Root.Stat(p.Base)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errPathChanged
+		}
+		return fmt.Errorf("lock: stat %q: %w", p.Base, err)
+	}
+	if !os.SameFile(fInfo, pInfo) {
+		return errPathChanged
+	}
+	return nil
+}
+
+// staleRemoveHookForTest fires inside removeStaleGuarded after the
+// flock upgrade and before the identity re-check — the window a
+// concurrent opener's remove-and-recreate must be detected in. Tests
+// install it via SetStaleRemoveHookForTest.
+var staleRemoveHookForTest atomic.Pointer[func()]
+
+// SetStaleRemoveHookForTest installs (or clears, with nil) the
+// stale-removal interleaving hook. Returns a restore func for defer.
+// Same convention as SetCreateInitHookForTest.
+func SetStaleRemoveHookForTest(hook func()) (restore func()) {
+	if hook == nil {
+		staleRemoveHookForTest.Store(nil)
+		return func() {}
+	}
+	staleRemoveHookForTest.Store(&hook)
+	return func() { staleRemoveHookForTest.Store(nil) }
+}
+
+// removeStaleGuarded unlinks a validated-stale lock file by name ONLY
+// while holding flock(LOCK_EX) on the validated fd AND after
+// re-verifying that the name still points at that inode. An unguarded
+// Remove(Base) races a concurrent opener that already removed the
+// stale file and created a fresh one: the by-name unlink takes out
+// the FRESH file, leaving its creator coordinating on an unlinked
+// inode — two lock files, two live writers, meta overwrite (the
+// split-brain interleaving this guard exists for). The flock
+// serialises concurrent removers (each holds an fd on the same stale
+// inode; exactly one upgrades); the identity re-check under the lock
+// closes the removed-and-recreated window (a loser sees the name
+// bound to a different inode and skips). LOCK_NB, not blocking: a
+// blocking upgrade could wait indefinitely on a live legacy
+// coordinator of the abandoned database still flocking the stale
+// inode — on contention we skip, and the caller's backoff de-syncs
+// the retry. flock conversion semantics (Linux, man 2 flock NOTES):
+// the held SH is DROPPED first, then EX attempted — a failed NB
+// conversion leaves this fd with no lock at all, which is safe here
+// (nothing reads the file afterwards; the deferred LOCK_UN is a
+// no-op) and is what lets one of two SH-holding removers win the
+// second conversion attempt instead of livelocking.
+//
+// Returns errStaleUUID after a successful removal or a name-gone /
+// re-bound skip (the Open loop retries immediately and observes the
+// post-removal state), errStaleContended on a lost flock conversion
+// (the Open loop backs off first), and a real error for a stat or
+// removal failure.
+func removeStaleGuarded(p OpenParams, f *os.File) error {
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return errStaleContended // another remover or a legacy holder
+	}
+	if hook := staleRemoveHookForTest.Load(); hook != nil {
+		(*hook)()
+	}
+	fInfo, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("lock: fstat %q under removal guard: %w", p.Base, err)
+	}
+	pInfo, err := p.Root.Stat(p.Base)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errStaleUUID // name already gone — nothing to remove
+		}
+		return fmt.Errorf("lock: stat %q under removal guard: %w", p.Base, err)
+	}
+	if !os.SameFile(fInfo, pInfo) {
+		return errStaleUUID // name re-bound: a concurrent opener already replaced it
+	}
+	if rmErr := p.Root.Remove(p.Base); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+		return fmt.Errorf("lock: remove stale %q: %w", p.Base, rmErr)
+	}
+	return errStaleUUID
 }
 
 // initLockFile truncates the file to the full lock-file size and

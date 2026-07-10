@@ -29,7 +29,7 @@ function. WIP = 1.
 - [x] 10. internal/lock: validated stale-clear — occupancy re-check
       before clear, acquire-window heartbeat/publish hardening,
       recovery-gate comment (+ cross-process.md rider)
-- [ ] 11. internal/lock: lock-file identity guard — inode-verified
+- [x] 11. internal/lock: lock-file identity guard — inode-verified
       stale removal, post-create identity re-check
       (+ cross-process.md rider)
 - [ ] 12. internal/lock: boot-epoch discriminator — invalidate

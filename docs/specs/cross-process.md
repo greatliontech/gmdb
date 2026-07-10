@@ -484,6 +484,46 @@ deleted (e.g., after all processes exit), the next opener
 recreates it. `MaxReaders` is NOT in the data file — it is a
 runtime coordination property.
 
+**Stale detection and identity-guarded removal.** Two validated
+states classify an existing lock file as STALE and route to
+delete-and-recreate: a `UUID` that does not match the data file's
+(a database recreated at the same path), and a plausible header
+(valid `Magic`, in-range `MaxReaders`) whose file size disagrees
+with the current layout — a lock file written by a binary with a
+different header layout. The size arm is sound only because a
+layout change ships with a data-format-incompatible change: an
+old-binary peer can never be LIVE on the same data file (it cannot
+even open it). Growing the header WITHOUT a data-format break
+would make that arm reachable with a live old-binary peer — grow
+the header only alongside a data-format break, or replace the arm
+first.
+
+Every by-name unlink of the lock file is IDENTITY-GUARDED. The
+stale-removal path holds `flock(LOCK_EX)` on the fd it VALIDATED
+(non-blocking — contention means another remover or a live legacy
+coordinator; skip and retry with backoff) and re-verifies, under
+that lock, that the name still points at the validated inode
+(fstat vs path stat); a re-bound or already-gone name skips the
+removal, and a stat failure other than not-exist is surfaced,
+never treated as a skip. The creator's failed-creation cleanup is
+SameFile-guarded only (no flock, no retry): it removes the name
+solely when it still points at the inode its own O_CREATE|O_EXCL
+made, and its guard errors are best-effort (the cleanup runs in a
+failure path that already has an error to surface). An unguarded
+`unlink(name)` races a concurrent opener that already removed the
+stale file and created a fresh one: the unlink takes out the FRESH file and its creator
+coordinates on an unlinked inode — two lock files, two
+simultaneous writers, meta overwrite. After adopt or create, and
+before coordinating, every opener re-verifies its fd still names
+the path's inode (defence against an unguarded remover — an old
+binary or external tampering); a mismatch retries against the
+current binding.
+(Removal guard pinned by `TestOpenStaleRemovalSkipsRecreatedLockFile`,
+`TestOpenStaleRemovalSkipsWhenNameAlreadyGone`,
+`TestOpenStaleRemovalSkipsUnderLiveFlockHolder`, and
+`TestOpenSizeMismatchRoutesThroughGuardedRemoval`; the identity
+verify by `TestVerifyPathIdentity`.)
+
 On open, if the lock file exists, the opener checks `WriterPID`.
 Non-zero: determine whether the writer is still alive via
 `kill(pid, 0)` + `WriterStartTime` comparison (see Process Start

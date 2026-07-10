@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -501,5 +502,213 @@ func TestBaseFor(t *testing.T) {
 		if got := BaseFor(c.in); got != c.want {
 			t.Errorf("BaseFor(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// A stale-file removal must never unlink a lock file it did not
+// validate: two concurrent openers hitting a stale file otherwise end
+// up on two different lock files — two simultaneous writers on one
+// data file (meta overwrite, page aliasing). The hook models the
+// losing opener's window: it validated the stale inode, and before
+// its removal runs, the WINNING opener has already removed the stale
+// file and created the fresh one. The loser's guarded removal must
+// detect the re-bound name, skip, and adopt the winner's file.
+func TestOpenStaleRemovalSkipsRecreatedLockFile(t *testing.T) {
+	root, base, _ := tmpLock(t)
+	uuidStale := [16]byte{0xAA}
+	uuidLive := [16]byte{0xBB}
+
+	// The stale leftover (previous database at this path).
+	fS, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuidStale, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open stale: %v", err)
+	}
+	fS.Close()
+
+	// The hook fires inside the guarded removal, after the flock
+	// upgrade, before the identity re-check — simulating the winner
+	// completing its remove+recreate in that window.
+	var winner *File
+	var winnerInfo os.FileInfo
+	fired := false
+	hook := func() {
+		if fired {
+			return
+		}
+		fired = true
+		if err := root.Remove(base); err != nil {
+			t.Errorf("winner remove: %v", err)
+			return
+		}
+		w, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuidLive, MaxReaders: 8})
+		if err != nil {
+			t.Errorf("winner create: %v", err)
+			return
+		}
+		winner = w
+		st, err := root.Stat(base)
+		if err != nil {
+			t.Errorf("winner stat: %v", err)
+			return
+		}
+		winnerInfo = st
+	}
+	restore := SetStaleRemoveHookForTest(hook)
+	defer restore()
+
+	// The losing opener: validates the stale inode, must NOT unlink
+	// the winner's file, and must converge onto it.
+	fB, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuidLive, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open loser: %v", err)
+	}
+	defer fB.Close()
+	if winner != nil {
+		defer winner.Close()
+	}
+	if winnerInfo == nil {
+		t.Fatal("fixture: winner never created its lock file")
+	}
+	// The winner's inode must still be what the path names — the
+	// pre-guard code unlinked it here, splitting the fleet across two
+	// lock files.
+	pInfo, err := root.Stat(base)
+	if err != nil {
+		t.Fatalf("stat after loser Open: %v", err)
+	}
+	if !os.SameFile(winnerInfo, pInfo) {
+		t.Fatalf("winner's lock file was unlinked by the losing opener's stale removal — split brain")
+	}
+	// And the loser coordinates on that same inode.
+	if got := fB.UUID(); got != uuidLive {
+		t.Errorf("loser adopted UUID %x, want %x", got, uuidLive)
+	}
+}
+
+// The guard's name-already-gone arm: the winner removed the stale
+// file but has not (yet) recreated it — the loser must skip the
+// removal (nothing to remove) and converge by creating fresh.
+func TestOpenStaleRemovalSkipsWhenNameAlreadyGone(t *testing.T) {
+	root, base, _ := tmpLock(t)
+	fS, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xAA}, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open stale: %v", err)
+	}
+	fS.Close()
+	fired := false
+	restore := SetStaleRemoveHookForTest(func() {
+		if fired {
+			return
+		}
+		fired = true
+		if err := root.Remove(base); err != nil {
+			t.Errorf("winner remove: %v", err)
+		}
+	})
+	defer restore()
+	fB, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xBB}, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open after name-gone skip: %v", err)
+	}
+	defer fB.Close()
+	if got := fB.UUID(); got != ([16]byte{0xBB}) {
+		t.Errorf("UUID = %x, want BB...", got)
+	}
+}
+
+// The guard's contention arm: a live holder of the stale inode's
+// flock (a legacy coordinator of the abandoned database) makes the
+// LOCK_EX|LOCK_NB conversion fail — the opener must SKIP the removal
+// (never unlink under a live user) and, with the holder never
+// releasing, exhaust its budget without removing the file.
+func TestOpenStaleRemovalSkipsUnderLiveFlockHolder(t *testing.T) {
+	root, base, path := tmpLock(t)
+	fS, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xAA}, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open stale: %v", err)
+	}
+	fS.Close()
+	// The legacy holder: an independent fd with LOCK_SH held for the
+	// duration (blocks every EX conversion).
+	holder, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("holder open: %v", err)
+	}
+	defer holder.Close()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_SH); err != nil {
+		t.Fatalf("holder flock: %v", err)
+	}
+
+	_, err = Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xBB}, MaxReaders: 8})
+	if err == nil {
+		t.Fatal("Open succeeded despite a live flock holder on the stale file")
+	}
+	if !errors.Is(err, errStaleContended) {
+		t.Fatalf("budget exhausted by %v, want errStaleContended", err)
+	}
+	// The stale file must have survived every attempt.
+	if _, statErr := root.Stat(base); statErr != nil {
+		t.Fatalf("stale file removed under a live flock holder: %v", statErr)
+	}
+	fCheck, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("reopen stale: %v", err)
+	}
+	defer fCheck.Close()
+}
+
+// The size-mismatch stale arm routes through the same identity guard
+// as the UUID arm.
+func TestOpenSizeMismatchRoutesThroughGuardedRemoval(t *testing.T) {
+	root, base, path := tmpLock(t)
+	fS, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xAA}, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	fS.Close()
+	// Grow the file past its layout's size: plausible header, wrong
+	// size — the old-binary-layout classification.
+	if err := os.Truncate(path, FileSize(8)+4096); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	hookFired := false
+	restore := SetStaleRemoveHookForTest(func() { hookFired = true })
+	defer restore()
+	fB, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xAA}, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open after size mismatch: %v", err)
+	}
+	defer fB.Close()
+	if !hookFired {
+		t.Fatal("size-mismatch removal did not route through the identity guard")
+	}
+}
+
+// verifyPathIdentity unit pins: same inode passes; re-bound and
+// removed names report errPathChanged.
+func TestVerifyPathIdentity(t *testing.T) {
+	root, base, _ := tmpLock(t)
+	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xAA}, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+	p := OpenParams{Root: root, Base: base}
+	if err := verifyPathIdentity(p, f.f); err != nil {
+		t.Fatalf("same inode: %v", err)
+	}
+	if err := root.Remove(base); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := verifyPathIdentity(p, f.f); !errors.Is(err, errPathChanged) {
+		t.Fatalf("name gone: err = %v, want errPathChanged", err)
+	}
+	f2, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xBB}, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	defer f2.Close()
+	if err := verifyPathIdentity(p, f.f); !errors.Is(err, errPathChanged) {
+		t.Fatalf("name re-bound: err = %v, want errPathChanged", err)
 	}
 }

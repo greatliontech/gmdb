@@ -81,7 +81,6 @@ chunks (bottom-up by layer, grouped by function).
 |------|-------|---------|
 | checkpoint-selfdurable-anchor-persist | 23 | [L] pure-SyncDataOnly Checkpoint leaves the persisted anchor trailing by one (peer reclamation delayed); persisting would rewrite the assertion's sole durable carrier in place — tear hazard |
 | reader-slot-versioned-layout | 12 | [M×3] frozen-mid-publish residuals: ghost stores clobber a re-winner's fields; same-TxnID re-win passes the ownership verify (two owners); scanner descheduled mid-guarded-clear zeroes a resumed owner's slot — needs a per-slot generation word (layout change) |
-| lockfile-stale-removal-race | 11 | [H] unguarded unlink-by-name on stale lock file → split brain, two writers |
 | shrink-gate-acquisition-residual | 12 | [M] shrink deferral has a reader-CAS acquisition window (corrupt-input SIGBUS residual, spec-recorded) — close via lock-file shrink seqlock |
 | lock-boot-epoch | 12 | [H] post-reboot future heartbeats + starttime collisions bypass the recovery gate; [L] lock file never deleted contra spec |
 | batch-goexit-deadlock | 13 | [H] closure Goexit kills coordinator, permanent deadlock; [L] cascade reserve re-price; [L] self-commit outcome doc |
