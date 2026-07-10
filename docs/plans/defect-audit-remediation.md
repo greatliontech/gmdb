@@ -11,7 +11,7 @@ function. WIP = 1.
 - [x] 2. internal/btree: delete-side re-encode growth — native-variant
       splice fallback for delete/range-delete rebuilds, in-place ref
       patch for relocate (+ page-formats.md rider)
-- [ ] 3. internal/btree: rebalance termination — leaf redistribute
+- [x] 3. internal/btree: rebalance termination — leaf redistribute
       fill-floor decline, deep-underflow heal propagation
       (+ range-delete.md rider)
 - [ ] 4. internal/btree: read-path validation — cousin-scan first-read

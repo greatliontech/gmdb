@@ -156,7 +156,7 @@ func findLeafSplitIndex(b *page.LeafBuilder, scratch []byte, cfg page.Config, en
 
 	// left = entries[:g] fits by construction. If right fits too, g is
 	// the balanced split point (the common case for moderately-sized
-	// entries, and always reachable on the redistribute path).
+	// entries).
 	if leafEntriesFit(b, scratch, cfg, entries[g:]) {
 		return g, true
 	}
@@ -256,11 +256,13 @@ func largestInlineEntry(entries []page.LeafEntry) int {
 //
 // ok=false means no contiguous two-page partition fits — a single separator
 // genuinely exceeds page capacity (unreachable under limits.md §Maximum Key
-// Size; the caller surfaces ErrKeyTooLarge on the split path) or, on the
-// redistribute path where a feasible boundary provably exists (the cells
-// arrived from two sibling branches that each already fit one page, with
-// separators bounded by limits.md §Maximum Key Size, so a two-page partition
-// always exists), ErrCorrupted.
+// Size; the caller surfaces ErrKeyTooLarge on the split path). On the branch
+// redistribute path a feasible boundary provably exists (the cells arrived
+// from two sibling branches that each already fit one page, with separators
+// bounded by limits.md §Maximum Key Size), so ok=false there is ErrCorrupted;
+// the LEAF redistribute path has no such guarantee (canonical re-encode of
+// variant-migrated inputs is not monotone) and DECLINES on ok=false instead
+// — see mergeOrRedistributeLeaves.
 //
 // Determinism (page-formats.md §Leaf Split deterministic-encoding
 // invariant): a pure function of (cfg, cells); ties in balance resolve to

@@ -712,7 +712,7 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 
 		if !isMerge && newLeftID == 0 {
 			// DECLINE: the redistribute could not restore the fill-floor
-			// for both halves (branches, large lifted separator) or the
+			// for both halves (either level) or the
 			// parent cannot fit the recomputed separator (either level),
 			// so it changed nothing. Leave both survivors as-is — the
 			// underflowing one stays below MT, accepted per
@@ -786,38 +786,55 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 			j = leftJ - 1
 		} else {
 			// Redistribute. The branch-level case requires explicit
-			// deep-underflow handling per side: the count-balanced
-			// split preserves the leftmost of each input as the
-			// leftmost of the corresponding output (leftPair.leftmost
-			// stays at newLeftID.leftmost; rightPair.leftmost is at
-			// the lifted-cell boundary and may end up as either
-			// newRightID.leftmost or newLeftID.cells[k].Child depending
-			// on where the count-split lands). For an input that was
-			// degenerate (cells=[]), the only carrier of its deep
-			// signal is its leftmost, so the destination side is
-			// uniquely determined: leftDeep → newLeftID; rightDeep →
-			// newRightID. cousinRebalanceBranch handles the search
-			// in case the count-split landed differently.
+			// deep-underflow handling per carried signal: the
+			// count-balanced split preserves the left input's leftmost
+			// as newLeftID.leftmost, but the right input's leftmost is
+			// at the lifted-cell boundary and can land in EITHER
+			// output depending on where the count-split falls — so the
+			// holder is scanned, never assumed (cousinRebalanceBranch
+			// errors on a miss; assuming rightDeep → newRightID failed
+			// a valid delete when the split landed it on the left).
 			finalLeft := newLeftID
 			finalRight := newRightID
 			leftResidual := uint64(0)
 			rightResidual := uint64(0)
 			if !leftIsLeaf {
-				if leftDeep != 0 {
-					nc, _, res, cerr := cousinRebalanceBranch(pw, cfg, newLeftID, leftDeep, mergeThreshold)
+				healedAny := false
+				for _, deep := range [2]uint64{leftDeep, rightDeep} {
+					if deep == 0 {
+						continue
+					}
+					// The count-balanced split decides which output
+					// received the deep (the right input's leftmost can
+					// migrate into the left output) — scan for the
+					// holder; cousinRebalanceBranch errors on a miss.
+					// With BOTH survivors carrying deeps, the first
+					// heal can merge the second deep into a sibling
+					// (both can land adjacent in one output) — that
+					// deep is then already healed by absorption, and
+					// only then is a scan miss legitimate.
+					holder, found, herr := deepHolderAfterRedistribute(pw, cfg, finalLeft, finalRight, deep)
+					if herr != nil {
+						return herr
+					}
+					if !found {
+						if healedAny {
+							continue // absorbed by the prior heal
+						}
+						return fmt.Errorf("%w: deep underflow child %d not found in either redistribute output (%d, %d)", ErrCorrupted, deep, finalLeft, finalRight)
+					}
+					nc, _, res, cerr := cousinRebalanceBranch(pw, cfg, holder, deep, mergeThreshold)
 					if cerr != nil {
 						return cerr
 					}
-					finalLeft = nc
-					leftResidual = res
-				}
-				if rightDeep != 0 {
-					nc, _, res, cerr := cousinRebalanceBranch(pw, cfg, newRightID, rightDeep, mergeThreshold)
-					if cerr != nil {
-						return cerr
+					healedAny = true
+					if holder == finalLeft {
+						finalLeft = nc
+						leftResidual = res
+					} else {
+						finalRight = nc
+						rightResidual = res
 					}
-					finalRight = nc
-					rightResidual = res
 				}
 			}
 			// Re-check each redistribute output's encoded fill via

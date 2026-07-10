@@ -125,10 +125,40 @@ Invariant: kind=clause-explicit;
     the physical-fit constraint (so it never piles the cheap same-cluster
     cells on one half and strands the other below MT), and one that still
     cannot clear the floor for both halves **declines** (changes nothing)
-    so the deficit is not relocated to a sibling — the underflowing child
+    so the deficit is not relocated to a sibling. The decline contract
+    holds for **leaf pairs identically**: a leaf redistribute's
+    byte-balanced split is entry-granular, so a single near-page inline
+    entry can strand the other half below MT — that redistribute
+    declines; and a pair whose combined set has **no feasible two-page
+    partition at all** (a variant-migrated delta-heavy input canonically
+    inflates past two pages — the same non-monotonicity as
+    `page-formats.md` §Insert and Delete's delete-side rebuild fallback)
+    also declines rather than failing: infeasibility on a valid pair is
+    an accepted-below-floor outcome, never an error. In every decline
+    the underflowing child
     is threaded upward as `deepUnderflowChild` for a higher level (with
     more cousins) to heal, or accepted below-floor if unreachable
-    everywhere; when the 2-survivor cousin-cascade case (`leftIdx=0 ∧
+    everywhere — and the thread is handled on **every** pair outcome at
+    the receiving level: a merge cousin-rebalances inside the merged
+    result, a redistribute cousin-rebalances inside whichever output
+    received the deep child (the count-balanced split decides which —
+    the holder is discovered, never assumed), and a decline re-threads
+    the unchanged wrapper upward. Two thread hygiene rules: (i) the id
+    a level threads upward must be **live in that level's final
+    returned topology** — a level's own post-decline re-rebalance can
+    merge the recorded wrapper away (and a partial heal can have
+    already merged the original deep itself), so a stale thread is
+    reconciled by **meaning, not identity**: the final topology's
+    branch children are rescanned for any still-below-floor
+    grandchild; the first found per child is healed (the cousin walk
+    absorbs adjacent ones), only a residual re-threads, and no
+    sub-MT grandchild
+    means every deep was absorbed — a stale thread is never an
+    error; (ii) when one redistributed pair carries
+    **two** deep signals (a range delete's two boundary survivors),
+    healing the first may merge the second into a sibling — that second
+    deep is then already healed by absorption, and its holder-scan miss
+    is the legitimate outcome, not an error; when the 2-survivor cousin-cascade case (`leftIdx=0 ∧
     rightIdx=cellCount` at the parent of two below-MT survivors) leaves the
     parent degenerate, the still-below-MT page is threaded upward as
     `deepUnderflowChild` and rebalanced against its cousins after the

@@ -611,7 +611,7 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		cells[posRightPair-1].Child = newRightID
 		cells[separatorIdx].Key = newSeparator
 		// Redistribute restored the floor for both halves (the decline
-		// guard in mergeOrRedistributeBranches guarantees it); the
+		// guards in mergeOrRedistributeLeaves / -Branches guarantee it); the
 		// recursed-into side (= descentIdx) is healthy. The post-merge
 		// re-rebalance loop below still runs for defense in depth.
 		insertedPos = int(descentIdx)
@@ -624,21 +624,76 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 	_ = posRightPair
 
 	// Cousin-rebalance step. When the recursion at the child level
-	// could not heal a sub-MT descendant (deepUnderflowChildIn != 0)
-	// AND the local case-C merge produced a branch result containing
-	// that descendant as a child, run cousinRebalanceBranch on the
-	// merged result. Same `(newID, branchUnderflow, residualDeepID)`
-	// contract as rebalanceChildAtPos but operating on an already-
-	// encoded branch (the helper handles the re-CoW + free).
+	// could not heal a sub-MT descendant (deepUnderflowChildIn != 0),
+	// the signal must be handled on EVERY case-C outcome, not only the
+	// merge — a redistribute relocates the deep's degenerate wrapper's
+	// children into the outputs, and a decline leaves the wrapper in
+	// place; silently dropping the signal on either outcome strands a
+	// sub-MT descendant below a reachable floor (range-delete.md
+	// §Invariants violation type (1)).
 	//
-	// Reachability: the only producer of deepUnderflowChildIn is a
+	// Reachability: deepUnderflowChildIn is produced either by a
 	// recursion that reduced its own branch to a single sub-MT child
-	// (rebalanceChildAtPos's "no siblings" exit). That means
-	// childUnderflow is also true (the degenerate branch's own
-	// encoded fill is ~0). So this branch path only fires when the
-	// case-C merge is branch-level — leaf-merge would imply the
+	// (rebalanceChildAtPos's "no siblings" exit — a degenerate, ~0
+	// fill wrapper) or by the forced-semantic-underflow producer at
+	// this function's tail, whose wrapper can have HEALTHY encoded
+	// fill (underflow is forced precisely so case-C runs here). Both
+	// producers thread branches, so these paths only fire when the
+	// case-C pair is branch-level — a leaf pair would imply the
 	// recursion was a leaf, which cannot produce deepUnderflowChildIn.
 	deepUnderflowChildOut := uint64(0)
+	if deepUnderflowChildIn != 0 && !leftIsLeaf && !isMerge {
+		if newLeftID == 0 {
+			// DECLINE: the pair is unchanged; the deep's degenerate
+			// wrapper (newChildID) is still a direct child of this
+			// branch. A cousin pass inside the wrapper cannot help —
+			// it has no siblings there — so thread the wrapper upward
+			// (same wrapper-propagation geometry as the merge arm);
+			// the parentUnderflow forcing below makes the next level
+			// run case-C and hand the deep new siblings.
+			deepUnderflowChildOut = newChildID
+		} else {
+			// REDISTRIBUTE: the wrapper's only child (the deep) is now
+			// a direct child of one output — scan for the holder (the
+			// count-balanced split decides which; see
+			// deepHolderAfterRedistribute) and heal there.
+			holder, found, herr := deepHolderAfterRedistribute(pw, cfg, newLeftID, newRightID, deepUnderflowChildIn)
+			if herr != nil {
+				return 0, false, 0, herr
+			}
+			if !found {
+				// A single in-flight deep is a direct child of exactly
+				// one output by the redistribute's child-concatenation
+				// geometry; a miss is structural corruption.
+				return 0, false, 0, fmt.Errorf("%w: deep underflow child %d not found in either redistribute output (%d, %d)", ErrCorrupted, deepUnderflowChildIn, newLeftID, newRightID)
+			}
+			healed, _, residual, herr := cousinRebalanceBranch(pw, cfg, holder, deepUnderflowChildIn, mergeThreshold)
+			if herr != nil {
+				return 0, false, 0, herr
+			}
+			if healed != holder {
+				// Re-point the parent slot (and the re-rebalance
+				// loop's tracked id) at the healed replacement.
+				switch {
+				case posLeftPair == 0 && holder == newLeftID:
+					leftmost = healed
+				case holder == newLeftID:
+					cells[posLeftPair-1].Child = healed
+				default: // holder == newRightID; posRightPair ≥ 1 always
+					cells[posRightPair-1].Child = healed
+				}
+				if insertedID == holder {
+					insertedID = healed
+				}
+			}
+			if residual != 0 {
+				// Propagate the direct-child wrapper (the healed
+				// output), not the buried residual — same geometry
+				// argument as the merge arm below.
+				deepUnderflowChildOut = healed
+			}
+		}
+	}
 	if deepUnderflowChildIn != 0 && isMerge && !leftIsLeaf {
 		newMergedID, _, residual, err := cousinRebalanceBranch(pw, cfg, mergedID, deepUnderflowChildIn, mergeThreshold)
 		if err != nil {
@@ -700,6 +755,83 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 		}
 	}
 
+	// Deep-thread liveness reconciliation. Every arm above records the
+	// deep's wrapper BEFORE the re-rebalance loop runs, and the loop
+	// can merge that wrapper into a sibling — freeing the recorded id
+	// while the loop's own overwrite only fires on a below-floor exit.
+	// Threading a freed id upward makes the next level's cousin pass
+	// (or holder scan) fail a valid delete with ErrCorrupted, or — on
+	// a decline there — strands the deep silently. The stale id cannot
+	// be chased by identity: a partial heal can have merged the
+	// ORIGINAL deep away too (freed) while its residual wrapper was in
+	// turn merged by the loop. Reconcile by MEANING instead: the
+	// thread exists to point the next level at an unhealed sub-MT
+	// descendant, so when the recorded id is no longer a direct child
+	// of the final topology, rescan the final topology's branch
+	// children for any below-floor grandchild, heal each where found
+	// (the merges gave them siblings), and thread only a residual. No
+	// sub-MT grandchild ⇒ every deep was absorbed by the loop's merges
+	// ⇒ thread nothing — a stale thread is never an error.
+	if deepUnderflowChildOut != 0 {
+		live := leftmost == deepUnderflowChildOut
+		for i := range cells {
+			if cells[i].Child == deepUnderflowChildOut {
+				live = true
+				break
+			}
+		}
+		if !live {
+			deepUnderflowChildOut = 0
+			for pos := 0; pos <= len(cells); pos++ {
+				id := leftmost
+				if pos > 0 {
+					id = cells[pos-1].Child
+				}
+				cbuf, cerr := pw.Page(id)
+				if cerr != nil {
+					return 0, false, 0, cerr
+				}
+				if typ, _, _, _ := page.ReadHeader(cbuf); typ != page.TypeBranch {
+					continue
+				}
+				clm, ccells := page.DecodeBranch(cbuf, cfg)
+				subMT := uint64(0)
+				for gpos := 0; gpos <= len(ccells); gpos++ {
+					gid := clm
+					if gpos > 0 {
+						gid = ccells[gpos-1].Child
+					}
+					below, uerr := pageUnderflow(pw, cfg, gid, mergeThreshold)
+					if uerr != nil {
+						return 0, false, 0, uerr
+					}
+					if below {
+						subMT = gid
+						break
+					}
+				}
+				if subMT == 0 {
+					continue
+				}
+				healed, _, residual, herr := cousinRebalanceBranch(pw, cfg, id, subMT, mergeThreshold)
+				if herr != nil {
+					return 0, false, 0, herr
+				}
+				if healed != id {
+					if pos == 0 {
+						leftmost = healed
+					} else {
+						cells[pos-1].Child = healed
+					}
+				}
+				if residual != 0 {
+					// Last-non-zero wins, matching the loop's own rule.
+					deepUnderflowChildOut = healed
+				}
+			}
+		}
+	}
+
 	if err := page.EncodeBranch(parentBuf, cfg, leftmost, cells); err != nil {
 		return 0, false, 0, fmt.Errorf("btree: encode branch after merge/redistribute: %w", err)
 	}
@@ -752,7 +884,7 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 	// triedLeft/triedRight: whether the left/right adjacent sibling has
 	// already been paired and DECLINED (merge overflows a page and a
 	// redistribute cannot restore the floor for both halves — see
-	// mergeOrRedistributeBranches). A decline changes no pages, so
+	// mergeOrRedistributeLeaves / -Branches). A decline changes no pages, so
 	// re-pairing the same sibling reruns the identical decision forever; a
 	// single "last tried" marker is insufficient because with both
 	// neighbours present the loop would ping-pong (try left, try right,
@@ -876,6 +1008,37 @@ func rebalanceChildAtPos(pw PageWriter, cfg page.Config, mergeThreshold uint8, l
 		}
 		// Loop re-checks underflow on curID.
 	}
+}
+
+// deepHolderAfterRedistribute reports which redistribute output holds
+// deepID as a direct child. A branch redistribute rebuilds both
+// outputs from the pair's combined child set, so a page that was a
+// direct child of either input is a direct child of exactly one
+// output — but WHICH one depends on where the count-balanced split
+// landed (the right input's leftmost can migrate into the left
+// output). cousinRebalanceBranch requires the exact holder (it errors
+// on a miss), so callers scan rather than assume a side.
+func deepHolderAfterRedistribute(pw PageWriter, cfg page.Config, leftID, rightID, deepID uint64) (holder uint64, found bool, err error) {
+	for _, id := range [2]uint64{leftID, rightID} {
+		buf, err := pw.Page(id)
+		if err != nil {
+			return 0, false, err
+		}
+		typ, _, _, _ := page.ReadHeader(buf)
+		if typ != page.TypeBranch {
+			return 0, false, fmt.Errorf("%w: redistribute output %d unexpected type %d in deep-holder scan", ErrCorrupted, id, typ)
+		}
+		leftmost, cells := page.DecodeBranch(buf, cfg)
+		if leftmost == deepID {
+			return id, true, nil
+		}
+		for _, c := range cells {
+			if c.Child == deepID {
+				return id, true, nil
+			}
+		}
+	}
+	return 0, false, nil
 }
 
 // cousinRebalanceBranch heals a sub-MT descendant `deepID` that lives
@@ -1123,7 +1286,7 @@ func mergeOrRedistributePair(pw PageWriter, cfg page.Config, mergeThreshold uint
 	out := pairOutcome{leftIsLeaf: leftIsLeaf}
 	switch {
 	case leftIsLeaf:
-		out.isMerge, out.mergedID, out.newLeftID, out.newRightID, out.newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, leftPairID, rightPairID, parentFits)
+		out.isMerge, out.mergedID, out.newLeftID, out.newRightID, out.newSeparator, err = mergeOrRedistributeLeaves(pw, cfg, mergeThreshold, leftPairID, rightPairID, parentFits)
 	case leftTyp == page.TypeBranch && rightTyp == page.TypeBranch:
 		out.isMerge, out.mergedID, out.newLeftID, out.newRightID, out.newSeparator, err = mergeOrRedistributeBranches(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
 	default:
@@ -1144,13 +1307,23 @@ func mergeOrRedistributePair(pw PageWriter, cfg page.Config, mergeThreshold uint
 //   - On merge: mergedID is set; new*ID and newSeparator are zero.
 //   - On redistribute: new*ID and newSeparator are set; mergedID is
 //     zero.
-//   - On DECLINE (all-zero, nil error): the parent cannot physically
-//     accommodate the redistribute's recomputed boundary separator
-//     (parentFits returned false). The redistribute allocated and
-//     freed nothing; the only page churn before a decline is the
-//     failed merge attempt's self-contained scratch (alloc + free of
-//     one loose page). The caller leaves the pair as-is and
-//     threads/accepts the underflow per range-delete.md §Invariants.
+//   - On DECLINE (all-zero, nil error): the redistribute cannot
+//     restore the fill floor for BOTH halves (a byte-balanced split
+//     is entry-granular, so one near-page entry can strand the other
+//     half below MergeThreshold), OR no feasible two-page partition
+//     exists (a variant-migrated combined set can canonically inflate
+//     past two pages — the same non-monotonicity as the delete
+//     rebuild's splice fallback), OR the parent cannot physically
+//     accommodate the recomputed boundary separator (parentFits).
+//     The redistribute allocated and freed nothing; the only page
+//     churn before a decline is the failed merge attempt's
+//     self-contained scratch (alloc + free of one loose page). The
+//     caller leaves the pair as-is and threads/accepts the underflow
+//     per range-delete.md §Invariants — the same decline contract as
+//     mergeOrRedistributeBranches, and the guarantee every rebalance
+//     loop's termination argument cites (a decline changes nothing,
+//     so re-pairing the same siblings re-declines; a successful
+//     redistribute leaves both halves at or above the floor).
 //
 // On merge and redistribute the input leftID and rightID are freed.
 //
@@ -1174,7 +1347,7 @@ func mergeOrRedistributePair(pw PageWriter, cfg page.Config, mergeThreshold uint
 // is a build-time policy choice, not a per-page invariant; merge/
 // redistribute homogenizes toward the keyspace-level target. No
 // spec clause requires variant preservation across merge.
-func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID uint64, parentFits func([]byte) bool) (bool, uint64, uint64, uint64, []byte, error) {
+func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, mergeThreshold uint8, leftID, rightID uint64, parentFits func([]byte) bool) (bool, uint64, uint64, uint64, []byte, error) {
 	leftSrc, err := pw.Page(leftID)
 	if err != nil {
 		return false, 0, 0, 0, nil, err
@@ -1245,13 +1418,12 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 	// Redistribute across two pages at a byte-balanced boundary
 	// (page-formats.md §Leaf Split), not the entry-count midpoint: a
 	// count split of size-skewed siblings can place more than a page of
-	// bytes on one half and spuriously fail. The combined entries arrived
-	// from two valid sibling pages, so a feasible two-page partition
-	// always exists (at minimum the original page boundary, which is
-	// at least as balanced as the input); findLeafSplitIndex returning
-	// ok=false therefore means a structurally-invalid input — a stored
-	// entry exceeding page capacity — a genuine ErrCorrupted, not a
-	// balance failure.
+	// bytes on one half and spuriously fail. The combined entries
+	// arrived from two valid sibling pages, but that does NOT guarantee
+	// a feasible two-page partition under the CANONICAL builder: a
+	// variant-migrated (or group-realigned) input's canonical re-encode
+	// can inflate past two pages — the same non-monotonicity as the
+	// delete rebuild's splice fallback — so ok=false declines below.
 	//
 	// The whole redistribute PLAN (split point + new separator +
 	// parent-fit check) is computed on heap scratch before any page
@@ -1260,11 +1432,52 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, leftID, rightID u
 	sb := page.NewLeafBuilder(scratch, cfg)
 	mid, ok := findLeafSplitIndex(sb, scratch, cfg, combined)
 	if !ok {
-		return false, 0, 0, 0, nil, fmt.Errorf("%w: redistribute leaves have no feasible two-page split", ErrCorrupted)
+		// No feasible two-page partition. NOT corruption: the combined
+		// set arrived from two valid sibling pages, but a canonical
+		// re-encode is not monotone — after a mid-life
+		// RestartGroupTarget change an old-variant delta-heavy input
+		// inflates far past two pages (docs recovery:
+		// git log --all -- docs/issues/btree-rebalance-termination.md).
+		// DECLINE per range-delete.md §Invariants: the pair stays
+		// as-is, the underflow threads upward or is accepted
+		// below-floor; the delete itself succeeds.
+		return false, 0, 0, 0, nil, nil
 	}
 	leftSplit := combined[:mid]
 	rightSplit := combined[mid:]
 	newSep := page.ShortestSeparator(leftSplit[len(leftSplit)-1].Key, rightSplit[0].Key)
+
+	// Fill-floor decline (range-delete.md §Invariants, leaf pairs): a
+	// byte-balanced split is entry-granular, so a single near-page
+	// inline entry can leave the other half below MergeThreshold.
+	// Performing such a redistribute would relocate the sub-MT deficit
+	// instead of healing it, and the rebalance loops' termination
+	// arguments (rebalanceChildAtPos tried-flags reset,
+	// rebalanceSurvivors rewind) require that a successful
+	// redistribute leaves BOTH halves at or above the floor. Measured
+	// on the finished scratch encode — exact parity with
+	// leafUnderflow's reader-based fill.
+	halfBelowFloor := func(es []page.LeafEntry) (bool, error) {
+		sb.Reset(scratch, cfg)
+		for _, e := range es {
+			if !sb.AddEntry(e) {
+				return false, fmt.Errorf("%w: redistribute half exceeds page capacity after feasible split", ErrCorrupted)
+			}
+		}
+		sb.Finish()
+		return leafUnderflow(scratch, cfg, mergeThreshold), nil
+	}
+	leftBelow, err := halfBelowFloor(leftSplit)
+	if err != nil {
+		return false, 0, 0, 0, nil, err
+	}
+	rightBelow, err := halfBelowFloor(rightSplit)
+	if err != nil {
+		return false, 0, 0, 0, nil, err
+	}
+	if leftBelow || rightBelow {
+		return false, 0, 0, 0, nil, nil
+	}
 
 	// Decline when the parent cannot physically accommodate the
 	// recomputed boundary separator (range-delete.md §Invariants —

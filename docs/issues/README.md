@@ -79,7 +79,6 @@ chunks (bottom-up by layer, grouped by function).
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| btree-rebalance-termination | 3 | [H] leaf redistribute lacks fill-floor decline → non-terminating delete loop; [H] redistribute ErrCorrupted on infeasible two-page partition (variant-migrated inputs); [M] deep-underflow heal dropped |
 | btree-readpath-validation-gaps | 4 | [M] unvalidated cousin-scan decode panics on corrupt page; [L] Cursor.Delete swallows reposition error |
 | subpage-promotion-single-leaf-cap | 5 | [H] promotion packs all members into one leaf: small-member sets hard-cap (~254 at fvs=8), reproduced |
 | fixed-size-nested-leaf-compaction | 6 | [L] spec'd compact fixed-size nested-leaf cells not implemented |
