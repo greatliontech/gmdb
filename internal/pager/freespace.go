@@ -172,21 +172,8 @@ func (p *Pager) AllocPage() (uint64, error) {
 
 	// 2. Allocation bitmap.
 	if id, ok := p.bitmap.FindFirst(); ok {
-		p.bitmap.Clear(id)
-		p.bitmap.SetHint(id)
-		_, wasInPendingAllocs := p.pendingAllocs[id]
-		p.pendingAllocs[id] = struct{}{}
-		if !wasInPendingAllocs {
-			p.recordSavepointUndo(fieldPendingAllocs, id, false)
-		}
-		// If id was in pendingFrees from earlier in this tx (a loose
-		// page that was already scheduled to be marked free), undo:
-		// the bitmap bit goes from set→clear (commit-time) but the
-		// page is now in active use again.
-		_, wasInPendingFrees := p.pendingFrees[id]
-		delete(p.pendingFrees, id)
-		if wasInPendingFrees {
-			p.recordSavepointUndo(fieldPendingFrees, id, true)
+		if err := p.claimBitmapPage(id); err != nil {
+			return 0, err
 		}
 		return id, nil
 	}
@@ -196,17 +183,8 @@ func (p *Pager) AllocPage() (uint64, error) {
 	// bitmap.
 	if p.reclaimRPL() > 0 {
 		if id, ok := p.bitmap.FindFirst(); ok {
-			p.bitmap.Clear(id)
-			p.bitmap.SetHint(id)
-			_, wasInPendingAllocs := p.pendingAllocs[id]
-			p.pendingAllocs[id] = struct{}{}
-			if !wasInPendingAllocs {
-				p.recordSavepointUndo(fieldPendingAllocs, id, false)
-			}
-			_, wasInPendingFrees := p.pendingFrees[id]
-			delete(p.pendingFrees, id)
-			if wasInPendingFrees {
-				p.recordSavepointUndo(fieldPendingFrees, id, true)
+			if err := p.claimBitmapPage(id); err != nil {
+				return 0, err
 			}
 			return id, nil
 		}
@@ -228,17 +206,8 @@ func (p *Pager) AllocPage() (uint64, error) {
 				p.reclamationBound = p.refreshReclamationBound()
 				if p.reclaimRPL() > 0 {
 					if id, ok := p.bitmap.FindFirst(); ok {
-						p.bitmap.Clear(id)
-						p.bitmap.SetHint(id)
-						_, wasInPendingAllocs := p.pendingAllocs[id]
-						p.pendingAllocs[id] = struct{}{}
-						if !wasInPendingAllocs {
-							p.recordSavepointUndo(fieldPendingAllocs, id, false)
-						}
-						_, wasInPendingFrees := p.pendingFrees[id]
-						delete(p.pendingFrees, id)
-						if wasInPendingFrees {
-							p.recordSavepointUndo(fieldPendingFrees, id, true)
+						if err := p.claimBitmapPage(id); err != nil {
+							return 0, err
 						}
 						return id, nil
 					}
@@ -287,6 +256,46 @@ func (p *Pager) AllocPage() (uint64, error) {
 	return id, nil
 }
 
+// claimBitmapPage commits a bitmap allocation of id. The file is
+// extended to cover the page FIRST: a crash-recovered image can carry
+// free bits above the truncated EOF (lazy tail-refund bit-clears
+// unflushed while the ftruncate metadata journaled), and handing such
+// a page out with a stale fileSize would make the verifying Page
+// accessor reject the page's own committed data as ErrCorrupted until
+// reopen (checksums.md §Structural and Allocation Bounds — the bound
+// must track reality, not lag it). ensureFileCovers is a no-op
+// compare on the common already-covered path.
+func (p *Pager) claimBitmapPage(id uint64) error {
+	if err := p.ensureFileCovers(id + 1); err != nil {
+		return err
+	}
+	// A claim at/above HighWaterMark raises it — exactly as the file-
+	// extension tier does. A legitimate crash-recovered claim is
+	// always below the adopted HWM (reclamation and refund only touch
+	// covered pages), so this fires only for a forged/corrupt free
+	// bit — and honoring it with a raised HWM keeps the SAME commit's
+	// maybeShrink (target derived from HWM) from truncating away the
+	// data just committed into the page. The forged shape degrades to
+	// bounded allocated-but-wasted space that maintenance's leak pass
+	// reclaims, never to silent data loss.
+	if id >= p.highWaterMark {
+		p.highWaterMark = id + 1
+	}
+	p.bitmap.Clear(id)
+	p.bitmap.SetHint(id)
+	_, wasInPendingAllocs := p.pendingAllocs[id]
+	p.pendingAllocs[id] = struct{}{}
+	if !wasInPendingAllocs {
+		p.recordSavepointUndo(fieldPendingAllocs, id, false)
+	}
+	_, wasInPendingFrees := p.pendingFrees[id]
+	delete(p.pendingFrees, id)
+	if wasInPendingFrees {
+		p.recordSavepointUndo(fieldPendingFrees, id, true)
+	}
+	return nil
+}
+
 // ensureFileCovers ftruncates the file up to at least pages * PageSize
 // bytes if the current file size is smaller. No-op when the file is
 // already large enough. The mmap reservation is separate and is sized
@@ -297,8 +306,10 @@ func (p *Pager) ensureFileCovers(pages uint64) error {
 		return nil
 	}
 	// Grow in GrowStep-aligned increments (file-format.md §File Growth):
-	// newSize = min(alignUp(pages, GrowStep), MaxSize). `pages` is the new
-	// HighWaterMark (= prior HWM + the one page just claimed). The pages
+	// newSize = min(alignUp(pages, GrowStep), MaxSize). `pages` is the
+	// one-past-the-end page the caller needs covered — the new
+	// HighWaterMark on the extension tier, or a bitmap-claimed id+1 on
+	// the coverage-first claim paths (always ≤ HWM there). The pages
 	// between `pages` and the aligned end are file-backed but above
 	// HighWaterMark, so later AllocPage calls advance HWM into them with NO
 	// further ftruncate — one syscall per GrowStep pages, giving the OS a
@@ -733,7 +744,9 @@ func (p *Pager) AllocContiguous(n uint32) (uint64, error) {
 
 	// 1. Bitmap contiguous-run search.
 	if firstID, ok := p.bitmap.FindContiguous(int(n)); ok {
-		p.reserveBitmapRun(firstID, n)
+		if err := p.reserveBitmapRun(firstID, n); err != nil {
+			return 0, err
+		}
 		return firstID, nil
 	}
 	// First bitmap scan found no contiguous run. If total free pages still
@@ -832,8 +845,17 @@ func (p *Pager) ConsumeContiguousAllocStats() (attempts, fragFails uint64) {
 // clears the bitmap bits, records pendingAllocs, drops any pendingFrees
 // entries that were scheduled (a loose-page free that hadn't been
 // committed). Sets the LIFO hint just past the run for locality.
-func (p *Pager) reserveBitmapRun(firstID uint64, n uint32) {
+func (p *Pager) reserveBitmapRun(firstID uint64, n uint32) error {
 	end := firstID + uint64(n)
+	// Same rules as claimBitmapPage: coverage-first for the
+	// crash-recovered above-EOF shape, HWM raised for a run reaching
+	// past it (see claimBitmapPage — shrink safety for forged bits).
+	if err := p.ensureFileCovers(end); err != nil {
+		return err
+	}
+	if end > p.highWaterMark {
+		p.highWaterMark = end
+	}
 	for id := firstID; id < end; id++ {
 		p.bitmap.Clear(id)
 		_, wasInPendingAllocs := p.pendingAllocs[id]
@@ -848,6 +870,7 @@ func (p *Pager) reserveBitmapRun(firstID uint64, n uint32) {
 		}
 	}
 	p.bitmap.SetHint(end - 1)
+	return nil
 }
 
 // FreeRun retires a contiguous run of n pages starting at firstID. Each

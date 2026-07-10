@@ -513,6 +513,16 @@ func (p *Pager) maybeShrink(shrinkThreshold uint64) error {
 	if p.fileSize-target < int64(shrinkThreshold)*int64(p.cfg.PageSize) {
 		return nil // trailing slack below threshold — avoid ftruncate thrash
 	}
+	// Shrink DEFERS while any reader is live (file-format.md §File
+	// Shrinkage): a reader's file-resident bound is fixed at Begin, so
+	// truncating under it would turn a corrupt content-derived page id
+	// into a SIGBUS instead of the ErrCorrupted checksums.md
+	// §Structural and Allocation Bounds promises. Consulted last —
+	// only when a truncation would actually happen — because the scan
+	// costs O(MaxReaders).
+	if p.shrinkAllowed != nil && !p.shrinkAllowed() {
+		return nil
+	}
 	if err := p.fops.Truncate(target); err != nil {
 		return err
 	}

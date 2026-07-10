@@ -140,6 +140,7 @@ type Pager struct {
 	// segment for an immediate log.
 	rplCorruptCount uint64
 	rplCorruptCb    func(segPageID uint64)
+	shrinkAllowed   func() bool
 
 	// rplRelocFloor arms a one-shot RPL chain-prefix relocation for
 	// the next commit (free-space.md §RPL segment relocation);
@@ -522,6 +523,18 @@ type TxParams struct {
 	// bound — at most once per call. nil = no callback; allocation
 	// falls through to file extension.
 	LaggingReader func(LaggingReaderInfo) LaggingReaderAction
+	// ShrinkAllowed gates post-commit file truncation
+	// (file-format.md §File Shrinkage): shrink DEFERS while any
+	// reader transaction is live, because a reader's file-resident
+	// bound is fixed at its Begin — truncating under it would turn
+	// the corrupt-input class checksums.md §Structural and
+	// Allocation Bounds promises ErrCorrupted for into a SIGBUS on
+	// the newly-unbacked region. Consulted only when a truncation
+	// would actually happen (after the threshold checks); the DB
+	// layer supplies a reader-table emptiness scan (the caller holds
+	// the write grant — the scan's LOCK_EX precondition). nil =
+	// always allowed (fixtures/tests).
+	ShrinkAllowed func() bool
 }
 
 // BeginTx seeds the pager for one write transaction from params, then
@@ -564,6 +577,7 @@ func (p *Pager) BeginTx(params TxParams) {
 	p.refreshReclamationBound = params.ReclamationBound
 	p.rplCorruptCb = params.RPLCorrupt
 	p.laggingReader = params.LaggingReader
+	p.shrinkAllowed = params.ShrinkAllowed
 	if params.ReclamationBound != nil {
 		p.reclamationBound = params.ReclamationBound()
 	} else {
@@ -981,8 +995,14 @@ func (p *Pager) Page(id uint64) ([]byte, error) {
 	// mmap access. The mmap spans the whole MaxSize reservation, but only
 	// the first p.fileSize bytes are file-backed — reading the gap
 	// SIGBUSes. Comparing page counts (not byte offsets) keeps id*PageSize
-	// from overflowing uint64 for a forged-huge id.
+	// from overflowing uint64 for a forged-huge id. Clamped to MaxSize:
+	// an externally-grown file can exceed the mmap reservation, and an
+	// id in that gap would slice past the mapping (the same canonical
+	// bound attachState and rebuildRPLChain use).
 	backedPages := uint64(p.fileSize) / uint64(p.cfg.PageSize)
+	if p.maxSizePages != 0 {
+		backedPages = min(backedPages, p.maxSizePages)
+	}
 	if id >= backedPages {
 		return nil, fmt.Errorf("%w: page id %d beyond file-resident extent (%d pages)",
 			ErrCorrupted, id, backedPages)

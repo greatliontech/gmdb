@@ -230,7 +230,8 @@ input — it returns an error instead:
 - **Page-id reachability bound.** Every content-derived page id
   (a branch child pointer, an overflow-run page, a nested-subtree
   root) is bounded against the file-resident page extent
-  (`fileSize / PageSize`) before any mmap access. An out-of-range
+  (`min(fileSize / PageSize, MaxSize)` — the file can be externally
+  grown past the mmap reservation) before any mmap access. An out-of-range
   id yields `ErrCorrupted`, never a SIGBUS on the unbacked region
   of the `MaxSize` mmap reservation (the reservation spans
   `MaxSize` but only the first `fileSize` bytes are file-backed;

@@ -79,10 +79,10 @@ chunks (bottom-up by layer, grouped by function).
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| pager-file-resident-bounds | 8 | [M×2] stale writer fileSize → spurious ErrCorrupted; reader SIGBUS window after shrink; [L] Page() MaxSize clamp |
 | pager-commit-residue | 9 | [L×3] checkpoint under-anchor; armed rplRelocFloor survives abort; relocation probe undercounts segments |
 | reader-slot-clear-validation | 10 | [H] stale-reader clear without occupancy re-check evicts a live reader (use-after-reclaim); [M] frozen-reader ghost-store |
 | lockfile-stale-removal-race | 11 | [H] unguarded unlink-by-name on stale lock file → split brain, two writers |
+| shrink-gate-acquisition-residual | 12 | [M] shrink deferral has a reader-CAS acquisition window (corrupt-input SIGBUS residual, spec-recorded) — close via lock-file shrink seqlock |
 | lock-boot-epoch | 12 | [H] post-reboot future heartbeats + starttime collisions bypass the recovery gate; [L] lock file never deleted contra spec |
 | batch-goexit-deadlock | 13 | [H] closure Goexit kills coordinator, permanent deadlock; [L] cascade reserve re-price; [L] self-commit outcome doc |
 | child-tx-contract-gaps | 14 | [M] child SetFileFormat silently dropped; [L] View error join; [L] iterators silently empty on guard errors; [L] SetCursor.Delete swallows re-seek corruption as end-of-iteration |

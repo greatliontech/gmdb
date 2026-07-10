@@ -831,6 +831,15 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 				"segPageID", segPageID)
 		},
 		LaggingReader: lagging,
+		ShrinkAllowed: func() bool {
+			// Shrink defers while any reader is live (file-format.md
+			// §File Shrinkage): a reader's file-resident bound is
+			// fixed at Begin; truncating under it turns corrupt
+			// content-derived page ids into SIGBUS instead of the
+			// contracted ErrCorrupted. We hold the write grant, so
+			// the reader-table scan's LOCK_EX precondition holds.
+			return coord == nil || coord.CountActiveReaders() == 0
+		},
 	})
 
 	held := &atomic.Bool{}

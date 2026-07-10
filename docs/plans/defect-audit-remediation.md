@@ -22,7 +22,7 @@ function. WIP = 1.
       cells per set-keyspace.md
 - [x] 7. internal/pager: crash-coherent RPL reclamation — neutralize
       half-reclaimed segments at Open (+ free-space.md rider)
-- [ ] 8. internal/pager: file-resident bounds — writer fileSize
+- [x] 8. internal/pager: file-resident bounds — writer fileSize
       tracking, reader shrink-stable bound, MaxSize clamp
 - [ ] 9. internal/pager: commit residue — checkpoint anchor advance,
       rplRelocFloor lifecycle, relocation probe segment projection

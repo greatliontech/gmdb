@@ -107,10 +107,27 @@ more than `ShrinkThreshold`:
 
 1. `newSize = alignUp(HighWaterMark, GrowStep)`.
 2. Clamp to `MinSize`.
-3. `ftruncate()`. The mmap reservation remains at `MaxSize` — the
-   truncated region becomes unmapped (SIGBUS on access), safe
-   because `HighWaterMark` in the meta page prevents any reader
-   from accessing those pages.
+3. Shrink DEFERS while any reader transaction is VISIBLE in the
+   reader table at the gate's scan: a reader's file-resident page
+   bound is fixed when it begins, and truncating under a live
+   reader would turn a corrupt content-derived page id — the input
+   class `checksums.md` §Structural and Allocation Bounds promises
+   `ErrCorrupted` for — into a SIGBUS on the newly-unbacked region.
+   Legitimate trees never reference the truncated range
+   (`HighWaterMark` plus the reclamation bound guarantee that), so
+   the deferral protects only the hardened corrupt-input path; the
+   shrink retries at the next eligible commit. **Accepted
+   residual**: reader-slot acquisition is a lock-free CAS with no
+   happens-before edge to the gate's scan, so a reader that
+   publishes its slot between the scan and the `ftruncate` — and
+   fstats before the truncate lands — retains the pre-shrink
+   bound for its lifetime. The window is bounded by the writer's
+   scan-to-truncate span and harms only the corrupt-input path
+   (never a legitimate read). Full closure requires a shared
+   happens-before mechanism — a shrink sequence counter readers
+   observe across their slot-publish + fstat, or a
+   truncation-stable reader bound.
+4. `ftruncate()`. The mmap reservation remains at `MaxSize`.
 
 Automatic and zero-overhead — happens as a natural consequence
 of tail-page refund during commit (see `free-space.md §Tail
