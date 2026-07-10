@@ -4,7 +4,22 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync/atomic"
 )
+
+// acquirePublishHookForTest, when set, fires after AcquireReaderSlot's
+// five publish stores and BEFORE the post-publish ownership verify —
+// the only window in which a stale-detection scan can age the acquire
+// out from under a frozen acquirer. Tests use it to simulate that
+// eviction deterministically. The callback must be non-blocking.
+var acquirePublishHookForTest atomic.Pointer[func(idx uint32)]
+
+// staleClearHookForTest, when set, fires after a scan classifies a
+// slot as stale and BEFORE the guarded clear re-validates it — the
+// window in which the classified occupant can be released and the
+// slot re-won. Tests use it to interleave a re-win deterministically.
+// The callback must be non-blocking.
+var staleClearHookForTest atomic.Pointer[func(idx uint32)]
 
 // NoSlot is the sentinel returned by AcquireReaderSlot / stored on a
 // Tx with no reader slot. ^uint32(0) is outside any legal MaxReaders
@@ -22,13 +37,33 @@ var ErrReadersFull = errors.New("lock: reader table full")
 // the caller's identity in the field order required by
 // cross-process.md §Reader Table (slot acquire):
 //
-//	a. Store Heartbeat = heartbeat            (atomic)
+//	a. Store Heartbeat = now()                (atomic; the clock is
+//	    read HERE, not by the caller — a caller-supplied value could
+//	    be arbitrarily old by store time if the acquirer was
+//	    descheduled or frozen after reading it, and a
+//	    stale-at-birth heartbeat lets the next scan age the
+//	    mid-publish window out immediately)
 //	b. Store HintEpoch = 0                    (atomic; clears any
 //	    leftover orphan anchor from a prior stale clear)
 //	c. Store PIDNamespace = pidNS             (atomic)
 //	d. Store ProcessStartTime = pst           (atomic)
 //	e. Store PID = pid                        (atomic; final identity
 //	    publish, gates the stale-detector's same-namespace PID path)
+//	f. Ownership verify: re-load TxnID. If it no longer holds this
+//	    acquisition's value, a stale-detection scan aged the window
+//	    out mid-publish (reachable only when this goroutine was
+//	    frozen > StaleTimeout between the CAS and here). Slot still
+//	    FREE: RE-CLAIM it (CAS) and re-publish — walking away would
+//	    strand this identity on a TxnID==0 slot forever, breaking
+//	    the free⇒PID==0 premise the detector's mid-publish grace
+//	    rests on. Slot re-won: ABANDON — zeroing would evict the
+//	    winner (the exact cascading eviction the guarded clear
+//	    prevents); the winner's own publish overwrites the ghost
+//	    stores, so no junk survives. Residuals: transient ghost
+//	    clobber of a re-winner's fields, and a same-TxnID re-win
+//	    passing the verify (two owners) — closable only by a
+//	    versioned slot layout (cross-process.md §Slot acquire
+//	    residual note).
 //
 // The ordering is load-bearing — see the slot-acquire invariant in
 // cross-process.md. Heartbeat first gives a crash-mid-acquire slot a
@@ -49,7 +84,7 @@ var ErrReadersFull = errors.New("lock: reader table full")
 // with a legitimate genesis snapshot of 0; the caller passes
 // max(activeMeta.TxnID, 1) to dodge this — documenting the precondition
 // here rather than silently coercing).
-func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS, heartbeat uint64) (uint32, error) {
+func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS uint64, now func() uint64) (uint32, error) {
 	if f.slots == nil {
 		panic("lock: AcquireReaderSlot on closed *File")
 	}
@@ -79,12 +114,45 @@ func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS, heartbeat 
 		if !CAS64(&slot.TxnID, 0, txnID) {
 			continue
 		}
-		// Won the CAS — finalise identity in the spec-required order.
-		Store64(&slot.Heartbeat, heartbeat)
-		Store64(&slot.HintEpoch, 0)
-		Store64(&slot.PIDNamespace, pidNS)
-		Store64(&slot.ProcessStartTime, pst)
-		Store64(&slot.PID, pid)
+		// Won the CAS — finalise identity in the spec-required order,
+		// heartbeat stamped at store time (step a rationale above).
+		won := false
+		for {
+			Store64(&slot.Heartbeat, now())
+			Store64(&slot.HintEpoch, 0)
+			Store64(&slot.PIDNamespace, pidNS)
+			Store64(&slot.ProcessStartTime, pst)
+			Store64(&slot.PID, pid)
+			if hook := acquirePublishHookForTest.Load(); hook != nil {
+				(*hook)(i)
+			}
+			// Step f — ownership verify (doc above). Still ours:
+			// done.
+			if Load64(&slot.TxnID) == txnID {
+				won = true
+				break
+			}
+			// Lost mid-publish. If the slot is still FREE (aged out
+			// and cleared, not re-won), RE-CLAIM it and re-publish:
+			// walking away would strand our identity stores on a
+			// free slot forever — nothing scrubs a TxnID==0 slot, and
+			// the junk breaks the free⇒PID==0 premise the detector's
+			// mid-publish grace period rests on (the next acquirer's
+			// CAS window would present its TxnID under OUR dead PID
+			// and be evicted through the identity path with no aging
+			// grace). Each re-publish needs another >StaleTimeout
+			// freeze to fail again, so the loop terminates in
+			// practice after one pass. If the re-claim CAS loses, the
+			// slot was re-won: the winner's own publish overwrites
+			// all five fields, so no junk survives — ABANDON (zeroing
+			// would evict the winner) and continue scanning.
+			if !CAS64(&slot.TxnID, 0, txnID) {
+				break
+			}
+		}
+		if !won {
+			continue
+		}
 		return i, nil
 	}
 	return NoSlot, ErrReadersFull
@@ -179,6 +247,52 @@ func (f *File) ClearStaleReaderSlot(idx uint32) {
 	clearReaderSlot(&f.slots[idx])
 }
 
+// readerSlotObservation is the full field tuple a stale-detection
+// scan loaded to classify a slot's occupant. The guarded clear
+// re-validates against it so a clear only ever zeroes the occupant
+// the scan classified — never a successor that released-and-re-won
+// the slot between classification (which runs syscalls: kill(2),
+// /proc reads) and the clear stores.
+type readerSlotObservation struct {
+	TxnID, PID, Heartbeat, HintEpoch, PST, PIDNS uint64
+}
+
+// clearStaleReaderSlotIfUnchanged clears the slot iff every field
+// still holds the observed value; a changed slot is skipped (the next
+// scan re-classifies the new occupant from scratch). Reports whether
+// the clear happened.
+//
+// Soundness: a stale verdict means the classified occupant is a dead
+// process instance (same-namespace ESRCH / start-time mismatch), an
+// aged-out crashed acquirer, or a heartbeat-expired cross-namespace
+// identity. A dead or crashed occupant cannot mutate its slot, and no
+// acquirer can CAS a slot whose TxnID is non-zero, so an unchanged
+// tuple means the classified occupant still holds the slot and the
+// clear stores cannot race a release. ABA is excluded field-by-field:
+// a release-then-re-win zeroes then re-stamps Heartbeat/HintEpoch/PID,
+// so a re-winner (even one pinning the same TxnID) presents at least
+// one differing field — a fresh heartbeat, a zeroed HintEpoch, or a
+// different PID/start-time. Residuals: a same-namespace re-winner
+// whose PID was recycled AND whose start time collides within the
+// clock tick (the start-time-collision hardening tracks that class),
+// and the cross-namespace frozen-but-alive occupant (the documented
+// longer-window trade — see §Stale-reader detection).
+//
+// Caller MUST hold flock(LOCK_EX), same as ClearStaleReaderSlot.
+func (f *File) clearStaleReaderSlotIfUnchanged(idx uint32, obs readerSlotObservation) bool {
+	slot := &f.slots[idx]
+	if Load64(&slot.TxnID) != obs.TxnID ||
+		Load64(&slot.PID) != obs.PID ||
+		Load64(&slot.Heartbeat) != obs.Heartbeat ||
+		Load64(&slot.HintEpoch) != obs.HintEpoch ||
+		Load64(&slot.ProcessStartTime) != obs.PST ||
+		Load64(&slot.PIDNamespace) != obs.PIDNS {
+		return false
+	}
+	clearReaderSlot(slot)
+	return true
+}
+
 // RaiseReaderSlotTxnID overwrites an OWNED slot's pinned TxnID with a
 // higher one — the post-publish snapshot-restabilization step of the
 // reader-begin protocol (cross-process.md §Reader Table, slot
@@ -256,18 +370,45 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 		panic("lock: OldestReaderTxnID on closed *File")
 	}
 	min := NoReaderTxnID
+	// clearStale runs the guarded clear for a slot the classification
+	// below judged stale. Classification runs syscalls (kill(2),
+	// /proc reads) between the loads and this point, so the occupant
+	// may have released and the slot been re-won by a LIVE reader —
+	// clearing unconditionally would evict it (its snapshot leaves
+	// the table, the reclamation bound advances past it:
+	// use-after-reclaim). On a failed guard the CURRENT TxnID joins
+	// the min instead — the new occupant is a fresh acquirer whose
+	// pin must floor the bound; the next scan re-classifies it.
+	clearStale := func(i int, obs readerSlotObservation) {
+		if hook := staleClearHookForTest.Load(); hook != nil {
+			(*hook)(uint32(i))
+		}
+		if !f.clearStaleReaderSlotIfUnchanged(uint32(i), obs) {
+			if cur := Load64(&f.slots[i].TxnID); cur != 0 && cur < min {
+				min = cur
+			}
+		}
+	}
 	for i := range f.slots {
 		slot := &f.slots[i]
 		txnID := Load64(&slot.TxnID)
 		if txnID == 0 {
 			continue
 		}
-		pid := Load64(&slot.PID)
-		hb := Load64(&slot.Heartbeat)
-		if pid == 0 {
+		// Load the FULL tuple up front: classification and the
+		// guarded clear must judge the same observation.
+		obs := readerSlotObservation{
+			TxnID:     txnID,
+			PID:       Load64(&slot.PID),
+			Heartbeat: Load64(&slot.Heartbeat),
+			HintEpoch: Load64(&slot.HintEpoch),
+			PST:       Load64(&slot.ProcessStartTime),
+			PIDNS:     Load64(&slot.PIDNamespace),
+		}
+		if obs.PID == 0 {
 			// Case 0: mid-acquire / mid-release / orphan.
 			switch {
-			case hb != 0 && !heartbeatStale(nowNanos, hb, staleTimeoutNanos):
+			case obs.Heartbeat != 0 && !heartbeatStale(nowNanos, obs.Heartbeat, staleTimeoutNanos):
 				// 0a: live owner mid-acquire/release (incl. a
 				// future-stamped heartbeat — a mid-publish reader whose
 				// clock read raced ahead of ours). Honour the
@@ -277,15 +418,14 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 				if txnID < min {
 					min = txnID
 				}
-			case hb != 0:
-				// 0b: heartbeat aged out; clear.
-				f.ClearStaleReaderSlot(uint32(i))
+			case obs.Heartbeat != 0:
+				// 0b: heartbeat aged out; clear (guarded).
+				clearStale(i, obs)
 			default:
 				// 0c: zero heartbeat. Use HintEpoch as cross-process
 				// orphan anchor.
-				epoch := Load64(&slot.HintEpoch)
 				switch {
-				case epoch == 0:
+				case obs.HintEpoch == 0:
 					// First observer: CAS-store now. If the CAS
 					// loses (another writer raced us in some
 					// future protocol extension), the next scan
@@ -299,8 +439,8 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 					if txnID < min {
 						min = txnID
 					}
-				case heartbeatStale(nowNanos, epoch, staleTimeoutNanos):
-					f.ClearStaleReaderSlot(uint32(i))
+				case heartbeatStale(nowNanos, obs.HintEpoch, staleTimeoutNanos):
+					clearStale(i, obs)
 				default:
 					// Epoch set but not yet aged out. Skip
 					// (slot remains non-free; treat as live so
@@ -318,9 +458,9 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 		// (zeroHeartbeatFresh — a pid!=0/heartbeat==0 slot is a
 		// release in flight; clearing it could stomp a third
 		// reader's fresh CAS).
-		if !identityLive(pid, Load64(&slot.ProcessStartTime), Load64(&slot.PIDNamespace),
-			hb, ourPIDNS, nowNanos, staleTimeoutNanos, crossNSTimeoutNanos, true) {
-			f.ClearStaleReaderSlot(uint32(i))
+		if !identityLive(obs.PID, obs.PST, obs.PIDNS,
+			obs.Heartbeat, ourPIDNS, nowNanos, staleTimeoutNanos, crossNSTimeoutNanos, true) {
+			clearStale(i, obs)
 			continue
 		}
 		if txnID < min {

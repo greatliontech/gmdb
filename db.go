@@ -583,9 +583,11 @@ func dbCleanupFn(info dbCleanupInfo) {
 //
 //  1. Win the close CAS (release-store on the shared *atomic.Bool).
 //     Visible to any subsequent Tx cleanup callback regardless of
-//     runtime.AddCleanup ordering between the DB and its Txs — they
-//     observe the close state and exit without touching torn-down
-//     resources. A second Close returns immediately.
+//     runtime.AddCleanup ordering between the DB and its Txs — a
+//     WRITE-Tx cleanup observes it and skips the flock signal; a
+//     READ-Tx cleanup releases its slot regardless, through its own
+//     lifetime reference on the lock-file mapping (step 8). A second
+//     Close returns immediately.
 //  2. Stop the batch coordinator (context cancel; its in-flight
 //     write transaction unwinds and releases the grant first).
 //  3. Stop the maintenance goroutine and wait for exit.
@@ -606,14 +608,17 @@ func dbCleanupFn(info dbCleanupInfo) {
 //     blocks on done-channels; the flock goroutine clears writer-
 //     header fields, unlocks a held writer, and fails pending
 //     acquisitions).
-//  8. Munmap the lock file, close the pager (data-file munmap), the
-//     data-file fd, and the *os.Root.
+//  8. Drop the handle's reference on the lock-file mapping (munmap
+//     and lock-file fd close happen at the LAST drop — an open
+//     ReadTx's reference keeps them alive), close the pager
+//     (data-file munmap), the data-file fd, and the *os.Root.
 //
 // Steps 1 → 4 ordering: the CAS is the public release-store; the
 // drain completes before any teardown. Step 5 sits after the stops
 // (they release grants it needs) and before the pointer capture (it
-// needs the live pager). Steps 7 → 8 ordering: the SIGSEGV path the
-// spec exists to prevent (final heartbeat tick on unmapped memory).
+// needs the live pager). Steps 7 → 8 ordering: a final heartbeat
+// tick must never land on unmapped memory, so the goroutines drain
+// before the handle's mapping reference drops.
 //
 // Returns the shutdown checkpoint's error, if any (nil otherwise;
 // the CAS loser of a concurrent double-Close always returns nil).
@@ -698,10 +703,13 @@ func (db *DB) Close() error {
 	if coord != nil {
 		_ = coord.Close()
 	}
-	// Step 8 — munmap the lock file. Safe: closeGate.BeginClose
-	// drained Tx cleanups that might still write to lockFile's
-	// mmap; Coord.Close drained heartbeat + flock goroutines that
-	// also touch lockFile mmap.
+	// Step 8 — drop the handle's lifetime reference on the lock-file
+	// mapping (leak-detection.md §Close() Ordering step 8). The
+	// munmap happens at the LAST drop: any still-open ReadTx holds
+	// its own reference from BeginRead, keeping its reader slot
+	// mapped — bound-pinning and releasable — until its own close.
+	// Goroutine safety: Coord.Close drained heartbeat + flock
+	// goroutines; closeGate.BeginClose drained BeginRead windows.
 	if lockFile != nil {
 		_ = lockFile.Close()
 	}

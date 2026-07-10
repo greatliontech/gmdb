@@ -26,7 +26,7 @@ function. WIP = 1.
       tracking, reader shrink-stable bound, MaxSize clamp
 - [x] 9. internal/pager: commit residue — checkpoint anchor advance,
       rplRelocFloor lifecycle, relocation probe segment projection
-- [ ] 10. internal/lock: validated stale-clear — occupancy re-check
+- [x] 10. internal/lock: validated stale-clear — occupancy re-check
       before clear, acquire-window heartbeat/publish hardening,
       recovery-gate comment (+ cross-process.md rider)
 - [ ] 11. internal/lock: lock-file identity guard — inode-verified

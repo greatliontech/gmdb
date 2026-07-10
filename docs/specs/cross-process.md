@@ -822,12 +822,48 @@ path is only used once the full identity has been populated).
 3. Atomically CAS the `TxnID` field from `0` to the current meta
    page's TxnID. CAS failure ⇒ continue scanning.
 4. Immediately after a successful CAS, in this exact order:
-   a. Store `Heartbeat = nowMonotonic()` (atomic).
+   a. Store `Heartbeat = nowMonotonic()` (atomic). The clock is
+      read AT STORE TIME, never earlier by the caller: a value read
+      before the CAS can be arbitrarily old by store time if the
+      acquirer was descheduled or frozen, and a stale-at-birth
+      heartbeat lets the next scan age the mid-publish window out
+      immediately.
    b. Store `HintEpoch = 0` (atomic, clears any prior
       orphan-anchor left over from a stale-cleared slot).
    c. Store `PIDNamespace = db.pidNamespace` (atomic).
    d. Store `ProcessStartTime = db.processStartTime` (atomic).
    e. Store `PID = currentPID` (atomic).
+   f. **Ownership verify**: re-load `TxnID`. If it no longer holds
+      this acquisition's value, a stale-detection scan aged the
+      mid-publish window out (reachable only when the acquirer was
+      frozen past `StaleTimeout` between the CAS and here). Two
+      sub-cases:
+      - Slot still FREE (cleared, not re-won): the acquirer
+        RE-CLAIMS it (CAS from 0) and re-publishes from step 4a.
+        Walking away would strand its identity stores on a
+        `TxnID == 0` slot forever — nothing scrubs a free slot, and
+        the junk breaks the free⇒`PID == 0` premise the detector's
+        mid-publish grace period rests on (the next acquirer's CAS
+        window would present its `TxnID` under the ghost's dead
+        `PID` and be evicted through the identity path with no
+        aging grace). Each re-publish round requires another
+        `> StaleTimeout` freeze to fail again.
+      - Slot re-won: the acquirer ABANDONS it — zeroing it would
+        evict the re-winner, exactly the eviction the guarded clear
+        prevents — and continues scanning. The winner's own publish
+        stores overwrite the ghost's, so no junk survives the
+        abandon.
+
+      **Accepted residual** until a versioned slot layout lands —
+      all requiring the acquirer frozen past `StaleTimeout`
+      mid-publish: (1) ghost stores b–e may transiently clobber a
+      re-winner's identity fields before the verify detects the
+      loss; (2) a re-win that pinned the SAME `TxnID` passes the
+      verify undetected (two owners); (3) a scanner descheduled
+      between its guard loads and its clear stores can zero a slot
+      whose frozen occupant resumed and re-published in between —
+      the resumed owner's verify may pass before the clear's final
+      `TxnID` store lands, leaving it on an unpinned snapshot.
 5. Register the slot index with the heartbeat goroutine's active
    list.
 6. Update `coord.readerSlotHint`.
@@ -971,6 +1007,31 @@ b. Fresh ⇒ not stale.
 back to PID-only liveness (legacy path).
 
 ### Clearing a stale slot
+
+**The clear is guarded by the classified observation.** The scan
+loads the slot's full field tuple (`TxnID`, `PID`, `Heartbeat`,
+`HintEpoch`, `ProcessStartTime`, `PIDNamespace`), classifies from
+those values — running syscalls (`kill(2)`, `/proc` reads) in
+between — and immediately before the clear re-validates that every
+field still holds the observed value. A changed slot is SKIPPED and
+its current `TxnID` joins the oldest-min computation; the next scan
+re-classifies the new occupant from scratch. Rationale: between
+classification and clear the classified occupant can release and a
+LIVE reader re-win the slot (the slot hint makes the just-freed slot
+the likely target); an unguarded clear evicts the re-winner — its
+snapshot leaves the table, the reclamation bound advances past it,
+and RPL reclamation frees pages it is reading. The guard is sound
+because a stale-classified occupant is a dead process instance or an
+aged-out crashed acquirer — it cannot mutate its own slot — and no
+acquirer can CAS a slot whose `TxnID` is non-zero; release-then-re-win
+always changes at least one field of the tuple (a fresh heartbeat, a
+zeroed `HintEpoch`, a different `PID`/start time), so an unchanged
+tuple means the classified occupant still holds the slot. Residuals:
+a re-winner whose recycled PID collides on start time within the
+clock tick (the start-time-collision class), the cross-namespace
+frozen-but-alive occupant (the documented longer-window trade
+above), and the scanner-descheduled-mid-clear interleave recorded
+as residual (3) under §Slot acquire step f.
 
 When the writer clears a stale slot, it stores in the SAME exact
 order as slot release:

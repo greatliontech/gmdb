@@ -66,6 +66,17 @@ type ReadTx struct {
 	// this ReadTx owns. NoSlot once released.
 	readerSlot uint32
 
+	// coord and lockFile are captured at BeginRead (not read through
+	// db, which nils its pointers during Close): the release path
+	// must work even after DB.Close completes. lockFile carries the
+	// lifetime reference taken at BeginRead — the reader-table
+	// mapping stays mapped, and this slot stays bound-pinning and
+	// releasable, until this transaction's own release drops it
+	// (leak-detection.md §Close() Ordering). Both nil on the
+	// lock-free read-only path (readerSlot == NoSlot).
+	coord    *lock.Coord
+	lockFile *lock.File
+
 	closed bool
 
 	// held tracks whether this ReadTx still owns the reader slot.
@@ -102,16 +113,18 @@ type ReadTx struct {
 // — which nils db.coord under db.mu — does not nil-deref this
 // callback.
 //
-// Note that pgr is intentionally NOT captured: per leak-detection.md
-// Tx-cleanup callbacks may not perform blocking syscalls (other
-// than the slog handler's bounded diagnostic write). pgr.Close
-// invokes munmap, which is a syscall. The leaked-Tx cleanup path
-// therefore releases only the reader slot; the orphaned mmap stays
-// mapped until process exit — a small leak per leaked-but-not-
-// closed reader, acceptable for the safety-net role.
+// Note that pgr is intentionally NOT captured: the reader's private
+// DATA mapping is potentially huge and has no correctness need to be
+// torn down here (nothing else references it), so the cleanup keeps
+// to leak-detection.md's bounded-work rule and releases only the
+// reader slot (plus the last-drop lock-file unref, a bounded
+// munmap+close the spec explicitly permits). The orphaned data mmap
+// stays mapped until process exit — a small leak per
+// leaked-but-not-closed reader, acceptable for the safety-net role.
 type readTxCleanupInfo struct {
 	gate      *closeGate
 	coord     *lock.Coord
+	lockFile  *lock.File
 	held      *atomic.Bool
 	slot      uint32
 	logger    *slog.Logger
@@ -124,13 +137,15 @@ type readTxCleanupInfo struct {
 // release path contests the same atomic, so the cleanup is a no-op
 // for callers that closed normally.
 //
-// Spec contract (leak-detection.md §Cleanup Behavior): observing
-// `*db.closed == true` MUST return without touching the reader-
-// table mmap. The Coord that owns the active-slot list and the
-// shared-mmap reader slot has already been drained by Close.
+// Spec contract (leak-detection.md §Cleanup Behavior): the reader-
+// slot release runs UNCONDITIONALLY — the leaked ReadTx's lifetime
+// reference keeps the reader-table mapping alive past DB.Close, so
+// the release is safe at any time and skipping it would strand the
+// slot occupied under a live PID (unreapable) and leak the mapping.
 //
-// Non-blocking constraint: only atomic ops + slog handler's bounded
-// write are permitted. info.coord.ReleaseReader is implemented as
+// Bounded-work constraint: atomic ops, the slog handler's bounded
+// write, and the last-drop lock-file munmap+close are permitted.
+// info.coord.ReleaseReader is implemented as
 // UnregisterReaderSlot (mutex Lock+Unlock, wait-free for an
 // uncontended mutex on the active-slot list) followed by atomic
 // stores on the reader-table mmap. The mutex acquisition is the
@@ -158,21 +173,24 @@ func readTxCleanupFn(info readTxCleanupInfo) {
 		"gmdb: read transaction leaked without Commit/Rollback",
 		"origin", formatStack(info.originPCs),
 	)
-	if !info.gate.EnterCleanup() {
-		// DB closed — its Close path drained the Coord and unmapped
-		// the lock file. Touching the reader-table mmap via
-		// ReleaseReader would SIGSEGV. Skip per spec invariant.
-		// ExitCleanup balances the EnterCleanup's Add(+1) so Close's
-		// drain isn't fooled by a phantom inflight counter.
-		info.gate.ExitCleanup()
-		return
-	}
+	// The release is safe regardless of Close's progress: the leaked
+	// ReadTx held a lifetime reference on the reader-table mapping
+	// (taken at BeginRead), so the slot is still mapped and must be
+	// both released and unpinned here — skipping would strand it
+	// occupied under a live PID (unreapable by stale detection) AND
+	// leak the mapping reference (the munmap never happens). The
+	// close-gate window is still entered for the drain accounting the
+	// test hook below documents.
+	info.gate.EnterCleanup()
 	defer info.gate.ExitCleanup()
 	// coord == nil on the read-only lock-free path (slot == NoSlot);
 	// nothing to release. ReleaseReader(NoSlot) is itself a no-op, but
 	// the nil-guard avoids the deref.
 	if info.coord != nil {
 		info.coord.ReleaseReader(info.slot)
+	}
+	if info.lockFile != nil {
+		_ = info.lockFile.Close() // drop the BeginRead reference
 	}
 	// Test-only synchronization point. Fires AFTER ReleaseReader so a
 	// waiting test observes the slot already cleared (TxnID=0 stored)
@@ -195,8 +213,8 @@ func readTxCleanupFn(info readTxCleanupInfo) {
 
 // readTxCleanupHookForTest, when set, is invoked at the tail of
 // readTxCleanupFn's active-release path (after info.coord.ReleaseReader
-// returns) — fires only on the gate-open branch where the slot was
-// actually released, NOT on the closed-observed skip path. Used by
+// returns) — after the unconditional slot release (the pre-refcount
+// design had a closed-observed skip path; it no longer exists). Used by
 // TestLeakedReadTxReleasesSlotViaCleanup to wait deterministically for
 // cleanup to fire instead of polling the slot table on a finalizer-
 // scheduling timer (which flaked under -race; see the test's godoc and
@@ -276,10 +294,12 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 	if db.poisoned.Load() {
 		return nil, ErrPoisoned
 	}
-	// Snapshot db.coord + db.file under db.mu (same race protection
-	// as the write-tx Begin path against a concurrent Close).
+	// Snapshot db.coord + db.lockFile + db.file under db.mu (same
+	// race protection as the write-tx Begin path against a
+	// concurrent Close).
 	db.mu.Lock()
 	coord := db.coord
+	lockFile := db.lockFile
 	file := db.file
 	cachedMeta := db.currentMeta
 	db.mu.Unlock()
@@ -423,6 +443,17 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		pgr.EnableColdTracking()
 	}
 
+	// Take the lifetime reference on the reader-table mapping LAST
+	// (every earlier error path released the slot and needs no
+	// unref). Still inside the close-gate window, so the mapping is
+	// alive here; from this point it stays alive until this
+	// transaction's release drops the reference — even across a
+	// concurrent DB.Close.
+	if coord != nil {
+		lockFile.Ref()
+	} else {
+		lockFile = nil // lock-free read-only path: no slot, no ref
+	}
 	held := &atomic.Bool{}
 	held.Store(true)
 	rtx := &ReadTx{
@@ -430,11 +461,14 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		pgr:        pgr,
 		meta:       meta,
 		readerSlot: slot,
+		coord:      coord,
+		lockFile:   lockFile,
 		held:       held,
 	}
 	rtx.cleanup = runtime.AddCleanup(rtx, readTxCleanupFn, readTxCleanupInfo{
 		gate:      db.closeGate,
 		coord:     coord,
+		lockFile:  lockFile,
 		held:      held,
 		slot:      slot,
 		logger:    db.logger,
@@ -509,12 +543,18 @@ func (rtx *ReadTx) close() error {
 	}
 	rtx.cleanup.Stop()
 	if rtx.held.CompareAndSwap(true, false) {
-		// Cleanup hasn't run; we own the release.
-		rtx.db.mu.Lock()
-		coord := rtx.db.coord
-		rtx.db.mu.Unlock()
-		if coord != nil {
-			coord.ReleaseReader(rtx.readerSlot)
+		// Cleanup hasn't run; we own the release. Safe even
+		// concurrent with — or after — DB.Close: this ReadTx holds a
+		// lifetime reference on the reader-table mapping (taken at
+		// BeginRead), so the slot stays mapped, bound-pinning, and
+		// releasable until the reference drops below. DB.Close never
+		// unpins a live snapshot (leak-detection.md §Close()
+		// Ordering).
+		if rtx.coord != nil {
+			rtx.coord.ReleaseReader(rtx.readerSlot)
+		}
+		if rtx.lockFile != nil {
+			_ = rtx.lockFile.Close() // drop the BeginRead reference
 		}
 	}
 	// Options.ReclaimOnClose: hint the kernel it may reclaim the page

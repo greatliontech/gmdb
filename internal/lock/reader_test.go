@@ -31,12 +31,16 @@ func openTestFile(t *testing.T, maxReaders uint32) *File {
 	return f
 }
 
+// clockAt adapts a fixed timestamp to AcquireReaderSlot's store-time
+// clock parameter for fixtures that need a specific heartbeat value.
+func clockAt(v uint64) func() uint64 { return func() uint64 { return v } }
+
 func TestAcquireReaderSlotBasic(t *testing.T) {
 	// Sanity: acquire returns a valid index, slot fields hold the
 	// stamped identity, TxnID = txnID, PID = pid. End-to-end ordering
 	// invariant exercised more aggressively below.
 	f := openTestFile(t, 4)
-	idx, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, 100)
+	idx, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, clockAt(100))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot: %v", err)
 	}
@@ -66,18 +70,18 @@ func TestAcquireReaderSlotBasic(t *testing.T) {
 
 func TestAcquireReaderSlotFull(t *testing.T) {
 	f := openTestFile(t, 2)
-	a, err := f.AcquireReaderSlot(0, 1, 1, 1, 1, 1)
+	a, err := f.AcquireReaderSlot(0, 1, 1, 1, 1, clockAt(1))
 	if err != nil {
 		t.Fatalf("acquire 1: %v", err)
 	}
-	b, err := f.AcquireReaderSlot(0, 2, 1, 1, 1, 1)
+	b, err := f.AcquireReaderSlot(0, 2, 1, 1, 1, clockAt(1))
 	if err != nil {
 		t.Fatalf("acquire 2: %v", err)
 	}
 	if a == b {
 		t.Errorf("acquire collided on idx %d", a)
 	}
-	_, err = f.AcquireReaderSlot(0, 3, 1, 1, 1, 1)
+	_, err = f.AcquireReaderSlot(0, 3, 1, 1, 1, clockAt(1))
 	if !errors.Is(err, ErrReadersFull) {
 		t.Errorf("acquire 3: got %v, want ErrReadersFull", err)
 	}
@@ -91,7 +95,7 @@ func TestAcquireReaderSlotHintSeeds(t *testing.T) {
 	// Occupy slot 0 via a raw store (skips the spec-ordered acquire
 	// path; this is a deliberate manufactured pre-state).
 	Store64(&f.Slot(0).TxnID, 99)
-	idx, err := f.AcquireReaderSlot(2, 1, 1, 1, 1, 1)
+	idx, err := f.AcquireReaderSlot(2, 1, 1, 1, 1, clockAt(1))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot hint=2: %v", err)
 	}
@@ -127,7 +131,7 @@ func TestAcquireReaderSlotTxnIDZeroPanics(t *testing.T) {
 			t.Error("expected panic on txnID=0")
 		}
 	}()
-	_, _ = f.AcquireReaderSlot(0, 0, 1, 1, 1, 1)
+	_, _ = f.AcquireReaderSlot(0, 0, 1, 1, 1, clockAt(1))
 }
 
 func TestReleaseReaderSlotOrdering(t *testing.T) {
@@ -142,7 +146,7 @@ func TestReleaseReaderSlotOrdering(t *testing.T) {
 	// ordering constraint (HintEpoch first prevents acquirer
 	// inheritance of stale epoch).
 	f := openTestFile(t, 1)
-	idx, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, 100)
+	idx, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, clockAt(100))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot: %v", err)
 	}
@@ -199,7 +203,7 @@ func TestOldestReaderTxnIDMinOfMany(t *testing.T) {
 	// so the slots aren't classified stale.
 	now := uint64(time.Now().UnixNano())
 	for i, txn := range []uint64{50, 10, 30, 25} {
-		idx, err := f.AcquireReaderSlot(uint32(i), txn, myPID, myPST, myNS, now)
+		idx, err := f.AcquireReaderSlot(uint32(i), txn, myPID, myPST, myNS, clockAt(now))
 		if err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}
@@ -223,11 +227,11 @@ func TestOldestReaderTxnIDClearsStaleHeartbeat(t *testing.T) {
 	// trigger the same-namespace IsAlive(pid) path against PIDs
 	// 9999/8888 which don't exist in this test process, classifying
 	// both as stale and defeating the heartbeat-path intent.
-	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, stale); err != nil {
+	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(stale)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	// Live slot also cross-namespace, fresh heartbeat.
-	if _, err := f.AcquireReaderSlot(1, 11, 8888, 1, 77, now); err != nil {
+	if _, err := f.AcquireReaderSlot(1, 11, 8888, 1, 77, clockAt(now)); err != nil {
 		t.Fatalf("acquire live: %v", err)
 	}
 	// First call should clear the stale slot (its TxnID=7) and
@@ -345,7 +349,7 @@ func TestOldestReaderTxnIDCase2FutureHBSkipsClear(t *testing.T) {
 	future := now + uint64(DefaultStaleTimeout) // ahead of the scan clock
 	// Foreign namespace (≠ ourPIDNS=99 in the scan) so the heartbeat path is
 	// taken rather than same-namespace IsAlive against a nonexistent PID.
-	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, future); err != nil {
+	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(future)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
@@ -419,7 +423,7 @@ func TestOldestReaderTxnIDSameNamespaceLiveSkipsClear(t *testing.T) {
 		t.Skip("PIDNamespace = 0 on this host; same-namespace path not exercised")
 	}
 	now := uint64(time.Now().UnixNano())
-	if _, err := f.AcquireReaderSlot(0, 77, myPID, myPST, myNS, now); err != nil {
+	if _, err := f.AcquireReaderSlot(0, 77, myPID, myPST, myNS, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
@@ -447,7 +451,7 @@ func TestOldestReaderTxnIDSameNamespacePSTMismatchClears(t *testing.T) {
 	now := uint64(time.Now().UnixNano())
 	// Acquire with a deliberately wrong PST so the rescan sees a
 	// mismatch and treats the slot as PID-recycled-since-acquire.
-	if _, err := f.AcquireReaderSlot(0, 33, myPID, myPST+1, myNS, now); err != nil {
+	if _, err := f.AcquireReaderSlot(0, 33, myPID, myPST+1, myNS, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
@@ -492,7 +496,7 @@ func TestOldestReaderTxnIDSameNamespaceDeadPIDClears(t *testing.T) {
 	}
 	f := openTestFile(t, 1)
 	now := uint64(time.Now().UnixNano())
-	if _, err := f.AcquireReaderSlot(0, 55, pid, pst, myNS, now); err != nil {
+	if _, err := f.AcquireReaderSlot(0, 55, pid, pst, myNS, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
@@ -743,7 +747,7 @@ func TestAcquireReaderConcurrentNoSlotAliasing(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			idx, err := f.AcquireReaderSlot(0, uint64(i+1), uint64(i+1), 1, 99, now)
+			idx, err := f.AcquireReaderSlot(0, uint64(i+1), uint64(i+1), 1, 99, clockAt(now))
 			if err != nil {
 				errCount.Add(1)
 				return
@@ -898,7 +902,7 @@ func TestClearedSlotDoesNotEvictMidPublishAcquirer(t *testing.T) {
 // contract's four panic guards.
 func TestRaiseReaderSlotTxnIDGuards(t *testing.T) {
 	f := openTestFile(t, 2)
-	idx, err := f.AcquireReaderSlot(0, 10, 1234, 1, 42, 100)
+	idx, err := f.AcquireReaderSlot(0, 10, 1234, 1, 42, clockAt(100))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot: %v", err)
 	}
@@ -938,7 +942,7 @@ func TestOldestReaderTxnIDReleaseInFlightNotCleared(t *testing.T) {
 	now := uint64(time.Now().UnixNano())
 	// Foreign namespace so classification takes the heartbeat path
 	// (same-namespace would kill(0) the fake PID).
-	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, now); err != nil {
+	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	// Manufacture the mid-release observation: Heartbeat zeroed, PID
@@ -950,5 +954,186 @@ func TestOldestReaderTxnIDReleaseInFlightNotCleared(t *testing.T) {
 	}
 	if Load64(&f.Slot(0).TxnID) != 7 {
 		t.Error("release-in-flight slot was cleared (phantom-eviction hazard)")
+	}
+}
+
+// A stale-detection scan classifies an occupant, then runs syscalls
+// (kill(2), /proc reads) before clearing; in that window the occupant
+// can release and the slot be re-won by a LIVE reader. The clear must
+// re-validate the classified tuple and skip a changed slot — clearing
+// it unconditionally evicts the re-winner: its snapshot leaves the
+// table, the reclamation bound advances past it, and RPL reclamation
+// frees pages it is reading (use-after-reclaim).
+func TestStaleClearSkipsRewonSlot(t *testing.T) {
+	f := openTestFile(t, 2)
+	slot := f.Slot(0)
+	stale := uint64(time.Second)
+	now := 10 * stale
+	// Classified-stale occupant: crashed mid-acquire (case 0b — aged
+	// heartbeat, PID never stamped).
+	Store64(&slot.TxnID, 7)
+	Store64(&slot.Heartbeat, now-2*stale)
+
+	// The hook fires exactly at the classification→clear boundary:
+	// the occupant's slot is released and re-won by a live reader
+	// pinning TxnID 5, mid-publish with a fresh heartbeat.
+	hook := func(idx uint32) {
+		if idx != 0 {
+			return
+		}
+		clearReaderSlot(slot)         // the release
+		Store64(&slot.TxnID, 5)       // the re-win (CAS equivalent)
+		Store64(&slot.Heartbeat, now) // fresh mid-publish heartbeat
+	}
+	staleClearHookForTest.Store(&hook)
+	defer staleClearHookForTest.Store(nil)
+
+	got := f.OldestReaderTxnID(99, now, stale, stale)
+	if tx := Load64(&slot.TxnID); tx != 5 {
+		t.Fatalf("re-won slot evicted: TxnID = %d, want 5 (the live reader's pin)", tx)
+	}
+	if got != 5 {
+		t.Errorf("OldestReaderTxnID = %d, want 5 (the re-winner's pin must floor the bound)", got)
+	}
+}
+
+// The identity-path variant: a dead same-namespace occupant is
+// classified via kill(2)/start-time, and the slot is re-won by THIS
+// live process before the clear. The guard must skip (PID and
+// start time differ from the observation).
+func TestStaleClearSkipsRewonSlotIdentityPath(t *testing.T) {
+	f := openTestFile(t, 1)
+	slot := f.Slot(0)
+	myPID := uint64(os.Getpid())
+	myPST, _ := ProcessStartTime(os.Getpid())
+	myNS, _ := PIDNamespace()
+	now := uint64(time.Now().UnixNano())
+	// Dead occupant: same-namespace PID that does not exist.
+	Store64(&slot.TxnID, 7)
+	Store64(&slot.Heartbeat, now)
+	Store64(&slot.PIDNamespace, myNS)
+	Store64(&slot.ProcessStartTime, 1)
+	Store64(&slot.PID, 400_000_000) // far beyond pid_max (2^22); kill(2) gives ESRCH
+	hook := func(idx uint32) {
+		// Release + re-win by this (live) process, same pinned TxnID
+		// — the guard must still catch it via PID/PST.
+		clearReaderSlot(slot)
+		Store64(&slot.TxnID, 7)
+		Store64(&slot.Heartbeat, now)
+		Store64(&slot.PIDNamespace, myNS)
+		Store64(&slot.ProcessStartTime, myPST)
+		Store64(&slot.PID, myPID)
+	}
+	staleClearHookForTest.Store(&hook)
+	defer staleClearHookForTest.Store(nil)
+
+	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
+	if tx := Load64(&slot.TxnID); tx != 7 {
+		t.Fatalf("re-won slot evicted: TxnID = %d, want 7", tx)
+	}
+	if got != 7 {
+		t.Errorf("OldestReaderTxnID = %d, want 7 (re-winner counted)", got)
+	}
+}
+
+// An acquirer frozen mid-publish past StaleTimeout can be aged out by
+// a scan and its slot re-won; on resume it must detect the loss at the
+// post-publish ownership verify and ABANDON the slot — returning it
+// would leave two owners (double release, cascading eviction), and
+// zeroing it would evict the re-winner.
+func TestAcquireAbandonsSlotClearedMidPublish(t *testing.T) {
+	f := openTestFile(t, 2)
+	fired := false
+	hook := func(idx uint32) {
+		if fired {
+			return
+		}
+		fired = true
+		// Simulate: a scan aged the mid-publish window out and
+		// cleared the slot; another reader re-won it pinning TxnID 9.
+		clearReaderSlot(f.Slot(idx))
+		Store64(&f.Slot(idx).TxnID, 9)
+	}
+	acquirePublishHookForTest.Store(&hook)
+	defer acquirePublishHookForTest.Store(nil)
+
+	idx, err := f.AcquireReaderSlot(0, 42, 1234, 1, 1, clockAt(100))
+	if err != nil {
+		t.Fatalf("AcquireReaderSlot: %v", err)
+	}
+	if idx == 0 {
+		t.Fatalf("acquire returned slot 0, which it lost mid-publish")
+	}
+	if tx := Load64(&f.Slot(0).TxnID); tx != 9 {
+		t.Errorf("re-winner's slot disturbed: TxnID = %d, want 9", tx)
+	}
+	if tx := Load64(&f.Slot(idx).TxnID); tx != 42 {
+		t.Errorf("acquired slot %d TxnID = %d, want 42", idx, tx)
+	}
+}
+
+// The 0c-aged clear is guarded like every other: a crashed-before-
+// heartbeat acquirer whose HintEpoch anchor aged out is about to be
+// cleared when its (actually frozen, now resumed) owner stores a
+// fresh heartbeat — the guard must skip, and the owner's pin must
+// floor the bound.
+func TestStaleClearSkips0cAgedWhenGhostResumes(t *testing.T) {
+	f := openTestFile(t, 1)
+	slot := f.Slot(0)
+	stale := uint64(time.Second)
+	now := 10 * stale
+	Store64(&slot.TxnID, 7)               // CAS'd, never heartbeat-stamped
+	Store64(&slot.HintEpoch, now-2*stale) // orphan anchor, aged out
+	hook := func(idx uint32) {
+		Store64(&slot.Heartbeat, now) // the frozen acquirer resumes: step 4a lands
+	}
+	staleClearHookForTest.Store(&hook)
+	defer staleClearHookForTest.Store(nil)
+
+	got := f.OldestReaderTxnID(99, now, stale, stale)
+	if tx := Load64(&slot.TxnID); tx != 7 {
+		t.Fatalf("resumed acquirer evicted: TxnID = %d, want 7", tx)
+	}
+	if got != 7 {
+		t.Errorf("OldestReaderTxnID = %d, want 7 (resumed acquirer's pin must floor the bound)", got)
+	}
+}
+
+// An acquirer that loses its slot mid-publish to an aging clear —
+// with the slot NOT re-won — must RE-CLAIM it rather than walk away:
+// abandoning strands its identity stores on a TxnID==0 slot forever
+// (nothing scrubs a free slot), and the junk breaks the free⇒PID==0
+// premise — the NEXT acquirer's CAS window would present its TxnID
+// under the ghost's dead PID and be evicted through the identity
+// path with no mid-publish aging grace.
+func TestAcquireReclaimsSlotClearedMidPublishNotRewon(t *testing.T) {
+	f := openTestFile(t, 2)
+	fired := false
+	hook := func(idx uint32) {
+		if fired {
+			return
+		}
+		fired = true
+		// A scan aged the mid-publish window out and cleared the
+		// slot; nobody re-wins it.
+		clearReaderSlot(f.Slot(idx))
+	}
+	acquirePublishHookForTest.Store(&hook)
+	defer acquirePublishHookForTest.Store(nil)
+
+	idx, err := f.AcquireReaderSlot(0, 42, 1234, 5, 6, clockAt(100))
+	if err != nil {
+		t.Fatalf("AcquireReaderSlot: %v", err)
+	}
+	if idx != 0 {
+		t.Fatalf("acquire moved to slot %d; must re-claim the cleared slot 0", idx)
+	}
+	s := f.Slot(0)
+	if tx, pid := Load64(&s.TxnID), Load64(&s.PID); tx != 42 || pid != 1234 {
+		t.Fatalf("re-claimed slot state (TxnID=%d, PID=%d), want (42, 1234)", tx, pid)
+	}
+	// No junk anywhere: slot 1 untouched and free.
+	if tx, pid := Load64(&f.Slot(1).TxnID), Load64(&f.Slot(1).PID); tx != 0 || pid != 0 {
+		t.Fatalf("slot 1 polluted: TxnID=%d PID=%d, want free and clean", tx, pid)
 	}
 }

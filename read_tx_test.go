@@ -788,3 +788,91 @@ func TestBeginReadCloseRaceReturnsErrClosed(t *testing.T) {
 		<-done
 	}
 }
+
+// DB.Close never unpins a live snapshot, and a ReadTx outliving
+// Close still releases its reader slot exactly once through its own
+// lifetime reference on the lock-file mapping (leak-detection.md
+// §Close() Ordering step 8). Two halves: while the ReadTx is open its
+// slot stays OCCUPIED (peers keep protecting its snapshot); its
+// post-Close Rollback then frees the slot — a skipped release would
+// strand it under a LIVE pid, unreapable by stale detection.
+func TestCloseReleasesOpenReaderSlots(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db2, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+	// Half 1 — the open ReadTx's slot survived Close: its snapshot
+	// stays reclamation-protected until the transaction itself ends.
+	if n := db2.Stats().ActiveReaders; n != 1 {
+		t.Fatalf("ActiveReaders = %d with the ReadTx still open, want 1 (Close must not unpin a live snapshot)", n)
+	}
+	// Half 2 — the post-Close release works (ref-held mapping) and
+	// frees the slot.
+	if err := rtx.Rollback(); err != nil {
+		t.Fatalf("post-Close Rollback: %v", err)
+	}
+	if n := db2.Stats().ActiveReaders; n != 0 {
+		t.Fatalf("ActiveReaders = %d after the ReadTx closed, want 0 (slot leaked)", n)
+	}
+}
+
+// A ReadTx leaked (never closed) whose DB was already Closed must
+// still release its reader slot via the GC cleanup — unconditionally,
+// through the transaction's own lifetime reference on the lock-file
+// mapping (leak-detection.md §Cleanup Behavior: the read release runs
+// regardless of the close state; this cleanup is also the LAST
+// reference drop, so the final munmap runs on the GC goroutine —
+// explicitly permitted bounded work). Pre-refcount, the cleanup's
+// closed-observed skip stranded the slot occupied under a live PID
+// forever.
+func TestLeakedReadTxReleasesSlotAfterDBClose(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	cleanupDone := make(chan struct{}, 1)
+	setReadTxCleanupHookForTest(func() {
+		select {
+		case cleanupDone <- struct{}{}:
+		default:
+		}
+	})
+	t.Cleanup(func() { setReadTxCleanupHookForTest(nil) })
+
+	leakReadTx(t, db, ctx)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	runtime.GC()
+	runtime.GC()
+	select {
+	case <-cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leaked-ReadTx cleanup did not fire within 5s after GC + Close")
+	}
+	db2, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+	if n := db2.Stats().ActiveReaders; n != 0 {
+		t.Fatalf("ActiveReaders = %d, want 0 (leaked ReadTx's slot stranded past DB.Close)", n)
+	}
+}

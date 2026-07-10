@@ -330,7 +330,13 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 // final tick must not race the *File's munmap. Callers must complete
 // Coord.Close before Closing the underlying *File.
 //
-// Idempotent.
+// Idempotent. Reader slots this handle's open read transactions
+// still hold are NOT touched: each transaction carries its own
+// lifetime reference on the *File mapping and releases its slot on
+// its own close — before or after this Close (leak-detection.md
+// §Close() Ordering). ReleaseReader keeps working after Close: the
+// active-list mutex is process-local and the slot stores go through
+// the ref-held mapping; no goroutine is left to race them.
 func (c *Coord) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.stopCh)

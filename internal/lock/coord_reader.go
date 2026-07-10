@@ -55,9 +55,14 @@ func (c *Coord) AcquireReader(ctx context.Context, txnID uint64) (uint32, error)
 		return NoSlot, errors.New("lock: AcquireReader requires txnID > 0")
 	}
 	hint := c.readerSlotHint.Load()
-	now := c.clock()
 	for {
-		idx, err := c.f.AcquireReaderSlot(hint, txnID, c.pid, c.startTime, c.pidNS, now)
+		// The clock func is passed through so the heartbeat is read
+		// AT STORE TIME inside AcquireReaderSlot (step a): a value
+		// read here could be arbitrarily old by the time the store
+		// lands if this goroutine is descheduled or frozen, and a
+		// stale-at-birth heartbeat lets a scan age the mid-publish
+		// window out immediately.
+		idx, err := c.f.AcquireReaderSlot(hint, txnID, c.pid, c.startTime, c.pidNS, c.clock)
 		if err == nil {
 			c.readerSlotHint.Store(idx)
 			c.RegisterReaderSlot(idx)
@@ -83,7 +88,6 @@ func (c *Coord) AcquireReader(ctx context.Context, txnID uint64) (uint32, error)
 			return NoSlot, ErrClosed
 		case <-time.After(1 * time.Millisecond):
 		}
-		now = c.clock()
 	}
 }
 
@@ -153,10 +157,15 @@ func (c *Coord) OldestReaderTxnID() uint64 {
 // flight during the scan. As a metrics/health signal
 // (DBStats.ActiveReaders) it is never a synchronization barrier. The
 // recovery-commit gate (durability.md §Recovery step 5) also consults
-// it — soundly: the gate holds flock(LOCK_EX) (no acquire/release can
-// race the scan) after a stale-slot reap, and counting a lingering
-// mid-acquire slot errs in the conservative direction (recovery is
-// merely deferred to a later Open). Stale slots
+// it — soundly, but NOT because the scan is race-free: the gate's
+// flock(LOCK_EX) excludes other CLEARERS only, while reader
+// acquire/release are lock-free and race the count freely. Soundness
+// rests on the error directions instead: a lingering mid-transition
+// slot inflates the count, which merely defers recovery to a later
+// Open; a reader that acquires AFTER the scan passed its slot is
+// missed, which is the lock-free acquisition window durability.md's
+// unrecovered-window contract already covers (the reader restabilizes
+// against the post-recovery meta). Stale slots
 // from crashed peers count until a writer or maintenance pass reaps
 // them.
 func (c *Coord) CountActiveReaders() int {

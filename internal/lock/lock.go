@@ -102,6 +102,15 @@ type File struct {
 	mmap   []byte
 	header *LockFileHeader
 	slots  []ReaderSlot
+	// refs counts lifetime references on the mapping: 1 for the
+	// owning handle (seeded at Open, dropped by its Close), plus one
+	// per open read transaction (Ref at BeginRead, dropped when the
+	// transaction's slot release completes). The munmap happens at
+	// the LAST drop, so a read transaction outliving DB.Close keeps
+	// its reader slot mapped — and therefore releasable and
+	// bound-pinning — until its own close (leak-detection.md
+	// §Close() Ordering).
+	refs atomic.Int32
 }
 
 // Open returns a *File for the lock file at Base within Root. The
@@ -481,22 +490,39 @@ func mmapAndOverlay(f *os.File, maxReaders uint32, fileSize int64) (*File, error
 		(*ReaderSlot)(unsafe.Pointer(&mapping[HeaderSize])),
 		int(maxReaders),
 	)
-	return &File{
+	lf := &File{
 		f:      f,
 		mmap:   mapping,
 		header: header,
 		slots:  slots,
-	}, nil
+	}
+	lf.refs.Store(1)
+	return lf, nil
 }
 
-// Close releases the mmap and closes the file descriptor. Idempotent.
-// Does NOT unlink the lock file — it is ephemeral and removal is
-// orthogonal to release (the next opener detects an empty/missing
-// file via the lifecycle's adopt-then-create path).
+// Ref takes an additional lifetime reference on the mapping (see the
+// refs field doc). Must be called while at least one reference is
+// held — the closeGate window BeginRead runs under guarantees that.
+func (f *File) Ref() {
+	if f.refs.Add(1) <= 1 {
+		panic("lock: Ref on a fully-closed *File")
+	}
+}
+
+// Close drops one lifetime reference; the LAST drop releases the mmap
+// and closes the file descriptor. The owning handle's teardown and
+// each open read transaction's release drop exactly one each, so the
+// mapping outlives DB.Close while any read transaction still needs
+// its reader slot. Does NOT unlink the lock file — it is ephemeral
+// and removal is orthogonal to release (the next opener detects an
+// empty/missing file via the lifecycle's adopt-then-create path).
 //
-// After Close every accessor on *File becomes a programmer error;
-// see the lifetime contract on the *File doc.
+// After the final Close every accessor on *File becomes a programmer
+// error; see the lifetime contract on the *File doc.
 func (f *File) Close() error {
+	if f.refs.Add(-1) > 0 {
+		return nil
+	}
 	if f.mmap != nil {
 		if err := munmap(f.mmap); err != nil {
 			return fmt.Errorf("lock: munmap: %w", err)

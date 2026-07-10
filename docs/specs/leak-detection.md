@@ -23,13 +23,19 @@ Depends on / interacts with:
 ## Invariants
 
 Invariant: kind=clause-explicit;
-  property=A `Tx` cleanup observing `*db.closed == true` returns
-    without touching the reader-table mmap or the flock goroutine
-    — it logs and exits;
-  from=this spec §Cleanup Behavior;
-  violation=A cleanup that runs after `Close()` has begun unmapping
-    SIGSEGVs the GC goroutine (touching unmapped memory), bringing
-    the process down — defeating the safety net entirely.
+  property=A WRITE-`Tx` cleanup observing `*db.closed == true`
+    returns without touching the flock goroutine — it logs and
+    exits. A READ-`Tx` slot release (normal close or leak cleanup)
+    runs unconditionally, but touches the reader-table mmap only
+    through the lifetime reference its `BeginRead` took on the
+    lock-file mapping (§`Close()` Ordering step 8): the mapping
+    cannot unmap before the release completes;
+  from=this spec §Cleanup Behavior + §`Close()` Ordering step 8;
+  violation=A reader-slot release without the reference races
+    `Close()`'s munmap and SIGSEGVs the GC goroutine (or the
+    caller), bringing the process down; a SKIPPED release strands
+    the slot occupied under a live PID — unreapable by stale
+    detection — pinning RPL reclamation for the process lifetime.
 
 Invariant: kind=clause-explicit;
   property=`db.closed` is a `*atomic.Bool` allocated on the heap and
@@ -101,19 +107,26 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=**Tx cleanup callbacks** run on a GC background
-    goroutine and perform only non-blocking operations: atomic
-    check of `db.closed`, atomic store on reader slot, non-
+    goroutine and perform only BOUNDED, non-blocking operations:
+    atomic check of `db.closed`, atomic store on reader slot, non-
     blocking channel send to flock goroutine, `sync.Mutex.Unlock`
     of a lock the leaked owner held (wait-free; not a contended
-    acquisition), and non-blocking diagnostic logging via the
-    configured `slog` handler. No mutex *acquisition* (no
-    `Lock`/`RLock`/spin), no blocking syscall (other than the
-    slog handler's bounded diagnostic write), no panic. The DB
-    cleanup callback is a separate concern (see next invariant);
+    acquisition), non-blocking diagnostic logging via the
+    configured `slog` handler, and — on a leaked READ-Tx whose
+    mapping reference is the LAST drop (reachable only when the DB
+    handle was closed or collected first) — the final lock-file
+    munmap + fd close, two bounded syscalls. No mutex *acquisition*
+    (no `Lock`/`RLock`/spin), no other syscalls beyond the
+    enumerated bounded ones, no unbounded blocking work, no panic.
+    The DB cleanup callback is a separate concern (see next
+    invariant);
   from=this spec §Cleanup Behavior;
-  violation=A blocking cleanup stalls all subsequent GC cleanups,
-    backing up the whole process; a panicking cleanup aborts the
-    program — the safety net becomes a single point of failure.
+  violation=An unbounded-blocking cleanup stalls all subsequent GC
+    cleanups, backing up the whole process; a panicking cleanup
+    aborts the program — the safety net becomes a single point of
+    failure. Conversely, FORBIDDING the last-drop munmap would
+    force the leaked-ReadTx cleanup to strand the mapping (and, if
+    it also skipped the release, the slot) forever.
 
 Invariant: kind=clause-explicit;
   property=The **DB cleanup callback** may perform a bounded
@@ -194,14 +207,18 @@ When the GC collects a leaked `Tx`:
    the underlying `atomic.Bool` lives until the last referencing
    cleanup releases its capture. `Close()` sets
    `*db.closed = true` (release-store) *before* it begins
-   unmapping. If a Tx cleanup observes `*db.closed == true`, it
-   logs the warning and returns immediately — it does NOT touch
-   the reader-table mmap (already unmapped or about to be) or
-   signal the flock goroutine (already stopped).
+   unmapping. A WRITE-Tx cleanup that observes `*db.closed ==
+   true` logs the warning and returns immediately — it does not
+   signal the flock goroutine (already stopped). A READ-Tx
+   cleanup releases its reader slot REGARDLESS of the close
+   state: the leaked ReadTx's lifetime reference on the lock-file
+   mapping (§`Close()` Ordering step 8) keeps the reader table
+   mapped until the release completes, and skipping would strand
+   the slot occupied under a live PID.
 1. **Log a warning** via the `*slog.Logger` on the `DB` struct
    (read txn / write txn, TxnID, Begin stack).
 2. **Release the reader slot** by storing `TxnID = 0` (atomic) in
-   the reader table.
+   the reader table, then drop the mapping reference.
 3. **Release the write lock** (if writable): non-blocking signal
    to the flock goroutine (channel send with `default:` branch —
    if the channel is closed because `Close()` raced past the
@@ -211,8 +228,12 @@ Cleanup runs on a GC background goroutine — must not block or
 panic. Permitted operations: atomic loads/stores, non-blocking
 channel sends, `sync.Mutex.Unlock` of a lock the leaked owner
 held (wait-free), and the configured `slog` handler's
-diagnostic write (a bounded syscall, not a blocking operation).
-Forbidden: mutex `Lock`/`RLock`/spin, blocking I/O, panic.
+diagnostic write (a bounded syscall, not a blocking operation),
+and — on a leaked READ-Tx whose reference is the LAST drop on the
+lock-file mapping — the final munmap + fd close (two bounded
+syscalls; reachable only when the DB handle was closed or
+collected first). Forbidden: mutex `Lock`/`RLock`/spin, unbounded
+blocking I/O, panic.
 
 ### Limitations
 
@@ -275,30 +296,64 @@ Cleanup Behavior step 0 above), `Close()` runs in this order:
    can extend the drain, up to that caller's ctx deadline). The
    spin is bounded by those windows — microseconds in the common
    case.
-5. Capture and nil the resource pointers (coord, lock file, pager,
+5. Run the shutdown checkpoint (`durability.md` §Clean shutdown)
+   while the pager and file are still alive — after the drain, no
+   new Begin can start and every in-flight write completed, so the
+   bump covers all acknowledged commits.
+6. Capture and nil the resource pointers (coord, lock file, pager,
    data file, directory root) under `db.mu`, so a concurrent
    `Begin` sees a consistent pre-close or post-nil view.
-6. `Coord.Close`: blocks until both the flock goroutine and the
+7. `Coord.Close`: blocks until both the flock goroutine and the
    heartbeat goroutine have exited. The flock goroutine's stop
    path releases any held flock, clears the writer-header fields,
    and fails pending `AcquireWriter` requests — writer-queue
    drainage lives inside the Coord, not in `Close()` itself.
-7. Munmap the lock file, then the data file; close all file
-   descriptors.
+8. Drop the handle's lifetime reference on the lock-file mapping,
+   then munmap the data file and close the data-file descriptors
+   (the lock-file munmap and its fd close happen at the LAST
+   mapping drop, which an open read transaction can defer). The
+   lock-file mapping is REFERENCE-COUNTED: the handle holds one
+   reference from Open, and every open read transaction holds one
+   from `BeginRead`; the munmap happens at the LAST drop. A read
+   transaction still open here therefore keeps the reader table
+   mapped — its slot stays bound-pinning and releasable — until
+   its own close (or its leak cleanup) releases the slot and drops
+   the reference.
 
-Any Tx cleanup invoked between steps 1 and 7 sees
-`db.closed = true` and exits without touching the soon-to-be-
-unmapped memory. After step 7 the mmap is gone but the cleanup's
-guard at step 0 prevents the SEGV. Cleanups that *had already
-passed* the guard at the moment step 1 fired complete fully
-before step 7 runs, because step 4 spins on the in-flight
+A WRITE-Tx cleanup invoked between steps 1 and 8 sees
+`db.closed = true` and skips the flock signal. A READ-Tx cleanup
+releases its slot at ANY time — before, during, or after these
+steps — protected not by the closed flag but by the leaked
+transaction's own mapping reference (step 8): the lock-file mmap
+cannot be gone while the release runs. BeginRead windows and
+cleanups that entered the gate before step 1's store complete
+fully before teardown, because step 4 spins on the in-flight
 refcount until they decrement.
 
 `Close()` is **not** safe to call concurrently with active write
-or batch transactions in the same process. Active *read*
-transactions hold reader slots that `Close()` will leave occupied;
-they continue to operate against the now-unmapped lock file ⇒
-undefined behavior. Callers must ensure all transactions in the
-process are committed or rolled back before calling `Close()` —
-see also `Compact()` for the related drain pattern in
-`api-surface.md`.
+or batch transactions in the same process; callers must complete
+those first — see also `Compact()` for the related drain pattern
+in `api-surface.md`. Active *read* transactions, by contrast, are
+DEFINED across a concurrent `Close()`, via the reference-counted
+lock-file mapping (step 8): `Close()` never unpins a live
+snapshot. An open ReadTx's reader slot stays occupied — visible
+to every peer's reclamation-bound scan — until the transaction's
+own `Commit`/`Rollback` (or leak cleanup) releases it, so
+operations already in flight and borrowed key/value slices remain
+backed by protected pages for the transaction's whole lifetime.
+NEW operations on the ReadTx after `Close()` begins fail with
+`ErrClosed`; the release path itself works at any time (it goes
+through the transaction's own mapping reference and its
+BeginRead-captured Coord, not through the nil'd `*DB` pointers),
+and each slot is freed exactly once (the `held` CAS). The cost of
+the guarantee: a ReadTx held open indefinitely past `Close()`
+keeps the lock-file mapping and its snapshot's pages pinned —
+exactly as it would with the DB still open. Heartbeat residual:
+after `Close()` stops the heartbeat goroutine, a cross-namespace
+peer ages the slot out after its longer window
+(`cross-process.md` §Stale-reader detection); same-namespace
+peers classify by PID liveness and keep it pinned — unless the
+occupant's start time is unreadable to the scanner (restricted
+/proc), whose fallback is the same frozen heartbeat and the
+SHORT window.
+(Pinned by `TestCloseReleasesOpenReaderSlots`.)
