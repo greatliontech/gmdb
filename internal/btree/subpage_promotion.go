@@ -8,14 +8,16 @@ package btree
 // PromoteSubpageToNestedTree implements the 4-step atomic algorithm
 // the spec describes:
 //
-//  1. Allocate a new leaf page for the nested B+tree.
-//  2. Copy all subpage entries into the new leaf page as regular
-//     cells (where "keys" are the values from the set and "values"
-//     are empty).
-//  3. Replace the subpage cell with a nested B+tree reference cell
+//  1. Build a nested B+tree containing every subpage entry as a
+//     regular cell (keys = the set's values, values empty) — packing
+//     the leading entries into one freshly-allocated leaf and growing
+//     the tree through the ordinary insert path for the remainder, so
+//     the result spans as many leaves as the entries' leaf encoding
+//     requires.
+//  2. Replace the subpage cell with a nested B+tree reference cell
 //     (the CALLER's responsibility, post-return — this function only
 //     yields (rootID, count) for the new cell).
-//  4. Insert the new value into the nested B+tree.
+//  3. Insert the new value into the nested B+tree.
 //
 // Atomicity (set-keyspace.md entailed invariant E3): on any error,
 // returns (0, 0, err) and the caller's tx-abort path retires every
@@ -29,7 +31,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
-// PromoteSubpageToNestedTree implements the 4-step promotion. Inputs:
+// PromoteSubpageToNestedTree implements the promotion algorithm. Inputs:
 //
 //   - subpageBuf: the raw subpage bytes (header + entries) being
 //     promoted, as produced by `internal/page.EncodeSubpage` or
@@ -92,19 +94,18 @@ func PromoteSubpageToNestedTree(
 	leafBuf, err := pw.ZeroPage(newLeafID)
 	if err != nil {
 		// AbortTx restores the bitmap snapshot and is sufficient for
-		// in-tx cleanup, but the explicit FreePage keeps the
-		// promotion function's per-failure-path contract symmetric
-		// with the AddInline / Put error branches below: every
-		// failure path that occurs AFTER AllocPage explicitly frees
-		// newLeafID before returning. This makes a future refactor
-		// that swaps PageWriter implementations (or adds a test
-		// double without AbortTx semantics) safe by construction.
+		// in-tx cleanup, but the explicit FreePage keeps the failure
+		// paths that occur BEFORE any Put has run symmetric: those
+		// paths still own newLeafID. Once a Put succeeds, ownership
+		// transfers to the tree (Put frees the old root internally on
+		// CoW) and the error paths deliberately free nothing — see the
+		// ownership-handoff comment below.
 		_ = pw.FreePage(newLeafID)
 		return 0, 0, fmt.Errorf("PromoteSubpageToNestedTree: alloc nested-root slab: %w", err)
 	}
 	b := page.NewLeafBuilder(leafBuf, cfg)
 	var copied uint64
-	var addErr error
+	var spill [][]byte
 	sp.AllValues(func(v []byte) bool {
 		// AllValues yields slices borrowed from subpageBuf;
 		// LeafBuilder.AddInline copies the key bytes into the new
@@ -112,32 +113,63 @@ func PromoteSubpageToNestedTree(
 		// next-call sort-order assertion borrows the key slice
 		// briefly until the next AddInline, but subpageBuf outlives
 		// the loop so the borrow is safe.
-		if !b.AddInline(v, nil) {
-			addErr = fmt.Errorf("PromoteSubpageToNestedTree: nested-root leaf overflowed adding entry %d (subpage size %d exceeds 50%% threshold of a single nested leaf)",
-				copied, sp.SizeBytes())
-			return false
+		//
+		// A threshold-sized subpage does NOT generally fit one leaf:
+		// a leaf cell costs >= 7 bytes + member where a subpage entry
+		// costs 2 + member (or just the fixed stride), so small
+		// members overflow the first leaf long before the subpage
+		// budget is exhausted. Entries past the first leaf's capacity
+		// spill to the ordinary insert path below, which grows the
+		// tree with proper splits — the promotion result is a
+		// multi-leaf nested tree whenever the members' leaf encoding
+		// requires one (set-keyspace.md §Subpage Promotion Threshold).
+		if len(spill) == 0 && b.AddInline(v, nil) {
+			copied++
+			return true
 		}
-		copied++
+		spill = append(spill, v)
 		return true
 	})
-	if addErr != nil {
-		_ = pw.FreePage(newLeafID)
-		return 0, 0, addErr
-	}
 	b.Finish()
 
-	// Step 4: insert newValue into the nested tree. btree.Put handles
-	// the typical case (in-place splice into the single leaf) and
-	// the edge case (leaf overflow → split into branch + two leaves)
-	// uniformly. The returned newRoot is the nested tree's new root
-	// — either the single leaf we just built (if in-place) or a
-	// fresh branch page (if Put triggered a split).
-	newRoot, err := Put(pw, cfg, newLeafID, newValue, nil)
+	// Spill + step 3: grow the tree through btree.Put — the same
+	// machinery every SetKeyspace nested insert uses, splits included.
+	// Members are unique and sorted (subpage invariants), so each Put
+	// is a fresh append-most insert; newValue's position is arbitrary.
+	// Ownership handoff: every successful Put below CoWs the current
+	// root and FREES it internally — so after the FIRST successful Put,
+	// newLeafID is no longer this function's to free (freeing it again
+	// would double-free a loose page, or mark a reallocated live page
+	// loose). The explicit error-path free applies only while no Put
+	// has run; past that point cleanup is wholly the caller's
+	// savepoint/tx-abort (set-keyspace.md E3 atomicity).
+	root := newLeafID
+	putRan := false
+	for _, v := range spill {
+		nr, existed, perr := PutReportExisting(pw, cfg, root, v, nil)
+		if perr != nil {
+			if !putRan {
+				_ = pw.FreePage(newLeafID)
+			}
+			return 0, 0, fmt.Errorf("PromoteSubpageToNestedTree: spill subpage entry into nested tree: %w", perr)
+		}
+		if existed {
+			// Structurally impossible — sp.Validate() enforced strict
+			// sorted-unique on the whole subpage — but a silent replace
+			// here would desync NestedCount from the tree (E-class
+			// Count equality), so encode the check like the newValue
+			// pre-check above.
+			return 0, 0, fmt.Errorf("%w: PromoteSubpageToNestedTree: duplicate subpage entry reached the spill path", ErrCorrupted)
+		}
+		putRan = true
+		root = nr
+		copied++
+	}
+	newRoot, err := Put(pw, cfg, root, newValue, nil)
 	if err != nil {
-		// Free the leaf we allocated; any pages Put allocated before
-		// failing are managed by its own rollback path. The pager's
-		// tx-abort releases the rest.
-		_ = pw.FreePage(newLeafID)
+		if !putRan {
+			_ = pw.FreePage(newLeafID)
+		}
 		return 0, 0, fmt.Errorf("PromoteSubpageToNestedTree: insert new value into nested tree: %w", err)
 	}
 	return newRoot, copied + 1, nil

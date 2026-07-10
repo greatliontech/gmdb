@@ -320,12 +320,17 @@ optional checksum footer).
 
 Promotion:
 
-1. Allocate a new leaf page for the nested B+tree.
-2. Copy all subpage entries into the new leaf page as regular cells
-   (where "keys" are the values from the set and "values" are
-   empty).
-3. Replace the subpage cell with a nested B+tree reference cell.
-4. Insert the new value into the nested B+tree.
+1. Build a nested B+tree containing every subpage entry as a
+   regular cell (keys = the set's values, values empty). The tree
+   spans as many leaves as the entries' leaf encoding requires — a
+   leaf cell carries per-entry overhead a subpage entry does not
+   (≥ 7 bytes + member vs 2 + member, or the bare fixed stride), so
+   a threshold-sized subpage of small members generally does NOT
+   fit a single leaf. Promotion must never fail for capacity
+   reasons on an in-spec set: the member-count ceiling is the tree's,
+   not one page's.
+2. Replace the subpage cell with a nested B+tree reference cell.
+3. Insert the new value into the nested B+tree.
 
 ## Nested B+tree Reference Cell
 

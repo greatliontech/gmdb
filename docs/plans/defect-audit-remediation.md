@@ -16,7 +16,7 @@ function. WIP = 1.
       (+ range-delete.md rider)
 - [x] 4. internal/btree: read-path validation — cousin-scan first-read
       validation, Cursor.Delete reposition error surfacing
-- [ ] 5. internal/btree + set keyspace: subpage promotion multi-leaf
+- [x] 5. internal/btree + set keyspace: subpage promotion multi-leaf
       build (+ set-keyspace.md rider)
 - [ ] 6. internal/btree + internal/page: compact fixed-size nested-leaf
       cells per set-keyspace.md
