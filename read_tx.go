@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/thegrumpylion/gmdb/internal/closegate"
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
@@ -127,7 +128,7 @@ type ReadTx struct {
 // stays mapped until process exit — a small leak per
 // leaked-but-not-closed reader, acceptable for the safety-net role.
 type readTxCleanupInfo struct {
-	gate      *closeGate
+	gate      *closegate.Gate
 	coord     *lock.Coord
 	lockFile  *lock.File
 	held      *atomic.Bool
@@ -209,7 +210,7 @@ func readTxCleanupFn(info readTxCleanupInfo) {
 	// channel sends, no Lock/RLock/spin, no blocking I/O, no panic;
 	// the test pattern is `select { case ch <- struct{}{}: default: }`.
 	// The hook runs INSIDE the EnterCleanup/ExitCleanup window —
-	// closeGate.BeginClose's drain (closegate.go) waits for it; the
+	// closeGate.BeginClose's drain (internal/closegate) waits for it; the
 	// non-blocking constraint bounds that wait to the cost of one
 	// atomic-pointer load plus the installed callback's own duration.
 	if hook := readTxCleanupHookForTest.Load(); hook != nil {

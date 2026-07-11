@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thegrumpylion/gmdb/internal/closegate"
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
@@ -1257,7 +1258,7 @@ func TestTxLeakAfterCloseNoCrash(t *testing.T) {
 
 func TestDBClosedFlagSharedByPointer(t *testing.T) {
 	// Spec-tier invariant (leak-detection.md):
-	// the close coordination state is a *closeGate shared by
+	// the close coordination state is a *closegate.Gate shared by
 	// pointer between DB, every txCleanupInfo, every
 	// readTxCleanupInfo, and dbCleanupInfo. We pin this by
 	// verifying the DB's closeGate pointer is non-nil so a
@@ -1270,7 +1271,7 @@ func TestDBClosedFlagSharedByPointer(t *testing.T) {
 	}
 	defer db.Close()
 	if db.closeGate == nil {
-		t.Fatal("db.closeGate is nil — should be heap-allocated *closeGate")
+		t.Fatal("db.closeGate is nil — should be heap-allocated *closegate.Gate")
 	}
 	// Confirm Begin captures the same pointer.
 	tx, err := db.Begin(ctx)
@@ -1294,17 +1295,11 @@ func TestTxCleanupFnDirectClosedSkipsRelease(t *testing.T) {
 	// txCleanupInfo directly and call txCleanupFn — deterministic
 	// pinning of the closed-branch behavior.
 	//
-	// Mechanism: a fresh *atomic.Bool set to true is the gate; pgr
-	// is a real *pager.Pager from a real DB so AbortTx WOULD be
-	// callable; grant is a fresh non-nil *lock.Grant. Post-call,
-	// neither pgr.AbortTx nor grant.Release should have been
-	// invoked. We verify by observing side-effects:
-	//   - pgr.AbortTx ABORTS the current tx — if we don't open one,
-	//     calling AbortTx on a fresh pager is a state mutation we
-	//     can detect via... actually pager.AbortTx without a
-	//     BeginTx may no-op or panic. Use the grant side instead:
-	//     grant.Release closes a channel; we hold a separate
-	//     reference to the channel and verify it's NOT closed.
+	// Mechanism: a closed gate + real pgr/grant; the release branch
+	// must be SKIPPED. txCleanupHookForTest fires at the tail of the
+	// active-release path, so hook-not-fired IS the skip, observed
+	// deterministically (grant.Release's sync.Once idempotency makes
+	// the branch otherwise indistinguishable from a later Rollback).
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
 	if err != nil {
@@ -1321,20 +1316,15 @@ func TestTxCleanupFnDirectClosedSkipsRelease(t *testing.T) {
 	tx.cleanup.Stop()
 
 	// Simulate "DB is closed" by setting the captured gate.
-	gate := newCloseGate()
+	gate := closegate.New()
 	gate.SwapClosed(true)
 
 	held := &atomic.Bool{}
 	held.Store(true)
 
-	// Capture the grant's release channel BEFORE the cleanup runs
-	// so we can probe whether Release was invoked.
-	releaseCh := tx.grant
-	_ = releaseCh // can't directly read internal channel; instead
-	// we'll observe via held — if cleanup skipped the release path,
-	// held became false (CAS) but pgr.AbortTx and grant.Release
-	// were not invoked. The grant remains "released" only via the
-	// later Rollback below.
+	var released atomic.Bool
+	setTxCleanupHookForTest(func() { released.Store(true) })
+	t.Cleanup(func() { setTxCleanupHookForTest(nil) })
 
 	info := txCleanupInfo{
 		gate:      gate,
@@ -1361,29 +1351,18 @@ func TestTxCleanupFnDirectClosedSkipsRelease(t *testing.T) {
 		t.Errorf("Rollback after synthesised cleanup: %v", err)
 	}
 
-	// The grant's sync.Once means Release is idempotent, so we
-	// can't distinguish "Release ran during cleanup" vs "Release
-	// ran in Rollback" via the channel alone. The strongest direct
-	// evidence we can extract: closed=true blocks the AbortTx +
-	// Release branch (lines 115-122 of tx.go); the code path is
-	// unambiguous by inspection. This test pins that the function
-	// COMPLETES on a closed=true input (no panic, no nil-deref,
-	// no SIGSEGV — invariant 1's intent).
+	// Hook not fired ⇒ the AbortTx + grant.Release branch was
+	// skipped — invariant 1's substance, not just its no-panic
+	// shadow.
+	if released.Load() {
+		t.Errorf("release branch ran despite closed gate")
+	}
 }
 
 func TestTxCleanupFnDirectClosedFalseRunsRelease(t *testing.T) {
 	// Complement: with closed=false, the cleanup MUST run the
-	// AbortTx + Release branch. We probe by checking that a
-	// subsequent Rollback returns ErrTxClosed (set by an
-	// out-of-band closed=true would mean closed=true was the
-	// branch) — instead, the tx is already aborted by our
-	// synthesised cleanup, so Rollback should ALSO succeed
-	// (idempotent grant.Release + tx.closed already true after the
-	// CAS).
-	//
-	// Simpler shape: just confirm no panic with closed=false. The
-	// AbortTx branch is exercised by the existing TestLeakedTx-
-	// ReleasesWriteLock end-to-end.
+	// AbortTx + Release branch — pinned via txCleanupHookForTest,
+	// which fires at the branch tail.
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
 	if err != nil {
@@ -1397,9 +1376,13 @@ func TestTxCleanupFnDirectClosedFalseRunsRelease(t *testing.T) {
 	}
 	tx.cleanup.Stop()
 
-	gate := newCloseGate() // closed=false
+	gate := closegate.New() // closed=false
 	held := &atomic.Bool{}
 	held.Store(true)
+
+	var released atomic.Bool
+	setTxCleanupHookForTest(func() { released.Store(true) })
+	t.Cleanup(func() { setTxCleanupHookForTest(nil) })
 
 	info := txCleanupInfo{
 		gate:      gate,
@@ -1413,6 +1396,9 @@ func TestTxCleanupFnDirectClosedFalseRunsRelease(t *testing.T) {
 
 	if held.Load() {
 		t.Errorf("held remained true; cleanup did not run")
+	}
+	if !released.Load() {
+		t.Errorf("release branch did not run with open gate")
 	}
 
 	// tx.Rollback on the now-aborted tx — sync.Once on grant.Release

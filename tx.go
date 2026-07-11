@@ -12,6 +12,7 @@ import (
 	"unique"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/closegate"
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
@@ -200,17 +201,17 @@ type Tx struct {
 // Deliberately omits the *Tx: runtime.AddCleanup rejects an arg that
 // reaches the obj, since resurrecting the obj would defeat collection.
 //
-// Captures the shared *closeGate by pointer (leak-detection.md
+// Captures the shared *closegate.Gate by pointer (leak-detection.md
 // clause-explicit invariant — required because runtime.AddCleanup
 // provides no ordering between the DB cleanup and Tx cleanups, and
 // the gate was promoted from a plain *atomic.Bool to a
-// *closeGate with an additional inflight-cleanup refcount so
+// *closegate.Gate with an additional inflight-cleanup refcount so
 // Close can drain in-flight cleanups before unmap). Also captures
 // *Pager and *Grant directly (not via *DB) so a concurrent
 // DB.Close — which sets db.pgr = nil and db.coord = nil — does not
 // nil-deref this callback.
 type txCleanupInfo struct {
-	gate      *closeGate
+	gate      *closegate.Gate
 	pgr       *pager.Pager
 	grant     *lock.Grant
 	held      *atomic.Bool
@@ -265,6 +266,31 @@ func txCleanupFn(info txCleanupInfo) {
 	// the leaked tx made but never committed.
 	info.pgr.AbortTx()
 	info.grant.Release()
+	if hook := txCleanupHookForTest.Load(); hook != nil {
+		(*hook)()
+	}
+}
+
+// txCleanupHookForTest, when set, is invoked at the tail of
+// txCleanupFn's active-release path (after info.grant.Release),
+// INSIDE the EnterCleanup/ExitCleanup window. Same contract as
+// readTxCleanupHookForTest: the installed callback MUST be
+// non-blocking per leak-detection.md §Cleanup Behavior. It exists
+// because the branch's effects are otherwise unobservable —
+// grant.Release is sync.Once-idempotent, so a test cannot
+// distinguish "released during cleanup" from "released by a later
+// Rollback" without a signal from inside the branch.
+var txCleanupHookForTest atomic.Pointer[func()]
+
+// setTxCleanupHookForTest installs (or clears, when hook==nil) the
+// test-only post-release synchronization hook described on
+// txCleanupHookForTest. Test-only.
+func setTxCleanupHookForTest(hook func()) {
+	if hook == nil {
+		txCleanupHookForTest.Store(nil)
+		return
+	}
+	txCleanupHookForTest.Store(&hook)
 }
 
 // captureOriginPCs records the call stack at Begin so the cleanup

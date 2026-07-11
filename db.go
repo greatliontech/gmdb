@@ -14,6 +14,7 @@ import (
 	"time"
 	"weak"
 
+	"github.com/thegrumpylion/gmdb/internal/closegate"
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
@@ -85,7 +86,7 @@ type DB struct {
 	// pointer with every txCleanupInfo, every readTxCleanupInfo, and
 	// the dbCleanupInfo. Composes the (closed bool, txInflight
 	// counter) pair that leak-detection.md
-	// §Cleanup Behavior + §Close Ordering requires — see closegate.go
+	// §Cleanup Behavior + §Close Ordering requires — see internal/closegate
 	// for the full rationale.
 	//
 	// Heap allocation is required because runtime.AddCleanup provides
@@ -98,7 +99,7 @@ type DB struct {
 	// leaked-Tx cleanup that passed the closed gate cannot race the
 	// unmap. The drain is a bounded spin (cleanup work is two
 	// atomic stores).
-	closeGate *closeGate
+	closeGate *closegate.Gate
 
 	// cleanup is the runtime.AddCleanup handle for THIS *DB; Stop()'d
 	// by Close so a normal teardown doesn't fire the leak-warning
@@ -450,7 +451,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		lockFile:  lockFile,
 		coord:     coord,
 		pgr:       opened.Pager,
-		closeGate: newCloseGate(),
+		closeGate: closegate.New(),
 		readOnly:  opts.ReadOnly,
 	}
 	db.adoptOpened(opened)
@@ -522,12 +523,12 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 var dbCleanupHookForTest atomic.Pointer[func()]
 
 // dbCleanupInfo bundles the resources a leaked-DB cleanup needs to
-// tear down. Captures the shared *closeGate by pointer (leak-
+// tear down. Captures the shared *closegate.Gate by pointer (leak-
 // detection.md clause-explicit invariant — gate must survive a
 // collected-first *DB); resource pointers are independent of the
 // *DB so a collected *DB doesn't dangle them.
 type dbCleanupInfo struct {
-	gate      *closeGate
+	gate      *closegate.Gate
 	coord     *lock.Coord
 	lockFile  *lock.File
 	pgr       *pager.Pager
@@ -680,7 +681,7 @@ func (db *DB) Close() error {
 	// wait for them to complete before unmapping. The gate's
 	// txInflight counter (incremented at the top of every cleanup,
 	// decremented at the bottom regardless of skip/work) lets us
-	// spin until quiescence. See closegate.go for the interleaving
+	// spin until quiescence. See internal/closegate for the interleaving
 	// analysis. Cleanups that fire AFTER this step observe
 	// closed=true and skip the resource-touching work.
 	//
@@ -917,7 +918,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 		startTime:    time.Now(), // TxStats.Duration anchor
 	}
 	// Wire the leak-detection cleanup per leak-detection.md. The
-	// cleanup info captures the shared *closeGate by pointer
+	// cleanup info captures the shared *closegate.Gate by pointer
 	// (clause-explicit invariant — required for cleanup to observe
 	// Close without nil-deref'ing through a potentially-collected
 	// *DB) plus *Pager, *Grant, the held atomic, and the origin

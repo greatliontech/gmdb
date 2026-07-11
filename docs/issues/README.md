@@ -69,6 +69,15 @@ tags.
 | index-kind-format-groundwork | 7 | registry entry v2 (kind discriminator + per-kind payload) + `IndexDecl.Kind` folded into the fingerprint; requirements from the 2026-07-11 architecture audit |
 | index-reverse-iteration | 9 | reverse-iteration `IterOption` clauses for `indexing.md §Lookup API` + `api-surface.md`; reverse == exact reversal of forward sequence |
 
+## Open — change-set review findings
+
+Adjacent findings surfaced by per-chunk adversarial reviews;
+pre-existing at their change set's base.
+
+| Slug | Lands | Summary |
+|------|-------|---------|
+| leak-detection-gate-phrasing | when leak-detection.md §Cleanup Behavior / §Close Ordering is next amended | [L] three clauses still call the closed flag a bare `*atomic.Bool`; the composite gate (closed + txInflight) is the implemented and elsewhere-specced shape |
+
 ## Open — design gaps (2026-07-11 architecture audit)
 
 | Slug | Lands | Summary |

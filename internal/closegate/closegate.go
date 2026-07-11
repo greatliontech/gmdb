@@ -1,11 +1,14 @@
-package gmdb
+// Package closegate provides the close-vs-cleanup coordination gate
+// shared between a database handle and its leaked-transaction
+// cleanups.
+package closegate
 
 import (
 	"runtime"
 	"sync/atomic"
 )
 
-// closeGate is the heap-allocated coordination structure shared by
+// Gate is the heap-allocated coordination structure shared by
 // pointer between the *DB, every txCleanupInfo, every
 // readTxCleanupInfo, and the dbCleanupInfo. It composes two
 // previously-separate concerns:
@@ -86,14 +89,14 @@ import (
 // `time.Sleep` to keep the latency bounded by the scheduler's
 // time-slice — cleanups complete in microseconds in practice, so
 // a true sleep would over-pessimise.
-type closeGate struct {
+type Gate struct {
 	closed     atomic.Bool
 	txInflight atomic.Int32
 }
 
-// newCloseGate returns a freshly-allocated *closeGate with
-// closed=false and txInflight=0.
-func newCloseGate() *closeGate { return &closeGate{} }
+// New returns a freshly-allocated *Gate with closed=false and
+// txInflight=0.
+func New() *Gate { return &Gate{} }
 
 // EnterCleanup is the cleanup-side entry. Returns true if the
 // cleanup must perform its full release path; false if the cleanup
@@ -104,7 +107,7 @@ func newCloseGate() *closeGate { return &closeGate{} }
 //
 // Returning false (skip) is the closed-observed path; the caller
 // still logs the leak warning before returning.
-func (g *closeGate) EnterCleanup() bool {
+func (g *Gate) EnterCleanup() bool {
 	g.txInflight.Add(1)
 	if g.closed.Load() {
 		return false
@@ -116,7 +119,7 @@ func (g *closeGate) EnterCleanup() bool {
 // 1:1 with EnterCleanup. Safe to call after EnterCleanup returned
 // false (the spec gate still requires the matching decrement so
 // Close's drain doesn't see a phantom).
-func (g *closeGate) ExitCleanup() { g.txInflight.Add(-1) }
+func (g *Gate) ExitCleanup() { g.txInflight.Add(-1) }
 
 // BeginClose stores closed=true (release-store), then spins on
 // txInflight until it reaches zero. The spin uses runtime.Gosched
@@ -124,7 +127,7 @@ func (g *closeGate) ExitCleanup() { g.txInflight.Add(-1) }
 // sequences, so a time.Sleep would over-pessimise the common case.
 //
 // MUST be called exactly once per DB.Close — the inner CAS that
-// guards Close's body (db.closeGate.closed.CompareAndSwap) is the
+// guards Close's body (db.closeGate.CompareAndSwapClosed) is the
 // "exactly once" arbiter; this method assumes the caller has won
 // that CAS.
 //
@@ -137,7 +140,7 @@ func (g *closeGate) ExitCleanup() { g.txInflight.Add(-1) }
 // Cleanups that fire AFTER BeginClose returns observe closed=true
 // (release-store visible by load-acquire happens-before) and skip
 // the resource-touching path inside their EnterCleanup gate.
-func (g *closeGate) BeginClose() {
+func (g *Gate) BeginClose() {
 	g.closed.Store(true)
 	for g.txInflight.Load() > 0 {
 		runtime.Gosched()
@@ -146,16 +149,16 @@ func (g *closeGate) BeginClose() {
 
 // IsClosed reports whether Close has begun. Used by the Tx-method
 // use-after-Close defense (tx.requireOpen / rtx.Page).
-func (g *closeGate) IsClosed() bool { return g.closed.Load() }
+func (g *Gate) IsClosed() bool { return g.closed.Load() }
 
 // CompareAndSwapClosed mirrors atomic.Bool.CompareAndSwap on the
 // closed flag. Used by DB.Close's idempotency check (only one
 // caller wins, runs BeginClose + drain).
-func (g *closeGate) CompareAndSwapClosed(old, new bool) bool {
+func (g *Gate) CompareAndSwapClosed(old, new bool) bool {
 	return g.closed.CompareAndSwap(old, new)
 }
 
 // SwapClosed mirrors atomic.Bool.Swap on the closed flag. Used by
 // the DB-cleanup callback as the Close-vs-cleanup gate (whoever
 // wins runs the drain; the loser skips).
-func (g *closeGate) SwapClosed(new bool) bool { return g.closed.Swap(new) }
+func (g *Gate) SwapClosed(new bool) bool { return g.closed.Swap(new) }

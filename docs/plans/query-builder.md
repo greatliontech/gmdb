@@ -6,7 +6,7 @@ Riders: `index-kind-format-groundwork` (chunk 7),
 behavior-free structure moves except the named exported knobs;
 tests move with their subjects, unmodified.
 
-- [ ] 1. `closeGate` → `internal/closegate` (zero-coupling sync
+- [x] 1. `closeGate` → `internal/closegate` (zero-coupling sync
       primitive; pure move).
 - [ ] 2. Keyspace-descriptor codec (40-byte encode / decode /
       validate) → `internal/` (home decided in-chunk, beside the
