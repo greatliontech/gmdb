@@ -12,6 +12,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/descriptor"
 	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
@@ -302,10 +303,10 @@ func collectReachable(rtx *ReadTx, cfg page.Config, meta pager.Meta, hwm, firstD
 	}
 	err := btree.WalkKV(pr, cfg, meta.KeyspaceRoot, hwm, func(k, v []byte) error {
 		name := string(k)
-		if len(v) != keyspaceDescriptorSize {
+		if len(v) != descriptor.Size {
 			return fmt.Errorf("%w: keyspace %q descriptor size %d", btree.ErrCorrupted, name, len(v))
 		}
-		desc := decodeKeyspaceDescriptor(v)
+		desc := descriptor.Decode(v)
 		if err := collect(desc.Root); err != nil {
 			return fmt.Errorf("keyspace %q data tree: %w", name, err)
 		}
@@ -425,10 +426,10 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	var descs []descEntry
 	walkErr := btree.WalkKV(pr, baseCfg, meta.KeyspaceRoot, hwm, func(k, v []byte) error {
 		name := string(k)
-		if len(v) != keyspaceDescriptorSize {
+		if len(v) != descriptor.Size {
 			return fmt.Errorf("%w: keyspace %q descriptor size %d", btree.ErrCorrupted, name, len(v))
 		}
-		desc := decodeKeyspaceDescriptor(v)
+		desc := descriptor.Decode(v)
 		cfg := baseCfg
 		if desc.RestartGroupTarget != 0 {
 			cfg.RestartGroupTarget = desc.RestartGroupTarget
@@ -436,13 +437,13 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 		nd := desc // rewrite Root + IndexRegistryRoot below
 
 		switch desc.Kind {
-		case keyspaceKindKeyspace:
+		case descriptor.KindKeyspace:
 			root, err := rebuildKVTree(w, pr, cfg, desc.Root, hwm)
 			if err != nil {
 				return fmt.Errorf("keyspace %q data tree: %w", name, err)
 			}
 			nd.Root = root
-		case keyspaceKindSetKeyspace:
+		case descriptor.KindSetKeyspace:
 			root, err := rebuildSetTree(w, pr, cfg, desc.Root, desc.FixedValueSize, hwm)
 			if err != nil {
 				return fmt.Errorf("set keyspace %q data tree: %w", name, err)
@@ -466,8 +467,8 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 			nd.IndexRegistryRoot = regRoot
 		}
 
-		encBuf := make([]byte, keyspaceDescriptorSize)
-		encodeKeyspaceDescriptor(encBuf, nd)
+		encBuf := make([]byte, descriptor.Size)
+		descriptor.Encode(encBuf, nd)
 		descs = append(descs, descEntry{name: append([]byte(nil), k...), enc: encBuf})
 		return nil
 	})

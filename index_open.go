@@ -2,9 +2,11 @@ package gmdb
 
 import (
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"sort"
 	"sync/atomic"
+
+	"github.com/thegrumpylion/gmdb/internal/descriptor"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 )
@@ -101,7 +103,7 @@ func buildPinnedIndexMap(decls []*IndexDecl) (map[string]*pinnedIndex, error) {
 // and the read-only write guard rejects every mutation before index
 // maintenance could need it. Returns nil for a keyspace with no
 // registry.
-func (tx *Tx) loadReadOnlyIndexes(desc keyspaceDescriptor) (map[string]*pinnedIndex, error) {
+func (tx *Tx) loadReadOnlyIndexes(desc descriptor.Keyspace) (map[string]*pinnedIndex, error) {
 	if desc.IndexRegistryRoot == 0 {
 		return nil, nil
 	}

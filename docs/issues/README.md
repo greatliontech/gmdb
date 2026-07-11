@@ -77,6 +77,8 @@ pre-existing at their change set's base.
 | Slug | Lands | Summary |
 |------|-------|---------|
 | leak-detection-gate-phrasing | when leak-detection.md §Cleanup Behavior / §Close Ordering is next amended | [L] three clauses still call the closed flag a bare `*atomic.Bool`; the composite gate (closed + txInflight) is the implemented and elsewhere-specced shape |
+| check-issue-codes-unpinned | when check.go's issue emission or api-surface.md §CheckIssue is next amended | [L] the spec's "stable, machine-parseable" `CheckIssue.Code` tokens have no pinning tests; a rename changed one token with a green suite (caught in review) |
+| descriptor-error-prefix | when internal/descriptor is next amended | [nit] descriptor validation errors carry a misleading `"page: "` prefix (never lived in internal/page) |
 
 ## Open — design gaps (2026-07-11 architecture audit)
 

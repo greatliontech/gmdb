@@ -4,15 +4,17 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"sync/atomic"
 	"unique"
+
+	"github.com/thegrumpylion/gmdb/internal/descriptor"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 )
 
 // descAdapterValue implements descriptorOwner for code paths that
-// work directly on a *keyspaceDescriptor without a *Keyspace /
+// work directly on a *descriptor.Keyspace without a *Keyspace /
 // *SetKeyspace handle (RebuildIndex / DropIndex on a
 // keyspace not currently cached in tx.openKeyspaces, per
 // indexing.md §Recovery pattern after ErrIndexFingerprintMismatch
@@ -20,12 +22,12 @@ import (
 // observed by the caller to decide whether to push the mutated
 // descriptor into tx.dirtyDescriptors at the end of the op.
 type descAdapterValue struct {
-	desc  keyspaceDescriptor
+	desc  descriptor.Keyspace
 	dirty bool
 }
 
-func (a *descAdapterValue) descriptor() *keyspaceDescriptor { return &a.desc }
-func (a *descAdapterValue) markDirty()                      { a.dirty = true }
+func (a *descAdapterValue) descriptor() *descriptor.Keyspace { return &a.desc }
+func (a *descAdapterValue) markDirty()                       { a.dirty = true }
 
 // resolveKeyspaceForIndexOp loads the keyspace's descriptor for a
 // RebuildIndex / DropIndex operation. Returns:
@@ -43,9 +45,9 @@ func (a *descAdapterValue) markDirty()                      { a.dirty = true }
 // Errors:
 //   - ErrNotFound if the keyspace does not exist on disk or in tx.
 //   - ErrKeyspaceReserved if the resolved descriptor is Kind=2.
-func (tx *Tx) resolveKeyspaceForIndexOp(name string) (owner descriptorOwner, cachedKS *Keyspace, cachedSKS *SetKeyspace, desc keyspaceDescriptor, err error) {
+func (tx *Tx) resolveKeyspaceForIndexOp(name string) (owner descriptorOwner, cachedKS *Keyspace, cachedSKS *SetKeyspace, desc descriptor.Keyspace, err error) {
 	if _, deleted := tx.pendingDeletes[name]; deleted {
-		return nil, nil, nil, keyspaceDescriptor{}, ErrNotFound
+		return nil, nil, nil, descriptor.Keyspace{}, ErrNotFound
 	}
 	handle := unique.Make(name)
 	if ks, ok := tx.openKeyspaces[handle]; ok && !ks.dead {
@@ -56,13 +58,13 @@ func (tx *Tx) resolveKeyspaceForIndexOp(name string) (owner descriptorOwner, cac
 	}
 	d, found, err := tx.lookupDescriptor(name)
 	if err != nil {
-		return nil, nil, nil, keyspaceDescriptor{}, err
+		return nil, nil, nil, descriptor.Keyspace{}, err
 	}
 	if !found {
-		return nil, nil, nil, keyspaceDescriptor{}, ErrNotFound
+		return nil, nil, nil, descriptor.Keyspace{}, ErrNotFound
 	}
-	if d.Kind == keyspaceKindIndexInternal {
-		return nil, nil, nil, keyspaceDescriptor{}, ErrKeyspaceReserved
+	if d.Kind == descriptor.KindIndexInternal {
+		return nil, nil, nil, descriptor.Keyspace{}, ErrKeyspaceReserved
 	}
 	// Not-cached path: build an adapter the caller propagates.
 	// The Kind=1 gate is removed now that
@@ -86,7 +88,7 @@ func (tx *Tx) propagateNotCachedDescChange(name string, owner descriptorOwner) e
 		return err
 	}
 	if tx.dirtyDescriptors == nil {
-		tx.dirtyDescriptors = make(map[string]keyspaceDescriptor)
+		tx.dirtyDescriptors = make(map[string]descriptor.Keyspace)
 	}
 	tx.dirtyDescriptors[name] = a.desc
 	tx.recalcFlushReserve()
@@ -306,7 +308,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	newRoot := uint64(0)
 	newCount := uint64(0)
 	hasCovering := len(decl.Covering) > 0
-	isSetKeyspace := desc.Kind == keyspaceKindSetKeyspace
+	isSetKeyspace := desc.Kind == descriptor.KindSetKeyspace
 
 	// processPair builds and writes index entries for one extractor
 	// input. For Keyspace: k1=rowKey, k2=rowValue. For SetKeyspace: k1=setKey, k2=setValue — per-(setKey, setValue)

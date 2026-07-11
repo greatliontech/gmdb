@@ -1,4 +1,4 @@
-package gmdb
+package descriptor
 
 import (
 	"bytes"
@@ -26,9 +26,9 @@ import (
 // inherits via callsite use of these primitives.
 
 func TestKeyspaceDescriptorSize(t *testing.T) {
-	if keyspaceDescriptorSize != 40 {
-		t.Fatalf("keyspaceDescriptorSize = %d, want 40 (8+8+1+2+8+2+8+3)",
-			keyspaceDescriptorSize)
+	if Size != 40 {
+		t.Fatalf("Size = %d, want 40 (8+8+1+2+8+2+8+3)",
+			Size)
 	}
 }
 
@@ -38,20 +38,20 @@ func TestKeyspaceDescriptorSize(t *testing.T) {
 // per field; assert every field round-trips and the encoded form has the
 // expected byte layout (each field's offset and width).
 func TestKeyspaceDescriptorRoundTripAllFields(t *testing.T) {
-	d := keyspaceDescriptor{
+	d := Keyspace{
 		Root:               0x0123456789ABCDEF,
 		Count:              0xFEDCBA9876543210,
-		Kind:               keyspaceKindSetKeyspace,
+		Kind:               KindSetKeyspace,
 		FixedValueSize:     0x1234,
 		NextSeq:            0xAABBCCDDEEFF0011,
 		RestartGroupTarget: 32,
 		IndexRegistryRoot:  0x1122334455667788,
 	}
 
-	buf := make([]byte, keyspaceDescriptorSize)
-	encodeKeyspaceDescriptor(buf, d)
+	buf := make([]byte, Size)
+	Encode(buf, d)
 
-	got := decodeKeyspaceDescriptor(buf)
+	got := Decode(buf)
 	if got != d {
 		t.Errorf("round-trip mismatch:\n got=%+v\nwant=%+v", got, d)
 	}
@@ -68,7 +68,7 @@ func TestKeyspaceDescriptorRoundTripAllFields(t *testing.T) {
 	}{
 		{"Root", 0, 8, 0x0123456789ABCDEF},
 		{"Count", 8, 8, 0xFEDCBA9876543210},
-		{"Kind", 16, 1, uint64(keyspaceKindSetKeyspace)},
+		{"Kind", 16, 1, uint64(KindSetKeyspace)},
 		{"FixedValueSize", 17, 2, 0x1234},
 		{"NextSeq", 19, 8, 0xAABBCCDDEEFF0011},
 		{"RestartGroupTarget", 27, 2, 32},
@@ -100,25 +100,25 @@ func TestKeyspaceDescriptorRoundTripAllFields(t *testing.T) {
 	// Encode → Decode → Encode produces byte-identical output. Pins
 	// against a future change that introduces nondeterminism (e.g. a
 	// reserved-byte slot used for a hash or counter).
-	buf2 := make([]byte, keyspaceDescriptorSize)
-	encodeKeyspaceDescriptor(buf2, got)
+	buf2 := make([]byte, Size)
+	Encode(buf2, got)
 	if !bytes.Equal(buf, buf2) {
 		t.Errorf("Encode is non-deterministic:\n first=%x\nsecond=%x", buf, buf2)
 	}
 }
 
 func TestKeyspaceDescriptorRoundTripZero(t *testing.T) {
-	var d keyspaceDescriptor
-	buf := make([]byte, keyspaceDescriptorSize)
-	encodeKeyspaceDescriptor(buf, d)
-	if !bytes.Equal(buf, make([]byte, keyspaceDescriptorSize)) {
+	var d Keyspace
+	buf := make([]byte, Size)
+	Encode(buf, d)
+	if !bytes.Equal(buf, make([]byte, Size)) {
 		t.Errorf("encoded zero descriptor = %x, want all zero", buf)
 	}
-	got := decodeKeyspaceDescriptor(buf)
-	if got != (keyspaceDescriptor{}) {
+	got := Decode(buf)
+	if got != (Keyspace{}) {
 		t.Errorf("decode of all-zero buf = %+v, want zero struct", got)
 	}
-	if err := validateKeyspaceDescriptor(buf, got); err != nil {
+	if err := Validate(buf, got); err != nil {
 		t.Errorf("validate of all-zero (Kind=0, empty keyspace): %v", err)
 	}
 }
@@ -127,11 +127,11 @@ func TestKeyspaceDescriptorEncodeOverwritesReservedBytes(t *testing.T) {
 	// A buffer pre-filled with non-zero bytes must come out clean in
 	// the reserved region after Encode — Encode owns the canonical
 	// 40 bytes.
-	buf := make([]byte, keyspaceDescriptorSize)
+	buf := make([]byte, Size)
 	for i := range buf {
 		buf[i] = 0xAB
 	}
-	encodeKeyspaceDescriptor(buf, keyspaceDescriptor{Kind: keyspaceKindKeyspace})
+	Encode(buf, Keyspace{Kind: KindKeyspace})
 	for i := 37; i < 40; i++ {
 		if buf[i] != 0 {
 			t.Errorf("reserved byte %d not cleared by Encode: 0x%02x", i, buf[i])
@@ -146,14 +146,14 @@ func TestKeyspaceDescriptorValidateRejectsUnknownKind(t *testing.T) {
 	// level. CreateKeyspace's API surface does not expose
 	// a Kind setter, so the violation path is on-disk corruption +
 	// reload, which is exactly the §Invariants violation case.
-	buf := make([]byte, keyspaceDescriptorSize)
-	encodeKeyspaceDescriptor(buf, keyspaceDescriptor{Kind: keyspaceKindKeyspace})
+	buf := make([]byte, Size)
+	Encode(buf, Keyspace{Kind: KindKeyspace})
 	buf[16] = 3 // overwrite Kind byte directly
 
-	d := decodeKeyspaceDescriptor(buf)
-	err := validateKeyspaceDescriptor(buf, d)
+	d := Decode(buf)
+	err := Validate(buf, d)
 	if err == nil {
-		t.Fatal("validateKeyspaceDescriptor with Kind=3: want error, got nil")
+		t.Fatal("Validate with Kind=3: want error, got nil")
 	}
 	if !strings.Contains(err.Error(), "Kind") {
 		t.Errorf("error doesn't mention Kind: %v", err)
@@ -161,16 +161,16 @@ func TestKeyspaceDescriptorValidateRejectsUnknownKind(t *testing.T) {
 
 	// Also verify each accepted Kind passes.
 	for _, k := range []uint8{
-		keyspaceKindKeyspace,
-		keyspaceKindSetKeyspace,
-		keyspaceKindIndexInternal,
+		KindKeyspace,
+		KindSetKeyspace,
+		KindIndexInternal,
 	} {
-		var d2 keyspaceDescriptor
+		var d2 Keyspace
 		d2.Kind = k
-		buf2 := make([]byte, keyspaceDescriptorSize)
-		encodeKeyspaceDescriptor(buf2, d2)
-		if err := validateKeyspaceDescriptor(buf2, decodeKeyspaceDescriptor(buf2)); err != nil {
-			t.Errorf("validateKeyspaceDescriptor Kind=%d: %v", k, err)
+		buf2 := make([]byte, Size)
+		Encode(buf2, d2)
+		if err := Validate(buf2, Decode(buf2)); err != nil {
+			t.Errorf("Validate Kind=%d: %v", k, err)
 		}
 	}
 }
@@ -182,15 +182,15 @@ func TestKeyspaceDescriptorValidateRejectsUnknownKind(t *testing.T) {
 // entry stride."
 func TestKeyspaceDescriptorValidateRejectsFixedValueSizeOnNonSet(t *testing.T) {
 	for _, kind := range []uint8{
-		keyspaceKindKeyspace,
-		keyspaceKindIndexInternal,
+		KindKeyspace,
+		KindIndexInternal,
 	} {
-		d := keyspaceDescriptor{Kind: kind, FixedValueSize: 8}
-		buf := make([]byte, keyspaceDescriptorSize)
-		encodeKeyspaceDescriptor(buf, d)
-		err := validateKeyspaceDescriptor(buf, decodeKeyspaceDescriptor(buf))
+		d := Keyspace{Kind: kind, FixedValueSize: 8}
+		buf := make([]byte, Size)
+		Encode(buf, d)
+		err := Validate(buf, Decode(buf))
 		if err == nil {
-			t.Errorf("validateKeyspaceDescriptor Kind=%d FixedValueSize=8: want error, got nil",
+			t.Errorf("Validate Kind=%d FixedValueSize=8: want error, got nil",
 				kind)
 			continue
 		}
@@ -201,20 +201,20 @@ func TestKeyspaceDescriptorValidateRejectsFixedValueSizeOnNonSet(t *testing.T) {
 
 	// Kind == SetKeyspace with FixedValueSize > 0 is the canonical
 	// fixed-size set keyspace — must pass.
-	d := keyspaceDescriptor{Kind: keyspaceKindSetKeyspace, FixedValueSize: 8}
-	buf := make([]byte, keyspaceDescriptorSize)
-	encodeKeyspaceDescriptor(buf, d)
-	if err := validateKeyspaceDescriptor(buf, decodeKeyspaceDescriptor(buf)); err != nil {
-		t.Errorf("validateKeyspaceDescriptor Kind=Set FixedValueSize=8: %v", err)
+	d := Keyspace{Kind: KindSetKeyspace, FixedValueSize: 8}
+	buf := make([]byte, Size)
+	Encode(buf, d)
+	if err := Validate(buf, Decode(buf)); err != nil {
+		t.Errorf("Validate Kind=Set FixedValueSize=8: %v", err)
 	}
 
 	// Kind == SetKeyspace with FixedValueSize == 0 is the
 	// variable-size set keyspace — must also pass.
-	d2 := keyspaceDescriptor{Kind: keyspaceKindSetKeyspace, FixedValueSize: 0}
-	buf2 := make([]byte, keyspaceDescriptorSize)
-	encodeKeyspaceDescriptor(buf2, d2)
-	if err := validateKeyspaceDescriptor(buf2, decodeKeyspaceDescriptor(buf2)); err != nil {
-		t.Errorf("validateKeyspaceDescriptor Kind=Set FixedValueSize=0: %v", err)
+	d2 := Keyspace{Kind: KindSetKeyspace, FixedValueSize: 0}
+	buf2 := make([]byte, Size)
+	Encode(buf2, d2)
+	if err := Validate(buf2, Decode(buf2)); err != nil {
+		t.Errorf("Validate Kind=Set FixedValueSize=0: %v", err)
 	}
 }
 
@@ -222,13 +222,13 @@ func TestKeyspaceDescriptorValidateRejectsFixedValueSizeOnNonSet(t *testing.T) {
 // reserved-bytes-zero clause from keyspaces.md §Keyspace Descriptor.
 func TestKeyspaceDescriptorValidateRejectsNonZeroReserved(t *testing.T) {
 	for off := 37; off < 40; off++ {
-		buf := make([]byte, keyspaceDescriptorSize)
-		encodeKeyspaceDescriptor(buf, keyspaceDescriptor{Kind: keyspaceKindKeyspace})
+		buf := make([]byte, Size)
+		Encode(buf, Keyspace{Kind: KindKeyspace})
 		buf[off] = 0xFF
 
-		err := validateKeyspaceDescriptor(buf, decodeKeyspaceDescriptor(buf))
+		err := Validate(buf, Decode(buf))
 		if err == nil {
-			t.Errorf("validateKeyspaceDescriptor with reserved[%d]=0xFF: want error, got nil",
+			t.Errorf("Validate with reserved[%d]=0xFF: want error, got nil",
 				off-37)
 			continue
 		}
@@ -245,12 +245,12 @@ func TestKeyspaceDescriptorValidateRejectsNonZeroReserved(t *testing.T) {
 // restart-table Count field is uint8."
 func TestKeyspaceDescriptorValidateRejectsRestartGroupTargetOverflow(t *testing.T) {
 	// 256 is the smallest invalid value.
-	d := keyspaceDescriptor{Kind: keyspaceKindKeyspace, RestartGroupTarget: 256}
-	buf := make([]byte, keyspaceDescriptorSize)
-	encodeKeyspaceDescriptor(buf, d)
-	err := validateKeyspaceDescriptor(buf, decodeKeyspaceDescriptor(buf))
+	d := Keyspace{Kind: KindKeyspace, RestartGroupTarget: 256}
+	buf := make([]byte, Size)
+	Encode(buf, d)
+	err := Validate(buf, Decode(buf))
 	if err == nil {
-		t.Fatal("validateKeyspaceDescriptor RestartGroupTarget=256: want error, got nil")
+		t.Fatal("Validate RestartGroupTarget=256: want error, got nil")
 	}
 	if !strings.Contains(err.Error(), "RestartGroupTarget") {
 		t.Errorf("error doesn't mention RestartGroupTarget: %v", err)
@@ -258,23 +258,23 @@ func TestKeyspaceDescriptorValidateRejectsRestartGroupTargetOverflow(t *testing.
 
 	// 255 is the largest valid value (the physical cap).
 	d.RestartGroupTarget = page.MaxRestartGroupTarget
-	encodeKeyspaceDescriptor(buf, d)
-	if err := validateKeyspaceDescriptor(buf, decodeKeyspaceDescriptor(buf)); err != nil {
-		t.Errorf("validateKeyspaceDescriptor RestartGroupTarget=255: %v", err)
+	Encode(buf, d)
+	if err := Validate(buf, Decode(buf)); err != nil {
+		t.Errorf("Validate RestartGroupTarget=255: %v", err)
 	}
 
 	// 0 (engine default) is valid.
 	d.RestartGroupTarget = 0
-	encodeKeyspaceDescriptor(buf, d)
-	if err := validateKeyspaceDescriptor(buf, decodeKeyspaceDescriptor(buf)); err != nil {
-		t.Errorf("validateKeyspaceDescriptor RestartGroupTarget=0: %v", err)
+	Encode(buf, d)
+	if err := Validate(buf, Decode(buf)); err != nil {
+		t.Errorf("Validate RestartGroupTarget=0: %v", err)
 	}
 
 	// 1 (uncompressed leaf selector) is valid.
 	d.RestartGroupTarget = 1
-	encodeKeyspaceDescriptor(buf, d)
-	if err := validateKeyspaceDescriptor(buf, decodeKeyspaceDescriptor(buf)); err != nil {
-		t.Errorf("validateKeyspaceDescriptor RestartGroupTarget=1: %v", err)
+	Encode(buf, d)
+	if err := Validate(buf, Decode(buf)); err != nil {
+		t.Errorf("Validate RestartGroupTarget=1: %v", err)
 	}
 }
 
@@ -285,33 +285,33 @@ func TestKeyspaceDescriptorValidateRejectsRestartGroupTargetOverflow(t *testing.
 func TestKeyspaceDescriptorEncodeBufferTooSmall(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Error("encodeKeyspaceDescriptor on 39-byte buf: want panic, got none")
+			t.Error("Encode on 39-byte buf: want panic, got none")
 		}
 	}()
-	buf := make([]byte, keyspaceDescriptorSize-1)
-	encodeKeyspaceDescriptor(buf, keyspaceDescriptor{})
+	buf := make([]byte, Size-1)
+	Encode(buf, Keyspace{})
 }
 
 func TestKeyspaceDescriptorDecodeBufferTooSmall(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Error("decodeKeyspaceDescriptor on 39-byte buf: want panic, got none")
+			t.Error("Decode on 39-byte buf: want panic, got none")
 		}
 	}()
-	buf := make([]byte, keyspaceDescriptorSize-1)
-	_ = decodeKeyspaceDescriptor(buf)
+	buf := make([]byte, Size-1)
+	_ = Decode(buf)
 }
 
 func TestKeyspaceDescriptorValidateBufferTooSmall(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
-			t.Error("validateKeyspaceDescriptor on 39-byte buf: want panic, got none")
+			t.Error("Validate on 39-byte buf: want panic, got none")
 		}
 	}()
-	buf := make([]byte, keyspaceDescriptorSize-1)
-	// The upfront `_ = buf[keyspaceDescriptorSize-1]` slice-index
+	buf := make([]byte, Size-1)
+	// The upfront `_ = buf[Size-1]` slice-index
 	// triggers an out-of-range panic on a 39-byte slice regardless of
 	// the descriptor's Kind. A valid Kind is supplied so the test would
 	// not pass for any reason other than the bounds-check.
-	_ = validateKeyspaceDescriptor(buf, keyspaceDescriptor{Kind: keyspaceKindKeyspace})
+	_ = Validate(buf, Keyspace{Kind: KindKeyspace})
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/descriptor"
 	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
@@ -196,14 +197,14 @@ func (tx *Tx) compactForest(floor uint64, budget int) (int, error) {
 	//    the descriptors up front.
 	type ksEntry struct {
 		name []byte
-		desc keyspaceDescriptor
+		desc descriptor.Keyspace
 	}
 	var roster []ksEntry
 	if err := btree.WalkKV(pw, baseCfg, tx.keyspaceRoot, hwm, func(k, v []byte) error {
-		if len(v) != keyspaceDescriptorSize {
+		if len(v) != descriptor.Size {
 			return fmt.Errorf("%w: keyspace %q descriptor size %d", btree.ErrCorrupted, string(k), len(v))
 		}
-		roster = append(roster, ksEntry{name: bytes.Clone(k), desc: decodeKeyspaceDescriptor(v)})
+		roster = append(roster, ksEntry{name: bytes.Clone(k), desc: descriptor.Decode(v)})
 		return nil
 	}); err != nil {
 		return 0, mapCompactErr(err)
@@ -251,7 +252,7 @@ func (tx *Tx) compactForest(floor uint64, budget int) (int, error) {
 				return 0, err
 			}
 			if tx.dirtyDescriptors == nil {
-				tx.dirtyDescriptors = make(map[string]keyspaceDescriptor)
+				tx.dirtyDescriptors = make(map[string]descriptor.Keyspace)
 			}
 			tx.dirtyDescriptors[string(ks.name)] = ks.desc
 			tx.recalcFlushReserve()

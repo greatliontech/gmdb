@@ -1,4 +1,6 @@
-package gmdb
+// Package descriptor holds the fixed 40-byte on-disk codec for
+// keyspace descriptors (keyspaces.md §Keyspace Descriptor).
+package descriptor
 
 import (
 	"encoding/binary"
@@ -11,7 +13,7 @@ import (
 // format — little-endian, matching every other persisted format.
 var le = binary.LittleEndian
 
-// keyspaceDescriptor is the 40-byte struct stored as the value for a
+// Keyspace is the 40-byte struct stored as the value for a
 // keyspace's entry in the keyspace B+tree. Layout per
 // keyspaces.md §Keyspace Descriptor:
 //
@@ -26,8 +28,8 @@ var le = binary.LittleEndian
 // reserved space and silently disconnects every index registry from its
 // keyspace). The codec round-trip test
 // (TestKeyspaceDescriptorRoundTripAllFields in
-// keyspace_descriptor_test.go) is the load-bearing enforcement.
-type keyspaceDescriptor struct {
+// descriptor_test.go) is the load-bearing enforcement.
+type Keyspace struct {
 	// Root is the page ID of this keyspace's B+tree root. Zero ⇒ empty
 	// keyspace.
 	Root uint64
@@ -36,14 +38,14 @@ type keyspaceDescriptor struct {
 	// SetKeyspace, the total pairs across all value sets.
 	Count uint64
 
-	// Kind is one of keyspaceKindKeyspace / keyspaceKindSetKeyspace /
-	// keyspaceKindIndexInternal. Set at creation, immutable after.
+	// Kind is one of KindKeyspace / KindSetKeyspace /
+	// KindIndexInternal. Set at creation, immutable after.
 	Kind uint8
 
 	// FixedValueSize is meaningful only when Kind ==
-	// keyspaceKindSetKeyspace: the fixed value size in bytes for set
+	// KindSetKeyspace: the fixed value size in bytes for set
 	// members (0 ⇒ variable). Must be 0 when Kind != SetKeyspace
-	// (validated by validateKeyspaceDescriptor).
+	// (validated by Validate).
 	FixedValueSize uint16
 
 	// NextSeq is the next sequence number for Keyspace.NextSequence().
@@ -54,7 +56,7 @@ type keyspaceDescriptor struct {
 	// size: 0 ⇒ engine default, 1 ⇒ uncompressed-leaf variant
 	// (TypeLeafUncompressed), [2, 255] ⇒ compressed-leaf variant with
 	// the value as the group target. Values > 255 are rejected by
-	// validateKeyspaceDescriptor (the compressed-leaf restart-table
+	// Validate (the compressed-leaf restart-table
 	// Count field is uint8 — 255 is the physical cap per
 	// page-formats.md §Compressed Leaf). uint16 on disk reserves bits
 	// 8..15 for future use.
@@ -66,25 +68,25 @@ type keyspaceDescriptor struct {
 	IndexRegistryRoot uint64
 }
 
-// Keyspace Kind values. Stored in keyspaceDescriptor.Kind.
+// Keyspace Kind values. Stored in Keyspace.Kind.
 const (
-	// keyspaceKindKeyspace is a key→value keyspace.
-	keyspaceKindKeyspace uint8 = 0
-	// keyspaceKindSetKeyspace is a key→sorted-set keyspace.
-	keyspaceKindSetKeyspace uint8 = 1
-	// keyspaceKindIndexInternal is an engine-internal index keyspace —
+	// KindKeyspace is a key→value keyspace.
+	KindKeyspace uint8 = 0
+	// KindSetKeyspace is a key→sorted-set keyspace.
+	KindSetKeyspace uint8 = 1
+	// KindIndexInternal is an engine-internal index keyspace —
 	// not directly openable by user code (filtered out of
 	// ListKeyspaces; OpenKeyspace returns ErrKeyspaceReserved per
 	// keyspaces.md invariant #4).
-	keyspaceKindIndexInternal uint8 = 2
+	KindIndexInternal uint8 = 2
 )
 
-// keyspaceDescriptorSize is the fixed on-disk byte length of one
+// Size is the fixed on-disk byte length of one
 // keyspace descriptor (8+8+1+2+8+2+8+3). The
-// keyspaceDescriptor.RestartGroupTarget cap is page.MaxRestartGroupTarget
+// Keyspace.RestartGroupTarget cap is page.MaxRestartGroupTarget
 // (defined alongside Config.RestartGroupTarget); the same uint8 physical
 // cap from page-formats.md §Compressed Leaf applies here.
-const keyspaceDescriptorSize = 40
+const Size = 40
 
 // Keyspace descriptor field offsets within the 40-byte buffer.
 const (
@@ -99,14 +101,14 @@ const (
 	ksdReservedLen           = 3
 )
 
-// decodeKeyspaceDescriptor reads a keyspaceDescriptor from the first
-// keyspaceDescriptorSize bytes of buf. Does not validate field-level
-// invariants; use validateKeyspaceDescriptor to detect malformed
+// Decode reads a Keyspace from the first
+// Size bytes of buf. Does not validate field-level
+// invariants; use Validate to detect malformed
 // descriptors (unknown Kind, FixedValueSize set on Kind != 1,
 // RestartGroupTarget > 255, non-zero reserved bytes).
-func decodeKeyspaceDescriptor(buf []byte) keyspaceDescriptor {
-	_ = buf[keyspaceDescriptorSize-1] // bounds check
-	return keyspaceDescriptor{
+func Decode(buf []byte) Keyspace {
+	_ = buf[Size-1] // bounds check
+	return Keyspace{
 		Root:               le.Uint64(buf[ksdOffRoot:]),
 		Count:              le.Uint64(buf[ksdOffCount:]),
 		Kind:               buf[ksdOffKind],
@@ -117,13 +119,13 @@ func decodeKeyspaceDescriptor(buf []byte) keyspaceDescriptor {
 	}
 }
 
-// encodeKeyspaceDescriptor writes d into the first
-// keyspaceDescriptorSize bytes of buf. The 3 reserved bytes are
+// Encode writes d into the first
+// Size bytes of buf. The 3 reserved bytes are
 // zeroed. The encoded form is the canonical representation — a
 // subsequent Decode + Encode round-trip is byte-identical (test
 // pinned).
-func encodeKeyspaceDescriptor(buf []byte, d keyspaceDescriptor) {
-	_ = buf[keyspaceDescriptorSize-1] // bounds check
+func Encode(buf []byte, d Keyspace) {
+	_ = buf[Size-1] // bounds check
 	le.PutUint64(buf[ksdOffRoot:], d.Root)
 	le.PutUint64(buf[ksdOffCount:], d.Count)
 	buf[ksdOffKind] = d.Kind
@@ -134,15 +136,15 @@ func encodeKeyspaceDescriptor(buf []byte, d keyspaceDescriptor) {
 	clear(buf[ksdOffReserved : ksdOffReserved+ksdReservedLen])
 }
 
-// validateKeyspaceDescriptor reports whether d is a well-formed
+// Validate reports whether d is a well-formed
 // descriptor as observed after decoding from disk. Reads
 // Kind/FixedValueSize/RestartGroupTarget from d and the reserved
 // bytes from buf (decode does not surface reserved into the struct).
 //
 // Intended call shape:
 //
-//	d := decodeKeyspaceDescriptor(buf)
-//	if err := validateKeyspaceDescriptor(buf, d); err != nil { ... }
+//	d := Decode(buf)
+//	if err := Validate(buf, d); err != nil { ... }
 //
 // Passing a mutated d alongside a stale buf produces well-defined but
 // possibly surprising results — Kind/FixedValueSize/RestartGroupTarget
@@ -150,22 +152,22 @@ func encodeKeyspaceDescriptor(buf []byte, d keyspaceDescriptor) {
 //
 // Enforces:
 //   - Kind ∈ {0, 1, 2} (keyspaces.md invariant #2).
-//   - FixedValueSize == 0 OR Kind == keyspaceKindSetKeyspace
+//   - FixedValueSize == 0 OR Kind == KindSetKeyspace
 //     (invariant #5: FixedValueSize meaningful only for Kind == 1).
 //   - RestartGroupTarget ≤ page.MaxRestartGroupTarget (255) — the
 //     compressed-leaf restart-table Count is uint8.
 //   - Reserved bytes are all zero (keyspaces.md §Keyspace Descriptor:
 //     "Open() rejects descriptors with non-zero reserved bytes").
-func validateKeyspaceDescriptor(buf []byte, d keyspaceDescriptor) error {
-	_ = buf[keyspaceDescriptorSize-1]
+func Validate(buf []byte, d Keyspace) error {
+	_ = buf[Size-1]
 	switch d.Kind {
-	case keyspaceKindKeyspace, keyspaceKindSetKeyspace, keyspaceKindIndexInternal:
+	case KindKeyspace, KindSetKeyspace, KindIndexInternal:
 	default:
 		return fmt.Errorf("page: keyspace descriptor Kind %d not in {0, 1, 2}", d.Kind)
 	}
-	if d.FixedValueSize != 0 && d.Kind != keyspaceKindSetKeyspace {
+	if d.FixedValueSize != 0 && d.Kind != KindSetKeyspace {
 		return fmt.Errorf("page: keyspace descriptor FixedValueSize %d set on Kind %d (only valid for Kind=%d SetKeyspace)",
-			d.FixedValueSize, d.Kind, keyspaceKindSetKeyspace)
+			d.FixedValueSize, d.Kind, KindSetKeyspace)
 	}
 	if d.RestartGroupTarget > page.MaxRestartGroupTarget {
 		return fmt.Errorf("page: keyspace descriptor RestartGroupTarget %d exceeds max %d",

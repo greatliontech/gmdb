@@ -8,7 +8,7 @@ tests move with their subjects, unmodified.
 
 - [x] 1. `closeGate` → `internal/closegate` (zero-coupling sync
       primitive; pure move).
-- [ ] 2. Keyspace-descriptor codec (40-byte encode / decode /
+- [x] 2. Keyspace-descriptor codec (40-byte encode / decode /
       validate) → `internal/` (home decided in-chunk, beside the
       registry codec; pure move).
 - [ ] 3. Index codec consolidation into `internal/indexing`:

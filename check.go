@@ -8,6 +8,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/descriptor"
 	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -350,7 +351,7 @@ type checker struct {
 // data-tree root of each registered index — gathered during the
 // structural walk so the index pass needs no second descriptor read.
 type ksInventory struct {
-	kind           uint8  // keyspaceKind* — selects the index codec
+	kind           uint8  // descriptor.Kind* — selects the index codec
 	fixedValueSize uint16 // SetKeyspace subpage member width (0 ⇒ variable)
 	dataRoot       uint64
 	indexRoots     map[string]uint64 // index name → index data-tree root
@@ -469,15 +470,15 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 	err := btree.WalkKV(rawPageReader{c.pgr}, c.cfg, c.meta.KeyspaceRoot, hwm, func(k, v []byte) error {
 		name := string(k)
 		keyspaceCount++
-		if len(v) != keyspaceDescriptorSize {
+		if len(v) != descriptor.Size {
 			if !c.emit(CheckIssue{Severity: CheckError, Code: "keyspaceDescriptorSize", Keyspace: name,
-				Message: fmt.Sprintf("descriptor value length %d != %d", len(v), keyspaceDescriptorSize)}) {
+				Message: fmt.Sprintf("descriptor value length %d != %d", len(v), descriptor.Size)}) {
 				return errCheckStop
 			}
 			return nil
 		}
-		desc := decodeKeyspaceDescriptor(v)
-		if verr := validateKeyspaceDescriptor(v, desc); verr != nil {
+		desc := descriptor.Decode(v)
+		if verr := descriptor.Validate(v, desc); verr != nil {
 			if !c.emit(CheckIssue{Severity: CheckError, Code: "KeyspaceDescriptorInvalid", Keyspace: name,
 				Message: verr.Error()}) {
 				return errCheckStop
@@ -499,7 +500,7 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 			return errCheckStop
 		} else if !structural {
 			want, unit := entries, "entries"
-			if desc.Kind == keyspaceKindSetKeyspace {
+			if desc.Kind == descriptor.KindSetKeyspace {
 				want, unit = values, "values"
 			}
 			if desc.Count != want {
@@ -515,7 +516,7 @@ func (c *checker) walkKeyspaces(firstData, hwm uint64) bool {
 		// api-surface.md §Check's "verifies … set keyspace subpage …
 		// integrity" claim (nested-tree integrity IS covered by the
 		// reachability walk, which recurses nested subtrees).
-		if desc.Kind == keyspaceKindSetKeyspace {
+		if desc.Kind == descriptor.KindSetKeyspace {
 			if !c.checkSetKeyspaceSubpages(name, desc.Root, desc.FixedValueSize, hwm) {
 				return errCheckStop
 			}
@@ -614,7 +615,7 @@ func (c *checker) checkSetKeyspaceSubpages(ks string, dataRoot uint64, fvs uint1
 // walkRegistry walks a keyspace's index registry sub-tree (registry
 // pages) and, for each registry entry, the index's data tree. Uses the
 // guarded WalkKV for the same reason as walkKeyspaces.
-func (c *checker) walkRegistry(ks string, desc keyspaceDescriptor, firstData, hwm uint64) bool {
+func (c *checker) walkRegistry(ks string, desc descriptor.Keyspace, firstData, hwm uint64) bool {
 	if !c.walkTree(ks, "", desc.IndexRegistryRoot, firstData, hwm) {
 		return false
 	}
@@ -962,9 +963,9 @@ func (c *checker) verifyIndexEquivalence(ks string, info *ksInventory, decl *Ind
 		structErr  error
 	)
 	switch info.kind {
-	case keyspaceKindKeyspace:
+	case descriptor.KindKeyspace:
 		expected, extractErr, structErr = c.expectedKeyspaceIndex(decl, info.dataRoot, hwm, hasCovering)
-	case keyspaceKindSetKeyspace:
+	case descriptor.KindSetKeyspace:
 		expected, extractErr, structErr = c.expectedSetKeyspaceIndex(decl, info.dataRoot, info.fixedValueSize, hwm, hasCovering)
 	default:
 		return c.emit(CheckIssue{Severity: CheckWarning, Code: "CheckIndexes.KeyspaceKindUnsupported", Keyspace: ks, Index: decl.Name,

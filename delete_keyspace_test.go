@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/descriptor"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -65,7 +66,7 @@ func TestDeleteKeyspaceRejectsKindIndexInternal(t *testing.T) {
 	defer db.Close()
 	tx, _ := db.Begin(ctx)
 	defer tx.Rollback()
-	forged := keyspaceDescriptor{Kind: keyspaceKindIndexInternal}
+	forged := descriptor.Keyspace{Kind: descriptor.KindIndexInternal}
 	if err := tx.storeDescriptor("__idx", forged); err != nil {
 		t.Fatalf("storeDescriptor Kind=2: %v", err)
 	}

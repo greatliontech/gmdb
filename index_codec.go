@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/descriptor"
 	"github.com/thegrumpylion/gmdb/internal/indexing"
 )
 
@@ -13,7 +14,7 @@ import (
 // keyspace's descriptor, AND transition the owning handle's
 // flush-state so the flushKeyspaces walk persists the
 // mutation at Commit. registryPut / registryDelete take this
-// interface (not a raw *keyspaceDescriptor) so that calling
+// interface (not a raw *descriptor.Keyspace) so that calling
 // the helper without also marking the parent dirty is structurally
 // impossible — closes a silent-data-loss path (registry mutation
 // without the parent dirty-mark never reaches Commit's flush).
@@ -23,7 +24,7 @@ import (
 // Created) so the descriptor still flushes via the Created arm of
 // flushKeyspaces.
 type descriptorOwner interface {
-	descriptor() *keyspaceDescriptor
+	descriptor() *descriptor.Keyspace
 	markDirty()
 }
 

@@ -8,6 +8,7 @@ import (
 	"unique"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/descriptor"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
@@ -76,7 +77,7 @@ type Keyspace struct {
 // (SetKeyspace — use OpenSetKeyspace); ErrKeyspaceReserved if the
 // name resolves to an engine-internal keyspace (Kind=2); ErrCorrupted
 // (wrapping the codec validate error) if the descriptor fails
-// validateKeyspaceDescriptor.
+// descriptor.Validate.
 //
 // IndexDecl handling: every declared index on the
 // keyspace must be supplied with a matching IndexDecl. Missing
@@ -129,7 +130,7 @@ func (tx *Tx) OpenKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, error
 	if !found {
 		return nil, ErrNotFound
 	}
-	if err := checkKeyspaceKind(desc.Kind, keyspaceKindKeyspace); err != nil {
+	if err := checkKeyspaceKind(desc.Kind, descriptor.KindKeyspace); err != nil {
 		return nil, err
 	}
 	// Cache the handle BEFORE validation so validatePinned* can
@@ -206,7 +207,7 @@ func (tx *Tx) OpenKeyspaceReadOnly(name string) (*Keyspace, error) {
 	if !found {
 		return nil, ErrNotFound
 	}
-	if err := checkKeyspaceKind(desc.Kind, keyspaceKindKeyspace); err != nil {
+	if err := checkKeyspaceKind(desc.Kind, descriptor.KindKeyspace); err != nil {
 		return nil, err
 	}
 	indexes, err := tx.loadReadOnlyIndexes(desc)
@@ -275,8 +276,8 @@ func (tx *Tx) CreateKeyspace(name string, indexes ...*IndexDecl) (*Keyspace, err
 	} else {
 		delete(tx.pendingDeletes, name)
 	}
-	desc := keyspaceDescriptor{
-		Kind: keyspaceKindKeyspace,
+	desc := descriptor.Keyspace{
+		Kind: descriptor.KindKeyspace,
 	}
 	tx.numKeyspaces++
 	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated)
@@ -326,7 +327,7 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Ke
 	}
 	if _, deleted := tx.pendingDeletes[name]; deleted {
 		delete(tx.pendingDeletes, name)
-		desc := keyspaceDescriptor{Kind: keyspaceKindKeyspace}
+		desc := descriptor.Keyspace{Kind: descriptor.KindKeyspace}
 		tx.numKeyspaces++
 		ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated)
 		ks.indexes = pinned // before finalize: its reserve pricing reads core.indexes
@@ -344,7 +345,7 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Ke
 		return nil, err
 	}
 	if found {
-		if err := checkKeyspaceKind(desc.Kind, keyspaceKindKeyspace); err != nil {
+		if err := checkKeyspaceKind(desc.Kind, descriptor.KindKeyspace); err != nil {
 			return nil, err
 		}
 		ks := tx.cacheOpenKeyspace(handle, desc, tx.openCacheState(name))
@@ -371,7 +372,7 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Ke
 		tx.recalcFlushReserve()
 		return ks, nil
 	}
-	desc = keyspaceDescriptor{Kind: keyspaceKindKeyspace}
+	desc = descriptor.Keyspace{Kind: descriptor.KindKeyspace}
 	tx.numKeyspaces++
 	ks := tx.cacheOpenKeyspace(handle, desc, keyspaceStateCreated)
 	ks.indexes = pinned // before finalize: its reserve pricing reads core.indexes
@@ -409,15 +410,15 @@ func (tx *Tx) ListKeyspaces() ([]string, error) {
 			if _, deleted := tx.pendingDeletes[name]; deleted {
 				continue
 			}
-			if len(v) != keyspaceDescriptorSize {
+			if len(v) != descriptor.Size {
 				return nil, fmt.Errorf("%w: keyspace descriptor value length %d != %d",
-					ErrCorrupted, len(v), keyspaceDescriptorSize)
+					ErrCorrupted, len(v), descriptor.Size)
 			}
-			desc := decodeKeyspaceDescriptor(v)
-			if err := validateKeyspaceDescriptor(v, desc); err != nil {
+			desc := descriptor.Decode(v)
+			if err := descriptor.Validate(v, desc); err != nil {
 				return nil, fmt.Errorf("%w: %v", ErrCorrupted, err)
 			}
-			if desc.Kind == keyspaceKindIndexInternal {
+			if desc.Kind == descriptor.KindIndexInternal {
 				continue
 			}
 			seen[name] = struct{}{}
@@ -433,7 +434,7 @@ func (tx *Tx) ListKeyspaces() ([]string, error) {
 		if ks.state != keyspaceStateCreated {
 			continue
 		}
-		if ks.desc.Kind == keyspaceKindIndexInternal {
+		if ks.desc.Kind == descriptor.KindIndexInternal {
 			continue
 		}
 		seen[ks.name.Value()] = struct{}{}
@@ -468,7 +469,7 @@ func (tx *Tx) ListKeyspaces() ([]string, error) {
 //
 // Returns (desc, true, nil) on hit; (zero, false, nil) when the name
 // is absent; (zero, false, err) on btree/codec failure.
-func (tx *Tx) lookupDescriptor(name string) (keyspaceDescriptor, bool, error) {
+func (tx *Tx) lookupDescriptor(name string) (descriptor.Keyspace, bool, error) {
 	handle := unique.Make(name)
 	if ks, ok := tx.openKeyspaces[handle]; ok {
 		return ks.desc, true, nil
@@ -510,25 +511,25 @@ func (tx *Tx) openCacheState(name string) keyspaceState {
 // pendingDeletes — used by lookupDescriptor as the disk-tier fallback
 // and by tests that need to inspect the persisted state regardless
 // of in-flight mutations.
-func (tx *Tx) loadDescriptor(name string) (keyspaceDescriptor, bool, error) {
+func (tx *Tx) loadDescriptor(name string) (descriptor.Keyspace, bool, error) {
 	if tx.keyspaceRoot == 0 {
-		return keyspaceDescriptor{}, false, nil
+		return descriptor.Keyspace{}, false, nil
 	}
 	cfg := tx.pgr.Config()
 	value, found, err := btree.Get(tx.pgr, cfg, tx.keyspaceRoot, []byte(name))
 	if err != nil {
-		return keyspaceDescriptor{}, false, mapBtreeErr(err)
+		return descriptor.Keyspace{}, false, mapBtreeErr(err)
 	}
 	if !found {
-		return keyspaceDescriptor{}, false, nil
+		return descriptor.Keyspace{}, false, nil
 	}
-	if len(value) != keyspaceDescriptorSize {
-		return keyspaceDescriptor{}, false, fmt.Errorf("%w: keyspace descriptor value length %d != %d",
-			ErrCorrupted, len(value), keyspaceDescriptorSize)
+	if len(value) != descriptor.Size {
+		return descriptor.Keyspace{}, false, fmt.Errorf("%w: keyspace descriptor value length %d != %d",
+			ErrCorrupted, len(value), descriptor.Size)
 	}
-	desc := decodeKeyspaceDescriptor(value)
-	if err := validateKeyspaceDescriptor(value, desc); err != nil {
-		return keyspaceDescriptor{}, false, fmt.Errorf("%w: %v", ErrCorrupted, err)
+	desc := descriptor.Decode(value)
+	if err := descriptor.Validate(value, desc); err != nil {
+		return descriptor.Keyspace{}, false, fmt.Errorf("%w: %v", ErrCorrupted, err)
 	}
 	return desc, true, nil
 }
@@ -539,9 +540,9 @@ func (tx *Tx) loadDescriptor(name string) (keyspaceDescriptor, bool, error) {
 // descriptor insert; keyspace-machinery tests (Kind-mismatch
 // forging, Kind-reserved forging) also use it to inject descriptors
 // the public surface cannot produce.
-func (tx *Tx) storeDescriptor(name string, desc keyspaceDescriptor) error {
-	buf := make([]byte, keyspaceDescriptorSize)
-	encodeKeyspaceDescriptor(buf, desc)
+func (tx *Tx) storeDescriptor(name string, desc descriptor.Keyspace) error {
+	buf := make([]byte, descriptor.Size)
+	descriptor.Encode(buf, desc)
 	cfg := tx.pgr.Config()
 	newRoot, err := btree.Put(btreeWriter{tx.pgr}, cfg, tx.keyspaceRoot, []byte(name), buf)
 	if err != nil {
@@ -610,7 +611,7 @@ func (tx *Tx) finalizeCreatedKeyspace(name string, core *keyspaceCore, pinned ma
 // tx's per-name cache with the supplied initial state (Clean for
 // Open paths, Created for Create paths). All Open and Create paths
 // route through here.
-func (tx *Tx) cacheOpenKeyspace(handle uniqueNameHandle, desc keyspaceDescriptor, state keyspaceState) *Keyspace {
+func (tx *Tx) cacheOpenKeyspace(handle uniqueNameHandle, desc descriptor.Keyspace, state keyspaceState) *Keyspace {
 	ks := &Keyspace{keyspaceCore: keyspaceCore{tx: tx, name: handle, desc: desc, state: state}}
 	if tx.openKeyspaces == nil {
 		tx.openKeyspaces = make(map[uniqueNameHandle]*Keyspace)
@@ -627,7 +628,7 @@ func checkKeyspaceKind(stored, requested uint8) error {
 	if stored == requested {
 		return nil
 	}
-	if stored == keyspaceKindIndexInternal {
+	if stored == descriptor.KindIndexInternal {
 		return ErrKeyspaceReserved
 	}
 	return ErrKeyspaceKindMismatch
@@ -1207,7 +1208,7 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 		return err
 	}
 	if tx.dirtyDescriptors == nil {
-		tx.dirtyDescriptors = make(map[string]keyspaceDescriptor)
+		tx.dirtyDescriptors = make(map[string]descriptor.Keyspace)
 	}
 	tx.dirtyDescriptors[name] = desc
 	tx.recalcFlushReserve()
@@ -1576,7 +1577,7 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 	handle := unique.Make(name)
 
 	var (
-		desc             keyspaceDescriptor
+		desc             descriptor.Keyspace
 		existingKS       *Keyspace
 		existingSKS      *SetKeyspace
 		needsBtreeDelete bool // true when an on-disk descriptor entry must be removed via btree.Delete at flush; false when the name lives only in-memory (state=Created)
@@ -1610,7 +1611,7 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 		desc = d
 		needsBtreeDelete = true
 	}
-	if desc.Kind == keyspaceKindIndexInternal {
+	if desc.Kind == descriptor.KindIndexInternal {
 		return ErrKeyspaceReserved
 	}
 	cfg := tx.pgr.Config()

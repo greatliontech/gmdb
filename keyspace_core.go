@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/descriptor"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -23,7 +24,7 @@ type keyspaceCore struct {
 	// descriptor.Count); the deferred-flush refactor promotes
 	// it to the on-disk keyspace B+tree at Tx.Commit's flushKeyspaces
 	// walk, not per data op.
-	desc keyspaceDescriptor
+	desc descriptor.Keyspace
 
 	// state controls how Tx.Commit's flushKeyspaces walk treats this
 	// handle: Created and Dirty cause a btree.Put on the keyspace
@@ -284,7 +285,7 @@ func (ks *keyspaceCore) NextSequence() (uint64, error) {
 // descriptorOwner interface — registryPut / registryDelete mutate the
 // descriptor in place AND call markDirty() so the
 // flushKeyspaces walk persists the mutation. Unexported.
-func (ks *keyspaceCore) descriptor() *keyspaceDescriptor {
+func (ks *keyspaceCore) descriptor() *descriptor.Keyspace {
 	return &ks.desc
 }
 
