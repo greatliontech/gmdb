@@ -831,3 +831,57 @@ func equalUint32(a, b []uint32) bool {
 	slices.Sort(y)
 	return slices.Equal(x, y)
 }
+
+func TestFindContiguousBelow(t *testing.T) {
+	b := newBitmap(t, 4096)
+	first := b.FirstDataPage()
+	// A 2-run low, a 4-run mid, a 4-run high.
+	for _, p := range []uint64{first + 10, first + 11} {
+		b.Set(p)
+	}
+	for _, p := range []uint64{first + 100, first + 101, first + 102, first + 103} {
+		b.Set(p)
+	}
+	for _, p := range []uint64{first + 900, first + 901, first + 902, first + 903} {
+		b.Set(p)
+	}
+
+	// Lowest qualifying run wins, independent of the hint.
+	b.SetHint(first + 800)
+	if p, ok := b.FindContiguousBelow(4, first+500); !ok || p != first+100 {
+		t.Errorf("FindContiguousBelow(4, mid) = (%d, %v), want (%d, true)", p, ok, first+100)
+	}
+	// The floor excludes runs that would end at or past it.
+	if p, ok := b.FindContiguousBelow(4, first+102); ok {
+		t.Errorf("FindContiguousBelow(4, floor cutting the run) = (%d, true), want none", p)
+	}
+	// n=1 degrades to a lowest-free scan below floor.
+	if p, ok := b.FindContiguousBelow(1, first+500); !ok || p != first+10 {
+		t.Errorf("FindContiguousBelow(1) = (%d, %v), want (%d, true)", p, ok, first+10)
+	}
+	// No run below a floor under the lowest free page.
+	if p, ok := b.FindContiguousBelow(2, first+10); ok {
+		t.Errorf("FindContiguousBelow below all free pages = (%d, true), want none", p)
+	}
+	// n<=0 rejected.
+	if _, ok := b.FindContiguousBelow(0, first+500); ok {
+		t.Error("FindContiguousBelow(0) = ok")
+	}
+}
+
+func TestCountFreeBelow(t *testing.T) {
+	b := newBitmap(t, 4096)
+	first := b.FirstDataPage()
+	for _, p := range []uint64{first + 3, first + 10, first + 11, first + 200} {
+		b.Set(p)
+	}
+	if n := b.CountFreeBelow(first + 12); n != 3 {
+		t.Errorf("CountFreeBelow(first+12) = %d, want 3 (the hole at first+200 is above the floor)", n)
+	}
+	if n := b.CountFreeBelow(first + 3); n != 0 {
+		t.Errorf("CountFreeBelow(first+3) = %d, want 0", n)
+	}
+	if n := b.CountFreeBelow(first + 201); n != 4 {
+		t.Errorf("CountFreeBelow(first+201) = %d, want 4", n)
+	}
+}

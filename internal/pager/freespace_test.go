@@ -803,3 +803,104 @@ func TestReclaimRPLQuarantinesOutOfRangeSegmentPage(t *testing.T) {
 		})
 	}
 }
+
+// AllocPageBelow / AllocContiguousBelow: incremental compaction's
+// consolidating allocator — the LOWEST free hole strictly below the
+// evacuation floor, probe-only (no reclaim, no extension), ok=false
+// when the region has none.
+func TestAllocBelowFloor(t *testing.T) {
+	p, bm, f := setupWriter(t, 64)
+	defer p.Close()
+	defer f.Close()
+	first := bm.FirstDataPage()
+	p.SetCommitState(40, 64, 0) // HWM above the holes
+
+	for _, id := range []uint64{first + 3, first + 20, first + 21, first + 30} {
+		bm.Set(id)
+	}
+	bm.SetHint(first + 25) // a stale LIFO hint must not matter
+
+	id, ok, err := p.AllocPageBelow(first + 10)
+	if err != nil || !ok || id != first+3 {
+		t.Fatalf("AllocPageBelow = (%d, %v, %v), want (%d, true, nil)", id, ok, err, first+3)
+	}
+	if bm.IsSet(id) {
+		t.Fatal("claimed page still free in the bitmap")
+	}
+	// Exhausted below the floor: ok=false, no error, nothing claimed.
+	if id, ok, err := p.AllocPageBelow(first + 3); err != nil || ok {
+		t.Fatalf("AllocPageBelow(exhausted) = (%d, %v, %v), want (0, false, nil)", id, ok, err)
+	}
+
+	// Contiguous: the 2-run at first+20 qualifies below a floor above it,
+	// not below one that cuts it.
+	id, ok, err = p.AllocContiguousBelow(2, first+30)
+	if err != nil || !ok || id != first+20 {
+		t.Fatalf("AllocContiguousBelow = (%d, %v, %v), want (%d, true, nil)", id, ok, err, first+20)
+	}
+	if bm.IsSet(first+20) || bm.IsSet(first+21) {
+		t.Fatal("claimed run still free in the bitmap")
+	}
+	if id, ok, err := p.AllocContiguousBelow(2, first+31); err != nil || ok {
+		t.Fatalf("AllocContiguousBelow(no run) = (%d, %v, %v), want (0, false, nil)", id, ok, err)
+	}
+}
+
+// EvacuationFloor: the exact feasibility scan — the LOWEST floor whose
+// band holds at most budget allocated pages while below-floor capacity
+// covers the band twice over plus reserve.
+func TestEvacuationFloorExact(t *testing.T) {
+	p, bm, f := setupWriter(t, 64)
+	defer p.Close()
+	defer f.Close()
+	first := bm.FirstDataPage()
+	p.SetCommitState(40, 64, 0) // HWM 40
+
+	// Layout: [first, first+20) free (20 holes), [first+20, 40) allocated.
+	for i := uint64(0); i < 20; i++ {
+		bm.Set(first + i)
+	}
+
+	// budget 100, reserve 2: feasibility fb >= 2*allocAbove + 2 →
+	// allocAbove <= 9. Scanning down from 40, the lowest feasible floor
+	// admits exactly 9 allocated band pages: floor = 40 - 9 = 31.
+	floor, ok := p.EvacuationFloor(first, 100, 2)
+	if !ok || floor != 31 {
+		t.Fatalf("EvacuationFloor = (%d, %v), want (31, true)", floor, ok)
+	}
+	// The budget caps the band when smaller than feasibility allows.
+	floor, ok = p.EvacuationFloor(first, 4, 2)
+	if !ok || floor != 36 {
+		t.Fatalf("EvacuationFloor(budget 4) = (%d, %v), want (36, true)", floor, ok)
+	}
+	// A larger reserve shrinks the feasible band.
+	floor, ok = p.EvacuationFloor(first, 100, 12)
+	if !ok || floor != 36 {
+		t.Fatalf("EvacuationFloor(reserve 12) = (%d, %v), want (36, true)", floor, ok)
+	}
+	// No free capacity at all → infeasible.
+	for i := uint64(0); i < 20; i++ {
+		bm.Clear(first + i)
+	}
+	if _, ok := p.EvacuationFloor(first, 100, 2); ok {
+		t.Fatal("EvacuationFloor with zero capacity = ok")
+	}
+	// No data region → infeasible.
+	if _, ok := p.EvacuationFloor(40, 100, 2); ok {
+		t.Fatal("EvacuationFloor with empty region = ok")
+	}
+	// Zero budget → infeasible.
+	for i := uint64(0); i < 20; i++ {
+		bm.Set(first + i)
+	}
+	if _, ok := p.EvacuationFloor(first, 0, 2); ok {
+		t.Fatal("EvacuationFloor with zero budget = ok")
+	}
+	// Entirely free region (nothing allocated to relocate) → infeasible.
+	for i := first + 20; i < 40; i++ {
+		bm.Set(i)
+	}
+	if _, ok := p.EvacuationFloor(first, 100, 2); ok {
+		t.Fatal("EvacuationFloor over an all-free region = ok")
+	}
+}

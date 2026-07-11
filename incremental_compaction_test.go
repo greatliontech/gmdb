@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
+	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
 // evacFloorAt returns a high-watermark evacuation floor at the midpoint of
@@ -28,19 +32,29 @@ func evacFloorAt(db *DB) uint64 {
 func runCompactForest(t *testing.T, db *DB, floor uint64, budget int) int {
 	t.Helper()
 	ctx := context.Background()
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		t.Fatalf("Begin(compact): %v", err)
+	for budget >= 1 {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("Begin(compact): %v", err)
+		}
+		moved, err := tx.compactForest(floor, budget)
+		if errors.Is(err, errCompactionSpaceExhausted) {
+			// Mirror the production driver: the batch outran the
+			// below-floor capacity — roll back and retry smaller.
+			_ = tx.Rollback()
+			budget /= 2
+			continue
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("compactForest: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit(compact): %v", err)
+		}
+		return moved
 	}
-	moved, err := tx.compactForest(func(id uint64) bool { return id >= floor }, budget)
-	if err != nil {
-		_ = tx.Rollback()
-		t.Fatalf("compactForest: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("Commit(compact): %v", err)
-	}
-	return moved
+	return 0
 }
 
 func assertCheckClean(t *testing.T, db *DB, when string) {
@@ -146,6 +160,15 @@ func TestCompactForestPreservesForest(t *testing.T) {
 	}
 	if err := tx2.Commit(); err != nil {
 		t.Fatalf("Commit delete: %v", err)
+	}
+	// Advance the reclamation bound past the deletes so the relocation
+	// pass's eager reclaim can return their pages as below-floor
+	// capacity (the consolidating allocator never extends the file).
+	txnudge, _ := db.Begin(ctx)
+	dn, _ := txnudge.OpenKeyspace("tiny")
+	_ = dn.Put([]byte("nudge"), []byte("x"))
+	if err := txnudge.Commit(); err != nil {
+		t.Fatalf("Commit nudge: %v", err)
 	}
 	survives := func(i int) bool { return i < 300 || i >= 1100 }
 
@@ -255,6 +278,33 @@ func TestCompactForestBudgetBound(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
+	// Free holes + bound advance: the consolidating allocator needs
+	// existing below-bound capacity (it never extends the file). The
+	// pad keyspace's create/delete churn supplies it via the CoW
+	// retirees the delete + nudge commits release (DeleteKeyspace
+	// itself defers the tree teardown to maintenance, disabled here)
+	// — without touching the probed rows.
+	txp, _ := db.Begin(ctx)
+	pad, _ := txp.CreateKeyspace("pad")
+	for i := range 400 {
+		_ = pad.Put(fmt.Appendf(nil, "pad%06d", i), bytes.Repeat([]byte{'p'}, 200))
+	}
+	if err := txp.Commit(); err != nil {
+		t.Fatalf("Commit pad: %v", err)
+	}
+	txd, _ := db.Begin(ctx)
+	if err := txd.DeleteKeyspace("pad"); err != nil {
+		t.Fatalf("DeleteKeyspace pad: %v", err)
+	}
+	if err := txd.Commit(); err != nil {
+		t.Fatalf("Commit delete: %v", err)
+	}
+	txn, _ := db.Begin(ctx)
+	ksn, _ := txn.OpenKeyspace("k")
+	_ = ksn.Put([]byte("nudge"), []byte("x"))
+	if err := txn.Commit(); err != nil {
+		t.Fatalf("Commit nudge: %v", err)
+	}
 
 	floor := uint64(2) + uint64(db.Meta().BitmapPages) // floor = firstData ⇒ whole forest eligible
 	const budget = 5
@@ -290,7 +340,7 @@ func TestCompactForestEmpty(t *testing.T) {
 	defer db.Close()
 
 	tx, _ := db.Begin(ctx)
-	moved, err := tx.compactForest(func(uint64) bool { return true }, 1000)
+	moved, err := tx.compactForest(0, 1000)
 	if err != nil || moved != 0 {
 		t.Errorf("empty forest: moved=%d err=%v, want 0,nil", moved, err)
 	}
@@ -300,7 +350,7 @@ func TestCompactForestEmpty(t *testing.T) {
 	tx2, _ := db.Begin(ctx)
 	ks, _ := tx2.CreateKeyspace("k")
 	_ = ks.Put([]byte("a"), []byte("b"))
-	moved, err = tx2.compactForest(func(uint64) bool { return true }, 0)
+	moved, err = tx2.compactForest(0, 0)
 	if err != nil || moved != 0 {
 		t.Errorf("zero budget: moved=%d err=%v, want 0,nil", moved, err)
 	}
@@ -330,37 +380,6 @@ func TestCompactionTriggered(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := compactionTriggered(c.attempts, c.fragFails, c.threshold); got != c.want {
 				t.Errorf("compactionTriggered(%d,%d,%g)=%v, want %v", c.attempts, c.fragFails, c.threshold, got, c.want)
-			}
-		})
-	}
-}
-
-func TestEvacuationFloor(t *testing.T) {
-	const fd, hwm = uint64(10), uint64(1010) // dataSpan 1000
-	cases := []struct {
-		name      string
-		firstData uint64
-		hwm       uint64
-		free      uint64
-		budget    int
-		wantFloor uint64
-		wantOK    bool
-	}{
-		{"no data region", fd, fd, 0, 100, 0, false},
-		{"hwm below firstData", fd, 5, 0, 100, 0, false},
-		{"zero budget", fd, hwm, 0, 0, 0, false},
-		{"entirely free", fd, hwm, 1000, 100, 0, false},
-		{"dense region thin band", fd, hwm, 0, 100, 910, true},     // density 1.0, band 100
-		{"sparse region wide band", fd, hwm, 900, 100, fd, true},   // density 0.1, band 1000 -> whole
-		{"mid density", fd, hwm, 500, 100, 810, true},              // density 0.5, band 200
-		{"budget covers whole region", fd, hwm, 0, 2000, fd, true}, // band 2000 -> whole
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			floor, ok := evacuationFloor(c.firstData, c.hwm, c.free, c.budget)
-			if ok != c.wantOK || (ok && floor != c.wantFloor) {
-				t.Errorf("evacuationFloor(%d,%d,%d,%d)=(%d,%v), want (%d,%v)",
-					c.firstData, c.hwm, c.free, c.budget, floor, ok, c.wantFloor, c.wantOK)
 			}
 		})
 	}
@@ -477,7 +496,7 @@ func TestCompactionPassReturnsTxTooLargeAndRollsBack(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 1 << 20,
-		MaxTxBufferBytes: 1 << 20, // 256 pages — smaller than the forest
+		MaxTxBufferBytes: 480 << 10, // 120 pages of slab — fixture batches fit; a full-band relocation does not
 		Maintenance:      MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
@@ -485,8 +504,32 @@ func TestCompactionPassReturnsTxTooLargeAndRollsBack(t *testing.T) {
 	}
 	defer db.Close()
 	buildOversizeForest(t, db)
+	// LOW capacity: deleting the first eight batches (one tx each, to
+	// fit the reduced slab) releases their overflow chains and leaves
+	// inline (row deletes free chains immediately; a DeleteKeyspace
+	// defers the tree teardown to maintenance, which is disabled
+	// here) — enough below-floor holes that the surviving batches'
+	// relocation cascade overruns the slab before the capacity runs
+	// out.
+	for batch := range 8 {
+		txd, _ := db.Begin(ctx)
+		ksd, _ := txd.OpenKeyspace("k")
+		for i := range 30 {
+			_ = ksd.Delete(fmt.Appendf(nil, "ovf%03d-%03d", batch, i))
+		}
+		if err := txd.Commit(); err != nil {
+			t.Fatalf("Commit delete %d: %v", batch, err)
+		}
+	}
+	txn, _ := db.Begin(ctx)
+	ksn, _ := txn.OpenKeyspace("k")
+	_ = ksn.Put([]byte("nudge"), []byte("x"))
+	if err := txn.Commit(); err != nil {
+		t.Fatalf("Commit nudge: %v", err)
+	}
 
-	// Huge budget ⇒ floor=firstData ⇒ relocate the whole (oversize) forest.
+	// Huge budget ⇒ the feasibility floor drops deep into the forest ⇒
+	// the relocation cascade overruns MaxTxBufferBytes.
 	_, err = db.compactionPass(ctx, 1<<20)
 	if !errors.Is(err, ErrTxTooLarge) {
 		t.Fatalf("compactionPass err = %v, want ErrTxTooLarge", err)
@@ -544,17 +587,47 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	// One overflow value (multi-page chain) plus filler so the tree has shape.
+	// LOW capacity first: a twin chain + filler rows created BEFORE
+	// the target chain occupy low ids; deleting them afterwards leaves
+	// a contiguous below-bound run (overflow chains are contiguous by
+	// construction) plus leaf holes BELOW the corrupt chain — trailing
+	// frees would just tail-refund away, and the relocation pass draws
+	// targets from existing capacity only.
 	tx, _ := db.Begin(ctx)
 	ks, _ := tx.CreateKeyspace("ovf")
-	if err := ks.Put([]byte("big"), bytes.Repeat([]byte{0xCC}, 9000)); err != nil {
-		t.Fatalf("Put big: %v", err)
+	if err := ks.Put([]byte("big2"), bytes.Repeat([]byte{0xDD}, 9000)); err != nil {
+		t.Fatalf("Put big2: %v", err)
 	}
-	for i := range 20 {
-		_ = ks.Put(fmt.Appendf(nil, "s%03d", i), []byte("v"))
+	for i := range 200 {
+		_ = ks.Put(fmt.Appendf(nil, "s%03d", i), bytes.Repeat([]byte{'v'}, 64))
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
+	}
+	tx1b, _ := db.Begin(ctx)
+	ks1b, _ := tx1b.OpenKeyspace("ovf")
+	if err := ks1b.Put([]byte("big"), bytes.Repeat([]byte{0xCC}, 9000)); err != nil {
+		t.Fatalf("Put big: %v", err)
+	}
+	if err := tx1b.Commit(); err != nil {
+		t.Fatalf("Commit big: %v", err)
+	}
+	txd, _ := db.Begin(ctx)
+	ksd, _ := txd.OpenKeyspace("ovf")
+	if err := ksd.Delete([]byte("big2")); err != nil {
+		t.Fatalf("Delete big2: %v", err)
+	}
+	for i := range 150 {
+		_ = ksd.Delete(fmt.Appendf(nil, "s%03d", i))
+	}
+	if err := txd.Commit(); err != nil {
+		t.Fatalf("Commit delete: %v", err)
+	}
+	txn, _ := db.Begin(ctx)
+	ksn, _ := txn.OpenKeyspace("ovf")
+	_ = ksn.Put([]byte("nudge"), []byte("x"))
+	if err := txn.Commit(); err != nil {
+		t.Fatalf("Commit nudge: %v", err)
 	}
 
 	// Locate the overflow chain's first page, then a FOLLOWER (first+1).
@@ -576,11 +649,11 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 	}
 	follower := first + 1
 
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	// Corrupt the follower's content (leaving its stored footer) → footer
-	// verification will mismatch on read.
+	// Corrupt the follower's content IN PLACE (leaving its stored
+	// footer) → footer verification mismatches on read. The DB stays
+	// open: a clean Close's checkpoint would consume the free capacity
+	// the fixture just arranged, and the mmap observes the external
+	// write through the shared page cache.
 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatalf("open for corruption: %v", err)
@@ -590,19 +663,10 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 	}
 	f.Close()
 
-	db2, err := Open(ctx, path, Options{
-		PageSize: 4096, MinSize: 16, MaxSize: 1 << 20,
-		Maintenance: MaintenanceOptions{Disable: true},
-	})
-	if err != nil {
-		t.Fatalf("re-Open: %v", err)
-	}
-	defer db2.Close()
-
 	// Relocate everything (floor=firstData): relocating the chain reads the
 	// corrupt follower via pw.Page → ErrBadPageChecksum, rolled back.
-	tx2, _ := db2.Begin(ctx)
-	_, err = tx2.compactForest(func(uint64) bool { return true }, 1<<20)
+	tx2, _ := db.Begin(ctx)
+	_, err = tx2.compactForest(0, 1<<20)
 	tx2.Rollback()
 	if !errors.Is(err, ErrBadPageChecksum) {
 		t.Fatalf("compactForest over a bitrotted follower err = %v, want ErrBadPageChecksum", err)
@@ -674,35 +738,53 @@ func TestCompactionPassRelocatesRPLSegments(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Dense fill, then scattered low deletes → holes below any
-	// sensible floor.
+	// DURABLE low holes: fill an early region A whose leaf pages sit
+	// below the later region B's, then delete A whole — the freed
+	// pages are NON-trailing (B's live pages sit above them), so the
+	// tail refund cannot take them and they survive as below-floor
+	// capacity for the prefix relocation's homes.
 	tx, _ := db.Begin(ctx)
 	ks, err := tx.CreateKeyspace("k")
 	if err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	for i := range 600 {
-		if err := ks.Put(fmt.Appendf(nil, "key%06d", i), make([]byte, 256)); err != nil {
-			t.Fatalf("Put: %v", err)
+	for i := range 900 {
+		if err := ks.Put(fmt.Appendf(nil, "a%06d", i), make([]byte, 256)); err != nil {
+			t.Fatalf("Put a: %v", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		t.Fatalf("commit fill: %v", err)
+		t.Fatalf("commit fill A: %v", err)
+	}
+	txb, _ := db.Begin(ctx)
+	ksb, _ := txb.OpenKeyspace("k")
+	for i := range 300 {
+		if err := ksb.Put(fmt.Appendf(nil, "b%06d", i), make([]byte, 256)); err != nil {
+			t.Fatalf("Put b: %v", err)
+		}
+	}
+	if err := txb.Commit(); err != nil {
+		t.Fatalf("commit fill B: %v", err)
 	}
 	txd, _ := db.Begin(ctx)
 	ksd, _ := txd.OpenKeyspace("k")
-	for i := 0; i < 200; i += 2 {
-		if err := ksd.Delete(fmt.Appendf(nil, "key%06d", i)); err != nil {
-			t.Fatalf("Delete: %v", err)
-		}
+	if _, err := ksd.DeleteRange([]byte("a"), []byte("b")); err != nil {
+		t.Fatalf("DeleteRange A: %v", err)
 	}
 	if err := txd.Commit(); err != nil {
 		t.Fatalf("commit holes: %v", err)
 	}
-	// One reclaim pass returns the holes to the bitmap before the
-	// reader pins the bound.
-	if _, err := db.compactionPass(ctx, 64); err != nil {
-		t.Fatalf("pre-pass: %v", err)
+	txnudge, _ := db.Begin(ctx)
+	ksnudge, _ := txnudge.OpenKeyspace("k")
+	_ = ksnudge.Put([]byte("nudge"), []byte("x"))
+	if err := txnudge.Commit(); err != nil {
+		t.Fatalf("commit nudge: %v", err)
+	}
+	// One reclaim-only commit returns the holes to the bitmap before
+	// the reader pins the bound — a full pass would consume them as
+	// relocation targets, leaving the prefix relocation no homes.
+	if !db.reclaimOrAdvanceCommit(ctx) {
+		t.Fatal("pre-reclaim did not commit")
 	}
 
 	// Lagging reader: pins the reclamation bound from here on.
@@ -717,7 +799,7 @@ func TestCompactionPassRelocatesRPLSegments(t *testing.T) {
 	for round := range 6 {
 		txc, _ := db.Begin(ctx)
 		ksc, _ := txc.OpenKeyspace("k")
-		for i := range 60 {
+		for i := range 10 {
 			if err := ksc.Put(fmt.Appendf(nil, "churn%02d-%04d", round, i), make([]byte, 256)); err != nil {
 				t.Fatalf("churn put: %v", err)
 			}
@@ -745,10 +827,9 @@ func TestCompactionPassRelocatesRPLSegments(t *testing.T) {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
 		db.mu.Lock()
-		hwm := db.currentMeta.HighWaterMark
 		firstData := uint64(2) + uint64(db.currentMeta.BitmapPages)
 		db.mu.Unlock()
-		floor, ok := evacuationFloor(firstData, hwm, pgr.NumFreePages(), 64)
+		floor, ok := pgr.EvacuationFloor(firstData, 64, uint64(pgr.RPLRelocationPrefixLen(firstData))+2)
 		if !ok {
 			break
 		}
@@ -768,5 +849,284 @@ func TestCompactionPassRelocatesRPLSegments(t *testing.T) {
 	}
 	if !relocatedSome {
 		t.Fatal("pre-existing RPL segments never left the evacuation band across 20 passes (reader still pinning)")
+	}
+}
+
+// Compaction passes must CONVERGE: relocated pages receive below-floor
+// ids (the consolidating allocator), so successive passes drain the
+// band and the trigger quiesces with the file near its live size.
+// Pre-fix, relocations drew from the LIFO hint — which each pass's
+// eager reclaim had just pointed INTO the band — so the band refilled
+// every pass: moved stayed positive forever and the HWM plateaued far
+// above the live size (background-maintenance.md §Incremental
+// Compaction step 2 + convergence clause).
+func TestCompactionConvergesToQuiescence(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 1 << 20,
+		ShrinkThreshold: 1,
+		Maintenance:     MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// 12000 rows, then delete a large LOW range: the live set is
+	// top-heavy and dense, global free density is low, so
+	// the evacuation floor lands well above the first data page (the STRICT
+	// regime) with a band population far above the per-pass budget —
+	// exactly the partial-evacuation steady state where pre-fix
+	// relocations re-landed in the band (the LIFO hint pointed at the
+	// holes the pass's own eager reclaim just opened there) and the
+	// tail refund could never pass the refilled band.
+	// An index rides along so the index forest (registry sub-tree +
+	// index data tree) is part of the relocation surface — it shares
+	// the pass's consolidating writer.
+	decl := &IndexDecl{
+		Name:    "byval",
+		Columns: []IndexColumn{{Name: "v"}},
+		Extract: func(key, value []byte) []IndexEntry {
+			return []IndexEntry{{Cols: [][]byte{value}}}
+		},
+	}
+	tx, _ := db.Begin(ctx)
+	ks, err := tx.CreateKeyspace("k", decl)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for i := range 12000 {
+		if err := ks.Put(fmt.Appendf(nil, "key%06d", i), fmt.Appendf(nil, "val%06d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	tx.Commit()
+	txd, _ := db.Begin(ctx)
+	ksd, _ := txd.OpenKeyspace("k", decl)
+	if _, err := ksd.DeleteRange(fmt.Appendf(nil, "key%06d", 100), fmt.Appendf(nil, "key%06d", 8000)); err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	txd.Commit()
+	txn, _ := db.Begin(ctx)
+	ksn, _ := txn.OpenKeyspace("k", decl)
+	_ = ksn.Put([]byte("nudge"), []byte("x"))
+	txn.Commit()
+
+	initialHWM := db.Meta().HighWaterMark
+	firstData := uint64(2) + uint64(db.Meta().BitmapPages)
+
+	// ~200 tiny surviving rows fit in a handful of pages; the bound is
+	// generous yet unmistakably below any band-refill plateau (pre-fix
+	// the plateau sat far above it: relocations re-landed in the band,
+	// so the tail refund could never pass it). Passes may keep
+	// repacking a tiny dense file (the whole-region regime; the
+	// fragmentation trigger governs invocation in production), so the
+	// convergence pin is the HWM reaching the live-size bound and
+	// never regressing — not moved hitting zero.
+	bound := firstData + 100 // ~4000 tiny live rows ≈ 80 pages + slack
+	reachedAt := -1
+	prev := initialHWM
+	for pass := range 60 {
+		// The production driver: handles mid-pass space exhaustion by
+		// landing the reclaim/bound-advance commit and retrying.
+		db.runCompaction(ctx)
+		hwm := db.Meta().HighWaterMark
+		if hwm > prev {
+			t.Errorf("pass %d: HWM grew %d -> %d", pass, prev, hwm)
+		}
+		prev = hwm
+		if hwm <= bound {
+			reachedAt = pass
+			break
+		}
+	}
+	if reachedAt < 0 {
+		t.Fatalf("HWM plateaued at %d after 60 passes (initial %d, live-size bound %d): the passes are not converging (band refill, or a frozen reclamation bound)", prev, initialHWM, bound)
+	}
+
+	// Full drain: two more passes land the trailing retirees — the
+	// declining pass's bound-advance commit is what makes the LAST
+	// batch reclaimable (without it the final retirees stay pending
+	// forever and the file holds their pages).
+	db.runCompaction(ctx)
+	db.runCompaction(ctx)
+	if rplE := db.Meta().RPLEntryCount; rplE != 0 {
+		t.Errorf("RPL not drained after convergence: %d entries still pending (the declining pass never advances the reclamation bound)", rplE)
+	}
+
+	// Integrity: survivors intact, deleted gone, Check clean.
+	rtx, _ := db.Begin(ctx)
+	rks, _ := rtx.OpenKeyspace("k", decl)
+	for _, i := range []int{0, 99, 8000, 11999} {
+		if _, err := rks.Get(fmt.Appendf(nil, "key%06d", i)); err != nil {
+			t.Errorf("survivor key%06d missing: %v", i, err)
+		}
+	}
+	if _, err := rks.Get(fmt.Appendf(nil, "key%06d", 1500)); err == nil {
+		t.Errorf("deleted key present")
+	}
+	rtx.Rollback()
+	assertCheckClean(t, db, "post-convergence")
+}
+
+// compactionWriter is the consolidating allocator's wiring: allocations
+// draw the LOWEST free hole strictly below allocBound regardless of the
+// LIFO hint (which eager reclaim points INTO the band being drained),
+// count against the pass-wide allowance, and abort with the space
+// sentinel rather than fall back to the base allocator's hint/extension
+// tiers.
+func TestCompactionWriterAllocPolicy(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.OpenFile(filepath.Join(dir, "db.gmdb"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	const pages = 64
+	if err := f.Truncate(int64(pages) * 4096); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	pool := pager.NewBufPool(4096)
+	p, err := pager.NewWriter(f, page.Config{PageSize: 4096}, int64(pages)*4096, pool, 16<<20)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer p.Close()
+	bm := bitmap.New(make([]byte, 4096), 4096, 1, pages)
+	p.AttachBitmap(bm)
+	p.SetCommitState(50, pages, 0) // HWM 50
+	first := bm.FirstDataPage()
+
+	// Holes below the bound (low) AND above it (in-band, near HWM);
+	// the hint points at the in-band ones — the base allocator would
+	// take those and refill the band.
+	low := []uint64{first + 4, first + 5, first + 6, first + 9}
+	high := []uint64{first + 40, first + 41, first + 42}
+	for _, id := range append(append([]uint64{}, low...), high...) {
+		bm.Set(id)
+	}
+	bm.SetHint(first + 40)
+
+	bound := first + 20
+	allowance := uint64(3)
+	w := compactionWriter{btreeWriter{p}, bound, &allowance}
+
+	id, err := w.AllocPage()
+	if err != nil || id != first+4 {
+		t.Fatalf("AllocPage = (%d, %v), want the lowest below-bound hole %d", id, err, first+4)
+	}
+	// Contiguous: the below-bound pair, never the in-band run.
+	id, err = w.AllocContiguous(2)
+	if err != nil {
+		t.Fatalf("AllocContiguous: %v", err)
+	}
+	if id >= bound {
+		t.Fatalf("AllocContiguous = %d — an at/above-bound target (band refill)", id)
+	}
+	// Allowance exhausted (3 pages consumed): the sentinel, never a
+	// fallback into the in-band holes.
+	if _, err := w.AllocPage(); !errors.Is(err, errCompactionSpaceExhausted) {
+		t.Fatalf("AllocPage past the allowance = %v, want errCompactionSpaceExhausted", err)
+	}
+	// Below-bound space exhausted with allowance remaining: sentinel
+	// too (the in-band holes are never targets). One below-bound hole
+	// (first+9) remains — consume it, then require the sentinel.
+	allowance = 5
+	if id, err := w.AllocPage(); err != nil || id != first+9 {
+		t.Fatalf("AllocPage = (%d, %v), want the last below-bound hole %d", id, err, first+9)
+	}
+	if _, err := w.AllocPage(); !errors.Is(err, errCompactionSpaceExhausted) {
+		t.Fatalf("AllocPage past below-bound capacity = %v, want errCompactionSpaceExhausted", err)
+	}
+	// Contiguous exhaustion below the bound: the in-band 3-run at
+	// first+40 must never be the fallback.
+	if _, err := w.AllocContiguous(2); !errors.Is(err, errCompactionSpaceExhausted) {
+		t.Fatalf("AllocContiguous past below-bound capacity = %v, want errCompactionSpaceExhausted", err)
+	}
+	if used := bm.IsSet(first + 40); !used {
+		t.Fatal("an in-band hole was consumed (base-allocator fallback)")
+	}
+}
+
+// runCompaction must TERMINATE when below-floor capacity is
+// unsatisfiable and the reclamation bound is frozen: a pinned reader
+// stops the bound regardless of how many commits land, so an
+// unconditional advance-commit-and-retry spins the maintenance
+// goroutine at ~1000 empty commits/s until the reader ends (the
+// once-per-invocation advance cap is the termination bound). The
+// fixture makes the floor feasible by COUNT while a 12-page contiguous
+// chain in the band cannot find a below-floor run → the sentinel path,
+// with the RPL held non-empty by post-pin churn.
+func TestRunCompactionTerminatesOnFrozenBound(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 1 << 20,
+		ShrinkThreshold: 1,
+		Maintenance:     MaintenanceOptions{Disable: true},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// One-page rows alternating across two keyspaces → page ownership
+	// interleaves, so deleting keyspace "del" leaves strictly
+	// SINGLE-PAGE holes: the floor is feasible by COUNT, but the
+	// 12-page chain relocation finds no contiguous below-floor run —
+	// the sentinel path, every pass.
+	tx, _ := db.Begin(ctx)
+	ka, _ := tx.CreateKeyspace("keep")
+	kb, _ := tx.CreateKeyspace("del")
+	for i := range 400 {
+		if err := ka.Put(fmt.Appendf(nil, "a%06d", i), bytes.Repeat([]byte{'a'}, 3500)); err != nil {
+			t.Fatalf("Put a: %v", err)
+		}
+		if err := kb.Put(fmt.Appendf(nil, "b%06d", i), bytes.Repeat([]byte{'b'}, 3500)); err != nil {
+			t.Fatalf("Put b: %v", err)
+		}
+	}
+	tx.Commit()
+	txd, _ := db.Begin(ctx)
+	kd, _ := txd.OpenKeyspace("del")
+	if _, err := kd.DeleteRange([]byte("b"), []byte("c")); err != nil {
+		t.Fatalf("DeleteRange: %v", err)
+	}
+	txd.Commit()
+	txe, _ := db.Begin(ctx)
+	ke, _ := txe.OpenKeyspace("keep")
+	_ = ke.Put([]byte("nudge0"), []byte("x"))
+	txe.Commit()
+	// The large contiguous chain lands high (the band).
+	txc, _ := db.Begin(ctx)
+	ksc, _ := txc.OpenKeyspace("keep")
+	if err := ksc.Put([]byte("zzz-big"), bytes.Repeat([]byte{'B'}, 48<<10)); err != nil {
+		t.Fatalf("Put big: %v", err)
+	}
+	txc.Commit()
+
+	// Pin the bound, then churn so the RPL stays non-empty.
+	pin, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
+	}
+	defer pin.Rollback()
+	txn, _ := db.Begin(ctx)
+	ksn, _ := txn.OpenKeyspace("keep")
+	_ = ksn.Put([]byte("nudge"), []byte("x"))
+	txn.Commit()
+
+	before := db.Meta().TxnID
+	done := make(chan struct{})
+	go func() {
+		db.runCompaction(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runCompaction did not return within 30s — the sentinel path is spinning against the frozen bound")
+	}
+	if delta := db.Meta().TxnID - before; delta > 16 {
+		t.Fatalf("runCompaction committed %d transactions in one invocation (want a small bounded count) — empty-commit churn against the frozen bound", delta)
 	}
 }

@@ -301,7 +301,6 @@ func TestExtractorPanicMidRebuildLeaksNothing(t *testing.T) {
 	}
 }
 
-
 // An EMPTY-parent Rebuild is a success: its registry write must
 // persist (the panic-restore defer must Release, not Restore, on this
 // early success return). The not-cached path is the sharp edge — the

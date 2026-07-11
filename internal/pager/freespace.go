@@ -825,6 +825,110 @@ func (p *Pager) AllocContiguous(n uint32) (uint64, error) {
 	return firstID, nil
 }
 
+// AllocPageBelow allocates the LOWEST free bitmap page strictly below
+// floor — incremental compaction's consolidating allocator
+// (background-maintenance.md §Incremental Compaction step 2: a
+// relocated page must receive a low id so it stops matching the
+// evacuation floor; the LIFO-hinted AllocPage would hand back the
+// band pages the pass's own eager reclaim just freed, refilling the
+// band it is draining). Probe-only tiers: no loose-page reuse, no RPL
+// reclamation, no extension — ok=false when no free page below floor
+// exists, and the caller decides between falling back and declining.
+func (p *Pager) AllocPageBelow(floor uint64) (uint64, bool, error) {
+	if p.readOnly {
+		return 0, false, ErrReadOnly
+	}
+	if p.bitmap == nil {
+		return 0, false, ErrFreespaceUnconfigured
+	}
+	id, ok := p.bitmap.FindFirstBelowFrom(0, floor)
+	if !ok {
+		return 0, false, nil
+	}
+	if err := p.claimBitmapPage(id); err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
+// FreePagesBelow reports how many free bitmap pages lie strictly
+// below floor — the below-floor capacity incremental compaction
+// budgets its relocations against.
+func (p *Pager) FreePagesBelow(floor uint64) uint64 {
+	if p.bitmap == nil {
+		return 0
+	}
+	return p.bitmap.CountFreeBelow(floor)
+}
+
+// EvacuationFloor chooses the incremental-compaction evacuation floor
+// by exact feasibility scan (background-maintenance.md §Incremental
+// Compaction step 1): the LOWEST floor whose band [floor, HWM) holds
+// at most budget allocated pages while the free capacity strictly
+// below it covers the band twice over (CoW-cascade headroom) plus
+// reserve (RPL prefix homes + head-segment append). Every hole the
+// pass may consume then lies strictly below every page it relocates —
+// relocations are strictly downward, the property the convergence
+// argument needs. ok=false when no floor is feasible (no free
+// capacity, or nothing allocated above any feasible floor) — the
+// caller declines the pass. O(band) scan, bounded by budget.
+func (p *Pager) EvacuationFloor(firstData, budget, reserve uint64) (uint64, bool) {
+	if p.bitmap == nil || budget == 0 {
+		return 0, false
+	}
+	hwm := p.highWaterMark
+	if hwm <= firstData {
+		return 0, false
+	}
+	totalFree := p.bitmap.CountFreeBelow(hwm)
+	var freeAbove, allocAbove, best uint64
+	ok := false
+	for floor := hwm; floor > firstData; floor-- {
+		id := floor - 1 // candidate band grows downward to include id
+		if p.bitmap.IsSet(id) {
+			freeAbove++
+		} else {
+			allocAbove++
+			if allocAbove > budget {
+				break
+			}
+		}
+		if allocAbove == 0 {
+			continue // an all-free band relocates nothing
+		}
+		if totalFree-freeAbove >= 2*allocAbove+reserve {
+			best, ok = id, true
+		}
+	}
+	return best, ok
+}
+
+// AllocContiguousBelow is AllocPageBelow's n-page variant: the lowest
+// run of n consecutive free pages entirely below floor, or ok=false.
+// Same probe-only contract — never reclaims or extends.
+func (p *Pager) AllocContiguousBelow(n uint32, floor uint64) (uint64, bool, error) {
+	if p.readOnly {
+		return 0, false, ErrReadOnly
+	}
+	if p.bitmap == nil {
+		return 0, false, ErrFreespaceUnconfigured
+	}
+	if n == 0 {
+		return 0, false, fmt.Errorf("pager: AllocContiguousBelow: n must be > 0")
+	}
+	if n == 1 {
+		return p.AllocPageBelow(floor)
+	}
+	firstID, ok := p.bitmap.FindContiguousBelow(int(n), floor)
+	if !ok {
+		return 0, false, nil
+	}
+	if err := p.reserveBitmapRun(firstID, n); err != nil {
+		return 0, false, err
+	}
+	return firstID, true, nil
+}
+
 // ConsumeContiguousAllocStats atomically reads and resets the contiguous-
 // allocation counters accumulated since the last call: attempts =
 // multi-page (n>1) AllocContiguous calls; fragFails = those whose first

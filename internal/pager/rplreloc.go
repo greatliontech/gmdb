@@ -19,7 +19,7 @@ import "fmt"
 // own commit). floor must be a data-region page id BELOW the
 // high-water mark — homes are claimed strictly below floor, and a
 // floor above the HWM could claim homes past it, which Check's
-// hwm-bounded RPL walk rejects (the compaction pass's evacuationFloor
+// hwm-bounded RPL walk rejects (the compaction pass's evacuation-floor selection
 // satisfies this by construction). 0 disarms.
 func (p *Pager) RequestRPLRelocation(floor uint64) {
 	p.rplRelocFloor = floor
@@ -197,4 +197,20 @@ func (p *Pager) relocateRPLPrefix() error {
 		prevNewID = newID
 	}
 	return nil
+}
+
+// RPLRelocationPrefixLen reports how many segment COPIES a chain-prefix
+// relocation at floor would place below the floor: the full prefix from
+// the deepest at-or-above-floor segment to the head (free-space.md §RPL
+// segment relocation — newer below-floor segments in the prefix are
+// copied too, so the home count exceeds the in-band count). 0 when no
+// segment sits at or above floor. The compaction pass reserves this
+// many below-floor holes before budgeting its tree relocations.
+func (p *Pager) RPLRelocationPrefixLen(floor uint64) int {
+	for i, seg := range p.rplSegments {
+		if seg.PageID >= floor {
+			return len(p.rplSegments) - i
+		}
+	}
+	return 0
 }

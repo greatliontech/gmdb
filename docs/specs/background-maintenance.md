@@ -396,10 +396,22 @@ than waiting for the lazy on-allocation reclaim), and relocates up to
 `CompactionBatchSize` pages (default 1024) by **high-watermark
 evacuation**:
 
-1. Choose an evacuation floor near the high-water mark, sized
-   so the band `[floor, HighWaterMark)` holds roughly
-   `CompactionBatchSize` allocated pages (estimated from the
-   free-page density). Walk every B+tree in the forest: the
+1. Choose an evacuation floor by EXACT feasibility scan over the
+   allocation bitmap: the lowest floor whose band
+   `[floor, HighWaterMark)` holds at most `CompactionBatchSize`
+   allocated pages while the free capacity strictly below the
+   floor covers the band twice over (CoW-cascade headroom) plus a
+   reserve for the RPL chain-prefix relocation's homes and the
+   commit's head-segment append. Every hole the pass may consume
+   then lies strictly below every page it relocates, so every
+   relocation is strictly DOWNWARD — the property the convergence
+   argument below rests on. (A density ESTIMATE is not
+   sufficient: a budget large relative to the region collapses an
+   estimated floor to the first data page, allocation targets and
+   sources interleave, and passes shuffle the same pages between
+   hole sets forever.) No feasible floor ⇒ the pass declines
+   relocation (see the shrink paragraph for what still commits).
+   Walk every B+tree in the forest: the
    keyspace descriptor tree, each keyspace's data tree, its
    index registry sub-tree and index data trees, and any
    set-keyspace nested trees. RPL segment pages are **never
@@ -415,10 +427,26 @@ evacuation**:
    placement rules live in that section).
 2. Relocate each allocated page at or above the floor: it is
    CoW'd to a fresh id, which the consolidating allocator draws
-   from a low free hole; every owning parent, descriptor, and
-   `KeyspaceRoot` is re-pointed so the relocated subtree stays
-   reachable (the same bottom-up CoW cascade a normal write
-   uses).
+   from the LOWEST free hole strictly below the floor; every
+   owning parent, descriptor, and `KeyspaceRoot` is re-pointed so
+   the relocated subtree stays reachable (the same bottom-up CoW
+   cascade a normal write uses). The allocator has NO fallback
+   tier: it never extends the file (extension would place live
+   pages at the file top, re-creating the band being drained) and
+   never takes an at-or-above-floor hole (the refill pathology).
+   Exhausting the below-floor capacity mid-pass aborts and rolls
+   the pass back; the driver lands the reclaim/bound-advance
+   commit described in the shrink paragraph AT MOST ONCE per
+   maintenance invocation and retries, and every further
+   exhaustion halves the batch — the earlier relocations then
+   fit. The once-per-invocation cap is the termination bound: the
+   reclamation bound moves at most once per commit and a
+   reader-pinned bound does not move at all, so an unconditional
+   retry would spin empty commits against frozen state; capped,
+   the driver runs at most 1 + log2(batch) passes per invocation.
+   (Convergence pinned by TestCompactionConvergesToQuiescence and
+   TestAllocBelowFloor/TestEvacuationFloorExact; termination by
+   TestRunCompactionTerminatesOnFrozenBound.)
 3. The old page goes to the RPL and is reclaimed in a future
    txn.
 4. Commit.
@@ -436,19 +464,22 @@ snapshot), so it cannot be freed — and the tail cannot refund past
 it — until the reclamation bound advances beyond this pass's commit,
 i.e. one pass later. The eager reclaim at each pass start drains the
 *previous* pass's relocated-from pages, so the trailing band frees up
-and `HighWaterMark` falls steadily across passes; with reader-safe
-freed space available, a pass never extends the file. The one
-exception is a pass that runs immediately after large frees not yet
-reader-safe (the reclamation bound has not advanced past them, e.g.
-compacting in the same instant as a bulk delete with no intervening
-commit): with no reclaimable space to relocate into, that pass extends
-the file by up to one batch. This is bounded, recovered within a pass
-or two as the bound advances, and *necessary* — the extending commit
-is what advances the bound; suppressing it (refusing to relocate
-without free space) would stall a quiescent database. Online
-compaction therefore shrinks amortised over passes, not instantly;
-`Compact()` remains the instant-shrink path (it rebuilds into a fresh,
-RPL-less file).
+and `HighWaterMark` falls steadily across passes. A pass NEVER
+extends the file. The state that once forced an extension — large
+frees not yet reader-safe (the reclamation bound has not advanced
+past them, e.g. compacting in the same instant as a bulk delete with
+no intervening commit), so nothing is reclaimable to relocate into —
+is handled by a RECLAIM/BOUND-ADVANCE COMMIT instead: a pass that
+declines relocation still commits whenever its eager reclaim freed
+pages (landing the tail refund a rollback would discard) or the RPL
+is non-empty (the commit advances the reclamation bound so the NEXT
+pass's reclaim frees the last pass's retirees — the bound covers
+only strictly-older transactions). One tiny commit per declined
+pass, self-limiting once the RPL drains; suppressing it would freeze
+the bound and stall a quiescent database at a permanent
+HighWaterMark plateau. Online compaction therefore shrinks amortised
+over passes, not instantly; `Compact()` remains the instant-shrink
+path (it rebuilds into a fresh, RPL-less file).
 
 **Cost per pass.** Two cost dimensions, separately bounded.
 

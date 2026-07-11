@@ -12,12 +12,94 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
-// compactForest relocates every page selected by shouldRelocate across all
+// errCompactionSpaceExhausted aborts a compaction pass when the
+// consolidating allocator finds free space ONLY at or above the
+// evacuation floor: relocating into the band being drained is the
+// no-progress pathology the below-floor policy exists to prevent, so
+// the pass rolls back and the driver retries with a halved budget
+// (earlier relocations may fit the below-floor capacity) until it
+// declines outright.
+var errCompactionSpaceExhausted = errors.New("gmdb: compaction: free space exhausted below the evacuation floor")
+
+// compactionReserve is the below-floor hole count a compaction pass
+// must NOT consume itself: homes for the RPL chain-prefix relocation
+// (the full prefix from the deepest at-or-above-floor segment to the
+// head) plus the commit's own head-segment append. One formula, used
+// by both the floor feasibility scan and the pass's allocation
+// allowance — a divergence between the two would let relocations eat
+// the prefix homes the floor was chosen to protect.
+func compactionReserve(pgr *pager.Pager, floor uint64) uint64 {
+	return uint64(pgr.RPLRelocationPrefixLen(floor)) + 2
+}
+
+// compactionWriter is the relocation pass's PageWriter: allocations
+// draw from the LOWEST free hole below allocBound (the consolidating
+// allocator, background-maintenance.md §Incremental Compaction step 2
+// — btree.PageWriter's AllocPage contract makes the allocation source
+// the writer's concern). Two regimes:
+//
+//   - strict (the evacuation floor sits above the first data page, so
+//     a below-floor region exists): allocBound = floor.
+//   - whole-region (floor at the first data page — the band covers
+//     everything, so there is no "below the band" to preserve):
+//     allocBound = HighWaterMark; lowest-hole-first packing still
+//     consolidates.
+//
+// There is NO fallback tier: exhaustion aborts the pass with
+// errCompactionSpaceExhausted. The base allocator's extension tier is
+// never a relocation target — extending places LIVE pages at the file
+// top, re-creating the band the pass is draining (observed as a
+// permanent HWM limit cycle) — and its in-band holes are the refill
+// pathology itself. The bound-advance the lazy-shrink clause needs in
+// the nothing-reader-safe state comes from the driver's reclaim/
+// bound-advance commit (reclaimOrAdvanceCommit), not from relocating
+// into extensions.
+type compactionWriter struct {
+	btreeWriter
+	allocBound uint64
+	// allowance is the below-bound hole budget for the WHOLE pass —
+	// decremented by every allocation (relocated leaves AND their CoW
+	// cascades alike; a leaf-count budget alone undercounts and would
+	// eat the holes reserved for the RPL prefix relocation's homes).
+	allowance *uint64
+}
+
+func (w compactionWriter) AllocPage() (uint64, error) {
+	if *w.allowance == 0 {
+		return 0, errCompactionSpaceExhausted
+	}
+	id, ok, err := w.Pager.AllocPageBelow(w.allocBound)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, errCompactionSpaceExhausted
+	}
+	*w.allowance--
+	return id, nil
+}
+
+func (w compactionWriter) AllocContiguous(n uint32) (uint64, error) {
+	if *w.allowance < uint64(n) {
+		return 0, errCompactionSpaceExhausted
+	}
+	id, ok, err := w.Pager.AllocContiguousBelow(n, w.allocBound)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, errCompactionSpaceExhausted
+	}
+	*w.allowance -= uint64(n)
+	return id, nil
+}
+
+// compactForest relocates every page at or above floor across all
 // B+trees reachable from this write transaction's keyspace forest, returning
 // the count of pages relocated. It is the in-place engine behind online
 // incremental compaction (background-maintenance.md §Incremental
-// Compaction); the orchestration layer supplies a high-watermark predicate
-// (id >= evacFloor) and a budget, then commits.
+// Compaction); the orchestration layer supplies the evacuation floor
+// (relocation predicate: id >= floor) and a budget, then commits.
 //
 // budget bounds the total relocations (btree.RelocatePages' maxMoves, shared
 // — and decremented — across every tree in the forest). When it is exhausted
@@ -62,11 +144,48 @@ import (
 // maintenance orchestration catches it and reduces the batch — it is never
 // user-visible). Partial work already applied to the slab is discarded by
 // the caller's rollback; nothing is committed.
-func (tx *Tx) compactForest(shouldRelocate func(uint64) bool, budget int) (int, error) {
+func (tx *Tx) compactForest(floor uint64, budget int) (int, error) {
 	if tx.keyspaceRoot == 0 || budget <= 0 {
 		return 0, nil
 	}
-	pw := btreeWriter{tx.pgr}
+	shouldRelocate := func(id uint64) bool { return id >= floor }
+	firstData := uint64(2) + uint64(tx.prevMeta.BitmapPages)
+	// Eager reclaim: return already-eligible freed pages to the bitmap
+	// so the capacity measured below is real (idempotent when the
+	// caller already reclaimed).
+	tx.pgr.ReclaimFreeSpace()
+	// Capacity accounting: the pass may consume below-bound holes for
+	// its relocations and cascades, MINUS a reserve for the RPL
+	// chain-prefix relocation's commit-time homes (the full prefix —
+	// free-space.md §RPL segment relocation copies newer below-floor
+	// segments too) and the commit's own head-segment append. A pass
+	// that consumed every hole would force the prefix relocation to
+	// decline each pass, and the re-appended head segment then lands
+	// in the freed top holes and pins the tail refund — a permanent
+	// HWM limit cycle (observed: rplHead re-appearing at the band top
+	// every pass).
+	allocBound := floor
+	if floor <= firstData {
+		// TEST-ONLY surface: production floors come from
+		// EvacuationFloor, which never returns floor <= firstData
+		// (feasibility needs free capacity strictly below the floor).
+		// Direct engine tests pass floor=0 for relocate-everything
+		// semantics; targets then pack toward the lowest holes below
+		// the HWM with no reserve — outside the amended spec's
+		// strictly-downward regime, acceptable for single-shot
+		// engine-level exercise.
+		allocBound = tx.pgr.HighWaterMark()
+	}
+	capacity := tx.pgr.FreePagesBelow(allocBound)
+	reserve := uint64(0)
+	if floor > firstData {
+		reserve = compactionReserve(tx.pgr, floor)
+	}
+	allowance := uint64(0)
+	if capacity > reserve {
+		allowance = capacity - reserve
+	}
+	pw := compactionWriter{btreeWriter: btreeWriter{tx.pgr}, allocBound: allocBound, allowance: &allowance}
 	baseCfg := pw.Config()
 	hwm := pw.HighWaterMark()
 	remaining := budget
@@ -116,7 +235,7 @@ func (tx *Tx) compactForest(shouldRelocate func(uint64) bool, budget int) (int, 
 		}
 
 		if ks.desc.IndexRegistryRoot != 0 && remaining > 0 {
-			newReg, m, err := tx.compactIndexRegistry(ks.desc.IndexRegistryRoot, shouldRelocate, baseCfg, hwm, &remaining)
+			newReg, m, err := tx.compactIndexRegistry(pw, ks.desc.IndexRegistryRoot, shouldRelocate, baseCfg, hwm, &remaining)
 			if err != nil {
 				return 0, err // already mapped
 			}
@@ -167,8 +286,7 @@ func (tx *Tx) compactForest(shouldRelocate func(uint64) bool, budget int) (int, 
 // tree itself is relocated. remaining is the shared forest budget, decremented
 // as pages move. Uses cfg (the base pager cfg) for both the registry tree and
 // the index data trees, matching the runtime's maintenance of them.
-func (tx *Tx) compactIndexRegistry(regRoot uint64, shouldRelocate func(uint64) bool, cfg page.Config, hwm uint64, remaining *int) (uint64, int, error) {
-	pw := btreeWriter{tx.pgr}
+func (tx *Tx) compactIndexRegistry(pw btree.PageWriter, regRoot uint64, shouldRelocate func(uint64) bool, cfg page.Config, hwm uint64, remaining *int) (uint64, int, error) {
 	moved := 0
 
 	// Snapshot the registry entries (name + decoded entry) before mutating.
@@ -286,11 +404,34 @@ func compactionTriggered(attempts, fragFails uint64, threshold float64) bool {
 // batch is one committed transaction.
 func (db *DB) runCompaction(ctx context.Context) {
 	budget := db.opts.Maintenance.CompactionBatchSize
+	spaceExhausted := false
+	advanced := false
 	for budget >= 1 {
 		moved, err := db.compactionPass(ctx, budget)
 		switch {
 		case errors.Is(err, ErrTxTooLarge):
 			budget /= 2 // batch too large for MaxTxBufferBytes — halve and retry
+			continue
+		case errors.Is(err, errCompactionSpaceExhausted):
+			// Free space exists only at or above the floor. The failed
+			// pass rolled back — including its eager reclaim — so land
+			// that progress in a reclaim/bound-advance commit ONCE per
+			// runCompaction call, then retry; every further sentinel
+			// halves the batch (a smaller batch may fit the remaining
+			// below-floor capacity); at budget 0, decline — the region
+			// is unsatisfiable until churn frees low holes. The
+			// once-per-call cap is the termination argument: an
+			// advance commit cannot help twice in a row (the bound
+			// moves at most once per commit, and a READER-pinned bound
+			// does not move at all — retrying the same budget against
+			// a frozen bound spun this loop at ~1000 empty commits/s),
+			// so the loop runs at most 1 + log2(budget) iterations.
+			spaceExhausted = true
+			if !advanced && db.reclaimOrAdvanceCommit(ctx) {
+				advanced = true
+				continue
+			}
+			budget /= 2
 			continue
 		case err != nil:
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
@@ -305,7 +446,41 @@ func (db *DB) runCompaction(ctx context.Context) {
 			return
 		}
 	}
+	if spaceExhausted {
+		db.logger.Info("gmdb: maintenance compaction declined — no free space below the evacuation floor")
+		return
+	}
 	db.logger.Warn("gmdb: maintenance compaction could not fit a single page relocation in MaxTxBufferBytes")
+}
+
+// reclaimOrAdvanceCommit opens a write transaction, eagerly reclaims
+// the RPL, and commits when that freed pages OR the RPL is non-empty:
+// a rolled-back compaction pass discards its own eager reclaim (the
+// tail refund happens only at commit), and pages retired by the LAST
+// commit need one further commit before the reclamation bound covers
+// them — this is the lazy-shrink clause's bound-advancing commit,
+// WITHOUT relocating anything into extensions. Returns whether a
+// commit landed; false (RPL empty and nothing reclaimed) means no
+// amount of committing will free more space.
+func (db *DB) reclaimOrAdvanceCommit(ctx context.Context) bool {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if tx.pgr.ReclaimFreeSpace() == 0 && tx.pgr.RPLSegmentsAtOrAbove(0) == 0 {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		return false
+	}
+	committed = true
+	return true
 }
 
 // compactionPass runs one compaction transaction: derive the high-watermark
@@ -333,36 +508,69 @@ func (db *DB) compactionPass(ctx context.Context, budget int) (int, error) {
 	// the file shrink monotonically across passes (background-maintenance.md
 	// §Incremental Compaction); without it reclamation is lazy and the file
 	// shrinks only stepwise after bitmap exhaustion.
-	tx.pgr.ReclaimFreeSpace()
+	reclaimed := tx.pgr.ReclaimFreeSpace()
+	// A decline below must still COMMIT when the reclaim freed pages —
+	// the tail refund happens only at commit, so a rolled-back decline
+	// would strand the freed band — and ALSO when the RPL is non-empty
+	// with nothing freed: the last pass's retirees become eligible only
+	// once a LATER commit advances the reclamation bound past theirs,
+	// so a declining pass that never commits freezes the bound and
+	// every later pass sees the same infeasible state (both observed
+	// as permanent HWM plateaus). Self-limiting: one tiny commit per
+	// declined pass, and the condition clears once the RPL drains.
+	commitReclaim := func() (int, error) {
+		if reclaimed == 0 && tx.pgr.RPLSegmentsAtOrAbove(0) == 0 {
+			return 0, nil // defer rolls back — nothing to land or advance
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		committed = true
+		return 0, nil
+	}
 
 	// Size the evacuation band against the post-reclaim free count + the
 	// current high-water mark (reclamation frees pages but does not lower the
 	// HWM — that happens via tail refund at commit).
 	firstData := uint64(2) + uint64(tx.prevMeta.BitmapPages)
-	floor, ok := evacuationFloor(firstData, tx.pgr.HighWaterMark(), tx.pgr.NumFreePages(), budget)
+	// Exact feasibility scan (replaces the former density ESTIMATE,
+	// which let a budget large relative to the region collapse the
+	// floor to the first data page — allocation targets and sources
+	// then interleaved and passes shuffled the same pages between hole
+	// sets forever, a permanent HWM plateau). reserve covers the RPL
+	// chain-prefix relocation's commit-time homes (the full prefix)
+	// plus the head-segment append.
+	floor, ok := tx.pgr.EvacuationFloor(firstData, uint64(budget), compactionReserve(tx.pgr, firstData))
 	if !ok {
-		return 0, nil // no data region / nothing allocated — defer rolls back
-	}
-	moved, err := tx.compactForest(func(id uint64) bool { return id >= floor }, budget)
-	if err != nil {
-		return 0, err
+		return commitReclaim() // nothing feasible to evacuate
 	}
 	// RPL segment pages in the band cannot be relocated out-of-band —
-	// arm the in-pipeline chain-prefix relocation, which this commit
-	// executes or declines (free-space.md §RPL segment relocation).
-	// Arm only when a below-floor region EXISTS (floor > firstData):
-	// a density-sized band covering the whole data region has nowhere
-	// to relocate to, and the request would be a guaranteed decline
-	// plus a warn every pass.
+	// they go through the in-pipeline chain-prefix relocation, whose
+	// below-floor HOMES are probed at commit time. Compute the band's
+	// segment count FIRST and budget the tree relocations against the
+	// remaining below-floor capacity: a pass that consumed every hole
+	// itself would force the prefix relocation to decline each pass,
+	// and the re-appended head segment then lands in the freed top
+	// holes and pins the tail refund — a permanent HWM limit cycle
+	// (observed: rplHead re-appearing at the band top every pass).
+	// The +2 covers the commit's own head-segment append. Arm only
+	// when a below-floor region EXISTS (floor > firstData): a
+	// density-sized band covering the whole data region has nowhere to
+	// relocate to, and the request would be a guaranteed decline plus
+	// a warn every pass.
 	rplInBand := 0
 	if floor > firstData {
 		rplInBand = tx.pgr.RPLSegmentsAtOrAbove(floor)
+	}
+	moved, err := tx.compactForest(floor, budget)
+	if err != nil {
+		return 0, err
 	}
 	if rplInBand > 0 {
 		tx.pgr.RequestRPLRelocation(floor)
 	}
 	if moved == 0 && rplInBand == 0 {
-		return 0, nil // nothing above the floor to move — defer rolls back
+		return commitReclaim() // nothing above the floor to move
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
@@ -379,34 +587,6 @@ func (db *DB) compactionPass(ctx context.Context, budget int) (int, error) {
 	return moved, nil
 }
 
-// evacuationFloor computes the high-watermark evacuation floor: the lowest page
-// id such that the trailing band [floor, hwm) holds roughly budget allocated
-// pages, estimated from the free-page density. Relocating that band lets it
-// drain into a contiguous free run so the file can shrink. Returns ok=false
-// when there is no data region or nothing allocated to relocate.
-//
-// Sizing the band to ~budget allocated pages (rather than fixing it at the very
-// top) keeps each pass's relocation count near the budget regardless of how
-// sparse the region is: a near-full region uses a thin band, a sparse one a
-// wider band.
-func evacuationFloor(firstData, hwm, numFreePages uint64, budget int) (uint64, bool) {
-	if budget <= 0 || hwm <= firstData {
-		return 0, false
-	}
-	dataSpan := hwm - firstData
-	freeInData := min(numFreePages, dataSpan)
-	allocInData := dataSpan - freeInData
-	if allocInData == 0 {
-		return 0, false // region is entirely free — nothing to relocate
-	}
-	density := float64(allocInData) / float64(dataSpan) // in (0, 1]
-	bandSpan := uint64(float64(budget) / density)
-	if bandSpan >= dataSpan {
-		return firstData, true // budget covers the whole region
-	}
-	return hwm - bandSpan, true
-}
-
 // mapCompactErr maps the btree + pager error surfaces that the relocation
 // engine spans onto the gmdb public sentinels, so the orchestration layer can
 // match ErrTxTooLarge (background-maintenance.md §Invariants) and callers see consistent errors.
@@ -415,6 +595,8 @@ func mapCompactErr(err error) error {
 		return nil
 	}
 	switch {
+	case errors.Is(err, errCompactionSpaceExhausted):
+		return errCompactionSpaceExhausted
 	case errors.Is(err, pager.ErrTxTooLarge):
 		return ErrTxTooLarge
 	case errors.Is(err, pager.ErrDBFull):

@@ -273,6 +273,53 @@ func (b *Bitmap) FindContiguous(n int) (uint64, bool) {
 	return 0, false
 }
 
+// FindContiguousBelow returns the starting page id of the lowest run
+// of n consecutive free pages lying entirely within
+// [firstDataPage, min(floor, totalPages)), or ok=false when none
+// exists. Unlike FindContiguous it ignores the hint (the caller wants
+// the LOWEST run, not the nearest) and never considers pages at or
+// above floor. Read-only — the caller claims the run itself. Serves
+// incremental compaction's consolidating allocator
+// (background-maintenance.md §Incremental Compaction step 2).
+func (b *Bitmap) FindContiguousBelow(n int, floor uint64) (uint64, bool) {
+	if n <= 0 {
+		return 0, false
+	}
+	hi := min(floor, b.totalPages)
+	if b.firstDataPage >= hi || uint64(n) > b.numFree {
+		return 0, false
+	}
+	if n == 1 {
+		return b.scanForward(b.firstDataPage, hi)
+	}
+	return b.runForward(b.firstDataPage, hi, n)
+}
+
+// CountFreeBelow returns how many free pages lie in
+// [firstDataPage, min(floor, totalPages)). O(words below floor).
+// Serves incremental compaction's capacity budgeting: the pass must
+// not consume more below-floor holes than exist, and must leave homes
+// for the in-pipeline RPL chain-prefix relocation.
+func (b *Bitmap) CountFreeBelow(floor uint64) uint64 {
+	hi := min(floor, b.totalPages)
+	if b.firstDataPage >= hi {
+		return 0
+	}
+	var n uint64
+	for id := b.firstDataPage; id < hi; {
+		byteIdx := id >> 3
+		lo := id & 7
+		bv := b.detail[byteIdx] >> lo
+		span := min(8-lo, hi-id)
+		if span < 8 {
+			bv &= (1 << span) - 1
+		}
+		n += uint64(bits.OnesCount8(bv))
+		id += span
+	}
+	return n
+}
+
 // DirtyPages returns the sorted list of bitmap-page indices (0-based
 // relative to the bitmap region; the on-disk page id is 2 + idx) that
 // have been modified since the last ClearDirty call. Returns nil when
