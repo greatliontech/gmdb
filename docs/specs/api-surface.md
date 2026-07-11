@@ -175,6 +175,7 @@ var (
 
     // Write batching.
     ErrBatchClosurePanic        = errors.New("gmdb: batch closure panicked")
+    ErrBatchClosureGoexit       = errors.New("gmdb: batch closure exited via runtime.Goexit")
 
     // Compact.
     ErrCompactReadersActive     = errors.New("gmdb: Compact drain timed out — in-process read transactions still active")
@@ -721,21 +722,31 @@ func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error
 
 // Batch submits a write operation to be batched with other concurrent
 // callers into a single transaction. The context governs the wait for
-// batch inclusion. Each closure runs in its own child transaction and
-// executes exactly once. See `transactions.md §Write Batching`.
+// batch inclusion and one pre-dispatch check: once accepted, the
+// caller blocks until the batch resolves (ctx cannot unblock the
+// wait); a ctx that fires before dispatch skips the closure — it runs
+// AT MOST once — and the caller receives context.Cause(ctx); once
+// dispatched, the outcome is reported truthfully regardless of ctx.
+// Each closure runs in its own child transaction. See
+// `transactions.md §Write Batching`.
 //
 // A closure that returns an error has its child rolled back and that
 // error returned to its caller; siblings are unaffected. A closure that
 // panics is recovered: its child is rolled back and the caller receives
 // ErrBatchClosurePanic wrapping the panic value, while sibling closures
-// still run. If the parent batch commit fails, every caller whose
-// closure succeeded receives the commit error.
+// still run. A closure that exits via runtime.Goexit (t.FailNow and
+// friends) is contained the same way; its caller receives
+// ErrBatchClosureGoexit. If the parent batch commit fails, every
+// caller whose closure succeeded receives the commit error.
 //
 // The closure MUST NOT call Commit() or Rollback() on the supplied
 // *Tx — the batch coordinator owns child-transaction lifecycle. A
 // closure that calls either causes the coordinator's subsequent
 // child-commit-or-rollback to error with ErrTxClosed, which
-// propagates to the caller as the closure's result. (A closure may open
+// propagates to the caller as the closure's result — note a
+// self-COMMITTED child's write still lands if the parent batch
+// commits (the self-commit already merged it); the error reports the
+// contract violation, not the write's outcome. (A closure may open
 // its own nested BeginChild, but must resolve it before returning, or
 // the caller receives ErrChildActive.)
 func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error

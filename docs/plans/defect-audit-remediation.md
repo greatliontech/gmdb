@@ -35,7 +35,7 @@ function. WIP = 1.
 - [x] 12. internal/lock: boot-epoch discriminator — invalidate
       cross-boot stamps/start-times, lock-file lifecycle clause
       (+ cross-process.md rider)
-- [ ] 13. batch: Goexit isolation, post-acceptance ctx contract,
+- [x] 13. batch: Goexit isolation, post-acceptance ctx contract,
       cascade reserve re-price, self-commit outcome doc
       (+ transactions.md rider)
 - [ ] 14. tx: child SetFileFormat merge, View error join, iterator

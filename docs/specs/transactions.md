@@ -232,6 +232,17 @@ type batchCall struct {
 
 1. `db.Batch(ctx, fn)` sends the closure, context, and a result
    channel to `db.batchCh`. The caller blocks on the result channel.
+   Once ACCEPTED into a batch, the caller blocks until the batch
+   resolves — past acceptance the ctx can no longer unblock the
+   wait. It is consulted ONCE more, before dispatch (step 4): if
+   already fired, the closure is skipped (it runs at most once) and
+   the caller receives `context.Cause(ctx)`. Once DISPATCHED, the
+   outcome is reported truthfully regardless of ctx — returning
+   early would misreport a write that may still land. Error-path
+   replies precede the parent commit (only success replies follow
+   it), so an error-receiving caller has no visibility ordering
+   against the batch's commit.
+   (Pinned by `TestBatchPostDispatchIgnoresCtxCancel`.)
 2. A coordinator goroutine reads from `db.batchCh`, collecting
    calls until either `Options.MaxBatchSize` calls have accumulated
    (default 1000) or `Options.MaxBatchDelay` has elapsed since the
@@ -251,13 +262,24 @@ type batchCall struct {
    receives `context.Cause(ctx)`.
 5. If a closure returns an error or **panics**, its child is
    **rolled back** (a panic is recovered and surfaced to the caller
-   as `ErrBatchClosurePanic` wrapping the panic value). The parent
+   as `ErrBatchClosurePanic` wrapping the panic value). A closure
+   that exits via `runtime.Goexit` (`t.FailNow` and friends) is
+   contained the same way: each closure runs on a dedicated worker
+   goroutine under a completion flag — unset without a recovered
+   panic means Goexit — and the caller receives
+   `ErrBatchClosureGoexit`. The parent
    transaction is unaffected; other closures' children remain
    intact. The failing caller receives the error. (A closure that
    leaves a nested `BeginChild` unresolved is treated the same way —
    its child is force-resolved and the caller receives
    `ErrChildActive` — so one misbehaving closure cannot freeze the
-   batch.)
+   batch. A closure that self-commits its child receives
+   `ErrTxClosed` from the coordinator's own child commit — the
+   write STILL LANDS if the parent commits, since the self-commit
+   already merged it; the error reports the contract violation, not
+   the write's outcome. Pinned by
+   `TestBatchSelfCommitReturnsErrTxClosedButWriteLands`.)
+   (Goexit containment pinned by `TestBatchClosureGoexitIsolated`.)
 6. If a closure succeeds, its child is **committed** (merged into
    the parent). The caller will receive `nil` when the parent
    commits.

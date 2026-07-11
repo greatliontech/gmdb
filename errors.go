@@ -32,6 +32,13 @@ var (
 	// are unaffected. Per transactions.md §Write Batching.
 	ErrBatchClosurePanic = errors.New("gmdb: batch closure panicked")
 
+	// ErrBatchClosureGoexit is returned by Batch when the closure exited
+	// via runtime.Goexit (t.FailNow and friends) instead of returning:
+	// the coordinator contains the unwind exactly like a panic — the
+	// child is rolled back, siblings and the parent batch are unaffected
+	// (transactions.md §Write Batching).
+	ErrBatchClosureGoexit = errors.New("gmdb: batch closure exited via runtime.Goexit")
+
 	// ErrChildActive is returned by the frozen operations on a write
 	// transaction that has an unresolved child transaction open
 	// (created via Tx.BeginChild) — data ops, Commit, and a second

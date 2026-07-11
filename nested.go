@@ -140,6 +140,11 @@ func (tx *Tx) cascadeRollback() {
 	tx.savepoint = nil
 	if tx.parent != nil {
 		tx.parent.activeChild = nil
+		// Re-price the commit-flush reserve exactly like rollbackChild:
+		// the pager savepoint does not capture externalReserve, so the
+		// dead child's flush obligations would otherwise stay priced in
+		// and siblings could see spurious ErrTxTooLarge near budget.
+		tx.parent.recalcFlushReserve()
 	}
 }
 

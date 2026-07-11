@@ -2,6 +2,7 @@ package gmdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -41,14 +42,28 @@ type batchCoordinator struct {
 // fn returns an error, its child is rolled back and the caller receives
 // that error; sibling closures are unaffected. If fn panics, the
 // coordinator recovers it, rolls the child back, and the caller receives
-// ErrBatchClosurePanic wrapping the panic value; siblings still run. If
-// the parent batch commit fails, every caller whose closure succeeded
+// ErrBatchClosurePanic wrapping the panic value; siblings still run. A
+// closure that exits via runtime.Goexit (t.FailNow and friends) is
+// contained the same way and its caller receives ErrBatchClosureGoexit.
+// If the parent batch commit fails, every caller whose closure succeeded
 // receives the commit error.
+//
+// Once a call is ACCEPTED into a batch, the caller blocks until the
+// batch resolves — past acceptance the ctx can no longer unblock the
+// wait. It is consulted once more before dispatch (a fired ctx skips
+// the closure — at most once — and the caller receives
+// context.Cause); once dispatched, the outcome is reported truthfully
+// regardless of ctx (returning early would misreport a write that may
+// still land).
 //
 // The closure MUST NOT call Commit or Rollback on the supplied *Tx — the
 // coordinator owns child-transaction lifecycle; doing so makes the
 // coordinator's subsequent child commit/rollback error, which propagates
-// to the caller.
+// to the caller. A closure that COMMITS its child anyway gets
+// ErrTxClosed back from the coordinator's own child commit — note the
+// write STILL LANDS if the parent batch commits (the self-commit
+// already merged it): the error reports the contract violation, not
+// the write's outcome.
 //
 // Errors:
 //   - context.Cause(ctx) if ctx fires before the call is queued.
@@ -180,6 +195,13 @@ func (db *DB) runBatch(ctx context.Context, batch []batchCall) {
 	// lock wait.
 	tx, err := db.Begin(ctx)
 	if err != nil {
+		// The coordinator ctx is cancelled ONLY by Close; Begin then
+		// surfaces context.Canceled, but the caller-facing contract is
+		// "ErrClosed if the DB is closing / closed" — map it (the
+		// callers never see the coordinator's private context).
+		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			err = ErrClosed
+		}
 		replyAll(batch, err)
 		return
 	}
@@ -241,17 +263,39 @@ func (db *DB) runBatch(ctx context.Context, batch []batchCall) {
 	replyAll(succeeded, nil)
 }
 
-// invokeClosure runs fn against the child transaction, converting a panic
-// into an error so one misbehaving closure cannot crash the coordinator
-// or harm sibling callers (transactions.md §Write Batching). The child is
-// rolled back by the caller on any non-nil return.
-func invokeClosure(child *Tx, fn func(tx *Tx) error) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("%w: %v", ErrBatchClosurePanic, r)
-		}
+// invokeClosure runs fn against the child transaction on a DEDICATED
+// goroutine, converting a panic into an error and containing
+// runtime.Goexit (e.g. a closure calling t.FailNow) so one misbehaving
+// closure cannot crash — or silently unwind — the coordinator or harm
+// sibling callers (transactions.md §Write Batching). Goexit runs the
+// worker's deferred recover(), which returns nil for Goexit, so the
+// completion flag is the discriminator: unset without a recovered
+// panic means the closure exited via Goexit. The channel close
+// happens-after the flag/err writes (defer LIFO), so the coordinator's
+// reads are ordered. The child is rolled back by the caller on any
+// non-nil return.
+func invokeClosure(child *Tx, fn func(tx *Tx) error) error {
+	var (
+		err       error
+		completed bool
+		done      = make(chan struct{})
+	)
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("%w: %v", ErrBatchClosurePanic, r)
+				completed = true
+			}
+		}()
+		err = fn(child)
+		completed = true
 	}()
-	return fn(child)
+	<-done
+	if !completed {
+		return ErrBatchClosureGoexit
+	}
+	return err
 }
 
 // replyAll delivers err to every call's result channel (buffered, so
