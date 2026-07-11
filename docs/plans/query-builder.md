@@ -21,7 +21,7 @@ tests move with their subjects, unmodified.
       `recordHeap`, `sortMerger`, cascade merging) →
       `internal/extsort` (pure move; no Tx/pager/cursor
       references).
-- [ ] 5. Compaction relocation core (`compactionWriter` +
+- [x] 5. Compaction relocation core (`compactionWriter` +
       evacuation-floor math) → `internal/` (pure move; drivers
       stay in root).
 - [ ] 6. Check verifier (`checker` + page walkers) + stats

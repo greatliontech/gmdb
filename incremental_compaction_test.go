@@ -13,6 +13,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/compaction"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
@@ -38,7 +39,7 @@ func runCompactForest(t *testing.T, db *DB, floor uint64, budget int) int {
 			t.Fatalf("Begin(compact): %v", err)
 		}
 		moved, err := tx.compactForest(floor, budget)
-		if errors.Is(err, errCompactionSpaceExhausted) {
+		if errors.Is(err, compaction.ErrSpaceExhausted) {
 			// Mirror the production driver: the batch outran the
 			// below-floor capacity — roll back and retry smaller.
 			_ = tx.Rollback()
@@ -969,7 +970,7 @@ func TestCompactionConvergesToQuiescence(t *testing.T) {
 	assertCheckClean(t, db, "post-convergence")
 }
 
-// compactionWriter is the consolidating allocator's wiring: allocations
+// compaction.Writer is the consolidating allocator's wiring: allocations
 // draw the LOWEST free hole strictly below allocBound regardless of the
 // LIFO hint (which eager reclaim points INTO the band being drained),
 // count against the pass-wide allowance, and abort with the space
@@ -1009,7 +1010,7 @@ func TestCompactionWriterAllocPolicy(t *testing.T) {
 
 	bound := first + 20
 	allowance := uint64(3)
-	w := compactionWriter{btreeWriter{p}, bound, &allowance}
+	w := compaction.Writer{PageWriter: btreeWriter{p}, Pgr: p, AllocBound: bound, Allowance: &allowance}
 
 	id, err := w.AllocPage()
 	if err != nil || id != first+4 {
@@ -1025,8 +1026,8 @@ func TestCompactionWriterAllocPolicy(t *testing.T) {
 	}
 	// Allowance exhausted (3 pages consumed): the sentinel, never a
 	// fallback into the in-band holes.
-	if _, err := w.AllocPage(); !errors.Is(err, errCompactionSpaceExhausted) {
-		t.Fatalf("AllocPage past the allowance = %v, want errCompactionSpaceExhausted", err)
+	if _, err := w.AllocPage(); !errors.Is(err, compaction.ErrSpaceExhausted) {
+		t.Fatalf("AllocPage past the allowance = %v, want compaction.ErrSpaceExhausted", err)
 	}
 	// Below-bound space exhausted with allowance remaining: sentinel
 	// too (the in-band holes are never targets). One below-bound hole
@@ -1035,13 +1036,13 @@ func TestCompactionWriterAllocPolicy(t *testing.T) {
 	if id, err := w.AllocPage(); err != nil || id != first+9 {
 		t.Fatalf("AllocPage = (%d, %v), want the last below-bound hole %d", id, err, first+9)
 	}
-	if _, err := w.AllocPage(); !errors.Is(err, errCompactionSpaceExhausted) {
-		t.Fatalf("AllocPage past below-bound capacity = %v, want errCompactionSpaceExhausted", err)
+	if _, err := w.AllocPage(); !errors.Is(err, compaction.ErrSpaceExhausted) {
+		t.Fatalf("AllocPage past below-bound capacity = %v, want compaction.ErrSpaceExhausted", err)
 	}
 	// Contiguous exhaustion below the bound: the in-band 3-run at
 	// first+40 must never be the fallback.
-	if _, err := w.AllocContiguous(2); !errors.Is(err, errCompactionSpaceExhausted) {
-		t.Fatalf("AllocContiguous past below-bound capacity = %v, want errCompactionSpaceExhausted", err)
+	if _, err := w.AllocContiguous(2); !errors.Is(err, compaction.ErrSpaceExhausted) {
+		t.Fatalf("AllocContiguous past below-bound capacity = %v, want compaction.ErrSpaceExhausted", err)
 	}
 	if used := bm.IsSet(first + 40); !used {
 		t.Fatal("an in-band hole was consumed (base-allocator fallback)")

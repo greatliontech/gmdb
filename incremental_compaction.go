@@ -7,93 +7,12 @@ import (
 	"fmt"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/compaction"
 	"github.com/thegrumpylion/gmdb/internal/descriptor"
 	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
-
-// errCompactionSpaceExhausted aborts a compaction pass when the
-// consolidating allocator finds free space ONLY at or above the
-// evacuation floor: relocating into the band being drained is the
-// no-progress pathology the below-floor policy exists to prevent, so
-// the pass rolls back and the driver retries with a halved budget
-// (earlier relocations may fit the below-floor capacity) until it
-// declines outright.
-var errCompactionSpaceExhausted = errors.New("gmdb: compaction: free space exhausted below the evacuation floor")
-
-// compactionReserve is the below-floor hole count a compaction pass
-// must NOT consume itself: homes for the RPL chain-prefix relocation
-// (the full prefix from the deepest at-or-above-floor segment to the
-// head) plus the commit's own head-segment append. One formula, used
-// by both the floor feasibility scan and the pass's allocation
-// allowance — a divergence between the two would let relocations eat
-// the prefix homes the floor was chosen to protect.
-func compactionReserve(pgr *pager.Pager, floor uint64) uint64 {
-	return uint64(pgr.RPLRelocationPrefixLen(floor)) + 2
-}
-
-// compactionWriter is the relocation pass's PageWriter: allocations
-// draw from the LOWEST free hole below allocBound (the consolidating
-// allocator, background-maintenance.md §Incremental Compaction step 2
-// — btree.PageWriter's AllocPage contract makes the allocation source
-// the writer's concern). Two regimes:
-//
-//   - strict (the evacuation floor sits above the first data page, so
-//     a below-floor region exists): allocBound = floor.
-//   - whole-region (floor at the first data page — the band covers
-//     everything, so there is no "below the band" to preserve):
-//     allocBound = HighWaterMark; lowest-hole-first packing still
-//     consolidates.
-//
-// There is NO fallback tier: exhaustion aborts the pass with
-// errCompactionSpaceExhausted. The base allocator's extension tier is
-// never a relocation target — extending places LIVE pages at the file
-// top, re-creating the band the pass is draining (observed as a
-// permanent HWM limit cycle) — and its in-band holes are the refill
-// pathology itself. The bound-advance the lazy-shrink clause needs in
-// the nothing-reader-safe state comes from the driver's reclaim/
-// bound-advance commit (reclaimOrAdvanceCommit), not from relocating
-// into extensions.
-type compactionWriter struct {
-	btreeWriter
-	allocBound uint64
-	// allowance is the below-bound hole budget for the WHOLE pass —
-	// decremented by every allocation (relocated leaves AND their CoW
-	// cascades alike; a leaf-count budget alone undercounts and would
-	// eat the holes reserved for the RPL prefix relocation's homes).
-	allowance *uint64
-}
-
-func (w compactionWriter) AllocPage() (uint64, error) {
-	if *w.allowance == 0 {
-		return 0, errCompactionSpaceExhausted
-	}
-	id, ok, err := w.Pager.AllocPageBelow(w.allocBound)
-	if err != nil {
-		return 0, err
-	}
-	if !ok {
-		return 0, errCompactionSpaceExhausted
-	}
-	*w.allowance--
-	return id, nil
-}
-
-func (w compactionWriter) AllocContiguous(n uint32) (uint64, error) {
-	if *w.allowance < uint64(n) {
-		return 0, errCompactionSpaceExhausted
-	}
-	id, ok, err := w.Pager.AllocContiguousBelow(n, w.allocBound)
-	if err != nil {
-		return 0, err
-	}
-	if !ok {
-		return 0, errCompactionSpaceExhausted
-	}
-	*w.allowance -= uint64(n)
-	return id, nil
-}
 
 // compactForest relocates every page at or above floor across all
 // B+trees reachable from this write transaction's keyspace forest, returning
@@ -180,15 +99,15 @@ func (tx *Tx) compactForest(floor uint64, budget int) (int, error) {
 	capacity := tx.pgr.FreePagesBelow(allocBound)
 	reserve := uint64(0)
 	if floor > firstData {
-		reserve = compactionReserve(tx.pgr, floor)
+		reserve = compaction.Reserve(tx.pgr, floor)
 	}
 	allowance := uint64(0)
 	if capacity > reserve {
 		allowance = capacity - reserve
 	}
-	pw := compactionWriter{btreeWriter: btreeWriter{tx.pgr}, allocBound: allocBound, allowance: &allowance}
-	baseCfg := pw.Config()
-	hwm := pw.HighWaterMark()
+	pw := compaction.Writer{PageWriter: btreeWriter{tx.pgr}, Pgr: tx.pgr, AllocBound: allocBound, Allowance: &allowance}
+	baseCfg := tx.pgr.Config()
+	hwm := tx.pgr.HighWaterMark()
 	remaining := budget
 	moved := 0
 
@@ -413,7 +332,7 @@ func (db *DB) runCompaction(ctx context.Context) {
 		case errors.Is(err, ErrTxTooLarge):
 			budget /= 2 // batch too large for MaxTxBufferBytes — halve and retry
 			continue
-		case errors.Is(err, errCompactionSpaceExhausted):
+		case errors.Is(err, compaction.ErrSpaceExhausted):
 			// Free space exists only at or above the floor. The failed
 			// pass rolled back — including its eager reclaim — so land
 			// that progress in a reclaim/bound-advance commit ONCE per
@@ -541,7 +460,7 @@ func (db *DB) compactionPass(ctx context.Context, budget int) (int, error) {
 	// sets forever, a permanent HWM plateau). reserve covers the RPL
 	// chain-prefix relocation's commit-time homes (the full prefix)
 	// plus the head-segment append.
-	floor, ok := tx.pgr.EvacuationFloor(firstData, uint64(budget), compactionReserve(tx.pgr, firstData))
+	floor, ok := tx.pgr.EvacuationFloor(firstData, uint64(budget), compaction.Reserve(tx.pgr, firstData))
 	if !ok {
 		return commitReclaim() // nothing feasible to evacuate
 	}
@@ -596,8 +515,8 @@ func mapCompactErr(err error) error {
 		return nil
 	}
 	switch {
-	case errors.Is(err, errCompactionSpaceExhausted):
-		return errCompactionSpaceExhausted
+	case errors.Is(err, compaction.ErrSpaceExhausted):
+		return compaction.ErrSpaceExhausted
 	case errors.Is(err, pager.ErrTxTooLarge):
 		return ErrTxTooLarge
 	case errors.Is(err, pager.ErrDBFull):
