@@ -165,6 +165,12 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 // inode verification.
 var errStaleInodeAtOpen = errors.New("gmdb: data file replaced during Open")
 
+// shrinkGateHookForTest fires inside the commit-time shrink gate
+// after the reader scan passed (no visible readers) and before the
+// ftruncate — the exact window the shrink seqlock exists to bracket.
+// Tests interleave a BeginRead here to pin the reader-side re-read.
+var shrinkGateHookForTest atomic.Pointer[func()]
+
 func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
@@ -824,6 +830,11 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	// §RPL Reclamation) which would otherwise be invisible until an
 	// explicit Check(): log it (db.logger defaults to a discard
 	// handler); DBStats carries the count for programmatic detection.
+	// Captured under db.mu for the ShrinkGate closure: the gate runs
+	// at commit time under the write grant, and Close cannot proceed
+	// past its own grant acquisition while this tx holds it, so the
+	// capture stays valid for the closure's lifetime.
+	lockFileForGate := db.lockFile
 	pgr.BeginTx(pager.TxParams{
 		HighWaterMark: prevMeta.HighWaterMark,
 		MaxSize:       prevMeta.MaxSize,
@@ -839,14 +850,34 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 				"segPageID", segPageID)
 		},
 		LaggingReader: lagging,
-		ShrinkAllowed: func() bool {
+		ShrinkGate: func(truncate func() error) error {
 			// Shrink defers while any reader is live (file-format.md
 			// §File Shrinkage): a reader's file-resident bound is
 			// fixed at Begin; truncating under it turns corrupt
 			// content-derived page ids into SIGBUS instead of the
 			// contracted ErrCorrupted. We hold the write grant, so
 			// the reader-table scan's LOCK_EX precondition holds.
-			return coord == nil || coord.CountActiveReaders() == 0
+			if coord == nil {
+				return truncate()
+			}
+			// Seqlock bracket: odd while the scan→truncate span is
+			// open, even when settled. A reader publishing its slot
+			// AFTER the scan passed it brackets its own file-size
+			// read against this counter and re-reads on overlap —
+			// closing the acquisition window during which it would
+			// otherwise retain a pre-shrink bound for its lifetime.
+			if lockFileForGate == nil {
+				return nil // no lock file (raced teardown): skip
+			}
+			lockFileForGate.BumpShrinkSeq()
+			defer lockFileForGate.BumpShrinkSeq()
+			if coord.CountActiveReaders() != 0 {
+				return nil // defer: reader visible
+			}
+			if hook := shrinkGateHookForTest.Load(); hook != nil {
+				(*hook)()
+			}
+			return truncate()
 		},
 	})
 

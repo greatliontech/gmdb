@@ -110,7 +110,10 @@ var (
 	// a deadline-bearing context the call retries until a slot
 	// becomes free or the deadline fires; with no deadline the call
 	// returns ErrReadersFull immediately so callers can distinguish
-	// "table at capacity" from other Begin failures.
+	// "table at capacity" from other Begin failures. Also returned
+	// (wrapped) when the begin's freshly-acquired slot was aged out
+	// mid-acquisition — reachable only when the process stalled past
+	// StaleTimeout inside BeginRead; retrying acquires a fresh slot.
 	ErrReadersFull = errors.New("gmdb: no reader slots available")
 
 	// ErrNotFound is returned by keyed-removal and lookup APIs when

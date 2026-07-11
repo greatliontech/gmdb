@@ -580,14 +580,14 @@ func TestReadOnlyCoordSkipsFlockGrant(t *testing.T) {
 	}
 
 	// Reader-slot acquisition (and release) still works.
-	idx, err := c.AcquireReader(context.Background(), 7)
+	idx, idxGen, err := c.AcquireReader(context.Background(), 7)
 	if err != nil {
 		t.Fatalf("AcquireReader on read-only coord: %v", err)
 	}
 	if idx == NoSlot {
 		t.Fatal("AcquireReader returned NoSlot")
 	}
-	c.ReleaseReader(idx)
+	c.ReleaseReader(idx, idxGen)
 
 	// Close must return promptly even though run() never started
 	// (doneCh was pre-closed). Guard with a deadline so a regression

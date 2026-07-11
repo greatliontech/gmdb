@@ -32,7 +32,7 @@ function. WIP = 1.
 - [x] 11. internal/lock: lock-file identity guard — inode-verified
       stale removal, post-create identity re-check
       (+ cross-process.md rider)
-- [ ] 12. internal/lock: boot-epoch discriminator — invalidate
+- [x] 12. internal/lock: boot-epoch discriminator — invalidate
       cross-boot stamps/start-times, lock-file lifecycle clause
       (+ cross-process.md rider)
 - [ ] 13. batch: Goexit isolation, post-acceptance ctx contract,

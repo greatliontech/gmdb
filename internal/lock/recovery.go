@@ -198,6 +198,15 @@ func RecoverStaleWriter(f *File, ourPIDNamespace uint64) {
 		}
 	}
 
+	// A writer that crashed between its shrink-seqlock bumps leaves
+	// the counter ODD — readers would burn their bracket retries on
+	// every BeginRead until it settles. The dead writer's truncate
+	// either never ran or already completed, so re-evening is safe
+	// (file-format.md §File Shrinkage).
+	if f.ShrinkSeq()%2 == 1 {
+		f.BumpShrinkSeq()
+	}
+
 	// Clear the writer-header. Per cross-process.md §Stale Writer
 	// Recovery step 3 all four fields are cleared (WriterHeartbeat
 	// too, unlike normal release which leaves it as-is).

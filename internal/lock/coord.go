@@ -76,7 +76,7 @@ type Coord struct {
 	// before writing slot Heartbeats outside the lock to keep tick
 	// cost bounded.
 	activeSlotsMu sync.Mutex
-	activeSlots   []uint32
+	activeSlots   []slotRef
 
 	heartbeatInterval time.Duration
 	staleTimeout      time.Duration
@@ -660,10 +660,18 @@ func (c *Coord) heartbeat() {
 			// Snapshot to a local. activeSlots is typically O(active
 			// readers) — small. The alloc is the only per-tick
 			// allocation; acceptable given a 1 s default cadence.
-			slots := append([]uint32(nil), c.activeSlots...)
+			slots := append([]slotRef(nil), c.activeSlots...)
 			c.activeSlotsMu.Unlock()
-			for _, idx := range slots {
-				slot := c.f.Slot(idx)
+			for _, ref := range slots {
+				slot := c.f.Slot(ref.idx)
+				// Gen-guarded: never stamp a slot this handle no
+				// longer owns (aged out + possibly re-won). The
+				// check-then-store races a concurrent re-win by one
+				// tick; the stray stamp freshens the RE-WINNER's live
+				// slot — conservative, never an eviction.
+				if Load64(&slot.Gen) != ref.gen {
+					continue
+				}
 				Store64(&slot.Heartbeat, now)
 			}
 			// Keep the last-writer record fresh for this handle's
@@ -692,10 +700,19 @@ func (c *Coord) heartbeat() {
 // two heartbeat writes per tick (harmless — both stores write the
 // same value) but UnregisterReaderSlot removes only the first match.
 // Internal callers are trusted not to double-register.
-func (c *Coord) RegisterReaderSlot(i uint32) {
+func (c *Coord) RegisterReaderSlot(i uint32, gen uint64) {
 	c.activeSlotsMu.Lock()
-	c.activeSlots = append(c.activeSlots, i)
+	c.activeSlots = append(c.activeSlots, slotRef{idx: i, gen: gen})
 	c.activeSlotsMu.Unlock()
+}
+
+// slotRef is a heartbeat-registry entry: the slot index plus the
+// acquisition generation, so a tick never stamps a slot this handle
+// lost to an aging clear (the stamp would ghost-freshen the
+// re-winner's heartbeat — or a free slot).
+type slotRef struct {
+	idx uint32
+	gen uint64
 }
 
 // ActiveReaderSlots reports how many reader slots this handle (this
@@ -758,7 +775,7 @@ func (c *Coord) RetryInterval() time.Duration { return c.retryInterval }
 func (c *Coord) UnregisterReaderSlot(i uint32) {
 	c.activeSlotsMu.Lock()
 	for j, s := range c.activeSlots {
-		if s == i {
+		if s.idx == i {
 			// Swap-with-last + truncate. Order doesn't matter; the
 			// heartbeat snapshot walks the whole slice per tick.
 			last := len(c.activeSlots) - 1

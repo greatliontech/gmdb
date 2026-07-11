@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync/atomic"
+	"time"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -63,8 +64,12 @@ type ReadTx struct {
 	meta pager.Meta
 
 	// readerSlot is the index in the lock-file reader table that
-	// this ReadTx owns. NoSlot once released.
+	// this ReadTx owns; readerGen is the acquisition generation — the
+	// (slot, gen) pair is the ownership token every release/raise
+	// verifies, so a slot lost to an aging clear and re-won is never
+	// zeroed or raised by this transaction. NoSlot once released.
 	readerSlot uint32
+	readerGen  uint64
 
 	// coord and lockFile are captured at BeginRead (not read through
 	// db, which nils its pointers during Close): the release path
@@ -127,6 +132,7 @@ type readTxCleanupInfo struct {
 	lockFile  *lock.File
 	held      *atomic.Bool
 	slot      uint32
+	gen       uint64
 	logger    *slog.Logger
 	originPCs []uintptr
 }
@@ -187,7 +193,7 @@ func readTxCleanupFn(info readTxCleanupInfo) {
 	// nothing to release. ReleaseReader(NoSlot) is itself a no-op, but
 	// the nil-guard avoids the deref.
 	if info.coord != nil {
-		info.coord.ReleaseReader(info.slot)
+		info.coord.ReleaseReader(info.slot, info.gen)
 	}
 	if info.lockFile != nil {
 		_ = info.lockFile.Close() // drop the BeginRead reference
@@ -331,6 +337,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 	// slot stays NoSlot and the read runs lock-free (the torn-read
 	// trade-off is documented on Options.ReadOnly).
 	slot := lock.NoSlot
+	var slotGen uint64
 	if coord != nil {
 		// Snapshot TxnID for the slot CAS. The per-slot "TxnID == 0 means
 		// free" sentinel collides with a legitimate genesis snapshot of 0
@@ -347,7 +354,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		if hook := beginReadPreAcquireHookForTest.Load(); hook != nil {
 			(*hook)()
 		}
-		slot, err = coord.AcquireReader(ctx, snapTxnID)
+		slot, slotGen, err = coord.AcquireReader(ctx, snapTxnID)
 		if err != nil {
 			return nil, mapReaderAcquireErr(err)
 		}
@@ -366,7 +373,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		for {
 			m2, rerr := pager.ReadLatestMeta(file, cachedMeta.PageSize)
 			if rerr != nil {
-				coord.ReleaseReader(slot)
+				coord.ReleaseReader(slot, slotGen)
 				return nil, mapPagerErr(rerr)
 			}
 			if m2.TxnID == meta.TxnID {
@@ -378,7 +385,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 				// the higher slot's bytes were corrupted mid-session.
 				// Error-not-crash (integrity.md): surface instead of
 				// letting the monotonic slot raise panic.
-				coord.ReleaseReader(slot)
+				coord.ReleaseReader(slot, slotGen)
 				return nil, fmt.Errorf("%w: latest meta regressed %d -> %d during reader snapshot restabilization",
 					ErrCorrupted, meta.TxnID, m2.TxnID)
 			}
@@ -387,9 +394,18 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 			if snapTxnID == 0 {
 				snapTxnID = 1
 			}
-			coord.RaiseReaderSlotTxnID(slot, snapTxnID)
+			if !coord.RaiseReaderSlotTxnID(slot, slotGen, snapTxnID) {
+				// The (slot, gen) token no longer owns the slot: a
+				// scan aged this acquisition out mid-restabilization
+				// (this goroutine was frozen past StaleTimeout). The
+				// pin is gone and the slot may be re-won — abandon it
+				// (releasing would zero the re-winner; the gen guard
+				// makes the release a no-op anyway) and surface the
+				// stale-eviction as a retryable begin failure.
+				return nil, fmt.Errorf("gmdb: reader slot aged out during snapshot restabilization (process stalled past StaleTimeout); retry BeginRead: %w", ErrReadersFull)
+			}
 			if cerr := ctx.Err(); cerr != nil {
-				coord.ReleaseReader(slot)
+				coord.ReleaseReader(slot, slotGen)
 				return nil, context.Cause(ctx)
 			}
 			// Bail if Close began: the loop is otherwise bounded by
@@ -398,7 +414,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 			// drain waits on this window. One iteration is the
 			// drain's worst case this way.
 			if db.closeGate.IsClosed() {
-				coord.ReleaseReader(slot)
+				coord.ReleaseReader(slot, slotGen)
 				return nil, ErrClosed
 			}
 		}
@@ -408,7 +424,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		// unlinked file and would read frozen pre-Compact data
 		// forever. Slot released before poisoning.
 		if gen := coord.DataGeneration(); gen != db.dataGeneration.Load() {
-			coord.ReleaseReader(slot)
+			coord.ReleaseReader(slot, slotGen)
 			db.poisoned.Store(true)
 			db.logger.Error("gmdb: data file replaced by a peer Compact; handle poisoned — Close and re-Open",
 				"cachedGeneration", db.dataGeneration.Load(), "currentGeneration", gen)
@@ -426,15 +442,55 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 	// motivates it.
 	cfg := page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(pager.MetaFlagPageChecksum)}
 	reservation := int64(meta.MaxSize) * int64(meta.PageSize)
-	pgr, err := pager.NewReader(file, cfg, reservation)
-	if err != nil {
-		// Slot acquisition succeeded; release before surfacing the
-		// pager error so we don't pin reclamation for nothing. No-op
-		// when coord == nil (read-only lock-free path; slot == NoSlot).
-		if coord != nil {
-			coord.ReleaseReader(slot)
+	// Shrink-seqlock bracket (file-format.md §File Shrinkage): the
+	// slot published above is only guaranteed visible to shrink scans
+	// that START after the publish — a scan already past our slot can
+	// truncate while NewReader fstats the size, leaving this reader a
+	// pre-shrink file-resident bound for its lifetime (a corrupt
+	// content-derived page id then SIGBUSes on the unbacked tail
+	// instead of returning ErrCorrupted). Bracket the size read: an
+	// odd or changed counter means a truncate span overlapped —
+	// rebuild the pager against the settled size. Each retry implies
+	// a completed writer commit, so the loop cannot spin without
+	// progress. Lock-free path (coord == nil): no lock file, but also
+	// no possible writer — no bracket needed.
+	// Retry cap: a writer CRASHED between its two seqlock bumps
+	// leaves the counter odd until stale-writer recovery re-evens it
+	// — but a dead writer's truncate either never ran or already
+	// settled, so after the cap the fstat below is against a stable
+	// size and proceeding is sound; only a LIVE writer mid-span is a
+	// hazard, and live writers close their bracket in microseconds.
+	var pgr *pager.Pager
+	for attempt := 0; ; attempt++ {
+		var seqBefore uint64
+		if coord != nil && lockFile != nil {
+			seqBefore = lockFile.ShrinkSeq()
 		}
-		return nil, mapPagerErr(err)
+		pgr, err = pager.NewReader(file, cfg, reservation)
+		if err != nil {
+			// Slot acquisition succeeded; release before surfacing the
+			// pager error so we don't pin reclamation for nothing. No-op
+			// when coord == nil (read-only lock-free path; slot == NoSlot).
+			if coord != nil {
+				coord.ReleaseReader(slot, slotGen)
+			}
+			return nil, mapPagerErr(err)
+		}
+		if coord == nil || lockFile == nil {
+			break
+		}
+		if seqBefore%2 == 0 && lockFile.ShrinkSeq() == seqBefore {
+			break
+		}
+		if attempt >= 64 {
+			break // crashed-writer residue (see cap doc above)
+		}
+		_ = pgr.Close()
+		if db.closeGate.IsClosed() {
+			coord.ReleaseReader(slot, slotGen)
+			return nil, ErrClosed
+		}
+		time.Sleep(time.Millisecond)
 	}
 	// Options.ReclaimOnClose: track the pages this read tx touches so
 	// close() can MADV_COLD them (mmap-strategy.md §Read Transaction
@@ -461,6 +517,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		pgr:        pgr,
 		meta:       meta,
 		readerSlot: slot,
+		readerGen:  slotGen,
 		coord:      coord,
 		lockFile:   lockFile,
 		held:       held,
@@ -471,6 +528,7 @@ func (db *DB) BeginRead(ctx context.Context) (*ReadTx, error) {
 		lockFile:  lockFile,
 		held:      held,
 		slot:      slot,
+		gen:       slotGen,
 		logger:    db.logger,
 		originPCs: captureOriginPCs(),
 	})
@@ -551,7 +609,7 @@ func (rtx *ReadTx) close() error {
 		// unpins a live snapshot (leak-detection.md §Close()
 		// Ordering).
 		if rtx.coord != nil {
-			rtx.coord.ReleaseReader(rtx.readerSlot)
+			rtx.coord.ReleaseReader(rtx.readerSlot, rtx.readerGen)
 		}
 		if rtx.lockFile != nil {
 			_ = rtx.lockFile.Close() // drop the BeginRead reference

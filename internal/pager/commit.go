@@ -517,15 +517,20 @@ func (p *Pager) maybeShrink(shrinkThreshold uint64) error {
 	// Shrinkage): a reader's file-resident bound is fixed at Begin, so
 	// truncating under it would turn a corrupt content-derived page id
 	// into a SIGBUS instead of the ErrCorrupted checksums.md
-	// §Structural and Allocation Bounds promises. Consulted last —
-	// only when a truncation would actually happen — because the scan
-	// costs O(MaxReaders).
-	if p.shrinkAllowed != nil && !p.shrinkAllowed() {
+	// §Structural and Allocation Bounds promises. The gate also owns
+	// the cross-process shrink-seqlock bracket that lets a reader
+	// publishing DURING the scan→truncate span detect the overlap and
+	// re-read the file size. Consulted last — only when a truncation
+	// would actually happen — because the scan costs O(MaxReaders).
+	truncate := func() error {
+		if err := p.fops.Truncate(target); err != nil {
+			return err
+		}
+		p.fileSize = target
 		return nil
 	}
-	if err := p.fops.Truncate(target); err != nil {
-		return err
+	if p.shrinkGate != nil {
+		return p.shrinkGate(truncate)
 	}
-	p.fileSize = target
-	return nil
+	return truncate()
 }

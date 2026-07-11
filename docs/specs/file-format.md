@@ -116,17 +116,31 @@ more than `ShrinkThreshold`:
    Legitimate trees never reference the truncated range
    (`HighWaterMark` plus the reclamation bound guarantee that), so
    the deferral protects only the hardened corrupt-input path; the
-   shrink retries at the next eligible commit. **Accepted
-   residual**: reader-slot acquisition is a lock-free CAS with no
-   happens-before edge to the gate's scan, so a reader that
-   publishes its slot between the scan and the `ftruncate` — and
-   fstats before the truncate lands — retains the pre-shrink
-   bound for its lifetime. The window is bounded by the writer's
-   scan-to-truncate span and harms only the corrupt-input path
-   (never a legitimate read). Full closure requires a shared
-   happens-before mechanism — a shrink sequence counter readers
-   observe across their slot-publish + fstat, or a
-   truncation-stable reader bound.
+   shrink retries at the next eligible commit. The lock-free
+   reader-CAS acquisition window is closed by the SHRINK SEQLOCK
+   (`ShrinkSeq` in the lock-file header): the writer increments it
+   to ODD immediately before the reader-visibility scan and to
+   EVEN after the truncate lands (or after deferring), serialised
+   under the write grant; a reader brackets its file-size read —
+   slot publish, read the counter, fstat, re-read — and an odd or
+   changed counter means a truncate span overlapped, so it
+   re-reads the size until the bracket is clean. A writer that
+   CRASHES mid-span leaves the counter odd; stale-writer recovery
+   re-evens it, and a reader's bracket retry is CAPPED (a dead
+   writer's truncate either never ran or already settled, so the
+   post-cap size read is stable). **Accepted residual**, narrowed:
+   a LIVE writer whose scan→truncate span outlasts the reader's
+   full retry budget — by being descheduled mid-span, or by an
+   `ftruncate` of a very large mapped region legitimately taking
+   that long (page-cache invalidation + PTE teardown across every
+   peer's mapping) — while that reader exhausts the cap.
+   Corrupt-input-only (never a legitimate read), and
+   multiplicatively rarer than the pre-seqlock any-acquisition
+   window. Latency note: a counter left ODD by a crashed writer
+   taxes every BeginRead with the full retry budget until the next
+   writer's grant acquisition re-evens it — a read-only aftermath
+   pays it per-begin. (Pinned by
+   `TestReaderBracketsShrinkSeqlock`.)
 4. `ftruncate()`. The mmap reservation remains at `MaxSize`.
 
 Automatic and zero-overhead — happens as a natural consequence

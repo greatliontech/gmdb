@@ -140,7 +140,13 @@ type Pager struct {
 	// segment for an immediate log.
 	rplCorruptCount uint64
 	rplCorruptCb    func(segPageID uint64)
-	shrinkAllowed   func() bool
+	// shrinkGate owns the reader-visibility deferral AND the
+	// cross-process shrink seqlock bracket around a commit-time
+	// ftruncate (file-format.md §File Shrinkage): the pager hands it
+	// the truncate thunk; the gate brackets the seqlock, scans for
+	// visible readers, and either runs the thunk or defers. Nil =
+	// ungated (raw pager tests).
+	shrinkGate func(truncate func() error) error
 
 	// rplRelocFloor arms a one-shot RPL chain-prefix relocation for
 	// the next commit (free-space.md §RPL segment relocation);
@@ -534,7 +540,7 @@ type TxParams struct {
 	// layer supplies a reader-table emptiness scan (the caller holds
 	// the write grant — the scan's LOCK_EX precondition). nil =
 	// always allowed (fixtures/tests).
-	ShrinkAllowed func() bool
+	ShrinkGate func(truncate func() error) error
 }
 
 // BeginTx seeds the pager for one write transaction from params, then
@@ -581,7 +587,7 @@ func (p *Pager) BeginTx(params TxParams) {
 	p.refreshReclamationBound = params.ReclamationBound
 	p.rplCorruptCb = params.RPLCorrupt
 	p.laggingReader = params.LaggingReader
-	p.shrinkAllowed = params.ShrinkAllowed
+	p.shrinkGate = params.ShrinkGate
 	if params.ReclamationBound != nil {
 		p.reclamationBound = params.ReclamationBound()
 	} else {

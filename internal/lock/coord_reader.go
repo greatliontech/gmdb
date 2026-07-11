@@ -44,15 +44,19 @@ func (c *Coord) crossNSTimeoutNanos() uint64 {
 // Returns the slot index. The caller MUST eventually call
 // ReleaseReader(idx) — leaking the slot pins RPL reclamation until
 // stale-detection ages out the slot (DefaultStaleTimeout = 10 s).
-func (c *Coord) AcquireReader(ctx context.Context, txnID uint64) (uint32, error) {
+// Returns the slot index plus the acquisition GENERATION — the
+// (slot, gen) pair is the caller's ownership token, required by
+// ReleaseReader and RaiseReaderSlotTxnID so a slot lost to an aging
+// clear and re-won is never released or raised by its former owner.
+func (c *Coord) AcquireReader(ctx context.Context, txnID uint64) (uint32, uint64, error) {
 	if err := ctx.Err(); err != nil {
-		return NoSlot, context.Cause(ctx)
+		return NoSlot, 0, context.Cause(ctx)
 	}
 	if txnID == 0 {
 		// Programmer-error precondition mirrored on AcquireReaderSlot;
 		// surface as a structured error rather than the file-level
 		// panic so the *ReadTx wrapper can map it cleanly.
-		return NoSlot, errors.New("lock: AcquireReader requires txnID > 0")
+		return NoSlot, 0, errors.New("lock: AcquireReader requires txnID > 0")
 	}
 	hint := c.readerSlotHint.Load()
 	for {
@@ -62,30 +66,30 @@ func (c *Coord) AcquireReader(ctx context.Context, txnID uint64) (uint32, error)
 		// lands if this goroutine is descheduled or frozen, and a
 		// stale-at-birth heartbeat lets a scan age the mid-publish
 		// window out immediately.
-		idx, err := c.f.AcquireReaderSlot(hint, txnID, c.pid, c.startTime, c.pidNS, c.clock)
+		idx, gen, err := c.f.AcquireReaderSlot(hint, txnID, c.pid, c.startTime, c.pidNS, c.clock)
 		if err == nil {
 			c.readerSlotHint.Store(idx)
-			c.RegisterReaderSlot(idx)
-			return idx, nil
+			c.RegisterReaderSlot(idx, gen)
+			return idx, gen, nil
 		}
 		if !errors.Is(err, ErrReadersFull) {
-			return NoSlot, err
+			return NoSlot, 0, err
 		}
 		// Table full. With no deadline, surface ErrReadersFull
 		// immediately per transactions.md §Read Transaction step 2.
 		// With a deadline, back off briefly and retry until a slot
 		// frees or the context expires.
 		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-			return NoSlot, ErrReadersFull
+			return NoSlot, 0, ErrReadersFull
 		}
 		// Small backoff — releases are atomic stores so a slot can
 		// free within a few microseconds; 1 ms gives the contending
 		// scheduler room without busy-spinning shared memory.
 		select {
 		case <-ctx.Done():
-			return NoSlot, context.Cause(ctx)
+			return NoSlot, 0, context.Cause(ctx)
 		case <-c.stopCh:
-			return NoSlot, ErrClosed
+			return NoSlot, 0, ErrClosed
 		case <-time.After(1 * time.Millisecond):
 		}
 	}
@@ -95,11 +99,15 @@ func (c *Coord) AcquireReader(ctx context.Context, txnID uint64) (uint32, error)
 // post-publish snapshot-restabilization step (see
 // File.RaiseReaderSlotTxnID). No-op on NoSlot (lock-free read-only
 // path).
-func (c *Coord) RaiseReaderSlotTxnID(idx uint32, txnID uint64) {
+// Reports whether the raise landed (false = the (idx, gen) token no
+// longer owns the slot; the caller must abandon the acquisition).
+// NoSlot returns true (lock-free path: nothing to raise, nothing
+// lost).
+func (c *Coord) RaiseReaderSlotTxnID(idx uint32, gen uint64, txnID uint64) bool {
 	if idx == NoSlot {
-		return
+		return true
 	}
-	c.f.RaiseReaderSlotTxnID(idx, txnID)
+	return c.f.RaiseReaderSlotTxnID(idx, gen, txnID)
 }
 
 // ReaderSlotTxnID returns the slot's currently pinned TxnID —
@@ -121,12 +129,15 @@ func (c *Coord) ReaderSlotTxnID(idx uint32) uint64 {
 // idx must be a valid slot index returned by a prior AcquireReader;
 // passing NoSlot is a no-op (covers the leaked-Tx cleanup path that
 // can race a normal Release).
-func (c *Coord) ReleaseReader(idx uint32) {
+// gen is the ownership token from AcquireReader; a slot lost to an
+// aging clear and re-won is unregistered locally but its on-mmap
+// state is left to the re-winner.
+func (c *Coord) ReleaseReader(idx uint32, gen uint64) {
 	if idx == NoSlot {
 		return
 	}
 	c.UnregisterReaderSlot(idx)
-	c.f.ReleaseReaderSlot(idx)
+	c.f.ReleaseReaderSlot(idx, gen)
 }
 
 // OldestReaderTxnID returns the minimum TxnID held by any live

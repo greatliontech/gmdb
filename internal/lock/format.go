@@ -11,10 +11,10 @@ const Magic uint64 = 0x6B636F6C62646D67
 
 // HeaderSize is the on-disk byte length of LockFileHeader. Frozen at
 // the value enforced by the compile-time size check in this file.
-const HeaderSize = 112
+const HeaderSize = 136
 
 // SlotSize is the on-disk byte length of one ReaderSlot, ditto.
-const SlotSize = 48
+const SlotSize = 56
 
 // MaxReaders bounds. The default is the api-surface.md
 // Options.MaxReaders default (4096); the floor is a sanity minimum
@@ -71,10 +71,33 @@ type LockFileHeader struct {
 	// continuing would commit to (or read) the unlinked file, silently
 	// diverging from every other process. Bumped atomically by Compact
 	// under the write grant, after the rename + directory fsync.
+	// SURVIVES the boot-epoch reset (it counts inode replacements,
+	// not boot-relative time).
 	DataGeneration uint64
+	// BootID is the boot-epoch discriminator (Linux
+	// /proc/sys/kernel/random/boot_id): every heartbeat and process
+	// start time in this file is meaningful ONLY within the boot that
+	// stamped it (CLOCK_BOOTTIME and starttime ticks are boot-relative,
+	// and PID/starttime identities can collide across boots). An
+	// adopter whose current boot differs — BOTH ids known (non-zero);
+	// see shouldResetBootEpoch — resets the volatile coordination
+	// state — writer blocks, every reader slot — under flock(LOCK_EX)
+	// and stamps the current boot: with both epochs known, no process
+	// from the stamped boot can still exist, so nothing live is
+	// evicted (cross-process.md §Lock File Layout, boot epoch).
+	BootID [16]byte
+	// ShrinkSeq is the file-shrink seqlock (file-format.md §File
+	// Shrinkage): the writer increments it to ODD before the
+	// reader-visibility scan that precedes an ftruncate and to EVEN
+	// after the truncate lands; a reader brackets its size read
+	// (slot publish → read seq → fstat → re-read seq; odd or changed
+	// ⇒ re-fstat). Closes the reader-CAS acquisition window during
+	// which a freshly-published reader could retain a pre-shrink
+	// file-resident bound.
+	ShrinkSeq uint64
 }
 
-// ReaderSlot overlays one 48-byte slot in the reader table. All six
+// ReaderSlot overlays one 56-byte slot in the reader table. All seven
 // fields are atomically accessed via the helpers in atomic.go;
 // cross-process visibility of these fields is the entire purpose of
 // the lock-file design.
@@ -86,6 +109,14 @@ type ReaderSlot struct {
 	PIDNamespace     uint64
 	Heartbeat        uint64
 	HintEpoch        uint64
+	// Gen is the slot's acquisition generation: monotonically bumped
+	// by every successful TxnID CAS, never zeroed by release or
+	// clear. An owner's ownership token is (TxnID, Gen-at-acquire):
+	// the post-publish verify, the release, and the restabilization
+	// raise all re-check it, so a slot lost to an aging clear and
+	// re-won — even at the SAME pinned TxnID — is never mistaken for
+	// still-owned (cross-process.md §Slot acquire).
+	Gen uint64
 }
 
 // Compile-time assertions that the structs' Go sizes match the spec's

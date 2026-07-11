@@ -179,7 +179,8 @@ func Open(p OpenParams) (*File, error) {
 			lastErr = err
 			continue
 		}
-		if errors.Is(err, errStaleContended) || errors.Is(err, errPathChanged) {
+		if errors.Is(err, errStaleContended) || errors.Is(err, errPathChanged) ||
+			errors.Is(err, errBootEpochContended) {
 			// Contended removal guard (another remover or a legacy
 			// coordinator holds the stale inode's flock), or the name
 			// was re-bound between our open/create and the final
@@ -368,6 +369,24 @@ func tryAdoptExisting(p OpenParams) (*File, error) {
 	}
 	if hdr.UUID != p.DataUUID {
 		return nil, removeStaleGuarded(p, f)
+	}
+
+	// Boot-epoch gate (cross-process.md §Lock File Layout, boot
+	// epoch): heartbeats and process start times are boot-relative,
+	// and PID/starttime identities can collide across boots — a
+	// pre-boot heartbeat reads as a huge FUTURE stamp (honoured as
+	// fresh forever) and a colliding identity passes the liveness
+	// check, so cross-boot state would bypass the recovery gate and
+	// pin reclamation. A header stamped by a DIFFERENT boot — both
+	// ids known (non-zero); an unknown epoch on either side disables
+	// invalidation instead of risking a live-peer eviction — has no
+	// live processes behind any of its records (the boot they lived
+	// in is gone), so the adopter resets the volatile coordination
+	// state under flock(LOCK_EX) and stamps the current boot.
+	if shouldResetBootEpoch(hdr.BootID, CurrentBootID()) {
+		if err := bootEpochReset(p, f, hdr.MaxReaders); err != nil {
+			return nil, err
+		}
 	}
 
 	// Success: the *File takes ownership of the fd; do not close it
@@ -587,6 +606,69 @@ func removeStaleGuarded(p OpenParams, f *os.File) error {
 	return errStaleUUID
 }
 
+// errBootEpochContended signals a lost flock conversion during the
+// boot-epoch reset (a concurrent adopter is resetting, or has already
+// reset and gone on to hold the write grant). The Open loop backs off
+// and retries; the next attempt observes the stamped current boot and
+// skips the reset entirely.
+var errBootEpochContended = errors.New("lock: boot-epoch reset contended")
+
+// bootEpochReset invalidates all boot-relative coordination state in
+// an adopted lock file stamped by a different boot: the writer block,
+// LastMaintenanceTime, the LastWriter recovery-gate record, ShrinkSeq,
+// and EVERY reader slot are zeroed, then the current boot id is
+// stamped (last — a crash mid-reset leaves the old id, and the next
+// adopter redoes the idempotent reset). DataGeneration survives: it
+// counts data-file inode replacements, not boot-relative time.
+//
+// Runs under a non-blocking LOCK_EX conversion (same drop-then-acquire
+// semantics as removeStaleGuarded); after winning, the boot id is
+// re-read — a concurrent resetter may have completed while we
+// converted, making the reset a no-op. Safety: no process from the
+// stamped (old) boot can exist (both ids known — the
+// shouldResetBootEpoch precondition), so nothing live is evicted; concurrent
+// CURRENT-boot openers are serialised by the flock (an acquirer
+// cannot CAS a slot before mmapAndOverlay, which happens only after
+// this returns on every path).
+func bootEpochReset(p OpenParams, f *os.File, maxReaders uint32) error {
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return errBootEpochContended
+	}
+	// Re-read the header under the lock: the winner of a concurrent
+	// reset already stamped the current boot.
+	headerBytes := make([]byte, HeaderSize)
+	if _, err := f.ReadAt(headerBytes, 0); err != nil {
+		return fmt.Errorf("lock: re-read header under boot-epoch reset: %w", err)
+	}
+	hdr := (*LockFileHeader)(unsafe.Pointer(&headerBytes[0]))
+	cur := CurrentBootID()
+	if !shouldResetBootEpoch(hdr.BootID, cur) {
+		return nil // winner already stamped, or an epoch went unknown
+	}
+	// Zero the volatile state: writer block + LastMaintenanceTime +
+	// LastWriter block (bytes [32, 104)), ShrinkSeq, and the whole
+	// reader table. Preserve Magic/MaxReaders/UUID/DataGeneration.
+	var zeroed LockFileHeader = *hdr
+	zeroed.WriterPID, zeroed.WriterStartTime, zeroed.WriterPIDNamespace, zeroed.WriterHeartbeat = 0, 0, 0, 0
+	zeroed.LastMaintenanceTime = 0
+	zeroed.LastWriterPID, zeroed.LastWriterStartTime, zeroed.LastWriterPIDNamespace, zeroed.LastWriterHeartbeat = 0, 0, 0, 0
+	zeroed.ShrinkSeq = 0
+	zeroed.BootID = cur
+	// Slots first, then the header with the new boot id LAST: a crash
+	// between the two leaves the old id and the next adopter repeats
+	// the (idempotent) reset. Slot Gen words are reset with the rest —
+	// generation monotonicity is only relied on within a boot.
+	zeroSlab := make([]byte, int64(SlotSize)*int64(maxReaders))
+	if _, err := f.WriteAt(zeroSlab, int64(HeaderSize)); err != nil {
+		return fmt.Errorf("lock: zero reader table under boot-epoch reset: %w", err)
+	}
+	out := (*[HeaderSize]byte)(unsafe.Pointer(&zeroed))[:]
+	if _, err := f.WriteAt(out, 0); err != nil {
+		return fmt.Errorf("lock: stamp boot epoch: %w", err)
+	}
+	return nil
+}
+
 // initLockFile truncates the file to the full lock-file size and
 // writes the header. Reader-table region is left zero — Truncate
 // produces zero-filled holes on every supported filesystem, which is
@@ -611,6 +693,9 @@ func initLockFile(f *os.File, uuid [16]byte, maxReaders uint32, fileSize int64) 
 		// Writer header fields are zero on creation — no writer holds
 		// the lock yet, so PID/StartTime/PIDNamespace/Heartbeat all
 		// default to 0 per the convention in cross-process.md.
+		// The boot epoch is stamped so adopters in THIS boot trust the
+		// file's boot-relative stamps (heartbeats, start times).
+		BootID: CurrentBootID(),
 	}
 	headerBytes := (*[HeaderSize]byte)(unsafe.Pointer(&hdr))[:]
 	if _, err := f.WriteAt(headerBytes, 0); err != nil {
@@ -669,9 +754,10 @@ func (f *File) Ref() {
 // and closes the file descriptor. The owning handle's teardown and
 // each open read transaction's release drop exactly one each, so the
 // mapping outlives DB.Close while any read transaction still needs
-// its reader slot. Does NOT unlink the lock file — it is ephemeral
-// and removal is orthogonal to release (the next opener detects an
-// empty/missing file via the lifecycle's adopt-then-create path).
+// its reader slot. Does NOT unlink the lock file — it persists as
+// transient coordination state (cross-process.md §Lock File Layout:
+// persistence is harmless; cross-boot state is invalidated by the
+// boot epoch, and a recreated database stale-classifies it by UUID).
 //
 // After the final Close every accessor on *File becomes a programmer
 // error; see the lifetime contract on the *File doc.
@@ -762,6 +848,30 @@ func (f *File) DataGeneration() uint64 {
 		panic("lock: DataGeneration on closed *File")
 	}
 	return Load64(&f.header.DataGeneration)
+}
+
+// ShrinkSeq reads the file-shrink seqlock (format.go field doc).
+// Readers bracket their file-size read with two calls: an odd value,
+// or a change between the two reads, means a truncate overlapped the
+// window — re-read the size (file-format.md §File Shrinkage).
+func (f *File) ShrinkSeq() uint64 {
+	if f.header == nil {
+		panic("lock: ShrinkSeq on closed *File")
+	}
+	return Load64(&f.header.ShrinkSeq)
+}
+
+// BumpShrinkSeq increments the shrink seqlock. The writer calls it
+// once immediately BEFORE the reader-visibility scan that gates an
+// ftruncate (making the value odd) and once immediately AFTER the
+// truncate lands (even) — writer-serialised under the write grant, so
+// plain increments suffice for the writer side while readers load
+// atomically.
+func (f *File) BumpShrinkSeq() {
+	if f.header == nil {
+		panic("lock: BumpShrinkSeq on closed *File")
+	}
+	Add64(&f.header.ShrinkSeq, 1)
 }
 
 // BumpDataGeneration increments the data-file replacement counter.

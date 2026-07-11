@@ -35,13 +35,17 @@ func IsLeafType(typ uint8) bool {
 const Magic uint32 = 0x62646D67
 
 // FormatVersion is the current on-disk format version. It is NOT bumped for
-// pre-v1 format changes (e.g. the within-page branch prefix-truncation
-// format, page-formats.md §Branch Page): with no installed base, a version
-// discriminator would be backcompat scaffolding for files that do not exist —
-// the clean break is to change the format and regenerate. The field exists
-// for the post-v1 compatibility contract; it advances only once a released
-// format must be distinguished from its successor.
-const FormatVersion uint32 = 1
+// routine pre-v1 format changes (e.g. the within-page branch
+// prefix-truncation format, page-formats.md §Branch Page): with no installed
+// base, a version discriminator would be backcompat scaffolding for files
+// that do not exist — the clean break is to change the format and
+// regenerate. It IS bumped when a change must partition a MIXED-BINARY
+// FLEET on one machine: the lock-file layout invariant (cross-process.md
+// §Lock File Lifecycle) requires that a binary with a different lock-file
+// layout cannot even open the data file, else the size-mismatch stale arm
+// removes a live peer's lock file (split brain). Version 2 = the
+// boot-epoch/seqlock/slot-generation lock-file layout.
+const FormatVersion uint32 = 2
 
 // Supported page-size range. PageSize is set at database creation, persisted
 // on the meta page, and immutable.

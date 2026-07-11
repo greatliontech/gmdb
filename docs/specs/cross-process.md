@@ -250,7 +250,8 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=Every process that mmaps a lock file does so with
-    size = 80 + (48 × LockFileHeader.MaxReaders), where
+    size = HeaderSize + (SlotSize × LockFileHeader.MaxReaders)
+    (136 + 56 × MaxReaders at the current layout), where
     MaxReaders is the value of the lock file's MaxReaders field
     at the moment the mmap is established. The mmap size is
     established once at Open and is never resized; MaxReaders is
@@ -325,7 +326,7 @@ Invariant: kind=entailed;
 ```
 Lock File
 +----------------------------------------------+
-| Header (112 bytes)                           |
+| Header (136 bytes)                           |
 | Magic              | uint64                  |
 | MaxReaders         | uint32                  |
 | Padding            | 4 bytes                 |
@@ -340,11 +341,13 @@ Lock File
 | LastWriterPIDNS    | uint64                  |
 | LastWriterHeartbeat| uint64                  |
 | DataGeneration     | uint64                  |
+| BootID             | [16]byte                |  boot-epoch discriminator
+| ShrinkSeq          | uint64                  |  file-shrink seqlock
 +----------------------------------------------+
 | Reader Table                                 |
 | +-------+-----+-----+------+-------+-------+ |
-| | TxnID | PID | PST | PIDN | HB    | HEpoch| | Slot 0 (48 bytes)
-| | u64   | u64 | u64 | u64  | u64   | u64   | |
+| | TxnID | PID | PST | PIDN | HB | HEpoch | Gen | Slot 0 (56 bytes)
+| | u64   | u64 | u64 | u64  | u64| u64    | u64 | |
 | +-------+-----+-----+------+-------+-------+ |
 | | ...                                       | | up to MaxReaders slots
 | +-------+-----+-----+------+-------+-------+ |
@@ -377,6 +380,8 @@ type LockFileHeader struct {
     LastWriterPIDNamespace uint64
     LastWriterHeartbeat    uint64
     DataGeneration      uint64
+    BootID              [16]byte
+    ShrinkSeq           uint64
 }
 
 type ReaderSlot struct {
@@ -387,6 +392,7 @@ type ReaderSlot struct {
     PIDNamespace     uint64
     Heartbeat        uint64
     HintEpoch        uint64 // monotonic clock; first observer of PID==0+Heartbeat==0 sets this
+    Gen              uint64 // acquisition generation; never zeroed
 }
 ```
 
@@ -395,16 +401,18 @@ memory structures. Data file page formats remain raw byte layouts
 with explicit endian-aware encode/decode functions for portability.
 
 **Cross-platform portability of the lock file is not a goal.** The
-lock file is ephemeral (deleted when all processes exit) and its
-layout deliberately follows the host platform's C ABI. A lock file
-written by a little-endian process is not readable by a big-endian
-process; mounting the database on a different architecture
-requires deleting any stale lock file (the next opener does this
-automatically when the UUID does not match the data file's). The
-data file itself is fully portable (little-endian, explicit
-encode/decode).
+lock file is transient coordination state — it PERSISTS on disk
+(no code path deletes it in normal operation; persistence is
+harmless because cross-boot state is invalidated by the boot
+epoch below, and a recreated database stale-classifies it by
+UUID) — and its layout deliberately follows the host platform's
+C ABI. A lock file written by a little-endian process is not
+readable by a big-endian process; mounting the database on a
+different architecture requires deleting any stale lock file
+manually. The data file itself is fully portable (little-endian,
+explicit encode/decode).
 
-### Header fields (112 bytes)
+### Header fields (136 bytes)
 
 - **Magic**: identifies the file as a gmdb lock file.
 - **MaxReaders**: number of reader slots, set at lock-file creation
@@ -426,6 +434,47 @@ encode/decode).
   completes (see `background-maintenance.md`).
 - **DataGeneration** (atomic): counts data-file replacements
   (Compact's rename-over). See §Data-file generation below.
+- **BootID**: the boot-epoch discriminator (Linux
+  `/proc/sys/kernel/random/boot_id`), stamped at creation and by
+  every cross-boot adoption reset. Heartbeats use a boot-relative
+  clock and process start times are ticks-since-boot, so every
+  stamp and identity in this file is meaningful ONLY within the
+  boot that wrote it: after a reboot, pre-boot heartbeats read as
+  huge FUTURE values (honoured as fresh forever by the future-stamp
+  guard) and PID/starttime identities can collide with new-boot
+  processes — both legs would bypass the recovery-commit gate and
+  pin reclamation. An adopter whose current boot differs RESETS the
+  volatile coordination state under a non-blocking
+  `flock(LOCK_EX)` conversion (contention ⇒ back off and re-adopt;
+  the winner already stamped): the writer block,
+  `LastMaintenanceTime`, the LastWriter record, `ShrinkSeq`, and
+  every reader slot (including `Gen`) are zeroed — no process from
+  the stamped boot can exist, so nothing live is evicted — then the
+  current boot id is stamped LAST (a crash mid-reset repeats the
+  idempotent reset). `DataGeneration` SURVIVES (it counts inode
+  replacements, not boot-relative time). The reset fires ONLY when
+  both the stamped and the current boot id are KNOWN (non-zero) and
+  differ: a zero on either side (unreadable `/proc` in a chroot or
+  mount namespace) DISABLES cross-boot invalidation — resetting on
+  an unknown epoch could zero a LIVE same-boot peer's slots
+  (use-after-reclaim), strictly worse than the cross-boot staleness
+  it would fix. Zero-epoch environments therefore keep the
+  pre-boot-epoch semantics (future-stamp guard only) as a
+  documented residual. The future-stamp guard's trust is thereby
+  scoped to SAME-BOOT stamps; within one boot it remains
+  load-bearing for mid-publish clock skew. A header CREATED by a
+  zero-epoch process keeps `BootID = 0` for the file's lifetime —
+  known-epoch adopters never upgrade the stamp (stamping without
+  resetting would bless unknown-epoch state; stamping with a reset
+  re-opens the live-peer eviction), so invalidation stays disabled
+  for that file, across real reboots too, until it is
+  stale-cycled (UUID or layout change). (Pinned by `TestAdoptForeignBootEpochResetsCoordinationState`
+  and `TestAdoptSameBootPreservesCoordinationState`.)
+- **ShrinkSeq**: the file-shrink seqlock — see `file-format.md`
+  §File Shrinkage for the protocol (writer brackets its
+  scan→truncate span odd/even under the write grant; readers
+  bracket their file-size read and re-read on overlap; stale-writer
+  recovery re-evens a counter left odd by a writer crash).
 - **LastWriterPID / LastWriterStartTime / LastWriterPIDNamespace /
   LastWriterHeartbeat** (atomic): the persisted identity of the most
   recent write-grant holder. Written at every grant acquisition
@@ -440,7 +489,7 @@ encode/decode).
   Classification mirrors the reader-slot rules (same-namespace
   kill(0) + start-time; cross-namespace heartbeat staleness).
 
-### Reader slot (48 bytes)
+### Reader slot (56 bytes)
 
 - **TxnID** (atomic): snapshot TxnID held by this reader. `0` =
   free.
@@ -451,6 +500,15 @@ encode/decode).
 - **PIDNamespace** (atomic): PID namespace inode of owner.
 - **Heartbeat** (atomic): monotonic clock, updated periodically
   (~1 s) by owning process's heartbeat goroutine.
+- **Gen** (atomic): the acquisition generation — bumped by every
+  successful `TxnID` CAS, never zeroed by release or clear (only
+  the cross-boot reset zeroes it). The `(TxnID, Gen)` pair is the
+  owner's TOKEN: the post-publish ownership verify, the release,
+  the restabilization raise, and the owner's heartbeat ticks all
+  re-check it, so a slot lost to an aging clear and re-won — even
+  at the SAME pinned TxnID — is never used, zeroed, raised, or
+  heartbeat-stamped by its former owner. The guarded clear's
+  observation tuple includes it.
 - **HintEpoch** (atomic): cross-process orphan-detection anchor.
   Zero during normal operation. The first writer-scan that
   observes the slot in the "stuck mid-acquire" state
@@ -460,12 +518,12 @@ encode/decode).
   writer-process turnover. Cleared back to 0 by slot release and
   by successful acquire's field-write phase.
 
-Total size: `80 + (48 × MaxReaders)`. Default 4096 readers:
-`80 + 196608 = 196688` bytes (~192 KB).
+Total size: `136 + (56 × MaxReaders)`. Default 4096 readers:
+`136 + 229376 = 229512` bytes (~224 KB).
 
 `MaxReaders` is bounded `[1, 65536]`. The lower bound is one slot
 (degenerate but legal); the upper bound caps the mmap at
-`80 + 48 × 65536 ≈ 3 MiB`, so a corrupted or maliciously-crafted
+`136 + 56 × 65536 ≈ 3.5 MiB`, so a corrupted or maliciously-crafted
 header value cannot demand a petabyte-scale mmap. A header
 `MaxReaders` value outside this range is treated as `ErrCorrupted`
 by `Open`.
@@ -475,8 +533,9 @@ reader table. The write lock is a separate concern via `flock()`.
 
 ## Lock File Lifecycle
 
-Ephemeral. The first process to open the database creates the
-lock file, writes the header
+Transient coordination state (persists on disk; see the
+portability note in §Lock File Layout — persistence is harmless).
+The first process to open the database creates the lock file, writes the header
 (`Magic`, `MaxReaders`, `WriterPID = 0`, `WriterStartTime = 0`),
 and initializes all slots to zero. Subsequent processes validate
 `Magic`, read `MaxReaders`, mmap at the corresponding size. If
@@ -827,7 +886,7 @@ on-disk artifacts.
 
 Slot allocation uses a simple scan with atomic CAS — no free
 stack or other auxiliary data structure. The reader table is a
-flat array of 48-byte slots in the lock file's shared mmap. All
+flat array of 56-byte slots in the lock file's shared mmap. All
 operations use atomic memory ops visible across processes.
 
 **Snapshot selection.** A read transaction (`BeginRead`) snapshots
@@ -860,8 +919,10 @@ path is only used once the full identity has been populated).
    `atomic.Uint32` on the Coord struct) rather than slot 0.
 2. Scan forward (with wraparound) for `TxnID == 0` (free).
 3. Atomically CAS the `TxnID` field from `0` to the current meta
-   page's TxnID. CAS failure ⇒ continue scanning.
-4. Immediately after a successful CAS, in this exact order:
+   page's TxnID. CAS failure ⇒ continue scanning. A successful CAS
+   immediately bumps `Gen`; the resulting `(TxnID, Gen)` pair is
+   the acquisition's OWNERSHIP TOKEN (see the `Gen` field doc).
+4. Immediately after the CAS + Gen bump, in this exact order:
    a. Store `Heartbeat = nowMonotonic()` (atomic). The clock is
       read AT STORE TIME, never earlier by the caller: a value read
       before the CAS can be arbitrarily old by store time if the
@@ -873,10 +934,12 @@ path is only used once the full identity has been populated).
    c. Store `PIDNamespace = db.pidNamespace` (atomic).
    d. Store `ProcessStartTime = db.processStartTime` (atomic).
    e. Store `PID = currentPID` (atomic).
-   f. **Ownership verify**: re-load `TxnID`. If it no longer holds
-      this acquisition's value, a stale-detection scan aged the
-      mid-publish window out (reachable only when the acquirer was
-      frozen past `StaleTimeout` between the CAS and here). Two
+   f. **Ownership verify**: re-load the `(TxnID, Gen)` token. If
+      either differs from this acquisition's values, a
+      stale-detection scan aged the mid-publish window out
+      (reachable only when the acquirer was frozen past
+      `StaleTimeout` between the CAS and here) — the Gen check
+      catches even a re-win that pinned the SAME TxnID. Two
       sub-cases:
       - Slot still FREE (cleared, not re-won): the acquirer
         RE-CLAIMS it (CAS from 0) and re-publishes from step 4a.
@@ -894,16 +957,27 @@ path is only used once the full identity has been populated).
         stores overwrite the ghost's, so no junk survives the
         abandon.
 
-      **Accepted residual** until a versioned slot layout lands —
-      all requiring the acquirer frozen past `StaleTimeout`
-      mid-publish: (1) ghost stores b–e may transiently clobber a
-      re-winner's identity fields before the verify detects the
-      loss; (2) a re-win that pinned the SAME `TxnID` passes the
-      verify undetected (two owners); (3) a scanner descheduled
+      **Accepted residual** — each requiring the acquirer (or
+      scanner) frozen past a load-bearing window: (1) a resumed
+      ghost's stores b–e may TRANSIENTLY clobber a re-winner's
+      identity fields before the verify detects the loss (the
+      token makes the loss detectable, closing every durable
+      consequence — the ghost never uses, releases, raises, or
+      heartbeats the slot — but the store interleaving itself
+      needs per-field CAS to close); (2) a scanner descheduled
       between its guard loads and its clear stores can zero a slot
       whose frozen occupant resumed and re-published in between —
       the resumed owner's verify may pass before the clear's final
-      `TxnID` store lands, leaving it on an unpinned snapshot.
+      `TxnID` store lands, leaving it on an unpinned snapshot. The
+      formerly-recorded same-TxnID two-owners residual is CLOSED
+      by the token (pinned by `TestAcquireDetectsSameTxnIDRewin`);
+      (3) a ghost frozen between its CAS and its Gen bump can, on
+      resume, leave a published slot NO one owns (both verifies
+      fail) — self-healing junk aged out within `StaleTimeout`,
+      never two owners;
+      the release/raise/heartbeat legs are pinned by
+      `TestReleaseSkipsRewonSlot`, `TestRaiseRefusedAfterSlotLost`,
+      and the gen-guarded tick.
 5. Register the slot index with the heartbeat goroutine's active
    list.
 6. Update `coord.readerSlotHint`.
@@ -933,8 +1007,8 @@ no cross-process coordination. Under steady-state load, the hint
 points to a recently-freed slot and the scan completes in 1–2
 iterations. Worst case wraps to O(MaxReaders).
 
-The CAS on `TxnID` is the serialization point. 48-byte slots ×
-4096 = 192 KB — fits in L2 cache, sequential scan with hardware
+The CAS on `TxnID` is the serialization point. 56-byte slots ×
+4096 = 224 KB — fits in L2 cache, sequential scan with hardware
 prefetching.
 
 ### Slot release (`Commit` / `Rollback` read transaction)
@@ -1071,7 +1145,7 @@ a re-winner whose recycled PID collides on start time within the
 clock tick (the start-time-collision class), the cross-namespace
 frozen-but-alive occupant (the documented longer-window trade
 above), and the scanner-descheduled-mid-clear interleave recorded
-as residual (3) under §Slot acquire step f.
+as residual (2) under §Slot acquire step f.
 
 When the writer clears a stale slot, it stores in the SAME exact
 order as slot release:

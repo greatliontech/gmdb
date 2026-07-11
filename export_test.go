@@ -221,3 +221,15 @@ func (db *DB) WriterFileOpsForTest() pager.FileOps {
 func (db *DB) FirstDataPageForTest() uint64 {
 	return 2 + uint64(db.currentMeta.BitmapPages)
 }
+
+// SetShrinkGateHookForTest installs (or clears) the hook firing inside
+// the shrink gate between the reader scan and the ftruncate. Returns a
+// restore func.
+func SetShrinkGateHookForTest(hook func()) (restore func()) {
+	if hook == nil {
+		shrinkGateHookForTest.Store(nil)
+		return func() {}
+	}
+	shrinkGateHookForTest.Store(&hook)
+	return func() { shrinkGateHookForTest.Store(nil) }
+}

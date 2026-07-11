@@ -1,4 +1,4 @@
-// Package lock owns the gmdb lock file: the ephemeral `<dbname>.lock`
+// Package lock owns the gmdb lock file: the transient `<dbname>.lock`
 // companion mmap'd by every process sharing a database, holding the
 // cross-process write-lock state (a single flock'd region) and the
 // reader-table.
@@ -18,7 +18,7 @@
 //
 // Layout. The on-disk layout is the structs.HostLayout shape of
 // LockFileHeader (HeaderSize bytes) followed by MaxReaders contiguous
-// ReaderSlot entries (48 bytes each). The mmap reservation equals
+// ReaderSlot entries (SlotSize bytes each). The mmap reservation equals
 // HeaderSize + SlotSize×MaxReaders exactly — per cross-process.md
 // the size is fixed at lock-file creation and never resized.
 package lock

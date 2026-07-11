@@ -71,10 +71,10 @@ func (f *walkFixture) readPage(id uint64) []byte {
 // standard bounds (LowBound 2, HighBound 1024) unless overridden.
 func (f *walkFixture) chainWalk(head, tail, entryCount uint64) RPLChainWalk {
 	return RPLChainWalk{
-		ReadPage:   f.readPage,
-		Cfg:        f.cfg,
-		Head:       head,
-		Tail:       tail,
+		ReadPage: f.readPage,
+		Cfg:      f.cfg,
+		Head:     head,
+		Tail:     tail,
 		// Honest projections record the head segment's own TxnID in
 		// the meta (RPLHeadTxnID) — the authenticity ceiling. Garbage
 		// or absent heads keep 0; those walks fail earlier anyway.

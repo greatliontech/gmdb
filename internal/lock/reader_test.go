@@ -40,7 +40,7 @@ func TestAcquireReaderSlotBasic(t *testing.T) {
 	// stamped identity, TxnID = txnID, PID = pid. End-to-end ordering
 	// invariant exercised more aggressively below.
 	f := openTestFile(t, 4)
-	idx, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, clockAt(100))
+	idx, _, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, clockAt(100))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot: %v", err)
 	}
@@ -70,18 +70,18 @@ func TestAcquireReaderSlotBasic(t *testing.T) {
 
 func TestAcquireReaderSlotFull(t *testing.T) {
 	f := openTestFile(t, 2)
-	a, err := f.AcquireReaderSlot(0, 1, 1, 1, 1, clockAt(1))
+	a, _, err := f.AcquireReaderSlot(0, 1, 1, 1, 1, clockAt(1))
 	if err != nil {
 		t.Fatalf("acquire 1: %v", err)
 	}
-	b, err := f.AcquireReaderSlot(0, 2, 1, 1, 1, clockAt(1))
+	b, _, err := f.AcquireReaderSlot(0, 2, 1, 1, 1, clockAt(1))
 	if err != nil {
 		t.Fatalf("acquire 2: %v", err)
 	}
 	if a == b {
 		t.Errorf("acquire collided on idx %d", a)
 	}
-	_, err = f.AcquireReaderSlot(0, 3, 1, 1, 1, clockAt(1))
+	_, _, err = f.AcquireReaderSlot(0, 3, 1, 1, 1, clockAt(1))
 	if !errors.Is(err, ErrReadersFull) {
 		t.Errorf("acquire 3: got %v, want ErrReadersFull", err)
 	}
@@ -95,7 +95,7 @@ func TestAcquireReaderSlotHintSeeds(t *testing.T) {
 	// Occupy slot 0 via a raw store (skips the spec-ordered acquire
 	// path; this is a deliberate manufactured pre-state).
 	Store64(&f.Slot(0).TxnID, 99)
-	idx, err := f.AcquireReaderSlot(2, 1, 1, 1, 1, clockAt(1))
+	idx, _, err := f.AcquireReaderSlot(2, 1, 1, 1, 1, clockAt(1))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot hint=2: %v", err)
 	}
@@ -112,14 +112,14 @@ func TestCoordAcquireReaderHintAdvances(t *testing.T) {
 	// post-condition.
 	c, _ := newTestCoord(t, 10*time.Millisecond)
 	ctx := context.Background()
-	idx, err := c.AcquireReader(ctx, 1)
+	idx, idxGen, err := c.AcquireReader(ctx, 1)
 	if err != nil {
 		t.Fatalf("AcquireReader: %v", err)
 	}
 	if got := c.readerSlotHint.Load(); got != idx {
 		t.Errorf("post-Acquire hint = %d, want %d (idx)", got, idx)
 	}
-	c.ReleaseReader(idx)
+	c.ReleaseReader(idx, idxGen)
 }
 
 func TestAcquireReaderSlotTxnIDZeroPanics(t *testing.T) {
@@ -131,7 +131,7 @@ func TestAcquireReaderSlotTxnIDZeroPanics(t *testing.T) {
 			t.Error("expected panic on txnID=0")
 		}
 	}()
-	_, _ = f.AcquireReaderSlot(0, 0, 1, 1, 1, clockAt(1))
+	_, _, _ = f.AcquireReaderSlot(0, 0, 1, 1, 1, clockAt(1))
 }
 
 func TestReleaseReaderSlotOrdering(t *testing.T) {
@@ -146,11 +146,11 @@ func TestReleaseReaderSlotOrdering(t *testing.T) {
 	// ordering constraint (HintEpoch first prevents acquirer
 	// inheritance of stale epoch).
 	f := openTestFile(t, 1)
-	idx, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, clockAt(100))
+	idx, gen, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, clockAt(100))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot: %v", err)
 	}
-	f.ReleaseReaderSlot(idx)
+	f.ReleaseReaderSlot(idx, gen)
 	slot := f.Slot(idx)
 	for name, p := range map[string]*uint64{
 		"TxnID": &slot.TxnID, "PID": &slot.PID,
@@ -203,7 +203,7 @@ func TestOldestReaderTxnIDMinOfMany(t *testing.T) {
 	// so the slots aren't classified stale.
 	now := uint64(time.Now().UnixNano())
 	for i, txn := range []uint64{50, 10, 30, 25} {
-		idx, err := f.AcquireReaderSlot(uint32(i), txn, myPID, myPST, myNS, clockAt(now))
+		idx, _, err := f.AcquireReaderSlot(uint32(i), txn, myPID, myPST, myNS, clockAt(now))
 		if err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}
@@ -227,11 +227,11 @@ func TestOldestReaderTxnIDClearsStaleHeartbeat(t *testing.T) {
 	// trigger the same-namespace IsAlive(pid) path against PIDs
 	// 9999/8888 which don't exist in this test process, classifying
 	// both as stale and defeating the heartbeat-path intent.
-	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(stale)); err != nil {
+	if _, _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(stale)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	// Live slot also cross-namespace, fresh heartbeat.
-	if _, err := f.AcquireReaderSlot(1, 11, 8888, 1, 77, clockAt(now)); err != nil {
+	if _, _, err := f.AcquireReaderSlot(1, 11, 8888, 1, 77, clockAt(now)); err != nil {
 		t.Fatalf("acquire live: %v", err)
 	}
 	// First call should clear the stale slot (its TxnID=7) and
@@ -349,7 +349,7 @@ func TestOldestReaderTxnIDCase2FutureHBSkipsClear(t *testing.T) {
 	future := now + uint64(DefaultStaleTimeout) // ahead of the scan clock
 	// Foreign namespace (≠ ourPIDNS=99 in the scan) so the heartbeat path is
 	// taken rather than same-namespace IsAlive against a nonexistent PID.
-	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(future)); err != nil {
+	if _, _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(future)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
@@ -423,7 +423,7 @@ func TestOldestReaderTxnIDSameNamespaceLiveSkipsClear(t *testing.T) {
 		t.Skip("PIDNamespace = 0 on this host; same-namespace path not exercised")
 	}
 	now := uint64(time.Now().UnixNano())
-	if _, err := f.AcquireReaderSlot(0, 77, myPID, myPST, myNS, clockAt(now)); err != nil {
+	if _, _, err := f.AcquireReaderSlot(0, 77, myPID, myPST, myNS, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
@@ -451,7 +451,7 @@ func TestOldestReaderTxnIDSameNamespacePSTMismatchClears(t *testing.T) {
 	now := uint64(time.Now().UnixNano())
 	// Acquire with a deliberately wrong PST so the rescan sees a
 	// mismatch and treats the slot as PID-recycled-since-acquire.
-	if _, err := f.AcquireReaderSlot(0, 33, myPID, myPST+1, myNS, clockAt(now)); err != nil {
+	if _, _, err := f.AcquireReaderSlot(0, 33, myPID, myPST+1, myNS, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
@@ -496,7 +496,7 @@ func TestOldestReaderTxnIDSameNamespaceDeadPIDClears(t *testing.T) {
 	}
 	f := openTestFile(t, 1)
 	now := uint64(time.Now().UnixNano())
-	if _, err := f.AcquireReaderSlot(0, 55, pid, pst, myNS, clockAt(now)); err != nil {
+	if _, _, err := f.AcquireReaderSlot(0, 55, pid, pst, myNS, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
@@ -548,7 +548,7 @@ func osStatFile(path string) (os.FileInfo, error) { return os.Stat(path) }
 func TestCoordAcquireReleaseReader(t *testing.T) {
 	c, f := newTestCoord(t, 10*time.Millisecond)
 	ctx := context.Background()
-	idx, err := c.AcquireReader(ctx, 5)
+	idx, idxGen, err := c.AcquireReader(ctx, 5)
 	if err != nil {
 		t.Fatalf("AcquireReader: %v", err)
 	}
@@ -562,7 +562,7 @@ func TestCoordAcquireReleaseReader(t *testing.T) {
 	if got := Load64(&slot.PID); got != 4242 {
 		t.Errorf("slot PID = %d, want 4242", got)
 	}
-	c.ReleaseReader(idx)
+	c.ReleaseReader(idx, idxGen)
 	if got := Load64(&slot.TxnID); got != 0 {
 		t.Errorf("post-Release TxnID = %d, want 0", got)
 	}
@@ -572,7 +572,7 @@ func TestCoordAcquireReaderRespectsCtxCancel(t *testing.T) {
 	c, _ := newTestCoord(t, 10*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := c.AcquireReader(ctx, 1)
+	_, _, err := c.AcquireReader(ctx, 1)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("AcquireReader on cancelled ctx: got %v, want context.Canceled", err)
 	}
@@ -593,10 +593,10 @@ func TestCoordAcquireReaderFullNoDeadline(t *testing.T) {
 		_ = c.Close()
 		_ = f.Close()
 	})
-	if _, err := c.AcquireReader(context.Background(), 1); err != nil {
+	if _, _, err := c.AcquireReader(context.Background(), 1); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	_, err = c.AcquireReader(context.Background(), 2)
+	_, _, err = c.AcquireReader(context.Background(), 2)
 	if !errors.Is(err, ErrReadersFull) {
 		t.Errorf("no-deadline second acquire: got %v, want ErrReadersFull", err)
 	}
@@ -617,12 +617,12 @@ func TestCoordAcquireReaderFullWithDeadline(t *testing.T) {
 		_ = c.Close()
 		_ = f.Close()
 	})
-	if _, err := c.AcquireReader(context.Background(), 1); err != nil {
+	if _, _, err := c.AcquireReader(context.Background(), 1); err != nil {
 		t.Fatalf("hold: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err = c.AcquireReader(ctx, 2)
+	_, _, err = c.AcquireReader(ctx, 2)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("deadlined second acquire: got %v, want DeadlineExceeded", err)
 	}
@@ -659,11 +659,11 @@ func TestCoordOldestReaderTxnIDLiveWithFlock(t *testing.T) {
 	})
 	ctx := context.Background()
 	// Two concurrent reader-tx Begins -> two slots.
-	idxA, err := c.AcquireReader(ctx, 10)
+	idxA, idxAGen, err := c.AcquireReader(ctx, 10)
 	if err != nil {
 		t.Fatalf("acquire A: %v", err)
 	}
-	idxB, err := c.AcquireReader(ctx, 7)
+	idxB, idxBGen, err := c.AcquireReader(ctx, 7)
 	if err != nil {
 		t.Fatalf("acquire B: %v", err)
 	}
@@ -677,8 +677,8 @@ func TestCoordOldestReaderTxnIDLiveWithFlock(t *testing.T) {
 	if got != 7 {
 		t.Errorf("OldestReaderTxnID = %d, want 7", got)
 	}
-	c.ReleaseReader(idxA)
-	c.ReleaseReader(idxB)
+	c.ReleaseReader(idxA, idxAGen)
+	c.ReleaseReader(idxB, idxBGen)
 }
 
 func TestCoordStaleTimeoutThreadsToOldestReaderTxnID(t *testing.T) {
@@ -747,7 +747,7 @@ func TestAcquireReaderConcurrentNoSlotAliasing(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			idx, err := f.AcquireReaderSlot(0, uint64(i+1), uint64(i+1), 1, 99, clockAt(now))
+			idx, _, err := f.AcquireReaderSlot(0, uint64(i+1), uint64(i+1), 1, 99, clockAt(now))
 			if err != nil {
 				errCount.Add(1)
 				return
@@ -793,7 +793,7 @@ func TestCoordReaderHeartbeatRegistration(t *testing.T) {
 		_ = c.Close()
 		_ = f.Close()
 	})
-	idx, err := c.AcquireReader(context.Background(), 1)
+	idx, idxGen, err := c.AcquireReader(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("AcquireReader: %v", err)
 	}
@@ -811,7 +811,7 @@ func TestCoordReaderHeartbeatRegistration(t *testing.T) {
 	if got := Load64(&f.Slot(idx).Heartbeat); got != 999 {
 		t.Errorf("heartbeat goroutine did not refresh slot: got %d, want 999", got)
 	}
-	c.ReleaseReader(idx)
+	c.ReleaseReader(idx, idxGen)
 	// After ReleaseReader the slot must NOT be refreshed on the
 	// next tick. Bump the clock and verify the slot stays at 0.
 	clk.Store(7777)
@@ -902,7 +902,7 @@ func TestClearedSlotDoesNotEvictMidPublishAcquirer(t *testing.T) {
 // contract's four panic guards.
 func TestRaiseReaderSlotTxnIDGuards(t *testing.T) {
 	f := openTestFile(t, 2)
-	idx, err := f.AcquireReaderSlot(0, 10, 1234, 1, 42, clockAt(100))
+	idx, gen, err := f.AcquireReaderSlot(0, 10, 1234, 1, 42, clockAt(100))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot: %v", err)
 	}
@@ -915,18 +915,18 @@ func TestRaiseReaderSlotTxnIDGuards(t *testing.T) {
 		}()
 		fn()
 	}
-	mustPanic("zero txnID", func() { f.RaiseReaderSlotTxnID(idx, 0) })
-	mustPanic("lower raise", func() { f.RaiseReaderSlotTxnID(idx, 9) })
-	mustPanic("index out of range", func() { f.RaiseReaderSlotTxnID(2, 11) })
+	mustPanic("zero txnID", func() { f.RaiseReaderSlotTxnID(idx, gen, 0) })
+	mustPanic("lower raise", func() { f.RaiseReaderSlotTxnID(idx, gen, 9) })
+	mustPanic("index out of range", func() { f.RaiseReaderSlotTxnID(2, 0, 11) })
 	// Equal and higher raises succeed.
-	f.RaiseReaderSlotTxnID(idx, 10)
-	f.RaiseReaderSlotTxnID(idx, 12)
+	f.RaiseReaderSlotTxnID(idx, gen, 10)
+	f.RaiseReaderSlotTxnID(idx, gen, 12)
 	if got := Load64(&f.Slot(idx).TxnID); got != 12 {
 		t.Errorf("TxnID = %d, want 12", got)
 	}
 	closed := openTestFile(t, 1)
 	_ = closed.Close()
-	mustPanic("closed file", func() { closed.RaiseReaderSlotTxnID(0, 1) })
+	mustPanic("closed file", func() { closed.RaiseReaderSlotTxnID(0, 0, 1) })
 }
 
 // TestOldestReaderTxnIDReleaseInFlightNotCleared pins the
@@ -942,7 +942,7 @@ func TestOldestReaderTxnIDReleaseInFlightNotCleared(t *testing.T) {
 	now := uint64(time.Now().UnixNano())
 	// Foreign namespace so classification takes the heartbeat path
 	// (same-namespace would kill(0) the fake PID).
-	if _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(now)); err != nil {
+	if _, _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	// Manufacture the mid-release observation: Heartbeat zeroed, PID
@@ -1057,7 +1057,7 @@ func TestAcquireAbandonsSlotClearedMidPublish(t *testing.T) {
 	acquirePublishHookForTest.Store(&hook)
 	defer acquirePublishHookForTest.Store(nil)
 
-	idx, err := f.AcquireReaderSlot(0, 42, 1234, 1, 1, clockAt(100))
+	idx, _, err := f.AcquireReaderSlot(0, 42, 1234, 1, 1, clockAt(100))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot: %v", err)
 	}
@@ -1121,7 +1121,7 @@ func TestAcquireReclaimsSlotClearedMidPublishNotRewon(t *testing.T) {
 	acquirePublishHookForTest.Store(&hook)
 	defer acquirePublishHookForTest.Store(nil)
 
-	idx, err := f.AcquireReaderSlot(0, 42, 1234, 5, 6, clockAt(100))
+	idx, _, err := f.AcquireReaderSlot(0, 42, 1234, 5, 6, clockAt(100))
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot: %v", err)
 	}
@@ -1135,5 +1135,86 @@ func TestAcquireReclaimsSlotClearedMidPublishNotRewon(t *testing.T) {
 	// No junk anywhere: slot 1 untouched and free.
 	if tx, pid := Load64(&f.Slot(1).TxnID), Load64(&f.Slot(1).PID); tx != 0 || pid != 0 {
 		t.Fatalf("slot 1 polluted: TxnID=%d PID=%d, want free and clean", tx, pid)
+	}
+}
+
+// The (TxnID, Gen) ownership token detects a re-win that pinned the
+// SAME TxnID — previously the recorded two-owners residual: both the
+// evicted ghost and the re-winner believed they owned the slot.
+func TestAcquireDetectsSameTxnIDRewin(t *testing.T) {
+	f := openTestFile(t, 2)
+	fired := false
+	hook := func(idx uint32) {
+		if fired {
+			return
+		}
+		fired = true
+		// Aging clear + re-win pinning the SAME TxnID (42) — the
+		// re-winner's CAS bumps Gen past the ghost's token.
+		clearReaderSlot(f.Slot(idx))
+		if !CAS64(&f.Slot(idx).TxnID, 0, 42) {
+			t.Error("fixture: re-win CAS failed")
+		}
+		Add64(&f.Slot(idx).Gen, 1)
+	}
+	acquirePublishHookForTest.Store(&hook)
+	defer acquirePublishHookForTest.Store(nil)
+
+	idx, _, err := f.AcquireReaderSlot(0, 42, 1234, 5, 6, clockAt(100))
+	if err != nil {
+		t.Fatalf("AcquireReaderSlot: %v", err)
+	}
+	if idx == 0 {
+		t.Fatalf("acquire kept slot 0 despite a same-TxnID re-win (two owners)")
+	}
+	if tx := Load64(&f.Slot(0).TxnID); tx != 42 {
+		t.Errorf("re-winner's slot disturbed: TxnID = %d, want 42", tx)
+	}
+}
+
+// A release presenting a stale generation token must NOT zero the
+// slot — it belongs to the re-winner (the cascading-eviction leg of
+// the frozen-ghost class).
+func TestReleaseSkipsRewonSlot(t *testing.T) {
+	f := openTestFile(t, 1)
+	idx, gen, err := f.AcquireReaderSlot(0, 10, 1, 2, 3, clockAt(100))
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// Aging clear + re-win by another reader.
+	clearReaderSlot(f.Slot(idx))
+	if !CAS64(&f.Slot(idx).TxnID, 0, 99) {
+		t.Fatal("fixture: re-win CAS failed")
+	}
+	Add64(&f.Slot(idx).Gen, 1)
+	Store64(&f.Slot(idx).PID, 777)
+
+	f.ReleaseReaderSlot(idx, gen) // the ghost's release: stale token
+	if tx := Load64(&f.Slot(idx).TxnID); tx != 99 {
+		t.Fatalf("ghost release zeroed the re-winner's slot (TxnID = %d, want 99)", tx)
+	}
+	if pid := Load64(&f.Slot(idx).PID); pid != 777 {
+		t.Errorf("re-winner's PID disturbed: %d, want 777", pid)
+	}
+}
+
+// A restabilization raise presenting a stale token is refused.
+func TestRaiseRefusedAfterSlotLost(t *testing.T) {
+	f := openTestFile(t, 1)
+	idx, gen, err := f.AcquireReaderSlot(0, 10, 1, 2, 3, clockAt(100))
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	clearReaderSlot(f.Slot(idx))
+	if !CAS64(&f.Slot(idx).TxnID, 0, 5) {
+		t.Fatal("fixture: re-win CAS failed")
+	}
+	Add64(&f.Slot(idx).Gen, 1)
+
+	if f.RaiseReaderSlotTxnID(idx, gen, 12) {
+		t.Fatal("raise landed with a stale ownership token")
+	}
+	if tx := Load64(&f.Slot(idx).TxnID); tx != 5 {
+		t.Errorf("re-winner's pin stomped: TxnID = %d, want 5", tx)
 	}
 }

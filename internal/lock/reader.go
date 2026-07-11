@@ -84,7 +84,7 @@ var ErrReadersFull = errors.New("lock: reader table full")
 // with a legitimate genesis snapshot of 0; the caller passes
 // max(activeMeta.TxnID, 1) to dodge this — documenting the precondition
 // here rather than silently coercing).
-func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS uint64, now func() uint64) (uint32, error) {
+func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS uint64, now func() uint64) (uint32, uint64, error) {
 	if f.slots == nil {
 		panic("lock: AcquireReaderSlot on closed *File")
 	}
@@ -97,7 +97,7 @@ func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS uint64, now
 	}
 	n := uint32(len(f.slots))
 	if n == 0 {
-		return NoSlot, ErrReadersFull
+		return NoSlot, 0, ErrReadersFull
 	}
 	if hint >= n {
 		hint = 0
@@ -114,8 +114,12 @@ func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS uint64, now
 		if !CAS64(&slot.TxnID, 0, txnID) {
 			continue
 		}
-		// Won the CAS — finalise identity in the spec-required order,
-		// heartbeat stamped at store time (step a rationale above).
+		// Won the CAS — bump the acquisition generation FIRST (the
+		// ownership token is the (TxnID, Gen) pair; every later
+		// owner-side touch re-checks it), then finalise identity in
+		// the spec-required order, heartbeat stamped at store time
+		// (step a rationale above).
+		myGen := Add64(&slot.Gen, 1)
 		won := false
 		for {
 			Store64(&slot.Heartbeat, now())
@@ -126,9 +130,10 @@ func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS uint64, now
 			if hook := acquirePublishHookForTest.Load(); hook != nil {
 				(*hook)(i)
 			}
-			// Step f — ownership verify (doc above). Still ours:
-			// done.
-			if Load64(&slot.TxnID) == txnID {
+			// Step f — ownership verify (doc above): the (TxnID,
+			// Gen) pair distinguishes even a re-win that pinned the
+			// SAME TxnID (the re-winner bumped Gen past ours).
+			if Load64(&slot.TxnID) == txnID && Load64(&slot.Gen) == myGen {
 				won = true
 				break
 			}
@@ -149,13 +154,14 @@ func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS uint64, now
 			if !CAS64(&slot.TxnID, 0, txnID) {
 				break
 			}
+			myGen = Add64(&slot.Gen, 1)
 		}
 		if !won {
 			continue
 		}
-		return i, nil
+		return i, myGen, nil
 	}
-	return NoSlot, ErrReadersFull
+	return NoSlot, 0, ErrReadersFull
 }
 
 // ReleaseReaderSlot performs the strict release-ordered atomic stores
@@ -179,12 +185,20 @@ func (f *File) AcquireReaderSlot(hint uint32, txnID, pid, pst, pidNS uint64, now
 //
 // idx must be a valid slot index; out-of-range is a programmer bug
 // and panics.
-func (f *File) ReleaseReaderSlot(idx uint32) {
+// gen must be the (TxnID, Gen) ownership token's generation from the
+// acquire: a slot lost to an aging clear and re-won carries a HIGHER
+// generation, and releasing it would zero the re-winner's live pin
+// (the cascading eviction the guarded clear exists to prevent) — the
+// release is skipped instead; the slot belongs to the re-winner.
+func (f *File) ReleaseReaderSlot(idx uint32, gen uint64) {
 	if f.slots == nil {
 		panic("lock: ReleaseReaderSlot on closed *File")
 	}
 	if idx >= uint32(len(f.slots)) {
 		panic("lock: ReleaseReaderSlot index out of range")
+	}
+	if Load64(&f.slots[idx].Gen) != gen {
+		return // lost to an aging clear + re-win: not ours to release
 	}
 	clearReaderSlot(&f.slots[idx])
 }
@@ -254,7 +268,7 @@ func (f *File) ClearStaleReaderSlot(idx uint32) {
 // the slot between classification (which runs syscalls: kill(2),
 // /proc reads) and the clear stores.
 type readerSlotObservation struct {
-	TxnID, PID, Heartbeat, HintEpoch, PST, PIDNS uint64
+	TxnID, PID, Heartbeat, HintEpoch, PST, PIDNS, Gen uint64
 }
 
 // clearStaleReaderSlotIfUnchanged clears the slot iff every field
@@ -286,7 +300,8 @@ func (f *File) clearStaleReaderSlotIfUnchanged(idx uint32, obs readerSlotObserva
 		Load64(&slot.Heartbeat) != obs.Heartbeat ||
 		Load64(&slot.HintEpoch) != obs.HintEpoch ||
 		Load64(&slot.ProcessStartTime) != obs.PST ||
-		Load64(&slot.PIDNamespace) != obs.PIDNS {
+		Load64(&slot.PIDNamespace) != obs.PIDNS ||
+		Load64(&slot.Gen) != obs.Gen {
 		return false
 	}
 	clearReaderSlot(slot)
@@ -303,7 +318,11 @@ func (f *File) clearStaleReaderSlotIfUnchanged(idx uint32, obs readerSlotObserva
 // a concurrent scan reading the OLD value computes a lower — strictly
 // conservative — reclamation bound, so no ordering beyond the single
 // atomic store is needed.
-func (f *File) RaiseReaderSlotTxnID(idx uint32, txnID uint64) {
+// gen is the acquire's ownership token; a mismatch means the slot was
+// aged out and (possibly) re-won mid-restabilization — the raise is
+// refused (returns false) so the caller can abandon the acquisition
+// instead of stomping the re-winner's pin.
+func (f *File) RaiseReaderSlotTxnID(idx uint32, gen uint64, txnID uint64) bool {
 	if f.slots == nil {
 		panic("lock: RaiseReaderSlotTxnID on closed *File")
 	}
@@ -314,10 +333,14 @@ func (f *File) RaiseReaderSlotTxnID(idx uint32, txnID uint64) {
 		panic("lock: RaiseReaderSlotTxnID called with txnID=0")
 	}
 	slot := &f.slots[idx]
+	if Load64(&slot.Gen) != gen {
+		return false // lost mid-restabilization: not ours to raise
+	}
 	if cur := Load64(&slot.TxnID); txnID < cur {
 		panic(fmt.Sprintf("lock: RaiseReaderSlotTxnID(%d) would lower pinned TxnID %d -> %d", idx, cur, txnID))
 	}
 	Store64(&slot.TxnID, txnID)
+	return true
 }
 
 // NoReaderTxnID is OldestReaderTxnID's "no live reader occupies a
@@ -404,6 +427,7 @@ func (f *File) OldestReaderTxnID(ourPIDNS uint64, nowNanos uint64, staleTimeoutN
 			HintEpoch: Load64(&slot.HintEpoch),
 			PST:       Load64(&slot.ProcessStartTime),
 			PIDNS:     Load64(&slot.PIDNamespace),
+			Gen:       Load64(&slot.Gen),
 		}
 		if obs.PID == 0 {
 			// Case 0: mid-acquire / mid-release / orphan.

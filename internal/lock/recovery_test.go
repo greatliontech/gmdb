@@ -686,3 +686,34 @@ func TestCrossNamespaceWindowGovernsReaderSlots(t *testing.T) {
 		t.Error("slot past the cross-NS window retained")
 	}
 }
+
+// A writer that crashed between its shrink-seqlock bumps leaves the
+// counter ODD; stale-writer recovery must re-even it, or every
+// BeginRead burns its full bracket-retry budget until some writer
+// opens (file-format.md §File Shrinkage).
+func TestRecoverStaleWriterReEvensShrinkSeq(t *testing.T) {
+	root, base, _ := tmpLock(t)
+	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xAA}, MaxReaders: 4})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+	f.BumpShrinkSeq() // crashed mid-span: counter odd
+	f.SetWriterPID(400_000_001)
+	f.SetWriterPIDNamespace(1)
+	f.SetWriterStartTime(1)
+
+	RecoverStaleWriter(f, 1)
+	if s := f.ShrinkSeq(); s%2 != 0 {
+		t.Fatalf("ShrinkSeq = %d after recovery, want even", s)
+	}
+	// And an already-even counter is left alone.
+	before := f.ShrinkSeq()
+	f.SetWriterPID(400_000_001)
+	f.SetWriterPIDNamespace(1)
+	f.SetWriterStartTime(1)
+	RecoverStaleWriter(f, 1)
+	if s := f.ShrinkSeq(); s != before {
+		t.Fatalf("ShrinkSeq = %d, want unchanged %d (even counter must not bump)", s, before)
+	}
+}

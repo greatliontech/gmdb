@@ -44,11 +44,11 @@ func TestFileSize(t *testing.T) {
 }
 
 func TestStructSizes(t *testing.T) {
-	if HeaderSize != 112 {
-		t.Errorf("HeaderSize = %d, want 112", HeaderSize)
+	if HeaderSize != 136 {
+		t.Errorf("HeaderSize = %d, want 136", HeaderSize)
 	}
-	if SlotSize != 48 {
-		t.Errorf("SlotSize = %d, want 48", SlotSize)
+	if SlotSize != 56 {
+		t.Errorf("SlotSize = %d, want 56", SlotSize)
 	}
 }
 
@@ -711,4 +711,181 @@ func TestVerifyPathIdentity(t *testing.T) {
 	if err := verifyPathIdentity(p, f.f); !errors.Is(err, errPathChanged) {
 		t.Fatalf("name re-bound: err = %v, want errPathChanged", err)
 	}
+}
+
+// Adopting a lock file stamped by a DIFFERENT boot must reset every
+// piece of volatile, boot-relative coordination state — pre-boot
+// heartbeats read as huge future stamps honoured as fresh forever,
+// and PID/starttime identities can collide across boots, so cross-boot
+// state would bypass the recovery gate and pin reclamation. Only
+// DataGeneration (an inode-replacement counter, not boot-relative)
+// survives.
+func TestAdoptForeignBootEpochResetsCoordinationState(t *testing.T) {
+	if CurrentBootID() == ([16]byte{}) {
+		t.Skip("host boot id unreadable: cross-boot invalidation disabled by design")
+	}
+	root, base, path := tmpLock(t)
+	uuid := [16]byte{0xAA}
+	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 4})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// Occupy state a reboot would have orphaned.
+	f.SetWriterPID(4242)
+	f.SetWriterHeartbeat(999)
+	f.SetLastWriterPID(4242)
+	f.SetLastWriterHeartbeat(999)
+	Store64(&f.Slot(1).TxnID, 33)
+	Store64(&f.Slot(1).PID, 4242)
+	Store64(&f.Slot(1).Heartbeat, 999)
+	f.BumpDataGeneration()
+	f.BumpShrinkSeq() // leave it odd, like a writer crashed mid-bracket
+	gen := f.DataGeneration()
+	f.Close()
+
+	// Forge a foreign boot id in the header (offset of BootID).
+	raw, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	foreign := make([]byte, 16)
+	foreign[0] = 0xFE
+	if _, err := raw.WriteAt(foreign, 112); err != nil {
+		t.Fatalf("forge boot id: %v", err)
+	}
+	raw.Close()
+
+	f2, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 4})
+	if err != nil {
+		t.Fatalf("re-adopt: %v", err)
+	}
+	defer f2.Close()
+	if got := f2.WriterPID(); got != 0 {
+		t.Errorf("WriterPID = %d, want 0 (cross-boot writer block must reset)", got)
+	}
+	if tx := Load64(&f2.Slot(1).TxnID); tx != 0 {
+		t.Errorf("slot 1 TxnID = %d, want 0 (cross-boot reader slots must reset)", tx)
+	}
+	if hb := Load64(&f2.Slot(1).Heartbeat); hb != 0 {
+		t.Errorf("slot 1 Heartbeat = %d, want 0", hb)
+	}
+	if s := f2.ShrinkSeq(); s != 0 {
+		t.Errorf("ShrinkSeq = %d, want 0 (reset re-evens the seqlock)", s)
+	}
+	if g := f2.DataGeneration(); g != gen {
+		t.Errorf("DataGeneration = %d, want %d (must SURVIVE the reset)", g, gen)
+	}
+	if lw := f2.LastWriterPID(); lw != 0 {
+		t.Errorf("LastWriterPID = %d, want 0 (recovery-gate record must reset)", lw)
+	}
+}
+
+// A same-boot adoption must NOT reset live coordination state.
+func TestAdoptSameBootPreservesCoordinationState(t *testing.T) {
+	root, base, _ := tmpLock(t)
+	uuid := [16]byte{0xAA}
+	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 4})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	Store64(&f.Slot(0).TxnID, 77)
+	f.Close()
+	f2, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 4})
+	if err != nil {
+		t.Fatalf("re-adopt: %v", err)
+	}
+	defer f2.Close()
+	if tx := Load64(&f2.Slot(0).TxnID); tx != 77 {
+		t.Errorf("slot 0 TxnID = %d, want 77 (same-boot state must survive)", tx)
+	}
+}
+
+// A zero boot id on EITHER side must disable the cross-boot reset:
+// resetting on an unknown epoch could evict a live same-boot peer's
+// coordination state (use-after-reclaim) — strictly worse than the
+// cross-boot staleness the reset exists to fix.
+func TestZeroBootEpochNeverResets(t *testing.T) {
+	var zero, a, b [16]byte
+	a[0], b[0] = 1, 2
+	for name, c := range map[string]struct {
+		stamped, current [16]byte
+		want             bool
+	}{
+		"both zero":           {zero, zero, false},
+		"stamped zero":        {zero, a, false},
+		"current zero":        {a, zero, false},
+		"known and equal":     {a, a, false},
+		"known and different": {a, b, true},
+	} {
+		if got := shouldResetBootEpoch(c.stamped, c.current); got != c.want {
+			t.Errorf("%s: shouldResetBootEpoch = %v, want %v", name, got, c.want)
+		}
+	}
+}
+
+// A contended boot-epoch reset (another holder on the file's flock)
+// backs off and retries; with the holder never releasing, Open
+// exhausts its budget with the contended sentinel and the foreign
+// state survives untouched.
+func TestBootEpochResetContendedSkips(t *testing.T) {
+	if CurrentBootID() == ([16]byte{}) {
+		t.Skip("host boot id unreadable: cross-boot invalidation disabled by design")
+	}
+	root, base, path := tmpLock(t)
+	uuid := [16]byte{0xAA}
+	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 4})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	Store64(&f.Slot(0).TxnID, 33)
+	f.Close()
+	// Forge a foreign (non-zero) boot id.
+	raw, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	forged := make([]byte, 16)
+	forged[0] = 0xFE
+	if _, err := raw.WriteAt(forged, 112); err != nil {
+		t.Fatalf("forge: %v", err)
+	}
+	raw.Close()
+	// A live flock holder blocks the LOCK_EX conversion.
+	holder, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("holder: %v", err)
+	}
+	defer holder.Close()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_SH); err != nil {
+		t.Fatalf("holder flock: %v", err)
+	}
+
+	_, err = Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 4})
+	if err == nil {
+		t.Fatal("Open succeeded despite a contended boot-epoch reset")
+	}
+	if !errors.Is(err, errBootEpochContended) {
+		t.Fatalf("budget exhausted by %v, want errBootEpochContended", err)
+	}
+	// The foreign state must be untouched (no unguarded reset).
+	f2raw, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("verify open: %v", err)
+	}
+	defer f2raw.Close()
+	buf := make([]byte, 8)
+	if _, err := f2raw.ReadAt(buf, 136); err != nil { // slot 0 TxnID
+		t.Fatalf("read slot: %v", err)
+	}
+	if v := le64(buf); v != 33 {
+		t.Fatalf("slot 0 TxnID = %d, want 33 (state reset without the lock)", v)
+	}
+}
+
+func le64(b []byte) uint64 {
+	var v uint64
+	for i := 7; i >= 0; i-- {
+		v = v<<8 | uint64(b[i])
+	}
+	return v
 }

@@ -93,7 +93,6 @@ func TestPageBoundClampedToMaxSize(t *testing.T) {
 	}
 }
 
-
 // A claim at/above HighWaterMark must RAISE the HWM (exactly like the
 // file-extension tier): otherwise a forged free bit above HWM lets
 // user data commit into the page and the same commit's shrink —

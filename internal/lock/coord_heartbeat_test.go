@@ -211,7 +211,7 @@ func TestHeartbeatWriterRefreshConfinedToLockHolder(t *testing.T) {
 
 	// A live reader slot witnesses that the heartbeat goroutine keeps
 	// ticking across the whole test.
-	c.RegisterReaderSlot(0)
+	c.RegisterReaderSlot(0, 0)
 
 	grant, err := c.AcquireWriter(context.Background())
 	if err != nil {
@@ -259,8 +259,8 @@ func TestHeartbeatActiveSlotsRefresh(t *testing.T) {
 	clk := newFakeClock(0)
 	c, f := newHeartbeatCoord(t, 3*time.Millisecond, clk.now)
 
-	c.RegisterReaderSlot(0)
-	c.RegisterReaderSlot(3)
+	c.RegisterReaderSlot(0, 0)
+	c.RegisterReaderSlot(3, 0)
 
 	clk.set(5_000_000)
 	time.Sleep(20 * time.Millisecond)
@@ -294,7 +294,7 @@ func TestHeartbeatUnregisterUnknownIsNoop(t *testing.T) {
 	clk := newFakeClock(0)
 	c, f := newHeartbeatCoord(t, time.Hour, clk.now)
 
-	c.RegisterReaderSlot(2)
+	c.RegisterReaderSlot(2, 0)
 	c.UnregisterReaderSlot(0) // not registered — no-op
 	c.UnregisterReaderSlot(2)
 
@@ -329,7 +329,7 @@ func TestHeartbeatCloseWaitsForGoroutine(t *testing.T) {
 		Clock:             clk.now,
 	})
 
-	c.RegisterReaderSlot(0)
+	c.RegisterReaderSlot(0, 0)
 	time.Sleep(10 * time.Millisecond)
 
 	if err := c.Close(); err != nil {
@@ -361,7 +361,7 @@ func TestHeartbeatConcurrentRegisterUnregister(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range Iter {
-				c.RegisterReaderSlot(i)
+				c.RegisterReaderSlot(i, 0)
 				c.UnregisterReaderSlot(i)
 			}
 		}()
@@ -399,7 +399,7 @@ func TestHeartbeatDefaultClock(t *testing.T) {
 		_ = f.Close()
 	})
 
-	c.RegisterReaderSlot(0)
+	c.RegisterReaderSlot(0, 0)
 	time.Sleep(20 * time.Millisecond)
 	if got := Load64(&f.Slot(0).Heartbeat); got == 0 {
 		t.Errorf("default clock produced 0 heartbeat")
