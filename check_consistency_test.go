@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/pager"
 	"os"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/pager"
 
 	"github.com/thegrumpylion/gmdb/internal/page"
 )

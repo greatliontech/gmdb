@@ -16,6 +16,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/compaction"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/thegrumpylion/gmdb/internal/verify"
 )
 
 // evacFloorAt returns a high-watermark evacuation floor at the midpoint of
@@ -636,7 +637,7 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 	rks, _ := rtx.OpenKeyspace("ovf")
 	root := rks.desc.Root
 	var first uint64
-	if err := btree.WalkLeafEntries(rawPageReader{db.pgr}, db.pgr.Config(), root, db.pgr.HighWaterMark(), func(e page.LeafEntry) error {
+	if err := btree.WalkLeafEntries(verify.RawPageReader{P: db.pgr}, db.pgr.Config(), root, db.pgr.HighWaterMark(), func(e page.LeafEntry) error {
 		if e.IsOverflow() && first == 0 {
 			first = e.OverflowPage
 		}

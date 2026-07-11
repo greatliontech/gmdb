@@ -5,6 +5,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/thegrumpylion/gmdb/internal/verify"
 )
 
 // DBStats is a point-in-time snapshot of database-level metrics
@@ -122,47 +123,6 @@ func (tx *Tx) statsHWM() uint64 {
 	return tx.prevMeta.HighWaterMark
 }
 
-// treePageStats tallies B+tree page kinds and the maximum descent depth.
-type treePageStats struct {
-	depth         int // number of levels (root→leaf); 0 for an empty tree
-	branchPages   uint64
-	leafPages     uint64
-	overflowPages uint64
-}
-
-// walkTreePageStats walks the B+tree rooted at root (a no-op for root ==
-// 0) and tallies branch / leaf / overflow page counts and the max
-// branch-or-leaf descent depth. Overflow pages are counted but do NOT
-// contribute to depth (Walk reports them at their leaf's depth + 1). For
-// a SetKeyspace the walk recurses into nested set-member subtrees, so
-// the depth is the deepest path including nesting. O(tree pages).
-func walkTreePageStats(pr btree.PageReader, cfg page.Config, root, hwm uint64) (treePageStats, error) {
-	var s treePageStats
-	maxLevel := -1
-	err := btree.Walk(pr, cfg, root, hwm, func(_ uint64, kind btree.PageKind, depth int) error {
-		switch kind {
-		case btree.PageKindBranch:
-			s.branchPages++
-			if depth > maxLevel {
-				maxLevel = depth
-			}
-		case btree.PageKindLeaf:
-			s.leafPages++
-			if depth > maxLevel {
-				maxLevel = depth
-			}
-		case btree.PageKindOverflow:
-			s.overflowPages++
-		}
-		return nil
-	})
-	if err != nil {
-		return treePageStats{}, mapBtreeErr(err)
-	}
-	s.depth = maxLevel + 1 // empty tree: maxLevel stays -1 ⇒ depth 0
-	return s, nil
-}
-
 // KeyspaceStats is a point-in-time snapshot of one keyspace's B+tree
 // shape (api-surface.md §Statistics). The page counts and depth come
 // from an O(tree) walk of the keyspace's data tree; Entries is the O(1)
@@ -189,6 +149,18 @@ type KeyspaceStats struct {
 	// keyspace (counted from the on-disk index registry, independent of
 	// how many were opened with an IndexDecl this transaction).
 	IndexCount int
+}
+
+// walkTreePageStats adapts verify.WalkTreePageStats to the public
+// error surface: raw btree walk errors map to the exported
+// sentinels exactly once, here, for every stats consumer
+// (KeyspaceStats and IndexStats alike).
+func walkTreePageStats(pr btree.PageReader, cfg page.Config, root, hwm uint64) (verify.TreePageStats, error) {
+	ts, err := verify.WalkTreePageStats(pr, cfg, root, hwm)
+	if err != nil {
+		return verify.TreePageStats{}, mapBtreeErr(err)
+	}
+	return ts, nil
 }
 
 // Stats returns the keyspace's B+tree statistics, or ErrKeyspaceClosed
@@ -226,10 +198,10 @@ func (kc *keyspaceCore) Stats() (KeyspaceStats, error) {
 	}
 
 	return KeyspaceStats{
-		Depth:         ts.depth,
-		BranchPages:   ts.branchPages,
-		LeafPages:     ts.leafPages,
-		OverflowPages: ts.overflowPages,
+		Depth:         ts.Depth,
+		BranchPages:   ts.BranchPages,
+		LeafPages:     ts.LeafPages,
+		OverflowPages: ts.OverflowPages,
 		Entries:       kc.desc.Count,
 		IndexCount:    indexCount,
 	}, nil

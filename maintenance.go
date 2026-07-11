@@ -3,10 +3,12 @@ package gmdb
 import (
 	"context"
 	"errors"
-	"github.com/thegrumpylion/gmdb/internal/pager"
 	"sync/atomic"
 	"time"
 	"weak"
+
+	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/thegrumpylion/gmdb/internal/verify"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -195,8 +197,8 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 		return // checksums disabled — no footers to verify
 	}
 	pageSize := meta.PageSize
-	c := &checker{pgr: rtx.pgr, cfg: page.Config{PageSize: pageSize, PageChecksum: true}, meta: meta}
-	bm, ok := c.snapshotBitmap()
+	c := &verify.Checker{Pgr: rtx.pgr, Cfg: page.Config{PageSize: pageSize, PageChecksum: true}, Meta: meta}
+	bm, ok := c.SnapshotBitmap()
 	if !ok {
 		return // no bitmap pages — empty database
 	}
@@ -287,15 +289,15 @@ func (db *DB) maintReclaimLeaks(ctx context.Context) (freed int, discarded bool)
 		(*hook)() // test seam: a commit landing inside the detection window
 	}
 	meta := rtx.meta
-	c := &checker{
-		pgr:    rtx.pgr,
-		cfg:    page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(pager.MetaFlagPageChecksum)},
-		meta:   meta,
-		yield:  func(CheckIssue) bool { return true }, // detection only — discard issues
-		repair: true,                                  // collect c.leaked instead of emitting
+	c := &verify.Checker{
+		Pgr:    rtx.pgr,
+		Cfg:    page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(pager.MetaFlagPageChecksum)},
+		Meta:   meta,
+		Yield:  func(verify.Issue) bool { return true }, // detection only — discard issues
+		Repair: true,                                    // collect c.Leaked instead of emitting
 	}
-	c.run()
-	leaked, sawError, stopped, rplBoundary := c.leaked, c.sawError, c.stopped, c.rplBoundary
+	c.Run()
+	leaked, sawError, stopped, rplBoundary := c.Leaked, c.SawError, c.Stopped, c.RPLBoundary
 	_ = rtx.Rollback()
 
 	if stopped || sawError {

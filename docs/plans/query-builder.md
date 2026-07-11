@@ -24,7 +24,7 @@ tests move with their subjects, unmodified.
 - [x] 5. Compaction relocation core (`compactionWriter` +
       evacuation-floor math) → `internal/` (pure move; drivers
       stay in root).
-- [ ] 6. Check verifier (`checker` + page walkers) + stats
+- [x] 6. Check verifier (`checker` + page walkers) + stats
       page-walker → `internal/` behind a verifier-input struct
       (pgr + meta + coord snapshot); exported `Check*` types and
       entry points stay in root (pure move + one input-struct

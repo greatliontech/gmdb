@@ -16,6 +16,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/thegrumpylion/gmdb/internal/verify"
 )
 
 // copyDest is CopyTo's destination-file seam, mirroring the pager's
@@ -213,7 +214,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	// a silent no-op on kernels < 5.14 / non-Linux.
 	_ = rtx.pgr.AdvisePreload(hwm)
 	for id := firstData; id < hwm; id++ {
-		if !reachable.test(id) {
+		if !reachable.Test(id) {
 			continue
 		}
 		if _, err := dest.WriteAt(rtx.pgr.PageRaw(id), int64(id)*pageSize); err != nil {
@@ -228,7 +229,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	detail := make([]byte, uint64(meta.BitmapPages)*uint64(meta.PageSize))
 	bm := bitmap.New(detail, meta.PageSize, meta.BitmapPages, meta.MaxSize)
 	for id := firstData; id < hwm; id++ {
-		if !reachable.test(id) {
+		if !reachable.Test(id) {
 			bm.Set(id)
 		}
 	}
@@ -289,12 +290,12 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 // recurses), index registry sub-tree, and index data trees. Mirrors the
 // Check structural walk, but records ids only. A walk failure
 // (corrupt/forged tree) is returned to the caller.
-func collectReachable(rtx *ReadTx, cfg page.Config, meta pager.Meta, hwm, firstData uint64) (bitset, error) {
-	reachable := newBitset(hwm)
-	pr := rawPageReader{p: rtx.pgr}
+func collectReachable(rtx *ReadTx, cfg page.Config, meta pager.Meta, hwm, firstData uint64) (verify.Bitset, error) {
+	reachable := verify.NewBitset(hwm)
+	pr := verify.RawPageReader{P: rtx.pgr}
 	collect := func(root uint64) error {
 		return btree.Walk(pr, cfg, root, hwm, func(id uint64, _ btree.PageKind, _ int) error {
-			reachable.set(id)
+			reachable.Set(id)
 			return nil
 		})
 	}
@@ -391,9 +392,9 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	// ErrBadPageChecksum into a permanent silent wrong value. Verifying here
 	// makes a bad footer abort the rebuild; the !committed defer removes the
 	// half-built file, so the corruption stays detectable on the original.
-	// (The verbatim CopyTo path keeps rawPageReader: it copies footers
+	// (The verbatim CopyTo path keeps verify.RawPageReader: it copies footers
 	// byte-for-byte, so corruption survives detectably without a re-encode.)
-	pr := verifyingPageReader{p: rtx.pgr}
+	pr := verify.VerifyingPageReader{P: rtx.pgr}
 
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {

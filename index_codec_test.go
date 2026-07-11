@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"strings"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 )
 
 // --- Codec roundtrip tests ----------------------------------------

@@ -7,45 +7,15 @@ import (
 )
 
 // IndexDecl describes one secondary index on a byte-oriented keyspace.
-// Supplied to Tx.OpenKeyspace / Tx.CreateKeyspace (and the SetKeyspace
-// mirrors) at every open of an indexed keyspace; every transaction that
-// opens the same keyspace for write must supply matching IndexDecls.
-// Per indexing.md §Index Declaration.
-type IndexDecl struct {
-	// Name is the index's logical identifier; unique within the
-	// keyspace. Contributes to the schema-hash fingerprint, so
-	// renaming an index forces a RebuildIndex.
-	Name string
-
-	// Columns is the ordered list of indexed columns. Concatenated
-	// lex-safely via the NUL-escape encoding (see indexing.md
-	// §Column Encoding + page-formats.md §NUL-escape encoding).
-	Columns []IndexColumn
-
-	// Covering optionally pins columns to be carried in the index
-	// entry value. Lookup returns covering bytes directly when the
-	// caller's query is satisfied by the covering set.
-	Covering []IndexCoveringColumn
-
-	// Unique rejects extractor-produced duplicate index keys
-	// (ErrIndexUniqueViolation on Put). Detection runs against both
-	// the on-disk index and the candidate-set produced by a single
-	// extractor invocation. Per indexing.md §Unique Indexes.
-	Unique bool
-
-	// Version is a user-supplied tag bumped after extractor-logic
-	// changes the engine cannot inspect (e.g. masking a column,
-	// changing partial-index predicate, reordering output). Stored
-	// alongside the schema-hash; mismatch returns
-	// ErrIndexFingerprintMismatch. Per indexing.md §Drift Guard.
-	Version string
-
-	// Extract produces zero or more IndexEntry values per row. A
-	// nil or zero-length slice signals "do not index this row"
-	// (partial-index semantics; the two are equivalent per
-	// indexing.md §Partial Indexes).
-	Extract IndexExtractor
-}
+// Declared at OpenKeyspace / CreateKeyspace; every write transaction
+// opening the keyspace must supply a matching set (indexing.md §Index
+// Declaration). Fields: Name (schema-hash input; renaming forces
+// RebuildIndex), Columns / Covering (positional, lex-safe bytes),
+// Unique, Version (extractor-logic drift tag), Extract.
+//
+// The concrete type lives in internal/indexing beside the entry and
+// registry codecs; this alias is the public surface.
+type IndexDecl = indexing.Decl
 
 // IndexColumn names a positional column in an index's column tuple.
 // The Name is a semantic anchor that contributes to the schema-hash
@@ -54,16 +24,18 @@ type IndexDecl struct {
 // a name for a column whose semantic content has changed is the
 // caller's responsibility — bump Version in that case (see
 // indexing.md §Covering Indexes for the rename-pair example).
-type IndexColumn struct {
-	Name string
-}
+type IndexColumn = indexing.Column
 
 // IndexCoveringColumn names a positional column in an index's covering
 // tuple. Same semantics as IndexColumn.Name. Adding / removing /
 // reordering covering columns triggers ErrIndexFingerprintMismatch.
-type IndexCoveringColumn struct {
-	Name string
-}
+type IndexCoveringColumn = indexing.CoveringColumn
+
+// IndexExtractor produces zero or more IndexEntry values for a row.
+// Returning a nil slice or a zero-length slice both signal "do not
+// index this row" (partial-index semantics) and are equivalent.
+// Per indexing.md §Overview.
+type IndexExtractor = indexing.Extractor
 
 // IndexEntry is one row's contribution to an index, produced by the
 // IndexExtractor. Cols holds the per-IndexColumn lex-safe byte
@@ -73,12 +45,6 @@ type IndexCoveringColumn struct {
 // The concrete type lives in internal/indexing beside the entry
 // codec; this alias is the public surface.
 type IndexEntry = indexing.Entry
-
-// IndexExtractor produces zero or more IndexEntry values for a row.
-// Returning a nil slice or a zero-length slice both signal "do not
-// index this row" (partial-index semantics) and are equivalent.
-// Per indexing.md §Overview.
-type IndexExtractor func(key, value []byte) []IndexEntry
 
 // IndexFingerprintError wraps ErrIndexFingerprintMismatch with the
 // drifted index's identity and the specific field that differs.

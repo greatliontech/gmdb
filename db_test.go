@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/thegrumpylion/gmdb/internal/pager"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/thegrumpylion/gmdb/internal/pager"
 
 	"github.com/thegrumpylion/gmdb/internal/closegate"
 	"github.com/thegrumpylion/gmdb/internal/lock"

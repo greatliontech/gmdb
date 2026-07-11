@@ -148,13 +148,13 @@ func (idx *IndexHandle) Stats() (IndexStats, error) {
 		return IndexStats{}, err
 	}
 	return IndexStats{
-		Depth:       ts.depth,
-		BranchPages: ts.branchPages,
-		LeafPages:   ts.leafPages,
+		Depth:       ts.Depth,
+		BranchPages: ts.BranchPages,
+		LeafPages:   ts.LeafPages,
 		Entries:     idx.pinned.count,
 		Unique:      idx.pinned.decl != nil && idx.pinned.decl.Unique,
 		Covering:    idx.pinned.decl != nil && len(idx.pinned.decl.Covering) > 0,
-		SizeBytes:   (ts.branchPages + ts.leafPages + ts.overflowPages) * uint64(cfg.PageSize),
+		SizeBytes:   (ts.BranchPages + ts.LeafPages + ts.OverflowPages) * uint64(cfg.PageSize),
 	}, nil
 }
 

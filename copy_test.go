@@ -5,10 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/pager"
 	"os"
 	"sync/atomic"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
 // firstByteDecl indexes rows on the first byte of their value — a small
