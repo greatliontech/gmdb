@@ -84,10 +84,16 @@ Invariant: kind=clause-explicit;
     exactly at `DataEnd`, entries in index order; every lookup-table
     entry (compressed restart-table Offset, uncompressed
     offset-table slot) equals its entry's position in that stream;
-  from=this spec §Cursor Iteration — the streaming iterator and
-    first-key reads decode by continuation from the entry-data
-    start with the unchecked hot-path decoders and never re-consult
-    the lookup tables mid-stream;
+  from=this spec §Cursor Iteration and §Leaf Page — the consumers
+    that decode by CONTINUATION with the unchecked hot-path
+    decoders: the compressed streaming iterator and first-key
+    reads, the compressed splice paths' continuation walks (which
+    resume decoding mid-page from a restart point), and the write
+    side's placement of the next entry at `DataEnd`. (The
+    uncompressed iterator is table-driven on every step per
+    §Cursor Iteration's O(1)-via-table clause — for it the
+    invariant protects the positional table's agreement with the
+    stream, not a mid-stream continuation.);
   violation=A page whose table offsets each pass a range check but
     do not match the stream (garbage bytes at offset 12 with the
     table pointing past them; a gap or overlap between restart
@@ -337,7 +343,12 @@ by the keyspace's `RestartGroupTarget`:
   prefixes with their neighbours are stored as deltas grouped into
   **variable-size restart groups**; two-phase lookup (binary search
   over the restart table + linear scan within the matched group).
-  Selected when `RestartGroupTarget ≥ 2`.
+  Selected when `RestartGroupTarget ≥ 2`. Group sizes are a TARGET,
+  not a bound: in-place inserts may grow a group up to
+  `min(2 × RestartGroupTarget, 255)` before the splice declines and
+  a rebuild rebalances it — persisted, observable on-disk state (a
+  reader must accept groups anywhere in `[1, 255]` regardless of
+  the keyspace's current target; 255 is the hard uint8 count cap).
 - **`TypeLeafUncompressed`.** Every key stored in full; lookup is a
   single O(log N) binary search via an offset table. Selected when
   `RestartGroupTarget == 1`.

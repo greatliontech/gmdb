@@ -2,9 +2,12 @@
 
 A **keyspace** is a named B+tree in the data file. The root meta
 page points to a **keyspace B+tree** whose keys are keyspace names
-and whose values are keyspace descriptors. Both user keyspaces and
-engine-internal keyspaces (per-index storage, per-index
-registries) live in this tree.
+and whose values are keyspace descriptors. Only USER keyspaces live
+in this tree: index storage hangs off each owning keyspace's
+descriptor (`IndexRegistryRoot` → the per-keyspace registry
+sub-tree, whose entries carry the index data-tree roots —
+`indexing.md §Storage Layout`), never as descriptor rows of its
+own.
 
 This spec defines the descriptor format, the keyspace `Kind`
 discriminator (Keyspace vs SetKeyspace vs engine-internal),
@@ -53,9 +56,12 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=`Kind` is one of `0` (Keyspace), `1` (SetKeyspace),
-    `2` (engine-internal index keyspace). `Open()` rejects
-    descriptors with unknown `Kind` values. `Kind` is set at
-    creation and immutable;
+    `2` (RESERVED: engine-internal index keyspace — the current
+    engine never CREATES Kind=2 rows, since index storage hangs
+    off `IndexRegistryRoot` instead; the value is defended
+    everywhere so a forged/corrupt descriptor cannot smuggle one
+    past the guards). `Open()` rejects descriptors with unknown
+    `Kind` values. `Kind` is set at creation and immutable;
   from=this spec §Keyspace Descriptor;
   violation=A mutable `Kind` lets a SetKeyspace silently
     transmute into a single-value Keyspace at a future open —
@@ -170,10 +176,11 @@ Total: `8 + 8 + 1 + 2 + 8 + 2 + 8 + 3 = 40` bytes.
 - **Count** (uint64): number of key-value pairs. For a
   SetKeyspace, total pairs across all value sets.
 - **Kind** (uint8): `0` = Keyspace (key → value), `1` =
-  SetKeyspace (key → sorted set of values), `2` =
-  engine-internal index keyspace (not directly openable by
-  users). `Open()` rejects unknown values. Set at creation,
-  immutable.
+  SetKeyspace (key → sorted set of values), `2` = RESERVED
+  (engine-internal index keyspace; never created by the current
+  engine — index storage hangs off `IndexRegistryRoot` — but
+  defensively rejected at every user surface). `Open()` rejects
+  unknown values. Set at creation, immutable.
 - **FixedValueSize** (uint16): for SetKeyspace, the fixed value
   size in bytes (`0` = variable). Must be `0` when `Kind != 1`.
 - **NextSeq** (uint64): next sequence number for `NextSequence()`.
@@ -183,8 +190,11 @@ Total: `8 + 8 + 1 + 2 + 8 + 2 + 8 + 3 = 40` bytes.
   default (16). `1` ⇒ uncompressed leaves
   (`TypeLeafUncompressed`); `[2, 255]` ⇒ compressed leaves
   (`TypeLeaf`) with variable-size groups capped at the target.
-  Values `> 255` are rejected by `Open()` and
-  `Tx.SetKeyspaceConfig()` with `ErrInvalidOptions` — the
+  Values `> 255` are rejected by `Tx.SetKeyspaceConfig()` with
+  `ErrInvalidOptions` and by descriptor validation at open with
+  `ErrCorrupted` — correctly different classes: the config API
+  gates every legitimate write path, so an out-of-range stored
+  value can only be on-disk corruption — the
   compressed-leaf restart-table `Count` field is `uint8`, so 255
   is the hard physical cap (see `page-formats.md §Compressed
   Leaf`). Set at creation, mutable via `Tx.SetKeyspaceConfig()`

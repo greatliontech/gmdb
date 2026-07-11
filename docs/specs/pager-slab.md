@@ -168,38 +168,21 @@ Invariant: kind=entailed;
 
 ## Roles
 
-A single `Pager` type per transaction handles both reads and writes.
-Read transactions get a read-only pager that resolves pages from the
-mmap. Write transactions get a writable pager that additionally owns
-the dirty-page slab.
-
-```
-type Pager struct {
-    mmap        []byte               // read-only view of the data file
-    pageSize    int
-    dirty       map[uint64]*[]byte   // page ID → slab buffer (write txn only)
-    dirtyBytes  int                  // current slab usage in bytes
-    maxBytes    int                  // Options.MaxTxBufferBytes
-    bufPool     *sync.Pool           // page-sized scratch buffers
-    readOnly    bool
-}
-```
+A single pager per transaction handles both reads and writes. Read
+transactions get a read-only pager that resolves pages from the mmap.
+Write transactions get a writable pager that additionally owns the
+dirty-page slab: the write set (`p.dirty`, page ID → slab buffer)
+and its running byte count (`dirtyBytes`), bounded by
+`Options.MaxTxBufferBytes`. Those two names are used throughout
+this spec for the write set and its budget charge.
 
 ## Page Resolution
 
-`pager.Page(id) []byte` returns a borrowed byte slice for the page at
-`id`:
-
-```
-if buf, ok := p.dirty[id]; ok {
-    return *buf                                             // own dirty page
-}
-return p.mmap[id*p.pageSize : (id+1)*p.pageSize]            // mmap
-```
-
-One branch, two cases. No layered buffer cache, no eviction policy.
-The OS page cache handles everything except the writer's own in-flight
-changes.
+Page resolution returns a borrowed byte slice: the transaction's own
+dirty slab buffer when the page was written this transaction,
+otherwise a slice of the mmap. One branch, two cases. No layered
+buffer cache, no eviction policy. The OS page cache handles
+everything except the writer's own in-flight changes.
 
 Reads through the mmap are file-cache-backed; the kernel handles
 eviction under memory pressure. There is no application-level page
@@ -213,21 +196,21 @@ readers serialize their snapshot via the meta page's `TxnID`.
 When the writer modifies a page from a prior transaction:
 
 1. Allocate a fresh page ID via `pageAlloc()` (see `free-space.md`).
-2. Acquire a page-sized buffer from `bufPool`.
-3. Copy current page content (from `pager.Page(oldID)` — mmap or a
+2. Acquire a page-sized buffer from the buffer pool.
+3. Copy the current page content (resolved as any read — mmap or a
    same-tx dirty buffer) into the slab buffer.
-4. Insert the buffer into `p.dirty[newID]`.
-5. `dirtyBytes += pageSize`. If `dirtyBytes > maxBytes`, return
-   `ErrTxTooLarge` — the caller must roll back.
-6. Track the old page ID for retirement (`tx.retiredPages` if from a
-   prior tx, `tx.loosePages` if same-tx CoW that has just been
-   superseded).
-7. Track the new page ID in `tx.pendingAllocs` and `tx.cowPages`.
+4. Register the buffer as the new page ID's dirty entry.
+5. Charge one page against the slab budget; over
+   `Options.MaxTxBufferBytes`, return `ErrTxTooLarge` — the caller
+   must roll back.
+6. Track the old page ID for retirement (RPL-bound if from a prior
+   tx; the loose pool if it was a same-tx CoW just superseded).
+7. Track the new page ID as pending-allocated and CoW'd-this-tx.
 8. Mutate the slab buffer in place.
 
-A re-modification of a page already in `p.dirty` mutates the existing
-buffer in place — no second buffer is allocated. `tx.cowPages` is the
-discriminator.
+A re-modification of a page already dirty this transaction mutates
+the existing buffer in place — no second buffer is allocated; the
+CoW'd-this-tx tracking is the discriminator.
 
 ## Slab Budget and `ErrTxTooLarge`
 
@@ -271,8 +254,8 @@ underlying page is CoW'd, rebalanced, or freed mid-transaction. The
 cost is bounded by `MaxTxBufferBytes` (loose buffers count against
 the same budget as live ones).
 
-The buffer pool is shared process-wide via `sync.Pool`. Returning a
-buffer clears it (zero-fill) and makes it available for reuse.
+The buffer pool is shared process-wide. Returning a buffer clears
+it (zero-fill) and makes it available for reuse.
 Cross-transaction reuse keeps allocator pressure low for steady write
 workloads; cross-process slab usage is not visible from any one DB
 handle (each process holds its own pool).
@@ -321,11 +304,14 @@ leakage.
   bitmap page directly from the bitmap's own storage — no slab
   buffer, outside `MaxTxBufferBytes` (bounded by `BitmapPages`, a
   file-geometry constant).
-- Construct the new meta page payload (new roots, new TxnID, updated
-  `HighWaterMark`, updated RPL pointers and counters, recomputed
-  xxhash64 checksum) into a fresh buffer held on the transaction (not
-  in `p.dirty` — the meta page lives at a fixed slot and is pwritten
-  in step 3).
+- The new meta page payload is NOT built here: it is composed after
+  step 2, because its `AnchoredDurableTxnID` may name the
+  step-2-anchored assertion (that fsync has completed) but never this
+  commit's own step-4, which has not run yet — durability.md
+  §Anchoring's no-forward-promise, the governing tier. Step 0
+  finalises everything ELSE the payload reads (HighWaterMark, RPL
+  chain, bitmap state — steps 1-2 change none of them); the anchored
+  epoch is the one input only step 2 settles.
 
 Any step-0 failure (`ErrTxTooLarge`, `ErrDBFull`, RPL capacity
 exhausted) is fully reversible *with respect to reader-observable
@@ -359,8 +345,12 @@ and bitmap pages are durable.
 
 ### Step 3 — Meta pwrite
 
-`pwrite` the meta-page buffer constructed in step 0 to the inactive
-meta slot.
+Compose the new meta payload (new roots, new TxnID, updated
+`HighWaterMark`, updated RPL pointers and counters, the anchored
+epoch as of the completed step 2, recomputed xxhash64 checksum) and
+`pwrite` it to the inactive meta slot. Composed here — after step 2,
+never in step 0 — per durability.md §Anchoring's no-forward-promise
+(see the step-0 bullet).
 
 ### Step 4 — fdatasync (meta) — atomic commit point
 

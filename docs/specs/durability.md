@@ -250,7 +250,25 @@ step. (Pinned by `TestCleanCloseCheckpointsSyncLazy`,
    rule); recompute the xxhash64 checksum over the full meta
    payload; `pwrite()` it back to the same slot. The TxnID is
    unchanged — Checkpoint records that the already-committed
-   state is durable, not a new transaction.
+   state is durable, not a new transaction. A meta that is
+   ALREADY self-durable skips the bump-and-pwrite; steps 2 and 4
+   still run (step 4 lands the previously-written sub-record on
+   stable storage even when the prior commit was `SyncDataOnly`,
+   which skipped its own step 4). The skip is LOAD-BEARING, not
+   an idempotence elision: a self-durable meta is the SOLE
+   durable carrier of its own assertion (the other slot's
+   sub-record predates it), and rewriting it in place — even
+   only to persist the step-2 anchor advance — risks a torn
+   step-4 fsync (the kernel consumes the writeback error and
+   marks the page clean) destroying the assertion on disk while
+   the intact page-cache copy keeps feeding peer reclamation
+   bounds: after a crash, recovery falls back to the other,
+   OLDER slot, whose tree references pages the bound let a peer
+   reuse — page aliasing. A non-self-durable bump has no such
+   hazard (its sub-record is carried in BOTH slots). Consequence
+   of the skip: the persisted `AnchoredDurableTxnID` deliberately
+   TRAILS the in-process anchored epoch in pure `SyncDataOnly`
+   use — delayed peer reclamation, never unsafety.
 4. `fdatasync(fd)` again so the sub-record bump itself reaches
    stable storage.
 5. Release the write lock.

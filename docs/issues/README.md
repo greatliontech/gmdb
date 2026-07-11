@@ -82,4 +82,3 @@ chunks (bottom-up by layer, grouped by function).
 | checkpoint-selfdurable-anchor-persist | 23 | [L] pure-SyncDataOnly Checkpoint leaves the persisted anchor trailing by one (peer reclamation delayed); persisting would rewrite the assertion's sole durable carrier in place — tear hazard |
 | copyto-hardlink-destination-support | when a non-hard-link destination filesystem is decided to be a supported CopyTo target | [L] publish fails on vfat/exfat/FUSE targets; [nit] NFS link() retransmission quirk |
 | reclaimed-boundary-torn-peer | when grant-handoff tear detection or reclaimed-boundary gating is settled | [H] surviving handle's chain predates a peer's torn never-published reclamation; reclamation behind the reclaimed boundary double-frees |
-| spec-descriptive-drift | 22 | [L] batch: spec clauses describing mechanisms the code doesn't use; code-shape content in specs |

@@ -386,8 +386,12 @@ Index entries are stored as plain B+tree key-value pairs:
 - **Non-unique index.** key = concatenated lex-safe columns +
   escaped PK; value = optional covering tuple.
 
-The `Count` field on the index descriptor is maintained
-incrementally on Put / Delete. `Stats()` returns it in O(1).
+The index's entry count is maintained incrementally on Put /
+Delete in the transaction's pinned per-index state; the registry
+entry's persisted `Count` (with the root) is synced from it once,
+at `Commit` — not per operation. `Stats()` returns the pinned
+count in O(1) and therefore always reflects this transaction's
+own mutations.
 
 ## Unique Indexes
 
@@ -966,19 +970,30 @@ the cost of rebuilding indexes that may not have drifted.
    indexes, any extractor-produced duplicate aborts the
    rebuild with `ErrIndexUniqueViolation` — the rebuild does
    not commit and the existing registry entry is unchanged.
-3. Update the registry entry: new `Root`, new `Count`, new
-   `SchemaHash` (computed from `decl`), new `UserVersion`
-   (from `decl.Version`). The old internal index keyspace's
-   pages enter `tx.retiredPages`.
+3. Write the registry entry — new `Root`, new `Count`, new
+   `SchemaHash` (computed from `decl`), new `UserVersion` (from
+   `decl.Version`) — DURING the rebuild, publish-then-retire:
+   the registry write lands strictly BEFORE the old tree is
+   freed, so the registry can never point at freed pages. Only
+   after the registry write, the old internal index keyspace's
+   pages are freed by a subtree walk: prior-transaction pages
+   retire to the RPL, same-transaction pages return to the loose
+   pool. The transaction's pinned per-index state is then synced
+   FROM the rebuilt entry (cached handles see it in place —
+   §Handle Invalidation). (Commit-time
+   `flushIndexRegistry` is the Put/Delete MAINTENANCE sync
+   mechanism — see §Storage Layout — not Rebuild's.)
 4. On `tx.Commit()`, the new index becomes active; old pages
    reclaim via the RPL.
 
-`Index.Stats()` called on a handle to the still-rebuilding
-index returns the *old* registry entry's count and tree
-statistics until the transaction commits — the new index is
-invisible until the registry write in step 3 lands at commit.
-A caller calling `Stats()` mid-`RebuildIndex` therefore sees
-the pre-rebuild state, not an intermediate.
+`Index.Stats()` follows the transaction's read-your-writes
+model, like every other same-tx surface: after `Rebuild`
+returns (still uncommitted), a handle's `Stats()` reflects the
+REBUILT index — the pinned state step 3 installed — never a
+half-built intermediate (Rebuild is atomic: it installs the new
+root only on full success). Other transactions continue to see
+the pre-rebuild index until the commit publishes the registry
+write.
 
 For very large keyspaces this may exceed `MaxTxBufferBytes` —
 the rebuild fails with `ErrTxTooLarge` and the caller must use

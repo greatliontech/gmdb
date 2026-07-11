@@ -128,10 +128,12 @@ Invariant: kind=clause-explicit;
     Recovery (shared future-stamp guard);
   violation=A mid-publish reader stores `Heartbeat = nowMonotonic()`
     (step 4a) before its `PID` (step 4e); a writer scanning with an
-    earlier `now` than that reader's clock read — reachable with no
-    happens-before between the two reads, and routine on
-    darwin/freebsd where `CLOCK_MONOTONIC` origins are per-process
-    (§Process Start Time) — sees `Heartbeat > now`, underflows, and
+    earlier `now` than that reader's clock read — reachable because
+    nothing orders the two clock reads (the writer may have sampled
+    `now` before the reader sampled its stamp; both clocks are
+    kernel-wide and boot-relative on every supported platform, so
+    the skew is bounded by scheduling, not clock domain) — sees
+    `Heartbeat > now`, underflows, and
     clears the live acquirer mid-publish. Its snapshot `TxnID`
     leaves the table, the reclamation bound advances past it, and
     RPL reclamation frees pages the reader is about to read:
@@ -1262,10 +1264,13 @@ stored value, the PID was recycled.
 | Platform | Source | Value | Notes |
 |----------|--------|-------|-------|
 | Linux | `/proc/[pid]/stat` field 22 | Clock ticks since boot (uint64) | No privileges. Pure Go: `os.ReadFile` + parse. |
-| macOS | `sysctl KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime` | timeval packed as `sec*1e6+usec` | Same-user processes. Pure Go via `syscall.Sysctl`. |
-| FreeBSD | `sysctl KERN_PROC_PID` → `kinfo_proc.ki_start` | timeval packed | Same as macOS interface. |
+| macOS | `sysctl KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime` | timeval packed as `sec*1e6+usec` | Same-user processes. PORT DESIGN — not shipped. |
+| FreeBSD | `sysctl KERN_PROC_PID` → `kinfo_proc.ki_start` | timeval packed | Same as macOS interface. PORT DESIGN — not shipped. |
 
-All pure Go. `processStartTime` per-platform via build tags.
+Only the Linux row is implemented; the macOS/FreeBSD rows are the
+settled design for those ports (see PLATFORM SUPPORT under
+§Heartbeat Goroutine — the lock file itself is Linux-only today,
+so the non-Linux helpers ship as error stubs).
 
 If `processStartTime` fails, falls back to heartbeat (if
 available) or PID-only liveness.
@@ -1369,12 +1374,22 @@ from the same writer, even before the first refresh tick fires.
 `CLOCK_BOOTTIME` on Linux because it is monotonic, survives
 suspend/resume, and is shared across all containers on the
 same host (kernel-wide, not per-PID-namespace).
-`CLOCK_MONOTONIC` on macOS / FreeBSD does not survive suspend;
-on a laptop that resumes after a long sleep, the heartbeat
-clock jumps forward by less than wall-time elapsed, so
-`StaleTimeout`'s 10-second default is safe — false-stale
-detection requires a heartbeat older than 10 s of *monotonic*
-time, which a suspended process cannot accumulate.
+
+PLATFORM SUPPORT: the lock file — and with it all cross-process
+coordination this spec defines — is currently implemented on
+LINUX ONLY: the non-Linux lock mmap shim returns an
+unsupported-platform error, so a WRITABLE open fails outright on
+non-Linux, and a read-only open falls back to lock-free
+operation. The macOS/FreeBSD material in this spec is the DESIGN
+for those ports, kept so a port implements a settled contract; it
+describes no shipped behavior. For those future
+ports: `CLOCK_MONOTONIC` on macOS / FreeBSD is kernel-wide and
+boot-relative but does not survive suspend; on a laptop that
+resumes after a long sleep, the heartbeat clock jumps forward by
+less than wall-time elapsed, so `StaleTimeout`'s 10-second
+default is safe — false-stale detection requires a heartbeat
+older than 10 s of *monotonic* time, which a suspended process
+cannot accumulate.
 
 `StaleTimeout` (default 10 s) controls how long a heartbeat
 must be stale before the slot is reclaimed. Must be

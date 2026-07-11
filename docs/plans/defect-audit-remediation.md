@@ -53,7 +53,7 @@ function. WIP = 1.
 - [x] 20. maintenance: leak reclamation gated on tail-reached RPL walk
       (+ background-maintenance.md rider)
 - [x] 21. compaction: below-floor allocation for tree-page relocations
-- [ ] 22. specs: descriptive-drift sync batch
+- [x] 22. specs: descriptive-drift sync batch
 - [ ] 23. durability: tear-safe anchor persist channel — amend
       §Anchoring so peers trust an advanced anchor only through
       their own rewrite+fsync (mirroring recovery's gate); the
