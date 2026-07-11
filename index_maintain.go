@@ -177,6 +177,7 @@ func (tx *Tx) flushIndexRegistry(owner descriptorOwner, indexes map[string]*pinn
 		entry := &indexing.RegistryEntry{
 			SchemaHash:  p.schemaHash,
 			Unique:      p.decl.Unique,
+			Kind:        p.decl.Kind,
 			Root:        p.root,
 			Count:       p.count,
 			UserVersion: p.decl.Version,

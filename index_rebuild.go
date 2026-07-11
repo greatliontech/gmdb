@@ -197,6 +197,9 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	if decl.Name == "" {
 		return ErrKeyEmpty
 	}
+	if decl.Kind != IndexKindComposite {
+		return fmt.Errorf("gmdb: index %q kind %d: %w", decl.Name, decl.Kind, ErrIndexKindUnknown)
+	}
 	if decl.Extract == nil {
 		return ErrIndexExtractorRequired
 	}
@@ -208,6 +211,14 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	existing, err := tx.registryGet(owner, decl.Name)
 	if err != nil {
 		return err
+	}
+	// Stored-entry kind gate (indexing.md §Rebuild / §Removing an
+	// Index): rebuilding a foreign-kind index with a composite decl
+	// would silently convert it — the very outcome the open path's
+	// gate ordering exists to prevent, via the documented recovery
+	// verb itself.
+	if existing.Kind != indexing.KindComposite {
+		return fmt.Errorf("gmdb: stored index %q kind %d: %w", decl.Name, existing.Kind, ErrIndexKindUnknown)
 	}
 
 	// Atomicity wrap (transactions.md §Write-helper error contract):
@@ -261,6 +272,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		newEntry := &indexing.RegistryEntry{
 			SchemaHash:  schemaHash(decl),
 			Unique:      decl.Unique,
+			Kind:        decl.Kind,
 			Root:        0,
 			Count:       0,
 			UserVersion: decl.Version,
@@ -417,6 +429,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	newEntry := &indexing.RegistryEntry{
 		SchemaHash:  schemaHash(decl),
 		Unique:      decl.Unique,
+		Kind:        decl.Kind,
 		Root:        newRoot,
 		Count:       newCount,
 		UserVersion: decl.Version,
@@ -598,6 +611,13 @@ func (tx *Tx) dropIndex(keyspace, indexName string) (retErr error) {
 	existing, err := tx.registryGet(owner, indexName)
 	if err != nil {
 		return err
+	}
+	// Stored-entry kind gate: a foreign kind's payload may reference
+	// state beyond Root that a composite FreeSubtree cannot see —
+	// this engine version must not retire what it cannot interpret
+	// (indexing.md §Removing an Index).
+	if existing.Kind != indexing.KindComposite {
+		return fmt.Errorf("gmdb: stored index %q kind %d: %w", indexName, existing.Kind, ErrIndexKindUnknown)
 	}
 	cfg := tx.pgr.Config()
 

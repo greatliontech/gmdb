@@ -201,8 +201,22 @@ type IndexDecl struct {
     Covering []IndexCoveringColumn   // optional; stored in the index value
     Unique   bool               // engine rejects extractor-produced duplicates
     Version  string             // user-supplied; bump after extractor-logic changes
+    Kind     IndexKind          // index kind; zero value = IndexKindComposite
     Extract  IndexExtractor
 }
+
+// IndexKind discriminates the index's data-structure family. The
+// composite-key lex-ordered B+tree is kind 0 (the zero value, so
+// existing declarations need no change) and the ONLY kind this
+// engine version accepts: OpenKeyspace / CreateKeyspace /
+// RebuildIndex reject any other value with ErrIndexKindUnknown,
+// before any work. The discriminator exists so future kinds
+// (token postings with corpus statistics; vector partitions with
+// centroid state) are an additive kind value plus a kind payload,
+// not a format break.
+type IndexKind uint8
+
+const IndexKindComposite IndexKind = 0
 
 type IndexColumn struct {
     // Name is a semantic anchor for the column: it identifies the
@@ -260,9 +274,17 @@ xxhash64(
   uvarint(len(index.Name)) || index.Name ||
   uvarint(len(Columns)) || for each col: uvarint(len(Name)) || Name ||
   uvarint(len(Covering)) || for each col: uvarint(len(Name)) || Name ||
-  uint8(Unique)
+  uint8(Unique) ||
+  uint8(Kind) || uvarint(len(KindParams)) || KindParams
 )
 ```
+
+`Kind` and its kind-specific parameter bytes (`KindParams` — empty
+for the composite kind) are fingerprint inputs: a kind change
+under an unchanged name/column/unique shape MUST fail the drift
+guard, or stored entries would be read under the wrong kind's
+semantics. The uvarint length prefix on `KindParams` keeps the
+grammar injective at its tail exactly as it is everywhere else.
 
 Every string input — `index.Name`, column names, covering names —
 is uvarint-length-prefixed. Without a prefix on `index.Name`, the
@@ -352,7 +374,8 @@ Index Registry Entry (value bytes)
 +----------------+----------------------------------+
 | SchemaHash     | uint64                           |
 | Unique         | uint8                            |
-| Padding        | [7]byte                          |
+| Kind           | uint8     (IndexKind; 0=composite)|
+| Padding        | [6]byte   (zero)                 |
 | Root           | uint64    (index B+tree root)    |
 | Count          | uint64    (entries in the index) |
 | UserVersionLen | uint16                           |
@@ -365,12 +388,27 @@ Index Registry Entry (value bytes)
 | For each col:                                     |
 |   NameLen      | uint16                           |
 |   Name         | bytes                            |
+| KindPayloadLen | uint32                           |
+| KindPayload    | bytes                            |
 +----------------+----------------------------------+
 ```
 
 Variable-length. Stored as a single byte-string value in the
-index registry tree. Padding after the `Unique` byte aligns the
-subsequent `Root` / `Count` uint64s.
+index registry tree. `Kind` plus the padding after it align the
+subsequent `Root` / `Count` uint64s (the fixed prefix stays 32
+bytes; `Root` at offset 16, `Count` at 24).
+
+`KindPayload` is the per-kind metadata tail: a future index kind
+stores its extra state here (a stats head, a centroid-tree root,
+kind configuration) without changing this layout — new kinds are
+a kind value plus a payload grammar of their own. The composite
+kind's canonical form is an EMPTY payload and zero padding, and
+the decoder REJECTS a composite entry carrying payload bytes: a
+nonzero payload written today would decode under a future kind's
+reader as that kind's metadata — a silent cross-version
+misinterpretation. Unknown `Kind` values decode structurally
+(the payload is length-delimited) but are rejected at open with
+`ErrIndexKindUnknown`.
 
 Each index's data lives in its own engine-internal keyspace
 descriptor (`Kind = 2`) referenced indirectly through `Root` in
@@ -888,6 +926,12 @@ calling `OpenKeyspace`.
 `decl.Extract` MUST be non-nil; a nil `Extract` returns
 `ErrIndexExtractorRequired`.
 
+A supplied decl OR a stored registry entry whose `Kind` this
+engine version does not implement returns `ErrIndexKindUnknown`
+— rebuilding a foreign-kind index with a composite decl would
+silently convert it, via the drift guard's own documented
+recovery verb.
+
 ### Recovery pattern after `ErrIndexFingerprintMismatch`
 
 A single `OpenKeyspace` call reports drift on *one* index at a
@@ -1028,9 +1072,18 @@ Two distinct open functions:
   read+write. Requires every declared index on the keyspace to
   be supplied with a matching `IndexDecl`. Missing or extra
   IndexDecls return `ErrIndexExtractorRequired` or
-  `ErrIndexUnknown`. Drift returns
-  `ErrIndexFingerprintMismatch` (caller must `RebuildIndex`).
+  `ErrIndexUnknown`. A supplied decl or a STORED registry entry
+  whose `Kind` this engine version does not implement returns
+  `ErrIndexKindUnknown` — the stored-entry check runs BEFORE the
+  fingerprint compare, because a fingerprint mismatch's
+  documented recovery (`RebuildIndex` with the supplied decl)
+  would silently convert a foreign-kind index to composite.
+  Drift returns `ErrIndexFingerprintMismatch` (caller must
+  `RebuildIndex`).
 - `OpenKeyspaceReadOnly(name)` opens a keyspace for reads only.
+  A stored registry entry with an unknown `Kind` is rejected
+  with `ErrIndexKindUnknown` here too — read-only lookups must
+  never walk a foreign kind's tree under composite semantics.
   No IndexDecls required (and none accepted — pass them via
   `OpenKeyspace` if you want write access). Index lookups
   still work — they read stored index entries directly.
@@ -1103,7 +1156,11 @@ needing both shapes use separate transactions.
 
 `tx.Indexes().Drop(keyspace, indexName)` removes the index entry
 from the per-keyspace registry and retires the index's
-internal keyspace pages. Future `OpenKeyspace` calls must
+internal keyspace pages. A stored entry with an unknown `Kind`
+is rejected with `ErrIndexKindUnknown`: a foreign kind's payload
+may reference state beyond `Root` that a composite retire cannot
+see — this engine version must not retire what it cannot
+interpret. Future `OpenKeyspace` calls must
 omit the corresponding `IndexDecl`, or a fresh declaration
 with the same name re-creates the index empty (next `Put`
 populates it as rows are written; existing rows are NOT

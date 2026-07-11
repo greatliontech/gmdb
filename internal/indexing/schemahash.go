@@ -13,7 +13,8 @@ import (
 //	  uvarint(len(name)) || name ||
 //	  uvarint(len(columns)) || for each col: uvarint(len(col)) || col ||
 //	  uvarint(len(covering)) || for each col: uvarint(len(col)) || col ||
-//	  uint8(unique)
+//	  uint8(unique) ||
+//	  uint8(kind) || uvarint(len(kindParams)) || kindParams
 //	)
 //
 // Inputs are exclusively byte sequences with explicit uvarint
@@ -36,7 +37,11 @@ import (
 // The user Version tag is NOT part of the schema-hash inputs: it
 // is stored and compared independently because it captures
 // extractor-logic drift the engine cannot inspect (per the spec).
-func SchemaHash(name string, columns, covering []string, unique bool) uint64 {
+// kind and kindParams (empty for the composite kind) are
+// fingerprint inputs per indexing.md §Drift Guard: a kind change
+// under an unchanged shape must fail the guard, or stored entries
+// would be read under the wrong kind's semantics.
+func SchemaHash(name string, columns, covering []string, unique bool, kind Kind, kindParams []byte) uint64 {
 	h := xxhash.New()
 	var buf [binary.MaxVarintLen64]byte
 	writeLenPrefixedString(h, buf[:], name)
@@ -58,6 +63,12 @@ func SchemaHash(name string, columns, covering []string, unique bool) uint64 {
 		uniqueByte[0] = 1
 	}
 	_, _ = h.Write(uniqueByte[:])
+
+	kindByte := [1]byte{byte(kind)}
+	_, _ = h.Write(kindByte[:])
+	n = binary.PutUvarint(buf[:], uint64(len(kindParams)))
+	_, _ = h.Write(buf[:n])
+	_, _ = h.Write(kindParams)
 
 	return h.Sum64()
 }

@@ -473,6 +473,32 @@ func (c *Checker) walkRegistry(ks string, desc descriptor.Keyspace, firstData, h
 			}
 			return nil
 		}
+		// Kind + padding assertions (indexing.md §Storage Layout):
+		// the decoder tolerates nonzero padding and unknown kinds
+		// structurally; the strict walk is where both surface. An
+		// unknown kind is exactly what open rejects — the walk must
+		// not silently pass what open refuses.
+		foreignKind := entry.Kind != indexing.KindComposite
+		if foreignKind {
+			if !c.Emit(Issue{Severity: Error, Code: "RegistryEntryKindUnknown", Keyspace: ks, Index: idxName,
+				Message: fmt.Sprintf("registry entry kind %d unknown to this engine version", entry.Kind)}) {
+				return errCheckStop
+			}
+			// Root is kind-agnostic spec contract (indexing.md
+			// §Storage Layout), so the STRUCTURAL walk below still
+			// runs — checksums verify and the pages count as
+			// reachable (no spurious BitmapLeak). Only the
+			// composite-semantic order pass is skipped.
+		}
+		for i := 10; i < 16; i++ {
+			if v[i] != 0 {
+				if !c.Emit(Issue{Severity: Error, Code: "RegistryEntryPaddingNonzero", Keyspace: ks, Index: idxName,
+					Message: fmt.Sprintf("registry entry padding byte %d is 0x%02x, want 0", i-10, v[i])}) {
+					return errCheckStop
+				}
+				break
+			}
+		}
 		if c.checkIndexesEnabled() {
 			if info := c.inv[ks]; info != nil {
 				info.indexRoots[idxName] = entry.Root
@@ -481,8 +507,10 @@ func (c *Checker) walkRegistry(ks string, desc descriptor.Keyspace, firstData, h
 		if !c.walkTree(ks, idxName, entry.Root, firstData, hwm) {
 			return errCheckStop
 		}
-		if _, _, ok, _ := c.validateTreeOrder(ks, idxName, entry.Root, 0, hwm); !ok {
-			return errCheckStop
+		if !foreignKind {
+			if _, _, ok, _ := c.validateTreeOrder(ks, idxName, entry.Root, 0, hwm); !ok {
+				return errCheckStop
+			}
 		}
 		return nil
 	})

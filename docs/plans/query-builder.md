@@ -1,8 +1,7 @@
 # Plan: structure phase + typed columns + query builder
 
 Spec: `docs/specs/typed-columns.md`, `docs/specs/query-builder.md`.
-Riders: `index-kind-format-groundwork` (chunk 7),
-`index-reverse-iteration` (chunk 9). Chunks 1–6 and 8 are
+Rider: `index-reverse-iteration` (chunk 9). Chunks 1–6 and 8 are
 behavior-free structure moves except the named exported knobs;
 tests move with their subjects, unmodified.
 
@@ -29,16 +28,15 @@ tests move with their subjects, unmodified.
       (pgr + meta + coord snapshot); exported `Check*` types and
       entry points stay in root (pure move + one input-struct
       seam).
-- [ ] 7. Index-kind format groundwork: registry entry v2 (kind
+- [x] 7. Index-kind format groundwork: registry entry v2 (kind
       discriminator + length-prefixed per-kind payload for
       future extra roots / stats heads), `IndexDecl.Kind`
       (composite = the only kind), both folded into the schema
       hash; `pinnedIndex` / snapshot / flush ripple. Spec
       amendment riding: `indexing.md §Storage Layout` + §Drift
-      Guard (requirements parked in issue doc
-      `index-kind-format-groundwork`). Pre-v1 clean break of
-      the registry-entry encoding — flagged here, ratified
-      2026-07-11.
+      Guard (requirements folded from the parked issue doc at 7.1).
+      Pre-v1 clean break of the registry-entry encoding —
+      ratified 2026-07-11.
 - [ ] 8. `gmdb/typed` extraction: move typed tier + encoders out
       of root; exported knobs `Keyspace.GuardIterConstruction` /
       `SetKeyspace.GuardIterConstruction`, `IndexHandle.Decl`,

@@ -59,17 +59,18 @@ func TestRegistryEntryRoundtripFull(t *testing.T) {
 
 // TestRegistryEntryRoundtripMinimal verifies the minimal entry:
 // no UserVersion, no Columns, no Covering, Unique=false, zero
-// SchemaHash/Root/Count. The encoded form is exactly the
-// fixed-prefix (32 B) + three uint16 zero counters = 38 B.
+// SchemaHash/Root/Count, composite kind with empty payload. The
+// encoded form is exactly the fixed prefix (32 B) + three uint16
+// zero counters + the uint32 zero payload length = 42 B.
 func TestRegistryEntryRoundtripMinimal(t *testing.T) {
 	want := &indexing.RegistryEntry{}
 	encoded, err := indexing.EncodeRegistryEntry(want)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if len(encoded) != indexing.RegistryEntryFixedPrefixSize+2+2+2 {
+	if len(encoded) != indexing.RegistryEntryFixedPrefixSize+2+2+2+4 {
 		t.Fatalf("minimal encoded length: got %d want %d",
-			len(encoded), indexing.RegistryEntryFixedPrefixSize+6)
+			len(encoded), indexing.RegistryEntryFixedPrefixSize+10)
 	}
 	got, err := indexing.DecodeRegistryEntry(encoded)
 	if err != nil {
@@ -91,8 +92,9 @@ func TestRegistryEntryRoundtripMinimal(t *testing.T) {
 
 // TestRegistryEntryFixedFieldsAtSpecOffsets verifies the binary
 // layout matches indexing.md §Storage Layout offsets exactly:
-// SchemaHash at 0, Unique at 8, Padding at 9..15, Root at 16,
-// Count at 24. Critical for cross-implementation compatibility.
+// SchemaHash at 0, Unique at 8, Kind at 9, Padding at 10..15,
+// Root at 16, Count at 24. Critical for cross-implementation
+// compatibility.
 func TestRegistryEntryFixedFieldsAtSpecOffsets(t *testing.T) {
 	e := &indexing.RegistryEntry{
 		SchemaHash: 0x1122334455667788,
@@ -110,7 +112,10 @@ func TestRegistryEntryFixedFieldsAtSpecOffsets(t *testing.T) {
 	if enc[8] != 1 {
 		t.Errorf("Unique@8: got %d want 1", enc[8])
 	}
-	for i := 9; i < 16; i++ {
+	if enc[9] != byte(indexing.KindComposite) {
+		t.Errorf("Kind@9: got %d want %d (composite)", enc[9], indexing.KindComposite)
+	}
+	for i := 10; i < 16; i++ {
 		if enc[i] != 0 {
 			t.Errorf("Padding@%d: got %d want 0", i, enc[i])
 		}
@@ -767,5 +772,78 @@ func TestOversizedIndexDeclSurfacesErrInvalidOptions(t *testing.T) {
 	_, err = tx.CreateKeyspace("k", decl)
 	if !errors.Is(err, ErrInvalidOptions) {
 		t.Fatalf("oversized decl through the public path: err = %v, want ErrInvalidOptions", err)
+	}
+}
+
+// The registry entry is self-describing by Kind: a non-composite
+// kind round-trips its payload verbatim behind the uint32 length
+// prefix, while the composite kind's canonical form REJECTS any
+// payload on both encode and decode — a stray payload would decode
+// under a future kind's reader as that kind's metadata
+// (indexing.md §Storage Layout).
+func TestRegistryEntryKindPayloadRoundTrip(t *testing.T) {
+	want := &indexing.RegistryEntry{
+		Kind:        indexing.Kind(7),
+		KindPayload: []byte{0xDE, 0xAD, 0x00, 0xBE, 0xEF},
+	}
+	enc, err := indexing.EncodeRegistryEntry(want)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	got, err := indexing.DecodeRegistryEntry(enc)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Kind != want.Kind || !bytes.Equal(got.KindPayload, want.KindPayload) {
+		t.Errorf("kind/payload round-trip: got (%d, %x) want (%d, %x)",
+			got.Kind, got.KindPayload, want.Kind, want.KindPayload)
+	}
+}
+
+func TestRegistryEntryCompositePayloadRejected(t *testing.T) {
+	_, err := indexing.EncodeRegistryEntry(&indexing.RegistryEntry{
+		Kind: indexing.KindComposite, KindPayload: []byte{1},
+	})
+	if !errors.Is(err, indexing.ErrRegistryEntryInvalid) {
+		t.Fatalf("encode composite+payload = %v, want ErrRegistryEntryInvalid", err)
+	}
+	// Decode side: forge the same illegal state byte-wise.
+	enc, err := indexing.EncodeRegistryEntry(&indexing.RegistryEntry{
+		Kind: indexing.Kind(1), KindPayload: []byte{1},
+	})
+	if err != nil {
+		t.Fatalf("encode kind=1: %v", err)
+	}
+	enc[9] = byte(indexing.KindComposite) // flip the kind back to composite
+	if _, err := indexing.DecodeRegistryEntry(enc); !errors.Is(err, indexing.ErrRegistryEntryInvalid) {
+		t.Fatalf("decode composite+payload = %v, want ErrRegistryEntryInvalid", err)
+	}
+}
+
+func TestRegistryEntryForgedPayloadLengthRejected(t *testing.T) {
+	enc, err := indexing.EncodeRegistryEntry(&indexing.RegistryEntry{})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	// Forge the payload length to point past the end of the entry.
+	binary.LittleEndian.PutUint32(enc[len(enc)-4:], 1<<20)
+	if _, err := indexing.DecodeRegistryEntry(enc); !errors.Is(err, indexing.ErrRegistryEntryShort) {
+		t.Fatalf("decode forged payload length = %v, want ErrRegistryEntryShort", err)
+	}
+}
+
+// Kind is a fingerprint input (indexing.md §Drift Guard): two
+// declarations differing ONLY in kind must hash differently, or a
+// kind change would pass the drift guard and stored entries would
+// be read under the wrong kind's semantics.
+func TestSchemaHashFoldsKind(t *testing.T) {
+	a := indexing.SchemaHash("i", []string{"c"}, nil, false, indexing.KindComposite, nil)
+	b := indexing.SchemaHash("i", []string{"c"}, nil, false, indexing.Kind(1), nil)
+	if a == b {
+		t.Fatal("schema hash identical across kinds — kind not folded")
+	}
+	c := indexing.SchemaHash("i", []string{"c"}, nil, false, indexing.Kind(1), []byte{9})
+	if b == c {
+		t.Fatal("schema hash identical across kind params — params not folded")
 	}
 }

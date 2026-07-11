@@ -237,6 +237,12 @@ var (
 	// are written. Per indexing.md §Unique Indexes.
 	ErrIndexUniqueViolation = errors.New("gmdb: unique index violation")
 
+	// ErrIndexKindUnknown rejects an IndexDecl whose Kind is not a
+	// kind this engine version implements (indexing.md §Overview —
+	// IndexKindComposite is currently the only kind). Surfaced at
+	// OpenKeyspace / CreateKeyspace / RebuildIndex, before any work.
+	ErrIndexKindUnknown = errors.New("gmdb: index kind unknown to this engine version")
+
 	// ErrIndexNotUnique is returned by Index.Get when called on a
 	// non-unique index. Get's contract (single (pk, value) result)
 	// is only well-defined for unique indexes. Per indexing.md

@@ -66,7 +66,6 @@ tags.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| index-kind-format-groundwork | 7 | registry entry v2 (kind discriminator + per-kind payload) + `IndexDecl.Kind` folded into the fingerprint; requirements from the 2026-07-11 architecture audit |
 | index-reverse-iteration | 9 | reverse-iteration `IterOption` clauses for `indexing.md §Lookup API` + `api-surface.md`; reverse == exact reversal of forward sequence |
 
 ## Open — change-set review findings
@@ -85,6 +84,7 @@ pre-existing at their change set's base.
 | Slug | Lands | Summary |
 |------|-------|---------|
 | index-background-maintenance-hook | when an index kind requiring asynchronous maintenance (vector ANN, FTS stats) is designed | index write path is synchronous-only: no deferred-obligation state, no background hook, per-op cursor invalidation (no epoch model), extractor-replay Check unsound for centroid-dependent kinds |
+| index-kind-payload-plumbing | when the first non-composite index kind is implemented | pinned index state / flush path rebuild registry entries from the decl and would drop a stored `KindPayload`; unreachable while the open gates reject non-composite kinds |
 
 ## Open — architecture / factoring audit
 

@@ -191,6 +191,11 @@ var (
     ErrIndexUnknown             = errors.New("gmdb: IndexDecl supplied for index not declared in registry")
     ErrIndexFingerprintMismatch = errors.New("gmdb: index fingerprint mismatch — RebuildIndex required")
     ErrIndexUniqueViolation     = errors.New("gmdb: unique index violation")
+    // ErrIndexKindUnknown rejects an IndexDecl whose Kind this engine
+    // version does not implement (indexing.md §Overview —
+    // IndexKindComposite is the only kind). Surfaced at OpenKeyspace /
+    // CreateKeyspace / RebuildIndex, before any work.
+    ErrIndexKindUnknown         = errors.New("gmdb: index kind unknown to this engine version")
     ErrIndexNotUnique           = errors.New("gmdb: Get called on non-unique index")
     ErrIndexExists              = errors.New("gmdb: index already exists")
     ErrIndexNotFound            = errors.New("gmdb: index not found")
@@ -1032,6 +1037,8 @@ func (tx *Tx) Indexes() TxIndexes
 //     without inspecting Tx state.
 //   - ErrKeyspaceReserved if the supplied keyspace name resolves
 //     to an engine-internal Kind=2 entry.
+//   - ErrIndexKindUnknown if decl.Kind is not a kind this engine
+//     version implements (indexing.md §Overview).
 //   - ErrIndexUniqueViolation if the rebuild's extractor produces
 //     duplicate keys for a unique index.
 //   - ErrTxTooLarge if the rebuilt index exceeds MaxTxBufferBytes

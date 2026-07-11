@@ -116,6 +116,13 @@ func (tx *Tx) loadReadOnlyIndexes(desc descriptor.Keyspace) (map[string]*pinnedI
 			return fmt.Errorf("%w: read-only index load %q: %w", ErrCorrupted, k, derr)
 		}
 		name := string(k)
+		// Stored-entry kind gate (indexing.md §Storage Layout /
+		// §Open Semantics): an entry whose Kind this engine version
+		// does not implement must never be served under composite
+		// semantics — reject before synthesizing a decl.
+		if e.Kind != indexing.KindComposite {
+			return fmt.Errorf("gmdb: stored index %q kind %d: %w", name, e.Kind, ErrIndexKindUnknown)
+		}
 		decl := &IndexDecl{
 			Name:    name,
 			Unique:  e.Unique,
@@ -215,6 +222,14 @@ func (tx *Tx) validatePinnedAgainstRegistry(
 			return err
 		}
 		p := pinned[name]
+		// Stored-entry kind gate, ordered BEFORE the fingerprint
+		// compare (indexing.md §Open Semantics): a fingerprint
+		// mismatch's documented recovery is RebuildIndex with the
+		// supplied decl, which would silently convert a foreign-kind
+		// index to composite — the kind rejection must win.
+		if entry.Kind != indexing.KindComposite {
+			return fmt.Errorf("gmdb: stored index %q kind %d: %w", name, entry.Kind, ErrIndexKindUnknown)
+		}
 		if entry.SchemaHash != p.schemaHash {
 			return &IndexFingerprintError{
 				Keyspace:     keyspaceName,
@@ -282,6 +297,7 @@ func (tx *Tx) writeNewIndexRegistry(
 		entry := &indexing.RegistryEntry{
 			SchemaHash:  p.schemaHash,
 			Unique:      p.decl.Unique,
+			Kind:        p.decl.Kind,
 			Root:        0, // empty index data tree
 			Count:       0,
 			UserVersion: p.decl.Version,

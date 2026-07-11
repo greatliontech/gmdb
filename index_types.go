@@ -31,6 +31,17 @@ type IndexColumn = indexing.Column
 // reordering covering columns triggers ErrIndexFingerprintMismatch.
 type IndexCoveringColumn = indexing.CoveringColumn
 
+// IndexKind discriminates the index's data-structure family
+// (indexing.md §Overview). The zero value, IndexKindComposite, is
+// the composite-key lex-ordered B+tree — the only kind this engine
+// version accepts; OpenKeyspace / CreateKeyspace / RebuildIndex
+// reject any other value with ErrIndexKindUnknown, before any
+// work. The concrete type lives in internal/indexing.
+type IndexKind = indexing.Kind
+
+// IndexKindComposite is the composite-key lex-ordered B+tree kind.
+const IndexKindComposite = indexing.KindComposite
+
 // IndexExtractor produces zero or more IndexEntry values for a row.
 // Returning a nil slice or a zero-length slice both signal "do not
 // index this row" (partial-index semantics) and are equivalent.
@@ -101,7 +112,7 @@ func schemaHash(decl *IndexDecl) uint64 {
 	for i, c := range decl.Covering {
 		cov[i] = c.Name
 	}
-	return indexing.SchemaHash(decl.Name, cols, cov, decl.Unique)
+	return indexing.SchemaHash(decl.Name, cols, cov, decl.Unique, decl.Kind, nil)
 }
 
 // validateIndexDecls rejects a variadic IndexDecl slice that contains
@@ -132,6 +143,9 @@ func validateIndexDecls(decls []*IndexDecl) error {
 		}
 		if d.Name == "" {
 			return fmt.Errorf("gmdb: IndexDecl at position %d has empty Name: %w", i, ErrKeyEmpty)
+		}
+		if d.Kind != IndexKindComposite {
+			return fmt.Errorf("gmdb: IndexDecl %q has kind %d: %w", d.Name, d.Kind, ErrIndexKindUnknown)
 		}
 		// Zero-column IndexDecls are unsupported: the non-unique
 		// decoder (indexing.ExtractSetCompoundPK +

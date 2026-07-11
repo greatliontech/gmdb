@@ -22,7 +22,8 @@ var ErrFieldTooLarge = errors.New("registry entry field exceeds uint16 encoding 
 //	+----------------+----------------------------------+
 //	| SchemaHash     | uint64                           |
 //	| Unique         | uint8                            |
-//	| Padding        | [7]byte                          |
+//	| Kind           | uint8                            |
+//	| Padding        | [6]byte                          |
 //	| Root           | uint64    (index B+tree root)    |
 //	| Count          | uint64    (entries in the index) |
 //	| UserVersionLen | uint16                           |
@@ -31,24 +32,38 @@ var ErrFieldTooLarge = errors.New("registry entry field exceeds uint16 encoding 
 //	| For each col: NameLen u16 || Name bytes           |
 //	| CoveringCount  | uint16                           |
 //	| For each col: NameLen u16 || Name bytes           |
+//	| KindPayloadLen | uint32                           |
+//	| KindPayload    | bytes                            |
 //	+----------------+----------------------------------+
 //
-// Padding after Unique aligns the subsequent Root / Count uint64s
-// at file-relative offsets 16 and 24.
+// Kind plus the padding after it align the subsequent Root / Count
+// uint64s at offsets 16 and 24. KindPayload is the per-kind
+// metadata tail (indexing.md §Storage Layout): a future kind's
+// extra state lives there behind its length prefix; the composite
+// kind's canonical form is an EMPTY payload, enforced on both
+// encode and decode — a stray payload would decode under a future
+// kind's reader as that kind's metadata.
 type RegistryEntry struct {
 	SchemaHash  uint64
 	Unique      bool
+	Kind        Kind
 	Root        uint64 // root page ID of the index's Kind=2 data sub-tree
 	Count       uint64 // entries in the index
 	UserVersion string
 	Columns     []string // ordered; positional
 	Covering    []string // ordered; positional; may be empty
+	KindPayload []byte   // per-kind metadata; empty for KindComposite
 }
 
 // RegistryEntryFixedPrefixSize is the byte length of the
-// fixed-size prefix (SchemaHash u64 + Unique u8 + Padding [7]byte +
-// Root u64 + Count u64) = 32 bytes.
+// fixed-size prefix (SchemaHash u64 + Unique u8 + Kind u8 +
+// Padding [6]byte + Root u64 + Count u64) = 32 bytes.
 const RegistryEntryFixedPrefixSize = 32
+
+// ErrRegistryEntryInvalid marks a structurally complete but
+// ill-formed registry entry — a composite entry carrying a kind
+// payload. Wrapped in ErrCorrupted at the caller's boundary.
+var ErrRegistryEntryInvalid = errors.New("registry entry invalid")
 
 // ErrRegistryEntryShort marks a registry-entry decode that ran out
 // of bytes mid-field. Wrapped in ErrCorrupted at the caller's
@@ -62,6 +77,14 @@ var ErrRegistryEntryShort = errors.New("registry entry truncated")
 // CoveringCount > 65535). The format is little-endian per the
 // engine's file-layout.md §Byte order convention.
 func EncodeRegistryEntry(e *RegistryEntry) ([]byte, error) {
+	if e.Kind == KindComposite && len(e.KindPayload) > 0 {
+		return nil, fmt.Errorf("indexing: composite entry with %d payload bytes: %w",
+			len(e.KindPayload), ErrRegistryEntryInvalid)
+	}
+	if uint64(len(e.KindPayload)) > math.MaxUint32 {
+		return nil, fmt.Errorf("indexing: KindPayload length %d exceeds uint32 max: %w",
+			len(e.KindPayload), ErrFieldTooLarge)
+	}
 	if len(e.UserVersion) > math.MaxUint16 {
 		return nil, fmt.Errorf("indexing: Version length %d exceeds uint16 max: %w",
 			len(e.UserVersion), ErrFieldTooLarge)
@@ -98,6 +121,7 @@ func EncodeRegistryEntry(e *RegistryEntry) ([]byte, error) {
 	for _, c := range e.Covering {
 		size += 2 + len(c)
 	}
+	size += 4 + len(e.KindPayload)
 
 	buf := make([]byte, size)
 	off := 0
@@ -109,8 +133,10 @@ func EncodeRegistryEntry(e *RegistryEntry) ([]byte, error) {
 		buf[off] = 1
 	}
 	off += 1
-	// Padding [7]byte is zero — already implicit in make.
-	off += 7
+	buf[off] = byte(e.Kind)
+	off += 1
+	// Padding [6]byte is zero — already implicit in make.
+	off += 6
 
 	binary.LittleEndian.PutUint64(buf[off:], e.Root)
 	off += 8
@@ -140,6 +166,10 @@ func EncodeRegistryEntry(e *RegistryEntry) ([]byte, error) {
 		off += len(c)
 	}
 
+	binary.LittleEndian.PutUint32(buf[off:], uint32(len(e.KindPayload)))
+	off += 4
+	copy(buf[off:], e.KindPayload)
+
 	return buf, nil
 }
 
@@ -162,7 +192,9 @@ func DecodeRegistryEntry(data []byte) (*RegistryEntry, error) {
 
 	e.Unique = data[off] != 0
 	off += 1
-	off += 7 // Padding
+	e.Kind = Kind(data[off])
+	off += 1
+	off += 6 // Padding
 
 	e.Root = binary.LittleEndian.Uint64(data[off:])
 	off += 8
@@ -243,6 +275,29 @@ func DecodeRegistryEntry(data []byte) (*RegistryEntry, error) {
 			off += nLen
 		}
 	}
+
+	if off+4 > len(data) {
+		return nil, fmt.Errorf("%w: KindPayloadLen u32 past end at offset %d", ErrRegistryEntryShort, off)
+	}
+	payloadLen := int(binary.LittleEndian.Uint32(data[off:]))
+	off += 4
+	// Forged-length bound (checksums.md §Structural and Allocation
+	// Bounds): verify the remaining bytes hold the declared payload
+	// before allocating.
+	if payloadLen > len(data)-off {
+		return nil, fmt.Errorf("%w: KindPayload(%d) past end at offset %d",
+			ErrRegistryEntryShort, payloadLen, off)
+	}
+	if e.Kind == KindComposite && payloadLen > 0 {
+		return nil, fmt.Errorf("%w: composite entry with %d payload bytes",
+			ErrRegistryEntryInvalid, payloadLen)
+	}
+	if payloadLen > 0 {
+		// Copy out of the (potentially mmap-borrowed) data slice, as
+		// for UserVersion above.
+		e.KindPayload = append([]byte(nil), data[off:off+payloadLen]...)
+	}
+	off += payloadLen
 
 	if off != len(data) {
 		return nil, fmt.Errorf("%w: %d trailing bytes after registry entry", ErrRegistryEntryShort, len(data)-off)

@@ -8,6 +8,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 	"github.com/thegrumpylion/gmdb/internal/descriptor"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 )
 
 // Convenience IndexDecl factory for tests.
@@ -1229,5 +1230,227 @@ func TestKind2DescriptorsHaveDistinctIndexRegistryRoots(t *testing.T) {
 	}
 	if len(seen) != 3 {
 		t.Errorf("distinct non-zero IndexRegistryRoots = %d, want 3", len(seen))
+	}
+}
+
+// An IndexDecl carrying a kind this engine version does not
+// implement is rejected before any work, at every decl entry point
+// (indexing.md §Overview): OpenKeyspace / CreateKeyspace via decl
+// validation, and Rebuild via its own gate.
+func TestIndexKindUnknownRejectedAtOpenAndRebuild(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	extract := func(_, _ []byte) []IndexEntry { return nil }
+	bad := &IndexDecl{Name: "i", Columns: []IndexColumn{{Name: "c"}},
+		Kind: IndexKind(9), Extract: extract}
+	if _, err := tx.CreateKeyspace("ks", bad); !errors.Is(err, ErrIndexKindUnknown) {
+		t.Fatalf("CreateKeyspace(kind=9) = %v, want ErrIndexKindUnknown", err)
+	}
+
+	good := &IndexDecl{Name: "i", Columns: []IndexColumn{{Name: "c"}}, Extract: extract}
+	if _, err := tx.CreateKeyspace("ks", good); err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := tx.Indexes().Rebuild("ks", bad); !errors.Is(err, ErrIndexKindUnknown) {
+		t.Fatalf("Rebuild(kind=9) = %v, want ErrIndexKindUnknown", err)
+	}
+}
+
+// A STORED registry entry whose Kind this engine version does not
+// implement is rejected at open — on the write path BEFORE the
+// fingerprint compare (a mismatch's documented recovery would
+// silently convert the index to composite), and on the read-only
+// path outright (indexing.md §Open Semantics + §Storage Layout).
+func TestIndexKindUnknownStoredEntryRejectedAtOpen(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	extract := func(_, _ []byte) []IndexEntry { return nil }
+	decl := &IndexDecl{Name: "i", Columns: []IndexColumn{{Name: "c"}}, Extract: extract}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := tx.CreateKeyspace("ks", decl); err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Forge the stored entry's Kind via the registry surface (the
+	// codec accepts any non-composite kind with an empty payload).
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin(forge): %v", err)
+	}
+	owner, _, _, _, err := tx.resolveKeyspaceForIndexOp("ks")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	entry, err := tx.registryGet(owner, "i")
+	if err != nil {
+		t.Fatalf("registryGet: %v", err)
+	}
+	entry.Kind = indexing.Kind(9)
+	if err := tx.registryPut(owner, "i", entry); err != nil {
+		t.Fatalf("registryPut: %v", err)
+	}
+	if err := tx.propagateNotCachedDescChange("ks", owner); err != nil {
+		t.Fatalf("propagate: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit(forge): %v", err)
+	}
+
+	// Confirm the forgery persisted (a pinned-state flush at commit
+	// would silently rewrite it from the composite decl).
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin(verify-forge): %v", err)
+	}
+	owner, _, _, _, err = tx.resolveKeyspaceForIndexOp("ks")
+	if err != nil {
+		t.Fatalf("resolve(verify-forge): %v", err)
+	}
+	if e2, err := tx.registryGet(owner, "i"); err != nil {
+		t.Fatalf("registryGet(verify-forge): %v", err)
+	} else if e2.Kind != indexing.Kind(9) {
+		t.Fatalf("forged kind did not persist: got %d want 9", e2.Kind)
+	}
+	tx.Rollback()
+
+	// Write-path open: ErrIndexKindUnknown, NOT a fingerprint error.
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin(open): %v", err)
+	}
+	_, err = tx.OpenKeyspace("ks", decl)
+	if !errors.Is(err, ErrIndexKindUnknown) {
+		t.Fatalf("OpenKeyspace over forged kind = %v, want ErrIndexKindUnknown", err)
+	}
+	var fpErr *IndexFingerprintError
+	if errors.As(err, &fpErr) {
+		t.Fatalf("OpenKeyspace surfaced a fingerprint error (%v) — the kind gate must win", err)
+	}
+	tx.Rollback()
+
+	// Read-only open: same sentinel.
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin(ro): %v", err)
+	}
+	defer tx.Rollback()
+	_, err = tx.OpenKeyspaceReadOnly("ks")
+	if !errors.Is(err, ErrIndexKindUnknown) {
+		t.Fatalf("OpenKeyspaceReadOnly over forged kind = %v, want ErrIndexKindUnknown", err)
+	}
+
+	// Rebuild and Drop load the stored entry outside the open
+	// gates — both must reject the foreign kind too (Rebuild would
+	// silently convert it; Drop cannot see past Root). Same write
+	// tx: the single-writer lock is still held above.
+	if err := tx.Indexes().Rebuild("ks", decl); !errors.Is(err, ErrIndexKindUnknown) {
+		t.Fatalf("Rebuild over forged kind = %v, want ErrIndexKindUnknown", err)
+	}
+	if err := tx.Indexes().Drop("ks", "i"); !errors.Is(err, ErrIndexKindUnknown) {
+		t.Fatalf("Drop over forged kind = %v, want ErrIndexKindUnknown", err)
+	}
+
+	// The integrity walk reports the same state rather than
+	// silently passing what open rejects.
+	found := false
+	for iss := range db.Check() {
+		if iss.Code == "RegistryEntryKindUnknown" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("Check emitted no RegistryEntryKindUnknown issue for the forged entry")
+	}
+}
+
+// The strict integrity walk asserts the registry entry's padding
+// bytes are zero (indexing.md §Storage Layout) — the decoder is
+// deliberately tolerant, so the walk is the enforcement point. A
+// nonzero padding byte written today would be reinterpreted by a
+// future layout revision's reader.
+func TestCheckReportsRegistryEntryPaddingNonzero(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	extract := func(_, _ []byte) []IndexEntry { return nil }
+	decl := &IndexDecl{Name: "i", Columns: []IndexColumn{{Name: "c"}}, Extract: extract}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := tx.CreateKeyspace("ks", decl); err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Forge a nonzero padding byte: encode the stored entry (the
+	// codec always zeroes padding), flip offset 10, and write the
+	// raw bytes into the registry tree, mirroring registryPut.
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin(forge): %v", err)
+	}
+	owner, _, _, _, err := tx.resolveKeyspaceForIndexOp("ks")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	entry, err := tx.registryGet(owner, "i")
+	if err != nil {
+		t.Fatalf("registryGet: %v", err)
+	}
+	encoded, err := indexing.EncodeRegistryEntry(entry)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	encoded[10] = 0xAB
+	desc := owner.descriptor()
+	newRoot, err := btree.Put(btreeWriter{tx.pgr}, tx.pgr.Config(), desc.IndexRegistryRoot, []byte("i"), encoded)
+	if err != nil {
+		t.Fatalf("raw registry put: %v", err)
+	}
+	desc.IndexRegistryRoot = newRoot
+	owner.markDirty()
+	if err := tx.propagateNotCachedDescChange("ks", owner); err != nil {
+		t.Fatalf("propagate: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit(forge): %v", err)
+	}
+
+	found := false
+	for iss := range db.Check() {
+		if iss.Code == "RegistryEntryPaddingNonzero" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("Check emitted no RegistryEntryPaddingNonzero issue for the forged padding byte")
 	}
 }

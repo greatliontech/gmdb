@@ -32,6 +32,7 @@ kind-specific checker.
 
 2026-07-11 architecture audit (index-kind assumptions
 inventory). The registry/decl format half of the same audit is
-handled by `index-kind-format-groundwork` (plan chunk 7); this
-issue is the write-path/invalidation/verification half,
-deliberately out of that chunk's scope.
+resolved — indexing.md §Storage Layout / §Drift Guard now carry
+the kind discriminator and per-kind payload; this issue is the
+write-path/invalidation/verification half, which that format
+groundwork deliberately left untouched.

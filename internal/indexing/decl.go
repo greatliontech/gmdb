@@ -32,6 +32,13 @@ type Decl struct {
 	// extractor invocation. Per indexing.md §Unique Indexes.
 	Unique bool
 
+	// Kind discriminates the index's data-structure family
+	// (indexing.md §Overview). The zero value is KindComposite —
+	// the composite-key lex-ordered B+tree, the only kind this
+	// engine version accepts; any other value is rejected at open
+	// with the engine's ErrIndexKindUnknown, before any work.
+	Kind Kind
+
 	// Version is a user-supplied tag bumped after extractor-logic
 	// changes the engine cannot inspect (e.g. masking a column,
 	// changing partial-index predicate, reordering output). Stored
@@ -69,3 +76,12 @@ type CoveringColumn struct {
 // index this row" (partial-index semantics) and are equivalent.
 // Per indexing.md §Overview.
 type Extractor func(key, value []byte) []Entry
+
+// Kind discriminates an index's data-structure family. Stored in
+// the registry entry and folded into the schema-hash fingerprint;
+// see indexing.md §Overview + §Storage Layout.
+type Kind uint8
+
+// KindComposite is the composite-key lex-ordered B+tree — kind 0,
+// the zero value, and the only kind the current engine accepts.
+const KindComposite Kind = 0
