@@ -10,12 +10,13 @@ redeferred, or closed.
 The v0 chunk roadmap, the architecture-consolidation plan, and the
 defect-audit remediation plan are complete; their plans were deleted
 at close-out (`git log --all -- docs/plans/<name>.md` recovers
-them). Every remaining entry is CONDITION-TRIGGERED: its `Lands:`
-names a self-contained condition, and the gates of whatever plan is
-active next walk this index at each chunk start. Entries may also be
-pulled as a proactive burn-down — each resolved as its own change
-set: diagnose → fix →
-regression test → adversarial review → promote-then-delete.
+them). The active plan is `docs/plans/query-builder.md`; its
+chunk-start gates (`N.1`) walk this index, and bare chunk numbers in
+`Lands:` refer to its chunks. Every other entry is
+condition-triggered with a self-contained condition. Entries may
+also be pulled as a proactive burn-down — each resolved as its own
+change set: diagnose → fix → regression test → adversarial review →
+promote-then-delete.
 
 When an issue is resolved, the load-bearing rationale moves inline
 into the spec / code where it belongs (kept-current artifact), all
@@ -56,10 +57,31 @@ first tagged release (`development: true`, `.semrel.yaml`). Resolved
 entries are removed from their table and preserved in git history
 (`git log --all -- docs/issues/<file>.md`).
 
+## Open — query-builder plan riders
+
+Not defects: spec-amend clause text and design requirements
+parked until the chunk that implements them (amendments to
+as-built specs ride their implementation chunks). No severity
+tags.
+
+| Slug | Lands | Summary |
+|------|-------|---------|
+| index-kind-format-groundwork | 7 | registry entry v2 (kind discriminator + per-kind payload) + `IndexDecl.Kind` folded into the fingerprint; requirements from the 2026-07-11 architecture audit |
+| index-reverse-iteration | 9 | reverse-iteration `IterOption` clauses for `indexing.md §Lookup API` + `api-surface.md`; reverse == exact reversal of forward sequence |
+
+## Open — design gaps (2026-07-11 architecture audit)
+
+| Slug | Lands | Summary |
+|------|-------|---------|
+| index-background-maintenance-hook | when an index kind requiring asynchronous maintenance (vector ANN, FTS stats) is designed | index write path is synchronous-only: no deferred-obligation state, no background hook, per-op cursor invalidation (no epoch model), extractor-replay Check unsound for centroid-dependent kinds |
+
 ## Open — architecture / factoring audit
 
 | Slug | Lands | Summary |
 |------|-------|---------|
+
+*None open — resolved issues live in git history
+(`git log --all -- docs/issues/<slug>.md`).*
 
 ## Open — completeness / correctness / algorithm audit (2026-05-30)
 
