@@ -17,7 +17,7 @@ tests move with their subjects, unmodified.
       `decodeUniqueIndexValue`, candidate-set collision check,
       `diffEntrySets` carve-out from `buildReplacePlans` (pure
       moves; extractor call sites stay in root).
-- [ ] 4. External merge sort (`indexSorter`, spill runs,
+- [x] 4. External merge sort (`indexSorter`, spill runs,
       `recordHeap`, `sortMerger`, cascade merging) →
       `internal/extsort` (pure move; no Tx/pager/cursor
       references).

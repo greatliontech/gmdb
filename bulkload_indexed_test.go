@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/extsort"
 )
 
 // --- shared indexed-BulkLoad test helpers -------------------------
@@ -427,16 +429,18 @@ func TestKeyspaceBulkLoadIndexedSpillWriteError(t *testing.T) {
 }
 
 // TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn forces the sorter to
-// spill more runs than maxMergeFanIn (via setMaxMergeFanInForTest + a
+// spill more runs than maxMergeFanIn (via extsort.SetMaxMergeFanInForTest + a
 // small MaxTxBufferBytes) and verifies the cascade reduces the final
 // merge fan-in to <= maxMergeFanIn while preserving end-to-end
 // correctness. Pins the bulkload.md §Interaction with Indexes
 // "Merge fan-in cap" invariant: the merger holds at most maxMergeFanIn
 // run files open concurrently regardless of #runs.
 //
-// Neuter: removing the s.cascadeRuns() call in buildIndexFromSorter
+// Neuter: removing the cascadeRuns call inside extsort.Cascade
 // (or replacing it with a no-op) leaves postRuns == preRuns > cap=2,
-// failing the postRuns assertion below.
+// failing the postRuns assertion below. Removing the whole
+// s.Cascade() call in buildIndexFromSorter instead fails earlier,
+// at the cascadeFired check.
 //
 // The probe assertion (preRuns > cap) defends against silent test-
 // workload shrinkage — if a future edit reduces nrows below the spill
@@ -448,18 +452,18 @@ func TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn(t *testing.T) {
 	// reduces those further; etc. The preRuns >= 2*testCap+1 probe
 	// below structurally guards multi-pass exercise regardless of the
 	// exact record-encoding size (which depends on the index encoder's
-	// non-unique key shape + sortRecordMemOverhead) — if a future edit
+	// non-unique key shape + extsort's internal recordMemOverhead) — if a future edit
 	// changes encoder sizing, the probe surfaces it.
 	const testCap = 2
-	restoreCap := setMaxMergeFanInForTest(testCap)
+	restoreCap := extsort.SetMaxMergeFanInForTest(testCap)
 	defer restoreCap()
 	var preRuns, postRuns int
 	var cascadeFired bool
-	setBulkLoadMergeCascadeHookForTest(func(pre, post int) {
+	extsort.SetMergeCascadeHookForTest(func(pre, post int) {
 		cascadeFired = true
 		preRuns, postRuns = pre, post
 	})
-	defer setBulkLoadMergeCascadeHookForTest(nil)
+	defer extsort.SetMergeCascadeHookForTest(nil)
 
 	ctx := context.Background()
 	scratch := t.TempDir()
@@ -487,7 +491,7 @@ func TestKeyspaceBulkLoadIndexedMergeCascadeBoundsFanIn(t *testing.T) {
 	}
 
 	// 900 rows at 8 KiB budget empirically produces ~6 spilled runs
-	// (the encoded non-unique index key + sortRecordMemOverhead per
+	// (the encoded non-unique index key + extsort's internal recordMemOverhead per
 	// record fits ~130 records per spill); the preRuns probe below
 	// enforces the multi-pass minimum without depending on the exact
 	// encoding constant.
@@ -1046,8 +1050,8 @@ func TestBulkLoadIndexKeyGateParitySpilled(t *testing.T) {
 	// path, not a silent duplicate of the in-memory case after a
 	// future budget change. Global hook: no t.Parallel().
 	spilled := false
-	setBulkLoadMergeCascadeHookForTest(func(pre, post int) { spilled = true })
-	defer setBulkLoadMergeCascadeHookForTest(nil)
+	extsort.SetMergeCascadeHookForTest(func(pre, post int) { spilled = true })
+	defer extsort.SetMergeCascadeHookForTest(nil)
 	_, err = ks.BulkLoad(func(yield func(k, v []byte) bool) {
 		for i := range 1200 { // ~1.8 MB of index entries > 1 MB budget
 			if !yield(fmt.Appendf(nil, "row%05d", i), []byte("v")) {
