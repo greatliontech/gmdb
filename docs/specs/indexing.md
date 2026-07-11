@@ -562,7 +562,23 @@ inconsistency surfaces only via `Check()`.
 ### Handle Invalidation
 
 An `*IndexHandle` handle returned by `ks.Index(name)` is bound to the
-parent keyspace for the lifetime of the transaction. Mutations
+parent keyspace for the lifetime of the transaction.
+
+**Covering-shape rebuilds through a cached handle.** A same-tx
+`Rebuild` re-pins cached handles in place; the value-return route
+follows the LIVE declaration, never the handle's creation-time
+shape. A typed CoverValue handle serves values from the index
+entry only while the live declaration still carries the typed
+full-row sentinel; a rebuild that REMOVES covering or replaces it
+with a byte-API projection routes the handle to the row
+back-lookup, which always returns the true row value. Recorded
+residual: a rebuild to a DIFFERENT typed sentinel (another
+value-encoder ID) still takes the typed route and decodes with the
+handle's original encoder — wrong value or decode error; the
+recovery, as with any same-tx declaration change, is re-opening
+the handle. Byte-API handles are unaffected (each `ks.Index` call
+returns a fresh handle without the typed opt-in).
+(Pinned by `TestRebuildRemovingCoveringDowngradesCachedHandle`.) Mutations
 that replace or free the index's data tree pages within the same
 transaction invalidate in-flight observers tied to that handle.
 Four distinct invalidation conditions, each with its canonical
@@ -786,6 +802,20 @@ All steps happen in the same CoW transaction. A failure at any
 step (including the unique probe) leaves the transaction in a
 consistent state — either rolled back, or continuing with the
 row unchanged.
+
+**Panic atomicity.** Extractors may PANIC (the typed layer does
+so by design on encode failures; user extractors may). For every
+maintenance entry point — Put, Delete, Cursor.Delete, the
+SetKeyspace mutators, and Rebuild — extraction for ALL indexes
+completes before ANY index mutation, and a panic escaping the
+maintenance (from extraction or mid-mutation) restores the
+operation's savepoint and pinned state BEFORE propagating: a
+recovering caller that commits observes zero index or pager state
+change from the panicked operation, and every savepoint is
+resolved (the pager's all-resolved-before-Commit assumption).
+(Pinned by `TestExtractorPanicOnDeleteLeavesNoPartialIndexState`,
+`TestExtractorPanicOnBulkKeyDeleteLeavesNoPartialState`, and
+`TestExtractorPanicMidRebuildLeaksNothing`.)
 
 **Delete(key):**
 

@@ -133,8 +133,16 @@ func (m *indexMaintainer) onDelete(value []byte) error {
 	if len(m.indexes) == 0 {
 		return nil
 	}
-	opIdx := 0
-	for _, name := range sortedIndexNames(m.indexes) {
+	// Extract EVERY index's entries BEFORE any mutation — the
+	// onReplace shape (buildReplacePlans): extractors panic by design
+	// (the typed layer, and user extractors may), and interleaving
+	// extraction with per-index deletion would let a panic while
+	// extracting for index "b" escape AFTER index "a"'s entries were
+	// already deleted — committed-visible partial index state if a
+	// recovering caller commits (indexing.md §Write Path).
+	names := sortedIndexNames(m.indexes)
+	perIndex := make([][]string, len(names))
+	for i, name := range names {
 		p := m.indexes[name]
 		olds, err := m.extract(p.decl, value)
 		if err != nil {
@@ -148,7 +156,14 @@ func (m *indexMaintainer) onDelete(value []byte) error {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		if err := m.deleteKeys(p, keys, &opIdx); err != nil {
+		perIndex[i] = keys
+	}
+	opIdx := 0
+	for i, name := range names {
+		if len(perIndex[i]) == 0 {
+			continue
+		}
+		if err := m.deleteKeys(m.indexes[name], perIndex[i], &opIdx); err != nil {
 			return err
 		}
 	}

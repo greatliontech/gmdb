@@ -741,7 +741,10 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	//       moderate batches.
 	sp := ks.tx.pgr.BeginShallowSavepoint()
 	rowSnap := snapshotIndexes(ks.indexes)
-	if err := ks.applyIndexMaintenanceOnPut(key, oldValue, value, existed); err != nil {
+	if err := withIndexPanicRestore(ks.tx.pgr, sp,
+		func() { restoreIndexes(ks.indexes, rowSnap) },
+		func() error { return ks.applyIndexMaintenanceOnPut(key, oldValue, value, existed) },
+	); err != nil {
 		// The helper does not snapshot pinned state — see its godoc.
 		// rowSnap is the sole atomicity-rollback for in-memory pinned
 		// state, covering both this helper's failure and the row
@@ -823,7 +826,10 @@ func (ks *Keyspace) Delete(key []byte) error {
 		copy(oldValue, v)
 		sp = ks.tx.pgr.BeginShallowSavepoint()
 		rowSnap = snapshotIndexes(ks.indexes)
-		if err := ks.applyIndexMaintenanceOnDelete(key, oldValue); err != nil {
+		if err := withIndexPanicRestore(ks.tx.pgr, sp,
+			func() { restoreIndexes(ks.indexes, rowSnap) },
+			func() error { return ks.applyIndexMaintenanceOnDelete(key, oldValue) },
+		); err != nil {
 			// The helper does not snapshot pinned state — see its godoc.
 			// rowSnap is the sole atomicity-rollback for in-memory
 			// pinned state, covering both this helper's failure and
@@ -1398,7 +1404,10 @@ func (c *Cursor) Delete() error {
 		copy(valueCopy, curValue)
 		sp = c.ks.tx.pgr.BeginShallowSavepoint()
 		rowSnap = snapshotIndexes(c.ks.indexes)
-		if err := c.ks.applyIndexMaintenanceOnDelete(keyCopy, valueCopy); err != nil {
+		if err := withIndexPanicRestore(c.ks.tx.pgr, sp,
+			func() { restoreIndexes(c.ks.indexes, rowSnap) },
+			func() error { return c.ks.applyIndexMaintenanceOnDelete(keyCopy, valueCopy) },
+		); err != nil {
 			// The helper does not snapshot pinned state — see its godoc.
 			// rowSnap is the sole atomicity-rollback for in-memory
 			// pinned state, covering both this helper's failure and

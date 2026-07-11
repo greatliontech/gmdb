@@ -227,8 +227,15 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	prevRegRoot := ownerDesc.IndexRegistryRoot
 	prevState, prevCharged := ownerFlushState(cachedKS, cachedSKS)
 	sp := tx.pgr.BeginSavepoint()
+	completed := false
 	defer func() {
-		if retErr != nil {
+		// completed distinguishes the success path from BOTH failure
+		// modes: retErr != nil (ordinary error) and a PANIC unwinding
+		// through this frame (retErr stays nil then — branching on it
+		// alone released the savepoint and permanently leaked the
+		// partial new-tree allocations when a recovering caller
+		// committed after an extractor panic).
+		if retErr != nil || !completed {
 			tx.pgr.RestoreSavepoint(sp)
 			ownerDesc.IndexRegistryRoot = prevRegRoot
 			// Revert the flush-state flip registryPut's markDirty
@@ -289,6 +296,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		if cachedSKS != nil {
 			cachedSKS.markIndexHandleStaleByName(decl.Name)
 		}
+		completed = true // empty-parent SUCCESS: the defer must Release, not Restore
 		return nil
 	}
 
@@ -455,6 +463,7 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 	if cachedSKS != nil {
 		cachedSKS.markIndexHandleStaleByName(decl.Name)
 	}
+	completed = true
 	return nil
 }
 

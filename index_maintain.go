@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 	"sort"
 	"sync/atomic"
 )
@@ -299,6 +300,30 @@ func (tx *Tx) flushIndexRegistry(owner descriptorOwner, indexes map[string]*pinn
 type indexSnapshot map[string]struct {
 	root  uint64
 	count uint64
+}
+
+// withIndexPanicRestore runs an applyIndexMaintenance* helper with
+// PANIC-path atomicity: extractors panic by design (the typed layer's
+// encode failures, and user extractors may), and a panic escaping
+// while the caller's shallow savepoint is open would leave partial
+// on-disk state and an unresolved savepoint for a recovering caller's
+// commit — violating the pager's all-savepoints-resolved-before-
+// Commit assumption. On panic (fn never returned) the pinned-state
+// restore and savepoint restore run BEFORE the panic propagates; the
+// caller's ordinary error paths are untouched (the defer is inert
+// once fn returns, error or not — the caller keeps its explicit
+// restore-on-error handling).
+func withIndexPanicRestore(pgr *pager.Pager, sp *pager.Savepoint, restorePinned func(), fn func() error) error {
+	completed := false
+	defer func() {
+		if !completed {
+			restorePinned()
+			pgr.RestoreSavepoint(sp)
+		}
+	}()
+	err := fn()
+	completed = true
+	return err
 }
 
 func snapshotIndexes(indexes map[string]*pinnedIndex) indexSnapshot {

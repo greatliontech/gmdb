@@ -123,7 +123,7 @@ func (e *IndexFingerprintError) Unwrap() error { return ErrIndexFingerprintMisma
 // per indexing.md §Drift Guard:
 //
 //	xxhash64(
-//	  Name ||
+//	  uvarint(len(Name)) || Name ||
 //	  uvarint(len(Columns)) || for each col: uvarint(len(Name)) || Name ||
 //	  uvarint(len(Covering)) || for each col: uvarint(len(Name)) || Name ||
 //	  uint8(Unique)

@@ -44,7 +44,7 @@ function. WIP = 1.
       detection reachable; LaggingReader reentrancy doc
 - [x] 16. keyspace: nested delete+recreate kills the parent's old
       handle (both kinds)
-- [ ] 17. indexing: onDelete extract-all-then-mutate, coverValue
+- [x] 17. indexing: onDelete extract-all-then-mutate, coverValue
       reconcile, schemaHash doc grammar
 - [ ] 18. bulkload: index-entry parity — key gate, overflow promotion,
       base config for index trees (+ bulkload.md rider)

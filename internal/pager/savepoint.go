@@ -604,3 +604,9 @@ func (p *Pager) ReleaseSavepoint(sp *Savepoint) {
 // root package's parent-freeze guard (which is interested in
 // user-facing nested-tx semantics, not internal-helper savepoints).
 func (p *Pager) SavepointDepth() int { return p.savepointDepth }
+
+// ActiveSavepointCount reports how many savepoints are currently
+// unresolved — the all-resolved-before-Commit assumption's observable
+// (commit.go's buffer-discard sweep and the loose-pop guard both rely
+// on it).
+func (p *Pager) ActiveSavepointCount() int { return len(p.activeSavepoints) }

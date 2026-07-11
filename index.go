@@ -439,7 +439,15 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 	// exactly one covering column with the typedCoverValuePrefix
 	// sentinel). The byte-API path below handles arbitrary covering
 	// projections; default (no Covering declared) is back-lookup.
-	if idx.coverValue {
+	// coverValue is the caller's OPT-IN; whether the stored layout is
+	// the TYPED full-row-covering shape follows the LIVE declaration —
+	// a same-tx Rebuild can remove or CHANGE the covering shape while
+	// this cached handle stays pinned. Decoding a plain layout as a
+	// tuple surfaces false ErrCorrupted; decoding a DIFFERENT covering
+	// shape returns silently wrong bytes as V. Either way the safe
+	// route for a shape-changed handle is the back-lookup below, which
+	// always returns the true row value.
+	if idx.coverValue && isTypedCoverValueIndex(idx.pinned.decl) {
 		coverCols, decErr := indexing.DecodeKey(encodedCovering)
 		if decErr != nil {
 			return nil, nil, false, fmt.Errorf("%w: index %q covering: %w", ErrCorrupted, idx.pinned.decl.Name, decErr)
@@ -463,7 +471,17 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 	// Copy the slice — encodedCovering may alias the value buffer the
 	// cursor will reuse (decodeUniqueIndexValue returns slices into
 	// indexValue; non-unique sets encodedCovering = indexValue).
-	if len(idx.pinned.decl.Covering) > 0 {
+	//
+	// A coverValue handle whose live decl LOST the typed sentinel
+	// never takes this byte-API branch either: the stored blob is in
+	// whatever NEW covering shape the rebuild installed, and handing
+	// it back as V would be silently wrong bytes — the back-lookup
+	// below returns the true row value instead. (Residual edge: a
+	// rebuild to a DIFFERENT typed sentinel — another value-encoder
+	// ID — still passes the sentinel check above and decodes with the
+	// handle's original encoder; recovery is re-opening the handle,
+	// as with any same-tx decl change.)
+	if !idx.coverValue && len(idx.pinned.decl.Covering) > 0 {
 		value = make([]byte, len(encodedCovering))
 		copy(value, encodedCovering)
 		return pk, value, false, nil

@@ -254,3 +254,10 @@ func (db *DB) DaemonDoneChansForTest() (maintDone, batchDone chan struct{}) {
 	db.batch.mu.Unlock()
 	return db.maint.done, batchDone
 }
+
+// ActiveSavepointDepthForTest reports the writer pager's open
+// savepoint count — the pager's all-resolved-before-Commit assumption
+// is testable through it.
+func (tx *Tx) ActiveSavepointDepthForTest() int {
+	return tx.pgr.ActiveSavepointCount()
+}

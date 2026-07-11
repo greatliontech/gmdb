@@ -628,7 +628,10 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 	var rowSnap indexSnapshot
 	if indexed {
 		rowSnap = snapshotIndexes(ks.indexes)
-		if mErr := ks.applyIndexMaintenanceOnAddValue(key, value); mErr != nil {
+		if mErr := withIndexPanicRestore(ks.tx.pgr, psp,
+			func() { restoreIndexes(ks.indexes, rowSnap) },
+			func() error { return ks.applyIndexMaintenanceOnAddValue(key, value) },
+		); mErr != nil {
 			// The helper does not snapshot pinned state — see its godoc.
 			// rowSnap is the sole atomicity-rollback for in-memory
 			// pinned state, covering both this helper's failure and
@@ -856,7 +859,10 @@ func (ks *SetKeyspace) Delete(key []byte) (err error) {
 	var rowSnap indexSnapshot
 	if len(ks.indexes) > 0 {
 		rowSnap = snapshotIndexes(ks.indexes)
-		if err := ks.applyIndexMaintenanceOnBulkKeyDelete(cfg, key, e); err != nil {
+		if err := withIndexPanicRestore(ks.tx.pgr, psp,
+			func() { restoreIndexes(ks.indexes, rowSnap) },
+			func() error { return ks.applyIndexMaintenanceOnBulkKeyDelete(cfg, key, e) },
+		); err != nil {
 			restoreIndexes(ks.indexes, rowSnap)
 			ks.tx.pgr.RestoreSavepoint(psp)
 			return err
@@ -973,7 +979,10 @@ func (ks *SetKeyspace) DeleteValue(key, value []byte) (err error) {
 	var rowSnap indexSnapshot
 	if indexed {
 		rowSnap = snapshotIndexes(ks.indexes)
-		if mErr := ks.applyIndexMaintenanceOnRemoveValue(key, value); mErr != nil {
+		if mErr := withIndexPanicRestore(ks.tx.pgr, psp,
+			func() { restoreIndexes(ks.indexes, rowSnap) },
+			func() error { return ks.applyIndexMaintenanceOnRemoveValue(key, value) },
+		); mErr != nil {
 			// The helper does not snapshot pinned state — see its godoc.
 			// rowSnap is the sole atomicity-rollback for in-memory
 			// pinned state, covering both this helper's failure and
