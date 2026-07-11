@@ -1011,7 +1011,7 @@ func (c *checker) expectedKeyspaceIndex(decl *IndexDecl, dataRoot, hwm uint64, h
 			return errCheckStop
 		}
 		for ek, entry := range entries {
-			expected[ek] = string(indexEntryValue(entry, k, decl.Unique, hasCovering))
+			expected[ek] = string(indexing.EntryValue(entry, k, decl.Unique, hasCovering))
 		}
 		return nil
 	})
@@ -1026,7 +1026,7 @@ func (c *checker) expectedKeyspaceIndex(decl *IndexDecl, dataRoot, hwm uint64, h
 
 // expectedSetKeyspaceIndex re-runs decl.Extract over every (setKey,
 // member) pair of a SetKeyspace and returns the expected (encoded key →
-// encoded value) set, using the SetKeyspace codec (encodeSetKeyspaceIndexKey
+// encoded value) set, using the SetKeyspace codec (indexing.EncodeSetEntryKey
 // + the compound (setKey,member) PK). Members live in a subpage (small
 // sets) or a nested B+tree keyed by the set key in the outer tree; both
 // are enumerated through the guarded walkers so a forged tree yields an
@@ -1040,9 +1040,9 @@ func (c *checker) expectedSetKeyspaceIndex(decl *IndexDecl, dataRoot uint64, fvs
 			extractErr = eerr
 			return errCheckStop
 		}
-		compoundPK := encodeSetKeyspaceCompoundPK(setKey, member)
+		compoundPK := indexing.EncodeSetCompoundPK(setKey, member)
 		for ek, entry := range entries {
-			expected[ek] = string(indexEntryValue(entry, compoundPK, decl.Unique, hasCovering))
+			expected[ek] = string(indexing.EntryValue(entry, compoundPK, decl.Unique, hasCovering))
 		}
 		return nil
 	}

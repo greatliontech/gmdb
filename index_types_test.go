@@ -238,7 +238,7 @@ func TestValidateIndexDeclsRejectsEmptyName(t *testing.T) {
 // TestValidateIndexDeclsRejectsZeroColumns verifies the
 // rejection rule: a zero-column IndexDecl is rejected with
 // ErrInvalidOptions at the variadic-IndexDecl entry points. The
-// non-unique decoder (extractSetKeyspaceCompoundPKFromIndexKey +
+// non-unique decoder (indexing.ExtractSetCompoundPK +
 // extractPKAndValue) needs at least one column terminator to bound
 // the PK component; a zero-column index would surface
 // indexing.ErrKeyMalformed at decode time. Rejecting at construction

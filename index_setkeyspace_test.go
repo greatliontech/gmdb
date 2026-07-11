@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"sort"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 )
@@ -39,8 +40,8 @@ func TestEncodeSetKeyspaceCompoundPKRoundtrip(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			encoded := encodeSetKeyspaceCompoundPK([]byte(c.sk), []byte(c.sv))
-			sk, sv, err := decodeSetKeyspaceCompoundPK(encoded)
+			encoded := indexing.EncodeSetCompoundPK([]byte(c.sk), []byte(c.sv))
+			sk, sv, err := indexing.DecodeSetCompoundPK(encoded)
 			if err != nil {
 				t.Fatalf("decode: %v", err)
 			}
@@ -67,7 +68,7 @@ func TestSetKeyspaceCompoundPKSeparatorPrefixFree(t *testing.T) {
 	// 0x00 0x01 separator after escaping.
 	sk := []byte{0x00, 0xAB}             // escape: 00 FF AB
 	sv := []byte{0xFF, 0x01, 0x00, 0x01} // escape: FF 01 00 FF 01
-	encoded := encodeSetKeyspaceCompoundPK(sk, sv)
+	encoded := indexing.EncodeSetCompoundPK(sk, sv)
 	// Count 0x00 0x01 occurrences in the encoded bytes; should
 	// be exactly ONE (the separator).
 	count := 0
@@ -80,7 +81,7 @@ func TestSetKeyspaceCompoundPKSeparatorPrefixFree(t *testing.T) {
 		t.Errorf("0x00 0x01 separator count: got %d want 1; encoded=%x", count, encoded)
 	}
 	// Roundtrip preserves both halves.
-	gotSK, gotSV, err := decodeSetKeyspaceCompoundPK(encoded)
+	gotSK, gotSV, err := indexing.DecodeSetCompoundPK(encoded)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -98,10 +99,10 @@ func TestEncodeSetKeyspaceIndexKeyNonUniqueShape(t *testing.T) {
 	cols := [][]byte{{0x42}}
 	sk := []byte("user1")
 	sv := []byte("topic_a")
-	got := encodeSetKeyspaceIndexKey(cols, sk, sv, false)
+	got := indexing.EncodeSetEntryKey(cols, sk, sv, false)
 	// Expected: indexing.EncodeKey([{0x42}]) + compoundPK + 00 00
 	wantPrefix := indexing.EncodeKey(cols)
-	wantCompound := encodeSetKeyspaceCompoundPK(sk, sv)
+	wantCompound := indexing.EncodeSetCompoundPK(sk, sv)
 	want := make([]byte, 0, len(wantPrefix)+len(wantCompound)+2)
 	want = append(want, wantPrefix...)
 	want = append(want, wantCompound...)
@@ -116,7 +117,7 @@ func TestEncodeSetKeyspaceIndexKeyNonUniqueShape(t *testing.T) {
 // PK lives in the value.
 func TestEncodeSetKeyspaceIndexKeyUniqueShape(t *testing.T) {
 	cols := [][]byte{{0x42}}
-	got := encodeSetKeyspaceIndexKey(cols, []byte("any"), []byte("any"), true)
+	got := indexing.EncodeSetEntryKey(cols, []byte("any"), []byte("any"), true)
 	want := indexing.EncodeKey(cols)
 	if !bytes.Equal(got, want) {
 		t.Errorf("unique key shape: got %x want %x", got, want)

@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 )
@@ -648,9 +649,9 @@ func TestIndexedPutWritesCoveringBytes(t *testing.T) {
 	if !found {
 		t.Fatalf("index entry not found")
 	}
-	pk, encodedCov, err := decodeUniqueIndexValue(val)
+	pk, encodedCov, err := indexing.DecodeUniqueValue(val)
 	if err != nil {
-		t.Fatalf("decodeUniqueIndexValue: %v", err)
+		t.Fatalf("indexing.DecodeUniqueValue: %v", err)
 	}
 	if string(pk) != "k1" {
 		t.Errorf("decoded pk: got %q want k1", pk)
@@ -1160,12 +1161,12 @@ func TestByteAPICoveringNilCoverReturnsEmpty(t *testing.T) {
 	}
 }
 
-// --- Regression: decodeUniqueIndexValue errors ---------------------
+// --- Regression: indexing.DecodeUniqueValue errors ---------------------
 
 // TestDecodeUniqueIndexValueRejectsEmpty verifies the malformed-
 // input branch.
 func TestDecodeUniqueIndexValueRejectsEmpty(t *testing.T) {
-	_, _, err := decodeUniqueIndexValue(nil)
+	_, _, err := indexing.DecodeUniqueValue(nil)
 	if !errors.Is(err, errIndexValueShort) {
 		t.Errorf("empty input: got %v want errIndexValueShort", err)
 	}
@@ -1178,7 +1179,7 @@ func TestDecodeUniqueIndexValueRejectsTruncatedPK(t *testing.T) {
 	// uvarint(100) = 0x64 0x... wait, 100 < 128 so uvarint(100) = 0x64.
 	// Then need 100 bytes of pk; supply only 2.
 	val := []byte{0x64, 0x41, 0x42}
-	_, _, err := decodeUniqueIndexValue(val)
+	_, _, err := indexing.DecodeUniqueValue(val)
 	if !errors.Is(err, errIndexValueShort) {
 		t.Errorf("truncated PK: got %v want errIndexValueShort", err)
 	}
@@ -1190,7 +1191,7 @@ func TestDecodeUniqueIndexValueRejectsTruncatedPK(t *testing.T) {
 func TestDecodeUniqueIndexValueAcceptsZeroLengthPK(t *testing.T) {
 	// uvarint(0) = 0x00; followed by no pk; covering = 3 bytes.
 	val := []byte{0x00, 0x41, 0x42, 0x43}
-	pk, cov, err := decodeUniqueIndexValue(val)
+	pk, cov, err := indexing.DecodeUniqueValue(val)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}

@@ -1,9 +1,9 @@
 package gmdb
 
 import (
-	"encoding/binary"
 	"fmt"
-	"github.com/cespare/xxhash/v2"
+
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 )
 
 // IndexDecl describes one secondary index on a byte-oriented keyspace.
@@ -69,10 +69,10 @@ type IndexCoveringColumn struct {
 // IndexExtractor. Cols holds the per-IndexColumn lex-safe byte
 // encoding; Cover holds the per-IndexCoveringColumn bytes (omit when
 // the IndexDecl declares no Covering). Per indexing.md §Overview.
-type IndexEntry struct {
-	Cols  [][]byte
-	Cover [][]byte
-}
+//
+// The concrete type lives in internal/indexing beside the entry
+// codec; this alias is the public surface.
+type IndexEntry = indexing.Entry
 
 // IndexExtractor produces zero or more IndexEntry values for a row.
 // Returning a nil slice or a zero-length slice both signal "do not
@@ -120,67 +120,22 @@ func (e *IndexFingerprintError) Error() string {
 func (e *IndexFingerprintError) Unwrap() error { return ErrIndexFingerprintMismatch }
 
 // schemaHash computes the deterministic schema-hash for an IndexDecl
-// per indexing.md §Drift Guard:
-//
-//	xxhash64(
-//	  uvarint(len(Name)) || Name ||
-//	  uvarint(len(Columns)) || for each col: uvarint(len(Name)) || Name ||
-//	  uvarint(len(Covering)) || for each col: uvarint(len(Name)) || Name ||
-//	  uint8(Unique)
-//	)
-//
-// Inputs are exclusively byte sequences with explicit uvarint
-// length prefixes — no gob, no JSON, no struct layout — so the
-// hash is deterministic across Go versions, build flags, and host
-// architectures (clause-explicit invariant: indexing.md §Drift
-// Guard schema-hash determinism).
-//
-// Version is NOT part of the schema-hash inputs: it is stored and
+// per indexing.md §Drift Guard. The hash core (grammar, injectivity
+// rationale) lives in internal/indexing (SchemaHash); this adapter
+// projects the decl's hashable inputs — Name, column names, covering
+// names, Unique. Version is NOT a hash input: it is stored and
 // compared independently because it captures extractor-logic drift
 // the engine cannot inspect (per the spec).
 func schemaHash(decl *IndexDecl) uint64 {
-	h := xxhash.New()
-	// All string inputs (Name, column names, covering names) are
-	// uvarint-length-prefixed for injectivity. Without a prefix on
-	// Name, two distinct decls can collide: Name="ab" +
-	// Columns=[{Name:""}] + Covering=[{Name:""}] + Unique=true
-	// encodes to the same 7 bytes (61 62 01 00 01 00 01) as
-	// Name="ab\x01" + Columns=[] + Covering=[{Name:""}] +
-	// Unique=true — the boundary between Name and
-	// uvarint(len(Columns)) is undetectable when Name's trailing
-	// bytes mimic a uvarint length. Uniform uvarint-prefixing is
-	// the minimal injective encoding consistent with the Drift-
-	// Guard clause-explicit invariant.
-	var buf [binary.MaxVarintLen64]byte
-	writeLenPrefixedString(h, buf[:], decl.Name)
-
-	n := binary.PutUvarint(buf[:], uint64(len(decl.Columns)))
-	_, _ = h.Write(buf[:n])
-	for _, c := range decl.Columns {
-		writeLenPrefixedString(h, buf[:], c.Name)
+	cols := make([]string, len(decl.Columns))
+	for i, c := range decl.Columns {
+		cols[i] = c.Name
 	}
-
-	n = binary.PutUvarint(buf[:], uint64(len(decl.Covering)))
-	_, _ = h.Write(buf[:n])
-	for _, c := range decl.Covering {
-		writeLenPrefixedString(h, buf[:], c.Name)
+	cov := make([]string, len(decl.Covering))
+	for i, c := range decl.Covering {
+		cov[i] = c.Name
 	}
-
-	var uniqueByte [1]byte
-	if decl.Unique {
-		uniqueByte[0] = 1
-	}
-	_, _ = h.Write(uniqueByte[:])
-
-	return h.Sum64()
-}
-
-// writeLenPrefixedString writes uvarint(len(s)) || s to h. Reusable
-// buf must have capacity binary.MaxVarintLen64.
-func writeLenPrefixedString(h *xxhash.Digest, buf []byte, s string) {
-	n := binary.PutUvarint(buf, uint64(len(s)))
-	_, _ = h.Write(buf[:n])
-	_, _ = h.Write([]byte(s))
+	return indexing.SchemaHash(decl.Name, cols, cov, decl.Unique)
 }
 
 // validateIndexDecls rejects a variadic IndexDecl slice that contains
@@ -213,7 +168,7 @@ func validateIndexDecls(decls []*IndexDecl) error {
 			return fmt.Errorf("gmdb: IndexDecl at position %d has empty Name: %w", i, ErrKeyEmpty)
 		}
 		// Zero-column IndexDecls are unsupported: the non-unique
-		// decoder (extractSetKeyspaceCompoundPKFromIndexKey +
+		// decoder (indexing.ExtractSetCompoundPK +
 		// extractPKAndValue) needs at least one column terminator
 		// to bound the PK component; a zero-column index would
 		// surface indexing.ErrKeyMalformed at decode time. Reject at

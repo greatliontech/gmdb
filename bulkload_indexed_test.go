@@ -1069,7 +1069,7 @@ func TestBulkLoadIndexKeyGateParitySpilled(t *testing.T) {
 // index-value layouts are pinned CONTENT-verified: the non-unique
 // layout resolves the overflow-promoted value through the cursor's
 // eager assembly, the unique layout through btree.Get +
-// decodeUniqueIndexValue — a reassembly bug in either would
+// indexing.DecodeUniqueValue — a reassembly bug in either would
 // otherwise pass a match-count-only check.
 func TestBulkLoadCoveringLargeValueRoundTrips(t *testing.T) {
 	ctx := context.Background()

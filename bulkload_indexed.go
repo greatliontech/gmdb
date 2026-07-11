@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
@@ -35,7 +36,7 @@ import (
 //     index pages are unreferenced bounded leakage (bulkload.md §Interaction with Indexes).
 //
 // The index entries are encoded EXACTLY as the per-Put maintenance path
-// (extractEntriesAsKeySet / setKeyspaceExtractEntries + indexEntryValue),
+// (extractEntriesAsKeySet / setKeyspaceExtractEntries + indexing.EntryValue),
 // so a BulkLoad-built keyspace answers Lookups identically to the same
 // keyspace built via Put (bulkload.md §Interaction with Indexes).
 
@@ -643,7 +644,7 @@ func emitKeyspaceIndexEntries(s *indexSorter, decl *IndexDecl, key, value []byte
 	}
 	hasCovering := len(decl.Covering) > 0
 	for ik, entry := range m {
-		val := indexEntryValue(entry, key, decl.Unique, hasCovering)
+		val := indexing.EntryValue(entry, key, decl.Unique, hasCovering)
 		if err := s.add([]byte(ik), val); err != nil {
 			return err
 		}
@@ -660,9 +661,9 @@ func emitSetKeyspaceIndexEntries(s *indexSorter, decl *IndexDecl, setKey, setVal
 		return err
 	}
 	hasCovering := len(decl.Covering) > 0
-	compoundPK := encodeSetKeyspaceCompoundPK(setKey, setValue)
+	compoundPK := indexing.EncodeSetCompoundPK(setKey, setValue)
 	for ik, entry := range m {
-		val := indexEntryValue(entry, compoundPK, decl.Unique, hasCovering)
+		val := indexing.EntryValue(entry, compoundPK, decl.Unique, hasCovering)
 		if err := s.add([]byte(ik), val); err != nil {
 			return err
 		}

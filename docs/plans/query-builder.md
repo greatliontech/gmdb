@@ -11,7 +11,7 @@ tests move with their subjects, unmodified.
 - [x] 2. Keyspace-descriptor codec (40-byte encode / decode /
       validate) → `internal/` (home decided in-chunk, beside the
       registry codec; pure move).
-- [ ] 3. Index codec consolidation into `internal/indexing`:
+- [x] 3. Index codec consolidation into `internal/indexing`:
       set-keyspace compound-PK codec, `schemaHash` over a decl
       projection struct, `indexEntryKey` / `indexEntryValue` /
       `decodeUniqueIndexValue`, candidate-set collision check,

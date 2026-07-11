@@ -322,9 +322,9 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 		for _, e := range entries {
 			var ik string
 			if isSetKeyspace {
-				ik = string(encodeSetKeyspaceIndexKey(e.Cols, k1, k2, decl.Unique))
+				ik = string(indexing.EncodeSetEntryKey(e.Cols, k1, k2, decl.Unique))
 			} else {
-				ik = string(indexEntryKey(e, k1, decl.Unique))
+				ik = string(indexing.EntryKey(e, k1, decl.Unique))
 			}
 			if _, dup := seen[ik]; dup {
 				if decl.Unique {
@@ -353,11 +353,11 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 			}
 			var pkForValue []byte
 			if isSetKeyspace {
-				pkForValue = encodeSetKeyspaceCompoundPK(k1, k2)
+				pkForValue = indexing.EncodeSetCompoundPK(k1, k2)
 			} else {
 				pkForValue = k1
 			}
-			val := indexEntryValue(entry, pkForValue, decl.Unique, hasCovering)
+			val := indexing.EntryValue(entry, pkForValue, decl.Unique, hasCovering)
 			updated, err := btree.Put(btreeWriter{tx.pgr}, cfg, newRoot, ikBytes, val)
 			if err != nil {
 				return fmt.Errorf("RebuildIndex %q.%q: btree.Put: %w", keyspace, decl.Name, mapBtreeErr(err))

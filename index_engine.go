@@ -1,19 +1,19 @@
 package gmdb
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"sort"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/page"
 )
 
 // indexPlan is the per-index unit of work the maintenance engine
 // computes once and then applies: the entries to delete from and
 // insert into one index's data tree. `news` is the insert source —
-// indexEntryValue reads the IndexEntry behind each key in `ins`.
+// indexing.EntryValue reads the IndexEntry behind each key in `ins`.
 type indexPlan struct {
 	p    *pinnedIndex
 	news map[string]IndexEntry // insert/update source: index key -> entry
@@ -190,41 +190,14 @@ func (m *indexMaintainer) buildReplacePlans(oldValue, newValue []byte, hadOld bo
 		if err != nil {
 			return nil, err
 		}
-		var dels, ins, upds []string
+		// Key-unchanged entries can still need a value rewrite: the
+		// covering payload is extracted from the ROW VALUE, which
+		// this operation is replacing (indexing.md §Covering
+		// Indexes) — indexing.DiffEntrySets owns the diff + that
+		// value comparison (lazy PK).
 		hasCovering := len(p.decl.Covering) > 0
-		var pk []byte
-		pkLoaded := false // lazy: the pure-insert path never pays for it
-		for k := range olds {
-			if _, ok := news[k]; !ok {
-				dels = append(dels, k)
-			}
-		}
-		for k, ne := range news {
-			oe, ok := olds[k]
-			if !ok {
-				ins = append(ins, k)
-				continue
-			}
-			// Key unchanged: the stored value can still differ — the
-			// covering payload is extracted from the ROW VALUE, which
-			// this operation is replacing (indexing.md §Covering
-			// Indexes). Without the rewrite, lookups serve the stale
-			// covering forever while Check(CheckIndexes) reports
-			// FingerprintDrift.
-			if hadOld && hasCovering {
-				if !pkLoaded {
-					pk = m.valuePK()
-					pkLoaded = true
-				}
-				if !bytes.Equal(indexEntryValue(oe, pk, p.decl.Unique, hasCovering),
-					indexEntryValue(ne, pk, p.decl.Unique, hasCovering)) {
-					upds = append(upds, k)
-				}
-			}
-		}
-		sort.Strings(dels)
-		sort.Strings(ins)
-		sort.Strings(upds)
+		dels, ins, upds := indexing.DiffEntrySets(olds, news, p.decl.Unique,
+			hadOld && hasCovering, m.valuePK)
 		plans = append(plans, indexPlan{p: p, news: news, dels: dels, ins: ins, upds: upds})
 	}
 	return plans, nil
@@ -302,7 +275,7 @@ func (m *indexMaintainer) applyInserts(plans []indexPlan, opIdx *int) error {
 		hasCovering := len(pl.p.decl.Covering) > 0
 		for _, k := range pl.ins {
 			entry := pl.news[k]
-			val := indexEntryValue(entry, pk, pl.p.decl.Unique, hasCovering)
+			val := indexing.EntryValue(entry, pk, pl.p.decl.Unique, hasCovering)
 			newRoot, err := btree.Put(btreeWriter{m.tx.pgr}, m.cfg, pl.p.root, []byte(k), val)
 			if err != nil {
 				return mapBtreeErr(err)
@@ -320,7 +293,7 @@ func (m *indexMaintainer) applyInserts(plans []indexPlan, opIdx *int) error {
 		// is a real index mutation for stats and the failure hook.
 		for _, k := range pl.upds {
 			entry := pl.news[k]
-			val := indexEntryValue(entry, pk, pl.p.decl.Unique, hasCovering)
+			val := indexing.EntryValue(entry, pk, pl.p.decl.Unique, hasCovering)
 			newRoot, err := btree.Put(btreeWriter{m.tx.pgr}, m.cfg, pl.p.root, []byte(k), val)
 			if err != nil {
 				return mapBtreeErr(err)
@@ -338,7 +311,7 @@ func (m *indexMaintainer) applyInserts(plans []indexPlan, opIdx *int) error {
 
 // newIndexMaintainer builds the engine for an indexed Keyspace
 // mutation. The index value carries the row key as its PK and index
-// keys encode via indexEntryKey.
+// keys encode via indexing.EntryKey.
 func (ks *Keyspace) newIndexMaintainer(key []byte) *indexMaintainer {
 	return &indexMaintainer{
 		tx:             ks.tx,
@@ -355,7 +328,7 @@ func (ks *Keyspace) newIndexMaintainer(key []byte) *indexMaintainer {
 
 // newIndexMaintainer builds the engine for an indexed SetKeyspace
 // mutation. The index value carries the compound (setKey,setValue) PK
-// and index keys encode via encodeSetKeyspaceIndexKey.
+// and index keys encode via indexing.EncodeSetEntryKey.
 func (ks *SetKeyspace) newIndexMaintainer(setKey, setValue []byte) *indexMaintainer {
 	return &indexMaintainer{
 		tx:             ks.tx,
@@ -364,7 +337,7 @@ func (ks *SetKeyspace) newIndexMaintainer(setKey, setValue []byte) *indexMaintai
 		mergeThreshold: ks.tx.db.opts.MergeThreshold,
 		extractKey:     setKey,
 		extractFn:      setKeyspaceExtractEntries,
-		valuePK:        func() []byte { return encodeSetKeyspaceCompoundPK(setKey, setValue) },
+		valuePK:        func() []byte { return indexing.EncodeSetCompoundPK(setKey, setValue) },
 		kind:           "SetKeyspace",
 		ksName:         ks.name.Value(),
 		setKey:         setKey,

@@ -1,106 +1,27 @@
 package gmdb
 
 import (
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
-	"github.com/thegrumpylion/gmdb/internal/pager"
 	"sort"
 	"sync/atomic"
+
+	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
 // Atomic index maintenance for Keyspace.Put / Delete /
 // Cursor.Delete. Implements indexing.md §Write Path: Atomic Index
 // Maintenance + §Unique Indexes.
 //
-// On-disk index-entry shape per indexing.md §Storage Layout:
-//
-//	Unique index:     key = indexing.EncodeKey(cols)
-//	                  value = uvarint(len(pk)) || pk_bytes || encoded_covering
-//	Non-unique index: key = indexing.EncodeKey(cols || pk)
-//	                  value = encoded_covering (empty if no Covering)
-//
-// encoded_covering = indexing.EncodeKey(coverColumns) when the
-// IndexDecl declares Covering; otherwise empty bytes.
-// The uvarint(len(pk)) length prefix on the unique value
-// delimits the PK from the optional covering blob — without it,
-// the decoder cannot distinguish where pk_bytes ends and
-// encoded_covering begins. Non-unique indexes carry the PK in the
-// key, so no length prefix is needed in the value.
+// The on-disk index-entry shape (key/value grammar) is documented
+// on the codec in internal/indexing (entry.go), per
+// indexing.md §Storage Layout.
 
-// indexEntryKey returns the on-disk index-tree key for a single
-// extractor-produced IndexEntry on a Keyspace row (the PK is the
-// row's key). For a SetKeyspace the pk argument is the
-// compound `escape(setKey) || 0x00 0x01 || escape(setValue)`.
-func indexEntryKey(entry IndexEntry, pk []byte, unique bool) []byte {
-	if unique {
-		return indexing.EncodeKey(entry.Cols)
-	}
-	// Append the PK as an extra "column" so it gets escaped +
-	// terminated by encodeIndexKey, matching the spec grammar.
-	withPK := make([][]byte, 0, len(entry.Cols)+1)
-	withPK = append(withPK, entry.Cols...)
-	withPK = append(withPK, pk)
-	return indexing.EncodeKey(withPK)
-}
-
-// indexEntryValue returns the on-disk index-tree value for entry on
-// a row whose PK is pk. Per the value-format godoc above:
-//
-//	Unique:     uvarint(len(pk)) || pk_bytes || encoded_covering
-//	Non-unique: encoded_covering
-//
-// encoded_covering = indexing.EncodeKey(entry.Cover) when the IndexDecl
-// declares Covering and the extractor produced Cover bytes;
-// otherwise empty.
-func indexEntryValue(entry IndexEntry, pk []byte, unique bool, hasCovering bool) []byte {
-	var covering []byte
-	if hasCovering && len(entry.Cover) > 0 {
-		covering = indexing.EncodeKey(entry.Cover)
-	}
-	if unique {
-		// uvarint(len(pk)) + pk + covering
-		var lenBuf [binary.MaxVarintLen64]byte
-		n := binary.PutUvarint(lenBuf[:], uint64(len(pk)))
-		out := make([]byte, 0, n+len(pk)+len(covering))
-		out = append(out, lenBuf[:n]...)
-		out = append(out, pk...)
-		out = append(out, covering...)
-		return out
-	}
-	// Non-unique: just the covering (empty if none).
-	if covering == nil {
-		return []byte{}
-	}
-	return covering
-}
-
-// decodeUniqueIndexValue unpacks the unique-index entry value
-// produced by indexEntryValue (unique=true) into the row PK and
-// the encoded covering bytes (which may be empty).
-//
-// Returns errIndexValueShort wrapped in ErrCorrupted at the
-// caller's boundary on malformed input.
-func decodeUniqueIndexValue(value []byte) (pk, encodedCovering []byte, err error) {
-	pkLen, n := binary.Uvarint(value)
-	if n <= 0 {
-		return nil, nil, fmt.Errorf("%w: bad uvarint pk-length prefix", errIndexValueShort)
-	}
-	if uint64(len(value)-n) < pkLen {
-		return nil, nil, fmt.Errorf("%w: pk length %d exceeds remaining %d bytes",
-			errIndexValueShort, pkLen, len(value)-n)
-	}
-	pk = value[n : n+int(pkLen)]
-	encodedCovering = value[n+int(pkLen):]
-	return pk, encodedCovering, nil
-}
-
-// errIndexValueShort marks a malformed index entry value (truncated
-// uvarint, pk-length past end). Wrapped in ErrCorrupted at the
-// caller boundary; index entries are engine-internal so a
-// malformed value signals on-disk corruption.
-var errIndexValueShort = errors.New("index entry value malformed")
+// The entry key/value codec (EntryKey / EntryValue /
+// DecodeUniqueValue) lives in internal/indexing beside the key
+// encoder; errIndexValueShort aliases its sentinel so existing
+// errors.Is chains keep resolving.
+var errIndexValueShort = indexing.ErrValueMalformed
 
 // extractEntriesAsKeySet runs the extractor and returns a
 // map[string]IndexEntry keyed by the encoded index-tree key. The
@@ -124,7 +45,7 @@ func extractEntriesAsKeySet(decl *IndexDecl, key, value []byte) (map[string]Inde
 	}
 	out := make(map[string]IndexEntry, len(raw))
 	for _, e := range raw {
-		k := string(indexEntryKey(e, key, decl.Unique))
+		k := string(indexing.EntryKey(e, key, decl.Unique))
 		// Set semantic: a second entry with the same encoded key
 		// overwrites (the user's two extractor outputs share the
 		// same on-disk slot — equivalent for non-unique; for

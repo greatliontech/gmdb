@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"iter"
+
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 
 	"github.com/thegrumpylion/gmdb/internal/btree"
 )
@@ -404,10 +405,10 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 	// the whole value for a non-unique one. Used by both covering-return
 	// branches below; empty for an index whose IndexDecl declares no
 	// Covering (the engine still stores it as empty per
-	// indexEntryValue).
+	// indexing.EntryValue).
 	var encodedCovering []byte
 	if idx.pinned.decl.Unique {
-		extractedPK, encCov, decErr := decodeUniqueIndexValue(indexValue)
+		extractedPK, encCov, decErr := indexing.DecodeUniqueValue(indexValue)
 		if decErr != nil {
 			return nil, nil, false, fmt.Errorf("%w: %w", ErrCorrupted, decErr)
 		}
@@ -469,7 +470,7 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 	// back-lookup against the row keyspace per spec.
 	//
 	// Copy the slice — encodedCovering may alias the value buffer the
-	// cursor will reuse (decodeUniqueIndexValue returns slices into
+	// cursor will reuse (indexing.DecodeUniqueValue returns slices into
 	// indexValue; non-unique sets encodedCovering = indexValue).
 	//
 	// A coverValue handle whose live decl LOST the typed sentinel
@@ -753,7 +754,7 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 			if !found {
 				return
 			}
-			pk, _, decErr := decodeUniqueIndexValue(val)
+			pk, _, decErr := indexing.DecodeUniqueValue(val)
 			if decErr != nil {
 				idx.err = fmt.Errorf("%w: %w", ErrCorrupted, decErr)
 				return
@@ -997,11 +998,11 @@ func (idx *IndexHandle) Get(cols ...[]byte) (pk, value []byte, err error) {
 //
 // Decoding routes:
 //   - Unique: uvarint-prefixed compound PK in the index value;
-//     decodeUniqueIndexValue extracts the compound bytes, then
-//     decodeSetKeyspaceCompoundPK splits on the 0x00 0x01
+//     indexing.DecodeUniqueValue extracts the compound bytes, then
+//     indexing.DecodeSetCompoundPK splits on the 0x00 0x01
 //     separator.
 //   - Non-unique: compound PK lives in the index key suffix after
-//     the column-tuple terminator; extractSetKeyspaceCompoundPKFromIndexKey
+//     the column-tuple terminator; indexing.ExtractSetCompoundPK
 //     walks the key counting real 0x00 0x00 terminators.
 //
 // Silent-skip applies per indexing.md §Lookup API: if the
@@ -1011,19 +1012,19 @@ func (idx *IndexHandle) Get(cols ...[]byte) (pk, value []byte, err error) {
 func (idx *IndexHandle) extractSetKeyspacePKAndValue(indexKey, indexValue []byte) (setKey, setValue []byte, skip bool, err error) {
 	var compoundPK []byte
 	if idx.pinned.decl.Unique {
-		pk, _, decErr := decodeUniqueIndexValue(indexValue)
+		pk, _, decErr := indexing.DecodeUniqueValue(indexValue)
 		if decErr != nil {
 			return nil, nil, false, fmt.Errorf("%w: %w", ErrCorrupted, decErr)
 		}
 		compoundPK = pk
 	} else {
-		extracted, extErr := extractSetKeyspaceCompoundPKFromIndexKey(indexKey, len(idx.pinned.decl.Columns))
+		extracted, extErr := indexing.ExtractSetCompoundPK(indexKey, len(idx.pinned.decl.Columns))
 		if extErr != nil {
 			return nil, nil, false, fmt.Errorf("%w: index %q: %w", ErrCorrupted, idx.pinned.decl.Name, extErr)
 		}
 		compoundPK = extracted
 	}
-	sk, sv, decErr := decodeSetKeyspaceCompoundPK(compoundPK)
+	sk, sv, decErr := indexing.DecodeSetCompoundPK(compoundPK)
 	if decErr != nil {
 		return nil, nil, false, fmt.Errorf("%w: %w", ErrCorrupted, decErr)
 	}
