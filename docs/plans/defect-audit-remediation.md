@@ -46,7 +46,7 @@ function. WIP = 1.
       handle (both kinds)
 - [x] 17. indexing: onDelete extract-all-then-mutate, coverValue
       reconcile, schemaHash doc grammar
-- [ ] 18. bulkload: index-entry parity — key gate, overflow promotion,
+- [x] 18. bulkload: index-entry parity — key gate, overflow promotion,
       base config for index trees (+ bulkload.md rider)
 - [ ] 19. copy/check: verbatim-walk clamp, temp+rename destination,
       overflow-header validation (+ api-surface.md/checksums.md riders)

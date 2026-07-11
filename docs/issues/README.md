@@ -80,7 +80,6 @@ chunks (bottom-up by layer, grouped by function).
 | Slug | Lands | Summary |
 |------|-------|---------|
 | checkpoint-selfdurable-anchor-persist | 23 | [L] pure-SyncDataOnly Checkpoint leaves the persisted anchor trailing by one (peer reclamation delayed); persisting would rewrite the assertion's sole durable carrier in place — tear hazard |
-| bulkload-index-parity | 18 | [H] index bulk build skips key-size gate → un-updatable/un-compactable DB; [M] no overflow promotion for index values; [L] config parity |
 | copyto-hardening | 19 | [M×2] verbatim CopyTo SIGBUS on truncated source; torn destination on crash; [L] Check misses overflow-header corruption |
 | maintenance-reclaim-truncated-walk | 20 | [H] leak reclamation behind a truncated RPL walk double-frees pages still in the live chain; [L] Check false-positive FreeAndPending beyond a reclaimed boundary |
 | compaction-consolidating-alloc | 21 | [M] relocations re-land in the evacuation band — no convergence; spec's consolidating allocator unimplemented |

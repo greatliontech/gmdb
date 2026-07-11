@@ -172,9 +172,18 @@ extractor-produced index key on the indexed variants) and an
 oversize set value that cannot fit a leaf even alone (including a
 key's FIRST value, which by design bypasses the promotion threshold
 to match Put's genesis shape) surface `ErrKeyTooLarge`, exactly as
-the same input would through `Put`. Internal builder sentinels never
+the same input would through `Put`. Extractor-produced index VALUES
+have the same parity: a value the per-op maintenance path stores by
+overflow promotion is overflow-promoted by the bulk index build too
+— never rejected, never inlined oversize. Bulk-built index trees
+are encoded with the BASE page config, exactly as the per-Put
+maintenance path builds them (a keyspace's RestartGroupTarget
+applies to its ROW tree only). Internal builder sentinels never
 escape the BulkLoad boundary. (Pinned per path by
-TestErrKeyTooLargeSentinel.)
+TestErrKeyTooLargeSentinel; index-key gate, value promotion, and
+config parity by TestBulkLoadIndexKeyGateParity,
+TestBulkLoadCoveringLargeValueRoundTrips, and
+TestBulkLoadIndexTreeConfigParity.)
 
 ## Algorithm
 

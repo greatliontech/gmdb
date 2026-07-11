@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -965,4 +966,295 @@ func slicesEqualStr(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// The bulk index build enforces the SAME split-safety key bound as
+// the online path (limits.md two-separators-per-branch): an
+// extractor-produced index key Put would reject must fail BulkLoad
+// with ErrKeyTooLarge — pre-fix it persisted, leaving rows
+// permanently un-updatable and the database un-compactable.
+func TestBulkLoadIndexKeyGateParity(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 512})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	bigKey := &IndexDecl{
+		Name:    "big",
+		Columns: []IndexColumn{{Name: "c"}},
+		Extract: func(key, value []byte) []IndexEntry {
+			return []IndexEntry{{Cols: [][]byte{make([]byte, 1500)}}}
+		},
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	ks, err := tx.CreateKeyspace("k", bigKey)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	// The online path rejects this input.
+	if err := ks.Put([]byte("row"), []byte("v")); !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("online Put = %v, want ErrKeyTooLarge (fixture: the 1500-byte column's ENCODED index key must exceed the spec bound yet fit an empty leaf)", err)
+	}
+	// BulkLoad must reject it identically.
+	_, err = ks.BulkLoad(func(yield func(k, v []byte) bool) {
+		yield([]byte("row"), []byte("v"))
+	})
+	if !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("BulkLoad = %v, want ErrKeyTooLarge (oversize index key accepted)", err)
+	}
+}
+
+// The SPILLED merge path shares the gate: enough rows to exceed the
+// per-index sort budget forces the external-merge branch, whose
+// bulkLeafEntry call must reject the same oversize key.
+func TestBulkLoadIndexKeyGateParitySpilled(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		MaxTxBufferBytes: 1 << 20, // shrink the sort budget to force spill
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	bigKey := &IndexDecl{
+		Name:    "big",
+		Columns: []IndexColumn{{Name: "c"}},
+		Extract: func(key, value []byte) []IndexEntry {
+			col := make([]byte, 1500)
+			copy(col, key) // distinct per row
+			return []IndexEntry{{Cols: [][]byte{col}}}
+		},
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	ks, err := tx.CreateKeyspace("k", bigKey)
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	// The hook fires only on the spilled branch (after the run
+	// cascade, before the merge loop where the gate rejects) —
+	// asserting it fired pins that this test exercises the merge
+	// path, not a silent duplicate of the in-memory case after a
+	// future budget change. Global hook: no t.Parallel().
+	spilled := false
+	setBulkLoadMergeCascadeHookForTest(func(pre, post int) { spilled = true })
+	defer setBulkLoadMergeCascadeHookForTest(nil)
+	_, err = ks.BulkLoad(func(yield func(k, v []byte) bool) {
+		for i := range 1200 { // ~1.8 MB of index entries > 1 MB budget
+			if !yield(fmt.Appendf(nil, "row%05d", i), []byte("v")) {
+				return
+			}
+		}
+	})
+	if !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("spilled BulkLoad = %v, want ErrKeyTooLarge", err)
+	}
+	if !spilled {
+		t.Fatal("index sorter never spilled — the test degraded to the in-memory case (raise the row count or lower MaxTxBufferBytes)")
+	}
+}
+
+// A covering index value the per-op path stores by overflow promotion
+// must round-trip through BulkLoad too — pre-fix the bulk build
+// aborted with a misleading ErrKeyTooLarge on data Put accepts. Both
+// index-value layouts are pinned CONTENT-verified: the non-unique
+// layout resolves the overflow-promoted value through the cursor's
+// eager assembly, the unique layout through btree.Get +
+// decodeUniqueIndexValue — a reassembly bug in either would
+// otherwise pass a match-count-only check.
+func TestBulkLoadCoveringLargeValueRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		unique bool
+	}{{"non_unique", false}, {"unique", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 1024})
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer db.Close()
+			bigVal := make([]byte, 5000)
+			for i := range bigVal {
+				bigVal[i] = byte(i)
+			}
+			cover := &IndexDecl{
+				Name:     "cov",
+				Unique:   tc.unique,
+				Columns:  []IndexColumn{{Name: "c"}},
+				Covering: []IndexCoveringColumn{{Name: "v"}},
+				Extract: func(key, value []byte) []IndexEntry {
+					return []IndexEntry{{Cols: [][]byte{key}, Cover: [][]byte{value}}}
+				},
+			}
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				t.Fatalf("Begin: %v", err)
+			}
+			ks, err := tx.CreateKeyspace("k", cover)
+			if err != nil {
+				t.Fatalf("CreateKeyspace: %v", err)
+			}
+			if _, err := ks.BulkLoad(func(yield func(k, v []byte) bool) {
+				yield([]byte("row"), bigVal)
+			}); err != nil {
+				t.Fatalf("BulkLoad = %v (large covering value rejected; the per-op path stores it)", err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("Commit: %v", err)
+			}
+			// The covering entry round-trips through the index read
+			// path, content included.
+			if err := db.Update(ctx, func(tx *Tx) error {
+				ks, e := tx.OpenKeyspace("k", cover)
+				if e != nil {
+					return e
+				}
+				h, e := ks.Index("cov")
+				if e != nil {
+					return e
+				}
+				n := 0
+				for pk, v := range h.Lookup([]byte("row")) {
+					n++
+					if string(pk) != "row" {
+						t.Errorf("pk = %q", pk)
+					}
+					cols, e := DecodeCoveringTuple(v)
+					if e != nil {
+						t.Errorf("DecodeCoveringTuple: %v", e)
+						continue
+					}
+					if len(cols) != 1 {
+						t.Errorf("covering tuple cols = %d, want 1", len(cols))
+					} else if !bytes.Equal(cols[0], bigVal) {
+						t.Errorf("covering column does not round-trip (%d bytes, want %d)", len(cols[0]), len(bigVal))
+					}
+				}
+				if e := h.Err(); e != nil {
+					return e
+				}
+				if n != 1 {
+					t.Errorf("Lookup matches = %d, want 1", n)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// Bulk-built index trees are encoded with the BASE page config —
+// byte-identical to the online maintenance path — even when the
+// keyspace's row tree uses a custom RestartGroupTarget. Covers BOTH
+// keyspace kinds: the Keyspace and SetKeyspace BulkLoad variants
+// build their index trees through separate finalizeIndexBuild call
+// sites, so each needs its own pin.
+func TestBulkLoadIndexTreeConfigParity(t *testing.T) {
+	ctx := context.Background()
+	decl := func() *IndexDecl {
+		return &IndexDecl{
+			Name:    "i",
+			Columns: []IndexColumn{{Name: "c"}},
+			Extract: func(key, value []byte) []IndexEntry {
+				return []IndexEntry{{Cols: [][]byte{value}}}
+			},
+		}
+	}
+	build := func(t *testing.T, set, bulk bool) []byte {
+		db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer db.Close()
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		defer tx.Rollback()
+		var (
+			put      func(k, v []byte) error
+			bulkLoad func(iter.Seq2[[]byte, []byte]) (uint64, error)
+			indexes  map[string]*pinnedIndex
+		)
+		if set {
+			ks, err := tx.CreateSetKeyspace("k", nil, decl())
+			if err != nil {
+				t.Fatalf("CreateSetKeyspace: %v", err)
+			}
+			put = func(k, v []byte) error { _, e := ks.Put(k, v); return e }
+			bulkLoad = ks.BulkLoad
+			indexes = ks.indexes
+		} else {
+			ks, err := tx.CreateKeyspace("k", decl())
+			if err != nil {
+				t.Fatalf("CreateKeyspace: %v", err)
+			}
+			put = ks.Put
+			bulkLoad = ks.BulkLoad
+			indexes = ks.indexes
+		}
+		if err := tx.SetKeyspaceConfig("k", KeyspaceConfig{RestartGroupTarget: 2}); err != nil {
+			t.Fatalf("SetKeyspaceConfig: %v", err)
+		}
+		if bulk {
+			if _, err := bulkLoad(func(yield func(k, v []byte) bool) {
+				yield([]byte("a"), []byte("v1"))
+				yield([]byte("b"), []byte("v2"))
+				yield([]byte("c"), []byte("v3"))
+			}); err != nil {
+				t.Fatalf("BulkLoad: %v", err)
+			}
+		} else {
+			for _, kv := range [][2]string{{"a", "v1"}, {"b", "v2"}, {"c", "v3"}} {
+				if err := put([]byte(kv[0]), []byte(kv[1])); err != nil {
+					t.Fatalf("Put: %v", err)
+				}
+			}
+		}
+		root := indexes["i"].root
+		// Compare COMMITTED bytes: online slab pages receive their
+		// checksum footer at commit-time pwrite, bulk pages at
+		// WriteDirect — pre-commit the footers legitimately differ.
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		rtx, err := db.BeginRead(ctx)
+		if err != nil {
+			t.Fatalf("BeginRead: %v", err)
+		}
+		defer rtx.Rollback()
+		buf, err := rtx.Page(root)
+		if err != nil {
+			t.Fatalf("Page: %v", err)
+		}
+		return append([]byte(nil), buf...)
+	}
+	for _, tc := range []struct {
+		name string
+		set  bool
+	}{{"keyspace", false}, {"set_keyspace", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			bulkLeaf, onlineLeaf := build(t, tc.set, true), build(t, tc.set, false)
+			if !bytes.Equal(bulkLeaf, onlineLeaf) {
+				for i := range bulkLeaf {
+					if bulkLeaf[i] != onlineLeaf[i] {
+						t.Logf("first diff at offset %d: bulk=%02x online=%02x", i, bulkLeaf[i], onlineLeaf[i])
+						break
+					}
+				}
+				t.Fatal("bulk-built index leaf differs from the online-built one — config parity broken")
+			}
+		})
+	}
 }

@@ -522,6 +522,14 @@ type indexBuildResult struct {
 	count uint64
 }
 
+// bulkIndexWriter is the union the index build needs: tree pages via
+// the page-writer half, overflow chains via AllocContiguous —
+// *pager.Pager implements both.
+type bulkIndexWriter interface {
+	bulkPageWriter
+	AllocContiguous(n uint32) (uint64, error)
+}
+
 // buildIndexFromSorter sorts the index's records and bulk-builds its data
 // tree, detecting unique-index violations at the (merged) sorted output.
 //
@@ -538,7 +546,7 @@ type indexBuildResult struct {
 // A non-unique index never has adjacent-equal keys at the output (Inv: PKs
 // distinct + within-row dedup), so the unique branch is the only one that
 // can fire ErrIndexUniqueViolation.
-func buildIndexFromSorter(pw bulkPageWriter, cfg page.Config, s *indexSorter, decl *IndexDecl, ksName string) (indexBuildResult, error) {
+func buildIndexFromSorter(pw bulkIndexWriter, cfg page.Config, s *indexSorter, decl *IndexDecl, ksName string) (indexBuildResult, error) {
 	b := newBulkBuilder(pw, cfg)
 	unique := decl.Unique
 	if !s.spilled {
@@ -551,7 +559,17 @@ func buildIndexFromSorter(pw bulkPageWriter, cfg page.Config, s *indexSorter, de
 			}
 		}
 		for i := range s.mem {
-			if err := b.add(page.LeafEntry{Key: s.mem[i].key, Value: s.mem[i].val}); err != nil {
+			// The SAME gate + overflow-promotion shape as the row
+			// path (bulkLeafEntry): the split-safety key bound and
+			// value overflow behave exactly as the per-Put
+			// maintenance path (bulkload.md §API sentinel parity;
+			// pre-fix, oversize index keys persisted un-updatably
+			// and large covering values aborted the load).
+			e, err := bulkLeafEntry(pw, cfg, s.mem[i].key, s.mem[i].val)
+			if err != nil {
+				return indexBuildResult{}, fmt.Errorf("gmdb: BulkLoad index %q: %w", decl.Name, err)
+			}
+			if err := b.add(e); err != nil {
 				return indexBuildResult{}, err
 			}
 		}
@@ -589,7 +607,11 @@ func buildIndexFromSorter(pw bulkPageWriter, cfg page.Config, s *indexSorter, de
 		if unique && have && bytes.Equal(rec.key, prevKey) {
 			return indexBuildResult{}, bulkUniqueViolation(decl.Name, ksName, rec.key)
 		}
-		if err := b.add(page.LeafEntry{Key: rec.key, Value: rec.val}); err != nil {
+		e, eerr := bulkLeafEntry(pw, cfg, rec.key, rec.val)
+		if eerr != nil {
+			return indexBuildResult{}, fmt.Errorf("gmdb: BulkLoad index %q: %w", decl.Name, eerr)
+		}
+		if err := b.add(e); err != nil {
 			return indexBuildResult{}, err
 		}
 		prevKey = append(prevKey[:0], rec.key...)
@@ -666,7 +688,7 @@ func newIndexSorters(opts Options, names []string) map[string]*indexSorter {
 // it returns (nil, err) having published NOTHING (bulkload.md §Interaction with Indexes): the
 // caller then leaves desc.Root + pinned state untouched. Each sorter's
 // in-memory chunk is released as soon as its tree is built.
-func finalizeIndexBuild(pw bulkPageWriter, cfg page.Config, ksName string, names []string, indexes map[string]*pinnedIndex, sorters map[string]*indexSorter) (oldRoots map[string]uint64, err error) {
+func finalizeIndexBuild(pw bulkIndexWriter, cfg page.Config, ksName string, names []string, indexes map[string]*pinnedIndex, sorters map[string]*indexSorter) (oldRoots map[string]uint64, err error) {
 	built := make(map[string]indexBuildResult, len(names))
 	for _, n := range names {
 		res, err := buildIndexFromSorter(pw, cfg, sorters[n], indexes[n].decl, ksName)
@@ -739,7 +761,7 @@ func (ks *Keyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, err
 
 	// Build every index tree (no publish yet — a unique violation or I/O
 	// error here must leave the keyspace at its pre-BulkLoad state).
-	oldRoots, err := finalizeIndexBuild(ks.tx.pgr, cfg, ks.name.Value(), names, ks.indexes, sorters)
+	oldRoots, err := finalizeIndexBuild(ks.tx.pgr, ks.tx.pgr.Config(), ks.name.Value(), names, ks.indexes, sorters)
 	if err != nil {
 		return 0, mapBtreeErr(bulkMapEntryTooLarge(err))
 	}
@@ -799,7 +821,7 @@ func (ks *SetKeyspace) bulkLoadIndexed(rows iter.Seq2[[]byte, []byte]) (uint64, 
 		return 0, mapBtreeErr(err)
 	}
 
-	oldRoots, err := finalizeIndexBuild(ks.tx.pgr, cfg, ks.name.Value(), names, ks.indexes, sorters)
+	oldRoots, err := finalizeIndexBuild(ks.tx.pgr, ks.tx.pgr.Config(), ks.name.Value(), names, ks.indexes, sorters)
 	if err != nil {
 		return 0, mapBtreeErr(bulkMapEntryTooLarge(err))
 	}

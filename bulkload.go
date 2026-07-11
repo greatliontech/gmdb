@@ -26,12 +26,14 @@ var errBulkEntryTooLarge = errors.New("gmdb: bulkload entry too large for an emp
 // bulkMapEntryTooLarge translates the builder's empty-leaf guard
 // into btree.ErrKeyTooLarge wherever a USER-derived entry can reach
 // it in-spec — set values and members (the first-value/nested cases
-// in the sentinel doc) and extractor-produced index keys or covering
-// payloads on the index-build boundary (limits.md subjects index
-// keys to the ordinary key maximum, and nothing bounds them at
-// declaration). The BulkLoad boundary's mapBtreeErr then surfaces
-// the public sentinel, matching what the same input yields through
-// Put. Every other error passes through unchanged.
+// in the sentinel doc). On the index-build boundary the guard is
+// defensive only: bulkLeafEntry pre-checks extractor-produced keys
+// against the two-separators bound and promotes over-inline covering
+// payloads to overflow references, so an index entry that reaches
+// the builder always fits an empty leaf. The BulkLoad boundary's
+// mapBtreeErr then surfaces the public sentinel, matching what the
+// same input yields through Put. Every other error passes through
+// unchanged.
 func bulkMapEntryTooLarge(err error) error {
 	if err != nil && errors.Is(err, errBulkEntryTooLarge) {
 		return fmt.Errorf("%w: %v", btree.ErrKeyTooLarge, err)
