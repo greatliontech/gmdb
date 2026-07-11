@@ -412,7 +412,14 @@ back into the parent by name: a parent handle for the same name is
 updated in place (so a caller still holding it observes the
 committed child work); a keyspace the child opened or created
 installs a fresh parent-owned handle; a keyspace the child deleted
-invalidates the parent's handle.
+invalidates the parent's handle. A name the child deleted AND
+re-created invalidates the parent's old handle and installs a
+fresh parent-owned one — exactly as if the parent had run
+DeleteKeyspace then CreateKeyspace itself: the permanent-
+invalidation clause (api-surface.md §DeleteKeyspace) composes
+through the child boundary; in-place update would resurrect a dead
+handle into a different keyspace generation. (Pinned by
+`TestNestedDeleteRecreateKillsParentHandle`.)
 
 **Child rollback.** Restore the pager savepoint:
 

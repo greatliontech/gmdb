@@ -42,7 +42,7 @@ function. WIP = 1.
       guard-error surfacing
 - [x] 15. db: daemon goroutines stop pinning *DB — handle-leak
       detection reachable; LaggingReader reentrancy doc
-- [ ] 16. keyspace: nested delete+recreate kills the parent's old
+- [x] 16. keyspace: nested delete+recreate kills the parent's old
       handle (both kinds)
 - [ ] 17. indexing: onDelete extract-all-then-mutate, coverValue
       reconcile, schemaHash doc grammar

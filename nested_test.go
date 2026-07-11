@@ -935,3 +935,113 @@ func TestChildSetFileFormatMergesOnCommit(t *testing.T) {
 		t.Errorf("MinSize = %d after child rollback, want unchanged %d", got, want.Lower)
 	}
 }
+
+// A child that DELETES then RECREATES a keyspace must not resurrect
+// the parent's old handle at child commit: DeleteKeyspace's contract
+// says re-creating the name does NOT reactivate old handles
+// (api-surface.md) — the parent's pre-existing handle dies exactly as
+// if the parent had deleted it, and a freshly opened handle sees the
+// new generation. Both keyspace kinds.
+func TestNestedDeleteRecreateKillsParentHandle(t *testing.T) {
+	ctx := context.Background()
+	db := openNestedTestDB(t)
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	pks, err := tx.CreateKeyspace("a")
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := pks.Put([]byte("old"), []byte("v")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	psks, err := tx.CreateSetKeyspace("s", nil)
+	if err != nil {
+		t.Fatalf("CreateSetKeyspace: %v", err)
+	}
+	if _, err := psks.Put([]byte("old"), []byte("v")); err != nil {
+		t.Fatalf("set Put: %v", err)
+	}
+
+	// A parent cursor opened pre-child pins the recreation branch's
+	// stale walk.
+	pcur := pks.Cursor()
+	if k, _ := pcur.First(); k == nil {
+		t.Fatalf("fixture cursor: %v", pcur.Err())
+	}
+
+	child, err := tx.BeginChild()
+	if err != nil {
+		t.Fatalf("BeginChild: %v", err)
+	}
+	if err := child.DeleteKeyspace("a"); err != nil {
+		t.Fatalf("child DeleteKeyspace: %v", err)
+	}
+	cks, err := child.CreateKeyspace("a")
+	if err != nil {
+		t.Fatalf("child CreateKeyspace: %v", err)
+	}
+	if err := cks.Put([]byte("new"), []byte("v2")); err != nil {
+		t.Fatalf("child Put: %v", err)
+	}
+	if err := child.DeleteKeyspace("s"); err != nil {
+		t.Fatalf("child DeleteSetKeyspace: %v", err)
+	}
+	// Recreate with a DIFFERENT option set: the kill makes the old
+	// handle's stale FixedValueSize unreachable (the issue's
+	// SetKeyspace leg).
+	csks, err := child.CreateSetKeyspace("s", &SetKeyspaceOptions{FixedValueSize: 8})
+	if err != nil {
+		t.Fatalf("child CreateSetKeyspace: %v", err)
+	}
+	if _, err := csks.Put([]byte("new"), []byte("12345678")); err != nil {
+		t.Fatalf("child set Put: %v", err)
+	}
+	if err := child.Commit(); err != nil {
+		t.Fatalf("child Commit: %v", err)
+	}
+
+	// The parent's OLD handles are dead — never resurrected.
+	if err := pks.Put([]byte("resurrect"), []byte("x")); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Fatalf("old keyspace handle Put = %v, want ErrKeyspaceClosed (handle resurrected)", err)
+	}
+	// The pre-child cursor is stale/dead — never yields from the
+	// freed old tree.
+	if k, _ := pcur.Next(); k != nil {
+		t.Fatalf("pre-child cursor yielded %q from the deleted generation", k)
+	}
+	if _, err := psks.Put([]byte("resurrect"), []byte("x")); !errors.Is(err, ErrKeyspaceClosed) {
+		t.Fatalf("old set handle Put = %v, want ErrKeyspaceClosed (handle resurrected)", err)
+	}
+	// A freshly opened handle sees the NEW generation only.
+	fks, err := tx.OpenKeyspace("a")
+	if err != nil {
+		t.Fatalf("OpenKeyspace: %v", err)
+	}
+	if _, err := fks.Get([]byte("old")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(old) = %v, want ErrNotFound (old generation leaked through)", err)
+	}
+	if v, err := fks.Get([]byte("new")); err != nil || string(v) != "v2" {
+		t.Fatalf("Get(new) = %q, %v", v, err)
+	}
+	fsks, err := tx.OpenSetKeyspace("s")
+	if err != nil {
+		t.Fatalf("OpenSetKeyspace: %v", err)
+	}
+	if has, _ := fsks.Has([]byte("old")); has {
+		t.Fatal("set old generation leaked through")
+	}
+	if has, err := fsks.Has([]byte("new")); err != nil || !has {
+		t.Fatalf("set Has(new) = %v, %v", has, err)
+	}
+	// The fresh generation's option set governs: an 8-byte fixed
+	// value is accepted, a differently-sized one rejected.
+	if _, err := fsks.Put([]byte("k8"), []byte("8bytes..")); err != nil {
+		t.Fatalf("fixed-size Put: %v", err)
+	}
+	if _, err := fsks.Put([]byte("kbad"), []byte("wrong")); err == nil {
+		t.Fatal("differently-sized value accepted — old generation's options leaked")
+	}
+}

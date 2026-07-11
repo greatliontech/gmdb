@@ -250,7 +250,8 @@ func clonePinnedIndexes(src map[string]*pinnedIndex) map[string]*pinnedIndex {
 // mergeKeyspaceHandles reconciles a committing child's open *Keyspace
 // handles into the parent:
 //
-//   - A name the parent already has open: the parent's existing handle
+//   - A name the parent already has open (and the child never
+//     deleted): the parent's existing handle
 //     is updated in place (desc / state / dead / indexes) so a caller
 //     still holding that handle observes the committed child work; if
 //     the data-tree root moved (copy-on-write changes the root on any
@@ -265,25 +266,51 @@ func clonePinnedIndexes(src map[string]*pinnedIndex) map[string]*pinnedIndex {
 //     child's open set): the parent's handle is invalidated
 //     (dead = true) and migrated to deadKeyspaces, matching DeleteKeyspace
 //     semantics (api-surface.md §Keyspace API DeleteKeyspace).
+//   - A name the parent had open that the child deleted AND RECREATED
+//     (present in both open sets, with the name among the child's dead
+//     clones): the parent's old handle is invalidated exactly as in
+//     the delete case — never updated in place, which would resurrect
+//     a permanently-dead handle into a different keyspace generation —
+//     and the child's state installs as a fresh parent-owned handle.
 //
 // The child cloned the parent's full open set at BeginChild, so a name
 // absent from the child's open set at commit can only be one the child
 // deleted — never one it merely left untouched.
 func mergeKeyspaceHandles(parent, child *Tx) {
+	// Names the child DELETED at least once (its dead clones carry
+	// them): a same-name handle still in the child's open set is a
+	// RECREATION — a different keyspace generation — so the parent's
+	// pre-existing handle must die exactly as if the parent itself
+	// had run DeleteKeyspace (api-surface.md: re-creating the name
+	// does not reactivate old handles), and the child's state
+	// installs as a FRESH parent-owned handle instead of resurrecting
+	// the old one in place.
+	var childDeleted map[uniqueNameHandle]struct{}
+	for _, dk := range child.deadKeyspaces {
+		if childDeleted == nil {
+			childDeleted = make(map[uniqueNameHandle]struct{}, len(child.deadKeyspaces))
+		}
+		childDeleted[dk.name] = struct{}{}
+	}
 	for h, cks := range child.openKeyspaces {
 		if pks, ok := parent.openKeyspaces[h]; ok {
-			rootMoved := pks.desc.Root != cks.desc.Root
-			pks.desc = cks.desc
-			pks.state = cks.state
-			pks.dead = cks.dead
-			pks.indexes = cks.indexes
-			pks.regPathLen = cks.regPathLen
-			pks.reserveCharged = cks.reserveCharged
-			pks.reconcileIndexHandles()
-			if rootMoved {
-				pks.markCursorsStale()
+			if _, recreated := childDeleted[h]; recreated {
+				killMergedKeyspaceHandle(parent, h, pks)
+				// Fall through to the fresh-install branch below.
+			} else {
+				rootMoved := pks.desc.Root != cks.desc.Root
+				pks.desc = cks.desc
+				pks.state = cks.state
+				pks.dead = cks.dead
+				pks.indexes = cks.indexes
+				pks.regPathLen = cks.regPathLen
+				pks.reserveCharged = cks.reserveCharged
+				pks.reconcileIndexHandles()
+				if rootMoved {
+					pks.markCursorsStale()
+				}
+				continue
 			}
-			continue
 		}
 		if parent.openKeyspaces == nil {
 			parent.openKeyspaces = make(map[uniqueNameHandle]*Keyspace, len(child.openKeyspaces))
@@ -304,42 +331,60 @@ func mergeKeyspaceHandles(parent, child *Tx) {
 	}
 	for h, pks := range parent.openKeyspaces {
 		if _, stillOpen := child.openKeyspaces[h]; !stillOpen {
-			pks.dead = true
-			// Mirror within-tx DeleteKeyspace's invalidation
-			// (Inv-IHS3): the child FreeSubtree'd this keyspace's
-			// row and index trees, so any parent cursor or index
-			// iter still in flight would yield from freed (and
-			// possibly reallocated) pages. Row cursors go stale
-			// (requireOpen then short-circuits on dead); index
-			// handle cursors likewise, with the closure mapping the
-			// stale to ErrKeyspaceClosed.
-			for _, c := range pks.openCursors {
-				c.inner.MarkStale()
-			}
-			pks.markIndexHandlesStale()
-			parent.deadKeyspaces = append(parent.deadKeyspaces, pks)
-			delete(parent.openKeyspaces, h)
+			killMergedKeyspaceHandle(parent, h, pks)
 		}
 	}
+}
+
+// killMergedKeyspaceHandle invalidates a parent handle whose keyspace
+// the child deleted (whether or not it then recreated the name),
+// mirroring within-tx DeleteKeyspace's invalidation (Inv-IHS3): the
+// child FreeSubtree'd this keyspace's row and index trees, so any
+// parent cursor or index iter still in flight would yield from freed
+// (and possibly reallocated) pages. Row cursors go stale (requireOpen
+// then short-circuits on dead); index handle cursors likewise, with
+// the closure mapping the stale to ErrKeyspaceClosed.
+func killMergedKeyspaceHandle(parent *Tx, h uniqueNameHandle, pks *Keyspace) {
+	pks.dead = true
+	for _, c := range pks.openCursors {
+		c.inner.MarkStale()
+	}
+	pks.markIndexHandlesStale()
+	parent.deadKeyspaces = append(parent.deadKeyspaces, pks)
+	delete(parent.openKeyspaces, h)
 }
 
 // mergeSetKeyspaceHandles is the Kind=1 partner of
 // mergeKeyspaceHandles.
 func mergeSetKeyspaceHandles(parent, child *Tx) {
+	// See mergeKeyspaceHandles: a name the child deleted then
+	// recreated must NOT resurrect the parent's old handle in place.
+	var childDeleted map[uniqueNameHandle]struct{}
+	for _, dk := range child.deadSetKeyspaces {
+		if childDeleted == nil {
+			childDeleted = make(map[uniqueNameHandle]struct{}, len(child.deadSetKeyspaces))
+		}
+		childDeleted[dk.name] = struct{}{}
+	}
 	for h, csks := range child.openSetKeyspaces {
 		if psks, ok := parent.openSetKeyspaces[h]; ok {
-			rootMoved := psks.desc.Root != csks.desc.Root
-			psks.desc = csks.desc
-			psks.state = csks.state
-			psks.dead = csks.dead
-			psks.indexes = csks.indexes
-			psks.regPathLen = csks.regPathLen
-			psks.reserveCharged = csks.reserveCharged
-			psks.reconcileIndexHandles()
-			if rootMoved {
-				psks.markSetCursorsStale()
+			if _, recreated := childDeleted[h]; recreated {
+				killMergedSetKeyspaceHandle(parent, h, psks)
+				// Fall through to the fresh-install branch below.
+			} else {
+				rootMoved := psks.desc.Root != csks.desc.Root
+				psks.desc = csks.desc
+				psks.state = csks.state
+				psks.dead = csks.dead
+				psks.indexes = csks.indexes
+				psks.regPathLen = csks.regPathLen
+				psks.reserveCharged = csks.reserveCharged
+				psks.reconcileIndexHandles()
+				if rootMoved {
+					psks.markSetCursorsStale()
+				}
+				continue
 			}
-			continue
 		}
 		if parent.openSetKeyspaces == nil {
 			parent.openSetKeyspaces = make(map[uniqueNameHandle]*SetKeyspace, len(child.openSetKeyspaces))
@@ -360,14 +405,19 @@ func mergeSetKeyspaceHandles(parent, child *Tx) {
 	}
 	for h, psks := range parent.openSetKeyspaces {
 		if _, stillOpen := child.openSetKeyspaces[h]; !stillOpen {
-			psks.dead = true
-			// SetCursor needs no explicit stale walk (requireOpen
-			// probes dead before touching outerCursor — the same
-			// argument as within-tx DeleteKeyspace), but index
-			// handle iters do (Inv-IHS3 mirror, as above).
-			psks.markIndexHandlesStale()
-			parent.deadSetKeyspaces = append(parent.deadSetKeyspaces, psks)
-			delete(parent.openSetKeyspaces, h)
+			killMergedSetKeyspaceHandle(parent, h, psks)
 		}
 	}
+}
+
+// killMergedSetKeyspaceHandle — the Kind=1 partner of
+// killMergedKeyspaceHandle. SetCursor needs no explicit stale walk
+// (requireOpen probes dead before touching outerCursor — the same
+// argument as within-tx DeleteKeyspace), but index handle iters do
+// (Inv-IHS3 mirror).
+func killMergedSetKeyspaceHandle(parent *Tx, h uniqueNameHandle, psks *SetKeyspace) {
+	psks.dead = true
+	psks.markIndexHandlesStale()
+	parent.deadSetKeyspaces = append(parent.deadSetKeyspaces, psks)
+	delete(parent.openSetKeyspaces, h)
 }
