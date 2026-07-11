@@ -74,12 +74,15 @@ type CheckOptions struct {
 	// plain Check (no Repair) for read-only diagnostics in that case.
 	//
 	// Repair is conservative (api-surface.md §Check, CopyTo, Compact): it frees a page ONLY when the
-	// structural walk completed without being stopped and emitted NO
-	// CheckError/CheckFatal. Any structural finding makes the reachable
-	// set unreliable, so a corrupt database reports its leaks with
-	// Repaired=false plus a CheckWarning "Repair.Skipped" and reclaims
-	// nothing. Reclaimed pages are reported as the usual BitmapLeak
-	// CheckWarning with Repaired=true. The freed bitmap is published
+	// structural walk completed without being stopped, emitted NO
+	// CheckError/CheckFatal, AND the RPL chain walk reached its
+	// authoritative tail or a reclaimed boundary. A structural finding
+	// makes the reachable set unreliable, and an RPL walk truncated at
+	// a corrupt-segment boundary hides still-pending segments whose
+	// entries then misclassify as leaked — either way the database
+	// reports its leaks with Repaired=false plus a CheckWarning
+	// "Repair.Skipped" and reclaims nothing. Reclaimed pages are
+	// reported as the usual BitmapLeak CheckWarning with Repaired=true. The freed bitmap is published
 	// through the normal commit pipeline (atomic meta-swap).
 	Repair bool
 
@@ -253,6 +256,22 @@ func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 				Message: "structural corruption present; leaked pages reported but not reclaimed (reachable set unreliable)"})
 			return
 		}
+		if c.rplBoundary {
+			// The RPL walk truncated at a corrupt-segment boundary: the
+			// leaked set may intersect the live writer's in-memory chain
+			// (this process frees those entries again when its
+			// reclamation reaches the segment — a double-free under any
+			// page re-allocated in between). Report unrepaired + skip,
+			// the structural-findings shape.
+			for _, id := range c.leaked {
+				if !c.emitLeak(id, false) {
+					return
+				}
+			}
+			c.emit(CheckIssue{Severity: CheckWarning, Code: "Repair.Skipped",
+				Message: "RPL chain walk stopped at a corrupt-segment boundary; leaked pages reported but not reclaimed (the set may intersect the live RPL)"})
+			return
+		}
 		if len(c.leaked) == 0 {
 			return // structurally clean, no leaks — nothing to commit
 		}
@@ -298,6 +317,22 @@ type checker struct {
 	// dirty walk leaves the reachable set unreliable, so Repair frees
 	// nothing).
 	sawError bool
+
+	// rplBoundary latches true when the RPL chain walk stopped at a
+	// footer/decode boundary — an AMBIGUOUS truncation (a segment can
+	// bitrot after the live writer built its in-memory chain, so the
+	// behind-boundary segments may still be live pending state whose
+	// entries then misclassify as leaked). Reclamation — background
+	// maintenance and Repair alike — must free nothing while it is
+	// set. A reclaimed boundary does NOT latch it: when every live
+	// handle's chain derives from a walk over the current image
+	// (crash recovery at Open, Resync after a TxnID advance), all
+	// walkers truncate there identically and behind-boundary pages
+	// are genuinely free. The residual — a surviving handle whose
+	// chain predates a peer's TORN, never-published reclamation
+	// (step-1 bitmap pwrites without the meta) — is recorded in
+	// background-maintenance.md §Bitmap Leak Reclamation.
+	rplBoundary bool
 
 	// repair, when set, makes accounting COLLECT the BitmapLeak set into
 	// leaked rather than emit it inline; checkRepair frees the set and
@@ -389,13 +424,23 @@ func (c *checker) run() {
 		}
 	}
 
+	// ONE bitmap copy shared by the RPL walk's reclaimed-boundary
+	// oracle and the accounting partition: the live bitmap has no MVCC
+	// (commits pwrite it in place), so two copies taken at different
+	// instants can disagree — the pending set built against the first
+	// and the free set read from the second would then emit spurious
+	// FreeAndPending/ReachableButFree CheckErrors on a healthy database
+	// under a concurrent writer. A single copy makes that incoherence
+	// unrepresentable.
+	bm, bmOK := c.snapshotBitmap()
+
 	// RPL chain → set of pages pending reclamation.
-	rplPages, ok := c.walkRPL(firstData, hwm)
+	rplPages, ok := c.walkRPL(firstData, hwm, bm, bmOK)
 	if !ok {
 		return
 	}
 
-	c.accounting(firstData, hwm, rplPages)
+	c.accounting(firstData, hwm, rplPages, bm, bmOK)
 
 	// Extractor-equivalence verification (opt-in). Runs after the
 	// structural walk so the inventory is complete and the
@@ -685,16 +730,16 @@ func (c *checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 // Hard walk errors surface as per-kind CheckError issues. firstData is
 // run()'s first-data-page boundary (the meta/bitmap region ends there).
 // Returns ok=false only when the caller stopped iterating.
-func (c *checker) walkRPL(firstData, hwm uint64) (bitset, bool) {
+func (c *checker) walkRPL(firstData, hwm uint64, bm *bitmap.Bitmap, bmOK bool) (bitset, bool) {
 	pending := newBitset(hwm)
 	head := c.meta.RPLHeadPage
 	if head == 0 {
 		return pending, true
 	}
-	// bm is the snapshot's allocation bitmap — the reclaimed-segment
-	// oracle; if unavailable the walk falls back to the footer/decode
-	// boundary alone.
-	bm, bmOK := c.snapshotBitmap()
+	// bm is run()'s single snapshot of the allocation bitmap — the
+	// reclaimed-segment oracle (shared with accounting so the two
+	// passes cannot disagree); if unavailable the walk falls back to
+	// the footer/decode boundary alone.
 	walk := pager.RPLChainWalk{
 		ReadPage:     c.pgr.PageRaw,
 		Cfg:          c.cfg,
@@ -722,9 +767,26 @@ func (c *checker) walkRPL(firstData, hwm uint64) (bitset, bool) {
 	if werr != nil {
 		return pending, c.emit(rplWalkIssue(werr, hwm))
 	}
-	if stop.Reason == pager.RPLWalkFooterBoundary {
+	// A footer/decode boundary is an AMBIGUOUS truncation: unlike the
+	// reclaimed boundary (whose behind-boundary segments every walker
+	// whose chain derives from the current image agrees are gone), a
+	// corrupt segment may have bitrotted AFTER the live writer built
+	// its in-memory chain, so segments behind it may still be live
+	// pending state. Latch the ambiguity for the reclamation gates
+	// (maintReclaimLeaks / Repair) and surface BOTH boundary kinds —
+	// pre-fix the decode boundary was silent, hiding the truncation
+	// from the operator.
+	switch stop.Reason {
+	case pager.RPLWalkFooterBoundary:
+		c.rplBoundary = true
 		if !c.emit(CheckIssue{Severity: CheckWarning, Code: "RPLSegmentChecksum", PageID: stop.PageID,
 			Message: fmt.Sprintf("RPL segment page %d fails checksum; chain walk stopped before tail %d (pages behind the boundary surface as BitmapLeak until reclamation quarantines the segment)", stop.PageID, c.meta.RPLTailPage)}) {
+			return pending, false
+		}
+	case pager.RPLWalkDecodeBoundary:
+		c.rplBoundary = true
+		if !c.emit(CheckIssue{Severity: CheckWarning, Code: "RPLSegmentBoundary", PageID: stop.PageID,
+			Message: fmt.Sprintf("RPL segment page %d does not decode; chain walk stopped before tail %d (pages behind the boundary surface as BitmapLeak until reclamation quarantines the segment)", stop.PageID, c.meta.RPLTailPage)}) {
 			return pending, false
 		}
 	}
@@ -773,9 +835,8 @@ func rplWalkIssue(werr *pager.RPLWalkError, hwm uint64) CheckIssue {
 // a reachable page the bitmap marks free is a ReachableButFree error; an
 // allocated page that is neither reachable nor RPL-pending is a
 // BitmapLeak warning. (page-accounting partition; api-surface.md §Check, CopyTo, Compact.)
-func (c *checker) accounting(firstData, hwm uint64, rplPages bitset) {
-	bm, ok := c.snapshotBitmap()
-	if !ok {
+func (c *checker) accounting(firstData, hwm uint64, rplPages bitset, bm *bitmap.Bitmap, bmOK bool) {
+	if !bmOK {
 		c.emit(CheckIssue{Severity: CheckWarning, Code: "BitmapUnavailable",
 			Message: "could not read allocation bitmap from snapshot; page accounting skipped"})
 		return

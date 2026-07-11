@@ -1594,12 +1594,17 @@ type CheckOptions struct {
     //
     // Repair is conservative: it frees a page ONLY when the structural
     // walk both completed (the caller did not break) and emitted NO
-    // CheckError/CheckFatal. Any structural finding makes the reachable
-    // set unreliable — a page under a walk-aborting corrupt subtree would
-    // be misclassified as leaked — so a corrupt database reports its
-    // would-be leaks with Repaired=false plus a CheckWarning
-    // "Repair.Skipped" and reclaims nothing. Reclaimed pages are reported
-    // as the usual BitmapLeak CheckWarning with Repaired=true.
+    // CheckError/CheckFatal, AND the RPL chain walk reached its
+    // authoritative tail or a reclaimed boundary. Any structural finding
+    // makes the reachable set unreliable — a page under a walk-aborting
+    // corrupt subtree would be misclassified as leaked — and an RPL walk
+    // truncated at a corrupt-segment (footer/decode) boundary hides
+    // still-pending segments whose entries then misclassify as leaked
+    // (background-maintenance.md §Bitmap Leak Reclamation) — so in either
+    // case the database reports its would-be leaks with Repaired=false
+    // plus a CheckWarning "Repair.Skipped" and reclaims nothing.
+    // Reclaimed pages are reported as the usual BitmapLeak
+    // CheckWarning with Repaired=true.
     //
     // The freed bitmap is published through the normal commit pipeline
     // (atomic meta-swap), so a crash mid-repair leaves either the

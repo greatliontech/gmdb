@@ -266,9 +266,12 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 // equality plus writer-pager identity, under the write grant) is
 // what makes the set trustworthy (background-maintenance.md
 // §Invariants). As with Repair, reclamation is gated on a clean walk
-// (no structural CheckError/CheckFatal): a walk-aborting corrupt subtree
-// would leave its live pages unvisited and thus mis-classified as leaked,
-// so on any structural finding the pass reclaims nothing and logs.
+// (no structural CheckError/CheckFatal) AND an RPL chain walk that
+// reached its authoritative tail or a reclaimed boundary: a
+// walk-aborting corrupt subtree leaves live pages unvisited, and an
+// RPL walk truncated at a corrupt-segment boundary hides still-pending
+// segments — both mis-classify live pages as leaked, so the pass
+// reclaims nothing and logs.
 //
 // Returns (freed, discarded): discarded=true means the guard rejected
 // a non-empty leaked set.
@@ -292,13 +295,26 @@ func (db *DB) maintReclaimLeaks(ctx context.Context) (freed int, discarded bool)
 		repair: true,                                  // collect c.leaked instead of emitting
 	}
 	c.run()
-	leaked, sawError, stopped := c.leaked, c.sawError, c.stopped
+	leaked, sawError, stopped, rplBoundary := c.leaked, c.sawError, c.stopped, c.rplBoundary
 	_ = rtx.Rollback()
 
 	if stopped || sawError {
 		// Structural issues present: the reachable set is unreliable, so
 		// reclaiming "leaked" pages could free live ones. Skip + log.
 		db.logger.Warn("gmdb: maintenance leak reclamation skipped — structural issues present in the snapshot")
+		return 0, false
+	}
+	if rplBoundary {
+		// The RPL walk truncated at a corrupt-segment boundary
+		// (footer/decode): segments behind it may still be in the live
+		// writer's in-memory chain — their entries classify as leaked
+		// only because the walk could not see them pending. Freeing
+		// them double-frees once the writer's own reclamation reaches
+		// the intact segments (background-maintenance.md §Bitmap Leak
+		// Reclamation: the walk must reach the authoritative tail or a
+		// reclaimed boundary). Skip; the set becomes reclaimable after
+		// the writer quarantines the corrupt segment.
+		db.logger.Warn("gmdb: maintenance leak reclamation skipped — RPL chain walk stopped at a corrupt-segment boundary")
 		return 0, false
 	}
 	if len(leaked) == 0 {

@@ -50,7 +50,7 @@ function. WIP = 1.
       base config for index trees (+ bulkload.md rider)
 - [x] 19. copy/check: verbatim-walk clamp, temp+rename destination,
       overflow-header validation (+ api-surface.md/checksums.md riders)
-- [ ] 20. maintenance: leak reclamation gated on tail-reached RPL walk
+- [x] 20. maintenance: leak reclamation gated on tail-reached RPL walk
       (+ background-maintenance.md rider)
 - [ ] 21. compaction: below-floor allocation for tree-page relocations
 - [ ] 22. specs: descriptive-drift sync batch

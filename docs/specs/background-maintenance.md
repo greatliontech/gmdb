@@ -63,6 +63,47 @@ Invariant: kind=clause-explicit;
     (Enforced by the TxnID + pager-identity guard in maintReclaimLeaks;
     pinned by TestMaintenanceReclaimDiscardsStaleDetection.)
 
+Invariant: kind=entailed;
+  property=Leak reclamation — background maintenance and
+    `CheckWithOptions(Repair)` alike — frees nothing when the
+    detection walk's RPL chain walk stopped at a footer/decode
+    boundary rather than reaching the authoritative tail or a
+    reclaimed boundary. A reclaimed boundary is safe when every
+    live handle's in-memory chain agrees with the on-disk
+    projection — self-authored (the ordinary single-writer case:
+    the image derives from the chain), or rebuilt by a walk over
+    the current image (crash recovery at Open, Resync after a
+    TxnID advance); only a peer's torn, never-published write
+    can break the agreement without advancing TxnID.
+    RESIDUAL GAP, recorded not closed: a surviving handle
+    whose chain predates a peer's TORN, never-published
+    reclamation (the peer died between its step-1 bitmap pwrites
+    and its meta publish) still lists segments the on-disk walk
+    sees behind a reclaimed boundary; no TxnID advanced, so no
+    Resync re-walks, and reclamation behind that boundary can
+    double-free exactly as below;
+    a footer/decode boundary is ambiguous — the segment
+    may have bitrotted AFTER the live writer built its in-memory
+    chain, in which case the still-pending segments behind it are
+    invisible to the walk and their entries misclassify as
+    leaked;
+  from=entailed: §Bitmap Leak Reclamation Safety says "absent
+    from the RPL" but no clause states which RPL — the walkable
+    on-disk projection and the live writer's in-memory chain can
+    diverge at exactly a corrupt segment;
+  violation=Bitrot one byte of a middle RPL segment: the
+    detection walk truncates there, an older INTACT segment's
+    entries classify as leaked and get freed, a user transaction
+    re-allocates one into the live tree, and the live writer's
+    own reclamation later consumes the intact in-memory segment
+    and frees the page under its new owner — double allocation,
+    silent corruption (demonstrated pre-fix: maintenance freed 30
+    pages behind the boundary).
+    (Enforced by the rplBoundary gate in maintReclaimLeaks and
+    checkRepair; pinned by
+    TestMaintenanceReclaimSkipsBehindRPLBoundary and
+    TestRepairSkipsBehindRPLBoundary.)
+
 Invariant: kind=clause-explicit;
   property=The checksum scrubber only reports corruption; it
     does not repair. Repair is the explicit `CheckWithOptions
@@ -204,7 +245,19 @@ and no tree references it. That argument covers only pages
 already leaked at snapshot time; because detection classifies
 against the LIVE bitmap, the snapshot-currency guard (step 2)
 is what makes the set trustworthy — see the reclamation
-invariant above.
+invariant above. It also presumes the detection walk saw the
+WHOLE RPL: the walk must have reached the authoritative tail or
+a reclaimed boundary (the latter safe only under the
+walker-agreement precondition the invariant above qualifies).
+A footer/decode truncation means segments
+behind the boundary — possibly still pending in the live
+writer's in-memory chain — were invisible, so their entries
+misclassify as leaked; reclamation then frees nothing (the set
+becomes reclaimable after the writer's own reclamation
+quarantines the corrupt segment and the chain no longer claims
+it). `CheckWithOptions(Repair)` applies the same gate: its
+exclusive access serialises writers but cannot make a truncated
+walk complete.
 
 **Trigger.** Every maintenance pass. Additionally, if `Open()`
 recovered to a durable epoch older than the selected meta's own
