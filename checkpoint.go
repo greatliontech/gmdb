@@ -167,7 +167,9 @@ func (db *DB) checkpointUnderGrant() error {
 		// sub-record is carried in BOTH slots. The persisted anchor
 		// therefore deliberately trails the in-process one in pure
 		// SyncDataOnly use (delayed peer reclamation, never
-		// unsafety).
+		// unsafety); peers close the gap through the tear-safe
+		// anchor persist channel (durability.md §Anchoring), never
+		// through a changed-bytes rewrite of this carrier.
 	} else {
 		meta.Durable = meta.LiveSubRecord()
 		meta.Durable.AnchoredTxnID = pgr.AnchoredEpoch()
@@ -180,6 +182,11 @@ func (db *DB) checkpointUnderGrant() error {
 		if err := stepErr(3); err != nil {
 			return failStep(3, err)
 		}
+		// The bump rewrote the active slot with CHANGED bytes: refresh
+		// the adopted-meta cache so the tear-safe anchor gate's
+		// byte-identity premise (cache == on-disk slot) stays true —
+		// the bumped meta is exactly what a peer would now adopt.
+		pgr.NoteAdoptedMeta(meta, activeIdx)
 	}
 
 	// Step 4 — fdatasync so the sub-record bump is durable. (Even if

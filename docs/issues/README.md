@@ -7,12 +7,14 @@ walked at every chunk-start gate (`N.1`) during the chunk roadmap —
 entries whose `Lands:` resolved to the current chunk were folded,
 redeferred, or closed.
 
-The v0 chunk roadmap and the architecture-consolidation plan are
-complete; their plans were deleted at close-out (`git log --all --
-docs/plans/<name>.md` recovers them). The active plan is
-`docs/plans/defect-audit-remediation.md`; its chunk-start gates (`N.1`)
-walk this index, and entries may also be pulled as a proactive
-burn-down — each resolved as its own change set: diagnose → fix →
+The v0 chunk roadmap, the architecture-consolidation plan, and the
+defect-audit remediation plan are complete; their plans were deleted
+at close-out (`git log --all -- docs/plans/<name>.md` recovers
+them). Every remaining entry is CONDITION-TRIGGERED: its `Lands:`
+names a self-contained condition, and the gates of whatever plan is
+active next walk this index at each chunk start. Entries may also be
+pulled as a proactive burn-down — each resolved as its own change
+set: diagnose → fix →
 regression test → adversarial review → promote-then-delete.
 
 When an issue is resolved, the load-bearing rationale moves inline
@@ -74,11 +76,8 @@ findings each shared-fix row covers.
 
 ## Open — defect audit (2026-07-10)
 
-`Lands:` numbers refer to `docs/plans/defect-audit-remediation.md`
-chunks (bottom-up by layer, grouped by function).
-
 | Slug | Lands | Summary |
 |------|-------|---------|
-| checkpoint-selfdurable-anchor-persist | 23 | [L] pure-SyncDataOnly Checkpoint leaves the persisted anchor trailing by one (peer reclamation delayed); persisting would rewrite the assertion's sole durable carrier in place — tear hazard |
 | copyto-hardlink-destination-support | when a non-hard-link destination filesystem is decided to be a supported CopyTo target | [L] publish fails on vfat/exfat/FUSE targets; [nit] NFS link() retransmission quirk |
 | reclaimed-boundary-torn-peer | when grant-handoff tear detection or reclaimed-boundary gating is settled | [H] surviving handle's chain predates a peer's torn never-published reclamation; reclamation behind the reclaimed boundary double-frees |
+| recovery-rewrite-identity-unverified | when a foreign/older-format writer can produce checksum-valid metas with nonzero padding | [L] gated Open's self-durable rewrite assumes encode∘decode identity; a padding-divergent meta would get a changed-bytes rewrite of the sole carrier |

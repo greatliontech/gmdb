@@ -1003,9 +1003,11 @@ func (db *DB) acquireWriteGrant(ctx context.Context) (*lock.Grant, *lock.Coord, 
 // our view stale. Without this a serialized cross-process writer builds
 // on a stale root (lost update), writes its meta over the slot holding
 // the peer's newer commit, and allocates from a stale bitmap (page
-// aliasing) — cross-process.md §Writer acquisition flow. Cheap no-op
-// when the on-disk active TxnID is unchanged (the common single-writer
-// path). On a Resync error the pager is fully unmodified
+// aliasing) — cross-process.md §Writer acquisition flow. Cheap when
+// the on-disk active TxnID is unchanged (the common single-writer
+// path): the bitmap/RPL rebuild is skipped, but the cached meta is
+// refreshed unconditionally (a peer's checkpoint bump changes the
+// sub-record without changing TxnID). On a Resync error the pager is fully unmodified
 // (attachState is atomic), so the handle stays usable — the caller
 // releases the grant and surfaces the error; no poison needed.
 //
@@ -1030,13 +1032,22 @@ func (db *DB) resyncPagerLocked() (*pager.Pager, *os.File, error) {
 	if pgr == nil || file == nil {
 		return nil, nil, ErrClosed
 	}
-	m, active, changed, err := pgr.Resync(file, db.currentMeta.TxnID)
+	m, active, _, err := pgr.Resync(file, db.currentMeta.TxnID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("gmdb: re-sync writer state on grant: %w", mapPagerErr(err))
 	}
-	if changed {
-		db.setMetaState(m, active)
-	}
+	// Refresh the cached meta UNCONDITIONALLY, not only on a TxnID
+	// change: a peer's CHECKPOINT BUMP rewrites the active slot's
+	// durable sub-record without changing TxnID, so a TxnID-equality
+	// gate would leave db.currentMeta stale — the next commit's
+	// buildNewMeta then carries a RETREATED durable epoch into its
+	// meta (a crash after it discards the peer's checkpointed epochs),
+	// and Checkpoint would evaluate SelfDurable() on the pre-bump
+	// struct and pwrite CHANGED bytes over the self-durable slot that
+	// is the sole durable carrier of its own assertion. Resync's own
+	// TxnID-equality check still gates the expensive bitmap/RPL
+	// rebuild — only the cached-meta refresh is unconditional.
+	db.setMetaState(m, active)
 	return pgr, file, nil
 }
 

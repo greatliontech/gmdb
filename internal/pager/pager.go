@@ -1,6 +1,7 @@
 package pager
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -154,6 +155,14 @@ type Pager struct {
 	// compaction pass. See rplreloc.go.
 	rplRelocFloor    uint64
 	rplRelocDeclined bool
+
+	// adoptedMeta / adoptedSlot cache the most recently adopted active
+	// meta (Resync, live-join attach, commit step 3 for our own) so the
+	// tear-safe anchor gate (gateAnchorAdvance) can rewrite it
+	// byte-identically without re-reading the file. adoptedSlot < 0
+	// means no adoption recorded (fresh pager pre-attach).
+	adoptedMeta Meta
+	adoptedSlot int
 
 	// anchoredEpoch is the newest DurableTxnID assertion this handle
 	// knows to be covered by a COMPLETED fdatasync (durability.md
@@ -368,12 +377,13 @@ func NewReader(file *os.File, cfg page.Config, reservationBytes int64) (*Pager, 
 		return nil, fmt.Errorf("pager: stat: %w", err)
 	}
 	return &Pager{
-		cfg:      cfg,
-		file:     file,
-		fops:     osFileOps{f: file},
-		mmap:     mapping,
-		fileSize: st.Size(),
-		readOnly: true,
+		cfg:         cfg,
+		file:        file,
+		fops:        osFileOps{f: file},
+		adoptedSlot: -1,
+		mmap:        mapping,
+		fileSize:    st.Size(),
+		readOnly:    true,
 	}, nil
 }
 
@@ -772,8 +782,92 @@ func (p *Pager) ReclaimFreeSpace() int {
 	if p.refreshReclamationBound != nil {
 		p.reclamationBound = p.refreshReclamationBound()
 	}
+	if p.gateAnchorAdvance() && p.refreshReclamationBound != nil {
+		p.reclamationBound = p.refreshReclamationBound()
+	}
 	return p.reclaimRPL()
 }
+
+// gateAnchorAdvance is the tear-safe anchor persist channel
+// (durability.md §Anchoring): when the adopted active meta is
+// SELF-DURABLE but its persisted AnchoredDurableTxnID trails its own
+// DurableTxnID — the shape a SyncDataOnly commit or a checkpointed
+// self-durable meta leaves behind, whose in-process anchor advance
+// never reaches a peer — this handle may adopt the meta's own
+// DurableTxnID as anchored only through ITS OWN completed fsync:
+// rewrite the active slot BYTE-IDENTICALLY, then fdatasync. Mirrors
+// the gated Open's recovery rewrite and shares its two load-bearing
+// properties: byte-identical means a torn write is harmless (any mix
+// of identical bytes is identical — the sole durable carrier cannot
+// be destroyed) and the rewrite re-dirties the page so a prior failed
+// fsync's consumed writeback error cannot let the fdatasync succeed
+// trivially. Lazy: called from the reclamation path only when the
+// trailing anchor is the binding constraint AND pending RPL entries
+// would actually become eligible — never on hot per-commit paths (a
+// SyncDurable commit's own step 4 already advances the in-process
+// anchor, making the gate a no-op). Returns whether the anchor
+// advanced. A rewrite or fsync failure leaves the anchor unadvanced
+// (conservative — reclamation stays delayed) and reports nothing: the
+// gate is an opportunistic advance, not an obligation.
+func (p *Pager) gateAnchorAdvance() bool {
+	if p.readOnly || p.adoptedSlot < 0 {
+		return false
+	}
+	m := p.adoptedMeta
+	if !m.SelfDurable() || p.anchoredEpoch >= m.Durable.TxnID {
+		return false
+	}
+	// Gain check: the advance must unblock something — the bound is
+	// anchor-limited (a reader-limited bound would not move) and the
+	// oldest pending segment sits in [anchored, durable).
+	if p.reclamationBound < p.anchoredEpoch {
+		return false // reader-limited: advancing the anchor moves nothing
+	}
+	if len(p.rplSegments) == 0 {
+		return false
+	}
+	oldest := p.rplSegments[0].TxnID
+	if oldest < p.anchoredEpoch || oldest >= m.Durable.TxnID {
+		return false
+	}
+	buf := make([]byte, p.cfg.PageSize)
+	EncodeMeta(buf, &m)
+	// Byte-identity is LOAD-BEARING, so verify it rather than assume
+	// it: read the slot back and compare. The tear-safety argument
+	// rests on the rewrite being identical to the on-disk bytes; any
+	// divergence (an encode/decode drift, foreign nonzero padding a
+	// checksum-valid meta could carry) would silently re-introduce the
+	// changed-bytes rewrite of the sole durable carrier this channel
+	// exists to avoid. Mismatch → skip, conservative.
+	onDisk := make([]byte, p.cfg.PageSize)
+	if _, err := p.fops.ReadAt(onDisk, int64(p.adoptedSlot)*int64(p.cfg.PageSize)); err != nil {
+		return false
+	}
+	if !bytes.Equal(buf, onDisk) {
+		return false
+	}
+	if _, err := p.fops.WriteAt(buf, int64(p.adoptedSlot)*int64(p.cfg.PageSize)); err != nil {
+		return false
+	}
+	if err := p.fops.Fdatasync(); err != nil {
+		return false
+	}
+	p.advanceAnchoredEpoch(m.Durable.TxnID)
+	return true
+}
+
+// noteAdoptedMeta records the active meta + slot for gateAnchorAdvance.
+func (p *Pager) noteAdoptedMeta(m Meta, slot int) {
+	p.adoptedMeta = m
+	p.adoptedSlot = slot
+}
+
+// NoteAdoptedMeta is noteAdoptedMeta for callers outside the package —
+// the checkpoint bump rewrites the active slot with changed bytes, so
+// it must refresh the adopted-meta cache (the bumped meta is exactly
+// what a peer would adopt) to keep the tear-safe gate's byte-identity
+// premise true.
+func (p *Pager) NoteAdoptedMeta(m Meta, slot int) { p.noteAdoptedMeta(m, slot) }
 
 // FileSize returns the file size observed at Open. Used to bound reads
 // (callers must additionally respect HighWaterMark from the active meta).

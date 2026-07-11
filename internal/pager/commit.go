@@ -165,6 +165,12 @@ func (p *Pager) Commit(cp CommitParams, prev Meta, prevActive int) (CommitResult
 		p.AbortTx()
 		return CommitResult{}, fmt.Errorf("pager: step 3 write meta %d: %w", newActive, err)
 	}
+	// Our own new meta is now the active one — the tear-safe anchor
+	// gate (gateAnchorAdvance) rewrites the ADOPTED meta, so keep the
+	// cache current (a SyncDataOnly commit leaves this meta
+	// self-durable with a trailing persisted anchor; the gate may
+	// later advance it through our own fsync).
+	p.noteAdoptedMeta(newMeta, newActive)
 
 	// Test injection point — see commitStep4HookForTest doc on Pager.
 	// Fires after step 3's pwrite has placed the new meta on disk so

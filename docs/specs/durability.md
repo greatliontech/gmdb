@@ -178,7 +178,49 @@ Each meta persists `AnchoredDurableTxnID` — the anchored epoch as
 known (completed) by its writer — so a peer acquiring the grant can
 bound reclamation without a channel beyond the meta itself; the
 live writer may additionally use its own newer in-process
-anchoring knowledge (fsyncs it has observed complete). After a
+anchoring knowledge (fsyncs it has observed complete).
+
+**The tear-safe persist channel.** A SELF-DURABLE meta whose
+persisted `AnchoredDurableTxnID` trails its own `DurableTxnID` —
+the shape every fsyncing commit leaves behind (`SyncDurable` and
+`SyncDataOnly` alike persist only the pre-commit anchored value,
+per no-forward-promise) and every checkpointed self-durable meta
+retains, because the checkpoint persist is deliberately withheld (§Checkpoint mechanics step 3: the meta is
+the sole durable carrier of its own assertion, and an in-place
+rewrite with CHANGED bytes risks a torn fsync destroying it) —
+still lets a peer reach the full anchor: the adopting handle may
+advance to the meta's own `DurableTxnID` only through ITS OWN
+completed fsync, by rewriting the active slot BYTE-IDENTICALLY and
+then fdatasync'ing. This mirrors the gated Open's recovery rewrite
+and inherits both of its load-bearing properties: byte-identical
+content makes any torn write harmless (every mix of identical
+bytes is identical — the sole carrier cannot be destroyed, which
+is exactly what a changed-bytes persist could not guarantee), and
+the rewrite re-dirties the page so a previously-failed fsync's
+consumed writeback error cannot let the gate's fdatasync succeed
+trivially. A failed gate write or fsync leaves the anchor
+unadvanced — conservative: reclamation stays delayed, the bound
+never names an assertion the disk did not witness. Byte-identity
+is VERIFIED, not assumed: before writing, the gate reads the slot
+back and compares; any divergence (an encode/decode drift, foreign
+nonzero padding on a checksum-valid meta) skips the gate the same
+conservative way — a changed-bytes rewrite of the sole carrier is
+exactly the hazard this channel exists to avoid. The gate runs
+LAZILY on the eager reclamation path (background maintenance and
+compaction), and only when the trailing anchor is the binding
+constraint with pending retirements in the `[anchored, durable)`
+window; allocation-pressure reclamation does not consult it — a
+handle's own next completed fsync subsumes the advance anyway
+(it anchors everything pwritten before it). The persisted FIELD
+catches up at the handle's next commit, whose new meta lands in
+the OTHER slot — tear-safe by the dual-slot protocol. (Pinned by
+TestGateAnchorAdvanceUnblocksReclaim,
+TestGateAnchorAdvanceFailureConservative,
+TestGateAnchorAdvanceDivergenceSkips, and
+TestGateAnchorAdvanceSkips; the withheld checkpoint persist by
+TestCheckpointSelfDurableAnchorsInProcessOnly; the peer-bump
+resync refresh by TestPeerCheckpointBumpSurvivesNextCommit and
+TestPeerCheckpointBumpThenOwnCheckpointSkips.) After a
 crash, anything read from disk is durable by definition, so a
 freshly-recovered handle treats the selected meta's `DurableTxnID`
 itself as anchored — and because a PROCESS crash leaves the OS page
@@ -268,7 +310,9 @@ step. (Pinned by `TestCleanCloseCheckpointsSyncLazy`,
    hazard (its sub-record is carried in BOTH slots). Consequence
    of the skip: the persisted `AnchoredDurableTxnID` deliberately
    TRAILS the in-process anchored epoch in pure `SyncDataOnly`
-   use — delayed peer reclamation, never unsafety.
+   use — delayed peer reclamation, never unsafety; a peer closes
+   the gap through the tear-safe persist channel (§Anchoring),
+   never through a changed-bytes rewrite of this carrier.
 4. `fdatasync(fd)` again so the sub-record bump itself reaches
    stable storage.
 5. Release the write lock.

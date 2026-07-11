@@ -224,6 +224,7 @@ func (p *Pager) AttachLatest(file *os.File) (Meta, int, error) {
 	if err := p.attachState(file, m); err != nil {
 		return Meta{}, 0, err
 	}
+	p.noteAdoptedMeta(m, active)
 	return m, active, nil
 }
 
@@ -507,8 +508,11 @@ func (p *Pager) attachState(file *os.File, m Meta) error {
 // On a corrupt on-disk image (both metas invalid, forged BitmapPages, corrupt
 // RPL chain) or a meta-read I/O error, Resync returns a wrapped error with the
 // pager left **fully unmodified** (attachState is atomic and the read/select
-// steps precede it) — except the monotone anchored-epoch advance, which is
-// always safe — so the caller releases the grant and returns the error
+// steps precede it) — except the monotone anchored-epoch advance and the
+// adopted-meta note for the tear-safe anchor gate, both always safe (the
+// note is refreshed from a fresh under-grant read on every later Resync
+// before any gate can consume it) — so the caller releases the grant and
+// returns the error
 // without poisoning — the handle stays usable (a retry re-reads; Close +
 // re-Open invokes Open's own corruption recovery).
 func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m Meta, active int, changed bool, err error) {
@@ -525,6 +529,7 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m Meta, active int, ch
 		return Meta{}, 0, false, err
 	}
 	p.advanceAnchoredEpoch(m.Durable.AnchoredTxnID)
+	p.noteAdoptedMeta(m, active)
 	if m.TxnID == knownTxnID {
 		return m, active, false, nil
 	}
@@ -599,6 +604,7 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 			return Meta{}, 0, false, fmt.Errorf("pager: anchor fdatasync: %w", err)
 		}
 		p.advanceAnchoredEpoch(selected.Durable.TxnID)
+		p.noteAdoptedMeta(selected, selectedIdx)
 		return selected, selectedIdx, false, nil
 	}
 
@@ -640,6 +646,7 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 	// The completed fsync anchors the recovery meta's own assertion;
 	// re-seed the commit state to the published meta's view.
 	p.advanceAnchoredEpoch(rm.Durable.TxnID)
+	p.noteAdoptedMeta(rm, newIdx)
 	p.SetCommitState(rm.HighWaterMark, rm.MaxSize, p.anchoredEpoch)
 	return rm, newIdx, true, nil
 }
