@@ -113,7 +113,14 @@ Invariant: kind=entailed;
     cursor is stale, re-pointed at the still-live pre-delete tree —
     re-positioning via First/Last/Seek* resumes safely; the error
     never leaves a cursor whose root was deallocated by its own
-    rollback;
+    rollback. The `SetCursor.Delete()` analogue surfaces the same
+    class of failure but with the APPLIED-WITH-ERROR arm: its
+    deletion commits its own savepoint before the successor
+    re-seek, so on a re-seek failure the deletion STAYS applied and
+    `Delete()` returns the error (wrapped, naming the re-seek) —
+    never a spurious nil that a drain loop would read as
+    end-of-iteration. (Pinned by
+    `TestSetCursorDeleteSurfacesReseekCorruption`.);
   from=entailed: cursor state machine (this spec) + cursor stack
     tolerance (`page-formats.md` §Cursor Iteration);
   violation=Cursor desync after delete causes the delete-range loop

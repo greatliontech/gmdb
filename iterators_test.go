@@ -2,6 +2,7 @@ package gmdb
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 )
@@ -129,4 +130,160 @@ func collectPairs(seq func(func([]byte, []byte) bool)) []string {
 		out = append(out, string(kb)+"="+string(vb))
 	}
 	return out
+}
+
+// Constructing an iterator on a handle whose transaction state
+// forbids every operation must PANIC — a silently empty sequence is
+// indistinguishable from no data (api-surface.md §Range Iterators).
+func TestIteratorConstructionPanicsOnGuardErrors(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	ks, err := tx.CreateKeyspace("ks")
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	sks, err := tx.CreateSetKeyspace("sks", nil)
+	if err != nil {
+		t.Fatalf("CreateSetKeyspace: %v", err)
+	}
+	mustPanic := func(name string, fn func()) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: no panic (silent empty sequence)", name)
+			}
+		}()
+		fn()
+	}
+	// Frozen parent (child active): every constructor panics.
+	child, err := tx.BeginChild()
+	if err != nil {
+		t.Fatalf("BeginChild: %v", err)
+	}
+	mustPanic("All frozen", func() { ks.All() })
+	mustPanic("Range frozen", func() { ks.Range(nil, nil) })
+	mustPanic("Prefix frozen", func() { ks.Prefix(nil) })
+	mustPanic("set All frozen", func() { sks.All() })
+	mustPanic("set Range frozen", func() { sks.Range(nil, nil) })
+	mustPanic("set Prefix frozen", func() { sks.Prefix(nil) })
+	if err := child.Rollback(); err != nil {
+		t.Fatalf("child Rollback: %v", err)
+	}
+	// Unfrozen: constructors work again (ErrChildActive is transient)
+	// and actually deliver rows.
+	if err := ks.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	rows := 0
+	for range ks.All() {
+		rows++
+	}
+	if rows != 1 {
+		t.Fatalf("post-resolve iteration yielded %d rows, want 1", rows)
+	}
+	// Dead keyspace handle: panics (ErrKeyspaceClosed class).
+	if err := tx.DeleteKeyspace("ks"); err != nil {
+		t.Fatalf("DeleteKeyspace: %v", err)
+	}
+	mustPanic("All dead handle", func() { ks.All() })
+	// Closed tx: panics again (ErrTxClosed class — the tx-closed
+	// check precedes the DB-closed check in requireOpen).
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	mustPanic("All closed tx", func() { sks.All() })
+}
+
+// The ErrClosed (closed-DB) guard class needs an OPEN transaction on
+// a closed DB — the supported use-after-Close shape.
+func TestIteratorConstructionPanicsOnClosedDB(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	ks, err := tx.CreateKeyspace("ks")
+	if err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Logf("Close: %v (live-write-tx skip path)", err)
+	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("All() on an open tx of a closed DB: no panic (ErrClosed class)")
+		}
+	}()
+	ks.All()
+}
+
+// The typed layer's All/Range/Prefix run the construction guard
+// EAGERLY: the panic fires at the typed call itself, never deferred
+// to loop start (api-surface.md §Range Iterators).
+func TestTypedIteratorConstructionPanicsEagerly(t *testing.T) {
+	tks, cleanup := newTypedNumsKS(t, 3)
+	defer cleanup()
+	// Freeze the parent.
+	child, err := tks.ks.tx.BeginChild()
+	if err != nil {
+		t.Fatalf("BeginChild: %v", err)
+	}
+	defer child.Rollback()
+	mustPanicHere := func(name string, fn func()) {
+		t.Helper()
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: no panic at the typed constructor call", name)
+			}
+		}()
+		fn()
+	}
+	// The constructor CALL panics — the returned seq is never ranged.
+	mustPanicHere("typed All", func() { _ = tks.All() })
+	mustPanicHere("typed Range", func() { _ = tks.Range(nil, nil) })
+	mustPanicHere("typed Prefix", func() { _ = tks.Prefix(1) })
+}
+
+// failingEncoder always errors — the encode-failure branch of the
+// typed constructors must still run the construction guard first
+// (an unusable handle panics regardless of bound validity).
+type failingEncoder struct{ Uint64Encoder }
+
+func (failingEncoder) AppendEncode(dst []byte, v uint64) ([]byte, error) {
+	return nil, errors.New("encode always fails")
+}
+
+func TestTypedIteratorEncodeFailureStillGuards(t *testing.T) {
+	tks, cleanup := newTypedNumsKS(t, 1)
+	defer cleanup()
+	bad := &TypedKeyspaceHandle[uint64, string]{
+		ks:     tks.ks,
+		keyEnc: failingEncoder{},
+		valEnc: tks.valEnc,
+	}
+	child, err := tks.ks.tx.BeginChild()
+	if err != nil {
+		t.Fatalf("BeginChild: %v", err)
+	}
+	defer child.Rollback()
+	one := uint64(1)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Range with failing encoder on a frozen handle: no panic")
+		}
+	}()
+	bad.Range(&one, nil)
 }

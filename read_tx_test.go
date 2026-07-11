@@ -876,3 +876,34 @@ func TestLeakedReadTxReleasesSlotAfterDBClose(t *testing.T) {
 		t.Fatalf("ActiveReaders = %d, want 0 (leaked ReadTx's slot stranded past DB.Close)", n)
 	}
 }
+
+// View joins fn's error with the cleanup error, per its doc — a slot
+// release/munmap failure must not vanish behind fn's error.
+func TestViewJoinsCleanupError(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	sentinel := errors.New("fn failed")
+	err = db.View(ctx, func(rtx *ReadTx) error {
+		// Force a cleanup error: View's own Rollback then returns
+		// ErrTxClosed (the deterministic cleanup-error seam).
+		_ = rtx.Rollback()
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("View = %v, want fn's error present", err)
+	}
+	if !errors.Is(err, ErrTxClosed) {
+		t.Fatalf("View = %v, want the cleanup error joined per the doc", err)
+	}
+	// Common path (fn fails, cleanup succeeds): fn's error IDENTITY is
+	// preserved — no unconditional wrapping (Update's documented
+	// shape).
+	err = db.View(ctx, func(rtx *ReadTx) error { return sentinel })
+	if err != sentinel {
+		t.Fatalf("View = %#v, want the exact sentinel identity on the common path", err)
+	}
+}

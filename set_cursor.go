@@ -504,7 +504,12 @@ func (c *SetCursor) CountValues() (uint64, error) {
 //
 // Errors: ErrCursorUnpositioned, ErrReadOnly (read-only tx),
 // ErrTxClosed, ErrKeyspaceClosed, ErrCorrupted (wrapped on
-// structural fault during the re-seek).
+// structural fault during the re-seek). A re-seek failure is
+// APPLIED-WITH-ERROR: the deletion committed its own savepoint
+// before the successor walk, so it stays applied — the error
+// reports the re-seek, and the cursor is dead (Err() set); the
+// pair really is gone (transactions.md §Cursor state machine,
+// post-delete invariant).
 func (c *SetCursor) Delete() error {
 	if !c.requireFresh(true) {
 		if c.closeErr != nil {
@@ -554,50 +559,77 @@ func (c *SetCursor) Delete() error {
 		next := append(append([]byte(nil), k...), 0x00)
 		ck, _ := c.outerCursor.SeekGE(next)
 		if ck == nil {
+			// nil is end-of-iteration ONLY when the walk succeeded: a
+			// structural failure during the successor re-seek must
+			// surface, never masquerade as a clean end — the deletion
+			// is already applied (its savepoint released) and STAYS
+			// applied; the error reports the re-seek, not the delete
+			// (transactions.md §Cursor.Delete post-delete state,
+			// applied-with-error arm).
+			if err := mapBtreeErr(c.outerCursor.Err()); err != nil {
+				c.closeErr = err
+				return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", err)
+			}
 			return nil
 		}
 		if err := c.materializeAtOuter(); err != nil {
 			c.closeErr = err
-			return err
+			return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", err)
 		}
 		if c.valSetFirst() == nil && c.closeErr != nil {
-			return c.closeErr
+			return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", c.closeErr)
 		}
 		return nil
 	}
 	// In-key: re-Seek to sucKey, then SeekValue to sucValue.
+	// The two Err() checks below guard DEFENSIVE arms: Seek(k)
+	// re-walks the root→k path DeleteValue just traversed and
+	// rewrote, so an in-spec structural failure here has no known
+	// reachable fixture (unlike the cross-key arm above, whose
+	// successor lives on a page the delete never touched — the
+	// pinned case). They surface rather than swallow on the same
+	// applied-with-error contract.
 	ck, _ := c.outerCursor.Seek(sucKey)
 	if ck == nil {
+		if err := mapBtreeErr(c.outerCursor.Err()); err != nil {
+			c.closeErr = err
+			return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", err)
+		}
 		// Defensive: the key vanished between delete and re-seek
 		// (shouldn't happen — we deleted a value, not the key).
 		// Fall back to SeekGE past k.
 		next := append(append([]byte(nil), k...), 0x00)
 		ck2, _ := c.outerCursor.SeekGE(next)
 		if ck2 == nil {
+			if err := mapBtreeErr(c.outerCursor.Err()); err != nil {
+				c.closeErr = err
+				return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", err)
+			}
 			return nil
 		}
 		if err := c.materializeAtOuter(); err != nil {
 			c.closeErr = err
-			return err
+			return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", err)
 		}
 		if c.valSetFirst() == nil && c.closeErr != nil {
-			return c.closeErr
+			return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", c.closeErr)
 		}
 		return nil
 	}
 	if err := c.materializeAtOuter(); err != nil {
 		c.closeErr = err
-		return err
+		return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", err)
 	}
 	if _, ok := c.valSeek(sucValue); !ok {
 		if c.closeErr != nil {
-			return c.closeErr // read error during the re-seek, not a miss
+			// Read error during the re-seek, not a miss.
+			return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", c.closeErr)
 		}
 		// Defensive: the successor value vanished (post-demote
 		// merge of values? shouldn't happen). Fall back to the
 		// first value.
 		if c.valSetFirst() == nil && c.closeErr != nil {
-			return c.closeErr
+			return fmt.Errorf("gmdb: SetCursor.Delete: walking to the post-delete successor (deletion applied): %w", c.closeErr)
 		}
 	}
 	return nil

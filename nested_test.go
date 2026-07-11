@@ -877,3 +877,61 @@ func TestUpdateFnErrorWithOpenChildReturnsFnErrorAlone(t *testing.T) {
 	}
 	_ = tx.Rollback()
 }
+
+// A child's SetFileFormat merges into the parent at child commit —
+// last set wins — and persists with the parent's commit; a child
+// ROLLBACK discards it (transactions.md §Nested Transactions: the
+// child's entries merge into the parent).
+func TestChildSetFileFormatMergesOnCommit(t *testing.T) {
+	ctx := context.Background()
+	db := openNestedTestDB(t)
+	const ps uint64 = 4096
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	child, err := tx.BeginChild()
+	if err != nil {
+		t.Fatalf("BeginChild: %v", err)
+	}
+	want := FileFormat{Lower: 20 * ps, Upper: db.Meta().MaxSize * ps, GrowStep: 8 * ps, ShrinkThreshold: 16 * ps}
+	if err := child.SetFileFormat(want); err != nil {
+		t.Fatalf("child SetFileFormat: %v", err)
+	}
+	if err := child.Commit(); err != nil {
+		t.Fatalf("child Commit: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("parent Commit: %v", err)
+	}
+	m := db.Meta()
+	if got := m.MinSize * ps; got != want.Lower {
+		t.Errorf("MinSize = %d bytes, want %d (child's SetFileFormat dropped)", got, want.Lower)
+	}
+	if got := m.GrowStep * ps; got != want.GrowStep {
+		t.Errorf("GrowStep = %d bytes, want %d", got, want.GrowStep)
+	}
+
+	// Rollback arm: a child's override dies with the child.
+	tx2, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin 2: %v", err)
+	}
+	child2, err := tx2.BeginChild()
+	if err != nil {
+		t.Fatalf("BeginChild 2: %v", err)
+	}
+	if err := child2.SetFileFormat(FileFormat{Lower: 30 * ps, Upper: db.Meta().MaxSize * ps, GrowStep: 4 * ps, ShrinkThreshold: 8 * ps}); err != nil {
+		t.Fatalf("child2 SetFileFormat: %v", err)
+	}
+	if err := child2.Rollback(); err != nil {
+		t.Fatalf("child2 Rollback: %v", err)
+	}
+	if err := tx2.Commit(); err != nil {
+		t.Fatalf("parent2 Commit: %v", err)
+	}
+	if got := db.Meta().MinSize * ps; got != want.Lower {
+		t.Errorf("MinSize = %d after child rollback, want unchanged %d", got, want.Lower)
+	}
+}

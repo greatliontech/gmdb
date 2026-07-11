@@ -1225,6 +1225,21 @@ func (ks *SetKeyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte]
 func (ks *SetKeyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte]
 ```
 
+Constructing an iterator on a handle whose state forbids every
+operation — a parent frozen by an active child (`ErrChildActive`),
+a closed transaction (`ErrTxClosed`), a closed DB (`ErrClosed`), or
+a DEAD keyspace handle (`ErrKeyspaceClosed`, the keyspace deleted
+in this transaction) — PANICS at the `All`/`Range`/`Prefix` call:
+these are programmer errors, and a silently empty sequence would be
+indistinguishable from no data (the Seq2 shape has no error
+channel). The typed layer's `All`/`Range`/`Prefix` run the same
+guard eagerly, so the panic fires at the typed call too, not at
+loop start. A state change AFTER construction (mid-loop close or
+freeze) still ends the sequence silently, like the stale contract.
+(Pinned by `TestIteratorConstructionPanicsOnGuardErrors`,
+`TestIteratorConstructionPanicsOnClosedDB`, and
+`TestTypedIteratorConstructionPanicsEagerly`.)
+
 Mutation during iteration: a loop-body mutation on the same keyspace
 stales the iterator's cursor and ENDS the sequence early (the Seq2
 error model has no channel; the stale surfaces as end-of-sequence) —

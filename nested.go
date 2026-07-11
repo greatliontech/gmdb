@@ -93,6 +93,16 @@ func (tx *Tx) commitChild() error {
 	parent.pendingDeletes = tx.pendingDeletes
 	parent.ksPathLen = tx.ksPathLen
 
+	// A child's SetFileFormat override merges like any other entry
+	// (transactions.md §Nested Transactions): the LAST set wins — a
+	// child that never called SetFileFormat has a nil override and
+	// leaves the parent's pending value untouched; rollback discards
+	// the child's copy with the rest of its state. No BeginChild seed
+	// is needed: composition comes entirely from this merge.
+	if tx.pendingFileFormat != nil {
+		parent.pendingFileFormat = tx.pendingFileFormat
+	}
+
 	mergeKeyspaceHandles(parent, tx)
 	mergeSetKeyspaceHandles(parent, tx)
 	// The merged obligation set is now the parent's; re-price the

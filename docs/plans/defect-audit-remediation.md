@@ -38,7 +38,7 @@ function. WIP = 1.
 - [x] 13. batch: Goexit isolation, post-acceptance ctx contract,
       cascade reserve re-price, self-commit outcome doc
       (+ transactions.md rider)
-- [ ] 14. tx: child SetFileFormat merge, View error join, iterator
+- [x] 14. tx: child SetFileFormat merge, View error join, iterator
       guard-error surfacing
 - [ ] 15. db: daemon goroutines stop pinning *DB — handle-leak
       detection reachable; LaggingReader reentrancy doc

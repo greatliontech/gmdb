@@ -178,8 +178,9 @@ func (t *TypedSetKeyspaceHandle[K, V]) Cursor() *TypedSetCursor[K, V] {
 // (a cursor / decode error ends the sequence — use Cursor()+Err() for
 // error visibility), matching TypedKeyspaceHandle.
 func (t *TypedSetKeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
+	seq := t.sks.All() // eager: the construction guard fires HERE, not at loop start
 	return func(yield func(K, V) bool) {
-		for kb, vb := range t.sks.All() {
+		for kb, vb := range seq {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
@@ -189,16 +190,17 @@ func (t *TypedSetKeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
 }
 
 func (t *TypedSetKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V] {
+	// Eager construction — uniform with the raw iterators and typed
+	// All; encode failure keeps its silent-empty contract.
+	sb, serr := encodeBound(t.keyEnc, start)
+	eb, eerr := encodeBound(t.keyEnc, end)
+	if serr != nil || eerr != nil {
+		guardIterConstruction(t.sks.tx, t.sks.dead)
+		return func(yield func(K, V) bool) {}
+	}
+	seq := t.sks.Range(sb, eb)
 	return func(yield func(K, V) bool) {
-		sb, err := encodeBound(t.keyEnc, start)
-		if err != nil {
-			return
-		}
-		eb, err := encodeBound(t.keyEnc, end)
-		if err != nil {
-			return
-		}
-		for kb, vb := range t.sks.Range(sb, eb) {
+		for kb, vb := range seq {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
@@ -208,12 +210,15 @@ func (t *TypedSetKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 }
 
 func (t *TypedSetKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
+	// Eager construction — see Range.
+	pb, perr := t.keyEnc.AppendEncode(nil, prefix)
+	if perr != nil {
+		guardIterConstruction(t.sks.tx, t.sks.dead)
+		return func(yield func(K, V) bool) {}
+	}
+	seq := t.sks.Prefix(pb)
 	return func(yield func(K, V) bool) {
-		pb, err := t.keyEnc.AppendEncode(nil, prefix)
-		if err != nil {
-			return
-		}
-		for kb, vb := range t.sks.Prefix(pb) {
+		for kb, vb := range seq {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return

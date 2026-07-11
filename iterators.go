@@ -2,6 +2,7 @@ package gmdb
 
 import (
 	"bytes"
+	"fmt"
 	"iter"
 )
 
@@ -19,6 +20,15 @@ import (
 // that must observe such errors should iterate with Cursor() and check
 // Err(). The typed layer (TypedKeyspaceHandle / TypedSetKeyspaceHandle) delegates to these.
 //
+// Guard errors PANIC at construction (api-surface.md §Range
+// Iterators): calling All/Range/Prefix on a handle whose transaction
+// is frozen by an active child (ErrChildActive), closed
+// (ErrTxClosed), or whose DB is closed (ErrClosed) is a programmer
+// error — a silently empty sequence is indistinguishable from no
+// data, and the Seq2 shape has no error channel to report through.
+// Mid-loop state changes still end the sequence silently (the stale
+// contract).
+//
 // Registration lifecycle: each closure registers its cursor while the
 // loop is live (a loop-body mutation on the same keyspace must reach
 // it via the staleness broadcast — which then ENDS the sequence; a
@@ -31,6 +41,7 @@ import (
 
 // All yields every (key, value) pair in ascending key order.
 func (ks *Keyspace) All() iter.Seq2[[]byte, []byte] {
+	guardIterConstruction(ks.tx, ks.dead)
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
 		defer ks.unregisterCursor(c) // registered while live: the loop body may mutate
@@ -46,6 +57,7 @@ func (ks *Keyspace) All() iter.Seq2[[]byte, []byte] {
 // ascending key order. A nil start begins at the first key; a nil end
 // runs to the last key.
 func (ks *Keyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
+	guardIterConstruction(ks.tx, ks.dead)
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
 		defer ks.unregisterCursor(c)
@@ -69,6 +81,7 @@ func (ks *Keyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 // Prefix yields (key, value) pairs whose key begins with prefix, in
 // ascending key order. A nil/empty prefix yields every pair.
 func (ks *Keyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte] {
+	guardIterConstruction(ks.tx, ks.dead)
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
 		defer ks.unregisterCursor(c)
@@ -86,6 +99,7 @@ func (ks *Keyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte] {
 // All yields every (key, value) member pair across all keys' value sets,
 // in ascending (key, value) order — each pair yields separately.
 func (ks *SetKeyspace) All() iter.Seq2[[]byte, []byte] {
+	guardIterConstruction(ks.tx, ks.dead)
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
 		defer ks.unregisterSetCursor(c)
@@ -100,6 +114,7 @@ func (ks *SetKeyspace) All() iter.Seq2[[]byte, []byte] {
 // Range yields (key, value) member pairs whose key is in [start, end).
 // A nil start begins at the first key; a nil end runs to the last key.
 func (ks *SetKeyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
+	guardIterConstruction(ks.tx, ks.dead)
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
 		defer ks.unregisterSetCursor(c)
@@ -123,6 +138,7 @@ func (ks *SetKeyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte] {
 // Prefix yields (key, value) member pairs whose key begins with prefix.
 // A nil/empty prefix yields every pair.
 func (ks *SetKeyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte] {
+	guardIterConstruction(ks.tx, ks.dead)
 	return func(yield func([]byte, []byte) bool) {
 		c := ks.Cursor()
 		defer ks.unregisterSetCursor(c)
@@ -134,5 +150,21 @@ func (ks *SetKeyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte] {
 				return
 			}
 		}
+	}
+}
+
+// guardIterConstruction panics when an iterator is constructed on a
+// handle whose state forbids every operation — a frozen parent
+// (ErrChildActive), a closed transaction (ErrTxClosed), a closed DB
+// (ErrClosed), or a DEAD keyspace handle (ErrKeyspaceClosed, the
+// keyspace deleted in this transaction). See the package doc: the Seq2 shape
+// has no error channel, and a silently empty sequence would be
+// indistinguishable from no data (api-surface.md §Range Iterators).
+func guardIterConstruction(tx *Tx, ksDead bool) {
+	if err := tx.requireOpen(false); err != nil {
+		panic(fmt.Sprintf("gmdb: iterator constructed on an unusable transaction: %v", err))
+	}
+	if ksDead {
+		panic(fmt.Sprintf("gmdb: iterator constructed on a dead keyspace handle: %v", ErrKeyspaceClosed))
 	}
 }

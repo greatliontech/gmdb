@@ -561,12 +561,19 @@ func (db *DB) View(ctx context.Context, fn func(rtx *ReadTx) error) error {
 	fnErr := fn(rtx)
 	// Rollback is the read-tx idempotent close path (both Commit and
 	// Rollback are equivalent for reads): a failing fn has no writes to
-	// undo, but the slot must be released.
+	// undo, but the slot must be released. A cleanup failure must not
+	// vanish behind fn's error — but the common path returns fn's
+	// error IDENTITY untouched (joined only when both fail), mirroring
+	// Update's documented shape.
 	rbErr := rtx.Rollback()
-	if fnErr != nil {
+	switch {
+	case fnErr == nil:
+		return rbErr
+	case rbErr == nil:
 		return fnErr
+	default:
+		return errors.Join(fnErr, rbErr)
 	}
-	return rbErr
 }
 
 // Commit releases the reader slot and closes the snapshot. For

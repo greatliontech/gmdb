@@ -252,8 +252,9 @@ func (t *TypedKeyspaceHandle[K, V]) Cursor() *TypedCursor[K, V] {
 // Err(); the bare iter.Seq2 has no error channel by design (matching
 // the spec's typed-iterator surface).
 func (t *TypedKeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
+	seq := t.ks.All() // eager: the construction guard fires HERE, not at loop start
 	return func(yield func(K, V) bool) {
-		for kb, vb := range t.ks.All() {
+		for kb, vb := range seq {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
@@ -263,16 +264,20 @@ func (t *TypedKeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
 }
 
 func (t *TypedKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V] {
+	// Bounds encode and the raw seq construct EAGERLY, so the
+	// construction guard fires here and a post-construction state
+	// change ends the sequence silently — uniform with the raw
+	// iterators and typed All. An encode failure keeps its existing
+	// contract: a silently empty sequence.
+	sb, serr := encodeBound(t.keyEnc, start)
+	eb, eerr := encodeBound(t.keyEnc, end)
+	if serr != nil || eerr != nil {
+		guardIterConstruction(t.ks.tx, t.ks.dead)
+		return func(yield func(K, V) bool) {}
+	}
+	seq := t.ks.Range(sb, eb)
 	return func(yield func(K, V) bool) {
-		sb, err := encodeBound(t.keyEnc, start)
-		if err != nil {
-			return
-		}
-		eb, err := encodeBound(t.keyEnc, end)
-		if err != nil {
-			return
-		}
-		for kb, vb := range t.ks.Range(sb, eb) {
+		for kb, vb := range seq {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
@@ -282,12 +287,15 @@ func (t *TypedKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 }
 
 func (t *TypedKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
+	// Eager construction — see Range.
+	pb, perr := t.keyEnc.AppendEncode(nil, prefix)
+	if perr != nil {
+		guardIterConstruction(t.ks.tx, t.ks.dead)
+		return func(yield func(K, V) bool) {}
+	}
+	seq := t.ks.Prefix(pb)
 	return func(yield func(K, V) bool) {
-		pb, err := t.keyEnc.AppendEncode(nil, prefix)
-		if err != nil {
-			return
-		}
-		for kb, vb := range t.ks.Prefix(pb) {
+		for kb, vb := range seq {
 			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
 			if !ok || !yield(k, v) {
 				return
