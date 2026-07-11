@@ -142,3 +142,12 @@ read transaction per request/operation," not per session — see
 ### `LaggingReaderInfo` / `LaggingReaderAction`
 
 The Go-level shape lives in `api-surface.md §Types and Options`.
+
+**Reentrancy.** The callback executes on the writer's goroutine while
+the write grant is HELD: any gmdb write entry point invoked from
+inside it (`Begin`/`Update`/`Batch`/`Checkpoint`/`Compact` on the
+same DB) queues behind the caller's own grant — a permanent
+self-deadlock under a no-deadline context. Corrective action
+("nudge the lagging reader", telemetry, load-shedding) must be
+signalled to another goroutine; the callback itself only chooses
+Wait or Abort.

@@ -40,7 +40,7 @@ function. WIP = 1.
       (+ transactions.md rider)
 - [x] 14. tx: child SetFileFormat merge, View error join, iterator
       guard-error surfacing
-- [ ] 15. db: daemon goroutines stop pinning *DB — handle-leak
+- [x] 15. db: daemon goroutines stop pinning *DB — handle-leak
       detection reachable; LaggingReader reentrancy doc
 - [ ] 16. keyspace: nested delete+recreate kills the parent's old
       handle (both kinds)

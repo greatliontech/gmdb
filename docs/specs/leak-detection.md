@@ -247,6 +247,30 @@ blocking I/O, panic.
 
 ## Database Handle Leak Detection
 
+**Reachability contract.** The leak cleanup can fire only if a
+dropped handle becomes GC-unreachable, so nothing long-lived may
+hold the `*DB` strongly: the maintenance loop and the batch
+coordinator hold it through a WEAK pointer, taking a strong
+reference only for the duration of one pass/batch (a mid-pass handle
+is reachable by definition, so the cleanup never races a pass; a
+collected handle makes the daemon exit at its next tick — the batch
+coordinator carries a liveness ticker for the abandoned-while-idle
+case). Callbacks stored on the long-lived writer pager must not
+capture `*db` either — the cleanup's own info holds the pager
+strongly, so a captured handle would be reachable through
+runtime → cleanup-info → pager → callback. Public API calls keep
+the handle reachable for their FULL duration — where the
+compiler's liveness analysis would end it before a blocking wait
+(`Batch`'s post-acceptance result wait), an explicit
+`runtime.KeepAlive` pins it, so a handle is never collected under
+an in-flight call. USER-supplied callbacks retained by the engine
+(`Options.LaggingReader`, `Options.Logger`) extend reachability to
+whatever they capture: a handle captured there never becomes
+leak-detectable — a documented caller responsibility. (Pinned by
+`TestLeakedDBHandleCleanupFires`,
+`TestLeakedDBHandleCleanupFiresAfterWriteTx`, and
+`TestBatchInFlightPinsHandle`.)
+
 `runtime.AddCleanup` applied to the `DB` struct too. A leaked `DB`
 holds open file descriptors, mmap regions, and the flock goroutine
 — process-scoped resources outliving any individual transaction.

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
+	"weak"
 )
 
 // batchCall is one queued DB.Batch invocation. result is buffered (cap 1)
@@ -69,6 +71,14 @@ type batchCoordinator struct {
 //   - context.Cause(ctx) if ctx fires before the call is queued.
 //   - ErrClosed if the DB is closing / closed.
 func (db *DB) Batch(ctx context.Context, fn func(tx *Tx) error) error {
+	// The handle must stay reachable for the CALL's full duration:
+	// the compiler ends db's liveness at its last mention (the
+	// coordinator lookup), and both blocking waits below reference
+	// only channels — without this, a fire-and-forget caller's handle
+	// can be collected mid-call, tearing the DB down under an
+	// accepted batch (leak-detection.md §Database Handle Leak
+	// Detection, entry-point clause).
+	defer runtime.KeepAlive(db)
 	if db.readOnly {
 		return ErrDatabaseReadOnly
 	}
@@ -111,7 +121,9 @@ func (db *DB) ensureBatchCoordinator() (chan batchCall, context.Context, bool) {
 		db.batch.done = make(chan struct{})
 		db.batch.ctx, db.batch.cancel = context.WithCancel(context.Background())
 		db.batch.started = true
-		go db.batchCoordinator(db.batch.ctx, db.batch.ch, db.batch.done)
+		// Weak handoff — see batchCoordinator's doc: the daemon must
+		// not pin an abandoned handle reachable.
+		go batchCoordinatorLoop(weak.Make(db), db.batch.ctx, db.batch.ch, db.batch.done, db.opts.MaxBatchDelay)
 	}
 	return db.batch.ch, db.batch.ctx, true
 }
@@ -135,16 +147,39 @@ func (db *DB) stopBatchCoordinator() {
 	<-done
 }
 
-// batchCoordinator is the single goroutine that drains db.batch.ch,
-// groups calls into batches, and runs each batch in one write
-// transaction. It exits when ctx is cancelled (Close).
-func (db *DB) batchCoordinator(ctx context.Context, ch chan batchCall, done chan struct{}) {
+// batchCoordinatorLoop is the single goroutine that drains the batch
+// channel, groups calls into batches, and runs each batch in one
+// write transaction. It exits when ctx is cancelled (Close) — or
+// when the *DB was collected: the handle is held WEAKLY
+// (leak-detection.md §Database Handle Leak Detection; a strong
+// receiver would pin an abandoned handle reachable forever and the
+// DB leak cleanup could never fire). A strong reference is taken
+// only per batch — every sender in Batch pins the *DB for its call's
+// duration via runtime.KeepAlive (the compiler would otherwise end
+// the handle's liveness before the blocking waits), so a RECEIVED
+// call implies a live handle; the liveness ticker covers the
+// abandoned-while-idle case (parked forever on a channel no one can
+// send to).
+func batchCoordinatorLoop(wp weak.Pointer[DB], ctx context.Context, ch chan batchCall, done chan struct{}, delay time.Duration) {
 	defer close(done)
+	liveness := time.NewTicker(delay + time.Second)
+	defer liveness.Stop()
 	for {
 		select {
 		case first := <-ch:
+			db := wp.Value()
+			if db == nil {
+				// Unreachable in practice (the sender holds the
+				// handle), but reply rather than strand the caller.
+				replyAll([]batchCall{first}, ErrClosed)
+				return
+			}
 			batch := db.collectBatch(ctx, ch, first)
 			db.runBatch(ctx, batch)
+		case <-liveness.C:
+			if wp.Value() == nil {
+				return // handle collected: the DB cleanup tears down
+			}
 		case <-ctx.Done():
 			return
 		}

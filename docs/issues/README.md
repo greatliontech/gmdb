@@ -80,7 +80,6 @@ chunks (bottom-up by layer, grouped by function).
 | Slug | Lands | Summary |
 |------|-------|---------|
 | checkpoint-selfdurable-anchor-persist | 23 | [L] pure-SyncDataOnly Checkpoint leaves the persisted anchor trailing by one (peer reclamation delayed); persisting would rewrite the assertion's sole durable carrier in place — tear hazard |
-| db-leak-detection-pinning | 15 | [M] daemon goroutines pin *DB — handle-leak detection unreachable; [L] LaggingReader reentrancy deadlock undocumented |
 | nested-keyspace-handle-resurrection | 16 | [M] child delete+recreate resurrects parent's dead handle (both kinds), reproduced |
 | index-ondelete-partial-state | 17 | [M] extractor panic mid-onDelete commits partial index state; [L] stale coverValue → false ErrCorrupted; [L] schemaHash doc grammar |
 | bulkload-index-parity | 18 | [H] index bulk build skips key-size gate → un-updatable/un-compactable DB; [M] no overflow promotion for index values; [L] config parity |

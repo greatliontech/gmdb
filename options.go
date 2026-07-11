@@ -219,12 +219,31 @@ type Options struct {
 	// once per AllocPage call (lock-ordering.md invariant) to avoid
 	// busy loops. Nil ⇒ AllocPage falls through to file extension
 	// when reclamation is blocked.
+	//
+	// REENTRANCY: the callback runs on the writer's goroutine WHILE
+	// the write grant is held. It must not call any gmdb write entry
+	// point (Begin/Update/Batch/Checkpoint/Compact) on the same DB —
+	// the call queues behind its own grant and, with a no-deadline
+	// context, deadlocks permanently. Signal another goroutine for
+	// corrective action instead (lock-ordering.md §Lagging Reader
+	// Handling).
+	//
+	// REACHABILITY: the engine retains this callback for the handle's
+	// lifetime; anything it captures — including the *DB itself —
+	// stays reachable, making handle-leak detection inert for such a
+	// handle (leak-detection.md §Database Handle Leak Detection).
 	LaggingReader func(info LaggingReaderInfo) LaggingReaderAction
 
 	// Logger receives diagnostic messages — leak detection warnings,
 	// non-fatal recovery events. Default: nil = discard. Set to
 	// slog.Default() to route to the process-wide handler, or to a
 	// custom *slog.Logger for structured per-DB logging.
+	//
+	// REACHABILITY: the engine retains the logger (including in leak-
+	// cleanup state) for the handle's lifetime; a handler capturing
+	// the *DB keeps it reachable and makes handle-leak detection
+	// inert for that handle (leak-detection.md §Database Handle Leak
+	// Detection).
 	Logger *slog.Logger
 
 	// ScratchDir is the directory used for BulkLoad sort spill on

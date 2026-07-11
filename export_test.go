@@ -233,3 +233,24 @@ func SetShrinkGateHookForTest(hook func()) (restore func()) {
 	shrinkGateHookForTest.Store(&hook)
 	return func() { shrinkGateHookForTest.Store(nil) }
 }
+
+// SetDBCleanupHookForTest installs (or clears) the hook firing at the
+// tail of the leaked-DB cleanup. Returns a restore func.
+func SetDBCleanupHookForTest(hook func()) (restore func()) {
+	if hook == nil {
+		dbCleanupHookForTest.Store(nil)
+		return func() {}
+	}
+	dbCleanupHookForTest.Store(&hook)
+	return func() { dbCleanupHookForTest.Store(nil) }
+}
+
+// DaemonDoneChansForTest returns the maintenance and batch
+// coordinator done channels (nil if the daemon never started) so leak
+// tests can assert daemon EXIT after handle collection.
+func (db *DB) DaemonDoneChansForTest() (maintDone, batchDone chan struct{}) {
+	db.batch.mu.Lock()
+	batchDone = db.batch.done
+	db.batch.mu.Unlock()
+	return db.maint.done, batchDone
+}

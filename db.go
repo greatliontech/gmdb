@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/pager"
@@ -508,10 +509,17 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		db.maint.ctx, db.maint.cancel = context.WithCancel(context.Background())
 		db.maint.done = make(chan struct{})
 		db.maint.started = true
-		go db.maintenanceLoop(db.maint.ctx, openRecovered)
+		// Weak handoff — see maintenanceLoop's doc: the daemon must
+		// not pin an abandoned handle reachable.
+		go maintenanceLoop(weak.Make(db), db.maint.ctx, db.maint.done, opts.Maintenance.Interval, openRecovered)
 	}
 	return db, nil
 }
+
+// dbCleanupHookForTest fires at the tail of dbCleanupFn (either
+// branch) — the leak test's deterministic wait, mirroring
+// readTxCleanupHookForTest. Non-blocking callback required.
+var dbCleanupHookForTest atomic.Pointer[func()]
 
 // dbCleanupInfo bundles the resources a leaked-DB cleanup needs to
 // tear down. Captures the shared *closeGate by pointer (leak-
@@ -543,6 +551,11 @@ type dbCleanupInfo struct {
 // drain is bounded by Options.LockRetryInterval +
 // Options.HeartbeatInterval.
 func dbCleanupFn(info dbCleanupInfo) {
+	defer func() {
+		if hook := dbCleanupHookForTest.Load(); hook != nil {
+			(*hook)()
+		}
+	}()
 	if info.gate.SwapClosed(true) {
 		// Close() ran first; nothing to tear down.
 		return
@@ -830,6 +843,13 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 	// §RPL Reclamation) which would otherwise be invisible until an
 	// explicit Check(): log it (db.logger defaults to a discard
 	// handler); DBStats carries the count for programmatic detection.
+	// Callbacks stored on the long-lived writer pager must not
+	// capture *db: the leaked-DB cleanup's info holds the pager
+	// strongly (runtime → dbCleanupInfo → pgr → callback), so a db
+	// capture would pin an abandoned handle reachable forever and the
+	// cleanup could never fire (leak-detection.md §Database Handle
+	// Leak Detection). Capture the needed fields instead.
+	logger := db.logger
 	// Captured under db.mu for the ShrinkGate closure: the gate runs
 	// at commit time under the write grant, and Close cannot proceed
 	// past its own grant acquisition while this tx holds it, so the
@@ -845,7 +865,7 @@ func (db *DB) Begin(ctx context.Context) (*Tx, error) {
 			return reclamationBound(coord, pgr)
 		},
 		RPLCorrupt: func(segPageID uint64) {
-			db.logger.Warn("gmdb: corrupt RPL segment quarantined during reclamation; "+
+			logger.Warn("gmdb: corrupt RPL segment quarantined during reclamation; "+
 				"its pages leak until Check()/Repair reclaims them",
 				"segPageID", segPageID)
 		},

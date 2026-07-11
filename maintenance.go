@@ -6,6 +6,7 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/pager"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/page"
@@ -58,19 +59,40 @@ func (db *DB) stopMaintenance() {
 // rate is ≤1 pass / Interval — background-maintenance.md §Invariants) until ctx is cancelled by Close.
 // When immediate is set (an unclean prior shutdown), the first pass runs at
 // startup instead of waiting a full interval.
-func (db *DB) maintenanceLoop(ctx context.Context, immediate bool) {
-	defer close(db.maint.done)
-	if immediate {
+// maintenanceLoop holds the *DB WEAKLY (leak-detection.md §Database
+// Handle Leak Detection): a strong receiver would pin an abandoned
+// handle reachable forever, making the DB leak cleanup structurally
+// unable to fire under default options. The loop takes a strong
+// reference only for the duration of one pass — a mid-pass handle is
+// reachable by definition, so the cleanup can never race a pass —
+// and exits when the handle was collected (Value() == nil; the
+// cleanup's teardown owns the resources from there). done/interval
+// are passed by value for the same reason.
+func maintenanceLoop(wp weak.Pointer[DB], ctx context.Context, done chan struct{}, interval time.Duration, immediate bool) {
+	defer close(done)
+	pass := func() bool {
+		db := wp.Value()
+		if db == nil {
+			return false // handle collected: the DB cleanup tears down
+		}
 		db.runMaintenancePass(ctx)
+		return true
 	}
-	t := time.NewTicker(db.opts.Maintenance.Interval)
+	if immediate {
+		if !pass() {
+			return
+		}
+	}
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			db.runMaintenancePass(ctx)
+			if !pass() {
+				return
+			}
 		}
 	}
 }
