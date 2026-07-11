@@ -1,16 +1,18 @@
-package gmdb
+package typed
 
 import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb"
 )
 
 // newTypedSetTx opens a fresh DB + write tx for typed-set tests.
-func newTypedSetTx(t *testing.T) (*Tx, func()) {
+func newTypedSetTx(t *testing.T) (*gmdb.Tx, func()) {
 	t.Helper()
 	ctx := context.Background()
-	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	db := openWith(t, ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		_ = db.Close()
@@ -26,7 +28,7 @@ func TestTypedSetKSRoundTrip(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -65,8 +67,8 @@ func TestTypedSetKSRoundTrip(t *testing.T) {
 	if n, _ := ks.CountValues(1); n != 1 {
 		t.Errorf("CountValues(1) after DeleteValue = %d, want 1", n)
 	}
-	if err := ks.DeleteValue(1, "a"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("DeleteValue(1,a) again = %v, want ErrNotFound", err)
+	if err := ks.DeleteValue(1, "a"); !errors.Is(err, gmdb.ErrNotFound) {
+		t.Errorf("DeleteValue(1,a) again = %v, want gmdb.ErrNotFound", err)
 	}
 	if err := ks.Delete(2); err != nil {
 		t.Fatalf("Delete(2): %v", err)
@@ -74,13 +76,13 @@ func TestTypedSetKSRoundTrip(t *testing.T) {
 	if has, _ := ks.Has(2); has {
 		t.Error("Has(2) after Delete = true, want false")
 	}
-	if err := ks.Delete(2); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Delete(2) again = %v, want ErrNotFound", err)
+	if err := ks.Delete(2); !errors.Is(err, gmdb.ErrNotFound) {
+		t.Errorf("Delete(2) again = %v, want gmdb.ErrNotFound", err)
 	}
 }
 
 // collectSetMembers returns "k/v" strings for every member via All().
-func collectSetMembers(ks *TypedSetKeyspaceHandle[uint64, string]) []string {
+func collectSetMembers(ks *SetKeyspaceHandle[uint64, string]) []string {
 	var out []string
 	for k, v := range ks.All() {
 		out = append(out, itoa(k)+"/"+v)
@@ -106,7 +108,7 @@ func TestTypedSetKSCursorAndIterators(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -179,7 +181,7 @@ func TestTypedSetKSEmptyValueMember(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -218,7 +220,7 @@ func TestTypedSetKSPrefix(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[string, string]("words", StringEncoder{}, StringEncoder{}, nil)
+	tsk := NewSetKeyspace[string, string]("words", StringEncoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -239,13 +241,13 @@ func TestTypedSetKSPrefix(t *testing.T) {
 	}
 }
 
-// TestTypedSetCursorLastPrevSeek covers the member-cursor navigation the
+// TestSetCursorLastPrevSeek covers the member-cursor navigation the
 // other tests don't (Last / Prev / exact Seek).
-func TestTypedSetCursorLastPrevSeek(t *testing.T) {
+func TestSetCursorLastPrevSeek(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -277,9 +279,9 @@ func TestTypedSetCursorLastPrevSeek(t *testing.T) {
 func TestTypedSetKSReadOnly(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	db := openWith(t, ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	db := openWith(t, ctx, path, gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tsk := NewTypedSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
+	tsk := NewSetKeyspace[uint64, string]("subs", Uint64Encoder{}, StringEncoder{}, nil)
 
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -308,8 +310,8 @@ func TestTypedSetKSReadOnly(t *testing.T) {
 	if has, err := rks.HasValue(1, "a"); err != nil || !has {
 		t.Errorf("HasValue(1,a) = (%v, %v), want (true, nil)", has, err)
 	}
-	if _, err := rks.Put(1, "b"); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("Put on read-only = %v, want ErrReadOnly", err)
+	if _, err := rks.Put(1, "b"); !errors.Is(err, gmdb.ErrReadOnly) {
+		t.Errorf("Put on read-only = %v, want gmdb.ErrReadOnly", err)
 	}
 }
 
@@ -319,8 +321,8 @@ func TestTypedSetKSFixedValueSize(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[uint64, uint64]("fixed", Uint64Encoder{}, Uint64Encoder{},
-		&SetKeyspaceOptions{FixedValueSize: 8})
+	tsk := NewSetKeyspace[uint64, uint64]("fixed", Uint64Encoder{}, Uint64Encoder{},
+		&gmdb.SetKeyspaceOptions{FixedValueSize: 8})
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -347,18 +349,18 @@ func TestTypedSetKSFixedValueSize(t *testing.T) {
 	}
 }
 
-// TestTypedSetCursorSignedOrder verifies signed key lex order through the
+// TestSetCursorSignedOrder verifies signed key lex order through the
 // set cursor (Inv-T1).
-func TestTypedSetCursorSignedOrder(t *testing.T) {
+func TestSetCursorSignedOrder(t *testing.T) {
 	ctx := context.Background()
-	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	db := openWith(t, ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
 	defer tx.Rollback()
-	tsk := NewTypedSetKeyspace[int64, string]("signed", Int64Encoder{}, StringEncoder{}, nil)
+	tsk := NewSetKeyspace[int64, string]("signed", Int64Encoder{}, StringEncoder{}, nil)
 	ks, err := tsk.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)

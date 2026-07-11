@@ -693,7 +693,7 @@ mid-helper error followed by `Tx.Commit`.
 
 ## Cursor State Machine
 
-Every cursor (`Cursor`, `SetCursor`, `TypedCursor`) is at any
+Every cursor (`Cursor`, `SetCursor`, `typed.Cursor`) is at any
 moment in exactly one of three states:
 
 | State | Meaning | Behavior |

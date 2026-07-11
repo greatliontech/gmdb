@@ -1,51 +1,38 @@
-package gmdb
+package typed
 
 import (
 	"fmt"
 	"iter"
-	"strings"
+
+	"github.com/thegrumpylion/gmdb"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 )
 
-// typedCoverValuePrefix marks the synthesized covering column of a
-// full-row-covering typed index (TypedIndex.CoverValue). The column name
-// is typedCoverValuePrefix + valEnc.ID(), so the value encoder's
-// identity is folded into the schema-hash fingerprint (drift detection)
-// AND TypedKeyspaceHandle.Index can recognize the index as full-row covering and
-// enable the byte-layer covering-return. This prefix is a reserved
-// covering-column namespace — a byte-API IndexDecl that names a covering
-// column with it would be (mis)treated as full-row covering on the typed
-// read path.
-const typedCoverValuePrefix = "gmdb/cover-value/"
+// The full-row cover-value sentinel contract (prefix, column
+// synthesis, decl recognition) lives in internal/indexing beside
+// the decl type: the engine's covering-return path recognizes it,
+// this tier writes it — one source for the persisted format.
 
-func typedCoverValueColumn(valEncID string) string { return typedCoverValuePrefix + valEncID }
-
-// isTypedCoverValueIndex reports whether decl is a typed full-row-
-// covering index (exactly one covering column with the cover-value
-// sentinel prefix).
-func isTypedCoverValueIndex(decl *IndexDecl) bool {
-	return len(decl.Covering) == 1 && strings.HasPrefix(decl.Covering[0].Name, typedCoverValuePrefix)
-}
-
-// Typed index layer (typed-keyspaces.md §Typed Indexes). A TypedIndex
-// declares a type-safe secondary index on a TypedKeyspace[K,V] with an
-// extracted index-key type IK; it lowers to a byte-layer *IndexDecl via
-// the sealed AnyTypedIndex.indexDecl, threading the keyspace's K/V
+// Typed index layer (typed-keyspaces.md §Typed Indexes). A Index
+// declares a type-safe secondary index on a Keyspace[K,V] with an
+// extracted index-key type IK; it lowers to a byte-layer *gmdb.IndexDecl via
+// the sealed AnyIndex.indexDecl, threading the keyspace's K/V
 // encoders so the extractor closure can decode the stored (key,value)
 // before running the user's typed Extract and encoding each IK.
 //
-// Schema-hash drift (typed-keyspaces.md §Invariants): the synthesized IndexColumn's Name is set
+// Schema-hash drift (typed-keyspaces.md §Invariants): the synthesized gmdb.IndexColumn's Name is set
 // to IKEnc.ID(). Since the byte schema-hash hashes column names (which
 // are pure fingerprint inputs, never read at decode), swapping IKEnc for
 // one with a different ID changes the column name and therefore the
-// stored fingerprint — surfacing as ErrIndexFingerprintMismatch at Open.
+// stored fingerprint — surfacing as gmdb.ErrIndexFingerprintMismatch at Open.
 
-// TypedIndex declares a typed index on a TypedKeyspace[K,V] with index-
+// Index declares a typed index on a Keyspace[K,V] with index-
 // key type IK.
 //
 // Extract produces zero or more IK values per row; an empty/nil slice
 // skips the row (partial index). IKEnc encodes each IK to lex-safe
 // bytes and MUST have a stable non-empty ID() (typed-keyspaces.md §Invariants) — an empty ID is
-// rejected at Open with ErrIndexEncoderIDEmpty.
+// rejected at Open with gmdb.ErrIndexEncoderIDEmpty.
 //
 // IKEnc MUST be able to encode every value Extract produces: the
 // byte-layer index extractor is infallible (it cannot return an error),
@@ -57,16 +44,16 @@ func isTypedCoverValueIndex(decl *IndexDecl) bool {
 // unrepresentable value.
 //
 // CoverValue makes this a full-row covering index: the encoded row value
-// is stored in each index entry, so TypedIndexQuery Lookup/Range/Prefix/
+// is stored in each index entry, so IndexQuery Lookup/Range/Prefix/
 // Get return V directly from the index without a back-lookup against the
 // row keyspace (a read optimization — identical results, fewer reads).
 // The keyspace's value-encoder ID is folded into the schema-hash
 // fingerprint, so swapping the value encoder triggers
-// ErrIndexFingerprintMismatch; an empty value-encoder ID is rejected
-// with ErrIndexEncoderIDEmpty. CoverValue has effect only on a
-// TypedKeyspace (Keyspace-backed) index — a SetKeyspace index's value is
+// gmdb.ErrIndexFingerprintMismatch; an empty value-encoder ID is rejected
+// with gmdb.ErrIndexEncoderIDEmpty. CoverValue has effect only on a
+// Keyspace (Keyspace-backed) index — a SetKeyspace index's value is
 // already carried in its compound PK, so there is no back-lookup to skip.
-type TypedIndex[K, V, IK any] struct {
+type Index[K, V, IK any] struct {
 	Name       string
 	IKEnc      Encoder[IK]
 	Unique     bool
@@ -75,49 +62,49 @@ type TypedIndex[K, V, IK any] struct {
 	CoverValue bool
 }
 
-// Compile-time proof that *TypedIndex implements the sealed
-// AnyTypedIndex — the only legal implementer (the unexported indexDecl
+// Compile-time proof that *Index implements the sealed
+// AnyIndex — the only legal implementer (the unexported indexDecl
 // method seals the interface to this package).
-var _ AnyTypedIndex[int, int] = (*TypedIndex[int, int, int])(nil)
+var _ AnyIndex[int, int] = (*Index[int, int, int])(nil)
 
-// indexDecl lowers the typed index to a byte *IndexDecl, threading the
+// indexDecl lowers the typed index to a byte *gmdb.IndexDecl, threading the
 // owning keyspace's encoders into the extractor closure. Implements
-// AnyTypedIndex[K,V] (sealed). Returns ErrIndexEncoderIDEmpty if IKEnc's
+// AnyIndex[K,V] (sealed). Returns gmdb.ErrIndexEncoderIDEmpty if IKEnc's
 // ID() is empty.
-func (t *TypedIndex[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*IndexDecl, error) {
+func (t *Index[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*gmdb.IndexDecl, error) {
 	ikID := t.IKEnc.ID()
 	if ikID == "" {
-		return nil, fmt.Errorf("gmdb: typed index %q index-key encoder: %w", t.Name, ErrIndexEncoderIDEmpty)
+		return nil, fmt.Errorf("gmdb: typed index %q index-key encoder: %w", t.Name, gmdb.ErrIndexEncoderIDEmpty)
 	}
-	decl := &IndexDecl{
+	decl := &gmdb.IndexDecl{
 		Name: t.Name,
 		// One opaque column for the IK; its Name = IKEnc.ID() folds the
 		// encoder identity into the schema-hash fingerprint (typed-keyspaces.md §Invariants).
-		Columns: []IndexColumn{{Name: ikID}},
+		Columns: []gmdb.IndexColumn{{Name: ikID}},
 		Unique:  t.Unique,
 		Version: t.Version,
 	}
 	if t.CoverValue {
 		valID := valEnc.ID()
 		if valID == "" {
-			return nil, fmt.Errorf("gmdb: typed index %q value encoder (CoverValue): %w", t.Name, ErrIndexEncoderIDEmpty)
+			return nil, fmt.Errorf("gmdb: typed index %q value encoder (CoverValue): %w", t.Name, gmdb.ErrIndexEncoderIDEmpty)
 		}
 		// One covering column carrying the full encoded value; its name
 		// folds the value-encoder identity into the fingerprint.
-		decl.Covering = []IndexCoveringColumn{{Name: typedCoverValueColumn(valID)}}
+		decl.Covering = []gmdb.IndexCoveringColumn{{Name: indexing.CoverValueColumn(valID)}}
 	}
 	decl.Extract = t.makeExtractor(keyEnc, valEnc)
 	return decl, nil
 }
 
-// makeExtractor builds the byte-layer IndexExtractor closure: decode the
+// makeExtractor builds the byte-layer gmdb.IndexExtractor closure: decode the
 // stored (key,value) into (K,V), run the typed Extract, encode each IK.
-// Decode/encode failures panic (see the TypedIndex godoc): the byte
+// Decode/encode failures panic (see the Index godoc): the byte
 // extractor contract is total, and silently dropping an entry would
 // diverge the index from the rows.
-func (t *TypedIndex[K, V, IK]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V]) IndexExtractor {
+func (t *Index[K, V, IK]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V]) gmdb.IndexExtractor {
 	coverValue := t.CoverValue
-	return func(keyBytes, valueBytes []byte) []IndexEntry {
+	return func(keyBytes, valueBytes []byte) []gmdb.IndexEntry {
 		k, err := keyEnc.Decode(keyBytes)
 		if err != nil {
 			panic(fmt.Errorf("gmdb: typed index %q: decode key: %w", t.Name, err))
@@ -132,7 +119,7 @@ func (t *TypedIndex[K, V, IK]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V
 		}
 		// Full-row covering: each entry carries the stored value bytes
 		// (which ARE encode(V)) as its single covering column, so Lookup
-		// can return V without a back-lookup. Copied so the IndexEntry
+		// can return V without a back-lookup. Copied so the gmdb.IndexEntry
 		// does not alias the caller's value buffer.
 		var cover [][]byte
 		if coverValue {
@@ -140,23 +127,23 @@ func (t *TypedIndex[K, V, IK]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V
 			copy(cb, valueBytes)
 			cover = [][]byte{cb}
 		}
-		entries := make([]IndexEntry, 0, len(iks))
+		entries := make([]gmdb.IndexEntry, 0, len(iks))
 		for _, ik := range iks {
 			ikb, err := t.IKEnc.AppendEncode(nil, ik)
 			if err != nil {
 				panic(fmt.Errorf("gmdb: typed index %q: encode index key: %w", t.Name, err))
 			}
-			entries = append(entries, IndexEntry{Cols: [][]byte{ikb}, Cover: cover})
+			entries = append(entries, gmdb.IndexEntry{Cols: [][]byte{ikb}, Cover: cover})
 		}
 		return entries
 	}
 }
 
 // Index returns a typed query handle for the named index on this typed
-// keyspace. The returned *TypedIndexHandle carries the keyspace's K/V
+// keyspace. The returned *IndexHandle carries the keyspace's K/V
 // encoders (type-erased); bind it to a specific IK type with
-// NewTypedIndexQuery. Returns ErrIndexNotFound if no such index.
-func (t *TypedKeyspaceHandle[K, V]) Index(name string) (*TypedIndexHandle, error) {
+// NewIndexQuery. Returns gmdb.ErrIndexNotFound if no such index.
+func (t *KeyspaceHandle[K, V]) Index(name string) (*IndexHandle, error) {
 	idx, err := t.ks.Index(name)
 	if err != nil {
 		return nil, err
@@ -164,39 +151,39 @@ func (t *TypedKeyspaceHandle[K, V]) Index(name string) (*TypedIndexHandle, error
 	// Enable the byte-layer covering-return for a full-row-covering typed
 	// index, so Lookup/Range/Prefix/Get return V from the index entry
 	// without a back-lookup.
-	if isTypedCoverValueIndex(idx.pinned.decl) {
-		idx.coverValue = true
+	if indexing.IsCoverValueDecl(idx.Decl()) {
+		idx.EnableCoverValueReturn()
 	}
-	return &TypedIndexHandle{idx: idx, keyEnc: t.keyEnc, valEnc: t.valEnc}, nil
+	return &IndexHandle{idx: idx, keyEnc: t.keyEnc, valEnc: t.valEnc}, nil
 }
 
 // Index returns a typed query handle for the named index on this typed
 // set keyspace. For a SetKeyspace index the query yields (setKey,
 // setValue) pairs, so bind K = the set-key type and V = the set-value
-// type in NewTypedIndexQuery.
-func (t *TypedSetKeyspaceHandle[K, V]) Index(name string) (*TypedIndexHandle, error) {
+// type in NewIndexQuery.
+func (t *SetKeyspaceHandle[K, V]) Index(name string) (*IndexHandle, error) {
 	idx, err := t.sks.Index(name)
 	if err != nil {
 		return nil, err
 	}
-	return &TypedIndexHandle{idx: idx, keyEnc: t.keyEnc, valEnc: t.valEnc}, nil
+	return &IndexHandle{idx: idx, keyEnc: t.keyEnc, valEnc: t.valEnc}, nil
 }
 
-// TypedIndexHandle is a type-erased handle to an opened index on a typed
-// keyspace. It carries the byte *IndexHandle plus the keyspace's K/V encoders
-// (as any); NewTypedIndexQuery re-introduces the static K/V/IK types.
-type TypedIndexHandle struct {
-	idx    *IndexHandle
+// IndexHandle is a type-erased handle to an opened index on a typed
+// keyspace. It carries the byte *gmdb.IndexHandle plus the keyspace's K/V encoders
+// (as any); NewIndexQuery re-introduces the static K/V/IK types.
+type IndexHandle struct {
+	idx    *gmdb.IndexHandle
 	keyEnc any // Encoder[K] of the owning keyspace
 	valEnc any // Encoder[V]
 }
 
-// TypedIndexQuery is a statically-typed query over an index whose
+// IndexQuery is a statically-typed query over an index whose
 // index-key type is IK and whose owning keyspace is keyed/valued by
-// K/V. Construct via NewTypedIndexQuery. Like the byte *IndexHandle, a query
+// K/V. Construct via NewIndexQuery. Like the byte *gmdb.IndexHandle, a query
 // handle is not safe for concurrent iteration; Err() is per-handle.
-type TypedIndexQuery[K, V, IK any] struct {
-	idx     *IndexHandle
+type IndexQuery[K, V, IK any] struct {
+	idx     *gmdb.IndexHandle
 	keyEnc  Encoder[K]
 	valEnc  Encoder[V]
 	ikEnc   Encoder[IK]
@@ -204,21 +191,21 @@ type TypedIndexQuery[K, V, IK any] struct {
 	err     error // per-sequence: IK encode / result decode / iteration error
 }
 
-// NewTypedIndexQuery binds a TypedIndexHandle to concrete K/V/IK types
+// NewIndexQuery binds a IndexHandle to concrete K/V/IK types
 // with the supplied index-key encoder. If the handle's keyspace
 // encoders do not match the requested K/V types (the caller passed the
 // wrong type parameters), the returned query is permanently inert:
 // every method yields nothing and Err() reports the mismatch.
-func NewTypedIndexQuery[K, V, IK any](h *TypedIndexHandle, ikEnc Encoder[IK]) *TypedIndexQuery[K, V, IK] {
-	q := &TypedIndexQuery[K, V, IK]{idx: h.idx, ikEnc: ikEnc}
+func NewIndexQuery[K, V, IK any](h *IndexHandle, ikEnc Encoder[IK]) *IndexQuery[K, V, IK] {
+	q := &IndexQuery[K, V, IK]{idx: h.idx, ikEnc: ikEnc}
 	ke, ok := h.keyEnc.(Encoder[K])
 	if !ok {
-		q.bindErr = fmt.Errorf("gmdb: NewTypedIndexQuery: keyspace key encoder type does not match K: %w", ErrInvalidOptions)
+		q.bindErr = fmt.Errorf("gmdb: NewIndexQuery: keyspace key encoder type does not match K: %w", gmdb.ErrInvalidOptions)
 		return q
 	}
 	ve, ok := h.valEnc.(Encoder[V])
 	if !ok {
-		q.bindErr = fmt.Errorf("gmdb: NewTypedIndexQuery: keyspace value encoder type does not match V: %w", ErrInvalidOptions)
+		q.bindErr = fmt.Errorf("gmdb: NewIndexQuery: keyspace value encoder type does not match V: %w", gmdb.ErrInvalidOptions)
 		return q
 	}
 	q.keyEnc = ke
@@ -228,7 +215,7 @@ func NewTypedIndexQuery[K, V, IK any](h *TypedIndexHandle, ikEnc Encoder[IK]) *T
 
 // encodeIK encodes a single IK value to the one-column tuple the byte
 // index API expects. Records an encode error on the query.
-func (q *TypedIndexQuery[K, V, IK]) encodeIK(ik IK) ([]byte, bool) {
+func (q *IndexQuery[K, V, IK]) encodeIK(ik IK) ([]byte, bool) {
 	b, err := q.ikEnc.AppendEncode(nil, ik)
 	if err != nil {
 		q.err = err
@@ -240,7 +227,7 @@ func (q *TypedIndexQuery[K, V, IK]) encodeIK(ik IK) ([]byte, bool) {
 // decodePair decodes a byte (pk, value) result into (K, V), recording
 // the first decode error. For a SetKeyspace index the byte layer yields
 // (setKey, setValue), decoded by the same K/V encoders.
-func (q *TypedIndexQuery[K, V, IK]) decodePair(pkb, vb []byte) (K, V, bool) {
+func (q *IndexQuery[K, V, IK]) decodePair(pkb, vb []byte) (K, V, bool) {
 	var zk K
 	var zv V
 	k, err := q.keyEnc.Decode(pkb)
@@ -258,7 +245,7 @@ func (q *TypedIndexQuery[K, V, IK]) decodePair(pkb, vb []byte) (K, V, bool) {
 
 // Lookup yields (K, V) pairs whose index key equals ik (exact match on
 // the single IK column). For a unique index yields at most one pair.
-func (q *TypedIndexQuery[K, V, IK]) Lookup(ik IK) iter.Seq2[K, V] {
+func (q *IndexQuery[K, V, IK]) Lookup(ik IK) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		if q.bindErr != nil {
 			return
@@ -284,7 +271,7 @@ func (q *TypedIndexQuery[K, V, IK]) Lookup(ik IK) iter.Seq2[K, V] {
 // SetKeyspace index this surfaces an error via Err() (the byte layer
 // has no single-key form for the compound (setKey,setValue) pair — use
 // Lookup).
-func (q *TypedIndexQuery[K, V, IK]) LookupKeys(ik IK) iter.Seq[K] {
+func (q *IndexQuery[K, V, IK]) LookupKeys(ik IK) iter.Seq[K] {
 	return func(yield func(K) bool) {
 		if q.bindErr != nil {
 			return
@@ -314,7 +301,7 @@ func (q *TypedIndexQuery[K, V, IK]) LookupKeys(ik IK) iter.Seq[K] {
 // boundary). Comparison is on the full IK value (the typed layer treats
 // IK as one opaque column — see typed-keyspaces.md §Limitation:
 // partial-prefix queries).
-func (q *TypedIndexQuery[K, V, IK]) Range(start, end *IK) iter.Seq2[K, V] {
+func (q *IndexQuery[K, V, IK]) Range(start, end *IK) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		if q.bindErr != nil {
 			return
@@ -343,7 +330,7 @@ func (q *TypedIndexQuery[K, V, IK]) Range(start, end *IK) iter.Seq2[K, V] {
 // boundTuple encodes an optional IK range boundary into the [][]byte
 // column tuple the byte index Range expects: nil pointer → nil tuple
 // (open). Records an encode error on the query.
-func (q *TypedIndexQuery[K, V, IK]) boundTuple(p *IK) ([][]byte, bool) {
+func (q *IndexQuery[K, V, IK]) boundTuple(p *IK) ([][]byte, bool) {
 	if p == nil {
 		return nil, true
 	}
@@ -358,7 +345,7 @@ func (q *TypedIndexQuery[K, V, IK]) boundTuple(p *IK) ([][]byte, bool) {
 // Prefix yields (K, V) whose index key has the encoded prefix as a byte
 // prefix. For a fixed-width IK encoder this is an exact match; see the
 // composite-IK limitation in the spec.
-func (q *TypedIndexQuery[K, V, IK]) Prefix(prefix IK) iter.Seq2[K, V] {
+func (q *IndexQuery[K, V, IK]) Prefix(prefix IK) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		if q.bindErr != nil {
 			return
@@ -381,8 +368,8 @@ func (q *TypedIndexQuery[K, V, IK]) Prefix(prefix IK) iter.Seq2[K, V] {
 }
 
 // Get is the unique-index shorthand: returns the single (K, V) matching
-// ik, or ErrNotFound. Returns ErrIndexNotUnique on a non-unique index.
-func (q *TypedIndexQuery[K, V, IK]) Get(ik IK) (K, V, error) {
+// ik, or gmdb.ErrNotFound. Returns gmdb.ErrIndexNotUnique on a non-unique index.
+func (q *IndexQuery[K, V, IK]) Get(ik IK) (K, V, error) {
 	var zk K
 	var zv V
 	if q.bindErr != nil {
@@ -410,11 +397,11 @@ func (q *TypedIndexQuery[K, V, IK]) Get(ik IK) (K, V, error) {
 
 // Err returns the first error encountered during the last query. A
 // permanent binding error (encoder-type mismatch from
-// NewTypedIndexQuery) takes precedence and is never reset; otherwise the
+// NewIndexQuery) takes precedence and is never reset; otherwise the
 // per-sequence error (IK encode, result decode, or underlying index
 // iteration), which is reset at the start of each Lookup / LookupKeys /
 // Range / Prefix / Get.
-func (q *TypedIndexQuery[K, V, IK]) Err() error {
+func (q *IndexQuery[K, V, IK]) Err() error {
 	if q.bindErr != nil {
 		return q.bindErr
 	}

@@ -18,7 +18,7 @@ import (
 // Errors: the iter.Seq2 has no error channel by design. A cursor I/O
 // error simply ends the sequence (the cursor returns a nil key); callers
 // that must observe such errors should iterate with Cursor() and check
-// Err(). The typed layer (TypedKeyspaceHandle / TypedSetKeyspaceHandle) delegates to these.
+// Err(). The typed layer (typed.KeyspaceHandle / typed.SetKeyspaceHandle) delegates to these.
 //
 // Guard errors PANIC at construction (api-surface.md §Range
 // Iterators): calling All/Range/Prefix on a handle whose transaction
@@ -167,4 +167,19 @@ func guardIterConstruction(tx *Tx, ksDead bool) {
 	if ksDead {
 		panic(fmt.Sprintf("gmdb: iterator constructed on a dead keyspace handle: %v", ErrKeyspaceClosed))
 	}
+}
+
+// GuardIterConstruction fires the same construction-time panic the
+// keyspace's own iterators fire when the transaction is unusable or
+// the keyspace handle is dead. It exists for tiers that wrap this
+// keyspace's iteration surfaces (gmdb/typed) and must fail their
+// error short-circuit paths identically; callers rarely need it.
+func (ks *Keyspace) GuardIterConstruction() {
+	guardIterConstruction(ks.tx, ks.dead)
+}
+
+// GuardIterConstruction is the SetKeyspace form of
+// (*Keyspace).GuardIterConstruction.
+func (sks *SetKeyspace) GuardIterConstruction() {
+	guardIterConstruction(sks.tx, sks.dead)
 }

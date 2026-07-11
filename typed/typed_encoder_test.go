@@ -1,4 +1,4 @@
-package gmdb
+package typed
 
 import (
 	"bytes"

@@ -3,7 +3,7 @@
 Per-field typed column declarations over typed keyspace rows, and
 the `ColumnIndex` declaration that compiles them into a
 multi-column byte-oriented `IndexDecl`. This is the typed form of
-the byte API's multi-column contract: where `TypedIndex[K, V, IK]`
+the byte API's multi-column contract: where `typed.Index[K, V, IK]`
 collapses a composite index key into one opaque column (see
 `typed-keyspaces.md §Limitation`), a `ColumnIndex` declares one
 byte `IndexColumn` per field. Partial-prefix queries, per-column
@@ -18,17 +18,17 @@ that makes index pushdown sound.
 Scope:
 - `Column[K, V, C]` and `MultiColumn[K, V, C]` declarations.
 - `ColumnIndex[K, V]`: options, `Where` predicate, covering
-  columns, `AnyTypedIndex` integration.
+  columns, `typed.AnyIndex` integration.
 - Compilation to the byte `IndexDecl`: extractor synthesis,
   Cartesian expansion, empty-slice gating.
 - Synthesized column-name grammar (schema-hash folding).
 - Typed covering projections and per-column projection decode.
-- Relationship to `TypedIndex[K, V, IK]`.
+- Relationship to `typed.Index[K, V, IK]`.
 
 Depends on / interacts with:
 - `typed-keyspaces.md` for `Encoder[T]`, the key-ordering
   constraint, encoder-ID immutability, and the sealed
-  `AnyTypedIndex` interface this tier implements.
+  `typed.AnyIndex` interface this tier implements.
 - `indexing.md` for the byte `IndexDecl` contract this tier
   compiles to: drift guard, unique semantics, partial-index
   semantics, covering storage, duplicate collapse.
@@ -61,7 +61,7 @@ Invariant: kind=clause-explicit;
     a column is injective over (declaration form, user column
     name, encoder ID), and the KEY-column name domain is
     disjoint from the synthesized-name domain of every OTHER
-    TYPED decl form (`TypedIndex`'s encoder-ID-derived synthesis
+    TYPED decl form (`typed.Index`'s encoder-ID-derived synthesis
     included; the raw byte API's caller-chosen names are an open
     namespace outside this guarantee). The one sanctioned shared
     name is the full-row covering sentinel
@@ -71,7 +71,7 @@ Invariant: kind=clause-explicit;
     the same key-column name;
   from=this spec §Synthesized column-name grammar;
   violation=A `Column` and a `MultiColumn` with the same user
-    name and encoder ID (or a `TypedIndex` whose synthesized
+    name and encoder ID (or a `typed.Index` whose synthesized
     name collides with a `ColumnIndex` column's) would hash
     identically; opening a keyspace whose stored index was built
     under one form with a decl of the other form passes the
@@ -171,7 +171,7 @@ by any number of `ColumnIndex` declarations over the same
 
 Both column forms are type-erased for aggregation via a sealed
 interface (`AnyColumn[K, V]`), sealed for the same reason
-`AnyTypedIndex` is: the compilation path relies on every column
+`typed.AnyIndex` is: the compilation path relies on every column
 having been constructed through `NewColumn` / `NewMultiColumn`,
 which pins encoder-ID folding and the name grammar. A second
 sealed erasure, `AnySingleColumn[K, V]`, is implemented ONLY by
@@ -193,8 +193,8 @@ type ColumnIndexOpts[K, V any] struct {
 }
 
 // NewColumnIndex declares an index over ordered columns.
-// The declaration implements AnyTypedIndex[K, V] and is passed
-// to TypedKeyspace Open / Create exactly like a TypedIndex.
+// The declaration implements typed.AnyIndex[K, V] and is passed
+// to typed.Keyspace Open / Create exactly like a typed.Index.
 func NewColumnIndex[K, V any](
     name string,
     columns []AnyColumn[K, V],
@@ -254,7 +254,7 @@ encoder distinct in the schema hash — their expansion semantics
 differ, so their fingerprints must too (neither prefix is a
 prefix of the other, or of `gmdb/cover-value/`). Encoder-ID
 folding gives the same guarantee the typed layer's synthesis
-gives `TypedIndex`: swapping a column's encoder surfaces as
+gives `typed.Index`: swapping a column's encoder surfaces as
 `ErrIndexFingerprintMismatch` at open, never as silently misread
 entries. Empty encoder IDs are rejected with
 `ErrIndexEncoderIDEmpty` at open, as for `IKEnc`.
@@ -264,14 +264,14 @@ reserved-namespace pattern the typed layer already uses for its
 full-row-covering sentinel (`gmdb/cover-value/`, the printable
 engine-namespace prefix the typed read path recognizes):
 `gmdb/col/` and `gmdb/multicol/` are reserved column-namespace
-prefixes. `TypedIndex`'s synthesized key-column name is its raw
+prefixes. `typed.Index`'s synthesized key-column name is its raw
 IK-encoder ID, so disjointness is enforced where the two domains
 could meet: an encoder ID beginning with a reserved
 column-namespace prefix (`gmdb/col/`, `gmdb/multicol/`,
 `gmdb/cover-value/`) is rejected at open with
 `ErrIndexEncoderIDReserved` — the rejection is what makes the
 engine namespace non-mintable (the `<pkg>/<type>` ID convention
-alone is only recommended). Existing `TypedIndex` fingerprints
+alone is only recommended). Existing `typed.Index` fingerprints
 are unaffected: the
 typed synthesis itself does not change, and no canonical encoder
 ID lies in the reserved namespace.
@@ -289,13 +289,13 @@ covering tuple, in declaration order, per
 `indexing.md §Covering Indexes`. This gives arbitrary covering
 projections the typed return surface that
 `typed-keyspaces.md §Covering` documents as absent from the
-`TypedIndex` tier: the consumer decodes per column, not per row.
+`typed.Index` tier: the consumer decodes per column, not per row.
 
 `CoverValue: true` is the full-row alternative: the entry stores
 `encode(V)` as the single covering column with the value
 encoder's ID folded into the fingerprint — the same mechanics
 AND the same `gmdb/cover-value/` sentinel as
-`TypedIndex.CoverValue` (`typed-keyspaces.md §Covering`), so the
+`typed.Index.CoverValue` (`typed-keyspaces.md §Covering`), so the
 typed read path recognizes the shape from either decl form and
 reads of `V` through the index skip the row back-lookup.
 `CoverValue` and a non-empty `Covering` are mutually exclusive
@@ -323,12 +323,12 @@ bytes versus row back-lookup is the planner's contract
 (`query-builder.md Inv-QB3`); this tier only guarantees the
 bytes round-trip.
 
-## Relationship to TypedIndex
+## Relationship to typed.Index
 
-`ColumnIndex` and `TypedIndex` coexist as peers implementing the
-same sealed `AnyTypedIndex`:
+`ColumnIndex` and `typed.Index` coexist as peers implementing the
+same sealed `typed.AnyIndex`:
 
-- `TypedIndex[K, V, IK]` remains the opaque-IK escape hatch: one
+- `typed.Index[K, V, IK]` remains the opaque-IK escape hatch: one
   encoder controls the entire key encoding, `Extract` may return
   multiple `IK`s with arbitrary logic. Maximum control, no
   per-column structure — and therefore invisible to the query

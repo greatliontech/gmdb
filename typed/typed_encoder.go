@@ -1,4 +1,4 @@
-package gmdb
+package typed
 
 import (
 	"encoding/binary"
@@ -60,7 +60,7 @@ func (f FuncEncoder[T]) ID() string                                   { return f
 
 // errDecode reports a malformed/truncated byte sequence for a canonical
 // encoder (wrong length). Surfaced to the typed caller, not wrapped in
-// ErrCorrupted: a decode failure on user data usually means the wrong
+// gmdb.ErrCorrupted: a decode failure on user data usually means the wrong
 // encoder was supplied, not engine corruption.
 func errDecode(enc string, got, want int) error {
 	return fmt.Errorf("gmdb: %s decode: got %d bytes, want %d", enc, got, want)

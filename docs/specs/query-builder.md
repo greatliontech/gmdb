@@ -44,7 +44,7 @@ Depends on / interacts with:
   return contract, and handle invalidation (the builder's
   iterators inherit `ErrCursorStale` / `ErrTxClosed` semantics
   unchanged).
-- `typed-keyspaces.md` for `TypedKeyspaceHandle` iteration used
+- `typed-keyspaces.md` for `typed.KeyspaceHandle` iteration used
   by scan plans.
 - `transactions.md` — a query executes within one transaction
   and sees its dirty state, exactly as the surfaces it composes.
@@ -203,7 +203,7 @@ planner's affair (§Planning rules).
 ## Query surface
 
 ```go
-func New[K, V any](ks *TypedKeyspaceHandle[K, V]) *Query[K, V]
+func New[K, V any](ks *typed.KeyspaceHandle[K, V]) *Query[K, V]
 
 func (q *Query[K, V]) Where(terms ...Term[K, V]) *Query[K, V]   // ANDed
 func (q *Query[K, V]) Filter(f func(K, V) bool) *Query[K, V]    // opaque residual
@@ -456,9 +456,9 @@ The executor additionally requires a typed→byte bridge:
 ```go
 // ByteIndex returns the byte-oriented handle for an index
 // declared on this keyspace — the surface the plan leaves
-// iterate (TypedIndexQuery is IK-opaque and cannot serve
+// iterate (typed.IndexQuery is IK-opaque and cannot serve
 // per-column entry bytes).
-func (t *TypedKeyspaceHandle[K, V]) ByteIndex(name string) (*IndexHandle, error)
+func (t *KeyspaceHandle[K, V]) ByteIndex(name string) (*gmdb.IndexHandle, error)
 ```
 
 Its normative clause belongs to `typed-keyspaces.md` /

@@ -1,23 +1,25 @@
-package gmdb
+package typed
 
 import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb"
 )
 
-// newTypedNumsKS creates a TypedKeyspace[uint64,string] populated with
+// newTypedNumsKS creates a Keyspace[uint64,string] populated with
 // keys 1..n (value "v<k>") and returns the handle + cleanup.
-func newTypedNumsKS(t *testing.T, n uint64) (*TypedKeyspaceHandle[uint64, string], func()) {
+func newTypedNumsKS(t *testing.T, n uint64) (*KeyspaceHandle[uint64, string], *gmdb.Tx, func()) {
 	t.Helper()
 	ctx := context.Background()
-	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	db := openWith(t, ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		_ = db.Close()
 		t.Fatalf("Begin: %v", err)
 	}
-	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
+	tks := NewKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		_ = tx.Rollback()
@@ -31,14 +33,14 @@ func newTypedNumsKS(t *testing.T, n uint64) (*TypedKeyspaceHandle[uint64, string
 			t.Fatalf("Put(%d): %v", i, err)
 		}
 	}
-	return ks, func() {
+	return ks, tx, func() {
 		_ = tx.Rollback()
 		_ = db.Close()
 	}
 }
 
-func TestTypedCursorForwardBackward(t *testing.T) {
-	ks, cleanup := newTypedNumsKS(t, 5)
+func TestCursorForwardBackward(t *testing.T) {
+	ks, _, cleanup := newTypedNumsKS(t, 5)
 	defer cleanup()
 
 	c := ks.Cursor()
@@ -63,8 +65,8 @@ func TestTypedCursorForwardBackward(t *testing.T) {
 	}
 }
 
-func TestTypedCursorSeek(t *testing.T) {
-	ks, cleanup := newTypedNumsKS(t, 10)
+func TestCursorSeek(t *testing.T) {
+	ks, _, cleanup := newTypedNumsKS(t, 10)
 	defer cleanup()
 
 	c := ks.Cursor()
@@ -82,8 +84,8 @@ func TestTypedCursorSeek(t *testing.T) {
 	}
 }
 
-func TestTypedCursorDelete(t *testing.T) {
-	ks, cleanup := newTypedNumsKS(t, 5)
+func TestCursorDelete(t *testing.T) {
+	ks, _, cleanup := newTypedNumsKS(t, 5)
 	defer cleanup()
 
 	c := ks.Cursor()
@@ -95,7 +97,7 @@ func TestTypedCursorDelete(t *testing.T) {
 		t.Fatalf("Delete: %v", err)
 	}
 	if _, err := ks.Get(3); err == nil {
-		t.Error("Get(3) after cursor Delete = nil err, want ErrNotFound")
+		t.Error("Get(3) after cursor Delete = nil err, want gmdb.ErrNotFound")
 	}
 	// Remaining keys via All.
 	var got []uint64
@@ -108,7 +110,7 @@ func TestTypedCursorDelete(t *testing.T) {
 }
 
 func TestTypedKSAllRangePrefix(t *testing.T) {
-	ks, cleanup := newTypedNumsKS(t, 6)
+	ks, _, cleanup := newTypedNumsKS(t, 6)
 	defer cleanup()
 
 	// All.
@@ -152,14 +154,14 @@ func TestTypedKSAllRangePrefix(t *testing.T) {
 // TestTypedKSPrefixString exercises true variable-width prefix matching.
 func TestTypedKSPrefixString(t *testing.T) {
 	ctx := context.Background()
-	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	db := openWith(t, ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
 	defer tx.Rollback()
-	tks := NewTypedKeyspace[string, string]("words", StringEncoder{}, StringEncoder{})
+	tks := NewKeyspace[string, string]("words", StringEncoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -178,20 +180,20 @@ func TestTypedKSPrefixString(t *testing.T) {
 	}
 }
 
-// TestTypedCursorSignedOrder is the end-to-end Inv-T1 integration check:
+// TestCursorSignedOrder is the end-to-end Inv-T1 integration check:
 // int64 keys with Int64Encoder must iterate in numeric order
 // (negatives below positives) through the cursor — not raw
 // two's-complement byte order.
-func TestTypedCursorSignedOrder(t *testing.T) {
+func TestCursorSignedOrder(t *testing.T) {
 	ctx := context.Background()
-	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	db := openWith(t, ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
 	defer tx.Rollback()
-	tks := NewTypedKeyspace[int64, string]("signed", Int64Encoder{}, StringEncoder{})
+	tks := NewKeyspace[int64, string]("signed", Int64Encoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -229,14 +231,14 @@ func TestTypedCursorSignedOrder(t *testing.T) {
 	}
 }
 
-// TestTypedCursorDecodeError verifies a value-decode failure during
-// iteration is sticky and surfaces via TypedCursor.Err(), and that the
+// TestCursorDecodeError verifies a value-decode failure during
+// iteration is sticky and surfaces via Cursor.Err(), and that the
 // convenience iterators end (yield nothing) on the same error. Uses an
 // asymmetric value encoder whose Decode always fails (Encode succeeds,
 // so Put writes a well-formed byte value the decoder then rejects).
-func TestTypedCursorDecodeError(t *testing.T) {
+func TestCursorDecodeError(t *testing.T) {
 	ctx := context.Background()
-	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	db := openWith(t, ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -249,7 +251,7 @@ func TestTypedCursorDecodeError(t *testing.T) {
 		DecodeFunc: func(src []byte) (string, error) { return "", errFailDecode },
 		EncoderID:  "test/fail-decode",
 	}
-	tks := NewTypedKeyspace[string, string]("bad", StringEncoder{}, failDec)
+	tks := NewKeyspace[string, string]("bad", StringEncoder{}, failDec)
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)

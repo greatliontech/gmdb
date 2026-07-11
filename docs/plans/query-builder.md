@@ -37,11 +37,11 @@ tests move with their subjects, unmodified.
       Guard (requirements folded from the parked issue doc at 7.1).
       Pre-v1 clean break of the registry-entry encoding —
       ratified 2026-07-11.
-- [ ] 8. `gmdb/typed` extraction: move typed tier + encoders out
+- [x] 8. `gmdb/typed` extraction: move typed tier + encoders out
       of root; exported knobs `Keyspace.GuardIterConstruction` /
       `SetKeyspace.GuardIterConstruction`, `IndexHandle.Decl`,
-      `IndexHandle.EnableTypedCoverValue` (or exported
-      cover-value sentinel contract — decided in-chunk);
+      `IndexHandle.EnableCoverValueReturn` (+ the sentinel contract
+      hoisted to internal/indexing — decided in-chunk);
       `Typed*` → `typed.*` renames. Spec amendments riding:
       `typed-keyspaces.md` (renames + knobs), `api-surface.md`,
       name cascade into `typed-columns.md` /

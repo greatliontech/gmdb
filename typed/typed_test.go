@@ -1,4 +1,4 @@
-package gmdb
+package typed
 
 import (
 	"bytes"
@@ -6,16 +6,18 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/thegrumpylion/gmdb"
 )
 
 // ptr returns a pointer to v (for the *K range-boundary arguments).
 func ptr[T any](v T) *T { return &v }
 
 // newTypedTx opens a fresh DB + write tx, returning the tx and a cleanup.
-func newTypedTx(t *testing.T) (*Tx, func()) {
+func newTypedTx(t *testing.T) (*gmdb.Tx, func()) {
 	t.Helper()
 	ctx := context.Background()
-	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	db := openWith(t, ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		_ = db.Close()
@@ -31,7 +33,7 @@ func TestTypedKSRoundTrip(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
+	tks := NewKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -56,18 +58,18 @@ func TestTypedKSRoundTrip(t *testing.T) {
 		t.Errorf("Get(1) after replace = %q, want uno", got)
 	}
 	// Miss.
-	if _, err := ks.Get(99); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get(99) = %v, want ErrNotFound", err)
+	if _, err := ks.Get(99); !errors.Is(err, gmdb.ErrNotFound) {
+		t.Errorf("Get(99) = %v, want gmdb.ErrNotFound", err)
 	}
 	// Delete + delete-miss.
 	if err := ks.Delete(1); err != nil {
 		t.Fatalf("Delete(1): %v", err)
 	}
-	if _, err := ks.Get(1); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get(1) after delete = %v, want ErrNotFound", err)
+	if _, err := ks.Get(1); !errors.Is(err, gmdb.ErrNotFound) {
+		t.Errorf("Get(1) after delete = %v, want gmdb.ErrNotFound", err)
 	}
-	if err := ks.Delete(1); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Delete(1) again = %v, want ErrNotFound", err)
+	if err := ks.Delete(1); !errors.Is(err, gmdb.ErrNotFound) {
+		t.Errorf("Delete(1) again = %v, want gmdb.ErrNotFound", err)
 	}
 }
 
@@ -75,7 +77,7 @@ func TestTypedKSStringKeyBytesValue(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[string, []byte]("blobs", StringEncoder{}, BytesEncoder{})
+	tks := NewKeyspace[string, []byte]("blobs", StringEncoder{}, BytesEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -106,7 +108,7 @@ func TestTypedKSDeleteRange(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
+	tks := NewKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -125,8 +127,8 @@ func TestTypedKSDeleteRange(t *testing.T) {
 		t.Errorf("DeleteRange deleted %d, want 4", n)
 	}
 	for _, k := range []uint64{3, 4, 5, 6} {
-		if _, err := ks.Get(k); !errors.Is(err, ErrNotFound) {
-			t.Errorf("Get(%d) = %v, want ErrNotFound (deleted)", k, err)
+		if _, err := ks.Get(k); !errors.Is(err, gmdb.ErrNotFound) {
+			t.Errorf("Get(%d) = %v, want gmdb.ErrNotFound (deleted)", k, err)
 		}
 	}
 	for _, k := range []uint64{1, 2, 7, 8, 9, 10} {
@@ -147,10 +149,10 @@ func TestTypedKSDeleteRange(t *testing.T) {
 func TestTypedKSReadOnly(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	db := openWith(t, ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	db := openWith(t, ctx, path, gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
 
-	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
+	tks := NewKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 	// Create + populate + commit.
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -168,7 +170,7 @@ func TestTypedKSReadOnly(t *testing.T) {
 	}
 
 	// Reopen the keyspace read-only on a fresh write tx (OpenReadOnly
-	// yields a handle that rejects mutations with ErrReadOnly).
+	// yields a handle that rejects mutations with gmdb.ErrReadOnly).
 	rtx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
@@ -181,8 +183,8 @@ func TestTypedKSReadOnly(t *testing.T) {
 	if got, err := rks.Get(7); err != nil || got != "seven" {
 		t.Errorf("Get(7) = (%q, %v), want (seven, nil)", got, err)
 	}
-	if err := rks.Put(8, "eight"); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("Put on read-only = %v, want ErrReadOnly", err)
+	if err := rks.Put(8, "eight"); !errors.Is(err, gmdb.ErrReadOnly) {
+		t.Errorf("Put on read-only = %v, want gmdb.ErrReadOnly", err)
 	}
 }
 
@@ -193,7 +195,7 @@ func TestTypedKSEncoderError(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[time.Time, string]("events", TimeEncoder{}, StringEncoder{})
+	tks := NewKeyspace[time.Time, string]("events", TimeEncoder{}, StringEncoder{})
 	ks, err := tks.Create(tx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -221,9 +223,9 @@ func TestTypedKSEncoderError(t *testing.T) {
 func TestTypedKSOpenVariants(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	db := openWith(t, ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	db := openWith(t, ctx, path, gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tks := NewTypedKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
+	tks := NewKeyspace[uint64, string]("nums", Uint64Encoder{}, StringEncoder{})
 
 	tx1, err := db.Begin(ctx)
 	if err != nil {

@@ -54,7 +54,7 @@ type IndexHandle struct {
 	// coverValue, when true, makes Lookup/Range/Prefix/Get return the
 	// row value from the index entry's covering blob instead of
 	// back-looking-up the row keyspace (typed full-row covering). Set
-	// only by the typed layer (TypedKeyspaceHandle.Index) for indexes whose covering
+	// only by the typed layer (typed.KeyspaceHandle.Index) for indexes whose covering
 	// it recognizes as a full encoded-value column; default false ⇒
 	// back-lookup, the behavior for every byte-layer and non-covering
 	// index. Keyspace-only (a SetKeyspace index's value lives in its
@@ -371,7 +371,7 @@ func (idx *IndexHandle) rowTx() *Tx {
 // row_value is the user-facing value, selected by index shape:
 //
 //   - Typed full-row covering (idx.coverValue=true, set by
-//     TypedKeyspaceHandle.Index for an index whose covering is the typed full-row
+//     typed.KeyspaceHandle.Index for an index whose covering is the typed full-row
 //     sentinel column): the covering blob's single column is decoded
 //     and returned as the encoded V — the typed wrapper then runs
 //     valEnc.Decode on it.
@@ -432,12 +432,12 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 	// typed-keyspaces.md §Covering). The covering blob is a single
 	// NUL-escaped column holding the encoded row value, so the value
 	// is returned directly from the index entry — skipping the
-	// back-lookup against the row keyspace. The TypedIndexQuery
+	// back-lookup against the row keyspace. The typed.IndexQuery
 	// wrapper then runs valEnc.Decode on the returned bytes.
 	//
 	// Gated by idx.coverValue, set only by the typed layer for indexes
-	// it recognizes as full-row covering (isTypedCoverValueIndex —
-	// exactly one covering column with the typedCoverValuePrefix
+	// it recognizes as full-row covering (indexing.IsCoverValueDecl —
+	// exactly one covering column with the indexing.CoverValuePrefix
 	// sentinel). The byte-API path below handles arbitrary covering
 	// projections; default (no Covering declared) is back-lookup.
 	// coverValue is the caller's OPT-IN; whether the stored layout is
@@ -448,7 +448,7 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 	// shape returns silently wrong bytes as V. Either way the safe
 	// route for a shape-changed handle is the back-lookup below, which
 	// always returns the true row value.
-	if idx.coverValue && isTypedCoverValueIndex(idx.pinned.decl) {
+	if idx.coverValue && indexing.IsCoverValueDecl(idx.pinned.decl) {
 		coverCols, decErr := indexing.DecodeKey(encodedCovering)
 		if decErr != nil {
 			return nil, nil, false, fmt.Errorf("%w: index %q covering: %w", ErrCorrupted, idx.pinned.decl.Name, decErr)
@@ -1045,3 +1045,25 @@ func (idx *IndexHandle) extractSetKeyspacePKAndValue(indexKey, indexValue []byte
 	copy(svCopy, sv)
 	return skCopy, svCopy, false, nil
 }
+
+// Decl returns the handle's pinned index declaration — the live
+// decl this handle serves under (indexing.md §Handle
+// Invalidation). Used by tiers that must inspect the declaration
+// shape (gmdb/typed's full-row covering recognition); treat as
+// read-only.
+func (idx *IndexHandle) Decl() *IndexDecl { return idx.pinned.decl }
+
+// EnableCoverValueReturn opts this handle into the byte-layer
+// full-row covering-return route: Lookup / Range / Prefix / Get
+// return the entry's stored encode(V) instead of back-looking-up
+// the row — valid ONLY for a decl the engine recognizes as
+// full-row covering (indexing.IsCoverValueDecl; the route
+// re-checks the LIVE decl on every read, so a same-tx rebuild
+// that removes the sentinel downgrades the handle safely). Used
+// by gmdb/typed; callers rarely need it.
+func (idx *IndexHandle) EnableCoverValueReturn() { idx.coverValue = true }
+
+// CoverValueReturnEnabled reports whether EnableCoverValueReturn
+// has been called on this handle. Read-side companion for tiers
+// (and their tests) that must observe the opt-in.
+func (idx *IndexHandle) CoverValueReturnEnabled() bool { return idx.coverValue }

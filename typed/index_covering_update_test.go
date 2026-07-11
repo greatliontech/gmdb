@@ -1,8 +1,10 @@
-package gmdb
+package typed
 
 import (
 	"context"
 	"testing"
+
+	"github.com/thegrumpylion/gmdb"
 )
 
 // Covering payloads are extracted from the ROW VALUE; replacing the
@@ -16,7 +18,7 @@ import (
 // row value changes, the index key does not.
 func TestCoveringValueRewrittenOnUpdate(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	db, err := gmdb.Open(ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,8 +35,8 @@ func TestCoveringValueRewrittenOnUpdate(t *testing.T) {
 		}
 		return []string{v[:1]}
 	}
-	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
-	idx := &TypedIndex[uint64, string, string]{
+	tks := NewKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
+	idx := &Index[uint64, string, string]{
 		Name: "by_first", IKEnc: StringEncoder{}, Extract: firstLetter, CoverValue: true,
 	}
 	ks, err := tks.Create(tx, idx)
@@ -51,7 +53,7 @@ func TestCoveringValueRewrittenOnUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	q := NewTypedIndexQuery[uint64, string, string](h, StringEncoder{})
+	q := NewIndexQuery[uint64, string, string](h, StringEncoder{})
 	got := map[uint64]string{}
 	for k, v := range q.Lookup("a") {
 		got[k] = v
@@ -72,11 +74,11 @@ func TestCoveringValueRewrittenOnUpdate(t *testing.T) {
 	}
 }
 
-func assertCheckIndexesClean(t *testing.T, db *DB, ks string, decls ...*IndexDecl) {
+func assertCheckIndexesClean(t *testing.T, db *gmdb.DB, ks string, decls ...*gmdb.IndexDecl) {
 	t.Helper()
-	for iss := range db.CheckWithOptions(&CheckOptions{
+	for iss := range db.CheckWithOptions(&gmdb.CheckOptions{
 		CheckIndexes: true,
-		Indexes:      map[string][]*IndexDecl{ks: decls},
+		Indexes:      map[string][]*gmdb.IndexDecl{ks: decls},
 	}) {
 		t.Errorf("CheckIndexes issue: %+v", iss)
 	}
@@ -86,7 +88,7 @@ func assertCheckIndexesClean(t *testing.T, db *DB, ks string, decls ...*IndexDec
 // while Cols stay fixed.
 func TestByteCoveringRewrittenOnUpdate(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	db, err := gmdb.Open(ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,16 +99,16 @@ func TestByteCoveringRewrittenOnUpdate(t *testing.T) {
 	}
 	defer tx.Rollback()
 
-	extract := func(key, value []byte) []IndexEntry {
-		return []IndexEntry{{
+	extract := func(key, value []byte) []gmdb.IndexEntry {
+		return []gmdb.IndexEntry{{
 			Cols:  [][]byte{value[:1]},
 			Cover: [][]byte{value[2:]},
 		}}
 	}
-	decl := &IndexDecl{
+	decl := &gmdb.IndexDecl{
 		Name:     "by_c",
-		Columns:  []IndexColumn{{Name: "c"}},
-		Covering: []IndexCoveringColumn{{Name: "cov"}},
+		Columns:  []gmdb.IndexColumn{{Name: "c"}},
+		Covering: []gmdb.IndexCoveringColumn{{Name: "cov"}},
 		Extract:  extract,
 	}
 	ks, err := tx.CreateKeyspace("t", decl)
@@ -125,7 +127,7 @@ func TestByteCoveringRewrittenOnUpdate(t *testing.T) {
 	}
 	var cover string
 	for _, v := range h.Lookup([]byte("a")) {
-		cols, err := DecodeCoveringTuple(v)
+		cols, err := gmdb.DecodeCoveringTuple(v)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -153,7 +155,7 @@ func TestByteCoveringRewrittenOnUpdate(t *testing.T) {
 // and produced FingerprintDrift false positives).
 func TestRebuildMatchesLiveDuplicateCollapse(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
+	db, err := gmdb.Open(ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,16 +167,16 @@ func TestRebuildMatchesLiveDuplicateCollapse(t *testing.T) {
 	defer tx.Rollback()
 
 	// Two entries, same Cols (same encoded key), different Cover.
-	extract := func(key, value []byte) []IndexEntry {
-		return []IndexEntry{
+	extract := func(key, value []byte) []gmdb.IndexEntry {
+		return []gmdb.IndexEntry{
 			{Cols: [][]byte{{'x'}}, Cover: [][]byte{[]byte("first")}},
 			{Cols: [][]byte{{'x'}}, Cover: [][]byte{[]byte("last")}},
 		}
 	}
-	decl := &IndexDecl{
+	decl := &gmdb.IndexDecl{
 		Name:     "dup",
-		Columns:  []IndexColumn{{Name: "c"}},
-		Covering: []IndexCoveringColumn{{Name: "cov"}},
+		Columns:  []gmdb.IndexColumn{{Name: "c"}},
+		Covering: []gmdb.IndexCoveringColumn{{Name: "cov"}},
 		Extract:  extract,
 	}
 	ks, err := tx.CreateKeyspace("t", decl)
@@ -191,7 +193,7 @@ func TestRebuildMatchesLiveDuplicateCollapse(t *testing.T) {
 		}
 		var cover string
 		for _, v := range h.Lookup([]byte{'x'}) {
-			cols, err := DecodeCoveringTuple(v)
+			cols, err := gmdb.DecodeCoveringTuple(v)
 			if err != nil {
 				t.Fatal(err)
 			}

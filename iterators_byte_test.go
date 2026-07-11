@@ -2,7 +2,6 @@ package gmdb
 
 import (
 	"context"
-	"errors"
 	"slices"
 	"testing"
 )
@@ -116,22 +115,6 @@ func TestSetKeyspaceByteIterators(t *testing.T) {
 	}
 }
 
-func collectKeys(seq func(func([]byte, []byte) bool)) []string {
-	var out []string
-	for kb := range seq {
-		out = append(out, string(kb))
-	}
-	return out
-}
-
-func collectPairs(seq func(func([]byte, []byte) bool)) []string {
-	var out []string
-	for kb, vb := range seq {
-		out = append(out, string(kb)+"="+string(vb))
-	}
-	return out
-}
-
 // Constructing an iterator on a handle whose transaction state
 // forbids every operation must PANIC — a silently empty sequence is
 // indistinguishable from no data (api-surface.md §Range Iterators).
@@ -230,60 +213,18 @@ func TestIteratorConstructionPanicsOnClosedDB(t *testing.T) {
 	ks.All()
 }
 
-// The typed layer's All/Range/Prefix run the construction guard
-// EAGERLY: the panic fires at the typed call itself, never deferred
-// to loop start (api-surface.md §Range Iterators).
-func TestTypedIteratorConstructionPanicsEagerly(t *testing.T) {
-	tks, cleanup := newTypedNumsKS(t, 3)
-	defer cleanup()
-	// Freeze the parent.
-	child, err := tks.ks.tx.BeginChild()
-	if err != nil {
-		t.Fatalf("BeginChild: %v", err)
+func collectKeys(seq func(func([]byte, []byte) bool)) []string {
+	var out []string
+	for kb := range seq {
+		out = append(out, string(kb))
 	}
-	defer child.Rollback()
-	mustPanicHere := func(name string, fn func()) {
-		t.Helper()
-		defer func() {
-			if recover() == nil {
-				t.Errorf("%s: no panic at the typed constructor call", name)
-			}
-		}()
-		fn()
-	}
-	// The constructor CALL panics — the returned seq is never ranged.
-	mustPanicHere("typed All", func() { _ = tks.All() })
-	mustPanicHere("typed Range", func() { _ = tks.Range(nil, nil) })
-	mustPanicHere("typed Prefix", func() { _ = tks.Prefix(1) })
+	return out
 }
 
-// failingEncoder always errors — the encode-failure branch of the
-// typed constructors must still run the construction guard first
-// (an unusable handle panics regardless of bound validity).
-type failingEncoder struct{ Uint64Encoder }
-
-func (failingEncoder) AppendEncode(dst []byte, v uint64) ([]byte, error) {
-	return nil, errors.New("encode always fails")
-}
-
-func TestTypedIteratorEncodeFailureStillGuards(t *testing.T) {
-	tks, cleanup := newTypedNumsKS(t, 1)
-	defer cleanup()
-	bad := &TypedKeyspaceHandle[uint64, string]{
-		ks:     tks.ks,
-		keyEnc: failingEncoder{},
-		valEnc: tks.valEnc,
+func collectPairs(seq func(func([]byte, []byte) bool)) []string {
+	var out []string
+	for kb, vb := range seq {
+		out = append(out, string(kb)+"="+string(vb))
 	}
-	child, err := tks.ks.tx.BeginChild()
-	if err != nil {
-		t.Fatalf("BeginChild: %v", err)
-	}
-	defer child.Rollback()
-	one := uint64(1)
-	defer func() {
-		if recover() == nil {
-			t.Fatal("Range with failing encoder on a frozen handle: no panic")
-		}
-	}()
-	bad.Range(&one, nil)
+	return out
 }

@@ -1,4 +1,4 @@
-package gmdb
+package typed
 
 import (
 	"context"
@@ -6,6 +6,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/thegrumpylion/gmdb"
 )
 
 // firstLetterIK extracts the first byte of the value as a string IK
@@ -20,12 +22,12 @@ func firstLetterIK(_ uint64, v string) []string {
 // wholeValIK extracts the whole value as a string IK (for unique tests).
 func wholeValIK(_ uint64, v string) []string { return []string{v} }
 
-func TestTypedIndexLookupNonUnique(t *testing.T) {
+func TestIndexLookupNonUnique(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
-	byFirst := &TypedIndex[uint64, string, string]{
+	tks := NewKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
+	byFirst := &Index[uint64, string, string]{
 		Name:    "by_first",
 		IKEnc:   StringEncoder{},
 		Extract: firstLetterIK,
@@ -45,7 +47,7 @@ func TestTypedIndexLookupNonUnique(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	q := NewTypedIndexQuery[uint64, string, string](h, StringEncoder{})
+	q := NewIndexQuery[uint64, string, string](h, StringEncoder{})
 
 	// Lookup "a" → ids 1,2,4 (alice, amy, anna), each with its name.
 	got := map[uint64]string{}
@@ -77,23 +79,23 @@ func TestTypedIndexLookupNonUnique(t *testing.T) {
 		t.Errorf("LookupKeys(b) = %v, want [3]", keys)
 	}
 
-	// Get on a non-unique index → ErrIndexNotUnique.
-	if _, _, err := q.Get("a"); !errors.Is(err, ErrIndexNotUnique) {
-		t.Errorf("Get on non-unique index = %v, want ErrIndexNotUnique", err)
+	// Get on a non-unique index → gmdb.ErrIndexNotUnique.
+	if _, _, err := q.Get("a"); !errors.Is(err, gmdb.ErrIndexNotUnique) {
+		t.Errorf("Get on non-unique index = %v, want gmdb.ErrIndexNotUnique", err)
 	}
 }
 
-// TestTypedIndexEncodeErrorPanics locks in the deliberate panic on an
-// IK-encode failure (the byte IndexExtractor is infallible; silently
+// TestIndexEncodeErrorPanics locks in the deliberate panic on an
+// IK-encode failure (the byte gmdb.IndexExtractor is infallible; silently
 // dropping the entry would diverge the index from the rows). The only
 // reachable trigger with a canonical encoder is an out-of-range
 // TimeEncoder index key.
-func TestTypedIndexEncodeErrorPanics(t *testing.T) {
+func TestIndexEncodeErrorPanics(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("events", Uint64Encoder{}, StringEncoder{})
-	byTime := &TypedIndex[uint64, string, time.Time]{
+	tks := NewKeyspace[uint64, string]("events", Uint64Encoder{}, StringEncoder{})
+	byTime := &Index[uint64, string, time.Time]{
 		Name:  "by_time",
 		IKEnc: TimeEncoder{},
 		// Yields an out-of-range time → IKEnc.AppendEncode fails.
@@ -115,12 +117,12 @@ func TestTypedIndexEncodeErrorPanics(t *testing.T) {
 	}()
 }
 
-func TestTypedIndexUniqueGet(t *testing.T) {
+func TestIndexUniqueGet(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
-	byName := &TypedIndex[uint64, string, string]{
+	tks := NewKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
+	byName := &Index[uint64, string, string]{
 		Name:    "by_name",
 		IKEnc:   StringEncoder{},
 		Unique:  true,
@@ -138,38 +140,38 @@ func TestTypedIndexUniqueGet(t *testing.T) {
 	}
 
 	h, _ := ks.Index("by_name")
-	q := NewTypedIndexQuery[uint64, string, string](h, StringEncoder{})
+	q := NewIndexQuery[uint64, string, string](h, StringEncoder{})
 	id, name, err := q.Get("alice")
 	if err != nil || id != 1 || name != "alice" {
 		t.Errorf("Get(alice) = (%d, %q, %v), want (1, alice, nil)", id, name, err)
 	}
-	if _, _, err := q.Get("nobody"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Get(nobody) = %v, want ErrNotFound", err)
+	if _, _, err := q.Get("nobody"); !errors.Is(err, gmdb.ErrNotFound) {
+		t.Errorf("Get(nobody) = %v, want gmdb.ErrNotFound", err)
 	}
 
 	// A duplicate unique key is rejected by the byte layer.
-	if err := ks.Put(3, "alice"); !errors.Is(err, ErrIndexUniqueViolation) {
-		t.Errorf("Put(3, alice) = %v, want ErrIndexUniqueViolation", err)
+	if err := ks.Put(3, "alice"); !errors.Is(err, gmdb.ErrIndexUniqueViolation) {
+		t.Errorf("Put(3, alice) = %v, want gmdb.ErrIndexUniqueViolation", err)
 	}
 }
 
-// TestTypedIndexEncoderIDDrift is the load-bearing Inv-T7 check: the IK
+// TestIndexEncoderIDDrift is the load-bearing Inv-T7 check: the IK
 // encoder's ID() is folded into the schema-hash fingerprint, so opening
 // with a different-ID encoder for the same column triggers
-// ErrIndexFingerprintMismatch.
-func TestTypedIndexEncoderIDDrift(t *testing.T) {
+// gmdb.ErrIndexFingerprintMismatch.
+func TestIndexEncoderIDDrift(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)
-	db := openWith(t, ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	db := openWith(t, ctx, path, gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 	defer db.Close()
-	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
+	tks := NewKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
 
 	// Create with the canonical StringEncoder (ID "gmdb/string").
 	tx1, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("Begin1: %v", err)
 	}
-	idxA := &TypedIndex[uint64, string, string]{Name: "by_name", IKEnc: StringEncoder{}, Extract: wholeValIK}
+	idxA := &Index[uint64, string, string]{Name: "by_name", IKEnc: StringEncoder{}, Extract: wholeValIK}
 	if _, err := tks.Create(tx1, idxA); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -188,37 +190,37 @@ func TestTypedIndexEncoderIDDrift(t *testing.T) {
 		t.Fatalf("Begin2: %v", err)
 	}
 	defer tx2.Rollback()
-	idxB := &TypedIndex[uint64, string, string]{Name: "by_name", IKEnc: altEnc, Extract: wholeValIK}
+	idxB := &Index[uint64, string, string]{Name: "by_name", IKEnc: altEnc, Extract: wholeValIK}
 	_, err = tks.Open(tx2, idxB)
-	if !errors.Is(err, ErrIndexFingerprintMismatch) {
-		t.Fatalf("Open with drifted encoder = %v, want ErrIndexFingerprintMismatch", err)
+	if !errors.Is(err, gmdb.ErrIndexFingerprintMismatch) {
+		t.Fatalf("Open with drifted encoder = %v, want gmdb.ErrIndexFingerprintMismatch", err)
 	}
 }
 
-// TestTypedIndexEmptyEncoderID verifies Inv-T3: an empty IKEnc ID() is
-// rejected (ErrIndexEncoderIDEmpty) when the encoder is referenced by a
+// TestIndexEmptyEncoderID verifies Inv-T3: an empty IKEnc ID() is
+// rejected (gmdb.ErrIndexEncoderIDEmpty) when the encoder is referenced by a
 // typed index, but an indexless typed keyspace with an empty-ID encoder
 // opens fine.
-func TestTypedIndexEmptyEncoderID(t *testing.T) {
+func TestIndexEmptyEncoderID(t *testing.T) {
 	emptyID := FuncEncoder[string]{
 		EncodeFunc: func(dst []byte, v string) ([]byte, error) { return append(dst, v...), nil },
 		DecodeFunc: func(src []byte) (string, error) { return string(src), nil },
 		EncoderID:  "", // empty
 	}
 
-	// (a) Referenced by a typed index → ErrIndexEncoderIDEmpty.
+	// (a) Referenced by a typed index → gmdb.ErrIndexEncoderIDEmpty.
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
-	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
-	badIdx := &TypedIndex[uint64, string, string]{Name: "by_name", IKEnc: emptyID, Extract: wholeValIK}
-	if _, err := tks.Create(tx, badIdx); !errors.Is(err, ErrIndexEncoderIDEmpty) {
-		t.Errorf("Create with empty-ID index encoder = %v, want ErrIndexEncoderIDEmpty", err)
+	tks := NewKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
+	badIdx := &Index[uint64, string, string]{Name: "by_name", IKEnc: emptyID, Extract: wholeValIK}
+	if _, err := tks.Create(tx, badIdx); !errors.Is(err, gmdb.ErrIndexEncoderIDEmpty) {
+		t.Errorf("Create with empty-ID index encoder = %v, want gmdb.ErrIndexEncoderIDEmpty", err)
 	}
 
 	// (b) Indexless typed keyspace with empty-ID encoders → fine.
 	tx2, cleanup2 := newTypedTx(t)
 	defer cleanup2()
-	indexless := NewTypedKeyspace[string, string]("plain", emptyID, emptyID)
+	indexless := NewKeyspace[string, string]("plain", emptyID, emptyID)
 	ks, err := indexless.Create(tx2)
 	if err != nil {
 		t.Fatalf("Create indexless with empty-ID encoders: %v", err)
@@ -231,14 +233,14 @@ func TestTypedIndexEmptyEncoderID(t *testing.T) {
 	}
 }
 
-// TestTypedIndexRange exercises a numeric IK with Range over the typed
+// TestIndexRange exercises a numeric IK with Range over the typed
 // index.
-func TestTypedIndexRange(t *testing.T) {
+func TestIndexRange(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
-	byLen := &TypedIndex[uint64, string, int64]{
+	tks := NewKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
+	byLen := &Index[uint64, string, int64]{
 		Name:    "by_len",
 		IKEnc:   Int64Encoder{},
 		Extract: func(_ uint64, v string) []int64 { return []int64{int64(len(v))} },
@@ -254,7 +256,7 @@ func TestTypedIndexRange(t *testing.T) {
 		}
 	}
 	h, _ := ks.Index("by_len")
-	q := NewTypedIndexQuery[uint64, string, int64](h, Int64Encoder{})
+	q := NewIndexQuery[uint64, string, int64](h, Int64Encoder{})
 
 	// Range [2, 4) → lengths 2,3 → ids 2,3.
 	var got []uint64
@@ -275,15 +277,15 @@ func TestTypedIndexRange(t *testing.T) {
 	}
 }
 
-// TestTypedIndexQueryBindMismatch verifies a NewTypedIndexQuery bound
+// TestIndexQueryBindMismatch verifies a NewIndexQuery bound
 // with the wrong K/V type parameters is permanently inert and reports
 // the mismatch via Err().
-func TestTypedIndexQueryBindMismatch(t *testing.T) {
+func TestIndexQueryBindMismatch(t *testing.T) {
 	tx, cleanup := newTypedTx(t)
 	defer cleanup()
 
-	tks := NewTypedKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
-	idx := &TypedIndex[uint64, string, string]{Name: "by_name", IKEnc: StringEncoder{}, Extract: wholeValIK}
+	tks := NewKeyspace[uint64, string]("users", Uint64Encoder{}, StringEncoder{})
+	idx := &Index[uint64, string, string]{Name: "by_name", IKEnc: StringEncoder{}, Extract: wholeValIK}
 	ks, err := tks.Create(tx, idx)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -293,7 +295,7 @@ func TestTypedIndexQueryBindMismatch(t *testing.T) {
 	}
 	h, _ := ks.Index("by_name")
 	// Wrong K type (string instead of uint64).
-	q := NewTypedIndexQuery[string, string, string](h, StringEncoder{})
+	q := NewIndexQuery[string, string, string](h, StringEncoder{})
 	n := 0
 	for range q.Lookup("alice") {
 		n++
@@ -301,8 +303,8 @@ func TestTypedIndexQueryBindMismatch(t *testing.T) {
 	if n != 0 {
 		t.Errorf("inert query yielded %d, want 0", n)
 	}
-	if !errors.Is(q.Err(), ErrInvalidOptions) {
-		t.Errorf("bind-mismatch Err() = %v, want ErrInvalidOptions", q.Err())
+	if !errors.Is(q.Err(), gmdb.ErrInvalidOptions) {
+		t.Errorf("bind-mismatch Err() = %v, want gmdb.ErrInvalidOptions", q.Err())
 	}
 }
 
@@ -312,8 +314,8 @@ func TestTypedSetIndexLookup(t *testing.T) {
 	tx, cleanup := newTypedSetTx(t)
 	defer cleanup()
 
-	tsk := NewTypedSetKeyspace[string, string]("groups", StringEncoder{}, StringEncoder{}, nil)
-	byFirst := &TypedIndex[string, string, string]{
+	tsk := NewSetKeyspace[string, string]("groups", StringEncoder{}, StringEncoder{}, nil)
+	byFirst := &Index[string, string, string]{
 		Name:    "by_member_first",
 		IKEnc:   StringEncoder{},
 		Extract: func(_ string, v string) []string { return []string{v[:1]} },
@@ -333,7 +335,7 @@ func TestTypedSetIndexLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index: %v", err)
 	}
-	q := NewTypedIndexQuery[string, string, string](h, StringEncoder{})
+	q := NewIndexQuery[string, string, string](h, StringEncoder{})
 	// Lookup "a" → (admins,alice),(admins,amy),(users,anna).
 	var got []string
 	for g, member := range q.Lookup("a") {
@@ -349,7 +351,7 @@ func TestTypedSetIndexLookup(t *testing.T) {
 	}
 
 	// LookupKeys on a SetKeyspace index has no single-key form (the PK is
-	// the compound (setKey,setValue) pair) → ErrInvalidOptions via Err().
+	// the compound (setKey,setValue) pair) → gmdb.ErrInvalidOptions via Err().
 	n := 0
 	for range q.LookupKeys("a") {
 		n++
@@ -357,7 +359,7 @@ func TestTypedSetIndexLookup(t *testing.T) {
 	if n != 0 {
 		t.Errorf("set index LookupKeys yielded %d, want 0", n)
 	}
-	if !errors.Is(q.Err(), ErrInvalidOptions) {
-		t.Errorf("set index LookupKeys Err() = %v, want ErrInvalidOptions", q.Err())
+	if !errors.Is(q.Err(), gmdb.ErrInvalidOptions) {
+		t.Errorf("set index LookupKeys Err() = %v, want gmdb.ErrInvalidOptions", q.Err())
 	}
 }

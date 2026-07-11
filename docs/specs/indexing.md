@@ -245,7 +245,7 @@ type IndexEntry struct {
 type IndexExtractor func(key, value []byte) []IndexEntry
 ```
 
-For typed callers, `TypedIndex[K, V, IK]` wraps `IndexDecl` and
+For typed callers, `typed.Index[K, V, IK]` wraps `IndexDecl` and
 generates column bytes automatically from a typed `Encoder[IK]` —
 see `typed-keyspaces.md`.
 
@@ -358,7 +358,7 @@ encoding`:
   their terminators, followed (for non-unique indexes) by the
   escaped row PK + a final `0x00 0x00`.
 
-The typed layer (`TypedIndex[K, V, IK]`) automates lex-safe
+The typed layer (`typed.Index[K, V, IK]`) automates lex-safe
 encoding via stable `Encoder[T]` implementations — see
 `typed-keyspaces.md`.
 
@@ -526,11 +526,11 @@ total. The extractor contract is "one `Cover[i]` per declared
 `IndexCoveringColumn`" — producing fewer is a caller-side contract
 violation, not an engine error.
 
-The typed full-row covering helper (`TypedIndex.CoverValue`,
+The typed full-row covering helper (`typed.Index.CoverValue`,
 see `typed-keyspaces.md §Covering`) is the typed-layer
 specialization: its extractor stores `encode(V)` as the single
-covering column, and `TypedKeyspaceHandle.Index` enables an internal
-single-column unwrap so `TypedIndexQuery.Lookup` returns `V`
+covering column, and `typed.KeyspaceHandle.Index` opts the handle into the engine covering-return
+route (IndexHandle.EnableCoverValueReturn) so `typed.IndexQuery.Lookup` returns `V`
 without forcing the caller to call `DecodeCoveringTuple`
 themselves.
 

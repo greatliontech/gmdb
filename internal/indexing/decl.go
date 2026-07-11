@@ -1,5 +1,7 @@
 package indexing
 
+import "strings"
+
 // The index declaration family. The engine's public IndexDecl /
 // IndexColumn / IndexCoveringColumn / IndexExtractor names are
 // aliases of these types; the concrete types live here beside the
@@ -85,3 +87,25 @@ type Kind uint8
 // KindComposite is the composite-key lex-ordered B+tree — kind 0,
 // the zero value, and the only kind the current engine accepts.
 const KindComposite Kind = 0
+
+// CoverValuePrefix marks the synthesized covering column of a
+// full-row-covering typed index: the column name is
+// CoverValuePrefix + the value encoder's ID, so the value
+// encoder's identity is folded into the schema-hash fingerprint
+// AND the engine's covering-return path can recognize the decl as
+// full-row covering. This prefix is a reserved covering-column
+// namespace — a byte-API decl that names a covering column with
+// it would be (mis)treated as full-row covering on the typed read
+// path (the raw tier owns its namespace).
+const CoverValuePrefix = "gmdb/cover-value/"
+
+// CoverValueColumn synthesizes the full-row covering column name
+// for a value encoder's ID.
+func CoverValueColumn(valEncID string) string { return CoverValuePrefix + valEncID }
+
+// IsCoverValueDecl reports whether decl is a full-row-covering
+// typed index: exactly one covering column bearing the
+// cover-value sentinel prefix.
+func IsCoverValueDecl(decl *Decl) bool {
+	return len(decl.Covering) == 1 && strings.HasPrefix(decl.Covering[0].Name, CoverValuePrefix)
+}

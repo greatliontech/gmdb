@@ -85,7 +85,7 @@ consistency in `indexing.md`.
 | Prefaulting | `MADV_POPULATE_READ` at open (opt-in, Linux 5.14+) | Eliminates first-access page faults; sequential kernel readahead; silent no-op on older kernels |
 | Huge pages | `MADV_HUGEPAGE` (opt-in, Linux) | Reduces TLB pressure for large databases |
 | Read txn cooldown | `MADV_COLD` on close (opt-in, Linux 5.4+) | Hints kernel to reclaim page cache after large scans |
-| Typed keyspaces | Generic `TypedKeyspace[K, V]` with `Encoder[T]` interface; `TypedIndex[K, V, IK]` follow-on | Zero-cost type-safe API over byte-oriented Keyspace; index extractors as `func(K, V) []IK` |
+| Typed keyspaces | Generic `typed.Keyspace[K, V]` with `Encoder[T]` interface; `typed.Index[K, V, IK]` follow-on | Zero-cost type-safe API over byte-oriented Keyspace; index extractors as `func(K, V) []IK` |
 | Keyspace names | `unique.Handle[string]` interning | Avoids repeated allocations for frequently opened keyspace names across transactions |
 | Integrity check | `Check() iter.Seq[CheckIssue]` with `CheckFatal` severity; opt-in `CheckIndexes` mode | Streaming `iter.Seq`; index-content verification is opt-in because it re-runs every extractor (O(rows × indexes)) |
 | Byte slice ownership | Borrowed references: values valid until tx close, keys valid until next cursor op | Zero-copy from mmap; prefix compression requires key reconstruction buffer (reused per cursor movement) |

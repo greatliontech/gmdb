@@ -268,7 +268,7 @@ var (
 	// dimension).
 	ErrIndexNotFound = errors.New("gmdb: index not found")
 
-	// ErrIndexEncoderIDEmpty is returned by TypedIndex declaration
+	// ErrIndexEncoderIDEmpty is returned by typed.Index declaration
 	// when the supplied Encoder[T].ID() returns "" — encoder IDs
 	// must be unique non-empty strings for schema-hash
 	// determinism. Per typed-keyspaces.md.

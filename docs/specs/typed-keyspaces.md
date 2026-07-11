@@ -1,19 +1,29 @@
 # Typed Keyspaces (Generics)
 
 Higher-level API on top of the byte-oriented `Keyspace` and
-`SetKeyspace`. Provides type-safe access by handling key/value
-serialisation via the `Encoder[T]` interface and typed-index
-declarations via `TypedIndex[K, V, IK]`.
+`SetKeyspace`, in its own package: `gmdb/typed`. Provides
+type-safe access by handling key/value serialisation via the
+`typed.Encoder[T]` interface and typed-index declarations via
+`typed.Index[K, V, IK]`. The tier is a pure client of the
+engine's exported surface plus four narrow engine knobs
+(api-surface.md): `Keyspace.GuardIterConstruction` /
+`SetKeyspace.GuardIterConstruction` (construction-guard parity
+for wrapped iterators), `IndexHandle.Decl` (live-declaration
+inspection), and `IndexHandle.EnableCoverValueReturn` /
+`CoverValueReturnEnabled` (the full-row covering opt-in). The
+cover-value sentinel contract itself (prefix, column synthesis,
+decl recognition) is shared engine/typed contract and lives in
+internal/indexing.
 
 Scope:
 - `Encoder[T]` interface and `FuncEncoder[T]` adapter.
 - Engine-provided canonical encoders.
-- `TypedKeyspace[K, V]` / `TypedKeyspaceHandle[K, V]` (single-value typed
-  keyspace) and `TypedSetKeyspace[K, V]` / `TypedSetKeyspaceHandle[K, V]`
+- `typed.Keyspace[K, V]` / `typed.KeyspaceHandle[K, V]` (single-value typed
+  keyspace) and `typed.SetKeyspace[K, V]` / `typed.SetKeyspaceHandle[K, V]`
   (typed set keyspace) wrappers.
-- `TypedCursor[K, V]` and `TypedSetCursor[K, V]`.
-- `TypedIndex[K, V, IK]`, sealed-interface `AnyTypedIndex`,
-  `TypedIndexHandle`, `TypedIndexQuery[K, V, IK]`.
+- `typed.Cursor[K, V]` and `typed.SetCursor[K, V]`.
+- `typed.Index[K, V, IK]`, sealed-interface `typed.AnyIndex`,
+  `typed.IndexHandle`, `typed.IndexQuery[K, V, IK]`.
 - Key-ordering constraint on `Encoder[K]`.
 - Encoder-ID immutability and the partial-prefix-range
   limitation through the typed API.
@@ -27,17 +37,19 @@ Depends on / interacts with:
   methods that this layer delegates to.
 
 **Naming convention.** Each typed tier has two types: a stateless
-*declaration* carrying the name + encoders (`TypedKeyspace`,
-`TypedSetKeyspace`, `TypedIndex`), and a transaction-scoped *handle*
+*declaration* carrying the name + encoders (`typed.Keyspace`,
+`typed.SetKeyspace`, `typed.Index`), and a transaction-scoped *handle*
 with a `Handle` suffix returned by Open / Create
-(`TypedKeyspaceHandle`, `TypedSetKeyspaceHandle`, `TypedIndexHandle`).
+(`typed.KeyspaceHandle`, `typed.SetKeyspaceHandle`, `typed.IndexHandle`).
 The declaration is the prepared form (`New…` builds it once, outside any
 transaction); `decl.Open(tx)` / `decl.Create(tx)` returns the opened,
-tx-bound handle. `TypedCursor` / `TypedSetCursor` and the bound
-`TypedIndexQuery` are handles in their own right. The byte layer has no
+tx-bound handle. `typed.Cursor` / `typed.SetCursor` and the bound
+`typed.IndexQuery` are handles in their own right. The byte layer has no
 such split — its `Keyspace` / `SetKeyspace` are opened directly by name
 — so the `…Handle` suffix is what distinguishes the typed handle from
-its declaration.
+its declaration. (The tier's own type names carry no `Typed`
+prefix: the package name qualifies them — `typed.Keyspace`,
+`typed.IndexQuery`.)
 
 ## Invariants
 
@@ -67,10 +79,10 @@ Invariant: kind=clause-explicit;
     `CreateKeyspace` time with `ErrIndexEncoderIDEmpty` when
     an encoder is referenced by a typed index's schema hash
     (`IKEnc`, covering encoders). Key and value encoders on
-    a `TypedKeyspace[K, V]` *without* indexes are not
+    a `typed.Keyspace[K, V]` *without* indexes are not
     validated for empty IDs;
   from=this spec §Encoder ID empty check + Empty encoder IDs
-    on TypedKeyspace without indexes;
+    on typed.Keyspace without indexes;
   violation=Allowing empty IDs through indexing bypasses the
     fingerprint-uniqueness invariant; rejecting them on
     indexless typed keyspaces would gratuitously break
@@ -90,14 +102,14 @@ Invariant: kind=clause-explicit;
     nobody knew was needed.
 
 Invariant: kind=clause-explicit;
-  property=`AnyTypedIndex[K, V]` is a **sealed** interface —
+  property=`typed.AnyIndex[K, V]` is a **sealed** interface —
     the method `indexDecl()` is unexported, so only types in
-    the `gmdb` package can implement it (in practice: only
-    `*TypedIndex[K, V, IK]`). Decoration must happen at the
+    the `gmdb/typed` package can implement it (in practice: only
+    `*typed.Index[K, V, IK]`). Decoration must happen at the
     *extractor function* level by wrapping the user's
-    `Extract` func inside a fresh `TypedIndex[K, V, IK]`
+    `Extract` func inside a fresh `typed.Index[K, V, IK]`
     declaration;
-  from=this spec §`AnyTypedIndex` sealing;
+  from=this spec §`typed.AnyIndex` sealing;
   violation=A user-supplied implementation could bypass
     encoder-ID consistency, deterministic schema-hash, or
     well-formed extractor wiring — the typed layer's
@@ -155,65 +167,65 @@ func (f FuncEncoder[T]) ID() string                                   { return f
 ## Typed Keyspace
 
 ```go
-// TypedKeyspace wraps a single-value Keyspace with type-safe encoding.
-type TypedKeyspace[K, V any] struct {
+// Keyspace wraps a single-value Keyspace with type-safe encoding.
+type Keyspace[K, V any] struct {
     name   string
     keyEnc Encoder[K]
     valEnc Encoder[V]
 }
 
-// NewTypedKeyspace creates a typed keyspace descriptor. The key
+// NewKeyspace creates a typed keyspace descriptor. The key
 // encoder MUST produce lexicographically ordered output for the
 // desired key ordering.
-func NewTypedKeyspace[K, V any](
+func NewKeyspace[K, V any](
     name string,
     keyEnc Encoder[K],
     valEnc Encoder[V],
-) *TypedKeyspace[K, V]
+) *Keyspace[K, V]
 
 // Open / Create / CreateIfNotExists within a transaction.
-// The variadic indexes are TypedIndex declarations.
-func (tks *TypedKeyspace[K, V]) Open(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKeyspaceHandle[K, V], error)
-func (tks *TypedKeyspace[K, V]) OpenReadOnly(tx *Tx) (*TypedKeyspaceHandle[K, V], error)
-func (tks *TypedKeyspace[K, V]) Create(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKeyspaceHandle[K, V], error)
-func (tks *TypedKeyspace[K, V]) CreateIfNotExists(tx *Tx, indexes ...AnyTypedIndex[K, V]) (*TypedKeyspaceHandle[K, V], error)
+// The variadic indexes are Index declarations.
+func (tks *Keyspace[K, V]) Open(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*KeyspaceHandle[K, V], error)
+func (tks *Keyspace[K, V]) OpenReadOnly(tx *gmdb.Tx) (*KeyspaceHandle[K, V], error)
+func (tks *Keyspace[K, V]) Create(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*KeyspaceHandle[K, V], error)
+func (tks *Keyspace[K, V]) CreateIfNotExists(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*KeyspaceHandle[K, V], error)
 
-// TypedKeyspaceHandle is a handle to an opened typed keyspace within a transaction.
-type TypedKeyspaceHandle[K, V any] struct { ... }
+// KeyspaceHandle is a handle to an opened typed keyspace within a transaction.
+type KeyspaceHandle[K, V any] struct { ... }
 
-func (t *TypedKeyspaceHandle[K, V]) Get(key K) (V, error)
-func (t *TypedKeyspaceHandle[K, V]) Put(key K, value V) error
+func (t *KeyspaceHandle[K, V]) Get(key K) (V, error)
+func (t *KeyspaceHandle[K, V]) Put(key K, value V) error
 
 // Delete returns ErrNotFound when the key does not exist
 // (per api-surface.md §Invariants — keyed-removal returns
-// ErrNotFound on miss; applies to TypedKeyspaceHandle / TypedSetKeyspaceHandle too).
-func (t *TypedKeyspaceHandle[K, V]) Delete(key K) error
+// ErrNotFound on miss; applies to KeyspaceHandle / SetKeyspaceHandle too).
+func (t *KeyspaceHandle[K, V]) Delete(key K) error
 
 // DeleteRange returns (0, nil) for an empty range.
-func (t *TypedKeyspaceHandle[K, V]) DeleteRange(start, end *K) (uint64, error)
-func (t *TypedKeyspaceHandle[K, V]) Cursor() *TypedCursor[K, V]
-func (t *TypedKeyspaceHandle[K, V]) All() iter.Seq2[K, V]
-func (t *TypedKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V]
-func (t *TypedKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V]
-func (t *TypedKeyspaceHandle[K, V]) Index(name string) (*TypedIndexHandle, error)
+func (t *KeyspaceHandle[K, V]) DeleteRange(start, end *K) (uint64, error)
+func (t *KeyspaceHandle[K, V]) Cursor() *Cursor[K, V]
+func (t *KeyspaceHandle[K, V]) All() iter.Seq2[K, V]
+func (t *KeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V]
+func (t *KeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V]
+func (t *KeyspaceHandle[K, V]) Index(name string) (*IndexHandle, error)
 
-type TypedCursor[K, V any] struct { ... }
+type Cursor[K, V any] struct { ... }
 
-func (c *TypedCursor[K, V]) First() (K, V, bool)
-func (c *TypedCursor[K, V]) Last() (K, V, bool)
-func (c *TypedCursor[K, V]) Next() (K, V, bool)
-func (c *TypedCursor[K, V]) Prev() (K, V, bool)
-func (c *TypedCursor[K, V]) Seek(target K) (K, V, bool)
-func (c *TypedCursor[K, V]) SeekGE(target K) (K, V, bool)
-func (c *TypedCursor[K, V]) Current() (K, V, bool)
+func (c *Cursor[K, V]) First() (K, V, bool)
+func (c *Cursor[K, V]) Last() (K, V, bool)
+func (c *Cursor[K, V]) Next() (K, V, bool)
+func (c *Cursor[K, V]) Prev() (K, V, bool)
+func (c *Cursor[K, V]) Seek(target K) (K, V, bool)
+func (c *Cursor[K, V]) SeekGE(target K) (K, V, bool)
+func (c *Cursor[K, V]) Current() (K, V, bool)
 
 // Delete removes the current entry. Same semantics as Cursor.Delete
 // — see `transactions.md §Cursor State Machine`. The third bool in
 // the navigation methods is `ok` (false when the cursor is at
 // end-of-iteration or unpositioned); Err() distinguishes those two
 // states.
-func (c *TypedCursor[K, V]) Delete() error
-func (c *TypedCursor[K, V]) Err() error
+func (c *Cursor[K, V]) Delete() error
+func (c *Cursor[K, V]) Err() error
 ```
 
 The typed layer is a **zero-cost abstraction** at the API level
@@ -233,21 +245,21 @@ The typed split between `Keyspace` and `SetKeyspace` extends to
 the typed layer.
 
 ```go
-// TypedSetKeyspace[K, V] wraps SetKeyspace with type-safe encoding.
-type TypedSetKeyspace[K, V any] struct { /* ... */ }
+// SetKeyspace[K, V] wraps SetKeyspace with type-safe encoding.
+type SetKeyspace[K, V any] struct { /* ... */ }
 
-func NewTypedSetKeyspace[K, V any](
+func NewSetKeyspace[K, V any](
     name string,
     keyEnc Encoder[K],
     valEnc Encoder[V],
-    opts *SetKeyspaceOptions,
-) *TypedSetKeyspace[K, V]
+    opts *gmdb.SetKeyspaceOptions,
+) *SetKeyspace[K, V]
 
-// TypedSetKeyspaceHandle[K, V] is a handle to an opened typed set keyspace.
-type TypedSetKeyspaceHandle[K, V any] struct { /* ... */ }
+// SetKeyspaceHandle[K, V] is a handle to an opened typed set keyspace.
+type SetKeyspaceHandle[K, V any] struct { /* ... */ }
 
-func (t *TypedSetKeyspaceHandle[K, V]) Has(key K) (bool, error)
-func (t *TypedSetKeyspaceHandle[K, V]) HasValue(key K, value V) (bool, error)
+func (t *SetKeyspaceHandle[K, V]) Has(key K) (bool, error)
+func (t *SetKeyspaceHandle[K, V]) HasValue(key K, value V) (bool, error)
 
 // Put inserts value into the key's sorted set. added reports whether
 // the set actually grew (false iff (key, value) was already present).
@@ -255,36 +267,36 @@ func (t *TypedSetKeyspaceHandle[K, V]) HasValue(key K, value V) (bool, error)
 // the load-bearing rationale (membership probe is already paid by
 // the insert path, surfacing the bool collapses Put + HasValue retry
 // patterns without a TOCTOU window). User-locked decision.
-func (t *TypedSetKeyspaceHandle[K, V]) Put(key K, value V) (added bool, err error)
+func (t *SetKeyspaceHandle[K, V]) Put(key K, value V) (added bool, err error)
 
 // Delete returns ErrNotFound when the key does not exist (per
 // api-surface.md §Invariants).
-func (t *TypedSetKeyspaceHandle[K, V]) Delete(key K) error
+func (t *SetKeyspaceHandle[K, V]) Delete(key K) error
 
 // DeleteValue returns ErrNotFound when the (key, value) pair
 // does not exist (per api-surface.md §Invariants).
-func (t *TypedSetKeyspaceHandle[K, V]) DeleteValue(key K, value V) error
+func (t *SetKeyspaceHandle[K, V]) DeleteValue(key K, value V) error
 
-func (t *TypedSetKeyspaceHandle[K, V]) CountValues(key K) (uint64, error)
+func (t *SetKeyspaceHandle[K, V]) CountValues(key K) (uint64, error)
 
 // DeleteRange returns (0, nil) for an empty range.
-func (t *TypedSetKeyspaceHandle[K, V]) DeleteRange(start, end *K) (uint64, error)
-func (t *TypedSetKeyspaceHandle[K, V]) Cursor() *TypedSetCursor[K, V]
-func (t *TypedSetKeyspaceHandle[K, V]) All() iter.Seq2[K, V]
-func (t *TypedSetKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V]
-func (t *TypedSetKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V]
+func (t *SetKeyspaceHandle[K, V]) DeleteRange(start, end *K) (uint64, error)
+func (t *SetKeyspaceHandle[K, V]) Cursor() *SetCursor[K, V]
+func (t *SetKeyspaceHandle[K, V]) All() iter.Seq2[K, V]
+func (t *SetKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V]
+func (t *SetKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V]
 ```
 
-`TypedKeyspaceHandle` has `Get`, `Put`, `Delete` — straightforward.
-`TypedSetKeyspaceHandle` has `Has`, `HasValue`, `Put`, `Delete`,
+`typed.KeyspaceHandle` has `Get`, `Put`, `Delete` — straightforward.
+`typed.SetKeyspaceHandle` has `Has`, `HasValue`, `Put`, `Delete`,
 `DeleteValue`, `CountValues` — set operations.
 
 ## Typed Indexes
 
 ```go
-// TypedIndex declares a typed index on TypedKeyspace[K, V] with
+// Index declares a typed index on Keyspace[K, V] with
 // extracted index key type IK.
-type TypedIndex[K, V, IK any] struct {
+type Index[K, V, IK any] struct {
     Name       string
     IKEnc      Encoder[IK]      // produces lex-safe bytes from IK
     Unique     bool
@@ -293,14 +305,14 @@ type TypedIndex[K, V, IK any] struct {
     CoverValue bool             // full-row covering (see §Covering)
 }
 
-// AnyTypedIndex is the type-erased interface satisfied by every
-// TypedIndex[K, V, IK]. It exists solely so a single
+// AnyIndex is the type-erased interface satisfied by every
+// Index[K, V, IK]. It exists solely so a single
 // Open / Create / CreateIfNotExists call can declare indexes with
 // heterogeneous IK types in one variadic argument.
 //
 // The interface is intentionally SEALED — the method indexDecl() is
-// unexported, so only types in the gmdb package can implement it (in
-// practice: only *TypedIndex[K, V, IK]). This is deliberate: the
+// unexported, so only types in the gmdb/typed package can implement
+// it (in practice: only *Index[K, V, IK]). This is deliberate: the
 // engine relies on every supplied *IndexDecl having been constructed
 // through the typed-index path, which guarantees encoder ID
 // consistency, deterministic schema-hash, and well-formed extractor
@@ -310,10 +322,10 @@ type TypedIndex[K, V, IK any] struct {
 // Library code that needs to wrap or decorate a typed index (for
 // observability, retry, etc.) must compose at the *extractor
 // function* level — wrap the user's Extract func inside a fresh
-// TypedIndex[K, V, IK] declaration. Wrapping at the IndexDecl level
+// Index[K, V, IK] declaration. Wrapping at the IndexDecl level
 // is not supported and not needed.
-type AnyTypedIndex[K, V any] interface {
-    indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*IndexDecl, error)
+type AnyIndex[K, V any] interface {
+    indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*gmdb.IndexDecl, error)
 }
 
 // indexDecl is unexported (the seal) and receives the owning keyspace's
@@ -322,24 +334,24 @@ type AnyTypedIndex[K, V any] interface {
 // ErrIndexEncoderIDEmpty for an empty IKEnc (or, for a CoverValue index,
 // value-encoder) ID. The exact signature is an implementation detail of
 // the sealed method.
-func (t *TypedIndex[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*IndexDecl, error) { /* implements AnyTypedIndex */ }
+func (t *Index[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*gmdb.IndexDecl, error) { /* implements AnyIndex */ }
 
-// TypedIndexHandle is the typed wrapper around IndexHandle for queries
+// IndexHandle is the typed wrapper around IndexHandle for queries
 // where IK is known.
-type TypedIndexHandle struct { /* unexported */ }
+type IndexHandle struct { /* unexported */ }
 
-// For static-type lookup, NewTypedIndexQuery binds an open
-// TypedIndexHandle with a specific IK type.
-func NewTypedIndexQuery[K, V, IK any](h *TypedIndexHandle, ikEnc Encoder[IK]) *TypedIndexQuery[K, V, IK]
+// For static-type lookup, NewIndexQuery binds an open
+// IndexHandle with a specific IK type.
+func NewIndexQuery[K, V, IK any](h *IndexHandle, ikEnc Encoder[IK]) *IndexQuery[K, V, IK]
 
-type TypedIndexQuery[K, V, IK any] struct { ... }
+type IndexQuery[K, V, IK any] struct { ... }
 
-func (q *TypedIndexQuery[K, V, IK]) Lookup(ik IK) iter.Seq2[K, V]
-func (q *TypedIndexQuery[K, V, IK]) LookupKeys(ik IK) iter.Seq[K]
-func (q *TypedIndexQuery[K, V, IK]) Range(start, end *IK) iter.Seq2[K, V]
-func (q *TypedIndexQuery[K, V, IK]) Prefix(prefix IK) iter.Seq2[K, V]
-func (q *TypedIndexQuery[K, V, IK]) Get(ik IK) (K, V, error) // unique only
-func (q *TypedIndexQuery[K, V, IK]) Err() error
+func (q *IndexQuery[K, V, IK]) Lookup(ik IK) iter.Seq2[K, V]
+func (q *IndexQuery[K, V, IK]) LookupKeys(ik IK) iter.Seq[K]
+func (q *IndexQuery[K, V, IK]) Range(start, end *IK) iter.Seq2[K, V]
+func (q *IndexQuery[K, V, IK]) Prefix(prefix IK) iter.Seq2[K, V]
+func (q *IndexQuery[K, V, IK]) Get(ik IK) (K, V, error) // unique only
+func (q *IndexQuery[K, V, IK]) Err() error
 ```
 
 The schema-hash inputs for a typed index include the index-key
@@ -354,7 +366,7 @@ byte schema-hash already hashes column names.)
 
 `CoverValue: true` makes the index a **full-row covering index**:
 the encoded row value is stored in each index entry, so
-`TypedIndexQuery` `Lookup` / `Range` / `Prefix` / `Get` return `V`
+`typed.IndexQuery` `Lookup` / `Range` / `Prefix` / `Get` return `V`
 directly from the index entry **without a back-lookup** against
 the row keyspace. It is a pure read optimization — identical
 `(K, V)` results, fewer reads.
@@ -367,12 +379,12 @@ returns that column instead of back-looking-up. The value
 encoder's `ID()` is folded into the fingerprint (an empty value
 encoder `ID()` is rejected with `ErrIndexEncoderIDEmpty`).
 
-`CoverValue` has effect only on a `TypedKeyspace`-backed index: a
-`TypedSetKeyspace` index's value (`setValue`) is already carried in
+`CoverValue` has effect only on a `typed.Keyspace`-backed index: a
+`typed.SetKeyspace` index's value (`setValue`) is already carried in
 its compound primary key, so there is no back-lookup to skip. This
 is the only covering shape the typed API exposes — arbitrary
 covering *projections* have no typed return surface (every
-`TypedIndexQuery` method returns the row value `V`). For arbitrary
+`typed.IndexQuery` method returns the row value `V`). For arbitrary
 covering projections, use the byte-oriented `IndexDecl` API: its
 `Lookup` / `Range` / `Prefix` / `Get` return the encoded covering
 tuple, decoded by the caller via `DecodeCoveringTuple` (see
@@ -389,7 +401,7 @@ awkward, fall back to the byte-oriented `IndexDecl` API.
 
 When `IK` is a composite struct, the typed layer treats the whole
 `IK` as one opaque column (one `Encoder[IK]` → one byte slice).
-Consequently `TypedIndexQuery.Range(start, end *IK)` compares
+Consequently `typed.IndexQuery.Range(start, end *IK)` compares
 full `IK` values; there is **no partial-prefix Range on a
 sub-field of IK** through the typed API.
 
@@ -412,15 +424,15 @@ common column types. The full canonical set:
 
 | Encoder | ID() | Lex order matches | Notes |
 |---|---|---|---|
-| `gmdb.StringEncoder` | `"gmdb/string"` | natural string order | UTF-8 bytes, no normalization |
-| `gmdb.BytesEncoder` | `"gmdb/bytes"` | natural byte order | identity |
-| `gmdb.Uint64Encoder` | `"gmdb/be-uint64"` | natural uint64 order | 8-byte big-endian |
-| `gmdb.Uint32Encoder` | `"gmdb/be-uint32"` | natural uint32 order | 4-byte big-endian |
-| `gmdb.Int64Encoder` | `"gmdb/be-int64"` | natural int64 order | 8-byte big-endian with sign bit XOR'd (XOR `0x80` on the top byte); maps two's-complement to lex order |
-| `gmdb.Int32Encoder` | `"gmdb/be-int32"` | natural int32 order | 4-byte big-endian with sign bit XOR'd |
-| `gmdb.TimeEncoder` | `"gmdb/be-time-nanos"` | natural time order | int64 nanos since epoch, same sign-bit-XOR transform as `be-int64` |
-| `gmdb.UUIDv4Encoder` | `"gmdb/uuid-v4"` | natural lex (random) | 16 bytes raw |
-| `gmdb.UUIDv7Encoder` | `"gmdb/uuid-v7"` | natural time order | 16 bytes raw; v7 timestamp prefix preserves lex=time |
+| `typed.StringEncoder` | `"gmdb/string"` | natural string order | UTF-8 bytes, no normalization |
+| `typed.BytesEncoder` | `"gmdb/bytes"` | natural byte order | identity |
+| `typed.Uint64Encoder` | `"gmdb/be-uint64"` | natural uint64 order | 8-byte big-endian |
+| `typed.Uint32Encoder` | `"gmdb/be-uint32"` | natural uint32 order | 4-byte big-endian |
+| `typed.Int64Encoder` | `"gmdb/be-int64"` | natural int64 order | 8-byte big-endian with sign bit XOR'd (XOR `0x80` on the top byte); maps two's-complement to lex order |
+| `typed.Int32Encoder` | `"gmdb/be-int32"` | natural int32 order | 4-byte big-endian with sign bit XOR'd |
+| `typed.TimeEncoder` | `"gmdb/be-time-nanos"` | natural time order | int64 nanos since epoch, same sign-bit-XOR transform as `be-int64` |
+| `typed.UUIDv4Encoder` | `"gmdb/uuid-v4"` | natural lex (random) | 16 bytes raw |
+| `typed.UUIDv7Encoder` | `"gmdb/uuid-v7"` | natural time order | 16 bytes raw; v7 timestamp prefix preserves lex=time |
 
 The signed-integer transform is sign-bit XOR
 (`x ^ 0x8000000000000000`), not zigzag — zigzag is a different
@@ -435,7 +447,7 @@ change to the encoding logic for an existing ID would silently
 corrupt every on-disk index built with the old encoder. If a bug
 is discovered in a canonical encoder, the fix ships under a NEW
 ID (e.g. `"gmdb/be-int64/v2"`) with a separate type (e.g.
-`gmdb.Int64EncoderV2`); the old type and ID remain available
+`typed.Int64EncoderV2`); the old type and ID remain available
 for backward read of existing indexes. Operators migrating from
 the buggy encoder rebuild the affected indexes via
 `tx.Indexes().Rebuild` with the new typed decl. This convention
@@ -443,12 +455,12 @@ extends to application-defined encoders
 (`"<pkg>/<type>[/<version>]"` — bump the version segment when
 the encoding logic changes; see `Encoder.ID()` godoc).
 
-**Empty encoder IDs on TypedKeyspace without indexes.** The
+**Empty encoder IDs on typed.Keyspace without indexes.** The
 `Encoder.ID()` empty check fires only when an encoder is
 referenced by a typed index's schema hash (`IKEnc`, covering
 encoders). The key and value encoders on
-`TypedKeyspace[K, V]` *without* indexes are not validated for
-empty IDs — a TypedKeyspace with no declared indexes may use
+`typed.Keyspace[K, V]` *without* indexes are not validated for
+empty IDs — a typed.Keyspace with no declared indexes may use
 encoders with empty `ID()` without error. This is inadvisable
 if indexes may be added later (declaring a typed index that
 depends on the key encoder will then fail at `OpenKeyspace`

@@ -70,8 +70,8 @@ Invariant: kind=clause-explicit;
     `ErrNotFound` when the addressed item is absent. The scope is
     `Keyspace.Delete(k)` / `SetKeyspace.Delete(k)` /
     `SetKeyspace.DeleteValue(k, v)` and their typed equivalents
-    (`TypedKeyspaceHandle.Delete`, `TypedSetKeyspaceHandle.Delete`,
-    `TypedSetKeyspaceHandle.DeleteValue`): all return `ErrNotFound` iff the
+    (`typed.KeyspaceHandle.Delete`, `typed.SetKeyspaceHandle.Delete`,
+    `typed.SetKeyspaceHandle.DeleteValue`): all return `ErrNotFound` iff the
     addressed item (the key, or the `(key, value)` pair for the
     value-level variant) does not exist at call time, never
     `nil` for a no-op miss. `Cursor.Delete()` and
@@ -1176,7 +1176,7 @@ func (ks *SetKeyspace) HasValue(key, value []byte) (bool, error)
 // broadcasts, ref-counted indexes, idempotent retries — all of which
 // need to know "did this call cause the set to grow" without the
 // TOCTOU window of HasValue-then-Put. (User-locked decision;
-// the typed mirror TypedSetKeyspaceHandle.Put propagates the bool.)
+// the typed mirror typed.SetKeyspaceHandle.Put propagates the bool.)
 func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error)
 
 // Delete returns ErrNotFound when the key does not exist (per
@@ -1274,6 +1274,16 @@ freeze) still ends the sequence silently, like the stale contract.
 (Pinned by `TestIteratorConstructionPanicsOnGuardErrors`,
 `TestIteratorConstructionPanicsOnClosedDB`, and
 `TestTypedIteratorConstructionPanicsEagerly`.)
+
+```go
+// GuardIterConstruction fires the same construction-time panic the
+// keyspace's own iterators fire when the transaction is unusable
+// or the keyspace handle is dead. For tiers that wrap iteration
+// surfaces (gmdb/typed) and must fail their error short-circuit
+// paths identically; callers rarely need it. SetKeyspace carries
+// the same method.
+func (ks *Keyspace) GuardIterConstruction()
+```
 
 Mutation during iteration: a loop-body mutation on the same keyspace
 stales the iterator's cursor and ENDS the sequence early (the Seq2
@@ -1385,6 +1395,24 @@ func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
 // value semantics and Inv-IHS3 / Inv-IHS2 dead-handle contract as
 // Lookup.
 func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
+
+// Decl returns the handle's pinned index declaration — the live
+// decl this handle serves under (indexing.md §Handle Invalidation).
+// For tiers that must inspect the declaration shape (gmdb/typed's
+// full-row covering recognition); treat as read-only.
+func (idx *IndexHandle) Decl() *IndexDecl
+
+// EnableCoverValueReturn opts this handle into the byte-layer
+// full-row covering-return route: Lookup / Range / Prefix / Get
+// return the entry's stored encode(V) instead of back-looking-up
+// the row — valid ONLY for a decl the engine recognizes as
+// full-row covering (the gmdb/cover-value/ sentinel; the route
+// re-checks the LIVE decl on every read, so a same-tx rebuild
+// that removes the sentinel downgrades the handle safely).
+// CoverValueReturnEnabled is the read-side companion. Used by
+// gmdb/typed; callers rarely need either.
+func (idx *IndexHandle) EnableCoverValueReturn()
+func (idx *IndexHandle) CoverValueReturnEnabled() bool
 
 // Get is shorthand for unique indexes: returns the single (pk, value)
 // or ErrNotFound. Returns ErrIndexNotUnique when called on a
