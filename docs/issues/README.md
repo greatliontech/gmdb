@@ -80,7 +80,7 @@ chunks (bottom-up by layer, grouped by function).
 | Slug | Lands | Summary |
 |------|-------|---------|
 | checkpoint-selfdurable-anchor-persist | 23 | [L] pure-SyncDataOnly Checkpoint leaves the persisted anchor trailing by one (peer reclamation delayed); persisting would rewrite the assertion's sole durable carrier in place — tear hazard |
-| copyto-hardening | 19 | [M×2] verbatim CopyTo SIGBUS on truncated source; torn destination on crash; [L] Check misses overflow-header corruption |
+| copyto-hardlink-destination-support | when a non-hard-link destination filesystem is decided to be a supported CopyTo target | [L] publish fails on vfat/exfat/FUSE targets; [nit] NFS link() retransmission quirk |
 | maintenance-reclaim-truncated-walk | 20 | [H] leak reclamation behind a truncated RPL walk double-frees pages still in the live chain; [L] Check false-positive FreeAndPending beyond a reclaimed boundary |
 | compaction-consolidating-alloc | 21 | [M] relocations re-land in the evacuation band — no convergence; spec's consolidating allocator unimplemented |
 | spec-descriptive-drift | 22 | [L] batch: spec clauses describing mechanisms the code doesn't use; code-shape content in specs |

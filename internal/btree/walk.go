@@ -223,6 +223,26 @@ func walkAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, visit
 						return fmt.Errorf("%w: overflow run [%d,+%d) on leaf %d out of range (hwm=%d)",
 							ErrCorrupted, e.OverflowPage, run64, leafID, hwm)
 					}
+					// Cross-check the run's first-page header against the
+					// leaf reference (checksums.md §Structural and
+					// Allocation Bounds): the read path rejects a wrong
+					// Type or AdditionalPages at assembly
+					// (DecodeOverflowFirstPage), so a walk that skipped
+					// the header would let Check pass a database clean
+					// while every Get of the key fails ErrCorrupted.
+					obuf, oerr := pr.Page(e.OverflowPage)
+					if oerr != nil {
+						return oerr
+					}
+					additional, derr := page.DecodeOverflowFirstPage(obuf)
+					if derr != nil {
+						return fmt.Errorf("%w: overflow run at %d on leaf %d: %w",
+							ErrCorrupted, e.OverflowPage, leafID, derr)
+					}
+					if uint64(additional)+1 != run64 {
+						return fmt.Errorf("%w: overflow run at %d on leaf %d: header AdditionalPages %d+1 disagrees with the TotalLen-derived run %d",
+							ErrCorrupted, e.OverflowPage, leafID, additional, run64)
+					}
 					for j := range run64 {
 						if err := visit(e.OverflowPage+j, PageKindOverflow, d+1); err != nil {
 							return err

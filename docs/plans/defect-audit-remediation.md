@@ -48,7 +48,7 @@ function. WIP = 1.
       reconcile, schemaHash doc grammar
 - [x] 18. bulkload: index-entry parity — key gate, overflow promotion,
       base config for index trees (+ bulkload.md rider)
-- [ ] 19. copy/check: verbatim-walk clamp, temp+rename destination,
+- [x] 19. copy/check: verbatim-walk clamp, temp+rename destination,
       overflow-header validation (+ api-surface.md/checksums.md riders)
 - [ ] 20. maintenance: leak reclamation gated on tail-reached RPL walk
       (+ background-maintenance.md rider)

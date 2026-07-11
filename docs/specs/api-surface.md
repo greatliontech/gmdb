@@ -132,6 +132,34 @@ Invariant: kind=entailed;
     the unlinked inode while other processes see the new
     inode — split-brain on a single database.
 
+Invariant: kind=clause-explicit;
+  property=At no point — including after a crash at any moment
+    during `CopyTo` — does the destination path name a file that
+    is not a complete, fsynced copy. The copy is written to a
+    `<path>.copytmp-*` temp file in the destination's directory,
+    fsynced, and only then published at path by an atomic hard
+    link (which also enforces the no-clobber contract: a file
+    appearing at path mid-copy fails the publish with the
+    pre-existing file untouched). A crash can leave only the
+    inert temp, safe to delete once no `CopyTo` is in flight. A
+    directory-fsync failure after the link UNPUBLISHES (removes
+    path) before returning the error, so in the live namespace an
+    error return means nothing was produced at path (best-effort:
+    a remove failure on top of the failed fsync, or a crash that
+    resurrects the un-fsynced unlink, can leave the file — always
+    a COMPLETE copy, never a partial one);
+  from=this spec §Check, CopyTo, Compact (CopyTo destination
+    crash-consistency); enforced by `TestCopyToPublishAtomicity`,
+    `TestCopyToPublishNeverClobbersLateFile`,
+    `TestCopyToDirSyncFailureUnpublishes`;
+  violation=Metas written directly at path can persist before
+    the data pages under them (no write-order barrier below the
+    final fsync) — a power loss then leaves a torn backup that
+    OPENS cleanly and either fails every read with
+    `ErrBadPageChecksum` or, with checksums disabled, silently
+    serves garbage; the retry's "path exists" failure reinforces
+    that the backup is good.
+
 ## Sentinel errors
 
 ```go
@@ -1653,6 +1681,25 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue]
 // its snapshot tree). The copy's RPL is empty: pages the source held
 // pending reader-pinned reclamation are unreferenced in the copy and
 // become free space.
+//
+// Destination crash-consistency: the copy is written to a
+// `<path>.copytmp-*` temp file in path's directory, fsynced, then
+// published at path via an atomic hard link — a crash mid-copy never
+// leaves a partial file at path, only the inert temp (safe to delete
+// once no CopyTo is in flight). The link publish is also the
+// authoritative no-clobber guard: a file appearing at path mid-copy
+// fails the publish (EEXIST) with the pre-existing file untouched.
+//
+// A verbatim (compact=false) copy of a source whose file no longer
+// covers its meta's HighWaterMark — a truncated transfer, a forged
+// meta — clamps its walk to the file-resident extent, exactly as
+// Check does, and fails with a corruption-class error when the tree
+// references the missing tail (checksums.md §Structural and
+// Allocation Bounds: error, never a SIGBUS). When the tree is intact
+// below the clamp, the copy SUCCEEDS and its meta carries the CLAMPED
+// HighWaterMark — the copy describes the file it actually is, never
+// the source's forged claim (pinned by
+// TestCopyToForgedHWMClampsCopyMeta).
 //
 // To change file format, re-open the copy and use SetFileFormat.
 func (db *DB) CopyTo(path string, compact bool) error

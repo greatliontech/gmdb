@@ -261,3 +261,27 @@ func (db *DB) DaemonDoneChansForTest() (maintDone, batchDone chan struct{}) {
 func (tx *Tx) ActiveSavepointDepthForTest() int {
 	return tx.pgr.ActiveSavepointCount()
 }
+
+// SetCopyDestWrapForTest wraps the destination file handle CopyTo's
+// internals write through, so a test can record the write/truncate/sync
+// order behind the publish invariant. Returns a restore func.
+func SetCopyDestWrapForTest(wrap func(copyDest) copyDest) (restore func()) {
+	if wrap == nil {
+		copyDestWrapForTest.Store(nil)
+		return func() {}
+	}
+	copyDestWrapForTest.Store(&wrap)
+	return func() { copyDestWrapForTest.Store(nil) }
+}
+
+// SetCopyPublishHookForTest fires after CopyTo's temp copy is complete
+// and fsynced, immediately before the hard-link publish. Returns a
+// restore func.
+func SetCopyPublishHookForTest(hook func(tmpPath string)) (restore func()) {
+	if hook == nil {
+		copyPublishHookForTest.Store(nil)
+		return func() {}
+	}
+	copyPublishHookForTest.Store(&hook)
+	return func() { copyPublishHookForTest.Store(nil) }
+}

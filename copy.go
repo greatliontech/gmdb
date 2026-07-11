@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/thegrumpylion/gmdb/internal/bitmap"
 	"github.com/thegrumpylion/gmdb/internal/btree"
@@ -14,6 +16,34 @@ import (
 	"github.com/thegrumpylion/gmdb/internal/page"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
+
+// copyDest is CopyTo's destination-file seam, mirroring the pager's
+// FileOps: every write, truncate, and fsync on the temp copy routes
+// through it so a test can record the operation order and assert the
+// publish invariant (the copy's bytes are complete and fsynced before
+// the destination path exists). Production: the *os.File itself.
+type copyDest interface {
+	io.WriterAt
+	Truncate(size int64) error
+	Sync() error
+}
+
+// copyDestWrapForTest, when set, wraps the destination file handle the
+// copy internals write through. Global state — tests that install must
+// not run in parallel with other CopyTo/Compact tests.
+var copyDestWrapForTest atomic.Pointer[func(copyDest) copyDest]
+
+// copyPublishHookForTest, when set, fires after the temp copy is
+// complete and fsynced, immediately before the hard-link publish.
+var copyPublishHookForTest atomic.Pointer[func(tmpPath string)]
+
+// wrapCopyDest applies the test seam (identity in production).
+func wrapCopyDest(f *os.File) copyDest {
+	if wrap := copyDestWrapForTest.Load(); wrap != nil {
+		return (*wrap)(f)
+	}
+	return f
+}
 
 // publicChecksumErr maps the internal pager checksum sentinel — surfaced by
 // the compact rebuild's verifying reader on a bitrotted source page — to the
@@ -47,6 +77,15 @@ func publicChecksumErr(err error) error {
 // trees are rebuilt structurally (from their stored entries — the
 // extractor closures are not on disk), not re-derived.
 //
+// The destination is crash-consistent (api-surface.md §Check, CopyTo,
+// Compact): the copy is written to a temp file in path's directory,
+// fsynced, and only then published at path via an atomic hard link — a
+// crash mid-copy never leaves a partial file at path, only a
+// `<path>.copytmp-*` temp, which is inert and safe to delete once no
+// CopyTo is in flight. The link also enforces no-clobber atomically: a
+// file appearing at path mid-copy fails the publish instead of being
+// overwritten.
+//
 // To change file format, re-open the copy and use SetFileFormat.
 func (db *DB) CopyTo(path string, compact bool) error {
 	rtx, err := db.BeginRead(context.Background())
@@ -58,10 +97,51 @@ func (db *DB) CopyTo(path string, compact bool) error {
 	if _, err := rand.Read(uuid[:]); err != nil {
 		return fmt.Errorf("gmdb: CopyTo generate UUID: %w", err)
 	}
-	if compact {
-		return publicChecksumErr(copyCompact(rtx, path, uuid))
+	// Fail fast when the destination already exists. Advisory only — the
+	// authoritative no-clobber guard is the atomic hard-link publish
+	// below (link fails EEXIST rather than overwriting).
+	if _, serr := os.Lstat(path); serr == nil {
+		return fmt.Errorf("gmdb: CopyTo create %q: %w", path, os.ErrExist)
+	} else if !errors.Is(serr, os.ErrNotExist) {
+		return fmt.Errorf("gmdb: CopyTo stat %q: %w", path, serr)
 	}
-	return copyVerbatim(rtx, path, uuid)
+	// Write the complete copy at a temp name in path's directory (same
+	// filesystem, so the publish link cannot fail EXDEV; the fresh UUID
+	// makes the name unique against concurrent CopyTo calls).
+	tmp := fmt.Sprintf("%s.copytmp-%x", path, uuid[:8])
+	if compact {
+		err = publicChecksumErr(copyCompact(rtx, tmp, uuid))
+	} else {
+		err = copyVerbatim(rtx, tmp, uuid)
+	}
+	if err != nil {
+		return err
+	}
+	if hook := copyPublishHookForTest.Load(); hook != nil {
+		(*hook)(tmp)
+	}
+	// Publish: hard-link the complete, fsynced temp at path — atomic and
+	// no-clobber (EEXIST if path appeared meanwhile) — make the new
+	// dirent durable (durability.md §Directory-entry durability), then
+	// drop the temp name. A crash between link and the dir fsync can
+	// lose the dirent but never expose partial bytes: path, when
+	// present, always names the fully-fsynced inode.
+	if lerr := os.Link(tmp, path); lerr != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("gmdb: CopyTo publish %q: %w", path, lerr)
+	}
+	if serr := syncDirPath(filepath.Dir(path)); serr != nil {
+		// All-or-nothing: the publish's durability is unknowable after a
+		// failed directory fsync, and a caller treating the error as "no
+		// backup produced" would otherwise retry into ErrExist forever
+		// (or delete a good copy by hand). Unpublish so error ⇒ nothing
+		// at path, matching every other CopyTo failure.
+		_ = os.Remove(path)
+		_ = os.Remove(tmp)
+		return fmt.Errorf("gmdb: CopyTo fsync dir: %w", serr)
+	}
+	_ = os.Remove(tmp)
+	return nil
 }
 
 // copyVerbatim implements CopyTo(compact=false): walk the snapshot's
@@ -72,6 +152,20 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	meta := rtx.meta
 	cfg := page.Config{PageSize: meta.PageSize, PageChecksum: meta.HasFlag(pager.MetaFlagPageChecksum)}
 	hwm := meta.HighWaterMark
+	// Clamp the walk/copy bound to the file-resident extent
+	// (checksums.md §Structural and Allocation Bounds — the same clamp
+	// Check applies): the verbatim path reads through the UNBOUNDED
+	// PageRaw, so a source truncated below its meta's HighWaterMark (an
+	// incomplete transfer; the meta itself intact) would otherwise
+	// SIGBUS on the unbacked tail of the MaxSize mmap reservation. With
+	// the clamp, a tree page beyond the extent fails the walk's bound as
+	// ErrCorrupted. On a well-formed source the file always covers the
+	// HighWaterMark, so the clamp is a no-op. The bound cannot shrink
+	// mid-copy: shrink defers while this read snapshot is visible
+	// (file-format.md §File Shrinkage).
+	if bound := min(uint64(rtx.pgr.FileSize())/uint64(meta.PageSize), meta.MaxSize); hwm > bound {
+		hwm = bound
+	}
 	firstData := uint64(2) + uint64(meta.BitmapPages)
 
 	// 1. Enumerate the reachable page set from the snapshot. Any walk
@@ -99,10 +193,11 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 			_ = os.Remove(path)
 		}
 	}()
+	dest := wrapCopyDest(f)
 
 	filePages := max(hwm, meta.MinSize, firstData)
 	pageSize := int64(meta.PageSize)
-	if err := f.Truncate(int64(filePages) * pageSize); err != nil {
+	if err := dest.Truncate(int64(filePages) * pageSize); err != nil {
 		return fmt.Errorf("gmdb: CopyTo truncate: %w", err)
 	}
 
@@ -120,7 +215,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 		if !reachable.test(id) {
 			continue
 		}
-		if _, err := f.WriteAt(rtx.pgr.PageRaw(id), int64(id)*pageSize); err != nil {
+		if _, err := dest.WriteAt(rtx.pgr.PageRaw(id), int64(id)*pageSize); err != nil {
 			return fmt.Errorf("gmdb: CopyTo write page %d: %w", id, err)
 		}
 	}
@@ -137,7 +232,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 		}
 	}
 	for i := uint64(0); i < uint64(meta.BitmapPages); i++ {
-		if _, err := f.WriteAt(bm.PageBytes(uint32(i)), int64(2+i)*pageSize); err != nil {
+		if _, err := dest.WriteAt(bm.PageBytes(uint32(i)), int64(2+i)*pageSize); err != nil {
 			return fmt.Errorf("gmdb: CopyTo write bitmap page %d: %w", i, err)
 		}
 	}
@@ -147,6 +242,10 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	// count. Written to both meta slots so either survives a torn write.
 	cm := meta
 	cm.UUID = uuid
+	// The clamped bound, not the source meta's claim: on a well-formed
+	// source they are equal; on a clamped (forged-meta) source the copy's
+	// HighWaterMark must describe the file the copy actually is.
+	cm.HighWaterMark = hwm
 	cm.RPLHeadPage = 0
 	cm.RPLTailPage = 0
 	cm.RPLEntryCount = 0
@@ -167,20 +266,17 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	metaBuf := make([]byte, meta.PageSize)
 	pager.EncodeMeta(metaBuf, &cm)
 	for slot := int64(0); slot < 2; slot++ {
-		if _, err := f.WriteAt(metaBuf, slot*pageSize); err != nil {
+		if _, err := dest.WriteAt(metaBuf, slot*pageSize); err != nil {
 			return fmt.Errorf("gmdb: CopyTo write meta %d: %w", slot, err)
 		}
 	}
 
-	if err := f.Sync(); err != nil {
+	// Bytes-durable barrier. Dirent durability for the published name is
+	// the caller's publish step (CopyTo links then fsyncs the directory);
+	// this temp's own dirent needs no durability — a crash leaves only an
+	// inert temp file.
+	if err := dest.Sync(); err != nil {
 		return fmt.Errorf("gmdb: CopyTo fsync: %w", err)
-	}
-	// Dirent durability for the copy (durability.md §Directory-entry
-	// durability): the bytes are synced, but the output file's
-	// directory entry survives a crash only after its parent
-	// directory is fsynced.
-	if err := syncDirPath(filepath.Dir(path)); err != nil {
-		return fmt.Errorf("gmdb: CopyTo fsync dir: %w", err)
 	}
 	committed = true
 	return nil
@@ -240,7 +336,7 @@ func collectReachable(rtx *ReadTx, cfg page.Config, meta pager.Meta, hwm, firstD
 // BulkLoad — the only difference is the destination (a fresh file rather
 // than the live pager).
 type freshFileWriter struct {
-	f        *os.File
+	f        copyDest
 	pageSize int64
 	checksum bool
 	next     uint64 // next page id to allocate (starts at firstData)
@@ -311,7 +407,7 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	}()
 
 	w := &freshFileWriter{
-		f:        f,
+		f:        wrapCopyDest(f),
 		pageSize: pageSize,
 		checksum: meta.HasFlag(pager.MetaFlagPageChecksum),
 		next:     firstData,
@@ -396,7 +492,7 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 
 	finalHWM := w.next
 	filePages := max(finalHWM, meta.MinSize, firstData)
-	if err := f.Truncate(int64(filePages) * pageSize); err != nil {
+	if err := w.f.Truncate(int64(filePages) * pageSize); err != nil {
 		return fmt.Errorf("gmdb: CopyTo(compact) truncate: %w", err)
 	}
 
@@ -405,7 +501,7 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	detail := make([]byte, uint64(meta.BitmapPages)*uint64(meta.PageSize))
 	bm := bitmap.New(detail, meta.PageSize, meta.BitmapPages, meta.MaxSize)
 	for i := uint64(0); i < uint64(meta.BitmapPages); i++ {
-		if _, err := f.WriteAt(bm.PageBytes(uint32(i)), int64(2+i)*pageSize); err != nil {
+		if _, err := w.f.WriteAt(bm.PageBytes(uint32(i)), int64(2+i)*pageSize); err != nil {
 			return fmt.Errorf("gmdb: CopyTo(compact) write bitmap page %d: %w", i, err)
 		}
 	}
@@ -428,20 +524,15 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	metaBuf := make([]byte, meta.PageSize)
 	pager.EncodeMeta(metaBuf, &cm)
 	for slot := int64(0); slot < 2; slot++ {
-		if _, err := f.WriteAt(metaBuf, slot*pageSize); err != nil {
+		if _, err := w.f.WriteAt(metaBuf, slot*pageSize); err != nil {
 			return fmt.Errorf("gmdb: CopyTo(compact) write meta %d: %w", slot, err)
 		}
 	}
 
-	if err := f.Sync(); err != nil {
+	// Bytes-durable barrier; dirent durability is the caller's concern
+	// (CopyTo's publish step, or Compact's post-rename directory fsync).
+	if err := w.f.Sync(); err != nil {
 		return fmt.Errorf("gmdb: CopyTo(compact) fsync: %w", err)
-	}
-	// Dirent durability for the copy (durability.md §Directory-entry
-	// durability): the bytes are synced, but the output file's
-	// directory entry survives a crash only after its parent
-	// directory is fsynced.
-	if err := syncDirPath(filepath.Dir(path)); err != nil {
-		return fmt.Errorf("gmdb: CopyTo(compact) fsync dir: %w", err)
 	}
 	committed = true
 	return nil

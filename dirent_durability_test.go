@@ -135,17 +135,14 @@ func TestCompactDirSyncFailurePoisons(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	// Compact performs two dir syncs: the tmp copy's (pre-rename — a
-	// failure there aborts cleanly, no poison warranted) and the
-	// post-rename one this test targets. Fail only the second.
+	// Compact's only dir sync is the post-rename one this test targets
+	// (the tmp copy's dirent needs no durability — a crash pre-rename
+	// leaves the original intact plus an inert temp).
 	injected := errors.New("injected dir fsync failure")
 	calls := 0
 	restore := SetSyncDirHookForTest(func(string) error {
 		calls++
-		if calls == 2 {
-			return injected
-		}
-		return nil
+		return injected
 	})
 	err = db.Compact()
 	restore()

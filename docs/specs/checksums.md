@@ -236,7 +236,23 @@ input — it returns an error instead:
   of the `MaxSize` mmap reservation (the reservation spans
   `MaxSize` but only the first `fileSize` bytes are file-backed;
   see `mmap-strategy.md`). The bound lives in the pager's
-  verifying page accessor (`pager-slab.md`).
+  verifying page accessor (`pager-slab.md`). Whole-tree walkers
+  that read through the RAW (unverified, unbounded) accessor —
+  `Check`'s structural walk and `CopyTo`'s verbatim enumeration —
+  carry the same bound themselves: each clamps its HighWaterMark
+  walk bound to this extent before walking, so a meta whose
+  HighWaterMark outruns the file (a truncated transfer, a forged
+  meta) yields `ErrCorrupted` from the walk, never a SIGBUS.
+  (Pinned by `TestCopyToTruncatedSourceErrors`.)
+- **Overflow-run header cross-check.** The shared tree walk
+  validates each overflow run's first-page header — the
+  `TypeOverflow` tag and an `AdditionalPages` count consistent
+  with the leaf reference's `TotalLen`-derived run — because the
+  read path rejects exactly that mismatch at assembly time. A walk
+  without the cross-check reports a database clean while every
+  `Get` of the affected key fails `ErrCorrupted` (reachable with
+  checksums disabled or a recomputed footer). (Pinned by
+  `TestCheckReportsCorruptOverflowHeader`.)
 - **Allocation bound.** An allocation sized from an on-disk
   length/count field — an overflow value's `TotalLen`, an index
   registry entry's column/covering counts, the meta-page
