@@ -432,7 +432,6 @@ const (
 	modeCover                     // full-row covering: V from the entry tuple
 )
 
-
 // matchPipe is the match stage of the execution tail: outer
 // residual terms (Inv-QB2) then opaque filters (Inv-QB7 — they
 // see whole rows). Matching rows continue to next; the returned

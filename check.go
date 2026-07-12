@@ -29,11 +29,11 @@ const (
 // tokens, single-sourced here and value-pinned by
 // TestCheckIssueCodeTokensPinned.
 const (
-	codeReadTxUnavailable = "ReadTxUnavailable"
-	codeRepairCommitFailed = "Repair.CommitFailed"
-	codeRepairFreeFailed = "Repair.FreeFailed"
-	codeRepairReadersActive = "Repair.ReadersActive"
-	codeRepairSkipped = "Repair.Skipped"
+	codeReadTxUnavailable        = "ReadTxUnavailable"
+	codeRepairCommitFailed       = "Repair.CommitFailed"
+	codeRepairFreeFailed         = "Repair.FreeFailed"
+	codeRepairReadersActive      = "Repair.ReadersActive"
+	codeRepairSkipped            = "Repair.Skipped"
 	codeRepairWriteTxUnavailable = "Repair.WriteTxUnavailable"
 )
 
