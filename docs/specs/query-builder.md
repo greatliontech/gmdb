@@ -132,10 +132,11 @@ Invariant: kind=clause-explicit;
   violation=A range term over a `MultiColumn` (one index entry
     per element) yields the same row once per matching element;
     a scan yields it once — plan-dependent duplication.
-    Enforced (landed slice: index-leaf expansion) by
-    `TestQueryMultiColumnRangeDedup` + the duplicate check inside
-    `TestQueryPlanScanEquivalence`; union-branch and ranked-source
-    dedup land with their nodes.
+    Enforced (landed slices: index-leaf expansion and Or-branch
+    overlap) by `TestQueryMultiColumnRangeDedup` +
+    `TestQueryUnionOverlapDedup` (both Union arms) + the duplicate
+    check inside `TestQueryPlanScanEquivalence`; ranked-source
+    dedup lands with its node.
 
 Invariant: kind=clause-explicit;
   property=Inv-QB5 (determinism): for a fixed keyspace state

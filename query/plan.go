@@ -117,6 +117,46 @@ func (n IndexRange) String() string {
 	return fmt.Sprintf("IndexRange(%s, prefix=%d, values=%s)", n.Index, n.PrefixLen, n.Values)
 }
 
+// Union joins one pushed top-level Or's branch plans (rule 4),
+// deduplicating by PK (Inv-QB4): the streaming merge arm when
+// every branch is an IndexSeek (all inputs ByPK — duplicates meet
+// at the merge point), the hash arm otherwise (branches drain in
+// plan order; deterministic, not canonical).
+type Union struct {
+	Branches []PlanNode
+	Merge    bool
+}
+
+func (Union) planNode() {}
+func (n Union) String() string {
+	arm := "hash"
+	if n.Merge {
+		arm = "merge"
+	}
+	s := fmt.Sprintf("Union(%s)[", arm)
+	for i, b := range n.Branches {
+		if i > 0 {
+			s += ", "
+		}
+		s += b.String()
+	}
+	return s + "]"
+}
+
+// Intersect joins two EQ-shaped seeks on different indexes
+// (rule 5): the build side materializes a PK set, the probe side
+// streams and keeps PKs present in it — the probe's ordering is
+// preserved.
+type Intersect struct {
+	Probe PlanNode
+	Build PlanNode
+}
+
+func (Intersect) planNode() {}
+func (n Intersect) String() string {
+	return fmt.Sprintf("Intersect(probe=%s, build=%s)", n.Probe, n.Build)
+}
+
 // Project is the projection transform (query-builder.md §Plan
 // nodes): present when the query carries a Select; Rows() decodes
 // its columns from the input's slots.

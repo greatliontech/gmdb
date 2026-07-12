@@ -48,13 +48,79 @@ type plannedLeaf struct {
 	covers bool
 }
 
+// planKind discriminates the chosen access-path shape.
+type planKind int
+
+const (
+	planLeaf planKind = iota
+	planUnion
+	planIntersect
+)
+
+// unionBranch is one Or group's planned access path plus the
+// group terms its leaf does not consume (evaluated on the
+// branch's rows before the merge point).
+type unionBranch struct {
+	leaf  plannedLeaf
+	resid []qrep.Term
+}
+
+// queryPlan is the planner's full result: a single leaf (or
+// scan), a Union over one pushed top-level Or's groups (rule 4),
+// or an Intersect of two EQ-shaped seeks (rule 5). residual holds
+// the top-level terms the chosen shape does not consume.
+type queryPlan struct {
+	kind     planKind
+	leaf     plannedLeaf
+	branches []unionBranch
+	// merge reports the streaming merge-dedup arm: sound only when
+	// every branch is an IndexSeek (ordering ByPK(asc) — within
+	// one fixed column-key group non-unique entries sort by their
+	// escaped-PK suffix); anything else takes hash dedup
+	// (query-builder.md §Plan nodes).
+	merge        bool
+	probe, build plannedLeaf
+	residual     []qrep.Term
+}
+
 // planQuery chooses the access path for the query's top-level
 // conjunction over the handle's declared ColumnIndexes. Rule 1's
 // partition is implicit: only leaf terms with EQ/range shapes on
-// declared columns are consumable; Or terms and opaque filters
-// always evaluate residually at this stage. selNames feeds rule
-// 3(b)'s "every column the query touches".
-func planQuery(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) plannedLeaf {
+// declared columns are consumable; nested Or terms and opaque
+// filters always evaluate residually. selNames feeds rule 3(b)'s
+// "every column the query touches".
+//
+// Shape selection is deterministic (Inv-QB5): the single-leaf
+// plan of rules 2-3 wins when it consumes anything; rule 5's
+// Intersect upgrades it when two disjoint EQ-shaped seeks on
+// different indexes together consume strictly more than the best
+// single leaf and no single candidate consumes both; rule 4's
+// Union applies when no conjunct term is consumable at all and
+// the FIRST top-level Or has every group independently pushable
+// — a group that cannot be pushed degrades the whole Or to
+// residual evaluation (never a partial union, Inv-QB1). Plan
+// choice is cost-only; results are identical across shapes.
+func planQuery(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) queryPlan {
+	cands := leafCandidates(terms, selNames, infos)
+	best := plannedLeaf{shape: shapeScan}
+	if len(cands) > 0 {
+		best = cands[0]
+	}
+	if best.shape != shapeScan {
+		if p, ok := intersectUpgrade(terms, cands, best); ok {
+			return p
+		}
+		return queryPlan{kind: planLeaf, leaf: best, residual: residualTerms(terms, best.consumed)}
+	}
+	if p, ok := unionPlan(terms, selNames, infos); ok {
+		return p
+	}
+	return queryPlan{kind: planLeaf, leaf: best, residual: terms}
+}
+
+// leafCandidates runs rules 2-3 over one conjunction: every
+// eligible index match, sorted by the scoring ladder.
+func leafCandidates(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) []plannedLeaf {
 	touched := touchedColumns(terms)
 	for _, n := range selNames {
 		touched[n] = struct{}{}
@@ -71,9 +137,6 @@ func planQuery(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) pla
 		if leaf, ok := matchIndex(terms, info, touched, entailed); ok {
 			cands = append(cands, leaf)
 		}
-	}
-	if len(cands) == 0 {
-		return plannedLeaf{shape: shapeScan}
 	}
 	// Rule 3 scoring: (a) most terms consumed, (b) covering,
 	// (c) unique over non-unique, (d) index name — the total order
@@ -96,7 +159,97 @@ func planQuery(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) pla
 		}
 		return strings.Compare(a.index.Name, b.index.Name)
 	})
-	return cands[0]
+	return cands
+}
+
+// intersectUpgrade applies rule 5: two candidates, each an
+// EQ-shaped seek consuming terms the other does not, on different
+// indexes, with no single candidate consuming their union —
+// planned as Intersect when together they consume strictly more
+// than the best single leaf. The better-scored seek probes (its
+// ordering is preserved); the other builds the PK set.
+func intersectUpgrade(terms []qrep.Term, cands []plannedLeaf, best plannedLeaf) (queryPlan, bool) {
+	var seeks []plannedLeaf
+	for _, c := range cands {
+		if c.shape == shapeSeek {
+			seeks = append(seeks, c)
+		}
+	}
+	for i := 0; i < len(seeks); i++ {
+		for j := i + 1; j < len(seeks); j++ {
+			a, b := seeks[i], seeks[j]
+			if a.index.Name == b.index.Name || sharesConsumed(a, b) {
+				continue
+			}
+			// Rule 5's "neither index alone consumes both" needs no
+			// separate check: a single candidate consuming a∪b
+			// scores ≥ the disjoint pair's total (rule 3a), so the
+			// strict-improvement test above already suppresses the
+			// pair.
+			if len(a.consumed)+len(b.consumed) <= len(best.consumed) {
+				continue
+			}
+			consumed := append(append([]int(nil), a.consumed...), b.consumed...)
+			return queryPlan{
+				kind:     planIntersect,
+				probe:    a,
+				build:    b,
+				residual: residualTerms(terms, consumed),
+			}, true
+		}
+	}
+	return queryPlan{}, false
+}
+
+func sharesConsumed(a, b plannedLeaf) bool {
+	in := make(map[int]struct{}, len(a.consumed))
+	for _, i := range a.consumed {
+		in[i] = struct{}{}
+	}
+	for _, i := range b.consumed {
+		if _, ok := in[i]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// unionPlan applies rule 4 to the first top-level Or whose every
+// group plans to an index leaf. Groups plan independently by
+// rules 1-3 over their own conjunction; group terms the branch
+// leaf does not consume evaluate on the branch's rows before the
+// merge point.
+func unionPlan(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) (queryPlan, bool) {
+	for oi, t := range terms {
+		if t.Kind != qrep.KindOr || len(t.Disjuncts) == 0 {
+			continue
+		}
+		branches := make([]unionBranch, 0, len(t.Disjuncts))
+		merge := true
+		ok := true
+		for _, g := range t.Disjuncts {
+			gc := leafCandidates(g, selNames, infos)
+			if len(gc) == 0 {
+				ok = false
+				break
+			}
+			leaf := gc[0]
+			if leaf.shape != shapeSeek {
+				merge = false
+			}
+			branches = append(branches, unionBranch{leaf: leaf, resid: residualTerms(g, leaf.consumed)})
+		}
+		if !ok {
+			continue
+		}
+		return queryPlan{
+			kind:     planUnion,
+			branches: branches,
+			merge:    merge,
+			residual: residualTerms(terms, []int{oi}),
+		}, true
+	}
+	return queryPlan{}, false
 }
 
 // entailedMultiColumns collects the multi columns whose element

@@ -99,7 +99,7 @@ tests move with their subjects, unmodified.
 - [x] 14. Covering-aware execution: `Select` / `Rows`,
       index-only plans, CoverValue route, Inv-QB3 / Inv-QB7
       anchors; grammar adds covering mixes.
-- [ ] 15. Combiners: `Or` pushdown via `Union`, `Intersect`,
+- [x] 15. Combiners: `Or` pushdown via `Union`, `Intersect`,
       distinct-by-PK everywhere (Inv-QB4); grammar adds
       disjunction + overlap-dedup anchors.
 - [ ] 16. Ordering + bounds: `OrderBy` (streaming asc/desc via

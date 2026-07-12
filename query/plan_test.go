@@ -55,8 +55,14 @@ func TestPlannerShapeSelection(t *testing.T) {
 		{"no terms falls back to scan", func() *query.Query[uint64, row] {
 			return query.New(h)
 		}, "scan", ""},
-		{"Or is not pushed at this stage", func() *query.Query[uint64, row] {
+		{"top-level Or with pushable groups becomes a Union", func() *query.Query[uint64, row] {
 			return query.New(h).Where(typed.Or([]typed.Term[uint64, row]{colGrp.Eq(1)}))
+		}, "union", ""},
+		{"Or with an unpushable group degrades whole to scan", func() *query.Query[uint64, row] {
+			return query.New(h).Where(typed.Or(
+				[]typed.Term[uint64, row]{colGrp.Eq(1)},
+				[]typed.Term[uint64, row]{colID.Eq(9)}, // id undeclared: group unpushable
+			))
 		}, "scan", ""},
 		{"undeclared column falls back to scan", func() *query.Query[uint64, row] {
 			return query.New(h).Where(colID.Eq(4))

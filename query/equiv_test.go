@@ -237,6 +237,16 @@ func randIndexes(rng *rand.Rand) (idxs []typed.AnyIndex[uint64, row], partial ma
 		}
 		idxs = append(idxs, typed.NewColumnIndex(name, cols, opts))
 	}
+	// The intersect arm: a deterministic pair of single-column
+	// scalar indexes makes rule 5's trigger (two disjoint EQ seeks
+	// on different indexes with no superset candidate) reachable
+	// from grp.Eq + name.Eq draws — census-floored below.
+	if rng.Intn(3) == 0 {
+		idxs = append(idxs,
+			typed.NewColumnIndex("sg", []typed.AnyColumn[uint64, row]{colGrp}, typed.ColumnIndexOpts[uint64, row]{}),
+			typed.NewColumnIndex("sn", []typed.AnyColumn[uint64, row]{colName}, typed.ColumnIndexOpts[uint64, row]{}),
+		)
+	}
 	return idxs, partial
 }
 
@@ -290,6 +300,7 @@ func planLeafOf(p query.Plan) (kind, index string) {
 }
 
 // planLeafRoute additionally reports the leaf's value route.
+// Combiner roots report their kind with no single index/route.
 func planLeafRoute(p query.Plan) (kind, index string, route query.ValueRoute) {
 	n := p.Root
 	if pr, ok := n.(query.Project); ok {
@@ -307,6 +318,10 @@ func planLeafRoute(p query.Plan) (kind, index string, route query.ValueRoute) {
 		return "prefix", l.Index, l.Values
 	case query.IndexRange:
 		return "range", l.Index, l.Values
+	case query.Union:
+		return "union", "", query.ValuesRowBytes
+	case query.Intersect:
+		return "intersect", "", query.ValuesRowBytes
 	}
 	return "?", "", query.ValuesRowBytes
 }
@@ -329,17 +344,36 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 			seedsRun++
 			rng := rand.New(rand.NewSource(seed))
 			idxs, partial := randIndexes(rng)
+			if seed == 8 {
+				// The intersect seed: exactly the two single-column
+				// indexes, so the fixed final round's EQ pair has no
+				// superset candidate and rule 5 fires (census floor).
+				idxs = []typed.AnyIndex[uint64, row]{
+					ci("sg", anyCols(colGrp), typed.ColumnIndexOpts[uint64, row]{}),
+					ci("sn", anyCols(colName), typed.ColumnIndexOpts[uint64, row]{}),
+				}
+				partial = map[string]bool{}
+			}
 			if len(partial) > 0 {
 				partialSeeds++
 			}
 			h, corpus, cleanup := openQueryDB(t, 60+rng.Intn(120), rng, idxs...)
 			defer cleanup()
 
-			for round := 0; round < 20; round++ {
-				nTerms := rng.Intn(4)
+			for round := 0; round < 31; round++ {
 				var terms []refTerm
-				for i := 0; i < nTerms; i++ {
-					terms = append(terms, randTerm(rng, 0))
+				if round == 30 {
+					// Fixed final round: the EQ pair every schema can
+					// serve — on the intersect seed it exercises rule 5.
+					terms = []refTerm{
+						{term: colGrp.Eq(2), eval: func(_ uint64, v row) bool { return v.Grp == 2 }},
+						{term: colName.Eq("beta"), eval: func(_ uint64, v row) bool { return v.Name == "beta" }},
+					}
+				} else {
+					nTerms := rng.Intn(4)
+					for i := 0; i < nTerms; i++ {
+						terms = append(terms, randTerm(rng, 0))
+					}
 				}
 				useFilter := rng.Intn(3) == 0
 
@@ -480,6 +514,15 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 	// only.
 	if census["values-entry"] < 1 {
 		t.Fatalf("no index-only Rows plan sampled: %v", census)
+	}
+	// Combiners must be sampled: Or pushdown (rule 4) and the
+	// intersect arm (rule 5, reachable via the deterministic
+	// single-column index pair).
+	if census["union"] < 1 {
+		t.Fatalf("no Union plan sampled: %v", census)
+	}
+	if census["intersect"] < 1 {
+		t.Fatalf("no Intersect plan sampled: %v", census)
 	}
 }
 

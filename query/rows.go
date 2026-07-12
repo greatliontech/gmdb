@@ -41,13 +41,13 @@ func (q *Query[K, V]) Rows() iter.Seq2[K, typed.Projection] {
 		if q.hasLim && q.limit <= 0 {
 			return
 		}
-		leaf := planQuery(q.terms, q.selNames(), q.ks.InternalIndexInfo())
-		if leaf.shape != shapeScan &&
-			entryEligible(leaf, q.sel, residualTerms(q.terms, leaf.consumed), len(q.filters)) {
-			q.rowsEntryExec(leaf, yield)
+		p := planQuery(q.terms, q.selNames(), q.ks.InternalIndexInfo())
+		if p.kind == planLeaf && p.leaf.shape != shapeScan &&
+			entryEligible(p.leaf, q.sel, p.residual, len(q.filters)) {
+			q.rowsEntryExec(p.leaf, p.residual, yield)
 			return
 		}
-		q.rowsMaterialized(leaf, yield)
+		q.rowsMaterialized(p, yield)
 	}
 }
 
@@ -56,7 +56,7 @@ func (q *Query[K, V]) Rows() iter.Seq2[K, typed.Projection] {
 // yields surviving (K, V) rows and every slot computes from the
 // decoded row via the column's own encoder — the identical bytes
 // a covering slot would carry (Inv-TC5's read-side identity).
-func (q *Query[K, V]) rowsMaterialized(leaf plannedLeaf, yield func(K, typed.Projection) bool) {
+func (q *Query[K, V]) rowsMaterialized(p queryPlan, yield func(K, typed.Projection) bool) {
 	names := q.selNames()
 	sink := func(k K, v V) bool {
 		slots := make([][]byte, len(q.sel))
@@ -70,11 +70,18 @@ func (q *Query[K, V]) rowsMaterialized(leaf plannedLeaf, yield func(K, typed.Pro
 		}
 		return yield(k, qrep.ProjectionSlots(names, slots).(typed.Projection))
 	}
-	if leaf.shape == shapeScan {
-		q.scanExec(sink)
-		return
+	switch p.kind {
+	case planUnion:
+		q.unionExec(p, sink)
+	case planIntersect:
+		q.intersectExec(p, sink)
+	default:
+		if p.leaf.shape == shapeScan {
+			q.scanExec(sink)
+			return
+		}
+		q.indexExec(p.leaf, p.residual, sink)
 	}
-	q.indexExec(leaf, sink)
 }
 
 // rowsEntryExec is the index-only route: RangeEntries over the
@@ -86,7 +93,7 @@ func (q *Query[K, V]) rowsMaterialized(leaf plannedLeaf, yield func(K, typed.Pro
 // snapshot; the live declaration is re-validated here and any
 // shape change falls back to the row-materialized scan, correct
 // under every declaration (Inv-QB3).
-func (q *Query[K, V]) rowsEntryExec(leaf plannedLeaf, yield func(K, typed.Projection) bool) {
+func (q *Query[K, V]) rowsEntryExec(leaf plannedLeaf, resid []qrep.Term, yield func(K, typed.Projection) bool) {
 	idx, err := q.ks.ByteIndex(leaf.index.Name)
 	if err != nil {
 		q.err = err
@@ -108,7 +115,6 @@ func (q *Query[K, V]) rowsEntryExec(leaf plannedLeaf, yield func(K, typed.Projec
 		_, ok := coverPos[name]
 		return ok
 	}
-	resid := residualTerms(q.terms, leaf.consumed)
 	liveOK := liveColumnsMatch(leaf.index, d)
 	for _, s := range q.sel {
 		liveOK = liveOK && resolvable(s.Name)
@@ -135,7 +141,7 @@ func (q *Query[K, V]) rowsEntryExec(leaf plannedLeaf, yield func(K, typed.Projec
 		// A same-tx Rebuild changed the tuple or dropped a needed
 		// covering column since open: serve row-materialized from
 		// a scan — correct under any live shape.
-		q.rowsMaterialized(plannedLeaf{shape: shapeScan}, yield)
+		q.rowsMaterialized(queryPlan{kind: planLeaf, leaf: plannedLeaf{shape: shapeScan}, residual: q.terms}, yield)
 		return
 	}
 
