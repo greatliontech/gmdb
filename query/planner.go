@@ -100,8 +100,8 @@ type queryPlan struct {
 // — a group that cannot be pushed degrades the whole Or to
 // residual evaluation (never a partial union, Inv-QB1). Plan
 // choice is cost-only; results are identical across shapes.
-func planQuery(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) queryPlan {
-	cands := leafCandidates(terms, selNames, infos)
+func planQuery(terms []qrep.Term, selNames, orderNames []string, infos []qrep.IndexInfo) queryPlan {
+	cands := leafCandidates(terms, selNames, orderNames, infos)
 	best := plannedLeaf{shape: shapeScan}
 	if len(cands) > 0 {
 		best = cands[0]
@@ -112,17 +112,22 @@ func planQuery(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) que
 		}
 		return queryPlan{kind: planLeaf, leaf: best, residual: residualTerms(terms, best.consumed)}
 	}
-	if p, ok := unionPlan(terms, selNames, infos); ok {
+	if p, ok := unionPlan(terms, selNames, orderNames, infos); ok {
 		return p
 	}
 	return queryPlan{kind: planLeaf, leaf: best, residual: terms}
 }
 
 // leafCandidates runs rules 2-3 over one conjunction: every
-// eligible index match, sorted by the scoring ladder.
-func leafCandidates(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) []plannedLeaf {
+// eligible index match, sorted by the scoring ladder. The touch
+// set for rule 3(b) is terms + Select + OrderBy columns
+// (query-builder.md: "every column the query touches").
+func leafCandidates(terms []qrep.Term, selNames, orderNames []string, infos []qrep.IndexInfo) []plannedLeaf {
 	touched := touchedColumns(terms)
 	for _, n := range selNames {
+		touched[n] = struct{}{}
+	}
+	for _, n := range orderNames {
 		touched[n] = struct{}{}
 	}
 	entailed := entailedMultiColumns(terms)
@@ -219,7 +224,7 @@ func sharesConsumed(a, b plannedLeaf) bool {
 // rules 1-3 over their own conjunction; group terms the branch
 // leaf does not consume evaluate on the branch's rows before the
 // merge point.
-func unionPlan(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) (queryPlan, bool) {
+func unionPlan(terms []qrep.Term, selNames, orderNames []string, infos []qrep.IndexInfo) (queryPlan, bool) {
 	for oi, t := range terms {
 		if t.Kind != qrep.KindOr || len(t.Disjuncts) == 0 {
 			continue
@@ -228,7 +233,7 @@ func unionPlan(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) (qu
 		merge := true
 		ok := true
 		for _, g := range t.Disjuncts {
-			gc := leafCandidates(g, selNames, infos)
+			gc := leafCandidates(g, selNames, orderNames, infos)
 			if len(gc) == 0 {
 				ok = false
 				break

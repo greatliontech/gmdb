@@ -94,11 +94,18 @@ type IndexPrefix struct {
 	// terms (1 ≤ PrefixLen < the index's column count).
 	PrefixLen int
 	Values    ValueRoute
+	// Reverse marks a streaming-descending drain (a requested
+	// OrderBy the entry order realizes backwards).
+	Reverse bool
 }
 
 func (IndexPrefix) planNode() {}
 func (n IndexPrefix) String() string {
-	return fmt.Sprintf("IndexPrefix(%s, prefix=%d, values=%s)", n.Index, n.PrefixLen, n.Values)
+	dir := ""
+	if n.Reverse {
+		dir = ", reverse"
+	}
+	return fmt.Sprintf("IndexPrefix(%s, prefix=%d, values=%s%s)", n.Index, n.PrefixLen, n.Values, dir)
 }
 
 // IndexRange is the leaf consuming a (possibly empty) leading-EQ
@@ -110,11 +117,17 @@ type IndexRange struct {
 	// bound column at position PrefixLen is not included.
 	PrefixLen int
 	Values    ValueRoute
+	// Reverse marks a streaming-descending drain.
+	Reverse bool
 }
 
 func (IndexRange) planNode() {}
 func (n IndexRange) String() string {
-	return fmt.Sprintf("IndexRange(%s, prefix=%d, values=%s)", n.Index, n.PrefixLen, n.Values)
+	dir := ""
+	if n.Reverse {
+		dir = ", reverse"
+	}
+	return fmt.Sprintf("IndexRange(%s, prefix=%d, values=%s%s)", n.Index, n.PrefixLen, n.Values, dir)
 }
 
 // Union joins one pushed top-level Or's branch plans (rule 4),
@@ -155,6 +168,32 @@ type Intersect struct {
 func (Intersect) planNode() {}
 func (n Intersect) String() string {
 	return fmt.Sprintf("Intersect(probe=%s, build=%s)", n.Probe, n.Build)
+}
+
+// Sort is the materializing ordering transform (OrderBy without a
+// Limit): the full matched set buffers (budget-counted, Inv-QB6)
+// and emits by the encoded keys with the directional PK tie-break
+// (Inv-QB5).
+type Sort struct {
+	Input PlanNode
+}
+
+func (Sort) planNode() {}
+func (n Sort) String() string {
+	return fmt.Sprintf("Sort <- %s", n.Input)
+}
+
+// TopK is the bounded ordering transform (OrderBy + Limit): a
+// heap of the best limit+offset rows (budget-counted, Inv-QB6).
+type TopK struct {
+	Input PlanNode
+	// K is the retained row bound: limit + offset.
+	K int
+}
+
+func (TopK) planNode() {}
+func (n TopK) String() string {
+	return fmt.Sprintf("TopK(%d) <- %s", n.K, n.Input)
 }
 
 // Project is the projection transform (query-builder.md §Plan

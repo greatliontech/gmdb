@@ -19,6 +19,12 @@ func unionArm(t *testing.T, p query.Plan) (merge bool, branches int) {
 	if pr, ok := n.(query.Project); ok {
 		n = pr.Input
 	}
+	if so, ok := n.(query.Sort); ok {
+		n = so.Input
+	}
+	if tk, ok := n.(query.TopK); ok {
+		n = tk.Input
+	}
 	if rf, ok := n.(query.ResidualFilter); ok {
 		n = rf.Input
 	}

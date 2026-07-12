@@ -102,7 +102,7 @@ tests move with their subjects, unmodified.
 - [x] 15. Combiners: `Or` pushdown via `Union`, `Intersect`,
       distinct-by-PK everywhere (Inv-QB4); grammar adds
       disjunction + overlap-dedup anchors.
-- [ ] 16. Ordering + bounds: `OrderBy` (streaming asc/desc via
+- [x] 16. Ordering + bounds: `OrderBy` (streaming asc/desc via
       chunk-9 surface, else `TopK` / `Sort`), materialization
       budget + `ErrQueryMaterializeLimit` (Inv-QB6), `Count`,
       directional PK tie-break determinism (Inv-QB5) enforced

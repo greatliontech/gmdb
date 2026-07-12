@@ -45,39 +45,33 @@ type rowKV[K, V any] struct {
 	v V
 }
 
-// unionExec drains a rule-4 Union: each branch's leaf rows (group
-// residuals applied inside the branch) dedup by PK across
-// branches (Inv-QB4), then the shared outer pipeline. The merge
-// arm runs a k-way minimum merge over the branches' PK-ascending
-// streams — duplicates meet at the merge point; the hash arm
-// drains branches in plan order against a seen-PK set
-// (deterministic, not canonical — Inv-QB5's no-OrderBy regime).
-func (q *Query[K, V]) unionExec(p queryPlan, yield func(K, V) bool) {
-	leaves := make([]plannedLeaf, len(p.branches))
-	for i, b := range p.branches {
-		leaves[i] = b.leaf
-	}
-	hs, ok := q.openBranches(leaves)
-	if !ok {
-		if q.err == nil {
-			q.scanExec(yield)
-		}
-		return
-	}
-	out := q.outerPipe(p.residual, yield)
+// unionDrive drains a RESOLVED rule-4 Union: each branch's leaf
+// rows (group residuals applied inside the branch) dedup by PK
+// across branches (Inv-QB4), then flow through the caller's tail.
+// The merge arm runs a k-way minimum merge over the branches'
+// PK-ascending streams — duplicates meet at the merge point; the
+// hash arm drains branches in plan order against a seen-PK set
+// (deterministic, not canonical — Inv-QB5's no-OrderBy regime),
+// charging the set against the materialization budget (Inv-QB6).
+func (q *Query[K, V]) unionDrive(p queryPlan, hs []branchHandle, m *meter, tail func(K, V) bool) {
 	if p.merge {
-		q.unionMerge(p, hs, out)
+		q.unionMerge(p, hs, m, tail)
 		return
 	}
 	seen := make(map[string]struct{})
 	for i, b := range p.branches {
 		stopped := false
-		q.leafDrive(hs[i].idx, hs[i].d, b.leaf, b.resid, func(pk string, k K, v V) bool {
+		q.leafDrive(hs[i].idx, hs[i].d, b.leaf, b.resid, false, m, func(pk string, k K, v V) bool {
 			if _, dup := seen[pk]; dup {
 				return true
 			}
+			if !m.charge(len(pk)) {
+				q.err = ErrQueryMaterializeLimit
+				stopped = true
+				return false
+			}
 			seen[pk] = struct{}{}
-			if !out(k, v) {
+			if !tail(k, v) {
 				stopped = true
 				return false
 			}
@@ -93,7 +87,7 @@ func (q *Query[K, V]) unionExec(p queryPlan, yield func(K, V) bool) {
 // (PK-ascending, one entry per row), so equal PKs from different
 // branches surface consecutively at the minimum-selection point
 // and dedup without buffering.
-func (q *Query[K, V]) unionMerge(p queryPlan, hs []branchHandle, out func(K, V) bool) {
+func (q *Query[K, V]) unionMerge(p queryPlan, hs []branchHandle, m *meter, tail func(K, V) bool) {
 	type head struct {
 		pk string
 		kv rowKV[K, V]
@@ -106,7 +100,7 @@ func (q *Query[K, V]) unionMerge(p queryPlan, hs []branchHandle, out func(K, V) 
 		b := p.branches[i]
 		h := hs[i]
 		seq := func(y func(string, rowKV[K, V]) bool) {
-			q.leafDrive(h.idx, h.d, b.leaf, b.resid, func(pk string, k K, v V) bool {
+			q.leafDrive(h.idx, h.d, b.leaf, b.resid, false, m, func(pk string, k K, v V) bool {
 				return y(pk, rowKV[K, V]{k: k, v: v})
 			})
 		}
@@ -138,7 +132,7 @@ func (q *Query[K, V]) unionMerge(p queryPlan, hs []branchHandle, out func(K, V) 
 		}
 		h := heads[min]
 		if !haveLast || h.pk != last {
-			if !out(h.kv.k, h.kv.v) {
+			if !tail(h.kv.k, h.kv.v) {
 				return
 			}
 			last, haveLast = h.pk, true
@@ -151,31 +145,28 @@ func (q *Query[K, V]) unionMerge(p queryPlan, hs []branchHandle, out func(K, V) 
 	}
 }
 
-// intersectExec drains a rule-5 Intersect: the build seek
-// materializes its PK set, the probe seek streams and keeps PKs
-// present in it (the probe's ordering is preserved); residual
-// terms and filters apply on the intersection's rows.
-func (q *Query[K, V]) intersectExec(p queryPlan, yield func(K, V) bool) {
-	hs, ok := q.openBranches([]plannedLeaf{p.probe, p.build})
-	if !ok {
-		if q.err == nil {
-			q.scanExec(yield)
-		}
-		return
-	}
+// intersectDrive drains a RESOLVED rule-5 Intersect: the build
+// seek materializes its PK set (charged against the
+// materialization budget — Inv-QB6), the probe seek streams and
+// keeps PKs present in it (the probe's ordering is preserved);
+// the caller's tail applies residuals, filters, and bounds.
+func (q *Query[K, V]) intersectDrive(p queryPlan, hs []branchHandle, m *meter, tail func(K, V) bool) {
 	buildSet := make(map[string]struct{})
-	q.leafDrive(hs[1].idx, hs[1].d, p.build, nil, func(pk string, _ K, _ V) bool {
+	q.leafDrive(hs[1].idx, hs[1].d, p.build, nil, false, m, func(pk string, _ K, _ V) bool {
+		if !m.charge(len(pk)) {
+			q.err = ErrQueryMaterializeLimit
+			return false
+		}
 		buildSet[pk] = struct{}{}
 		return true
 	})
 	if q.err != nil {
 		return
 	}
-	out := q.outerPipe(p.residual, yield)
-	q.leafDrive(hs[0].idx, hs[0].d, p.probe, nil, func(pk string, k K, v V) bool {
+	q.leafDrive(hs[0].idx, hs[0].d, p.probe, nil, false, m, func(pk string, k K, v V) bool {
 		if _, ok := buildSet[pk]; !ok {
 			return true
 		}
-		return out(k, v)
+		return tail(k, v)
 	})
 }

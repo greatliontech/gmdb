@@ -466,6 +466,7 @@ func (t *KeyspaceHandle[K, V]) InternalRowOps() qrep.RowOps {
 	return qrep.RowOps{
 		ValEncID:  t.valEnc.ID(),
 		DecodeKey: func(pk []byte) (any, error) { return t.keyEnc.Decode(pk) },
+		EncodeKey: func(k any) ([]byte, error) { return t.keyEnc.AppendEncode(nil, k.(K)) },
 		DecodeVal: func(vb []byte) (any, error) { return t.valEnc.Decode(vb) },
 		FetchRow: func(pk []byte) (any, bool, error) {
 			vb, err := t.ks.Get(pk)

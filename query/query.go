@@ -32,6 +32,8 @@ type Query[K, V any] struct {
 	terms   []qrep.Term
 	filters []func(K, V) bool
 	sel     []qrep.SelectCol
+	order   []qrep.OrderKey
+	budget  int
 	limit   int
 	hasLim  bool
 	offset  int
@@ -90,6 +92,38 @@ func (q *Query[K, V]) Select(cols ...typed.AnySingleColumn[K, V]) *Query[K, V] {
 	return q
 }
 
+// OrderBy sets the result ordering (query-builder.md §Result
+// semantics): rows order by the keys' encoded bytes (Inv-QB2),
+// ties broken by PK in the FINAL key's direction (Inv-QB5 — the
+// ordered sequence is identical across plan choices). An ordering
+// the chosen index realizes streams; otherwise the execution
+// materializes through TopK (with a Limit) or Sort, counting
+// against the materialization budget when one is set (Inv-QB6).
+func (q *Query[K, V]) OrderBy(keys ...typed.OrderKey[K, V]) *Query[K, V] {
+	for _, k := range keys {
+		rep := k.InternalRep()
+		if rep.EncodeRow == nil {
+			q.terms = append(q.terms, qrep.Term{Err: fmt.Errorf("gmdb/query: zero-value OrderKey (order keys are built by column constructors): %w", errBadPredicate)})
+			continue
+		}
+		q.order = append(q.order, rep)
+	}
+	return q
+}
+
+// WithMaterializeLimit bounds the total bytes buffered by
+// buffering nodes for one query execution — Sort, TopK's heap,
+// hash dedup, and the Intersect build side (query-builder.md
+// §Materialization budget). Accounting basis: the retained
+// per-row bytes a node holds (encoded sort keys + PK bytes for
+// Sort/TopK; PK bytes for hash sets). Zero (the default) means
+// unbounded. Exceeding a set budget fails the iteration with
+// ErrQueryMaterializeLimit — never silent truncation (Inv-QB6).
+func (q *Query[K, V]) WithMaterializeLimit(bytes int) *Query[K, V] {
+	q.budget = bytes
+	return q
+}
+
 // selNames returns the selected columns' synthesized names.
 func (q *Query[K, V]) selNames() []string {
 	if len(q.sel) == 0 {
@@ -98,6 +132,18 @@ func (q *Query[K, V]) selNames() []string {
 	names := make([]string, len(q.sel))
 	for i, s := range q.sel {
 		names[i] = s.Name
+	}
+	return names
+}
+
+// orderNames returns the order keys' synthesized column names.
+func (q *Query[K, V]) orderNames() []string {
+	if len(q.order) == 0 {
+		return nil
+	}
+	names := make([]string, len(q.order))
+	for i, o := range q.order {
+		names[i] = o.ColumnName
 	}
 	return names
 }
@@ -111,8 +157,12 @@ func (q *Query[K, V]) Limit(n int) *Query[K, V] {
 }
 
 // Offset skips the first n results of the final sequence.
-// Non-positive n skips nothing.
+// Non-positive n skips nothing (normalized to zero here — every
+// consumption site reads the stored value arithmetically).
 func (q *Query[K, V]) Offset(n int) *Query[K, V] {
+	if n < 0 {
+		n = 0
+	}
 	q.offset = n
 	return q
 }
@@ -185,19 +235,61 @@ func (q *Query[K, V]) All() iter.Seq2[K, V] {
 		if q.hasLim && q.limit <= 0 {
 			return
 		}
-		p := planQuery(q.terms, q.selNames(), q.ks.InternalIndexInfo())
-		switch p.kind {
-		case planUnion:
-			q.unionExec(p, yield)
-		case planIntersect:
-			q.intersectExec(p, yield)
-		default:
-			if p.leaf.shape == shapeScan {
-				q.scanExec(yield)
-				return
-			}
-			q.indexExec(p.leaf, p.residual, yield)
+		p, hs := q.resolvePlan(planQuery(q.terms, q.selNames(), q.orderNames(), q.ks.InternalIndexInfo()))
+		if q.err != nil {
+			return
 		}
+		if len(q.order) > 0 {
+			q.orderedExec(p, hs, yield)
+			return
+		}
+		q.drive(p, hs, false, q.newMeter(), q.matchPipe(p.residual, q.boundPipe(yield)))
+	}
+}
+
+// resolvePlan obtains fresh byte handles for every index leaf of
+// p and validates each live tuple (Inv-QB3): any mismatch after a
+// same-tx Rebuild degrades the whole plan to the scan, whose
+// residual is the full conjunction — correct under any live shape
+// (Inv-QB1). A handle-acquisition error lands on q.err.
+func (q *Query[K, V]) resolvePlan(p queryPlan) (queryPlan, []branchHandle) {
+	var leaves []plannedLeaf
+	switch p.kind {
+	case planUnion:
+		for _, b := range p.branches {
+			leaves = append(leaves, b.leaf)
+		}
+	case planIntersect:
+		leaves = []plannedLeaf{p.probe, p.build}
+	default:
+		if p.leaf.shape == shapeScan {
+			return p, nil
+		}
+		leaves = []plannedLeaf{p.leaf}
+	}
+	hs, ok := q.openBranches(leaves)
+	if !ok || q.err != nil {
+		return queryPlan{kind: planLeaf, leaf: plannedLeaf{shape: shapeScan}, residual: q.terms}, nil
+	}
+	return p, hs
+}
+
+// drive pushes every row of the RESOLVED plan through tail. m is
+// the execution's ONE budget meter (query-builder.md
+// §Materialization budget bounds the TOTAL buffered bytes per
+// execution — every buffering node shares it).
+func (q *Query[K, V]) drive(p queryPlan, hs []branchHandle, reverse bool, m *meter, tail func(K, V) bool) {
+	switch p.kind {
+	case planUnion:
+		q.unionDrive(p, hs, m, tail)
+	case planIntersect:
+		q.intersectDrive(p, hs, m, tail)
+	default:
+		if p.leaf.shape == shapeScan {
+			q.scanDrive(tail)
+			return
+		}
+		q.leafDrive(hs[0].idx, hs[0].d, p.leaf, nil, reverse, m, func(_ string, k K, v V) bool { return tail(k, v) })
 	}
 }
 
@@ -210,7 +302,7 @@ func (q *Query[K, V]) All() iter.Seq2[K, V] {
 // declarations; execution re-derives against the live declaration
 // (Inv-QB3) — results are identical, routes are read strategies.
 func (q *Query[K, V]) Explain() Plan {
-	p := planQuery(q.terms, q.selNames(), q.ks.InternalIndexInfo())
+	p := planQuery(q.terms, q.selNames(), q.orderNames(), q.ks.InternalIndexInfo())
 	var root PlanNode
 	switch p.kind {
 	case planUnion:
@@ -242,10 +334,46 @@ func (q *Query[K, V]) Explain() Plan {
 	if len(p.residual) > 0 || len(q.filters) > 0 {
 		root = ResidualFilter{Input: root, Terms: len(p.residual), Filters: len(q.filters)}
 	}
+	if len(q.order) > 0 {
+		streamed := false
+		if p.kind == planLeaf && p.leaf.shape != shapeScan {
+			if reverse, ok := streamable(p.leaf, q.order); ok {
+				streamed = true
+				if reverse {
+					// Mark the streaming-descending drain on the leaf.
+					root = markReverse(root)
+				}
+			}
+		}
+		if !streamed {
+			if q.hasLim {
+				root = TopK{Input: root, K: q.limit + q.offset}
+			} else {
+				root = Sort{Input: root}
+			}
+		}
+	}
 	if len(q.sel) > 0 {
 		root = Project{Input: root, Columns: len(q.sel)}
 	}
 	return Plan{Root: root}
+}
+
+// markReverse flips the Reverse marker on the plan's index leaf
+// (possibly under a ResidualFilter).
+func markReverse(n PlanNode) PlanNode {
+	switch t := n.(type) {
+	case ResidualFilter:
+		t.Input = markReverse(t.Input)
+		return t
+	case IndexPrefix:
+		t.Reverse = true
+		return t
+	case IndexRange:
+		t.Reverse = true
+		return t
+	}
+	return n
 }
 
 // leafNode renders one planned leaf as its public node.
@@ -274,48 +402,18 @@ func snapshotRoute(leaf plannedLeaf) ValueRoute {
 	return ValuesRowBytes
 }
 
-// scanExec is the Scan leaf: full typed-cursor iteration with
-// every term and filter residual.
-func (q *Query[K, V]) scanExec(yield func(K, V) bool) {
+// scanDrive iterates the whole keyspace via the typed cursor,
+// pushing EVERY row through tail (residuals, filters, and bounds
+// live in the composed pipeline). The scan is ascending-only
+// (query-builder.md §Plan nodes) — descending orders materialize.
+func (q *Query[K, V]) scanDrive(tail func(K, V) bool) {
 	c := q.ks.Cursor()
 	// Each execution opens a fresh cursor; Close releases its
 	// staleness registration so repeated executions in one long
 	// transaction don't accumulate per-mutation tracking cost.
 	defer c.Close()
-	skipped, yielded := 0, 0
 	for k, v, ok := c.First(); ok; k, v, ok = c.Next() {
-		match := true
-		for _, t := range q.terms {
-			ok, err := evalTerm[K, V](t, k, v)
-			if err != nil {
-				q.err = err
-				return
-			}
-			if !ok {
-				match = false
-				break
-			}
-		}
-		if match {
-			for _, f := range q.filters {
-				if !f(k, v) {
-					match = false
-					break
-				}
-			}
-		}
-		if !match {
-			continue
-		}
-		if skipped < q.offset {
-			skipped++
-			continue
-		}
-		if !yield(k, v) {
-			return
-		}
-		yielded++
-		if q.hasLim && yielded >= q.limit {
+		if !tail(k, v) {
 			return
 		}
 	}
@@ -334,32 +432,12 @@ const (
 	modeCover                     // full-row covering: V from the entry tuple
 )
 
-// indexExec drains one single-index plan: the leaf-drive core
-// plus the shared outer pipeline (opaque filters, offset, limit).
-// A live-declaration tuple change falls back to the scan
-// (Inv-QB3/Inv-QB1 — see leafDrive).
-func (q *Query[K, V]) indexExec(leaf plannedLeaf, resid []qrep.Term, yield func(K, V) bool) {
-	idx, err := q.ks.ByteIndex(leaf.index.Name)
-	if err != nil {
-		q.err = err
-		return
-	}
-	d := idx.Decl()
-	if !liveColumnsMatch(leaf.index, d) {
-		q.scanExec(yield)
-		return
-	}
-	out := q.outerPipe(nil, yield)
-	q.leafDrive(idx, d, leaf, resid, func(_ string, k K, v V) bool { return out(k, v) })
-}
 
-// outerPipe builds the shared tail of every execution: outer
-// residual terms, opaque filters (Inv-QB7 — they see whole rows),
-// offset, then limit applied to the final sequence (Inv-QB1). The
-// returned func reports false to STOP the drain (error, consumer
-// break, or limit-complete — q.err distinguishes).
-func (q *Query[K, V]) outerPipe(resid []qrep.Term, yield func(K, V) bool) func(K, V) bool {
-	skipped, yielded := 0, 0
+// matchPipe is the match stage of the execution tail: outer
+// residual terms (Inv-QB2) then opaque filters (Inv-QB7 — they
+// see whole rows). Matching rows continue to next; the returned
+// func reports false to STOP the drain.
+func (q *Query[K, V]) matchPipe(resid []qrep.Term, next func(K, V) bool) func(K, V) bool {
 	return func(k K, v V) bool {
 		for _, t := range resid {
 			ok, err := evalTerm[K, V](t, k, v)
@@ -376,6 +454,15 @@ func (q *Query[K, V]) outerPipe(resid []qrep.Term, yield func(K, V) bool) func(K
 				return true
 			}
 		}
+		return next(k, v)
+	}
+}
+
+// boundPipe is the bound stage: offset then limit, applied to the
+// FINAL sequence (Inv-QB1) — after any ordering.
+func (q *Query[K, V]) boundPipe(yield func(K, V) bool) func(K, V) bool {
+	skipped, yielded := 0, 0
+	return func(k K, v V) bool {
 		if skipped < q.offset {
 			skipped++
 			return true
@@ -402,7 +489,11 @@ func (q *Query[K, V]) outerPipe(resid []qrep.Term, yield func(K, V) bool) func(K
 // (mirroring byte Lookup's silent-skip of vanished rows). The
 // caller has already validated liveColumnsMatch. yield receives
 // (pk key, K, V) for rows passing resid; false stops the drain.
-func (q *Query[K, V]) leafDrive(idx *gmdb.IndexHandle, d *gmdb.IndexDecl, leaf plannedLeaf, resid []qrep.Term, yield func(string, K, V) bool) {
+func (q *Query[K, V]) leafDrive(idx *gmdb.IndexHandle, d *gmdb.IndexDecl, leaf plannedLeaf, resid []qrep.Term, reverse bool, m *meter, yield func(string, K, V) bool) {
+	var opts []gmdb.IterOption
+	if reverse {
+		opts = append(opts, gmdb.Reverse())
+	}
 	ops := q.ks.InternalRowOps()
 	mode := modeRowBytes
 	switch {
@@ -427,6 +518,12 @@ func (q *Query[K, V]) leafDrive(idx *gmdb.IndexHandle, d *gmdb.IndexDecl, leaf p
 		if seen != nil {
 			if _, dup := seen[s]; dup {
 				return true
+			}
+			// Leaf-level multi-expansion dedup is hash dedup: its
+			// set counts against the budget (Inv-QB6).
+			if !m.charge(len(s)) {
+				q.err = ErrQueryMaterializeLimit
+				return false
 			}
 			seen[s] = struct{}{}
 		}
@@ -485,27 +582,27 @@ func (q *Query[K, V]) leafDrive(idx *gmdb.IndexHandle, d *gmdb.IndexDecl, leaf p
 	switch leaf.shape {
 	case shapeSeek:
 		if mode == modeFetch {
-			for pk := range idx.LookupKeys(leaf.eqVals) {
+			for pk := range idx.LookupKeys(leaf.eqVals, opts...) {
 				if !row(pk, nil) {
 					break
 				}
 			}
 		} else {
-			for pk, vb := range idx.Lookup(leaf.eqVals) {
+			for pk, vb := range idx.Lookup(leaf.eqVals, opts...) {
 				if !row(pk, vb) {
 					break
 				}
 			}
 		}
 	case shapePrefix:
-		for pk, vb := range idx.Prefix(leaf.eqVals) {
+		for pk, vb := range idx.Prefix(leaf.eqVals, opts...) {
 			if !row(pk, vb) {
 				break
 			}
 		}
 	case shapeRange:
 		start, end := rangeBounds(leaf.eqVals, leaf.bound)
-		for pk, vb := range idx.Range(start, end) {
+		for pk, vb := range idx.Range(start, end, opts...) {
 			if !row(pk, vb) {
 				break
 			}

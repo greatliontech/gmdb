@@ -293,6 +293,74 @@ func selPool() []selArm {
 	}
 }
 
+// ordArm pairs an order key with the reference encoder that
+// mirrors it (independent of the builder's EncodeRow path).
+type ordArm struct {
+	key  typed.OrderKey[uint64, row]
+	enc  func(k uint64, v row) []byte
+	desc bool
+}
+
+func ordPool() []ordArm {
+	encGrp := func(_ uint64, v row) []byte { return encU32(v.Grp) }
+	encName := func(_ uint64, v row) []byte { return encStr(v.Name) }
+	encID := func(k uint64, _ row) []byte {
+		b, _ := (typed.Uint64Encoder{}).AppendEncode(nil, k)
+		return b
+	}
+	return []ordArm{
+		{colGrp.Asc(), encGrp, false},
+		{colGrp.Desc(), encGrp, true},
+		{colName.Asc(), encName, false},
+		{colName.Desc(), encName, true},
+		{colID.Asc(), encID, false},
+		{colID.Desc(), encID, true},
+	}
+}
+
+// refSortRows orders (k, v) pairs by the reference encoders with
+// the directional PK tie-break — the Inv-QB5 canonical sequence.
+func refSortRows(rows [][2]any, ord []ordArm) {
+	pk := func(k uint64) []byte {
+		b, _ := (typed.Uint64Encoder{}).AppendEncode(nil, k)
+		return b
+	}
+	slices.SortFunc(rows, func(a, b [2]any) int {
+		ka, va := a[0].(uint64), a[1].(row)
+		kb, vb := b[0].(uint64), b[1].(row)
+		for _, o := range ord {
+			c := slices.Compare(o.enc(ka, va), o.enc(kb, vb))
+			if o.desc {
+				c = -c
+			}
+			if c != 0 {
+				return c
+			}
+		}
+		c := slices.Compare(pk(ka), pk(kb))
+		if ord[len(ord)-1].desc {
+			c = -c
+		}
+		return c
+	})
+}
+
+// orderedShape classifies an ordered plan: "stream" (no
+// materializing node), "sort", or "topk".
+func orderedShape(p query.Plan) string {
+	n := p.Root
+	if pr, ok := n.(query.Project); ok {
+		n = pr.Input
+	}
+	switch n.(type) {
+	case query.Sort:
+		return "sort"
+	case query.TopK:
+		return "topk"
+	}
+	return "stream"
+}
+
 // planLeafOf unwraps a plan to its leaf kind and index name.
 func planLeafOf(p query.Plan) (kind, index string) {
 	kind, index, _ = planLeafRoute(p)
@@ -305,6 +373,12 @@ func planLeafRoute(p query.Plan) (kind, index string, route query.ValueRoute) {
 	n := p.Root
 	if pr, ok := n.(query.Project); ok {
 		n = pr.Input
+	}
+	if so, ok := n.(query.Sort); ok {
+		n = so.Input
+	}
+	if tk, ok := n.(query.TopK); ok {
+		n = tk.Input
 	}
 	if rf, ok := n.(query.ResidualFilter); ok {
 		n = rf.Input
@@ -401,6 +475,36 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 					q.Select(cols...)
 				}
 
+				// The OrderBy arm: 1-2 random directional keys; the
+				// ordered SEQUENCE must equal the reference sort
+				// (Inv-QB5's directional PK tie-break makes it
+				// canonical across plans).
+				var ord []ordArm
+				ordLimit, ordOffset := 0, 0
+				if rng.Intn(3) == 0 {
+					pool := ordPool()
+					for _, i := range rng.Perm(len(pool))[:1+rng.Intn(2)] {
+						ord = append(ord, pool[i])
+					}
+					keys := make([]typed.OrderKey[uint64, row], len(ord))
+					for i, o := range ord {
+						keys[i] = o.key
+					}
+					q.OrderBy(keys...)
+					// The bounds arm: ordered Limit/Offset cut the
+					// canonical sequence (TopK becomes
+					// grammar-reachable); a sufficient budget must
+					// change nothing (Inv-QB6's non-tripping side).
+					if rng.Intn(2) == 0 {
+						ordLimit = 1 + rng.Intn(8)
+						ordOffset = rng.Intn(4)
+						q.Limit(ordLimit).Offset(ordOffset)
+						if rng.Intn(2) == 0 {
+							q.WithMaterializeLimit(1 << 20)
+						}
+					}
+				}
+
 				// Rule 7: a Where-partial index is never chosen,
 				// no matter how well its columns match.
 				leafKind, leafIdx, leafRoute := planLeafRoute(q.Explain())
@@ -408,11 +512,15 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 				if len(sel) > 0 {
 					census["values-"+leafRoute.String()]++
 				}
+				if len(ord) > 0 {
+					census["ordered-"+orderedShape(q.Explain())]++
+				}
 				if partial[leafIdx] {
 					t.Fatalf("round %d: planner chose partial index %q: %s", round, leafIdx, q.Explain())
 				}
 
 				got := map[uint64]row{}
+				var gotSeq []uint64
 				for k, v := range q.All() {
 					// Distinct-by-PK (Inv-QB4): multi-column entry
 					// expansion must never yield a row twice.
@@ -420,6 +528,7 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 						t.Fatalf("round %d: duplicate key %d (plan %s)", round, k, q.Explain())
 					}
 					got[k] = v
+					gotSeq = append(gotSeq, k)
 				}
 				if err := q.Err(); err != nil {
 					t.Fatalf("round %d: Err: %v (plan %s)", round, err, q.Explain())
@@ -441,12 +550,50 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 						want[k] = v
 					}
 				}
-				if len(got) != len(want) {
-					t.Fatalf("round %d: %d rows, want %d (plan %s)", round, len(got), len(want), q.Explain())
+				if ordLimit == 0 {
+					if len(got) != len(want) {
+						t.Fatalf("round %d: %d rows, want %d (plan %s)", round, len(got), len(want), q.Explain())
+					}
+					for k := range want {
+						if _, ok := got[k]; !ok {
+							t.Fatalf("round %d: missing key %d (plan %s)", round, k, q.Explain())
+						}
+					}
+				} else {
+					for k := range got {
+						if _, ok := want[k]; !ok {
+							t.Fatalf("round %d: key %d outside the matched set (plan %s)", round, k, q.Explain())
+						}
+					}
 				}
-				for k := range want {
-					if _, ok := got[k]; !ok {
-						t.Fatalf("round %d: missing key %d (plan %s)", round, k, q.Explain())
+
+				// Ordered regime (Inv-QB1/Inv-QB5): the SEQUENCE
+				// equals the reference sort (cut by the bounds arm
+				// when drawn).
+				if len(ord) > 0 {
+					refRows := make([][2]any, 0, len(want))
+					for k, v := range want {
+						refRows = append(refRows, [2]any{k, v})
+					}
+					refSortRows(refRows, ord)
+					wantSeq := make([]uint64, len(refRows))
+					for i, r := range refRows {
+						wantSeq[i] = r[0].(uint64)
+					}
+					wantCount := uint64(len(want))
+					if ordLimit > 0 {
+						lo := min(ordOffset, len(wantSeq))
+						hi := min(lo+ordLimit, len(wantSeq))
+						wantSeq = wantSeq[lo:hi]
+						wantCount = uint64(hi - lo)
+					}
+					if !slices.Equal(gotSeq, wantSeq) {
+						t.Fatalf("round %d: ordered sequence = %v, want %v (plan %s)", round, gotSeq, wantSeq, q.Explain())
+					}
+					// Count follows the Inv-QB1 cardinality formula.
+					n, err := q.Count()
+					if err != nil || n != wantCount {
+						t.Fatalf("round %d: Count = %d (err %v), want %d", round, n, err, wantCount)
 					}
 				}
 
@@ -474,6 +621,9 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 							t.Fatalf("round %d: Rows duplicate key %d (plan %s)", round, k, q.Explain())
 						}
 						rowsGot[k] = true
+						if _, ok := want[k]; !ok {
+							t.Fatalf("round %d: Rows key %d outside the matched set (plan %s)", round, k, q.Explain())
+						}
 						for _, s := range sel {
 							if err := s.verify(k, corpus[k], p); err != nil {
 								t.Fatalf("round %d: key %d: %v (plan %s)", round, k, err, q.Explain())
@@ -483,12 +633,18 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 					if err := q.Err(); err != nil {
 						t.Fatalf("round %d: Rows Err: %v (plan %s)", round, err, q.Explain())
 					}
-					if len(rowsGot) != len(want) {
-						t.Fatalf("round %d: Rows %d rows, want %d (plan %s)", round, len(rowsGot), len(want), q.Explain())
+					wantRows := len(want)
+					if ordLimit > 0 {
+						wantRows = max(0, min(ordLimit, len(want)-ordOffset))
 					}
-					for k := range want {
-						if !rowsGot[k] {
-							t.Fatalf("round %d: Rows missing key %d (plan %s)", round, k, q.Explain())
+					if len(rowsGot) != wantRows {
+						t.Fatalf("round %d: Rows %d rows, want %d (plan %s)", round, len(rowsGot), wantRows, q.Explain())
+					}
+					if ordLimit == 0 {
+						for k := range want {
+							if !rowsGot[k] {
+								t.Fatalf("round %d: Rows missing key %d (plan %s)", round, k, q.Explain())
+							}
 						}
 					}
 				}
@@ -523,6 +679,11 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 	}
 	if census["intersect"] < 1 {
 		t.Fatalf("no Intersect plan sampled: %v", census)
+	}
+	// Every ordered shape must be sampled — the bounds sub-arm
+	// feeds the TopK floor.
+	if census["ordered-stream"] < 1 || census["ordered-sort"] < 1 || census["ordered-topk"] < 1 {
+		t.Fatalf("ordered shapes unsampled: %v", census)
 	}
 }
 

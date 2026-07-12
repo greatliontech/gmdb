@@ -41,11 +41,20 @@ func (q *Query[K, V]) Rows() iter.Seq2[K, typed.Projection] {
 		if q.hasLim && q.limit <= 0 {
 			return
 		}
-		p := planQuery(q.terms, q.selNames(), q.ks.InternalIndexInfo())
+		p := planQuery(q.terms, q.selNames(), q.orderNames(), q.ks.InternalIndexInfo())
 		if p.kind == planLeaf && p.leaf.shape != shapeScan &&
 			entryEligible(p.leaf, q.sel, p.residual, len(q.filters)) {
-			q.rowsEntryExec(p.leaf, p.residual, yield)
-			return
+			// Index-only serves an ordering only when the entry
+			// order realizes it (streaming); otherwise the ordered
+			// materialized route below is the correct shape.
+			if len(q.order) == 0 {
+				q.rowsEntryExec(p.leaf, p.residual, false, yield)
+				return
+			}
+			if reverse, ok := streamable(p.leaf, q.order); ok {
+				q.rowsEntryExec(p.leaf, p.residual, reverse, yield)
+				return
+			}
 		}
 		q.rowsMaterialized(p, yield)
 	}
@@ -57,8 +66,12 @@ func (q *Query[K, V]) Rows() iter.Seq2[K, typed.Projection] {
 // decoded row via the column's own encoder — the identical bytes
 // a covering slot would carry (Inv-TC5's read-side identity).
 func (q *Query[K, V]) rowsMaterialized(p queryPlan, yield func(K, typed.Projection) bool) {
+	p, hs := q.resolvePlan(p)
+	if q.err != nil {
+		return
+	}
 	names := q.selNames()
-	sink := func(k K, v V) bool {
+	project := func(k K, v V) bool {
 		slots := make([][]byte, len(q.sel))
 		for i, s := range q.sel {
 			b, err := s.EncodeRow(k, v)
@@ -70,18 +83,13 @@ func (q *Query[K, V]) rowsMaterialized(p queryPlan, yield func(K, typed.Projecti
 		}
 		return yield(k, qrep.ProjectionSlots(names, slots).(typed.Projection))
 	}
-	switch p.kind {
-	case planUnion:
-		q.unionExec(p, sink)
-	case planIntersect:
-		q.intersectExec(p, sink)
-	default:
-		if p.leaf.shape == shapeScan {
-			q.scanExec(sink)
-			return
-		}
-		q.indexExec(p.leaf, p.residual, sink)
+	if len(q.order) > 0 {
+		// Ordered rows emit post-sort, post-bounds; slots compute
+		// only for emitted rows.
+		q.orderedExec(p, hs, project)
+		return
 	}
+	q.drive(p, hs, false, q.newMeter(), q.matchPipe(p.residual, q.boundPipe(project)))
 }
 
 // rowsEntryExec is the index-only route: RangeEntries over the
@@ -93,7 +101,7 @@ func (q *Query[K, V]) rowsMaterialized(p queryPlan, yield func(K, typed.Projecti
 // snapshot; the live declaration is re-validated here and any
 // shape change falls back to the row-materialized scan, correct
 // under every declaration (Inv-QB3).
-func (q *Query[K, V]) rowsEntryExec(leaf plannedLeaf, resid []qrep.Term, yield func(K, typed.Projection) bool) {
+func (q *Query[K, V]) rowsEntryExec(leaf plannedLeaf, resid []qrep.Term, reverse bool, yield func(K, typed.Projection) bool) {
 	idx, err := q.ks.ByteIndex(leaf.index.Name)
 	if err != nil {
 		q.err = err
@@ -151,13 +159,23 @@ func (q *Query[K, V]) rowsEntryExec(leaf plannedLeaf, resid []qrep.Term, yield f
 	if leaf.needDedup {
 		seen = make(map[string]struct{})
 	}
+	m := q.newMeter()
 	skipped, yielded := 0, 0
+	var opts []gmdb.IterOption
+	if reverse {
+		opts = append(opts, gmdb.Reverse())
+	}
 	start, end := entryBounds(leaf)
-	for ek, vb := range idx.RangeEntries(start, end) {
+	for ek, vb := range idx.RangeEntries(start, end, opts...) {
 		if seen != nil {
 			s := string(ek.PK)
 			if _, dup := seen[s]; dup {
 				continue
+			}
+			// Hash dedup counts against the budget (Inv-QB6).
+			if !m.charge(len(s)) {
+				q.err = ErrQueryMaterializeLimit
+				return
 			}
 			seen[s] = struct{}{}
 		}

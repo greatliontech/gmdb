@@ -179,6 +179,11 @@ type RowOps struct {
 	ValEncID string
 	// DecodeKey decodes a primary-key byte slice to K.
 	DecodeKey func(pk []byte) (any, error)
+	// EncodeKey encodes K to its primary-key bytes — ordered
+	// executions tie-break by PK BYTES (Inv-QB5; byte order equals
+	// the typed order for the order-preserving key encoders), and
+	// the scan path holds only the decoded K.
+	EncodeKey func(k any) ([]byte, error)
 	// DecodeVal decodes stored row bytes to V.
 	DecodeVal func(vb []byte) (any, error)
 	// FetchRow back-looks-up pk's row and decodes it. found=false

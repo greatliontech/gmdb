@@ -81,12 +81,13 @@ Invariant: kind=clause-explicit;
     fully push (e.g. treating a range term as an EQ prefix)
     returns rows a scan would exclude, or excludes rows a scan
     would return — silently, since no error surface fires.
-    Enforced (landed slices: single-index plans, set regime and
-    the limit/offset cardinality regime) by
-    `TestQueryPlanScanEquivalence` +
+    Enforced by `TestQueryPlanScanEquivalence` (set, ordered, and
+    limit/offset cardinality regimes; the ordered arm compares
+    SEQUENCES against an independent reference sort) +
     `TestQueryLimitOffsetCardinality` +
-    `TestQueryRangeBoundAnchors`; the ordered regime lands with
-    `OrderBy`.
+    `TestQueryRangeBoundAnchors` + the cross-plan ordered anchors
+    in `TestQueryOrderByStreams` /
+    `TestQueryOrderByEqualKeyLimitBoundary`.
 
 Invariant: kind=clause-explicit;
   property=Inv-QB2 (encoded comparison): sargable terms evaluate
@@ -158,10 +159,13 @@ Invariant: kind=clause-explicit;
     iteration (equal-key runs arrive PK-descending on a
     non-unique index), forcing either an equal-key-run buffer no
     Inv-QB6 node sanctions or plan-dependent sequences.
-    Enforced (landed slice: repeat-execution determinism, the
-    no-OrderBy regime) by the repeat check inside
-    `TestQueryPlanScanEquivalence`; the directional tie-break
-    lands with ordered output.
+    Enforced by the repeat check inside
+    `TestQueryPlanScanEquivalence` (no-OrderBy regime) and, for
+    the directional tie-break, `TestQueryOrderByStreams`
+    (descending equal-key runs) +
+    `TestQueryOrderByEqualKeyLimitBoundary` (equal-key Limit cuts
+    identical across executions and plan choices) + the harness's
+    ordered-sequence arm.
 
 Invariant: kind=clause-explicit;
   property=Inv-QB6 (bounded materialization, explicit failure):
@@ -174,6 +178,10 @@ Invariant: kind=clause-explicit;
   violation=A capped-but-successful sort returns a correct-
     looking prefix of the wrong result set — a silent coverage
     cap indistinguishable from a correct small result.
+    Enforced by `TestQueryMaterializeBudget` (Sort, TopK, hash
+    dedup, and Intersect build all trip
+    `ErrQueryMaterializeLimit`; pure streams are unaffected;
+    a sufficient budget changes nothing).
 
 Invariant: kind=clause-explicit;
   property=Inv-QB7 (opaque filters see whole rows): a `Filter`
@@ -459,9 +467,15 @@ error at `From`, not a zero value.
 `WithMaterializeLimit(bytes)` bounds the total bytes buffered by
 buffering nodes for one query execution — `Sort`, `TopK` (its
 heap holds O(limit + offset) rows and is NOT exempt), hash
-dedup, and the `Intersect` build side. Zero (the default) means
-unbounded — the caller owns the tradeoff, as with `Sort` in any
-embedded engine. When a budget is set, exceeding it fails the
+dedup, and the `Intersect` build side; one budget spans ALL of an
+execution's buffering nodes. The accounting basis is each node's
+retained INDEXABLE bytes: encoded sort-key bytes plus PK bytes
+per buffered row for `Sort`/`TopK`, PK bytes per entry for hash
+sets — the decoded row values a sort node also holds are not
+re-encoded just to be measured (accounting must not cost more
+than what it accounts). Zero (the default) means unbounded — the
+caller owns the tradeoff, as with `Sort` in any embedded engine.
+When a budget is set, exceeding it fails the
 iteration with `ErrQueryMaterializeLimit` (Inv-QB6). Pure
 streams (index-order iteration, streaming merge-dedup) buffer
 nothing and are unaffected — the budget exists precisely to
