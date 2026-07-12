@@ -7,15 +7,15 @@ walked at every chunk-start gate (`N.1`) during the chunk roadmap —
 entries whose `Lands:` resolved to the current chunk were folded,
 redeferred, or closed.
 
-The v0 chunk roadmap, the architecture-consolidation plan, and the
-defect-audit remediation plan are complete; their plans were deleted
-at close-out (`git log --all -- docs/plans/<name>.md` recovers
-them). The active plan is `docs/plans/query-builder.md`; its
-chunk-start gates (`N.1`) walk this index, and bare chunk numbers in
-`Lands:` refer to its chunks. Every other entry is
-condition-triggered with a self-contained condition. Entries may
-also be pulled as a proactive burn-down — each resolved as its own
-change set: diagnose → fix → regression test → adversarial review →
+The v0 chunk roadmap, the architecture-consolidation plan, the
+defect-audit remediation plan, and the query-builder plan
+(structure phase + typed columns + query builder) are complete;
+their plans were deleted at close-out
+(`git log --all -- docs/plans/<name>.md` recovers them). With no
+active plan, every entry is condition-triggered with a
+self-contained condition. Entries may also be pulled as a
+proactive burn-down — each resolved as its own change set:
+diagnose → fix → regression test → adversarial review →
 promote-then-delete.
 
 When an issue is resolved, the load-bearing rationale moves inline
@@ -56,18 +56,6 @@ Several factoring rows are pre-v1 **clean-break** candidates gated by the
 first tagged release (`development: true`, `.semrel.yaml`). Resolved
 entries are removed from their table and preserved in git history
 (`git log --all -- docs/issues/<file>.md`).
-
-## Open — query-builder plan riders
-
-Not defects: spec-amend clause text and design requirements
-parked until the chunk that implements them (amendments to
-as-built specs ride their implementation chunks). No severity
-tags.
-
-| Slug | Lands | Summary |
-|------|-------|---------|
-
-*None open.*
 
 ## Open — change-set review findings
 
