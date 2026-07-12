@@ -384,3 +384,219 @@ func TestColumnIndexDuplicateColumnRejected(t *testing.T) {
 		t.Fatalf("duplicate column = %v, want ErrInvalidOptions", err)
 	}
 }
+
+// Inv-TC5: covering slot bytes round-trip through Column.From and
+// track the row's CURRENT value — the covering-rewrite-on-update
+// anchor through the typed projection surface (indexing.md
+// §Covering Indexes, update rewrites covering).
+func TestColumnCoveringProjectionRoundTripAndRewrite(t *testing.T) {
+	grp := colGrp()
+	ci := NewColumnIndex("byTag", []AnyColumn[uint64, rowVal]{colTags()},
+		ColumnIndexOpts[uint64, rowVal]{Covering: []AnySingleColumn[uint64, rowVal]{grp}})
+	h, _, cleanup := openColumnsDB(t, ci)
+	defer cleanup()
+	idx, err := h.Index("byTag")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+
+	readGrp := func(tag string) uint32 {
+		t.Helper()
+		b, _ := StringEncoder{}.AppendEncode(nil, tag)
+		for _, cov := range idx.idx.Lookup([][]byte{b}) {
+			cols, err := gmdb.DecodeCoveringTuple(cov)
+			if err != nil {
+				t.Fatalf("DecodeCoveringTuple: %v", err)
+			}
+			p := newProjection([]string{grp.columnName()}, cols)
+			g, err := grp.From(p)
+			if err != nil {
+				t.Fatalf("From: %v", err)
+			}
+			return g
+		}
+		t.Fatalf("no entry for tag %q", tag)
+		return 0
+	}
+
+	if err := h.Put(1, rowVal{Grp: 3, Tags: []string{"go"}}); err != nil {
+		t.Fatalf("Put v1: %v", err)
+	}
+	if g := readGrp("go"); g != 3 {
+		t.Fatalf("covering projection = %d, want 3", g)
+	}
+	// Same index key, different covering payload: the rewrite must
+	// serve the CURRENT value.
+	if err := h.Put(1, rowVal{Grp: 7, Tags: []string{"go"}}); err != nil {
+		t.Fatalf("Put v2: %v", err)
+	}
+	if g := readGrp("go"); g != 7 {
+		t.Fatalf("covering projection after update = %d, want 7 (stale covering served)", g)
+	}
+
+	// ErrColumnAbsent: a column the projection does not carry.
+	b, _ := StringEncoder{}.AppendEncode(nil, "go")
+	for _, cov := range idx.idx.Lookup([][]byte{b}) {
+		cols, _ := gmdb.DecodeCoveringTuple(cov)
+		p := newProjection([]string{grp.columnName()}, cols)
+		other := NewColumn("elsewhere", StringEncoder{}, func(_ uint64, _ rowVal) string { return "" })
+		if _, err := other.From(p); !errors.Is(err, ErrColumnAbsent) {
+			t.Fatalf("From(absent column) = %v, want ErrColumnAbsent", err)
+		}
+		break
+	}
+}
+
+// ColumnIndex.CoverValue reuses the shared gmdb/cover-value/
+// sentinel: the typed read path recognizes the shape (the handle
+// opts into the engine covering-return) and the served value IS
+// encode(V) for the row's current value.
+func TestColumnIndexCoverValueRecognizedAndServed(t *testing.T) {
+	ci := NewColumnIndex("cv", []AnyColumn[uint64, rowVal]{colGrp()},
+		ColumnIndexOpts[uint64, rowVal]{CoverValue: true})
+	h, _, cleanup := openColumnsDB(t, ci)
+	defer cleanup()
+	if err := h.Put(1, rowVal{Grp: 5, Tags: []string{"a"}}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	idx, err := h.Index("cv")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if !idx.idx.CoverValueReturnEnabled() {
+		t.Fatal("CoverValue ColumnIndex not recognized by the typed read path")
+	}
+	gb, _ := Uint32Encoder{}.AppendEncode(nil, 5)
+	got := 0
+	for _, vb := range idx.idx.Lookup([][]byte{gb}) {
+		v, err := rowEnc{}.Decode(vb)
+		if err != nil {
+			t.Fatalf("decode served value: %v", err)
+		}
+		if v.Grp != 5 || len(v.Tags) != 1 || v.Tags[0] != "a" {
+			t.Fatalf("cover-value served %+v", v)
+		}
+		got++
+	}
+	if got != 1 {
+		t.Fatalf("entries = %d, want 1", got)
+	}
+}
+
+// CoverValue and Covering are mutually exclusive; nil and
+// duplicate covering columns are rejected.
+func TestColumnIndexCoveringDeclarationRejections(t *testing.T) {
+	grp := colGrp()
+	both := NewColumnIndex("b", []AnyColumn[uint64, rowVal]{colTags()},
+		ColumnIndexOpts[uint64, rowVal]{CoverValue: true, Covering: []AnySingleColumn[uint64, rowVal]{grp}})
+	if _, err := both.indexDecl(Uint64Encoder{}, rowEnc{}); !errors.Is(err, gmdb.ErrInvalidOptions) {
+		t.Fatalf("CoverValue+Covering = %v, want ErrInvalidOptions", err)
+	}
+	nilCov := NewColumnIndex("n", []AnyColumn[uint64, rowVal]{colTags()},
+		ColumnIndexOpts[uint64, rowVal]{Covering: []AnySingleColumn[uint64, rowVal]{nil}})
+	if _, err := nilCov.indexDecl(Uint64Encoder{}, rowEnc{}); !errors.Is(err, gmdb.ErrInvalidOptions) {
+		t.Fatalf("nil covering column = %v, want ErrInvalidOptions", err)
+	}
+	dup := NewColumnIndex("d", []AnyColumn[uint64, rowVal]{colTags()},
+		ColumnIndexOpts[uint64, rowVal]{Covering: []AnySingleColumn[uint64, rowVal]{grp, grp}})
+	if _, err := dup.indexDecl(Uint64Encoder{}, rowEnc{}); !errors.Is(err, gmdb.ErrInvalidOptions) {
+		t.Fatalf("duplicate covering column = %v, want ErrInvalidOptions", err)
+	}
+}
+
+// Covering-specific declaration guards: empty and reserved
+// encoder IDs on covering columns, empty value-encoder ID under
+// CoverValue, and the SetKeyspace rejection (covering payloads
+// have no read path on set indexes).
+func TestColumnIndexCoveringGuards(t *testing.T) {
+	emptyEnc := FuncEncoder[string]{
+		EncodeFunc: func(dst []byte, v string) ([]byte, error) { return append(dst, v...), nil },
+		DecodeFunc: func(src []byte) (string, error) { return string(src), nil },
+	}
+	badCov := NewColumn("c", emptyEnc, func(_ uint64, _ rowVal) string { return "" })
+	ci := NewColumnIndex("e", []AnyColumn[uint64, rowVal]{colTags()},
+		ColumnIndexOpts[uint64, rowVal]{Covering: []AnySingleColumn[uint64, rowVal]{badCov}})
+	if _, err := ci.indexDecl(Uint64Encoder{}, rowEnc{}); !errors.Is(err, gmdb.ErrIndexEncoderIDEmpty) {
+		t.Fatalf("empty covering encoder ID = %v, want ErrIndexEncoderIDEmpty", err)
+	}
+
+	emptyEnc.EncoderID = "gmdb/multicol/evil"
+	badCov2 := NewColumn("c", emptyEnc, func(_ uint64, _ rowVal) string { return "" })
+	ci2 := NewColumnIndex("r", []AnyColumn[uint64, rowVal]{colTags()},
+		ColumnIndexOpts[uint64, rowVal]{Covering: []AnySingleColumn[uint64, rowVal]{badCov2}})
+	if _, err := ci2.indexDecl(Uint64Encoder{}, rowEnc{}); !errors.Is(err, gmdb.ErrIndexEncoderIDReserved) {
+		t.Fatalf("reserved covering encoder ID = %v, want ErrIndexEncoderIDReserved", err)
+	}
+
+	emptyVal := FuncEncoder[rowVal]{
+		EncodeFunc: func(dst []byte, v rowVal) ([]byte, error) { return rowEnc{}.AppendEncode(dst, v) },
+		DecodeFunc: func(src []byte) (rowVal, error) { return rowEnc{}.Decode(src) },
+	}
+	cv := NewColumnIndex("cv", []AnyColumn[uint64, rowVal]{colGrp()},
+		ColumnIndexOpts[uint64, rowVal]{CoverValue: true})
+	if _, err := cv.indexDecl(Uint64Encoder{}, emptyVal); !errors.Is(err, gmdb.ErrIndexEncoderIDEmpty) {
+		t.Fatalf("CoverValue with empty value-encoder ID = %v, want ErrIndexEncoderIDEmpty", err)
+	}
+
+	// SetKeyspace rejection.
+	ctx := context.Background()
+	db := openWith(t, ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	tsk := NewSetKeyspace[uint64, rowVal]("s", Uint64Encoder{}, rowEnc{}, nil)
+	covIdx := NewColumnIndex("byTag", []AnyColumn[uint64, rowVal]{colTags()},
+		ColumnIndexOpts[uint64, rowVal]{Covering: []AnySingleColumn[uint64, rowVal]{colGrp()}})
+	if _, err := tsk.Create(tx, covIdx); !errors.Is(err, gmdb.ErrInvalidOptions) {
+		t.Fatalf("covering ColumnIndex on SetKeyspace Create = %v, want ErrInvalidOptions", err)
+	}
+	if _, err := tsk.Open(tx, covIdx); !errors.Is(err, gmdb.ErrInvalidOptions) {
+		t.Fatalf("covering ColumnIndex on SetKeyspace Open = %v, want ErrInvalidOptions", err)
+	}
+	if _, err := tsk.CreateIfNotExists(tx, covIdx); !errors.Is(err, gmdb.ErrInvalidOptions) {
+		t.Fatalf("covering ColumnIndex on SetKeyspace CreateIfNotExists = %v, want ErrInvalidOptions", err)
+	}
+}
+
+// The covering value-encoder identity is a fingerprint input for
+// this decl form too: swapping a covering column's encoder fails
+// the drift guard at open.
+func TestColumnIndexCoveringEncoderSwapFailsFingerprint(t *testing.T) {
+	ctx := context.Background()
+	db := openWith(t, ctx, tmpPath(t), gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	defer db.Close()
+	tks := NewKeyspace[uint64, rowVal]("rows", Uint64Encoder{}, rowEnc{})
+
+	mk := func(encID string) *ColumnIndex[uint64, rowVal] {
+		enc := FuncEncoder[uint32]{
+			EncodeFunc: func(dst []byte, v uint32) ([]byte, error) { return Uint32Encoder{}.AppendEncode(dst, v) },
+			DecodeFunc: func(src []byte) (uint32, error) { return Uint32Encoder{}.Decode(src) },
+			EncoderID:  encID,
+		}
+		cov := NewColumn("grp", enc, func(_ uint64, v rowVal) uint32 { return uint32(v.Grp) })
+		return NewColumnIndex("i", []AnyColumn[uint64, rowVal]{colTags()},
+			ColumnIndexOpts[uint64, rowVal]{Covering: []AnySingleColumn[uint64, rowVal]{cov}})
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := tks.Create(tx, mk("test/enc-v1")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+	if _, err := tks.Open(tx, mk("test/enc-v2")); !errors.Is(err, gmdb.ErrIndexFingerprintMismatch) {
+		t.Fatalf("covering encoder swap = %v, want ErrIndexFingerprintMismatch", err)
+	}
+}

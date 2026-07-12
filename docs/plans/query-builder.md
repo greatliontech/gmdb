@@ -67,7 +67,7 @@ tests move with their subjects, unmodified.
       cross-form distinctness, Inv-TC4 compilation equivalence
       property (incl. duplicate-element unique-violation
       anchor), unique×multi element semantics.
-- [ ] 11. Typed covering projections + full-row `CoverValue`:
+- [x] 11. Typed covering projections + full-row `CoverValue`:
       `Covering` (`AnySingleColumn`), `CoverValue`/`Covering`
       mutual exclusion (`ErrInvalidOptions`), `Projection`,
       `Column.From` / `ErrColumnAbsent`. Spec amendments riding:

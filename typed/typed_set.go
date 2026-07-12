@@ -1,6 +1,7 @@
 package typed
 
 import (
+	"fmt"
 	"iter"
 
 	"github.com/thegrumpylion/gmdb"
@@ -41,12 +42,29 @@ func (tsk *SetKeyspace[K, V]) wrap(sks *gmdb.SetKeyspace) *SetKeyspaceHandle[K, 
 	return &SetKeyspaceHandle[K, V]{sks: sks, keyEnc: tsk.keyEnc, valEnc: tsk.valEnc}
 }
 
+// rejectCoveringDecls bars covering-declaring column indexes from
+// set keyspaces — see (*ColumnIndex).coveringDeclared.
+func rejectCoveringDecls[K, V any](indexes []AnyIndex[K, V]) error {
+	for _, idx := range indexes {
+		if p, ok := idx.(interface{ coveringDeclared() (string, bool) }); ok {
+			if name, has := p.coveringDeclared(); has {
+				return fmt.Errorf("gmdb: column index %q: Covering/CoverValue on a SetKeyspace has no read path: %w",
+					name, gmdb.ErrInvalidOptions)
+			}
+		}
+	}
+	return nil
+}
+
 // Open opens the set keyspace for read+write within tx with the supplied
 // typed indexes. OpenReadOnly opens for reads only (no index decls).
 // Create / CreateIfNotExists create with the descriptor's options.
 // All three share openTypedHandle (typed.go) with the byte SetKeyspace
 // factory target; only OpenReadOnly takes no index decls.
 func (tsk *SetKeyspace[K, V]) Open(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*SetKeyspaceHandle[K, V], error) {
+	if err := rejectCoveringDecls(indexes); err != nil {
+		return nil, err
+	}
 	return openTypedHandle(tsk.keyEnc, tsk.valEnc, indexes,
 		func(decls []*gmdb.IndexDecl) (*gmdb.SetKeyspace, error) {
 			return tx.OpenSetKeyspace(tsk.name, decls...)
@@ -63,6 +81,9 @@ func (tsk *SetKeyspace[K, V]) OpenReadOnly(tx *gmdb.Tx) (*SetKeyspaceHandle[K, V
 }
 
 func (tsk *SetKeyspace[K, V]) Create(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*SetKeyspaceHandle[K, V], error) {
+	if err := rejectCoveringDecls(indexes); err != nil {
+		return nil, err
+	}
 	return openTypedHandle(tsk.keyEnc, tsk.valEnc, indexes,
 		func(decls []*gmdb.IndexDecl) (*gmdb.SetKeyspace, error) {
 			return tx.CreateSetKeyspace(tsk.name, tsk.opts, decls...)
@@ -71,6 +92,9 @@ func (tsk *SetKeyspace[K, V]) Create(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*S
 }
 
 func (tsk *SetKeyspace[K, V]) CreateIfNotExists(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*SetKeyspaceHandle[K, V], error) {
+	if err := rejectCoveringDecls(indexes); err != nil {
+		return nil, err
+	}
 	return openTypedHandle(tsk.keyEnc, tsk.valEnc, indexes,
 		func(decls []*gmdb.IndexDecl) (*gmdb.SetKeyspace, error) {
 			return tx.CreateSetKeyspaceIfNotExists(tsk.name, tsk.opts, decls...)

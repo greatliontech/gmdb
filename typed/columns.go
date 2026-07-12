@@ -2,6 +2,7 @@ package typed
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -131,10 +132,32 @@ type AnyColumn[K, V any] interface {
 	encodeAll(indexName string, k K, v V) [][]byte
 }
 
+// AnySingleColumn is the sealed erasure for SINGLE-VALUED columns
+// — implemented only by *Column. It types the positions where a
+// multi-valued column is structurally illegal (covering
+// declarations: a multi-valued covering slot has no single
+// enc(get(k, v)) payload and no From surface), making
+// "MultiColumn in Covering" unrepresentable rather than a runtime
+// rejection (typed-columns.md §Covering projections).
+type AnySingleColumn[K, V any] interface {
+	AnyColumn[K, V]
+	// encodeOne returns the single encoded value for a row.
+	// PANICS on encode failure, per the tier's convention.
+	encodeOne(indexName string, k K, v V) []byte
+}
+
 func (c *Column[K, V, C]) columnName() string {
 	return synthesizeColumnName(columnNamePrefix, c.name, c.enc.ID())
 }
 func (c *Column[K, V, C]) encoderIdentity() (string, string) { return c.name, c.enc.ID() }
+func (c *Column[K, V, C]) encodeOne(indexName string, k K, v V) []byte {
+	b, err := c.enc.AppendEncode(nil, c.get(k, v))
+	if err != nil {
+		panic(fmt.Errorf("gmdb: column index %q covering column %q: encode: %w", indexName, c.name, err))
+	}
+	return b
+}
+
 func (c *Column[K, V, C]) encodeAll(indexName string, k K, v V) [][]byte {
 	b, err := c.enc.AppendEncode(nil, c.get(k, v))
 	if err != nil {
@@ -178,6 +201,22 @@ type ColumnIndexOpts[K, V any] struct {
 	// the entire row (no entries). Element-level filtering is the
 	// accessor's job. nil ⇒ index every row.
 	Where func(K, V) bool
+
+	// Covering pins single-valued columns to be carried in each
+	// index entry's value — the typed covering projection surface
+	// (typed-columns.md §Covering projections): reads satisfiable
+	// from key + covering columns never touch the row keyspace,
+	// and Column.From decodes the projected slots.
+	Covering []AnySingleColumn[K, V]
+
+	// CoverValue makes this a full-row covering index: each entry
+	// stores encode(V) as the single covering column under the
+	// shared gmdb/cover-value/ sentinel, so the typed read path
+	// recognizes the shape and reads of V skip the row
+	// back-lookup. Mutually exclusive with Covering (full-row
+	// already covers every projection): declaring both is
+	// rejected with ErrInvalidOptions.
+	CoverValue bool
 }
 
 // ColumnIndex declares an index over ordered per-field columns,
@@ -199,6 +238,17 @@ func NewColumnIndex[K, V any](name string, columns []AnyColumn[K, V], opts Colum
 // Compile-time proof that *ColumnIndex implements the sealed
 // AnyIndex — the second legal implementer beside *Index.
 var _ AnyIndex[int, int] = (*ColumnIndex[int, int])(nil)
+
+// coveringDeclared reports the declaration's covering state —
+// probed by the SetKeyspace factories, which reject covering
+// declarations outright: a set index's covering payload has no
+// read path (the byte layer never serves covering for set
+// indexes; the compound PK already carries the member value), so
+// declaring one would pay write amplification for nothing
+// (typed-columns.md §Covering projections).
+func (ci *ColumnIndex[K, V]) coveringDeclared() (string, bool) {
+	return ci.name, ci.opts.CoverValue || len(ci.opts.Covering) > 0
+}
 
 // indexDecl lowers the column index to a byte *gmdb.IndexDecl:
 // synthesized column names (encoder IDs folded into the schema
@@ -238,6 +288,36 @@ func (ci *ColumnIndex[K, V]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*g
 		}
 		seen[dc.Name] = struct{}{}
 	}
+	if ci.opts.CoverValue && len(ci.opts.Covering) > 0 {
+		return nil, fmt.Errorf("gmdb: column index %q declares both CoverValue and Covering (full-row covering already covers every projection): %w",
+			ci.name, gmdb.ErrInvalidOptions)
+	}
+	if ci.opts.CoverValue {
+		valID := valEnc.ID()
+		if valID == "" {
+			return nil, fmt.Errorf("gmdb: column index %q value encoder (CoverValue): %w", ci.name, gmdb.ErrIndexEncoderIDEmpty)
+		}
+		decl.Covering = []gmdb.IndexCoveringColumn{{Name: indexing.CoverValueColumn(valID)}}
+	}
+	coverSeen := make(map[string]struct{}, len(ci.opts.Covering))
+	for i, col := range ci.opts.Covering {
+		if col == nil {
+			return nil, fmt.Errorf("gmdb: column index %q covering column %d is nil: %w", ci.name, i, gmdb.ErrInvalidOptions)
+		}
+		userName, encID := col.encoderIdentity()
+		if encID == "" {
+			return nil, fmt.Errorf("gmdb: column index %q covering column %q: %w", ci.name, userName, gmdb.ErrIndexEncoderIDEmpty)
+		}
+		if err := validateEncoderIDNamespace(fmt.Sprintf("column index %q covering column %q", ci.name, userName), encID); err != nil {
+			return nil, err
+		}
+		name := col.columnName()
+		if _, dup := coverSeen[name]; dup {
+			return nil, fmt.Errorf("gmdb: column index %q declares covering column %q twice: %w", ci.name, userName, gmdb.ErrInvalidOptions)
+		}
+		coverSeen[name] = struct{}{}
+		decl.Covering = append(decl.Covering, gmdb.IndexCoveringColumn{Name: name})
+	}
 	decl.Extract = ci.makeExtractor(keyEnc, valEnc)
 	return decl, nil
 }
@@ -253,6 +333,8 @@ func (ci *ColumnIndex[K, V]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V])
 	cols := ci.columns
 	where := ci.opts.Where
 	name := ci.name
+	covering := ci.opts.Covering
+	coverValue := ci.opts.CoverValue
 	return func(keyBytes, valueBytes []byte) []gmdb.IndexEntry {
 		k, err := keyEnc.Decode(keyBytes)
 		if err != nil {
@@ -264,6 +346,21 @@ func (ci *ColumnIndex[K, V]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V])
 		}
 		if where != nil && !where(k, v) {
 			return nil
+		}
+		// Covering payload is per-ROW (computed once, shared by
+		// every product entry): the projection columns'
+		// enc(get(k, v)), or encode(V) verbatim under CoverValue
+		// (copied so the entry does not alias the caller's buffer).
+		var cover [][]byte
+		if coverValue {
+			cb := make([]byte, len(valueBytes))
+			copy(cb, valueBytes)
+			cover = [][]byte{cb}
+		} else if len(covering) > 0 {
+			cover = make([][]byte, len(covering))
+			for i, cc := range covering {
+				cover[i] = cc.encodeOne(name, k, v)
+			}
 		}
 		perCol := make([][][]byte, len(cols))
 		total := 1
@@ -281,7 +378,7 @@ func (ci *ColumnIndex[K, V]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V])
 			if depth == len(cols) {
 				e := make([][]byte, len(cols))
 				copy(e, tuple)
-				entries = append(entries, gmdb.IndexEntry{Cols: e})
+				entries = append(entries, gmdb.IndexEntry{Cols: e, Cover: cover})
 				return
 			}
 			for _, b := range perCol[depth] {
@@ -292,4 +389,47 @@ func (ci *ColumnIndex[K, V]) makeExtractor(keyEnc Encoder[K], valEnc Encoder[V])
 		expand(0)
 		return entries
 	}
+}
+
+// ErrColumnAbsent reports a Column.From call against a projection
+// that does not carry that column's slot — never a zero value
+// (typed-columns.md §Covering projections).
+var ErrColumnAbsent = errors.New("gmdb/typed: column not carried by this projection")
+
+// Projection is an opaque row produced by a covering-index read:
+// it carries the column slots the serving plan resolved, keyed by
+// synthesized column name. Columns are decoded individually via
+// Column.From. Construction is package-internal; the query
+// package — the producing surface (query-builder.md
+// §Covering-aware execution) — reaches it through the internal
+// representation seam the two packages share.
+type Projection struct {
+	slots map[string][]byte
+}
+
+// newProjection builds a projection from parallel synthesized
+// column names and their raw slot bytes (the decoded covering
+// tuple, in declaration order).
+func newProjection(names []string, vals [][]byte) Projection {
+	slots := make(map[string][]byte, len(names))
+	for i, n := range names {
+		if i < len(vals) {
+			slots[n] = vals[i]
+		}
+	}
+	return Projection{slots: slots}
+}
+
+// From decodes this column's slot out of a projection row.
+// Requesting a column the projection does not carry returns
+// ErrColumnAbsent. From is the read-side inverse of the covering
+// write (Inv-TC5): the returned value equals get(k, v) evaluated
+// on the row's current value.
+func (c *Column[K, V, C]) From(p Projection) (C, error) {
+	b, ok := p.slots[c.columnName()]
+	if !ok {
+		var zero C
+		return zero, fmt.Errorf("column %q: %w", c.name, ErrColumnAbsent)
+	}
+	return c.enc.Decode(b)
 }

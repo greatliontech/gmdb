@@ -39,8 +39,15 @@ Depends on / interacts with:
 
 ## Invariants
 
-All invariants in this section are spec-tier; each carries
-`Lands: when code able to violate it is first written.`
+Inv-TC1 and Inv-TC3 are documented caller contracts (their
+encoders and accessors are caller code the engine cannot
+inspect). The rest are enforced:
+Inv-TC2 by `TestColumnFormsAreFingerprintDistinct`,
+`TestReservedEncoderIDNamespaceRejected`, and
+`TestSynthesizedColumnNameInjective`; Inv-TC4 by
+`TestColumnIndexExtractorMatchesRule` and
+`TestColumnIndexProductOrderRightmostFastest`; Inv-TC5 by
+`TestColumnCoveringProjectionRoundTripAndRewrite`.
 
 Invariant: kind=clause-explicit;
   property=Inv-TC1: every `Column` / `MultiColumn` encoder MUST
@@ -295,6 +302,14 @@ covering tuple, in declaration order, per
 projections the typed return surface that
 `typed-keyspaces.md §Covering` documents as absent from the
 `typed.Index` tier: the consumer decodes per column, not per row.
+
+Covering declarations are `typed.Keyspace`-backed only: on a
+SetKeyspace a covering payload has no read path (the byte layer
+never serves covering for set indexes, and the compound primary
+key already carries the member value), so a covering-declaring
+`ColumnIndex` is REJECTED by the SetKeyspace factories with
+`ErrInvalidOptions` — paying write amplification for unreadable
+bytes is a trap, not an option.
 
 `CoverValue: true` is the full-row alternative: the entry stores
 `encode(V)` as the single covering column with the value

@@ -4,8 +4,11 @@ A typed query surface over keyspaces with `ColumnIndex`
 declarations (`typed-columns.md`): structured predicates, index
 selection, ordered and ranked result composition, and typed
 projections. Planning and execution live in their own package
-(`gmdb/query`), consuming only exported gmdb and `gmdb/typed`
-surfaces — keyspace handles, index handles, cursors. The inert
+(`gmdb/query`), consuming exported gmdb and `gmdb/typed`
+surfaces — keyspace handles, index handles, cursors — plus one
+shared internal representation package (the predicate and
+projection seam; term and projection internals stay unexported
+in the public surface). The inert
 declaration-tier value types shared with the column
 declarations — `Term`, `OrderKey`, `Projection` — live in the
 typed package (`gmdb/typed`; their constructors are `Column`

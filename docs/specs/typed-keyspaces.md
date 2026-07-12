@@ -391,12 +391,14 @@ encoder `ID()` is rejected with `ErrIndexEncoderIDEmpty`).
 `CoverValue` has effect only on a `typed.Keyspace`-backed index: a
 `typed.SetKeyspace` index's value (`setValue`) is already carried in
 its compound primary key, so there is no back-lookup to skip. This
-is the only covering shape the typed API exposes — arbitrary
-covering *projections* have no typed return surface (every
-`typed.IndexQuery` method returns the row value `V`). For arbitrary
-covering projections, use the byte-oriented `IndexDecl` API: its
-`Lookup` / `Range` / `Prefix` / `Get` return the encoded covering
-tuple, decoded by the caller via `DecodeCoveringTuple` (see
+is `typed.Index`'s only covering shape; arbitrary covering
+*projections* have their typed surface on the column tier —
+`typed.ColumnIndex`'s `Covering` columns plus `Projection` /
+`Column.From` (typed-columns.md §Covering projections). Every
+`typed.IndexQuery` method still returns the row value `V`; the
+byte-oriented `IndexDecl` API also remains: its `Lookup` /
+`Range` / `Prefix` / `Get` return the encoded covering tuple,
+decoded by the caller via `DecodeCoveringTuple` (see
 `indexing.md §Covering Indexes` and `api-surface.md §Index Lookup
 API`).
 
