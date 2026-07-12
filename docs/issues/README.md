@@ -70,6 +70,7 @@ pre-existing at their change set's base.
 | Slug | Lands | Summary |
 |------|-------|---------|
 | index-background-maintenance-hook | when an index kind requiring asynchronous maintenance (vector ANN, FTS stats) is designed | index write path is synchronous-only: no deferred-obligation state, no background hook, per-op cursor invalidation (no epoch model), extractor-replay Check unsound for centroid-dependent kinds |
+| change-notification-wait-primitive | when a consumer's poll cadence becomes a real cost or latency bound | no cross-process change notification; substrate-watching readers poll the root version |
 
 ## Open — architecture / factoring audit
 
