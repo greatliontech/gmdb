@@ -231,7 +231,15 @@ self-durable — a rewrite of that meta to its own slot followed by
 fdatasync. The rewrite is load-bearing: a prior failed fsync both
 consumes the kernel's writeback error and marks the pages clean, so a
 bare fdatasync could succeed trivially, anchoring an assertion the
-disk never received. The reclamation bound is
+disk never received. Byte-identity of that rewrite is VERIFIED, not
+assumed (the same rule the live-peer anchor gate enforces): the slot
+is read back and compared against the re-encode, and a divergent
+carrier — a checksum-valid meta whose nonzero padding a foreign or
+older-format writer left (decode ignores it, encode zeroes it, the
+checksum covers it) — is never rewritten; the open takes the
+recovery-commit publication instead (the next TxnID to the other
+slot), which is tear-safe by dual-slot and cannot create the
+equal-TxnID pair that undefines meta selection. The reclamation bound is
 `min(oldestActiveReaderTxnID, anchoredEpoch)` (`free-space.md §RPL
 Reclamation`); recovery adoption is unaffected (it reads
 `DurableTxnID` from disk, where anchoring is a tautology).
@@ -427,9 +435,15 @@ On recovery (Open after crash):
    projection first would walk a possibly-unflushed post-epoch RPL
    head — exempt from boundary treatment, hence a hard error — and
    permanently fail an Open whose durable projection is intact.
-5. **Recovery commit** — writable Open only, when `DurableTxnID <
-   TxnID` AND the open establishes the database has **no live
-   author**: the lock file was freshly created, or its persisted
+5. **Recovery commit** — writable Open only, when the open
+   establishes the database has **no live author** AND either
+   `DurableTxnID < TxnID`, or the selected meta is self-durable
+   but its on-disk carrier diverges byte-wise from the re-encode
+   (§Anchoring's verified-identity rule — a foreign writer's
+   checksum-valid nonzero padding; the anchor rewrite must not
+   change the carrier's bytes and an equal-TxnID copy would
+   undefine selection, so the divergent case republishes here).
+   The no-live-author gate: the lock file was freshly created, or its persisted
    last-writer record and every reader slot classify as dead/stale
    (`cross-process.md §Lock File Layout`, LastWriter*; §Reader
    Table). The last-writer record — written at grant acquisition,

@@ -1,6 +1,8 @@
 package pager
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 )
@@ -153,5 +155,86 @@ func TestAnchorArmRewritesTheSlot(t *testing.T) {
 	}
 	if rec.syncs == 0 {
 		t.Fatal("anchor arm did not fdatasync through the seam")
+	}
+}
+
+// TestAnchorDivergentMetaFallsToRecoveryCommit pins the verified-
+// identity anchor (durability.md §Anchoring — "byte-identity is
+// VERIFIED, not assumed", the recovery instance): a checksum-valid
+// meta carrying nonzero padding re-encodes to different bytes, so
+// the anchor must NOT rewrite its slot (the changed-bytes hazard)
+// and must NOT copy the same TxnID to the other slot either (an
+// equal-TxnID pair is the commit-protocol violation that bricks
+// meta selection) — it falls through to the recovery-commit
+// publication: TxnID+1 to the other slot, after which selection
+// still works and the divergent carrier is byte-identical.
+func TestAnchorDivergentMetaFallsToRecoveryCommit(t *testing.T) {
+	f, db, cleanup := initDB(t, false)
+	defer cleanup()
+	p := db.Pager
+	ps := int(p.cfg.PageSize)
+
+	// One self-durable commit past genesis, so the equal-TxnID
+	// hazard regime (nonzero TxnIDs) is the one under test.
+	prev, prevActive := db.Meta, db.ActiveMetaIdx
+	p.BeginTx(TxParams{
+		HighWaterMark: prev.HighWaterMark, MaxSize: prev.MaxSize,
+		GrowStep: prev.GrowStep, MinSize: prev.MinSize, TxnID: 1,
+		ReclamationBound: func() uint64 { return 0 },
+	})
+	id, err := p.AllocPage()
+	if err != nil {
+		t.Fatalf("AllocPage: %v", err)
+	}
+	if _, err := p.AllocSlab(id); err != nil {
+		t.Fatalf("AllocSlab: %v", err)
+	}
+	res, err := p.Commit(CommitParams{NewTxnID: 1, Flags: prev.Flags, Sync: SyncBoth}, prev, prevActive)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if !res.Meta.SelfDurable() || res.Meta.TxnID != 1 {
+		t.Fatalf("fixture: TxnID=%d SelfDurable=%v, want 1/true", res.Meta.TxnID, res.Meta.SelfDurable())
+	}
+	slot := res.ActiveMetaIdx
+
+	// Plant a nonzero padding byte, re-checksummed — the foreign
+	// checksum-valid shape DecodeMeta ignores and EncodeMeta zeroes.
+	page := make([]byte, ps)
+	if _, err := f.ReadAt(page, int64(slot*ps)); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	page[metaOffPadding] = 0xA5
+	binary.LittleEndian.PutUint64(page[MetaChecksumOffsetForTest():], ComputeMetaChecksum(page))
+	if _, err := f.WriteAt(page, int64(slot*ps)); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+	divergent := append([]byte(nil), page...)
+
+	m, active, recovered, err := p.RecoverToDurable(f)
+	if err != nil {
+		t.Fatalf("RecoverToDurable: %v", err)
+	}
+	if !recovered || m.TxnID != 2 || !m.SelfDurable() {
+		t.Fatalf("recovered=%v TxnID=%d SelfDurable=%v, want true/2/true (recovery-commit publication)", recovered, m.TxnID, m.SelfDurable())
+	}
+	if active != 1-slot {
+		t.Fatalf("published slot = %d, want the OTHER slot %d", active, 1-slot)
+	}
+	// The divergent carrier is byte-identical to what we planted.
+	if _, err := f.ReadAt(page, int64(slot*ps)); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if !bytes.Equal(page, divergent) {
+		t.Fatal("the divergent slot was rewritten — the changed-bytes hazard the verification exists to avoid")
+	}
+	// Meta selection still works and picks the publication — the
+	// equal-TxnID brick is the failure mode this pins against.
+	latest, err := ReadLatestMeta(f, p.cfg.PageSize)
+	if err != nil {
+		t.Fatalf("ReadLatestMeta after divergent-carrier recovery: %v (meta selection bricked?)", err)
+	}
+	if latest.TxnID != 2 {
+		t.Fatalf("latest TxnID = %d, want 2", latest.TxnID)
 	}
 }

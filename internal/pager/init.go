@@ -1,6 +1,7 @@
 package pager
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -546,10 +547,16 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m Meta, active int, ch
 // blocked — publishing from it would clobber an acked peer commit and
 // retreat the durable epoch), selects the latest valid meta, and:
 //
-//   - Self-durable: attaches the live (== durable) projection, then
-//     anchors the assertion by rewriting the meta to its own slot and
-//     fsyncing (the meta may have been read from a surviving page
-//     cache; §Anchoring), and returns it. recovered = false.
+//   - Self-durable with a VERIFIED byte-identical carrier: attaches
+//     the live (== durable) projection, then anchors the assertion
+//     by rewriting the meta to its own slot and fsyncing (the meta
+//     may have been read from a surviving page cache; §Anchoring),
+//     and returns it. recovered = false. A carrier whose bytes
+//     diverge from the re-encode (checksum-valid nonzero padding —
+//     a foreign writer's) takes the recovery-commit arm below
+//     instead; rewriting it would change the sole durable carrier's
+//     bytes, and copying the same TxnID to the other slot would
+//     brick meta selection (equal-TxnID pair).
 //   - Otherwise: attaches the DURABLE projection (walking the RPL
 //     with the adopted epoch as the reclaim reference, so the epoch's
 //     own head keeps its hard-error exemption), then publishes the
@@ -580,9 +587,6 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 		return Meta{}, 0, false, err
 	}
 	if selected.SelfDurable() {
-		if err := p.attachState(file, selected); err != nil {
-			return Meta{}, 0, false, err
-		}
 		// Anchor the assertion by re-writing the meta to its own slot
 		// and fsyncing. The pwrite is load-bearing, not redundant: the
 		// meta may live only in a surviving page cache, and a PRIOR
@@ -595,17 +599,40 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 		// byte-identical meta makes trivial success impossible; a torn
 		// write of identical bytes is harmless and the other slot is
 		// untouched.
+		//
+		// Byte-identity is LOAD-BEARING and VERIFIED, not assumed
+		// (mirroring gateAnchorAdvance): a checksum-valid meta
+		// carrying nonzero padding — a foreign or older-format
+		// writer's — re-encodes to DIFFERENT bytes, and rewriting
+		// the sole durable carrier with changed bytes is the exact
+		// hazard the byte-identical design avoids. A divergent
+		// carrier falls through to the recovery-commit publication
+		// below instead: TxnID+1 to the OTHER slot — tear-safe by
+		// dual-slot AND selection-sound (same-TxnID bytes in both
+		// slots would be the equal-TxnID commit-protocol violation
+		// that bricks meta selection). For a self-durable meta the
+		// durable projection is the meta itself, so the publication
+		// republishes the same state under a fresh TxnID.
 		buf := make([]byte, p.cfg.PageSize)
 		EncodeMeta(buf, &selected)
-		if _, err := p.fops.WriteAt(buf, int64(selectedIdx)*int64(p.cfg.PageSize)); err != nil {
-			return Meta{}, 0, false, fmt.Errorf("pager: anchor rewrite meta %d: %w", selectedIdx, err)
+		onDisk := make([]byte, p.cfg.PageSize)
+		if _, err := p.fops.ReadAt(onDisk, int64(selectedIdx)*int64(p.cfg.PageSize)); err != nil {
+			return Meta{}, 0, false, fmt.Errorf("pager: anchor read-back meta %d: %w", selectedIdx, err)
 		}
-		if err := p.fops.Fdatasync(); err != nil {
-			return Meta{}, 0, false, fmt.Errorf("pager: anchor fdatasync: %w", err)
+		if bytes.Equal(buf, onDisk) {
+			if err := p.attachState(file, selected); err != nil {
+				return Meta{}, 0, false, err
+			}
+			if _, err := p.fops.WriteAt(buf, int64(selectedIdx)*int64(p.cfg.PageSize)); err != nil {
+				return Meta{}, 0, false, fmt.Errorf("pager: anchor rewrite meta %d: %w", selectedIdx, err)
+			}
+			if err := p.fops.Fdatasync(); err != nil {
+				return Meta{}, 0, false, fmt.Errorf("pager: anchor fdatasync: %w", err)
+			}
+			p.advanceAnchoredEpoch(selected.Durable.TxnID)
+			p.noteAdoptedMeta(selected, selectedIdx)
+			return selected, selectedIdx, false, nil
 		}
-		p.advanceAnchoredEpoch(selected.Durable.TxnID)
-		p.noteAdoptedMeta(selected, selectedIdx)
-		return selected, selectedIdx, false, nil
 	}
 
 	// Attach the durable projection FIRST, as a self-consistent meta at

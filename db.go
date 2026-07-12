@@ -419,7 +419,11 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 				return nil, mapPagerErr(rerr)
 			}
 			if recovered {
-				logger.Warn("gmdb: crash recovery rolled back to the durable epoch",
+				// Fires on the durable-rollback case AND on the
+				// divergent-carrier republication (durability.md
+				// §Recovery step 5), where durable == live and
+				// nothing is lost — the message covers both.
+				logger.Warn("gmdb: recovery commit published (rolled back to the durable epoch, or republished a divergent self-durable carrier)",
 					"path", path,
 					"durableEpoch", rm.Durable.AnchoredTxnID,
 					"recoveryTxnID", rm.TxnID)

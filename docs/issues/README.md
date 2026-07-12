@@ -98,4 +98,3 @@ findings each shared-fix row covers.
 |------|-------|---------|
 | copyto-hardlink-destination-support | when a non-hard-link destination filesystem is decided to be a supported CopyTo target | [L] publish fails on vfat/exfat/FUSE targets; [nit] NFS link() retransmission quirk |
 | reclaimed-boundary-torn-peer | when grant-handoff tear detection or reclaimed-boundary gating is settled | [H] surviving handle's chain predates a peer's torn never-published reclamation; reclamation behind the reclaimed boundary double-frees |
-| recovery-rewrite-identity-unverified | when a foreign/older-format writer can produce checksum-valid metas with nonzero padding | [L] gated Open's self-durable rewrite assumes encode∘decode identity; a padding-divergent meta would get a changed-bytes rewrite of the sole carrier |
