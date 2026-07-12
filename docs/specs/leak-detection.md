@@ -38,25 +38,27 @@ Invariant: kind=clause-explicit;
     detection — pinning RPL reclamation for the process lifetime.
 
 Invariant: kind=clause-explicit;
-  property=`db.closed` is a `*atomic.Bool` allocated on the heap and
-    shared by pointer between the `DB` struct, every
-    `txCleanupInfo`, and the `dbCleanupInfo` itself;
+  property=`db.closeGate` is a heap-allocated composite gate
+    (`internal/closegate.Gate`: the `closed` flag plus the
+    `txInflight` drain counter) shared by pointer between the `DB`
+    struct, every `txCleanupInfo`, and the `dbCleanupInfo` itself;
   from=this spec §Cleanup Behavior step 0;
-  violation=An inline `closed` field on `DB` is captured by Tx
-    cleanups as `&db.closed`; if `DB` is GC'd before a leaked Tx,
-    the captured pointer dangles and the Tx cleanup reads garbage,
+  violation=An inline gate on `DB` is captured by Tx cleanups as
+    `&db.closeGate`; if `DB` is GC'd before a leaked Tx, the
+    captured pointer dangles and the Tx cleanup reads garbage,
     bypassing the close guard.
 
 Invariant: kind=clause-explicit;
-  property=`Close()` sets `*db.closed = true` (release-store)
-    *before* it begins unmapping or stopping the flock goroutine;
+  property=`Close()` stores the gate's closed flag (release-store
+    via `closeGate.CompareAndSwapClosed`) *before* it begins
+    unmapping or stopping the flock goroutine;
     the heartbeat and flock goroutines exit (with done-channel
     confirmation) *before* `Close()` unmaps the lock file or data
     file;
   from=this spec §`Close()` Ordering;
   violation=Unmapping before goroutines exit allows a final
     heartbeat tick to write to unmapped memory; releasing
-    goroutines after `db.closed = true` is observable lets Tx
+    goroutines after the closed store is observable lets Tx
     cleanups race the unmap and SIGSEGV.
 
 Invariant: kind=clause-explicit;
@@ -194,21 +196,21 @@ are both cheap, allocation-free operations.
 
 When the GC collects a leaked `Tx`:
 
-0. **Check `db.closed` first.** `db.closed` is a `*atomic.Bool`
-   allocated on the heap and shared by pointer between the `DB`
-   struct, every `txCleanupInfo`, and the `dbCleanupInfo` itself.
-   The pointer is captured into each cleanup at
-   `runtime.AddCleanup` time. Allocating the flag separately (not
+0. **Check the close gate first.** `db.closeGate` is a
+   heap-allocated `internal/closegate.Gate` — the `closed` flag
+   plus the `txInflight` drain counter — shared by pointer between
+   the `DB` struct, every `txCleanupInfo`, and the `dbCleanupInfo`
+   itself. The pointer is captured into each cleanup at
+   `runtime.AddCleanup` time. Allocating the gate separately (not
    as an inline field of `DB`) is required because
    `runtime.AddCleanup` provides no ordering guarantee between a
    `DB` cleanup and the `Tx` cleanups that depend on observing the
    close state — if `DB` is collected first, an inline-on-`DB`
-   flag would become a dangling pointer. With the shared-heap flag,
-   the underlying `atomic.Bool` lives until the last referencing
-   cleanup releases its capture. `Close()` sets
-   `*db.closed = true` (release-store) *before* it begins
-   unmapping. A WRITE-Tx cleanup that observes `*db.closed ==
-   true` logs the warning and returns immediately — it does not
+   gate would become a dangling pointer. With the shared heap
+   gate, it lives until the last referencing cleanup releases its
+   capture. `Close()` stores closed=true (release-store via
+   `CompareAndSwapClosed`) *before* it begins unmapping. A WRITE-Tx cleanup that observes closed ==
+   true (via `EnterCleanup`) logs the warning and returns immediately — it does not
    signal the flock goroutine (already stopped). A READ-Tx
    cleanup releases its reader slot REGARDLESS of the close
    state: the leaked ReadTx's lifetime reference on the lock-file
@@ -278,10 +280,11 @@ holds open file descriptors, mmap regions, and the flock goroutine
 The cleanup logs a warning with the Open stack trace, stops the
 flock + heartbeat goroutines, munmaps data + lock files, and
 closes file descriptors. The Close-vs-cleanup coordination uses
-the shared-`*atomic.Bool` gate pattern (invariant 4): the cleanup
-calls `Swap(true)` on `*db.closed` — if the prior value was true
-(i.e., `Close()` already stored it via `CompareAndSwap(false,
-true)`), the cleanup exits silently with no drain. Otherwise the
+the shared-gate pattern (invariant 4): the cleanup calls
+`SwapClosed(true)` on the shared `closeGate` — if the prior value
+was true (i.e., `Close()` already stored it via
+`CompareAndSwapClosed(false, true)`), the cleanup exits silently
+with no drain. Otherwise the
 cleanup wins the gate, logs, and drains the resources itself.
 `Close()` additionally calls `db.cleanup.Stop()` at the end of
 its drain, but the gate is the load-bearing safety against

@@ -487,7 +487,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	// DB-level leak-detection cleanup. The cleanup info captures
 	// resources by pointer (not via *DB) so a leaked-then-collected
 	// DB doesn't nil-deref when the cleanup fires. The shared
-	// db.closed atomic is the gate: if Close() ran, the cleanup
+	// The shared closeGate is the gate: if Close() ran, the cleanup
 	// is Stop()'d AND a defensive Swap(true) returns true → cleanup
 	// exits silently.
 	db.cleanup = runtime.AddCleanup(db, dbCleanupFn, dbCleanupInfo{
@@ -648,7 +648,7 @@ func dbCleanupFn(info dbCleanupInfo) {
 // §Close Ordering, callers must commit or rollback all
 // transactions before Close.
 //
-// Close-vs-dbCleanupFn race: the shared *db.closed atomic guards
+// Close-vs-dbCleanupFn race: the shared closeGate guards
 // against double-drain (cleanup's Swap(true) returns true if Close
 // won the CAS first; Close returns nil if the cleanup won the
 // Swap first). The race is unreachable under normal use — for
