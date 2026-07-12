@@ -237,6 +237,15 @@ var (
 	// are written. Per indexing.md §Unique Indexes.
 	ErrIndexUniqueViolation = errors.New("gmdb: unique index violation")
 
+	// ErrIndexEncoderIDReserved rejects an encoder ID inside the
+	// reserved column namespace (gmdb/col/, gmdb/multicol/,
+	// gmdb/cover-value/ — typed-keyspaces.md §Encoder interface):
+	// the synthesized-name domains of the typed declaration forms
+	// stay provably disjoint only because callers cannot mint IDs
+	// inside them. Surfaced at OpenKeyspace / CreateKeyspace through
+	// the typed tier's declaration lowering, before any work.
+	ErrIndexEncoderIDReserved = errors.New("gmdb: encoder ID is inside the reserved column namespace")
+
 	// ErrIndexKindUnknown rejects an IndexDecl whose Kind is not a
 	// kind this engine version implements (indexing.md §Overview —
 	// IndexKindComposite is currently the only kind). Surfaced at

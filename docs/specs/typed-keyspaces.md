@@ -69,7 +69,7 @@ Invariant: kind=clause-explicit;
     hashed into the schema fingerprint of any typed index
     that uses the encoder; collisions make schema changes
     undetectable;
-  from=this spec §Encoder ID contract;
+  from=this spec §Encoder interface;
   violation=A shared ID across encoders with different
     encodings lets a schema change (encoder swap) bypass the
     drift guard — every on-disk index entry decodes as garbage.
@@ -104,8 +104,9 @@ Invariant: kind=clause-explicit;
 Invariant: kind=clause-explicit;
   property=`typed.AnyIndex[K, V]` is a **sealed** interface —
     the method `indexDecl()` is unexported, so only types in
-    the `gmdb/typed` package can implement it (in practice: only
-    `*typed.Index[K, V, IK]`). Decoration must happen at the
+    the `gmdb/typed` package can implement it (in practice:
+    `*typed.Index[K, V, IK]` and `*typed.ColumnIndex[K, V]` —
+    typed-columns.md). Decoration must happen at the
     *extractor function* level by wrapping the user's
     `Extract` func inside a fresh `typed.Index[K, V, IK]`
     declaration;
@@ -145,6 +146,13 @@ Invariant: kind=clause-explicit;
 // ErrIndexEncoderIDEmpty, naming the offending encoder by index name
 // and column position. This catches the common misconfiguration of
 // declaring a FuncEncoder without setting EncoderID.
+//
+// IDs inside the reserved column namespace (gmdb/col/,
+// gmdb/multicol/, gmdb/cover-value/) are rejected with
+// ErrIndexEncoderIDReserved: the typed declaration forms'
+// synthesized column names stay provably disjoint only because
+// callers cannot mint IDs inside them (typed-columns.md
+// §Synthesized column-name grammar).
 type Encoder[T any] interface {
     AppendEncode(dst []byte, v T) ([]byte, error)
     Decode(src []byte) (T, error)
@@ -312,7 +320,8 @@ type Index[K, V, IK any] struct {
 //
 // The interface is intentionally SEALED — the method indexDecl() is
 // unexported, so only types in the gmdb/typed package can implement
-// it (in practice: only *Index[K, V, IK]). This is deliberate: the
+// it (in practice: *Index[K, V, IK] and *ColumnIndex[K, V]). This is
+// deliberate: the
 // engine relies on every supplied *IndexDecl having been constructed
 // through the typed-index path, which guarantees encoder ID
 // consistency, deterministic schema-hash, and well-formed extractor
@@ -405,7 +414,10 @@ Consequently `typed.IndexQuery.Range(start, end *IK)` compares
 full `IK` values; there is **no partial-prefix Range on a
 sub-field of IK** through the typed API.
 
-Workarounds:
+Resolved for typed callers by the column declaration tier
+(`typed-columns.md`): a `ColumnIndex` declares one byte
+`IndexColumn` per field, so partial-prefix queries compose
+naturally. Byte-oriented workarounds remain available:
 
 - Use the byte-oriented `IndexDecl` directly, declaring each
   sub-field as a separate `IndexColumn` (one column per

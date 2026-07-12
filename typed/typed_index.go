@@ -63,7 +63,7 @@ type Index[K, V, IK any] struct {
 }
 
 // Compile-time proof that *Index implements the sealed
-// AnyIndex — the only legal implementer (the unexported indexDecl
+// AnyIndex (the unexported indexDecl
 // method seals the interface to this package).
 var _ AnyIndex[int, int] = (*Index[int, int, int])(nil)
 
@@ -75,6 +75,14 @@ func (t *Index[K, V, IK]) indexDecl(keyEnc Encoder[K], valEnc Encoder[V]) (*gmdb
 	ikID := t.IKEnc.ID()
 	if ikID == "" {
 		return nil, fmt.Errorf("gmdb: typed index %q index-key encoder: %w", t.Name, gmdb.ErrIndexEncoderIDEmpty)
+	}
+	// Cross-form disjointness (typed-columns.md Inv-TC2): this
+	// decl form's synthesized column name IS the raw IK-encoder
+	// ID, so an ID inside the reserved column namespace could
+	// collide with a ColumnIndex column's synthesized name — the
+	// namespace is not mintable.
+	if err := validateEncoderIDNamespace(fmt.Sprintf("typed index %q index-key encoder", t.Name), ikID); err != nil {
+		return nil, err
 	}
 	decl := &gmdb.IndexDecl{
 		Name: t.Name,

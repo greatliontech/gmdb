@@ -209,6 +209,11 @@ that should be indexed. There is no separate predicate primitive,
 matching `indexing.md §Partial Indexes` ("the extractor is the
 predicate"; here, `Where` plus the accessors are the extractor).
 
+Declaring the same column twice in one `ColumnIndex` (two
+identical synthesized names) is rejected at open with
+`ErrInvalidOptions` — positions would be ambiguous for per-column
+consumers.
+
 `Unique` composes with `MultiColumn` at element granularity:
 every expanded entry key must be unique, so a unique index over a
 multi-column enforces global element uniqueness. Two entries with

@@ -52,7 +52,7 @@ tests move with their subjects, unmodified.
       property test: reverse sequence == exact reversal of
       forward sequence over same snapshot, invalidation contract
       (Inv-IHS1..5) exercised on reverse walks.
-- [ ] 10. Column declaration tier (lands in `gmdb/typed`):
+- [x] 10. Column declaration tier (lands in `gmdb/typed`):
       `Column` / `MultiColumn` / `AnyColumn` /
       `AnySingleColumn` (sealed) / `ColumnIndex` implementing
       the sealed lowering; synthesized-name grammar (reserved

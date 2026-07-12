@@ -20,8 +20,8 @@ import (
 // types in a single variadic argument.
 //
 // The interface is intentionally SEALED — indexDecl is unexported, so
-// only types in this package implement it (in practice only
-// *Index[K, V, IK]). The
+// only types in this package implement it (in practice
+// *Index[K, V, IK] and *ColumnIndex[K, V]). The
 // engine relies on every supplied *gmdb.IndexDecl having been constructed
 // through the typed-index path, which guarantees encoder-ID
 // consistency, deterministic schema-hash, and well-formed extractor

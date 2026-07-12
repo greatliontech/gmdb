@@ -245,9 +245,11 @@ type IndexEntry struct {
 type IndexExtractor func(key, value []byte) []IndexEntry
 ```
 
-For typed callers, `typed.Index[K, V, IK]` wraps `IndexDecl` and
-generates column bytes automatically from a typed `Encoder[IK]` —
-see `typed-keyspaces.md`.
+For typed callers, `typed.Index[K, V, IK]` wraps `IndexDecl` as
+one opaque column, and `typed.ColumnIndex[K, V]`
+(`typed-columns.md`) lowers per-field column declarations to the
+multi-column form; both generate column bytes automatically from
+typed encoders — see `typed-keyspaces.md`.
 
 ## Index Declaration
 

@@ -191,6 +191,12 @@ var (
     ErrIndexUnknown             = errors.New("gmdb: IndexDecl supplied for index not declared in registry")
     ErrIndexFingerprintMismatch = errors.New("gmdb: index fingerprint mismatch — RebuildIndex required")
     ErrIndexUniqueViolation     = errors.New("gmdb: unique index violation")
+    // ErrIndexEncoderIDReserved rejects an encoder ID inside the
+    // reserved column namespace (gmdb/col/, gmdb/multicol/,
+    // gmdb/cover-value/); surfaced through the typed tier's
+    // declaration lowering at OpenKeyspace / CreateKeyspace
+    // (typed-keyspaces.md §Encoder interface).
+    ErrIndexEncoderIDReserved   = errors.New("gmdb: encoder ID is inside the reserved column namespace")
     // ErrIndexKindUnknown rejects an IndexDecl whose Kind this engine
     // version does not implement (indexing.md §Overview —
     // IndexKindComposite is the only kind). Surfaced at OpenKeyspace /
