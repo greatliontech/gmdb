@@ -23,8 +23,9 @@ Depends on / interacts with:
 ## Invariants
 
 Invariant: kind=clause-explicit;
-  property=A WRITE-`Tx` cleanup observing `*db.closed == true`
-    returns without touching the flock goroutine — it logs and
+  property=A WRITE-`Tx` cleanup observing the gate closed
+    (`EnterCleanup` returning false) returns without touching the
+    flock goroutine — it logs and
     exits. A READ-`Tx` slot release (normal close or leak cleanup)
     runs unconditionally, but touches the reader-table mmap only
     through the lifetime reference its `BeginRead` took on the
@@ -69,10 +70,10 @@ Invariant: kind=clause-explicit;
     hold windows: leaked-Tx cleanups, and `BeginRead`'s acquire
     sequence (transactions.md §Read Transaction, Close-vs-BeginRead
     invariant). A cleanup that
-    observed `*db.closed == false` (and therefore proceeded into
+    observed the gate open (and therefore proceeded into
     the resource-touching path) MUST complete before `Close`
-    advances to unmap. The drain pairs with the release-store on
-    `*db.closed` to close the read-tx-leak race that the original
+    advances to unmap. The drain pairs with the gate's closed
+    release-store to close the read-tx-leak race that the original
     closed-only gate left open: a leaked-ReadTx cleanup that
     passed the gate could otherwise race `Close`'s subsequent
     `lockFile.Close` and SIGSEGV writing to the unmapped reader
