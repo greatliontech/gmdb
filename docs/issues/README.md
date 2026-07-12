@@ -70,7 +70,6 @@ pre-existing at their change set's base.
 | Slug | Lands | Summary |
 |------|-------|---------|
 | index-background-maintenance-hook | when an index kind requiring asynchronous maintenance (vector ANN, FTS stats) is designed | index write path is synchronous-only: no deferred-obligation state, no background hook, per-op cursor invalidation (no epoch model), extractor-replay Check unsound for centroid-dependent kinds |
-| index-kind-payload-plumbing | when the first non-composite index kind is implemented | pinned index state / flush path rebuild registry entries from the decl and would drop a stored `KindPayload`; unreachable while the open gates reject non-composite kinds |
 
 ## Open — architecture / factoring audit
 

@@ -276,6 +276,10 @@ func (tx *Tx) rebuildIndex(keyspace string, decl *IndexDecl) (retErr error) {
 			Root:        0,
 			Count:       0,
 			UserVersion: decl.Version,
+			// A rebuild replaces the index wholesale from the
+			// supplied decl: the OLD entry's per-kind payload does
+			// not carry over — a non-composite kind's rebuild
+			// produces its own fresh payload.
 		}
 		for _, c := range decl.Columns {
 			newEntry.Columns = append(newEntry.Columns, c.Name)
@@ -524,6 +528,11 @@ func (tx *Tx) syncRebuildToCachedPinned(cachedKS *Keyspace, cachedSKS *SetKeyspa
 	p.count = newCount
 	p.schemaHash = schemaHash(decl)
 	p.decl = decl
+	// The rebuild wrote a fresh, payload-less entry; the pinned
+	// copy must match or Commit's flushIndexRegistry would
+	// resurrect the OLD kind's payload over it (a non-composite
+	// kind's rebuild installs its own payload here).
+	p.kindPayload = nil
 }
 
 // retireIndexRegistry implements steps 2+3 of the three-subtree

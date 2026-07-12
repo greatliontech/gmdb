@@ -181,6 +181,12 @@ func (tx *Tx) flushIndexRegistry(owner descriptorOwner, indexes map[string]*pinn
 			Root:        p.root,
 			Count:       p.count,
 			UserVersion: p.decl.Version,
+			// Round-trip the stored per-kind payload: the flush
+			// REBUILDS the entry from pinned state, and dropping
+			// the payload here would lose a non-composite kind's
+			// metadata on the next commit (indexing.md §Storage
+			// Layout).
+			KindPayload: p.kindPayload,
 		}
 		for _, c := range p.decl.Columns {
 			entry.Columns = append(entry.Columns, c.Name)

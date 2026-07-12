@@ -42,6 +42,17 @@ type pinnedIndex struct {
 	// count is the number of entries in the index data tree
 	// (registry entry's Count field). Updated by atomic Put.
 	count uint64
+
+	// kindPayload is the registry entry's per-kind metadata,
+	// captured verbatim at open and round-tripped by every flush
+	// (indexing.md §Storage Layout). Empty for KindComposite (the
+	// codec rejects a composite entry carrying one). READ-ONLY
+	// within a transaction under the current plumbing: a future
+	// kind that mutates its payload in-tx must extend the
+	// panic-restore snapshot pair (snapshotIndexes/restoreIndexes)
+	// the same way root/count are covered. Not a hashable input —
+	// runtime state, like root/count.
+	kindPayload []byte
 }
 
 // indexesEqualByHashableInputs reports whether two pinned-index maps
@@ -249,9 +260,13 @@ func (tx *Tx) validatePinnedAgainstRegistry(
 			}
 		}
 		// Fingerprints agree — populate runtime fields from the
-		// on-disk entry.
+		// on-disk entry. The payload capture is the round-trip
+		// rail for non-composite kinds; the kind gate above keeps
+		// it vacuous (composite payloads are empty) until a kind
+		// is admitted.
 		p.root = entry.Root
 		p.count = entry.Count
+		p.kindPayload = entry.KindPayload
 	}
 	return nil
 }
@@ -301,6 +316,8 @@ func (tx *Tx) writeNewIndexRegistry(
 			Root:        0, // empty index data tree
 			Count:       0,
 			UserVersion: p.decl.Version,
+			// A NEW index starts with no per-kind payload; the
+			// kind's own build produces one (non-composite kinds).
 		}
 		for _, c := range p.decl.Columns {
 			entry.Columns = append(entry.Columns, c.Name)
