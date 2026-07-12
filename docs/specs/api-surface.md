@@ -1636,11 +1636,13 @@ type CheckIssue struct {
     Severity CheckSeverity
     // Code is a stable, machine-parseable token for the issue class
     // (e.g., "BitmapLeak", "CheckIndexes.KeyspaceNotFound",
-    // "BadPageChecksum", "RPLChainBroken"). Stable across gmdb
+    // "BadPageChecksum", "RPLSegmentChecksum"). Stable across gmdb
     // versions for the purposes of tooling that pattern-matches on
     // issues; new codes may be added but existing ones never change
-    // meaning. Use Code for programmatic decisions; use Message for
-    // human-facing display.
+    // meaning. Every token is single-sourced as a code constant and
+    // value-pinned (INV enforcement:
+    // TestCheckIssueCodeTokensPinned). Use Code for programmatic
+    // decisions; use Message for human-facing display.
     Code     string
     PageID   uint64
     Keyspace string

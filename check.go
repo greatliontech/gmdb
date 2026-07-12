@@ -25,6 +25,18 @@ const (
 	CheckFatal   = verify.Fatal
 )
 
+// Check-driver issue codes (api-surface.md §CheckIssue): stable
+// tokens, single-sourced here and value-pinned by
+// TestCheckIssueCodeTokensPinned.
+const (
+	codeReadTxUnavailable = "ReadTxUnavailable"
+	codeRepairCommitFailed = "Repair.CommitFailed"
+	codeRepairFreeFailed = "Repair.FreeFailed"
+	codeRepairReadersActive = "Repair.ReadersActive"
+	codeRepairSkipped = "Repair.Skipped"
+	codeRepairWriteTxUnavailable = "Repair.WriteTxUnavailable"
+)
+
 // CheckIssue is one finding from a Check walk. See api-surface.md
 // §Check, CopyTo, Compact. Code is a stable machine-parseable token;
 // Message is free-form human-facing text (do not pattern-match on it).
@@ -171,7 +183,7 @@ func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 					return
 				}
 			}
-			c.Emit(CheckIssue{Severity: CheckWarning, Code: "Repair.Skipped",
+			c.Emit(CheckIssue{Severity: CheckWarning, Code: codeRepairSkipped,
 				Message: "structural corruption present; leaked pages reported but not reclaimed (reachable set unreliable)"})
 			return
 		}
@@ -187,7 +199,7 @@ func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 					return
 				}
 			}
-			c.Emit(CheckIssue{Severity: CheckWarning, Code: "Repair.Skipped",
+			c.Emit(CheckIssue{Severity: CheckWarning, Code: codeRepairSkipped,
 				Message: "RPL chain walk stopped at a corrupt-segment boundary; leaked pages reported but not reclaimed (the set may intersect the live RPL)"})
 			return
 		}
@@ -198,13 +210,13 @@ func (db *DB) checkRepair(opts *CheckOptions) iter.Seq[CheckIssue] {
 		// Free exactly the leaked set in the bitmap and publish via commit.
 		for _, id := range c.Leaked {
 			if err := tx.pgr.FreeLeakedPage(id); err != nil {
-				c.Emit(CheckIssue{Severity: CheckFatal, Code: "Repair.FreeFailed", PageID: id,
+				c.Emit(CheckIssue{Severity: CheckFatal, Code: codeRepairFreeFailed, PageID: id,
 					Message: fmt.Sprintf("could not free leaked page %d: %v", id, err)})
 				return
 			}
 		}
 		if err := tx.Commit(); err != nil {
-			c.Emit(CheckIssue{Severity: CheckFatal, Code: "Repair.CommitFailed",
+			c.Emit(CheckIssue{Severity: CheckFatal, Code: codeRepairCommitFailed,
 				Message: fmt.Sprintf("repair commit failed; no pages reclaimed: %v", err)})
 			return
 		}

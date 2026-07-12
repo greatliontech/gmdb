@@ -224,7 +224,7 @@ func (c *Checker) EmitLeak(id uint64, repaired bool) bool {
 	if repaired {
 		msg = fmt.Sprintf("page %d was allocated but unreferenced (leaked); reclaimed by Repair", id)
 	}
-	return c.Emit(Issue{Severity: Warning, Code: "BitmapLeak", PageID: id, Repaired: repaired, Message: msg})
+	return c.Emit(Issue{Severity: Warning, Code: CodeBitmapLeak, PageID: id, Repaired: repaired, Message: msg})
 }
 
 func (c *Checker) Run() {
@@ -238,7 +238,7 @@ func (c *Checker) Run() {
 	// (Check never crashes on a forged page; integrity.md §Forged / structural corruption tolerance.)
 	bound := min(uint64(c.Pgr.FileSize())/uint64(c.Cfg.PageSize), c.Meta.MaxSize)
 	if hwm > bound {
-		c.Emit(Issue{Severity: Error, Code: "HighWaterMarkOutOfRange",
+		c.Emit(Issue{Severity: Error, Code: CodeHighWaterMarkOutOfRange,
 			Message: fmt.Sprintf("meta HighWaterMark %d exceeds file/MaxSize bound %d; walk clamped", hwm, bound)})
 		hwm = bound
 	}
@@ -249,7 +249,7 @@ func (c *Checker) Run() {
 	}
 
 	if err := pager.ValidateMeta(c.Meta); err != nil {
-		if !c.Emit(Issue{Severity: Error, Code: "MetaInvalid",
+		if !c.Emit(Issue{Severity: Error, Code: CodeMetaInvalid,
 			Message: fmt.Sprintf("active meta invalid: %v", err)}) {
 			return
 		}
@@ -312,7 +312,7 @@ func (c *Checker) walkKeyspaces(firstData, hwm uint64) bool {
 		name := string(k)
 		keyspaceCount++
 		if len(v) != descriptor.Size {
-			if !c.Emit(Issue{Severity: Error, Code: "keyspaceDescriptorSize", Keyspace: name,
+			if !c.Emit(Issue{Severity: Error, Code: CodeKeyspaceDescriptorSize, Keyspace: name,
 				Message: fmt.Sprintf("descriptor value length %d != %d", len(v), descriptor.Size)}) {
 				return errCheckStop
 			}
@@ -320,7 +320,7 @@ func (c *Checker) walkKeyspaces(firstData, hwm uint64) bool {
 		}
 		desc := descriptor.Decode(v)
 		if verr := descriptor.Validate(v, desc); verr != nil {
-			if !c.Emit(Issue{Severity: Error, Code: "KeyspaceDescriptorInvalid", Keyspace: name,
+			if !c.Emit(Issue{Severity: Error, Code: CodeKeyspaceDescriptorInvalid, Keyspace: name,
 				Message: verr.Error()}) {
 				return errCheckStop
 			}
@@ -345,7 +345,7 @@ func (c *Checker) walkKeyspaces(firstData, hwm uint64) bool {
 				want, unit = values, "values"
 			}
 			if desc.Count != want {
-				if !c.Emit(Issue{Severity: Error, Code: "KeyspaceCountMismatch", Keyspace: name,
+				if !c.Emit(Issue{Severity: Error, Code: CodeKeyspaceCountMismatch, Keyspace: name,
 					Message: fmt.Sprintf("descriptor Count %d, tree holds %d %s", desc.Count, want, unit)}) {
 					return errCheckStop
 				}
@@ -370,7 +370,7 @@ func (c *Checker) walkKeyspaces(firstData, hwm uint64) bool {
 		return nil
 	})
 	if err == nil && keyspaceCount != c.Meta.NumKeyspaces {
-		if !c.Emit(Issue{Severity: Error, Code: "NumKeyspacesMismatch",
+		if !c.Emit(Issue{Severity: Error, Code: CodeNumKeyspacesMismatch,
 			Message: fmt.Sprintf("meta.NumKeyspaces %d, descriptor tree holds %d", c.Meta.NumKeyspaces, keyspaceCount)}) {
 			return false
 		}
@@ -431,14 +431,14 @@ func (c *Checker) checkSetKeyspaceSubpages(ks string, dataRoot uint64, fvs uint1
 		// not total over a malformed header — bound the length first, the
 		// same guard the CheckIndexes path uses.
 		if len(e.Value) < page.SubpageHeaderSize {
-			if !c.Emit(Issue{Severity: Error, Code: "SubpageCorrupt", Keyspace: ks,
+			if !c.Emit(Issue{Severity: Error, Code: CodeSubpageCorrupt, Keyspace: ks,
 				Message: fmt.Sprintf("set key %q subpage is %d bytes (< header %d)", e.Key, len(e.Value), page.SubpageHeaderSize)}) {
 				return errCheckStop
 			}
 			return nil
 		}
 		if verr := page.NewSubpageReader(e.Value, fvs).Validate(); verr != nil {
-			if !c.Emit(Issue{Severity: Error, Code: "SubpageCorrupt", Keyspace: ks,
+			if !c.Emit(Issue{Severity: Error, Code: CodeSubpageCorrupt, Keyspace: ks,
 				Message: fmt.Sprintf("set key %q subpage invalid: %v", e.Key, verr)}) {
 				return errCheckStop
 			}
@@ -467,7 +467,7 @@ func (c *Checker) walkRegistry(ks string, desc descriptor.Keyspace, firstData, h
 		idxName := string(k)
 		entry, derr := indexing.DecodeRegistryEntry(v)
 		if derr != nil {
-			if !c.Emit(Issue{Severity: Error, Code: "RegistryEntryInvalid", Keyspace: ks, Index: idxName,
+			if !c.Emit(Issue{Severity: Error, Code: CodeRegistryEntryInvalid, Keyspace: ks, Index: idxName,
 				Message: fmt.Sprintf("registry entry decode: %v", derr)}) {
 				return errCheckStop
 			}
@@ -480,7 +480,7 @@ func (c *Checker) walkRegistry(ks string, desc descriptor.Keyspace, firstData, h
 		// not silently pass what open refuses.
 		foreignKind := entry.Kind != indexing.KindComposite
 		if foreignKind {
-			if !c.Emit(Issue{Severity: Error, Code: "RegistryEntryKindUnknown", Keyspace: ks, Index: idxName,
+			if !c.Emit(Issue{Severity: Error, Code: CodeRegistryEntryKindUnknown, Keyspace: ks, Index: idxName,
 				Message: fmt.Sprintf("registry entry kind %d unknown to this engine version", entry.Kind)}) {
 				return errCheckStop
 			}
@@ -492,7 +492,7 @@ func (c *Checker) walkRegistry(ks string, desc descriptor.Keyspace, firstData, h
 		}
 		for i := 10; i < 16; i++ {
 			if v[i] != 0 {
-				if !c.Emit(Issue{Severity: Error, Code: "RegistryEntryPaddingNonzero", Keyspace: ks, Index: idxName,
+				if !c.Emit(Issue{Severity: Error, Code: CodeRegistryEntryPaddingNonzero, Keyspace: ks, Index: idxName,
 					Message: fmt.Sprintf("registry entry padding byte %d is 0x%02x, want 0", i-10, v[i])}) {
 					return errCheckStop
 				}
@@ -548,14 +548,14 @@ func (c *Checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 	}
 	visit := func(id uint64, kind btree.PageKind, depth int) error {
 		if id < firstData {
-			if !c.Emit(Issue{Severity: Error, Code: "PointerIntoReservedRegion", PageID: id, Keyspace: ks, Index: idx,
+			if !c.Emit(Issue{Severity: Error, Code: CodePointerIntoReservedRegion, PageID: id, Keyspace: ks, Index: idx,
 				Message: fmt.Sprintf("tree page %d lies in the reserved meta/bitmap region (< %d)", id, firstData)}) {
 				return errCheckStop
 			}
 			return nil
 		}
 		if c.reachable.Test(id) {
-			if !c.Emit(Issue{Severity: Error, Code: "PageDoubleReferenced", PageID: id, Keyspace: ks, Index: idx,
+			if !c.Emit(Issue{Severity: Error, Code: CodePageDoubleReferenced, PageID: id, Keyspace: ks, Index: idx,
 				Message: fmt.Sprintf("page %d is reachable from more than one parent", id)}) {
 				return errCheckStop
 			}
@@ -564,7 +564,7 @@ func (c *Checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 		c.reachable.Set(id)
 		if c.Cfg.PageChecksum {
 			if !page.VerifyPageFooter(c.Pgr.PageRaw(id), c.Cfg.PageSize) {
-				if !c.Emit(Issue{Severity: Error, Code: "BadPageChecksum", PageID: id, Keyspace: ks, Index: idx,
+				if !c.Emit(Issue{Severity: Error, Code: CodeBadPageChecksum, PageID: id, Keyspace: ks, Index: idx,
 					Message: fmt.Sprintf("page %d checksum mismatch", id)}) {
 					return errCheckStop
 				}
@@ -649,13 +649,13 @@ func (c *Checker) walkRPL(firstData, hwm uint64, bm *bitmap.Bitmap, bmOK bool) (
 	switch stop.Reason {
 	case pager.RPLWalkFooterBoundary:
 		c.RPLBoundary = true
-		if !c.Emit(Issue{Severity: Warning, Code: "RPLSegmentChecksum", PageID: stop.PageID,
+		if !c.Emit(Issue{Severity: Warning, Code: CodeRPLSegmentChecksum, PageID: stop.PageID,
 			Message: fmt.Sprintf("RPL segment page %d fails checksum; chain walk stopped before tail %d (pages behind the boundary surface as BitmapLeak until reclamation quarantines the segment)", stop.PageID, c.Meta.RPLTailPage)}) {
 			return pending, false
 		}
 	case pager.RPLWalkDecodeBoundary:
 		c.RPLBoundary = true
-		if !c.Emit(Issue{Severity: Warning, Code: "RPLSegmentBoundary", PageID: stop.PageID,
+		if !c.Emit(Issue{Severity: Warning, Code: CodeRPLSegmentBoundary, PageID: stop.PageID,
 			Message: fmt.Sprintf("RPL segment page %d does not decode; chain walk stopped before tail %d (pages behind the boundary surface as BitmapLeak until reclamation quarantines the segment)", stop.PageID, c.Meta.RPLTailPage)}) {
 			return pending, false
 		}
@@ -707,7 +707,7 @@ func rplWalkIssue(werr *pager.RPLWalkError, hwm uint64) Issue {
 // BitmapLeak warning. (page-accounting partition; api-surface.md §Check, CopyTo, Compact.)
 func (c *Checker) accounting(firstData, hwm uint64, rplPages Bitset, bm *bitmap.Bitmap, bmOK bool) {
 	if !bmOK {
-		c.Emit(Issue{Severity: Warning, Code: "BitmapUnavailable",
+		c.Emit(Issue{Severity: Warning, Code: CodeBitmapUnavailable,
 			Message: "could not read allocation bitmap from snapshot; page accounting skipped"})
 		return
 	}
@@ -719,12 +719,12 @@ func (c *Checker) accounting(firstData, hwm uint64, rplPages Bitset, bm *bitmap.
 		// free, RPL-pending}. Any overlap is corruption.
 		switch {
 		case reach && free:
-			if !c.Emit(Issue{Severity: Error, Code: "ReachableButFree", PageID: id,
+			if !c.Emit(Issue{Severity: Error, Code: CodeReachableButFree, PageID: id,
 				Message: fmt.Sprintf("page %d is referenced by the tree but marked free in the bitmap", id)}) {
 				return
 			}
 		case reach && pending:
-			if !c.Emit(Issue{Severity: Error, Code: "ReachableInRPL", PageID: id,
+			if !c.Emit(Issue{Severity: Error, Code: CodeReachableInRPL, PageID: id,
 				Message: fmt.Sprintf("page %d is referenced by the tree but also pending RPL reclamation", id)}) {
 				return
 			}
@@ -732,7 +732,7 @@ func (c *Checker) accounting(firstData, hwm uint64, rplPages Bitset, bm *bitmap.
 			// A page on the free list AND in the RPL will be set free a
 			// second time when reclamation processes its segment — a
 			// future double-allocation hazard.
-			if !c.Emit(Issue{Severity: Error, Code: "FreeAndPending", PageID: id,
+			if !c.Emit(Issue{Severity: Error, Code: CodeFreeAndPending, PageID: id,
 				Message: fmt.Sprintf("page %d is both free in the bitmap and pending RPL reclamation", id)}) {
 				return
 			}
@@ -749,7 +749,7 @@ func (c *Checker) accounting(firstData, hwm uint64, rplPages Bitset, bm *bitmap.
 	}
 	// NumFree consistency (advisory under concurrent writes).
 	if got := bm.Recount(); got != c.Meta.NumFreePages {
-		c.Emit(Issue{Severity: Warning, Code: "FreeCountMismatch",
+		c.Emit(Issue{Severity: Warning, Code: CodeFreeCountMismatch,
 			Message: fmt.Sprintf("bitmap free-page count %d != meta NumFreePages %d", got, c.Meta.NumFreePages)})
 	}
 }
@@ -772,7 +772,7 @@ func (c *Checker) checkIndexes(hwm uint64) {
 		if _, ok := c.Opts.Indexes[ksName]; ok {
 			continue
 		}
-		if !c.Emit(Issue{Severity: Warning, Code: "CheckIndexes.KeyspaceNotSupplied", Keyspace: ksName,
+		if !c.Emit(Issue{Severity: Warning, Code: CodeCheckIndexesKeyspaceNotSupplied, Keyspace: ksName,
 			Message: fmt.Sprintf("indexed keyspace %q has no IndexDecls supplied; extractor-equivalence skipped (structure still checked)", ksName)}) {
 			return
 		}
@@ -781,7 +781,7 @@ func (c *Checker) checkIndexes(hwm uint64) {
 	for ksName, decls := range c.Opts.Indexes {
 		info, ok := c.inv[ksName]
 		if !ok {
-			if !c.Emit(Issue{Severity: Warning, Code: "CheckIndexes.KeyspaceNotFound", Keyspace: ksName,
+			if !c.Emit(Issue{Severity: Warning, Code: CodeCheckIndexesKeyspaceNotFound, Keyspace: ksName,
 				Message: fmt.Sprintf("supplied keyspace %q does not exist in the database", ksName)}) {
 				return
 			}
@@ -793,7 +793,7 @@ func (c *Checker) checkIndexes(hwm uint64) {
 			}
 			idxRoot, ok := info.indexRoots[decl.Name]
 			if !ok {
-				if !c.Emit(Issue{Severity: Warning, Code: "CheckIndexes.IndexNotInRegistry", Keyspace: ksName, Index: decl.Name,
+				if !c.Emit(Issue{Severity: Warning, Code: CodeCheckIndexesIndexNotInRegistry, Keyspace: ksName, Index: decl.Name,
 					Message: fmt.Sprintf("supplied index %q is not registered on keyspace %q", decl.Name, ksName)}) {
 					return
 				}
@@ -816,7 +816,7 @@ func (c *Checker) checkIndexes(hwm uint64) {
 // when the caller stopped iterating.
 func (c *Checker) verifyIndexEquivalence(ks string, info *ksInventory, decl *indexing.Decl, idxRoot, hwm uint64) bool {
 	if decl.Extract == nil {
-		return c.Emit(Issue{Severity: Error, Code: "CheckIndexes.ExtractorMissing", Keyspace: ks, Index: decl.Name,
+		return c.Emit(Issue{Severity: Error, Code: CodeCheckIndexesExtractorMissing, Keyspace: ks, Index: decl.Name,
 			Message: fmt.Sprintf("supplied IndexDecl %q has a nil Extract", decl.Name)})
 	}
 	hasCovering := len(decl.Covering) > 0
@@ -837,17 +837,17 @@ func (c *Checker) verifyIndexEquivalence(ks string, info *ksInventory, decl *ind
 	case descriptor.KindSetKeyspace:
 		expected, extractErr, structErr = c.expectedSetKeyspaceIndex(decl, info.dataRoot, info.fixedValueSize, hwm, hasCovering)
 	default:
-		return c.Emit(Issue{Severity: Warning, Code: "CheckIndexes.KeyspaceKindUnsupported", Keyspace: ks, Index: decl.Name,
+		return c.Emit(Issue{Severity: Warning, Code: CodeCheckIndexesKeyspaceKindUnsupported, Keyspace: ks, Index: decl.Name,
 			Message: fmt.Sprintf("keyspace %q has kind %d, which CheckIndexes cannot verify", ks, info.kind)})
 	}
 	if extractErr != nil {
-		return c.Emit(Issue{Severity: Error, Code: "CheckIndexes.ExtractorError", Keyspace: ks, Index: decl.Name,
+		return c.Emit(Issue{Severity: Error, Code: CodeCheckIndexesExtractorError, Keyspace: ks, Index: decl.Name,
 			Message: fmt.Sprintf("re-running extractor failed: %v", extractErr)})
 	}
 	if structErr != nil {
 		// Structural failure enumerating rows/members (already reported by
 		// the structural pass); skip equivalence for this index.
-		return c.Emit(Issue{Severity: Warning, Code: "CheckIndexes.RowsUnreadable", Keyspace: ks, Index: decl.Name,
+		return c.Emit(Issue{Severity: Warning, Code: CodeCheckIndexesRowsUnreadable, Keyspace: ks, Index: decl.Name,
 			Message: fmt.Sprintf("could not enumerate rows/members for index verification: %v", structErr)})
 	}
 	// Stored entries: enumerate the index data tree.
@@ -857,11 +857,11 @@ func (c *Checker) verifyIndexEquivalence(ks string, info *ksInventory, decl *ind
 		return nil
 	})
 	if serr != nil {
-		return c.Emit(Issue{Severity: Warning, Code: "CheckIndexes.IndexUnreadable", Keyspace: ks, Index: decl.Name,
+		return c.Emit(Issue{Severity: Warning, Code: CodeCheckIndexesIndexUnreadable, Keyspace: ks, Index: decl.Name,
 			Message: fmt.Sprintf("could not enumerate stored index entries: %v", serr)})
 	}
 	if missing, extra, mism := diffEntrySets(expected, stored); missing > 0 || extra > 0 || mism > 0 {
-		return c.Emit(Issue{Severity: Error, Code: "CheckIndexes.FingerprintDrift", Keyspace: ks, Index: decl.Name,
+		return c.Emit(Issue{Severity: Error, Code: CodeCheckIndexesFingerprintDrift, Keyspace: ks, Index: decl.Name,
 			Message: fmt.Sprintf("index %q drift: %d expected entries missing from the index, %d stored entries the extractor did not produce, %d value mismatches",
 				decl.Name, missing, extra, mism)})
 	}
