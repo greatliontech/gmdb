@@ -105,7 +105,7 @@ var (
 	// ErrClosed is returned by operations against a DB handle whose
 	// Close has been called (or is concurrently in progress). Surfaces
 	// from Begin when the cross-process coordinator's goroutine has
-	// already shut down. The full db.closed semantics are specified
+	// already shut down. The full close-gate semantics are specified
 	// by cross-process.md §Heartbeat Goroutine + leak-detection.md
 	// §Close Ordering — this sentinel is the user-facing surface
 	// that contract requires.

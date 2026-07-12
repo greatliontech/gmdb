@@ -34,7 +34,7 @@ type Tx struct {
 	// db.Close (which nil's db.pgr under db.mu). Once Begin returns
 	// a *Tx, pgr is stable for the tx's lifetime; the pager's heap
 	// state survives independently of db.pgr nil'ing. Use-after-Close
-	// is gated by db.closed checks at method entry rather than by
+	// is gated by close-gate checks at method entry rather than by
 	// re-reading db.pgr.
 	pgr *pager.Pager
 
@@ -227,7 +227,7 @@ type txCleanupInfo struct {
 // the cleanup is a no-op for transactions the caller closed normally.
 //
 // Spec contract (leak-detection.md §Cleanup Behavior clause-explicit
-// invariants): observing `*db.closed == true` MUST return without
+// invariants): observing the gate closed MUST return without
 // touching the reader-table mmap or signalling the flock goroutine.
 // We DO log the leak warning either way — the warning is the user-
 // facing signal that they forgot to Commit/Rollback; suppressing it
@@ -508,7 +508,7 @@ func (tx *Tx) requireOpen(needsWrite bool) error {
 	// returns ErrClosed rather than SIGSEGV'ing on the now-unmapped
 	// mmap. The check is atomic and race-clean; the eventual pager
 	// op below this point still races a concurrent Close that
-	// hasn't yet stored db.closed, but tx.pgr (captured at Begin)
+	// hasn't yet stored the gate's closed flag, but tx.pgr (captured at Begin)
 	// is a stable Go-heap pointer so the field access itself is
 	// race-clean.
 	if tx.db.closeGate.IsClosed() {

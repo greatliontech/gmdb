@@ -614,7 +614,7 @@ func TestReaderPinsRPLAgainstReclamation(t *testing.T) {
 
 func TestReadTxLeakAfterCloseNoCrash(t *testing.T) {
 	// Symmetric to TestTxLeakAfterCloseNoCrash for writes: a
-	// leaked-ReadTx cleanup that observes *db.closed == true MUST
+	// leaked-ReadTx cleanup that observes the gate closed MUST
 	// return without touching the (already-unmapped) reader-table
 	// mmap.
 	ctx := context.Background()
@@ -625,7 +625,7 @@ func TestReadTxLeakAfterCloseNoCrash(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	leakReadTx(t, db, ctx)
-	// Close BEFORE GC — the cleanup observes db.closed=true.
+	// Close BEFORE GC — the cleanup observes the gate closed.
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

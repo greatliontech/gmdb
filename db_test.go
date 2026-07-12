@@ -1089,7 +1089,7 @@ func TestCloseDuringBlockedBegin(t *testing.T) {
 	// must return promptly, and Close must complete without deadlock.
 	//
 	// The held tx is deliberately orphaned (not Rollback'd) — the
-	// Rollback-vs-Close race is covered separately (db.closed
+	// Rollback-vs-Close race is covered separately (the close gate
 	// promotion). What is strictly guaranteed here is: Close drains
 	// the Coord's flock goroutine even with a grant outstanding (the
 	// stopCh path clears header + unlocks), and a blocked Begin sees
@@ -1136,8 +1136,8 @@ func TestCloseDuringBlockedBegin(t *testing.T) {
 
 func TestCloseSetsDBClosedFlag(t *testing.T) {
 	// Spec-tier invariant (leak-detection.md §Close Ordering): Close
-	// sets *db.closed = true (release-store) BEFORE unmapping or
-	// stopping goroutines. We pin this by reading db.closed AFTER
+	// stores the gate's closed flag (release-store) BEFORE unmapping or
+	// stopping goroutines. We pin this by reading the gate AFTER
 	// Close returns — true. Combined with TestBeginAfterCloseReturns
 	// ErrClosed, this verifies the flag is observable to
 	// any concurrent caller.
@@ -1188,7 +1188,7 @@ func TestCloseIdempotentViaCAS(t *testing.T) {
 func TestTxMethodAfterCloseReturnsErrClosed(t *testing.T) {
 	// Use-after-Close graceful-fail: Tx methods invoked after the
 	// DB has been Closed must return ErrClosed (not SIGSEGV). Spec
-	// permits this via the requireOpen db.closed.Load check. Note:
+	// permits this via the requireOpen close-gate check. Note:
 	// this is a defensive guard — per leak-detection.md the caller
 	// is expected to Commit/Rollback before Close.
 	ctx := context.Background()
@@ -1204,7 +1204,7 @@ func TestTxMethodAfterCloseReturnsErrClosed(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// tx is now in a state where db.closed == true. requireOpen
+	// tx is now in a state where the gate is closed. requireOpen
 	// should surface ErrClosed for each mutating method.
 	if _, err := tx.AllocPage(); !errors.Is(err, ErrClosed) {
 		t.Errorf("AllocPage after Close: got %v, want ErrClosed", err)
@@ -1228,7 +1228,7 @@ func TestTxMethodAfterCloseReturnsErrClosed(t *testing.T) {
 
 func TestTxLeakAfterCloseNoCrash(t *testing.T) {
 	// Spec-tier invariant (leak-detection.md): a Tx cleanup that
-	// observes *db.closed == true returns without touching the
+	// observes the gate closed returns without touching the
 	// reader-table mmap or signalling the flock goroutine. We test
 	// by: leaking a Tx, Closing the DB, then forcing GC. The
 	// cleanup should fire, log a warning, and exit without crashing.
@@ -1241,13 +1241,13 @@ func TestTxLeakAfterCloseNoCrash(t *testing.T) {
 	leakWriteTx(t, db, ctx)
 
 	// Close BEFORE forcing GC — the cleanup, when it fires, will
-	// observe db.closed=true.
+	// observe the gate closed.
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
 	// Two GC cycles to drain the cleanup queue. The cleanup must
-	// see db.closed=true and return without panicking. If the
+	// see the gate closed and return without panicking. If the
 	// invariant were violated (cleanup touched the torn-down
 	// pager/grant), this would SIGSEGV.
 	runtime.GC()
@@ -1289,7 +1289,7 @@ func TestDBClosedFlagSharedByPointer(t *testing.T) {
 
 func TestTxCleanupFnDirectClosedSkipsRelease(t *testing.T) {
 	// Spec invariant 1 (leak-detection.md): a Tx cleanup observing
-	// *db.closed == true returns without touching the pager / grant.
+	// the gate observed closed returns without touching the pager / grant.
 	// TestTxLeakAfterCloseNoCrash exercises this end-to-end but
 	// non-deterministically — runtime.GC scheduling can fire the
 	// cleanup either before or after Close. Here we synthesise a
