@@ -11,11 +11,11 @@ import (
 	"time"
 	"unique"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/closegate"
-	"github.com/thegrumpylion/gmdb/internal/descriptor"
-	"github.com/thegrumpylion/gmdb/internal/lock"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/closegate"
+	"github.com/greatliontech/gmdb/internal/descriptor"
+	"github.com/greatliontech/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // Tx is a write transaction. Its surface is keyspace and index

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/lock"
 )
 
 // TestDBStats exercises db.Stats(): meta-derived fields, the cluster

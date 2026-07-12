@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // ErrValidateStopped is returned by ValidateOrder when the report

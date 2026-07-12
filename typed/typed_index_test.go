@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // firstLetterIK extracts the first byte of the value as a string IK

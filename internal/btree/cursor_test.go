@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // buildTree puts every (key, value) in pairs into a fresh tree

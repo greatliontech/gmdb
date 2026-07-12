@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // SetCursor is a bidirectional iterator over a SetKeyspace's

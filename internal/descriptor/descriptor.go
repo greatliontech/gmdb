@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // le is the on-disk byte order for the keyspace-descriptor row

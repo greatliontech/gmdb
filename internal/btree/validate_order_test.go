@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // buildOrderFixture assembles a two-leaf tree by direct page encoding:

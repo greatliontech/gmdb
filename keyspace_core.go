@@ -3,9 +3,9 @@ package gmdb
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/descriptor"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/descriptor"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // keyspaceCore is the state and behavior shared by *Keyspace and

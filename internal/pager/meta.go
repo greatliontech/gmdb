@@ -3,7 +3,7 @@ package pager
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 
 	"github.com/cespare/xxhash/v2"
 )

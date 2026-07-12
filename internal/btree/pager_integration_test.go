@@ -6,9 +6,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/bitmap"
-	"github.com/thegrumpylion/gmdb/internal/pager"
-	"github.com/thegrumpylion/gmdb/internal/pagertest"
+	"github.com/greatliontech/gmdb/internal/bitmap"
+	"github.com/greatliontech/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/pagertest"
 )
 
 // Inv-3: PageWriter parity — the overflow chain

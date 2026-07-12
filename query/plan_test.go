@@ -9,9 +9,9 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
-	"github.com/thegrumpylion/gmdb/query"
-	"github.com/thegrumpylion/gmdb/typed"
+	"github.com/greatliontech/gmdb"
+	"github.com/greatliontech/gmdb/query"
+	"github.com/greatliontech/gmdb/typed"
 )
 
 func ci(name string, cols []typed.AnyColumn[uint64, row], opts typed.ColumnIndexOpts[uint64, row]) typed.AnyIndex[uint64, row] {

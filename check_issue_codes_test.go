@@ -3,7 +3,7 @@ package gmdb
 import (
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/verify"
+	"github.com/greatliontech/gmdb/internal/verify"
 )
 
 // CheckIssue.Code tokens are a documented stable contract

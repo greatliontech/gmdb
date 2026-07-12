@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // fakeReader satisfies PageReader with a manufactured page set —

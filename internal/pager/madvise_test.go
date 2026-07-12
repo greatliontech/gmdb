@@ -3,7 +3,7 @@ package pager
 import (
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // TestColdTrackingRecordsAccessRange verifies the Options.ReclaimOnClose

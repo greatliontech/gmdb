@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // compactDrainPoll is the spin interval while waiting for in-process

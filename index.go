@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"iter"
 
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/indexing"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/btree"
 )
 
 // Index is a handle for querying a declared index on a Keyspace or

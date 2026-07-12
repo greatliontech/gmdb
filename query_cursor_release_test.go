@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
-	"github.com/thegrumpylion/gmdb/query"
-	"github.com/thegrumpylion/gmdb/typed"
+	"github.com/greatliontech/gmdb"
+	"github.com/greatliontech/gmdb/query"
+	"github.com/greatliontech/gmdb/typed"
 )
 
 // Each query execution opens a fresh typed cursor; releasing it via

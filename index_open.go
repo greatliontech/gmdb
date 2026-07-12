@@ -5,10 +5,10 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/thegrumpylion/gmdb/internal/descriptor"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/descriptor"
+	"github.com/greatliontech/gmdb/internal/indexing"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/btree"
 )
 
 // pinnedIndex carries the per-index state that survives the open-time

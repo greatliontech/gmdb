@@ -4,7 +4,7 @@ import (
 	"iter"
 	"strings"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // Union and Intersect execution (query-builder.md §Plan nodes).

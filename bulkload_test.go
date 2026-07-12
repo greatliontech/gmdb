@@ -9,8 +9,8 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // bulkTestTx opens a fresh DB, begins a write transaction, and returns the

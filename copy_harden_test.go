@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // A verbatim CopyTo of a source whose file was truncated below the

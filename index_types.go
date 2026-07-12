@@ -3,7 +3,7 @@ package gmdb
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/indexing"
 )
 
 // IndexDecl describes one secondary index on a byte-oriented keyspace.

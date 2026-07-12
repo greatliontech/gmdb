@@ -15,9 +15,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/bitmap"
-	"github.com/thegrumpylion/gmdb/internal/page"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/bitmap"
+	"github.com/greatliontech/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // Params configures SetupWriter. Zero values: PageSize 4096,

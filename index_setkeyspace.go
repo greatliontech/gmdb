@@ -3,10 +3,10 @@ package gmdb
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/indexing"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // The compound-PK codec (EncodeSetCompoundPK / DecodeSetCompoundPK /

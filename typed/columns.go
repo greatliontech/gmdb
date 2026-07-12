@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/thegrumpylion/gmdb"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
-	"github.com/thegrumpylion/gmdb/internal/qrep"
+	"github.com/greatliontech/gmdb"
+	"github.com/greatliontech/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/qrep"
 )
 
 // Per-field typed column declarations and the ColumnIndex that

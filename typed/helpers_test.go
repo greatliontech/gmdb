@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 func tmpPath(t *testing.T) string {

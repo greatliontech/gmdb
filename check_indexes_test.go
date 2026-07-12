@@ -7,7 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // secondByteExtract indexes the value's SECOND byte — used to simulate

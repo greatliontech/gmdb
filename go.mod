@@ -1,4 +1,4 @@
-module github.com/thegrumpylion/gmdb
+module github.com/greatliontech/gmdb
 
 go 1.26.1
 

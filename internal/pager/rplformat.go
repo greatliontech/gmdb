@@ -3,7 +3,7 @@ package pager
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // Retired Page Log segment-page layout, per free-space.md §Retired Page Log.

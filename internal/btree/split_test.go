@@ -3,7 +3,7 @@ package btree
 import (
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // splitTestEntry builds an inline leaf entry with a 2-byte sorted key and

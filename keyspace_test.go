@@ -6,8 +6,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/descriptor"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/descriptor"
 )
 
 // These tests promote four invariants over the keyspace surface:

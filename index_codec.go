@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/descriptor"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/descriptor"
+	"github.com/greatliontech/gmdb/internal/indexing"
 )
 
 // descriptorOwner is the contract a *Keyspace or *SetKeyspace

@@ -7,7 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // checksums.md §Data Page Checksums: data-page checksums are opt-out,

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"slices"
 
-	"github.com/thegrumpylion/gmdb/internal/qrep"
+	"github.com/greatliontech/gmdb/internal/qrep"
 )
 
 // ErrQueryMaterializeLimit reports that a buffering node (Sort,

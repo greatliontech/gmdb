@@ -13,7 +13,7 @@ package btree
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // GetEntry descends the tree rooted at rootID looking for key. On a

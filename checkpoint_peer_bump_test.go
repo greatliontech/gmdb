@@ -7,7 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // forgePeerCheckpointBump rewrites the active meta slot as a peer's

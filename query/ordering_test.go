@@ -6,8 +6,8 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/query"
-	"github.com/thegrumpylion/gmdb/typed"
+	"github.com/greatliontech/gmdb/query"
+	"github.com/greatliontech/gmdb/typed"
 )
 
 // twoKeyspaces builds the same corpus twice: once with the given

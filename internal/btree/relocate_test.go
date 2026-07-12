@@ -6,7 +6,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // buildTreeForRelocate builds a multi-level B+tree of n keys (100-byte

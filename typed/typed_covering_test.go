@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // TestIndexCoverValueRoundTrip verifies a full-row-covering typed

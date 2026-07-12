@@ -7,8 +7,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // rplSegmentIDs walks the meta-claimed RPL chain head→tail and returns

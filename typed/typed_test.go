@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // ptr returns a pointer to v (for the *K range-boundary arguments).

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // newTypedSetTx opens a fresh DB + write tx for typed-set tests.

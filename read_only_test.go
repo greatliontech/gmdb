@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/lock"
 )
 
 // seedDB creates a writable DB at path, commits one keyspace

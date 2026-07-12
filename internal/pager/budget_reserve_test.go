@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/bitmap"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/bitmap"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // setupWriterMaxBytes is setupWriter with a caller-chosen slab budget,

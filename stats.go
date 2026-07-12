@@ -3,9 +3,9 @@ package gmdb
 import (
 	"time"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/page"
-	"github.com/thegrumpylion/gmdb/internal/verify"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/verify"
 )
 
 // DBStats is a point-in-time snapshot of database-level metrics

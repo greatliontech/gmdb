@@ -7,10 +7,10 @@ import (
 	"sync/atomic"
 	"unique"
 
-	"github.com/thegrumpylion/gmdb/internal/descriptor"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/descriptor"
+	"github.com/greatliontech/gmdb/internal/indexing"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/btree"
 )
 
 // descAdapterValue implements descriptorOwner for code paths that

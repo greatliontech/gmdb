@@ -3,7 +3,7 @@ package gmdb
 import (
 	"context"
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/pager"
 	"sync/atomic"
 )
 

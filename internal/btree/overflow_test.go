@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // boundedReader mimics the pager's verifying Page (Inv-RV3): it returns

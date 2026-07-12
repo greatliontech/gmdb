@@ -3,7 +3,7 @@ package btree
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // FreeSubtree retires every page reachable from rootID and returns

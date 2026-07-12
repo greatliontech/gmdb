@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // indexPlan is the per-index unit of work the maintenance engine

@@ -3,7 +3,7 @@ package btree
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // PathLen reports the number of pages on a root-to-leaf descent of

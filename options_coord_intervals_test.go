@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/lock"
 )
 
 // TestOptionsCoordIntervalsWiring proves the three cross-process

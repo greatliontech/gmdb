@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/indexing"
 )
 
 // --- Codec roundtrip tests ----------------------------------------

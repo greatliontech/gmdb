@@ -2,7 +2,7 @@ package descriptor
 
 import (
 	"bytes"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 	"strings"
 	"testing"
 )

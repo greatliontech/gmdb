@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"iter"
 
-	"github.com/thegrumpylion/gmdb"
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb"
+	"github.com/greatliontech/gmdb/internal/indexing"
 )
 
 // The full-row cover-value sentinel contract (prefix, column

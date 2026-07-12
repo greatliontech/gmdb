@@ -4,8 +4,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/thegrumpylion/gmdb"
-	"github.com/thegrumpylion/gmdb/internal/qrep"
+	"github.com/greatliontech/gmdb"
+	"github.com/greatliontech/gmdb/internal/qrep"
 )
 
 // The rule-based planner (query-builder.md §Planning rules):

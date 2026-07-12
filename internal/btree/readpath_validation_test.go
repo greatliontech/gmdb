@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // Corrupt pages first-resolved OFF the validated descent path (the

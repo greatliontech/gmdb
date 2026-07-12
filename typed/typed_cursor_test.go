@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // newTypedNumsKS creates a Keyspace[uint64,string] populated with

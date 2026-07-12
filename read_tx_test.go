@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // TestReadTxKeyspaceReadsAreSnapshotIsolated is the headline test for the

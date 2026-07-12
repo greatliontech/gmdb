@@ -12,8 +12,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // SyncMode controls the durability guarantees of committed

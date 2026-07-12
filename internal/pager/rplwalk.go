@@ -3,7 +3,7 @@ package pager
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // This file is the single implementation of the on-disk RPL chain-walk

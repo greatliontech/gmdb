@@ -8,9 +8,9 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
-	"github.com/thegrumpylion/gmdb/query"
-	"github.com/thegrumpylion/gmdb/typed"
+	"github.com/greatliontech/gmdb"
+	"github.com/greatliontech/gmdb/query"
+	"github.com/greatliontech/gmdb/typed"
 )
 
 // poisonRowCodec wraps rowCodec with a switchable Decode failure:

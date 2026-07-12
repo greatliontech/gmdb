@@ -3,8 +3,8 @@ package gmdb
 import (
 	"context"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // Test-only handle methods.

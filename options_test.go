@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/lock"
 )
 
 // TestCrossNamespaceStaleTimeoutValidation pins the cross-NS window's

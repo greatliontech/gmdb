@@ -8,8 +8,8 @@ import (
 	"os"
 	"slices"
 
-	"github.com/thegrumpylion/gmdb/internal/bitmap"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/bitmap"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // InitParams describes a fresh database file's creation parameters. All

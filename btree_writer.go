@@ -1,8 +1,8 @@
 package gmdb
 
 import (
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // btreeWriter adapts *pager.Pager to btree.PageWriter. It is the one

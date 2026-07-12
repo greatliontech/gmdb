@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/pager"
 
-	"github.com/thegrumpylion/gmdb/internal/closegate"
-	"github.com/thegrumpylion/gmdb/internal/lock"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/closegate"
+	"github.com/greatliontech/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 func tmpPath(t *testing.T) string {

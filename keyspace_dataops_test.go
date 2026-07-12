@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // These tests promote four data-op invariants:

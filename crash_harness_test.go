@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // Crash-consistency harness. A crashRecorder installed on the DB writer's

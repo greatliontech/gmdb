@@ -5,7 +5,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // walkFixture is a synthetic on-disk RPL chain: a page-id → buffer map

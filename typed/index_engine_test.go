@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // A same-tx Rebuild that REMOVES the covering shape must downgrade a

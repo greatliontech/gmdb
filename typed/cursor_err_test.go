@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // Cursor.Err() sentinel-conformance per transactions.md §Cursor State

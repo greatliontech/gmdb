@@ -5,8 +5,8 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/thegrumpylion/gmdb/internal/indexing"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // Atomic index maintenance for Keyspace.Put / Delete /

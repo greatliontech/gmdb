@@ -8,7 +8,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // rowVal is the test row type for column-tier tests.

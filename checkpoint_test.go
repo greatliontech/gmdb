@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 func TestSyncModesAllAccepted(t *testing.T) {

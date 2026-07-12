@@ -3,7 +3,7 @@ package btree
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // RelocatePages walks the B+tree rooted at root and relocates every page

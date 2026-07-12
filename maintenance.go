@@ -7,11 +7,11 @@ import (
 	"time"
 	"weak"
 
-	"github.com/thegrumpylion/gmdb/internal/pager"
-	"github.com/thegrumpylion/gmdb/internal/verify"
+	"github.com/greatliontech/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/verify"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // maintDetectHookForTest fires inside maintReclaimLeaks's detection

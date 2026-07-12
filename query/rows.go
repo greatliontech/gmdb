@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"iter"
 
-	"github.com/thegrumpylion/gmdb"
-	"github.com/thegrumpylion/gmdb/internal/qrep"
-	"github.com/thegrumpylion/gmdb/typed"
+	"github.com/greatliontech/gmdb"
+	"github.com/greatliontech/gmdb/internal/qrep"
+	"github.com/greatliontech/gmdb/typed"
 )
 
 // errNoSelect marks a Rows() call on a query with no Select — the

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/bitmap"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/bitmap"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // LaggingReader callback tests promote Inv-F:

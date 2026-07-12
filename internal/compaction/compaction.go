@@ -9,8 +9,8 @@ package compaction
 import (
 	"errors"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // ErrSpaceExhausted aborts a compaction pass when the

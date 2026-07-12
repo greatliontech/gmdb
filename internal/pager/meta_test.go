@@ -3,7 +3,7 @@ package pager
 import (
 	"bytes"
 	"fmt"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 	"testing"
 )
 

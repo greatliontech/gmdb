@@ -7,8 +7,8 @@ import (
 	"os"
 	"sync/atomic"
 
-	"github.com/thegrumpylion/gmdb/internal/bitmap"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/bitmap"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // Errors surfaced by the pager. Sentinels so callers can use errors.Is /

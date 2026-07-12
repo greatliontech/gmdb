@@ -7,10 +7,10 @@ import (
 	"sort"
 	"unique"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/descriptor"
-	"github.com/thegrumpylion/gmdb/internal/page"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/descriptor"
+	"github.com/greatliontech/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // uniqueNameHandle is the interned form of a keyspace name. unique.Make

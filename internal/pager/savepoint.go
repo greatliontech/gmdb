@@ -3,7 +3,7 @@ package pager
 import (
 	"slices"
 
-	"github.com/thegrumpylion/gmdb/internal/bitmap"
+	"github.com/greatliontech/gmdb/internal/bitmap"
 )
 
 // SavepointKind selects the savepoint flavour. The Nested kind is the

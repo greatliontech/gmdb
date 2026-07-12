@@ -5,7 +5,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/indexing"
 )
 
 // The registry-entry flush REBUILDS entries from pinned state; a

@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"iter"
 
-	"github.com/thegrumpylion/gmdb/internal/lock"
-	"github.com/thegrumpylion/gmdb/internal/page"
-	"github.com/thegrumpylion/gmdb/internal/pager"
-	"github.com/thegrumpylion/gmdb/internal/verify"
+	"github.com/greatliontech/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/verify"
 )
 
 // CheckSeverity classifies a CheckIssue: CheckWarning (non-critical

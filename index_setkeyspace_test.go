@@ -7,9 +7,9 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/greatliontech/gmdb/internal/indexing"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/btree"
 )
 
 // setKeyspaceFirstByteExtract emits one IndexEntry whose column is

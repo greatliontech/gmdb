@@ -3,7 +3,7 @@ package gmdb
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // FileFormat controls the database file's size bounds and growth/shrink

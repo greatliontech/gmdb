@@ -1,7 +1,7 @@
 package pager
 
 import (
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/page"
 	"reflect"
 	"testing"
 )

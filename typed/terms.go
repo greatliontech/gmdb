@@ -3,7 +3,7 @@ package typed
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/qrep"
+	"github.com/greatliontech/gmdb/internal/qrep"
 )
 
 // Term is one structured predicate over rows of a Keyspace[K, V]:

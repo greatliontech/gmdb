@@ -8,8 +8,8 @@ import (
 	"iter"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb/internal/btree"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/btree"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // setData is one key with its sorted, unique value set.

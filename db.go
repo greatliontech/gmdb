@@ -14,9 +14,9 @@ import (
 	"time"
 	"weak"
 
-	"github.com/thegrumpylion/gmdb/internal/closegate"
-	"github.com/thegrumpylion/gmdb/internal/lock"
-	"github.com/thegrumpylion/gmdb/internal/pager"
+	"github.com/greatliontech/gmdb/internal/closegate"
+	"github.com/greatliontech/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/pager"
 )
 
 // DB is a handle to an open gmdb database. Concurrent reads + a single

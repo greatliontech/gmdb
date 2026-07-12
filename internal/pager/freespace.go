@@ -3,8 +3,8 @@ package pager
 import (
 	"fmt"
 
-	"github.com/thegrumpylion/gmdb/internal/bitmap"
-	"github.com/thegrumpylion/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/bitmap"
+	"github.com/greatliontech/gmdb/internal/page"
 )
 
 // AllocPage allocates a single page following the priority order in

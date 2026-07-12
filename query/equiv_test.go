@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
-	"github.com/thegrumpylion/gmdb/query"
-	"github.com/thegrumpylion/gmdb/typed"
+	"github.com/greatliontech/gmdb"
+	"github.com/greatliontech/gmdb/query"
+	"github.com/greatliontech/gmdb/typed"
 )
 
 // The Inv-QB1 equivalence harness, scan-only stage: query results

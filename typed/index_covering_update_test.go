@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/thegrumpylion/gmdb"
+	"github.com/greatliontech/gmdb"
 )
 
 // Covering payloads are extracted from the ROW VALUE; replacing the
