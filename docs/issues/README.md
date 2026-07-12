@@ -96,5 +96,5 @@ findings each shared-fix row covers.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| copyto-hardlink-destination-support | when a non-hard-link destination filesystem is decided to be a supported CopyTo target | [L] publish fails on vfat/exfat/FUSE targets; [nit] NFS link() retransmission quirk |
+| copyto-hardlink-destination-support | decided: supported — implement the no-replace-rename fallback | [L] publish fails on vfat/exfat/FUSE targets; [nit] NFS link() retransmission quirk |
 | reclaimed-boundary-torn-peer | when grant-handoff tear detection or reclaimed-boundary gating is settled | [H] surviving handle's chain predates a peer's torn never-published reclamation; reclamation behind the reclaimed boundary double-frees |

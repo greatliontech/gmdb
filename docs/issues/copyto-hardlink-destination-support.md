@@ -1,7 +1,12 @@
 # CopyTo publish requires hard-link support on the destination filesystem
 
-Lands: when a non-hard-link destination filesystem (vfat/exfat, some
-FUSE/object-store mounts) is decided to be a supported CopyTo target
+Lands: decided 2026-07-12 — non-hard-link destinations ARE
+supported targets; implement the fallback (hard link first, then
+no-replace rename: renameat2(RENAME_NOREPLACE) on Linux,
+best-effort elsewhere; a failed link with path already naming the
+copied inode — the NFS retransmission quirk — is success), with
+the api-surface.md destination crash-consistency invariant amended
+to the per-filesystem form
 
 ## Findings
 
