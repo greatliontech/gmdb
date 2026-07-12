@@ -108,7 +108,7 @@ type ReadTx struct {
 
 // readTxCleanupInfo is the argument bundle for ReadTx's AddCleanup
 // callback. Symmetric to txCleanupInfo for the write path; captures
-// the shared *db.closed atomic by pointer (leak-detection.md
+// the shared closeGate by pointer (leak-detection.md
 // clause-explicit invariant — required because runtime.AddCleanup
 // provides no ordering between the DB cleanup and Tx cleanups).
 //

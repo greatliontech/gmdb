@@ -28,9 +28,9 @@ Invariant: kind=clause-explicit;
 Invariant: kind=clause-explicit;
   property=Cleanup callbacks (`runtime.AddCleanup`) run on GC
     background goroutines and acquire none of these locks; they
-    only do non-blocking operations (atomic check of
-    `db.closed`, atomic store on reader slot, non-blocking
-    channel send to flock goroutine);
+    only do non-blocking operations (atomic close-gate check,
+    atomic store on reader slot, non-blocking channel send to
+    flock goroutine);
   from=this spec §Lock Ordering notes + `leak-detection.md`;
   violation=A cleanup that acquires a mutex can deadlock against
     a goroutine holding that mutex while waiting on GC — the

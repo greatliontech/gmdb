@@ -94,11 +94,11 @@ Invariant: kind=clause-explicit;
   property=A `Commit()` or `Rollback()` on a `Tx` cancels its
     `runtime.AddCleanup` callback (via `.Stop()`) BEFORE releasing
     the resource. A `Close()` on a `DB` achieves the same property
-    via a different pattern: it sets the shared `*db.closed`
-    atomic to `true` BEFORE the resource drain and `.Stop()`s the
+    via a different pattern: it stores the shared `closeGate`'s
+    closed flag BEFORE the resource drain and `.Stop()`s the
     DB-level cleanup at the end; the cleanup callback itself
-    consults the same shared atomic and short-circuits when it
-    observes `true`. Both patterns prevent a cleanup from re-
+    consults the same shared gate and short-circuits when it
+    observes it closed. Both patterns prevent a cleanup from re-
     releasing a resource the normal-close path is already
     releasing;
   from=this spec §Normal Close (Tx path) + §`Close()` Ordering
@@ -111,7 +111,8 @@ Invariant: kind=clause-explicit;
 Invariant: kind=clause-explicit;
   property=**Tx cleanup callbacks** run on a GC background
     goroutine and perform only BOUNDED, non-blocking operations:
-    atomic check of `db.closed`, atomic store on reader slot, non-
+    atomic gate check (`closeGate.EnterCleanup`), atomic store on
+    reader slot, non-
     blocking channel send to flock goroutine, `sync.Mutex.Unlock`
     of a lock the leaked owner held (wait-free; not a contended
     acquisition), non-blocking diagnostic logging via the
@@ -348,8 +349,8 @@ Cleanup Behavior step 0 above), `Close()` runs in this order:
    its own close (or its leak cleanup) releases the slot and drops
    the reference.
 
-A WRITE-Tx cleanup invoked between steps 1 and 8 sees
-`db.closed = true` and skips the flock signal. A READ-Tx cleanup
+A WRITE-Tx cleanup invoked between steps 1 and 8 sees the gate
+closed and skips the flock signal. A READ-Tx cleanup
 releases its slot at ANY time — before, during, or after these
 steps — protected not by the closed flag but by the leaked
 transaction's own mapping reference (step 8): the lock-file mmap

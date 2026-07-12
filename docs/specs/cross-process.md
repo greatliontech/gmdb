@@ -1396,8 +1396,9 @@ must be stale before the slot is reclaimed. Must be
 significantly larger than the heartbeat interval (1 s) for
 scheduling jitter.
 
-**Shutdown coordination.** `Close()` sets `db.closed = true`
-(atomic, see `leak-detection.md`), closes the heartbeat
+**Shutdown coordination.** `Close()` stores the shared close
+gate's closed flag (atomic, see `leak-detection.md`), closes the
+heartbeat
 goroutine's stop channel, and **waits** for the goroutine to
 acknowledge via a done channel before unmapping the lock file.
 The heartbeat goroutine checks the stop channel before each
