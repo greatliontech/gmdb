@@ -179,6 +179,14 @@ var (
 	// Machine, the caller re-positions to recover.
 	ErrCursorStale = errors.New("gmdb: cursor invalidated by sibling mutation")
 
+	// ErrCursorClosed is returned by every Cursor / SetCursor
+	// operation after the cursor was explicitly released via
+	// Close(). Terminal for the cursor's lifetime — unlike
+	// ErrCursorStale there is no re-position recovery; the caller
+	// opens a fresh cursor. Per transactions.md §Cursor State
+	// Machine (explicit cursor release).
+	ErrCursorClosed = errors.New("gmdb: cursor closed")
+
 	// ErrKeyspaceClosed is returned by Keyspace / SetKeyspace /
 	// Cursor / SetCursor operations against a handle whose parent
 	// keyspace was DeleteKeyspace'd within the same write

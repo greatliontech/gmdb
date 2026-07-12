@@ -1035,8 +1035,9 @@ func (ks *Keyspace) Cursor() *Cursor {
 // Paired with a defer at the range-iterator closures' exit so the
 // slice does not grow unboundedly across iterations in one tx (each
 // registered entry costs a markCursorsStale visit on every sibling
-// mutation). Explicit Cursor() callers are never unregistered — their
-// cursors stay re-positionable for the tx lifetime by contract.
+// mutation). Explicit Cursor() callers stay registered — and
+// re-positionable — for the tx lifetime unless they release early
+// via Cursor.Close.
 func (ks *Keyspace) unregisterCursor(c *Cursor) {
 	for i, x := range ks.openCursors {
 		if x == c {
@@ -1478,6 +1479,33 @@ func (c *Cursor) Delete() error {
 	return nil
 }
 
+// Close releases the cursor before the transaction ends: it
+// unregisters from the keyspace's staleness tracking (each
+// registered cursor costs a visit on every sibling mutation, so a
+// caller creating many cursors in one long tx bounds that cost by
+// closing them) and makes every subsequent operation surface
+// ErrCursorClosed. Terminal and idempotent; an earlier sticky
+// error (ErrTxClosed / ErrKeyspaceClosed) is preserved, and a dead
+// keyspace's precedence holds even when Close is the first call
+// after the DeleteKeyspace. Closing is optional — an unclosed
+// cursor stays valid for the tx lifetime. Per transactions.md
+// §Cursor State Machine (explicit cursor release).
+func (c *Cursor) Close() {
+	c.ks.unregisterCursor(c)
+	if c.closeErr != nil {
+		return
+	}
+	// Latch dead-keyspace state before the closed sentinel, matching
+	// require()'s precedence: a dead handle reports ErrKeyspaceClosed
+	// from every method even when no earlier op latched it
+	// (api-surface.md §Keyspace API).
+	if c.ks.dead {
+		c.closeErr = ErrKeyspaceClosed
+		return
+	}
+	c.closeErr = ErrCursorClosed
+}
+
 // Err returns the sticky error captured by the most recent op on this
 // cursor. The sticky-error contract surfaces:
 //
@@ -1487,6 +1515,7 @@ func (c *Cursor) Delete() error {
 //     reports ErrKeyspaceClosed, including Err() called before any
 //     nav op latches closeErr).
 //   - ErrTxClosed when the parent tx has closed.
+//   - ErrCursorClosed after an explicit Close().
 //   - ErrCursorStale on a sibling-mutation invalidation that the
 //     caller has not yet recovered via First / Last / Seek / SeekGE.
 //   - ErrCorrupted (wrapped) on a structural fault surfaced by the

@@ -401,6 +401,12 @@ func (c *Cursor[K, V]) SeekGE(target K) (K, V, bool) {
 // Delete removes the current entry (same semantics as gmdb.Cursor.Delete).
 func (c *Cursor[K, V]) Delete() error { return c.bc.Delete() }
 
+// Close releases the cursor before the transaction ends (same
+// semantics as gmdb.Cursor.Close: unregisters from staleness
+// tracking; subsequent operations surface gmdb.ErrCursorClosed;
+// terminal, idempotent, optional).
+func (c *Cursor[K, V]) Close() { c.bc.Close() }
+
 // Err returns the first error encountered: a sticky decode/encode error
 // from the typed layer takes precedence, else the byte cursor's error.
 func (c *Cursor[K, V]) Err() error {

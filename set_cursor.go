@@ -176,6 +176,26 @@ func (ks *SetKeyspace) unregisterSetCursor(c *SetCursor) {
 	}
 }
 
+// Close releases the cursor before the transaction ends — the
+// SetCursor analogue of Cursor.Close: unregisters from staleness
+// tracking and makes every subsequent operation surface
+// ErrCursorClosed. Terminal and idempotent; an earlier sticky
+// error is preserved. Per transactions.md §Cursor State Machine
+// (explicit cursor release).
+func (c *SetCursor) Close() {
+	c.ks.unregisterSetCursor(c)
+	if c.closeErr != nil {
+		return
+	}
+	// Latch dead-keyspace state before the closed sentinel, matching
+	// require()'s precedence (see Cursor.Close).
+	if c.ks.dead {
+		c.closeErr = ErrKeyspaceClosed
+		return
+	}
+	c.closeErr = ErrCursorClosed
+}
+
 // requireOpen short-circuits closed-state and dead-keyspace checks
 // (the shared cursorGuard core). Used by RE-POSITIONING ops (First /
 // Last / Seek / SeekGE) which recover from a stale state and so
@@ -636,9 +656,10 @@ func (c *SetCursor) Delete() error {
 }
 
 // Err returns the cursor's current error state. Closed-state
-// errors (ErrTxClosed / ErrKeyspaceClosed / ErrClosed) are sticky;
-// ErrCursorStale is transient and clears when the caller
-// re-positions via First / Last / Seek / SeekGE.
+// errors (ErrTxClosed / ErrKeyspaceClosed / ErrClosed /
+// ErrCursorClosed) are sticky; ErrCursorStale is transient and
+// clears when the caller re-positions via First / Last / Seek /
+// SeekGE.
 func (c *SetCursor) Err() error {
 	if c.closeErr != nil {
 		return c.closeErr

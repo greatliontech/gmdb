@@ -233,6 +233,9 @@ func (c *Cursor[K, V]) Current() (K, V, bool)
 // end-of-iteration or unpositioned); Err() distinguishes those two
 // states.
 func (c *Cursor[K, V]) Delete() error
+// Close — same semantics as Cursor.Close (explicit cursor
+// release, `transactions.md §Cursor State Machine`).
+func (c *Cursor[K, V]) Close()
 func (c *Cursor[K, V]) Err() error
 ```
 

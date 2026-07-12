@@ -274,6 +274,15 @@ func SetCopyDestWrapForTest(wrap func(copyDest) copyDest) (restore func()) {
 	return func() { copyDestWrapForTest.Store(nil) }
 }
 
+// OpenCursorCountForTest reports the keyspace's registered-cursor
+// count — the probe behind the cursor-release contract
+// (Cursor.Close unregisters; abandoned-but-closed cursors must not
+// accumulate per-mutation staleness-walk cost).
+func (ks *Keyspace) OpenCursorCountForTest() int { return len(ks.openCursors) }
+
+// OpenSetCursorCountForTest — the SetKeyspace analogue.
+func (ks *SetKeyspace) OpenSetCursorCountForTest() int { return len(ks.openSetCursors) }
+
 // SetCopyPublishHookForTest fires after CopyTo's temp copy is complete
 // and fsynced, immediately before the hard-link publish. Returns a
 // restore func.

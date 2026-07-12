@@ -757,3 +757,32 @@ Index handle previously opened on that keyspace within the same
 transaction. Subsequent use of an invalidated cursor or Index
 returns `ErrKeyspaceClosed`. The caller is responsible for not
 retaining handles past a `DeleteKeyspace` call.
+
+### Explicit cursor release (`Close`)
+
+`Cursor.Close()` / `SetCursor.Close()` (and the delegating
+`typed.Cursor.Close()`) release a cursor before the transaction
+ends:
+
+- Close removes the cursor from the keyspace's staleness tracking
+  — sibling-mutation invalidation walks every live registered
+  cursor, so a caller opening many cursors in one transaction
+  bounds that per-mutation cost by closing the ones it is done
+  with.
+- Close is terminal: every subsequent operation on the cursor
+  behaves like the other lifecycle-invalidation cases (returns the
+  zero navigation result; `Err()` and `Delete()` surface
+  `ErrCursorClosed`). Unlike `ErrCursorStale` there is no
+  re-position recovery — a closed cursor is never observably live
+  again, which is what makes dropping it from staleness tracking
+  safe.
+- Close is idempotent, and preserves an earlier sticky lifecycle
+  error (`ErrTxClosed` / `ErrKeyspaceClosed`) rather than
+  replacing it. Dead-keyspace precedence does not depend on a
+  prior operation having latched it: closing a cursor whose parent
+  keyspace was already `DeleteKeyspace`'d leaves the cursor
+  reporting `ErrKeyspaceClosed`, per the invalidation clause
+  above.
+- Closing is optional. An unclosed cursor keeps the pre-existing
+  contract: registered, re-positionable, and staleness-tracked for
+  the transaction lifetime.

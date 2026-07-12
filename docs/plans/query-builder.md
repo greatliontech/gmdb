@@ -74,7 +74,7 @@ tests move with their subjects, unmodified.
       `typed-keyspaces.md §Covering` "only covering shape"
       clause; `api-surface.md` rider. Tests: Inv-TC5 round-trip
       + covering-rewrite-on-update anchor.
-- [ ] 12. `gmdb/query` package + typed-homed declaration-tier
+- [x] 12. `gmdb/query` package + typed-homed declaration-tier
       types (`Term` / `OrderKey`, constructors as `Column`
       methods, free `Or`): term constructors, predicate
       representation (shared `internal/` package readable by

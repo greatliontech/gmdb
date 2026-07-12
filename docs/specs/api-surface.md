@@ -180,6 +180,7 @@ var (
     ErrPoisoned                = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
     ErrClosed                  = errors.New("gmdb: database is closed")
     ErrCursorUnpositioned      = errors.New("gmdb: cursor not positioned")
+    ErrCursorClosed            = errors.New("gmdb: cursor closed")
     ErrChildActive             = errors.New("gmdb: transaction is frozen by an active child transaction")
     ErrKeyspaceKindMismatch    = errors.New("gmdb: keyspace kind does not match existing keyspace")
     ErrKeyspaceReserved        = errors.New("gmdb: keyspace name reserved for engine use")
@@ -1160,6 +1161,15 @@ func (c *Cursor) Current() (key, value []byte)
 // inconsistency).
 func (c *Cursor) Delete() error
 
+// Close releases the cursor before the transaction ends:
+// unregisters it from the keyspace's staleness tracking and makes
+// every subsequent operation surface ErrCursorClosed. Terminal and
+// idempotent; an earlier sticky error is preserved. Optional — an
+// unclosed cursor stays valid for the tx lifetime. See
+// `transactions.md §Cursor State Machine` (explicit cursor
+// release). SetCursor and typed.Cursor carry the same method.
+func (c *Cursor) Close()
+
 func (c *Cursor) Err() error
 ```
 
@@ -1239,6 +1249,8 @@ func (c *SetCursor) Seek(target []byte) (key, value []byte)
 func (c *SetCursor) SeekGE(target []byte) (key, value []byte)
 func (c *SetCursor) Current() (key, value []byte)
 func (c *SetCursor) Delete() error
+// Close — same semantics as Cursor.Close (explicit cursor release).
+func (c *SetCursor) Close()
 func (c *SetCursor) Err() error
 
 // Value navigation (within current key's set).
