@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"iter"
 
+	"github.com/thegrumpylion/gmdb"
+	"github.com/thegrumpylion/gmdb/internal/indexing"
 	"github.com/thegrumpylion/gmdb/internal/qrep"
 	"github.com/thegrumpylion/gmdb/typed"
 )
@@ -29,6 +31,7 @@ type Query[K, V any] struct {
 	ks      *typed.KeyspaceHandle[K, V]
 	terms   []qrep.Term
 	filters []func(K, V) bool
+	sel     []qrep.SelectCol
 	limit   int
 	hasLim  bool
 	offset  int
@@ -67,6 +70,36 @@ func (q *Query[K, V]) Filter(f func(K, V) bool) *Query[K, V] {
 	}
 	q.filters = append(q.filters, f)
 	return q
+}
+
+// Select names the projection columns Rows() serves
+// (query-builder.md §Covering-aware execution). Selected columns
+// count toward the planner's covering tie-break, and a plan whose
+// index carries every selected and residual-term column serves
+// Rows index-only — the row keyspace is never read. Columns are
+// single-valued by construction (AnySingleColumn): a multi-valued
+// column has no single projection slot and no From surface.
+func (q *Query[K, V]) Select(cols ...typed.AnySingleColumn[K, V]) *Query[K, V] {
+	for _, c := range cols {
+		if c == nil {
+			q.terms = append(q.terms, qrep.Term{Err: fmt.Errorf("gmdb/query: nil Select column: %w", errBadPredicate)})
+			continue
+		}
+		q.sel = append(q.sel, c.InternalSelectRep())
+	}
+	return q
+}
+
+// selNames returns the selected columns' synthesized names.
+func (q *Query[K, V]) selNames() []string {
+	if len(q.sel) == 0 {
+		return nil
+	}
+	names := make([]string, len(q.sel))
+	for i, s := range q.sel {
+		names[i] = s.Name
+	}
+	return names
 }
 
 // Limit caps the result count. Applied to the final sequence,
@@ -152,7 +185,7 @@ func (q *Query[K, V]) All() iter.Seq2[K, V] {
 		if q.hasLim && q.limit <= 0 {
 			return
 		}
-		leaf := planQuery(q.terms, q.ks.InternalIndexInfo())
+		leaf := planQuery(q.terms, q.selNames(), q.ks.InternalIndexInfo())
 		if leaf.shape == shapeScan {
 			q.scanExec(yield)
 			return
@@ -166,21 +199,39 @@ func (q *Query[K, V]) All() iter.Seq2[K, V] {
 // Explain plans regardless of carried construction errors (a term
 // with a literal-encode error still has a plan shape); every
 // EXECUTION of such a query fails at iteration start via Err.
+// Leaf value routes are derived from the handle's open-time
+// declarations; execution re-derives against the live declaration
+// (Inv-QB3) — results are identical, routes are read strategies.
 func (q *Query[K, V]) Explain() Plan {
-	leaf := planQuery(q.terms, q.ks.InternalIndexInfo())
+	leaf := planQuery(q.terms, q.selNames(), q.ks.InternalIndexInfo())
+	route := ValuesRowBytes
+	if leaf.shape != shapeScan {
+		resid := residualTerms(q.terms, leaf.consumed)
+		switch {
+		case entryEligible(leaf, q.sel, resid, len(q.filters)):
+			route = ValuesEntry
+		case leaf.index.CoverValue:
+			route = ValuesCoverValue
+		case len(leaf.index.Covering) > 0:
+			route = ValuesBackLookup
+		}
+	}
 	var root PlanNode
 	switch leaf.shape {
 	case shapeSeek:
-		root = IndexSeek{Index: leaf.index.Name}
+		root = IndexSeek{Index: leaf.index.Name, Values: route}
 	case shapePrefix:
-		root = IndexPrefix{Index: leaf.index.Name, PrefixLen: len(leaf.eqVals)}
+		root = IndexPrefix{Index: leaf.index.Name, PrefixLen: len(leaf.eqVals), Values: route}
 	case shapeRange:
-		root = IndexRange{Index: leaf.index.Name, PrefixLen: len(leaf.eqVals)}
+		root = IndexRange{Index: leaf.index.Name, PrefixLen: len(leaf.eqVals), Values: route}
 	default:
 		root = Scan{}
 	}
 	if resid := len(q.terms) - len(leaf.consumed); resid > 0 || len(q.filters) > 0 {
 		root = ResidualFilter{Input: root, Terms: resid, Filters: len(q.filters)}
+	}
+	if len(q.sel) > 0 {
+		root = Project{Input: root, Columns: len(q.sel)}
 	}
 	return Plan{Root: root}
 }
@@ -247,21 +298,50 @@ func (q *Query[K, V]) scanExec(yield func(K, V) bool) {
 // handle instead (index-only serving is the covering execution
 // surface, not this leaf; the back-lookup mirrors byte Lookup's
 // silent-skip of vanished rows).
+// valueMode is indexExec's per-entry value-acquisition strategy,
+// derived from the LIVE declaration.
+type valueMode int
+
+const (
+	modeRowBytes valueMode = iota // entry value = row bytes
+	modeFetch                     // back-lookup via the row keyspace
+	modeCover                     // full-row covering: V from the entry tuple
+)
+
 func (q *Query[K, V]) indexExec(leaf plannedLeaf, yield func(K, V) bool) {
 	idx, err := q.ks.ByteIndex(leaf.index.Name)
 	if err != nil {
 		q.err = err
 		return
 	}
-	resid := residualTerms(q.terms, leaf.consumed)
+	// Value interpretation AND tuple shape follow the LIVE
+	// declaration (Inv-QB3), probed on the fresh handle — not the
+	// handle's open-time planner snapshot: a same-tx Rebuild can
+	// change the covering shape (entry value bytes become a
+	// covering TUPLE, never row bytes) or the column tuple itself
+	// (the plan's literals would seek wrong entries). A changed
+	// tuple falls back to the scan, correct under any shape; the
+	// snapshot still drives plan CHOICE — cost-only under Inv-QB1.
+	d := idx.Decl()
+	if !liveColumnsMatch(leaf.index, d) {
+		q.scanExec(yield)
+		return
+	}
 	ops := q.ks.InternalRowOps()
-	// Value interpretation follows the LIVE declaration (Inv-QB3),
-	// probed on the fresh handle — not the handle's open-time
-	// planner snapshot: a same-tx Rebuild can change the covering
-	// shape, and a covering entry's value bytes are a covering
-	// TUPLE, never row bytes. (The snapshot still drives plan
-	// CHOICE — rule 3(b) — which is cost-only under Inv-QB1.)
-	covering := len(idx.Decl().Covering) > 0
+	mode := modeRowBytes
+	switch {
+	// The full-row route additionally verifies the live sentinel
+	// embeds THIS handle's value-encoder ID: a same-tx Rebuild can
+	// install another encoder's cover-value sentinel, whose bytes
+	// this codec would decode silently wrong — those entries
+	// back-look-up instead (correct under any encoder).
+	case indexing.IsCoverValueDecl(d) &&
+		d.Covering[0].Name == indexing.CoverValueColumn(ops.ValEncID):
+		mode = modeCover
+	case len(d.Covering) > 0:
+		mode = modeFetch
+	}
+	resid := residualTerms(q.terms, leaf.consumed)
 	var seen map[string]struct{}
 	if leaf.needDedup {
 		seen = make(map[string]struct{})
@@ -269,7 +349,7 @@ func (q *Query[K, V]) indexExec(leaf plannedLeaf, yield func(K, V) bool) {
 	skipped, yielded := 0, 0
 	// row processes one index entry; false stops the drain (error,
 	// consumer break, or limit-complete — q.err distinguishes).
-	row := func(pk, vb []byte, haveRow bool) bool {
+	row := func(pk, vb []byte) bool {
 		if seen != nil {
 			s := string(pk)
 			if _, dup := seen[s]; dup {
@@ -283,12 +363,31 @@ func (q *Query[K, V]) indexExec(leaf plannedLeaf, yield func(K, V) bool) {
 			return false
 		}
 		var vAny any
-		if haveRow {
+		switch mode {
+		case modeRowBytes:
 			if vAny, err = ops.DecodeVal(vb); err != nil {
 				q.err = err
 				return false
 			}
-		} else {
+		case modeCover:
+			// Full-row covering: the entry value is a one-column
+			// covering tuple holding encode(V) — no row read
+			// (route 2, query-builder.md §Covering-aware execution).
+			cols, err := gmdb.DecodeCoveringTuple(vb)
+			if err != nil {
+				q.err = err
+				return false
+			}
+			if len(cols) == 0 {
+				q.err = fmt.Errorf("gmdb/query: index %q: full-row covering tuple has no slots: %w",
+					leaf.index.Name, gmdb.ErrCoveringTupleMalformed)
+				return false
+			}
+			if vAny, err = ops.DecodeVal(cols[0]); err != nil {
+				q.err = err
+				return false
+			}
+		case modeFetch:
 			var found bool
 			if vAny, found, err = ops.FetchRow(pk); err != nil {
 				q.err = err
@@ -325,29 +424,29 @@ func (q *Query[K, V]) indexExec(leaf plannedLeaf, yield func(K, V) bool) {
 	}
 	switch leaf.shape {
 	case shapeSeek:
-		if covering {
+		if mode == modeFetch {
 			for pk := range idx.LookupKeys(leaf.eqVals) {
-				if !row(pk, nil, false) {
+				if !row(pk, nil) {
 					break
 				}
 			}
 		} else {
 			for pk, vb := range idx.Lookup(leaf.eqVals) {
-				if !row(pk, vb, true) {
+				if !row(pk, vb) {
 					break
 				}
 			}
 		}
 	case shapePrefix:
 		for pk, vb := range idx.Prefix(leaf.eqVals) {
-			if !row(pk, vb, !covering) {
+			if !row(pk, vb) {
 				break
 			}
 		}
 	case shapeRange:
 		start, end := rangeBounds(leaf.eqVals, leaf.bound)
 		for pk, vb := range idx.Range(start, end) {
-			if !row(pk, vb, !covering) {
+			if !row(pk, vb) {
 				break
 			}
 		}

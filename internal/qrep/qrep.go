@@ -7,6 +7,8 @@
 // (query-builder.md §Terms).
 package qrep
 
+import "bytes"
+
 // Kind discriminates a term's comparison shape.
 type Kind uint8
 
@@ -105,6 +107,63 @@ type IndexInfo struct {
 	Partial bool
 }
 
+// EvalScalar implements Inv-QB2's byte-level comparison for the
+// scalar term kinds — the SAME semantics an index seek realizes,
+// so pushdown, row-residual, and entry-slot evaluation agree by
+// construction. enc is the encoded column value under comparison;
+// lo/hi are the term's encoded literals. Returns false for kinds
+// it does not handle (Contains kinds are remapped by callers; Or
+// never reaches scalar evaluation) — callers that must fail loud
+// on an unhandled kind check HandledScalarKind first.
+func EvalScalar(kind Kind, enc, lo, hi []byte) bool {
+	switch kind {
+	case KindEq:
+		return bytes.Equal(enc, lo)
+	case KindLt:
+		return bytes.Compare(enc, lo) < 0
+	case KindLte:
+		return bytes.Compare(enc, lo) <= 0
+	case KindGt:
+		return bytes.Compare(enc, lo) > 0
+	case KindGte:
+		return bytes.Compare(enc, lo) >= 0
+	case KindBetween:
+		return bytes.Compare(enc, lo) >= 0 && bytes.Compare(enc, hi) < 0
+	case KindHasPrefix:
+		return bytes.HasPrefix(enc, lo)
+	}
+	return false
+}
+
+// HandledScalarKind reports whether EvalScalar implements kind.
+func HandledScalarKind(kind Kind) bool {
+	switch kind {
+	case KindEq, KindLt, KindLte, KindGt, KindGte, KindBetween, KindHasPrefix:
+		return true
+	}
+	return false
+}
+
+// SelectCol is one selected projection column, erased for the
+// query executor: the synthesized byte column name (what index
+// key/covering slots are matched by) plus the row-side encoder —
+// route-3 projections (query-builder.md §Covering-aware execution)
+// compute slots from the materialized row with it.
+type SelectCol struct {
+	Name string
+	// EncodeRow returns enc(get(k, v)) for the column (type-erased,
+	// as Term.Eval).
+	EncodeRow func(k, v any) ([]byte, error)
+}
+
+// ProjectionSlots builds the typed Projection value from parallel
+// synthesized column names and slot bytes; the typed tier
+// registers its constructor here so the query package — the
+// producing surface — can build Projection values without the
+// typed package exporting the constructor (typed-columns.md
+// §Covering projections).
+var ProjectionSlots func(names []string, vals [][]byte) any
+
 // RowOps is the executor's type-erased row codec over one typed
 // keyspace handle: index leaves yield raw PK / value bytes, and
 // the query package — which cannot reach the handle's unexported
@@ -112,6 +171,12 @@ type IndexInfo struct {
 // boxed exactly as Term.Eval's arguments (the typed tier asserts
 // back to its K / V).
 type RowOps struct {
+	// ValEncID is the handle's value-encoder identity — the
+	// executor verifies a live full-row-covering sentinel embeds
+	// THIS ID before decoding entry bytes as V (a same-tx Rebuild
+	// can install a foreign encoder's sentinel; decoding its bytes
+	// with this codec would be silently wrong).
+	ValEncID string
 	// DecodeKey decodes a primary-key byte slice to K.
 	DecodeKey func(pk []byte) (any, error)
 	// DecodeVal decodes stored row bytes to V.

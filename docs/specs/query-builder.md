@@ -115,6 +115,13 @@ Invariant: kind=clause-explicit;
     reverse) yields garbage values or a decode error on every
     covered read — the covering feature becomes unusable through
     the builder despite being correct at the byte layer.
+    Enforced by `TestQueryIndexExecFollowsLiveCoveringShape` +
+    `TestQueryIndexExecFallsBackOnLiveTupleChange` (live-decl
+    routing) and the index-only/cover-value route anchors in
+    `TestQueryRowsIndexOnlyFromCovering` /
+    `TestQueryRowsIndexOnlyFromKeyColumns` /
+    `TestQueryAllCoverValueRoute` /
+    `TestQueryRowsCoveringFreshAfterUpdate`.
 
 Invariant: kind=clause-explicit;
   property=Inv-QB4 (distinct-by-PK): a query's result sequence
@@ -178,6 +185,8 @@ Invariant: kind=clause-explicit;
     filter with a partially-populated V evaluates user logic on
     fields that silently read as zero — wrong inclusion or
     exclusion with no error.
+    Enforced by `TestQueryFilterForcesWholeRows` (a filter query
+    is never index-only and observes fields outside the index).
 
 ## Terms
 
@@ -228,7 +237,11 @@ func New[K, V any](ks *typed.KeyspaceHandle[K, V]) *Query[K, V]
 
 func (q *Query[K, V]) Where(terms ...Term[K, V]) *Query[K, V]   // ANDed
 func (q *Query[K, V]) Filter(f func(K, V) bool) *Query[K, V]    // opaque residual
-func (q *Query[K, V]) Select(cols ...AnyColumn[K, V]) *Query[K, V]
+// Select takes SINGLE-VALUED columns (the same sealed erasure as
+// Covering declarations): a multi-valued column has no single
+// projection slot and no From surface, so MultiColumn-in-Select
+// is unrepresentable rather than a runtime rejection.
+func (q *Query[K, V]) Select(cols ...AnySingleColumn[K, V]) *Query[K, V]
 func (q *Query[K, V]) OrderBy(keys ...OrderKey[K, V]) *Query[K, V]
 func (q *Query[K, V]) Limit(n int) *Query[K, V]
 func (q *Query[K, V]) Offset(n int) *Query[K, V]
@@ -236,7 +249,10 @@ func (q *Query[K, V]) WithMaterializeLimit(bytes int) *Query[K, V]
 
 func (q *Query[K, V]) All() iter.Seq2[K, V]        // whole rows
 func (q *Query[K, V]) Keys() iter.Seq[K]           // PKs only
-func (q *Query[K, V]) Rows() iter.Seq2[K, Projection] // with Select
+// Rows serves the Select projection. Calling it on a query with
+// no Select fails at iteration start via Err — there is nothing
+// to project.
+func (q *Query[K, V]) Rows() iter.Seq2[K, Projection]
 func (q *Query[K, V]) Count() (uint64, error)
 func (q *Query[K, V]) Err() error
 func (q *Query[K, V]) Explain() Plan

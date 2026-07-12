@@ -240,23 +240,75 @@ func randIndexes(rng *rand.Rand) (idxs []typed.AnyIndex[uint64, row], partial ma
 	return idxs, partial
 }
 
+// selArm pairs a selectable column with its reference verifier:
+// the projected slot must decode to the same value the accessor
+// computes from the corpus row.
+type selArm struct {
+	col    typed.AnySingleColumn[uint64, row]
+	verify func(k uint64, v row, p typed.Projection) error
+}
+
+func selPool() []selArm {
+	return []selArm{
+		{colGrp, func(_ uint64, v row, p typed.Projection) error {
+			g, err := colGrp.From(p)
+			if err != nil {
+				return fmt.Errorf("grp From: %w", err)
+			}
+			if g != v.Grp {
+				return fmt.Errorf("grp slot = %d, want %d", g, v.Grp)
+			}
+			return nil
+		}},
+		{colName, func(_ uint64, v row, p typed.Projection) error {
+			n, err := colName.From(p)
+			if err != nil {
+				return fmt.Errorf("name From: %w", err)
+			}
+			if n != v.Name {
+				return fmt.Errorf("name slot = %q, want %q", n, v.Name)
+			}
+			return nil
+		}},
+		{colID, func(k uint64, _ row, p typed.Projection) error {
+			id, err := colID.From(p)
+			if err != nil {
+				return fmt.Errorf("id From: %w", err)
+			}
+			if id != k {
+				return fmt.Errorf("id slot = %d, want %d", id, k)
+			}
+			return nil
+		}},
+	}
+}
+
 // planLeafOf unwraps a plan to its leaf kind and index name.
 func planLeafOf(p query.Plan) (kind, index string) {
+	kind, index, _ = planLeafRoute(p)
+	return kind, index
+}
+
+// planLeafRoute additionally reports the leaf's value route.
+func planLeafRoute(p query.Plan) (kind, index string, route query.ValueRoute) {
 	n := p.Root
+	if pr, ok := n.(query.Project); ok {
+		n = pr.Input
+	}
 	if rf, ok := n.(query.ResidualFilter); ok {
 		n = rf.Input
 	}
 	switch l := n.(type) {
 	case query.Scan:
-		return "scan", ""
+		return "scan", "", query.ValuesRowBytes
 	case query.IndexSeek:
-		return "seek", l.Index
+		return "seek", l.Index, l.Values
 	case query.IndexPrefix:
-		return "prefix", l.Index
+		return "prefix", l.Index, l.Values
 	case query.IndexRange:
-		return "range", l.Index
+		return "range", l.Index, l.Values
 	}
-	return "?", ""
+	return "?", "", query.ValuesRowBytes
 }
 
 // The Inv-QB1 property live: for every generated schema (indexes
@@ -299,11 +351,29 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 				if useFilter {
 					q.Filter(filter)
 				}
+				// The Select arm: a random subset of the scalar
+				// columns, verified against the reference row via
+				// Column.From on every projection.
+				var sel []selArm
+				if rng.Intn(2) == 0 {
+					pool := selPool()
+					for _, i := range rng.Perm(len(pool))[:1+rng.Intn(2)] {
+						sel = append(sel, pool[i])
+					}
+					cols := make([]typed.AnySingleColumn[uint64, row], len(sel))
+					for i, s := range sel {
+						cols[i] = s.col
+					}
+					q.Select(cols...)
+				}
 
 				// Rule 7: a Where-partial index is never chosen,
 				// no matter how well its columns match.
-				leafKind, leafIdx := planLeafOf(q.Explain())
+				leafKind, leafIdx, leafRoute := planLeafRoute(q.Explain())
 				census[leafKind]++
+				if len(sel) > 0 {
+					census["values-"+leafRoute.String()]++
+				}
 				if partial[leafIdx] {
 					t.Fatalf("round %d: planner chose partial index %q: %s", round, leafIdx, q.Explain())
 				}
@@ -359,6 +429,35 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 				if !slices.Equal(seq1, seq2) {
 					t.Fatalf("round %d: repeat execution diverged", round)
 				}
+
+				// Rows(): the same matched key set, every selected
+				// slot equal to the reference accessor's value
+				// (Inv-QB1/Inv-QB3 across all value routes).
+				if len(sel) > 0 {
+					rowsGot := map[uint64]bool{}
+					for k, p := range q.Rows() {
+						if rowsGot[k] {
+							t.Fatalf("round %d: Rows duplicate key %d (plan %s)", round, k, q.Explain())
+						}
+						rowsGot[k] = true
+						for _, s := range sel {
+							if err := s.verify(k, corpus[k], p); err != nil {
+								t.Fatalf("round %d: key %d: %v (plan %s)", round, k, err, q.Explain())
+							}
+						}
+					}
+					if err := q.Err(); err != nil {
+						t.Fatalf("round %d: Rows Err: %v (plan %s)", round, err, q.Explain())
+					}
+					if len(rowsGot) != len(want) {
+						t.Fatalf("round %d: Rows %d rows, want %d (plan %s)", round, len(rowsGot), len(want), q.Explain())
+					}
+					for k := range want {
+						if !rowsGot[k] {
+							t.Fatalf("round %d: Rows missing key %d (plan %s)", round, k, q.Explain())
+						}
+					}
+				}
 			}
 		})
 	}
@@ -375,6 +474,12 @@ func TestQueryPlanScanEquivalence(t *testing.T) {
 	}
 	if partialSeeds < 2 {
 		t.Fatalf("only %d seed(s) generated a partial index — rule 7's property arm is near-vacuous", partialSeeds)
+	}
+	// The Select arm must sample the index-only route (route 1) —
+	// the covering-execution property is otherwise scan-projected
+	// only.
+	if census["values-entry"] < 1 {
+		t.Fatalf("no index-only Rows plan sampled: %v", census)
 	}
 }
 

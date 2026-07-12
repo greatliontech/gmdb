@@ -96,7 +96,7 @@ tests move with their subjects, unmodified.
       (Inv-QB1) goes live; grammar covers index shapes incl.
       `Where`-partial (never chosen, results correct) + plan
       pinning via Explain.
-- [ ] 14. Covering-aware execution: `Select` / `Rows`,
+- [x] 14. Covering-aware execution: `Select` / `Rows`,
       index-only plans, CoverValue route, Inv-QB3 / Inv-QB7
       anchors; grammar adds covering mixes.
 - [ ] 15. Combiners: `Or` pushdown via `Union`, `Intersect`,

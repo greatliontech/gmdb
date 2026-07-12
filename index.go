@@ -979,6 +979,147 @@ func (idx *IndexHandle) Range(start, end [][]byte, opts ...IterOption) iter.Seq2
 	}
 }
 
+// IndexEntryKey is one index entry's decoded key: the per-column
+// byte tuple in declaration order plus the row's primary key.
+// Yielded by RangeEntries; both slices are fresh allocations.
+type IndexEntryKey struct {
+	Cols [][]byte
+	PK   []byte
+}
+
+// RangeEntries yields the index's stored entries in [start, end)
+// as (entry key, stored value bytes): the decoded column tuple +
+// PK, and the entry's value VERBATIM — the encoded covering tuple
+// (decode via DecodeCoveringTuple), empty when the declaration
+// carries no covering. Unlike Range, RangeEntries performs NO
+// back-lookup and NO covering-route interpretation: it is the raw
+// entry surface for callers composing their own value acquisition
+// (the query executor's index-only plans — query-builder.md
+// §Covering-aware execution). Because it never probes the row
+// keyspace it does not observe the silent-skip case (exactly like
+// LookupKeys — use Check() for row/index consistency).
+//
+// Same partial-tuple prefix-bound semantics, IterOption surface,
+// Err contract, and handle-invalidation behavior as Range.
+// Keyspace indexes only: a SetKeyspace index's natural result is
+// the (setKey, setValue) pair already served by the existing
+// surfaces, and its compound-PK key encoding does not decode as a
+// plain column tuple — calling RangeEntries on one sets Err to an
+// ErrInvalidOptions wrap and yields nothing.
+func (idx *IndexHandle) RangeEntries(start, end [][]byte, opts ...IterOption) iter.Seq2[IndexEntryKey, []byte] {
+	return func(yield func(IndexEntryKey, []byte) bool) {
+		// Per-sequence Err reset.
+		idx.err = nil
+		// Dead-keyspace check (Inv-IHS3) — see Lookup for rationale.
+		if idx.keyspaceDead() {
+			idx.err = ErrKeyspaceClosed
+			return
+		}
+		// Dead-handle check (Inv-IHS2).
+		if idx.dead {
+			idx.err = idx.indexNotFoundError()
+			return
+		}
+		// Owning-tx state guard (mirrors Stats).
+		if err := idx.requireLive(); err != nil {
+			idx.err = err
+			return
+		}
+		if idx.sks != nil {
+			idx.err = fmt.Errorf("gmdb: index %q RangeEntries: SetKeyspace indexes are not supported (use Lookup/Range/Prefix — the (setKey, setValue) pair is the natural result): %w",
+				idx.pinned.decl.Name, ErrInvalidOptions)
+			return
+		}
+		// Tuple-arity validation — same rule as Range.
+		if got, max := len(start), len(idx.pinned.decl.Columns); got > max {
+			idx.err = fmt.Errorf("gmdb: index %q RangeEntries: start has %d cols, index declares %d: %w",
+				idx.pinned.decl.Name, got, max, ErrInvalidOptions)
+			return
+		}
+		if got, max := len(end), len(idx.pinned.decl.Columns); got > max {
+			idx.err = fmt.Errorf("gmdb: index %q RangeEntries: end has %d cols, index declares %d: %w",
+				idx.pinned.decl.Name, got, max, ErrInvalidOptions)
+			return
+		}
+		if idx.pinned.root == 0 {
+			return
+		}
+		var startKey, endKey []byte
+		if start != nil {
+			startKey = indexing.EncodeKey(start)
+		}
+		if end != nil {
+			endKey = indexing.EncodeKey(end)
+		}
+		tx := idx.rowTx()
+		cfg := tx.pgr.Config()
+		mergeThreshold := tx.db.opts.MergeThreshold
+		c := btree.NewCursor(btreeWriter{tx.pgr}, cfg, idx.pinned.root, mergeThreshold)
+		idx.registerCursor(c)
+		defer idx.unregisterCursor(c)
+		var k, v []byte
+		step := c.Next
+		inBounds := func(k []byte) bool { return endKey == nil || bytes.Compare(k, endKey) < 0 }
+		if applyIterOptions(opts).reverse {
+			k, v = seekLastBelow(c, endKey)
+			step = c.Prev
+			inBounds = func(k []byte) bool { return startKey == nil || bytes.Compare(k, startKey) >= 0 }
+		} else if startKey != nil {
+			k, v = c.SeekGE(startKey)
+		} else {
+			k, v = c.First()
+		}
+		for ; k != nil; k, v = step() {
+			if !inBounds(k) {
+				break
+			}
+			keyCopy := make([]byte, len(k))
+			copy(keyCopy, k)
+			valCopy := make([]byte, len(v))
+			copy(valCopy, v)
+			entry, value, err := idx.splitEntry(keyCopy, valCopy)
+			if err != nil {
+				idx.err = err
+				return
+			}
+			if !yield(entry, value) {
+				return
+			}
+		}
+		if err := c.Err(); err != nil {
+			idx.err = idx.mapCursorErr(err)
+		}
+	}
+}
+
+// splitEntry decodes one stored index entry into its column tuple,
+// PK, and raw value bytes. Non-unique entries carry the PK as the
+// key's last column and the covering blob as the whole value;
+// unique entries carry all declared columns in the key and
+// (PK, covering blob) packed in the value (indexing.md §Storage
+// Layout).
+func (idx *IndexHandle) splitEntry(indexKey, indexValue []byte) (IndexEntryKey, []byte, error) {
+	cols, err := indexing.DecodeKey(indexKey)
+	if err != nil {
+		return IndexEntryKey{}, nil, fmt.Errorf("%w: index %q: %w", ErrCorrupted, idx.pinned.decl.Name, err)
+	}
+	if idx.pinned.decl.Unique {
+		pk, encCov, err := indexing.DecodeUniqueValue(indexValue)
+		if err != nil {
+			return IndexEntryKey{}, nil, fmt.Errorf("%w: index %q: %w", ErrCorrupted, idx.pinned.decl.Name, err)
+		}
+		pkCopy := make([]byte, len(pk))
+		copy(pkCopy, pk)
+		covCopy := make([]byte, len(encCov))
+		copy(covCopy, encCov)
+		return IndexEntryKey{Cols: cols, PK: pkCopy}, covCopy, nil
+	}
+	if len(cols) == 0 {
+		return IndexEntryKey{}, nil, fmt.Errorf("%w: index %q: non-unique key has zero columns", ErrCorrupted, idx.pinned.decl.Name)
+	}
+	return IndexEntryKey{Cols: cols[:len(cols)-1], PK: cols[len(cols)-1]}, indexValue, nil
+}
+
 // Prefix returns matches whose leading columns equal the prefix.
 // Equivalent to `Range(prefix, nextPrefix)` but the caller doesn't
 // have to compute the upper bound. Same value semantics as Lookup

@@ -150,10 +150,28 @@ type AnySingleColumn[K, V any] interface {
 	// encodeOne returns the single encoded value for a row.
 	// PANICS on encode failure, per the tier's convention.
 	encodeOne(indexName string, k K, v V) []byte
+	// InternalSelectRep exposes the column's projection
+	// representation to the query package through the shared
+	// internal seam (query-builder.md §Covering-aware execution).
+	// The returned type lives in an internal package: callers
+	// outside this module cannot name or construct it, so the
+	// representation carries no compatibility promise.
+	InternalSelectRep() qrep.SelectCol
 }
 
 func (c *Column[K, V, C]) columnName() string {
 	return synthesizeColumnName(columnNamePrefix, c.name, c.enc.ID())
+}
+
+// InternalSelectRep — see AnySingleColumn.
+func (c *Column[K, V, C]) InternalSelectRep() qrep.SelectCol {
+	col := c
+	return qrep.SelectCol{
+		Name: c.columnName(),
+		EncodeRow: func(k, v any) ([]byte, error) {
+			return col.enc.AppendEncode(nil, col.get(k.(K), v.(V)))
+		},
+	}
 }
 func (c *Column[K, V, C]) encoderIdentity() (string, string) { return c.name, c.enc.ID() }
 func (c *Column[K, V, C]) multiValued() bool                 { return false }

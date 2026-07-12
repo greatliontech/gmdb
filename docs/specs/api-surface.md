@@ -1427,6 +1427,32 @@ func (idx *IndexHandle) Range(start, end [][]byte, opts ...IterOption) iter.Seq2
 // Lookup.
 func (idx *IndexHandle) Prefix(leadingCols [][]byte, opts ...IterOption) iter.Seq2[[]byte, []byte]
 
+// IndexEntryKey is one index entry's decoded key: the per-column
+// byte tuple in declaration order plus the row's primary key.
+type IndexEntryKey struct {
+    Cols [][]byte
+    PK   []byte
+}
+
+// RangeEntries yields the index's stored entries in [start, end)
+// as (entry key, stored value bytes): the decoded column tuple +
+// PK, and the entry's value VERBATIM — the encoded covering tuple
+// (decode via DecodeCoveringTuple), empty when the declaration
+// carries no covering. Unlike Range it performs NO back-lookup
+// and NO covering-route interpretation: it is the raw entry
+// surface for callers composing their own value acquisition (the
+// query executor's index-only plans — query-builder.md
+// §Covering-aware execution). Because it never probes the row
+// keyspace it does not observe the silent-skip case (exactly like
+// LookupKeys). Same partial-tuple prefix-bounds, IterOption
+// surface, Err contract, and handle-invalidation behavior as
+// Range. Keyspace indexes only: a SetKeyspace index's compound-PK
+// key encoding does not decode as a plain column tuple, and its
+// natural result — the (setKey, setValue) pair — is already
+// served by the existing surfaces; calling RangeEntries on one
+// sets Err to an ErrInvalidOptions wrap and yields nothing.
+func (idx *IndexHandle) RangeEntries(start, end [][]byte, opts ...IterOption) iter.Seq2[IndexEntryKey, []byte]
+
 // Decl returns the handle's pinned index declaration — the live
 // decl this handle serves under (indexing.md §Handle Invalidation).
 // For tiers that must inspect the declaration shape (gmdb/typed's

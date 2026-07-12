@@ -585,6 +585,16 @@ API`. Brief summary:
   single `(pk, value)` or `ErrNotFound`; returns
   `ErrIndexNotUnique` on a non-unique index. Takes no iteration
   options — it yields at most one row.
+- `RangeEntries(start, end, opts...)` →
+  `iter.Seq2[IndexEntryKey, value]` — the raw entry surface:
+  the decoded column tuple + PK, plus the stored value bytes
+  VERBATIM (the encoded covering tuple; empty without covering).
+  No back-lookup, no covering-route interpretation, no
+  silent-skip observation (like `LookupKeys`). Keyspace indexes
+  only — on a SetKeyspace index it sets `Err` to an
+  `ErrInvalidOptions` wrap. Serves callers composing their own
+  value acquisition (`query-builder.md §Covering-aware
+  execution`'s index-only plans).
 - `Err()` returns the first error encountered during the last
   sequence's iteration. The `Err` state is per-handle; two
   overlapping iterators on the same `*IndexHandle` race — open the

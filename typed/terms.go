@@ -1,7 +1,6 @@
 package typed
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/thegrumpylion/gmdb/internal/qrep"
@@ -59,30 +58,18 @@ func (c *Column[K, V, C]) term(kind qrep.Kind, lo, hi []byte, encErr error) Term
 	}}
 }
 
-// evalScalar implements Inv-QB2's byte-level comparison for the
-// scalar kinds — the SAME semantics an index seek realizes, so
-// plan and scan agree by construction.
+// evalScalar delegates to the seam's single byte-comparison source
+// (qrep.EvalScalar — Inv-QB2: the SAME semantics an index seek and
+// the executor's entry-slot evaluation realize, so plan and scan
+// agree by construction).
 func evalScalar(kind qrep.Kind, enc, lo, hi []byte) bool {
-	switch kind {
-	case qrep.KindEq:
-		return bytes.Equal(enc, lo)
-	case qrep.KindLt:
-		return bytes.Compare(enc, lo) < 0
-	case qrep.KindLte:
-		return bytes.Compare(enc, lo) <= 0
-	case qrep.KindGt:
-		return bytes.Compare(enc, lo) > 0
-	case qrep.KindGte:
-		return bytes.Compare(enc, lo) >= 0
-	case qrep.KindBetween:
-		return bytes.Compare(enc, lo) >= 0 && bytes.Compare(enc, hi) < 0
-	case qrep.KindHasPrefix:
-		return bytes.HasPrefix(enc, lo)
+	if !qrep.HandledScalarKind(kind) {
+		// Unreachable: Contains kinds are remapped before this call
+		// and Or never reaches Eval. A new kind missed here must
+		// fail loud, not silently match nothing.
+		panic(fmt.Sprintf("gmdb/typed: evalScalar: unhandled term kind %d", kind))
 	}
-	// Unreachable: Contains kinds are remapped before this call and
-	// Or never reaches Eval. A new kind missed here must fail loud,
-	// not silently match nothing.
-	panic(fmt.Sprintf("gmdb/typed: evalScalar: unhandled term kind %d", kind))
+	return qrep.EvalScalar(kind, enc, lo, hi)
 }
 
 // Eq matches rows whose column equals v.
@@ -198,6 +185,14 @@ func (m *MultiColumn[K, V, C]) ContainsRange(lo, hi C) Term[K, V] {
 		err1 = err2
 	}
 	return m.term(qrep.KindContainsRange, lb, hb, err1)
+}
+
+// The query package constructs Projection values through the
+// shared internal seam (typed-columns.md §Covering projections).
+func init() {
+	qrep.ProjectionSlots = func(names []string, vals [][]byte) any {
+		return newProjection(names, vals)
+	}
 }
 
 // Or builds a disjunction: each group is a conjunction of terms;

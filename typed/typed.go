@@ -464,6 +464,7 @@ func (t *KeyspaceHandle[K, V]) InternalIndexInfo() []qrep.IndexInfo { return t.i
 // silent-skip (indexing.md §Lookup API).
 func (t *KeyspaceHandle[K, V]) InternalRowOps() qrep.RowOps {
 	return qrep.RowOps{
+		ValEncID:  t.valEnc.ID(),
 		DecodeKey: func(pk []byte) (any, error) { return t.keyEnc.Decode(pk) },
 		DecodeVal: func(vb []byte) (any, error) { return t.valEnc.Decode(vb) },
 		FetchRow: func(pk []byte) (any, bool, error) {

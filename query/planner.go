@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/thegrumpylion/gmdb"
 	"github.com/thegrumpylion/gmdb/internal/qrep"
 )
 
@@ -51,9 +52,13 @@ type plannedLeaf struct {
 // conjunction over the handle's declared ColumnIndexes. Rule 1's
 // partition is implicit: only leaf terms with EQ/range shapes on
 // declared columns are consumable; Or terms and opaque filters
-// always evaluate residually at this stage.
-func planQuery(terms []qrep.Term, infos []qrep.IndexInfo) plannedLeaf {
+// always evaluate residually at this stage. selNames feeds rule
+// 3(b)'s "every column the query touches".
+func planQuery(terms []qrep.Term, selNames []string, infos []qrep.IndexInfo) plannedLeaf {
 	touched := touchedColumns(terms)
+	for _, n := range selNames {
+		touched[n] = struct{}{}
+	}
 	entailed := entailedMultiColumns(terms)
 	var cands []plannedLeaf
 	for _, info := range infos {
@@ -343,4 +348,95 @@ func prefixSuccessor(p []byte) []byte {
 		}
 	}
 	return nil
+}
+
+// liveColumnsMatch guards the executor against a same-tx Rebuild
+// that changed the index's column tuple: the plan's consumed
+// literals target the SNAPSHOT column order, and seeking live
+// entries with them would silently return rows a scan excludes
+// (Inv-QB1). Name equality in order is exactly "same tuple
+// meaning" — column names are semantic anchors (indexing.md). On
+// mismatch the executor falls back to a full scan, which is
+// correct under any declaration shape.
+func liveColumnsMatch(info qrep.IndexInfo, decl *gmdb.IndexDecl) bool {
+	if len(decl.Columns) != len(info.KeyCols) {
+		return false
+	}
+	for i, c := range decl.Columns {
+		if c.Name != info.KeyCols[i].Name {
+			return false
+		}
+	}
+	return true
+}
+
+// entryBounds compiles the leaf's consumed shape into RangeEntries
+// bounds: a seek or prefix is the [eqVals, group-close) interval;
+// a range keeps its trailing-bound construction.
+func entryBounds(leaf plannedLeaf) (start, end [][]byte) {
+	if leaf.shape == shapeRange {
+		return rangeBounds(leaf.eqVals, leaf.bound)
+	}
+	return leaf.eqVals, groupClose(leaf.eqVals)
+}
+
+// entryEligible reports whether the leaf can serve the query
+// INDEX-ONLY (route 1, query-builder.md §Covering-aware
+// execution): every selected column and every residual term column
+// resolves from the index's key or covering columns; residual
+// Contains-kind terms are excluded (their existential semantics
+// range over the row's whole element set, which one entry does not
+// carry); opaque filters force whole-row materialization
+// (Inv-QB7). Judged on the open-time snapshot — execution
+// validates the live declaration still matches before serving.
+func entryEligible(leaf plannedLeaf, sel []qrep.SelectCol, resid []qrep.Term, nFilters int) bool {
+	if nFilters > 0 || len(sel) == 0 {
+		return false
+	}
+	if leaf.index.CoverValue {
+		// Full-row covering has no per-column slots — its Rows
+		// route materializes V from the entry (no row read) via the
+		// executor's cover-value path, not the slot path.
+		return false
+	}
+	carried := make(map[string]struct{}, len(leaf.index.KeyCols)+len(leaf.index.Covering))
+	for _, c := range leaf.index.KeyCols {
+		carried[c.Name] = struct{}{}
+	}
+	for _, c := range leaf.index.Covering {
+		carried[c] = struct{}{}
+	}
+	for _, s := range sel {
+		if _, ok := carried[s.Name]; !ok {
+			return false
+		}
+	}
+	var evaluable func(ts []qrep.Term) bool
+	evaluable = func(ts []qrep.Term) bool {
+		for _, t := range ts {
+			switch t.Kind {
+			case qrep.KindOr:
+				for _, g := range t.Disjuncts {
+					if !evaluable(g) {
+						return false
+					}
+				}
+			case qrep.KindContains, qrep.KindContainsRange:
+				return false
+			default:
+				// A kind the scalar comparator does not implement
+				// routes to the materialized path, whose Term.Eval
+				// fails loud — never a silent no-match on the entry
+				// route.
+				if !qrep.HandledScalarKind(t.Kind) {
+					return false
+				}
+				if _, ok := carried[t.ColumnName]; !ok {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return evaluable(resid)
 }
