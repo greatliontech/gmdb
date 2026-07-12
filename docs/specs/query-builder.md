@@ -351,6 +351,15 @@ inputs interleaved by construction.
 Normative; the planner is rule-based and deterministic, not
 cost-based.
 
+**Shape precedence.** Rules 2-5 compose in a fixed order: the
+rule-2/3 single-leaf plan wins whenever it consumes at least one
+term; rule 5's `Intersect` replaces it only under rule 5's
+strict-improvement condition; rule 4's `Union` applies only when
+no conjunct term is consumable at all; otherwise rule 6's scan.
+The precedence is load-bearing for plan pinning (`Explain`) and
+Inv-QB5's determinism; like every plan choice it is cost-only
+under Inv-QB1.
+
 1. Flatten the top-level conjunction. Partition leaves into
    sargable terms (on declared columns) and everything else
    (opaque filters; nested disjunctions the rules below do not
@@ -389,9 +398,21 @@ cost-based.
    and joins with `Union`. A group that cannot be pushed at all
    degrades the whole `Or` to residual evaluation over a wider
    plan (never a partial union — that would violate Inv-QB1).
-5. Two conjuncts each consumable only by DIFFERENT indexes may
-   plan as `Intersect`; the planner does so only when neither
-   index alone consumes both and both seeks are EQ-shaped.
+   With multiple top-level `Or` terms, the FIRST (in term order)
+   with at least one group and every group pushable is the one
+   pushed; the others evaluate residually over the union's rows
+   (an `Or` with no groups matches nothing and is never
+   pushed). A group's rule-3(b) touch set is the group's own
+   terms plus the query's `Select` and `OrderBy` columns; outer
+   conjunct terms are not part of a branch's touch set.
+5. Two conjuncts may plan as `Intersect` over two different
+   indexes; the planner does so only when both seeks are
+   EQ-shaped, their consumed term sets are disjoint, and together
+   they consume strictly more terms than the best single
+   candidate. The strict-improvement condition entails that no
+   single index consumes both: a candidate consuming the pair's
+   union scores at least the disjoint pair's total under
+   rule 3(a), so such a pair never improves on it.
 6. Unconsumed sargable terms and all opaque filters become
    `ResidualFilter` nodes. No index fits ⇒ `Scan`.
 7. `Where`-partial indexes (a `ColumnIndex` with a non-nil

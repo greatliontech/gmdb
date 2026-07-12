@@ -9,10 +9,9 @@ import (
 )
 
 // The rule-based planner (query-builder.md §Planning rules):
-// deterministic, not cost-based. This stage plans a single index
-// leaf per query — disjunction pushdown (Union) and Intersect are
-// combiner rules that compose on top without changing leaf
-// selection.
+// deterministic, not cost-based. Leaf selection (rules 2-3) is
+// shared by every plan shape; Union and Intersect compose on top
+// of it per the spec's shape precedence.
 
 type leafShape int
 
@@ -87,19 +86,12 @@ type queryPlan struct {
 // conjunction over the handle's declared ColumnIndexes. Rule 1's
 // partition is implicit: only leaf terms with EQ/range shapes on
 // declared columns are consumable; nested Or terms and opaque
-// filters always evaluate residually. selNames feeds rule 3(b)'s
-// "every column the query touches".
-//
-// Shape selection is deterministic (Inv-QB5): the single-leaf
-// plan of rules 2-3 wins when it consumes anything; rule 5's
-// Intersect upgrades it when two disjoint EQ-shaped seeks on
-// different indexes together consume strictly more than the best
-// single leaf and no single candidate consumes both; rule 4's
-// Union applies when no conjunct term is consumable at all and
-// the FIRST top-level Or has every group independently pushable
-// — a group that cannot be pushed degrades the whole Or to
-// residual evaluation (never a partial union, Inv-QB1). Plan
-// choice is cost-only; results are identical across shapes.
+// filters always evaluate residually. selNames/orderNames feed
+// rule 3(b)'s "every column the query touches". Shape precedence
+// (single leaf, then the Intersect upgrade, then Union, then
+// scan), the first-pushable-Or rule, and rule 5's
+// strict-improvement condition are normative — query-builder.md
+// §Planning rules.
 func planQuery(terms []qrep.Term, selNames, orderNames []string, infos []qrep.IndexInfo) queryPlan {
 	cands := leafCandidates(terms, selNames, orderNames, infos)
 	best := plannedLeaf{shape: shapeScan}
@@ -167,12 +159,10 @@ func leafCandidates(terms []qrep.Term, selNames, orderNames []string, infos []qr
 	return cands
 }
 
-// intersectUpgrade applies rule 5: two candidates, each an
-// EQ-shaped seek consuming terms the other does not, on different
-// indexes, with no single candidate consuming their union —
-// planned as Intersect when together they consume strictly more
-// than the best single leaf. The better-scored seek probes (its
-// ordering is preserved); the other builds the PK set.
+// intersectUpgrade applies rule 5 (query-builder.md §Planning
+// rules — the strict-improvement formulation is normative). The
+// better-scored seek probes (its ordering is preserved); the
+// other builds the PK set.
 func intersectUpgrade(terms []qrep.Term, cands []plannedLeaf, best plannedLeaf) (queryPlan, bool) {
 	var seeks []plannedLeaf
 	for _, c := range cands {
@@ -186,11 +176,8 @@ func intersectUpgrade(terms []qrep.Term, cands []plannedLeaf, best plannedLeaf) 
 			if a.index.Name == b.index.Name || sharesConsumed(a, b) {
 				continue
 			}
-			// Rule 5's "neither index alone consumes both" needs no
-			// separate check: a single candidate consuming a∪b
-			// scores ≥ the disjoint pair's total (rule 3a), so the
-			// strict-improvement test above already suppresses the
-			// pair.
+			// No separate consumes-both check: entailed by the
+			// strict-improvement condition (rule 5).
 			if len(a.consumed)+len(b.consumed) <= len(best.consumed) {
 				continue
 			}
@@ -219,11 +206,10 @@ func sharesConsumed(a, b plannedLeaf) bool {
 	return false
 }
 
-// unionPlan applies rule 4 to the first top-level Or whose every
-// group plans to an index leaf. Groups plan independently by
-// rules 1-3 over their own conjunction; group terms the branch
-// leaf does not consume evaluate on the branch's rows before the
-// merge point.
+// unionPlan applies rule 4 (query-builder.md §Planning rules —
+// the first-pushable-Or and per-group touch-set clauses are
+// normative). Group terms the branch leaf does not consume
+// evaluate on the branch's rows before the merge point.
 func unionPlan(terms []qrep.Term, selNames, orderNames []string, infos []qrep.IndexInfo) (queryPlan, bool) {
 	for oi, t := range terms {
 		if t.Kind != qrep.KindOr || len(t.Disjuncts) == 0 {
