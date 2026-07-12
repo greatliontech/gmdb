@@ -331,7 +331,7 @@ Lock File
 | Header (136 bytes)                           |
 | Magic              | uint64                  |
 | MaxReaders         | uint32                  |
-| Padding            | 4 bytes                 |
+| TakeoverSeq        | uint32                  |  dead-author takeover counter
 | UUID               | [16]byte                |  must match data file's UUID
 | WriterPID          | uint64                  |
 | WriterStartTime    | uint64                  |
@@ -360,6 +360,20 @@ PST = Process Start Time. PIDN = PID Namespace. HB = Heartbeat.
 HEpoch = HintEpoch (cross-process orphan-detection anchor for
 slots stuck mid-acquire; see Stale Reader Detection).
 
+TakeoverSeq counts torn-unpublished-write events: grant
+acquisitions that observed a non-zero WriterPID — a holder that
+died without its clear-before-unlock (definitionally dead under
+the acquirer's LOCK_EX; no liveness classifier runs) — bumped
+under the acquisition's LOCK_EX before stale-writer recovery
+clears the header, plus publication-phase commit failures, where
+the poisoning author bumps under the grant it still holds. Each
+writable handle caches the value its bitmap + RPL state was last
+rebuilt at and forces a full re-sync rebuild on mismatch
+(`free-space.md §Grant-handoff tear detection`). It
+occupies former header padding, so HeaderSize is unchanged —
+header GROWTH remains gated on shipping with a data-format break
+(see the stale-recreate arm's safety invariant).
+
 The lock-file structures use Go structs with `structs.HostLayout`
 (Go 1.24+), which guarantees the host platform's C ABI layout.
 This allows safely overlaying Go structs on the mmap'd shared
@@ -370,7 +384,7 @@ type LockFileHeader struct {
     _                   structs.HostLayout
     Magic               uint64
     MaxReaders          uint32
-    _                   [4]byte
+    TakeoverSeq         uint32
     UUID                [16]byte
     WriterPID           uint64
     WriterStartTime     uint64
@@ -770,7 +784,14 @@ latency and bounded cancellation latency.
    have acquired it, committed, and released — leaving every one of
    those stale. Before building the transaction, re-read both meta
    pages and, if the on-disk state advanced, rebuild bitmap + RPL +
-   fileSize + commit-state from disk (`Pager.Resync`). The mmap is
+   fileSize + commit-state from disk (`Pager.Resync`). An unchanged
+   TxnID skips the rebuild — EXCEPT when the header's takeover
+   sequence differs from the value cached at this handle's last full
+   rebuild, which forces it: a holder that died mid-reclamation — or whose
+   publication-phase commit failed — leaves torn bitmap writes with
+   no TxnID advance, and every surviving handle's chain must be
+   rebuilt over them
+   (`free-space.md §Grant-handoff tear detection`). The mmap is
    reused unchanged: `MaxSize` and `PageSize` are immutable for the
    file's life, so the reservation always covers the current file
    (a peer can only grow it up to `MaxSize`). Skipping this step is a

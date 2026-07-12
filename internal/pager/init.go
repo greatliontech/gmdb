@@ -516,7 +516,19 @@ func (p *Pager) attachState(file *os.File, m Meta) error {
 // returns the error
 // without poisoning — the handle stays usable (a retry re-reads; Close +
 // re-Open invokes Open's own corruption recovery).
-func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m Meta, active int, changed bool, err error) {
+// force overrides the TxnID-equality skip: a handle whose cached
+// takeover sequence lags the lock header's must rebuild the bitmap +
+// RPL chain from the on-disk image even when TxnID never advanced —
+// a peer may have died mid-reclamation, or poisoned on a failed
+// publication, leaving torn bitmap writes and an on-disk chain
+// projection this handle's in-memory chain predates (free-space.md
+// §Grant-handoff tear detection). attachState's walk truncates at the tear's reclaimed
+// boundary and rearmCrashedReclamation restores the
+// in-chain/allocated invariant, exactly as at Open; without the
+// forced rebuild, reclamation behind that boundary double-frees
+// (the walker-agreement argument fails for chains predating a torn,
+// never-published peer reclamation).
+func (p *Pager) Resync(file *os.File, knownTxnID uint64, force bool) (m Meta, active int, changed bool, err error) {
 	meta0, meta1, err := readMetaPair(file, p.cfg.PageSize)
 	if err != nil {
 		return Meta{}, 0, false, err
@@ -531,7 +543,7 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64) (m Meta, active int, ch
 	}
 	p.advanceAnchoredEpoch(m.Durable.AnchoredTxnID)
 	p.noteAdoptedMeta(m, active)
-	if m.TxnID == knownTxnID {
+	if m.TxnID == knownTxnID && !force {
 		return m, active, false, nil
 	}
 	if err := p.attachState(file, m); err != nil {

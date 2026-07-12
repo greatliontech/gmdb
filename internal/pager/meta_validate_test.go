@@ -55,7 +55,7 @@ func TestSelectionRejectsInvalidFieldsMeta(t *testing.T) {
 	if _, err := ReadLatestMeta(f, testPageSize); !errors.Is(err, ErrCorrupted) {
 		t.Errorf("ReadLatestMeta: got %v, want ErrCorrupted", err)
 	}
-	if _, _, _, err := od.Pager.Resync(f, 999); !errors.Is(err, ErrCorrupted) {
+	if _, _, _, err := od.Pager.Resync(f, 999, false); !errors.Is(err, ErrCorrupted) {
 		t.Errorf("Resync: got %v, want ErrCorrupted", err)
 	}
 	if err := od.Pager.Close(); err != nil {

@@ -620,6 +620,53 @@ projection's recorded head TxnID, so the walk truncates at any
 segment newer than its predecessor (or the head record) exactly
 like the reclaimed boundary.
 
+**Grant-handoff tear detection.** The truncating walk and re-arm
+above run wherever the bitmap + chain are rebuilt from the on-disk
+image: at `Open` and on a re-sync that rebuilds. A surviving handle
+has a third exposure: a writer that died BETWEEN its reclamation's
+bitmap pwrites and its meta publish advanced no TxnID, so the
+ordinary re-sync equality skip would keep the survivor's in-memory
+chain — built before the tear, still listing segments the on-disk
+walk sees behind a reclaimed boundary — and reclamation from that
+stale chain double-frees. The signal must be LEVEL-triggered: the
+crashed holder's on-lock-file evidence is consumed by the FIRST
+grant acquisition after the death (recovery clears the writer
+header; the acquisition stamps its own identity), while the tear
+poisons EVERY handle whose chain predates it — any intermediate
+acquisition, including another handle of the survivor's own
+process, launders the evidence. The lock file therefore carries a
+takeover sequence (`cross-process.md §Lock File Layout`,
+TakeoverSeq), bumped under the grant's LOCK_EX at each of the TWO
+states in which torn reclamation writes can exist unpublished —
+every reclamation bitmap pwrite happens under the grant, so a tear
+requires the holder to stop between its pwrites and its meta
+publish, which happens exactly two ways. (1) The holder DIED
+there: the next acquisition observes a non-zero WriterPID (a
+holder that died without its clear-before-unlock — definitional
+under the acquirer's LOCK_EX) and bumps. The trigger deliberately
+runs NO liveness classifier: a classifier's false-live window
+(cross-namespace fresh heartbeat, unreaped zombie) would swallow
+the bump, and a swallowed bump is permanent — the evidence is
+destroyed by the same acquisition. (2) The holder's
+publication-phase commit FAILED (a step-1+ pwrite/fsync error):
+the author poisons its handle and bumps the sequence ITSELF,
+under the grant it still holds, before releasing cleanly — a
+clean release leaves no WriterPID evidence, so the next acquirer
+cannot supply this bump. Each writable handle compares
+the sequence at every grant re-sync against the value cached at
+its last full rebuild — a mismatch forces the bitmap + chain
+rebuild from the on-disk image even at an unchanged TxnID. The
+walk truncates at the tear's reclaimed boundary and the re-arm
+restores the in-chain/allocated invariant, exactly as at `Open`;
+each handle SUCCESSFULLY rebuilds at most once per takeover (a
+failed forced re-sync leaves the cache behind, so the next grant
+retries). (Enforced by the
+takeover-sequence force on the writer-grant re-sync; pinned by
+`TestTakeoverAfterPeerTornReclamationRebuildsChain`,
+`TestTakeoverSeqReachesLaunderedHandles`,
+`TestPoisonedPublicationBumpsTakeoverSeq`, and
+`TestResyncForceRebuildsFromTornImage`.)
+
 ### Reclamation-bound derivation points
 
 Scanning the reader table is O(MaxReaders), so the writer derives

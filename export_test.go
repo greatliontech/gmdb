@@ -3,6 +3,7 @@ package gmdb
 import (
 	"context"
 
+	"github.com/thegrumpylion/gmdb/internal/lock"
 	"github.com/thegrumpylion/gmdb/internal/pager"
 )
 
@@ -150,8 +151,23 @@ func SetCheckpointStepHookForTest(hook func(step int) error) (restore func()) {
 	return func() { checkpointStepHookForTest.Store(nil) }
 }
 
+// TakeoverSeqSeenForTest reads the handle's cached takeover
+// sequence — the grant-handoff tests pin that a forced rebuild
+// advances it (otherwise every subsequent grant re-runs the full
+// bitmap+RPL rebuild).
+func (db *DB) TakeoverSeqSeenForTest() uint32 {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.takeoverSeqSeen
+}
+
 // PgrForTest exposes the writer pager for white-box fault injection.
 func (db *DB) PgrForTest() *pager.Pager { return db.pgr }
+
+// CoordForTest exposes the cross-process coordinator so tests can
+// plant lock-file last-writer records (grant-handoff tear
+// detection).
+func (db *DB) CoordForTest() *lock.Coord { return db.coord }
 
 // SetSyncDirHookForTest observes (and optionally injects a failure
 // into) syncDir calls, after the real directory fsync succeeded.

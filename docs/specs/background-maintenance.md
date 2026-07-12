@@ -72,17 +72,14 @@ Invariant: kind=entailed;
     live handle's in-memory chain agrees with the on-disk
     projection — self-authored (the ordinary single-writer case:
     the image derives from the chain), or rebuilt by a walk over
-    the current image (crash recovery at Open, Resync after a
-    TxnID advance); only a peer's torn, never-published write
-    can break the agreement without advancing TxnID.
-    RESIDUAL GAP, recorded not closed: a surviving handle
-    whose chain predates a peer's TORN, never-published
-    reclamation (the peer died between its step-1 bitmap pwrites
-    and its meta publish) still lists segments the on-disk walk
-    sees behind a reclaimed boundary; no TxnID advanced, so no
-    Resync re-walks, and reclamation behind that boundary can
-    double-free exactly as below;
-    a footer/decode boundary is ambiguous — the segment
+    the current image (crash recovery at Open, re-sync after
+    a TxnID advance, or the takeover-sequence-forced re-sync —
+    the one case where a peer's torn, never-published
+    reclamation could otherwise leave a surviving handle's
+    chain predating the tear without a TxnID advance to
+    trigger the rebuild;
+    `free-space.md §Grant-handoff tear detection`).
+    A footer/decode boundary is ambiguous — the segment
     may have bitrotted AFTER the live writer built its in-memory
     chain, in which case the still-pending segments behind it are
     invisible to the walk and their entries misclassify as

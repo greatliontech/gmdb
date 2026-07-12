@@ -171,6 +171,12 @@ func (db *DB) reopenAfterCompact(base string) error {
 	// Meta baseline mirrors Open (adoptOpened): a compacted file is
 	// fully durable and self-durable at TxnID 0 (copy.go).
 	db.adoptOpened(opened)
+	// The adopted state is a full rebuild from the (fresh) on-disk
+	// image; refresh the takeover-sequence cache like Open's attach
+	// arms do (Compact holds the grant, so the read is stable).
+	if db.coord != nil {
+		db.takeoverSeqSeen = db.coord.TakeoverSeq()
+	}
 	db.mu.Unlock()
 
 	// Re-point the DB leak-detection cleanup at the new pager + file (the

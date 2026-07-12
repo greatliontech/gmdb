@@ -35,14 +35,37 @@ const (
 //
 // Every uint64 field is 8-byte aligned by construction: the mmap base
 // is page-aligned (MAP_SHARED ⇒ ≥ 4096-byte alignment), Magic at
-// offset 0 is 8-aligned, MaxReaders+padding consume bytes 8..15, UUID
+// offset 0 is 8-aligned, MaxReaders+TakeoverSeq consume bytes 8..15
+// (TakeoverSeq at offset 12 is 4-aligned, as 32-bit atomics require), UUID
 // is byte-aligned (and self-contained), and the trailing uint64s start
 // at offset 32 — all multiples of 8.
 type LockFileHeader struct {
-	_                   structs.HostLayout
-	Magic               uint64
-	MaxReaders          uint32
-	_                   [4]byte
+	_          structs.HostLayout
+	Magic      uint64
+	MaxReaders uint32
+	// TakeoverSeq counts torn-unpublished-write events — the two
+	// states in which torn reclamation writes can exist unpublished
+	// (cross-process.md §Lock File Layout, takeover sequence): a
+	// grant acquisition observing a non-zero WriterPID (a holder
+	// that died without its clear-before-unlock) bumps under its
+	// LOCK_EX with NO liveness classifier (a false-live window would
+	// swallow the bump permanently); a publication-phase commit
+	// failure bumps from the poisoning author itself, under the
+	// grant it still holds (a clean release leaves no WriterPID
+	// evidence). Each handle caches the value its
+	// in-memory bitmap + RPL chain was last (re)built at and forces a
+	// full rebuild from the on-disk image when they differ.
+	// Level-triggered on purpose: the crashed holder's header is
+	// consumed by the FIRST acquisition (recovery clears it, the
+	// stamp overwrites it), while its torn, never-published
+	// reclamation poisons EVERY surviving handle's chain without
+	// advancing TxnID (free-space.md §Grant-handoff tear detection).
+	// Occupies what was header
+	// padding, so HeaderSize is unchanged (see the size-growth safety
+	// invariant at the adopt-time size check); pre-takeover lock files
+	// carry 0. uint32 wrap would need 2^32 dead-writer takeovers
+	// between two grants of one handle.
+	TakeoverSeq         uint32
 	UUID                [16]byte
 	WriterPID           uint64
 	WriterStartTime     uint64

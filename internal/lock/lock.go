@@ -653,6 +653,11 @@ func bootEpochReset(p OpenParams, f *os.File, maxReaders uint32) error {
 	zeroed.LastMaintenanceTime = 0
 	zeroed.LastWriterPID, zeroed.LastWriterStartTime, zeroed.LastWriterPIDNamespace, zeroed.LastWriterHeartbeat = 0, 0, 0, 0
 	zeroed.ShrinkSeq = 0
+	// TakeoverSeq is zeroed with the rest: like slot Gen words, its
+	// monotonicity is relied on only among live handles, and the
+	// reset's precondition (no process from the stamped boot exists)
+	// means no handle holds a cached value.
+	zeroed.TakeoverSeq = 0
 	zeroed.BootID = cur
 	// Slots first, then the header with the new boot id LAST: a crash
 	// between the two leaves the old id and the next adopter repeats
@@ -859,6 +864,26 @@ func (f *File) ShrinkSeq() uint64 {
 		panic("lock: ShrinkSeq on closed *File")
 	}
 	return Load64(&f.header.ShrinkSeq)
+}
+
+// TakeoverSeq reads the dead-author takeover counter (format.go
+// field doc). Stable while the caller holds the write grant — bumps
+// happen only inside a grant acquisition, under the same LOCK_EX.
+func (f *File) TakeoverSeq() uint32 {
+	if f.header == nil {
+		panic("lock: TakeoverSeq on closed *File")
+	}
+	return Load32(&f.header.TakeoverSeq)
+}
+
+// BumpTakeoverSeq increments the dead-author takeover counter.
+// Caller MUST hold flock(LOCK_EX) — the grant-acquisition publish
+// step, on observing a dead pre-acquisition last-writer record.
+func (f *File) BumpTakeoverSeq() {
+	if f.header == nil {
+		panic("lock: BumpTakeoverSeq on closed *File")
+	}
+	Add32(&f.header.TakeoverSeq, 1)
 }
 
 // BumpShrinkSeq increments the shrink seqlock. The writer calls it

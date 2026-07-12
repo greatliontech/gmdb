@@ -30,12 +30,16 @@ func CAS64(p *uint64, old, new uint64) bool {
 	return atomic.CompareAndSwapUint64(p, old, new)
 }
 
-// Load32 / Store32 cover the single 32-bit shared-memory field —
-// MaxReaders. After lock-file creation the value is immutable; the
-// load is exposed so consumers can sanity-check the header against
-// the size argument used to mmap.
+// Load32 / Store32 cover the 32-bit shared-memory fields —
+// MaxReaders (immutable after creation; the load lets consumers
+// sanity-check the header against the size argument used to mmap)
+// and TakeoverSeq.
 func Load32(p *uint32) uint32     { return atomic.LoadUint32(p) }
 func Store32(p *uint32, v uint32) { atomic.StoreUint32(p, v) }
+
+// Add32 atomically adds delta to a shared-memory uint32 field and
+// returns the new value — the TakeoverSeq bump.
+func Add32(p *uint32, delta uint32) uint32 { return atomic.AddUint32(p, delta) }
 
 // Add64 atomically adds delta to a shared-memory uint64 field and
 // returns the new value.

@@ -81,6 +81,12 @@ type DB struct {
 	// mismatch means a peer's Compact replaced the inode this handle
 	// still maps — poison, Close + re-Open converges.
 	dataGeneration atomic.Uint64
+	// takeoverSeqSeen is the lock header's takeover sequence as of
+	// this handle's last full bitmap+RPL (re)build from the on-disk
+	// image — Open's attach, or a forced grant re-sync. Written at
+	// Open before the handle escapes, then only under db.mu + the
+	// write grant (resyncPagerLocked).
+	takeoverSeqSeen uint32
 
 	// closeGate is a heap-allocated coordination struct shared by
 	// pointer with every txCleanupInfo, every readTxCleanupInfo, and
@@ -397,6 +403,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	// re-read — the pre-grant snapshot can be stale by any number of
 	// peer commits that landed while AcquireWriter blocked).
 	openRecovered := false
+	openTakeoverSeq := uint32(0)
 	if !opts.ReadOnly && coord != nil {
 		teardown := func() {
 			coord.Close()
@@ -442,6 +449,11 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 			}
 			opened.Meta, opened.ActiveMetaIdx = lm, lidx
 		}
+		// Both attach arms rebuilt bitmap + RPL from the current
+		// on-disk image; cache the takeover sequence under the same
+		// grant (this acquisition's own dead-prev bump, if any, is
+		// already included — correct: our state postdates it).
+		openTakeoverSeq = coord.TakeoverSeq()
 		grant.Release()
 	}
 
@@ -459,6 +471,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		readOnly:  opts.ReadOnly,
 	}
 	db.adoptOpened(opened)
+	db.takeoverSeqSeen = openTakeoverSeq
 	if coord != nil {
 		db.dataGeneration.Store(coord.DataGeneration())
 		// Inode verification AFTER the generation cache read: if a
@@ -1037,9 +1050,32 @@ func (db *DB) resyncPagerLocked() (*pager.Pager, *os.File, error) {
 	if pgr == nil || file == nil {
 		return nil, nil, ErrClosed
 	}
-	m, active, _, err := pgr.Resync(file, db.currentMeta.TxnID)
+	// Grant-handoff tear detection (free-space.md §Grant-handoff
+	// tear detection): a writer that died mid-reclamation left torn
+	// bitmap writes with NO TxnID advance, so the equality skip
+	// would keep every surviving handle's chain predating the tear,
+	// and reclamation behind the tear's reclaimed boundary
+	// double-frees. The takeover sequence is level-triggered: bumped
+	// under LOCK_EX at either tear source (an acquisition observing
+	// the died-holding-grant writer header, or a publication-phase
+	// commit failure's own poison-site bump), and compared here
+	// against the value cached at THIS handle's last rebuild — the
+	// header alone is edge-triggered and consumed by any
+	// intermediate acquisition (including another handle of our own
+	// process).
+	force := false
+	var seq uint32
+	if coord := db.coord; coord != nil {
+		if seq = coord.TakeoverSeq(); seq != db.takeoverSeqSeen {
+			force = true
+		}
+	}
+	m, active, _, err := pgr.Resync(file, db.currentMeta.TxnID, force)
 	if err != nil {
 		return nil, nil, fmt.Errorf("gmdb: re-sync writer state on grant: %w", mapPagerErr(err))
+	}
+	if force {
+		db.takeoverSeqSeen = seq
 	}
 	// Refresh the cached meta UNCONDITIONALLY, not only on a TxnID
 	// change: a peer's CHECKPOINT BUMP rewrites the active slot's

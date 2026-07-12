@@ -513,6 +513,18 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 	// clear; activating it before the publish ensures step-3's
 	// header values aren't immediately overwritten by recovery.
 	if c.f.WriterPID() != 0 {
+		// Died-holding-grant is one of the takeover-sequence's two
+		// tear sources (format.go, TakeoverSeq; the other — a
+		// publication-phase commit failure — bumps from the
+		// poisoning author itself, since its clean release leaves no
+		// evidence here). The clear-before-unlock invariant makes
+		// the non-zero PID here definitional death. No liveness
+		// classifier runs, so no false-live window (cross-NS fresh
+		// heartbeat, unreaped zombie) can swallow the bump; a
+		// swallowed bump would be permanent — step 3 stamps our
+		// identity and recovery clears the header, destroying the
+		// evidence.
+		c.f.BumpTakeoverSeq()
 		RecoverStaleWriter(c.f, c.pidNS)
 	}
 
@@ -793,6 +805,61 @@ func (c *Coord) UnregisterReaderSlot(i uint32) {
 // the instant it is read) and must not be used as a lock.
 func (c *Coord) WriterHeld() bool {
 	return c.writerHeld.Load()
+}
+
+// SetWriterRecordForTest overwrites the lock file's writer header —
+// grant-handoff tear-detection tests plant a died-holding-grant
+// state with it (an in-process test cannot die holding the grant;
+// the kernel released the dead holder's flock, so the fields are
+// writable, and the next LOCK_EX acquisition observes them exactly
+// as it would a real crashed holder's). pidNS zero means "this
+// handle's namespace".
+//
+// Grant.Release returns BEFORE the flock goroutine's asynchronous
+// clear+unlock, so a plant issued right after a Commit/Rollback
+// races the clear and can be silently erased. Wait for the whole
+// clear to land first — the release path zeroes PID, then
+// StartTime, then PIDNamespace, so all three must read 0 before the
+// plant (observing PID == 0 alone can interleave the plant between
+// the trailing zero-stores). After all three read 0 the goroutine
+// touches no further header bytes (its only remaining action is the
+// LOCK_UN syscall).
+func (c *Coord) SetWriterRecordForTest(pid, startTime, pidNS, heartbeat uint64) {
+	if pidNS == 0 {
+		pidNS = c.pidNS
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for c.f.WriterPID() != 0 || c.f.WriterStartTime() != 0 || c.f.WriterPIDNamespace() != 0 {
+		if time.Now().After(deadline) {
+			panic("lock: SetWriterRecordForTest: writer header never cleared (grant still held?)")
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+	c.f.SetWriterPID(pid)
+	c.f.SetWriterStartTime(startTime)
+	c.f.SetWriterPIDNamespace(pidNS)
+	c.f.SetWriterHeartbeat(heartbeat)
+}
+
+// TakeoverSeq reads the lock file's dead-author takeover counter
+// (lock file format.go, TakeoverSeq field doc). The caller MUST hold
+// the write grant: bumps happen only inside a grant acquisition,
+// under the same LOCK_EX, so the value is stable for the grant's
+// duration.
+func (c *Coord) TakeoverSeq() uint32 {
+	return c.f.TakeoverSeq()
+}
+
+// BumpTakeoverSeq increments the lock file's takeover sequence. The
+// caller MUST hold the write grant (the bump must land under
+// LOCK_EX). The grant-holder-side tear source: a publication-phase
+// commit failure leaves torn unpublished bitmap writes exactly like
+// a died-holding-grant crash, but the author survives to release
+// cleanly — so the author itself bumps, under the grant it still
+// holds, when it poisons (free-space.md §Grant-handoff tear
+// detection).
+func (c *Coord) BumpTakeoverSeq() {
+	c.f.BumpTakeoverSeq()
 }
 
 // PrevLastWriterLive reports whether the last-writer record AS IT

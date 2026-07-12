@@ -425,6 +425,19 @@ func (tx *Tx) Commit() error {
 		// overruns the budget, or background compaction's budget-halving retry (background-maintenance.md §Invariants)).
 		if !errors.Is(err, pager.ErrTxTooLarge) && !errors.Is(err, pager.ErrDBFull) {
 			tx.db.poisoned.Store(true)
+			// The publication-phase pwrites that DID land are torn
+			// unpublished state — bitmap bits for reclaimed segments,
+			// with no meta publish — exactly the image a
+			// died-holding-grant crash leaves, but the header will be
+			// cleared by our clean release. Bump the takeover sequence
+			// under the grant this tx still holds (deferred release)
+			// so every surviving handle's next grant re-sync forces
+			// the bitmap+RPL rebuild (free-space.md §Grant-handoff
+			// tear detection). This handle itself is poisoned and
+			// never writes again.
+			if tx.db.coord != nil {
+				tx.db.coord.BumpTakeoverSeq()
+			}
 		}
 		return mapPagerErr(err)
 	}
