@@ -67,9 +67,10 @@ var (
 	colGrp  = typed.NewColumn("grp", typed.Uint32Encoder{}, func(_ uint64, v row) uint32 { return v.Grp })
 	colName = typed.NewColumn("name", typed.StringEncoder{}, func(_ uint64, v row) string { return v.Name })
 	colTags = typed.NewMultiColumn("tag", typed.StringEncoder{}, func(_ uint64, v row) []string { return v.Tags })
+	colID   = typed.NewColumn("id", typed.Uint64Encoder{}, func(k uint64, _ row) uint64 { return k })
 )
 
-func openQueryDB(t *testing.T, n int, rng *rand.Rand) (*typed.KeyspaceHandle[uint64, row], map[uint64]row, func()) {
+func openQueryDB(t *testing.T, n int, rng *rand.Rand, indexes ...typed.AnyIndex[uint64, row]) (*typed.KeyspaceHandle[uint64, row], map[uint64]row, func()) {
 	t.Helper()
 	ctx := context.Background()
 	db, err := gmdb.Open(ctx, filepath.Join(t.TempDir(), "db.gmdb"),
@@ -83,7 +84,7 @@ func openQueryDB(t *testing.T, n int, rng *rand.Rand) (*typed.KeyspaceHandle[uin
 		t.Fatalf("Begin: %v", err)
 	}
 	tks := typed.NewKeyspace[uint64, row]("rows", typed.Uint64Encoder{}, rowCodec{})
-	h, err := tks.Create(tx)
+	h, err := tks.Create(tx, indexes...)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -118,7 +119,13 @@ func cmpU32(a, b uint32) int { return slices.Compare(encU32(a), encU32(b)) }
 func cmpStr(a, b string) int { return slices.Compare(encStr(a), encStr(b)) }
 
 func randTerm(rng *rand.Rand, depth int) refTerm {
-	switch rng.Intn(10) {
+	switch rng.Intn(12) {
+	case 10:
+		id := uint64(rng.Intn(200))
+		return refTerm{term: colID.Eq(id), eval: func(k uint64, _ row) bool { return k == id }}
+	case 11:
+		nm := []string{"alpha", "beta", "Alpha", "b", ""}[rng.Intn(5)]
+		return refTerm{term: colName.Eq(nm), eval: func(_ uint64, v row) bool { return v.Name == nm }}
 	case 0:
 		g := uint32(rng.Intn(6))
 		return refTerm{term: colGrp.Eq(g), eval: func(_ uint64, v row) bool { return cmpU32(v.Grp, g) == 0 }}
@@ -174,15 +181,110 @@ func randTerm(rng *rand.Rand, depth int) refTerm {
 	}
 }
 
-func TestQueryScanEquivalence(t *testing.T) {
+// randIndexes generates the schema arm of the grammar: 0–3
+// ColumnIndexes over random subsets/orders of the declared
+// columns, with unique (only when the injective id column is
+// present), Where-partial (rule 7's exclusion arm), CoverValue,
+// and covering mixes. Returns the declarations plus the set of
+// partial index names — the planner must never choose those.
+func randIndexes(rng *rand.Rand) (idxs []typed.AnyIndex[uint64, row], partial map[string]bool) {
+	scalar := []typed.AnyColumn[uint64, row]{colGrp, colName, colID}
+	all := []typed.AnyColumn[uint64, row]{colGrp, colName, colTags, colID}
+	partial = map[string]bool{}
+	n := 1 + rng.Intn(3)
+	for i := 0; i < n; i++ {
+		// Bias toward short scalar-led indexes: an index with an
+		// unconsumed MultiColumn is never an access path (rule 2's
+		// eligibility clause), so an all-arms-equal draw starves
+		// the planner and the census below trips.
+		pool := scalar
+		if rng.Intn(3) == 0 {
+			pool = all
+		}
+		perm := rng.Perm(len(pool))
+		take := 1 + rng.Intn(2)
+		if rng.Intn(4) == 0 {
+			take = 3
+		}
+		var cols []typed.AnyColumn[uint64, row]
+		hasID, hasMulti := false, false
+		for _, p := range perm[:take] {
+			cols = append(cols, pool[p])
+			if pool[p] == typed.AnyColumn[uint64, row](colID) {
+				hasID = true
+			}
+			if pool[p] == typed.AnyColumn[uint64, row](colTags) {
+				hasMulti = true
+			}
+		}
+		name := fmt.Sprintf("ix%d", i)
+		opts := typed.ColumnIndexOpts[uint64, row]{}
+		// Unique needs tuple injectivity: the id column makes the
+		// tuple injective per row, but a multi column re-introduces
+		// intra-row candidate-set duplicates (a row's tag list may
+		// repeat an element), so unique stays multi-free.
+		if hasID && !hasMulti && rng.Intn(2) == 0 {
+			opts.Unique = true
+		}
+		switch rng.Intn(4) {
+		case 0:
+			opts.Where = func(_ uint64, v row) bool { return v.Grp%2 == 0 }
+			partial[name] = true
+		case 1:
+			opts.CoverValue = true
+		case 2:
+			opts.Covering = []typed.AnySingleColumn[uint64, row]{colName}
+		}
+		idxs = append(idxs, typed.NewColumnIndex(name, cols, opts))
+	}
+	return idxs, partial
+}
+
+// planLeafOf unwraps a plan to its leaf kind and index name.
+func planLeafOf(p query.Plan) (kind, index string) {
+	n := p.Root
+	if rf, ok := n.(query.ResidualFilter); ok {
+		n = rf.Input
+	}
+	switch l := n.(type) {
+	case query.Scan:
+		return "scan", ""
+	case query.IndexSeek:
+		return "seek", l.Index
+	case query.IndexPrefix:
+		return "prefix", l.Index
+	case query.IndexRange:
+		return "range", l.Index
+	}
+	return "?", ""
+}
+
+// The Inv-QB1 property live: for every generated schema (indexes
+// included), corpus, and query, the planned execution equals the
+// independent reference evaluation; Where-partial indexes are
+// never chosen (rule 7) while results stay correct. The census
+// asserted at the end keeps the property non-vacuous: every
+// landed leaf kind must actually be sampled, and the rule-7
+// assertion must run against generated partial indexes — a
+// generator drift that starves the planner would otherwise leave
+// this green while testing scan-vs-scan only (a silent coverage
+// cap).
+func TestQueryPlanScanEquivalence(t *testing.T) {
+	census := map[string]int{}
+	partialSeeds, seedsRun := 0, 0
 	for seed := int64(1); seed <= 8; seed++ {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			seedsRun++
 			rng := rand.New(rand.NewSource(seed))
-			h, corpus, cleanup := openQueryDB(t, 60+rng.Intn(120), rng)
+			idxs, partial := randIndexes(rng)
+			if len(partial) > 0 {
+				partialSeeds++
+			}
+			h, corpus, cleanup := openQueryDB(t, 60+rng.Intn(120), rng, idxs...)
 			defer cleanup()
 
-			for round := 0; round < 10; round++ {
-				nTerms := rng.Intn(3)
+			for round := 0; round < 20; round++ {
+				nTerms := rng.Intn(4)
 				var terms []refTerm
 				for i := 0; i < nTerms; i++ {
 					terms = append(terms, randTerm(rng, 0))
@@ -198,12 +300,25 @@ func TestQueryScanEquivalence(t *testing.T) {
 					q.Filter(filter)
 				}
 
+				// Rule 7: a Where-partial index is never chosen,
+				// no matter how well its columns match.
+				leafKind, leafIdx := planLeafOf(q.Explain())
+				census[leafKind]++
+				if partial[leafIdx] {
+					t.Fatalf("round %d: planner chose partial index %q: %s", round, leafIdx, q.Explain())
+				}
+
 				got := map[uint64]row{}
 				for k, v := range q.All() {
+					// Distinct-by-PK (Inv-QB4): multi-column entry
+					// expansion must never yield a row twice.
+					if _, dup := got[k]; dup {
+						t.Fatalf("round %d: duplicate key %d (plan %s)", round, k, q.Explain())
+					}
 					got[k] = v
 				}
 				if err := q.Err(); err != nil {
-					t.Fatalf("round %d: Err: %v", round, err)
+					t.Fatalf("round %d: Err: %v (plan %s)", round, err, q.Explain())
 				}
 
 				want := map[uint64]row{}
@@ -223,11 +338,11 @@ func TestQueryScanEquivalence(t *testing.T) {
 					}
 				}
 				if len(got) != len(want) {
-					t.Fatalf("round %d: %d rows, want %d", round, len(got), len(want))
+					t.Fatalf("round %d: %d rows, want %d (plan %s)", round, len(got), len(want), q.Explain())
 				}
 				for k := range want {
 					if _, ok := got[k]; !ok {
-						t.Fatalf("round %d: missing key %d", round, k)
+						t.Fatalf("round %d: missing key %d (plan %s)", round, k, q.Explain())
 					}
 				}
 
@@ -246,6 +361,20 @@ func TestQueryScanEquivalence(t *testing.T) {
 				}
 			}
 		})
+	}
+	// Non-vacuity census (see the doc comment): every landed leaf
+	// kind sampled several times, and the rule-7 assertion backed
+	// by generated partial indexes in more than one seed. Only
+	// meaningful over the full seed set — `-run .../seed=N`
+	// filtering must not trip it spuriously.
+	if seedsRun < 8 {
+		return
+	}
+	if census["seek"] < 3 || census["prefix"] < 3 || census["range"] < 3 || census["scan"] < 3 {
+		t.Fatalf("leaf census too thin: %v — the generator no longer exercises the planner", census)
+	}
+	if partialSeeds < 2 {
+		t.Fatalf("only %d seed(s) generated a partial index — rule 7's property arm is near-vacuous", partialSeeds)
 	}
 }
 
@@ -339,48 +468,68 @@ func TestQueryTermEncodeErrorFailsAtStart(t *testing.T) {
 // Offset/Limit apply to the final sequence with the documented
 // cardinality (Inv-QB1 third regime).
 func TestQueryLimitOffsetCardinality(t *testing.T) {
-	rng := rand.New(rand.NewSource(2))
-	h, corpus, cleanup := openQueryDB(t, 40, rng)
-	defer cleanup()
-
-	sel := colGrp.Lt(4) // selective: subset semantics observable
-	matched := 0
-	inRef := map[uint64]bool{}
-	for k, v := range corpus {
-		if v.Grp < 4 {
-			matched++
-			inRef[k] = true
-		}
-	}
-	for _, tc := range []struct{ limit, offset int }{
-		{10, 0},
-		{10, matched - 5},
-		{10, matched + 60},
-		{0, 7}, // offset only (limit unset below)
+	// Both regimes of the same contract: the scan plan (no
+	// indexes) and an IndexRange plan over the selective term's
+	// column must satisfy the identical cardinality formula.
+	for _, arm := range []struct {
+		name string
+		idxs []typed.AnyIndex[uint64, row]
+	}{
+		{"scan", nil},
+		{"indexed", []typed.AnyIndex[uint64, row]{
+			typed.NewColumnIndex("ixgrp", []typed.AnyColumn[uint64, row]{colGrp}, typed.ColumnIndexOpts[uint64, row]{}),
+		}},
 	} {
-		q := query.New(h).Where(sel).Offset(tc.offset)
-		if tc.limit > 0 {
-			q.Limit(tc.limit)
-		}
-		n := 0
-		for k := range q.Keys() {
-			if !inRef[k] {
-				t.Fatalf("limit=%d offset=%d: key %d outside the matched set", tc.limit, tc.offset, k)
+		t.Run(arm.name, func(t *testing.T) {
+			rng := rand.New(rand.NewSource(2))
+			h, corpus, cleanup := openQueryDB(t, 40, rng, arm.idxs...)
+			defer cleanup()
+
+			sel := colGrp.Lt(4) // selective: subset semantics observable
+			matched := 0
+			inRef := map[uint64]bool{}
+			for k, v := range corpus {
+				if v.Grp < 4 {
+					matched++
+					inRef[k] = true
+				}
 			}
-			n++
-		}
-		// Inv-QB1 third regime: max(0, min(limit, matched − offset)),
-		// unset limit = ∞.
-		want := matched - tc.offset
-		if tc.limit > 0 && tc.limit < want {
-			want = tc.limit
-		}
-		if want < 0 {
-			want = 0
-		}
-		if n != want {
-			t.Fatalf("limit=%d offset=%d: %d rows, want %d (matched=%d)", tc.limit, tc.offset, n, want, matched)
-		}
+			if arm.idxs != nil {
+				if kind, idx := planLeafOf(query.New(h).Where(sel).Explain()); kind != "range" || idx != "ixgrp" {
+					t.Fatalf("plan = %s %s, want range over ixgrp", kind, idx)
+				}
+			}
+			for _, tc := range []struct{ limit, offset int }{
+				{10, 0},
+				{10, matched - 5},
+				{10, matched + 60},
+				{0, 7}, // offset only (limit unset below)
+			} {
+				q := query.New(h).Where(sel).Offset(tc.offset)
+				if tc.limit > 0 {
+					q.Limit(tc.limit)
+				}
+				n := 0
+				for k := range q.Keys() {
+					if !inRef[k] {
+						t.Fatalf("limit=%d offset=%d: key %d outside the matched set", tc.limit, tc.offset, k)
+					}
+					n++
+				}
+				// Inv-QB1 third regime: max(0, min(limit, matched − offset)),
+				// unset limit = ∞.
+				want := matched - tc.offset
+				if tc.limit > 0 && tc.limit < want {
+					want = tc.limit
+				}
+				if want < 0 {
+					want = 0
+				}
+				if n != want {
+					t.Fatalf("limit=%d offset=%d: %d rows, want %d (matched=%d)", tc.limit, tc.offset, n, want, matched)
+				}
+			}
+		})
 	}
 }
 

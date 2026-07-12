@@ -74,3 +74,51 @@ type OrderKey struct {
 	// materialized ordering (type-erased, as Eval).
 	EncodeRow func(k, v any) ([]byte, error)
 }
+
+// IndexCol is one key column of a planner-eligible index: the
+// synthesized byte column name plus whether the column is
+// multi-valued (a MultiColumn — one index entry per element, which
+// is what forces distinct-by-PK dedup on partial consumption).
+type IndexCol struct {
+	Name  string
+	Multi bool
+}
+
+// IndexInfo is the planner's view of one ColumnIndex declared on a
+// typed keyspace handle, distilled at open/create time from the
+// same declaration the byte lowering consumes. It exists because
+// the lowered byte IndexDecl cannot answer planner questions: a
+// Where predicate folds invisibly into the extractor closure, and
+// the multi/scalar form of each column is only recoverable from
+// the typed declaration (query-builder.md §Planning rules).
+type IndexInfo struct {
+	Name    string
+	KeyCols []IndexCol
+	// Covering holds the synthesized covering column names (empty
+	// under CoverValue).
+	Covering   []string
+	CoverValue bool
+	Unique     bool
+	// Partial reports a non-nil Where: rule 7 — never
+	// planner-eligible (the entry set excludes rows the query may
+	// want).
+	Partial bool
+}
+
+// RowOps is the executor's type-erased row codec over one typed
+// keyspace handle: index leaves yield raw PK / value bytes, and
+// the query package — which cannot reach the handle's unexported
+// encoders — decodes rows through these closures. Values are
+// boxed exactly as Term.Eval's arguments (the typed tier asserts
+// back to its K / V).
+type RowOps struct {
+	// DecodeKey decodes a primary-key byte slice to K.
+	DecodeKey func(pk []byte) (any, error)
+	// DecodeVal decodes stored row bytes to V.
+	DecodeVal func(vb []byte) (any, error)
+	// FetchRow back-looks-up pk's row and decodes it. found=false
+	// reports a vanished row — the caller skips the entry, matching
+	// the byte Lookup contract's silent-skip of index/row
+	// inconsistencies (indexing.md §Lookup API).
+	FetchRow func(pk []byte) (val any, found bool, err error)
+}

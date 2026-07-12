@@ -5,6 +5,7 @@ import (
 	"iter"
 
 	"github.com/thegrumpylion/gmdb"
+	"github.com/thegrumpylion/gmdb/internal/qrep"
 )
 
 // Typed set keyspace layer (typed-keyspaces.md §Typed Set Keyspace).
@@ -38,7 +39,10 @@ func NewSetKeyspace[K, V any](name string, keyEnc Encoder[K], valEnc Encoder[V],
 	return &SetKeyspace[K, V]{name: name, keyEnc: keyEnc, valEnc: valEnc, opts: opts}
 }
 
-func (tsk *SetKeyspace[K, V]) wrap(sks *gmdb.SetKeyspace) *SetKeyspaceHandle[K, V] {
+// wrap ignores the planner index metadata openTypedHandle threads:
+// the query surface plans over single-value keyspaces only
+// (query-builder.md §Query surface takes a KeyspaceHandle).
+func (tsk *SetKeyspace[K, V]) wrap(sks *gmdb.SetKeyspace, _ []qrep.IndexInfo) *SetKeyspaceHandle[K, V] {
 	return &SetKeyspaceHandle[K, V]{sks: sks, keyEnc: tsk.keyEnc, valEnc: tsk.valEnc}
 }
 
@@ -77,7 +81,7 @@ func (tsk *SetKeyspace[K, V]) OpenReadOnly(tx *gmdb.Tx) (*SetKeyspaceHandle[K, V
 	if err != nil {
 		return nil, err
 	}
-	return tsk.wrap(sks), nil
+	return tsk.wrap(sks, nil), nil
 }
 
 func (tsk *SetKeyspace[K, V]) Create(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*SetKeyspaceHandle[K, V], error) {

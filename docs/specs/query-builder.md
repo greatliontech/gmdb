@@ -54,8 +54,10 @@ Depends on / interacts with:
 
 ## Invariants
 
-All invariants in this section are spec-tier; each carries
-`Lands: when code able to violate it is first written.`
+Invariants without an enforcement pointer are spec-tier and carry
+`Lands: when code able to violate it is first written.` Landed
+slices are annotated per invariant; an invariant whose surface is
+only partially built names the enforced slice.
 
 Invariant: kind=clause-explicit;
   property=Inv-QB1 (plan/scan equivalence): for every keyspace
@@ -79,6 +81,12 @@ Invariant: kind=clause-explicit;
     fully push (e.g. treating a range term as an EQ prefix)
     returns rows a scan would exclude, or excludes rows a scan
     would return — silently, since no error surface fires.
+    Enforced (landed slices: single-index plans, set regime and
+    the limit/offset cardinality regime) by
+    `TestQueryPlanScanEquivalence` +
+    `TestQueryLimitOffsetCardinality` +
+    `TestQueryRangeBoundAnchors`; the ordered regime lands with
+    `OrderBy`.
 
 Invariant: kind=clause-explicit;
   property=Inv-QB2 (encoded comparison): sargable terms evaluate
@@ -91,6 +99,8 @@ Invariant: kind=clause-explicit;
     with case folding) returns different rows depending on
     whether the planner chose an index — plan-dependent results,
     the exact failure Inv-QB1 forbids.
+    Enforced by `TestQueryEncodedComparisonAnchor` +
+    `TestQueryNaNSafeFloatAnchor`.
 
 Invariant: kind=clause-explicit;
   property=Inv-QB3 (covering interpretation): the executor
@@ -115,6 +125,10 @@ Invariant: kind=clause-explicit;
   violation=A range term over a `MultiColumn` (one index entry
     per element) yields the same row once per matching element;
     a scan yields it once — plan-dependent duplication.
+    Enforced (landed slice: index-leaf expansion) by
+    `TestQueryMultiColumnRangeDedup` + the duplicate check inside
+    `TestQueryPlanScanEquivalence`; union-branch and ranked-source
+    dedup land with their nodes.
 
 Invariant: kind=clause-explicit;
   property=Inv-QB5 (determinism): for a fixed keyspace state
@@ -136,6 +150,10 @@ Invariant: kind=clause-explicit;
     iteration (equal-key runs arrive PK-descending on a
     non-unique index), forcing either an equal-key-run buffer no
     Inv-QB6 node sanctions or plan-dependent sequences.
+    Enforced (landed slice: repeat-execution determinism, the
+    no-OrderBy regime) by the repeat check inside
+    `TestQueryPlanScanEquivalence`; the directional tie-break
+    lands with ordered output.
 
 Invariant: kind=clause-explicit;
   property=Inv-QB6 (bounded materialization, explicit failure):
@@ -320,6 +338,23 @@ cost-based.
    to exactly one leaf: all columns EQ ⇒ `IndexSeek`; a shorter
    EQ prefix with no trailing bound ⇒ `IndexPrefix`; an EQ
    prefix (possibly empty) + trailing bound ⇒ `IndexRange`.
+   An index containing a `MultiColumn` is a sound access path
+   only when EVERY multi column's element existence is entailed
+   by the query: the column is consumed by the leaf (`Contains`
+   in the EQ prefix, or `ContainsRange` as the trailing bound),
+   or a TOP-LEVEL `Contains`/`ContainsRange` term on it
+   evaluates residually. A row whose multi accessor returns an
+   empty slice has NO entries in such an index
+   (`typed-columns.md` Inv-TC4 — an empty column sequence
+   empties the Cartesian product); under entailment the omitted
+   rows are rows the query rejects anyway, so nothing is lost.
+   An `Or`-nested `Contains` does NOT entail existence — a
+   disjunct may be false for a row another group matches. A
+   match leaving any multi column unentailed excludes rows the
+   query may want — rule 7's exclusion class, at element
+   granularity — and is skipped during candidate enumeration.
+   An entailed-but-unconsumed multi column keeps one entry per
+   element, so such leaves dedup by PK (Inv-QB4).
 3. Score candidates: (a) most terms consumed; tie-break (b)
    covering — an index whose key + covering columns satisfy
    every column the query touches (terms, Select, OrderBy) wins;
@@ -449,10 +484,9 @@ group `(X)` is closed from above by the value-level successor
 `X || 0x00` as the bound column — so the builder never touches
 the NUL-escape encoding.
 
-One byte surface is REQUIRED and does not exist yet: reverse
-iteration (streaming `Desc`). Its normative clause belongs to
-`indexing.md §Lookup API` / `api-surface.md §Index Lookup API`
-(Lands: with the surface's implementation).
+Reverse iteration (streaming `Desc`) is the `Reverse()`
+`IterOption` — its normative clause lives in `indexing.md
+§Lookup API` / `api-surface.md §Index Lookup API`.
 
 The executor additionally requires a typed→byte bridge:
 
@@ -464,11 +498,10 @@ The executor additionally requires a typed→byte bridge:
 func (t *KeyspaceHandle[K, V]) ByteIndex(name string) (*gmdb.IndexHandle, error)
 ```
 
-Its normative clause belongs to `typed-keyspaces.md` /
-`api-surface.md` (Lands: with the builder's executor). The
-general fallback rule stands regardless: any term the planner
-cannot push is evaluated residually (Inv-QB2), never
-approximated.
+Its normative clause lives in `typed-keyspaces.md §Typed
+Indexes` / `api-surface.md §Index Lookup API`. The general
+fallback rule stands regardless: any term the planner cannot
+push is evaluated residually (Inv-QB2), never approximated.
 
 ## Testing contract
 

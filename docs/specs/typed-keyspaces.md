@@ -364,6 +364,18 @@ func (q *IndexQuery[K, V, IK]) Range(start, end *IK) iter.Seq2[K, V]
 func (q *IndexQuery[K, V, IK]) Prefix(prefix IK) iter.Seq2[K, V]
 func (q *IndexQuery[K, V, IK]) Get(ik IK) (K, V, error) // unique only
 func (q *IndexQuery[K, V, IK]) Err() error
+
+// ByteIndex returns the byte-oriented *gmdb.IndexHandle for an
+// index declared on this keyspace — the typed→byte bridge
+// (query-builder.md §Byte-surface requirements): typed.IndexQuery
+// is IK-opaque and cannot serve per-column entry bytes, so the
+// query executor's plan leaves iterate the byte surface directly.
+// Each call returns a FRESH handle, exactly like
+// gmdb.Keyspace.Index — per-handle Err state makes handle sharing
+// between concurrently-draining iterators mutually clobbering, so
+// the executor obtains one per plan leaf per execution. Returns
+// gmdb.ErrIndexNotFound for an unknown name.
+func (t *KeyspaceHandle[K, V]) ByteIndex(name string) (*gmdb.IndexHandle, error)
 ```
 
 The schema-hash inputs for a typed index include the index-key

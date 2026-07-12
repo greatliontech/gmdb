@@ -1,9 +1,11 @@
 package typed
 
 import (
+	"errors"
 	"iter"
 
 	"github.com/thegrumpylion/gmdb"
+	"github.com/thegrumpylion/gmdb/internal/qrep"
 )
 
 // Typed keyspace layer (typed-keyspaces.md §Typed Keyspace). A
@@ -55,24 +57,40 @@ func NewKeyspace[K, V any](name string, keyEnc Encoder[K], valEnc Encoder[V]) *K
 	return &Keyspace[K, V]{name: name, keyEnc: keyEnc, valEnc: valEnc}
 }
 
+// plannerCandidate is the optional interface a typed index
+// declaration implements to advertise itself to the query planner.
+// Only *ColumnIndex does: an opaque Index[K, V, IK] has no
+// per-column structure to plan over (query-builder.md §Planning
+// rules — rule 2 enumerates ColumnIndexes only).
+type plannerCandidate interface {
+	plannerInfo() qrep.IndexInfo
+}
+
 // buildIndexDecls lowers typed index declarations to byte-layer
 // *gmdb.IndexDecl, threading the keyspace's encoders so each Index can
 // build its extractor closure and validate encoder IDs. A nil/empty
 // slice yields a nil decl slice (indexless keyspace). Shared by the
-// Keyspace and SetKeyspace typed factories.
-func buildIndexDecls[K, V any](keyEnc Encoder[K], valEnc Encoder[V], indexes []AnyIndex[K, V]) ([]*gmdb.IndexDecl, error) {
+// Keyspace and SetKeyspace typed factories. The second result is
+// the planner's distilled view of the ColumnIndex declarations
+// (qrep.IndexInfo) — derived here, from the same declaration
+// values the lowering consumes, so the two views cannot diverge.
+func buildIndexDecls[K, V any](keyEnc Encoder[K], valEnc Encoder[V], indexes []AnyIndex[K, V]) ([]*gmdb.IndexDecl, []qrep.IndexInfo, error) {
 	if len(indexes) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	decls := make([]*gmdb.IndexDecl, 0, len(indexes))
+	var infos []qrep.IndexInfo
 	for _, idx := range indexes {
 		d, err := idx.indexDecl(keyEnc, valEnc)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		decls = append(decls, d)
+		if pc, ok := idx.(plannerCandidate); ok {
+			infos = append(infos, pc.plannerInfo())
+		}
 	}
-	return decls, nil
+	return decls, infos, nil
 }
 
 // openTypedHandle translates the typed index declarations, invokes the
@@ -84,9 +102,9 @@ func openTypedHandle[K, V, BK, H any](
 	keyEnc Encoder[K], valEnc Encoder[V],
 	indexes []AnyIndex[K, V],
 	byteOpen func(decls []*gmdb.IndexDecl) (BK, error),
-	wrap func(BK) H,
+	wrap func(BK, []qrep.IndexInfo) H,
 ) (H, error) {
-	decls, err := buildIndexDecls(keyEnc, valEnc, indexes)
+	decls, infos, err := buildIndexDecls(keyEnc, valEnc, indexes)
 	if err != nil {
 		var zero H
 		return zero, err
@@ -96,7 +114,7 @@ func openTypedHandle[K, V, BK, H any](
 		var zero H
 		return zero, err
 	}
-	return wrap(bk), nil
+	return wrap(bk, infos), nil
 }
 
 // Open opens the keyspace for read+write within tx, declaring the
@@ -111,13 +129,15 @@ func (tks *Keyspace[K, V]) Open(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*Keyspa
 
 // OpenReadOnly opens the keyspace for reads only (no index decls; index
 // lookups still work against stored entries). Mutations on the returned
-// handle return gmdb.ErrReadOnly.
+// handle return gmdb.ErrReadOnly. With no declarations supplied the
+// handle carries no planner index metadata — queries over it plan as
+// full scans (results identical per Inv-QB1; plan choice is cost-only).
 func (tks *Keyspace[K, V]) OpenReadOnly(tx *gmdb.Tx) (*KeyspaceHandle[K, V], error) {
 	ks, err := tx.OpenKeyspaceReadOnly(tks.name)
 	if err != nil {
 		return nil, err
 	}
-	return tks.wrap(ks), nil
+	return tks.wrap(ks, nil), nil
 }
 
 // Create creates the keyspace (error if it already exists) with the
@@ -139,8 +159,8 @@ func (tks *Keyspace[K, V]) CreateIfNotExists(tx *gmdb.Tx, indexes ...AnyIndex[K,
 		tks.wrap)
 }
 
-func (tks *Keyspace[K, V]) wrap(ks *gmdb.Keyspace) *KeyspaceHandle[K, V] {
-	return &KeyspaceHandle[K, V]{ks: ks, keyEnc: tks.keyEnc, valEnc: tks.valEnc}
+func (tks *Keyspace[K, V]) wrap(ks *gmdb.Keyspace, infos []qrep.IndexInfo) *KeyspaceHandle[K, V] {
+	return &KeyspaceHandle[K, V]{ks: ks, keyEnc: tks.keyEnc, valEnc: tks.valEnc, idxInfo: infos}
 }
 
 // KeyspaceHandle is a handle to an opened typed keyspace within a transaction.
@@ -149,6 +169,10 @@ type KeyspaceHandle[K, V any] struct {
 	ks     *gmdb.Keyspace
 	keyEnc Encoder[K]
 	valEnc Encoder[V]
+	// idxInfo is the planner's distilled view of the ColumnIndex
+	// declarations this handle was opened with (nil for
+	// OpenReadOnly and decl-less opens).
+	idxInfo []qrep.IndexInfo
 }
 
 // Get returns the value for key, or the zero V and gmdb.ErrNotFound if the
@@ -406,6 +430,58 @@ func (c *Cursor[K, V]) Delete() error { return c.bc.Delete() }
 // tracking; subsequent operations surface gmdb.ErrCursorClosed;
 // terminal, idempotent, optional).
 func (c *Cursor[K, V]) Close() { c.bc.Close() }
+
+// ByteIndex returns the byte-oriented handle for an index declared
+// on this keyspace — the typed→byte bridge the query executor's
+// plan leaves iterate (typed.IndexQuery is IK-opaque and cannot
+// serve per-column entry bytes; query-builder.md §Byte-surface
+// requirements). Each call returns a FRESH *gmdb.IndexHandle,
+// exactly like gmdb.Keyspace.Index — the per-handle Err state
+// makes handle sharing between concurrently-draining iterators
+// mutually clobbering, so the executor obtains one per plan leaf
+// per execution. Returns gmdb.ErrIndexNotFound for an unknown
+// name.
+func (t *KeyspaceHandle[K, V]) ByteIndex(name string) (*gmdb.IndexHandle, error) {
+	return t.ks.Index(name)
+}
+
+// InternalIndexInfo exposes the planner's distilled view of this
+// handle's ColumnIndex declarations through the shared internal
+// seam (query-builder.md §Planning rules). The returned types live
+// in an internal package: callers outside this module cannot name
+// or construct them, so the representation carries no
+// compatibility promise. Treat as read-only. Nil for handles
+// opened without declarations (OpenReadOnly) — the planner then
+// falls back to a full scan.
+func (t *KeyspaceHandle[K, V]) InternalIndexInfo() []qrep.IndexInfo { return t.idxInfo }
+
+// InternalRowOps exposes the handle's type-erased row codec
+// through the shared internal seam — the query executor decodes
+// index-leaf PK / value bytes and back-looks-up rows with it (it
+// cannot reach the handle's encoders). Same internal-type
+// non-promise as InternalIndexInfo. FetchRow reports found=false
+// on a vanished row, mirroring the byte Lookup contract's
+// silent-skip (indexing.md §Lookup API).
+func (t *KeyspaceHandle[K, V]) InternalRowOps() qrep.RowOps {
+	return qrep.RowOps{
+		DecodeKey: func(pk []byte) (any, error) { return t.keyEnc.Decode(pk) },
+		DecodeVal: func(vb []byte) (any, error) { return t.valEnc.Decode(vb) },
+		FetchRow: func(pk []byte) (any, bool, error) {
+			vb, err := t.ks.Get(pk)
+			if err != nil {
+				if errors.Is(err, gmdb.ErrNotFound) {
+					return nil, false, nil
+				}
+				return nil, false, err
+			}
+			v, err := t.valEnc.Decode(vb)
+			if err != nil {
+				return nil, false, err
+			}
+			return v, true, nil
+		},
+	}
+}
 
 // Err returns the first error encountered: a sticky decode/encode error
 // from the typed layer takes precedence, else the byte cursor's error.

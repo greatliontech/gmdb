@@ -8,6 +8,7 @@ import (
 
 	"github.com/thegrumpylion/gmdb"
 	"github.com/thegrumpylion/gmdb/internal/indexing"
+	"github.com/thegrumpylion/gmdb/internal/qrep"
 )
 
 // Per-field typed column declarations and the ColumnIndex that
@@ -130,6 +131,11 @@ type AnyColumn[K, V any] interface {
 	// established convention (the byte extractor is infallible;
 	// the engine's panic-atomicity contract contains it).
 	encodeAll(indexName string, k K, v V) [][]byte
+	// multiValued reports the column form — true for MultiColumn.
+	// The planner needs it: partial consumption of an index with a
+	// multi-valued column yields one entry per element, forcing
+	// distinct-by-PK dedup (query-builder.md Inv-QB4).
+	multiValued() bool
 }
 
 // AnySingleColumn is the sealed erasure for SINGLE-VALUED columns
@@ -150,6 +156,7 @@ func (c *Column[K, V, C]) columnName() string {
 	return synthesizeColumnName(columnNamePrefix, c.name, c.enc.ID())
 }
 func (c *Column[K, V, C]) encoderIdentity() (string, string) { return c.name, c.enc.ID() }
+func (c *Column[K, V, C]) multiValued() bool                 { return false }
 func (c *Column[K, V, C]) encodeOne(indexName string, k K, v V) []byte {
 	b, err := c.enc.AppendEncode(nil, c.get(k, v))
 	if err != nil {
@@ -170,6 +177,7 @@ func (m *MultiColumn[K, V, C]) columnName() string {
 	return synthesizeColumnName(multiColumnNamePrefix, m.name, m.enc.ID())
 }
 func (m *MultiColumn[K, V, C]) encoderIdentity() (string, string) { return m.name, m.enc.ID() }
+func (m *MultiColumn[K, V, C]) multiValued() bool                 { return true }
 func (m *MultiColumn[K, V, C]) encodeAll(indexName string, k K, v V) [][]byte {
 	vals := m.get(k, v)
 	if len(vals) == 0 {
@@ -238,6 +246,30 @@ func NewColumnIndex[K, V any](name string, columns []AnyColumn[K, V], opts Colum
 // Compile-time proof that *ColumnIndex implements the sealed
 // AnyIndex — the second legal implementer beside *Index.
 var _ AnyIndex[int, int] = (*ColumnIndex[int, int])(nil)
+
+// plannerInfo distills the declaration into the planner's view
+// (query-builder.md §Planning rules): synthesized key-column names
+// with their multi/scalar form, covering names, and the two
+// eligibility inputs the lowered byte decl cannot answer — Partial
+// (the Where predicate folds invisibly into the extractor; rule 7
+// excludes partial indexes unconditionally) and per-column
+// multiplicity (Inv-QB4 dedup). Derived from the same declaration
+// the lowering consumes, in the same open call.
+func (ci *ColumnIndex[K, V]) plannerInfo() qrep.IndexInfo {
+	info := qrep.IndexInfo{
+		Name:       ci.name,
+		Unique:     ci.opts.Unique,
+		Partial:    ci.opts.Where != nil,
+		CoverValue: ci.opts.CoverValue,
+	}
+	for _, col := range ci.columns {
+		info.KeyCols = append(info.KeyCols, qrep.IndexCol{Name: col.columnName(), Multi: col.multiValued()})
+	}
+	for _, col := range ci.opts.Covering {
+		info.Covering = append(info.Covering, col.columnName())
+	}
+	return info
+}
 
 // coveringDeclared reports the declaration's covering state —
 // probed by the SetKeyspace factories, which reject covering

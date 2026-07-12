@@ -127,16 +127,16 @@ func evalTerm[K, V any](t qrep.Term, k K, v V) (bool, error) {
 	return t.Eval(k, v)
 }
 
-// All yields the matching (K, V) rows. The current plan shape is
-// a full scan with residual evaluation; order is plan-defined
-// (Inv-QB5 — deterministic per query, not canonical across
-// plans). Check Err after iteration: the scan runs on the typed
-// cursor so a mid-scan cursor or decode error SURFACES via Err —
-// a truncated result is never silently indistinguishable from a
-// small one (Inv-QB1's forbidden class). A limit-complete result
-// ends the scan at the cap: rows past it are outside the
-// observable sequence and never read, so they cannot contribute
-// errors.
+// All yields the matching (K, V) rows via the planner's chosen
+// access path (query-builder.md §Planning rules); order is
+// plan-defined (Inv-QB5 — deterministic per query, not canonical
+// across plans; plan choice is never observable in results,
+// Inv-QB1). Check Err after iteration: a mid-iteration cursor,
+// index, or decode error SURFACES via Err — a truncated result is
+// never silently indistinguishable from a small one (Inv-QB1's
+// forbidden class). A limit-complete result ends iteration at the
+// cap: rows past it are outside the observable sequence and never
+// read, so they cannot contribute errors.
 func (q *Query[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		q.err = nil
@@ -146,55 +146,214 @@ func (q *Query[K, V]) All() iter.Seq2[K, V] {
 		}
 		// The limit caps the observable sequence (Inv-QB1's
 		// cardinality formula): rows past it are unreachable, so a
-		// non-positive limit never opens a cursor and the loop below
-		// returns at the limit-th yield — scan work and scan ERRORS
+		// non-positive limit never opens a cursor or handle and the
+		// executors return at the limit-th yield — work and ERRORS
 		// beyond the cap must not leak into a complete result.
 		if q.hasLim && q.limit <= 0 {
 			return
 		}
-		c := q.ks.Cursor()
-		// Each execution opens a fresh cursor; Close releases its
-		// staleness registration so repeated executions in one long
-		// transaction don't accumulate per-mutation tracking cost.
-		defer c.Close()
-		skipped, yielded := 0, 0
-		for k, v, ok := c.First(); ok; k, v, ok = c.Next() {
-			match := true
-			for _, t := range q.terms {
-				ok, err := evalTerm[K, V](t, k, v)
-				if err != nil {
-					q.err = err
-					return
-				}
-				if !ok {
+		leaf := planQuery(q.terms, q.ks.InternalIndexInfo())
+		if leaf.shape == shapeScan {
+			q.scanExec(yield)
+			return
+		}
+		q.indexExec(leaf, yield)
+	}
+}
+
+// Explain returns the chosen plan as a value without executing
+// (query-builder.md §Query surface) — the plan-pinning surface.
+// Explain plans regardless of carried construction errors (a term
+// with a literal-encode error still has a plan shape); every
+// EXECUTION of such a query fails at iteration start via Err.
+func (q *Query[K, V]) Explain() Plan {
+	leaf := planQuery(q.terms, q.ks.InternalIndexInfo())
+	var root PlanNode
+	switch leaf.shape {
+	case shapeSeek:
+		root = IndexSeek{Index: leaf.index.Name}
+	case shapePrefix:
+		root = IndexPrefix{Index: leaf.index.Name, PrefixLen: len(leaf.eqVals)}
+	case shapeRange:
+		root = IndexRange{Index: leaf.index.Name, PrefixLen: len(leaf.eqVals)}
+	default:
+		root = Scan{}
+	}
+	if resid := len(q.terms) - len(leaf.consumed); resid > 0 || len(q.filters) > 0 {
+		root = ResidualFilter{Input: root, Terms: resid, Filters: len(q.filters)}
+	}
+	return Plan{Root: root}
+}
+
+// scanExec is the Scan leaf: full typed-cursor iteration with
+// every term and filter residual.
+func (q *Query[K, V]) scanExec(yield func(K, V) bool) {
+	c := q.ks.Cursor()
+	// Each execution opens a fresh cursor; Close releases its
+	// staleness registration so repeated executions in one long
+	// transaction don't accumulate per-mutation tracking cost.
+	defer c.Close()
+	skipped, yielded := 0, 0
+	for k, v, ok := c.First(); ok; k, v, ok = c.Next() {
+		match := true
+		for _, t := range q.terms {
+			ok, err := evalTerm[K, V](t, k, v)
+			if err != nil {
+				q.err = err
+				return
+			}
+			if !ok {
+				match = false
+				break
+			}
+		}
+		if match {
+			for _, f := range q.filters {
+				if !f(k, v) {
 					match = false
 					break
 				}
 			}
-			if match {
-				for _, f := range q.filters {
-					if !f(k, v) {
-						match = false
-						break
-					}
-				}
+		}
+		if !match {
+			continue
+		}
+		if skipped < q.offset {
+			skipped++
+			continue
+		}
+		if !yield(k, v) {
+			return
+		}
+		yielded++
+		if q.hasLim && yielded >= q.limit {
+			return
+		}
+	}
+	if err := c.Err(); err != nil {
+		q.err = err
+	}
+}
+
+// indexExec drains one index leaf: a FRESH byte handle per
+// execution (per-handle Err state makes sharing between
+// concurrently-draining iterators mutually clobbering —
+// query-builder.md §Plan nodes), PK dedup when the leaf can yield
+// one entry per multi-column element (Inv-QB4), residual
+// evaluation of the unconsumed terms (Inv-QB2), and value
+// acquisition per the declaration: entry value bytes ARE the row
+// bytes for a non-covering index; a covering declaration's entry
+// bytes are a covering tuple, so rows back-look-up via the typed
+// handle instead (index-only serving is the covering execution
+// surface, not this leaf; the back-lookup mirrors byte Lookup's
+// silent-skip of vanished rows).
+func (q *Query[K, V]) indexExec(leaf plannedLeaf, yield func(K, V) bool) {
+	idx, err := q.ks.ByteIndex(leaf.index.Name)
+	if err != nil {
+		q.err = err
+		return
+	}
+	resid := residualTerms(q.terms, leaf.consumed)
+	ops := q.ks.InternalRowOps()
+	// Value interpretation follows the LIVE declaration (Inv-QB3),
+	// probed on the fresh handle — not the handle's open-time
+	// planner snapshot: a same-tx Rebuild can change the covering
+	// shape, and a covering entry's value bytes are a covering
+	// TUPLE, never row bytes. (The snapshot still drives plan
+	// CHOICE — rule 3(b) — which is cost-only under Inv-QB1.)
+	covering := len(idx.Decl().Covering) > 0
+	var seen map[string]struct{}
+	if leaf.needDedup {
+		seen = make(map[string]struct{})
+	}
+	skipped, yielded := 0, 0
+	// row processes one index entry; false stops the drain (error,
+	// consumer break, or limit-complete — q.err distinguishes).
+	row := func(pk, vb []byte, haveRow bool) bool {
+		if seen != nil {
+			s := string(pk)
+			if _, dup := seen[s]; dup {
+				return true
 			}
-			if !match {
-				continue
+			seen[s] = struct{}{}
+		}
+		kAny, err := ops.DecodeKey(pk)
+		if err != nil {
+			q.err = err
+			return false
+		}
+		var vAny any
+		if haveRow {
+			if vAny, err = ops.DecodeVal(vb); err != nil {
+				q.err = err
+				return false
 			}
-			if skipped < q.offset {
-				skipped++
-				continue
-			}
-			if !yield(k, v) {
-				return
-			}
-			yielded++
-			if q.hasLim && yielded >= q.limit {
-				return
+		} else {
+			var found bool
+			if vAny, found, err = ops.FetchRow(pk); err != nil {
+				q.err = err
+				return false
+			} else if !found {
+				return true
 			}
 		}
-		if err := c.Err(); err != nil {
+		k, v := kAny.(K), vAny.(V)
+		for _, t := range resid {
+			ok, err := evalTerm[K, V](t, k, v)
+			if err != nil {
+				q.err = err
+				return false
+			}
+			if !ok {
+				return true
+			}
+		}
+		for _, f := range q.filters {
+			if !f(k, v) {
+				return true
+			}
+		}
+		if skipped < q.offset {
+			skipped++
+			return true
+		}
+		if !yield(k, v) {
+			return false
+		}
+		yielded++
+		return !(q.hasLim && yielded >= q.limit)
+	}
+	switch leaf.shape {
+	case shapeSeek:
+		if covering {
+			for pk := range idx.LookupKeys(leaf.eqVals) {
+				if !row(pk, nil, false) {
+					break
+				}
+			}
+		} else {
+			for pk, vb := range idx.Lookup(leaf.eqVals) {
+				if !row(pk, vb, true) {
+					break
+				}
+			}
+		}
+	case shapePrefix:
+		for pk, vb := range idx.Prefix(leaf.eqVals) {
+			if !row(pk, vb, !covering) {
+				break
+			}
+		}
+	case shapeRange:
+		start, end := rangeBounds(leaf.eqVals, leaf.bound)
+		for pk, vb := range idx.Range(start, end) {
+			if !row(pk, vb, !covering) {
+				break
+			}
+		}
+	}
+	if q.err == nil {
+		if err := idx.Err(); err != nil {
 			q.err = err
 		}
 	}

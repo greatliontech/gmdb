@@ -85,7 +85,7 @@ tests move with their subjects, unmodified.
       rider. Tests: Inv-QB2 anchors (NaN-safe float, folding
       encoder), equivalence-harness scaffold + generator grammar
       v1 (schemas, corpora, term lists).
-- [ ] 13. Planner: single-index selection (EQ-prefix + one
+- [x] 13. Planner: single-index selection (EQ-prefix + one
       trailing range via `Range` partial-tuple prefix-bounds),
       full scoring rule, partial-index exclusion (rule 7),
       `Scan` / `IndexSeek` / `IndexPrefix` / `IndexRange` /

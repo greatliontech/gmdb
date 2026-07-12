@@ -1495,6 +1495,14 @@ func (idx *IndexHandle) Stats() (IndexStats, error)
 func DecodeCoveringTuple(value []byte) ([][]byte, error)
 ```
 
+The typed tier bridges to this surface via
+`typed.KeyspaceHandle.ByteIndex(name)` — it returns a FRESH
+`*IndexHandle` per call (exactly like `Keyspace.Index`), which is
+what lets the query executor obtain one handle per plan leaf per
+execution so concurrently-draining iterators never share Err
+state (`typed-keyspaces.md §Typed Indexes`, `query-builder.md
+§Byte-surface requirements`).
+
 ## Statistics
 
 ```go
