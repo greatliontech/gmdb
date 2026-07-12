@@ -66,7 +66,8 @@ tags.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| index-reverse-iteration | 9 | reverse-iteration `IterOption` clauses for `indexing.md §Lookup API` + `api-surface.md`; reverse == exact reversal of forward sequence |
+
+*None open.*
 
 ## Open — change-set review findings
 

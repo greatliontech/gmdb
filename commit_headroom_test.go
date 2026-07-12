@@ -299,7 +299,7 @@ func TestCommitNeedsOnlyReservedHeadroom(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := 0
-	for range h.Lookup([]byte("z")) {
+	for range h.Lookup([][]byte{[]byte("z")}) {
 		n++
 	}
 	if err := h.Err(); err != nil {

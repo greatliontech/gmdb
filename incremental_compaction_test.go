@@ -185,7 +185,7 @@ func TestCompactForestPreservesForest(t *testing.T) {
 			t.Fatalf("Index: %v", err)
 		}
 		var got []string
-		for pk := range idx.LookupKeys([]byte{idxKey}) {
+		for pk := range idx.LookupKeys([][]byte{[]byte{idxKey}}) {
 			got = append(got, string(pk))
 		}
 		if err := idx.Err(); err != nil {

@@ -334,7 +334,7 @@ func TestSetKeyspaceIndexLookupReturnsSetKeyValuePair(t *testing.T) {
 		setKey, setValue string
 	}
 	var got []pair
-	for sk, sv := range idx.Lookup([]byte{'a'}) {
+	for sk, sv := range idx.Lookup([][]byte{[]byte{'a'}}) {
 		got = append(got, pair{string(sk), string(sv)})
 	}
 	if idx.Err() != nil {
@@ -417,7 +417,7 @@ func TestSetKeyspaceIndexLookupKeysRejected(t *testing.T) {
 	}
 	idx, _ := sks.Index("by_topic")
 	n := 0
-	for range idx.LookupKeys([]byte{'a'}) {
+	for range idx.LookupKeys([][]byte{[]byte{'a'}}) {
 		n++
 	}
 	if n != 0 {
@@ -512,7 +512,7 @@ func TestSetKeyspaceIndexPrefixYieldsSetKeyValuePairs(t *testing.T) {
 	idx, _ := sks.Index("by_topic_bytes")
 	// Prefix on first byte 'a' (0x61) → u1/ab and u2/ac.
 	var got []string
-	for sk, sv := range idx.Prefix([]byte{0x61}) {
+	for sk, sv := range idx.Prefix([][]byte{[]byte{0x61}}) {
 		got = append(got, string(sk)+"/"+string(sv))
 	}
 	sort.Strings(got)
@@ -645,7 +645,7 @@ func TestSetKeyspaceIndexedPersistsAcrossCommit(t *testing.T) {
 	}
 	idx, _ := sks.Index("by_topic")
 	n := 0
-	for range idx.Lookup([]byte{'a'}) {
+	for range idx.Lookup([][]byte{[]byte{'a'}}) {
 		n++
 	}
 	if n != 1 {

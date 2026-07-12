@@ -98,7 +98,7 @@ func TestReadOnlyOpenIndexLookup(t *testing.T) {
 		t.Fatalf("Index on read-only keyspace: %v (indexing.md §Open Semantics)", err)
 	}
 	n, cover := 0, ""
-	for _, v := range h.Lookup([]byte("a")) {
+	for _, v := range h.Lookup([][]byte{[]byte("a")}) {
 		n++
 		cols, derr := DecodeCoveringTuple(v)
 		if derr != nil {
@@ -129,7 +129,7 @@ func TestReadOnlyOpenIndexLookup(t *testing.T) {
 		t.Fatalf("Index on read-only set keyspace: %v", err)
 	}
 	sn := 0
-	for range sh.Lookup([]byte("m")) {
+	for range sh.Lookup([][]byte{[]byte("m")}) {
 		sn++
 	}
 	if err := sh.Err(); err != nil {
@@ -145,7 +145,7 @@ func TestReadOnlyOpenIndexLookup(t *testing.T) {
 		t.Fatalf("Index(plain): %v", err)
 	}
 	var rowVal string
-	for _, v := range ph.Lookup([]byte("a")) {
+	for _, v := range ph.Lookup([][]byte{[]byte("a")}) {
 		rowVal = string(v)
 	}
 	if err := ph.Err(); err != nil {
@@ -160,7 +160,7 @@ func TestReadOnlyOpenIndexLookup(t *testing.T) {
 		t.Fatalf("Index(uniq): %v", err)
 	}
 	un := 0
-	for k := range uh.Lookup([]byte("k1")) {
+	for k := range uh.Lookup([][]byte{[]byte("k1")}) {
 		un++
 		if string(k) != "k1" {
 			t.Errorf("RO unique Lookup key = %q, want k1", k)
@@ -193,7 +193,7 @@ func TestReadTxOpenIndexLookup(t *testing.T) {
 			t.Fatalf("Index on ReadTx keyspace: %v", err)
 		}
 		n := 0
-		for range h.Lookup([]byte("a")) {
+		for range h.Lookup([][]byte{[]byte("a")}) {
 			n++
 		}
 		if err := h.Err(); err != nil {

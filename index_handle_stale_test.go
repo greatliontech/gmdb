@@ -94,7 +94,7 @@ func TestIndexHandleLookupAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	}
 	// Lookup (non-unique iter path): yield nothing, idx.Err() = ErrIndexNotFound.
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -116,7 +116,7 @@ func TestIndexHandleLookupAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	}
 	// Prefix path: same shape.
 	yielded = 0
-	for range idx.Prefix() {
+	for range idx.Prefix(nil) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -127,7 +127,7 @@ func TestIndexHandleLookupAfterDropReturnsErrIndexNotFound(t *testing.T) {
 	}
 	// LookupKeys path.
 	yielded = 0
-	for range idx.LookupKeys([]byte{0x42}) {
+	for range idx.LookupKeys([][]byte{[]byte{0x42}}) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -200,7 +200,7 @@ func TestIndexHandleInFlightRebuildSurfacesCursorStale(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			// Mid-iter rebuild: FreeSubtree's the old data tree and
@@ -246,7 +246,7 @@ func TestIndexHandleInFlightSiblingPutSurfacesCursorStale(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			// Sibling Put on parent ks → atomic index maintenance →
@@ -288,7 +288,7 @@ func TestIndexHandleInFlightSiblingDeleteSurfacesCursorStale(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			if err := ks.Delete([]byte("c")); err != nil {
@@ -330,7 +330,7 @@ func TestIndexHandleInFlightDropSurfacesCursorStaleAndDead(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			if err := tx.Indexes().Drop("items", "by_color"); err != nil {
@@ -347,7 +347,7 @@ func TestIndexHandleInFlightDropSurfacesCursorStaleAndDead(t *testing.T) {
 	// Second iter call after the in-flight Drop: handle is dead → next
 	// iter sets idx.Err() = ErrIndexNotFound and yields nothing.
 	yielded = 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -391,7 +391,7 @@ func TestIndexHandleAfterRebuildRePositionWorks(t *testing.T) {
 	}
 	// Fresh iter on the cached handle: descends from the NEW root.
 	seen := map[string]struct{}{}
-	for k := range idx.LookupKeys([]byte{0x42}) {
+	for k := range idx.LookupKeys([][]byte{[]byte{0x42}}) {
 		seen[string(k)] = struct{}{}
 	}
 	if err := idx.Err(); err != nil {
@@ -432,7 +432,7 @@ func TestIndexHandleInFlightCursorDeleteSurfacesCursorStale(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			// Position a row cursor on "c" and Cursor.Delete it.
@@ -513,7 +513,7 @@ func TestSetKeyspaceIndexHandleInFlightSetCursorDeleteSurfacesCursorStale(t *tes
 		t.Fatalf("Index: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			sc := sks.Cursor()
@@ -559,7 +559,7 @@ func TestSetKeyspaceIndexHandleInFlightSiblingPutSurfacesCursorStale(t *testing.
 		t.Fatalf("Index: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			if _, err := sks.Put([]byte("c"), []byte{0x42, 'Z'}); err != nil {
@@ -662,7 +662,7 @@ func TestStatsPreservesInFlightStaleSignal(t *testing.T) {
 	// Mid-iter sibling Put → cursor MarkStale'd → idx.err =
 	// ErrCursorStale via mapCursorErr.
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			if err := ks.Put([]byte("c"), []byte{0x42}); err != nil {
@@ -719,7 +719,7 @@ func TestErrSymmetricWithStatsAfterDeleteKeyspace(t *testing.T) {
 	}
 	// Bad-cols Lookup (0 supplied, 1 declared) sets idx.err =
 	// ErrInvalidOptions wrap.
-	for range idx.Lookup() {
+	for range idx.Lookup(nil) {
 	}
 	if !errors.Is(idx.Err(), ErrInvalidOptions) {
 		t.Fatalf("setup: idx.Err() = %v, want ErrInvalidOptions wrap", idx.Err())
@@ -792,7 +792,7 @@ func TestIndexHandleDropThenDeleteReportsErrKeyspaceClosed(t *testing.T) {
 		t.Errorf("Err: %v, want ErrKeyspaceClosed", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -879,7 +879,7 @@ func TestIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing
 	}
 	// Lookup (non-unique iter path).
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -901,7 +901,7 @@ func TestIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing
 	}
 	// Prefix.
 	yielded = 0
-	for range idx.Prefix() {
+	for range idx.Prefix(nil) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -912,7 +912,7 @@ func TestIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed(t *testing
 	}
 	// LookupKeys.
 	yielded = 0
-	for range idx.LookupKeys([]byte{0x42}) {
+	for range idx.LookupKeys([][]byte{[]byte{0x42}}) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -989,7 +989,7 @@ func TestIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed(t *testing.T
 		t.Fatalf("Index: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			if err := tx.DeleteKeyspace("items"); err != nil {
@@ -1005,7 +1005,7 @@ func TestIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed(t *testing.T
 	}
 	// A subsequent iter call hits the entry-time ks.dead guard.
 	yielded = 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -1089,7 +1089,7 @@ func TestSetKeyspaceIndexHandleLookupAfterDeleteKeyspaceReturnsErrKeyspaceClosed
 		t.Fatalf("DeleteKeyspace: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 	}
 	if yielded != 0 {
@@ -1128,7 +1128,7 @@ func TestSetKeyspaceIndexHandleInFlightDeleteKeyspaceSurfacesErrKeyspaceClosed(t
 		t.Fatalf("Index: %v", err)
 	}
 	yielded := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		yielded++
 		if yielded == 1 {
 			if err := tx.DeleteKeyspace("members"); err != nil {

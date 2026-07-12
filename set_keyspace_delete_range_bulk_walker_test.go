@@ -253,7 +253,7 @@ func TestSetKeyspaceDeleteRangeIndexedDispatchPreservesPerRowMaintenance(t *test
 	// Verify index is per-row maintained: only u3/carrot survives.
 	idx, _ := sks.Index("by_topic")
 	var found []string
-	for sk, sv := range idx.Lookup([]byte{'c'}) {
+	for sk, sv := range idx.Lookup([][]byte{[]byte{'c'}}) {
 		found = append(found, string(sk)+"/"+string(sv))
 	}
 	sort.Strings(found)

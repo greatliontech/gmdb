@@ -52,7 +52,7 @@ func collectAllIndexPairs(t *testing.T, idx *IndexHandle) []string {
 func lookupKeysSorted(t *testing.T, idx *IndexHandle, cols ...[]byte) []string {
 	t.Helper()
 	var out []string
-	for pk := range idx.LookupKeys(cols...) {
+	for pk := range idx.LookupKeys(cols) {
 		out = append(out, string(pk))
 	}
 	if err := idx.Err(); err != nil {
@@ -660,7 +660,7 @@ func TestSetKeyspaceBulkLoadIndexedRoundTrip(t *testing.T) {
 	}
 	// 'a' → (u1,alice),(u1,amy),(u2,ann); the iter.Seq2 yields (setKey, setValue).
 	var aPairs []string
-	for sk, sv := range idx.Lookup([]byte("a")) {
+	for sk, sv := range idx.Lookup([][]byte{[]byte("a")}) {
 		aPairs = append(aPairs, string(sk)+"/"+string(sv))
 	}
 	if err := idx.Err(); err != nil {
@@ -1128,7 +1128,7 @@ func TestBulkLoadCoveringLargeValueRoundTrips(t *testing.T) {
 					return e
 				}
 				n := 0
-				for pk, v := range h.Lookup([]byte("row")) {
+				for pk, v := range h.Lookup([][]byte{[]byte("row")}) {
 					n++
 					if string(pk) != "row" {
 						t.Errorf("pk = %q", pk)

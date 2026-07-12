@@ -268,7 +268,7 @@ func TestSetKeyspaceIndexedDeleteRangeClearsIndexEntries(t *testing.T) {
 	// Verify u3 still in the SetKeyspace.
 	idx, _ := sks.Index("by_topic")
 	var found []string
-	for sk, sv := range idx.Lookup([]byte{'c'}) {
+	for sk, sv := range idx.Lookup([][]byte{[]byte{'c'}}) {
 		found = append(found, string(sk)+"/"+string(sv))
 	}
 	sort.Strings(found)

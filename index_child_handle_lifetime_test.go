@@ -109,7 +109,7 @@ func assertHandleClosed(t *testing.T, h *IndexHandle, when string) {
 		t.Errorf("bare Err() %s: %v, want ErrTxClosed", when, err)
 	}
 
-	if n := drainSeq2(h.Lookup([]byte("a"))); n != 0 {
+	if n := drainSeq2(h.Lookup([][]byte{[]byte("a")})); n != 0 {
 		t.Errorf("Lookup %s yielded %d rows, want 0", when, n)
 	}
 	if err := h.Err(); !errors.Is(err, ErrTxClosed) {
@@ -117,7 +117,7 @@ func assertHandleClosed(t *testing.T, h *IndexHandle, when string) {
 	}
 
 	n := 0
-	for range h.LookupKeys([]byte("a")) {
+	for range h.LookupKeys([][]byte{[]byte("a")}) {
 		n++
 	}
 	if n != 0 {
@@ -134,7 +134,7 @@ func assertHandleClosed(t *testing.T, h *IndexHandle, when string) {
 		t.Errorf("Range %s: Err=%v, want ErrTxClosed", when, err)
 	}
 
-	if n := drainSeq2(h.Prefix([]byte("a"))); n != 0 {
+	if n := drainSeq2(h.Prefix([][]byte{[]byte("a")})); n != 0 {
 		t.Errorf("Prefix %s yielded %d rows, want 0", when, n)
 	}
 	if err := h.Err(); !errors.Is(err, ErrTxClosed) {
@@ -183,7 +183,7 @@ func TestParentIndexHandleFrozenByActiveChild(t *testing.T) {
 		t.Errorf("truly-bare Err() during active child: %v, want ErrChildActive", err)
 	}
 
-	if n := drainSeq2(h.Lookup([]byte("a"))); n != 0 {
+	if n := drainSeq2(h.Lookup([][]byte{[]byte("a")})); n != 0 {
 		t.Errorf("Lookup during active child yielded %d rows, want 0", n)
 	}
 	if err := h.Err(); !errors.Is(err, ErrChildActive) {
@@ -204,7 +204,7 @@ func TestParentIndexHandleFrozenByActiveChild(t *testing.T) {
 	if err := child.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	n := drainSeq2(h.Lookup([]byte("a")))
+	n := drainSeq2(h.Lookup([][]byte{[]byte("a")}))
 	if err := h.Err(); err != nil {
 		t.Fatalf("parent handle Err after child resolve: %v", err)
 	}

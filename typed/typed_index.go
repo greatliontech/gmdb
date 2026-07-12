@@ -255,7 +255,7 @@ func (q *IndexQuery[K, V, IK]) Lookup(ik IK) iter.Seq2[K, V] {
 		if !ok {
 			return
 		}
-		for pkb, vb := range q.idx.Lookup(ikb) {
+		for pkb, vb := range q.idx.Lookup([][]byte{ikb}) {
 			k, v, ok := q.decodePair(pkb, vb)
 			if !ok || !yield(k, v) {
 				return
@@ -281,7 +281,7 @@ func (q *IndexQuery[K, V, IK]) LookupKeys(ik IK) iter.Seq[K] {
 		if !ok {
 			return
 		}
-		for pkb := range q.idx.LookupKeys(ikb) {
+		for pkb := range q.idx.LookupKeys([][]byte{ikb}) {
 			k, err := q.keyEnc.Decode(pkb)
 			if err != nil {
 				q.err = err
@@ -355,7 +355,7 @@ func (q *IndexQuery[K, V, IK]) Prefix(prefix IK) iter.Seq2[K, V] {
 		if !ok {
 			return
 		}
-		for pkb, vb := range q.idx.Prefix(pb) {
+		for pkb, vb := range q.idx.Prefix([][]byte{pb}) {
 			k, v, ok := q.decodePair(pkb, vb)
 			if !ok || !yield(k, v) {
 				return

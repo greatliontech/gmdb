@@ -507,6 +507,70 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 	return pk, value, false, nil
 }
 
+// IterOption configures an index-handle iteration surface
+// (Lookup / LookupKeys / Range / Prefix). Get takes none — it
+// yields at most one row.
+type IterOption func(*iterConfig)
+
+type iterConfig struct{ reverse bool }
+
+// Reverse makes the iteration yield the same entry SET in exactly
+// reversed order (indexing.md §Lookup API): the sequence is the
+// element-wise reversal of the forward sequence over the same
+// snapshot, same-tx dirty state included — the set equality that
+// makes a streaming-descending plan interchangeable with a
+// materialized one. The handle-invalidation contract is unchanged
+// (a reverse iterator is a cursor walk and stales identically —
+// Inv-IHS1..5 apply as written). On a unique index's Lookup /
+// LookupKeys (at most one row) it is a no-op.
+func Reverse() IterOption { return func(c *iterConfig) { c.reverse = true } }
+
+func applyIterOptions(opts []IterOption) iterConfig {
+	var c iterConfig
+	for _, o := range opts {
+		o(&c)
+	}
+	return c
+}
+
+// prefixSuccessor returns the smallest byte string greater than
+// every string having p as a prefix — p with its last non-0xFF
+// byte incremented and the tail truncated — or nil when no such
+// bound exists (p empty or all-0xFF), meaning the scan is
+// upper-open.
+func prefixSuccessor(p []byte) []byte {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] != 0xFF {
+			succ := make([]byte, i+1)
+			copy(succ, p[:i+1])
+			succ[i]++
+			return succ
+		}
+	}
+	return nil
+}
+
+// seekLastBelow positions c on the LAST entry strictly below
+// bound (nil bound ⇒ the tree's last entry) and returns it, or
+// (nil, nil) when no entry qualifies or the descent failed
+// (surfaced via c.Err()). Composition over the cursor's state
+// machine: SeekGE(bound) lands on the first entry >= bound, whose
+// Prev is the last entry below it; a SeekGE that walks off the
+// end (every entry < bound) transitions to End-of-iteration, from
+// which Prev stays End — so that arm re-positions via Last.
+func seekLastBelow(c *btree.Cursor, bound []byte) (k, v []byte) {
+	if bound == nil {
+		return c.Last()
+	}
+	if k, _ = c.SeekGE(bound); k != nil {
+		return c.Prev()
+	}
+	if c.Err() != nil {
+		return nil, nil
+	}
+	return c.Last()
+}
+
 // Lookup returns (pk, value) pairs whose index columns equal the
 // supplied tuple. Per indexing.md §Lookup API: exact match on
 // **all** declared columns. Supplying fewer or more columns than
@@ -539,7 +603,7 @@ func (idx *IndexHandle) extractPKAndValue(indexKey, indexValue []byte) (pk, valu
 // *IndexHandle's transaction; concurrent iteration on the same handle
 // races. For concurrent queries, call ks.Index(name) once per
 // goroutine.
-func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
+func (idx *IndexHandle) Lookup(cols [][]byte, opts ...IterOption) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset.
 		idx.err = nil
@@ -603,7 +667,7 @@ func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 		// Non-unique: scan the prefix `encoded` (each on-disk key is
 		// encoded || indexing.EscapeColumn(pk) || 0x00 0x00). Stop when the
 		// cursor key no longer has encoded as a prefix.
-		idx.iteratePrefix(encoded, yield)
+		idx.iteratePrefix(encoded, applyIterOptions(opts).reverse, yield)
 	}
 }
 
@@ -618,14 +682,25 @@ func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte] {
 // when index pages are CoW'd or freed (Inv-IHS1). The defer'd
 // unregister keeps the slice bounded across long-running tx with
 // many iter calls on the same handle.
-func (idx *IndexHandle) iteratePrefix(prefix []byte, yield func([]byte, []byte) bool) {
+func (idx *IndexHandle) iteratePrefix(prefix []byte, reverse bool, yield func([]byte, []byte) bool) {
 	tx := idx.rowTx()
 	cfg := tx.pgr.Config()
 	mergeThreshold := tx.db.opts.MergeThreshold
 	c := btree.NewCursor(btreeWriter{tx.pgr}, cfg, idx.pinned.root, mergeThreshold)
 	idx.registerCursor(c)
 	defer idx.unregisterCursor(c)
-	for k, v := c.SeekGE(prefix); k != nil; k, v = c.Next() {
+	var k, v []byte
+	step := c.Next
+	if reverse {
+		// Reverse: start at the last key inside the prefix group —
+		// the last entry below the group's prefix-successor (an
+		// exhausted/empty successor means the group is upper-open).
+		k, v = seekLastBelow(c, prefixSuccessor(prefix))
+		step = c.Prev
+	} else {
+		k, v = c.SeekGE(prefix)
+	}
+	for ; k != nil; k, v = step() {
 		if !bytes.HasPrefix(k, prefix) {
 			break
 		}
@@ -697,7 +772,7 @@ func (idx *IndexHandle) mapCursorErr(err error) error {
 // keyspace, so it does not observe the silent-skip case — every
 // index entry yields its raw PK, even when the row has somehow
 // vanished. Use Check() for row/index consistency verification.
-func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
+func (idx *IndexHandle) LookupKeys(cols [][]byte, opts ...IterOption) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		// Per-sequence Err reset.
 		idx.err = nil
@@ -769,7 +844,15 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 		c := btree.NewCursor(btreeWriter{tx.pgr}, cfg, idx.pinned.root, mergeThreshold)
 		idx.registerCursor(c)
 		defer idx.unregisterCursor(c)
-		for k, _ := c.SeekGE(encoded); k != nil; k, _ = c.Next() {
+		var k []byte
+		step := func() { k, _ = c.Next() }
+		if applyIterOptions(opts).reverse {
+			k, _ = seekLastBelow(c, prefixSuccessor(encoded))
+			step = func() { k, _ = c.Prev() }
+		} else {
+			k, _ = c.SeekGE(encoded)
+		}
+		for ; k != nil; step() {
 			if !bytes.HasPrefix(k, encoded) {
 				break
 			}
@@ -804,7 +887,7 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte] {
 // the encoded covering tuple (decode via DecodeCoveringTuple)
 // when IndexDecl.Covering is non-empty, otherwise the row's
 // stored bytes via back-lookup. See indexing.md §Covering Indexes.
-func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
+func (idx *IndexHandle) Range(start, end [][]byte, opts ...IterOption) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset.
 		idx.err = nil
@@ -856,13 +939,22 @@ func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 		idx.registerCursor(c)
 		defer idx.unregisterCursor(c)
 		var k, v []byte
-		if startKey != nil {
+		step := c.Next
+		inBounds := func(k []byte) bool { return endKey == nil || bytes.Compare(k, endKey) < 0 }
+		if applyIterOptions(opts).reverse {
+			// Reverse: start at the last entry below the exclusive
+			// end (nil end ⇒ the tree's last entry) and walk Prev
+			// until the inclusive start bound.
+			k, v = seekLastBelow(c, endKey)
+			step = c.Prev
+			inBounds = func(k []byte) bool { return startKey == nil || bytes.Compare(k, startKey) >= 0 }
+		} else if startKey != nil {
 			k, v = c.SeekGE(startKey)
 		} else {
 			k, v = c.First()
 		}
-		for ; k != nil; k, v = c.Next() {
-			if endKey != nil && bytes.Compare(k, endKey) >= 0 {
+		for ; k != nil; k, v = step() {
+			if !inBounds(k) {
 				break
 			}
 			keyCopy := make([]byte, len(k))
@@ -892,7 +984,7 @@ func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte] {
 // have to compute the upper bound. Same value semantics as Lookup
 // — covering tuple when IndexDecl.Covering is non-empty, row
 // bytes via back-lookup otherwise.
-func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] {
+func (idx *IndexHandle) Prefix(leadingCols [][]byte, opts ...IterOption) iter.Seq2[[]byte, []byte] {
 	return func(yield func([]byte, []byte) bool) {
 		// Per-sequence Err reset.
 		idx.err = nil
@@ -923,7 +1015,7 @@ func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte] 
 		prefixSlices := make([][]byte, len(leadingCols))
 		copy(prefixSlices, leadingCols)
 		encoded := indexing.EncodeKey(prefixSlices)
-		idx.iteratePrefix(encoded, yield)
+		idx.iteratePrefix(encoded, applyIterOptions(opts).reverse, yield)
 	}
 }
 

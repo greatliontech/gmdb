@@ -1298,6 +1298,19 @@ stay registered — and re-positionable — for the transaction lifetime.
 ```go
 type IndexHandle struct { /* unexported */ }
 
+// IterOption configures an index-handle iteration surface
+// (Lookup / LookupKeys / Range / Prefix; Get takes none — it
+// yields at most one row). The one option is Reverse().
+type IterOption func(*iterConfig)
+
+// Reverse makes the iteration yield the same entry SET in exactly
+// reversed order: the element-wise reversal of the forward
+// sequence over the same snapshot, same-tx dirty state included.
+// No-op on a unique index's Lookup / LookupKeys. The
+// handle-invalidation contract is direction-blind (Inv-IHS1..5
+// apply as written).
+func Reverse() IterOption
+
 // Lookup returns (pk, value) pairs matching the **exact** column
 // tuple. The number of supplied cols MUST equal the index's
 // declared column count; supplying fewer or more sets idx.Err()
@@ -1335,7 +1348,7 @@ type IndexHandle struct { /* unexported */ }
 // ErrKeyspaceClosed — the whole keyspace is gone, not just this
 // index; the parent-dead sentinel wins over the per-handle dead
 // sentinel (mirroring Cursor.Err's dead-check ordering).
-func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
+func (idx *IndexHandle) Lookup(cols [][]byte, opts ...IterOption) iter.Seq2[[]byte, []byte]
 
 // LookupKeys returns matching primary keys without back-lookup or
 // covering decode. Iteration cost is O(matches) leaf scans only.
@@ -1349,7 +1362,7 @@ func (idx *IndexHandle) Lookup(cols ...[]byte) iter.Seq2[[]byte, []byte]
 // on Lookup) — every index entry yields its raw PK, even if the
 // corresponding row has somehow vanished. Use Check() for
 // row/index consistency verification.
-func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
+func (idx *IndexHandle) LookupKeys(cols [][]byte, opts ...IterOption) iter.Seq[[]byte]
 
 // Range returns matches in [start, end). Each tuple is a slice of
 // per-column byte slices; nil tuple = open-ended. Same value
@@ -1382,7 +1395,7 @@ func (idx *IndexHandle) LookupKeys(cols ...[]byte) iter.Seq[[]byte]
 // match the encoding: Err() reports ErrInvalidOptions (matching
 // Lookup / LookupKeys / Prefix). Fewer columns is the documented
 // prefix-bound semantics above.
-func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
+func (idx *IndexHandle) Range(start, end [][]byte, opts ...IterOption) iter.Seq2[[]byte, []byte]
 
 // Prefix returns matches whose leading columns equal the prefix.
 // The number of leading columns must be ≤ the index's declared
@@ -1394,7 +1407,7 @@ func (idx *IndexHandle) Range(start, end [][]byte) iter.Seq2[[]byte, []byte]
 // Prefix don't need to compute that upper bound themselves. Same
 // value semantics and Inv-IHS3 / Inv-IHS2 dead-handle contract as
 // Lookup.
-func (idx *IndexHandle) Prefix(leadingCols ...[]byte) iter.Seq2[[]byte, []byte]
+func (idx *IndexHandle) Prefix(leadingCols [][]byte, opts ...IterOption) iter.Seq2[[]byte, []byte]
 
 // Decl returns the handle's pinned index declaration — the live
 // decl this handle serves under (indexing.md §Handle Invalidation).

@@ -44,7 +44,7 @@ func TestIndexLookupUniqueReturnsSingleMatch(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	var pks, values [][]byte
-	for pk, value := range idx.Lookup([]byte{0x42}) {
+	for pk, value := range idx.Lookup([][]byte{[]byte{0x42}}) {
 		pks = append(pks, pk)
 		values = append(values, value)
 	}
@@ -85,7 +85,7 @@ func TestIndexLookupUniqueNoMatchEmptySeq(t *testing.T) {
 	}
 	idx, _ := ks.Index("by_color")
 	n := 0
-	for range idx.Lookup([]byte{0x99}) {
+	for range idx.Lookup([][]byte{[]byte{0x99}}) {
 		n++
 	}
 	if n != 0 {
@@ -129,7 +129,7 @@ func TestIndexLookupNonUniqueReturnsAllMatches(t *testing.T) {
 	}
 	idx, _ := ks.Index("by_color")
 	var pks []string
-	for pk := range idx.Lookup([]byte{0x42}) {
+	for pk := range idx.Lookup([][]byte{[]byte{0x42}}) {
 		pks = append(pks, string(pk))
 	}
 	if idx.Err() != nil {
@@ -176,7 +176,7 @@ func TestIndexLookupNonUniqueDifferentColorsIsolated(t *testing.T) {
 	}
 	idx, _ := ks.Index("by_color")
 	var pks []string
-	for pk := range idx.Lookup([]byte{0x42}) {
+	for pk := range idx.Lookup([][]byte{[]byte{0x42}}) {
 		pks = append(pks, string(pk))
 	}
 	sort.Strings(pks)
@@ -216,7 +216,7 @@ func TestIndexLookupKeysReturnsPKsWithoutBackLookup(t *testing.T) {
 	}
 	idx, _ := ks.Index("by_color")
 	var pks []string
-	for pk := range idx.LookupKeys([]byte{0x42}) {
+	for pk := range idx.LookupKeys([][]byte{[]byte{0x42}}) {
 		pks = append(pks, string(pk))
 	}
 	sort.Strings(pks)
@@ -345,7 +345,7 @@ func TestIndexPrefixMatchesLeadingCols(t *testing.T) {
 	}
 	idx, _ := ks.Index("by_color_size")
 	var pks []string
-	for pk := range idx.Prefix([]byte{0x42}) {
+	for pk := range idx.Prefix([][]byte{[]byte{0x42}}) {
 		pks = append(pks, string(pk))
 	}
 	sort.Strings(pks)
@@ -490,7 +490,7 @@ func TestIndexLookupPartialColsReturnsErrInvalidOptions(t *testing.T) {
 
 	// Partial cols (1 supplied vs 2 declared) must NOT widen to Prefix.
 	n := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		n++
 	}
 	if n != 0 {
@@ -502,7 +502,7 @@ func TestIndexLookupPartialColsReturnsErrInvalidOptions(t *testing.T) {
 
 	// Zero cols — same outcome.
 	n = 0
-	for range idx.Lookup() {
+	for range idx.Lookup(nil) {
 		n++
 	}
 	if n != 0 {
@@ -578,14 +578,14 @@ func TestIndexLookupResetsErrOnNewSequence(t *testing.T) {
 	}
 	idx, _ := ks.Index("by_color")
 	// First call: partial-cols → idx.err set.
-	for range idx.Lookup() {
+	for range idx.Lookup(nil) {
 	}
 	if idx.Err() == nil {
 		t.Fatalf("expected idx.Err after partial-cols Lookup")
 	}
 	// Second call: valid Lookup → idx.err must reset.
 	n := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		n++
 	}
 	if idx.Err() != nil {
@@ -717,7 +717,7 @@ func TestByteAPIUniqueCoveringLookupReturnsCovering(t *testing.T) {
 	}
 	var gotPK, gotVal []byte
 	count := 0
-	for pk, v := range idx.Lookup([]byte{0x42}) {
+	for pk, v := range idx.Lookup([][]byte{[]byte{0x42}}) {
 		gotPK = append([]byte(nil), pk...)
 		gotVal = append([]byte(nil), v...)
 		count++
@@ -802,7 +802,7 @@ func TestByteAPIUniqueCoveringMultiColumnRoundTrip(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	var gotVal []byte
-	for _, v := range idx.Lookup([]byte{0x42}) {
+	for _, v := range idx.Lookup([][]byte{[]byte{0x42}}) {
 		gotVal = append([]byte(nil), v...)
 	}
 	if err := idx.Err(); err != nil {
@@ -880,7 +880,7 @@ func TestByteAPINonUniqueCoveringLookupReturnsCovering(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	got := map[string][]byte{}
-	for pk, v := range idx.Lookup([]byte{0x42}) {
+	for pk, v := range idx.Lookup([][]byte{[]byte{0x42}}) {
 		got[string(pk)] = append([]byte(nil), v...)
 	}
 	if err := idx.Err(); err != nil {

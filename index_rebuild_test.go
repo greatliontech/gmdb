@@ -62,7 +62,7 @@ func TestRebuildIndexBasicReplacesExtractor(t *testing.T) {
 		t.Fatalf("Index: %v", err)
 	}
 	n := 0
-	for range idx.Lookup([]byte{0x42}) {
+	for range idx.Lookup([][]byte{[]byte{0x42}}) {
 		n++
 	}
 	if idx.Err() != nil {

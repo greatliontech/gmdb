@@ -1,7 +1,7 @@
 # Plan: structure phase + typed columns + query builder
 
 Spec: `docs/specs/typed-columns.md`, `docs/specs/query-builder.md`.
-Rider: `index-reverse-iteration` (chunk 9). Chunks 1–6 and 8 are
+Chunks 1–6 and 8 are
 behavior-free structure moves except the named exported knobs;
 tests move with their subjects, unmodified.
 
@@ -46,7 +46,7 @@ tests move with their subjects, unmodified.
       `typed-keyspaces.md` (renames + knobs), `api-surface.md`,
       name cascade into `typed-columns.md` /
       `query-builder.md`.
-- [ ] 9. Reverse iteration `IterOption` on `Lookup` /
+- [x] 9. Reverse iteration `IterOption` on `Lookup` /
       `LookupKeys` / `Range` / `Prefix`; amendment clauses merge
       into `indexing.md §Lookup API` + `api-surface.md`;
       property test: reverse sequence == exact reversal of

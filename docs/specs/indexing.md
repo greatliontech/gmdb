@@ -567,24 +567,38 @@ escape hatch.
 For the Go-level signatures, see `api-surface.md §Index Lookup
 API`. Brief summary:
 
-- `Lookup(cols...)` → `iter.Seq2[pk, value]` — exact match on
-  all declared columns. `value` is read from the index entry's
-  covering bytes when the index covers the requested columns;
-  otherwise via back-lookup against the row keyspace.
-- `LookupKeys(cols...)` → `iter.Seq[pk]` — same matching, no
-  back-lookup, no covering decode.
-- `Range(start, end [][]byte)` → `iter.Seq2[pk, value]` —
-  matches in `[start, end)`. `nil` tuple ⇒ open-ended.
-- `Prefix(leadingCols...)` → `iter.Seq2[pk, value]` — matches
-  whose leading columns equal the prefix.
+- `Lookup(cols, opts...)` → `iter.Seq2[pk, value]` — exact match
+  on all declared columns (`cols [][]byte`, one slice per
+  column). `value` is read from the index entry's covering bytes
+  when the index covers the requested columns; otherwise via
+  back-lookup against the row keyspace.
+- `LookupKeys(cols, opts...)` → `iter.Seq[pk]` — same matching,
+  no back-lookup, no covering decode.
+- `Range(start, end [][]byte, opts...)` → `iter.Seq2[pk, value]`
+  — matches in `[start, end)`. `nil` tuple ⇒ open-ended.
+- `Prefix(leadingCols, opts...)` → `iter.Seq2[pk, value]` —
+  matches whose leading columns equal the prefix (zero columns ⇒
+  every entry).
 - `Get(cols...)` — shorthand for unique indexes: returns the
   single `(pk, value)` or `ErrNotFound`; returns
-  `ErrIndexNotUnique` on a non-unique index.
+  `ErrIndexNotUnique` on a non-unique index. Takes no iteration
+  options — it yields at most one row.
 - `Err()` returns the first error encountered during the last
   sequence's iteration. The `Err` state is per-handle; two
   overlapping iterators on the same `*IndexHandle` race — open the
   keyspace in separate transactions, or call
   `ks.Index(name)` once per goroutine.
+
+Each iteration surface accepts `IterOption`s; the one option is
+`Reverse()`, which yields the same entry SET in exactly reversed
+order — the sequence is the element-wise reversal of the forward
+sequence over the same snapshot, same-tx dirty state included.
+That set equality is the invariant making a streaming-descending
+consumer interchangeable with one that materializes and reverses.
+On a unique index's `Lookup` / `LookupKeys` (at most one row)
+`Reverse()` is a no-op. The handle-invalidation contract is
+direction-blind: a reverse iterator is a cursor walk and stales
+identically (Inv-IHS1..5 apply as written).
 
 **Intra-transaction consistency.** Index cursor and back-lookup
 both read the current transaction's dirty state. Row writes

@@ -14,7 +14,7 @@ import (
 // single-byte column value to.
 func lookupPKs(idx *IndexHandle, col byte) []string {
 	var pks []string
-	for pk := range idx.LookupKeys([]byte{col}) {
+	for pk := range idx.LookupKeys([][]byte{[]byte{col}}) {
 		pks = append(pks, string(pk))
 	}
 	sort.Strings(pks)

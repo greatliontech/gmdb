@@ -109,7 +109,7 @@ func TestRebuildFreesLiveSameTxIndexTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := 0
-	for range h.Lookup([]byte("v")) {
+	for range h.Lookup([][]byte{[]byte("v")}) {
 		n++
 	}
 	if err := h.Err(); err != nil {

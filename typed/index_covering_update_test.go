@@ -126,7 +126,7 @@ func TestByteCoveringRewrittenOnUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	var cover string
-	for _, v := range h.Lookup([]byte("a")) {
+	for _, v := range h.Lookup([][]byte{[]byte("a")}) {
 		cols, err := gmdb.DecodeCoveringTuple(v)
 		if err != nil {
 			t.Fatal(err)
@@ -192,7 +192,7 @@ func TestRebuildMatchesLiveDuplicateCollapse(t *testing.T) {
 			t.Fatal(err)
 		}
 		var cover string
-		for _, v := range h.Lookup([]byte{'x'}) {
+		for _, v := range h.Lookup([][]byte{[]byte{'x'}}) {
 			cols, err := gmdb.DecodeCoveringTuple(v)
 			if err != nil {
 				t.Fatal(err)

@@ -72,7 +72,7 @@ func TestIndexHandleSeesChildCommit(t *testing.T) {
 	}
 
 	n := 0
-	for range h.Lookup([]byte("a")) {
+	for range h.Lookup([][]byte{[]byte("a")}) {
 		n++
 	}
 	if err := h.Err(); err != nil {
@@ -106,7 +106,7 @@ func TestIndexHandleDeadAfterChildDrop(t *testing.T) {
 	if err := child.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	for range h.Lookup([]byte("a")) {
+	for range h.Lookup([][]byte{[]byte("a")}) {
 	}
 	if err := h.Err(); !errors.Is(err, ErrIndexNotFound) {
 		t.Errorf("parent handle after child Drop: Err=%v, want ErrIndexNotFound", err)
@@ -164,7 +164,7 @@ func TestSetIndexHandleSeesChildCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := 0
-	for range h.Lookup([]byte("a")) {
+	for range h.Lookup([][]byte{[]byte("a")}) {
 		n++
 	}
 	if err := h.Err(); err != nil {
@@ -183,7 +183,7 @@ func TestSetIndexHandleSeesChildCommit(t *testing.T) {
 func TestIndexIterAcrossChildCommit(t *testing.T) {
 	tx, _, h, mkDecl := childMergeFixture(t)
 	seen := 0
-	for range h.Lookup([]byte("a")) {
+	for range h.Lookup([][]byte{[]byte("a")}) {
 		seen++
 		if seen == 1 {
 			child, err := tx.BeginChild()
@@ -210,7 +210,7 @@ func TestIndexIterAcrossChildCommit(t *testing.T) {
 	}
 	// A fresh pass through the SAME handle serves the merged tree.
 	n := 0
-	for range h.Lookup([]byte("a")) {
+	for range h.Lookup([][]byte{[]byte("a")}) {
 		n++
 	}
 	if err := h.Err(); err != nil {
@@ -244,7 +244,7 @@ func TestIndexHandleAfterChildRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := 0
-	for range h.Lookup([]byte("a")) {
+	for range h.Lookup([][]byte{[]byte("a")}) {
 		n++
 	}
 	if err := h.Err(); err != nil {
@@ -277,7 +277,7 @@ func TestParentCursorsInvalidatedByChildDeleteKeyspace(t *testing.T) {
 	}
 	rowSeen++
 
-	for range h.Lookup([]byte("a")) {
+	for range h.Lookup([][]byte{[]byte("a")}) {
 		idxSeen++
 		if idxSeen == 1 {
 			child, err := tx.BeginChild()
@@ -340,7 +340,7 @@ func TestIndexIterAcrossChildRebuild(t *testing.T) {
 		}
 	}
 	seen := 0
-	for range h.Lookup([]byte("a")) {
+	for range h.Lookup([][]byte{[]byte("a")}) {
 		seen++
 		if seen == 1 {
 			child, err := tx.BeginChild()
@@ -360,7 +360,7 @@ func TestIndexIterAcrossChildRebuild(t *testing.T) {
 	}
 	// Fresh pass through the same handle: merged (rebuilt) tree.
 	n := 0
-	for range h.Lookup([]byte("a")) {
+	for range h.Lookup([][]byte{[]byte("a")}) {
 		n++
 	}
 	if err := h.Err(); err != nil {
