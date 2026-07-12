@@ -127,13 +127,31 @@ func (tks *Keyspace[K, V]) Open(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*Keyspa
 		tks.wrap)
 }
 
+// ReadOpener is the read-only keyspace-open surface the typed tier
+// requires of a transaction: both *gmdb.Tx and *gmdb.ReadTx satisfy it,
+// so one OpenReadOnly entry point serves write transactions and
+// snapshot read transactions (db.View / db.BeginRead). Over a ReadTx
+// the returned handle observes the snapshot's consistent, immutable
+// view — the engine's single-writer + N-snapshot-readers path — and is
+// bound to that ReadTx's lifetime: once it closes, error-returning
+// operations return gmdb.ErrTxClosed and iterator construction panics
+// per the byte tier's construction-panic rule (api-surface.md §Range
+// Iterators). A ReadTx serves one goroutine; open one per goroutine
+// for concurrent reads.
+type ReadOpener interface {
+	OpenKeyspaceReadOnly(name string) (*gmdb.Keyspace, error)
+	OpenSetKeyspaceReadOnly(name string) (*gmdb.SetKeyspace, error)
+}
+
 // OpenReadOnly opens the keyspace for reads only (no index decls; index
-// lookups still work against stored entries). Mutations on the returned
+// lookups still work against stored entries). src is either a write
+// transaction (*gmdb.Tx) or a snapshot read transaction (*gmdb.ReadTx);
+// the handle is bound to src's lifetime. Mutations on the returned
 // handle return gmdb.ErrReadOnly. With no declarations supplied the
 // handle carries no planner index metadata — queries over it plan as
 // full scans (results identical per Inv-QB1; plan choice is cost-only).
-func (tks *Keyspace[K, V]) OpenReadOnly(tx *gmdb.Tx) (*KeyspaceHandle[K, V], error) {
-	ks, err := tx.OpenKeyspaceReadOnly(tks.name)
+func (tks *Keyspace[K, V]) OpenReadOnly(src ReadOpener) (*KeyspaceHandle[K, V], error) {
+	ks, err := src.OpenKeyspaceReadOnly(tks.name)
 	if err != nil {
 		return nil, err
 	}

@@ -82,8 +82,12 @@ func (tsk *SetKeyspace[K, V]) Open(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*Set
 		tsk.wrap)
 }
 
-func (tsk *SetKeyspace[K, V]) OpenReadOnly(tx *gmdb.Tx) (*SetKeyspaceHandle[K, V], error) {
-	sks, err := tx.OpenSetKeyspaceReadOnly(tsk.name)
+// OpenReadOnly opens the set keyspace for reads only. src is either a
+// write transaction (*gmdb.Tx) or a snapshot read transaction
+// (*gmdb.ReadTx); the handle is bound to src's lifetime and mutations
+// on it return gmdb.ErrReadOnly.
+func (tsk *SetKeyspace[K, V]) OpenReadOnly(src ReadOpener) (*SetKeyspaceHandle[K, V], error) {
+	sks, err := src.OpenSetKeyspaceReadOnly(tsk.name)
 	if err != nil {
 		return nil, err
 	}
@@ -341,6 +345,13 @@ func (c *SetCursor[K, V]) SeekGE(target K) (K, V, bool) {
 // Delete removes the current (key, value) member (same semantics as
 // SetCursor.Delete).
 func (c *SetCursor[K, V]) Delete() error { return c.sc.Delete() }
+
+// Close releases the cursor before the transaction ends (same
+// semantics as gmdb.SetCursor.Close: unregisters from staleness
+// tracking; subsequent operations surface gmdb.ErrCursorClosed,
+// though an earlier sticky error is preserved by Err; terminal,
+// idempotent, optional).
+func (c *SetCursor[K, V]) Close() { c.sc.Close() }
 
 // Err returns the first error: a sticky decode/encode error from the
 // typed layer takes precedence, else the byte set cursor's error.

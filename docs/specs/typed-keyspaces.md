@@ -191,10 +191,19 @@ func NewKeyspace[K, V any](
     valEnc Encoder[V],
 ) *Keyspace[K, V]
 
+// ReadOpener is the read-only keyspace-open surface the typed tier
+// requires of a transaction. Both *gmdb.Tx and *gmdb.ReadTx satisfy
+// it, so one OpenReadOnly entry point serves write transactions and
+// snapshot read transactions (db.View / db.BeginRead).
+type ReadOpener interface {
+    OpenKeyspaceReadOnly(name string) (*gmdb.Keyspace, error)
+    OpenSetKeyspaceReadOnly(name string) (*gmdb.SetKeyspace, error)
+}
+
 // Open / Create / CreateIfNotExists within a transaction.
 // The variadic indexes are Index declarations.
 func (tks *Keyspace[K, V]) Open(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*KeyspaceHandle[K, V], error)
-func (tks *Keyspace[K, V]) OpenReadOnly(tx *gmdb.Tx) (*KeyspaceHandle[K, V], error)
+func (tks *Keyspace[K, V]) OpenReadOnly(src ReadOpener) (*KeyspaceHandle[K, V], error)
 func (tks *Keyspace[K, V]) Create(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*KeyspaceHandle[K, V], error)
 func (tks *Keyspace[K, V]) CreateIfNotExists(tx *gmdb.Tx, indexes ...AnyIndex[K, V]) (*KeyspaceHandle[K, V], error)
 
@@ -249,6 +258,34 @@ Go append pattern, allowing callers to pass reusable buffers
 sequences whose lex order matches the desired key order. For
 `uint64` keys, big-endian. For `string` keys, natural byte
 representation.
+
+## Snapshot reads
+
+`OpenReadOnly` (on both `typed.Keyspace` and `typed.SetKeyspace`)
+takes a `ReadOpener` rather than a `*gmdb.Tx`, so typed reads — and
+`gmdb/query` execution over the returned handle — run over a
+snapshot read transaction (`db.View` / `db.BeginRead`,
+api-surface.md §ReadTx) without acquiring the cross-process write
+grant. A handle opened over a `*gmdb.ReadTx`:
+
+- observes the snapshot's consistent, immutable view — a commit
+  that lands after `BeginRead` is invisible to it;
+- returns `gmdb.ErrReadOnly` from every mutator (inherited from
+  the ReadTx-backed read-only transaction);
+- is bound to that `ReadTx`'s lifetime: once it closes,
+  error-returning operations return `gmdb.ErrTxClosed`, and
+  constructing an iterator (`All` / `Range` / `Prefix`) panics per
+  the byte tier's construction-panic rule (api-surface.md §Range
+  Iterators — a `Seq2` has no error channel);
+- serves one goroutine — one `ReadTx` (one `BeginRead`) per
+  goroutine is the concurrent-read pattern (api-surface.md
+  §ReadTx); the typed tier adds no synchronization.
+
+As with `OpenReadOnly` over a write transaction, no index
+declarations are supplied: index lookups against stored entries
+still work, but the handle carries no planner index metadata, so
+`gmdb/query` plans over it as full scans (results identical per
+Inv-QB1; plan choice is cost-only).
 
 ## Typed Set Keyspace
 

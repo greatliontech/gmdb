@@ -857,6 +857,14 @@ type ReadTx struct { ... }
 // §Sparse Reservation), and pager.Meta is an internal storage struct.
 // The snapshot identity callers need is the curated TxnID (uint64);
 // DB.Stats (§Statistics) covers DB-level numbers.
+//
+// A ReadTx serves one goroutine: it is not safe for concurrent use
+// by multiple goroutines. Concurrent reads are N ReadTxs — one
+// BeginRead per goroutine — not N goroutines on one snapshot.
+//
+// The typed tier reads through a ReadTx via typed.ReadOpener — an
+// interface both *Tx and *ReadTx satisfy (typed-keyspaces.md
+// §Snapshot reads).
 func (rtx *ReadTx) OpenKeyspaceReadOnly(name string) (*Keyspace, error)
 func (rtx *ReadTx) OpenSetKeyspaceReadOnly(name string) (*SetKeyspace, error)
 func (rtx *ReadTx) ListKeyspaces() ([]string, error)
