@@ -46,13 +46,19 @@ func (tsk *SetKeyspace[K, V]) wrap(sks *gmdb.SetKeyspace, _ []qrep.IndexInfo) *S
 	return &SetKeyspaceHandle[K, V]{sks: sks, keyEnc: tsk.keyEnc, valEnc: tsk.valEnc}
 }
 
-// rejectCoveringDecls bars covering-declaring column indexes from
-// set keyspaces — see (*ColumnIndex).coveringDeclared.
+// rejectCoveringDecls bars covering-declaring typed indexes —
+// both forms: ColumnIndex Covering/CoverValue and Index
+// CoverValue — from set keyspaces (typed-keyspaces.md §Covering):
+// a set index's covering payload has no read path (the byte layer
+// never serves covering for set indexes; the compound PK already
+// carries the member value), while the write path would pay the
+// covering bytes per set member — fingerprinted write
+// amplification for bytes no read can reach.
 func rejectCoveringDecls[K, V any](indexes []AnyIndex[K, V]) error {
 	for _, idx := range indexes {
 		if p, ok := idx.(interface{ coveringDeclared() (string, bool) }); ok {
 			if name, has := p.coveringDeclared(); has {
-				return fmt.Errorf("gmdb: column index %q: Covering/CoverValue on a SetKeyspace has no read path: %w",
+				return fmt.Errorf("gmdb: typed index %q: Covering/CoverValue on a SetKeyspace has no read path: %w",
 					name, gmdb.ErrInvalidOptions)
 			}
 		}

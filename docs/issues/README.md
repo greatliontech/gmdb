@@ -64,7 +64,6 @@ pre-existing at their change set's base.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| typed-index-covervalue-set-inert | when typed-keyspaces.md §Covering is next amended | [L] typed.Index CoverValue on a SetKeyspace stores unreadable covering bytes (documented-inert); the sibling ColumnIndex form now rejects the same combination — the two typed forms disagree |
 
 ## Open — design gaps (2026-07-11 architecture audit)
 

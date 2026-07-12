@@ -559,6 +559,35 @@ func TestColumnIndexCoveringGuards(t *testing.T) {
 	if _, err := tsk.CreateIfNotExists(tx, covIdx); !errors.Is(err, gmdb.ErrInvalidOptions) {
 		t.Fatalf("covering ColumnIndex on SetKeyspace CreateIfNotExists = %v, want ErrInvalidOptions", err)
 	}
+
+	// The sibling decl form: a CoverValue Index is rejected by the
+	// same probe — the two typed forms agree (a set index's
+	// covering payload has no read path, and the write path would
+	// pay it per member).
+	cvIdx := &Index[uint64, rowVal, string]{
+		Name:       "cv",
+		IKEnc:      StringEncoder{},
+		Extract:    func(_ uint64, _ rowVal) []string { return []string{"ik"} },
+		CoverValue: true,
+	}
+	if _, err := tsk.Create(tx, cvIdx); !errors.Is(err, gmdb.ErrInvalidOptions) {
+		t.Fatalf("CoverValue Index on SetKeyspace Create = %v, want ErrInvalidOptions", err)
+	}
+	if _, err := tsk.Open(tx, cvIdx); !errors.Is(err, gmdb.ErrInvalidOptions) {
+		t.Fatalf("CoverValue Index on SetKeyspace Open = %v, want ErrInvalidOptions", err)
+	}
+	if _, err := tsk.CreateIfNotExists(tx, cvIdx); !errors.Is(err, gmdb.ErrInvalidOptions) {
+		t.Fatalf("CoverValue Index on SetKeyspace CreateIfNotExists = %v, want ErrInvalidOptions", err)
+	}
+	// A plain (non-covering) Index stays accepted on set keyspaces.
+	plain := &Index[uint64, rowVal, string]{
+		Name:    "plain",
+		IKEnc:   StringEncoder{},
+		Extract: func(_ uint64, _ rowVal) []string { return []string{"ik"} },
+	}
+	if _, err := tsk.Create(tx, plain); err != nil {
+		t.Fatalf("plain Index on SetKeyspace Create: %v", err)
+	}
 }
 
 // The covering value-encoder identity is a fingerprint input for

@@ -403,10 +403,17 @@ returns that column instead of back-looking-up. The value
 encoder's `ID()` is folded into the fingerprint (an empty value
 encoder `ID()` is rejected with `ErrIndexEncoderIDEmpty`).
 
-`CoverValue` has effect only on a `typed.Keyspace`-backed index: a
-`typed.SetKeyspace` index's value (`setValue`) is already carried in
-its compound primary key, so there is no back-lookup to skip. This
-is `typed.Index`'s only covering shape; arbitrary covering
+`CoverValue` is `typed.Keyspace`-only: a `typed.SetKeyspace`
+index's value (`setValue`) is already carried in its compound
+primary key, so there is no back-lookup to skip — while the write
+path would still store the covering payload per set member,
+fingerprinted write amplification for bytes no read path can
+reach. The SetKeyspace factories REJECT a `CoverValue`
+`typed.Index` with `ErrInvalidOptions`, exactly as they reject
+the sibling `typed.ColumnIndex` covering forms (the two typed
+declaration forms agree; `typed-columns.md` §Covering
+projections). This is `typed.Index`'s only covering shape;
+arbitrary covering
 *projections* have their typed surface on the column tier —
 `typed.ColumnIndex`'s `Covering` columns plus `Projection` /
 `Column.From` (typed-columns.md §Covering projections). Every

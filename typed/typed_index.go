@@ -50,9 +50,12 @@ import (
 // The keyspace's value-encoder ID is folded into the schema-hash
 // fingerprint, so swapping the value encoder triggers
 // gmdb.ErrIndexFingerprintMismatch; an empty value-encoder ID is rejected
-// with gmdb.ErrIndexEncoderIDEmpty. CoverValue has effect only on a
-// Keyspace (Keyspace-backed) index — a SetKeyspace index's value is
-// already carried in its compound PK, so there is no back-lookup to skip.
+// with gmdb.ErrIndexEncoderIDEmpty. CoverValue is Keyspace-only: a
+// SetKeyspace index's value is already carried in its compound PK, so
+// there is no back-lookup to skip — and the write path would still pay
+// the covering bytes per set member. The SetKeyspace factories REJECT
+// a CoverValue Index with gmdb.ErrInvalidOptions, exactly like the
+// sibling ColumnIndex covering forms (typed-keyspaces.md §Covering).
 type Index[K, V, IK any] struct {
 	Name       string
 	IKEnc      Encoder[IK]
@@ -66,6 +69,14 @@ type Index[K, V, IK any] struct {
 // AnyIndex (the unexported indexDecl
 // method seals the interface to this package).
 var _ AnyIndex[int, int] = (*Index[int, int, int])(nil)
+
+// coveringDeclared reports the declaration's covering state — the
+// SetKeyspace factories' rejection probe (covering payloads have
+// no read path on set indexes; see typed_set.go
+// rejectCoveringDecls).
+func (t *Index[K, V, IK]) coveringDeclared() (string, bool) {
+	return t.Name, t.CoverValue
+}
 
 // indexDecl lowers the typed index to a byte *gmdb.IndexDecl, threading the
 // owning keyspace's encoders into the extractor closure. Implements

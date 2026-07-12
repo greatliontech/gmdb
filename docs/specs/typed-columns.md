@@ -307,9 +307,11 @@ Covering declarations are `typed.Keyspace`-backed only: on a
 SetKeyspace a covering payload has no read path (the byte layer
 never serves covering for set indexes, and the compound primary
 key already carries the member value), so a covering-declaring
-`ColumnIndex` is REJECTED by the SetKeyspace factories with
-`ErrInvalidOptions` — paying write amplification for unreadable
-bytes is a trap, not an option.
+typed index — either form: a `ColumnIndex` with `Covering` or
+`CoverValue`, or a `typed.Index` with `CoverValue`
+(`typed-keyspaces.md` §Covering) — is REJECTED by the SetKeyspace
+factories with `ErrInvalidOptions`: paying write amplification
+for unreadable bytes is a trap, not an option.
 
 `CoverValue: true` is the full-row alternative: the entry stores
 `encode(V)` as the single covering column with the value
