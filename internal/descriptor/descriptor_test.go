@@ -158,6 +158,9 @@ func TestKeyspaceDescriptorValidateRejectsUnknownKind(t *testing.T) {
 	if !strings.Contains(err.Error(), "Kind") {
 		t.Errorf("error doesn't mention Kind: %v", err)
 	}
+	if !strings.HasPrefix(err.Error(), "descriptor: ") {
+		t.Errorf("validation error prefix = %v, want the package-locating \"descriptor: \" prefix", err)
+	}
 
 	// Also verify each accepted Kind passes.
 	for _, k := range []uint8{

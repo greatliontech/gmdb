@@ -163,19 +163,19 @@ func Validate(buf []byte, d Keyspace) error {
 	switch d.Kind {
 	case KindKeyspace, KindSetKeyspace, KindIndexInternal:
 	default:
-		return fmt.Errorf("page: keyspace descriptor Kind %d not in {0, 1, 2}", d.Kind)
+		return fmt.Errorf("descriptor: keyspace descriptor Kind %d not in {0, 1, 2}", d.Kind)
 	}
 	if d.FixedValueSize != 0 && d.Kind != KindSetKeyspace {
-		return fmt.Errorf("page: keyspace descriptor FixedValueSize %d set on Kind %d (only valid for Kind=%d SetKeyspace)",
+		return fmt.Errorf("descriptor: keyspace descriptor FixedValueSize %d set on Kind %d (only valid for Kind=%d SetKeyspace)",
 			d.FixedValueSize, d.Kind, KindSetKeyspace)
 	}
 	if d.RestartGroupTarget > page.MaxRestartGroupTarget {
-		return fmt.Errorf("page: keyspace descriptor RestartGroupTarget %d exceeds max %d",
+		return fmt.Errorf("descriptor: keyspace descriptor RestartGroupTarget %d exceeds max %d",
 			d.RestartGroupTarget, page.MaxRestartGroupTarget)
 	}
 	for i := 0; i < ksdReservedLen; i++ {
 		if b := buf[ksdOffReserved+i]; b != 0 {
-			return fmt.Errorf("page: keyspace descriptor reserved byte %d is 0x%02x, want 0", i, b)
+			return fmt.Errorf("descriptor: keyspace descriptor reserved byte %d is 0x%02x, want 0", i, b)
 		}
 	}
 	return nil
