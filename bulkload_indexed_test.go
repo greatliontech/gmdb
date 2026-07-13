@@ -972,11 +972,10 @@ func slicesEqualStr(a, b []string) bool {
 	return true
 }
 
-// The bulk index build enforces the SAME split-safety key bound as
-// the online path (limits.md two-separators-per-branch): an
-// extractor-produced index key Put would reject must fail BulkLoad
-// with ErrKeyTooLarge — pre-fix it persisted, leaving rows
-// permanently un-updatable and the database un-compactable.
+// The bulk index build accepts the SAME keys as the online path
+// (limits.md — one threshold, no drift): an extractor-produced index
+// key over the inline threshold stores as an overflow-key cell
+// through BOTH paths, and the index lookup resolves it to the row.
 func TestBulkLoadIndexKeyGateParity(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 512})
@@ -1000,22 +999,47 @@ func TestBulkLoadIndexKeyGateParity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	// The online path rejects this input.
-	if err := ks.Put([]byte("row"), []byte("v")); !errors.Is(err, ErrKeyTooLarge) {
-		t.Fatalf("online Put = %v, want ErrKeyTooLarge (fixture: the 1500-byte column's ENCODED index key must exceed the spec bound yet fit an empty leaf)", err)
+	// Online path: the 1500-byte all-zero column NUL-escapes to ~3000
+	// bytes — over the inline threshold — and stores as an
+	// overflow-key index cell.
+	if err := ks.Put([]byte("row"), []byte("v")); err != nil {
+		t.Fatalf("online Put with over-threshold index key: %v", err)
 	}
-	// BulkLoad must reject it identically.
-	_, err = ks.BulkLoad(func(yield func(k, v []byte) bool) {
+	lookupRow := func(ks *Keyspace, label string) {
+		idx, err := ks.Index("big")
+		if err != nil {
+			t.Fatalf("%s Index: %v", label, err)
+		}
+		var pks [][]byte
+		for pk := range idx.LookupKeys([][]byte{make([]byte, 1500)}) {
+			pks = append(pks, bytes.Clone(pk))
+		}
+		if err := idx.Err(); err != nil {
+			t.Fatalf("%s LookupKeys: %v", label, err)
+		}
+		if len(pks) != 1 || !bytes.Equal(pks[0], []byte("row")) {
+			t.Fatalf("%s lookup = %q, want [row]", label, pks)
+		}
+	}
+	lookupRow(ks, "online")
+	// BulkLoad accepts it identically (fresh keyspace) and the lookup
+	// resolves through the bulk-built index tree.
+	ks2, err := tx.CreateKeyspace("k2", bigKey)
+	if err != nil {
+		t.Fatalf("CreateKeyspace k2: %v", err)
+	}
+	if _, err = ks2.BulkLoad(func(yield func(k, v []byte) bool) {
 		yield([]byte("row"), []byte("v"))
-	})
-	if !errors.Is(err, ErrKeyTooLarge) {
-		t.Fatalf("BulkLoad = %v, want ErrKeyTooLarge (oversize index key accepted)", err)
+	}); err != nil {
+		t.Fatalf("BulkLoad with over-threshold index key: %v", err)
 	}
+	lookupRow(ks2, "bulk")
 }
 
-// The SPILLED merge path shares the gate: enough rows to exceed the
-// per-index sort budget forces the external-merge branch, whose
-// bulkLeafEntry call must reject the same oversize key.
+// The SPILLED merge path shares the acceptance contract: enough rows
+// to exceed the per-index sort budget forces the external-merge
+// branch, whose bulkLeafEntry call stores the same over-threshold
+// index keys as overflow-key cells.
 func TestBulkLoadIndexKeyGateParitySpilled(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{
@@ -1052,18 +1076,34 @@ func TestBulkLoadIndexKeyGateParitySpilled(t *testing.T) {
 	spilled := false
 	extsort.SetMergeCascadeHookForTest(func(pre, post int) { spilled = true })
 	defer extsort.SetMergeCascadeHookForTest(nil)
-	_, err = ks.BulkLoad(func(yield func(k, v []byte) bool) {
+	if _, err = ks.BulkLoad(func(yield func(k, v []byte) bool) {
 		for i := range 1200 { // ~1.8 MB of index entries > 1 MB budget
 			if !yield(fmt.Appendf(nil, "row%05d", i), []byte("v")) {
 				return
 			}
 		}
-	})
-	if !errors.Is(err, ErrKeyTooLarge) {
-		t.Fatalf("spilled BulkLoad = %v, want ErrKeyTooLarge", err)
+	}); err != nil {
+		t.Fatalf("spilled BulkLoad with over-threshold index keys: %v", err)
 	}
 	if !spilled {
 		t.Fatal("index sorter never spilled — the test degraded to the in-memory case (raise the row count or lower MaxTxBufferBytes)")
+	}
+	// Spot-check a lookup through the spill-built index tree.
+	idx, err := ks.Index("big")
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	probe := make([]byte, 1500)
+	copy(probe, []byte("row00042"))
+	var pks [][]byte
+	for pk := range idx.LookupKeys([][]byte{probe}) {
+		pks = append(pks, bytes.Clone(pk))
+	}
+	if err := idx.Err(); err != nil {
+		t.Fatalf("LookupKeys: %v", err)
+	}
+	if len(pks) != 1 || string(pks[0]) != "row00042" {
+		t.Fatalf("spilled lookup = %q, want [row00042]", pks)
 	}
 }
 

@@ -188,8 +188,8 @@ func TestRebalanceSurvivorsDeepHolderScan(t *testing.T) {
 		{origIdx: 0, child: lbr},
 		{origIdx: 1, child: rbr, underflow: true, deepUnderflow: d},
 	}
-	origCellKeys := [][]byte{fatKey('d')}
-	if err := rebalanceSurvivors(pw, cfg, DefaultMergeThreshold, origCellKeys, &survivors); err != nil {
+	origSepCells := []page.BranchCell{{Key: fatKey('d')}}
+	if err := rebalanceSurvivors(pw, cfg, DefaultMergeThreshold, origSepCells, make([]bool, len(origSepCells)), &survivors); err != nil {
 		t.Fatalf("rebalanceSurvivors: %v", err)
 	}
 	// Fixture guard: this test pins the holder SCAN, so the deep must
@@ -362,8 +362,8 @@ func TestRebalanceSurvivorsTwoDeepsAbsorbed(t *testing.T) {
 		{origIdx: 0, child: lbr, underflow: true, deepUnderflow: dL},
 		{origIdx: 1, child: rbr, underflow: true, deepUnderflow: dR},
 	}
-	origCellKeys := [][]byte{fatKeyN('f', 600)}
-	if err := rebalanceSurvivors(pw, cfg, DefaultMergeThreshold, origCellKeys, &survivors); err != nil {
+	origSepCells := []page.BranchCell{{Key: fatKeyN('f', 600)}}
+	if err := rebalanceSurvivors(pw, cfg, DefaultMergeThreshold, origSepCells, make([]bool, len(origSepCells)), &survivors); err != nil {
 		t.Fatalf("rebalanceSurvivors: %v", err)
 	}
 	// Absorption guard: the scenario is only pinned if the first heal

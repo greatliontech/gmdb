@@ -995,8 +995,8 @@ func TestMergeBranchesForgedSiblingNoPanic(t *testing.T) {
 	right[16], right[17] = 0xFF, 0xFF
 	pw.pages[2] = right
 
-	_, _, _, _, _, err := mergeOrRedistributeBranches(pw, cfg, DefaultMergeThreshold, 1, 2, []byte("sep"),
-		func([]byte) bool { return true })
+	_, _, _, _, _, err := mergeOrRedistributeBranches(pw, cfg, DefaultMergeThreshold, 1, 2, page.BranchCell{Key: []byte("sep")},
+		func(page.BranchCell) bool { return true })
 	if !errors.Is(err, ErrCorrupted) {
 		t.Fatalf("mergeOrRedistributeBranches with forged sibling = %v, want ErrCorrupted (no panic)", err)
 	}
@@ -1116,7 +1116,7 @@ func buildDeclineFixture(t *testing.T, pw *fakeWriter, cfg page.Config) declineF
 	// parent (this is the guard the fix adds; assert the topology
 	// actually exercises it).
 	probe := append(bytes.Clone(pfx), []byte("-0")...)
-	if parentFitsSeparator(cfg, cells, 0, probe) {
+	if parentFitsSeparator(cfg, cells, 0, sizingSeparatorCell(cfg, probe)) {
 		t.Fatalf("fixture: parent has room for a %d-byte separator; slack too large", len(probe))
 	}
 
@@ -1270,15 +1270,15 @@ func TestMergeOrRedistributeBranchesParentFitDecline(t *testing.T) {
 		return cells
 	}
 
-	run := func(fits bool) (bool, uint64, uint64, uint64, []byte, *fakeWriter) {
+	run := func(fits bool) (bool, uint64, uint64, uint64, page.BranchCell, *fakeWriter) {
 		pw := newFakeWriter(t, 4096)
 		leftID, _ := pw.AllocPage()
 		build(pw, leftID, 100, mkCells('c', 7, 101))
 		rightID, _ := pw.AllocPage()
 		build(pw, rightID, 200, mkCells('s', 7, 201))
 		isMerge, mergedID, newLeftID, newRightID, newSep, err := mergeOrRedistributeBranches(
-			pw, cfg, DefaultMergeThreshold, leftID, rightID, []byte("m"),
-			func([]byte) bool { return fits })
+			pw, cfg, DefaultMergeThreshold, leftID, rightID, page.BranchCell{Key: []byte("m")},
+			func(page.BranchCell) bool { return fits })
 		if err != nil {
 			t.Fatalf("mergeOrRedistributeBranches(fits=%v): %v", fits, err)
 		}
@@ -1292,14 +1292,14 @@ func TestMergeOrRedistributeBranchesParentFitDecline(t *testing.T) {
 	// fixture reaches the redistribute plan, so the decline below is
 	// attributable to parentFits alone).
 	_, _, nl, nr, sep, _ := run(true)
-	if nl == 0 || nr == 0 || len(sep) == 0 {
-		t.Fatalf("fits=true: got (%d, %d, %q), want a performed redistribute", nl, nr, sep)
+	if nl == 0 || nr == 0 || len(sep.Key) == 0 {
+		t.Fatalf("fits=true: got (%d, %d, %q), want a performed redistribute", nl, nr, sep.Key)
 	}
 
 	// Unfit parent: decline — all-zero, nothing allocated or freed.
 	_, mergedID, nl, nr, sep, pw := run(false)
-	if mergedID != 0 || nl != 0 || nr != 0 || sep != nil {
-		t.Errorf("fits=false: got (%d, %d, %d, %q), want all-zero decline", mergedID, nl, nr, sep)
+	if mergedID != 0 || nl != 0 || nr != 0 || sep.Key != nil || sep.KeyExtPage != 0 {
+		t.Errorf("fits=false: got (%d, %d, %d, %q), want all-zero decline", mergedID, nl, nr, sep.Key)
 	}
 	if len(pw.freed) != 0 {
 		t.Errorf("fits=false: %d pages freed on decline, want 0", len(pw.freed))
@@ -1336,7 +1336,7 @@ func TestMergePairRejectsMixedSiblingTypes(t *testing.T) {
 		t.Fatalf("EncodeBranch: %v", err)
 	}
 
-	_, err = mergeOrRedistributePair(pw, cfg, 30, 5, 6, []byte("m"), func([]byte) bool { return true })
+	_, err = mergeOrRedistributePair(pw, cfg, 30, 5, 6, page.BranchCell{Key: []byte("m")}, func(page.BranchCell) bool { return true })
 	if !errors.Is(err, ErrCorrupted) {
 		t.Fatalf("mixed-type pair: err = %v, want ErrCorrupted", err)
 	}

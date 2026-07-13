@@ -107,7 +107,10 @@ func descendToLeafForKey(pw PageWriter, cfg page.Config, rootID uint64, key []by
 		if e := validateBranchPage(buf, cfg, cur); e != nil {
 			return nil, 0, nil, e
 		}
-		i := page.BranchSearch(buf, cfg, key)
+		i, serr := page.BranchSearch(buf, cfg, key, keyTail(pw, cfg))
+		if serr != nil {
+			return nil, 0, nil, serr
+		}
 		next := page.BranchChildAt(buf, cfg, i)
 		if next == 0 {
 			return nil, 0, nil, fmt.Errorf("%w: null child pointer in branch %d during put descent", ErrCorrupted, cur)
@@ -177,13 +180,12 @@ func InsertIfAbsent(pw PageWriter, cfg page.Config, rootID uint64, key, value []
 // any page (the InsertIfAbsent no-op-on-present contract); otherwise it
 // performs the standard replace-or-insert.
 func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte, insertOnly bool) (newRoot uint64, existed bool, err error) {
-	// Split-safety key bound (limits.md §Maximum Key Size): a branch
-	// must hold TWO full separators of this key. This is the spec's
-	// stated bound (~(PageSize-40)/2), enforced at the entry gate so
-	// acceptance is uniform across Put, PutEntry, and the bulk
-	// builders — the split machinery itself tolerates single-cell
-	// halves, so this is spec conformance, not a crash guard.
-	if !branchHoldsTwoSeparators(cfg, len(key)) {
+	// Storable-key bound (limits.md §Maximum Key Size): any key up to
+	// the uint32 encoding bound is accepted — over the inline
+	// threshold it takes the overflow-key form (page-formats.md
+	// §Overflow-Key Cells). Enforced at the entry gate so acceptance
+	// is uniform across Put, PutEntry, and the bulk builders.
+	if !keyWithinBound(key) {
 		return 0, false, ErrKeyTooLarge
 	}
 	if rootID == 0 {
@@ -208,7 +210,10 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 	if e := rdr.Validate(); e != nil {
 		return 0, false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, leafID, e)
 	}
-	searchIdx, _, searchFound := rdr.SearchLeaf(key)
+	searchIdx, _, searchFound, serr := rdr.SearchLeaf(key, keyTail(pw, cfg))
+	if serr != nil {
+		return 0, false, serr
+	}
 
 	// InsertIfAbsent no-op-on-present: skip the write entirely (no CoW, no
 	// alloc) when the key already exists.
@@ -261,6 +266,9 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			runLen := page.OverflowRunLength(cfg, newEntry.TotalLen)
 			_ = pw.FreeRun(newEntry.OverflowPage, runLen)
 		}
+		if newEntry.IsOverflowKey() {
+			_ = pw.FreeRun(newEntry.KeyExtPage, keyExtentRunLen(cfg, newEntry.KeyTotalLen))
+		}
 		for _, pe := range promotedChains {
 			runLen := page.OverflowRunLength(cfg, pe.TotalLen)
 			_ = pw.FreeRun(pe.OverflowPage, runLen)
@@ -303,14 +311,23 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			return 0, false, e
 		}
 		if ok {
+			sepCell, e := makeSeparatorCell(pw, cfg, sep, rightID)
+			if e != nil {
+				_ = pw.FreePage(leftID)
+				_ = pw.FreePage(rightID)
+				rollbackNewChain()
+				return 0, false, e
+			}
 			if e := pw.FreePage(leafID); e != nil {
+				_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 				_ = pw.FreePage(leftID)
 				_ = pw.FreePage(rightID)
 				rollbackNewChain()
 				return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, e)
 			}
-			nr, e := ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
+			nr, e := ascendWithSplit(pw, cfg, path, leftID, sepCell)
 			if e != nil {
+				_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 				_ = pw.FreePage(leftID)
 				_ = pw.FreePage(rightID)
 				rollbackNewChain()
@@ -351,7 +368,7 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 	// PutReportExisting / InsertIfAbsent.
 	entries := leafEntriesDeepCopyFrom(page.NewLeafReader(leftBuf, cfg))
 	var displaced page.LeafEntry
-	entries, displaced, existed = insertOrReplaceLeaf(entries, newEntry)
+	entries, displaced, existed = insertOrReplaceLeafAt(entries, newEntry, searchIdx, searchFound)
 
 	// Store entries into one leaf if they fit, else a byte-balanced
 	// two-page split (page-formats.md §Leaf Split — NOT the entry-count
@@ -392,6 +409,11 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 				rollbackNewChain()
 				return 0, false, err
 			}
+			if err := freeKeyExtentIfPresent(pw, cfg, displaced); err != nil {
+				_ = pw.FreePage(leftID)
+				rollbackNewChain()
+				return 0, false, err
+			}
 			if err := pw.FreePage(leafID); err != nil {
 				_ = pw.FreePage(leftID)
 				rollbackNewChain()
@@ -426,6 +448,12 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 				rollbackNewChain()
 				return 0, false, perr
 			}
+			// Preserve the key half: an overflow-key entry keeps its
+			// resident-prefix Key (passed above) and its extent
+			// reference through the value promotion.
+			promoted.Flags |= entries[pi].Flags & page.CellFlagOverflowKey
+			promoted.KeyExtPage = entries[pi].KeyExtPage
+			promoted.KeyTotalLen = entries[pi].KeyTotalLen
 			entries[pi] = promoted
 			promotedChains = append(promotedChains, promoted)
 			continue
@@ -479,6 +507,12 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			rollbackNewChain()
 			return 0, false, err
 		}
+		if err := freeKeyExtentIfPresent(pw, cfg, displaced); err != nil {
+			_ = pw.FreePage(leftID)
+			_ = pw.FreePage(rightID)
+			rollbackNewChain()
+			return 0, false, err
+		}
 		if err := pw.FreePage(leafID); err != nil {
 			_ = pw.FreePage(leftID)
 			_ = pw.FreePage(rightID)
@@ -486,10 +520,27 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
 		}
 
-		// Separator: shortest S with leftLast < S <= rightFirst.
-		sep := page.ShortestSeparator(entries[mid-1].Key, entries[mid].Key)
-		nr, e := ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
+		// Separator: shortest S with leftLast < S <= rightFirst,
+		// computed over FULL boundary keys (extent-materializing only
+		// on a resident tie), then encoded as a branch cell (writing a
+		// key extent when the separator itself exceeds the threshold).
+		sep, e := shortestSeparatorEntries(pw, cfg, entries[mid-1], entries[mid])
 		if e != nil {
+			_ = pw.FreePage(leftID)
+			_ = pw.FreePage(rightID)
+			rollbackNewChain()
+			return 0, false, e
+		}
+		sepCell, e := makeSeparatorCell(pw, cfg, sep, rightID)
+		if e != nil {
+			_ = pw.FreePage(leftID)
+			_ = pw.FreePage(rightID)
+			rollbackNewChain()
+			return 0, false, e
+		}
+		nr, e := ascendWithSplit(pw, cfg, path, leftID, sepCell)
+		if e != nil {
+			_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 			_ = pw.FreePage(leftID)
 			_ = pw.FreePage(rightID)
 			rollbackNewChain()
@@ -505,13 +556,50 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 // single-entry leaf capacity. Returns ErrKeyTooLarge if even the
 // overflow-reference form doesn't fit (key alone is too large).
 func buildPutEntry(pw PageWriter, cfg page.Config, key, value []byte) (page.LeafEntry, error) {
+	var e page.LeafEntry
 	if !needsOverflow(cfg, key, value) {
-		return page.LeafEntry{Key: key, Value: value}, nil
+		e = page.LeafEntry{Key: key, Value: value}
+	} else {
+		if !overflowRefFitsLeaf(cfg, key) {
+			return page.LeafEntry{}, ErrKeyTooLarge
+		}
+		var err error
+		e, err = writeOverflowChain(pw, cfg, key, value)
+		if err != nil {
+			return page.LeafEntry{}, err
+		}
 	}
-	if !overflowRefFitsLeaf(cfg, key) {
-		return page.LeafEntry{}, ErrKeyTooLarge
+	// Key half: an over-threshold key takes the overflow-key form
+	// (page-formats.md §Overflow-Key Cells) — resident first-T bytes
+	// inline, key[T:] in a freshly-written extent.
+	converted, err := convertToOverflowKeyForm(pw, cfg, e)
+	if err != nil {
+		if e.IsOverflow() {
+			_ = pw.FreeRun(e.OverflowPage, page.OverflowRunLength(cfg, e.TotalLen))
+		}
+		return page.LeafEntry{}, err
 	}
-	return writeOverflowChain(pw, cfg, key, value)
+	return converted, nil
+}
+
+// convertToOverflowKeyForm rewrites e's key half to the overflow-key
+// form when the (full) key in e.Key exceeds the inline threshold;
+// no-op otherwise. The caller owns rollback of the written extent via
+// freeKeyExtentIfPresent / rollback helpers on later failure.
+func convertToOverflowKeyForm(pw PageWriter, cfg page.Config, e page.LeafEntry) (page.LeafEntry, error) {
+	t := cfg.InlineThreshold()
+	if e.IsOverflowKey() || len(e.Key) <= t {
+		return e, nil
+	}
+	ext, err := writeKeyExtent(pw, cfg, e.Key)
+	if err != nil {
+		return page.LeafEntry{}, err
+	}
+	e.Flags |= page.CellFlagOverflowKey
+	e.KeyTotalLen = uint32(len(e.Key))
+	e.Key = e.Key[:t]
+	e.KeyExtPage = ext
+	return e, nil
 }
 
 // putEmpty allocates a single-leaf root containing just (key,
@@ -523,27 +611,29 @@ func putEmpty(pw PageWriter, cfg page.Config, key, value []byte) (uint64, error)
 	if err != nil {
 		return 0, err
 	}
-	id, err := pw.AllocPage()
-	if err != nil {
+	rollbackGenesis := func() {
 		if newEntry.IsOverflow() {
 			_ = pw.FreeRun(newEntry.OverflowPage, page.OverflowRunLength(cfg, newEntry.TotalLen))
 		}
+		if newEntry.IsOverflowKey() {
+			_ = pw.FreeRun(newEntry.KeyExtPage, keyExtentRunLen(cfg, newEntry.KeyTotalLen))
+		}
+	}
+	id, err := pw.AllocPage()
+	if err != nil {
+		rollbackGenesis()
 		return 0, fmt.Errorf("btree: alloc genesis leaf: %w", err)
 	}
 	buf, err := pw.ZeroPage(id)
 	if err != nil {
 		_ = pw.FreePage(id)
-		if newEntry.IsOverflow() {
-			_ = pw.FreeRun(newEntry.OverflowPage, page.OverflowRunLength(cfg, newEntry.TotalLen))
-		}
+		rollbackGenesis()
 		return 0, fmt.Errorf("btree: alloc genesis slab: %w", err)
 	}
 	b := page.NewLeafBuilder(buf, cfg)
 	if !b.AddEntry(newEntry) {
 		_ = pw.FreePage(id)
-		if newEntry.IsOverflow() {
-			_ = pw.FreeRun(newEntry.OverflowPage, page.OverflowRunLength(cfg, newEntry.TotalLen))
-		}
+		rollbackGenesis()
 		// Genesis single entry must fit by construction (overflow
 		// promotion sized it down to a small reference); reaching
 		// this branch implies an oversize key past
@@ -601,38 +691,31 @@ func leafEntriesDeepCopyFrom(r page.LeafReader) []page.LeafEntry {
 	return out
 }
 
-// insertOrReplaceLeaf finds the position of `newEntry.Key` in the
-// sorted-by-key entries slice and either replaces the entry there
-// (key exists) or inserts newEntry at the correct sorted position.
-// Returns the modified slice plus the DISPLACED entry — non-zero
-// on replace (the LeafEntry that was at the replaced slot, used
-// by the caller to free any owned overflow chain) and zero-valued
-// on insert.
+// insertOrReplaceLeafAt splices newEntry into the sorted entries
+// slice at the caller-computed position: replace at idx when found,
+// else insert before idx. The position comes from an EXTENT-AWARE
+// SearchLeaf on the same leaf (overflow-key residents can tie without
+// the keys being equal, so a resident-byte binary search here would
+// mis-target — the caller's search already resolved ties through
+// the key extents). Returns the modified slice plus the DISPLACED
+// entry — non-zero on replace (the LeafEntry that was at the replaced
+// slot, used by the caller to free any owned overflow chain and key
+// extent) and zero-valued on insert.
 //
 // The original entries slice may be shared with the caller — do
 // not retain. The replace path overwrites the slot wholesale so a
 // stale Flags / OverflowPage / TotalLen from the old entry doesn't
 // survive into the rebuilt leaf; the displaced entry is returned
 // separately so the chain-free path runs on the OLD overflow info.
-func insertOrReplaceLeaf(entries []page.LeafEntry, newEntry page.LeafEntry) ([]page.LeafEntry, page.LeafEntry, bool) {
-	lo, hi := 0, len(entries)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		cmp := bytes.Compare(entries[mid].Key, newEntry.Key)
-		switch {
-		case cmp < 0:
-			lo = mid + 1
-		case cmp > 0:
-			hi = mid
-		default:
-			displaced := entries[mid]
-			entries[mid] = newEntry
-			return entries, displaced, true
-		}
+func insertOrReplaceLeafAt(entries []page.LeafEntry, newEntry page.LeafEntry, idx int, found bool) ([]page.LeafEntry, page.LeafEntry, bool) {
+	if found {
+		displaced := entries[idx]
+		entries[idx] = newEntry
+		return entries, displaced, true
 	}
 	entries = append(entries, page.LeafEntry{})
-	copy(entries[lo+1:], entries[lo:])
-	entries[lo] = newEntry
+	copy(entries[idx+1:], entries[idx:])
+	entries[idx] = newEntry
 	return entries, page.LeafEntry{}, false
 }
 
@@ -687,7 +770,7 @@ func ascendNoSplit(pw PageWriter, cfg page.Config, path []pathFrame, newChildID 
 // If the path is empty (the root itself was a leaf that split), a
 // new root branch is allocated with two children: leftID and
 // rightID, separator sep.
-func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID uint64, sep []byte, rightID uint64) (uint64, error) {
+func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID uint64, sepCell page.BranchCell) (uint64, error) {
 	// ascendWithSplit is reached only after a leaf split (its two call
 	// sites in putReportCore) — count that one leaf split here; each
 	// branch split inside the loop is counted at its completion below
@@ -727,7 +810,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		// silently drop the Child update.
 		newCells := make([]page.BranchCell, 0, len(cells)+1)
 		newCells = append(newCells, cells[:f.childIdx]...)
-		newCells = append(newCells, page.BranchCell{Key: sep, Child: rightID})
+		newCells = append(newCells, sepCell)
 		newCells = append(newCells, cells[f.childIdx:]...)
 		if f.childIdx == 0 {
 			leftmost = leftID
@@ -770,7 +853,10 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		// new right branch. The left branch keeps cells [0:mid]
 		// and its leftmost is unchanged. The right branch gets
 		// cells [mid+1:] with leftmost = newCells[mid].Child.
-		nextSep := newCells[mid].Key
+		// The lifted cell carries its key extent BY REFERENCE to the
+		// parent (page-formats.md §Overflow-Key Cells, Branch form) —
+		// the fixed byte-T cut makes the extent page-independent.
+		nextSepCell := newCells[mid]
 		nextRightLeftmost := newCells[mid].Child
 		leftCells := newCells[:mid]
 		rightCells := newCells[mid+1:]
@@ -800,10 +886,11 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 			return 0, fmt.Errorf("btree: free old branch %d: %w", f.pageID, err)
 		}
 		recordSplit(pw) // branch divided into two (TxStats.Splits)
-		// Loop up with the new (sep, right) pair.
+		// Loop up with the new separator cell; its Child becomes the
+		// freshly-allocated right branch.
 		leftID = newBranchID
-		sep = nextSep
-		rightID = newRightID
+		nextSepCell.Child = newRightID
+		sepCell = nextSepCell
 	}
 
 	// Path exhausted. Root grew: allocate a new root branch with
@@ -817,7 +904,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		_ = pw.FreePage(newRootID)
 		return 0, fmt.Errorf("btree: alloc new root slab: %w", err)
 	}
-	cells := []page.BranchCell{{Key: sep, Child: rightID}}
+	cells := []page.BranchCell{sepCell}
 	if err := page.EncodeBranch(newRootBuf, cfg, leftID, cells); err != nil {
 		_ = pw.FreePage(newRootID)
 		return 0, fmt.Errorf("btree: encode new root branch: %w", err)

@@ -100,6 +100,17 @@ func freeSubtreeAt(pw PageWriter, cfg page.Config, pageID uint64, depth int) (ui
 			}
 			children = append(children, c)
 		}
+		// Retire the key extents of overflow branch separators in the
+		// retired subtree — the interior walk is the ONLY reference
+		// holder for these runs (page-formats.md §Overflow-Key Cells;
+		// range-delete.md: no overflow page survives the delete of its
+		// only referencing entry or separator).
+		for i := uint16(0); i < cellCount; i++ {
+			c := page.BranchCellAt(buf, cfg, i)
+			if err := freeBranchCellExtentIfPresent(pw, cfg, c); err != nil {
+				return 0, err
+			}
+		}
 		for _, c := range children {
 			n, err := freeSubtreeAt(pw, cfg, c, depth+1)
 			if err != nil {
@@ -135,6 +146,9 @@ func freeSubtreeAt(pw PageWriter, cfg page.Config, pageID uint64, depth int) (ui
 			e, ok := it.Next()
 			if !ok {
 				break
+			}
+			if err := freeKeyExtentIfPresent(pw, cfg, e); err != nil {
+				return 0, fmt.Errorf("btree: leaf %d: %w", pageID, err)
 			}
 			switch {
 			case e.IsOverflow():

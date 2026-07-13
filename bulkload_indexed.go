@@ -86,7 +86,7 @@ func buildIndexFromSorter(pw bulkIndexWriter, cfg page.Config, s *extsort.Sorter
 			if err != nil {
 				return indexBuildResult{}, fmt.Errorf("gmdb: BulkLoad index %q: %w", decl.Name, err)
 			}
-			if err := b.add(e); err != nil {
+			if err := b.add(e, mem[i].Key); err != nil {
 				return indexBuildResult{}, err
 			}
 		}
@@ -124,7 +124,7 @@ func buildIndexFromSorter(pw bulkIndexWriter, cfg page.Config, s *extsort.Sorter
 		if eerr != nil {
 			return indexBuildResult{}, fmt.Errorf("gmdb: BulkLoad index %q: %w", decl.Name, eerr)
 		}
-		if err := b.add(e); err != nil {
+		if err := b.add(e, rec.Key); err != nil {
 			return indexBuildResult{}, err
 		}
 		prevKey = append(prevKey[:0], rec.Key...)

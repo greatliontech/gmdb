@@ -215,7 +215,19 @@ func deleteRangeFromLeaf(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	deleted := make([]page.LeafEntry, 0)
 	deletedIdxs := make([]int, 0)
 	for i, e := range entries {
-		if keyInRange(e.Key, start, end) {
+		// Overflow-key entries are classified on their FULL key —
+		// resident bytes can tie with a boundary that only diverges
+		// in the extent, and a mis-classification either deletes an
+		// out-of-range key or retains an in-range one.
+		k := e.Key
+		if e.IsOverflowKey() {
+			full, err := materializeEntryKey(pw, cfg, e)
+			if err != nil {
+				return 0, 0, false, err
+			}
+			k = full
+		}
+		if keyInRange(k, start, end) {
 			deleted = append(deleted, e)
 			deletedIdxs = append(deletedIdxs, i)
 		} else {
@@ -330,11 +342,19 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 
 	leftIdx := uint16(0)
 	if start != nil {
-		leftIdx = page.BranchSearch(srcBuf, cfg, start)
+		var serr error
+		leftIdx, serr = page.BranchSearch(srcBuf, cfg, start, keyTail(pw, cfg))
+		if serr != nil {
+			return 0, 0, false, 0, serr
+		}
 	}
 	rightIdx := cellCount
 	if end != nil {
-		rightIdx = page.BranchSearch(srcBuf, cfg, end)
+		var serr error
+		rightIdx, serr = page.BranchSearch(srcBuf, cfg, end, keyTail(pw, cfg))
+		if serr != nil {
+			return 0, 0, false, 0, serr
+		}
 	}
 
 	if leftIdx == rightIdx {
@@ -450,18 +470,33 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	}
 
 	if len(survivors) == 0 {
-		// Entire branch retired.
+		// Entire branch retired. This branch's OWN overflow-separator
+		// key extents are reachable only through it (FreeSubtree covers
+		// interior children's branches, not this one) — retire them
+		// before the page (page-formats.md §Overflow-Key Cells,
+		// lifecycle).
+		for i := uint16(0); i < cellCount; i++ {
+			if err := freeBranchCellExtentIfPresent(pw, cfg, page.BranchCellAt(srcBuf, cfg, i)); err != nil {
+				return 0, 0, false, 0, err
+			}
+		}
 		if err := pw.FreePage(pageID); err != nil {
 			return 0, 0, false, 0, fmt.Errorf("btree: free emptied branch %d: %w", pageID, err)
 		}
 		return 0, deletedCount, true, 0, nil
 	}
 
-	// Decode the original cells once (for separator-key lookup).
+	// Decode the original cells once (for separator lookup). Cells are
+	// carried WHOLE — an overflow separator's key-extent reference must
+	// survive into the rebuilt parent or be explicitly retired
+	// (page-formats.md §Overflow-Key Cells, lifecycle); a keys-only
+	// snapshot would silently drop every extent.
 	_, origCells := page.DecodeBranch(srcBuf, cfg)
-	origCellKeys := make([][]byte, len(origCells))
+	origSepCells := make([]page.BranchCell, len(origCells))
+	sepDisposed := make([]bool, len(origCells))
 	for i, c := range origCells {
-		origCellKeys[i] = bytes.Clone(c.Key)
+		c.Key = bytes.Clone(c.Key)
+		origSepCells[i] = c
 	}
 
 	// Phase 3 rebalance: for each underflowing boundary slot, merge or
@@ -480,14 +515,24 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	// a deepUnderflow descendant from the boundary recursion, that
 	// descendant gets cousin-rebalanced against its new siblings inside
 	// the merged branch.
-	if err := rebalanceSurvivors(pw, cfg, mergeThreshold, origCellKeys, &survivors); err != nil {
+	if err := rebalanceSurvivors(pw, cfg, mergeThreshold, origSepCells, sepDisposed, &survivors); err != nil {
 		return 0, 0, false, 0, err
 	}
 
 	// Encode the new branch.
 	if len(survivors) == 0 {
 		// All collapsed away by rebalance? Shouldn't happen post-fix,
-		// but handle defensively.
+		// but handle defensively — including the undisposed
+		// separators' key extents (the residue pass below never runs
+		// on this return).
+		for i := range origSepCells {
+			if sepDisposed[i] {
+				continue
+			}
+			if err := freeBranchCellExtentIfPresent(pw, cfg, origSepCells[i]); err != nil {
+				return 0, 0, false, 0, err
+			}
+		}
 		if err := pw.FreePage(pageID); err != nil {
 			return 0, 0, false, 0, fmt.Errorf("btree: free emptied branch (post-rebalance) %d: %w", pageID, err)
 		}
@@ -504,10 +549,23 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 		// the surviving pair, because survivor pairs are not bridged
 		// across removed children (interior children are dropped, not
 		// replaced — see range-delete.md §Algorithm).
-		newCells = append(newCells, page.BranchCell{
-			Key:   origCellKeys[survivors[j].origIdx-1],
-			Child: survivors[j].child,
-		})
+		c := origSepCells[survivors[j].origIdx-1]
+		c.Child = survivors[j].child
+		newCells = append(newCells, c)
+		sepDisposed[survivors[j].origIdx-1] = true
+	}
+
+	// Retire the key extents of separators that neither survived into
+	// newCells nor were disposed by a pair rebalance (leaf-pair frees /
+	// branch-pair embeds) — the separators of retired interior children.
+	// Their extents are referenced by nothing else.
+	for i := range origSepCells {
+		if sepDisposed[i] {
+			continue
+		}
+		if err := freeBranchCellExtentIfPresent(pw, cfg, origSepCells[i]); err != nil {
+			return 0, 0, false, 0, err
+		}
 	}
 
 	newBranchID, err := pw.AllocPage()
@@ -642,7 +700,7 @@ func deleteRangeFromBranch(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 //     pass leaves a still-degenerate residual, it surfaces as the
 //     merged slot's new deepUnderflow for the next merge round or
 //     for upward propagation by the caller.
-func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, origCellKeys [][]byte, survivors *[]slot) error {
+func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, origSepCells []page.BranchCell, sepDisposed []bool, survivors *[]slot) error {
 	for j := 0; j < len(*survivors); j++ {
 		s := (*survivors)[j]
 		if !s.underflow {
@@ -675,7 +733,7 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 		// The separator between leftJ and rightJ is at
 		// origCellKeys[(*survivors)[rightJ].origIdx - 1].
 		sepKeyIdx := (*survivors)[rightJ].origIdx - 1
-		separator := origCellKeys[sepKeyIdx]
+		sepCell := origSepCells[sepKeyIdx]
 
 		// Capture deepUnderflow signals from BOTH sides before the
 		// merge (the helpers free the inputs, so the slot info we
@@ -691,23 +749,23 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 		// later separator replacements re-run this same check against
 		// the then-current set, so checking the current set is exact
 		// for this step and conservative for the final encode.
-		parentFits := func(newSep []byte) bool {
+		parentFits := func(candCell page.BranchCell) bool {
 			cand := make([]page.BranchCell, 0, len(*survivors)-1)
 			for jj := 1; jj < len(*survivors); jj++ {
-				k := origCellKeys[(*survivors)[jj].origIdx-1]
+				c := origSepCells[(*survivors)[jj].origIdx-1]
 				if (*survivors)[jj].origIdx-1 == sepKeyIdx {
-					k = newSep
+					c = candCell
 				}
-				cand = append(cand, page.BranchCell{Key: k})
+				cand = append(cand, c)
 			}
 			return page.BranchEncodedSize(cfg, cand) <= cfg.ContentEnd()
 		}
-		pair, err := mergeOrRedistributePair(pw, cfg, mergeThreshold, leftPairID, rightPairID, separator, parentFits)
+		pair, err := mergeOrRedistributePair(pw, cfg, mergeThreshold, leftPairID, rightPairID, sepCell, parentFits)
 		if err != nil {
 			return err
 		}
 		isMerge, mergedID := pair.isMerge, pair.mergedID
-		newLeftID, newRightID, newSeparator := pair.newLeftID, pair.newRightID, pair.newSeparator
+		newLeftID, newRightID, newSepCell := pair.newLeftID, pair.newRightID, pair.newSepCell
 		leftIsLeaf := pair.leftIsLeaf
 
 		if !isMerge && newLeftID == 0 {
@@ -724,7 +782,12 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 		}
 
 		if isMerge {
-			// leftJ absorbs the merge; rightJ is removed.
+			// leftJ absorbs the merge; rightJ is removed. The pair
+			// disposed of the boundary separator cell (leaf pairs:
+			// extent freed; branch pairs: embedded into the merged
+			// branch) — mark it so the parent rebuild's residue pass
+			// neither double-frees nor frees a live embedded extent.
+			sepDisposed[sepKeyIdx] = true
 			//
 			// Cousin step. If either input carried a deepUnderflow
 			// descendant AND the merge was branch-level (the only case
@@ -855,8 +918,15 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 			(*survivors)[rightJ].underflow = rightUf
 			(*survivors)[leftJ].deepUnderflow = leftResidual
 			(*survivors)[rightJ].deepUnderflow = rightResidual
-			// Update the separator between leftJ and rightJ.
-			origCellKeys[sepKeyIdx] = newSeparator
+			// Update the separator between leftJ and rightJ. The pair
+			// already disposed of the OLD cell's extent (leaf pairs:
+			// freed; branch pairs: embedded into the outputs); the
+			// replacement carries its own reference and is live — it
+			// is consumed by the parent rebuild or disposed by a
+			// later pair, exactly like an original cell.
+			origSepCells[sepKeyIdx] = newSepCell
+			origSepCells[sepKeyIdx].Key = bytes.Clone(newSepCell.Key)
+			sepDisposed[sepKeyIdx] = false
 			// Rewind j so the for-loop's j++ re-checks the redistribute
 			// output that's still below MT for another merge round
 			// against its next adjacent survivor.

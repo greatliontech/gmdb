@@ -1,7 +1,5 @@
 package page
 
-import "bytes"
-
 // Uncompressed-leaf decode + search helpers. Page layout per
 // page-formats.md §Uncompressed Leaf:
 //
@@ -37,35 +35,41 @@ func (r LeafReader) ucOffset(idx int) int {
 // table. Returns the entry's index (or the insertion point on miss), the
 // entry value-side fields (Key cleared on found — caller has target),
 // and the found flag.
-func (r LeafReader) ucSearchLeaf(target []byte) (int, LeafEntry, bool) {
+func (r LeafReader) ucSearchLeaf(target []byte, tail TailCompare) (int, LeafEntry, bool, error) {
 	lo, hi := 0, r.count
 	for lo < hi {
 		mid := lo + (hi-lo)/2
 		e, _ := r.decodeFullKeyEntry(r.ucOffset(mid))
-		cmp := bytes.Compare(e.Key, target)
+		cmp, cerr := compareEntryKey(e, target, tail)
+		if cerr != nil {
+			return 0, LeafEntry{}, false, cerr
+		}
 		switch {
 		case cmp < 0:
 			lo = mid + 1
 		case cmp == 0:
 			e.Key = nil
-			return mid, e, true
+			return mid, e, true, nil
 		default:
 			hi = mid
 		}
 	}
-	return lo, LeafEntry{}, false
+	return lo, LeafEntry{}, false, nil
 }
 
 // ucSearchLeafIter mirrors compressedSearchLeafIter: returns the lookup
 // result plus a LeafIter positioned past the found / successor entry. On
 // uncompressed pages "past" is just idx+1 — no group walk, no delta
 // state to seed.
-func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []LeafEntry) (int, LeafEntry, bool, LeafIter) {
+func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []LeafEntry, tail TailCompare) (int, LeafEntry, bool, LeafIter, error) {
 	lo, hi := 0, r.count
 	for lo < hi {
 		mid := lo + (hi-lo)/2
 		e, _ := r.decodeFullKeyEntry(r.ucOffset(mid))
-		cmp := bytes.Compare(e.Key, target)
+		cmp, cerr := compareEntryKey(e, target, tail)
+		if cerr != nil {
+			return 0, LeafEntry{}, false, LeafIter{}, cerr
+		}
 		switch {
 		case cmp < 0:
 			lo = mid + 1
@@ -84,7 +88,7 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 			}
 			ret := e
 			ret.Key = nil
-			return mid, ret, true, it
+			return mid, ret, true, it, nil
 		default:
 			hi = mid
 		}
@@ -100,7 +104,7 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 			bufKeys:    bufKeys[:0],
 			bufEnts:    bufEnts[:0],
 		}
-		return r.count, LeafEntry{}, false, it
+		return r.count, LeafEntry{}, false, it, nil
 	}
 	// successor at lo
 	e, _ := r.decodeFullKeyEntry(r.ucOffset(lo))
@@ -113,5 +117,5 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 		bufKeys:    bufKeys[:0],
 		bufEnts:    bufEnts[:0],
 	}
-	return lo, e, false, it
+	return lo, e, false, it, nil
 }

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/greatliontech/gmdb/internal/page"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/zeebo/xxh3"
 )
 
 // le is the on-disk byte order for the pager-domain formats (meta,
@@ -188,7 +188,7 @@ func DecodeMeta(buf []byte) Meta {
 }
 
 // EncodeMeta writes m into the first MetaPayloadSize bytes of buf and
-// stores the xxhash64 checksum of the preceding fields into the Checksum
+// stores the XXH3-64 checksum of the preceding fields into the Checksum
 // slot. Padding bytes are zeroed. m.Checksum is updated in place to the
 // value written.
 func EncodeMeta(buf []byte, m *Meta) {
@@ -227,12 +227,12 @@ func EncodeMeta(buf []byte, m *Meta) {
 	le.PutUint64(buf[metaOffChecksum:], m.Checksum)
 }
 
-// ComputeMetaChecksum returns the xxhash64 of the fields preceding the
+// ComputeMetaChecksum returns the XXH3-64 of the fields preceding the
 // Checksum slot: bytes 0 through metaOffChecksum-1. The meta-page Magic /
 // Version / PageSize / Flags / ... are all covered; the trailing 8 bytes
 // are the checksum itself.
 func ComputeMetaChecksum(buf []byte) uint64 {
-	return xxhash.Sum64(buf[:metaOffChecksum])
+	return xxh3.Hash(buf[:metaOffChecksum])
 }
 
 // MetaChecksumOffsetForTest exposes the byte offset of the meta checksum
@@ -268,7 +268,7 @@ func ValidateMeta(m Meta) error {
 	return nil
 }
 
-// VerifyMeta recomputes the xxhash64 of the meta-page prefix and compares
+// VerifyMeta recomputes the XXH3-64 of the meta-page prefix and compares
 // it against the stored Checksum field. Returns true on match.
 func VerifyMeta(buf []byte) bool {
 	_ = buf[MetaPayloadSize-1] // bounds check

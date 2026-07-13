@@ -495,6 +495,33 @@ func (c *Cursor) reclaimIterBuffers() {
 // csPositioned (the key was found), but Err() surfaces the
 // failure so the caller can decide whether to continue.
 func (c *Cursor) adoptEntry(e page.LeafEntry) {
+	if e.IsOverflowKey() && e.Key != nil {
+		// Overflow-key entries carry only the resident first-T bytes
+		// in e.Key; the cursor's public contract yields FULL keys
+		// (page-formats.md §Overflow-Key Cells: cursor key
+		// materialization copies inline + extent bytes). Stash the
+		// materialized key in curKeyBuf so it survives iterator
+		// buffer reuse like every other cursor-owned key.
+		full, err := materializeEntryKey(c.pr, c.cfg, e)
+		if err != nil {
+			// Surface through the miss channel and end iteration: a
+			// nil curKey stops the root-package iterators (which loop
+			// on key != nil) instead of yielding a phantom ("", nil)
+			// pair; the end-of-iteration state blocks Cursor.Delete
+			// (nil would otherwise resolve as the empty key for a
+			// caller ignoring both error signals); Err() carries the
+			// failure — sticky, so it survives the state transition.
+			c.err = err
+			c.state = csEndOfIteration
+			c.curKey = nil
+			c.curValue = nil
+			return
+		}
+		c.curKeyBuf = append(c.curKeyBuf[:0], full...)
+		c.curKey = c.curKeyBuf
+		c.curValue = c.valueFor(e)
+		return
+	}
 	c.curKey = e.Key
 	if c.curKey == nil {
 		c.curKey = emptyPositionedKey // see adoptTargetKey — nil is the miss channel
@@ -551,10 +578,10 @@ var emptyPositionedKey = []byte{}
 // rightmost, key-search — are the only variation across the cursor's
 // descent paths; everything else (page read, type check, validation,
 // frame push, depth bound) is descendFrom's one skeleton.
-type branchPick func(buf []byte) (childIdx uint16, child uint64, label string)
+type branchPick func(buf []byte) (childIdx uint16, child uint64, label string, err error)
 
-func pickLeftmost(buf []byte) (uint16, uint64, string) {
-	return 0, page.BranchLeftmostChild(buf), "leftmost"
+func pickLeftmost(buf []byte) (uint16, uint64, string, error) {
+	return 0, page.BranchLeftmostChild(buf), "leftmost", nil
 }
 
 // descendFrom appends path frames from cur down to a leaf, choosing
@@ -585,7 +612,10 @@ func (c *Cursor) descendFrom(cur uint64, pick branchPick, onLeaf func(r page.Lea
 		if err := validateBranchPage(buf, c.cfg, cur); err != nil {
 			return err
 		}
-		idx, child, label := pick(buf)
+		idx, child, label, err := pick(buf)
+		if err != nil {
+			return err
+		}
 		if child == 0 {
 			return fmt.Errorf("%w: null %s child in branch %d (index %d)", ErrCorrupted, label, cur, idx)
 		}
@@ -596,12 +626,12 @@ func (c *Cursor) descendFrom(cur uint64, pick branchPick, onLeaf func(r page.Lea
 }
 
 func pickRightmost(cfg page.Config) branchPick {
-	return func(buf []byte) (uint16, uint64, string) {
+	return func(buf []byte) (uint16, uint64, string, error) {
 		n := page.BranchCellCount(buf)
 		if n == 0 {
-			return n, page.BranchLeftmostChild(buf), "rightmost"
+			return n, page.BranchLeftmostChild(buf), "rightmost", nil
 		}
-		return n, page.BranchCellAt(buf, cfg, n-1).Child, "rightmost"
+		return n, page.BranchCellAt(buf, cfg, n-1).Child, "rightmost", nil
 	}
 }
 
@@ -631,12 +661,19 @@ func (c *Cursor) descendRightmost(rootID uint64) error {
 // §Leaf Lookup.
 func (c *Cursor) descendToKey(rootID uint64, target []byte) (idx int, entry page.LeafEntry, found bool, err error) {
 	c.resetPath()
-	err = c.descendFrom(rootID, func(buf []byte) (uint16, uint64, string) {
-		i := page.BranchSearch(buf, c.cfg, target)
-		return i, page.BranchChildAt(buf, c.cfg, i), "searched"
+	var leafErr error
+	err = c.descendFrom(rootID, func(buf []byte) (uint16, uint64, string, error) {
+		i, serr := page.BranchSearch(buf, c.cfg, target, keyTail(c.pr, c.cfg))
+		if serr != nil {
+			return 0, 0, "searched", serr
+		}
+		return i, page.BranchChildAt(buf, c.cfg, i), "searched", nil
 	}, func(r page.LeafReader) {
-		idx, entry, found, c.iter = r.SearchLeafIter(target, c.keyBuf, c.bufKeys, c.bufEnts)
+		idx, entry, found, c.iter, leafErr = r.SearchLeafIter(target, c.keyBuf, c.bufKeys, c.bufEnts, keyTail(c.pr, c.cfg))
 	})
+	if err == nil {
+		err = leafErr
+	}
 	if err != nil {
 		return 0, page.LeafEntry{}, false, err
 	}

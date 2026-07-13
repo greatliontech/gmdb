@@ -784,7 +784,7 @@ func probeMetaPageSize(file *os.File) (uint32, []byte, error) {
 }
 
 // isGmdbMeta reports whether buf is a recognizably-gmdb meta payload:
-// the xxhash64 footer verifies AND Magic + Version match the package
+// the XXH3-64 footer verifies AND Magic + Version match the package
 // constants. Used by DiscoverPageSize and probeMetaPageSize as a
 // single point of trust for "this 144-byte slice is one of our metas."
 func isGmdbMeta(buf []byte) bool {
@@ -795,22 +795,38 @@ func isGmdbMeta(buf []byte) bool {
 	return m.Magic == page.Magic && m.Version == page.FormatVersion
 }
 
-// isVersionMismatchMeta reports whether buf is an intact gmdb meta
-// (checksum verifies, Magic matches) of a DIFFERENT format version — a
-// valid gmdb file this binary cannot read, as opposed to a corrupt one.
-// Mirror of isGmdbMeta with the Version condition flipped. The meta
-// identity header (Magic@0, Version@4, checksum footer) is the
-// version-stable contract that makes this classification possible
-// across format evolutions (file-layout.md §Meta Page). Requiring the
-// checksum to verify is what distinguishes a deliberately-written
-// different-version file from bitrot that merely corrupted the Version
-// field — the latter has no valid checksum and is ErrCorrupted.
+// isVersionMismatchMeta reports whether buf is a gmdb meta of a
+// DIFFERENT format version — a valid gmdb file this binary cannot
+// read, as opposed to a corrupt one. The meta identity header
+// (Magic@0, Version@4) is the version-stable contract that makes this
+// classification possible across format evolutions (file-layout.md
+// §Meta Page).
+//
+// Two arms:
+//   - Checksum-verified (same digest family): the strong form —
+//     verification distinguishes a deliberately-written
+//     different-version file from bitrot that merely corrupted the
+//     Version field.
+//   - KNOWN PRIOR versions (1 <= v < FormatVersion) accept on
+//     Magic + Version alone: version 3 changed the persisted digest
+//     family (XXH64 → XXH3-64), so a v2 meta CANNOT verify with this
+//     binary's family by construction — requiring verification would
+//     misdiagnose every v2 file as corrupt, the exact failure the
+//     version gate exists to prevent (page.FormatVersion doc). The
+//     trade: bitrot that leaves the 4-byte Magic and a plausible
+//     prior Version intact while damaging the rest classifies as
+//     version-mismatch rather than corruption — the benign direction
+//     (both diagnoses end in regenerate-or-use-matching-binary; the
+//     reverse misdiagnosis sends a healthy file to recovery).
 func isVersionMismatchMeta(buf []byte) bool {
-	if !VerifyMeta(buf) {
+	m := DecodeMeta(buf)
+	if m.Magic != page.Magic || m.Version == page.FormatVersion {
 		return false
 	}
-	m := DecodeMeta(buf)
-	return m.Magic == page.Magic && m.Version != page.FormatVersion
+	if VerifyMeta(buf) {
+		return true
+	}
+	return m.Version >= 1 && m.Version < page.FormatVersion
 }
 
 // rebuildRPLChain walks the on-disk RPL chain head → tail through the

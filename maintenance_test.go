@@ -362,7 +362,7 @@ func writeKeyspaceForScrub(t *testing.T, path string, n int) (root uint64, pageS
 
 // corruptPageByte flips one byte inside page pageID's checksummed region
 // (offset 16, well clear of the footer) directly on the file, breaking its
-// xxhash64 footer. The db must be closed (no live mmap).
+// XXH3-64 footer. The db must be closed (no live mmap).
 func corruptPageByte(t *testing.T, path string, pageID uint64, pageSize uint32) {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)

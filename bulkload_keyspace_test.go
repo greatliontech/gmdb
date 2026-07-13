@@ -417,9 +417,9 @@ func TestKeyspaceBulkLoadReusedKeyBuffer(t *testing.T) {
 }
 
 // TestKeyspaceBulkLoadKeyTooLarge verifies a key too large for even an
-// overflow-reference entry surfaces the public gmdb.ErrKeyTooLarge
-// sentinel (the internal btree.ErrKeyTooLarge is translated by
-// mapBtreeErr at the BulkLoad boundary).
+// overflow-key form stores through BulkLoad exactly as through Put
+// (limits.md §Maximum Key Size — one threshold, no drift) and reads
+// back through the ordinary lookup path.
 func TestKeyspaceBulkLoadKeyTooLarge(t *testing.T) {
 	ctx := context.Background()
 	db := openWith(t, ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -433,10 +433,14 @@ func TestKeyspaceBulkLoadKeyTooLarge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
-	// A key larger than the leaf content area can't fit even as an
-	// overflow reference.
+	// A key larger than the leaf content area stores as an
+	// overflow-key cell (resident first-T bytes + key extent).
 	bigKey := bytes.Repeat([]byte("K"), 4096)
-	if _, err := ks.BulkLoad(seqOf([]kv{{bigKey, []byte("v")}})); !errors.Is(err, ErrKeyTooLarge) {
-		t.Errorf("BulkLoad oversize key = %v, want gmdb.ErrKeyTooLarge", err)
+	if _, err := ks.BulkLoad(seqOf([]kv{{bigKey, []byte("v")}})); err != nil {
+		t.Fatalf("BulkLoad over-threshold key: %v", err)
+	}
+	v, err := ks.Get(bigKey)
+	if err != nil || !bytes.Equal(v, []byte("v")) {
+		t.Errorf("Get over-threshold bulk key = %q, %v; want v, nil", v, err)
 	}
 }

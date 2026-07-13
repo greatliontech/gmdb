@@ -43,7 +43,7 @@ func buildBulkTree(t *testing.T, pw bulkPageWriter, cfg page.Config, kvs []kv) (
 	t.Helper()
 	b := newBulkBuilder(pw, cfg)
 	for _, e := range kvs {
-		if err := b.add(page.LeafEntry{Key: e.k, Value: e.v}); err != nil {
+		if err := b.add(page.LeafEntry{Key: e.k, Value: e.v}, e.k); err != nil {
 			t.Fatalf("add(%q): %v", e.k, err)
 		}
 	}
@@ -226,15 +226,15 @@ func TestBulkBuilderOutOfOrder(t *testing.T) {
 	cfg := tx.pgr.Config()
 
 	b := newBulkBuilder(tx.pgr, cfg)
-	if err := b.add(page.LeafEntry{Key: []byte("b"), Value: []byte("1")}); err != nil {
+	if err := b.add(page.LeafEntry{Key: []byte("b"), Value: []byte("1")}, []byte("b")); err != nil {
 		t.Fatalf("add b: %v", err)
 	}
 	// Equal key (not strictly greater) is out of order.
-	if err := b.add(page.LeafEntry{Key: []byte("b"), Value: []byte("2")}); !errors.Is(err, ErrBulkLoadOutOfOrder) {
+	if err := b.add(page.LeafEntry{Key: []byte("b"), Value: []byte("2")}, []byte("b")); !errors.Is(err, ErrBulkLoadOutOfOrder) {
 		t.Errorf("add equal key = %v, want ErrBulkLoadOutOfOrder", err)
 	}
 	// Smaller key is out of order.
-	if err := b.add(page.LeafEntry{Key: []byte("a"), Value: []byte("3")}); !errors.Is(err, ErrBulkLoadOutOfOrder) {
+	if err := b.add(page.LeafEntry{Key: []byte("a"), Value: []byte("3")}, []byte("a")); !errors.Is(err, ErrBulkLoadOutOfOrder) {
 		t.Errorf("add smaller key = %v, want ErrBulkLoadOutOfOrder", err)
 	}
 }
@@ -332,7 +332,7 @@ func TestBulkBuilderBranchSizeAccounting(t *testing.T) {
 				if len(cells) > 0 {
 					prefixLen = commonPrefixLen(cells[0].Key, k)
 				}
-				incr := page.BranchEncodedSizeOf(len(cells)+1, keyLenSum+len(k), prefixLen)
+				incr := page.BranchEncodedSizeOf(len(cells)+1, keyLenSum+len(k), prefixLen, 0)
 				cells = append(cells, page.BranchCell{Key: k, Child: uint64(i + 1)})
 				keyLenSum += len(k)
 				if got := page.BranchEncodedSize(cfg, cells); got != incr {

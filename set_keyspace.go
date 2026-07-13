@@ -416,9 +416,12 @@ func validateSetOpts(opts *SetKeyspaceOptions, cfg page.Config) (uint16, error) 
 		return 0, fmt.Errorf("%w: SetKeyspaceOptions.FixedValueSize %d out of range [0, 65535]",
 			ErrInvalidOptions, opts.FixedValueSize)
 	}
-	if opts.FixedValueSize > 0 && !btree.KeyFitsBranchSeparators(cfg, opts.FixedValueSize) {
-		return 0, fmt.Errorf("%w: SetKeyspaceOptions.FixedValueSize %d exceeds the maximum set value size for PageSize %d (limits.md §Maximum Key Size)",
-			ErrInvalidOptions, opts.FixedValueSize, cfg.PageSize)
+	if opts.FixedValueSize > 0 && opts.FixedValueSize > cfg.InlineThreshold() {
+		// Fixed-stride storage carries no per-value length and cannot
+		// hold overflow-key members (limits.md §Maximum Value Size
+		// (Set Keyspaces)).
+		return 0, fmt.Errorf("%w: SetKeyspaceOptions.FixedValueSize %d exceeds the inline threshold %d for PageSize %d (limits.md §Maximum Value Size (Set Keyspaces))",
+			ErrInvalidOptions, opts.FixedValueSize, cfg.InlineThreshold(), cfg.PageSize)
 	}
 	return uint16(opts.FixedValueSize), nil
 }
@@ -587,7 +590,7 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 	// and then fails the promotion insert when a SECOND value
 	// arrives (the tree-shape-dependent late failure the uniform
 	// gate exists to prevent).
-	if !btree.KeyFitsBranchSeparators(ks.builderCfg(), len(value)) {
+	if !setValueWithinInlineBound(ks.builderCfg(), len(value)) {
 		return false, fmt.Errorf("gmdb: set value exceeds maximum size (%d bytes): %w: %v",
 			len(value), ErrKeyTooLarge, btree.ErrKeyTooLarge)
 	}
@@ -1100,6 +1103,9 @@ func (ks *SetKeyspace) deleteValueFromSubpage(cfg page.Config, key, value []byte
 // total returned by DeleteRange equals desc.Count's per-cell
 // accounting (set-keyspace.md §Invariants, entailed value-count accounting).
 func setKeyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry) (uint64, error) {
+	if err := btree.FreeKeyExtentIfPresent(pw, cfg, e); err != nil {
+		return 0, err
+	}
 	switch {
 	case e.IsNestedTree():
 		if e.NestedRoot == 0 {
@@ -1377,4 +1383,14 @@ func (ks *SetKeyspace) deleteValueFromNestedTree(cfg page.Config, key, value []b
 	ks.markDirty()
 	ks.markSetCursorsStale()
 	return nil
+}
+
+// setValueWithinInlineBound bounds set values at the inline threshold:
+// a set value becomes a nested-tree KEY on promotion, and the
+// set-keyspace surface has not yet adopted the overflow-key member
+// form — over-threshold values keep the clean ErrKeyTooLarge surface
+// until it does (limits.md §Maximum Value Size (Set Keyspaces) defines
+// the target state; fixed-stride sets stay bounded permanently).
+func setValueWithinInlineBound(cfg page.Config, n int) bool {
+	return n <= cfg.InlineThreshold()
 }

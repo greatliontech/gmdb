@@ -30,7 +30,7 @@ func TestSearchLeafIter_ExactMatch_Uncompressed_NoChecksum(t *testing.T) {
 	}
 
 	for i, e := range entries {
-		idx, ent, found, it := r.SearchLeafIter([]byte(e[0]), nil, nil, nil)
+		idx, ent, found, it, _ := r.SearchLeafIter([]byte(e[0]), nil, nil, nil, NoExtentTail)
 		if !found || idx != i {
 			t.Fatalf("SearchLeafIter(%q): found=%v idx=%d, want true/%d", e[0], found, idx, i)
 		}
@@ -154,7 +154,7 @@ func TestSearchLeafIter_Miss_Uncompressed(t *testing.T) {
 	}{
 		{"a", 0}, {"bbb", 1}, {"ddd", 2}, {"fff", 3},
 	} {
-		idx, ent, found, it := r.SearchLeafIter([]byte(tc.target), nil, nil, nil)
+		idx, ent, found, it, _ := r.SearchLeafIter([]byte(tc.target), nil, nil, nil, NoExtentTail)
 		if found || idx != tc.wantIdx {
 			t.Fatalf("SearchLeafIter(%q): found=%v idx=%d, want false/%d", tc.target, found, idx, tc.wantIdx)
 		}
@@ -174,7 +174,7 @@ func TestSearchLeafIter_Miss_Uncompressed(t *testing.T) {
 	// Past-end miss: idx == count, iterator positioned exactly at count
 	// (a mispositioned iter would satisfy Next→!ok for any idx ≥ count
 	// but step Prev to the wrong entry) and immediately exhausted.
-	idx, _, found, it := r.SearchLeafIter([]byte("zzz"), nil, nil, nil)
+	idx, _, found, it, _ := r.SearchLeafIter([]byte("zzz"), nil, nil, nil, NoExtentTail)
 	if found || idx != r.Count() {
 		t.Fatalf("SearchLeafIter(zzz): found=%v idx=%d, want false/%d", found, idx, r.Count())
 	}

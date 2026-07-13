@@ -83,6 +83,20 @@ func validateOrderAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth i
 			return fmt.Errorf("%w: branch %d at depth %d: %w", ErrCorrupted, pageID, depth, err)
 		}
 		leftmost, cells := page.DecodeBranch(buf, cfg)
+		// Materialize overflow separators so every ordering / routing
+		// compare below runs over FULL keys — resident bytes can tie
+		// between distinct overflow separators (page-formats.md
+		// §Overflow-Key Cells), which would surface as false
+		// strictly-increasing violations (or mask real ones).
+		for i := range cells {
+			if cells[i].IsOverflowKey() {
+				full, err := materializeCellKey(pr, cfg, cells[i])
+				if err != nil {
+					return fmt.Errorf("%w: branch %d separator[%d] key extent: %w", ErrCorrupted, pageID, i, err)
+				}
+				cells[i].Key = full
+			}
+		}
 		for i, c := range cells {
 			if i > 0 && bytes.Compare(cells[i-1].Key, c.Key) >= 0 {
 				if !report(OrderKeys, pageID, fmt.Sprintf("branch %d separator[%d] %q not strictly greater than separator[%d] %q",
@@ -134,6 +148,15 @@ func validateOrderAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth i
 			e, ok := it.Next()
 			if !ok {
 				break
+			}
+			if e.IsOverflowKey() {
+				// Materialize the full key for the ordering and
+				// routing checks — see the branch-side rationale.
+				full, err := materializeEntryKey(pr, cfg, e)
+				if err != nil {
+					return fmt.Errorf("%w: leaf %d key extent: %w", ErrCorrupted, pageID, err)
+				}
+				e.Key = full
 			}
 			if havePrev && bytes.Compare(prev, e.Key) >= 0 {
 				if !report(OrderKeys, pageID, fmt.Sprintf("leaf %d key %q not strictly greater than predecessor %q", pageID, e.Key, prev)) {

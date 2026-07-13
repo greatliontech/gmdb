@@ -170,6 +170,25 @@ func walkKVAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, key
 				if !ok {
 					return nil
 				}
+				// WalkKV yields FULL keys: an overflow-key entry's
+				// resident bytes are materialized with its extent tail
+				// (bounded by hwm like value runs) so consumers — the
+				// CopyTo rebuilders, Check's extractor replay — never
+				// see a truncated key (page-formats.md §Overflow-Key
+				// Cells).
+				key := e.Key
+				if e.IsOverflowKey() {
+					extRun := uint64(keyExtentRunLen(cfg, e.KeyTotalLen))
+					if e.KeyExtPage == 0 || e.KeyExtPage >= hwm || e.KeyExtPage+extRun > hwm {
+						return fmt.Errorf("%w: key extent [%d,+%d) on leaf %d out of range (hwm=%d)",
+							ErrCorrupted, e.KeyExtPage, extRun, leafID, hwm)
+					}
+					full, kerr := materializeEntryKey(pr, cfg, e)
+					if kerr != nil {
+						return kerr
+					}
+					key = full
+				}
 				switch {
 				case e.IsOverflow():
 					// Forged-length bound (checksums.md §Structural and Allocation Bounds): uint64 run length — a forged TotalLen whose
@@ -184,13 +203,13 @@ func walkKVAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, key
 					if err != nil {
 						return err
 					}
-					if err := fn(e.Key, val); err != nil {
+					if err := fn(key, val); err != nil {
 						return err
 					}
 				case e.IsNestedTree() || e.IsSubpage():
 					return fmt.Errorf("%w: unexpected multi-value cell in plain key→value tree at leaf %d", ErrCorrupted, leafID)
 				default:
-					if err := fn(e.Key, e.Value); err != nil {
+					if err := fn(key, e.Value); err != nil {
 						return err
 					}
 				}
@@ -198,10 +217,59 @@ func walkKVAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, key
 		})
 }
 
+// walkVisitKeyExtent bounds-checks and visits every page of one key
+// extent run — the key-half analog of the value-run visit in walkAt,
+// with the same header cross-check discipline.
+func walkVisitKeyExtent(pr PageReader, cfg page.Config, ownerID uint64, extPage uint64, keyTotalLen uint32, hwm uint64, d int, visit VisitFunc) error {
+	extRun := uint64(keyExtentRunLen(cfg, keyTotalLen))
+	if extPage == 0 || extPage >= hwm || extPage+extRun > hwm {
+		return fmt.Errorf("%w: key extent [%d,+%d) on page %d out of range (hwm=%d)",
+			ErrCorrupted, extPage, extRun, ownerID, hwm)
+	}
+	obuf, oerr := pr.Page(extPage)
+	if oerr != nil {
+		return oerr
+	}
+	additional, derr := page.DecodeOverflowFirstPage(obuf)
+	if derr != nil {
+		return fmt.Errorf("%w: key extent at %d on page %d: %w", ErrCorrupted, extPage, ownerID, derr)
+	}
+	if uint64(additional)+1 != extRun {
+		return fmt.Errorf("%w: key extent at %d on page %d: header AdditionalPages %d+1 disagrees with the KeyTotalLen-derived run %d",
+			ErrCorrupted, extPage, ownerID, additional, extRun)
+	}
+	for j := range extRun {
+		if err := visit(extPage+j, PageKindOverflow, d+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func walkAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, visit VisitFunc) error {
 	return walkNode(pr, cfg, pageID, hwm, depth,
 		func(branchID uint64, d int) error {
-			return visit(branchID, PageKindBranch, d)
+			if err := visit(branchID, PageKindBranch, d); err != nil {
+				return err
+			}
+			// Overflow branch separators carry key extents reachable
+			// ONLY through this branch — the walk must visit them or
+			// Check's accounting reports them leaked (page-formats.md
+			// §Overflow-Key Cells, lifecycle).
+			buf, err := pr.Page(branchID)
+			if err != nil {
+				return err
+			}
+			n := page.BranchCellCount(buf)
+			for i := uint16(0); i < n; i++ {
+				c := page.BranchCellAt(buf, cfg, i)
+				if c.IsOverflowKey() {
+					if err := walkVisitKeyExtent(pr, cfg, branchID, c.KeyExtPage, c.KeyTotalLen, hwm, d, visit); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
 		},
 		func(leafID uint64, d int, r page.LeafReader) error {
 			if err := visit(leafID, PageKindLeaf, d); err != nil {
@@ -213,6 +281,11 @@ func walkAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, visit
 				e, ok := it.Next()
 				if !ok {
 					break
+				}
+				if e.IsOverflowKey() {
+					if err := walkVisitKeyExtent(pr, cfg, leafID, e.KeyExtPage, e.KeyTotalLen, hwm, d, visit); err != nil {
+						return err
+					}
 				}
 				switch {
 				case e.IsOverflow():

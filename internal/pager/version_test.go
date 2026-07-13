@@ -64,3 +64,45 @@ func TestOpenVersionMismatch(t *testing.T) {
 	}
 	_ = f.Close()
 }
+
+// TestOpenVersionMismatchCrossDigestFamily pins the KNOWN-PRIOR arm of
+// isVersionMismatchMeta: a prior-version meta whose checksum CANNOT
+// verify with this binary's digest family (format v3 changed XXH64 →
+// XXH3-64, so every v2 file is in this class) still classifies as
+// ErrVersionMismatch — not ErrCorrupted, the misdiagnosis the
+// page.FormatVersion doc names as the bump's rationale.
+func TestOpenVersionMismatchCrossDigestFamily(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db.gmdb")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ip := InitParams{
+		PageSize:        testPageSize,
+		MinSize:         16,
+		MaxSize:         128,
+		GrowStep:        4,
+		ShrinkThreshold: 8,
+		UUID:            [16]byte{0xAA, 0xBB, 0xCC, 0xDD},
+	}
+	if err := Init(f, ip); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Forge meta-0 to a KNOWN PRIOR version WITHOUT recomputing the
+	// checksum: the stale digest models a prior-family checksum this
+	// binary cannot verify (exactly a v2 file's shape to a v3 binary).
+	buf := make([]byte, MetaPayloadSize)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read meta0: %v", err)
+	}
+	buf[4] = byte(page.FormatVersion - 1) // Version field @4, LE low byte
+	if _, err := f.WriteAt(buf, 0); err != nil {
+		t.Fatalf("write forged meta0: %v", err)
+	}
+
+	if _, err := DiscoverPageSize(f); !errors.Is(err, ErrVersionMismatch) {
+		t.Errorf("DiscoverPageSize cross-family: got %v, want ErrVersionMismatch", err)
+	}
+}

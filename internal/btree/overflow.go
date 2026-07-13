@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/greatliontech/gmdb/internal/page"
@@ -58,39 +59,51 @@ const singleEntryPageOverhead = 12 + 4
 // single-entry capacity), the resulting leaf has exactly 1 entry
 // per page — space-inefficient but functionally correct.
 func needsOverflow(cfg page.Config, key, value []byte) bool {
-	inlineSize := inlineEntryHeaderOverhead + len(key) + len(value)
+	inlineSize := inlineEntryHeaderOverhead + residentKeyCost(cfg, key) + len(value)
 	return inlineSize > cfg.ContentEnd()-singleEntryPageOverhead
 }
 
-// overflowRefFitsLeaf reports whether an overflow-reference entry
-// for `key` fits in a single-entry leaf page. False ⇒ the key is
-// too large for even the overflow form (ErrKeyTooLarge surface).
-func overflowRefFitsLeaf(cfg page.Config, key []byte) bool {
-	refSize := overflowEntryHeaderOverhead + len(key)
-	if refSize > cfg.ContentEnd()-singleEntryPageOverhead {
-		return false
+// residentKeyCost returns the on-leaf byte cost of an entry's key
+// half past the fixed header: the full key when it fits the inline
+// threshold, or the resident first-T slice plus the 12-byte
+// key-extent reference for overflow keys (page-formats.md
+// §Overflow-Key Cells).
+func residentKeyCost(cfg page.Config, key []byte) int {
+	t := cfg.InlineThreshold()
+	if len(key) <= t {
+		return len(key)
 	}
-	return branchHoldsTwoSeparators(cfg, len(key))
+	return t + 12
 }
 
-// KeyFitsBranchSeparators exports the split-safety key bound for the
-// bulk-load construction path (package gmdb), which must gate keys
-// identically to Put — one threshold, no drift.
-func KeyFitsBranchSeparators(cfg page.Config, keyLen int) bool {
-	return branchHoldsTwoSeparators(cfg, keyLen)
+// overflowRefFitsLeaf reports whether an overflow-reference entry
+// for `key` fits in a single-entry leaf page. With the overflow-key
+// form the resident key cost is capped at InlineThreshold + 12 —
+// sized for two-per-branch-page — so this holds at every page size;
+// kept as arithmetic (not a constant true) as defense in depth.
+func overflowRefFitsLeaf(cfg page.Config, key []byte) bool {
+	refSize := overflowEntryHeaderOverhead + residentKeyCost(cfg, key)
+	return refSize <= cfg.ContentEnd()-singleEntryPageOverhead
 }
 
-// branchHoldsTwoSeparators reports whether a branch page can hold TWO
-// full separators of the given key length with no shared prefix — the
-// spec's key bound (limits.md §Maximum Key Size, ~(PageSize-40)/2).
-// The split machinery itself tolerates single-cell branch halves, so
-// keys in the gap (leaf-entry-fit but not two-per-branch) did not
-// crash — enforcing the bound at every entry gate is spec
-// conformance, keeping acceptance uniform across Put / PutEntry /
-// bulk / CopyTo rebuild. Worst case is zero shared prefix, so the
-// bound uses prefixLen=0.
-func branchHoldsTwoSeparators(cfg page.Config, keyLen int) bool {
-	return page.BranchEncodedSizeOf(2, 2*keyLen, 0) <= cfg.ContentEnd()
+// maxKeyTotalLen is the encoding bound on a full key: KeyTotalLen is
+// uint32 on the wire (limits.md §Maximum Key Size).
+const maxKeyTotalLen = 1<<32 - 1
+
+// keyWithinBound reports whether a key is storable: any length up to
+// the uint32 encoding bound — over the inline threshold it takes the
+// overflow-key form, never a rejection (limits.md §Maximum Key Size).
+// Enforced deterministically at every entry gate: Put, PutEntry, the
+// bulk-load builders, and CopyTo's rebuild — one threshold, no drift.
+func keyWithinBound(key []byte) bool {
+	return uint64(len(key)) <= maxKeyTotalLen
+}
+
+// KeyWithinBound exports the storable-key gate for the bulk-load
+// construction path (package gmdb), which must gate keys identically
+// to Put — one threshold, no drift.
+func KeyWithinBound(keyLen int) bool {
+	return keyLen >= 0 && uint64(keyLen) <= maxKeyTotalLen
 }
 
 // NeedsOverflow exports needsOverflow for the bulk-load construction
@@ -161,6 +174,229 @@ func freeOverflowChainIfPresent(pw PageWriter, cfg page.Config, entry page.LeafE
 		return fmt.Errorf("btree: free overflow chain at %d (run=%d): %w", entry.OverflowPage, runLen, err)
 	}
 	return nil
+}
+
+// keyTail returns the page.TailCompare that resolves overflow-key
+// comparisons over pr (page-formats.md §Overflow-Key Cells,
+// Comparison). Precondition per the type's contract: probe's first
+// T bytes equal the stored key's resident bytes and len(probe) > T.
+// The comparison streams the extent run one page at a time — never
+// materializing the stored tail — with the same forged-length
+// discipline as readOverflowValue.
+func keyTail(pr PageReader, cfg page.Config) page.TailCompare {
+	t := cfg.InlineThreshold()
+	firstCap := page.OverflowFirstPageCapacity(cfg)
+	followCap := page.OverflowFollowerCapacity(cfg)
+	return func(probe []byte, extPage uint64, totalLen uint32) (int, error) {
+		probeTail := probe[t:]
+		storedTail := int(totalLen) - t
+		if storedTail <= 0 {
+			return 0, fmt.Errorf("%w: overflow-key extent at %d with KeyTotalLen %d <= inline threshold %d",
+				ErrCorrupted, extPage, totalLen, t)
+		}
+		remaining := storedTail
+		pi := uint64(0)
+		pos := 0 // consumed bytes of probeTail
+		for remaining > 0 {
+			buf, err := pr.Page(extPage + pi)
+			if err != nil {
+				return 0, err
+			}
+			chunk := followCap
+			start := 0
+			if pi == 0 {
+				chunk = firstCap
+				start = page.HeaderSize
+			}
+			if chunk > remaining {
+				chunk = remaining
+			}
+			stored := buf[start : start+chunk]
+			k := min(len(probeTail)-pos, chunk)
+			if c := bytes.Compare(probeTail[pos:pos+k], stored[:k]); c != 0 {
+				return c, nil
+			}
+			pos += k
+			if k < chunk {
+				// probe exhausted while stored bytes remain — probe is
+				// a strict prefix of the stored key.
+				return -1, nil
+			}
+			remaining -= chunk
+			if pos == len(probeTail) && remaining > 0 {
+				// Probe exhausted exactly at a page boundary with
+				// stored bytes remaining — strict prefix; skip the
+				// pointless zero-byte compare of the next page.
+				return -1, nil
+			}
+			pi++
+		}
+		// Stored tail exhausted with every byte tied.
+		if pos < len(probeTail) {
+			return 1, nil // probe longer — stored is a strict prefix
+		}
+		return 0, nil
+	}
+}
+
+// writeKeyExtent allocates and encodes the key extent holding
+// key[T:] and returns the run's first page ID. Mirrors
+// writeOverflowChain's all-or-nothing allocation discipline.
+func writeKeyExtent(pw PageWriter, cfg page.Config, key []byte) (uint64, error) {
+	t := cfg.InlineThreshold()
+	tail := key[t:]
+	runLen := page.OverflowRunLength(cfg, uint64(len(tail)))
+	firstID, err := pw.AllocContiguous(runLen)
+	if err != nil {
+		return 0, fmt.Errorf("btree: alloc key extent (run=%d): %w", runLen, err)
+	}
+	pages, err := pw.ZeroPageRun(firstID, runLen)
+	if err != nil {
+		_ = pw.FreeRun(firstID, runLen)
+		return 0, fmt.Errorf("btree: alloc key extent slab run: %w", err)
+	}
+	if err := page.EncodeOverflowRun(pages, cfg, tail); err != nil {
+		_ = pw.FreeRun(firstID, runLen)
+		return 0, fmt.Errorf("btree: encode key extent run: %w", err)
+	}
+	return firstID, nil
+}
+
+// keyExtentRunLen returns the page-run length of a key extent given
+// the stored full key length.
+func keyExtentRunLen(cfg page.Config, keyTotalLen uint32) uint32 {
+	t := cfg.InlineThreshold()
+	return page.OverflowRunLength(cfg, uint64(int(keyTotalLen)-t))
+}
+
+// freeKeyExtentIfPresent retires the key extent of an overflow-key
+// leaf entry (no-op otherwise) — the key-half sibling of
+// freeOverflowChainIfPresent, with the same after-CoW call
+// discipline. Key extents follow the value-overflow lifecycle
+// (page-formats.md §Overflow-Key Cells).
+func freeKeyExtentIfPresent(pw PageWriter, cfg page.Config, entry page.LeafEntry) error {
+	if !entry.IsOverflowKey() {
+		return nil
+	}
+	runLen := keyExtentRunLen(cfg, entry.KeyTotalLen)
+	if err := pw.FreeRun(entry.KeyExtPage, runLen); err != nil {
+		return fmt.Errorf("btree: free key extent at %d (run=%d): %w", entry.KeyExtPage, runLen, err)
+	}
+	return nil
+}
+
+// clearKeyExtent returns e with its key-half extent fields zeroed and
+// the OverflowKey bit dropped — the shape PutEntry hands back after
+// retiring the displaced entry's key extent, so no caller can
+// double-free it. The resident Key bytes and every value-half field
+// are untouched.
+func clearKeyExtent(e page.LeafEntry) page.LeafEntry {
+	e.Flags &^= page.CellFlagOverflowKey
+	e.KeyExtPage = 0
+	e.KeyTotalLen = 0
+	return e
+}
+
+// FreeKeyExtentIfPresent exports freeKeyExtentIfPresent for the
+// keyspace layers' DeleteRange per-cell callbacks (package gmdb),
+// which retire per-entry resources outside the btree walkers.
+func FreeKeyExtentIfPresent(pw PageWriter, cfg page.Config, entry page.LeafEntry) error {
+	return freeKeyExtentIfPresent(pw, cfg, entry)
+}
+
+// freeBranchCellExtentIfPresent retires the key extent of an overflow
+// branch cell (no-op otherwise). Called when a separator is REMOVED or
+// REPLACED — never on a separator move, which carries the extent by
+// reference (page-formats.md §Overflow-Key Cells, Branch form).
+func freeBranchCellExtentIfPresent(pw PageWriter, cfg page.Config, c page.BranchCell) error {
+	if !c.IsOverflowKey() {
+		return nil
+	}
+	runLen := keyExtentRunLen(cfg, c.KeyTotalLen)
+	if err := pw.FreeRun(c.KeyExtPage, runLen); err != nil {
+		return fmt.Errorf("btree: free branch-separator key extent at %d (run=%d): %w", c.KeyExtPage, runLen, err)
+	}
+	return nil
+}
+
+// readKeyExtentTail assembles key[T:] from a key extent. Shared by
+// leaf-entry and branch-cell key materialization.
+func readKeyExtentTail(pr PageReader, cfg page.Config, extPage uint64, keyTotalLen uint32) ([]byte, error) {
+	t := cfg.InlineThreshold()
+	tailLen := int(keyTotalLen) - t
+	if tailLen <= 0 {
+		return nil, fmt.Errorf("%w: key extent at %d with KeyTotalLen %d <= inline threshold %d",
+			ErrCorrupted, extPage, keyTotalLen, t)
+	}
+	fake := page.LeafEntry{
+		Flags:        page.CellFlagOverflow,
+		OverflowPage: extPage,
+		TotalLen:     uint64(tailLen),
+	}
+	return readOverflowValue(pr, cfg, fake)
+}
+
+// materializeEntryKey returns the FULL key of a leaf entry — the
+// resident bytes for ordinary entries; resident + extent tail for
+// overflow-key entries. The result is freshly allocated when an
+// extent read occurs, otherwise it aliases e.Key.
+func materializeEntryKey(pr PageReader, cfg page.Config, e page.LeafEntry) ([]byte, error) {
+	if !e.IsOverflowKey() {
+		return e.Key, nil
+	}
+	tail, err := readKeyExtentTail(pr, cfg, e.KeyExtPage, e.KeyTotalLen)
+	if err != nil {
+		return nil, err
+	}
+	full := make([]byte, 0, int(e.KeyTotalLen))
+	full = append(full, e.Key...)
+	full = append(full, tail...)
+	return full, nil
+}
+
+// MaterializeEntryKey exports materializeEntryKey for the CopyTo
+// rebuilders (package gmdb), whose set-tree walk receives raw leaf
+// entries and must recover full outer keys before re-accumulating.
+func MaterializeEntryKey(pr PageReader, cfg page.Config, e page.LeafEntry) ([]byte, error) {
+	return materializeEntryKey(pr, cfg, e)
+}
+
+// materializeCellKey is materializeEntryKey for branch cells.
+func materializeCellKey(pr PageReader, cfg page.Config, c page.BranchCell) ([]byte, error) {
+	if !c.IsOverflowKey() {
+		return c.Key, nil
+	}
+	tail, err := readKeyExtentTail(pr, cfg, c.KeyExtPage, c.KeyTotalLen)
+	if err != nil {
+		return nil, err
+	}
+	full := make([]byte, 0, int(c.KeyTotalLen))
+	full = append(full, c.Key...)
+	full = append(full, tail...)
+	return full, nil
+}
+
+// makeSeparatorCell builds the branch cell for a freshly-computed FULL
+// separator: separators within the inline threshold carry the full key;
+// longer ones get a key extent written for sep[T:] and carry the
+// resident first-T slice (page-formats.md §Overflow-Key Cells, Branch
+// form). The extent is written exactly once here; every later move
+// carries it by reference.
+func makeSeparatorCell(pw PageWriter, cfg page.Config, sep []byte, child uint64) (page.BranchCell, error) {
+	t := cfg.InlineThreshold()
+	if len(sep) <= t {
+		return page.BranchCell{Key: sep, Child: child}, nil
+	}
+	ext, err := writeKeyExtent(pw, cfg, sep)
+	if err != nil {
+		return page.BranchCell{}, err
+	}
+	return page.BranchCell{
+		Key:         sep[:t],
+		Child:       child,
+		KeyExtPage:  ext,
+		KeyTotalLen: uint32(len(sep)),
+	}, nil
 }
 
 // readOverflowValue assembles the value bytes from the overflow

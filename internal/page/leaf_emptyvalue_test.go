@@ -74,7 +74,7 @@ func TestEmptyValueCellRoundTripAndSplice(t *testing.T) {
 			if err := r2.Validate(); err != nil {
 				t.Fatalf("post-splice Validate: %v", err)
 			}
-			if idx, _, found := r2.SearchLeaf([]byte("member-0006x")); !found {
+			if idx, _, found, _ := r2.SearchLeaf([]byte("member-0006x"), NoExtentTail); !found {
 				t.Fatal("spliced-in member not found")
 			} else if idx != 7 {
 				t.Fatalf("spliced-in member at %d, want 7", idx)
@@ -137,7 +137,7 @@ func TestEmptyValueLegacyZeroValueLenStillDecodes(t *testing.T) {
 	if err := r.Validate(); err != nil {
 		t.Fatalf("legacy form must stay valid: %v", err)
 	}
-	idx, e, found := r.SearchLeaf(key)
+	idx, e, found, _ := r.SearchLeaf(key, NoExtentTail)
 	if !found || idx != 0 {
 		t.Fatalf("legacy cell not found (idx=%d found=%v)", idx, found)
 	}

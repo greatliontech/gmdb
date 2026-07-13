@@ -123,24 +123,40 @@ func (r LeafReader) compressedLastKey(keyBuf []byte) ([]byte, []byte) {
 // compressedSearchLeaf is the two-phase compressed-leaf lookup:
 //  1. binary search over restart-table offsets (each probe decodes one
 //     restart-point key, full decode);
-//  2. linear scan within the matched group, decoding each delta entry
-//     fully and byte-comparing its key against target.
+//  2. kcpl skip-scan within the matched group: maintaining kcpl — the
+//     known common prefix length between the last compared key and
+//     target — a delta whose SharedLen > kcpl is provably < target
+//     and is SKIPPED with a header-only advance (no key
+//     reconstruction: every fixed-length field precedes the variable
+//     bytes, so the next-entry offset is header-computable — the
+//     §field-ordering property); SharedLen < kcpl proves the entry
+//     > target (scan stops); only SharedLen == kcpl compares, and
+//     then only the bytes past kcpl.
 //
-// The kcpl skip-without-decode optimization is intentionally absent.
-// The spec layout puts ValueLen between UnsharedLen and UnsharedKey for
-// inline deltas (so the scanner can't compute next-entry offset from
-// SharedLen + UnsharedLen alone), and the simpler "decode every delta
-// in the matched group" loop is the more robust implementation at the
-// default RestartGroupTarget = 16. Profiling can revisit this if
-// SearchLeaf becomes a hot spot.
-func (r LeafReader) compressedSearchLeaf(target []byte) (index int, entry LeafEntry, found bool) {
-	// Phase 1: binary search over restart points.
+// Soundness of the skip (the invariant threaded through the scan):
+// every visited key so far is < target, and the running delta base p
+// satisfies p[:kcpl] == target[:kcpl] with either p a strict prefix
+// of target (kcpl == len(p) — SharedLen > kcpl is then impossible)
+// or p[kcpl] < target[kcpl]. A skipped entry (SharedLen > kcpl)
+// preserves p's first kcpl+1 bytes, so it inherits p's divergence
+// below target and the invariant; a stop (SharedLen < kcpl) has
+// entry[SharedLen] > p[SharedLen] == target[SharedLen] since keys
+// ascend. Delta entries never carry overflow keys (singleton-group
+// rule), so the skip-scan needs no extent access.
+func (r LeafReader) compressedSearchLeaf(target []byte, tail TailCompare) (index int, entry LeafEntry, found bool, err error) {
+	// Phase 1: binary search over restart points. Restart entries may
+	// be overflow-key cells (always singleton groups), so the compare
+	// goes through compareEntryKey, which consults the key extent via
+	// tail exactly on a first-T-bytes tie with a longer target.
 	lo, hi := 0, r.rt.RestartCount()
 	for lo < hi {
 		mid := lo + (hi-lo)/2
 		off := r.rt.Offset(mid)
 		e, _ := r.decodeFullKeyEntry(off)
-		cmp := bytes.Compare(e.Key, target)
+		cmp, cerr := compareEntryKey(e, target, tail)
+		if cerr != nil {
+			return 0, LeafEntry{}, false, cerr
+		}
 		switch {
 		case cmp < 0:
 			lo = mid + 1
@@ -148,7 +164,7 @@ func (r LeafReader) compressedSearchLeaf(target []byte) (index int, entry LeafEn
 			idx := r.rt.GroupStartIndex(mid)
 			ret := e
 			ret.Key = nil
-			return idx, ret, true
+			return idx, ret, true, nil
 		default:
 			hi = mid
 		}
@@ -157,10 +173,12 @@ func (r LeafReader) compressedSearchLeaf(target []byte) (index int, entry LeafEn
 	group := lo - 1
 	if group < 0 {
 		// target precedes every restart key — insertion point is entry 0.
-		return 0, LeafEntry{}, false
+		return 0, LeafEntry{}, false, nil
 	}
 
-	// Phase 2: scan within the matched group.
+	// Phase 2: kcpl skip-scan within the matched group (see the doc
+	// comment). An overflow-key group has gc == 1 and the loop is
+	// empty; the restart key of a multi-entry group is always inline.
 	startIdx := r.rt.GroupStartIndex(group)
 	off := r.rt.Offset(group)
 	gc := r.rt.GroupEntryCount(group)
@@ -170,23 +188,83 @@ func (r LeafReader) compressedSearchLeaf(target []byte) (index int, entry LeafEn
 	// restart key is strictly < target here (phase 1 would have returned
 	// on equality, and binary search wouldn't have descended here on
 	// strictly-greater).
-	prevKey := re.Key
-	var keyBuf []byte
-	var e LeafEntry
+	kcpl := sharedPrefixLen(re.Key, target)
 	for idx := startIdx + 1; idx < endIdx; idx++ {
-		e, off, keyBuf = r.decodeDeltaEntry(off, prevKey, keyBuf)
-		cmp := bytes.Compare(e.Key, target)
+		flags, sharedLen, unsharedOff, unsharedLen, next := r.deltaHeader(off)
+		switch {
+		case sharedLen > kcpl:
+			// Provably < target — advance without touching the key.
+			off = next
+			continue
+		case sharedLen < kcpl:
+			// Provably > target — the insertion point.
+			return idx, LeafEntry{}, false, nil
+		}
+		// sharedLen == kcpl: the entry's key is target[:kcpl] plus its
+		// unshared bytes; compare only past the shared prefix.
+		unshared := r.buf[unsharedOff : unsharedOff+unsharedLen]
+		cmp := bytes.Compare(unshared, target[kcpl:])
 		switch {
 		case cmp == 0:
-			ret := e
-			ret.Key = nil
-			return idx, ret, true
+			ret := r.decodeDeltaValueHalf(flags, unsharedOff+unsharedLen, next)
+			return idx, ret, true, nil
 		case cmp > 0:
-			return idx, LeafEntry{}, false
+			return idx, LeafEntry{}, false, nil
 		}
-		prevKey = e.Key
+		// Entry < target — extend kcpl by the newly-matched bytes and
+		// continue; the invariant holds with this entry as the base.
+		kcpl += sharedPrefixLen(unshared, target[kcpl:])
+		off = next
 	}
-	return endIdx, LeafEntry{}, false
+	return endIdx, LeafEntry{}, false, nil
+}
+
+// deltaHeader reads a delta entry's fixed-length header fields and
+// computes its layout without touching the variable bytes: the flags,
+// SharedLen, the unshared bytes' offset and length, and the next
+// entry's offset. The header-computability of `next` is the
+// §field-ordering property (every fixed field precedes the variable
+// ones in all three delta forms).
+func (r LeafReader) deltaHeader(off int) (flags uint8, sharedLen, unsharedOff, unsharedLen, next int) {
+	flags = r.buf[off]
+	sharedLen = int(le.Uint16(r.buf[off+1:]))
+	unsharedLen = int(le.Uint16(r.buf[off+3:]))
+	switch {
+	case cellHasTrailerOnly(flags):
+		unsharedOff = off + 5
+		next = unsharedOff + unsharedLen + 16
+	case flags&CellFlagEmptyValue != 0:
+		unsharedOff = off + 5
+		next = unsharedOff + unsharedLen
+	default:
+		valLen := int(le.Uint32(r.buf[off+5:]))
+		unsharedOff = off + 9
+		next = unsharedOff + unsharedLen + valLen
+	}
+	return flags, sharedLen, unsharedOff, unsharedLen, next
+}
+
+// decodeDeltaValueHalf builds the found-entry view for the skip-scan's
+// exact match: the value half per flags (Key stays nil — SearchLeaf's
+// contract; the caller already holds the target). valueOff is the
+// first byte past the unshared key; next is the entry's end offset
+// (from deltaHeader), which bounds the inline value without re-reading
+// ValueLen.
+func (r LeafReader) decodeDeltaValueHalf(flags uint8, valueOff, next int) LeafEntry {
+	e := LeafEntry{Flags: flags}
+	switch {
+	case flags&CellFlagOverflow != 0:
+		e.OverflowPage = le.Uint64(r.buf[valueOff:])
+		e.TotalLen = le.Uint64(r.buf[valueOff+8:])
+	case e.IsNestedTree():
+		e.NestedRoot = le.Uint64(r.buf[valueOff:])
+		e.NestedCount = le.Uint64(r.buf[valueOff+8:])
+	case flags&CellFlagEmptyValue != 0:
+		e.Value = r.buf[valueOff:valueOff]
+	default:
+		e.Value = r.buf[valueOff:next]
+	}
+	return e
 }
 
 // compressedSearchLeafIter mirrors compressedSearchLeaf but also returns a
@@ -202,14 +280,18 @@ func (r LeafReader) compressedSearchLeaf(target []byte) (index int, entry LeafEn
 //   - found==false, idx==count: past the leaf's last entry (no successor
 //     in this leaf); entry is the zero value; caller advances to the
 //     next leaf.
-func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []LeafEntry) (int, LeafEntry, bool, LeafIter) {
-	// Phase 1.
+func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []LeafEntry, tail TailCompare) (int, LeafEntry, bool, LeafIter, error) {
+	// Phase 1. Restart entries may be overflow-key cells; see
+	// compressedSearchLeaf.
 	lo, hi := 0, r.rt.RestartCount()
 	for lo < hi {
 		mid := lo + (hi-lo)/2
 		off := r.rt.Offset(mid)
 		e, afterValOff := r.decodeFullKeyEntry(off)
-		cmp := bytes.Compare(e.Key, target)
+		cmp, cerr := compareEntryKey(e, target, tail)
+		if cerr != nil {
+			return 0, LeafEntry{}, false, LeafIter{}, cerr
+		}
 		switch {
 		case cmp < 0:
 			lo = mid + 1
@@ -233,7 +315,7 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 			}
 			ret := e
 			ret.Key = nil
-			return idx, ret, true, it
+			return idx, ret, true, it, nil
 		default:
 			hi = mid
 		}
@@ -243,7 +325,8 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 	if group < 0 {
 		// target precedes every restart key; successor is entry 0.
 		// Position iter at group 0 from its restart.
-		return r.iterFromGroupRestart(0, keyBuf, bufKeys, bufEnts)
+		i, e, f, it := r.iterFromGroupRestart(0, keyBuf, bufKeys, bufEnts)
+		return i, e, f, it, nil
 	}
 
 	// Phase 2. Walk the group fully — no kcpl-skip shortcut here,
@@ -290,7 +373,7 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 			}
 			ret := e
 			ret.Key = nil
-			return idx, ret, true, it
+			return idx, ret, true, it, nil
 		}
 		if cmp > 0 {
 			it := LeafIter{
@@ -306,7 +389,7 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 				bufKeys:     bufKeys[:0],
 				bufEnts:     bufEnts[:0],
 			}
-			return idx, e, false, it
+			return idx, e, false, it, nil
 		}
 	}
 
@@ -322,9 +405,10 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 			bufKeys:    bufKeys[:0],
 			bufEnts:    bufEnts[:0],
 		}
-		return endIdx, LeafEntry{}, false, it
+		return endIdx, LeafEntry{}, false, it, nil
 	}
-	return r.iterFromGroupRestart(group+1, keyBuf, bufKeys, bufEnts)
+	i, e2, f, it := r.iterFromGroupRestart(group+1, keyBuf, bufKeys, bufEnts)
+	return i, e2, f, it, nil
 }
 
 // iterFromGroupRestart decodes the first (restart) entry of groupIdx and

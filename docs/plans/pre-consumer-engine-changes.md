@@ -27,7 +27,7 @@ two no-shared-prefix separators must fit one branch page
       same 8-byte footer, benchmark-gated) while the format
       version bumps anyway; amendments to `limits.md`,
       `page-formats.md`, `keyspaces.md`.
-- [ ] 2. Overflow-key cells: format version bump; leaf and branch
+- [x] 2. Overflow-key cells: format version bump; leaf and branch
       write, read, and compare paths (inline prefix first, chase
       the extent only on prefix tie); retirement of key extents
       on delete/split/merge through the RPL like value overflow;

@@ -868,6 +868,9 @@ func (ks *Keyspace) Delete(key []byte) error {
 // semantics are preserved exactly (count of cells == count of values
 // for Kind=0).
 func keyspaceCellFree(pw btree.PageWriter, cfg page.Config, e page.LeafEntry) (uint64, error) {
+	if err := btree.FreeKeyExtentIfPresent(pw, cfg, e); err != nil {
+		return 0, err
+	}
 	if e.IsOverflow() {
 		runLen := page.OverflowRunLength(cfg, e.TotalLen)
 		if err := pw.FreeRun(e.OverflowPage, runLen); err != nil {

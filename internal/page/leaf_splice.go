@@ -126,15 +126,23 @@ func tryAppendCompressed(buf []byte, cfg Config, e LeafEntry, prevKey []byte) bo
 	target := int(cfg.EffectiveRestartGroupTarget())
 
 	// Group decision — identical to the builder. shared doubles as the
-	// delta's SharedLen when we extend the last group.
+	// delta's SharedLen when we extend the last group. Overflow-key
+	// entries are singleton restart groups (page-formats.md
+	// §Overflow-Key Cells): the new entry forces a restart when it is
+	// overflow-key, and also when the LAST entry is overflow-key (its
+	// group is sealed — no delta ever chains through a resident-prefix
+	// key), mirroring the builder's forceRestart.
+	lastEntryOff := int(le.Uint16(buf[lastGroupOff:]))
+	lastIsOvk := lastGroupCount == 1 && buf[lastEntryOff]&CellFlagOverflowKey != 0
 	shared := sharedPrefixLen(prevKey, e.Key)
-	isRestart := lastGroupCount >= target || shared == 0
+	isRestart := lastGroupCount >= target || shared == 0 || e.IsOverflowKey() || lastIsOvk
 
-	// Entry size (header + value part). valuePartSize handles the inline vs
-	// 16-byte-trailer (overflow / nested-tree) split.
+	// Entry size (header + key part + value part). keyPartSize handles
+	// the key-extent reference of overflow-key cells; valuePartSize the
+	// inline vs 16-byte-trailer (overflow / nested-tree) split.
 	var entrySize int
 	if isRestart {
-		entrySize = 1 + 2 + len(e.Key) // Flags + KeyLen + Key
+		entrySize = 1 + keyPartSize(e.Flags, e.Key) // Flags + KeyLen + Key (+ key-extent ref)
 	} else {
 		entrySize = 1 + 2 + 2 + (len(e.Key) - shared) // Flags + SharedLen + UnsharedLen + UnsharedKey
 	}
@@ -161,7 +169,7 @@ func tryAppendCompressed(buf []byte, cfg Config, e LeafEntry, prevKey []byte) bo
 	// Write the new entry at the old DataEnd (the start of free space).
 	var wp int
 	if isRestart {
-		wp = writeFullKeyEntry(buf, dataEnd, e.Flags, e.Key, e.Value, ovflPage, totalLen)
+		wp = writeFullKeyEntry(buf, dataEnd, e.Flags, e.Key, e.Value, ovflPage, totalLen, e.KeyExtPage, e.KeyTotalLen)
 	} else {
 		wp = writeCompressedDeltaEntry(buf, dataEnd, e.Flags, shared, e.Key[shared:], e.Value, ovflPage, totalLen)
 	}
@@ -211,7 +219,7 @@ func ucTryAppend(buf []byte, cfg Config, e LeafEntry) bool {
 
 	// Fit check — identical to LeafBuilder.addUCEntry's. Must fire before any
 	// write so a decline leaves the page byte-unchanged.
-	entrySize := 1 + 2 + len(e.Key) + valuePartSize(e.Flags, e.Value)
+	entrySize := 1 + keyPartSize(e.Flags, e.Key) + valuePartSize(e.Flags, e.Value)
 	if dataEnd+entrySize+(count+1)*ucOffsetEntrySize > contentEnd {
 		return false
 	}
@@ -220,7 +228,7 @@ func ucTryAppend(buf []byte, cfg Config, e LeafEntry) bool {
 	// (gmdb's ValueLen-before-key order; entryTrailer supplies the trailer u64s
 	// for overflow / nested cells, ignored for inline / subpage).
 	t0, t1 := entryTrailer(e)
-	newDataEnd := writeFullKeyEntry(buf, dataEnd, e.Flags, e.Key, e.Value, t0, t1)
+	newDataEnd := writeFullKeyEntry(buf, dataEnd, e.Flags, e.Key, e.Value, t0, t1, e.KeyExtPage, e.KeyTotalLen)
 
 	// Grow the offset table by one slot. The table grows backward from
 	// ContentEnd, so adding a slot shifts the existing `count` offsets one slot
@@ -320,6 +328,16 @@ func tryInsertAtCompressed(buf []byte, cfg Config, insertIdx int, e LeafEntry) b
 		return false
 	}
 
+	// Overflow-key entries are singleton restart groups (page-formats.md
+	// §Overflow-Key Cells): inserting an overflow-key entry mid-page, or
+	// inserting into a group whose restart entry is overflow-key (I-B
+	// would re-encode it as a delta; I-D would delta against its
+	// resident-prefix key), declines to the rebuild fallback — the
+	// builder enforces the singleton rule canonically.
+	if e.IsOverflowKey() || buf[r.rt.Offset(targetGroup)]&CellFlagOverflowKey != 0 {
+		return false
+	}
+
 	// Walk the target group from its restart, reconstructing keys, to capture
 	// newShared (E[p-1] vs new key; unused at p == 0) and the successor E[p]
 	// (its flags, full key, value/trailer, byte extent) so it can be re-encoded
@@ -401,7 +419,7 @@ func tryInsertAtCompressed(buf []byte, cfg Config, insertIdx int, e LeafEntry) b
 	newT0, newT1 := entryTrailer(e)
 	var off int
 	if p == 0 {
-		off = writeFullKeyEntry(buf, spliceOff, e.Flags, e.Key, e.Value, newT0, newT1)
+		off = writeFullKeyEntry(buf, spliceOff, e.Flags, e.Key, e.Value, newT0, newT1, e.KeyExtPage, e.KeyTotalLen)
 	} else {
 		off = writeCompressedDeltaEntry(buf, spliceOff, e.Flags, newShared, e.Key[newShared:], e.Value, newT0, newT1)
 	}
@@ -449,7 +467,7 @@ func ucTryInsertAt(buf []byte, cfg Config, insertIdx int, e LeafEntry) bool {
 	contentEnd := cfg.ContentEnd()
 	dataEnd := int(le.Uint16(buf[ucLeafOffDataEnd:]))
 
-	entrySize := 1 + 2 + len(e.Key) + valuePartSize(e.Flags, e.Value)
+	entrySize := 1 + keyPartSize(e.Flags, e.Key) + valuePartSize(e.Flags, e.Value)
 	if dataEnd+entrySize+(count+1)*ucOffsetEntrySize > contentEnd {
 		return false
 	}
@@ -462,7 +480,7 @@ func ucTryInsertAt(buf []byte, cfg Config, insertIdx int, e LeafEntry) bool {
 	gapOff := int(le.Uint16(buf[oldTableStart+insertIdx*ucOffsetEntrySize:]))
 	copy(buf[gapOff+entrySize:dataEnd+entrySize], buf[gapOff:dataEnd])
 	t0, t1 := entryTrailer(e)
-	writeFullKeyEntry(buf, gapOff, e.Flags, e.Key, e.Value, t0, t1)
+	writeFullKeyEntry(buf, gapOff, e.Flags, e.Key, e.Value, t0, t1, e.KeyExtPage, e.KeyTotalLen)
 
 	// Offset-table surgery (count → count+1; the table grows one slot toward
 	// DataEnd). The three regions are disjoint by construction:
@@ -737,7 +755,7 @@ func tryDeleteAtCompressed(buf []byte, cfg Config, deleteIdx int) bool {
 	// Go-cloned (succKey / succVal), independent of the bytes just shifted.
 	if hasSucc {
 		if p == 0 {
-			writeFullKeyEntry(buf, spliceOff, succFlags, succKey, succVal, succT0, succT1)
+			writeFullKeyEntry(buf, spliceOff, succFlags, succKey, succVal, succT0, succT1, 0, 0)
 		} else {
 			writeCompressedDeltaEntry(buf, spliceOff, succFlags, newShared, succKey[newShared:], succVal, succT0, succT1)
 		}

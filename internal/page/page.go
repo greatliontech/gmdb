@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/zeebo/xxh3"
 )
 
 var le = binary.LittleEndian
@@ -40,12 +40,20 @@ const Magic uint32 = 0x62646D67
 // base, a version discriminator would be backcompat scaffolding for files
 // that do not exist — the clean break is to change the format and
 // regenerate. It IS bumped when a change must partition a MIXED-BINARY
-// FLEET on one machine: the lock-file layout invariant (cross-process.md
-// §Lock File Lifecycle) requires that a binary with a different lock-file
-// layout cannot even open the data file, else the size-mismatch stale arm
-// removes a live peer's lock file (split brain). Version 2 = the
-// boot-epoch/seqlock/slot-generation lock-file layout.
-const FormatVersion uint32 = 2
+// FLEET on one machine: a binary that cannot correctly read or coexist
+// with the other's on-disk or lock-file state must strict-reject at the
+// version gate rather than misdiagnose. Two partition causes so far: the
+// lock-file layout invariant (cross-process.md §Lock File Lifecycle —
+// a binary with a different lock-file layout must not open the data
+// file, else the size-mismatch stale arm removes a live peer's lock
+// file, split brain), and a persisted-digest family change (a binary
+// hashing with the other family reads every checksummed page as corrupt
+// — ErrVersionMismatch is the honest error, ErrCorrupted a misdiagnosis).
+// Version 2 = the boot-epoch/seqlock/slot-generation lock-file layout.
+// Version 3 = XXH3-64 persisted digests (page footers, meta checksum,
+// index schema fingerprint) + overflow-key cells (page-formats.md
+// §Overflow-Key Cells).
+const FormatVersion uint32 = 3
 
 // Supported page-size range. PageSize is set at database creation, persisted
 // on the meta page, and immutable.
@@ -58,7 +66,7 @@ const (
 // non-meta, non-bitmap page.
 const HeaderSize = 8
 
-// FooterSize is the byte length of the xxhash64 footer when PageChecksum is
+// FooterSize is the byte length of the XXH3-64 footer when PageChecksum is
 // enabled. Footer occupies the last FooterSize bytes of the page.
 const FooterSize = 8
 
@@ -168,6 +176,26 @@ func (c Config) UsableSpace() int {
 	return c.ContentEnd() - HeaderSize
 }
 
+// InlineThreshold returns T — the largest key length stored wholly
+// inline; longer keys take the overflow-key cell form (page-formats.md
+// §Overflow-Key Cells). T is the largest value such that a branch page
+// holds TWO overflow-key cells at PrefixLen == 0, the split-feasibility
+// floor:
+//
+//	content = ContentEnd - 8 (header) - 8 (leftmost ptr)
+//	          - 4 (PrefixLen + Reserved)                    = ContentEnd - 20
+//	percell = 4 (directory) + T (inline) + 12 (extent ref) + 8 (child)
+//	2 × percell <= content  ⇒  T = (ContentEnd - 68) / 2
+//
+// which is (PageSize-76)/2 with checksums, (PageSize-68)/2 without —
+// the exact constants pinned in limits.md §Maximum Key Size and by
+// TestInlineThresholdValues. A pure function of (PageSize,
+// PageChecksum): the deterministic-encoding invariant depends on every
+// encoder deriving the same T.
+func (c Config) InlineThreshold() int {
+	return (c.ContentEnd() - 68) / 2
+}
+
 // ReadHeader decodes the 8-byte page header at the start of buf.
 func ReadHeader(buf []byte) (typ uint8, flags uint8, count uint16, additional uint32) {
 	_ = buf[HeaderSize-1] // bounds check
@@ -190,7 +218,7 @@ func WriteHeader(buf []byte, typ uint8, count uint16, additional uint32) {
 	le.PutUint32(buf[offAdditionalPages:], additional)
 }
 
-// ComputePageChecksum returns the xxhash64 of bytes 0 through
+// ComputePageChecksum returns the XXH3-64 of bytes 0 through
 // pageSize-FooterSize-1 inclusive (the spec-mandated coverage region per
 // checksums.md §Storage). buf must be exactly pageSize bytes — passing a
 // larger or smaller slice panics.
@@ -204,10 +232,10 @@ func ComputePageChecksum(buf []byte, pageSize uint32) uint64 {
 	if len(buf) != int(pageSize) {
 		panic(fmt.Sprintf("page: ComputePageChecksum buf len %d != PageSize %d", len(buf), pageSize))
 	}
-	return xxhash.Sum64(buf[:int(pageSize)-FooterSize])
+	return xxh3.Hash(buf[:int(pageSize)-FooterSize])
 }
 
-// WritePageFooter computes the xxhash64 footer of buf and writes it into
+// WritePageFooter computes the XXH3-64 footer of buf and writes it into
 // the last FooterSize bytes of the page region. Used at commit time on
 // each dirty slab buffer, before pwrite. Panics under the same condition
 // as ComputePageChecksum.
@@ -216,7 +244,7 @@ func WritePageFooter(buf []byte, pageSize uint32) {
 	le.PutUint64(buf[int(pageSize)-FooterSize:int(pageSize)], c)
 }
 
-// VerifyPageFooter recomputes the xxhash64 footer of buf and compares it
+// VerifyPageFooter recomputes the XXH3-64 footer of buf and compares it
 // to the stored last 8 bytes. Returns true on match.
 func VerifyPageFooter(buf []byte, pageSize uint32) bool {
 	want := ComputePageChecksum(buf, pageSize)

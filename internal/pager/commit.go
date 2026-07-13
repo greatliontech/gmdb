@@ -389,7 +389,7 @@ func (p *Pager) headPageID() uint64 {
 }
 
 // commitStep1 pwrites the dirty data/RPL pages from p.dirty and the
-// modified bitmap pages from the bitmap struct. Computes the xxhash64
+// modified bitmap pages from the bitmap struct. Computes the XXH3-64
 // footer for each page that needs one (data + RPL — bitmap pages carry
 // no checksum per checksums.md §Storage).
 func (p *Pager) commitStep1() (int, error) {

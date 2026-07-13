@@ -306,7 +306,7 @@ func verifyDurableCrashImage(t *testing.T, opts Options, img []byte, label strin
 //	    two writes) — data pages precede the meta publish, so before the
 //	    meta lands the epoch is unchanged;
 //	(b) a TORN meta write (the step-3 single-page meta pwrite half-lands) —
-//	    the xxhash64 footer rejects it and recovery falls back to the other
+//	    the XXH3-64 footer rejects it and recovery falls back to the other
 //	    slot (durability.md §Checkpoints single-meta-slot atomicity).
 func TestCrashMidInflightCommitPreservesDurableEpoch(t *testing.T) {
 	ctx := context.Background()

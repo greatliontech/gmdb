@@ -57,12 +57,24 @@ const (
 	// empty-value cell).
 	CellFlagEmptyValue uint8 = 1 << 3
 
+	// CellFlagOverflowKey marks an overflow-key cell (page-formats.md
+	// §Overflow-Key Cells): the key half stores exactly the first
+	// T(cfg) bytes of the full key inline (KeyLen == T), followed by
+	// a 12-byte key-extent reference — KeyExtPage(u64), the first
+	// page of an overflow run holding key[T:], and KeyTotalLen(u32),
+	// the FULL key length. The bit modifies only the key half; the
+	// value half per bits 0–3 follows the extent reference unchanged
+	// in form. Restart/uncompressed entries only — a delta entry
+	// never carries this bit, and a compressed overflow-key entry is
+	// always a singleton restart group.
+	CellFlagOverflowKey uint8 = 1 << 4
+
 	// cellFlagKnownMask is the union of currently-defined cell flag
 	// bits. The strict-reject rule from file-layout.md §Reserved-byte
 	// policy is enforced via LeafReader.Validate (not in the hot-path
 	// decoders, which assume well-formed input); see Validate's doc
 	// for the boundary discipline.
-	cellFlagKnownMask = CellFlagOverflow | CellFlagMultiValue | CellFlagNestedTree | CellFlagEmptyValue
+	cellFlagKnownMask = CellFlagOverflow | CellFlagMultiValue | CellFlagNestedTree | CellFlagEmptyValue | CellFlagOverflowKey
 )
 
 // ErrCorrupted is the leaf-decoder corruption sentinel. Wraps a
@@ -115,6 +127,17 @@ type LeafEntry struct {
 	// are zero.
 	NestedRoot  uint64
 	NestedCount uint64
+
+	// Overflow-key fields (valid iff Flags has CellFlagOverflowKey
+	// set; zero otherwise). Key then holds only the RESIDENT first
+	// T(cfg) bytes of the full key; KeyExtPage is the first page of
+	// the overflow run holding key[T:]; KeyTotalLen is the full key
+	// length (page-formats.md §Overflow-Key Cells). Comparisons that
+	// tie through the resident bytes against a longer probe must
+	// consult the extent — the page layer never reads it (pure over
+	// one page); the btree layer chases via its PageReader.
+	KeyExtPage  uint64
+	KeyTotalLen uint32
 }
 
 // IsOverflow reports whether the entry's value lives in an overflow run
@@ -137,6 +160,57 @@ func (e LeafEntry) IsSubpage() bool {
 // count is e.NestedCount.
 func (e LeafEntry) IsNestedTree() bool {
 	return e.Flags&CellFlagMultiValue != 0 && e.Flags&CellFlagNestedTree != 0
+}
+
+// IsOverflowKey reports whether the entry's key exceeds the inline
+// threshold and is stored as resident-first-T bytes plus a key extent
+// (page-formats.md §Overflow-Key Cells). e.Key then holds only
+// key[0:T]; key[T:] lives in the run starting at e.KeyExtPage and the
+// full length is e.KeyTotalLen.
+func (e LeafEntry) IsOverflowKey() bool { return e.Flags&CellFlagOverflowKey != 0 }
+
+// TailCompare resolves the order of probe against the FULL key of an
+// overflow-key cell whose first-T bytes tie with probe's (page-formats.md
+// §Overflow-Key Cells, Comparison). Precondition established by the
+// caller: len(probe) > T and probe[0:T] equals the cell's resident
+// bytes; the implementation compares probe[T:] against the extent run
+// at extPage (totalLen is the stored key's full length). Returns
+// bytes.Compare semantics for probe vs the stored full key. The page
+// package never reads pages other than the one it decodes — the btree
+// layer supplies this over its PageReader.
+type TailCompare func(probe []byte, extPage uint64, totalLen uint32) (int, error)
+
+// NoExtentTail is a TailCompare for callers that guarantee the searched
+// pages contain no overflow-key cells (unit tests over hand-built
+// pages; surfaces whose keys are structurally bounded under the inline
+// threshold). Invoking it reports the broken guarantee as an error
+// rather than a wrong comparison.
+var NoExtentTail TailCompare = func([]byte, uint64, uint32) (int, error) {
+	return 0, fmt.Errorf("%w: overflow-key extent comparison required but caller supplied NoExtentTail", ErrCorrupted)
+}
+
+// compareEntryKey returns bytes.Compare(storedFullKey, target) for an
+// entry that may be overflow-key, reading the extent (via tail) exactly
+// when the spec's comparison rule requires it: target longer than the
+// resident portion AND tying through all of it. For ordinary entries it
+// is bytes.Compare(e.Key, target).
+func compareEntryKey(e LeafEntry, target []byte, tail TailCompare) (int, error) {
+	if !e.IsOverflowKey() {
+		return bytes.Compare(e.Key, target), nil
+	}
+	t := len(e.Key) // resident length == InlineThreshold by Validate
+	k := min(len(target), t)
+	if c := bytes.Compare(e.Key[:k], target[:k]); c != 0 {
+		return c, nil
+	}
+	if len(target) <= t {
+		// target is a (possibly full-length) prefix of the resident
+		// bytes; the stored key is strictly longer (KeyTotalLen > T by
+		// Validate) — stored > target, no extent read.
+		return 1, nil
+	}
+	c, err := tail(target, e.KeyExtPage, e.KeyTotalLen)
+	return -c, err
 }
 
 // LeafReader provides read access over both compressed and uncompressed
@@ -236,14 +310,18 @@ func (r LeafReader) GroupEntryCount(i int) int {
 // less than target). SearchLeaf uses the unchecked hot-path decoders and
 // assumes structural validity — first-resolve callers must gate the page
 // through Validate (see the Validate doc for the trust boundary).
-func (r LeafReader) SearchLeaf(target []byte) (index int, entry LeafEntry, found bool) {
+//
+// tail resolves overflow-key first-T-byte ties against the key extent
+// (page-formats.md §Overflow-Key Cells, Comparison); its page reads are
+// the only error source.
+func (r LeafReader) SearchLeaf(target []byte, tail TailCompare) (index int, entry LeafEntry, found bool, err error) {
 	if r.count == 0 {
-		return 0, LeafEntry{}, false
+		return 0, LeafEntry{}, false, nil
 	}
 	if !r.compressed {
-		return r.ucSearchLeaf(target)
+		return r.ucSearchLeaf(target, tail)
 	}
-	return r.compressedSearchLeaf(target)
+	return r.compressedSearchLeaf(target, tail)
 }
 
 // SearchLeafIter is the cursor-friendly form of SearchLeaf: returns the
@@ -257,19 +335,19 @@ func (r LeafReader) SearchLeaf(target []byte) (index int, entry LeafEntry, found
 // the iter; pass the cursor's previously-returned KeyBuf/BufKeys/BufEnts
 // so allocation amortizes to zero across leaf transitions in the steady-
 // state cursor loop.
-func (r LeafReader) SearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []LeafEntry) (int, LeafEntry, bool, LeafIter) {
+func (r LeafReader) SearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []LeafEntry, tail TailCompare) (int, LeafEntry, bool, LeafIter, error) {
 	if r.count == 0 {
 		return 0, LeafEntry{}, false, LeafIter{
 			r:       r,
 			keyBuf:  keyBuf[:0],
 			bufKeys: bufKeys[:0],
 			bufEnts: bufEnts[:0],
-		}
+		}, nil
 	}
 	if !r.compressed {
-		return r.ucSearchLeafIter(target, keyBuf, bufKeys, bufEnts)
+		return r.ucSearchLeafIter(target, keyBuf, bufKeys, bufEnts, tail)
 	}
-	return r.compressedSearchLeafIter(target, keyBuf, bufKeys, bufEnts)
+	return r.compressedSearchLeafIter(target, keyBuf, bufKeys, bufEnts, tail)
 }
 
 // EntryAt decodes the entry at absolute index idx. For compressed leaves
@@ -481,7 +559,7 @@ func (r LeafReader) Validate() error {
 			if off != expected {
 				return fmt.Errorf("%w: uncompressed leaf offset[%d]=%d != entry stream position %d", ErrCorrupted, i, off, expected)
 			}
-			next, _, err := r.validateFullKeyEntry(off)
+			next, _, _, err := r.validateFullKeyEntry(off)
 			if err != nil {
 				return fmt.Errorf("%w: uncompressed leaf entry %d: %w", ErrCorrupted, i, err)
 			}
@@ -507,7 +585,16 @@ func (r LeafReader) Validate() error {
 			var next int
 			var err error
 			if i == 0 {
-				next, prevKeyLen, err = r.validateFullKeyEntry(off)
+				var flags uint8
+				next, prevKeyLen, flags, err = r.validateFullKeyEntry(off)
+				// Singleton-restart-group rule (page-formats.md
+				// §Overflow-Key Cells): an overflow-key entry is
+				// always the sole entry of its group — delta
+				// reconstruction never chains through an
+				// extent-resident key.
+				if err == nil && flags&CellFlagOverflowKey != 0 && gc != 1 {
+					err = fmt.Errorf("overflow-key restart entry in group with Count=%d (must be a singleton group)", gc)
+				}
 			} else {
 				next, prevKeyLen, err = r.validateDeltaEntry(off, prevKeyLen)
 			}
@@ -538,44 +625,51 @@ func (r LeafReader) decodeFullKeyEntry(off int) (LeafEntry, int) {
 	off++
 	keyLen := int(le.Uint16(r.buf[off:]))
 	off += 2
-	if e.Flags&CellFlagOverflow != 0 {
-		// [Flags][KeyLen][Key][OvflPage uint64][TotalLen uint64]
-		e.Key = r.buf[off : off+keyLen]
-		off += keyLen
+	// ValueLen (inline / subpage forms only) sits in the header BEFORE
+	// the key bytes — the decode-speed field ordering (page-formats.md
+	// §Compressed Leaf). Trailer-only and empty-value forms have no
+	// ValueLen.
+	valLen := -1
+	if !cellHasTrailerOnly(e.Flags) && e.Flags&CellFlagEmptyValue == 0 {
+		valLen = int(le.Uint32(r.buf[off:]))
+		off += 4
+	}
+	e.Key = r.buf[off : off+keyLen]
+	off += keyLen
+	if e.Flags&CellFlagOverflowKey != 0 {
+		// Key half is resident-first-T bytes + 12-byte key-extent
+		// reference; the value half follows unchanged in form
+		// (page-formats.md §Overflow-Key Cells).
+		e.KeyExtPage = le.Uint64(r.buf[off:])
+		off += 8
+		e.KeyTotalLen = le.Uint32(r.buf[off:])
+		off += 4
+	}
+	switch {
+	case e.Flags&CellFlagOverflow != 0:
+		// [... Key half ...][OvflPage uint64][TotalLen uint64]
 		e.OverflowPage = le.Uint64(r.buf[off:])
 		off += 8
 		e.TotalLen = le.Uint64(r.buf[off:])
 		off += 8
-		return e, off
-	}
-	if e.IsNestedTree() {
-		// [Flags][KeyLen][Key][Root uint64][Count uint64] — same wire
+	case e.IsNestedTree():
+		// [... Key half ...][Root uint64][Count uint64] — same wire
 		// shape as overflow; different decoded-view fields. Per
 		// set-keyspace.md §Nested B+tree Reference Cell.
-		e.Key = r.buf[off : off+keyLen]
-		off += keyLen
 		e.NestedRoot = le.Uint64(r.buf[off:])
 		off += 8
 		e.NestedCount = le.Uint64(r.buf[off:])
 		off += 8
-		return e, off
-	}
-	if e.Flags&CellFlagEmptyValue != 0 {
-		// [Flags][KeyLen][Key] — compact empty-value form; the value
-		// half is absent. Value decodes to a non-nil zero-length
-		// slice, matching the legacy zero-ValueLen inline decode.
-		e.Key = r.buf[off : off+keyLen]
-		off += keyLen
+	case e.Flags&CellFlagEmptyValue != 0:
+		// Compact empty-value form; the value half is absent. Value
+		// decodes to a non-nil zero-length slice, matching the legacy
+		// zero-ValueLen inline decode.
 		e.Value = r.buf[off:off]
-		return e, off
+	default:
+		// Inline / subpage: [ValueLen already read][Value]
+		e.Value = r.buf[off : off+valLen]
+		off += valLen
 	}
-	// [Flags][KeyLen][ValueLen][Key][Value]
-	valLen := int(le.Uint32(r.buf[off:]))
-	off += 4
-	e.Key = r.buf[off : off+keyLen]
-	off += keyLen
-	e.Value = r.buf[off : off+valLen]
-	off += valLen
 	return e, off
 }
 
@@ -607,8 +701,8 @@ func validateCellFlagsCombo(flags uint8) error {
 	if flags&CellFlagNestedTree != 0 && flags&CellFlagMultiValue == 0 {
 		return fmt.Errorf("CellFlags 0x%x sets NestedTree without MultiValue (only valid when MultiValue is set)", flags)
 	}
-	if flags&CellFlagEmptyValue != 0 && flags&^CellFlagEmptyValue != 0 {
-		return fmt.Errorf("CellFlags 0x%x sets EmptyValue alongside other flags (EmptyValue is exclusive: trailer and subpage forms carry their own value halves)", flags)
+	if flags&CellFlagEmptyValue != 0 && flags&^(CellFlagEmptyValue|CellFlagOverflowKey) != 0 {
+		return fmt.Errorf("CellFlags 0x%x sets EmptyValue alongside other value-form flags (EmptyValue is exclusive among bits 0-2: trailer and subpage forms carry their own value halves; OverflowKey composes — it modifies only the key half)", flags)
 	}
 	return nil
 }
@@ -620,49 +714,92 @@ func validateCellFlagsCombo(flags uint8) error {
 // group's delta chain reconstructs keys from it). Returns a non-nil
 // error (without ErrCorrupted wrap — the caller wraps with structural
 // context) on any bounds violation or unknown CellFlags.
-func (r LeafReader) validateFullKeyEntry(off int) (next, keyLen int, err error) {
+func (r LeafReader) validateFullKeyEntry(off int) (next, keyLen int, flags uint8, err error) {
 	if err := r.ensureBytes(off, 1); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	flags := r.buf[off]
+	flags = r.buf[off]
 	if flags&^cellFlagKnownMask != 0 {
-		return 0, 0, fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
+		return 0, 0, 0, fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
 	}
 	if err := validateCellFlagsCombo(flags); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	off++
 	if err := r.ensureBytes(off, 2); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	keyLen = int(le.Uint16(r.buf[off:]))
 	off += 2
-	if cellHasTrailerOnly(flags) {
-		// Overflow: [Flags][KeyLen][Key][OvflPage u64][TotalLen u64].
-		// NestedTree: [Flags][KeyLen][Key][Root u64][Count u64].
-		// Identical wire shape; the trailer is always 16 bytes.
-		if err := r.ensureBytes(off, keyLen+16); err != nil {
-			return 0, 0, fmt.Errorf("full-key trailer body: %w", err)
+	// Key-half tail: 12-byte key-extent reference when OverflowKey is
+	// set. The derivable-length read policy (page-formats.md
+	// §Overflow-Key Cells): the resident length is EXACTLY the inline
+	// threshold, and the stored full length strictly exceeds it —
+	// divergence is structural corruption, never a trusted field.
+	keyTail := 0
+	if flags&CellFlagOverflowKey != 0 {
+		t := r.cfg.InlineThreshold()
+		if keyLen != t {
+			return 0, 0, 0, fmt.Errorf("overflow-key resident length %d != inline threshold %d", keyLen, t)
 		}
-		return off + keyLen + 16, keyLen, nil
+		keyTail = 12
+	}
+	if cellHasTrailerOnly(flags) {
+		// Overflow: [.. Key half ..][OvflPage u64][TotalLen u64].
+		// NestedTree: [.. Key half ..][Root u64][Count u64].
+		// Identical wire shape; the trailer is always 16 bytes.
+		if err := r.ensureBytes(off, keyLen+keyTail+16); err != nil {
+			return 0, 0, 0, fmt.Errorf("full-key trailer body: %w", err)
+		}
+		if err := r.validateKeyExt(flags, off+keyLen, keyLen); err != nil {
+			return 0, 0, 0, err
+		}
+		return off + keyLen + keyTail + 16, keyLen, flags, nil
 	}
 	if flags&CellFlagEmptyValue != 0 {
-		// [Flags][KeyLen][Key] — no value half.
-		if err := r.ensureBytes(off, keyLen); err != nil {
-			return 0, 0, fmt.Errorf("full-key empty-value body: %w", err)
+		// [Flags][KeyLen][Key half] — no value half.
+		if err := r.ensureBytes(off, keyLen+keyTail); err != nil {
+			return 0, 0, 0, fmt.Errorf("full-key empty-value body: %w", err)
 		}
-		return off + keyLen, keyLen, nil
+		if err := r.validateKeyExt(flags, off+keyLen, keyLen); err != nil {
+			return 0, 0, 0, err
+		}
+		return off + keyLen + keyTail, keyLen, flags, nil
 	}
-	// [Flags][KeyLen][ValueLen][Key][Value]
+	// [Flags][KeyLen][ValueLen][Key half][Value]
 	if err := r.ensureBytes(off, 4); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	valLen := int(le.Uint32(r.buf[off:]))
 	off += 4
-	if err := r.ensureBytes(off, keyLen+valLen); err != nil {
-		return 0, 0, fmt.Errorf("full-key inline body keyLen=%d valLen=%d: %w", keyLen, valLen, err)
+	if err := r.ensureBytes(off, keyLen+keyTail+valLen); err != nil {
+		return 0, 0, 0, fmt.Errorf("full-key inline body keyLen=%d valLen=%d: %w", keyLen, valLen, err)
 	}
-	return off + keyLen + valLen, keyLen, nil
+	if err := r.validateKeyExt(flags, off+keyLen, keyLen); err != nil {
+		return 0, 0, 0, err
+	}
+	return off + keyLen + keyTail + valLen, keyLen, flags, nil
+}
+
+// validateKeyExt checks the 12-byte key-extent reference of an
+// overflow-key cell whose reference begins at extOff (immediately after
+// the resident key bytes). residentLen is the already-validated
+// resident length (== InlineThreshold). No-op for cells without
+// CellFlagOverflowKey. Bounds were established by the caller's
+// ensureBytes over the full body.
+func (r LeafReader) validateKeyExt(flags uint8, extOff, residentLen int) error {
+	if flags&CellFlagOverflowKey == 0 {
+		return nil
+	}
+	extPage := le.Uint64(r.buf[extOff:])
+	totalLen := int(le.Uint32(r.buf[extOff+8:]))
+	if extPage == 0 {
+		return fmt.Errorf("overflow-key extent page is 0")
+	}
+	if totalLen <= residentLen {
+		return fmt.Errorf("overflow-key KeyTotalLen %d does not exceed resident length %d", totalLen, residentLen)
+	}
+	return nil
 }
 
 // validateDeltaEntry mirrors validateFullKeyEntry for delta entries.
@@ -680,6 +817,11 @@ func (r LeafReader) validateDeltaEntry(off, prevKeyLen int) (next, keyLen int, e
 	flags := r.buf[off]
 	if flags&^cellFlagKnownMask != 0 {
 		return 0, 0, fmt.Errorf("unknown CellFlags 0x%x", flags&^cellFlagKnownMask)
+	}
+	if flags&CellFlagOverflowKey != 0 {
+		// page-formats.md §Overflow-Key Cells: a delta entry never
+		// carries an overflow key (singleton-restart-group rule).
+		return 0, 0, fmt.Errorf("delta entry carries CellFlagOverflowKey (overflow-key entries are restart-only singleton groups)")
 	}
 	if err := validateCellFlagsCombo(flags); err != nil {
 		return 0, 0, err

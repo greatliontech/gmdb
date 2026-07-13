@@ -204,6 +204,8 @@ Invariant: kind=clause-explicit;
     or decoding a wrong key; a variable inline length breaks the
     §Leaf Split deterministic-encoding invariant — a `Check()`
     re-encode produces different bytes than the original writer.
+    (Pinned by TestInlineThresholdValues, TestOverflowKeyLeafRoundTrip,
+    TestBranchOverflowCellRoundTrip.)
 
 Invariant: kind=clause-explicit;
   property=Comparison against an overflow-key cell is stated over
@@ -225,6 +227,9 @@ Invariant: kind=clause-explicit;
     is dimensionally wrong for `PrefixLen > 0` — a shared-prefix
     target shorter than `PrefixLen + T` can tie through the inline
     bytes while the true order lives in the extent.
+    (Pinned by TestCompareEntryKeyExtentRule and
+    TestBranchOverflowCellRoundTrip; end-to-end by
+    TestPutStoresOverThresholdKey.)
 
 Invariant: kind=clause-explicit;
   property=An overflow-key leaf entry is always a restart entry and
@@ -238,6 +243,8 @@ Invariant: kind=clause-explicit;
     (unbounded `keyBuf` growth), and a reconstructed over-`T` key
     re-encoded by the delete keep-set rebuild cannot fit its cell —
     violating §Insert and Delete's rebuild-never-fails clause.
+    (Pinned by TestOverflowKeyLeafRoundTrip's singleton-group check
+    and TestValidateRejectsMalformedOverflowKey.)
 
 Invariant: kind=entailed;
   property=A key extent follows the same lifecycle rules as a value
@@ -254,6 +261,9 @@ Invariant: kind=entailed;
     run when both referents retire (corrupting an unrelated later
     allocation); dropping the reference without RPL retirement
     leaks pages that `Check()` attributes to no keyspace.
+    (Pinned by TestOverflowKeyLifecycleThroughSplitsAndDeletes's
+    slab-partition checks, TestOverflowKeyWalkVisitsExtents, and
+    TestOverflowKeyRelocation.)
 
 ## Branch Page (Internal B+tree Node)
 

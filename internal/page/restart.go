@@ -4,7 +4,7 @@ package page
 // future page kind that adopts variable-size restart groups).
 //
 // Per page-formats.md §Compressed Leaf, the restart table sits at the end
-// of the page's content area, immediately before the optional xxhash64
+// of the page's content area, immediately before the optional XXH3-64
 // footer, growing backward from ContentEnd. Each entry is 4 bytes:
 //
 //	+----------+--------+-----------+

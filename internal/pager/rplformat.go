@@ -19,7 +19,7 @@ import (
 //
 // Total per-segment overhead: 24 bytes. The page-header Count field
 // carries the entry count — no separate EntryCount field exists. With
-// PageChecksum enabled, the last 8 bytes of the page are the xxhash64
+// PageChecksum enabled, the last 8 bytes of the page are the XXH3-64
 // footer, costing one entry slot.
 
 // RPL segment field offsets.
@@ -63,7 +63,7 @@ func (s RPLSegment) EntryCount() int { return len(s.PageIDs) }
 // of range, or buf too short for cfg.PageSize). Callers must treat false
 // as corruption.
 //
-// Does NOT verify the xxhash64 footer — every caller that reads
+// Does NOT verify the XXH3-64 footer — every caller that reads
 // segment pages via a raw (non-verifying) accessor must verify the
 // footer itself (VerifyPageFooter, when PageChecksum is enabled)
 // before trusting the decoded view, per checksums.md §Verification.
@@ -89,7 +89,7 @@ func DecodeRPLSegment(buf []byte, cfg page.Config) (RPLSegment, bool) {
 }
 
 // EncodeRPLSegment writes an RPL segment into buf. The caller is
-// responsible for writing the xxhash64 footer (via page.WritePageFooter) when
+// responsible for writing the XXH3-64 footer (via page.WritePageFooter) when
 // PageChecksum is enabled, after EncodeRPLSegment returns. Padding and
 // the unused entry tail (between the last entry and ContentEnd) are
 // zeroed.

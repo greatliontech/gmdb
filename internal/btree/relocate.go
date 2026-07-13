@@ -118,11 +118,34 @@ func relocateNode(pw PageWriter, cfg page.Config, id uint64, shouldRelocate func
 		}
 	}
 
+	// Overflow branch separators own key extents (page-formats.md
+	// §Overflow-Key Cells); relocate eligible runs and record the
+	// pointer fixes alongside the child updates.
+	type extUpdate struct {
+		cell uint16
+		ext  uint64
+	}
+	var extUpdates []extUpdate
+	for i := uint16(0); i < n; i++ {
+		c := page.BranchCellAt(buf, cfg, i)
+		if !c.IsOverflowKey() || !shouldRelocate(c.KeyExtPage) || *budget <= 0 {
+			continue
+		}
+		runLen := keyExtentRunLen(cfg, c.KeyTotalLen)
+		nf, err := relocateOverflowChain(pw, c.KeyExtPage, runLen)
+		if err != nil {
+			return 0, false, err
+		}
+		extUpdates = append(extUpdates, extUpdate{cell: i, ext: nf})
+		*budget -= int(runLen)
+		*moved += int(runLen)
+	}
+
 	eligible := shouldRelocate(id) && *budget > 0
 	// CoW this branch iff it is itself being relocated OR a child moved
-	// (a mandatory pointer fix). The two can co-occur (an eligible branch
-	// whose children also moved); it is at most one CoW regardless.
-	if !eligible && len(updates) == 0 {
+	// OR a separator's key extent moved (mandatory pointer fixes). These
+	// can co-occur; it is at most one CoW regardless.
+	if !eligible && len(updates) == 0 && len(extUpdates) == 0 {
 		return id, false, nil
 	}
 	nid, nbuf, err := relocateVerbatim(pw, id)
@@ -135,6 +158,9 @@ func relocateNode(pw PageWriter, cfg page.Config, id uint64, shouldRelocate func
 		} else {
 			page.SetBranchCellChild(nbuf, cfg, u.slot-1, u.child)
 		}
+	}
+	for _, u := range extUpdates {
+		page.SetBranchCellKeyExtPage(nbuf, cfg, u.cell, u.ext)
 	}
 	if eligible {
 		*budget--
@@ -171,8 +197,20 @@ func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldR
 		return 0, false, err
 	}
 	refsRewritten := false
+	keyExtRewritten := false
 	for k := range entries {
 		e := &entries[k]
+		if e.IsOverflowKey() && shouldRelocate(e.KeyExtPage) && *budget > 0 {
+			runLen := keyExtentRunLen(cfg, e.KeyTotalLen)
+			nf, err := relocateOverflowChain(pw, e.KeyExtPage, runLen)
+			if err != nil {
+				return 0, false, err
+			}
+			e.KeyExtPage = nf
+			*budget -= int(runLen)
+			*moved += int(runLen)
+			keyExtRewritten = true
+		}
 		switch {
 		case e.IsOverflow():
 			if !shouldRelocate(e.OverflowPage) || *budget <= 0 {
@@ -211,7 +249,7 @@ func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldR
 	}
 
 	leafEligible := shouldRelocate(id) && *budget > 0
-	if !refsRewritten && !leafEligible {
+	if !refsRewritten && !keyExtRewritten && !leafEligible {
 		return id, false, nil
 	}
 	nid, err := pw.AllocPage()
@@ -231,6 +269,12 @@ func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldR
 				return entries[i].OverflowPage
 			}
 			return entries[i].NestedRoot
+		})
+	}
+	if keyExtRewritten {
+		// Same in-place discipline for the key-half references.
+		page.NewLeafReader(nbuf, cfg).PatchKeyExtRefs(func(i int, e page.LeafEntry) uint64 {
+			return entries[i].KeyExtPage
 		})
 	}
 	if err := pw.FreePage(id); err != nil {

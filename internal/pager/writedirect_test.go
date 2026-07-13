@@ -54,7 +54,7 @@ func TestWriteDirectPersistsToFile(t *testing.T) {
 	}
 }
 
-// TestWriteDirectWritesChecksumFooter verifies the xxhash64 footer is
+// TestWriteDirectWritesChecksumFooter verifies the XXH3-64 footer is
 // written in place when PageChecksum is enabled, matching commitStep1.
 func TestWriteDirectWritesChecksumFooter(t *testing.T) {
 	p, _, f := setupWriter(t, 16)

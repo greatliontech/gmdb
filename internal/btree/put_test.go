@@ -2,7 +2,6 @@ package btree
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"testing"
 
@@ -726,20 +725,40 @@ func TestPutOverflowReplaceFreesOldChain(t *testing.T) {
 	checkSlabPartition(t, pw, cfg, root)
 }
 
-func TestPutRejectsOversizeKey(t *testing.T) {
-	// Contract: ErrKeyTooLarge fires only on keys too
-	// large for the overflow-reference leaf entry (a small fixed
-	// header per limits.md §Maximum Key Size). At 4 KB pages the
-	// overflow-reference entry overhead is 19 bytes plus the
-	// key; a key > ~4076 bytes can't fit a single-entry leaf.
+func TestPutStoresOverThresholdKey(t *testing.T) {
+	// Contract (limits.md §Maximum Key Size): keys are not bounded by
+	// the page size — a key over the inline threshold takes the
+	// overflow-key cell form (page-formats.md §Overflow-Key Cells)
+	// and round-trips; ErrKeyTooLarge fires only past the uint32
+	// encoding bound.
 	cfg := page.Config{PageSize: 4096}
 	pw := newFakeWriter(t, 4096)
-	// Key larger than any single-entry leaf can hold even with
-	// overflow value reference.
-	bigKey := bytes.Repeat([]byte{'k'}, 5000)
-	_, err := Put(pw, cfg, 0, bigKey, []byte("v"))
-	if !errors.Is(err, ErrKeyTooLarge) {
-		t.Errorf("Put oversize key on empty tree: err = %v, want ErrKeyTooLarge", err)
+	bigKey := bytes.Repeat([]byte{'k'}, 5000) // > InlineThreshold (2014, no checksum)
+	root, err := Put(pw, cfg, 0, bigKey, []byte("v"))
+	if err != nil {
+		t.Fatalf("Put over-threshold key: %v", err)
+	}
+	got, found, err := Get(pw, cfg, root, bigKey)
+	if err != nil || !found || !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("Get over-threshold key: val=%q found=%v err=%v", got, found, err)
+	}
+	// A probe differing only past the inline threshold must miss.
+	miss := bytes.Clone(bigKey)
+	miss[4999] = 'x'
+	if _, found, err := Get(pw, cfg, root, miss); err != nil || found {
+		t.Fatalf("Get tail-divergent probe: found=%v err=%v (want miss)", found, err)
+	}
+}
+
+func TestKeyWithinBoundEncodingLimit(t *testing.T) {
+	// The uint32 encoding bound (limits.md §Maximum Key Size) — probed
+	// via the exported length gate; a real >4 GiB key is impractical
+	// to materialize in a unit test.
+	if !KeyWithinBound(1 << 31) {
+		t.Errorf("KeyWithinBound(2^31) = false, want true")
+	}
+	if KeyWithinBound(1 << 32) {
+		t.Errorf("KeyWithinBound(2^32) = true, want false (uint32 bound)")
 	}
 }
 
@@ -814,6 +833,17 @@ func collectReachable(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, 
 			if !ok {
 				break
 			}
+			if e.IsOverflowKey() {
+				runLen := keyExtentRunLen(cfg, e.KeyTotalLen)
+				for i := range runLen {
+					extID := e.KeyExtPage + uint64(i)
+					if _, seen := out[extID]; seen {
+						t.Errorf("key extent page %d reachable from two entries", extID)
+						continue
+					}
+					out[extID] = struct{}{}
+				}
+			}
 			if !e.IsOverflow() {
 				continue
 			}
@@ -836,6 +866,17 @@ func collectReachable(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, 
 	lm, cells := page.DecodeBranch(buf, cfg)
 	collectReachable(t, pw, cfg, lm, out)
 	for _, c := range cells {
+		if c.IsOverflowKey() {
+			runLen := keyExtentRunLen(cfg, c.KeyTotalLen)
+			for i := range runLen {
+				extID := c.KeyExtPage + uint64(i)
+				if _, seen := out[extID]; seen {
+					t.Errorf("branch key extent page %d reachable twice", extID)
+					continue
+				}
+				out[extID] = struct{}{}
+			}
+		}
 		collectReachable(t, pw, cfg, c.Child, out)
 	}
 }

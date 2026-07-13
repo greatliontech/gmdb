@@ -59,7 +59,7 @@ func TestPageBoundRejectsOutOfFileExtent(t *testing.T) {
 }
 
 // TestPageVerifiesFooter (Inv-RV1): when checksums are enabled, Page
-// verifies the xxhash64 footer on read and returns ErrBadPageChecksum on
+// verifies the XXH3-64 footer on read and returns ErrBadPageChecksum on
 // a mismatch. A zero-filled page's footer (all zeroes) cannot match the
 // hash of its zero content, so it is the simplest corrupt page.
 func TestPageVerifiesFooter(t *testing.T) {

@@ -482,7 +482,7 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	if len(descs) > 0 {
 		db := newBulkBuilder(w, baseCfg)
 		for _, d := range descs {
-			if err := db.add(page.LeafEntry{Key: d.name, Value: d.enc}); err != nil {
+			if err := db.add(page.LeafEntry{Key: d.name, Value: d.enc}, d.name); err != nil {
 				return fmt.Errorf("gmdb: CopyTo(compact) descriptor tree: %w", err)
 			}
 		}
@@ -554,7 +554,7 @@ func rebuildKVTree(w *freshFileWriter, pr btree.PageReader, cfg page.Config, roo
 		if err != nil {
 			return err
 		}
-		return b.add(e)
+		return b.add(e, k)
 	})
 	if err != nil {
 		return 0, err
@@ -591,7 +591,7 @@ func rebuildRegistry(w *freshFileWriter, pr btree.PageReader, cfg page.Config, r
 		if eerr != nil {
 			return fmt.Errorf("index %q re-encode: %w", string(k), eerr)
 		}
-		return b.add(page.LeafEntry{Key: k, Value: nv})
+		return b.add(page.LeafEntry{Key: k, Value: nv}, k)
 	})
 	if err != nil {
 		return 0, err
@@ -619,7 +619,18 @@ func rebuildSetTree(w *freshFileWriter, pr btree.PageReader, cfg page.Config, ro
 		threshold: page.SubpagePromotionThreshold(cfg),
 	}
 	err := btree.WalkLeafEntries(pr, cfg, root, hwm, func(e page.LeafEntry) error {
-		sb.startKey(e.Key)
+		// The raw walk yields resident-only keys for overflow-key
+		// outer entries; the rebuild re-accumulates by FULL key or the
+		// rebuilt set keys would be silently truncated.
+		outerKey := e.Key
+		if e.IsOverflowKey() {
+			full, kerr := btree.MaterializeEntryKey(pr, cfg, e)
+			if kerr != nil {
+				return kerr
+			}
+			outerKey = full
+		}
+		sb.startKey(outerKey)
 		switch {
 		case e.IsSubpage():
 			if len(e.Value) < page.SubpageHeaderSize {

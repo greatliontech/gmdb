@@ -40,8 +40,17 @@ type LeafBuilder struct {
 	ucOffsetsBuf [512]uint16
 
 	// Debug: previous key for sort-order assertion (shared across
-	// modes). Initialized lazily.
+	// modes). Initialized lazily. lastWasOvk records whether the
+	// previous entry was overflow-key (resident-prefix equality is
+	// then legal between overflow-key neighbors).
 	lastAddedKey []byte
+	lastWasOvk   bool
+
+	// forceRestart forces the next compressed entry to open a new
+	// restart group: set after writing an overflow-key entry so its
+	// group stays a singleton (page-formats.md §Overflow-Key Cells,
+	// restart-group rule).
+	forceRestart bool
 }
 
 // NewLeafBuilder initializes a builder writing into buf. Caller must
@@ -66,6 +75,8 @@ func (b *LeafBuilder) Reset(buf []byte, cfg Config) {
 	b.compressed = cfg.EffectiveRestartGroupTarget() != 1
 	b.dataPos = leafEntryStart
 	b.lastAddedKey = nil
+	b.lastWasOvk = false
+	b.forceRestart = false
 	if b.compressed {
 		b.rgt.init()
 		b.prevKey = b.prevKeyBuf[:0]
@@ -79,14 +90,14 @@ func (b *LeafBuilder) Reset(buf []byte, cfg Config) {
 // finish + start a new page). Panics on out-of-order key (debug
 // assertion — pre-sorting is the caller's responsibility).
 func (b *LeafBuilder) AddInline(key, value []byte) bool {
-	return b.addEntry(key, 0, value, 0, 0)
+	return b.addEntry(key, 0, value, 0, 0, 0, 0)
 }
 
 // AddOverflow appends an overflow-reference entry. ovflPage is the first
 // page ID of the overflow run; totalLen is the assembled value size.
 // Returns false on page-full.
 func (b *LeafBuilder) AddOverflow(key []byte, ovflPage, totalLen uint64) bool {
-	return b.addEntry(key, CellFlagOverflow, nil, ovflPage, totalLen)
+	return b.addEntry(key, CellFlagOverflow, nil, ovflPage, totalLen, 0, 0)
 }
 
 // AddSubpage appends a SetKeyspace subpage cell (CellFlagMultiValue
@@ -105,7 +116,7 @@ func (b *LeafBuilder) AddOverflow(key []byte, ovflPage, totalLen uint64) bool {
 // layer's responsibility — this builder does not enforce it and will
 // happily build a leaf containing an over-threshold subpage if asked.
 func (b *LeafBuilder) AddSubpage(key, subpage []byte) bool {
-	return b.addEntry(key, CellFlagMultiValue, subpage, 0, 0)
+	return b.addEntry(key, CellFlagMultiValue, subpage, 0, 0, 0, 0)
 }
 
 // AddNestedTreeRef appends a SetKeyspace nested-B+tree reference cell
@@ -125,7 +136,7 @@ func (b *LeafBuilder) AddSubpage(key, subpage []byte) bool {
 // reachable from Root) is the SetKeyspace surface's responsibility;
 // the builder writes whatever (root, count) the caller supplies.
 func (b *LeafBuilder) AddNestedTreeRef(key []byte, root, count uint64) bool {
-	return b.addEntry(key, CellFlagMultiValue|CellFlagNestedTree, nil, root, count)
+	return b.addEntry(key, CellFlagMultiValue|CellFlagNestedTree, nil, root, count, 0, 0)
 }
 
 // AddEntry dispatches by e.Flags. Convenience for callers that
@@ -151,34 +162,47 @@ func (b *LeafBuilder) AddEntry(e LeafEntry) bool {
 	case e.Flags&CellFlagOverflow != 0 && e.Flags&CellFlagMultiValue != 0:
 		panic(fmt.Sprintf("page: LeafBuilder.AddEntry on CellFlagOverflow|CellFlagMultiValue cell (flags=0x%x) — these bits are mutually exclusive per page-formats.md §Leaf Page (CellFlags bit layout)", e.Flags))
 	case e.Flags&CellFlagOverflow != 0:
-		return b.AddOverflow(e.Key, e.OverflowPage, e.TotalLen)
+		return b.addEntry(e.Key, e.Flags, nil, e.OverflowPage, e.TotalLen, e.KeyExtPage, e.KeyTotalLen)
 	case e.IsNestedTree():
-		return b.AddNestedTreeRef(e.Key, e.NestedRoot, e.NestedCount)
-	case e.IsSubpage():
-		return b.AddSubpage(e.Key, e.Value)
+		return b.addEntry(e.Key, e.Flags, nil, e.NestedRoot, e.NestedCount, e.KeyExtPage, e.KeyTotalLen)
 	default:
-		return b.AddInline(e.Key, e.Value)
+		// Subpage and plain inline share the inline wire form; the
+		// flags pass through so subpage cells (and the OverflowKey
+		// bit on any form) survive rebuilds without demotion.
+		return b.addEntry(e.Key, e.Flags, e.Value, 0, 0, e.KeyExtPage, e.KeyTotalLen)
 	}
 }
 
-func (b *LeafBuilder) addEntry(key []byte, flags uint8, value []byte, ovflPage, totalLen uint64) bool {
+func (b *LeafBuilder) addEntry(key []byte, flags uint8, value []byte, ovflPage, totalLen uint64, keyExtPage uint64, keyTotalLen uint32) bool {
 	if flags&^cellFlagKnownMask != 0 {
 		panic(fmt.Sprintf("page: LeafBuilder.AddEntry unknown CellFlags bits 0x%x", flags&^cellFlagKnownMask))
 	}
-	if b.lastAddedKey != nil && bytes.Compare(b.lastAddedKey, key) >= 0 {
-		panic(fmt.Sprintf("page: LeafBuilder keys out of order — last %q, next %q", b.lastAddedKey, key))
+	ovk := flags&CellFlagOverflowKey != 0
+	if b.lastAddedKey != nil {
+		// Ordering assertion over the bytes the builder can see. For
+		// overflow-key entries `key` is the RESIDENT first-T prefix;
+		// two overflow-key entries may legitimately share it (their
+		// order lives in the extents, which the builder cannot read),
+		// so equality is tolerated exactly when both neighbors are
+		// overflow-key — every other equality or inversion is a
+		// caller bug.
+		c := bytes.Compare(b.lastAddedKey, key)
+		if c > 0 || (c == 0 && !(ovk && b.lastWasOvk)) {
+			panic(fmt.Sprintf("page: LeafBuilder keys out of order — last %q, next %q", b.lastAddedKey, key))
+		}
 	}
 	var ok bool
 	if !b.compressed {
-		ok = b.addUCEntry(key, flags, value, ovflPage, totalLen)
+		ok = b.addUCEntry(key, flags, value, ovflPage, totalLen, keyExtPage, keyTotalLen)
 	} else {
-		ok = b.addCompressedEntry(key, flags, value, ovflPage, totalLen)
+		ok = b.addCompressedEntry(key, flags, value, ovflPage, totalLen, keyExtPage, keyTotalLen)
 	}
 	if ok {
 		// Stash the key we just wrote for the next ordering check.
 		// Borrow the on-page bytes — they live for the builder's
 		// lifetime and don't get re-encoded later.
 		b.lastAddedKey = key
+		b.lastWasOvk = ovk
 	}
 	return ok
 }
@@ -186,13 +210,13 @@ func (b *LeafBuilder) addEntry(key []byte, flags uint8, value []byte, ovflPage, 
 // addUCEntry writes an uncompressed entry via the shared writeFullKeyEntry encoder
 // (single source of truth for the uncompressed byte layout, shared with the
 // uncompressed in-place splice helpers).
-func (b *LeafBuilder) addUCEntry(key []byte, flags uint8, value []byte, ovflPage, totalLen uint64) bool {
-	entrySize := 1 + 2 + len(key) + valuePartSize(flags, value)
+func (b *LeafBuilder) addUCEntry(key []byte, flags uint8, value []byte, ovflPage, totalLen uint64, keyExtPage uint64, keyTotalLen uint32) bool {
+	entrySize := 1 + keyPartSize(flags, key) + valuePartSize(flags, value)
 	newTableSize := (b.count + 1) * ucOffsetEntrySize
 	if b.dataPos+entrySize+newTableSize > b.cfg.ContentEnd() {
 		return false
 	}
-	newPos := writeFullKeyEntry(b.buf, b.dataPos, flags, key, value, ovflPage, totalLen)
+	newPos := writeFullKeyEntry(b.buf, b.dataPos, flags, key, value, ovflPage, totalLen, keyExtPage, keyTotalLen)
 	b.ucOffsets = append(b.ucOffsets, uint16(b.dataPos))
 	b.dataPos = newPos
 	b.count++
@@ -213,31 +237,42 @@ func (b *LeafBuilder) addUCEntry(key []byte, flags uint8, value []byte, ovflPage
 // The ONE encoder for both variants, shared by LeafBuilder and the
 // in-place splice helpers; do not duplicate the layout. (Only DELTA
 // entries have a distinct layout — writeDeltaEntry.)
-func writeFullKeyEntry(buf []byte, off int, flags uint8, key, value []byte, ovflPage, totalLen uint64) int {
+func writeFullKeyEntry(buf []byte, off int, flags uint8, key, value []byte, ovflPage, totalLen uint64, keyExtPage uint64, keyTotalLen uint32) int {
 	flags = effectiveCellFlags(flags, value)
 	buf[off] = flags
 	off++
 	le.PutUint16(buf[off:], uint16(len(key)))
 	off += 2
-	if cellHasTrailerOnly(flags) {
-		copy(buf[off:], key)
-		off += len(key)
+	// ValueLen (inline / subpage forms) precedes the key bytes — the
+	// decode-speed field ordering. The key half then ends with the
+	// 12-byte key-extent reference for overflow-key cells
+	// (page-formats.md §Overflow-Key Cells); the value half follows
+	// unchanged in form.
+	hasValueLen := !cellHasTrailerOnly(flags) && flags&CellFlagEmptyValue == 0
+	if hasValueLen {
+		le.PutUint32(buf[off:], uint32(len(value)))
+		off += 4
+	}
+	copy(buf[off:], key)
+	off += len(key)
+	if flags&CellFlagOverflowKey != 0 {
+		le.PutUint64(buf[off:], keyExtPage)
+		off += 8
+		le.PutUint32(buf[off:], keyTotalLen)
+		off += 4
+	}
+	switch {
+	case cellHasTrailerOnly(flags):
 		le.PutUint64(buf[off:], ovflPage)
 		off += 8
 		le.PutUint64(buf[off:], totalLen)
 		off += 8
-		return off
+	case flags&CellFlagEmptyValue != 0:
+		// no value half
+	default:
+		copy(buf[off:], value)
+		off += len(value)
 	}
-	if flags&CellFlagEmptyValue != 0 {
-		copy(buf[off:], key)
-		return off + len(key)
-	}
-	le.PutUint32(buf[off:], uint32(len(value)))
-	off += 4
-	copy(buf[off:], key)
-	off += len(key)
-	copy(buf[off:], value)
-	off += len(value)
 	return off
 }
 
@@ -248,13 +283,19 @@ func writeFullKeyEntry(buf []byte, off int, flags uint8, key, value []byte, ovfl
 // group early so the delta-header overhead doesn't accrue on entries
 // that gain nothing from sharing. This is the "natural break" policy
 // described in page-formats.md §Compressed Leaf.
-func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, ovflPage, totalLen uint64) bool {
+func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, ovflPage, totalLen uint64, keyExtPage uint64, keyTotalLen uint32) bool {
 	target := int(b.cfg.EffectiveRestartGroupTarget())
+	ovk := flags&CellFlagOverflowKey != 0
 
-	// Decide if this entry must start a new group.
+	// Decide if this entry must start a new group. Overflow-key
+	// entries are ALWAYS restart entries in singleton groups
+	// (page-formats.md §Overflow-Key Cells): the entry itself forces
+	// a restart, and forceRestart (set below) makes the FOLLOWING
+	// entry restart too, so no delta ever chains through an
+	// extent-resident key.
 	atTarget := b.rgt.IsRestart(b.count, target)
 	naturalBreak := false
-	if !atTarget && b.count > 0 && b.rgt.CurGroupCount() > 0 {
+	if !atTarget && !ovk && !b.forceRestart && b.count > 0 && b.rgt.CurGroupCount() > 0 {
 		// Compute SharedLen against the previous key cheaply. If
 		// it's zero, force a new group (avoid spending 2 extra
 		// bytes per delta entry on no-shared-prefix keys when we
@@ -263,7 +304,7 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 			naturalBreak = true
 		}
 	}
-	isRestart := atTarget || naturalBreak
+	isRestart := atTarget || naturalBreak || ovk || b.forceRestart
 
 	// Finalize the in-progress group before opening a new one.
 	if isRestart && b.rgt.CurGroupCount() > 0 {
@@ -280,7 +321,7 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 	// Compute the entry's on-page size.
 	headerSize := 1 // CellFlags
 	if isRestart {
-		headerSize += 2 + len(key) // KeyLen + Key
+		headerSize += keyPartSize(flags, key) // KeyLen + Key (+ key-extent ref)
 	} else {
 		headerSize += 2 + 2 + len(unsharedKey) // SharedLen + UnsharedLen + UnsharedKey
 	}
@@ -308,7 +349,7 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 	// §Leaf Split deterministic-encoding invariant).
 	var off int
 	if isRestart {
-		off = writeFullKeyEntry(b.buf, b.dataPos, flags, key, value, ovflPage, totalLen)
+		off = writeFullKeyEntry(b.buf, b.dataPos, flags, key, value, ovflPage, totalLen, keyExtPage, keyTotalLen)
 	} else {
 		off = writeCompressedDeltaEntry(b.buf, b.dataPos, flags, sharedLen, unsharedKey, value, ovflPage, totalLen)
 	}
@@ -317,6 +358,9 @@ func (b *LeafBuilder) addCompressedEntry(key []byte, flags uint8, value []byte, 
 	b.prevKey = append(b.prevKey[:0], key...)
 	b.count++
 	b.rgt.IncrCount()
+	// Seal the singleton: the next entry must open a fresh group so
+	// it never deltas against this entry's resident-prefix key.
+	b.forceRestart = ovk
 	return true
 }
 
@@ -412,8 +456,10 @@ func (b *LeafBuilder) FreeSpace() int {
 // size projection, so a projected size always matches the bytes
 // written. Flagged cells (trailer, subpage) keep their own forms.
 func effectiveCellFlags(flags uint8, value []byte) uint8 {
-	if flags == 0 && len(value) == 0 {
-		return CellFlagEmptyValue
+	if flags&^CellFlagOverflowKey == 0 && len(value) == 0 {
+		// Plain inline cell (with or without the key-half OverflowKey
+		// bit) and an empty value → compact empty-value form.
+		return flags | CellFlagEmptyValue
 	}
 	if flags&CellFlagEmptyValue != 0 && len(value) != 0 {
 		// Writing value bytes under the no-value-half form would drop
@@ -438,6 +484,19 @@ func valuePartSize(flags uint8, value []byte) int {
 		return 0
 	}
 	return 4 + len(value) // ValueLen uint32 + value bytes
+}
+
+// keyPartSize returns the on-page byte size of a full-key entry's key
+// half past the CellFlags byte: KeyLen(u16) + key bytes, plus the
+// 12-byte key-extent reference for overflow-key cells (page-formats.md
+// §Overflow-Key Cells). Delta entries have their own key-half math and
+// never carry an overflow key.
+func keyPartSize(flags uint8, key []byte) int {
+	n := 2 + len(key)
+	if flags&CellFlagOverflowKey != 0 {
+		n += 12
+	}
+	return n
 }
 
 // zeroFreeSpace clears bytes in [lo, hi). Mirrors the

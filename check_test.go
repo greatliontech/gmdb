@@ -173,7 +173,7 @@ func TestCheckDetectsBadChecksum(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Flip a byte in the root page's xxhash64 footer (last 8 bytes), so
+	// Flip a byte in the root page's XXH3-64 footer (last 8 bytes), so
 	// the page structure still validates but the checksum no longer
 	// matches — isolating a BadPageChecksum from a structural error.
 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)

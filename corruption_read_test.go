@@ -46,7 +46,7 @@ func TestGetBitrotReturnsBadPageChecksum(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Flip a byte in the root page's xxhash64 footer (last 8 bytes): the
+	// Flip a byte in the root page's XXH3-64 footer (last 8 bytes): the
 	// page structure still validates but the checksum no longer matches.
 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
@@ -161,7 +161,7 @@ func TestGetForgedOutOfRangeChildNoCrash(t *testing.T) {
 }
 
 // corruptRootChecksumDB builds a checksummed DB with a multi-level
-// keyspace "k", flips a byte in the data-tree root page's xxhash64
+// keyspace "k", flips a byte in the data-tree root page's XXH3-64
 // footer, and returns the path to the closed, corrupted file.
 func corruptRootChecksumDB(t *testing.T, ctx context.Context) string {
 	t.Helper()

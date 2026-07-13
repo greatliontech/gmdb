@@ -84,11 +84,51 @@ func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.
 
 	// Separator: leftLast < sep <= rightFirst. rightFirst is the original
 	// boundary entry (the appended e is the right's LAST key, not its first).
-	// ShortestSeparator returns a fresh slice, so neither key is retained.
+	// Boundary entries may be overflow-key cells whose resident bytes tie —
+	// shortestSeparatorEntries materializes their extents only on that tie.
 	leftLast, _ := page.NewLeafReader(leftBuf, cfg).EntryAt(leftCount-1, nil)
 	firstRight, _ := page.NewLeafReader(rightBuf, cfg).EntryAt(0, nil)
-	sep = page.ShortestSeparator(leftLast.Key, firstRight.Key)
+	sep, err = shortestSeparatorEntries(pw, cfg, leftLast, firstRight)
+	if err != nil {
+		// rightID is not returned on the error path — free it here;
+		// the caller's error path frees leftID.
+		_ = pw.FreePage(rightID)
+		return nil, 0, false, err
+	}
 	return sep, rightID, true, nil
+}
+
+// shortestSeparatorEntries computes the shortest separator between two
+// adjacent leaf entries over their FULL keys. The common case decides
+// from resident bytes alone (the divergence lands within them); only a
+// full resident tie — overflow-key neighbors sharing their first-T
+// bytes, or a resident that is a strict prefix of the other's — forces
+// key-extent materialization.
+func shortestSeparatorEntries(pr PageReader, cfg page.Config, left, right page.LeafEntry) ([]byte, error) {
+	lk, rk := left.Key, right.Key
+	n := min(len(lk), len(rk))
+	for i := range n {
+		if lk[i] != rk[i] {
+			// Divergence within resident bytes: sep = right[:i+1] is
+			// valid against the FULL keys too (rk is a prefix of
+			// right's full key; left's full key still diverges at i).
+			sep := make([]byte, i+1)
+			copy(sep, rk[:i+1])
+			return sep, nil
+		}
+	}
+	if !left.IsOverflowKey() && !right.IsOverflowKey() {
+		return page.ShortestSeparator(lk, rk), nil
+	}
+	fl, err := materializeEntryKey(pr, cfg, left)
+	if err != nil {
+		return nil, err
+	}
+	fr, err := materializeEntryKey(pr, cfg, right)
+	if err != nil {
+		return nil, err
+	}
+	return page.ShortestSeparator(fl, fr), nil
 }
 
 // findLeafSplitIndex chooses the boundary at which an overflowing leaf's
@@ -205,7 +245,7 @@ func leafEntriesFit(b *page.LeafBuilder, scratch []byte, cfg page.Config, es []p
 func largestInlineEntry(entries []page.LeafEntry) int {
 	best, bestLen := -1, -1
 	for i := range entries {
-		if entries[i].Flags != 0 {
+		if entries[i].Flags&^page.CellFlagOverflowKey != 0 {
 			continue
 		}
 		if len(entries[i].Value) > bestLen {

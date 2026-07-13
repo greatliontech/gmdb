@@ -3,13 +3,13 @@ package indexing
 import (
 	"encoding/binary"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/zeebo/xxh3"
 )
 
 // SchemaHash computes the deterministic schema-hash for an index
 // declaration per indexing.md §Drift Guard:
 //
-//	xxhash64(
+//	XXH3-64(
 //	  uvarint(len(name)) || name ||
 //	  uvarint(len(columns)) || for each col: uvarint(len(col)) || col ||
 //	  uvarint(len(covering)) || for each col: uvarint(len(col)) || col ||
@@ -42,7 +42,7 @@ import (
 // under an unchanged shape must fail the guard, or stored entries
 // would be read under the wrong kind's semantics.
 func SchemaHash(name string, columns, covering []string, unique bool, kind Kind, kindParams []byte) uint64 {
-	h := xxhash.New()
+	h := xxh3.New()
 	var buf [binary.MaxVarintLen64]byte
 	writeLenPrefixedString(h, buf[:], name)
 
@@ -75,7 +75,7 @@ func SchemaHash(name string, columns, covering []string, unique bool, kind Kind,
 
 // writeLenPrefixedString writes uvarint(len(s)) || s to h. Reusable
 // buf must have capacity binary.MaxVarintLen64.
-func writeLenPrefixedString(h *xxhash.Digest, buf []byte, s string) {
+func writeLenPrefixedString(h *xxh3.Hasher, buf []byte, s string) {
 	n := binary.PutUvarint(buf, uint64(len(s)))
 	_, _ = h.Write(buf[:n])
 	_, _ = h.Write([]byte(s))

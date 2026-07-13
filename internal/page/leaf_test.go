@@ -56,7 +56,7 @@ func TestLeafReader_Compressed_RoundTrip(t *testing.T) {
 
 	// Every key must be findable; every value must round-trip.
 	for i, e := range entries {
-		idx, ent, found := r.SearchLeaf([]byte(e[0]))
+		idx, ent, found, _ := r.SearchLeaf([]byte(e[0]), NoExtentTail)
 		if !found {
 			t.Errorf("SearchLeaf(%q): not found", e[0])
 			continue
@@ -71,7 +71,7 @@ func TestLeafReader_Compressed_RoundTrip(t *testing.T) {
 
 	// Misses on either side and gaps.
 	for _, miss := range []string{"", "aa", "carrot", "elderberryX", "zzzzz"} {
-		_, _, found := r.SearchLeaf([]byte(miss))
+		_, _, found, _ := r.SearchLeaf([]byte(miss), NoExtentTail)
 		if found {
 			t.Errorf("SearchLeaf(%q): unexpectedly found", miss)
 		}
@@ -105,7 +105,7 @@ func TestLeafReader_Uncompressed_RoundTrip(t *testing.T) {
 	}
 
 	for _, e := range sorted {
-		_, ent, found := r.SearchLeaf([]byte(e[0]))
+		_, ent, found, _ := r.SearchLeaf([]byte(e[0]), NoExtentTail)
 		if !found {
 			t.Errorf("SearchLeaf(%q): not found", e[0])
 			continue
@@ -115,7 +115,7 @@ func TestLeafReader_Uncompressed_RoundTrip(t *testing.T) {
 		}
 	}
 	for _, miss := range []string{"", "alphabet", "z"} {
-		_, _, found := r.SearchLeaf([]byte(miss))
+		_, _, found, _ := r.SearchLeaf([]byte(miss), NoExtentTail)
 		if found {
 			t.Errorf("SearchLeaf(%q): unexpectedly found", miss)
 		}
@@ -144,7 +144,7 @@ func TestLeafBuilder_NaturalBreakStartsNewGroup(t *testing.T) {
 	}
 	// All keys still findable.
 	for _, e := range entries {
-		_, _, found := r.SearchLeaf([]byte(e[0]))
+		_, _, found, _ := r.SearchLeaf([]byte(e[0]), NoExtentTail)
 		if !found {
 			t.Errorf("SearchLeaf(%q): not found", e[0])
 		}
@@ -310,7 +310,7 @@ func TestSearchLeafIter_ExactMatch_Compressed(t *testing.T) {
 	r := NewLeafReader(buf, cfg)
 
 	for i, e := range entries {
-		idx, ent, found, it := r.SearchLeafIter([]byte(e[0]), nil, nil, nil)
+		idx, ent, found, it, _ := r.SearchLeafIter([]byte(e[0]), nil, nil, nil, NoExtentTail)
 		if !found {
 			t.Errorf("SearchLeafIter(%q): not found", e[0])
 			continue
@@ -350,7 +350,7 @@ func TestSearchLeafIter_Successor_Compressed(t *testing.T) {
 	r := NewLeafReader(buf, cfg)
 	for i := range entries {
 		target := fmt.Sprintf("k-%03d", i*2+1) // between entries[i] and entries[i+1]
-		idx, ent, found, _ := r.SearchLeafIter([]byte(target), nil, nil, nil)
+		idx, ent, found, _, _ := r.SearchLeafIter([]byte(target), nil, nil, nil, NoExtentTail)
 		if found {
 			t.Errorf("SearchLeafIter(%q): unexpectedly found", target)
 			continue
@@ -378,7 +378,7 @@ func TestSearchLeafIter_Empty(t *testing.T) {
 	b := NewLeafBuilder(buf, cfg)
 	b.Finish()
 	r := NewLeafReader(buf, cfg)
-	idx, _, found, _ := r.SearchLeafIter([]byte("k"), nil, nil, nil)
+	idx, _, found, _, _ := r.SearchLeafIter([]byte("k"), nil, nil, nil, NoExtentTail)
 	if found || idx != 0 {
 		t.Errorf("SearchLeafIter on empty: idx=%d found=%v want=(0,false)", idx, found)
 	}
@@ -398,7 +398,7 @@ func TestLeafBuilder_OverflowEntry_Compressed(t *testing.T) {
 	b.Finish()
 
 	r := NewLeafReader(buf, cfg)
-	_, ent, found := r.SearchLeaf([]byte("b-big"))
+	_, ent, found, _ := r.SearchLeaf([]byte("b-big"), NoExtentTail)
 	if !found {
 		t.Fatal("SearchLeaf(b-big): not found")
 	}
@@ -917,7 +917,7 @@ func FuzzLeafValidateTotal(f *testing.F) {
 			// Every accepted entry's key must be searchable
 			// without panicking (found or not — ordering is not
 			// Validate's contract, totality is).
-			r.SearchLeaf(e.Key)
+			r.SearchLeaf(e.Key, NoExtentTail)
 		}
 	})
 }

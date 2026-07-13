@@ -63,7 +63,7 @@ var (
 	// layout). Wraps a more specific sub-error where possible.
 	ErrCorrupted = errors.New("gmdb: database is corrupted")
 
-	// ErrBadPageChecksum is returned when the xxhash64 footer on a
+	// ErrBadPageChecksum is returned when the XXH3-64 footer on a
 	// data page does not match the page content. Wraps with the
 	// page ID where useful.
 	ErrBadPageChecksum = errors.New("gmdb: page checksum mismatch")

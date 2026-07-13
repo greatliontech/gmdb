@@ -93,7 +93,7 @@ func TestBranchSearchDescendIndex(t *testing.T) {
 		{"k", 30}, {"l", 30}, {"z", 30},
 	}
 	for _, c := range cases {
-		idx := BranchSearch(buf, cfg, []byte(c.target))
+		idx, _ := BranchSearch(buf, cfg, []byte(c.target), NoExtentTail)
 		got := BranchChildAt(buf, cfg, idx)
 		if got != c.want {
 			t.Errorf("search %q: idx=%d child=%d, want child=%d", c.target, idx, got, c.want)

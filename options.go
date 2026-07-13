@@ -97,7 +97,7 @@ type Options struct {
 	// power of two in [4 KB, 64 KB]. Default 4096.
 	PageSize uint32
 
-	// DisablePageChecksum turns OFF the xxhash64 page-footer that is
+	// DisablePageChecksum turns OFF the XXH3-64 page-footer that is
 	// otherwise written and verified on every data page. Set at
 	// creation, immutable for the life of the file. The zero value
 	// (false) leaves checksums ENABLED — the spec default (see

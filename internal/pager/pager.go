@@ -58,7 +58,7 @@ var (
 	// gmdb.ErrVersionMismatch.
 	ErrVersionMismatch = errors.New("pager: on-disk format version mismatch")
 
-	// ErrBadPageChecksum is returned by Page when a data page's xxhash64
+	// ErrBadPageChecksum is returned by Page when a data page's XXH3-64
 	// footer does not match its content (checksums.md §Verification). Distinct from ErrCorrupted: a checksum mismatch is silent
 	// bitrot on a structurally-plausible page, whereas ErrCorrupted is a
 	// structural-layout violation. mapPagerErr translates this into
@@ -253,7 +253,7 @@ type Pager struct {
 	savepointUndoLog []savepointUndoEntry
 
 	// verified is the per-transaction checksum-verification cache
-	// (checksums.md §Verification): a mmap page whose xxhash64
+	// (checksums.md §Verification): a mmap page whose XXH3-64
 	// footer has been verified once in this tx is recorded here and not
 	// re-verified on subsequent accesses within the tx. A compact
 	// []uint64 bitset indexed by page id, lazily allocated on the first
@@ -1091,7 +1091,7 @@ func (p *Pager) AdviseColdAccessed() error {
 //     ErrCorrupted instead of a SIGBUS on the unbacked MaxSize
 //     reservation. (A dirty slab buffer lives in process memory and is
 //     this-tx content, so it is returned without bound or verification.)
-//   - Checksum verification (checksums.md §Verification): when checksums are enabled, the xxhash64 footer is
+//   - Checksum verification (checksums.md §Verification): when checksums are enabled, the XXH3-64 footer is
 //     verified on the page's first mmap access within the transaction
 //     and the id recorded in p.verified so subsequent accesses skip the
 //     re-hash; a mismatch yields ErrBadPageChecksum.
@@ -1307,7 +1307,7 @@ func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
 //     reference a page with the wrong bytes. The two write paths are
 //     mutually exclusive per page.
 //
-// On PageChecksum, WriteDirect writes the xxhash64 footer into the last
+// On PageChecksum, WriteDirect writes the XXH3-64 footer into the last
 // FooterSize bytes of buf in place — identical to commitStep1 — before
 // the pwrite, so a subsequent checksum-verified read of id succeeds.
 // The caller may reuse buf after WriteDirect returns.

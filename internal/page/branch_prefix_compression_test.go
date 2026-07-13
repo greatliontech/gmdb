@@ -181,7 +181,7 @@ func TestBranchSearchEquivalence(t *testing.T) {
 			}
 
 			for _, tg := range targets {
-				got := BranchSearch(buf, cfg, tg)
+				got, _ := BranchSearch(buf, cfg, tg, NoExtentTail)
 				want := refBranchSearch(cells, tg)
 				if got != want {
 					t.Fatalf("prefix#%d n=%d: BranchSearch(%q) = %d, want %d (cells=%d, P=%d)",

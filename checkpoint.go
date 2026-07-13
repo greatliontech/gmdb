@@ -39,7 +39,7 @@ var checkpointStepHookForTest atomic.Pointer[func(step int) error]
 //  2. fdatasync the file to flush prior pwrites from the OS page
 //     cache.
 //  3. Read the active meta, bump its durable sub-record to its own
-//     live state, recompute xxhash64, pwrite back to the same slot.
+//     live state, recompute XXH3-64, pwrite back to the same slot.
 //     The TxnID is unchanged — Checkpoint records that the
 //     already-committed state is durable, not a new transaction.
 //  4. fdatasync again so the sub-record bump reaches stable storage.
@@ -146,7 +146,7 @@ func (db *DB) checkpointUnderGrant() error {
 	// no-forward-promise), recompute the checksum, pwrite back to the
 	// SAME slot. The single-meta-slot pwrite is atomic within one page
 	// per durability.md (an unaligned tear cannot affect a single
-	// contiguous sub-page region, and the xxhash64 checksum catches
+	// contiguous sub-page region, and the XXH3-64 checksum catches
 	// partial writes — recovery falls back to the other slot).
 	if meta.SelfDurable() {
 		// Already at its own durable epoch — step 2's fdatasync is

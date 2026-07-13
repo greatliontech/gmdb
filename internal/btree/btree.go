@@ -108,7 +108,10 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 			if err := validateBranchPage(buf, cfg, cur); err != nil {
 				return nil, false, err
 			}
-			i := page.BranchSearch(buf, cfg, key)
+			i, err := page.BranchSearch(buf, cfg, key, keyTail(pr, cfg))
+			if err != nil {
+				return nil, false, err
+			}
 			next := page.BranchChildAt(buf, cfg, i)
 			if next == 0 {
 				return nil, false, fmt.Errorf("%w: null child pointer in branch page %d at descent index %d",
@@ -120,7 +123,10 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 			if err := r.Validate(); err != nil {
 				return nil, false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
 			}
-			_, entry, found := r.SearchLeaf(key)
+			_, entry, found, err := r.SearchLeaf(key, keyTail(pr, cfg))
+			if err != nil {
+				return nil, false, err
+			}
 			if !found {
 				return nil, false, nil
 			}
@@ -165,7 +171,10 @@ func Has(pr PageReader, cfg page.Config, rootID uint64, key []byte) (bool, error
 			if err := validateBranchPage(buf, cfg, cur); err != nil {
 				return false, err
 			}
-			i := page.BranchSearch(buf, cfg, key)
+			i, err := page.BranchSearch(buf, cfg, key, keyTail(pr, cfg))
+			if err != nil {
+				return false, err
+			}
 			next := page.BranchChildAt(buf, cfg, i)
 			if next == 0 {
 				return false, fmt.Errorf("%w: null child pointer in branch page %d at descent index %d",
@@ -177,8 +186,8 @@ func Has(pr PageReader, cfg page.Config, rootID uint64, key []byte) (bool, error
 			if err := r.Validate(); err != nil {
 				return false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, cur, err)
 			}
-			_, _, found := r.SearchLeaf(key)
-			return found, nil
+			_, _, found, err := r.SearchLeaf(key, keyTail(pr, cfg))
+			return found, err
 		default:
 			return false, fmt.Errorf("%w: page %d has unexpected type %d (expected branch=%d or leaf=%d/%d)",
 				ErrCorrupted, cur, typ, page.TypeBranch, page.TypeLeaf, page.TypeLeafUncompressed)

@@ -151,7 +151,7 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 	db.maintCompact(ctx)
 }
 
-// maintScrubChecksums verifies the xxhash64 footers of a bounded batch of
+// maintScrubChecksums verifies the XXH3-64 footers of a bounded batch of
 // allocated data pages, advancing a persistent cursor across passes
 // (background-maintenance.md §Checksum Scrubbing). Its purpose is to catch
 // silent bitrot proactively — before a user transaction reads the page and
@@ -165,7 +165,7 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 // Footer-bearing gate: only pages the engine guarantees carry a footer are
 // verified — allocated pages (the snapshot bitmap's bit is clear) in
 // [firstData, hwm). The meta/bitmap region (< firstData) carries no
-// xxhash64 footer (checksums.md §Storage), and a free page holds no valid
+// XXH3-64 footer (checksums.md §Storage), and a free page holds no valid
 // footer; verifying either would emit a spurious BadPageChecksum per page
 // on any non-full database, flooding the log and burying real bitrot.
 //

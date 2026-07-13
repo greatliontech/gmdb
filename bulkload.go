@@ -48,6 +48,11 @@ func bulkMapEntryTooLarge(err error) error {
 // touch the slab.
 type bulkPageWriter interface {
 	AllocPage() (uint64, error)
+	// AllocContiguous serves the branch builder's overflow-separator
+	// key extents (page-formats.md §Overflow-Key Cells) in addition
+	// to bulkOverflowWriter's value runs; both concrete writers (the
+	// live pager and CopyTo's fresh-file writer) provide it.
+	AllocContiguous(n uint32) (uint64, error)
 	WriteDirect(id uint64, buf []byte) error
 }
 
@@ -95,6 +100,7 @@ type bulkBranchLevel struct {
 	cells     []page.BranchCell // (separator, child) for non-leftmost children
 	sep       []byte            // separator routing to the in-progress page in its parent (nil = first page at this level)
 	keyLenSum int               // Σ len(cell.Key) of the in-progress page's cells (for non-additive size tracking)
+	extRefs   int               // count of overflow (key-extent-bearing) cells in the in-progress page
 	closedAny bool              // a page at this level was already closed+propagated (⇒ >1 page exists here)
 }
 
@@ -113,22 +119,33 @@ func newBulkBuilder(pw bulkPageWriter, cfg page.Config) *bulkBuilder {
 // the LeafBuilder's order precondition as an error rather than a panic).
 // The entry's flags decide its leaf encoding (inline / overflow-ref /
 // subpage / nested-tree), all opaque to the builder.
-func (b *bulkBuilder) add(e page.LeafEntry) error {
-	if b.leafLast != nil && bytes.Compare(b.leafLast, e.Key) >= 0 {
+// add appends e to the in-progress leaf. fullKey is e's FULL key —
+// identical to e.Key for inline entries; the complete (resident +
+// extent) key for overflow-key entries, whose e.Key holds only the
+// resident first-T slice (page-formats.md §Overflow-Key Cells). The
+// ordering check and the separator computation both run over full
+// keys: resident slices can tie between distinct overflow keys, which
+// would trip the ascending check spuriously and — worse — compute
+// truncated separators.
+func (b *bulkBuilder) add(e page.LeafEntry, fullKey []byte) error {
+	if b.leafLast != nil && bytes.Compare(b.leafLast, fullKey) >= 0 {
 		return ErrBulkLoadOutOfOrder
 	}
-	// Clone the key once and use the clone everywhere. page.LeafBuilder
-	// retains the key by reference for its ascending-order assertion
-	// (lastAddedKey borrows the caller's slice, not the on-page copy —
-	// compressed leaves store only the unshared suffix, so the full key
-	// cannot be recovered from the page), and we retain it as leafLast
-	// for separator computation. The iter.Seq2 input contract lets the
-	// caller reuse the key buffer after yield returns, so borrowing e.Key
-	// would be a use-after-free. The clone is owned by the builder and
-	// released when the next add overwrites leafLast / the leaf's
-	// lastAddedKey.
-	k := bytes.Clone(e.Key)
-	e.Key = k
+	// Clone both key views once and use the clones everywhere.
+	// page.LeafBuilder retains e.Key by reference for its
+	// ascending-order assertion (lastAddedKey borrows the caller's
+	// slice, not the on-page copy — compressed leaves store only the
+	// unshared suffix, so the full key cannot be recovered from the
+	// page), and we retain the FULL key as leafLast for separator
+	// computation. The iter.Seq2 input contract lets the caller reuse
+	// the key buffer after yield returns, so borrowing would be a
+	// use-after-free.
+	k := bytes.Clone(fullKey)
+	if len(e.Key) == len(fullKey) {
+		e.Key = k
+	} else {
+		e.Key = k[:len(e.Key)] // resident slice of the same clone
+	}
 	if !b.leafHave {
 		b.startLeaf()
 		b.leafSep = nil // first leaf is the leftmost child of level 0
@@ -267,13 +284,38 @@ func (b *bulkBuilder) addLink(level int, sep []byte, child uint64) error {
 	// largest, prefix = commonPrefix(cells[0], sep)) — lengthens every
 	// existing cell's stored suffix. Recompute the would-be size against the
 	// new prefix rather than accumulating a per-cell cost.
-	newPrefixLen := len(sep)
-	if len(bl.cells) > 0 {
-		newPrefixLen = commonPrefixLen(bl.cells[0].Key, sep)
+	// Overflow separators (page-formats.md §Overflow-Key Cells): size
+	// with the RESIDENT first-T slice + the 12-byte extent reference;
+	// the extent is written only when the cell is actually appended,
+	// so the page-full decline path (which re-threads sep as the next
+	// page's parent separator) never leaks a run.
+	t := b.cfg.InlineThreshold()
+	resident := sep
+	sepOvk := len(sep) > t
+	if sepOvk {
+		resident = sep[:t]
 	}
-	if page.BranchEncodedSizeOf(len(bl.cells)+1, bl.keyLenSum+len(sep), newPrefixLen) <= b.cfg.ContentEnd() {
-		bl.cells = append(bl.cells, page.BranchCell{Key: sep, Child: child})
-		bl.keyLenSum += len(sep)
+	newPrefixLen := len(resident)
+	if len(bl.cells) > 0 {
+		newPrefixLen = commonPrefixLen(bl.cells[0].Key, resident)
+	}
+	extRefs := bl.extRefs
+	if sepOvk {
+		extRefs++
+	}
+	if page.BranchEncodedSizeOf(len(bl.cells)+1, bl.keyLenSum+len(resident), newPrefixLen, extRefs) <= b.cfg.ContentEnd() {
+		cell := page.BranchCell{Key: resident, Child: child}
+		if sepOvk {
+			ext, err := writeBulkOverflowChain(b.pw, b.cfg, sep[t:])
+			if err != nil {
+				return err
+			}
+			cell.KeyExtPage = ext
+			cell.KeyTotalLen = uint32(len(sep))
+		}
+		bl.cells = append(bl.cells, cell)
+		bl.keyLenSum += len(resident)
+		bl.extRefs = extRefs
 		return nil
 	}
 	// The in-progress page is full: write it, then start a new page whose
@@ -301,6 +343,7 @@ func (b *bulkBuilder) startBranch(bl *bulkBranchLevel, sep []byte, leftmost uint
 	bl.cells = bl.cells[:0]
 	bl.sep = sep
 	bl.keyLenSum = 0
+	bl.extRefs = 0
 	bl.have = true
 }
 
@@ -483,7 +526,7 @@ func (ks *Keyspace) bulkLoadRows(rows iter.Seq2[[]byte, []byte], cfg page.Config
 			loopErr = err
 			return false
 		}
-		if err := b.add(e); err != nil {
+		if err := b.add(e, key); err != nil {
 			loopErr = err
 			return false
 		}
@@ -703,12 +746,12 @@ func (sb *setBulk) addValue(v []byte) error {
 	// data. Checked before EITHER storage branch — the post-
 	// promotion nested path must not readmit what the subpage path
 	// rejects.
-	if !btree.KeyFitsBranchSeparators(sb.cfg, len(v)) {
+	if !setValueWithinInlineBound(sb.cfg, len(v)) {
 		return btree.ErrKeyTooLarge
 	}
 	sb.total++
 	if sb.nested != nil {
-		return sb.nested.add(page.LeafEntry{Key: v})
+		return sb.nested.add(page.LeafEntry{Key: v}, v)
 	}
 	newSize := sb.bufferedSize + sb.entrySize(v)
 	// Promote only when a SECOND-or-later value would push the subpage past
@@ -721,7 +764,7 @@ func (sb *setBulk) addValue(v []byte) error {
 		if err := sb.promote(); err != nil {
 			return err
 		}
-		return sb.nested.add(page.LeafEntry{Key: v})
+		return sb.nested.add(page.LeafEntry{Key: v}, v)
 	}
 	sb.buffered = append(sb.buffered, bytes.Clone(v))
 	sb.bufferedSize = newSize
@@ -733,7 +776,7 @@ func (sb *setBulk) addValue(v []byte) error {
 func (sb *setBulk) promote() error {
 	sb.nested = newBulkBuilder(sb.pw, sb.cfg)
 	for _, v := range sb.buffered {
-		if err := sb.nested.add(page.LeafEntry{Key: v}); err != nil {
+		if err := sb.nested.add(page.LeafEntry{Key: v}, v); err != nil {
 			return err
 		}
 	}
@@ -748,35 +791,42 @@ func (sb *setBulk) flush() error {
 	if !sb.haveKey {
 		return nil
 	}
-	// Pre-check the set key fits a leaf entry (mirrors bulkLeafEntry on
-	// the Keyspace path): an oversize set key surfaces the public
-	// ErrKeyTooLarge at the BulkLoad boundary rather than the internal
-	// errBulkEntryTooLarge from the builder's empty-leaf guard. The
-	// SetKeyspace layer bounds value size but not the set key.
-	if !btree.OverflowRefFitsLeaf(sb.cfg, sb.curKey) {
+	// Set keys share the ordinary key contract (mirrors bulkLeafEntry
+	// on the Keyspace path): the uint32 encoding bound gates, and an
+	// over-threshold set key takes the overflow-key form with its
+	// extent written through the bulk writer (page-formats.md
+	// §Overflow-Key Cells).
+	if !btree.KeyWithinBound(len(sb.curKey)) {
 		return btree.ErrKeyTooLarge
+	}
+	e := page.LeafEntry{Key: sb.curKey}
+	if t := sb.cfg.InlineThreshold(); len(sb.curKey) > t {
+		ext, err := writeBulkOverflowChain(sb.top.pw, sb.cfg, sb.curKey[t:])
+		if err != nil {
+			return err
+		}
+		e.Flags |= page.CellFlagOverflowKey
+		e.KeyTotalLen = uint32(len(sb.curKey))
+		e.Key = sb.curKey[:t]
+		e.KeyExtPage = ext
 	}
 	if sb.nested != nil {
 		root, cnt, err := sb.nested.finish()
 		if err != nil {
 			return err
 		}
-		return sb.top.add(page.LeafEntry{
-			Flags:       page.CellFlagMultiValue | page.CellFlagNestedTree,
-			Key:         sb.curKey,
-			NestedRoot:  root,
-			NestedCount: cnt,
-		})
+		e.Flags |= page.CellFlagMultiValue | page.CellFlagNestedTree
+		e.NestedRoot = root
+		e.NestedCount = cnt
+		return sb.top.add(e, sb.curKey)
 	}
 	sub, err := page.EncodeSubpage(sb.buffered, sb.fvs)
 	if err != nil {
 		return fmt.Errorf("gmdb: bulkload encode subpage: %w", err)
 	}
-	return sb.top.add(page.LeafEntry{
-		Flags: page.CellFlagMultiValue,
-		Key:   sb.curKey,
-		Value: sub,
-	})
+	e.Flags |= page.CellFlagMultiValue
+	e.Value = sub
+	return sb.top.add(e, sb.curKey)
 }
 
 // bulkLeafEntry builds the leaf entry for one (key, value): an inline entry
@@ -792,28 +842,40 @@ func bulkLeafEntry(pw bulkOverflowWriter, cfg page.Config, key, value []byte) (p
 	if value == nil {
 		value = []byte{}
 	}
-	// Split-safety key bound first (limits.md §Maximum Key Size) —
-	// the same spec-bound gate as btree.Put, so bulk and per-op
-	// loads accept identical keys; OverflowRefFitsLeaf subsumes it
-	// on the overflow branch, but an inline-fitting key must be
-	// bounded here too.
-	if !btree.KeyFitsBranchSeparators(cfg, len(key)) {
+	// Storable-key bound first (limits.md §Maximum Key Size) — the
+	// same spec-bound gate as btree.Put, so bulk and per-op loads
+	// accept identical keys.
+	if !btree.KeyWithinBound(len(key)) {
 		return page.LeafEntry{}, btree.ErrKeyTooLarge
 	}
+	var e page.LeafEntry
 	if !btree.NeedsOverflow(cfg, key, value) {
-		return page.LeafEntry{Key: key, Value: value}, nil
+		e = page.LeafEntry{Key: key, Value: value}
+	} else {
+		firstID, err := writeBulkOverflowChain(pw, cfg, value)
+		if err != nil {
+			return page.LeafEntry{}, err
+		}
+		e = page.LeafEntry{
+			Flags:        page.CellFlagOverflow,
+			Key:          key,
+			OverflowPage: firstID,
+			TotalLen:     uint64(len(value)),
+		}
 	}
-	if !btree.OverflowRefFitsLeaf(cfg, key) {
-		return page.LeafEntry{}, btree.ErrKeyTooLarge
+	// Key half: an over-threshold key takes the overflow-key form
+	// (page-formats.md §Overflow-Key Cells) with its extent written
+	// through the same bulk writer as value overflow.
+	t := cfg.InlineThreshold()
+	if len(key) > t {
+		ext, err := writeBulkOverflowChain(pw, cfg, key[t:])
+		if err != nil {
+			return page.LeafEntry{}, err
+		}
+		e.Flags |= page.CellFlagOverflowKey
+		e.KeyTotalLen = uint32(len(key))
+		e.Key = key[:t]
+		e.KeyExtPage = ext
 	}
-	firstID, err := writeBulkOverflowChain(pw, cfg, value)
-	if err != nil {
-		return page.LeafEntry{}, err
-	}
-	return page.LeafEntry{
-		Flags:        page.CellFlagOverflow,
-		Key:          key,
-		OverflowPage: firstID,
-		TotalLen:     uint64(len(value)),
-	}, nil
+	return e, nil
 }

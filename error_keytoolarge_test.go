@@ -8,12 +8,11 @@ import (
 	"testing"
 )
 
-// TestErrKeyTooLargeSentinel verifies the documented public sentinel:
-// a key too large even for an overflow-reference leaf entry surfaces as
-// gmdb.ErrKeyTooLarge through both Put and BulkLoad (the internal
-// btree.ErrKeyTooLarge is translated by mapBtreeErr). Before this wiring
-// the symbol did not exist, so errors.Is(err, gmdb.ErrKeyTooLarge) could
-// not even compile.
+// TestErrKeyTooLargeSentinel verifies the documented public sentinel
+// on the surfaces where a size bound REMAINS after overflow-key cells
+// (limits.md): set VALUES over the inline threshold (the set-keyspace
+// surface has not adopted overflow-key members). Ordinary keys of any
+// length store — TestOverThresholdKeysRoundTrip pins that side.
 func TestErrKeyTooLargeSentinel(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 128})
@@ -22,25 +21,39 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 	}
 	defer db.Close()
 
-	// A key larger than a whole page cannot fit in a single-entry leaf
-	// even in the overflow-reference form (keys, unlike values, never
-	// promote to an overflow chain) — a genuine oversize key.
+	// Keys over the inline threshold take the overflow-key form on
+	// EVERY entry path — Put, plain BulkLoad, set-key BulkLoad,
+	// indexed BulkLoad — and round-trip (limits.md §Maximum Key Size).
 	bigKey := bytes.Repeat([]byte("k"), 8000)
 
-	putErr := db.Update(ctx, func(tx *Tx) error {
+	if err := db.Update(ctx, func(tx *Tx) error {
 		ks, e := tx.CreateKeyspace("ks")
 		if e != nil {
 			return e
 		}
 		return ks.Put(bigKey, []byte("v"))
-	})
-	if !errors.Is(putErr, ErrKeyTooLarge) {
-		t.Errorf("Put oversize key: got %v, want ErrKeyTooLarge", putErr)
+	}); err != nil {
+		t.Errorf("Put over-threshold key: %v", err)
+	}
+	if err := db.View(ctx, func(rtx *ReadTx) error {
+		ks, e := rtx.OpenKeyspaceReadOnly("ks")
+		if e != nil {
+			return e
+		}
+		v, e := ks.Get(bigKey)
+		if e != nil {
+			return e
+		}
+		if !bytes.Equal(v, []byte("v")) {
+			return fmt.Errorf("Get over-threshold key = %q, want %q", v, "v")
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("read back over-threshold key: %v", err)
 	}
 
 	oneBig := func(yield func([]byte, []byte) bool) { yield(bigKey, []byte("v")) }
 
-	// Keyspace.BulkLoad (non-indexed).
 	if e := db.Update(ctx, func(tx *Tx) error {
 		ks, err := tx.CreateKeyspace("ks2")
 		if err != nil {
@@ -48,14 +61,11 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		}
 		_, err = ks.BulkLoad(oneBig)
 		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("Keyspace.BulkLoad oversize key: got %v, want ErrKeyTooLarge", e)
+	}); e != nil {
+		t.Errorf("Keyspace.BulkLoad over-threshold key: %v", e)
 	}
 
-	// SetKeyspace.BulkLoad (non-indexed): the set-key path now pre-checks
-	// the set key (setBulk.flush) and the boundary translates via
-	// mapBtreeErr, so an oversize set key surfaces the public sentinel
-	// (was the internal errBulkEntryTooLarge).
+	// Set-keyspace TOP-LEVEL keys share the ordinary key contract.
 	if e := db.Update(ctx, func(tx *Tx) error {
 		sks, err := tx.CreateSetKeyspace("sks", nil)
 		if err != nil {
@@ -63,11 +73,13 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		}
 		_, err = sks.BulkLoad(oneBig)
 		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("SetKeyspace.BulkLoad oversize set key: got %v, want ErrKeyTooLarge", e)
+	}); e != nil {
+		t.Errorf("SetKeyspace.BulkLoad over-threshold set key: %v", e)
 	}
 
-	// Indexed Keyspace.BulkLoad (the indexed-path wrap).
+	setExtract := func(setKey, member []byte) []IndexEntry {
+		return []IndexEntry{{Cols: [][]byte{member[:1]}}}
+	}
 	if e := db.Update(ctx, func(tx *Tx) error {
 		decl := testDecl("by_b", "b")
 		decl.Extract = firstByteExtract
@@ -77,15 +89,8 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		}
 		_, err = ks.BulkLoad(oneBig)
 		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("indexed Keyspace.BulkLoad oversize key: got %v, want ErrKeyTooLarge", e)
-	}
-
-	// Indexed SetKeyspace.BulkLoad — the audited missing path: the
-	// three boundary returns previously leaked the internal
-	// btree/bulkload sentinels unmapped.
-	setExtract := func(setKey, member []byte) []IndexEntry {
-		return []IndexEntry{{Cols: [][]byte{member[:1]}}}
+	}); e != nil {
+		t.Errorf("indexed Keyspace.BulkLoad over-threshold key: %v", e)
 	}
 	if e := db.Update(ctx, func(tx *Tx) error {
 		sks, err := tx.CreateSetKeyspace("idxsks", nil,
@@ -95,8 +100,8 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		}
 		_, err = sks.BulkLoad(oneBig)
 		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("indexed SetKeyspace.BulkLoad oversize set key: got %v, want ErrKeyTooLarge", e)
+	}); e != nil {
+		t.Errorf("indexed SetKeyspace.BulkLoad over-threshold set key: %v", e)
 	}
 
 	// Oversize FIRST value of a set key (variable-size sets): bypasses
@@ -128,11 +133,13 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		t.Errorf("indexed SetKeyspace.BulkLoad oversize first value: got %v, want ErrKeyTooLarge", e)
 	}
 
-	// Oversize INDEX key produced by the extractor (limits.md subjects
-	// index keys to the ordinary key maximum): the index-build
-	// boundary must map the builder guard too — both indexed variants.
+	// Over-threshold INDEX keys produced by the extractor share the
+	// ordinary key contract (limits.md §Maximum Index Key Size): they
+	// store as overflow-key cells in the index tree and the lookup
+	// resolves them — both indexed variants.
+	hugeCol := bytes.Repeat([]byte("c"), 8000)
 	hugeColExtract := func(_, _ []byte) []IndexEntry {
-		return []IndexEntry{{Cols: [][]byte{bytes.Repeat([]byte("c"), 8000)}}}
+		return []IndexEntry{{Cols: [][]byte{hugeCol}}}
 	}
 	if e := db.Update(ctx, func(tx *Tx) error {
 		ks, err := tx.CreateKeyspace("idxkshuge",
@@ -140,24 +147,39 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		_, err = ks.BulkLoad(func(yield func([]byte, []byte) bool) { yield([]byte("k"), []byte("v")) })
-		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("indexed Keyspace.BulkLoad oversize index key: got %v, want ErrKeyTooLarge", e)
-	}
-	hugeMemberColExtract := func(_, _ []byte) []IndexEntry {
-		return []IndexEntry{{Cols: [][]byte{bytes.Repeat([]byte("c"), 8000)}}}
+		if _, err = ks.BulkLoad(func(yield func([]byte, []byte) bool) { yield([]byte("k"), []byte("v")) }); err != nil {
+			return err
+		}
+		idx, err := ks.Index("hg")
+		if err != nil {
+			return err
+		}
+		var pks [][]byte
+		for pk := range idx.LookupKeys([][]byte{hugeCol}) {
+			pks = append(pks, bytes.Clone(pk))
+		}
+		if err := idx.Err(); err != nil {
+			return err
+		}
+		if len(pks) != 1 || !bytes.Equal(pks[0], []byte("k")) {
+			return fmt.Errorf("huge-index-key lookup = %q, want [k]", pks)
+		}
+		return nil
+	}); e != nil {
+		t.Errorf("indexed Keyspace over-threshold index key: %v", e)
 	}
 	if e := db.Update(ctx, func(tx *Tx) error {
 		sks, err := tx.CreateSetKeyspace("idxskshuge", nil,
-			&IndexDecl{Name: "hg2", Columns: []IndexColumn{{Name: "c"}}, Extract: hugeMemberColExtract})
+			&IndexDecl{Name: "hg2", Columns: []IndexColumn{{Name: "c"}}, Extract: func(_, _ []byte) []IndexEntry {
+				return []IndexEntry{{Cols: [][]byte{hugeCol}}}
+			}})
 		if err != nil {
 			return err
 		}
 		_, err = sks.BulkLoad(func(yield func([]byte, []byte) bool) { yield([]byte("k"), []byte("m")) })
 		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("indexed SetKeyspace.BulkLoad oversize index key: got %v, want ErrKeyTooLarge", e)
+	}); e != nil {
+		t.Errorf("indexed SetKeyspace over-threshold index key: %v", e)
 	}
 
 	// Put parity for the oversize single value (the contract the bulk
@@ -174,12 +196,14 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 	}
 }
 
-// TestKeyTooLargeDeterministicAtBound pins the split-safety key
-// bound (limits.md §Maximum Key Size): every entry gate enforces the
-// spec's two-full-separators-per-branch bound (~(PageSize-40)/2), so
-// a key in the gap between leaf-entry fit and the spec bound fails
-// ErrKeyTooLarge AT the operation, uniformly across Put and the bulk
-// builders. Keys at the bound must work through real splits.
+// TestKeyTooLargeDeterministicAtBound pins the storable-key contract
+// at the inline-threshold boundary (limits.md §Maximum Key Size):
+// keys just past the threshold — the range the old branch-budget gate
+// rejected — store uniformly across Put and the set-key path and
+// round-trip; set MEMBERS keep their inline bound (limits.md §Maximum
+// Value Size (Set Keyspaces)) uniformly across Put and BulkLoad, and
+// an over-threshold FixedValueSize is rejected at declaration. Keys
+// near the threshold must survive real splits on both sides.
 func TestKeyTooLargeDeterministicAtBound(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 512})
@@ -188,8 +212,9 @@ func TestKeyTooLargeDeterministicAtBound(t *testing.T) {
 	}
 	defer db.Close()
 
-	// ~3000 bytes at 4 KiB: fits a single leaf entry (the old gate
-	// accepted it) but two such separators cannot share a branch.
+	// ~3000 bytes at 4 KiB: over the inline threshold (2010 with
+	// checksums) — the old branch-budget gate rejected it; it now
+	// stores as an overflow-key cell and reads back.
 	gapKey := bytes.Repeat([]byte("g"), 3000)
 	if e := db.Update(ctx, func(tx *Tx) error {
 		ks, err := tx.CreateKeyspace("gap")
@@ -197,13 +222,28 @@ func TestKeyTooLargeDeterministicAtBound(t *testing.T) {
 			return err
 		}
 		return ks.Put(gapKey, []byte("v"))
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("gap-key Put: got %v, want ErrKeyTooLarge (deterministic at the entry gate)", e)
+	}); e != nil {
+		t.Errorf("gap-key Put: %v", e)
+	}
+	if e := db.View(ctx, func(rtx *ReadTx) error {
+		ks, err := rtx.OpenKeyspaceReadOnly("gap")
+		if err != nil {
+			return err
+		}
+		v, err := ks.Get(gapKey)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(v, []byte("v")) {
+			return fmt.Errorf("gap-key Get = %q, want v", v)
+		}
+		return nil
+	}); e != nil {
+		t.Errorf("gap-key read back: %v", e)
 	}
 
-	// SetKeyspace top-level key (PutEntry path — the demonstrated fault:
-	// an ungated set key was accepted by Put and then failed CopyTo's
-	// gated rebuild) and set MEMBERS (bulk path) obey the same bound.
+	// SetKeyspace top-level key (PutEntry path) shares the ordinary
+	// key contract.
 	if e := db.Update(ctx, func(tx *Tx) error {
 		sks, err := tx.CreateSetKeyspace("sgap", nil)
 		if err != nil {
@@ -211,8 +251,8 @@ func TestKeyTooLargeDeterministicAtBound(t *testing.T) {
 		}
 		_, err = sks.Put(gapKey, []byte("m"))
 		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("set gap-key Put: got %v, want ErrKeyTooLarge", e)
+	}); e != nil {
+		t.Errorf("set gap-key Put: %v", e)
 	}
 	gapMember := bytes.Repeat([]byte("m"), 3000)
 	if e := db.Update(ctx, func(tx *Tx) error {

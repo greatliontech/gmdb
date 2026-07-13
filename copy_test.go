@@ -771,7 +771,7 @@ func TestCompactAbortsOnBitrotRatherThanLaundering(t *testing.T) {
 	}
 
 	// Flip a byte inside the data-tree root page's footer: the page still
-	// decodes structurally, but its xxhash64 footer no longer matches — the
+	// decodes structurally, but its XXH3-64 footer no longer matches — the
 	// exact silent-bitrot class checksums exist to catch.
 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {

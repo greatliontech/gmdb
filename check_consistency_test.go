@@ -150,7 +150,7 @@ func TestCheckDetectsOrderingAndCountCorruption(t *testing.T) {
 			pageStart := int(m.KeyspaceRoot) * 4096
 			pageBuf := data[pageStart : pageStart+4096]
 			r := page.NewLeafReader(pageBuf, cfg)
-			_, e, found := r.SearchLeaf([]byte("k"))
+			_, e, found, _ := r.SearchLeaf([]byte("k"), page.NoExtentTail)
 			if !found {
 				t.Fatalf("keyspace descriptor entry not found (root not a leaf?)")
 			}

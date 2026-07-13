@@ -68,7 +68,9 @@ encoding's `KeyTotalLen uint32` — `2^32 - 1` bytes — enforced
 deterministically at every entry gate (`btree.Put`,
 `btree.PutEntry` for set keys, the bulk-load builders including
 set members, and CopyTo's rebuild: one threshold, no drift — the
-same input is accepted or rejected identically on every path).
+same input is accepted or rejected identically on every path;
+pinned by TestErrKeyTooLargeSentinel and
+TestKeyTooLargeDeterministicAtBound).
 Practical bounds arrive earlier: a written key
 rides the transaction slab (`MaxTxBufferBytes`) and every deep
 comparison materializes shared-prefix bytes.

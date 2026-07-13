@@ -25,11 +25,44 @@ package page
 // valid — PatchRefs uses the unchecked hot-path decoders under the same
 // Validate trust boundary as every other read path.
 func (r LeafReader) PatchRefs(refAt func(idx int, e LeafEntry) uint64) {
+	r.patchEntryRefs(refAt, nil)
+}
+
+// PatchKeyExtRefs rewrites the KeyExtPage field of every overflow-key
+// cell in place — the key-half analog of PatchRefs, with the same
+// size-identical guarantee (the reference is a fixed u64 at a
+// header-computable offset after the resident key bytes; KeyTotalLen
+// is immutable — relocation moves pages, never sizes). keyExtAt is
+// called once per overflow-key cell in entry order and returns the
+// cell's key-extent first page — e.KeyExtPage unchanged, or the
+// relocated value. May be combined with PatchRefs on the same page
+// (the two patch disjoint fields).
+func (r LeafReader) PatchKeyExtRefs(keyExtAt func(idx int, e LeafEntry) uint64) {
+	r.patchEntryRefs(nil, keyExtAt)
+}
+
+func (r LeafReader) patchEntryRefs(refAt, keyExtAt func(idx int, e LeafEntry) uint64) {
 	patch := func(idx int, e LeafEntry, nextOff int) {
-		if e.Flags&CellFlagOverflow == 0 && !e.IsNestedTree() {
-			return
+		if refAt != nil && (e.Flags&CellFlagOverflow != 0 || e.IsNestedTree()) {
+			le.PutUint64(r.buf[nextOff-16:], refAt(idx, e))
 		}
-		le.PutUint64(r.buf[nextOff-16:], refAt(idx, e))
+		if keyExtAt != nil && e.IsOverflowKey() {
+			// The key-extent reference sits immediately after the
+			// resident key bytes: [KeyExtPage u64][KeyTotalLen u32],
+			// followed by the value half (16-byte trailer for
+			// overflow/nested forms; value bytes for inline; nothing
+			// for empty-value). Compute its offset back from nextOff.
+			valueHalf := 0
+			switch {
+			case cellHasTrailerOnly(e.Flags):
+				valueHalf = 16
+			case e.Flags&CellFlagEmptyValue != 0:
+				valueHalf = 0
+			default:
+				valueHalf = len(e.Value)
+			}
+			le.PutUint64(r.buf[nextOff-valueHalf-12:], keyExtAt(idx, e))
+		}
 	}
 
 	if !r.compressed {

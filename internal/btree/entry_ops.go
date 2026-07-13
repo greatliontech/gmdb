@@ -46,7 +46,10 @@ func GetEntry(pr PageReader, cfg page.Config, rootID uint64, key []byte) (page.L
 			if err := r.Validate(); err != nil {
 				return page.LeafEntry{}, false, fmt.Errorf("%w: leaf %d at depth %d: %w", ErrCorrupted, cur, depth, err)
 			}
-			idx, e, found := r.SearchLeaf(key)
+			idx, e, found, serr := r.SearchLeaf(key, keyTail(pr, cfg))
+			if serr != nil {
+				return page.LeafEntry{}, false, serr
+			}
 			if !found {
 				return page.LeafEntry{}, false, nil
 			}
@@ -63,7 +66,10 @@ func GetEntry(pr PageReader, cfg page.Config, rootID uint64, key []byte) (page.L
 		if err := validateBranchPage(buf, cfg, cur); err != nil {
 			return page.LeafEntry{}, false, err
 		}
-		i := page.BranchSearch(buf, cfg, key)
+		i, serr := page.BranchSearch(buf, cfg, key, keyTail(pr, cfg))
+		if serr != nil {
+			return page.LeafEntry{}, false, serr
+		}
 		next := page.BranchChildAt(buf, cfg, i)
 		if next == 0 {
 			return page.LeafEntry{}, false, fmt.Errorf("%w: null child pointer in branch %d during GetEntry descent", ErrCorrupted, cur)
@@ -106,42 +112,78 @@ func GetEntry(pr PageReader, cfg page.Config, rootID uint64, key []byte) (page.L
 // Mirrors btree.Put's descent + rebuild infrastructure. The only
 // differences from Put: no buildPutEntry (caller-supplied), no
 // chain rollback (caller-managed), and the displaced entry is
-// returned to the caller instead of being freed internally.
+// returned to the caller instead of being freed internally — for its
+// VALUE-half resources (overflow chain, subpage bytes, nested root),
+// which the caller may carry forward. The displaced KEY half is
+// PutEntry's own domain (PutEntry converts keys to the overflow-key
+// form itself, writing a fresh extent for the incoming entry), so the
+// displaced key extent is retired HERE, after the leaf lands, and the
+// returned displaced entry has its key-extent fields cleared —
+// callers must not (and cannot) free it again.
 func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (newRoot uint64, displaced page.LeafEntry, err error) {
-	// Split-safety key bound — same gate as Put (limits.md §Maximum
-	// Key Size): without it a set key admitted here diverges from
-	// every other entry point and fails CopyTo's gated rebuild.
-	if !branchHoldsTwoSeparators(cfg, len(e.Key)) {
+	// Storable-key bound — same gate as Put (limits.md §Maximum Key
+	// Size): without it a set key admitted here diverges from every
+	// other entry point and fails CopyTo's gated rebuild.
+	if !keyWithinBound(e.Key) {
 		return 0, page.LeafEntry{}, ErrKeyTooLarge
+	}
+	// The caller supplies e with its FULL key; the search target stays
+	// the full key while the stored form may be overflow-key.
+	fullKey := e.Key
+	e, err = convertToOverflowKeyForm(pw, cfg, e)
+	if err != nil {
+		return 0, page.LeafEntry{}, err
+	}
+	rollbackKeyExt := func() {
+		if e.IsOverflowKey() {
+			_ = pw.FreeRun(e.KeyExtPage, keyExtentRunLen(cfg, e.KeyTotalLen))
+		}
 	}
 	if rootID == 0 {
 		id, err := putEmptyEntry(pw, cfg, e)
+		if err != nil {
+			rollbackKeyExt()
+		}
 		return id, page.LeafEntry{}, err
 	}
 
 	// Phase 1: the shared descent (the pre-CoW leaf buffer is unused
 	// here — PutEntry decodes from its CoW copy).
-	path, leafID, _, err := descendToLeafForKey(pw, cfg, rootID, e.Key)
+	path, leafID, _, err := descendToLeafForKey(pw, cfg, rootID, fullKey)
 	if err != nil {
+		rollbackKeyExt()
 		return 0, page.LeafEntry{}, err
 	}
 
 	// Phase 2: leaf mutation.
 	leftID, err := pw.AllocPage()
 	if err != nil {
+		rollbackKeyExt()
 		return 0, page.LeafEntry{}, fmt.Errorf("btree: alloc CoW leaf: %w", err)
 	}
 	leftBuf, err := pw.CopyPage(leafID, leftID)
 	if err != nil {
+		rollbackKeyExt()
+		_ = pw.FreePage(leftID)
 		return 0, page.LeafEntry{}, fmt.Errorf("btree: CoW leaf: %w", err)
 	}
 	entries, err := readLeafEntriesDeepCopyWithTrailers(leftBuf, cfg, leafID)
 	if err != nil {
+		rollbackKeyExt()
 		_ = pw.FreePage(leftID)
 		return 0, page.LeafEntry{}, err
 	}
 
-	entries, displaced, _ = insertOrReplaceLeaf(entries, e)
+	// Extent-aware position: overflow-key residents can tie without key
+	// equality, so the splice position comes from SearchLeaf over the
+	// full key, never a resident-byte binary search.
+	searchIdx, _, searchFound, serr := page.NewLeafReader(leftBuf, cfg).SearchLeaf(fullKey, keyTail(pw, cfg))
+	if serr != nil {
+		rollbackKeyExt()
+		_ = pw.FreePage(leftID)
+		return 0, page.LeafEntry{}, serr
+	}
+	entries, displaced, _ = insertOrReplaceLeafAt(entries, e, searchIdx, searchFound)
 
 	// Attempt single-page build.
 	b := page.NewLeafBuilder(leftBuf, cfg)
@@ -162,6 +204,10 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 		if err != nil {
 			return 0, page.LeafEntry{}, err
 		}
+		if err := freeKeyExtentIfPresent(pw, cfg, displaced); err != nil {
+			return 0, page.LeafEntry{}, err
+		}
+		displaced = clearKeyExtent(displaced)
 		return newID, displaced, nil
 	}
 
@@ -209,11 +255,23 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 		return 0, page.LeafEntry{}, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
 	}
 
-	sep := page.ShortestSeparator(entries[mid-1].Key, entries[mid].Key)
-	newID, err := ascendWithSplit(pw, cfg, path, leftID, sep, rightID)
+	sep, err := shortestSeparatorEntries(pw, cfg, entries[mid-1], entries[mid])
 	if err != nil {
 		return 0, page.LeafEntry{}, err
 	}
+	sepCell, err := makeSeparatorCell(pw, cfg, sep, rightID)
+	if err != nil {
+		return 0, page.LeafEntry{}, err
+	}
+	newID, err := ascendWithSplit(pw, cfg, path, leftID, sepCell)
+	if err != nil {
+		_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
+		return 0, page.LeafEntry{}, err
+	}
+	if err := freeKeyExtentIfPresent(pw, cfg, displaced); err != nil {
+		return 0, page.LeafEntry{}, err
+	}
+	displaced = clearKeyExtent(displaced)
 	return newID, displaced, nil
 }
 

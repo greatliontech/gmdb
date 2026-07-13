@@ -48,7 +48,7 @@ func TestLeafBuilderAddSubpageRoundTripUncompressed(t *testing.T) {
 	if r.Count() != 1 {
 		t.Fatalf("Count=%d, want 1", r.Count())
 	}
-	idx, entry, found := r.SearchLeaf([]byte("topic-1"))
+	idx, entry, found, _ := r.SearchLeaf([]byte("topic-1"), NoExtentTail)
 	if !found || idx != 0 {
 		t.Fatalf("SearchLeaf: idx=%d found=%v, want (0,true)", idx, found)
 	}
