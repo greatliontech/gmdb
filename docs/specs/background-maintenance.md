@@ -161,7 +161,7 @@ Invariant: kind=entailed;
     prove carry a footer: allocated pages (the snapshot
     bitmap's bit is clear) in `[firstData, HighWaterMark)`.
     The meta/bitmap region (`< firstData`) carries no
-    xxhash64 footer (`checksums.md §Storage`), and a free or
+    XXH3-64 footer (`checksums.md §Storage`), and a free or
     never-written page holds no valid footer — neither is
     verified;
   from=entailed: §Checksum Scrubbing says "verify data pages
@@ -301,7 +301,7 @@ reader table clean.
 ### 3. Checksum Scrubbing
 
 When `PageChecksum` is enabled, the maintenance goroutine
-performs a background read-only scan that verifies xxhash64
+performs a background read-only scan that verifies XXH3-64
 footers on data pages proactively — before they are accessed
 by a user transaction. Catches silent bitrot early.
 
@@ -318,7 +318,7 @@ HighWaterMark)` — data and RPL segment pages, both of which
 carry a footer (`pager-slab.md §Commit`). Free page IDs in
 that window are advanced over but not verified — a free page
 holds no valid footer. The meta/bitmap region (`< firstData`)
-is excluded entirely: those pages carry no xxhash64 footer
+is excluded entirely: those pages carry no XXH3-64 footer
 (`checksums.md §Storage`).
 
 The scrubber is **best-effort and report-only**, not a

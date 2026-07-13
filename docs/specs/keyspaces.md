@@ -91,14 +91,20 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=`FixedValueSize` is meaningful only when `Kind == 1`
-    and non-zero. It is immutable after creation, and
-    `Open()` rejects descriptors with `FixedValueSize != 0
-    AND Kind != 1`;
+    and non-zero. It is immutable after creation, bounded by the
+    inline threshold `T` (`limits.md §Maximum Key Size` —
+    fixed-stride storage cannot hold overflow-key members), and
+    `Open()` rejects descriptors with `FixedValueSize != 0 AND
+    Kind != 1`, or with `FixedValueSize > T`, as structural
+    corruption (`ErrCorrupted`) — the create-time
+    `ErrInvalidOptions` gate makes a stored over-`T` value
+    unreachable except through corruption;
   from=this spec §Keyspace Descriptor;
-  violation=A mutable or wrong-kind `FixedValueSize` silently
-    re-interprets the on-disk subpage entry stride (no
+  violation=A mutable, wrong-kind, or over-`T` `FixedValueSize`
+    silently re-interprets the on-disk subpage entry stride (no
     `ValueLen` prefix when fixed; explicit prefix when
-    variable) — every existing entry decodes garbage.
+    variable) or admits members the stride arithmetic cannot
+    encode — every existing entry decodes garbage.
 
 Invariant: kind=clause-explicit;
   property=`RestartGroupTarget` is mutable via

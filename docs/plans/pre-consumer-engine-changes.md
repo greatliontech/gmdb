@@ -15,7 +15,7 @@ separator truncation already exist (`page-formats.md
 two no-shared-prefix separators must fit one branch page
 (`limits.md §Maximum Key Size`) — is what chunks 1–3 remove.
 
-- [ ] 1. Spec: long-key contract — overflow-key cell form for
+- [x] 1. Spec: long-key contract — overflow-key cell form for
       leaf keys AND branch separators (inline prefix +
       extent reference, reusing the existing run-length overflow
       mechanism), inline-prefix threshold, minimum-fanout

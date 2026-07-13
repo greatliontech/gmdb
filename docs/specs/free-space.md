@@ -297,7 +297,7 @@ the decoder reads it.
 
 Segment capacity at 4 KB: 8 (header) + 8 (TxnID) + 8 (link) = 24
 bytes overhead. Remaining `4096 - 24 = 4072` / 8 = **509 entries per
-segment** (508 with checksums enabled, due to the 8-byte xxhash64
+segment** (508 with checksums enabled, due to the 8-byte XXH3-64
 footer: `4096 - 24 - 8 = 4064` / 8 = 508).
 
 Meta stores `RPLHeadPage` (newest) and `RPLTailPage` (oldest).

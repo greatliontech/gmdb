@@ -297,7 +297,7 @@ step. (Pinned by `TestCleanCloseCheckpointsSyncLazy`,
    2's completed fsync anchors the pre-bump meta's assertion;
    the bump's own assertion is anchored by step 4 and persisted
    by the NEXT meta write — §Anchoring's no-forward-promise
-   rule); recompute the xxhash64 checksum over the full meta
+   rule); recompute the XXH3-64 checksum over the full meta
    payload; `pwrite()` it back to the same slot. The TxnID is
    unchanged — Checkpoint records that the already-committed
    state is durable, not a new transaction. A meta that is
@@ -329,7 +329,7 @@ Steps 2 and 4 are both required: step 2 makes prior lazy commits
 durable; step 4 makes the sub-record bump durable so recovery can
 trust it. The single-meta-slot pwrite in step 3 is atomic because
 it stays within one page (an unaligned tear cannot affect a single
-contiguous sub-page region, and the xxhash64 checksum catches
+contiguous sub-page region, and the XXH3-64 checksum catches
 any partial write — recovery falls back to the other slot).
 
 Bounded live-read anomaly: a LOCK-FREE cross-process reader (a
@@ -416,7 +416,7 @@ fsynced. Three sites carry that obligation:
 
 On recovery (Open after crash):
 
-1. Read both meta pages. Discard any with invalid xxhash64
+1. Read both meta pages. Discard any with invalid XXH3-64
    checksum.
 2. Of the valid metas, select the one with the highest `TxnID` —
    the SAME selection every live path uses (`file-layout.md

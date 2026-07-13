@@ -44,15 +44,19 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=entailed;
   property=After `DeleteRange` commits, every overflow run referenced
-    by any deleted entry is retired (its page IDs appear in
-    `tx.retiredPages`). No overflow page survives a delete of its
-    only referencing leaf entry;
+    by any deleted entry — value runs AND key extents
+    (`page-formats.md §Overflow-Key Cells`) — and the key extent of
+    every removed branch separator is retired (its page IDs appear
+    in `tx.retiredPages`). No overflow page survives a delete of
+    its only referencing entry or separator;
   from=entailed: tree-integrity + free-space accounting
     (`page-formats.md` + `free-space.md`);
   violation=Orphan overflow runs become permanent bitmap leakage
     that background maintenance cannot reclaim until the
     leak-reclamation pass identifies them — for large value
-    workloads this is unbounded leakage in practice.
+    workloads this is unbounded leakage in practice; branch-
+    separator key extents dropped by the interior walk are the
+    same leakage through a path no leaf-scoped retirement covers.
 
 Invariant: kind=entailed;
   property=A successful `DeleteRange` leaves the keyspace's B+tree
@@ -91,6 +95,12 @@ Invariant: kind=clause-explicit;
     is measured on **logical (uncompressed) content** — the bytes its
     separators would occupy with no within-page prefix truncation
     (`page.BranchLogicalSize`) — NOT its physical compressed size.
+    An overflow branch cell's logical content is its RESIDENT bytes
+    (the `T`-byte first-`T` slice + the 12-byte extent reference +
+    child pointer), never `KeyTotalLen`: the floor and the
+    redistribute balance measure page utilisation, and counting
+    extent bytes would let one giant separator satisfy any floor
+    while the page is physically near-empty.
     Within-page branch prefix truncation (`page-formats.md` §Branch
     Page) stores a page's shared separator prefix once, so a
     maximally-dense same-cluster branch carries high fan-out yet few
@@ -106,7 +116,8 @@ Invariant: kind=clause-explicit;
     within-page truncation packs many such separators per page (high
     fan-out, high logical content), so they land above MT, not at
     fanout-2. It is **NOT** reachable in two residual cases. (a) A branch
-    reduced to a **single near-§Maximum-Key-Size separator**: no feasible
+    reduced to a **single near-`T` separator** (`T` per
+    `page-formats.md §Overflow-Key Cells`): no feasible
     split's logical content reaches MT (e.g. one ~1400-byte separator at
     MergeThreshold 50), and because a branch redistribute **lifts** the
     boundary separator to the parent, both halves can fall below MT. (b) A
@@ -231,9 +242,10 @@ ancestor (LCA). At each level between LCA and leaves:
 Retiring a subtree walks the branch pages recursively. For each page
 encountered, add its page ID to `tx.retiredPages`. For leaf pages,
 accumulate the entry count for the return value. For overflow pages
-referenced by leaf cells, retire the entire overflow run. The walk
-visits every page in the subtree exactly once — `O(pages in
-subtree)`.
+referenced by leaf cells — value runs and key extents alike — and
+for the key extents of the subtree's own branch overflow cells,
+retire the entire run. The walk visits every page in the subtree
+exactly once — `O(pages in subtree)`.
 
 ### Phase 3 — Clean up boundary leaves and rebalance
 
@@ -243,9 +255,11 @@ subtree)`.
   key before `end`.
 - If both boundaries are in the same leaf, delete entries between
   them.
-- Retire any overflow pages referenced by deleted entries.
+- Retire any overflow pages referenced by deleted entries (value
+  runs and key extents).
 - Walk up from boundary leaves to LCA, removing the retired interior
-  child pointers from each branch (CoW each branch).
+  child pointers from each branch (CoW each branch); a removed
+  separator that is an overflow branch cell retires its key extent.
 - Rebalance: check fill ratios on modified branches and leaves. Merge
   or redistribute per `MergeThreshold` (see Options in
   `api-surface.md`).

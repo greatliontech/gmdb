@@ -57,7 +57,7 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=entailed;
   property=Of the two meta pages, the **active** meta is the one with
-    the highest `TxnID` whose xxhash64 checksum is valid (crash
+    the highest `TxnID` whose XXH3-64 checksum is valid (crash
     recovery adopts its durable sub-record, `durability.md
     §Recovery`); the other
     meta points to a strictly older consistent state;
@@ -208,7 +208,7 @@ verifies page type and structural validity at each offset; no stored
 PageID is needed.
 
 When `PageChecksum` is enabled (the default), every data page
-(branch, leaf, overflow, RPL segment) carries an 8-byte xxhash64
+(branch, leaf, overflow, RPL segment) carries an 8-byte XXH3-64
 footer in the last 8 bytes of the page. See `checksums.md`.
 
 ## Meta Page
@@ -250,7 +250,7 @@ Meta Page
 | DurableNumFreePages  | uint64 - the durable epoch's free-page count
 | DurableKeyspaceRoot  | uint64 - the durable epoch's keyspace root
 | DurableNumKeyspaces  | uint64 - the durable epoch's keyspace count
-| Checksum             | uint64 - xxhash64 of all preceding bytes
+| Checksum             | uint64 - XXH3-64 of all preceding bytes
 +----------------------+
 ```
 

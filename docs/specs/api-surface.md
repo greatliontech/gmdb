@@ -495,7 +495,7 @@ type Options struct {
     // Must be a power of 2 in [4096, 65536]. Default: 4096.
     PageSize uint32
 
-    // DisablePageChecksum turns OFF the xxhash64 footers that are
+    // DisablePageChecksum turns OFF the XXH3-64 footers that are
     // otherwise written and verified on every data page. Stored as a
     // flag in the meta page — immutable after creation. The zero value
     // leaves checksums ENABLED (the spec default); opt out only on
@@ -926,6 +926,10 @@ func (tx *Tx) CreateKeyspaceIfNotExists(name string, indexes ...*IndexDecl) (*Ke
 // OpenSetKeyspace, OpenSetKeyspaceReadOnly, CreateSetKeyspace,
 // CreateSetKeyspaceIfNotExists follow the same pattern.
 type SetKeyspaceOptions struct {
+    // FixedValueSize must be <= the inline threshold T
+    // (limits.md §Maximum Key Size); creation with a larger
+    // value returns ErrInvalidOptions — fixed-stride storage
+    // cannot hold overflow-key members.
     FixedValueSize int
 }
 

@@ -413,6 +413,18 @@ values must be exactly that byte size. Enables:
 
 A `Put` with a value of the wrong size returns `ErrValueSizeMismatch`.
 
+`FixedValueSize` must be `<= T`, the inline threshold
+(`page-formats.md §Overflow-Key Cells`), validated at creation
+(`ErrInvalidOptions`) and re-validated against the stored
+descriptor at open (`keyspaces.md` — an over-`T` stored value is
+structural corruption): the flat-array and direct-offset
+properties above depend on every member being wholly inline, so
+fixed-stride members can never take the overflow-key form.
+Variable-size set keyspaces have no such cap — an over-`T` value
+resides in a subpage while the set is small enough, and becomes
+an overflow-key member of the nested tree on promotion
+(`limits.md §Maximum Value Size (Set Keyspaces)`).
+
 ## Indexes on SetKeyspaces
 
 A SetKeyspace can carry secondary indexes. The extractor signature

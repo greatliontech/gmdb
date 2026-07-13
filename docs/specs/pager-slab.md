@@ -328,7 +328,7 @@ contract still holds.
 ### Step 1 — Data + RPL + bitmap pwrite
 
 For each `(pageID, buf)` in `p.dirty` (now containing data pages, RPL
-segment pages, and modified bitmap pages): compute the xxhash64
+segment pages, and modified bitmap pages): compute the XXH3-64
 footer (if `PageChecksum`), then `pwrite(fd, *buf, pageID *
 pageSize)`. Order within step 1 is unspecified; implementations may
 coalesce contiguous runs via `pwritev2` on Linux.
@@ -347,7 +347,7 @@ and bitmap pages are durable.
 
 Compose the new meta payload (new roots, new TxnID, updated
 `HighWaterMark`, updated RPL pointers and counters, the anchored
-epoch as of the completed step 2, recomputed xxhash64 checksum) and
+epoch as of the completed step 2, recomputed XXH3-64 checksum) and
 `pwrite` it to the inactive meta slot. Composed here — after step 2,
 never in step 0 — per durability.md §Anchoring's no-forward-promise
 (see the step-0 bullet).

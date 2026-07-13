@@ -272,7 +272,7 @@ For each declared index, the engine computes a deterministic
 **schema hash**:
 
 ```
-xxhash64(
+XXH3-64(
   uvarint(len(index.Name)) || index.Name ||
   uvarint(len(Columns)) || for each col: uvarint(len(Name)) || Name ||
   uvarint(len(Covering)) || for each col: uvarint(len(Name)) || Name ||
@@ -298,7 +298,7 @@ B: Name="ab\x01", Columns=[],          Covering=[{Name:""}], Unique=true
 ```
 
 both encode to the byte sequence `61 62 01 00 01 00 01` (7 bytes,
-verifiable by hand), so xxhash64 returns the same value for two
+verifiable by hand), so XXH3-64 returns the same value for two
 structurally different indexes — a collision. The boundary between
 `Name` and `uvarint(len(Columns))` is undetectable when `Name`'s
 trailing bytes can mimic a uvarint length. Uniform uvarint-

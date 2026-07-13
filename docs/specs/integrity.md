@@ -116,7 +116,7 @@ open the keyspace until `RebuildIndex` is called. See
 ## Silent bitrot detection
 
 When `PageChecksum` is enabled (the default), every data page
-read is verified against its xxhash64 footer on first access in a
+read is verified against its XXH3-64 footer on first access in a
 transaction (cached thereafter). Corruption is detected at read
 time with `ErrBadPageChecksum` identifying the affected page. See
 `checksums.md §Verification`.

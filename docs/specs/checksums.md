@@ -1,10 +1,12 @@
 # Checksums
 
-gmdb uses a single hash algorithm — **xxhash64**
-(`github.com/cespare/xxhash/v2`, `xxhash.Sum64`) — across the
-entire file: meta-page checksum (mandatory) and data-page footers
-(opt-out, on by default). One hash family means one implementation,
-one performance profile, and no algorithm version flags.
+gmdb uses a single hash algorithm — **XXH3-64**
+(`github.com/zeebo/xxh3`, `xxh3.Hash`) — across every persisted
+digest in the file: meta-page checksum (mandatory), data-page
+footers (opt-out, on by default), and the index schema fingerprint
+(`indexing.md §Drift Guard`). One hash family means one
+implementation, one performance profile, and no algorithm version
+flags.
 
 Scope:
 - Meta-page checksum: always-on, atomic-commit anchor.
@@ -24,7 +26,7 @@ Depends on / interacts with:
 ## Invariants
 
 Invariant: kind=clause-explicit;
-  property=Every meta page carries an xxhash64 checksum of all
+  property=Every meta page carries an XXH3-64 checksum of all
     preceding fields. Recovery accepts only metas whose checksum
     verifies; a meta with an invalid checksum is treated as
     if it does not exist;
@@ -106,7 +108,7 @@ Invariant: kind=clause-explicit;
 
 ## Meta Page Checksum (Always On)
 
-Both meta pages carry an xxhash64 checksum of all preceding
+Both meta pages carry an XXH3-64 checksum of all preceding
 fields. Mandatory, cannot be disabled. The meta page is the
 atomic commit point — a torn write here would silently point
 to an inconsistent tree. The checksum detects this and triggers
@@ -118,7 +120,7 @@ Stored as the trailing `uint64` of the meta page payload (see
 ## Data Page Checksums (On by Default)
 
 Data pages (branch, leaf, overflow, RPL segment) carry an 8-byte
-xxhash64 footer in the last 8 bytes of the page when checksums
+XXH3-64 footer in the last 8 bytes of the page when checksums
 are enabled.
 
 Checksums are ON by default: a zero-value `Options` creates a
@@ -129,7 +131,7 @@ meta page's `Flags` field (bit 0) and is **immutable after
 creation** — all pages in a checksummed database have checksums; all
 pages in a non-checksummed database do not.
 
-The default is on. xxhash64 is fast enough in software (no
+The default is on. XXH3-64 is fast enough in software (no
 hardware-acceleration requirement unlike CRC32C) that the cost is
 negligible compared to mmap page-fault and B+tree traversal
 costs, and the protection against silent bitrot on commodity
@@ -146,7 +148,7 @@ Page (with checksum enabled)
 | Page Content          |
 | (PageSize - 16 bytes) |
 +-----------------------+
-| xxhash64 (8 bytes)    |  footer: hash of bytes 0 through PageSize-9
+| XXH3-64 (8 bytes)    |  footer: hash of bytes 0 through PageSize-9
 +-----------------------+
 ```
 
@@ -161,28 +163,31 @@ guaranteed by the CoW model and the meta page checksum (the
 meta references the bitmap indirectly through `NumFreePages`
 and the page-allocation invariants that `Check()` verifies).
 
-## Algorithm: xxhash64
+## Algorithm: XXH3-64
 
-`xxhash.Sum64` from `github.com/cespare/xxhash/v2`. Pure Go,
-SIMD-accelerated on amd64 / arm64 where the compiler can
-vectorise.
+`xxh3.Hash` from `github.com/zeebo/xxh3`. Pure Go with
+SIMD-accelerated paths (AVX2/SSE2 on amd64) and a portable
+generic fallback.
 
-- ~4 ns per 64 bytes; ~50–80 ns per 4 KB page in practice.
-- Faster than CRC32C in pure software; competitive with
-  CRC32C+SSE4.2 on amd64.
+- ~97 ns per 4 KB page, ~1.4 µs per 64 KB page (measured; ~42
+  GB/s) — far past CRC32C or XXH64 in pure software.
 - 8-byte output — slightly larger than CRC32C's 4 bytes but a
   stronger hash and consistent with the meta-page checksum.
+- XXH3-64 is the ONLY digest any engine version verifies — there
+  is no dual-verification or alternate-algorithm path; a file
+  whose digests were computed by another algorithm fails
+  verification and is rejected at the format-version gate first.
 
-The same library and algorithm power the meta-page checksum, so
-the runtime cost is amortised across one hash implementation in
-the binary.
+The same library and algorithm power the meta-page checksum and
+the index schema fingerprint (`indexing.md §Drift Guard`), so one
+hash family covers every persisted digest in the file.
 
 ## Verification (Read Path)
 
 When checksums are enabled, every page read from the pager is
 verified on first access in a transaction:
 
-1. Compute xxhash64 of bytes 0 through `PageSize - 9`.
+1. Compute XXH3-64 of bytes 0 through `PageSize - 9`.
 2. Compare with the 8-byte footer.
 3. Mismatch ⇒ return `ErrBadPageChecksum` with the page ID.
 
@@ -284,7 +289,7 @@ on-disk surface.
 
 ## Computation (Write Path)
 
-When checksums are enabled, the xxhash64 footer is computed on
+When checksums are enabled, the XXH3-64 footer is computed on
 each dirty slab buffer at commit time, before the pwrite. The
 footer is written into the last 8 bytes of the buffer.
 

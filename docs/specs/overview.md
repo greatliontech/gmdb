@@ -57,6 +57,7 @@ consistency in `indexing.md`.
 | File layout | Fixed-size pages (4KB–64KB, configurable, immutable after creation) | Matches OS page size, mmap-friendly |
 | Page header | 8 bytes (Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID) | PageID is redundant (computable from file offset); Type/Flags split reserves 8 flag bits for future per-page metadata at zero cost |
 | Value storage | Inline + overflow pages | Simple single read path, overflow for large values |
+| Key storage | Inline up to threshold `T` + key extents past it (overflow-key cells, singleton restart groups) | Keys unbounded by page size (filesystem paths, composite index tuples); comparisons resolve in the inline prefix except on deep shared-prefix ties |
 | Multiple values per key | Set keyspace with subpage + nested B+tree | First-class data primitive for set-shaped data (graph adjacency, postings lists, ZSET-shaped storage). **Not the indexing mechanism** — secondary indexes use composite-key plain keyspaces |
 | Secondary indexes | Engine-maintained, composite-key storage, declarative extractor with persisted drift guard | Removes the manual-maintenance bug class without giving up the single-keyspace primitive; schema hash + user version tag catches drift at Open |
 | Free space | Allocation bitmap + retired page log (RPL) | O(1) alloc via bitmap, no self-referential allocation, RPL tracks MVCC retirement |
@@ -73,7 +74,7 @@ consistency in `indexing.md`.
 | Leaf compression | Two variants: prefix-compressed leaves (variable-size restart groups, default) and uncompressed leaves (`RestartGroupTarget = 1`) | Density gains for shared-prefix workloads (directory listings, composite keys); per-keyspace tuning picks compressed or uncompressed; the uncompressed variant trades compression for single-O(log N) lookup, O(1) `Prev`, and simpler `Check()` walks |
 | Key ordering | Lexicographic (byte-ordered) | Simple, general, no custom comparator needed |
 | Byte order | Little-endian (fixed) | Portable across architectures |
-| Checksums | Unified xxhash64 footer (8 bytes) on meta and data pages; on by default | One hash family across the file; software-fast (benchmark-favored over CRC32C); defense against silent bitrot on commodity filesystems |
+| Checksums | Unified XXH3-64 footer (8 bytes) on meta and data pages; on by default | One hash family across the file; software-fast (benchmark-favored over CRC32C); defense against silent bitrot on commodity filesystems |
 | API | Transaction-based with `context.Context` | Explicit read/write txns; context governs lock acquisition, not txn lifetime; `context.Cause(ctx)` preserves cancellation reasons |
 | Iteration | Cursor (stateful, bidirectional, mutable) + `iter.Seq2` (read-only, composable) | Cursor for mutation and bidirectional movement; `iter.Seq2` for idiomatic `for range` loops |
 | Bulk insert | `BulkLoad` API (sorted-input bottom-up tree construction; streaming pwrite, bypasses slab) | Fast SQLite→gmdb migration in gitfs, initial import in notes; bounded memory regardless of input size |
