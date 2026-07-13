@@ -7,14 +7,23 @@ substrate-watching consumer (a session picker refreshing while other
 processes register work; any watch-shaped reader over shared state)
 polls the root version.
 
-Fix shape: a blocking `WaitVersion(from uint64, ctx) (uint64, error)`
-that returns when the committed root version exceeds `from`.
-Implementable first as an internal adaptive poll over the mmap'd meta
-(cheap — one cached read per tick), upgradeable to a futex word in the
-shared lock-file region (where PID heartbeats already live) with no
-API change. Cross-namespace fallback stays poll.
+Fix shape: `Version() uint64` plus a blocking
+`WaitVersion(ctx, from uint64) (uint64, error)` that returns when
+the committed-visible root version exceeds `from`, and a
+keyspace-scoped `WaitKeyspaceVersion(ctx, name, from)`; spurious
+wakeups allowed, callers re-check. The notification region in the
+shared lock file (where PID heartbeats already live) is a fixed
+array of counter words: slot 0 bumps on every commit (global wait),
+slots 1..K bump per touched keyspace by name-hash — so scoped
+waiters are not woken by unrelated-keyspace commits, and a hash
+collision is just a spurious wake. Futex wait on the slot word on
+Linux, adaptive poll over the mmap'd words as the portable
+fallback; cross-namespace fallback stays poll. Futex-first because
+the triggering consumer — gitfs's cross-runtime change-propagation
+channel — carries a sub-millisecond wake contract that an adaptive
+poll's backoff ceiling cannot honor.
 
-Lands: when a consumer's poll cadence becomes a real cost or latency
-bound (weaver's substrate-watching surfaces — session pickers,
-unowned-state listings — are the nearest consumers; live streams
-reach their serving process directly and never need this).
+Lands: 7 (`docs/plans/pre-consumer-engine-changes.md`). (weaver's
+substrate-watching surfaces — session pickers, unowned-state
+listings — remain follow-on consumers; live streams reach their
+serving process directly and never need this.)
