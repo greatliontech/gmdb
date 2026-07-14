@@ -330,7 +330,7 @@ var (
 	errInvalidMergeThreshold       = errors.New("gmdb: MergeThreshold must be in [1, 50]")
 	errInvalidRestartGroupTarget   = errors.New("gmdb: RestartGroupTarget must be in [0, 255]")
 	errInvalidLeafLayout           = errors.New("gmdb: unknown LeafLayout")
-	errInvalidBranchLayout         = errors.New("gmdb: unknown or unsupported BranchLayout")
+	errInvalidBranchLayout         = errors.New("gmdb: unknown BranchLayout")
 	errInvalidMaxBatchSize         = errors.New("gmdb: MaxBatchSize must be >= 1")
 	errInvalidMaxBatchDelay        = errors.New("gmdb: MaxBatchDelay must be >= 0")
 	errInvalidMaintenance          = errors.New("gmdb: invalid MaintenanceOptions (Interval/ScrubBatchSize/CompactionBatchSize must be >= 0; CompactionThreshold in [0,1])")

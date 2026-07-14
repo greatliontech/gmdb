@@ -40,7 +40,7 @@ func collectNestedTreeValues(t *testing.T, pw PageWriter, cfg page.Config, rootI
 			for e, ok := it.Next(); ok; e, ok = it.Next() {
 				out = append(out, append([]byte(nil), e.Key...))
 			}
-		case typ == page.TypeBranch:
+		case page.IsBranchType(typ):
 			_, _, cellCount, _ := page.ReadHeader(buf)
 			children := make([]uint64, 0, int(cellCount)+1)
 			for i := uint16(0); i <= cellCount; i++ {

@@ -102,7 +102,7 @@ func TestBranchSearchDescendIndex(t *testing.T) {
 }
 
 func TestBranchEncodedSizeFits(t *testing.T) {
-	cfg := Config{PageSize: 4096}
+	cfg := Config{PageSize: 4096, BranchLayout: BranchLayoutPlain}
 	cells := []BranchCell{
 		{Key: bytes.Repeat([]byte("k"), 100), Child: 1},
 		{Key: bytes.Repeat([]byte("l"), 100), Child: 2},

@@ -283,6 +283,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		MaxTxBufferBytes:   opts.MaxTxBufferBytes,
 		RestartGroupTarget: opts.RestartGroupTarget,
 		LeafLayout:         page.LeafLayout(opts.LeafLayout),
+		BranchLayout:       page.BranchLayout(opts.BranchLayout),
 	}
 	var opened *pager.OpenedDB
 	if opts.ReadOnly {

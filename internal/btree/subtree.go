@@ -78,7 +78,7 @@ func freeSubtreeAt(pw PageWriter, cfg page.Config, pageID uint64, depth int) (ui
 	}
 	typ, _, cellCount, _ := page.ReadHeader(buf)
 	switch {
-	case typ == page.TypeBranch:
+	case page.IsBranchType(typ):
 		if err := validateBranchPage(buf, cfg, pageID); err != nil {
 			return 0, err
 		}
@@ -188,8 +188,8 @@ func freeSubtreeAt(pw PageWriter, cfg page.Config, pageID uint64, depth int) (ui
 			count += n
 		}
 	default:
-		return 0, fmt.Errorf("%w: page %d has unexpected type %d at depth %d (expected branch=%d or a leaf type)",
-			ErrCorrupted, pageID, typ, depth, page.TypeBranch)
+		return 0, fmt.Errorf("%w: page %d has unexpected type %d at depth %d (expected a branch or leaf type)",
+			ErrCorrupted, pageID, typ, depth)
 	}
 	// Retire the page itself. Branch-or-leaf, the FreePage contract
 	// is the same: same-tx pages enter loosePages; prior-tx pages

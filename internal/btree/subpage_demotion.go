@@ -79,7 +79,7 @@ func DemoteNestedTreeIfFits(
 		// demotion candidate. Return (nil, false, nil) without
 		// inspecting further; the caller keeps the nested-tree-ref
 		// cell unchanged.
-		if typ != page.TypeBranch {
+		if !page.IsBranchType(typ) {
 			return nil, false, fmt.Errorf("%w: nested-tree root page %d has unexpected type %d (expected branch or leaf)",
 				ErrCorrupted, rootID, typ)
 		}

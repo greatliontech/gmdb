@@ -108,7 +108,7 @@ func walkNode(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int,
 	}
 	typ, _, cellCount, _ := page.ReadHeader(buf)
 	switch {
-	case typ == page.TypeBranch:
+	case page.IsBranchType(typ):
 		if err := page.ValidateBranch(buf, cfg); err != nil {
 			return fmt.Errorf("%w: branch %d at depth %d: %w", ErrCorrupted, pageID, depth, err)
 		}
@@ -139,8 +139,8 @@ func walkNode(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int,
 		}
 		return onLeaf(pageID, depth, r)
 	default:
-		return fmt.Errorf("%w: page %d unexpected type %d at depth %d (want branch=%d or a leaf type)",
-			ErrCorrupted, pageID, typ, depth, page.TypeBranch)
+		return fmt.Errorf("%w: page %d unexpected type %d at depth %d (want a branch or leaf type)",
+			ErrCorrupted, pageID, typ, depth)
 	}
 	return nil
 }

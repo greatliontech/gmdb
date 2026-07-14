@@ -70,7 +70,7 @@ and 10 remove.
       marker per the amended spec; separator computation, split,
       merge, and the landed overflow-separator paths re-anchored;
       generator grammars extended.
-- [ ] 6. Segregated branch: shared-prefix-once layout, heap-
+- [x] 6. Segregated branch: shared-prefix-once layout, heap-
       relative offsets-only directory with sentinel, child-pointer
       array, child-pointer-bit-63 overflow marker; per-keyspace
       declaration; generator grammars extended.

@@ -350,7 +350,7 @@ func countLeaves(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64) int
 		switch {
 		case page.IsLeafType(typ):
 			n++
-		case typ == page.TypeBranch:
+		case page.IsBranchType(typ):
 			lm, cells := page.DecodeBranch(buf, cfg)
 			walk(lm)
 			for _, c := range cells {
@@ -381,7 +381,7 @@ func walkLeavesUC(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64) {
 			return
 		case page.TypeLeaf:
 			t.Errorf("page %d encoded as compressed (TypeLeaf) under RestartGroupTarget=1; want TypeLeafUncompressed", id)
-		case page.TypeBranch:
+		case page.TypeBranch, page.TypeBranchSegregated:
 			lm, cells := page.DecodeBranch(buf, cfg)
 			walk(lm)
 			for _, c := range cells {
@@ -436,7 +436,7 @@ func TestPutForcesLeafSplitAndRootGrows(t *testing.T) {
 	// Root should now be a branch (depth > 0).
 	rootBuf, _ := pw.Page(root)
 	typ, _, _, _ := page.ReadHeader(rootBuf)
-	if typ != page.TypeBranch {
+	if !page.IsBranchType(typ) {
 		t.Errorf("root type = %d after %d puts, want TypeBranch=%d", typ, N, page.TypeBranch)
 	}
 	// All keys still retrievable.
@@ -545,7 +545,7 @@ func treeDepth(t *testing.T, pw *fakeWriter, root uint64) int {
 		if page.IsLeafType(typ) {
 			return depth
 		}
-		if typ != page.TypeBranch {
+		if !page.IsBranchType(typ) {
 			t.Fatalf("treeDepth: page %d type %d", cur, typ)
 		}
 		depth++
@@ -856,7 +856,7 @@ func collectReachable(t *testing.T, pw *fakeWriter, cfg page.Config, id uint64, 
 		}
 		return
 	}
-	if typ != page.TypeBranch {
+	if !page.IsBranchType(typ) {
 		t.Errorf("collectReachable: page %d type %d unexpected", id, typ)
 		return
 	}

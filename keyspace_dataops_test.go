@@ -474,7 +474,7 @@ func TestKeyspaceLayoutDeclaration(t *testing.T) {
 		walk = func(id uint64) {
 			b := tx.pgr.PageRaw(id)
 			switch ty, _, _, _ := page.ReadHeader(b); ty {
-			case page.TypeBranch:
+			case page.TypeBranch, page.TypeBranchSegregated:
 				lm, cells := page.DecodeBranch(b, tx.pgr.Config())
 				walk(lm)
 				for _, c := range cells {
@@ -523,9 +523,86 @@ func TestKeyspaceLayoutDeclaration(t *testing.T) {
 	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{LeafLayout: 3}); !errors.Is(err, ErrInvalidOptions) {
 		t.Fatalf("LeafLayout=3: err = %v, want ErrInvalidOptions", err)
 	}
-	// Branch layouts are rejected until their encoders land.
-	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{BranchLayout: BranchLayoutPlain}); !errors.Is(err, ErrInvalidOptions) {
-		t.Fatalf("BranchLayout=plain: err = %v, want ErrInvalidOptions", err)
+	// Branch layout declarations flow the same way. Build a separate
+	// keyspace whose LONG shared-prefix keys make separators ~800
+	// bytes — branch fanout ~4 — so the tree carries SEVERAL branch
+	// pages; a declaration flip then re-encodes only the branches on
+	// later write paths, leaving genuinely mixed branch variants.
+	ksb, err := tx.CreateKeyspace("ksb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CLUSTERED long keys: within a cluster, adjacent keys share an
+	// ~800-byte prefix (long separators); across clusters they diverge
+	// at byte 0. A segregated branch spanning clusters therefore has a
+	// zero page prefix and each ~800-byte separator costs full bytes —
+	// fanout ~5 — so the tree carries several branch pages (the same
+	// shape as the unreachable-floor fixtures).
+	longP := strings.Repeat("P", 800)
+	bigVal := []byte(strings.Repeat("v", 1200)) // ~2 entries per leaf
+	var bkeys []string
+	putB := func(k string) {
+		if err := ksb.Put([]byte(k), bigVal); err != nil {
+			t.Fatalf("ksb.Put(%q): %v", k, err)
+		}
+	}
+	for c := range 12 {
+		for j := range 4 {
+			k := fmt.Sprintf("%c%s-%03d", 'A'+c, longP, j)
+			bkeys = append(bkeys, k)
+			putB(k)
+		}
+	}
+	countBranchTypes := func() (seg, plain int) {
+		var walk func(id uint64)
+		walk = func(id uint64) {
+			b := tx.pgr.PageRaw(id)
+			switch ty, _, _, _ := page.ReadHeader(b); ty {
+			case page.TypeBranchSegregated:
+				seg++
+			case page.TypeBranch:
+				plain++
+			default:
+				return
+			}
+			lm, cells := page.DecodeBranch(b, tx.pgr.Config())
+			walk(lm)
+			for _, c := range cells {
+				walk(c.Child)
+			}
+		}
+		walk(ksb.desc.Root)
+		return seg, plain
+	}
+	if seg, plain := countBranchTypes(); seg < 2 || plain != 0 {
+		t.Fatalf("pre-declaration branches: seg=%d plain=%d, want several segregated only", seg, plain)
+	}
+	if err := tx.SetKeyspaceConfig("ksb", KeyspaceConfig{BranchLayout: BranchLayoutPlain}); err != nil {
+		t.Fatalf("SetKeyspaceConfig(BranchLayout=plain): %v", err)
+	}
+	// Insert into only the first few clusters — the touched write
+	// paths re-encode their branches to plain, the rest keep the
+	// segregated type byte.
+	for c := range 3 {
+		k := fmt.Sprintf("%c%s-%03d", 'A'+c, longP, 4)
+		bkeys = append(bkeys, k)
+		putB(k)
+	}
+	if seg, plain := countBranchTypes(); plain == 0 || seg == 0 {
+		t.Fatalf("after declaring plain and splitting: seg=%d plain=%d, want both variants coexisting", seg, plain)
+	}
+	for _, k := range bkeys {
+		if v, err := ksb.Get([]byte(k)); err != nil || !bytes.Equal(v, bigVal) {
+			t.Fatalf("ksb.Get(%q) with mixed branch layouts: %d bytes, %v", k, len(v), err)
+		}
+	}
+	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{BranchLayout: 3}); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("BranchLayout=3: err = %v, want ErrInvalidOptions", err)
+	}
+	// The leaf-side keyspace also declares plain branches so the
+	// reopened-descriptor assertion below covers both bit fields.
+	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{BranchLayout: BranchLayoutPlain}); err != nil {
+		t.Fatalf("SetKeyspaceConfig(ks, BranchLayout=plain): %v", err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
@@ -551,6 +628,9 @@ func TestKeyspaceLayoutDeclaration(t *testing.T) {
 	if ks2.desc.LeafLayoutBits() != uint8(LeafLayoutInterleaved) {
 		t.Fatalf("reopened descriptor LeafLayoutBits = %d, want %d", ks2.desc.LeafLayoutBits(), LeafLayoutInterleaved)
 	}
+	if ks2.desc.BranchLayoutBits() != uint8(BranchLayoutPlain) {
+		t.Fatalf("reopened descriptor BranchLayoutBits = %d, want %d", ks2.desc.BranchLayoutBits(), BranchLayoutPlain)
+	}
 	for _, k := range []string{"a", "b"} {
 		v, err := ks2.Get([]byte(k))
 		if err != nil || string(v) != "v" {
@@ -567,5 +647,34 @@ func TestKeyspaceLayoutDeclaration(t *testing.T) {
 		if err != nil || string(v) != "v" {
 			t.Fatalf("Get(%q) after flip back: %q, %v", k, v, err)
 		}
+	}
+}
+
+// TestOptionsBranchLayoutReachesBuilder pins the ENGINE-WIDE
+// Options.BranchLayout flow (keyspaces.md: descriptor 0 defers to the
+// opening process's engine default): with no per-keyspace declaration,
+// branches build in the Options-selected layout.
+func TestOptionsBranchLayoutReachesBuilder(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 256,
+		BranchLayout: BranchLayoutPlain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, _ := db.Begin(ctx)
+	defer tx.Rollback()
+	ks, _ := tx.CreateKeyspace("ks")
+	for i := range 60 {
+		if err := ks.Put([]byte(fmt.Sprintf("k-%03d-%s", i, strings.Repeat("x", 200))), []byte("v")); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	buf := tx.pgr.PageRaw(ks.desc.Root)
+	typ, _, _, _ := page.ReadHeader(buf)
+	if typ != page.TypeBranch {
+		t.Fatalf("root type = %d, want TypeBranch (engine-wide Options.BranchLayout=plain ignored)", typ)
 	}
 }

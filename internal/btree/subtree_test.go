@@ -80,7 +80,7 @@ func TestFreeSubtreeMultiLeafBranch(t *testing.T) {
 	for id := range reachable {
 		buf, _ := pw.Page(id)
 		typ, _, _, _ := page.ReadHeader(buf)
-		if typ == page.TypeBranch {
+		if page.IsBranchType(typ) {
 			branchSeen = true
 			break
 		}
@@ -179,7 +179,7 @@ func collectSubtreePages(t *testing.T, pr PageReader, cfg page.Config, rootID ui
 		buf, _ := pr.Page(id)
 		typ, _, count, _ := page.ReadHeader(buf)
 		switch {
-		case typ == page.TypeBranch:
+		case page.IsBranchType(typ):
 			for i := uint16(0); i <= count; i++ {
 				walk(page.BranchChildAt(buf, cfg, i), depth+1)
 			}

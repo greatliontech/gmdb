@@ -246,7 +246,7 @@ func collectReachablePages(t *testing.T, pr btree.PageReader, cfg page.Config, r
 		buf, _ := pr.Page(id)
 		typ, _, count, _ := page.ReadHeader(buf)
 		switch {
-		case typ == page.TypeBranch:
+		case page.IsBranchType(typ):
 			// Descent-index range: BranchChildAt(0) = leftmost,
 			// BranchChildAt(i ∈ [1, count]) = cell i-1's child.
 			for i := uint16(0); i <= count; i++ {

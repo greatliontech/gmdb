@@ -88,7 +88,7 @@ func relocateNode(pw PageWriter, cfg page.Config, id uint64, shouldRelocate func
 	if page.IsLeafType(typ) {
 		return relocateLeaf(pw, cfg, id, buf, shouldRelocate, budget, moved, depth)
 	}
-	if typ != page.TypeBranch {
+	if !page.IsBranchType(typ) {
 		return 0, false, fmt.Errorf("%w: page %d has unexpected type %d during relocation", ErrCorrupted, id, typ)
 	}
 	if err := validateBranchPage(buf, cfg, id); err != nil {

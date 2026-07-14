@@ -492,10 +492,7 @@ func (o Options) validate() error {
 	if o.LeafLayout > LeafLayoutSegregated {
 		return errInvalidLeafLayout
 	}
-	// Branch layout variants land with their encoders; until then only
-	// the engine default is accepted (the descriptor field and its
-	// validation already follow the final keyspaces.md contract).
-	if o.BranchLayout != BranchLayoutDefault {
+	if o.BranchLayout > BranchLayoutSegregated {
 		return errInvalidBranchLayout
 	}
 	// Validated after applyDefaults: a zero MaxBatchSize/MaxBatchDelay has

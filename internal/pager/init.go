@@ -137,6 +137,7 @@ type OpenParams struct {
 	// persisted; zero values defer to the page-package defaults.
 	RestartGroupTarget uint16
 	LeafLayout         page.LeafLayout
+	BranchLayout       page.BranchLayout
 }
 
 // OpenedDB bundles the products of Open: the UNATTACHED writer pager,
@@ -186,6 +187,7 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		PageChecksum:       m.HasFlag(MetaFlagPageChecksum),
 		RestartGroupTarget: op.RestartGroupTarget,
 		LeafLayout:         op.LeafLayout,
+		BranchLayout:       op.BranchLayout,
 	}
 
 	// 3) Reservation = MaxSize * PageSize, mmap, mprotect.
@@ -264,6 +266,7 @@ func OpenReadOnly(file *os.File, op OpenParams) (*OpenedDB, error) {
 		PageChecksum:       m.HasFlag(MetaFlagPageChecksum),
 		RestartGroupTarget: op.RestartGroupTarget,
 		LeafLayout:         op.LeafLayout,
+		BranchLayout:       op.BranchLayout,
 	}
 	reservation := int64(m.MaxSize) * int64(pageSize)
 	p, err := NewReader(file, cfg, reservation)

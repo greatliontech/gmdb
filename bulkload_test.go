@@ -170,8 +170,8 @@ func TestBulkBuilderRootTypeProgression(t *testing.T) {
 	// Many large-valued entries → branch root (multiple leaves).
 	bigRoot, _ := buildBulkTree(t, tx.pgr, cfg, genKVs(2000, 400))
 	btyp, _, _, _ := page.ReadHeader(tx.pgr.PageRaw(bigRoot))
-	if btyp != page.TypeBranch {
-		t.Errorf("big-tree root type = %d, want TypeBranch(%d)", btyp, page.TypeBranch)
+	if !page.IsBranchType(btyp) {
+		t.Errorf("big-tree root type = %d, want a branch type", btyp)
 	}
 }
 
@@ -212,7 +212,7 @@ func TestBulkBuilderLargeSeparatorsByteDriven(t *testing.T) {
 		t.Errorf("count = %d, want %d", count, len(kvs))
 	}
 	// Large keys + values force many leaves and at least one branch level.
-	if typ, _, _, _ := page.ReadHeader(tx.pgr.PageRaw(root)); typ != page.TypeBranch {
+	if typ, _, _, _ := page.ReadHeader(tx.pgr.PageRaw(root)); !page.IsBranchType(typ) {
 		t.Fatalf("root type = %d, want TypeBranch (no branch level built)", typ)
 	}
 	verifyBulkTree(t, tx.pgr, cfg, root, kvs)
@@ -319,15 +319,40 @@ func TestBulkBuilderBranchSizeAccounting(t *testing.T) {
 	}
 	for name, keys := range cases {
 		t.Run(name, func(t *testing.T) {
-			var cells []page.BranchCell
-			keyLenSum := 0
-			for i, k := range keys {
-				// Mirror addLink's additive plain-branch tally.
-				incr := page.BranchEncodedSizeOf(len(cells)+1, keyLenSum+len(k), 0)
-				cells = append(cells, page.BranchCell{Key: k, Child: uint64(i + 1)})
-				keyLenSum += len(k)
-				if got := page.BranchEncodedSize(cfg, cells); got != incr {
-					t.Fatalf("after %d cells: incremental size %d != BranchEncodedSize %d", i+1, incr, got)
+			// Mirror addLink's incremental tally through the SAME
+			// dispatched sizing (page.BranchSizeOf) — under the
+			// segregated layout the size is non-additive in the
+			// running shared prefix, under plain the prefix is
+			// ignored; both must equal the authoritative
+			// BranchEncodedSize after every append.
+			for _, bl := range []page.BranchLayout{page.BranchLayoutPlain, page.BranchLayoutSegregated} {
+				lcfg := cfg
+				lcfg.BranchLayout = bl
+				var cells []page.BranchCell
+				keyLenSum := 0
+				for i, k := range keys {
+					prefixLen := len(k)
+					if len(cells) > 0 {
+						prefixLen = sharedLen(cells[0].Key, k)
+					}
+					incr := page.BranchSizeOf(lcfg, len(cells)+1, keyLenSum+len(k), prefixLen, 0)
+					cells = append(cells, page.BranchCell{Key: k, Child: uint64(i + 1)})
+					keyLenSum += len(k)
+					if got := page.BranchEncodedSize(lcfg, cells); got != incr {
+						t.Fatalf("layout=%d after %d cells: incremental size %d != BranchEncodedSize %d", bl, i+1, incr, got)
+					}
+					// Encoder-anchored oracle: the formula must equal
+					// the ACTUAL page occupancy (ContentEnd - free
+					// space) of an encode — otherwise formula and
+					// encoder drift together and the tally check above
+					// is a tautology.
+					buf := make([]byte, lcfg.PageSize)
+					if err := page.EncodeBranch(buf, lcfg, 1, cells); err != nil {
+						t.Fatalf("layout=%d EncodeBranch: %v", bl, err)
+					}
+					if occ := lcfg.ContentEnd() - page.BranchFreeSpace(buf, lcfg); occ != incr {
+						t.Fatalf("layout=%d after %d cells: formula %d != encoded occupancy %d", bl, i+1, incr, occ)
+					}
 				}
 			}
 		})

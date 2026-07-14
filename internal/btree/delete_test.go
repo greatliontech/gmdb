@@ -126,7 +126,7 @@ func TestDeleteCausesRootCollapseAfterLeafMerge(t *testing.T) {
 	// Confirm initial topology: root is a branch.
 	rootBuf, _ := pw.Page(root)
 	typ, _, _, _ := page.ReadHeader(rootBuf)
-	if typ != page.TypeBranch {
+	if !page.IsBranchType(typ) {
 		t.Fatalf("setup: root type = %d, want TypeBranch", typ)
 	}
 
@@ -627,7 +627,7 @@ func checkBalance(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64) {
 		switch {
 		case page.IsLeafType(typ):
 			leafDepths[depth]++
-		case typ == page.TypeBranch:
+		case page.IsBranchType(typ):
 			lm, cells := page.DecodeBranch(buf, cfg)
 			walk(lm, depth+1)
 			for _, c := range cells {
@@ -670,7 +670,7 @@ func checkUnderflowInvariant(t *testing.T, pw *fakeWriter, cfg page.Config, root
 				t.Errorf("non-root leaf %d underflowed: size=%d (%.1f%% of %d), threshold=%d%%",
 					id, size, float64(size)*100/float64(cfg.ContentEnd()), cfg.ContentEnd(), threshold)
 			}
-		case typ == page.TypeBranch:
+		case page.IsBranchType(typ):
 			lm, cells := page.DecodeBranch(buf, cfg)
 			if !isRoot {
 				// Fill-floor is measured on LOGICAL (uncompressed) content,
@@ -736,7 +736,7 @@ func checkReachableFloor(t *testing.T, pw *fakeWriter, cfg page.Config, root uin
 	var walk func(id uint64)
 	walk = func(id uint64) {
 		buf, _ := pw.Page(id)
-		if typ, _, _, _ := page.ReadHeader(buf); typ != page.TypeBranch {
+		if typ, _, _, _ := page.ReadHeader(buf); !page.IsBranchType(typ) {
 			return
 		}
 		lm, cells := page.DecodeBranch(buf, cfg)
@@ -1145,7 +1145,7 @@ func verifyDeclineOutcome(t *testing.T, pw *fakeWriter, cfg page.Config, fx decl
 	if err != nil {
 		t.Fatalf("Page(newRoot): %v", err)
 	}
-	if typ, _, _, _ := page.ReadHeader(rootBuf); typ != page.TypeBranch {
+	if typ, _, _, _ := page.ReadHeader(rootBuf); !page.IsBranchType(typ) {
 		t.Fatalf("newRoot type = %d, want branch", typ)
 	}
 	_, cells := page.DecodeBranch(rootBuf, cfg)

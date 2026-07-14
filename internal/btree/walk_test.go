@@ -23,7 +23,7 @@ func TestWalkVisitsEveryReachablePageOnce(t *testing.T) {
 
 	// Root must be a branch for this test to mean anything.
 	rootBuf, _ := pw.Page(root)
-	if typ, _, _, _ := page.ReadHeader(rootBuf); typ != page.TypeBranch {
+	if typ, _, _, _ := page.ReadHeader(rootBuf); !page.IsBranchType(typ) {
 		t.Fatalf("root type = %d, want branch (need a multi-level tree)", typ)
 	}
 
@@ -108,7 +108,7 @@ func TestWalkRejectsForgedBranchDirectory(t *testing.T) {
 	root, pw := buildTree(t, cfg, pairs)
 	hwm := pw.nextID
 	buf, _ := pw.Page(root)
-	if typ, _, n, _ := page.ReadHeader(buf); typ != page.TypeBranch || n == 0 {
+	if typ, _, n, _ := page.ReadHeader(buf); !page.IsBranchType(typ) || n == 0 {
 		t.Fatalf("root not a non-empty branch")
 	}
 	// Corrupt the first cell-directory entry's offset to 0xFFFF (way

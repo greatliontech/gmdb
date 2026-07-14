@@ -28,7 +28,15 @@ const (
 	TypeRPLSegment       uint8 = 4
 	TypeLeafUncompressed uint8 = 5
 	TypeLeafSegregated   uint8 = 6
+	TypeBranchSegregated uint8 = 7
 )
+
+// IsBranchType reports whether typ is any branch variant (plain or
+// segregated). The btree dispatcher uses this to gate descent on a
+// page's type byte without committing to a specific encoding.
+func IsBranchType(typ uint8) bool {
+	return typ == TypeBranch || typ == TypeBranchSegregated
+}
 
 // IsLeafType reports whether typ is any leaf variant. The btree
 // dispatcher uses this to gate descent on a page's type byte without
@@ -118,6 +126,27 @@ const (
 // Valid reports whether l is a defined LeafLayout value.
 func (l LeafLayout) Valid() bool { return l <= LeafLayoutSegregated }
 
+// BranchLayout selects the branch layout variant a builder produces
+// (page-formats.md §Branch Page). Readers always dispatch by the
+// page's type byte — the config value never affects decoding.
+type BranchLayout uint8
+
+const (
+	// BranchLayoutDefault defers to the engine default (segregated).
+	BranchLayoutDefault BranchLayout = 0
+	// BranchLayoutPlain builds TypeBranch pages: full separator bytes
+	// per cell — the probe-latency floor.
+	BranchLayoutPlain BranchLayout = 1
+	// BranchLayoutSegregated builds TypeBranchSegregated pages: the
+	// page's shared separator prefix stored once, an offsets-only
+	// suffix-heap directory, and a segregated child-pointer array —
+	// the density choice for deep-shared-prefix separator sets.
+	BranchLayoutSegregated BranchLayout = 2
+)
+
+// Valid reports whether b is a defined BranchLayout value.
+func (b BranchLayout) Valid() bool { return b <= BranchLayoutSegregated }
+
 // MaxRestartGroupTarget is the hard physical cap on RestartGroupTarget: the
 // compressed-leaf restart-table entry's Count field is uint8 (per
 // page-formats.md §Compressed Leaf), so groups can hold at most 255 entries.
@@ -151,6 +180,11 @@ type Config struct {
 	// Decode-side machinery never consults it — readers dispatch on
 	// the page type byte.
 	LeafLayout LeafLayout
+
+	// BranchLayout selects the branch variant the builders produce
+	// (BranchLayoutDefault resolves to segregated). Decode-side
+	// machinery never consults it.
+	BranchLayout BranchLayout
 }
 
 // EffectiveRestartGroupTarget returns the effective target — the configured
@@ -178,6 +212,16 @@ func (c Config) EffectiveLeafType() uint8 {
 	return TypeLeafSegregated
 }
 
+// EffectiveBranchType returns the page type the branch encoder
+// produces under this config (BranchLayoutDefault ⇒ segregated, the
+// engine default per keyspaces.md).
+func (c Config) EffectiveBranchType() uint8 {
+	if c.BranchLayout == BranchLayoutPlain {
+		return TypeBranch
+	}
+	return TypeBranchSegregated
+}
+
 // Validate reports whether c describes a supported page configuration.
 // Returns an error when PageSize is not a power of two in [MinPageSize,
 // MaxPageSize], or when RestartGroupTarget exceeds MaxRestartGroupTarget;
@@ -196,6 +240,9 @@ func (c Config) Validate() error {
 	}
 	if !c.LeafLayout.Valid() {
 		return fmt.Errorf("page: unknown LeafLayout %d", c.LeafLayout)
+	}
+	if !c.BranchLayout.Valid() {
+		return fmt.Errorf("page: unknown BranchLayout %d", c.BranchLayout)
 	}
 	return nil
 }

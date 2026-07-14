@@ -31,7 +31,15 @@ func refBranchSearch(cells []BranchCell, target []byte) uint16 {
 // separator sets with deep shared bytes are the regime the plain
 // layout must handle without any prefix machinery.
 func TestBranchRoundTripSharedPrefixShapes(t *testing.T) {
-	cfg := Config{PageSize: 4096}
+	for _, cfg := range []Config{
+		{PageSize: 4096, BranchLayout: BranchLayoutPlain},
+		{PageSize: 4096, BranchLayout: BranchLayoutSegregated},
+	} {
+		testBranchRoundTripSharedPrefixShapes(t, cfg)
+	}
+}
+
+func testBranchRoundTripSharedPrefixShapes(t *testing.T, cfg Config) {
 	deep := bytes.Repeat([]byte("shared/prefix/"), 30) // ~420-byte common prefix
 	cases := map[string][]BranchCell{
 		"no shared prefix": {
@@ -95,7 +103,15 @@ func TestBranchRoundTripSharedPrefixShapes(t *testing.T) {
 // insurance that the plain layout's single-phase search has no
 // prefix-dependent blind spots.
 func TestBranchSearchEquivalence(t *testing.T) {
-	cfg := Config{PageSize: 4096}
+	for _, cfg := range []Config{
+		{PageSize: 4096, BranchLayout: BranchLayoutPlain},
+		{PageSize: 4096, BranchLayout: BranchLayoutSegregated},
+	} {
+		testBranchSearchEquivalence(t, cfg)
+	}
+}
+
+func testBranchSearchEquivalence(t *testing.T, cfg Config) {
 	rng := rand.New(rand.NewPCG(0x5eed, 0xb00c))
 
 	makeCells := func(prefix []byte, n int) []BranchCell {
@@ -200,7 +216,14 @@ func TestBranchSearchEquivalence(t *testing.T) {
 // Check() repair / recovery rely on).
 func TestBranchEncodeDeterministic(t *testing.T) {
 	for _, checksum := range []bool{false, true} {
-		cfg := Config{PageSize: 4096, PageChecksum: checksum}
+		for _, layout := range []BranchLayout{BranchLayoutPlain, BranchLayoutSegregated} {
+			testBranchEncodeDeterministic(t, Config{PageSize: 4096, PageChecksum: checksum, BranchLayout: layout})
+		}
+	}
+}
+
+func testBranchEncodeDeterministic(t *testing.T, cfg Config) {
+	{
 		deep := bytes.Repeat([]byte("x/y/z/"), 40)
 		cells := []BranchCell{
 			{Key: append(append([]byte(nil), deep...), []byte("01")...), Child: 11},
@@ -216,7 +239,7 @@ func TestBranchEncodeDeterministic(t *testing.T) {
 			t.Fatalf("encode b: %v", err)
 		}
 		if !bytes.Equal(a, b) {
-			t.Errorf("checksum=%v: two encodes of the same input differ", checksum)
+			t.Errorf("cfg=%+v: two encodes of the same input differ", cfg)
 		}
 		// Decode then re-encode → byte-identical.
 		lm, decoded := DecodeBranch(a, cfg)
@@ -225,24 +248,28 @@ func TestBranchEncodeDeterministic(t *testing.T) {
 			t.Fatalf("re-encode: %v", err)
 		}
 		if !bytes.Equal(a, c) {
-			t.Errorf("checksum=%v: re-encode of decoded page is not byte-identical", checksum)
+			t.Errorf("cfg=%+v: re-encode of decoded page is not byte-identical", cfg)
 		}
 	}
 }
 
-// FuzzPlainBranchSearchAndRoundTrip: random sorted cell sets — shared
+// FuzzBranchSearchAndRoundTrip: random sorted cell sets — shared
 // prefixes of seed-driven depth, a sprinkle of overflow-key cells with
 // resident first-T slices — must (a) round-trip byte-identically
 // through Encode/Decode/Encode, (b) pass ValidateBranch, and (c) agree
 // with the linear refBranchSearch for a probe battery, with overflow
-// ties resolved through a synthetic tail comparator.
-func FuzzPlainBranchSearchAndRoundTrip(f *testing.F) {
+// ties resolved through a synthetic tail comparator. The layout under
+// test is seed-selected so one corpus covers both branch variants.
+func FuzzBranchSearchAndRoundTrip(f *testing.F) {
 	f.Add(uint64(1), uint64(2))
 	f.Add(uint64(42), uint64(7))
 	f.Add(uint64(0xDEADBEEF), uint64(0xCAFEBABE))
 
 	f.Fuzz(func(t *testing.T, cellSeed, probeSeed uint64) {
-		cfg := Config{PageSize: 4096}
+		cfg := Config{PageSize: 4096, BranchLayout: BranchLayoutPlain}
+		if cellSeed%2 == 1 {
+			cfg.BranchLayout = BranchLayoutSegregated
+		}
 		tt := cfg.InlineThreshold()
 		rng := rand.New(rand.NewPCG(cellSeed, cellSeed^0x9E3779B97F4A7C15))
 
@@ -373,12 +400,16 @@ func FuzzPlainBranchSearchAndRoundTrip(f *testing.F) {
 // or survives a full DecodeBranch + BranchSearch pass without panicking.
 func FuzzValidateBranchTotal(f *testing.F) {
 	cfg := Config{PageSize: 4096}
-	seed := make([]byte, cfg.PageSize)
-	_ = EncodeBranch(seed, cfg, 5, []BranchCell{
-		{Key: []byte("ccc"), Child: 10},
-		{Key: []byte("mmm"), Child: 20},
-	})
-	f.Add(seed, byte(0), uint16(0))
+	for _, bl := range []BranchLayout{BranchLayoutPlain, BranchLayoutSegregated} {
+		c := cfg
+		c.BranchLayout = bl
+		seed := make([]byte, c.PageSize)
+		_ = EncodeBranch(seed, c, 5, []BranchCell{
+			{Key: []byte("ccc"), Child: 10},
+			{Key: []byte("mmm"), Child: 20},
+		})
+		f.Add(seed, byte(0), uint16(0))
+	}
 	f.Fuzz(func(t *testing.T, pg []byte, mutByte byte, mutOff uint16) {
 		if len(pg) == 0 {
 			return
@@ -388,7 +419,7 @@ func FuzzValidateBranchTotal(f *testing.F) {
 		buf[int(mutOff)%len(buf)] ^= mutByte
 		// Mirror the production boundary: callers gate on the type
 		// byte before treating a page as a branch.
-		if typ, _, _, _ := ReadHeader(buf); typ != TypeBranch {
+		if typ, _, _, _ := ReadHeader(buf); !IsBranchType(typ) {
 			return
 		}
 		if err := ValidateBranch(buf, cfg); err != nil {

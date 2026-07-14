@@ -172,7 +172,7 @@ func TestDemoteNestedTreeMultiLeafReturnsFalse(t *testing.T) {
 	// Verify the tree has a branch root.
 	buf, _ := pw.Page(root)
 	typ, _, _, _ := page.ReadHeader(buf)
-	if typ != page.TypeBranch {
+	if !page.IsBranchType(typ) {
 		t.Fatalf("root type=%d, want branch (test premise: multi-leaf tree)", typ)
 	}
 

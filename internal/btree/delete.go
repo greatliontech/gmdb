@@ -129,7 +129,7 @@ func deleteFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8, pageID uin
 	case page.IsLeafType(typ):
 		newID, underflow, found, err = deleteFromLeaf(pw, cfg, mergeThreshold, pageID, buf, key)
 		return newID, underflow, found, 0, err
-	case typ == page.TypeBranch:
+	case page.IsBranchType(typ):
 		if err := validateBranchPage(buf, cfg, pageID); err != nil {
 			return 0, false, false, 0, err
 		}
@@ -374,7 +374,7 @@ func pageUnderflow(pw PageReader, cfg page.Config, id uint64, mergeThreshold uin
 			return false, fmt.Errorf("%w: leaf %d: %w", ErrCorrupted, id, err)
 		}
 		return leafUnderflow(buf, cfg, mergeThreshold), nil
-	case typ == page.TypeBranch:
+	case page.IsBranchType(typ):
 		if err := validateBranchPage(buf, cfg, id); err != nil {
 			return false, err
 		}
@@ -431,7 +431,7 @@ func collapseDegenerateRoot(pw PageWriter, cfg page.Config, rootID uint64) (uint
 			return 0, err
 		}
 		typ, _, count, _ := page.ReadHeader(buf)
-		if typ != page.TypeBranch || count != 0 {
+		if !page.IsBranchType(typ) || count != 0 {
 			break
 		}
 		if err := validateBranchPage(buf, cfg, rootID); err != nil {
@@ -854,7 +854,7 @@ func patchBranchAfterChildDelete(pw PageWriter, cfg page.Config, mergeThreshold 
 				if cerr != nil {
 					return 0, false, 0, cerr
 				}
-				if typ, _, _, _ := page.ReadHeader(cbuf); typ != page.TypeBranch {
+				if typ, _, _, _ := page.ReadHeader(cbuf); !page.IsBranchType(typ) {
 					continue
 				}
 				if verr := validateBranchPage(cbuf, cfg, id); verr != nil {
@@ -1086,7 +1086,7 @@ func deepHolderAfterRedistribute(pw PageWriter, cfg page.Config, leftID, rightID
 			return 0, false, err
 		}
 		typ, _, _, _ := page.ReadHeader(buf)
-		if typ != page.TypeBranch {
+		if !page.IsBranchType(typ) {
 			return 0, false, fmt.Errorf("%w: redistribute output %d unexpected type %d in deep-holder scan", ErrCorrupted, id, typ)
 		}
 		if err := validateBranchPage(buf, cfg, id); err != nil {
@@ -1215,7 +1215,7 @@ func cousinRebalanceBranch(pw PageWriter, cfg page.Config, branchID uint64, deep
 				return 0, false, 0, perr
 			}
 			scanTyp, _, _, _ := page.ReadHeader(scanBuf)
-			if scanTyp != page.TypeBranch {
+			if !page.IsBranchType(scanTyp) {
 				break
 			}
 			scanLeftmost, scanCells := page.DecodeBranch(scanBuf, cfg)
@@ -1374,7 +1374,7 @@ func mergeOrRedistributePair(pw PageWriter, cfg page.Config, mergeThreshold uint
 				err = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 			}
 		}
-	case leftTyp == page.TypeBranch && rightTyp == page.TypeBranch:
+	case page.IsBranchType(leftTyp) && page.IsBranchType(rightTyp):
 		// Branch pairs EMBED the parent separator cell into the
 		// combined set (extent carried by reference — never freed
 		// here) and lift a middle cell back out on redistribute.

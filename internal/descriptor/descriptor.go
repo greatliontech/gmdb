@@ -102,6 +102,9 @@ func ApplyToConfig(d Keyspace, cfg page.Config) page.Config {
 	if b := d.LeafLayoutBits(); b != 0 {
 		cfg.LeafLayout = page.LeafLayout(b)
 	}
+	if b := d.BranchLayoutBits(); b != 0 {
+		cfg.BranchLayout = page.BranchLayout(b)
+	}
 	return cfg
 }
 

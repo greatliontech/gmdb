@@ -32,7 +32,7 @@ func PathLen(pr PageReader, cfg page.Config, root uint64) (int, error) {
 		if page.IsLeafType(typ) {
 			return n, nil
 		}
-		if typ != page.TypeBranch {
+		if !page.IsBranchType(typ) {
 			return 0, fmt.Errorf("%w: page %d has unexpected type %d during PathLen descent", ErrCorrupted, cur, typ)
 		}
 		if err := validateBranchPage(buf, cfg, cur); err != nil {

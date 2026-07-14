@@ -119,9 +119,10 @@ Invariant: kind=entailed;
     hold (two overflow-key + overflow-value entries exceed
     `PageSize` at every size); requiring it would misderive `T`.
     (Leaf floors enforced by TestLeafFloorOneMaximalEntryEveryLayout;
-    the current branch layout's two-cell floor by
-    TestInlineThresholdValues. Per-variant branch floors:
-    Lands: when the second branch layout variant is first written.)
+    per-variant branch floors by TestInlineThresholdValues — both
+    layouts' two-cell budgets at every page size and checksum mode —
+    and by TestBranchOverflowCellRoundTrip's two-cell floor fixtures,
+    which encode, validate, and tight-side-reject under each layout.)
 
 Invariant: kind=clause-explicit;
   property=Within a leaf restart group, the entry at the group's
@@ -542,10 +543,11 @@ cluster prefix stores that prefix once, so its fan-out stays high
 even when each separator approaches the inline threshold `T`
 (§Overflow-Key Cells) — the case that, in the plain layout,
 collapses fan-out toward 2 (a branch holding only ~2 near-`T`
-separators) and builds trees born below the `range-delete.md
-§Invariants` fill-floor. Keyspaces whose branch separators can
-approach `T` with shared prefixes should declare the segregated
-branch layout.
+separators): a depth/breadth cost — such branches are byte-full and
+sit ABOVE the `range-delete.md §Invariants` fill-floor by its own
+logical-fill metric — but every descent pays the extra levels.
+Keyspaces whose branch separators can approach `T` with shared
+prefixes should declare the segregated branch layout.
 
 **Interaction with key size**: separator truncation and within-page
 prefix truncation are density optimizations — they cannot bound key

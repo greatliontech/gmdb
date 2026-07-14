@@ -88,7 +88,7 @@ func TestDeleteSizeSkewedSiblingsDeclinesAndTerminates(t *testing.T) {
 	// The decline path keeps the pair unmerged: root is still a branch
 	// with two leaf children (the small one accepted below-floor).
 	buf, _ := pw.Page(newRoot)
-	if typ, _, count, _ := page.ReadHeader(buf); typ != page.TypeBranch || count != 1 {
+	if typ, _, count, _ := page.ReadHeader(buf); !page.IsBranchType(typ) || count != 1 {
 		t.Fatalf("root type=%d cells=%d, want branch with 1 cell (2 children)", typ, count)
 	}
 }
@@ -156,7 +156,7 @@ func TestDeleteInfeasibleRedistributeDeclines(t *testing.T) {
 	{
 		buf, _ := pw.Page(newRoot)
 		typ, _, count, _ := page.ReadHeader(buf)
-		if typ != page.TypeBranch || count != 1 {
+		if !page.IsBranchType(typ) || count != 1 {
 			t.Fatalf("root type=%d cells=%d, want branch with 1 cell (pair kept)", typ, count)
 		}
 		hbuf, _ := pw.Page(page.BranchLeftmostChild(buf))
@@ -212,7 +212,7 @@ func TestDeleteBalancedRedistributeStillFires(t *testing.T) {
 	// Redistribute fired: both children at/above the floor.
 	buf, _ := pw.Page(newRoot)
 	typ, _, count, _ := page.ReadHeader(buf)
-	if typ != page.TypeBranch || count != 1 {
+	if !page.IsBranchType(typ) || count != 1 {
 		t.Fatalf("root type=%d cells=%d, want branch with 1 cell", typ, count)
 	}
 	leftmost := page.BranchLeftmostChild(buf)

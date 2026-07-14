@@ -181,7 +181,7 @@ func deleteRangeFrom(pw PageWriter, cfg page.Config, mergeThreshold uint8,
 	case page.IsLeafType(typ):
 		newID, count, underflow, err := deleteRangeFromLeaf(pw, cfg, mergeThreshold, pageID, buf, start, end, perCellFree)
 		return newID, count, underflow, 0, err
-	case typ == page.TypeBranch:
+	case page.IsBranchType(typ):
 		if err := validateBranchPage(buf, cfg, pageID); err != nil {
 			return 0, 0, false, 0, err
 		}
@@ -830,7 +830,7 @@ func rebalanceSurvivors(pw PageWriter, cfg page.Config, mergeThreshold uint8, or
 			switch {
 			case page.IsLeafType(mergedTyp):
 				mergedFillUnderflow = leafUnderflow(mergedBuf, cfg, mergeThreshold)
-			case mergedTyp == page.TypeBranch:
+			case page.IsBranchType(mergedTyp):
 				_, mc := page.DecodeBranch(mergedBuf, cfg)
 				mergedFillUnderflow = branchUnderflow(cfg, mc, mergeThreshold)
 			default:

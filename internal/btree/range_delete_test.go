@@ -230,7 +230,7 @@ func TestBtreeDeleteRangeMultiLevelInteriorRetire(t *testing.T) {
 	// Sanity: tree should have at least one branch level.
 	rootBuf, _ := pw.Page(root)
 	rootTyp, _, _, _ := page.ReadHeader(rootBuf)
-	if rootTyp != page.TypeBranch {
+	if !page.IsBranchType(rootTyp) {
 		t.Fatalf("test setup too small — root is leaf, not branch")
 	}
 	// Delete the middle 600 keys [k00300, k00900).

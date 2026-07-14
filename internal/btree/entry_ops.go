@@ -60,7 +60,7 @@ func GetEntry(pr PageReader, cfg page.Config, rootID uint64, key []byte) (page.L
 			_ = e
 			return full, true, nil
 		}
-		if typ != page.TypeBranch {
+		if !page.IsBranchType(typ) {
 			return page.LeafEntry{}, false, fmt.Errorf("%w: page %d has unexpected type %d during GetEntry descent", ErrCorrupted, cur, typ)
 		}
 		if err := validateBranchPage(buf, cfg, cur); err != nil {

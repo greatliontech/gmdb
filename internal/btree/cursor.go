@@ -606,7 +606,7 @@ func (c *Cursor) descendFrom(cur uint64, pick branchPick, onLeaf func(r page.Lea
 			onLeaf(r)
 			return nil
 		}
-		if typ != page.TypeBranch {
+		if !page.IsBranchType(typ) {
 			return fmt.Errorf("%w: page %d unexpected type %d in cursor descent", ErrCorrupted, cur, typ)
 		}
 		if err := validateBranchPage(buf, c.cfg, cur); err != nil {

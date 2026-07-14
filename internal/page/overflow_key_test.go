@@ -31,11 +31,15 @@ func TestInlineThresholdValues(t *testing.T) {
 		if got := cfg.InlineThreshold(); got != c.want {
 			t.Errorf("InlineThreshold(%d, checksum=%v) = %d, want %d", c.pageSize, c.checksum, got, c.want)
 		}
-		// The floor: a plain branch page holds TWO worst-case
-		// overflow cells (page-formats.md §Invariants).
+		// The floor: EVERY branch layout holds TWO worst-case
+		// overflow cells (page-formats.md §Invariants) — plain and
+		// segregated budgets both checked at every size.
 		tt := cfg.InlineThreshold()
 		if need := BranchEncodedSizeOf(2, 2*tt, 2); need > cfg.ContentEnd() {
-			t.Errorf("two overflow cells at T=%d need %d > ContentEnd %d", tt, need, cfg.ContentEnd())
+			t.Errorf("plain: two overflow cells at T=%d need %d > ContentEnd %d", tt, need, cfg.ContentEnd())
+		}
+		if need := segBranchEncodedSizeOf(2, 2*tt, 0, 2); need > cfg.ContentEnd() {
+			t.Errorf("segregated: two overflow cells at T=%d need %d > ContentEnd %d", tt, need, cfg.ContentEnd())
 		}
 		// 15-bit fit for the branch directory's overflow marker.
 		if tt >= 1<<15 {
@@ -310,7 +314,15 @@ func TestCompareEntryKeyExtentRule(t *testing.T) {
 // overflow cell; the two-ovk floor page is round-tripped separately
 // below.
 func TestBranchOverflowCellRoundTrip(t *testing.T) {
-	cfg := Config{PageSize: 4096}
+	for _, cfg := range []Config{
+		{PageSize: 4096, BranchLayout: BranchLayoutPlain},
+		{PageSize: 4096, BranchLayout: BranchLayoutSegregated},
+	} {
+		testBranchOverflowCellRoundTrip(t, cfg)
+	}
+}
+
+func testBranchOverflowCellRoundTrip(t *testing.T, cfg Config) {
 	tt := cfg.InlineThreshold()
 	pfx := bytes.Repeat([]byte{'p'}, 64)
 	mkSep := func(c byte) []byte {
@@ -357,6 +369,26 @@ func TestBranchOverflowCellRoundTrip(t *testing.T) {
 	if err := EncodeBranch(make([]byte, cfg.PageSize), cfg, 9, over); err == nil {
 		t.Fatal("EncodeBranch accepted two worst-case overflow cells plus a third")
 	}
+	// The spec's WORST-case floor is at ZERO shared prefix
+	// (page-formats.md §Invariants) — the mkSep fixtures share 64
+	// bytes, so encode a genuinely prefix-free two-ovk page too.
+	zpA := bytes.Repeat([]byte{'a'}, tt+7)
+	zpB := bytes.Repeat([]byte{'b'}, tt+7)
+	zero := []BranchCell{
+		{Key: zpA[:tt], Child: 1, KeyExtPage: 51, KeyTotalLen: uint32(len(zpA))},
+		{Key: zpB[:tt], Child: 2, KeyExtPage: 52, KeyTotalLen: uint32(len(zpB))},
+	}
+	zbuf := make([]byte, cfg.PageSize)
+	if err := EncodeBranch(zbuf, cfg, 9, zero); err != nil {
+		t.Fatalf("EncodeBranch(zero-prefix two-ovk floor): %v", err)
+	}
+	if err := ValidateBranch(zbuf, cfg); err != nil {
+		t.Fatalf("ValidateBranch(zero-prefix floor): %v", err)
+	}
+	if err := EncodeBranch(make([]byte, cfg.PageSize), cfg, 9,
+		append(append([]BranchCell{}, zero...), BranchCell{Key: []byte{0xFF}, Child: 3})); err == nil {
+		t.Fatal("EncodeBranch accepted zero-prefix two-ovk floor plus a third cell")
+	}
 	for i := range cells {
 		if !bytes.Equal(gotCells[i].Key, cells[i].Key) || gotCells[i].Child != cells[i].Child ||
 			gotCells[i].KeyExtPage != cells[i].KeyExtPage || gotCells[i].KeyTotalLen != cells[i].KeyTotalLen {
@@ -400,12 +432,26 @@ func TestBranchOverflowCellRoundTrip(t *testing.T) {
 	if calls != 0 {
 		t.Errorf("short probe consulted the extent %d times, want 0", calls)
 	}
+	// An EXACT-T probe that fully matches the resident bytes is a
+	// strict prefix of the stored key — strictly less, decided with
+	// NO extent read (page-formats.md §Overflow-Key Cells).
+	calls = 0
+	idxT, err := BranchSearch(buf, cfg, bytes.Clone(sepA[:tt]), tail)
+	if err != nil {
+		t.Fatalf("BranchSearch exact-T: %v", err)
+	}
+	if idxT != 0 {
+		t.Errorf("BranchSearch(exact-T resident) = %d, want 0 (< sepA)", idxT)
+	}
+	if calls != 0 {
+		t.Errorf("exact-T probe consulted the extent %d times, want 0", calls)
+	}
 }
 
 // TestBranchValidateRejectsForgedOverflowCell pins ValidateBranch's
 // derivable-length policy for overflow cells.
 func TestBranchValidateRejectsForgedOverflowCell(t *testing.T) {
-	cfg := Config{PageSize: 4096}
+	cfg := Config{PageSize: 4096, BranchLayout: BranchLayoutPlain}
 	tt := cfg.InlineThreshold()
 	// Two overflow cells — the plain-branch floor shape; each cell's
 	// inline bytes are the full T-byte resident slice and the extent

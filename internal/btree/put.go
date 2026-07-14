@@ -101,7 +101,7 @@ func descendToLeafForKey(pw PageWriter, cfg page.Config, rootID uint64, key []by
 		if page.IsLeafType(typ) {
 			return path, cur, buf, nil
 		}
-		if typ != page.TypeBranch {
+		if !page.IsBranchType(typ) {
 			return nil, 0, nil, fmt.Errorf("%w: page %d has unexpected type %d during put descent", ErrCorrupted, cur, typ)
 		}
 		if e := validateBranchPage(buf, cfg, cur); e != nil {

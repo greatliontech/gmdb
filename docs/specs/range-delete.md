@@ -115,21 +115,26 @@ Invariant: kind=clause-explicit;
     (leaf restart-group compression keeps byte-fill representative
     because leaves also store values).
     **Reachability qualifier.** The floor is reachable — and so
-    enforced — for the common case AND for deep-shared-prefix branches:
-    within-page truncation packs many such separators per page (high
-    fan-out, high logical content), so they land above MT, not at
-    fanout-2. It is **NOT** reachable in two residual cases. (a) A branch
-    reduced to a **single near-`T` separator** (`T` per
+    enforced — for the common case AND for deep-shared-prefix branches
+    under either branch layout: in the segregated layout, within-page
+    truncation packs many such separators per page (high fan-out, high
+    logical content); in the plain layout, near-`T` separators are
+    byte-full — two of them already exceed most thresholds' logical
+    fill — so deep-prefix branches land above MT either way, never at
+    a sub-floor state. It is **NOT** reachable in two residual cases.
+    (a) A branch reduced to a **single near-`T` separator** (`T` per
     `page-formats.md §Overflow-Key Cells`): no feasible
     split's logical content reaches MT (e.g. one ~1400-byte separator at
     MergeThreshold 50), and because a branch redistribute **lifts** the
     boundary separator to the parent, both halves can fall below MT. (b) A
     **cluster-seam branch** — a large within-cluster separator plus a tiny
-    cross-cluster one — whose neighbours are dense same-cluster branches:
-    absorbing more cells would un-compress across the cluster boundary and
-    overflow a physical page, so no merge (combined > one page) and no
-    redistribute (every physically-fitting split leaves the seam half
-    logically below MT) can raise it. A page that no adjacent merge or
+    cross-cluster one — whose dense neighbours cannot absorb more cells
+    within one physical page (in the segregated layout because
+    absorbing them would un-compress across the cluster boundary; in
+    the plain layout because the neighbours are already byte-full): no
+    merge (combined > one page) and no redistribute (every
+    physically-fitting split leaves the seam half logically below MT)
+    can raise it. A page that no adjacent merge or
     floor-clearing redistribute can heal is **accepted below-floor**, and
     the rebalance MUST terminate rather than loop attempting to heal it.
     Where reachable, the floor is maintained by the merge/redistribute

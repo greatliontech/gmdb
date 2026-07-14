@@ -1142,10 +1142,8 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 	if cfg.LeafLayout > LeafLayoutSegregated {
 		return fmt.Errorf("%w: unknown LeafLayout %d", ErrInvalidOptions, cfg.LeafLayout)
 	}
-	// Branch layout variants land with their encoders; until then only
-	// the leave-unchanged sentinel is accepted.
-	if cfg.BranchLayout != BranchLayoutDefault {
-		return fmt.Errorf("%w: unsupported BranchLayout %d", ErrInvalidOptions, cfg.BranchLayout)
+	if cfg.BranchLayout > BranchLayoutSegregated {
+		return fmt.Errorf("%w: unknown BranchLayout %d", ErrInvalidOptions, cfg.BranchLayout)
 	}
 	if _, deleted := tx.pendingDeletes[name]; deleted {
 		return ErrNotFound

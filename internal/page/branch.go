@@ -106,8 +106,8 @@ func SetBranchLeftmostChild(buf []byte, child uint64) {
 // of a non-branch page.
 func BranchCellCount(buf []byte) uint16 {
 	typ, _, count, _ := ReadHeader(buf)
-	if typ != TypeBranch {
-		panic(fmt.Sprintf("page: BranchCellCount on type %d (want %d)", typ, TypeBranch))
+	if !IsBranchType(typ) {
+		panic(fmt.Sprintf("page: BranchCellCount on type %d (want a branch type)", typ))
 	}
 	return count
 }
@@ -127,6 +127,16 @@ func SetBranchCellChild(buf []byte, cfg Config, i uint16, child uint64) {
 	if i >= n {
 		panic(fmt.Sprintf("page: SetBranchCellChild(%d) out of range [0, %d)", i, n))
 	}
+	if typ, _, _, _ := ReadHeader(buf); typ == TypeBranchSegregated {
+		ce := cfg.ContentEnd()
+		m := segBranchPrefixLen(buf)
+		off := segBranchChildOff(ce, m, int(n), int(i))
+		// Preserve the overflow marker bit (page-formats.md
+		// §Segregated Branch — the marker rides the child word).
+		marker := le.Uint64(buf[off:]) & segBranchChildOverflowBit
+		le.PutUint64(buf[off:], child|marker)
+		return
+	}
 	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
 	off := int(le.Uint16(buf[dirOff:]))
 	off += branchCellChildSkip(le.Uint16(buf[dirOff+2:]))
@@ -144,6 +154,18 @@ func SetBranchCellKeyExtPage(buf []byte, cfg Config, i uint16, extPage uint64) {
 	n := BranchCellCount(buf)
 	if i >= n {
 		panic(fmt.Sprintf("page: SetBranchCellKeyExtPage(%d) out of range [0, %d)", i, n))
+	}
+	if typ, _, _, _ := ReadHeader(buf); typ == TypeBranchSegregated {
+		ce := cfg.ContentEnd()
+		m := segBranchPrefixLen(buf)
+		raw := segBranchChildRaw(buf, ce, m, int(n), int(i))
+		if raw&segBranchChildOverflowBit == 0 {
+			panic(fmt.Sprintf("page: SetBranchCellKeyExtPage(%d) on a non-overflow cell", i))
+		}
+		hb := segBranchHeapBase(int(n))
+		end := hb + segBranchDirSlot(buf, int(i)+1)
+		le.PutUint64(buf[end-branchKeyExtRefSize:], extPage)
+		return
 	}
 	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
 	raw := le.Uint16(buf[dirOff+2:])
@@ -179,6 +201,9 @@ func BranchCellAt(buf []byte, cfg Config, i uint16) BranchCell {
 	n := BranchCellCount(buf)
 	if i >= n {
 		panic(fmt.Sprintf("page: BranchCellAt(%d) out of range [0, %d)", i, n))
+	}
+	if typ, _, _, _ := ReadHeader(buf); typ == TypeBranchSegregated {
+		return segBranchCellAt(buf, cfg, i, n)
 	}
 	ce := cfg.ContentEnd()
 	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
@@ -226,6 +251,13 @@ func branchCellChild(buf []byte, i uint16) uint64 {
 func BranchFreeSpace(buf []byte, cfg Config) int {
 	cfg.MustValidate()
 	n := int(BranchCellCount(buf))
+	if typ, _, _, _ := ReadHeader(buf); typ == TypeBranchSegregated {
+		// Free window sits between the heap end and the child array.
+		hb := segBranchHeapBase(n)
+		heapEnd := hb + segBranchDirSlot(buf, n)
+		childBase := cfg.ContentEnd() - segBranchPrefixLen(buf) - 8*n
+		return childBase - heapEnd
+	}
 	dirEnd := branchHeaderEnd + n*branchDirEntrySize
 	low := cfg.ContentEnd()
 	for i := range n {
@@ -247,6 +279,13 @@ func EncodeBranchEmpty(buf []byte, cfg Config, leftmost uint64) {
 		panic(fmt.Sprintf("page: EncodeBranchEmpty buf len %d != PageSize %d", len(buf), cfg.PageSize))
 	}
 	clear(buf)
+	if cfg.EffectiveBranchType() == TypeBranchSegregated {
+		WriteHeader(buf, TypeBranchSegregated, 0, 0)
+		SetBranchLeftmostChild(buf, leftmost)
+		// PrefixLen 0 and the single zero sentinel slot are the
+		// cleared bytes already.
+		return
+	}
 	WriteHeader(buf, TypeBranch, 0, 0)
 	SetBranchLeftmostChild(buf, leftmost)
 }
@@ -291,6 +330,9 @@ func EncodeBranch(buf []byte, cfg Config, leftmost uint64, cells []BranchCell) e
 		if !c.IsOverflowKey() && len(c.Key) > t {
 			return fmt.Errorf("page: EncodeBranch cell %d inline key length %d exceeds inline threshold %d", i, len(c.Key), t)
 		}
+	}
+	if cfg.EffectiveBranchType() == TypeBranchSegregated {
+		return segEncodeBranch(buf, cfg, leftmost, cells)
 	}
 	ce := cfg.ContentEnd()
 	need := BranchEncodedSize(cfg, cells)
@@ -345,6 +387,9 @@ func BranchEncodedSizeOf(n, keyLenSum, extRefs int) int {
 // Overflow cells contribute their RESIDENT key bytes (Key holds sep[0:T])
 // plus the 12-byte extent reference.
 func BranchEncodedSize(cfg Config, cells []BranchCell) int {
+	if cfg.EffectiveBranchType() == TypeBranchSegregated {
+		return segBranchEncodedSize(cells)
+	}
 	keyLenSum, extRefs := 0, 0
 	for _, c := range cells {
 		keyLenSum += len(c.Key)
@@ -353,6 +398,19 @@ func BranchEncodedSize(cfg Config, cells []BranchCell) int {
 		}
 	}
 	return BranchEncodedSizeOf(len(cells), keyLenSum, extRefs)
+}
+
+// BranchSizeOf sizes a prospective branch page from aggregate
+// quantities under cfg's declared layout — the incremental-tally form
+// the bulk-load branch builder uses: n cells whose resident keys total
+// keyLenSum bytes and share a prefixLen-byte common prefix, extRefs of
+// them overflow. The plain layout ignores prefixLen (additive); the
+// segregated layout is non-additive in it.
+func BranchSizeOf(cfg Config, n, keyLenSum, prefixLen, extRefs int) int {
+	if cfg.EffectiveBranchType() == TypeBranchSegregated {
+		return segBranchEncodedSizeOf(n, keyLenSum, prefixLen, extRefs)
+	}
+	return BranchEncodedSizeOf(n, keyLenSum, extRefs)
 }
 
 // BranchLogicalSize returns the branch's LOGICAL content size — the
@@ -418,6 +476,9 @@ func DecodeBranch(buf []byte, cfg Config) (leftmost uint64, cells []BranchCell) 
 // (the full-key comparison rule, page-formats.md §Overflow-Key Cells).
 func BranchSearch(buf []byte, cfg Config, target []byte, tailCmp TailCompare) (uint16, error) {
 	cfg.MustValidate()
+	if typ, _, _, _ := ReadHeader(buf); typ == TypeBranchSegregated {
+		return segBranchSearch(buf, cfg, target, tailCmp)
+	}
 	n := int(BranchCellCount(buf))
 	if n == 0 {
 		return 0, nil
@@ -521,8 +582,11 @@ func ValidateBranch(buf []byte, cfg Config) error {
 		return fmt.Errorf("%w: branch buffer len %d < content end %d", ErrCorrupted, len(buf), contentEnd)
 	}
 	typ, _, n, _ := ReadHeader(buf)
+	if typ == TypeBranchSegregated {
+		return segValidateBranch(buf, cfg)
+	}
 	if typ != TypeBranch {
-		return fmt.Errorf("%w: branch page has type %d (want %d)", ErrCorrupted, typ, TypeBranch)
+		return fmt.Errorf("%w: branch page has type %d (want a branch type)", ErrCorrupted, typ)
 	}
 	dirEnd := branchHeaderEnd + int(n)*branchDirEntrySize
 	if dirEnd > contentEnd {
@@ -577,6 +641,12 @@ func BranchChildAt(buf []byte, cfg Config, i uint16) uint64 {
 	cfg.MustValidate()
 	if i == 0 {
 		return BranchLeftmostChild(buf)
+	}
+	if typ, _, count, _ := ReadHeader(buf); typ == TypeBranchSegregated {
+		ce := cfg.ContentEnd()
+		m := segBranchPrefixLen(buf)
+		raw := segBranchChildRaw(buf, ce, m, int(count), int(i-1))
+		return raw &^ segBranchChildOverflowBit
 	}
 	return branchCellChild(buf, i-1)
 }

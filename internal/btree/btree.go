@@ -104,7 +104,7 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch {
-		case typ == page.TypeBranch:
+		case page.IsBranchType(typ):
 			if err := validateBranchPage(buf, cfg, cur); err != nil {
 				return nil, false, err
 			}
@@ -139,8 +139,8 @@ func Get(pr PageReader, cfg page.Config, rootID uint64, key []byte) ([]byte, boo
 			}
 			return entry.Value, true, nil
 		default:
-			return nil, false, fmt.Errorf("%w: page %d has unexpected type %d (expected branch=%d or a leaf type)",
-				ErrCorrupted, cur, typ, page.TypeBranch)
+			return nil, false, fmt.Errorf("%w: page %d has unexpected type %d (expected a branch or leaf type)",
+				ErrCorrupted, cur, typ)
 		}
 	}
 	return nil, false, ErrTreeTooDeep
@@ -167,7 +167,7 @@ func Has(pr PageReader, cfg page.Config, rootID uint64, key []byte) (bool, error
 		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		switch {
-		case typ == page.TypeBranch:
+		case page.IsBranchType(typ):
 			if err := validateBranchPage(buf, cfg, cur); err != nil {
 				return false, err
 			}
@@ -189,8 +189,8 @@ func Has(pr PageReader, cfg page.Config, rootID uint64, key []byte) (bool, error
 			_, _, found, err := r.SearchLeaf(key, keyTail(pr, cfg))
 			return found, err
 		default:
-			return false, fmt.Errorf("%w: page %d has unexpected type %d (expected branch=%d or a leaf type)",
-				ErrCorrupted, cur, typ, page.TypeBranch)
+			return false, fmt.Errorf("%w: page %d has unexpected type %d (expected a branch or leaf type)",
+				ErrCorrupted, cur, typ)
 		}
 	}
 	return false, ErrTreeTooDeep

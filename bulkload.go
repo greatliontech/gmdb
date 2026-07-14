@@ -99,7 +99,7 @@ type bulkBranchLevel struct {
 	leftmost  uint64            // leftmost child of the in-progress page
 	cells     []page.BranchCell // (separator, child) for non-leftmost children
 	sep       []byte            // separator routing to the in-progress page in its parent (nil = first page at this level)
-	keyLenSum int               // Σ len(cell.Key) of the in-progress page's cells (for non-additive size tracking)
+	keyLenSum int               // Σ len(cell.Key) of the in-progress page's cells
 	extRefs   int               // count of overflow (key-extent-bearing) cells in the in-progress page
 	closedAny bool              // a page at this level was already closed+propagated (⇒ >1 page exists here)
 }
@@ -278,10 +278,13 @@ func (b *bulkBuilder) addLink(level int, sep []byte, child uint64) error {
 		b.startBranch(bl, sep, child)
 		return nil
 	}
-	// Plain-branch sizing is additive (page-formats.md §Plain Branch):
-	// each cell costs its stored key bytes + directory entry + child
-	// pointer, so the running (count, keyLenSum, extRefs) tally sizes
-	// the would-be page exactly.
+	// Sizing goes through page.BranchSizeOf, which dispatches on the
+	// configured branch layout: plain is additive in (count,
+	// keyLenSum, extRefs); segregated is non-additive in the shared
+	// prefix — adding a separator that shares less prefix lengthens
+	// every existing cell's stored suffix — so each append recomputes
+	// prefixLen = commonPrefix(cells[0], newest) (cells arrive
+	// ascending, making first-vs-newest the whole-set prefix).
 	// Overflow separators (page-formats.md §Overflow-Key Cells): size
 	// with the RESIDENT first-T slice + the 12-byte extent reference;
 	// the extent is written only when the cell is actually appended,
@@ -297,7 +300,11 @@ func (b *bulkBuilder) addLink(level int, sep []byte, child uint64) error {
 	if sepOvk {
 		extRefs++
 	}
-	if page.BranchEncodedSizeOf(len(bl.cells)+1, bl.keyLenSum+len(resident), extRefs) <= b.cfg.ContentEnd() {
+	newPrefixLen := len(resident)
+	if len(bl.cells) > 0 {
+		newPrefixLen = sharedLen(bl.cells[0].Key, resident)
+	}
+	if page.BranchSizeOf(b.cfg, len(bl.cells)+1, bl.keyLenSum+len(resident), newPrefixLen, extRefs) <= b.cfg.ContentEnd() {
 		cell := page.BranchCell{Key: resident, Child: child}
 		if sepOvk {
 			ext, err := writeBulkOverflowChain(b.pw, b.cfg, sep[t:])
@@ -859,4 +866,17 @@ func bulkLeafEntry(pw bulkOverflowWriter, cfg page.Config, key, value []byte) (p
 		e.KeyExtPage = ext
 	}
 	return e, nil
+}
+
+// sharedLen returns the length of the longest common byte prefix of a
+// and b — the bulk branch builder's running shared-prefix tally for
+// segregated-branch sizing.
+func sharedLen(a, b []byte) int {
+	n := min(len(a), len(b))
+	for i := range n {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
 }

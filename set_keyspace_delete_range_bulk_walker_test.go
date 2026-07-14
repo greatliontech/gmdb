@@ -157,7 +157,7 @@ func TestSetKeyspaceDeleteRangeUnindexedNoLeakInteriorSubtreeRetire(t *testing.T
 	// test would pass for the wrong reason).
 	if buf, perr := tx.pgr.Page(sks.desc.Root); perr == nil {
 		typ, _, cellCount, _ := page.ReadHeader(buf)
-		if typ != page.TypeBranch {
+		if !page.IsBranchType(typ) {
 			t.Fatalf("workload too small: root is type=%d (want TypeBranch=%d) — "+
 				"Phase 2 FreeSubtree will not fire", typ, page.TypeBranch)
 		}
