@@ -17,11 +17,11 @@ var le = binary.LittleEndian
 // keyspace's entry in the keyspace B+tree. Layout per
 // keyspaces.md §Keyspace Descriptor:
 //
-//	+----------+----------+----------+----------------+----------+----------+--------------------+----------+
-//	| Root     | Count    | Kind     | FixedValueSize | NextSeq  | RestartGT| IndexRegistryRoot  | Reserved |
-//	| uint64   | uint64   | uint8    | uint16         | uint64   | uint16   | uint64             | [3]byte  |
-//	+----------+----------+----------+----------------+----------+----------+--------------------+----------+
-//	  8 + 8 + 1 + 2 + 8 + 2 + 8 + 3 = 40 bytes
+//	+----------+----------+----------+----------------+----------+----------+--------------------+-------------+----------+
+//	| Root     | Count    | Kind     | FixedValueSize | NextSeq  | RestartGT| IndexRegistryRoot  | NodeLayouts | Reserved |
+//	| uint64   | uint64   | uint8    | uint16         | uint64   | uint16   | uint64             | uint8       | [2]byte  |
+//	+----------+----------+----------+----------------+----------+----------+--------------------+-------------+----------+
+//	  8 + 8 + 1 + 2 + 8 + 2 + 8 + 1 + 2 = 40 bytes
 //
 // Field order and sizes are part of the on-disk contract — invariant #1
 // in keyspaces.md (an extra byte shifts every IndexRegistryRoot into the
@@ -66,6 +66,43 @@ type Keyspace struct {
 	// index registry sub-tree. Zero ⇒ no indexes declared on this
 	// keyspace.
 	IndexRegistryRoot uint64
+
+	// NodeLayouts declares the keyspace's node layout variants
+	// (keyspaces.md §Keyspace Descriptor): bits 0-1 the leaf layout
+	// (0 = engine default, 1 = interleaved, 2 = segregated; 3
+	// invalid), bits 2-3 the branch layout (same scheme), bits 4-7
+	// zero. 0 defers to the opening process's engine default,
+	// resolved at page-build time — never persisted back. Mutable
+	// via Tx.SetKeyspaceConfig as a builder hint; readers dispatch
+	// by page type byte, never by this field.
+	NodeLayouts uint8
+}
+
+// NodeLayouts bit accessors (keyspaces.md §Keyspace Descriptor).
+
+// LeafLayoutBits extracts the leaf-layout declaration (bits 0-1).
+func (d Keyspace) LeafLayoutBits() uint8 { return d.NodeLayouts & 0b11 }
+
+// BranchLayoutBits extracts the branch-layout declaration (bits 2-3).
+func (d Keyspace) BranchLayoutBits() uint8 { return (d.NodeLayouts >> 2) & 0b11 }
+
+// ApplyToConfig resolves the descriptor's per-keyspace builder
+// overrides over the engine-wide base config: a non-zero
+// RestartGroupTarget replaces the base's, and a non-default leaf
+// layout declaration replaces the base's LeafLayout. THE single
+// mapping from descriptor to builder configuration — the row write
+// path, CopyTo's rebuild, and incremental compaction's relocation all
+// resolve through it, so the three can never disagree on how a
+// declaration takes effect. Zero values defer to the base (the
+// opening process's engine defaults), never persisted back.
+func ApplyToConfig(d Keyspace, cfg page.Config) page.Config {
+	if d.RestartGroupTarget != 0 {
+		cfg.RestartGroupTarget = d.RestartGroupTarget
+	}
+	if b := d.LeafLayoutBits(); b != 0 {
+		cfg.LeafLayout = page.LeafLayout(b)
+	}
+	return cfg
 }
 
 // Keyspace Kind values. Stored in Keyspace.Kind.
@@ -82,7 +119,7 @@ const (
 )
 
 // Size is the fixed on-disk byte length of one
-// keyspace descriptor (8+8+1+2+8+2+8+3). The
+// keyspace descriptor (8+8+1+2+8+2+8+1+2). The
 // Keyspace.RestartGroupTarget cap is page.MaxRestartGroupTarget
 // (defined alongside Config.RestartGroupTarget); the same uint8 physical
 // cap from page-formats.md §Compressed Leaf applies here.
@@ -97,8 +134,9 @@ const (
 	ksdOffNextSeq            = 19
 	ksdOffRestartGroupTarget = 27
 	ksdOffIndexRegistryRoot  = 29
-	ksdOffReserved           = 37
-	ksdReservedLen           = 3
+	ksdOffNodeLayouts        = 37
+	ksdOffReserved           = 38
+	ksdReservedLen           = 2
 )
 
 // Decode reads a Keyspace from the first
@@ -116,11 +154,12 @@ func Decode(buf []byte) Keyspace {
 		NextSeq:            le.Uint64(buf[ksdOffNextSeq:]),
 		RestartGroupTarget: le.Uint16(buf[ksdOffRestartGroupTarget:]),
 		IndexRegistryRoot:  le.Uint64(buf[ksdOffIndexRegistryRoot:]),
+		NodeLayouts:        buf[ksdOffNodeLayouts],
 	}
 }
 
 // Encode writes d into the first
-// Size bytes of buf. The 3 reserved bytes are
+// Size bytes of buf. The 2 reserved bytes are
 // zeroed. The encoded form is the canonical representation — a
 // subsequent Decode + Encode round-trip is byte-identical (test
 // pinned).
@@ -133,6 +172,7 @@ func Encode(buf []byte, d Keyspace) {
 	le.PutUint64(buf[ksdOffNextSeq:], d.NextSeq)
 	le.PutUint16(buf[ksdOffRestartGroupTarget:], d.RestartGroupTarget)
 	le.PutUint64(buf[ksdOffIndexRegistryRoot:], d.IndexRegistryRoot)
+	buf[ksdOffNodeLayouts] = d.NodeLayouts
 	clear(buf[ksdOffReserved : ksdOffReserved+ksdReservedLen])
 }
 
@@ -156,6 +196,8 @@ func Encode(buf []byte, d Keyspace) {
 //     (invariant #5: FixedValueSize meaningful only for Kind == 1).
 //   - RestartGroupTarget ≤ page.MaxRestartGroupTarget (255) — the
 //     compressed-leaf restart-table Count is uint8.
+//   - NodeLayouts has no field value 3 and zero high bits
+//     (keyspaces.md §Keyspace Descriptor).
 //   - Reserved bytes are all zero (keyspaces.md §Keyspace Descriptor:
 //     "Open() rejects descriptors with non-zero reserved bytes").
 func Validate(buf []byte, d Keyspace) error {
@@ -172,6 +214,9 @@ func Validate(buf []byte, d Keyspace) error {
 	if d.RestartGroupTarget > page.MaxRestartGroupTarget {
 		return fmt.Errorf("descriptor: keyspace descriptor RestartGroupTarget %d exceeds max %d",
 			d.RestartGroupTarget, page.MaxRestartGroupTarget)
+	}
+	if d.LeafLayoutBits() == 3 || d.BranchLayoutBits() == 3 || d.NodeLayouts&0xF0 != 0 {
+		return fmt.Errorf("descriptor: keyspace descriptor NodeLayouts 0x%02x invalid (field value 3 or non-zero high bits)", d.NodeLayouts)
 	}
 	for i := 0; i < ksdReservedLen; i++ {
 		if b := buf[ksdOffReserved+i]; b != 0 {

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/greatliontech/gmdb/internal/page"
@@ -410,15 +412,16 @@ func TestKeyspacePutHonorsPerKeyspaceRestartGroupTarget(t *testing.T) {
 	defer tx.Rollback()
 	ks, _ := tx.CreateKeyspace("ks")
 
-	// Default RGT=0 (engine default = 16 = compressed leaf).
+	// Default RGT=0 (engine default = compressed leaf in the default
+	// layout — segregated).
 	_ = ks.Put([]byte("a"), []byte("v"))
 	leafBuf := tx.pgr.PageRaw(ks.desc.Root)
 	if !page.IsLeafType(leafBuf[0]) {
 		t.Fatalf("root is not a leaf: type=%d", leafBuf[0])
 	}
-	if leafBuf[0] != page.TypeLeaf {
-		t.Errorf("default RGT: leaf type = %d, want %d (TypeLeaf compressed)",
-			leafBuf[0], page.TypeLeaf)
+	if leafBuf[0] != page.TypeLeafSegregated {
+		t.Errorf("default RGT: leaf type = %d, want %d (TypeLeafSegregated compressed)",
+			leafBuf[0], page.TypeLeafSegregated)
 	}
 
 	// Set RGT=1 → next leaf should be uncompressed.
@@ -433,5 +436,136 @@ func TestKeyspacePutHonorsPerKeyspaceRestartGroupTarget(t *testing.T) {
 		t.Errorf("after SetKeyspaceConfig(RGT=1): leaf type = %d, "+
 			"want %d (TypeLeafUncompressed) — per-keyspace RGT not "+
 			"reaching the builder", leafBuf[0], page.TypeLeafUncompressed)
+	}
+}
+
+// TestKeyspaceLayoutDeclaration pins the NodeLayouts flow (keyspaces.md
+// §Per-Keyspace Configuration): SetKeyspaceConfig's LeafLayout reaches
+// the builder for pages written after the call, existing pages keep
+// their on-disk variant (readers dispatch by type byte, never config —
+// page-formats.md §Invariants), the declaration persists across reopen,
+// and invalid values reject.
+func TestKeyspaceLayoutDeclaration(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, _ := db.Begin(ctx)
+	ks, _ := tx.CreateKeyspace("ks")
+
+	// Default layout: segregated. Fill several leaves so a later
+	// declaration flip leaves genuinely MIXED-variant pages behind
+	// (untouched leaves keep their type byte).
+	put := func(k string) {
+		if err := ks.Put([]byte(k), []byte("v")); err != nil {
+			t.Fatalf("Put(%q): %v", k, err)
+		}
+	}
+	var keys []string
+	for i := range 40 {
+		k := fmt.Sprintf("seg-%03d-%s", i, strings.Repeat("x", 200))
+		keys = append(keys, k)
+		put(k)
+	}
+	countLeafTypes := func() (seg, il int) {
+		var walk func(id uint64)
+		walk = func(id uint64) {
+			b := tx.pgr.PageRaw(id)
+			switch ty, _, _, _ := page.ReadHeader(b); ty {
+			case page.TypeBranch:
+				lm, cells := page.DecodeBranch(b, tx.pgr.Config())
+				walk(lm)
+				for _, c := range cells {
+					walk(c.Child)
+				}
+			case page.TypeLeafSegregated:
+				seg++
+			case page.TypeLeaf:
+				il++
+			}
+		}
+		walk(ks.desc.Root)
+		return seg, il
+	}
+	if seg, il := countLeafTypes(); seg < 2 || il != 0 {
+		t.Fatalf("default layout: leaves seg=%d il=%d, want several segregated only", seg, il)
+	}
+
+	// Declare interleaved: pages written after the call use it; the
+	// untouched leaves keep their segregated type — the tree holds
+	// BOTH variants at once, and every read dispatches by the page's
+	// type byte (page-formats.md §Invariants).
+	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{LeafLayout: LeafLayoutInterleaved}); err != nil {
+		t.Fatalf("SetKeyspaceConfig(LeafLayout): %v", err)
+	}
+	for i := range 40 {
+		k := fmt.Sprintf("il--%03d-%s", i, strings.Repeat("y", 200))
+		keys = append(keys, k)
+		put(k)
+	}
+	if seg, il := countLeafTypes(); seg == 0 || il == 0 {
+		t.Fatalf("after flip: leaves seg=%d il=%d, want both variants coexisting", seg, il)
+	}
+	// Every key readable through the mixed tree.
+	for _, k := range keys {
+		if v, err := ks.Get([]byte(k)); err != nil || string(v) != "v" {
+			t.Fatalf("Get(%q) on mixed tree: %q, %v", k, v, err)
+		}
+	}
+	put("b")
+	keys = append(keys, "b")
+	put("a")
+	keys = append(keys, "a")
+
+	// Unknown values reject.
+	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{LeafLayout: 3}); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("LeafLayout=3: err = %v, want ErrInvalidOptions", err)
+	}
+	// Branch layouts are rejected until their encoders land.
+	if err := tx.SetKeyspaceConfig("ks", KeyspaceConfig{BranchLayout: BranchLayoutPlain}); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("BranchLayout=plain: err = %v, want ErrInvalidOptions", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen: the declaration persisted; both keys readable (the root
+	// page keeps its interleaved variant; type-byte dispatch reads it
+	// regardless of any config).
+	db2, err := Open(ctx, path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	tx2, _ := db2.Begin(ctx)
+	defer tx2.Rollback()
+	ks2, err := tx2.OpenKeyspace("ks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ks2.desc.LeafLayoutBits() != uint8(LeafLayoutInterleaved) {
+		t.Fatalf("reopened descriptor LeafLayoutBits = %d, want %d", ks2.desc.LeafLayoutBits(), LeafLayoutInterleaved)
+	}
+	for _, k := range []string{"a", "b"} {
+		v, err := ks2.Get([]byte(k))
+		if err != nil || string(v) != "v" {
+			t.Fatalf("Get(%q) after reopen: %q, %v", k, v, err)
+		}
+	}
+	// Flip back to segregated: new pages use it, old pages still read.
+	if err := tx2.SetKeyspaceConfig("ks", KeyspaceConfig{LeafLayout: LeafLayoutSegregated}); err != nil {
+		t.Fatal(err)
+	}
+	_ = ks2.Put([]byte("c"), []byte("v"))
+	for _, k := range []string{"a", "b", "c"} {
+		v, err := ks2.Get([]byte(k))
+		if err != nil || string(v) != "v" {
+			t.Fatalf("Get(%q) after flip back: %q, %v", k, v, err)
+		}
 	}
 }

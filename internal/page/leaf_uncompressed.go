@@ -78,13 +78,13 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 			// check fires before any offset-table read, so no table
 			// slot is touched past the last entry.
 			it := LeafIter{
-				r:          r,
-				idx:        mid + 1,
-				endIdx:     r.count,
-				compressed: false,
-				keyBuf:     keyBuf,
-				bufKeys:    bufKeys[:0],
-				bufEnts:    bufEnts[:0],
+				r:       r,
+				idx:     mid + 1,
+				endIdx:  r.count,
+				variant: TypeLeafUncompressed,
+				keyBuf:  keyBuf,
+				bufKeys: bufKeys[:0],
+				bufEnts: bufEnts[:0],
 			}
 			ret := e
 			ret.Key = nil
@@ -96,26 +96,26 @@ func (r LeafReader) ucSearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []L
 	if lo >= r.count {
 		// past end of leaf; successor not in this page.
 		it := LeafIter{
-			r:          r,
-			idx:        r.count,
-			endIdx:     r.count,
-			compressed: false,
-			keyBuf:     keyBuf,
-			bufKeys:    bufKeys[:0],
-			bufEnts:    bufEnts[:0],
+			r:       r,
+			idx:     r.count,
+			endIdx:  r.count,
+			variant: TypeLeafUncompressed,
+			keyBuf:  keyBuf,
+			bufKeys: bufKeys[:0],
+			bufEnts: bufEnts[:0],
 		}
 		return r.count, LeafEntry{}, false, it, nil
 	}
 	// successor at lo
 	e, _ := r.decodeFullKeyEntry(r.ucOffset(lo))
 	it := LeafIter{
-		r:          r,
-		idx:        lo + 1,
-		endIdx:     r.count,
-		compressed: false,
-		keyBuf:     keyBuf,
-		bufKeys:    bufKeys[:0],
-		bufEnts:    bufEnts[:0],
+		r:       r,
+		idx:     lo + 1,
+		endIdx:  r.count,
+		variant: TypeLeafUncompressed,
+		keyBuf:  keyBuf,
+		bufKeys: bufKeys[:0],
+		bufEnts: bufEnts[:0],
 	}
 	return lo, e, false, it, nil
 }

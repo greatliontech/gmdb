@@ -188,8 +188,8 @@ func freeSubtreeAt(pw PageWriter, cfg page.Config, pageID uint64, depth int) (ui
 			count += n
 		}
 	default:
-		return 0, fmt.Errorf("%w: page %d has unexpected type %d at depth %d (expected branch=%d or leaf=%d/%d)",
-			ErrCorrupted, pageID, typ, depth, page.TypeBranch, page.TypeLeaf, page.TypeLeafUncompressed)
+		return 0, fmt.Errorf("%w: page %d has unexpected type %d at depth %d (expected branch=%d or a leaf type)",
+			ErrCorrupted, pageID, typ, depth, page.TypeBranch)
 	}
 	// Retire the page itself. Branch-or-leaf, the FreePage contract
 	// is the same: same-tx pages enter loosePages; prior-tx pages

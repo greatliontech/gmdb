@@ -130,6 +130,13 @@ func Init(file *os.File, ip InitParams) error {
 type OpenParams struct {
 	Pool             *BufPool // page-sized buffer pool; PageSize must match
 	MaxTxBufferBytes int      // slab budget for write transactions
+
+	// Engine-wide builder defaults (api-surface.md Options): applied
+	// into the pager's page.Config, overridden per-keyspace via the
+	// descriptor (descriptor.ApplyToConfig). Per-open, never
+	// persisted; zero values defer to the page-package defaults.
+	RestartGroupTarget uint16
+	LeafLayout         page.LeafLayout
 }
 
 // OpenedDB bundles the products of Open: the UNATTACHED writer pager,
@@ -174,7 +181,12 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 		return nil, err
 	}
 
-	cfg := page.Config{PageSize: pageSize, PageChecksum: m.HasFlag(MetaFlagPageChecksum)}
+	cfg := page.Config{
+		PageSize:           pageSize,
+		PageChecksum:       m.HasFlag(MetaFlagPageChecksum),
+		RestartGroupTarget: op.RestartGroupTarget,
+		LeafLayout:         op.LeafLayout,
+	}
 
 	// 3) Reservation = MaxSize * PageSize, mmap, mprotect.
 	reservation := int64(m.MaxSize) * int64(pageSize)
@@ -247,7 +259,12 @@ func OpenReadOnly(file *os.File, op OpenParams) (*OpenedDB, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg := page.Config{PageSize: pageSize, PageChecksum: m.HasFlag(MetaFlagPageChecksum)}
+	cfg := page.Config{
+		PageSize:           pageSize,
+		PageChecksum:       m.HasFlag(MetaFlagPageChecksum),
+		RestartGroupTarget: op.RestartGroupTarget,
+		LeafLayout:         op.LeafLayout,
+	}
 	reservation := int64(m.MaxSize) * int64(pageSize)
 	p, err := NewReader(file, cfg, reservation)
 	if err != nil {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/greatliontech/gmdb/internal/closegate"
 	"github.com/greatliontech/gmdb/internal/lock"
+	"github.com/greatliontech/gmdb/internal/page"
 	"github.com/greatliontech/gmdb/internal/pager"
 )
 
@@ -278,8 +279,10 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	}
 	pool := pager.NewBufPool(int(persistedPageSize))
 	pop := pager.OpenParams{
-		Pool:             pool,
-		MaxTxBufferBytes: opts.MaxTxBufferBytes,
+		Pool:               pool,
+		MaxTxBufferBytes:   opts.MaxTxBufferBytes,
+		RestartGroupTarget: opts.RestartGroupTarget,
+		LeafLayout:         page.LeafLayout(opts.LeafLayout),
 	}
 	var opened *pager.OpenedDB
 	if opts.ReadOnly {

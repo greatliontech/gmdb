@@ -7,10 +7,10 @@ package page
 //
 // Two modes per page-formats.md §Cursor Iteration:
 //
-//   - Forward-streaming (initial state on compressed leaves). Maintains
-//     keyBuf carrying the current full key. Next() reads the next delta
-//     entry, truncates keyBuf to SharedLen, appends UnsharedKey — O(1)
-//     amortized.
+//   - Forward-streaming (initial state on compressed leaves, interleaved
+//     and segregated alike). Maintains keyBuf carrying the current full
+//     key. Next() reads the next delta entry, truncates keyBuf to
+//     SharedLen, appends UnsharedKey — O(1) amortized.
 //   - Buffered (entered on first Prev / At on a compressed leaf).
 //     Decodes the containing restart group into bufEnts + bufKeys; all
 //     subsequent Next/Prev/At serve from the buffer; group-boundary
@@ -25,18 +25,23 @@ package page
 // them across leaf transitions so per-cursor allocation amortizes to
 // zero in the steady-state loop.
 type LeafIter struct {
-	r          LeafReader
-	idx        int // index of the next entry Next() will return
-	startIdx   int // lower bound (inclusive) for Prev / At
-	endIdx     int // upper bound (exclusive) for Next
-	off        int // current byte offset (compressed forward-streaming only)
-	compressed bool
+	r        LeafReader
+	idx      int   // index of the next entry Next() will return
+	startIdx int   // lower bound (inclusive) for Prev / At
+	endIdx   int   // upper bound (exclusive) for Next
+	off      int   // current byte offset (compressed forward-streaming only)
+	variant  uint8 // TypeLeaf | TypeLeafSegregated | TypeLeafUncompressed
 
-	// Compressed forward-streaming fields.
+	// Compressed forward-streaming fields (interleaved + segregated).
 	prevKey     []byte // the previous entry's full key (alias keyBuf for delta entries)
 	keyBuf      []byte // delta reconstruction buffer
 	nextRestart int    // absolute idx of the next restart entry
 	groupIdx    int    // index of the group nextRestart belongs to
+
+	// Segregated only: the value-span end of the LAST entry in this
+	// iter's range — ValueEnd for whole-leaf iters; the next group's
+	// restart VOff for group-scoped iters (loadBufferedGroup).
+	segEndVOff int
 
 	// Compressed buffered-mode fields (populated on first Prev/At).
 	buffered bool
@@ -54,15 +59,19 @@ type LeafIter struct {
 // them on the next iter construction.
 func (r LeafReader) IterForReuse(keyBuf, bufKeys []byte, bufEnts []LeafEntry) LeafIter {
 	it := LeafIter{
-		r:          r,
-		endIdx:     r.count,
-		compressed: r.compressed,
-		keyBuf:     keyBuf,
-		bufKeys:    bufKeys[:0],
-		bufEnts:    bufEnts[:0],
+		r:       r,
+		endIdx:  r.count,
+		variant: r.variant,
+		keyBuf:  keyBuf,
+		bufKeys: bufKeys[:0],
+		bufEnts: bufEnts[:0],
 	}
-	if r.compressed {
+	switch r.variant {
+	case TypeLeaf:
 		it.off = leafEntryStart
+	case TypeLeafSegregated:
+		it.off = segLeafEntryStart
+		it.segEndVOff = r.valueEnd
 	}
 	return it
 }
@@ -81,30 +90,32 @@ func (r LeafReader) IterAtForReuse(startIdx int, keyBuf, bufKeys []byte, bufEnts
 			r:          r,
 			idx:        r.count,
 			endIdx:     r.count,
-			compressed: r.compressed,
+			variant:    r.variant,
+			segEndVOff: r.valueEnd,
 			keyBuf:     keyBuf,
 			bufKeys:    bufKeys[:0],
 			bufEnts:    bufEnts[:0],
 		}
 	}
-	if !r.compressed {
+	if r.uc() {
 		// Position is idx alone: uncompressed Next/Prev/At all resolve
 		// their byte offset from the positional offset table, so there
 		// is no stream state to seed.
 		return LeafIter{
-			r:          r,
-			idx:        startIdx,
-			endIdx:     r.count,
-			compressed: false,
-			keyBuf:     keyBuf,
-			bufKeys:    bufKeys[:0],
-			bufEnts:    bufEnts[:0],
+			r:       r,
+			idx:     startIdx,
+			endIdx:  r.count,
+			variant: r.variant,
+			keyBuf:  keyBuf,
+			bufKeys: bufKeys[:0],
+			bufEnts: bufEnts[:0],
 		}
 	}
 
-	// Compressed: find the group containing startIdx, walk from its
-	// restart point to build keyBuf state up to (but not including)
-	// startIdx, so Next() returns the entry at startIdx.
+	// Compressed (interleaved / segregated): find the group containing
+	// startIdx, walk from its restart point to build keyBuf state up to
+	// (but not including) startIdx, so Next() returns the entry at
+	// startIdx.
 	groupIdx := 0
 	accum := 0
 	for g := 0; g < r.rt.RestartCount(); g++ {
@@ -120,7 +131,8 @@ func (r LeafReader) IterAtForReuse(startIdx int, keyBuf, bufKeys []byte, bufEnts
 		idx:         accum,
 		endIdx:      r.count,
 		off:         r.rt.Offset(groupIdx),
-		compressed:  true,
+		variant:     r.variant,
+		segEndVOff:  r.valueEnd,
 		keyBuf:      keyBuf,
 		nextRestart: accum,
 		groupIdx:    groupIdx,
@@ -134,28 +146,39 @@ func (r LeafReader) IterAtForReuse(startIdx int, keyBuf, bufKeys []byte, bufEnts
 }
 
 // groupIter returns an iterator scoped to a single restart group on a
-// compressed leaf. Panics on uncompressed pages — the abstraction is
-// undefined there. Package-private: only loadBufferedGroup calls it.
-// The bounds (startIdx and endIdx) make At() reject out-of-group access,
-// preserving the "scoped to one group" contract — callers that want a
-// whole-leaf iter use IterAtForReuse.
+// compressed leaf (interleaved or segregated). Panics on uncompressed
+// pages — the abstraction is undefined there. Package-private: only
+// loadBufferedGroup calls it. The bounds (startIdx and endIdx) make
+// At() reject out-of-group access, preserving the "scoped to one group"
+// contract — callers that want a whole-leaf iter use IterAtForReuse.
 func (r LeafReader) groupIter(groupIdx int, keyBuf []byte) LeafIter {
-	if !r.compressed {
+	if r.uc() {
 		panic("page: groupIter called on uncompressed leaf")
 	}
 	startIdx := r.rt.GroupStartIndex(groupIdx)
 	gc := r.rt.GroupEntryCount(groupIdx)
-	return LeafIter{
+	it := LeafIter{
 		r:           r,
 		idx:         startIdx,
 		startIdx:    startIdx,
 		endIdx:      startIdx + gc,
 		off:         r.rt.Offset(groupIdx),
-		compressed:  true,
+		variant:     r.variant,
 		keyBuf:      keyBuf,
 		nextRestart: startIdx,
 		groupIdx:    groupIdx,
 	}
+	if r.seg() {
+		// The group's last entry's value span ends at the NEXT group's
+		// restart VOff (value spans are contiguous in entry order), or
+		// at ValueEnd when this is the page's last group.
+		if groupIdx+1 < r.rt.RestartCount() {
+			it.segEndVOff = segReadVOff(r.buf, r.rt.Offset(groupIdx+1), true)
+		} else {
+			it.segEndVOff = r.valueEnd
+		}
+	}
+	return it
 }
 
 // Next decodes the next entry and advances. Returns (LeafEntry{}, false)
@@ -167,7 +190,7 @@ func (it *LeafIter) Next() (LeafEntry, bool) {
 	if it.idx >= it.endIdx {
 		return LeafEntry{}, false
 	}
-	if !it.compressed {
+	if it.variant == TypeLeafUncompressed {
 		// Table-driven (page-formats.md §Cursor Iteration): idx is the
 		// single source of position, so Prev/At repositioning can never
 		// desynchronize a separately-tracked stream offset.
@@ -180,6 +203,30 @@ func (it *LeafIter) Next() (LeafEntry, bool) {
 			it.loadBufferedGroup(it.bufGroup + 1)
 		}
 		e := it.bufEnts[it.idx-it.bufStart]
+		it.idx++
+		return e, true
+	}
+	if it.variant == TypeLeafSegregated {
+		var e LeafEntry
+		var voff int
+		if it.idx == it.nextRestart {
+			var key []byte
+			e.Flags, key, voff, it.off = it.r.decodeSegRestart(it.off)
+			e.Key = key
+			it.prevKey = key
+			it.nextRestart += it.r.rt.GroupEntryCount(it.groupIdx)
+			it.groupIdx++
+		} else {
+			e.Flags, e.Key, voff, it.off, it.keyBuf = it.r.decodeSegDelta(it.off, it.prevKey, it.keyBuf)
+			it.prevKey = it.keyBuf
+		}
+		// Value span end: the next entry's VOff (restart iff it opens
+		// the next group), or the iter-range bound for the last entry.
+		vend := it.segEndVOff
+		if it.idx+1 < it.endIdx {
+			vend = segReadVOff(it.r.buf, it.off, it.idx+1 == it.nextRestart)
+		}
+		it.r.segValueHalf(&e, voff, vend)
 		it.idx++
 		return e, true
 	}
@@ -206,7 +253,7 @@ func (it *LeafIter) At(idx int) (LeafEntry, bool) {
 	if idx < it.startIdx || idx >= it.endIdx {
 		return LeafEntry{}, false
 	}
-	if !it.compressed {
+	if it.variant == TypeLeafUncompressed {
 		e, _ := it.r.decodeFullKeyEntry(it.r.ucOffset(idx))
 		it.idx = idx + 1
 		return e, true
@@ -262,7 +309,7 @@ func (it *LeafIter) Prev() (LeafEntry, bool) {
 		// At the first entry; no prev available.
 		return LeafEntry{}, false
 	}
-	if !it.compressed {
+	if it.variant == TypeLeafUncompressed {
 		e, _ := it.r.decodeFullKeyEntry(it.r.ucOffset(target))
 		it.idx = target + 1
 		return e, true
@@ -286,7 +333,10 @@ func (it *LeafIter) Prev() (LeafEntry, bool) {
 // loadBufferedGroup decodes all entries of the given restart group into
 // bufEnts; keys are copied into bufKeys so the buffered entries remain
 // stable across subsequent iter calls (the page buffer's borrowed slices
-// for delta entries would be clobbered by re-using keyBuf).
+// for delta entries would be clobbered by re-using keyBuf). Buffered
+// VALUES keep borrowing the page buffer directly — inline values live in
+// the entry stream (interleaved) or the value region (segregated), both
+// stable page bytes.
 func (it *LeafIter) loadBufferedGroup(groupIdx int) {
 	it.bufEnts = it.bufEnts[:0]
 	it.bufKeys = it.bufKeys[:0]

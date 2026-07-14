@@ -1,11 +1,17 @@
 package page
 
-// Leaf-page formats per page-formats.md §Leaf Page. Two variants share the
-// 8-byte common header and the "entries forward / lookup table backward"
-// layout; only the per-entry encoding and lookup machinery differ:
+// Leaf-page formats per page-formats.md §Leaf Page. Three variants share
+// the 8-byte common header and the "entries forward / lookup table
+// backward" layout; only the per-entry encoding, value placement, and
+// lookup machinery differ:
 //
-//   - TypeLeaf (compressed): variable-size restart groups, prefix-compressed
-//     delta entries within each group. Format details in leaf_compressed.go.
+//   - TypeLeaf (interleaved compressed): variable-size restart groups,
+//     prefix-compressed delta entries, value bytes following each
+//     entry's key bytes. Format details in leaf_compressed.go.
+//   - TypeLeafSegregated (segregated compressed, the default): the same
+//     restart-group key compression over a pure headers+keys entry
+//     stream; value bytes in a separate end-anchored region located by
+//     per-entry VOff. Format details in leaf_segregated.go.
 //   - TypeLeafUncompressed: full keys per entry, positional offset table.
 //     Format details in leaf_uncompressed.go.
 //
@@ -213,18 +219,20 @@ func compareEntryKey(e LeafEntry, target []byte, tail TailCompare) (int, error) 
 	return -c, err
 }
 
-// LeafReader provides read access over both compressed and uncompressed
-// leaf pages. Constructed once per Page-resolution boundary in the btree
-// descent; cheap by value, holds only a slice header into the page buffer
-// plus precomputed extents.
+// LeafReader provides read access over all leaf page variants.
+// Constructed once per Page-resolution boundary in the btree descent;
+// cheap by value, holds only a slice header into the page buffer plus
+// precomputed extents.
 type LeafReader struct {
-	buf        []byte
-	cfg        Config
-	count      int
-	dataEnd    int
-	compressed bool
-	// Compressed variant only:
+	buf     []byte
+	cfg     Config
+	count   int
+	dataEnd int
+	variant uint8 // TypeLeaf | TypeLeafSegregated | TypeLeafUncompressed
+	// Restart-group variants (interleaved + segregated) only:
 	rt restartTable
+	// Segregated variant only:
+	valueEnd int
 	// Uncompressed variant only:
 	ucTableOff int // byte offset of the positional offset table
 }
@@ -243,24 +251,37 @@ func NewLeafReader(buf []byte, cfg Config) LeafReader {
 		panic(fmt.Sprintf("page: NewLeafReader on non-leaf type %d", typ))
 	}
 	contentEnd := cfg.ContentEnd()
-	if typ == TypeLeafUncompressed {
+	switch typ {
+	case TypeLeafUncompressed:
 		return LeafReader{
 			buf:        buf,
 			cfg:        cfg,
 			count:      int(count),
 			dataEnd:    int(le.Uint16(buf[ucLeafOffDataEnd:])),
-			compressed: false,
+			variant:    typ,
 			ucTableOff: contentEnd - int(count)*ucOffsetEntrySize,
 		}
-	}
-	rc := int(le.Uint16(buf[leafOffRestartCount:]))
-	return LeafReader{
-		buf:        buf,
-		cfg:        cfg,
-		count:      int(count),
-		dataEnd:    int(le.Uint16(buf[leafOffDataEnd:])),
-		compressed: true,
-		rt:         newRestartTable(buf, rc, contentEnd),
+	case TypeLeafSegregated:
+		rc := int(le.Uint16(buf[leafOffRestartCount:]))
+		return LeafReader{
+			buf:      buf,
+			cfg:      cfg,
+			count:    int(count),
+			dataEnd:  int(le.Uint16(buf[leafOffDataEnd:])),
+			variant:  typ,
+			valueEnd: int(le.Uint16(buf[segLeafOffValueEnd:])),
+			rt:       newRestartTable(buf, rc, contentEnd),
+		}
+	default: // TypeLeaf
+		rc := int(le.Uint16(buf[leafOffRestartCount:]))
+		return LeafReader{
+			buf:     buf,
+			cfg:     cfg,
+			count:   int(count),
+			dataEnd: int(le.Uint16(buf[leafOffDataEnd:])),
+			variant: typ,
+			rt:      newRestartTable(buf, rc, contentEnd),
+		}
 	}
 }
 
@@ -270,10 +291,20 @@ func NewLeafReader(buf []byte, cfg Config) LeafReader {
 // reader's lifetime.
 func (r LeafReader) Buf() []byte { return r.buf }
 
-// Compressed reports whether this leaf is a compressed (variable-restart-
-// groups, delta-encoded) page. False ⇒ uncompressed (positional offset
-// table, full keys).
-func (r LeafReader) Compressed() bool { return r.compressed }
+// Compressed reports whether this leaf is a restart-group compressed
+// page (interleaved OR segregated). False ⇒ uncompressed (positional
+// offset table, full keys).
+func (r LeafReader) Compressed() bool { return r.variant != TypeLeafUncompressed }
+
+// Variant returns the page's leaf type byte (TypeLeaf,
+// TypeLeafSegregated, or TypeLeafUncompressed) — the read-side
+// dispatch authority per page-formats.md §Invariants.
+func (r LeafReader) Variant() uint8 { return r.variant }
+
+// seg reports the segregated variant; uc the uncompressed one. The
+// interleaved variant is the residual case.
+func (r LeafReader) seg() bool { return r.variant == TypeLeafSegregated }
+func (r LeafReader) uc() bool  { return r.variant == TypeLeafUncompressed }
 
 // Count returns the number of entries in the leaf.
 func (r LeafReader) Count() int { return r.count }
@@ -287,7 +318,7 @@ func (r LeafReader) DataEnd() int { return r.dataEnd }
 // returns Count(); the abstraction lets generic walkers iterate
 // group-by-group regardless of variant.
 func (r LeafReader) RestartCount() int {
-	if !r.compressed {
+	if r.uc() {
 		return r.count
 	}
 	return r.rt.RestartCount()
@@ -296,7 +327,7 @@ func (r LeafReader) RestartCount() int {
 // GroupEntryCount returns the number of entries in the i-th restart group.
 // For uncompressed leaves every group has exactly 1 entry.
 func (r LeafReader) GroupEntryCount(i int) int {
-	if !r.compressed {
+	if r.uc() {
 		return 1
 	}
 	return r.rt.GroupEntryCount(i)
@@ -318,10 +349,14 @@ func (r LeafReader) SearchLeaf(target []byte, tail TailCompare) (index int, entr
 	if r.count == 0 {
 		return 0, LeafEntry{}, false, nil
 	}
-	if !r.compressed {
+	switch r.variant {
+	case TypeLeafUncompressed:
 		return r.ucSearchLeaf(target, tail)
+	case TypeLeafSegregated:
+		return r.segSearchLeaf(target, tail)
+	default:
+		return r.compressedSearchLeaf(target, tail)
 	}
-	return r.compressedSearchLeaf(target, tail)
 }
 
 // SearchLeafIter is the cursor-friendly form of SearchLeaf: returns the
@@ -339,15 +374,20 @@ func (r LeafReader) SearchLeafIter(target, keyBuf, bufKeys []byte, bufEnts []Lea
 	if r.count == 0 {
 		return 0, LeafEntry{}, false, LeafIter{
 			r:       r,
+			variant: r.variant,
 			keyBuf:  keyBuf[:0],
 			bufKeys: bufKeys[:0],
 			bufEnts: bufEnts[:0],
 		}, nil
 	}
-	if !r.compressed {
+	switch r.variant {
+	case TypeLeafUncompressed:
 		return r.ucSearchLeafIter(target, keyBuf, bufKeys, bufEnts, tail)
+	case TypeLeafSegregated:
+		return r.segSearchLeafIter(target, keyBuf, bufKeys, bufEnts, tail)
+	default:
+		return r.compressedSearchLeafIter(target, keyBuf, bufKeys, bufEnts, tail)
 	}
-	return r.compressedSearchLeafIter(target, keyBuf, bufKeys, bufEnts, tail)
 }
 
 // EntryAt decodes the entry at absolute index idx. For compressed leaves
@@ -361,11 +401,15 @@ func (r LeafReader) EntryAt(idx int, keyBuf []byte) (LeafEntry, []byte) {
 	if idx < 0 || idx >= r.count {
 		panic(fmt.Sprintf("page: LeafReader.EntryAt %d out of range [0, %d)", idx, r.count))
 	}
-	if !r.compressed {
+	switch r.variant {
+	case TypeLeafUncompressed:
 		e, _ := r.decodeFullKeyEntry(r.ucOffset(idx))
 		return e, keyBuf
+	case TypeLeafSegregated:
+		return r.segEntryAt(idx, keyBuf)
+	default:
+		return r.compressedEntryAt(idx, keyBuf)
 	}
-	return r.compressedEntryAt(idx, keyBuf)
 }
 
 // LastKey returns the key of the last entry in the leaf, doing the
@@ -378,7 +422,8 @@ func (r LeafReader) LastKey(keyBuf []byte) ([]byte, []byte) {
 	if r.count == 0 {
 		return nil, keyBuf
 	}
-	if !r.compressed {
+	switch r.variant {
+	case TypeLeafUncompressed:
 		off := r.ucOffset(r.count - 1)
 		flags := r.buf[off]
 		off++
@@ -386,8 +431,11 @@ func (r LeafReader) LastKey(keyBuf []byte) ([]byte, []byte) {
 		off += 2
 		off += cellPreKeySkip(flags)
 		return r.buf[off : off+keyLen], keyBuf
+	case TypeLeafSegregated:
+		return r.segLastKey(keyBuf)
+	default:
+		return r.compressedLastKey(keyBuf)
 	}
-	return r.compressedLastKey(keyBuf)
 }
 
 // cellHasTrailerOnly reports whether the entry's value half is the
@@ -412,13 +460,18 @@ func cellPreKeySkip(flags uint8) int {
 	return 4
 }
 
-// FirstKey returns the key of the first entry. Both variants store the
+// FirstKey returns the key of the first entry. Every variant stores the
 // first entry's full key inline (compressed: at the first restart point;
-// uncompressed: at offset 0 of the entry-data region), so this is a
-// constant-time slice into the page buffer regardless of variant.
+// uncompressed: at offset 0 of the entry-data region; segregated: at
+// the fixed 5-byte header offset), so this is a constant-time slice
+// into the page buffer regardless of variant.
 func (r LeafReader) FirstKey() []byte {
 	if r.count == 0 {
 		return nil
+	}
+	if r.seg() {
+		_, key, _, _ := r.decodeSegRestart(segLeafEntryStart)
+		return key
 	}
 	flags := r.buf[leafEntryStart]
 	off := leafEntryStart
@@ -438,10 +491,23 @@ func (r LeafReader) FirstKey() []byte {
 // not reachable from a well-formed page; the helpers gate their use on
 // the returned value being nonnegative.
 func (r LeafReader) FreeSpace() int {
-	if !r.compressed {
+	switch r.variant {
+	case TypeLeafUncompressed:
 		return r.cfg.ContentEnd() - r.dataEnd - r.count*ucOffsetEntrySize
+	case TypeLeafSegregated:
+		// Two disjoint free regions: the middle gap between the entry
+		// stream and the value region's first byte, plus any gap
+		// between ValueEnd and the restart table (left by table
+		// shrinks; zero in canonical form).
+		voff0 := r.valueEnd
+		if r.count > 0 {
+			voff0 = segReadVOff(r.buf, segLeafEntryStart, true)
+		}
+		tableBase := r.cfg.ContentEnd() - r.rt.RestartCount()*restartTableEntrySize
+		return (voff0 - r.dataEnd) + (tableBase - r.valueEnd)
+	default:
+		return r.cfg.ContentEnd() - r.dataEnd - r.rt.RestartCount()*restartTableEntrySize
 	}
-	return r.cfg.ContentEnd() - r.dataEnd - r.rt.RestartCount()*restartTableEntrySize
 }
 
 // Validate walks the page's structural surface and returns ErrCorrupted
@@ -489,11 +555,14 @@ func (r LeafReader) FreeSpace() int {
 // sibling helpers (validateFullKeyEntry, validateDeltaEntry)
 // defined below.
 func (r LeafReader) Validate() error {
+	if r.seg() {
+		return r.segValidate()
+	}
 	contentEnd := r.cfg.ContentEnd()
 	if r.dataEnd < leafEntryStart || r.dataEnd > contentEnd {
 		return fmt.Errorf("%w: leaf DataEnd %d outside [%d, %d]", ErrCorrupted, r.dataEnd, leafEntryStart, contentEnd)
 	}
-	if r.compressed {
+	if r.variant == TypeLeaf {
 		rc := r.rt.RestartCount()
 		// Restart table must fit between DataEnd and ContentEnd.
 		tableBytes := rc * restartTableEntrySize
@@ -552,7 +621,7 @@ func (r LeafReader) Validate() error {
 	// examined. DataEnd==stream-end matters because the splice paths
 	// Validate first and then write the next entry at DataEnd:
 	// trailing slack would put the new entry outside the stream.
-	if !r.compressed {
+	if r.uc() {
 		expected := leafEntryStart
 		for i := range r.count {
 			off := r.ucOffset(i)

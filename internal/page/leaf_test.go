@@ -28,7 +28,7 @@ func buildLeaf(t *testing.T, cfg Config, entries [][2]string) []byte {
 // ---------------------------------------------------------------------------
 
 func TestLeafReader_Compressed_RoundTrip(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}
 	entries := [][2]string{
 		{"apple", "A"}, {"apricot", "A2"}, {"banana", "B"}, {"blueberry", "B2"},
 		{"cherry", "C"}, {"date", "D"}, {"durian", "D2"}, {"elderberry", "E"},
@@ -510,9 +510,13 @@ func TestLeafReader_Validate_AcceptsWellFormed(t *testing.T) {
 		cfg  Config
 		keys [][2]string
 	}{
-		{"compressed-shared", Config{PageSize: 4096, RestartGroupTarget: 4},
+		{"segregated-shared", Config{PageSize: 4096, RestartGroupTarget: 4},
 			[][2]string{{"aaa-1", "v"}, {"aaa-2", "v"}, {"aaa-3", "v"}}},
-		{"compressed-natural-breaks", Config{PageSize: 4096, RestartGroupTarget: 16},
+		{"interleaved-shared", Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved},
+			[][2]string{{"aaa-1", "v"}, {"aaa-2", "v"}, {"aaa-3", "v"}}},
+		{"segregated-natural-breaks", Config{PageSize: 4096, RestartGroupTarget: 16},
+			[][2]string{{"aaa", "v"}, {"bbb", "v"}, {"ccc", "v"}}},
+		{"interleaved-natural-breaks", Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			[][2]string{{"aaa", "v"}, {"bbb", "v"}, {"ccc", "v"}}},
 		{"uncompressed", Config{PageSize: 4096, RestartGroupTarget: 1},
 			[][2]string{{"a", "1"}, {"b", "2"}, {"c", "3"}}},
@@ -599,7 +603,7 @@ func TestLeafReader_Validate_RejectsCompressedCellFlags(t *testing.T) {
 // (decoder-using) implementation panicked on these inputs; this
 // test pins the regression boundary.
 func TestLeafReader_Validate_TotalOverInput(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}
 	mk := func() []byte {
 		// Build a small compressed leaf as the base; tests mutate it.
 		return buildLeaf(t, cfg, [][2]string{
@@ -882,9 +886,11 @@ func TestConfig_ValidateRejectsBadRestartGroupTarget(t *testing.T) {
 // (hot path), so this property is exactly what makes Validate a
 // sufficient gate for pages resolved from disk.
 func FuzzLeafValidateTotal(f *testing.F) {
-	cfgC := Config{PageSize: 4096, RestartGroupTarget: 4}
+	cfgC := Config{PageSize: 4096, RestartGroupTarget: 4} // default layout: segregated
+	cfgI := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}
 	cfgU := Config{PageSize: 4096, RestartGroupTarget: 1}
 	f.Add(buildLeafF(cfgC, [][2]string{{"aaa-1", "v"}, {"aaa-2", "v"}, {"aaa-3", "v"}}), byte(0), uint16(0))
+	f.Add(buildLeafF(cfgI, [][2]string{{"aaa-1", "v"}, {"aaa-2", "v"}, {"aaa-3", "v"}}), byte(0), uint16(0))
 	f.Add(buildLeafF(cfgU, [][2]string{{"alpha", "1"}, {"beta", "2"}}), byte(0), uint16(0))
 	f.Fuzz(func(t *testing.T, page []byte, mutByte byte, mutOff uint16) {
 		if len(page) == 0 {

@@ -24,20 +24,32 @@ import (
 // PageSize) fall back to heap allocation transparently — the builder
 // grows the relevant slice without changing the public surface.
 type LeafBuilder struct {
-	rgt        restartGroupTracker // compressed mode only
-	buf        []byte
-	cfg        Config
-	count      int
-	dataPos    int
-	compressed bool
+	rgt     restartGroupTracker // compressed modes only
+	buf     []byte
+	cfg     Config
+	count   int
+	dataPos int
+	variant uint8 // TypeLeaf | TypeLeafSegregated | TypeLeafUncompressed
 
-	// Compressed-mode running state.
+	// Compressed-mode running state (interleaved + segregated).
 	prevKey    []byte
 	prevKeyBuf [512]byte
 
 	// Uncompressed-mode positional offset accumulator.
 	ucOffsets    []uint16
 	ucOffsetsBuf [512]uint16
+
+	// Segregated-mode accumulators: value-region content in add order
+	// (copied into place at Finish, when the restart table's size —
+	// and so the region's end-anchored position — is known), plus the
+	// buf position of each entry's VOff field and its content's
+	// relative start for the Finish-time patch.
+	segVals         []byte
+	segValsBuf      [1024]byte
+	segVOffSlots    []int32
+	segVOffSlotsBuf [512]int32
+	segRel          []uint32
+	segRelBuf       [512]uint32
 
 	// Debug: previous key for sort-order assertion (shared across
 	// modes). Initialized lazily. lastWasOvk records whether the
@@ -72,16 +84,24 @@ func (b *LeafBuilder) Reset(buf []byte, cfg Config) {
 	b.buf = buf
 	b.cfg = cfg
 	b.count = 0
-	b.compressed = cfg.EffectiveRestartGroupTarget() != 1
+	b.variant = cfg.EffectiveLeafType()
 	b.dataPos = leafEntryStart
 	b.lastAddedKey = nil
 	b.lastWasOvk = false
 	b.forceRestart = false
-	if b.compressed {
+	switch b.variant {
+	case TypeLeafUncompressed:
+		b.ucOffsets = b.ucOffsetsBuf[:0]
+	case TypeLeafSegregated:
+		b.dataPos = segLeafEntryStart
 		b.rgt.init()
 		b.prevKey = b.prevKeyBuf[:0]
-	} else {
-		b.ucOffsets = b.ucOffsetsBuf[:0]
+		b.segVals = b.segValsBuf[:0]
+		b.segVOffSlots = b.segVOffSlotsBuf[:0]
+		b.segRel = b.segRelBuf[:0]
+	default:
+		b.rgt.init()
+		b.prevKey = b.prevKeyBuf[:0]
 	}
 }
 
@@ -192,9 +212,12 @@ func (b *LeafBuilder) addEntry(key []byte, flags uint8, value []byte, ovflPage, 
 		}
 	}
 	var ok bool
-	if !b.compressed {
+	switch b.variant {
+	case TypeLeafUncompressed:
 		ok = b.addUCEntry(key, flags, value, ovflPage, totalLen, keyExtPage, keyTotalLen)
-	} else {
+	case TypeLeafSegregated:
+		ok = b.addSegEntry(key, flags, value, ovflPage, totalLen, keyExtPage, keyTotalLen)
+	default:
 		ok = b.addCompressedEntry(key, flags, value, ovflPage, totalLen, keyExtPage, keyTotalLen)
 	}
 	if ok {
@@ -274,6 +297,130 @@ func writeFullKeyEntry(buf []byte, off int, flags uint8, key, value []byte, ovfl
 		off += len(value)
 	}
 	return off
+}
+
+// segValueContentSize returns the value-region byte size of an entry's
+// content: the 12-byte key-extent reference (overflow-key cells), then
+// the 16-byte trailer (overflow / nested-tree) or the raw value bytes
+// (inline / subpage; empty ⇒ zero — no EmptyValue form in the
+// segregated layout, emptiness is derived).
+func segValueContentSize(flags uint8, value []byte) int {
+	n := 0
+	if flags&CellFlagOverflowKey != 0 {
+		n += 12
+	}
+	if cellHasTrailerOnly(flags) {
+		return n + 16
+	}
+	return n + len(value)
+}
+
+// addSegEntry writes a segregated entry: the stream half (headers +
+// key bytes) into buf at dataPos with a placeholder VOff, the value
+// content into the segVals accumulator. The group decision — restart
+// at target / natural break / overflow-key singleton — is IDENTICAL to
+// addCompressedEntry's, so the two compressed layouts group the same
+// input identically.
+func (b *LeafBuilder) addSegEntry(key []byte, flags uint8, value []byte, ovflPage, totalLen uint64, keyExtPage uint64, keyTotalLen uint32) bool {
+	// The segregated layout has no EmptyValue form (page-formats.md
+	// §Segregated Leaf) — normalize entries decoded from interleaved
+	// pages (variant migration) rather than reject them.
+	flags &^= CellFlagEmptyValue
+	target := int(b.cfg.EffectiveRestartGroupTarget())
+	ovk := flags&CellFlagOverflowKey != 0
+
+	atTarget := b.rgt.IsRestart(b.count, target)
+	naturalBreak := false
+	if !atTarget && !ovk && !b.forceRestart && b.count > 0 && b.rgt.CurGroupCount() > 0 {
+		if sharedPrefixLen(b.prevKey, key) == 0 {
+			naturalBreak = true
+		}
+	}
+	isRestart := atTarget || naturalBreak || ovk || b.forceRestart
+	if isRestart && b.rgt.CurGroupCount() > 0 {
+		b.rgt.FinalizeCurrentGroup()
+	}
+
+	var sharedLen int
+	unsharedKey := key
+	if !isRestart {
+		sharedLen = sharedPrefixLen(b.prevKey, key)
+		unsharedKey = key[sharedLen:]
+	}
+
+	// Stream size: restart [Flags][KeyLen][VOff][Key] = 5 + len(key);
+	// delta [Flags][Shared][Unshared][VOff][UnsharedKey] = 7 + unshared.
+	var entrySize int
+	if isRestart {
+		entrySize = 5 + len(key)
+	} else {
+		entrySize = 7 + len(unsharedKey)
+	}
+	valSize := segValueContentSize(flags, value)
+
+	extraRestart := 0
+	if isRestart {
+		extraRestart = 1
+	}
+	tableSize := b.rgt.TableSize(extraRestart)
+	// Regions must not collide: stream forward from dataPos, value
+	// region + table backward from ContentEnd.
+	if b.dataPos+entrySize+len(b.segVals)+valSize+tableSize > b.cfg.ContentEnd() {
+		return false
+	}
+
+	if isRestart {
+		b.rgt.StartGroup(b.dataPos)
+	}
+
+	// Stream half. VOff is a placeholder patched at Finish (the
+	// end-anchored region position needs the final table size).
+	off := b.dataPos
+	b.buf[off] = flags
+	off++
+	if isRestart {
+		le.PutUint16(b.buf[off:], uint16(len(key)))
+		off += 2
+		b.segVOffSlots = append(b.segVOffSlots, int32(off))
+		le.PutUint16(b.buf[off:], 0)
+		off += 2
+		copy(b.buf[off:], key)
+		off += len(key)
+	} else {
+		le.PutUint16(b.buf[off:], uint16(sharedLen))
+		off += 2
+		le.PutUint16(b.buf[off:], uint16(len(unsharedKey)))
+		off += 2
+		b.segVOffSlots = append(b.segVOffSlots, int32(off))
+		le.PutUint16(b.buf[off:], 0)
+		off += 2
+		copy(b.buf[off:], unsharedKey)
+		off += len(unsharedKey)
+	}
+
+	// Value content, in add order.
+	b.segRel = append(b.segRel, uint32(len(b.segVals)))
+	if flags&CellFlagOverflowKey != 0 {
+		var ref [12]byte
+		le.PutUint64(ref[:], keyExtPage)
+		le.PutUint32(ref[8:], keyTotalLen)
+		b.segVals = append(b.segVals, ref[:]...)
+	}
+	if cellHasTrailerOnly(flags) {
+		var tr [16]byte
+		le.PutUint64(tr[:], ovflPage)
+		le.PutUint64(tr[8:], totalLen)
+		b.segVals = append(b.segVals, tr[:]...)
+	} else {
+		b.segVals = append(b.segVals, value...)
+	}
+
+	b.dataPos = off
+	b.prevKey = append(b.prevKey[:0], key...)
+	b.count++
+	b.rgt.IncrCount()
+	b.forceRestart = ovk
+	return true
 }
 
 // addCompressedEntry writes a compressed entry — restart or delta as
@@ -409,7 +556,8 @@ func writeCompressedDeltaEntry(buf []byte, off int, flags uint8, sharedLen int, 
 // page into the same builder.
 func (b *LeafBuilder) Finish() uint16 {
 	count := uint16(b.count)
-	if !b.compressed {
+	switch b.variant {
+	case TypeLeafUncompressed:
 		// Zero the free-space region for determinism (matches behavior
 		// of EncodeLeaf which cleared the whole buffer before writing).
 		zeroFreeSpace(b.buf, b.dataPos, b.cfg.ContentEnd()-int(count)*ucOffsetEntrySize)
@@ -425,16 +573,40 @@ func (b *LeafBuilder) Finish() uint16 {
 			le.PutUint16(b.buf[off:], b.ucOffsets[i])
 		}
 		return count
-	}
 
-	// Compressed: write restart table first, then header (so RestartCount
-	// is known and stored).
-	rc := b.rgt.WriteTable(b.buf, b.cfg.ContentEnd())
-	zeroFreeSpace(b.buf, b.dataPos, b.cfg.ContentEnd()-rc*restartTableEntrySize)
-	WriteHeader(b.buf, TypeLeaf, count, 0)
-	le.PutUint16(b.buf[leafOffRestartCount:], uint16(rc))
-	le.PutUint16(b.buf[leafOffDataEnd:], uint16(b.dataPos))
-	return count
+	case TypeLeafSegregated:
+		// Restart table first (fixes the table base), then the value
+		// region packed flush against it (the canonical end-anchored
+		// form: ValueEnd == table base; empty page: ValueEnd == entry
+		// start), then the VOff patch pass over the recorded slots.
+		contentEnd := b.cfg.ContentEnd()
+		rc := b.rgt.WriteTable(b.buf, contentEnd)
+		valueEnd := contentEnd - rc*restartTableEntrySize
+		if b.count == 0 {
+			valueEnd = segLeafEntryStart
+		}
+		valueStart := valueEnd - len(b.segVals)
+		copy(b.buf[valueStart:valueEnd], b.segVals)
+		for i, slot := range b.segVOffSlots {
+			le.PutUint16(b.buf[slot:], uint16(valueStart+int(b.segRel[i])))
+		}
+		zeroFreeSpace(b.buf, b.dataPos, valueStart)
+		WriteHeader(b.buf, TypeLeafSegregated, count, 0)
+		le.PutUint16(b.buf[leafOffRestartCount:], uint16(rc))
+		le.PutUint16(b.buf[leafOffDataEnd:], uint16(b.dataPos))
+		le.PutUint16(b.buf[segLeafOffValueEnd:], uint16(valueEnd))
+		return count
+
+	default:
+		// Interleaved compressed: write restart table first, then
+		// header (so RestartCount is known and stored).
+		rc := b.rgt.WriteTable(b.buf, b.cfg.ContentEnd())
+		zeroFreeSpace(b.buf, b.dataPos, b.cfg.ContentEnd()-rc*restartTableEntrySize)
+		WriteHeader(b.buf, TypeLeaf, count, 0)
+		le.PutUint16(b.buf[leafOffRestartCount:], uint16(rc))
+		le.PutUint16(b.buf[leafOffDataEnd:], uint16(b.dataPos))
+		return count
+	}
 }
 
 // Count returns the number of entries added so far.
@@ -444,10 +616,14 @@ func (b *LeafBuilder) Count() int { return b.count }
 // entry. Used by bulkload + split heuristics to decide when to close a
 // page.
 func (b *LeafBuilder) FreeSpace() int {
-	if !b.compressed {
+	switch b.variant {
+	case TypeLeafUncompressed:
 		return b.cfg.ContentEnd() - b.dataPos - b.count*ucOffsetEntrySize
+	case TypeLeafSegregated:
+		return b.cfg.ContentEnd() - b.dataPos - len(b.segVals) - b.rgt.TableSize(0)
+	default:
+		return b.cfg.ContentEnd() - b.dataPos - b.rgt.TableSize(0)
 	}
-	return b.cfg.ContentEnd() - b.dataPos - b.rgt.TableSize(0)
 }
 
 // effectiveCellFlags upgrades a plain inline cell with an empty value

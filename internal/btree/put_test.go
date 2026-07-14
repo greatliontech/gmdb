@@ -502,7 +502,7 @@ func TestPutForcesMultiLevelTreeAndBranchSplit(t *testing.T) {
 	// branch structure needs many leaves. N=1500 (~375 leaves)
 	// clears that threshold; the prior count (400, ~100 leaves)
 	// fit a single compressed root branch (depth 1).
-	cfg := page.Config{PageSize: 4096}
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // depth calibration: N=1500 → ~375 leaves at target 16
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
 	const N = 1500

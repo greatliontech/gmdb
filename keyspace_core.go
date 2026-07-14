@@ -89,17 +89,14 @@ type keyspaceCore struct {
 func (ks *keyspaceCore) Name() string { return ks.name.Value() }
 
 // builderCfg returns the page.Config to pass to btree.* calls for this
-// keyspace. When a per-keyspace RestartGroupTarget is set (via
-// SetKeyspaceConfig per keyspaces.md invariant #6) it overrides the
-// engine default — newly written leaves use the per-keyspace target.
-// Decoding ignores RestartGroupTarget so the override is safe on the
-// Get side too.
+// keyspace. Per-keyspace declarations (RestartGroupTarget, NodeLayouts
+// — via SetKeyspaceConfig per keyspaces.md) override the engine
+// defaults through descriptor.ApplyToConfig, the single
+// descriptor-to-config mapping shared with CopyTo and incremental
+// compaction. Decoding ignores builder fields (readers dispatch by
+// page type byte) so the override is safe on the Get side too.
 func (ks *keyspaceCore) builderCfg() page.Config {
-	cfg := ks.tx.pgr.Config()
-	if ks.desc.RestartGroupTarget != 0 {
-		cfg.RestartGroupTarget = ks.desc.RestartGroupTarget
-	}
-	return cfg
+	return descriptor.ApplyToConfig(ks.desc, ks.tx.pgr.Config())
 }
 
 // newRootCursor builds a *btree.Cursor positioned at the keyspace's

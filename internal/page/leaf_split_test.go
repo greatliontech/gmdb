@@ -61,7 +61,7 @@ func TestSplitLeafAtGroup_MatchesRebuild(t *testing.T) {
 	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
 
 	t.Run("shared-prefix groups (RGT=4)", func(t *testing.T) {
-		cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}
 		var entries []LeafEntry
 		for i := range 12 { // 3 groups of 4 (all share "key-")
 			entries = append(entries, mk(fmt.Sprintf("key-%04d", i), "v"))
@@ -76,7 +76,7 @@ func TestSplitLeafAtGroup_MatchesRebuild(t *testing.T) {
 	})
 
 	t.Run("natural-break single-entry groups", func(t *testing.T) {
-		cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 		// No shared prefixes → every entry its own group.
 		entries := []LeafEntry{mk("aaa", "1"), mk("bbb", "2"), mk("ccc", "3"), mk("ddd", "4")}
 		buf := mustBuild(t, cfg, entries)
@@ -89,7 +89,7 @@ func TestSplitLeafAtGroup_MatchesRebuild(t *testing.T) {
 	})
 
 	t.Run("mixed cell kinds", func(t *testing.T) {
-		cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}
 		entries := []LeafEntry{
 			mk("key-0", "v"), mk("key-1", "v"), mk("key-2", "v"), mk("key-3", "v"),
 			{Flags: CellFlagOverflow, Key: []byte("key-4"), OverflowPage: 7, TotalLen: 99},
@@ -105,7 +105,7 @@ func TestSplitLeafAtGroup_MatchesRebuild(t *testing.T) {
 
 func TestFindSplitGroup(t *testing.T) {
 	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}
 
 	// Uniform entries → 4 groups of 4; the ~50% byte boundary is the middle
 	// group index. The result must be in [1, rc) and split the bytes near half.
@@ -143,7 +143,7 @@ func FuzzSplitLeafAtGroup(f *testing.F) {
 	f.Add(uint64(0xDEADBEEF), uint64(2))
 
 	f.Fuzz(func(t *testing.T, leafSeed, groupSeed uint64) {
-		cfg := Config{PageSize: 4096, RestartGroupTarget: 4} // smaller RGT → more groups
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved} // smaller RGT → more groups
 		entries := randomFittingMixed(leafSeed, cfg)
 		if len(entries) == 0 {
 			return
@@ -275,7 +275,7 @@ func FuzzUCSplitLeafAt(f *testing.F) {
 // left truncate) — in-place, zero-alloc — vs the decode/re-encode split it
 // replaces on the append-overflow hot path.
 func BenchmarkSplitLeafAtGroup(b *testing.B) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	var entries []LeafEntry
 	for i := 0; ; i++ {
 		entries = append(entries, LeafEntry{Key: fmt.Appendf(nil, "key-%05d", i), Value: bytes.Repeat([]byte("v"), 40)})

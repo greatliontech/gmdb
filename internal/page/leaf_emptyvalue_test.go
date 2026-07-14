@@ -27,7 +27,7 @@ func TestEmptyValueCellRoundTripAndSplice(t *testing.T) {
 		name string
 		cfg  Config
 	}{
-		{"compressed", Config{PageSize: 4096, RestartGroupTarget: 4, PageChecksum: false}},
+		{"compressed", Config{PageSize: 4096, RestartGroupTarget: 4, PageChecksum: false, LeafLayout: LeafLayoutInterleaved}},
 		{"uncompressed", Config{PageSize: 4096, RestartGroupTarget: 1, PageChecksum: false}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -232,7 +232,7 @@ func TestEmptyValueFirstLastKey(t *testing.T) {
 		name string
 		cfg  Config
 	}{
-		{"compressed", Config{PageSize: 4096, RestartGroupTarget: 4, PageChecksum: false}},
+		{"compressed", Config{PageSize: 4096, RestartGroupTarget: 4, PageChecksum: false, LeafLayout: LeafLayoutInterleaved}},
 		{"uncompressed", Config{PageSize: 4096, RestartGroupTarget: 1, PageChecksum: false}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

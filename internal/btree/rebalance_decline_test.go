@@ -38,7 +38,7 @@ func installTwoLeafTree(t *testing.T, pw *fakeWriter, cfg page.Config, left, rig
 // leaving the below-floor page accepted. Pre-decline this looped
 // forever (merge → identical skewed split → tried-flags reset → …).
 func TestDeleteSizeSkewedSiblingsDeclinesAndTerminates(t *testing.T) {
-	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false}
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false, LeafLayout: page.LeafLayoutInterleaved}
 	pw := newFakeWriter(t, 4096)
 
 	huge := []page.LeafEntry{{Key: []byte("a-huge"), Value: bytes.Repeat([]byte("H"), 3500)}}
@@ -100,7 +100,7 @@ func TestDeleteSizeSkewedSiblingsDeclinesAndTerminates(t *testing.T) {
 // boundary — previously ErrCorrupted on a valid delete, now a DECLINE:
 // the delete succeeds and the pair stays as-is.
 func TestDeleteInfeasibleRedistributeDeclines(t *testing.T) {
-	buildCfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false}
+	buildCfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false, LeafLayout: page.LeafLayoutInterleaved}
 	pw := newFakeWriter(t, 4096)
 
 	// The delta-heavy adversarial leaf from the growth fixtures.
@@ -186,7 +186,7 @@ func TestDeleteInfeasibleRedistributeDeclines(t *testing.T) {
 // overflows but whose byte-balanced halves both clear the floor
 // rebalance normally (guards the declines against over-declining).
 func TestDeleteBalancedRedistributeStillFires(t *testing.T) {
-	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false}
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false, LeafLayout: page.LeafLayoutInterleaved}
 	pw := newFakeWriter(t, 4096)
 
 	mk := func(prefix string, n, vlen int) []page.LeafEntry {

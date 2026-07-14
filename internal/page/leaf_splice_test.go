@@ -89,34 +89,34 @@ func TestTryAppendCompressed_MatchesRebuild(t *testing.T) {
 	}{
 		{
 			name: "delta-extends-group",
-			cfg:  Config{PageSize: 4096, RestartGroupTarget: 16},
+			cfg:  Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			base: []LeafEntry{mk("key-0001", "v1"), mk("key-0002", "v2")},
 			e:    mk("key-0003", "v3"),
 		},
 		{
 			name:         "natural-break-new-group",
-			cfg:          Config{PageSize: 4096, RestartGroupTarget: 16},
+			cfg:          Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			base:         []LeafEntry{mk("aaa-1", "v1"), mk("aaa-2", "v2")},
 			e:            mk("zzz", "v3"), // sharedPrefixLen("aaa-2","zzz")==0
 			wantNewGroup: true,
 		},
 		{
 			name:         "target-cap-new-group",
-			cfg:          Config{PageSize: 4096, RestartGroupTarget: 4},
+			cfg:          Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved},
 			base:         []LeafEntry{mk("k-00", "v"), mk("k-01", "v"), mk("k-02", "v"), mk("k-03", "v")},
 			e:            mk("k-04", "v"),
 			wantNewGroup: true,
 		},
 		{
 			name:         "overflow-entry",
-			cfg:          Config{PageSize: 4096, RestartGroupTarget: 16},
+			cfg:          Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			base:         []LeafEntry{mk("aaa", "v1")},
 			e:            LeafEntry{Flags: CellFlagOverflow, Key: []byte("bbb"), OverflowPage: 42, TotalLen: 100000},
 			wantNewGroup: true, // sharedPrefixLen("aaa","bbb")==0 → natural break
 		},
 		{
 			name:         "overflow-entry-shared-prefix",
-			cfg:          Config{PageSize: 4096, RestartGroupTarget: 16},
+			cfg:          Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			base:         []LeafEntry{mk("key-1", "v1"), mk("key-2", "v2")},
 			e:            LeafEntry{Flags: CellFlagOverflow, Key: []byte("key-3"), OverflowPage: 7, TotalLen: 99},
 			wantNewGroup: false, // shares "key-" → delta extends the group
@@ -164,7 +164,7 @@ func TestTryAppendCompressed_MatchesRebuild(t *testing.T) {
 // stale non-zero byte left by an earlier splice would diverge from the
 // rebuild on a later one.
 func TestTryAppendCompressed_SequentialMatchesRebuild(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}
 	var entries []LeafEntry
 	for _, pfx := range []string{"alpha", "beta", "gamma"} {
 		for i := range 6 {
@@ -199,7 +199,7 @@ func TestTryAppendCompressed_SequentialMatchesRebuild(t *testing.T) {
 }
 
 func TestTryAppendCompressed_PageFull(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	// Fill a page to capacity with 10-byte values, then drop the entry that
 	// overflowed so base is a packed-but-valid page.
 	var base []LeafEntry
@@ -223,7 +223,7 @@ func TestTryAppendCompressed_PageFull(t *testing.T) {
 }
 
 func TestTryAppendOnEmptyPage(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	buf, _ := tryBuild(cfg, nil) // count==0 leaf
 	before := bytes.Clone(buf)
 	if TryAppend(buf, cfg, LeafEntry{Key: []byte("a"), Value: []byte("1")}, nil) {
@@ -278,7 +278,7 @@ func TestTryAppendVariantMismatchDeclines(t *testing.T) {
 	}
 	before := bytes.Clone(buf)
 	// Same uncompressed page, but the keyspace is now configured compressed.
-	if TryAppend(buf, Config{PageSize: 4096, RestartGroupTarget: 16}, LeafEntry{Key: []byte("ccc"), Value: []byte("3")}, []byte("bbb")) {
+	if TryAppend(buf, Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}, LeafEntry{Key: []byte("ccc"), Value: []byte("3")}, []byte("bbb")) {
 		t.Fatal("TryAppend should decline an uncompressed page when RGT>=2 (migrate to compressed via rebuild)")
 	}
 	if !bytes.Equal(buf, before) {
@@ -294,7 +294,7 @@ func TestTryAppendVariantMismatchDeclines(t *testing.T) {
 // This is the page-level analog of the gmdb-level
 // TestKeyspacePutHonorsPerKeyspaceRestartGroupTarget.
 func TestTryAppendCompressedDeclinesWhenConfiguredUncompressed(t *testing.T) {
-	buildCfg := Config{PageSize: 4096, RestartGroupTarget: 16} // compressed page
+	buildCfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved} // compressed page
 	base := []LeafEntry{{Key: []byte("aaa"), Value: []byte("1")}, {Key: []byte("bbb"), Value: []byte("2")}}
 	buf, ok := tryBuild(buildCfg, base)
 	if !ok {
@@ -325,7 +325,7 @@ func FuzzTryAppendCompressed(f *testing.F) {
 	f.Add(uint64(0xDEADBEEF), uint64(0xCAFEBABE))
 
 	f.Fuzz(func(t *testing.T, leafSeed, appendSeed uint64) {
-		cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 		base := randomFittingEntries(leafSeed, cfg)
 		if len(base) == 0 {
 			return
@@ -387,8 +387,14 @@ func assertLeafDecodesTo(t *testing.T, buf []byte, cfg Config, expected []LeafEn
 		}
 		// The writers canonicalize plain empty-value cells to the
 		// compact form (effectiveCellFlags) — the oracle must expect
-		// the canonical flags, not the input's.
-		if wantFlags := effectiveCellFlags(want.Flags, want.Value); got.Flags != wantFlags {
+		// the canonical flags, not the input's. The segregated layout
+		// has NO EmptyValue form (derived lengths); its canonical
+		// flags strip the bit instead.
+		wantFlags := effectiveCellFlags(want.Flags, want.Value)
+		if r.Variant() == TypeLeafSegregated {
+			wantFlags = want.Flags &^ CellFlagEmptyValue
+		}
+		if got.Flags != wantFlags {
 			t.Fatalf("entry %d: flags 0x%x, want 0x%x", i, got.Flags, wantFlags)
 		}
 		switch {
@@ -414,6 +420,26 @@ func assertFreeSpaceZeroed(t *testing.T, buf []byte, cfg Config) {
 	r := NewLeafReader(buf, cfg)
 	dataEnd := r.DataEnd()
 	tableStart := cfg.ContentEnd() - r.RestartCount()*restartTableEntrySize
+	if r.Variant() == TypeLeafSegregated {
+		// Two free regions bracket the value region: the middle gap
+		// [DataEnd, VOff0) and any table-shrink gap [ValueEnd,
+		// tableStart).
+		voff0 := r.valueEnd
+		if r.Count() > 0 {
+			voff0 = segReadVOff(buf, segLeafEntryStart, true)
+		}
+		for i := dataEnd; i < voff0; i++ {
+			if buf[i] != 0 {
+				t.Fatalf("free-space byte at %d = 0x%x, want 0 (DataEnd=%d VOff0=%d)", i, buf[i], dataEnd, voff0)
+			}
+		}
+		for i := r.valueEnd; i < tableStart; i++ {
+			if buf[i] != 0 {
+				t.Fatalf("gap byte at %d = 0x%x, want 0 (ValueEnd=%d tableStart=%d)", i, buf[i], r.valueEnd, tableStart)
+			}
+		}
+		return
+	}
 	for i := dataEnd; i < tableStart; i++ {
 		if buf[i] != 0 {
 			t.Fatalf("free-space byte at %d = 0x%x, want 0 (DataEnd=%d tableStart=%d)", i, buf[i], dataEnd, tableStart)
@@ -452,16 +478,16 @@ func TestTryInsertAtCompressed_Positions(t *testing.T) {
 		return LeafEntry{Flags: CellFlagOverflow, Key: []byte(k), OverflowPage: pg, TotalLen: tl}
 	}
 	t.Run("I-B front", func(t *testing.T) {
-		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16},
+		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			[]LeafEntry{mk("bbb", "1"), mk("ccc", "2")}, 0, mk("aaa", "x"))
 	})
 	t.Run("I-C interior shared-prefix", func(t *testing.T) {
-		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16},
+		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			[]LeafEntry{mk("key-1", "1"), mk("key-3", "2")}, 1, mk("key-2", "x"))
 	})
 	t.Run("I-C interior prefix-break", func(t *testing.T) {
 		// New key shares no prefix with either neighbour — still valid (sharedLen 0).
-		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16},
+		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			[]LeafEntry{mk("aaa", "1"), mk("ccc", "2")}, 1, mk("bbb", "x"))
 	})
 	t.Run("I-D group boundary (multi-group)", func(t *testing.T) {
@@ -469,9 +495,9 @@ func TestTryInsertAtCompressed_Positions(t *testing.T) {
 		// idx 4 (the boundary) routes into group 0 as p==gc (I-D).
 		base := []LeafEntry{mk("key-0", "0"), mk("key-1", "1"), mk("key-2", "2"), mk("key-3", "3"),
 			mk("key-4", "4"), mk("key-5", "5"), mk("key-6", "6"), mk("key-7", "7")}
-		buf := checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 4}, base, 4, mk("key-35", "x"))
+		buf := checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}, base, 4, mk("key-35", "x"))
 		// Group 0 grew to 5; group 1 unchanged at 4; RestartCount unchanged.
-		r := NewLeafReader(buf, Config{PageSize: 4096, RestartGroupTarget: 4})
+		r := NewLeafReader(buf, Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved})
 		if r.RestartCount() != 2 {
 			t.Fatalf("RestartCount = %d, want 2 (insert grows a group, never adds one)", r.RestartCount())
 		}
@@ -480,17 +506,17 @@ func TestTryInsertAtCompressed_Positions(t *testing.T) {
 		}
 	})
 	t.Run("overflow successor", func(t *testing.T) {
-		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16},
+		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			[]LeafEntry{mk("key-1", "1"), ovf("key-3", 99, 100000)}, 1, mk("key-2", "x"))
 	})
 	t.Run("new overflow entry interior", func(t *testing.T) {
-		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16},
+		checkInsert(t, Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
 			[]LeafEntry{mk("key-1", "1"), mk("key-3", "2")}, 1, ovf("key-2", 7, 50000))
 	})
 }
 
 func TestTryInsertAtCompressed_GrowsThenCapDeclines(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 4} // maxGroup = 2*4 = 8
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved} // maxGroup = 2*4 = 8
 	// One group of 4 prefix-sharing keys (even-numbered, so odd keys slot in).
 	base := []LeafEntry{
 		{Key: []byte("key-00"), Value: []byte("v")},
@@ -531,7 +557,7 @@ func TestTryInsertAtCompressed_GrowsThenCapDeclines(t *testing.T) {
 }
 
 func TestTryInsertAtCompressed_PageFull(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	var base []LeafEntry
 	for i := 0; ; i++ {
 		base = append(base, LeafEntry{Key: fmt.Appendf(nil, "key-%05d", i*2), Value: bytes.Repeat([]byte("v"), 10)})
@@ -555,7 +581,7 @@ func TestTryInsertAtCompressed_PageFull(t *testing.T) {
 
 func TestTryInsertAtCompressed_VariantDeclines(t *testing.T) {
 	base := []LeafEntry{{Key: []byte("aaa"), Value: []byte("1")}, {Key: []byte("ccc"), Value: []byte("2")}}
-	buf, ok := tryBuild(Config{PageSize: 4096, RestartGroupTarget: 16}, base)
+	buf, ok := tryBuild(Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}, base)
 	if !ok {
 		t.Fatal("base did not fit")
 	}
@@ -579,7 +605,7 @@ func FuzzTryInsertAtCompressed(f *testing.F) {
 	f.Add(uint64(0xDEADBEEF), uint64(0xCAFEBABE), uint64(5))
 
 	f.Fuzz(func(t *testing.T, leafSeed, keySeed, posSeed uint64) {
-		cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 		// Mixed cell kinds (inline / overflow / subpage / nested-tree) so the
 		// successor-stash + re-encode paths are fuzzed for every cell form, not
 		// just inline.
@@ -646,7 +672,7 @@ func BenchmarkTryInsertAtCompressed(b *testing.B) {
 	for _, gc := range []int{4, 8, 16} {
 		for _, valSize := range []int{8, 100} {
 			b.Run(fmt.Sprintf("gc=%d/val=%d", gc, valSize), func(b *testing.B) {
-				cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+				cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 				val := bytes.Repeat([]byte("v"), valSize)
 				var base []LeafEntry
 				for i := range gc {
@@ -707,7 +733,7 @@ func TestTryDeleteAtCompressed_Positions(t *testing.T) {
 	ovf := func(k string, pg, tl uint64) LeafEntry {
 		return LeafEntry{Flags: CellFlagOverflow, Key: []byte(k), OverflowPage: pg, TotalLen: tl}
 	}
-	cfg16 := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg16 := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 
 	// One group of three (all share "key-") exercises D-B / D-C / D-D; the group
 	// survives so RestartCount stays 1.
@@ -760,7 +786,7 @@ func TestTryDeleteAtCompressed_Positions(t *testing.T) {
 	t.Run("D-C with later groups (offsets shift)", func(t *testing.T) {
 		// RGT=4 → 8 shared-prefix keys make two full groups [k0..k3][k4..k7].
 		// Deleting idx 1 (group 0) must shift group 1's stored offset left.
-		cfg4 := Config{PageSize: 4096, RestartGroupTarget: 4}
+		cfg4 := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}
 		base := []LeafEntry{mk("key-0", "0"), mk("key-1", "1"), mk("key-2", "2"), mk("key-3", "3"),
 			mk("key-4", "4"), mk("key-5", "5"), mk("key-6", "6"), mk("key-7", "7")}
 		buf := checkDelete(t, cfg4, base, 1)
@@ -777,7 +803,7 @@ func TestTryDeleteAtCompressed_Positions(t *testing.T) {
 func TestTryDeleteAtCompressed_SingleEntryLastInGroupSurvives(t *testing.T) {
 	// A two-entry group where the deleted entry is the tail (D-D), leaving the
 	// group with one entry (still a valid restart-only group).
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
 	buf := checkDelete(t, cfg, []LeafEntry{mk("key-1", "1"), mk("key-2", "2")}, 1)
 	if r := NewLeafReader(buf, cfg); r.GroupEntryCount(0) != 1 {
@@ -792,7 +818,7 @@ func TestTryDeleteAtCompressed_SingleEntryLastInGroupSurvives(t *testing.T) {
 // because the removed ~60-byte entry dominates. Proves byteDelta < 0 even at the
 // pathological maximum.
 func TestTryDeleteAtCompressed_ReencodingGrowthIsBounded(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	prefix := bytes.Repeat([]byte("z"), 50)
 	base := []LeafEntry{
 		{Key: []byte("x"), Value: []byte("v")},
@@ -808,7 +834,7 @@ func TestTryDeleteAtCompressed_ReencodingGrowthIsBounded(t *testing.T) {
 // decodes correctly. The splice never declines for space (a delete always
 // shrinks the page).
 func TestTryDeleteAtCompressed_AlwaysShrinks(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 4}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4, LeafLayout: LeafLayoutInterleaved}
 	var base []LeafEntry
 	// Two no-shared-prefix keys → two single-entry groups (D-A).
 	base = append(base, LeafEntry{Key: []byte("aaa"), Value: bytes.Repeat([]byte("v"), 5)})
@@ -831,7 +857,7 @@ func TestTryDeleteAtCompressed_AlwaysShrinks(t *testing.T) {
 }
 
 func TestTryDeleteAtCompressed_EmptyDeclines(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	buf, ok := tryBuild(cfg, []LeafEntry{{Key: []byte("only"), Value: []byte("v")}})
 	if !ok {
 		t.Fatal("base did not fit")
@@ -847,7 +873,7 @@ func TestTryDeleteAtCompressed_EmptyDeclines(t *testing.T) {
 
 func TestTryDeleteAtCompressed_VariantDeclines(t *testing.T) {
 	base := []LeafEntry{{Key: []byte("aaa"), Value: []byte("1")}, {Key: []byte("bbb"), Value: []byte("2")}}
-	buf, ok := tryBuild(Config{PageSize: 4096, RestartGroupTarget: 16}, base)
+	buf, ok := tryBuild(Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}, base)
 	if !ok {
 		t.Fatal("base did not fit")
 	}
@@ -871,7 +897,7 @@ func TestTryDeleteAtCompressed_VariantDeclines(t *testing.T) {
 // places the table correctly. (The footer itself is recomputed at commit time,
 // not by the splice; Validate checks structure within ContentEnd only.)
 func TestTryDeleteAtCompressed_WithChecksum(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 4, PageChecksum: true}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 4, PageChecksum: true, LeafLayout: LeafLayoutInterleaved}
 	mk := func(k, v string) LeafEntry { return LeafEntry{Key: []byte(k), Value: []byte(v)} }
 	base := []LeafEntry{
 		mk("aaa", "x"), // single-entry group (D-A reachable)
@@ -891,7 +917,7 @@ func FuzzTryDeleteAtCompressed(f *testing.F) {
 	f.Add(uint64(0xDEADBEEF), uint64(5))
 
 	f.Fuzz(func(t *testing.T, leafSeed, posSeed uint64) {
-		cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+		cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 		base := randomFittingMixed(leafSeed, cfg)
 		if len(base) == 0 {
 			return
@@ -927,7 +953,7 @@ func BenchmarkTryDeleteAtCompressed(b *testing.B) {
 	for _, gc := range []int{4, 8, 16} {
 		for _, valSize := range []int{8, 100} {
 			b.Run(fmt.Sprintf("gc=%d/val=%d", gc, valSize), func(b *testing.B) {
-				cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+				cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 				val := bytes.Repeat([]byte("v"), valSize)
 				var base []LeafEntry
 				for i := range gc {
@@ -1078,7 +1104,7 @@ func TestUCTryDeleteAt_MatchesRebuild(t *testing.T) {
 // rebuild) — the dispatchers' variant switch, exercised for the insert/delete ops.
 func TestUCSpliceVariantMismatchDeclines(t *testing.T) {
 	ucCfg := Config{PageSize: 4096, RestartGroupTarget: 1}
-	compressedCfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	compressedCfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	base := []LeafEntry{{Key: []byte("aaa"), Value: []byte("1")}, {Key: []byte("ccc"), Value: []byte("2")}}
 	ucBuf, ok := tryBuild(ucCfg, base)
 	if !ok {
@@ -1293,14 +1319,37 @@ func randomLeafEntry(r *rand.Rand, key []byte) LeafEntry {
 
 // randomFittingMixed is randomFittingEntries with random cell kinds (built via
 // AddEntry). Returns the sorted prefix that fits one page.
+//
+// Key-form grammar: with low probability a key is promoted to an
+// OVERFLOW-KEY entry — the key padded to exactly T resident bytes plus
+// a synthetic extent reference — so the fuzzers reach the ovk-adjacent
+// splice paths (singleton-group preservation, insert declines, the
+// 12-byte value-region prepend under shifts). The zero-padded key must
+// still sort strictly between its neighbours; promotion is skipped
+// when padding would break that (m == k || 0x00... prefixes).
 func randomFittingMixed(seed uint64, cfg Config) []LeafEntry {
 	r := rand.New(rand.NewPCG(seed, seed^0x2545f4914f6cdd1d))
 	keys := randomSortedKeys(r, 1+r.IntN(50))
 	buf := make([]byte, cfg.PageSize)
 	b := NewLeafBuilder(buf, cfg)
+	tt := cfg.InlineThreshold()
 	out := make([]LeafEntry, 0, len(keys))
-	for _, k := range keys {
+	for i, k := range keys {
 		e := randomLeafEntry(r, bytes.Clone(k))
+		if r.IntN(10) == 0 && len(k) < tt {
+			padded := make([]byte, tt)
+			copy(padded, k)
+			ok := true
+			if i+1 < len(keys) && bytes.Compare(padded, keys[i+1]) >= 0 {
+				ok = false
+			}
+			if ok {
+				e.Key = padded
+				e.Flags |= CellFlagOverflowKey
+				e.KeyExtPage = 1 + r.Uint64()%1000
+				e.KeyTotalLen = uint32(tt + 1 + r.IntN(200))
+			}
+		}
 		if !b.AddEntry(e) {
 			break
 		}

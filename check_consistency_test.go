@@ -3,6 +3,7 @@ package gmdb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"testing"
@@ -169,14 +170,37 @@ func TestCheckDetectsOrderingAndCountCorruption(t *testing.T) {
 	t.Run("nested-count", func(t *testing.T) {
 		path := buildConsistencyFixture(t)
 		surgeon(t, path, func(data []byte) {
-			// Nested-tree cell layout: [Flags][KeyLen][Key][Root][Count].
-			// Locate the "setkey" cell and bump its Count low byte.
-			i := bytes.Index(data, []byte("setkey"))
-			if i < 0 {
-				t.Fatalf("set key not found")
+			// Locate the "setkey" nested-tree cell's [Root u64][Count
+			// u64] pair variant-agnostically: walk leaf pages for the
+			// entry, then find the Root's LE encoding in the page (the
+			// pair is contiguous in every layout — after the key in
+			// the interleaved stream, in the value region in the
+			// segregated one) and bump the adjacent Count low byte.
+			cfg := page.Config{PageSize: 4096}
+			for start := 0; start+4096 <= len(data); start += 4096 {
+				pageBuf := data[start : start+4096]
+				typ, _, _, _ := page.ReadHeader(pageBuf)
+				if !page.IsLeafType(typ) {
+					continue
+				}
+				r := page.NewLeafReader(pageBuf, cfg)
+				if r.Validate() != nil {
+					continue
+				}
+				_, e, found, _ := r.SearchLeaf([]byte("setkey"), page.NoExtentTail)
+				if !found || !e.IsNestedTree() {
+					continue
+				}
+				var rootLE [8]byte
+				binary.LittleEndian.PutUint64(rootLE[:], e.NestedRoot)
+				i := bytes.Index(pageBuf, rootLE[:])
+				if i < 0 {
+					t.Fatalf("nested Root bytes not located in page")
+				}
+				pageBuf[i+8]++ // Count low byte
+				return
 			}
-			countOff := i + len("setkey") + 8 // skip Root
-			data[countOff]++
+			t.Fatalf("set key not found in any leaf page")
 		})
 		codes := checkCodes(t, path)
 		if codes["NestedCountMismatch"] == 0 && codes["KeyspaceCountMismatch"] == 0 {

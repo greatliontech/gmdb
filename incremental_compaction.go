@@ -135,10 +135,7 @@ func (tx *Tx) compactForest(floor uint64, budget int) (int, error) {
 			break
 		}
 		ks := &roster[i]
-		dataCfg := baseCfg
-		if ks.desc.RestartGroupTarget != 0 {
-			dataCfg.RestartGroupTarget = ks.desc.RestartGroupTarget
-		}
+		dataCfg := descriptor.ApplyToConfig(ks.desc, baseCfg)
 		dirty := false
 
 		if ks.desc.Root != 0 {

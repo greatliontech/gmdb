@@ -10,24 +10,31 @@ import (
 var le = binary.LittleEndian
 
 // Page type constants stored in the Type field of the page header.
-// TypeLeaf is the prefix-compressed leaf variant (variable-size restart
-// groups per page-formats.md §Compressed Leaf); TypeLeafUncompressed is the
-// variant selected by RestartGroupTarget == 1 (full keys + positional
-// offset table per §Uncompressed Leaf). Both share the 8-byte common
-// header and place entry data at offset 12.
+// TypeLeaf is the interleaved prefix-compressed leaf variant
+// (variable-size restart groups per page-formats.md §Compressed Leaf,
+// value bytes following each entry's key bytes); TypeLeafSegregated is
+// the segregated prefix-compressed variant (§Segregated Leaf — pure
+// headers+keys entry stream, value bytes in a separate region located
+// by per-entry VOff); TypeLeafUncompressed is the variant selected by
+// RestartGroupTarget == 1 (full keys + positional offset table per
+// §Uncompressed Leaf). All share the 8-byte common header; entry data
+// starts at offset 12 (segregated: 14 — one extra ValueEnd u16 header
+// field). Readers dispatch a page's layout by its type byte alone,
+// never by keyspace configuration (page-formats.md §Invariants).
 const (
 	TypeBranch           uint8 = 1
 	TypeLeaf             uint8 = 2
 	TypeOverflow         uint8 = 3
 	TypeRPLSegment       uint8 = 4
 	TypeLeafUncompressed uint8 = 5
+	TypeLeafSegregated   uint8 = 6
 )
 
-// IsLeafType reports whether typ is any leaf variant (compressed or
-// uncompressed). The btree dispatcher uses this to gate descent on a
-// page's type byte without committing to a specific encoding.
+// IsLeafType reports whether typ is any leaf variant. The btree
+// dispatcher uses this to gate descent on a page's type byte without
+// committing to a specific encoding.
 func IsLeafType(typ uint8) bool {
-	return typ == TypeLeaf || typ == TypeLeafUncompressed
+	return typ == TypeLeaf || typ == TypeLeafUncompressed || typ == TypeLeafSegregated
 }
 
 // Magic identifies a gmdb file. LE encoding produces bytes
@@ -90,7 +97,26 @@ func ValidPageSize(size uint32) bool {
 // DefaultRestartGroupTarget is the engine default restart-group target
 // applied when Config.RestartGroupTarget == 0. Mirrors the spec at
 // api-surface.md Options.RestartGroupTarget default.
-const DefaultRestartGroupTarget uint16 = 16
+const DefaultRestartGroupTarget uint16 = 6
+
+// LeafLayout selects the compressed-leaf layout variant a builder
+// produces (page-formats.md §Leaf Page). Readers always dispatch by
+// the page's type byte — the config value never affects decoding.
+type LeafLayout uint8
+
+const (
+	// LeafLayoutDefault defers to the engine default (segregated).
+	LeafLayoutDefault LeafLayout = 0
+	// LeafLayoutInterleaved builds TypeLeaf pages: each entry's value
+	// bytes follow its key bytes in one stream.
+	LeafLayoutInterleaved LeafLayout = 1
+	// LeafLayoutSegregated builds TypeLeafSegregated pages: pure
+	// headers+keys entry stream; value bytes in a separate region.
+	LeafLayoutSegregated LeafLayout = 2
+)
+
+// Valid reports whether l is a defined LeafLayout value.
+func (l LeafLayout) Valid() bool { return l <= LeafLayoutSegregated }
 
 // MaxRestartGroupTarget is the hard physical cap on RestartGroupTarget: the
 // compressed-leaf restart-table entry's Count field is uint8 (per
@@ -117,6 +143,14 @@ type Config struct {
 	PageSize           uint32
 	PageChecksum       bool
 	RestartGroupTarget uint16
+
+	// LeafLayout selects the compressed-leaf variant the builders
+	// produce (keyspaces.md §Per-Keyspace Configuration NodeLayouts;
+	// LeafLayoutDefault resolves to segregated). Ignored when
+	// RestartGroupTarget == 1 (the uncompressed variant overrides).
+	// Decode-side machinery never consults it — readers dispatch on
+	// the page type byte.
+	LeafLayout LeafLayout
 }
 
 // EffectiveRestartGroupTarget returns the effective target — the configured
@@ -128,6 +162,20 @@ func (c Config) EffectiveRestartGroupTarget() uint16 {
 		return DefaultRestartGroupTarget
 	}
 	return c.RestartGroupTarget
+}
+
+// EffectiveLeafType returns the page type the leaf builders produce
+// under this config: TypeLeafUncompressed at RestartGroupTarget == 1,
+// otherwise the declared compressed layout (LeafLayoutDefault ⇒
+// segregated, the engine default per keyspaces.md).
+func (c Config) EffectiveLeafType() uint8 {
+	if c.EffectiveRestartGroupTarget() == 1 {
+		return TypeLeafUncompressed
+	}
+	if c.LeafLayout == LeafLayoutInterleaved {
+		return TypeLeaf
+	}
+	return TypeLeafSegregated
 }
 
 // Validate reports whether c describes a supported page configuration.
@@ -145,6 +193,9 @@ func (c Config) Validate() error {
 	if c.RestartGroupTarget > MaxRestartGroupTarget {
 		return fmt.Errorf("page: RestartGroupTarget %d exceeds MaxRestartGroupTarget %d (Count field is uint8)",
 			c.RestartGroupTarget, MaxRestartGroupTarget)
+	}
+	if !c.LeafLayout.Valid() {
+		return fmt.Errorf("page: unknown LeafLayout %d", c.LeafLayout)
 	}
 	return nil
 }

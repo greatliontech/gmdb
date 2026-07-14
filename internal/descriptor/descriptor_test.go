@@ -224,7 +224,7 @@ func TestKeyspaceDescriptorValidateRejectsFixedValueSizeOnNonSet(t *testing.T) {
 // TestKeyspaceDescriptorValidateRejectsNonZeroReserved promotes the
 // reserved-bytes-zero clause from keyspaces.md §Keyspace Descriptor.
 func TestKeyspaceDescriptorValidateRejectsNonZeroReserved(t *testing.T) {
-	for off := 37; off < 40; off++ {
+	for off := 38; off < 40; off++ {
 		buf := make([]byte, Size)
 		Encode(buf, Keyspace{Kind: KindKeyspace})
 		buf[off] = 0xFF
@@ -232,12 +232,33 @@ func TestKeyspaceDescriptorValidateRejectsNonZeroReserved(t *testing.T) {
 		err := Validate(buf, Decode(buf))
 		if err == nil {
 			t.Errorf("Validate with reserved[%d]=0xFF: want error, got nil",
-				off-37)
+				off-38)
 			continue
 		}
 		if !strings.Contains(err.Error(), "reserved") {
 			t.Errorf("error doesn't mention reserved: %v", err)
 		}
+	}
+}
+
+func TestKeyspaceDescriptorValidateNodeLayouts(t *testing.T) {
+	for _, v := range []uint8{0b11, 0b1100, 0b10000, 0xF0, 0xFF} {
+		buf := make([]byte, Size)
+		Encode(buf, Keyspace{Kind: KindKeyspace, NodeLayouts: v})
+		if err := Validate(buf, Decode(buf)); err == nil {
+			t.Errorf("Validate NodeLayouts=0x%02x: want error, got nil", v)
+		}
+	}
+	for _, v := range []uint8{0, 0b01, 0b10, 0b0100, 0b1000, 0b1010, 0b0110} {
+		buf := make([]byte, Size)
+		Encode(buf, Keyspace{Kind: KindKeyspace, NodeLayouts: v})
+		if err := Validate(buf, Decode(buf)); err != nil {
+			t.Errorf("Validate NodeLayouts=0x%02x: unexpected error %v", v, err)
+		}
+	}
+	d := Keyspace{NodeLayouts: 0b0110} // leaf=segregated(2), branch=plain(1)
+	if d.LeafLayoutBits() != 2 || d.BranchLayoutBits() != 1 {
+		t.Errorf("bit accessors: leaf=%d branch=%d, want 2/1", d.LeafLayoutBits(), d.BranchLayoutBits())
 	}
 }
 

@@ -124,6 +124,163 @@ func TruncateLeafToGroups(buf []byte, cfg Config, splitGroup int) (leftCount int
 }
 
 // ---------------------------------------------------------------------------
+// Segregated leaf split (group boundary) — the segregated analog of the
+// compressed group split above. The stream half carves exactly like the
+// interleaved one (group bytes verbatim, restart-table offsets rebased);
+// the value region carves by the same boundary — the right half's values
+// are the CONTIGUOUS span [VOff(first right entry), ValueEnd) because
+// value spans follow entry order — and each half's region re-anchors
+// flush against its own restart table (the canonical end-anchored form),
+// with every VOff patched by a constant delta.
+// ---------------------------------------------------------------------------
+
+// FindSegSplitGroup returns the restart-group index in [1, RestartCount)
+// at which to split a segregated leaf: the boundary whose left-side
+// STREAM+VALUE byte span is closest to 50% of the page's data bytes
+// (both regions count — stream bytes alone would skew the balance by
+// the value mass, which lives outside the stream in this layout).
+// Caller must ensure buf is a segregated leaf with RestartCount > 1.
+// Pure function of the page bytes → deterministic.
+func FindSegSplitGroup(buf []byte, cfg Config) int {
+	rc := int(le.Uint16(buf[leafOffRestartCount:]))
+	dataEnd := int(le.Uint16(buf[leafOffDataEnd:]))
+	valueEnd := int(le.Uint16(buf[segLeafOffValueEnd:]))
+	restartTableOff := cfg.ContentEnd() - rc*restartTableEntrySize
+	voff0 := segReadVOff(buf, segLeafEntryStart, true)
+
+	total := (dataEnd - segLeafEntryStart) + (valueEnd - voff0)
+	target := total / 2
+
+	best, bestDist := 1, total+1
+	for g := 1; g < rc; g++ {
+		gOff := int(le.Uint16(buf[restartTableOff+g*restartTableEntrySize:]))
+		gVOff := segReadVOff(buf, gOff, true)
+		leftBytes := (gOff - segLeafEntryStart) + (gVOff - voff0)
+		dist := leftBytes - target
+		if dist < 0 {
+			dist = -dist
+		}
+		if dist < bestDist { // strict < ⇒ the lower index wins ties
+			bestDist = dist
+			best = g
+		}
+	}
+	return best
+}
+
+// segPatchAllVOffs adds delta to the VOff field of every entry in the
+// segregated leaf buf — a header-only walk over the page's own restart
+// table. Used by the split carve to rebase a half's value region.
+func segPatchAllVOffs(buf []byte, cfg Config, delta int) {
+	if delta == 0 {
+		return
+	}
+	r := NewLeafReader(buf, cfg)
+	segShiftVOffs(r, r.Count(), delta)
+}
+
+// SplitSegRightHalf copies groups [splitGroup, rc) of the segregated
+// leaf src into dst as a standalone right-half leaf, READ-ONLY on src.
+// Returns the two halves' entry counts. dst must be a distinct
+// page-sized buffer (a split supplies a fresh, zeroed page).
+func SplitSegRightHalf(src, dst []byte, cfg Config, splitGroup int) (leftCount, rightCount int) {
+	_, _, count, _ := ReadHeader(src)
+	rc := int(le.Uint16(src[leafOffRestartCount:]))
+	contentEnd := cfg.ContentEnd()
+	srcDataEnd := int(le.Uint16(src[leafOffDataEnd:]))
+	srcValueEnd := int(le.Uint16(src[segLeafOffValueEnd:]))
+	srcRestartTableOff := contentEnd - rc*restartTableEntrySize
+
+	for g := range splitGroup {
+		leftCount += int(src[srcRestartTableOff+g*restartTableEntrySize+2])
+	}
+	rightCount = int(count) - leftCount
+
+	rightRC := rc - splitGroup
+	srcGroupStart := int(le.Uint16(src[srcRestartTableOff+splitGroup*restartTableEntrySize:]))
+	rightStreamLen := srcDataEnd - srcGroupStart
+	copy(dst[segLeafEntryStart:segLeafEntryStart+rightStreamLen], src[srcGroupStart:srcDataEnd])
+
+	// Rebased restart table.
+	adjust := segLeafEntryStart - srcGroupStart
+	dstTableOff := contentEnd - rightRC*restartTableEntrySize
+	for i := range rightRC {
+		srcOff := srcRestartTableOff + (splitGroup+i)*restartTableEntrySize
+		dstOff := dstTableOff + i*restartTableEntrySize
+		le.PutUint16(dst[dstOff:], uint16(int(le.Uint16(src[srcOff:]))+adjust))
+		dst[dstOff+2] = src[srcOff+2]
+		dst[dstOff+3] = 0
+	}
+
+	// Right half's values: the contiguous span from the split
+	// boundary's VOff to ValueEnd, re-anchored flush against the
+	// right's own table.
+	vRightStart := segReadVOff(src, srcGroupStart, true)
+	rightValLen := srcValueEnd - vRightStart
+	dstValueEnd := dstTableOff
+	dstValStart := dstValueEnd - rightValLen
+	copy(dst[dstValStart:dstValueEnd], src[vRightStart:srcValueEnd])
+
+	rightDataEnd := segLeafEntryStart + rightStreamLen
+	WriteHeader(dst, TypeLeafSegregated, uint16(rightCount), 0)
+	le.PutUint16(dst[leafOffRestartCount:], uint16(rightRC))
+	le.PutUint16(dst[leafOffDataEnd:], uint16(rightDataEnd))
+	le.PutUint16(dst[segLeafOffValueEnd:], uint16(dstValueEnd))
+
+	// Patch the right VOffs (stream field values still point into src's
+	// value region) by the constant relocation delta, and clear the
+	// free middle so the free-space-zeroed invariant holds.
+	segPatchAllVOffs(dst, cfg, dstValStart-vRightStart)
+	clear(dst[rightDataEnd:dstValStart])
+
+	return leftCount, rightCount
+}
+
+// TruncateSegToGroups truncates the segregated leaf buf in place to
+// groups [0, splitGroup) — the left half of a group split. The restart
+// table shrinks and relocates toward ContentEnd; the left value region
+// re-anchors flush against it; the freed middle is zeroed. Returns the
+// left half's entry count.
+func TruncateSegToGroups(buf []byte, cfg Config, splitGroup int) (leftCount int) {
+	rc := int(le.Uint16(buf[leafOffRestartCount:]))
+	contentEnd := cfg.ContentEnd()
+	srcRestartTableOff := contentEnd - rc*restartTableEntrySize
+
+	for g := range splitGroup {
+		leftCount += int(buf[srcRestartTableOff+g*restartTableEntrySize+2])
+	}
+	leftDataEnd := int(le.Uint16(buf[srcRestartTableOff+splitGroup*restartTableEntrySize:]))
+	voff0 := segReadVOff(buf, segLeafEntryStart, true)
+	vRightStart := segReadVOff(buf, leftDataEnd, true) // right half's first restart, pre-truncation
+	leftValLen := vRightStart - voff0
+
+	newTableOff := contentEnd - splitGroup*restartTableEntrySize
+	newValueEnd := newTableOff
+	newValStart := newValueEnd - leftValLen
+
+	// Order is load-bearing: (1) patch the left VOffs while the OLD
+	// table still enumerates the groups (the walk mutates only stream
+	// VOff fields); (2) relocate the table up BEFORE the value move —
+	// the value bytes' destination [newValStart, newValueEnd) overlaps
+	// the old table's low slots, so moving values first would clobber
+	// the table-copy source; (3) move the value bytes up flush against
+	// the relocated table.
+	{
+		r := NewLeafReader(buf, cfg)
+		segShiftVOffs(r, leftCount, newValStart-voff0)
+	}
+	copy(buf[newTableOff:newTableOff+splitGroup*restartTableEntrySize], buf[srcRestartTableOff:srcRestartTableOff+splitGroup*restartTableEntrySize])
+	copy(buf[newValStart:newValueEnd], buf[voff0:vRightStart])
+
+	WriteHeader(buf, TypeLeafSegregated, uint16(leftCount), 0)
+	le.PutUint16(buf[leafOffRestartCount:], uint16(splitGroup))
+	le.PutUint16(buf[leafOffDataEnd:], uint16(leftDataEnd))
+	le.PutUint16(buf[segLeafOffValueEnd:], uint16(newValueEnd))
+	clear(buf[leftDataEnd:newValStart])
+	return leftCount
+}
+
+// ---------------------------------------------------------------------------
 // Uncompressed leaf split (entry boundary) — the uncompressed analog. An
 // uncompressed leaf is a sorted, packed entry array + sorted offset table, so it
 // splits at an ENTRY boundary (FindUCSplitIndex), and the two-phase byte-carve

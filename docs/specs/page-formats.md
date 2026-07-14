@@ -92,8 +92,8 @@ Invariant: kind=entailed;
     config-driven reader decode an old-variant page with the new
     variant's offset arithmetic — fabricated entries or slice-bounds
     panics on a page every write-path rule produced correctly.
-    Lands: when the second layout variant of either node kind is
-    first written.
+    (Enforced by TestKeyspaceLayoutDeclaration — mixed-variant
+    pages stay readable across declaration flips and reopen.)
 
 Invariant: kind=entailed;
   property=Every supported BRANCH layout holds at least two
@@ -118,8 +118,10 @@ Invariant: kind=entailed;
     Two maximal leaf entries per page is NOT required and does not
     hold (two overflow-key + overflow-value entries exceed
     `PageSize` at every size); requiring it would misderive `T`.
-    Lands: when the second layout variant of either node kind is
-    first written.
+    (Leaf floors enforced by TestLeafFloorOneMaximalEntryEveryLayout;
+    the current branch layout's two-cell floor by
+    TestInlineThresholdValues. Per-variant branch floors:
+    Lands: when the second branch layout variant is first written.)
 
 Invariant: kind=clause-explicit;
   property=Within a leaf restart group, the entry at the group's
@@ -238,7 +240,9 @@ Invariant: kind=clause-explicit;
     one splice later an entry's derived length swallows its
     neighbour's value bytes while every offset individually stays
     in range.
-    Lands: when the segregated leaf encoding is first written.
+    (Enforced by TestSegLeafZeroLengthValueAliasing and
+    TestSegValidateRejectsVOffRegression; splice maintenance fuzzed
+    by FuzzSegTryInsertAt / FuzzSegTryDeleteAt in `internal/page`.)
 
 Invariant: kind=clause-explicit;
   property=The NUL-escape encoding (every `0x00` inside a column →

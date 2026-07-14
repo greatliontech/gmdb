@@ -431,10 +431,7 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 			return fmt.Errorf("%w: keyspace %q descriptor size %d", btree.ErrCorrupted, name, len(v))
 		}
 		desc := descriptor.Decode(v)
-		cfg := baseCfg
-		if desc.RestartGroupTarget != 0 {
-			cfg.RestartGroupTarget = desc.RestartGroupTarget
-		}
+		cfg := descriptor.ApplyToConfig(desc, baseCfg)
 		nd := desc // rewrite Root + IndexRegistryRoot below
 
 		switch desc.Kind {

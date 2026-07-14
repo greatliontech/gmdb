@@ -63,7 +63,8 @@ func TestLeafIter_PrevThenNextResumes_BothVariants(t *testing.T) {
 		cfg  Config
 	}{
 		{"uncompressed", Config{PageSize: 4096, RestartGroupTarget: 1, PageChecksum: false}},
-		{"compressed", Config{PageSize: 4096, RestartGroupTarget: 2, PageChecksum: false}},
+		{"interleaved", Config{PageSize: 4096, RestartGroupTarget: 2, PageChecksum: false, LeafLayout: LeafLayoutInterleaved}},
+		{"segregated", Config{PageSize: 4096, RestartGroupTarget: 2, PageChecksum: false, LeafLayout: LeafLayoutSegregated}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := buildLeaf(t, tc.cfg, entries)
@@ -108,7 +109,8 @@ func TestLeafIter_PastEndAtPrevNext_BothVariants(t *testing.T) {
 		cfg  Config
 	}{
 		{"uncompressed", Config{PageSize: 4096, RestartGroupTarget: 1, PageChecksum: false}},
-		{"compressed", Config{PageSize: 4096, RestartGroupTarget: 2, PageChecksum: false}},
+		{"interleaved", Config{PageSize: 4096, RestartGroupTarget: 2, PageChecksum: false, LeafLayout: LeafLayoutInterleaved}},
+		{"segregated", Config{PageSize: 4096, RestartGroupTarget: 2, PageChecksum: false, LeafLayout: LeafLayoutSegregated}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := buildLeaf(t, tc.cfg, entries)

@@ -113,7 +113,7 @@ func verifyTreeExact(t *testing.T, pw *fakeWriter, cfg page.Config, root uint64,
 // succeed via the native-variant splice fallback (previously returned
 // ErrCorrupted), leaving the exact keep-set readable and ordered.
 func TestDeleteRangeKeepSetGrowthSpliceFallback(t *testing.T) {
-	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false}
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false, LeafLayout: page.LeafLayoutInterleaved}
 	pw := newFakeWriter(t, 4096)
 	root, entries := buildGrowthFixtureLeaf(t, pw, cfg)
 
@@ -139,7 +139,7 @@ func TestDeleteRangeKeepSetGrowthSpliceFallback(t *testing.T) {
 // A mid-range DeleteRange (several entries, interior of the leaf) must
 // take the same fallback and splice out exactly the in-range entries.
 func TestDeleteRangeKeepSetGrowthSpliceFallback_MidRange(t *testing.T) {
-	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false}
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false, LeafLayout: page.LeafLayoutInterleaved}
 	pw := newFakeWriter(t, 4096)
 	root, entries := buildGrowthFixtureLeaf(t, pw, cfg)
 
@@ -187,7 +187,7 @@ func TestDeleteRangeKeepSetGrowthSpliceFallback_MidRange(t *testing.T) {
 // failing, keeping the page compressed (migration is opportunistic,
 // never load-bearing).
 func TestDeleteVariantMigrationOverflowSpliceFallback(t *testing.T) {
-	buildCfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false}
+	buildCfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false, LeafLayout: page.LeafLayoutInterleaved}
 	pw := newFakeWriter(t, 4096)
 	root, entries := buildGrowthFixtureLeaf(t, pw, buildCfg)
 
@@ -213,7 +213,7 @@ func TestDeleteVariantMigrationOverflowSpliceFallback(t *testing.T) {
 // a re-encode. Previously returned ErrCorrupted and permanently
 // blocked incremental compaction of the region.
 func TestRelocateLeafVariantMismatchPatchesInPlace(t *testing.T) {
-	buildCfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false}
+	buildCfg := page.Config{PageSize: 4096, RestartGroupTarget: 8, PageChecksum: false, LeafLayout: page.LeafLayoutInterleaved}
 	pw := newFakeWriter(t, 4096)
 
 	// The adversarial leaf again, with one overflow entry appended past

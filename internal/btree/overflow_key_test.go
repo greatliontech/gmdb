@@ -28,7 +28,15 @@ func ovkKey(cfg page.Config, cluster byte, i int) []byte {
 // allocated page is either reachable (including key extents on both
 // leaf entries and branch cells) or freed.
 func TestOverflowKeyLifecycleThroughSplitsAndDeletes(t *testing.T) {
-	cfg := page.Config{PageSize: 4096}
+	for _, cfg := range []page.Config{
+		{PageSize: 4096}, // default layout (segregated)
+		{PageSize: 4096, LeafLayout: page.LeafLayoutInterleaved},
+	} {
+		testOverflowKeyLifecycleThroughSplitsAndDeletes(t, cfg)
+	}
+}
+
+func testOverflowKeyLifecycleThroughSplitsAndDeletes(t *testing.T, cfg page.Config) {
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
 	const n = 24

@@ -198,8 +198,8 @@ func validateOrderAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth i
 			}
 		}
 	default:
-		return fmt.Errorf("%w: page %d unexpected type %d at depth %d (want branch=%d or leaf=%d/%d)",
-			ErrCorrupted, pageID, typ, depth, page.TypeBranch, page.TypeLeaf, page.TypeLeafUncompressed)
+		return fmt.Errorf("%w: page %d unexpected type %d at depth %d (want branch=%d or a leaf type)",
+			ErrCorrupted, pageID, typ, depth, page.TypeBranch)
 	}
 	return nil
 }

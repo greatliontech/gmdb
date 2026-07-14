@@ -305,7 +305,7 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 				idx:         idx + 1,
 				endIdx:      r.count,
 				off:         afterValOff,
-				compressed:  true,
+				variant:     TypeLeaf,
 				prevKey:     e.Key,
 				keyBuf:      keyBuf[:0],
 				nextRestart: idx + gc,
@@ -363,7 +363,7 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 				idx:         idx + 1,
 				endIdx:      r.count,
 				off:         off,
-				compressed:  true,
+				variant:     TypeLeaf,
 				prevKey:     prevKeyBuf,
 				keyBuf:      prevKeyBuf,
 				nextRestart: nextRestart,
@@ -381,7 +381,7 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 				idx:         idx + 1,
 				endIdx:      r.count,
 				off:         off,
-				compressed:  true,
+				variant:     TypeLeaf,
 				prevKey:     prevKeyBuf,
 				keyBuf:      prevKeyBuf,
 				nextRestart: nextRestart,
@@ -397,13 +397,13 @@ func (r LeafReader) compressedSearchLeafIter(target, keyBuf, bufKeys []byte, buf
 	// the first entry of the next group.
 	if endIdx >= r.count {
 		it := LeafIter{
-			r:          r,
-			idx:        r.count,
-			endIdx:     r.count,
-			compressed: true,
-			keyBuf:     keyBuf[:0],
-			bufKeys:    bufKeys[:0],
-			bufEnts:    bufEnts[:0],
+			r:       r,
+			idx:     r.count,
+			endIdx:  r.count,
+			variant: TypeLeaf,
+			keyBuf:  keyBuf[:0],
+			bufKeys: bufKeys[:0],
+			bufEnts: bufEnts[:0],
 		}
 		return endIdx, LeafEntry{}, false, it, nil
 	}
@@ -431,7 +431,7 @@ func (r LeafReader) iterFromGroupRestart(groupIdx int, keyBuf, bufKeys []byte, b
 		idx:         groupStart + 1,
 		endIdx:      r.count,
 		off:         afterValOff,
-		compressed:  true,
+		variant:     TypeLeaf,
 		prevKey:     e.Key,
 		keyBuf:      keyBuf[:0],
 		nextRestart: groupStart + gc,

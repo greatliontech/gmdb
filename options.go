@@ -41,6 +41,40 @@ const (
 	SyncLazy                     // skips all syncs. Rolls back to the durable epoch on crash.
 )
 
+// LeafLayout selects a compressed-leaf layout variant
+// (page-formats.md §Leaf Page). Numeric values match the keyspace
+// descriptor's NodeLayouts field encoding (keyspaces.md).
+type LeafLayout uint8
+
+const (
+	// LeafLayoutDefault defers to the engine default (segregated).
+	LeafLayoutDefault LeafLayout = 0
+	// LeafLayoutInterleaved stores each entry's value bytes after its
+	// key bytes in one stream — favors in-place value splices on
+	// write-heavy keyspaces.
+	LeafLayoutInterleaved LeafLayout = 1
+	// LeafLayoutSegregated packs entry headers + key bytes as a pure
+	// search region and value bytes in a separate region — the
+	// engine default.
+	LeafLayoutSegregated LeafLayout = 2
+)
+
+// BranchLayout selects a branch layout variant (page-formats.md
+// §Branch Page). Numeric values match the descriptor encoding.
+type BranchLayout uint8
+
+const (
+	// BranchLayoutDefault defers to the engine default (segregated).
+	BranchLayoutDefault BranchLayout = 0
+	// BranchLayoutPlain stores full separator bytes per cell — the
+	// probe-latency floor for small hot keyspaces.
+	BranchLayoutPlain BranchLayout = 1
+	// BranchLayoutSegregated stores the page's shared separator
+	// prefix once with an offsets-only suffix directory — the
+	// density choice for large trees.
+	BranchLayoutSegregated BranchLayout = 2
+)
+
 // LaggingReaderInfo carries the diagnostic context the
 // Options.LaggingReader callback needs to decide whether to wait or
 // abort. Per lock-ordering.md §Lagging Reader Handling, the engine
@@ -182,11 +216,25 @@ type Options struct {
 	// restart-group target — the maximum entries per group on
 	// compressed leaves. Per-keyspace overrides via
 	// Tx.SetKeyspaceConfig. Bounded to [0, 255]: 0 ⇒ engine default
-	// (16); 1 ⇒ uncompressed leaf variant; [2, 255] ⇒ compressed
+	// (6); 1 ⇒ uncompressed leaf variant; [2, 255] ⇒ compressed
 	// with that target. Open rejects values > 255 with
 	// ErrInvalidOptions — the compressed-leaf restart-table Count
-	// is uint8. Default: 16.
+	// is uint8. Default: 6.
 	RestartGroupTarget uint16
+
+	// LeafLayout and BranchLayout are the engine-wide default node
+	// layout variants for keyspaces whose descriptor declares the
+	// engine default (keyspaces.md §Keyspace Descriptor NodeLayouts).
+	// Zero values take the engine defaults (segregated). Per-OPEN,
+	// not persisted (unlike DisablePageChecksum): the opening
+	// process's value resolves descriptor-0 keyspaces at page-build
+	// time, the same semantics as RestartGroupTarget — per-page
+	// type-byte dispatch makes differing defaults across opens yield
+	// mixed-layout pages, never misreads. Per-keyspace overrides via
+	// Tx.SetKeyspaceConfig. Open rejects unknown values with
+	// ErrInvalidOptions.
+	LeafLayout   LeafLayout
+	BranchLayout BranchLayout
 
 	// MergeThreshold is the B+tree page fill percentage that doubles
 	// as the post-deletion merge **trigger** AND the maintained
@@ -440,6 +488,15 @@ func (o Options) validate() error {
 	}
 	if o.RestartGroupTarget > page.MaxRestartGroupTarget {
 		return errInvalidRestartGroupTarget
+	}
+	if o.LeafLayout > LeafLayoutSegregated {
+		return errInvalidLeafLayout
+	}
+	// Branch layout variants land with their encoders; until then only
+	// the engine default is accepted (the descriptor field and its
+	// validation already follow the final keyspaces.md contract).
+	if o.BranchLayout != BranchLayoutDefault {
+		return errInvalidBranchLayout
 	}
 	// Validated after applyDefaults: a zero MaxBatchSize/MaxBatchDelay has
 	// already been replaced by its default, so only an explicit negative

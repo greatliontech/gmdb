@@ -59,7 +59,7 @@ and 10 remove.
       restart-group target 16→6) recorded as benchmark-gated.
       Amends `page-formats.md`, `checksums.md`, `limits.md`,
       `keyspaces.md`, `api-surface.md`.
-- [ ] 4. Segregated leaf implementation: encode/decode/lookup/
+- [x] 4. Segregated leaf implementation: encode/decode/lookup/
       splice/split, entry-order `VOff` maintenance, overflow-key
       and overflow-value forms in the value region, per-keyspace
       declaration + config plumbing, `Check`/`Validate` coverage;
@@ -81,9 +81,11 @@ and 10 remove.
       overflow-value ownership contract; `Check` and relocation
       walkers updated.
 - [ ] 8. Layout benchmarks + defaults: spike-methodology corpus
-      benchmarks over gmdb's real encodings; settle the
-      benchmark-gated defaults (leaf layout, branch layout,
-      restart-group target) and pin the chosen constants by test.
+      benchmarks over gmdb's real encodings; validate the
+      spec-recorded defaults already in effect (segregated leaf —
+      live since chunk 4 — segregated branch, restart-group
+      target 6), confirming or reverting each, and pin the chosen
+      constants by test.
 - [ ] 9. Append-aware splits: lopsided right-edge split point +
       rightmost-leaf hint so ascending-key workloads stop
       stranding half-full left pages; sequential-insert corpus

@@ -1080,30 +1080,53 @@ func (ks *Keyspace) markCursorsStale() {
 }
 
 // KeyspaceConfig is the mutable per-keyspace configuration surface
-// for Tx.SetKeyspaceConfig.
+// for Tx.SetKeyspaceConfig. Every field uses its zero value as the
+// "leave unchanged" sentinel (distinct from the on-disk descriptor's
+// "0 = engine default" semantic).
 type KeyspaceConfig struct {
 	// RestartGroupTarget sets the leaf-builder restart-group target
 	// for leaves written AFTER this call (existing leaves keep
 	// their stored group structure per keyspaces.md invariant #6).
-	// 0 = leave unchanged (the sentinel distinct from the on-disk
-	// descriptor's "0 = engine default" semantic).
-	// [1, 255] = the new builder hint.
-	// > 255 returns ErrInvalidOptions.
+	// [1, 255] = the new builder hint; > 255 returns
+	// ErrInvalidOptions.
 	RestartGroupTarget uint16
+
+	// LeafLayout / BranchLayout set the keyspace's declared node
+	// layout variants (keyspaces.md §Keyspace Descriptor
+	// NodeLayouts) for pages written AFTER this call — builder
+	// hints exactly like RestartGroupTarget: existing pages keep
+	// their on-disk variant and migrate when next split, merged, or
+	// rebuilt. Unknown values return ErrInvalidOptions.
+	LeafLayout   LeafLayout
+	BranchLayout BranchLayout
+}
+
+// applyToDescriptor returns desc with cfg's non-zero fields applied.
+func (cfg KeyspaceConfig) applyToDescriptor(desc descriptor.Keyspace) descriptor.Keyspace {
+	if cfg.RestartGroupTarget != 0 {
+		desc.RestartGroupTarget = cfg.RestartGroupTarget
+	}
+	if cfg.LeafLayout != 0 {
+		desc.NodeLayouts = (desc.NodeLayouts &^ 0b11) | uint8(cfg.LeafLayout)
+	}
+	if cfg.BranchLayout != 0 {
+		desc.NodeLayouts = (desc.NodeLayouts &^ 0b1100) | uint8(cfg.BranchLayout)<<2
+	}
+	return desc
 }
 
 // SetKeyspaceConfig updates mutable per-keyspace settings on the named
 // keyspace. Kind-agnostic at the descriptor layer (the descriptor's
-// RestartGroupTarget field lives independently of Kind). Returns:
+// mutable fields live independently of Kind). Returns:
 //
 //   - ErrNotFound if the named keyspace does not exist (consistent
 //     with Tx.DeleteKeyspace and the Delete-on-miss
 //     invariant family per api-surface.md §Invariants).
 //   - ErrKeyEmpty for an empty name.
-//   - ErrInvalidOptions when cfg.RestartGroupTarget > 255.
+//   - ErrInvalidOptions when cfg.RestartGroupTarget > 255 or a
+//     layout value is unknown.
 //
-// cfg.RestartGroupTarget == 0 is the "leave unchanged" sentinel — the
-// existing descriptor's RestartGroupTarget is preserved. A no-op call
+// A zero field is the "leave unchanged" sentinel; a no-op call
 // (every field zero) is harmless and does not write the descriptor.
 func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 	if err := tx.requireOpen(true); err != nil {
@@ -1116,14 +1139,20 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 		return fmt.Errorf("%w: RestartGroupTarget %d exceeds max %d",
 			ErrInvalidOptions, cfg.RestartGroupTarget, page.MaxRestartGroupTarget)
 	}
+	if cfg.LeafLayout > LeafLayoutSegregated {
+		return fmt.Errorf("%w: unknown LeafLayout %d", ErrInvalidOptions, cfg.LeafLayout)
+	}
+	// Branch layout variants land with their encoders; until then only
+	// the leave-unchanged sentinel is accepted.
+	if cfg.BranchLayout != BranchLayoutDefault {
+		return fmt.Errorf("%w: unsupported BranchLayout %d", ErrInvalidOptions, cfg.BranchLayout)
+	}
 	if _, deleted := tx.pendingDeletes[name]; deleted {
 		return ErrNotFound
 	}
-	// 0 = leave unchanged. No other fields are configurable today.
-	if cfg.RestartGroupTarget == 0 {
-		// Existence still needs to be verified — the
-		// contract requires ErrNotFound for a missing
-		// name even on a no-op call.
+	// All fields zero = pure existence check (the contract requires
+	// ErrNotFound for a missing name even on a no-op call).
+	if cfg == (KeyspaceConfig{}) {
 		_, found, err := tx.lookupDescriptor(name)
 		if err != nil {
 			return err
@@ -1142,19 +1171,20 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 			// dead handle.
 			return ErrNotFound
 		}
-		if ks.desc.RestartGroupTarget == cfg.RestartGroupTarget {
+		next := cfg.applyToDescriptor(ks.desc)
+		if next == ks.desc {
 			return nil
 		}
 		if err := tx.ensureKeyspacePathLen(); err != nil {
 			return err
 		}
-		prev, prevState, prevCharged := ks.desc.RestartGroupTarget, ks.state, ks.reserveCharged
-		ks.desc.RestartGroupTarget = cfg.RestartGroupTarget
+		prev, prevState, prevCharged := ks.desc, ks.state, ks.reserveCharged
+		ks.desc = next
 		ks.markDirty()
 		// Obligation-edge admission: unwind the transition entirely
 		// on rejection (this branch mutates no pages).
 		if err := tx.checkReserveAffordable(); err != nil {
-			ks.desc.RestartGroupTarget = prev
+			ks.desc = prev
 			ks.state, ks.reserveCharged = prevState, prevCharged
 			tx.recalcFlushReserve()
 			return err
@@ -1162,8 +1192,8 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 		return nil
 	}
 	// Kind=1 partner of the Kind=0 cached-handle branch above. Per
-	// keyspaces.md inv #6, RestartGroupTarget is kind-agnostic: the
-	// descriptor field is mutable for any Kind via SetKeyspaceConfig.
+	// keyspaces.md inv #6, the mutable descriptor fields are
+	// kind-agnostic: mutable for any Kind via SetKeyspaceConfig.
 	// Without this branch a same-tx CreateSetKeyspace +
 	// SetKeyspaceConfig silently returns ErrNotFound (the cached
 	// SetKeyspace's desc never gets updated, and the on-disk lookup
@@ -1172,17 +1202,18 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 		if sks.dead {
 			return ErrNotFound
 		}
-		if sks.desc.RestartGroupTarget == cfg.RestartGroupTarget {
+		next := cfg.applyToDescriptor(sks.desc)
+		if next == sks.desc {
 			return nil
 		}
 		if err := tx.ensureKeyspacePathLen(); err != nil {
 			return err
 		}
-		prev, prevState, prevCharged := sks.desc.RestartGroupTarget, sks.state, sks.reserveCharged
-		sks.desc.RestartGroupTarget = cfg.RestartGroupTarget
+		prev, prevState, prevCharged := sks.desc, sks.state, sks.reserveCharged
+		sks.desc = next
 		sks.markDirty()
 		if err := tx.checkReserveAffordable(); err != nil {
-			sks.desc.RestartGroupTarget = prev
+			sks.desc = prev
 			sks.state, sks.reserveCharged = prevState, prevCharged
 			tx.recalcFlushReserve()
 			return err
@@ -1190,11 +1221,11 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 		return nil
 	}
 	if desc, ok := tx.dirtyDescriptors[name]; ok {
-		if desc.RestartGroupTarget == cfg.RestartGroupTarget {
+		next := cfg.applyToDescriptor(desc)
+		if next == desc {
 			return nil
 		}
-		desc.RestartGroupTarget = cfg.RestartGroupTarget
-		tx.dirtyDescriptors[name] = desc
+		tx.dirtyDescriptors[name] = next
 		return nil
 	}
 	desc, found, err := tx.loadDescriptor(name)
@@ -1204,10 +1235,11 @@ func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error {
 	if !found {
 		return ErrNotFound
 	}
-	if desc.RestartGroupTarget == cfg.RestartGroupTarget {
+	next := cfg.applyToDescriptor(desc)
+	if next == desc {
 		return nil
 	}
-	desc.RestartGroupTarget = cfg.RestartGroupTarget
+	desc = next
 	if err := tx.ensureKeyspacePathLen(); err != nil {
 		return err
 	}

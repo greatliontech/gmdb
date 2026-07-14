@@ -33,16 +33,19 @@ func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.
 	if r.Count() <= 1 {
 		return nil, 0, false, nil // nothing to split off
 	}
-	compressed := r.Compressed()
-	if compressed && r.RestartCount() <= 1 {
+	variant := r.Variant()
+	if r.Compressed() && r.RestartCount() <= 1 {
 		return nil, 0, false, nil // single group — decode split
 	}
 
 	// Boundary nearest 50% of data bytes (variant-specific).
 	var boundary int
-	if compressed {
+	switch variant {
+	case page.TypeLeaf:
 		boundary = page.FindSplitGroup(leftBuf, cfg)
-	} else {
+	case page.TypeLeafSegregated:
+		boundary = page.FindSegSplitGroup(leftBuf, cfg)
+	default:
 		boundary = page.FindUCSplitIndex(leftBuf, cfg)
 	}
 
@@ -59,9 +62,12 @@ func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.
 	// Build the right half into the fresh page — READ-ONLY on leftBuf, so a
 	// decline below leaves leftBuf intact for the decode-split fallback.
 	var leftCount int
-	if compressed {
+	switch variant {
+	case page.TypeLeaf:
 		leftCount, _ = page.SplitLeafRightHalf(leftBuf, rightBuf, cfg, boundary)
-	} else {
+	case page.TypeLeafSegregated:
+		leftCount, _ = page.SplitSegRightHalf(leftBuf, rightBuf, cfg, boundary)
+	default:
 		leftCount, _ = page.SplitUCRightHalf(leftBuf, rightBuf, cfg, boundary)
 	}
 
@@ -76,9 +82,12 @@ func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.
 	}
 
 	// Committed: now truncate leftBuf in place to the left half (variant-specific).
-	if compressed {
+	switch variant {
+	case page.TypeLeaf:
 		page.TruncateLeafToGroups(leftBuf, cfg, boundary)
-	} else {
+	case page.TypeLeafSegregated:
+		page.TruncateSegToGroups(leftBuf, cfg, boundary)
+	default:
 		page.TruncateUCToEntries(leftBuf, cfg, boundary)
 	}
 

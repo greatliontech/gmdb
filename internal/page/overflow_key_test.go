@@ -122,7 +122,7 @@ func TestOverflowKeyLeafRoundTrip(t *testing.T) {
 // (page-formats.md §Overflow-Key Cells, Leaf forms): OverflowKey ×
 // {inline, empty, overflow-value, nested-tree, subpage} all round-trip.
 func TestOverflowKeyValueFormComposition(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	tt := cfg.InlineThreshold()
 	mk := func(c byte) []byte { return bytes.Repeat([]byte{c}, tt+9) }
 
@@ -164,7 +164,7 @@ func TestOverflowKeyValueFormComposition(t *testing.T) {
 // rejections (page-formats.md §Overflow-Key Cells: derivable-length
 // read policy; singleton-group rule; extent-reference sanity).
 func TestValidateRejectsMalformedOverflowKey(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}
 	tt := cfg.InlineThreshold()
 	full := bytes.Repeat([]byte("K"), tt+100)
 

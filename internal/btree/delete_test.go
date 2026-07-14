@@ -228,7 +228,7 @@ func TestDeleteCascadesBranchMergeAndRootCollapse(t *testing.T) {
 	// merge from the leaf level up through one or more branch levels.
 	// Pin: (a) all leaves at the same depth post-delete; (b) every
 	// non-root page above threshold; (c) every key retrievable.
-	cfg := page.Config{PageSize: 4096}
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // depth calibration: N=1500 → ~375 leaves at target 16
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
 	// Long shared-prefix keys (~57B) and large values (512B) to force a
@@ -302,7 +302,7 @@ func TestDeleteForcesBranchMergeAndRedistribute(t *testing.T) {
 	// and merge with each other — invariants checked per delete.
 	// N=1500: with within-page branch prefix truncation, ~260 shared-prefix
 	// separators fit one branch, so a multi-level tree needs ~375 leaves.
-	cfg := page.Config{PageSize: 4096}
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // depth calibration: N=1500 → ~375 leaves at target 16
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
 	const N = 1500
@@ -655,8 +655,8 @@ func checkUnderflowInvariant(t *testing.T, pw *fakeWriter, cfg page.Config, root
 	walk = func(id uint64, isRoot bool) {
 		buf, _ := pw.Page(id)
 		typ, _, _, _ := page.ReadHeader(buf)
-		switch typ {
-		case page.TypeLeaf, page.TypeLeafUncompressed:
+		switch {
+		case page.IsLeafType(typ):
 			r := page.NewLeafReader(buf, cfg)
 			if err := r.Validate(); err != nil {
 				t.Errorf("checkUnderflowInvariant: validate leaf %d: %v", id, err)
@@ -670,7 +670,7 @@ func checkUnderflowInvariant(t *testing.T, pw *fakeWriter, cfg page.Config, root
 				t.Errorf("non-root leaf %d underflowed: size=%d (%.1f%% of %d), threshold=%d%%",
 					id, size, float64(size)*100/float64(cfg.ContentEnd()), cfg.ContentEnd(), threshold)
 			}
-		case page.TypeBranch:
+		case typ == page.TypeBranch:
 			lm, cells := page.DecodeBranch(buf, cfg)
 			if !isRoot {
 				// Fill-floor is measured on LOGICAL (uncompressed) content,

@@ -65,7 +65,13 @@ func (r LeafReader) patchEntryRefs(refAt, keyExtAt func(idx int, e LeafEntry) ui
 		}
 	}
 
-	if !r.compressed {
+	if r.seg() {
+		// Segregated: references live in the value region at fixed
+		// offsets from each entry's VOff; dedicated walk.
+		r.segPatchRefs(refAt, keyExtAt)
+		return
+	}
+	if r.uc() {
 		for i := 0; i < r.count; i++ {
 			e, next := r.decodeFullKeyEntry(r.ucOffset(i))
 			patch(i, e, next)

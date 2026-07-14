@@ -92,13 +92,16 @@ func TryAppend(buf []byte, cfg Config, e LeafEntry, prevKey []byte) bool {
 	// rebuild). A within-compressed RGT change (e.g. 16→8, still compressed) is
 	// NOT a mismatch — tryAppendCompressed keeps the existing groups and encodes
 	// the new entry per the new target; see the file-header determinism note.
-	switch {
-	case typ == TypeLeaf && cfg.EffectiveRestartGroupTarget() != 1:
-		return tryAppendCompressed(buf, cfg, e, prevKey)
-	case typ == TypeLeafUncompressed && cfg.EffectiveRestartGroupTarget() == 1:
-		return ucTryAppend(buf, cfg, e)
-	default:
+	if typ != cfg.EffectiveLeafType() {
 		return false
+	}
+	switch typ {
+	case TypeLeaf:
+		return tryAppendCompressed(buf, cfg, e, prevKey)
+	case TypeLeafSegregated:
+		return trySegAppend(buf, cfg, e, prevKey)
+	default:
+		return ucTryAppend(buf, cfg, e)
 	}
 }
 
@@ -274,13 +277,16 @@ func TryInsertAt(buf []byte, cfg Config, insertIdx int, e LeafEntry) bool {
 	}
 	// Same variant gate as TryAppend: splice only when the page's on-disk
 	// variant matches the configured one; otherwise migrate via rebuild.
-	switch {
-	case typ == TypeLeaf && cfg.EffectiveRestartGroupTarget() != 1:
-		return tryInsertAtCompressed(buf, cfg, insertIdx, e)
-	case typ == TypeLeafUncompressed && cfg.EffectiveRestartGroupTarget() == 1:
-		return ucTryInsertAt(buf, cfg, insertIdx, e)
-	default:
+	if typ != cfg.EffectiveLeafType() {
 		return false
+	}
+	switch typ {
+	case TypeLeaf:
+		return tryInsertAtCompressed(buf, cfg, insertIdx, e)
+	case TypeLeafSegregated:
+		return trySegInsertAt(buf, cfg, insertIdx, e)
+	default:
+		return ucTryInsertAt(buf, cfg, insertIdx, e)
 	}
 }
 
@@ -540,13 +546,16 @@ func TryDeleteAt(buf []byte, cfg Config, deleteIdx int) bool {
 	// Same variant gate as TryAppend / TryInsertAt: splice only when the page's
 	// on-disk variant matches the configured one; otherwise the leaf migrates to
 	// the configured variant through the rebuild fallback.
-	switch {
-	case typ == TypeLeaf && cfg.EffectiveRestartGroupTarget() != 1:
-		return tryDeleteAtCompressed(buf, cfg, deleteIdx)
-	case typ == TypeLeafUncompressed && cfg.EffectiveRestartGroupTarget() == 1:
-		return ucTryDeleteAt(buf, cfg, deleteIdx)
-	default:
+	if typ != cfg.EffectiveLeafType() {
 		return false
+	}
+	switch typ {
+	case TypeLeaf:
+		return tryDeleteAtCompressed(buf, cfg, deleteIdx)
+	case TypeLeafSegregated:
+		return trySegDeleteAt(buf, cfg, deleteIdx)
+	default:
+		return ucTryDeleteAt(buf, cfg, deleteIdx)
 	}
 }
 
@@ -575,6 +584,8 @@ func TryDeleteAtNative(buf []byte, cfg Config, deleteIdx int) bool {
 	switch typ {
 	case TypeLeaf:
 		return tryDeleteAtCompressed(buf, cfg, deleteIdx)
+	case TypeLeafSegregated:
+		return trySegDeleteAt(buf, cfg, deleteIdx)
 	case TypeLeafUncompressed:
 		return ucTryDeleteAt(buf, cfg, deleteIdx)
 	default:

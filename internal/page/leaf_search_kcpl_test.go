@@ -14,8 +14,16 @@ import (
 // scan's soundness argument lives on compressedSearchLeaf; this test
 // is its enforcement.
 func TestCompressedSearchKcplEquivalence(t *testing.T) {
+	for _, cfg := range []Config{
+		{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved},
+		{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutSegregated},
+	} {
+		testCompressedSearchKcplEquivalence(t, cfg)
+	}
+}
+
+func testCompressedSearchKcplEquivalence(t *testing.T, cfg Config) {
 	rng := rand.New(rand.NewSource(42))
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
 
 	for round := range 200 {
 		// Cluster keys under a handful of shared prefixes with varied
