@@ -10,15 +10,15 @@ import (
 )
 
 // unreachableFloorKeys builds keys with deep (~1400-byte) shared prefixes
-// within each of 6 clusters. Within-page branch prefix truncation
-// (page-formats.md §Branch Page) packs same-cluster separators densely — two
-// of them are ~70% logical fill, above MergeThreshold 50 — so the tree is no
-// longer born uniformly underfull. What stays below the (logical) floor at
-// this maximum threshold is the residual unreachable set (range-delete.md
-// §Invariants "where reachable"): a branch reduced to a SINGLE near-max
-// separator (~35%), and cluster-SEAM branches (a large within-cluster
-// separator plus a tiny cross-cluster one) that cannot absorb more cells
-// without un-compressing across the cluster boundary and overflowing a page.
+// within each of 6 clusters. A plain branch holds two such ~1400-byte
+// separators at ~70% logical fill — above MergeThreshold 50 — so the
+// tree is not born uniformly underfull. What stays below the (logical)
+// floor at this maximum threshold is the residual unreachable set
+// (range-delete.md §Invariants "where reachable"): a branch reduced to
+// a SINGLE near-max separator (~35%), and cluster-SEAM branches (a
+// large within-cluster separator plus a tiny cross-cluster one) whose
+// dense neighbours cannot absorb more cells without overflowing a
+// physical page.
 // 6 clusters × 12 keys + large (1300-byte) values → a depth->=3 tree carrying
 // those unreachable branches, which exercises the delete-rebalance decline +
 // termination machinery.
@@ -65,12 +65,11 @@ func buildUnreachableFloorTree(t *testing.T) (*fakeWriter, page.Config, uint64, 
 // every surviving key reads back.
 //
 // It deliberately does NOT assert the fill-floor (checkUnderflowInvariant):
-// the residual single-near-max-separator and cluster-seam branches sit below
-// the floor where it is genuinely unreachable (range-delete.md §Invariants).
-// The architectural root fix — within-page branch prefix truncation — has
-// landed (page-formats.md §Branch Page); it raises fan-out for deep-shared-
-// prefix keys but cannot make those residual cases reachable, so this test
-// pins termination + integrity rather than the strict floor.
+// the residual single-near-max-separator and cluster-seam branches sit
+// below the floor where it is genuinely unreachable (range-delete.md
+// §Invariants) — no layout can make a post-lift single-separator branch
+// reach the floor — so this test pins termination + integrity rather
+// than the strict floor.
 func TestDeleteUnreachableFloorTerminates(t *testing.T) {
 	pw, cfg, root, keys := buildUnreachableFloorTree(t)
 

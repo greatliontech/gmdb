@@ -20,7 +20,7 @@ import (
 // resulting branches mix large and tiny separators, so an entry-count
 // midpoint can cluster large separators on one half — the exact shape the
 // byte-balanced branch splitter must handle (page-formats.md
-// §Prefix-Truncated Branch Keys).
+// §Separator Computation).
 func skewedBranchKeys(clusters, per, prefixLen int) [][]byte {
 	var keys [][]byte
 	for c := range clusters {

@@ -5,36 +5,34 @@ import (
 	"fmt"
 )
 
-// Branch-page layout per page-formats.md §Branch Page. Separators are
-// prefix-truncated WITHIN the page: the single common prefix P of all
-// separators on the page is stored once at the content tail, and each cell
-// stores only the suffix key[len(P):] followed by its right child pointer.
+// Plain-branch page layout per page-formats.md §Plain Branch: full
+// separator bytes per cell, addressed by an offset+length directory.
 //
 //	+-----------------------+ offset 0
 //	| Page Header (8 bytes) | Type=TypeBranch, Count=N (cell count)
 //	+-----------------------+ offset 8
 //	| Ptr[0] (uint64)       | leftmost child pointer
 //	+-----------------------+ offset 16
-//	| PrefixLen uint16      | length of the page-wide shared prefix P
-//	| Reserved  uint16      | zero on write (keeps the directory at offset 20)
-//	+-----------------------+ offset 20
-//	| Cell Directory        | N × (Offset uint16, SuffixLen uint16) = N × 4 bytes
+//	| Cell Directory        | N × (Offset uint16, KeyLen uint16) = N × 4 bytes
 //	| ...                   | grows forward
 //	+-----------------------+
 //	|       free space      |
 //	+-----------------------+
-//	| Cell Data 1           | each cell: SuffixBytes || ChildPtr(uint64),
-//	| Cell Data 0           | packed below the prefix region, growing backward
-//	+-----------------------+ ContentEnd - PrefixLen
-//	| Prefix bytes P        | the page-wide shared prefix
+//	| Cell Data 1           | each cell: KeyBytes || ChildPtr(uint64),
+//	| Cell Data 0           | packed backward from ContentEnd
 //	+-----------------------+ ContentEnd (PageSize - optional 8-byte footer)
 //
-// The full separator of cell i is P || Suffix[i]. Cells are stored in sorted
-// key order, so P = commonPrefix(cell[0], cell[N-1]) — the common prefix of
-// the whole sorted set. For N cells there are N+1 child pointers: Ptr[0]
-// (leftmost) + N ChildPtrs (one per cell). When the separators share no
-// prefix, PrefixLen is 0 and each cell stores its full key (the uncompressed
-// case, no penalty beyond the fixed header fields).
+// Cells are stored in sorted key order. For N cells there are N+1 child
+// pointers: Ptr[0] (leftmost) + N ChildPtrs (one per cell). Every
+// binary-search probe compares directly against stored separator bytes
+// — no prefix gate, no reconstruction (the latency-floor property the
+// layout exists for; the density alternative is the segregated branch).
+//
+// An OVERFLOW branch cell (separator longer than the inline threshold
+// T) is marked in bit 15 of the directory's KeyLen; the low 15 bits
+// give the inline length — always exactly T — and the cell data is
+// Inline(T bytes) || KeyExtPage(u64) || KeyTotalLen(u32) ||
+// ChildPtr(u64) (page-formats.md §Overflow-Key Cells).
 
 const (
 	// branchChildPtrSize is the trailing child-pointer byte length on each
@@ -42,39 +40,29 @@ const (
 	branchChildPtrSize = 8
 
 	// branchDirEntrySize is the per-cell directory size:
-	// (Offset uint16, SuffixLen uint16).
+	// (Offset uint16, KeyLen uint16).
 	branchDirEntrySize = 4
 
 	// branchLeftmostOff is the byte offset of the leftmost child pointer
 	// Ptr[0] within the page.
 	branchLeftmostOff = HeaderSize // 8
 
-	// branchPrefixLenOff is the byte offset of the PrefixLen uint16 (the
-	// page-wide shared-separator-prefix length), after the leftmost child
-	// pointer. A Reserved uint16 follows it (zero on write).
-	branchPrefixLenOff = HeaderSize + branchChildPtrSize // 16
-
 	// branchHeaderEnd is the byte offset where the cell directory begins:
-	// after the page header (8), the leftmost child pointer (8), and the
-	// PrefixLen + Reserved uint16 pair (4).
-	branchHeaderEnd = branchPrefixLenOff + 4 // 20
+	// after the page header (8) and the leftmost child pointer (8).
+	branchHeaderEnd = branchLeftmostOff + branchChildPtrSize // 16
 )
 
 // BranchCell is the decoded form of one branch cell: the separator key +
-// the right child pointer. For ordinary cells Key is the reconstructed
-// full separator (P || suffix); DecodeBranch / BranchCellAt return it as
-// an owned slice (the on-page prefix and suffix are non-contiguous, so
-// the full key cannot alias the buffer), so callers may retain it past
-// the page-buffer lifetime.
+// the right child pointer. DecodeBranch / BranchCellAt return Key as an
+// owned slice, so callers may retain it past the page-buffer lifetime.
 //
 // For OVERFLOW branch cells (KeyExtPage != 0 — page-formats.md
 // §Overflow-Key Cells) Key holds only the RESIDENT first
-// InlineThreshold bytes of the separator (`sep[0:T]`, reconstructed as
-// P || inline); the extent run at KeyExtPage holds sep[T:], and
-// KeyTotalLen is the full separator length. The extent cut is fixed at
-// byte T of the FULL key, page-independent, so moving a cell between
-// pages re-slices only the resident bytes and carries the extent by
-// reference.
+// InlineThreshold bytes of the separator (`sep[0:T]`); the extent run
+// at KeyExtPage holds sep[T:], and KeyTotalLen is the full separator
+// length. The extent cut is fixed at byte T of the FULL key,
+// page-independent, so moving a cell between pages carries the extent
+// by reference.
 type BranchCell struct {
 	Key         []byte
 	Child       uint64
@@ -86,22 +74,15 @@ type BranchCell struct {
 // threshold and carries a key-extent reference.
 func (c BranchCell) IsOverflowKey() bool { return c.KeyExtPage != 0 }
 
-// branchDirSuffixOverflowBit marks an overflow branch cell in the
-// directory's SuffixLen field (bit 15); the low 15 bits give the inline
-// suffix length, always exactly InlineThreshold - PrefixLen
-// (page-formats.md §Branch Page). InlineThreshold fits 15 bits at every
-// page size.
-const branchDirSuffixOverflowBit = 0x8000
+// branchDirKeyOverflowBit marks an overflow branch cell in the
+// directory's KeyLen field (bit 15); the low 15 bits give the inline
+// length, always exactly InlineThreshold (page-formats.md §Plain
+// Branch). InlineThreshold fits 15 bits at every page size.
+const branchDirKeyOverflowBit = 0x8000
 
 // branchKeyExtRefSize is the byte length of the key-extent reference in
 // an overflow branch cell's data: KeyExtPage(u64) + KeyTotalLen(u32).
 const branchKeyExtRefSize = 12
-
-// branchPrefixLen reads the page-wide shared-prefix length from the header.
-func branchPrefixLen(buf []byte) int { return int(le.Uint16(buf[branchPrefixLenOff:])) }
-
-// setBranchPrefixLen writes the page-wide shared-prefix length.
-func setBranchPrefixLen(buf []byte, n int) { le.PutUint16(buf[branchPrefixLenOff:], uint16(n)) }
 
 // BranchLeftmostChild returns Ptr[0] (the leftmost child pointer)
 // from a branch page. Panics on a buffer too small to hold the
@@ -137,9 +118,9 @@ func BranchCellCount(buf []byte) uint16 {
 // cell index [0, N); the leftmost child (Ptr[0]) is rewritten via
 // SetBranchLeftmostChild instead.
 //
-// The child pointer sits immediately after the cell's stored suffix, so a
-// child-only rewrite is independent of the page-wide prefix and needs no
-// re-encode.
+// The child pointer sits immediately after the cell's stored key
+// bytes (and extent reference, for overflow cells), so a child-only
+// rewrite needs no re-encode.
 func SetBranchCellChild(buf []byte, cfg Config, i uint16, child uint64) {
 	cfg.MustValidate()
 	n := BranchCellCount(buf)
@@ -155,7 +136,7 @@ func SetBranchCellChild(buf []byte, cfg Config, i uint16, child uint64) {
 // SetBranchCellKeyExtPage rewrites the KeyExtPage field of overflow
 // branch cell i in place — the branch analog of the leaf
 // PatchKeyExtRefs primitive (size-identical: the reference is a fixed
-// u64 after the inline suffix bytes; KeyTotalLen is immutable). Panics
+// u64 after the inline key bytes; KeyTotalLen is immutable). Panics
 // on an out-of-range index or a non-overflow cell — a caller asking to
 // repoint a cell with no extent is a programming error.
 func SetBranchCellKeyExtPage(buf []byte, cfg Config, i uint16, extPage uint64) {
@@ -166,33 +147,33 @@ func SetBranchCellKeyExtPage(buf []byte, cfg Config, i uint16, extPage uint64) {
 	}
 	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
 	raw := le.Uint16(buf[dirOff+2:])
-	if raw&branchDirSuffixOverflowBit == 0 {
+	if raw&branchDirKeyOverflowBit == 0 {
 		panic(fmt.Sprintf("page: SetBranchCellKeyExtPage(%d) on a non-overflow cell", i))
 	}
-	off := int(le.Uint16(buf[dirOff:])) + int(raw&^branchDirSuffixOverflowBit)
+	off := int(le.Uint16(buf[dirOff:])) + int(raw&^branchDirKeyOverflowBit)
 	le.PutUint64(buf[off:], extPage)
 }
 
 // branchCellChildSkip returns the byte distance from a cell's data start
-// to its child pointer, given the raw directory SuffixLen field: the
-// inline suffix bytes plus the 12-byte key-extent reference when the
+// to its child pointer, given the raw directory KeyLen field: the
+// inline key bytes plus the 12-byte key-extent reference when the
 // overflow marker (bit 15) is set.
-func branchCellChildSkip(rawSuffixLen uint16) int {
-	n := int(rawSuffixLen &^ branchDirSuffixOverflowBit)
-	if rawSuffixLen&branchDirSuffixOverflowBit != 0 {
+func branchCellChildSkip(rawKeyLen uint16) int {
+	n := int(rawKeyLen &^ branchDirKeyOverflowBit)
+	if rawKeyLen&branchDirKeyOverflowBit != 0 {
 		n += branchKeyExtRefSize
 	}
 	return n
 }
 
-// BranchCellAt returns the i-th branch cell with its full reconstructed
-// separator key (P || suffix). Panics on a malformed page (cell directory
-// entry points outside the page) or on out-of-range index.
+// BranchCellAt returns the i-th branch cell. Panics on a malformed page
+// (cell directory entry points outside the page) or on out-of-range
+// index.
 //
-// The returned BranchCell.Key is a freshly-allocated owned slice (the
-// on-page prefix and suffix are non-contiguous), so it is safe to retain and
-// to modify. This is off the hot descent path — BranchSearch / BranchChildAt
-// read the page directly without reconstructing keys.
+// The returned BranchCell.Key is a freshly-allocated owned slice, so it
+// is safe to retain and to modify. This is off the hot descent path —
+// BranchSearch / BranchChildAt read the page directly without
+// materializing keys.
 func BranchCellAt(buf []byte, cfg Config, i uint16) BranchCell {
 	cfg.MustValidate()
 	n := BranchCellCount(buf)
@@ -200,22 +181,17 @@ func BranchCellAt(buf []byte, cfg Config, i uint16) BranchCell {
 		panic(fmt.Sprintf("page: BranchCellAt(%d) out of range [0, %d)", i, n))
 	}
 	ce := cfg.ContentEnd()
-	m := branchPrefixLen(buf)
-	prefixStart := ce - m
 	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
 	off := int(le.Uint16(buf[dirOff:]))
 	raw := le.Uint16(buf[dirOff+2:])
-	slen := int(raw &^ branchDirSuffixOverflowBit)
-	ovk := raw&branchDirSuffixOverflowBit != 0
+	klen := int(raw &^ branchDirKeyOverflowBit)
+	ovk := raw&branchDirKeyOverflowBit != 0
 	end := off + branchCellChildSkip(raw) + branchChildPtrSize
-	if off < branchHeaderEnd+int(n)*branchDirEntrySize || end > prefixStart {
-		panic(fmt.Sprintf("page: BranchCellAt(%d) offset/len out of range: off=%d slen=%d prefixStart=%d", i, off, slen, prefixStart))
+	if off < branchHeaderEnd+int(n)*branchDirEntrySize || end > ce {
+		panic(fmt.Sprintf("page: BranchCellAt(%d) offset/len out of range: off=%d klen=%d contentEnd=%d", i, off, klen, ce))
 	}
-	key := make([]byte, m+slen)
-	copy(key, buf[prefixStart:ce])
-	copy(key[m:], buf[off:off+slen])
-	c := BranchCell{Key: key}
-	p := off + slen
+	c := BranchCell{Key: bytes.Clone(buf[off : off+klen])}
+	p := off + klen
 	if ovk {
 		c.KeyExtPage = le.Uint64(buf[p:])
 		c.KeyTotalLen = le.Uint32(buf[p+8:])
@@ -226,7 +202,7 @@ func BranchCellAt(buf []byte, cfg Config, i uint16) BranchCell {
 }
 
 // branchCellChild reads the right child pointer of cell i (0-based) directly
-// from the directory + cell data, without reconstructing the separator key.
+// from the directory + cell data, without materializing the separator key.
 // Hot-path helper for BranchChildAt.
 func branchCellChild(buf []byte, i uint16) uint64 {
 	dirOff := branchHeaderEnd + int(i)*branchDirEntrySize
@@ -236,13 +212,8 @@ func branchCellChild(buf []byte, i uint16) uint64 {
 }
 
 // BranchFreeSpace returns the number of unused bytes between the
-// end of the cell directory and the start of the first packed cell.
+// end of the cell directory and the start of the lowest packed cell.
 // Used by branch insert/split logic to decide when to split.
-//
-// The page-wide prefix region sits above all cells (at the content tail), so
-// the free-space window is [dirEnd, lowestCellOffset); the walk starts from
-// the prefix region's low edge (ContentEnd - PrefixLen) so an empty page
-// (no cells) reports the correct free span.
 //
 // Implementation note: EncodeBranch packs cells in directory-index
 // order with strictly-decreasing offsets, so the last directory
@@ -256,7 +227,7 @@ func BranchFreeSpace(buf []byte, cfg Config) int {
 	cfg.MustValidate()
 	n := int(BranchCellCount(buf))
 	dirEnd := branchHeaderEnd + n*branchDirEntrySize
-	low := cfg.ContentEnd() - branchPrefixLen(buf) // walking backward from the prefix region
+	low := cfg.ContentEnd()
 	for i := range n {
 		dirOff := branchHeaderEnd + i*branchDirEntrySize
 		off := int(le.Uint16(buf[dirOff:]))
@@ -278,17 +249,14 @@ func EncodeBranchEmpty(buf []byte, cfg Config, leftmost uint64) {
 	clear(buf)
 	WriteHeader(buf, TypeBranch, 0, 0)
 	SetBranchLeftmostChild(buf, leftmost)
-	// PrefixLen + Reserved are left zero by clear.
 }
 
-// EncodeBranch writes cells + leftmost into buf in sorted-key order, applying
-// within-page prefix truncation (page-formats.md §Branch Page). The page-wide
-// prefix P = commonPrefix(cells[0], cells[N-1]) is stored once at the content
-// tail; each cell stores its suffix key[len(P):] + child pointer. The
-// directory is laid out contiguously after the header; cells are packed from
-// just below the prefix region downward in the SAME order as the directory
-// (cell 0 highest offset → cell N-1 lowest), so the on-disk iteration order
-// matches the cell-directory index.
+// EncodeBranch writes cells + leftmost into buf in sorted-key order
+// (page-formats.md §Plain Branch). The directory is laid out
+// contiguously after the header; cells are packed from ContentEnd
+// downward in the SAME order as the directory (cell 0 highest offset →
+// cell N-1 lowest), so the on-disk iteration order matches the
+// cell-directory index.
 //
 // Returns an error if the cells don't fit cfg.ContentEnd(). The caller
 // computes "will this fit?" with BranchEncodedSize and acts BEFORE calling
@@ -297,9 +265,9 @@ func EncodeBranchEmpty(buf []byte, cfg Config, leftmost uint64) {
 // Keys MUST be in ascending byte order; EncodeBranch verifies via a sort
 // check and returns an error on violation (callers compose the cell slice;
 // the codec doesn't reorder). The output is a pure function of (cfg,
-// leftmost, cells): P, suffixes, directory, and packing order are all
-// deterministic (page-formats.md §Leaf Split deterministic-encoding
-// invariant, for branch pages).
+// leftmost, cells): directory and packing order are deterministic
+// (page-formats.md §Leaf Split deterministic-encoding invariant, for
+// branch pages).
 func EncodeBranch(buf []byte, cfg Config, leftmost uint64, cells []BranchCell) error {
 	cfg.MustValidate()
 	if len(buf) != int(cfg.PageSize) {
@@ -320,6 +288,9 @@ func EncodeBranch(buf []byte, cfg Config, leftmost uint64, cells []BranchCell) e
 		if c.IsOverflowKey() && len(c.Key) != t {
 			return fmt.Errorf("page: EncodeBranch overflow cell %d resident length %d != inline threshold %d", i, len(c.Key), t)
 		}
+		if !c.IsOverflowKey() && len(c.Key) > t {
+			return fmt.Errorf("page: EncodeBranch cell %d inline key length %d exceeds inline threshold %d", i, len(c.Key), t)
+		}
 	}
 	ce := cfg.ContentEnd()
 	need := BranchEncodedSize(cfg, cells)
@@ -330,38 +301,20 @@ func EncodeBranch(buf []byte, cfg Config, leftmost uint64, cells []BranchCell) e
 	WriteHeader(buf, TypeBranch, uint16(len(cells)), 0)
 	SetBranchLeftmostChild(buf, leftmost)
 
-	var m int
-	if len(cells) > 0 {
-		m = sharedPrefixLen(cells[0].Key, cells[len(cells)-1].Key)
-		// Prefix bytes at the content tail: [ContentEnd-m, ContentEnd).
-		// Guarded by len(cells) > 0 so cells[0] is never indexed on an
-		// empty (leftmost-only) branch, where m is 0 anyway.
-		// The spec's PrefixLen <= T cap (page-formats.md §Branch Page)
-		// holds by construction: every stored Key is <= T bytes (full
-		// separators <= T inline; overflow cells hold exactly the
-		// first-T resident bytes), so their common prefix cannot
-		// exceed T.
-		copy(buf[ce-m:ce], cells[0].Key[:m])
-	}
-	setBranchPrefixLen(buf, m)
-
-	// Cell data packs from just below the prefix region downward; entries
-	// are placed so iteration index i lands at successively LOWER offsets
-	// (cell 0 highest, cell N-1 lowest). That keeps "find lowest packed
-	// offset" trivially equal to "last cell's offset" for the free-space
-	// check.
-	off := ce - m
+	// Cell data packs from ContentEnd downward; entries are placed so
+	// iteration index i lands at successively LOWER offsets (cell 0
+	// highest, cell N-1 lowest).
+	off := ce
 	for i, c := range cells {
-		suffix := c.Key[m:]
-		cellSize := len(suffix) + branchChildPtrSize
-		rawSuffixLen := uint16(len(suffix))
+		cellSize := len(c.Key) + branchChildPtrSize
+		rawKeyLen := uint16(len(c.Key))
 		if c.IsOverflowKey() {
 			cellSize += branchKeyExtRefSize
-			rawSuffixLen |= branchDirSuffixOverflowBit
+			rawKeyLen |= branchDirKeyOverflowBit
 		}
 		off -= cellSize
-		copy(buf[off:], suffix)
-		p := off + len(suffix)
+		copy(buf[off:], c.Key)
+		p := off + len(c.Key)
 		if c.IsOverflowKey() {
 			le.PutUint64(buf[p:], c.KeyExtPage)
 			le.PutUint32(buf[p+8:], c.KeyTotalLen)
@@ -370,43 +323,28 @@ func EncodeBranch(buf []byte, cfg Config, leftmost uint64, cells []BranchCell) e
 		le.PutUint64(buf[p:], c.Child)
 		dirOff := branchHeaderEnd + i*branchDirEntrySize
 		le.PutUint16(buf[dirOff:], uint16(off))
-		le.PutUint16(buf[dirOff+2:], rawSuffixLen)
+		le.PutUint16(buf[dirOff+2:], rawKeyLen)
 	}
 	return nil
 }
 
-// BranchEncodedSizeOf returns the encoded byte size of a branch page holding
-// n cells whose full separator keys total keyLenSum bytes and share a common
-// prefix of prefixLen bytes. It is the single source of truth for the
-// (non-additive) branch sizing: the shared prefix is stored once, so a cell's
-// stored cost is its suffix (len(key)-prefixLen) + child pointer + directory
-// entry. BranchEncodedSize, the byte-balanced branch splitter, and the
-// bulk-load branch builder all size prospective pages through it.
-//
-// Branch sizing is non-additive because prefixLen depends on the whole cell
-// set: adding a separator that shares less prefix lengthens every other
-// cell's stored suffix. There is therefore no fixed per-cell cost (the prior
-// BranchCellCost) — callers track (n, keyLenSum, prefixLen) and recompute.
-func BranchEncodedSizeOf(n, keyLenSum, prefixLen, extRefs int) int {
-	// header + N directory entries + N child pointers + the suffixes
-	// (keyLenSum - N*prefixLen) + the shared prefix stored once (prefixLen)
-	// + one 12-byte key-extent reference per overflow cell (extRefs):
-	//   = branchHeaderEnd + N*(dir+child) + keyLenSum - (N-1)*prefixLen + 12*extRefs
-	return branchHeaderEnd + n*(branchDirEntrySize+branchChildPtrSize) + keyLenSum - (n-1)*prefixLen + extRefs*branchKeyExtRefSize
+// BranchEncodedSizeOf returns the encoded byte size of a plain-branch
+// page holding n cells whose stored (resident) key bytes total
+// keyLenSum, extRefs of which carry a 12-byte key-extent reference.
+// Plain-branch sizing is additive: header + per-cell directory entry +
+// key bytes + child pointer (+ extent reference).
+func BranchEncodedSizeOf(n, keyLenSum, extRefs int) int {
+	return branchHeaderEnd + n*(branchDirEntrySize+branchChildPtrSize) + keyLenSum + extRefs*branchKeyExtRefSize
 }
 
-// BranchEncodedSize returns the byte size a branch page with the given cells
-// would occupy under within-page prefix truncation. Used by the splitter and
-// bulk-load to decide when a proposed cell set fits a page (compared against
+// BranchEncodedSize returns the byte size a plain-branch page with the
+// given cells would occupy. Used by the splitter and bulk-load to
+// decide when a proposed cell set fits a page (compared against
 // cfg.ContentEnd(), which already excludes the optional footer). cfg is
 // accepted for call-site stability; the size is configuration-independent.
 // Overflow cells contribute their RESIDENT key bytes (Key holds sep[0:T])
 // plus the 12-byte extent reference.
 func BranchEncodedSize(cfg Config, cells []BranchCell) int {
-	if len(cells) == 0 {
-		return BranchEncodedSizeOf(0, 0, 0, 0)
-	}
-	m := sharedPrefixLen(cells[0].Key, cells[len(cells)-1].Key)
 	keyLenSum, extRefs := 0, 0
 	for _, c := range cells {
 		keyLenSum += len(c.Key)
@@ -414,25 +352,23 @@ func BranchEncodedSize(cfg Config, cells []BranchCell) int {
 			extRefs++
 		}
 	}
-	return BranchEncodedSizeOf(len(cells), keyLenSum, m, extRefs)
+	return BranchEncodedSizeOf(len(cells), keyLenSum, extRefs)
 }
 
-// BranchLogicalSize returns the branch's UNCOMPRESSED content size — the
-// bytes the cells would occupy with NO within-page prefix truncation
-// (Σ full-key + child-pointer + directory costs; equals
-// BranchEncodedSizeOf(n, keyLenSum, 0)). This is the measure for the
-// range-delete.md §Invariants fill-floor: within-page compression is a
-// storage optimization that must not, by itself, make a logically-dense
-// branch look underfull (a fanout-many same-cluster branch compresses to few
-// bytes yet carries plenty of children). So "is this branch underfull?" is
-// asked of the LOGICAL content (this function), while "does this cell set fit
-// a page?" uses the PHYSICAL compressed size (BranchEncodedSize). The two
-// notions coincide exactly when the separators share no prefix.
-// An overflow cell's logical content is its RESIDENT bytes (the first-T
+// BranchLogicalSize returns the branch's LOGICAL content size — the
+// bytes the cells occupy with no within-page compression. This is the
+// measure for the range-delete.md §Invariants fill-floor: within-page
+// compression is a storage optimization that must not, by itself, make
+// a logically-dense branch look underfull. For the PLAIN branch,
+// logical and physical content coincide (full separators are stored;
+// there is no within-page compression), so this equals
+// BranchEncodedSize; the segregated branch layout diverges. An
+// overflow cell's logical content is its RESIDENT bytes (the first-T
 // key slice + the 12-byte extent reference), never KeyTotalLen: the
 // floor and the redistribute balance measure page utilisation, and
-// counting extent bytes would let one giant separator satisfy any floor
-// while the page is physically near-empty (range-delete.md §Invariants).
+// counting extent bytes would let one giant separator satisfy any
+// floor while the page is physically near-empty (range-delete.md
+// §Invariants).
 func BranchLogicalSize(cells []BranchCell) int {
 	keyLenSum, extRefs := 0, 0
 	for _, c := range cells {
@@ -441,13 +377,12 @@ func BranchLogicalSize(cells []BranchCell) int {
 			extRefs++
 		}
 	}
-	return BranchEncodedSizeOf(len(cells), keyLenSum, 0, extRefs)
+	return BranchEncodedSizeOf(len(cells), keyLenSum, extRefs)
 }
 
-// DecodeBranch returns all cells from a branch page in directory order, each
-// with its full reconstructed key. Convenience for tests + tree-walk /
-// split / merge consumers; hot-path search uses BranchSearch + BranchChildAt
-// to avoid materializing keys.
+// DecodeBranch returns all cells from a branch page in directory order.
+// Convenience for tests + tree-walk / split / merge consumers; hot-path
+// search uses BranchSearch + BranchChildAt to avoid materializing keys.
 func DecodeBranch(buf []byte, cfg Config) (leftmost uint64, cells []BranchCell) {
 	cfg.MustValidate()
 	n := BranchCellCount(buf)
@@ -464,16 +399,9 @@ func DecodeBranch(buf []byte, cfg Config) (leftmost uint64, cells []BranchCell) 
 
 // BranchSearch binary-searches the branch's separators for the first one
 // strictly greater than `target`, returning the descent index `i` (or `n` if
-// every separator is <= target) per page-formats.md §Branch Page.
-//
-// Separators are prefix-truncated within the page, so the search is two-step
-// and entirely zero-copy (no full-key reconstruction):
-//
-//  1. Compare target against the page-wide prefix P. If target does not start
-//     with P, it sorts before every separator (descend leftmost, i=0) or
-//     after every separator (descend rightmost, i=n) — decided by
-//     bytes.Compare(target, P).
-//  2. Otherwise binary-search target[len(P):] against the cells' suffixes.
+// every separator is <= target) per page-formats.md §Plain Branch. Every
+// probe compares target directly against the stored separator bytes —
+// single-phase, zero-copy.
 //
 // The descent caller uses i to pick the next child:
 //   - i == 0   → Ptr[0]    (leftmost child)
@@ -481,60 +409,42 @@ func DecodeBranch(buf []byte, cfg Config) (leftmost uint64, cells []BranchCell) 
 //     bounds, so i-1's child holds keys < separators[i])
 //   - i == N   → ChildPtr of last cell  (rightmost child)
 //
-// When target == Key[k], step 2 returns k+1 (the suffix search finds the
-// LEAST i with target[len(P):] < suffix[i]), so the target descends into that
-// separator's right child — separators are right-child lower bounds.
+// When target == Key[k], the search returns k+1 (the least i with
+// target < separator[i]), so the target descends into that separator's
+// right child — separators are right-child lower bounds.
+//
+// For an overflow cell the stored bytes are sep[0:T]; a tie through
+// them with a still-longer target consults the key extent via tailCmp
+// (the full-key comparison rule, page-formats.md §Overflow-Key Cells).
 func BranchSearch(buf []byte, cfg Config, target []byte, tailCmp TailCompare) (uint16, error) {
 	cfg.MustValidate()
 	n := int(BranchCellCount(buf))
 	if n == 0 {
 		return 0, nil
 	}
-	ce := cfg.ContentEnd()
-	m := branchPrefixLen(buf)
-	prefix := buf[ce-m : ce]
-
-	// Step 1: locate target relative to the page-wide prefix. P is a
-	// genuine prefix of every separator including overflow cells
-	// (P || Inline covers sep[0:T]), so a target that does not start
-	// with P is decided against P alone — no extent involvement.
-	if len(target) < m || !bytes.Equal(target[:m], prefix) {
-		// target does not start with P.
-		if bytes.Compare(target, prefix) < 0 {
-			return 0, nil // target < every separator → leftmost child
-		}
-		return uint16(n), nil // target > every separator → rightmost child
-	}
-
-	// Step 2: binary-search the suffix tail against the cells' suffixes.
-	// f(i) := target < separator[i]; the loop finds the least such i.
-	// For an overflow cell the inline suffix is sep[m:T]; a tie through
-	// it with a still-longer target consults the key extent (the
-	// full-key comparison rule, page-formats.md §Overflow-Key Cells).
-	tail := target[m:]
 	lo, hi := 0, n
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
 		dirOff := branchHeaderEnd + mid*branchDirEntrySize
 		off := int(le.Uint16(buf[dirOff:]))
 		raw := le.Uint16(buf[dirOff+2:])
-		slen := int(raw &^ branchDirSuffixOverflowBit)
-		suffix := buf[off : off+slen]
+		klen := int(raw &^ branchDirKeyOverflowBit)
+		key := buf[off : off+klen]
 		var targetLess bool
-		if raw&branchDirSuffixOverflowBit == 0 {
-			targetLess = bytes.Compare(tail, suffix) < 0
+		if raw&branchDirKeyOverflowBit == 0 {
+			targetLess = bytes.Compare(target, key) < 0
 		} else {
-			k := min(len(tail), slen)
-			switch c := bytes.Compare(tail[:k], suffix[:k]); {
+			k := min(len(target), klen)
+			switch c := bytes.Compare(target[:k], key[:k]); {
 			case c != 0:
 				targetLess = c < 0
-			case len(tail) <= slen:
+			case len(target) <= klen:
 				// target is a (possibly full) prefix of sep[0:T];
 				// the separator is strictly longer — target < sep.
 				targetLess = true
 			default:
-				extPage := le.Uint64(buf[off+slen:])
-				totalLen := le.Uint32(buf[off+slen+8:])
+				extPage := le.Uint64(buf[off+klen:])
+				totalLen := le.Uint32(buf[off+klen+8:])
 				c, err := tailCmp(target, extPage, totalLen)
 				if err != nil {
 					return 0, err
@@ -552,15 +462,11 @@ func BranchSearch(buf []byte, cfg Config, target []byte, tailCmp TailCompare) (u
 }
 
 // ShortestSeparator returns the shortest byte string S satisfying
-// `left < S <= right` — the prefix-truncated separator used at
-// branch insertion time per page-formats.md §Prefix-Truncated
-// Branch Keys. Constructed as the common prefix of left and right
-// extended by exactly one byte from right at the first divergence
-// position.
-//
-// This is the CROSS-LEVEL truncation (the separator distinguishes left from
-// right subtree); it is independent of the WITHIN-page prefix truncation that
-// EncodeBranch applies to the resulting separator set.
+// `left < S <= right` — the cross-level-truncated separator used at
+// branch insertion time per page-formats.md §Separator Computation
+// (Cross-Level Truncation). Constructed as the common prefix of left
+// and right extended by exactly one byte from right at the first
+// divergence position.
 //
 // Precondition: left < right (strict). Callers compute this from
 // the boundary keys of a freshly-split pair (last key of left leaf,
@@ -601,14 +507,14 @@ func ShortestSeparator(left, right []byte) []byte {
 
 // ValidateBranch reports whether buf is a structurally well-formed branch
 // page: the header type is TypeBranch, the buffer covers the page content
-// region, the page-wide prefix region fits above the directory, and every
-// cell's (Offset, SuffixLen) points within the cell-data region [dirEnd,
-// ContentEnd-PrefixLen) with room for the trailing 8-byte child pointer. It
-// returns a non-nil error (wrapping ErrCorrupted) on any violation and never
-// panics — the decoder-robustness contract ("total over input, never panics
-// on a forged page"), so reachability walks (Check, FreeSubtree) and the
-// btree readers can call BranchSearch / BranchCellAt / BranchChildAt safely
-// after Validate passes. Mirrors the per-cell bounds those readers assume.
+// region, and every cell's (Offset, KeyLen) points within the cell-data
+// region [dirEnd, ContentEnd) with room for the trailing 8-byte child
+// pointer. It returns a non-nil error (wrapping ErrCorrupted) on any
+// violation and never panics — the decoder-robustness contract ("total
+// over input, never panics on a forged page"), so reachability walks
+// (Check, FreeSubtree) and the btree readers can call BranchSearch /
+// BranchCellAt / BranchChildAt safely after Validate passes. Mirrors
+// the per-cell bounds those readers assume.
 func ValidateBranch(buf []byte, cfg Config) error {
 	contentEnd := cfg.ContentEnd()
 	if len(buf) < contentEnd {
@@ -618,43 +524,33 @@ func ValidateBranch(buf []byte, cfg Config) error {
 	if typ != TypeBranch {
 		return fmt.Errorf("%w: branch page has type %d (want %d)", ErrCorrupted, typ, TypeBranch)
 	}
-	m := branchPrefixLen(buf)
-	prefixStart := contentEnd - m
 	dirEnd := branchHeaderEnd + int(n)*branchDirEntrySize
-	if prefixStart < dirEnd {
-		// Covers an over-long PrefixLen and a directory that overruns the
-		// content/prefix region (prefixStart <= contentEnd always since m>=0).
-		return fmt.Errorf("%w: branch prefix region (PrefixLen=%d) overlaps cell directory (%d cells): prefixStart=%d dirEnd=%d",
-			ErrCorrupted, m, n, prefixStart, dirEnd)
+	if dirEnd > contentEnd {
+		return fmt.Errorf("%w: branch cell directory (%d cells) overruns content end %d", ErrCorrupted, n, contentEnd)
 	}
 	t := cfg.InlineThreshold()
-	if m > t {
-		// PrefixLen <= InlineThreshold holds by construction on every
-		// encoder path (page-formats.md §Branch Page); over-T is forged.
-		return fmt.Errorf("%w: branch PrefixLen %d exceeds inline threshold %d", ErrCorrupted, m, t)
-	}
 	for i := 0; i < int(n); i++ {
 		dirOff := branchHeaderEnd + i*branchDirEntrySize
 		off := int(le.Uint16(buf[dirOff:]))
 		raw := le.Uint16(buf[dirOff+2:])
-		slen := int(raw &^ branchDirSuffixOverflowBit)
+		klen := int(raw &^ branchDirKeyOverflowBit)
 		end := off + branchCellChildSkip(raw) + branchChildPtrSize
-		if off < dirEnd || end > prefixStart {
-			return fmt.Errorf("%w: branch cell %d offset/len out of range: off=%d slen=%d end=%d (dirEnd=%d prefixStart=%d)",
-				ErrCorrupted, i, off, slen, end, dirEnd, prefixStart)
+		if off < dirEnd || end > contentEnd {
+			return fmt.Errorf("%w: branch cell %d offset/len out of range: off=%d klen=%d end=%d (dirEnd=%d contentEnd=%d)",
+				ErrCorrupted, i, off, klen, end, dirEnd, contentEnd)
 		}
-		if raw&branchDirSuffixOverflowBit != 0 {
+		if raw&branchDirKeyOverflowBit != 0 {
 			// Derivable-length read policy (page-formats.md
 			// §Overflow-Key Cells): an overflow cell's inline length is
-			// EXACTLY InlineThreshold - PrefixLen; its extent reference
-			// must name a nonzero page and a full length strictly past
-			// the threshold. Divergence is structural corruption.
-			if slen != t-m {
-				return fmt.Errorf("%w: branch overflow cell %d inline length %d != threshold-prefix %d",
-					ErrCorrupted, i, slen, t-m)
+			// EXACTLY InlineThreshold; its extent reference must name a
+			// nonzero page and a full length strictly past the
+			// threshold. Divergence is structural corruption.
+			if klen != t {
+				return fmt.Errorf("%w: branch overflow cell %d inline length %d != inline threshold %d",
+					ErrCorrupted, i, klen, t)
 			}
-			extPage := le.Uint64(buf[off+slen:])
-			totalLen := int(le.Uint32(buf[off+slen+8:]))
+			extPage := le.Uint64(buf[off+klen:])
+			totalLen := int(le.Uint32(buf[off+klen+8:]))
 			if extPage == 0 {
 				return fmt.Errorf("%w: branch overflow cell %d extent page is 0", ErrCorrupted, i)
 			}
@@ -662,6 +558,9 @@ func ValidateBranch(buf []byte, cfg Config) error {
 				return fmt.Errorf("%w: branch overflow cell %d KeyTotalLen %d does not exceed inline threshold %d",
 					ErrCorrupted, i, totalLen, t)
 			}
+		} else if klen > t {
+			return fmt.Errorf("%w: branch cell %d inline key length %d exceeds inline threshold %d",
+				ErrCorrupted, i, klen, t)
 		}
 	}
 	return nil
@@ -672,7 +571,7 @@ func ValidateBranch(buf []byte, cfg Config) error {
 //   - i == 0 → leftmost (Ptr[0])
 //   - 0 < i ≤ N → ChildPtr of cell i-1
 //
-// Reads the child pointer directly (no separator-key reconstruction), so it
+// Reads the child pointer directly (no separator-key materialization), so it
 // is allocation-free on the hot descent path.
 func BranchChildAt(buf []byte, cfg Config, i uint16) uint64 {
 	cfg.MustValidate()

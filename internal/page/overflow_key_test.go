@@ -31,10 +31,10 @@ func TestInlineThresholdValues(t *testing.T) {
 		if got := cfg.InlineThreshold(); got != c.want {
 			t.Errorf("InlineThreshold(%d, checksum=%v) = %d, want %d", c.pageSize, c.checksum, got, c.want)
 		}
-		// The derivation's own constraint: a branch page holds TWO
-		// overflow cells at PrefixLen == 0.
+		// The floor: a plain branch page holds TWO worst-case
+		// overflow cells (page-formats.md §Invariants).
 		tt := cfg.InlineThreshold()
-		if need := BranchEncodedSizeOf(2, 2*tt, 0, 2); need > cfg.ContentEnd() {
+		if need := BranchEncodedSizeOf(2, 2*tt, 2); need > cfg.ContentEnd() {
 			t.Errorf("two overflow cells at T=%d need %d > ContentEnd %d", tt, need, cfg.ContentEnd())
 		}
 		// 15-bit fit for the branch directory's overflow marker.
@@ -301,10 +301,14 @@ func TestCompareEntryKeyExtentRule(t *testing.T) {
 }
 
 // TestBranchOverflowCellRoundTrip pins the branch overflow-cell form
-// (page-formats.md §Branch Page bit-15; §Overflow-Key Cells Branch
-// form): resident slice = sep[PrefixLen:T], extent fields round-trip,
+// (page-formats.md §Plain Branch KeyLen bit 15; §Overflow-Key Cells
+// Branch form): resident slice = sep[0:T], extent fields round-trip,
 // ValidateBranch accepts, child pointers read/write correctly, and
 // BranchSearch consults the extent exactly on an over-T resident tie.
+// A plain branch holds exactly TWO worst-case overflow cells (the
+// split-feasibility floor), so the mixed ovk+short fixture carries one
+// overflow cell; the two-ovk floor page is round-tripped separately
+// below.
 func TestBranchOverflowCellRoundTrip(t *testing.T) {
 	cfg := Config{PageSize: 4096}
 	tt := cfg.InlineThreshold()
@@ -314,10 +318,9 @@ func TestBranchOverflowCellRoundTrip(t *testing.T) {
 		return append(s, []byte("tail-")...) // full length tt+5 > T
 	}
 	sepA, sepB := mkSep('a'), mkSep('b')
-	short := append(bytes.Clone(pfx), 'q')
+	short := append(bytes.Clone(pfx), 'q') // sorts after sepA's resident bytes
 	cells := []BranchCell{
 		{Key: sepA[:tt], Child: 101, KeyExtPage: 41, KeyTotalLen: uint32(len(sepA))},
-		{Key: sepB[:tt], Child: 102, KeyExtPage: 42, KeyTotalLen: uint32(len(sepB))},
 		{Key: short, Child: 103},
 	}
 	buf := make([]byte, cfg.PageSize)
@@ -328,8 +331,31 @@ func TestBranchOverflowCellRoundTrip(t *testing.T) {
 		t.Fatalf("ValidateBranch: %v", err)
 	}
 	gotLeftmost, gotCells := DecodeBranch(buf, cfg)
-	if gotLeftmost != 100 || len(gotCells) != 3 {
+	if gotLeftmost != 100 || len(gotCells) != 2 {
 		t.Fatalf("decode: leftmost=%d cells=%d", gotLeftmost, len(gotCells))
+	}
+
+	// The floor page: exactly two worst-case overflow cells fit
+	// (page-formats.md §Invariants, branch floor) and round-trip.
+	floor := []BranchCell{
+		{Key: sepA[:tt], Child: 1, KeyExtPage: 41, KeyTotalLen: uint32(len(sepA))},
+		{Key: sepB[:tt], Child: 2, KeyExtPage: 42, KeyTotalLen: uint32(len(sepB))},
+	}
+	fbuf := make([]byte, cfg.PageSize)
+	if err := EncodeBranch(fbuf, cfg, 9, floor); err != nil {
+		t.Fatalf("EncodeBranch(two-ovk floor): %v", err)
+	}
+	if err := ValidateBranch(fbuf, cfg); err != nil {
+		t.Fatalf("ValidateBranch(two-ovk floor): %v", err)
+	}
+	if _, fc := DecodeBranch(fbuf, cfg); len(fc) != 2 || fc[0].KeyExtPage != 41 || fc[1].KeyExtPage != 42 {
+		t.Fatalf("two-ovk floor decode mismatch: %+v", fc)
+	}
+	// The floor's tight side: two worst-case overflow cells plus ANY
+	// third cell exceed the page — EncodeBranch must reject.
+	over := append(append([]BranchCell{}, floor...), BranchCell{Key: []byte{0xFF}, Child: 3})
+	if err := EncodeBranch(make([]byte, cfg.PageSize), cfg, 9, over); err == nil {
+		t.Fatal("EncodeBranch accepted two worst-case overflow cells plus a third")
 	}
 	for i := range cells {
 		if !bytes.Equal(gotCells[i].Key, cells[i].Key) || gotCells[i].Child != cells[i].Child ||
@@ -353,11 +379,7 @@ func TestBranchOverflowCellRoundTrip(t *testing.T) {
 	calls := 0
 	tail := func(probe []byte, extPage uint64, totalLen uint32) (int, error) {
 		calls++
-		fullSep := sepA
-		if extPage == 42 {
-			fullSep = sepB
-		}
-		return bytes.Compare(probe, fullSep), nil
+		return bytes.Compare(probe, sepA), nil
 	}
 	probe := append(bytes.Clone(sepA[:tt]), []byte("tail-x")...) // > sepA
 	idx, err := BranchSearch(buf, cfg, probe, tail)
@@ -368,7 +390,7 @@ func TestBranchOverflowCellRoundTrip(t *testing.T) {
 		t.Error("BranchSearch never consulted the extent on an over-T resident tie")
 	}
 	if idx != 1 {
-		t.Errorf("BranchSearch(> sepA, < sepB) = %d, want 1", idx)
+		t.Errorf("BranchSearch(> sepA, < short) = %d, want 1", idx)
 	}
 	// A short probe never touches extents.
 	calls = 0
@@ -385,14 +407,9 @@ func TestBranchOverflowCellRoundTrip(t *testing.T) {
 func TestBranchValidateRejectsForgedOverflowCell(t *testing.T) {
 	cfg := Config{PageSize: 4096}
 	tt := cfg.InlineThreshold()
-	// Two overflow cells with no shared prefix keep PrefixLen == 0, so
-	// each cell's inline suffix is the full T-byte resident slice and
-	// the extent reference sits at a directly-computable offset. (A
-	// SINGLE overflow cell is the P == T edge: the page prefix absorbs
-	// the whole resident slice and the inline suffix is empty — pinned
-	// by the clean-fixture Validate below via TestBranchOverflowCell's
-	// prefix case; here the two-cell layout is what the mutations
-	// need.)
+	// Two overflow cells — the plain-branch floor shape; each cell's
+	// inline bytes are the full T-byte resident slice and the extent
+	// reference sits at a directly-computable offset.
 	sepA := bytes.Repeat([]byte{'a'}, tt+10)
 	sepB := bytes.Repeat([]byte{'b'}, tt+10)
 	cells := []BranchCell{
@@ -419,7 +436,7 @@ func TestBranchValidateRejectsForgedOverflowCell(t *testing.T) {
 	if err := build(func(buf []byte) {
 		dirOff := branchHeaderEnd
 		raw := le.Uint16(buf[dirOff+2:])
-		le.PutUint16(buf[dirOff+2:], (raw&branchDirSuffixOverflowBit)|uint16(tt-1))
+		le.PutUint16(buf[dirOff+2:], (raw&branchDirKeyOverflowBit)|uint16(tt-1))
 	}); err == nil {
 		t.Error("wrong inline length accepted by ValidateBranch")
 	}
@@ -427,7 +444,7 @@ func TestBranchValidateRejectsForgedOverflowCell(t *testing.T) {
 	// length policy specifically).
 	if err := build(func(buf []byte) {
 		dirOff := branchHeaderEnd
-		off := int(le.Uint16(buf[dirOff:])) + tt // ext ref after inline suffix (PrefixLen == 0)
+		off := int(le.Uint16(buf[dirOff:])) + tt // ext ref after the inline key bytes
 		le.PutUint32(buf[off+8:], uint32(tt))
 	}); err == nil || !strings.Contains(err.Error(), "does not exceed") {
 		t.Errorf("small KeyTotalLen: err = %v, want rejection", err)

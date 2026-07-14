@@ -194,8 +194,8 @@ func genSkewedSeparatorKVs(clusters, per, prefixLen, valueLen int) []kv {
 }
 
 // TestBulkBuilderLargeSeparatorsByteDriven covers the bulk branch builder
-// under size-skewed separators (page-formats.md §Prefix-Truncated Branch
-// Keys). The
+// under size-skewed separators (page-formats.md §Separator
+// Computation). The
 // bottom-up builder is fill-driven by construction — addLink appends a cell
 // only while the page's BranchEncodedSizeOf stays <= ContentEnd (bulkload.go) — so unlike
 // the top-down Put/Delete split it never chose a count midpoint and cannot
@@ -291,15 +291,12 @@ func TestBulkBuilderRandomKeys(t *testing.T) {
 }
 
 // TestBulkBuilderBranchSizeAccounting locks the bulk builder's incremental
-// branch-size tracking against a full BranchEncodedSize recompute. Branch
-// sizing is NON-additive (page-formats.md §Branch Page): the page-wide shared
-// prefix is stored once and shrinks as separators that share less prefix are
-// appended, lengthening every existing cell's suffix — so there is no fixed
-// per-cell cost. addLink tracks (keyLenSum, prefix) and sizes via
-// BranchEncodedSizeOf; this mirrors that exact accounting and asserts it
-// equals the authoritative BranchEncodedSize after every append, across a
-// shared-prefix run, a distinct-prefix run, and a run where the page prefix
-// collapses mid-build.
+// branch-size tracking against a full BranchEncodedSize recompute:
+// addLink's additive (count, keyLenSum, extRefs) tally must equal the
+// authoritative BranchEncodedSize after every append (page-formats.md
+// §Plain Branch — additive sizing), across shared-prefix, distinct-key,
+// and mixed key-shape runs. An anchor against the tally and the encoder
+// drifting apart, not independent arithmetic.
 func TestBulkBuilderBranchSizeAccounting(t *testing.T) {
 	cfg := page.Config{PageSize: 4096}
 	withPrefix := func(p []byte, suffix string) []byte {
@@ -325,14 +322,8 @@ func TestBulkBuilderBranchSizeAccounting(t *testing.T) {
 			var cells []page.BranchCell
 			keyLenSum := 0
 			for i, k := range keys {
-				// Mirror addLink: prefix = commonPrefix(cells[0], new key)
-				// (cells arrive ascending, so the new key is the largest and
-				// commonPrefix(first,last) is the whole-set prefix).
-				prefixLen := len(k)
-				if len(cells) > 0 {
-					prefixLen = commonPrefixLen(cells[0].Key, k)
-				}
-				incr := page.BranchEncodedSizeOf(len(cells)+1, keyLenSum+len(k), prefixLen, 0)
+				// Mirror addLink's additive plain-branch tally.
+				incr := page.BranchEncodedSizeOf(len(cells)+1, keyLenSum+len(k), 0)
 				cells = append(cells, page.BranchCell{Key: k, Child: uint64(i + 1)})
 				keyLenSum += len(k)
 				if got := page.BranchEncodedSize(cfg, cells); got != incr {

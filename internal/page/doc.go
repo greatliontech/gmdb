@@ -1,7 +1,7 @@
 // Package page implements pure byte-slice encoders and decoders for the
 // B+tree NODE formats and the shared wire/header base every persisted
 // format builds on: the 8-byte page header + page-type registry, Config,
-// the XXH3-64 footer, the branch page (prefix-truncated separators),
+// the XXH3-64 footer, the plain branch page (full separators),
 // the leaf page in three variants (interleaved compressed — restart
 // groups with value bytes following each entry's key bytes; segregated
 // compressed — the same restart-group key compression with a pure

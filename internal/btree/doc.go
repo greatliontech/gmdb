@@ -12,7 +12,8 @@
 //   - Read-only descent: Get(rootID, key) ⇒ value via recursive
 //     descent and leaf binary search (page.LeafReader.SearchLeaf).
 //   - Insert + split: copy-on-write from leaf to root with
-//     prefix-truncated separators for new branch entries.
+//     shortest-distinguishing (cross-level-truncated) separators for new
+//     branch entries.
 //   - Delete + merge/redistribute, governed by MergeThreshold.
 //   - A variable-size restart-group leaf format (page.LeafReader /
 //     LeafBuilder / LeafIter); Validate runs at the pager-resolve

@@ -699,12 +699,11 @@ func checkUnderflowInvariant(t *testing.T, pw *fakeWriter, cfg page.Config, root
 // checkReachableFloor asserts the rebalance left no below-floor branch that
 // COULD have been raised above the fill-floor by merging or redistributing
 // with an adjacent same-parent sibling. The fill-floor is LOGICAL
-// (range-delete.md §Invariants); within-page prefix truncation
-// (page-formats.md §Branch Page) makes some branches genuinely un-healable —
-// a cluster-SEAM branch (a large within-cluster separator plus a tiny
-// cross-cluster one) whose neighbours are dense same-cluster branches cannot
-// absorb more cells without un-compressing across the cluster boundary and
-// overflowing a physical page. Those are the "where reachable" exception and
+// (range-delete.md §Invariants); some branches are genuinely
+// un-healable — a cluster-SEAM branch (a large within-cluster
+// separator plus a tiny cross-cluster one) whose dense neighbours
+// cannot absorb more cells without overflowing a physical page.
+// Those are the "where reachable" exception and
 // are allowed below the floor. A below-floor branch that IS healable is a
 // rebalance defect (e.g. balancing a redistribute on compressed instead of
 // logical size piles the cheap same-cluster cells on one half and strands the

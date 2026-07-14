@@ -142,7 +142,7 @@ func branchTestCell(lead byte, idx int, keyLen int) page.BranchCell {
 // (16 + 2·1412 + 3·14 = 2882 ≤ 4096), so inserting a third big separator
 // is an in-spec mutation. The entry-count midpoint (idx 3) then clusters
 // all three bigs on the left half (16 + 3·1412 = 4252 > 4096), the exact
-// count-midpoint branch-split fault (page-formats.md §Prefix-Truncated
+// count-midpoint branch-split fault (page-formats.md §Separator
 // Branch Keys).
 func skewedBranchCells() []page.BranchCell {
 	return []page.BranchCell{
@@ -166,7 +166,7 @@ func branchHalvesFit(cfg page.Config, cells []page.BranchCell, mid int) bool {
 
 // TestBranchCountSplitFaultDemonstration is the demonstrated-fault anchor
 // for the branch count-midpoint split fault (page-formats.md
-// §Prefix-Truncated Branch Keys). It proves,
+// §Separator Computation). It proves,
 // against page.BranchEncodedSize alone, that the entry-COUNT midpoint
 // (`mid := len(cells)/2`, what put.go/delete.go chose) places more than one
 // page of cells on a half for a reachable cell set, so the count split

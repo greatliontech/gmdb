@@ -126,7 +126,7 @@ func TestBranchEncodeRejectsOversized(t *testing.T) {
 }
 
 func TestShortestSeparatorBoundaryCases(t *testing.T) {
-	// Spec inv 1 (page-formats.md §Prefix-Truncated Branch Keys):
+	// Spec inv 1 (page-formats.md §Separator Computation):
 	// the separator S satisfies max(L) < S <= min(R).
 	cases := []struct {
 		left, right, want string

@@ -65,7 +65,7 @@ and 10 remove.
       declaration + config plumbing, `Check`/`Validate` coverage;
       fuzz and property generator grammars extended to the
       variant.
-- [ ] 5. Plain branch: full-separator cells with offset+length
+- [x] 5. Plain branch: full-separator cells with offset+length
       directory replace the prefix-truncated form; overflow
       marker per the amended spec; separator computation, split,
       merge, and the landed overflow-separator paths re-anchored;

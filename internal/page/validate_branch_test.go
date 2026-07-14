@@ -1,7 +1,9 @@
 package page
 
 import (
+	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -58,8 +60,8 @@ func TestValidateBranchRejectsForged(t *testing.T) {
 
 	t.Run("cell offset out of range", func(t *testing.T) {
 		b := base()
-		// First directory entry begins at branchHeaderEnd (offset 20):
-		// (Offset uint16, SuffixLen uint16). Forge the offset past ContentEnd.
+		// First directory entry begins at branchHeaderEnd (offset 16):
+		// (Offset uint16, KeyLen uint16). Forge the offset past ContentEnd.
 		b[branchHeaderEnd] = 0xFF   // dir[0] offset low byte
 		b[branchHeaderEnd+1] = 0xFF // high byte → offset 0xFFFF
 		if err := ValidateBranch(b, cfg); !errors.Is(err, ErrCorrupted) {
@@ -67,15 +69,29 @@ func TestValidateBranchRejectsForged(t *testing.T) {
 		}
 	})
 
-	t.Run("prefix region overlaps directory", func(t *testing.T) {
-		b := base()
-		// PrefixLen uint16 lives at branchPrefixLenOff (offset 16). A huge
-		// value pushes the prefix region (ContentEnd-PrefixLen) below the cell
-		// directory — structural corruption the new format must reject.
-		b[branchPrefixLenOff] = 0xFF
-		b[branchPrefixLenOff+1] = 0xFF // PrefixLen = 0xFFFF
-		if err := ValidateBranch(b, cfg); !errors.Is(err, ErrCorrupted) {
-			t.Errorf("got %v, want ErrCorrupted", err)
+	t.Run("inline key length exceeds threshold", func(t *testing.T) {
+		// A plain cell can never store an over-T key (page-formats.md
+		// §Overflow-Key Cells — over-T keys must take the overflow
+		// form). The forgery must stay INSIDE the page bounds so only
+		// this rule can reject: cell 1 packs below cell 0's T-byte
+		// key, so KeyLen = T+1 reads into cell 0's bytes without
+		// overrunning ContentEnd.
+		tt := cfg.InlineThreshold()
+		b := make([]byte, cfg.PageSize)
+		cells := []BranchCell{
+			{Key: bytes.Repeat([]byte{'a'}, tt), Child: 1},
+			{Key: []byte("bbb"), Child: 2},
+		}
+		if err := EncodeBranch(b, cfg, 5, cells); err != nil {
+			t.Fatalf("EncodeBranch: %v", err)
+		}
+		le.PutUint16(b[branchHeaderEnd+branchDirEntrySize+2:], uint16(tt+1))
+		err := ValidateBranch(b, cfg)
+		if !errors.Is(err, ErrCorrupted) {
+			t.Fatalf("got %v, want ErrCorrupted", err)
+		}
+		if !strings.Contains(err.Error(), "exceeds inline threshold") {
+			t.Errorf("rejection reached the wrong rule: %v", err)
 		}
 	})
 

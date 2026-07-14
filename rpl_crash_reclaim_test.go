@@ -23,13 +23,14 @@ import (
 // allocated (position-independent across arbitrary per-segment tear
 // subsets) and the touched bitmap pages are persisted immediately so
 // a post-crash Check is clean.
-func TestCrashTornReclamationRearmedAtOpen(t *testing.T) {
-	ctx := context.Background()
+// buildTornReclamationCrashImage runs one fixture attempt: drive the
+// workload to a mid-reclamation crash point and synthesize the torn
+// image. Returns ok=false (no test failure) when the byte-granular
+// bitmap revert erased the half-reclaimed window — the caller retries
+// with a fresh allocation draw.
+func buildTornReclamationCrashImage(t *testing.T, ctx context.Context, opts Options) (img []byte, liveAtCrash map[string][]byte, ok bool) {
+	t.Helper()
 	path := tmpPath(t)
-	opts := Options{
-		PageSize: 4096, MinSize: 16, MaxSize: 512,
-		Maintenance: MaintenanceOptions{Disable: true},
-	}
 	db, err := Open(ctx, path, opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -86,7 +87,6 @@ func TestCrashTornReclamationRearmedAtOpen(t *testing.T) {
 	// half-reclaimed window closes.
 	var reclaimedSeg uint64
 	var beforeMark, afterMark int
-	var liveAtCrash map[string][]byte
 	round := 0
 	for ; round < 60; round++ {
 		commit(round)
@@ -169,7 +169,7 @@ func TestCrashTornReclamationRearmedAtOpen(t *testing.T) {
 	ops := rec.ops
 	rec.mu.Unlock()
 	initial := synthImage(preRecorder, ops, beforeMark)
-	img := synthImage(preRecorder, ops, beforeMark)
+	img = synthImage(preRecorder, ops, beforeMark)
 	pageSize := int64(4096)
 	// The probe may reclaim SEVERAL aged segments in one pass. The
 	// dangerous crash shape keeps every reclaimed segment IN the
@@ -243,11 +243,38 @@ func TestCrashTornReclamationRearmedAtOpen(t *testing.T) {
 			}
 		}
 		if freeEntries < 3 {
-			t.Fatalf("fixture drifted: only %d of %d reclaimed-segment entries are free in the crash image (need the half-reclaimed window)", freeEntries, entryCount)
+			t.Logf("fixture attempt drifted: only %d of %d reclaimed-segment entries free in the crash image; retrying", freeEntries, entryCount)
+			return nil, nil, false
 		}
 	}
 	if len(segPages) < 2 {
-		t.Fatalf("fixture drifted: only %d reclaimed segments in the crash image — the multi-segment mixed tear is unpinned", len(segPages))
+		t.Logf("fixture attempt drifted: only %d reclaimed segments in the crash image; retrying", len(segPages))
+		return nil, nil, false
+	}
+	return img, liveAtCrash, true
+}
+
+func TestCrashTornReclamationRearmedAtOpen(t *testing.T) {
+	ctx := context.Background()
+	opts := Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 512,
+		Maintenance: MaintenanceOptions{Disable: true},
+	}
+	// The crash-image construction reverts WHOLE bitmap bytes (the
+	// declared tear model), so when a reclaimed segment's entry-page
+	// ids share a bitmap byte with a reclaimed segment-page id, the
+	// entries' free bits revert too and the image loses the
+	// half-reclaimed window the test exists to pin. That adjacency is
+	// allocation-layout luck; rebuild the fixture (fresh draw) until
+	// the guards hold rather than depend on it.
+	var img []byte
+	var liveAtCrash map[string][]byte
+	built := false
+	for attempt := 0; attempt < 6 && !built; attempt++ {
+		img, liveAtCrash, built = buildTornReclamationCrashImage(t, ctx, opts)
+	}
+	if !built {
+		t.Fatal("fixture: all attempts drifted (bitmap-byte adjacency) — reshape the workload")
 	}
 
 	crashPath := tmpPath(t)

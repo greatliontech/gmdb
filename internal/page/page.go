@@ -42,8 +42,8 @@ func IsLeafType(typ uint8) bool {
 const Magic uint32 = 0x62646D67
 
 // FormatVersion is the current on-disk format version. It is NOT bumped for
-// routine pre-v1 format changes (e.g. the within-page branch
-// prefix-truncation format, page-formats.md §Branch Page): with no installed
+// routine pre-v1 format changes (e.g. the branch-layout replacement,
+// page-formats.md §Plain Branch): with no installed
 // base, a version discriminator would be backcompat scaffolding for files
 // that do not exist — the clean break is to change the format and
 // regenerate. It IS bumped when a change must partition a MIXED-BINARY
@@ -229,20 +229,20 @@ func (c Config) UsableSpace() int {
 
 // InlineThreshold returns T — the largest key length stored wholly
 // inline; longer keys take the overflow-key cell form (page-formats.md
-// §Overflow-Key Cells). T is the largest value such that a branch page
-// holds TWO overflow-key cells at PrefixLen == 0, the split-feasibility
-// floor:
-//
-//	content = ContentEnd - 8 (header) - 8 (leftmost ptr)
-//	          - 4 (PrefixLen + Reserved)                    = ContentEnd - 20
-//	percell = 4 (directory) + T (inline) + 12 (extent ref) + 8 (child)
-//	2 × percell <= content  ⇒  T = (ContentEnd - 68) / 2
-//
-// which is (PageSize-76)/2 with checksums, (PageSize-68)/2 without —
-// the exact constants pinned in limits.md §Maximum Key Size and by
-// TestInlineThresholdValues. A pure function of (PageSize,
-// PageChecksum): the deterministic-encoding invariant depends on every
-// encoder deriving the same T.
+// §Overflow-Key Cells). T is one shared constant across every layout
+// variant — (PageSize-76)/2 with checksums, (PageSize-68)/2 without —
+// chosen so every BRANCH layout holds TWO worst-case overflow-key
+// cells per page and every LEAF layout holds one maximal-form entry
+// (the per-layout split-feasibility floors, page-formats.md §The
+// inline threshold T; the plain branch needs 2T+72 <= PageSize with
+// checksums, the tightest current budget is the segregated branch at
+// 2T+74). The exact constants are pinned in limits.md §Maximum Key
+// Size and by TestInlineThresholdValues; the floors by
+// TestLeafFloorOneMaximalEntryEveryLayout and the branch round-trip
+// floor fixtures. A pure function of (PageSize, PageChecksum): the
+// deterministic-encoding invariant depends on every encoder deriving
+// the same T, and a per-layout T would move the extent cut when a key
+// crosses layout boundaries.
 func (c Config) InlineThreshold() int {
 	return (c.ContentEnd() - 68) / 2
 }

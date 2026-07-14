@@ -308,12 +308,13 @@ func leafUnderflow(buf []byte, cfg page.Config, mergeThreshold uint8) bool {
 
 // branchUnderflow is the analogue for a branch page. The fill-floor is
 // measured on the LOGICAL (uncompressed) content size, not the physical
-// compressed size (range-delete.md §Invariants): within-page prefix
-// truncation (page-formats.md §Branch Page) is a storage optimization that
-// shrinks a same-cluster branch's bytes without reducing its fanout, so a
-// logically-dense branch must not read as underfull just because its shared
-// prefix compressed away. Capacity ("does it fit a page?") still uses the
-// physical BranchEncodedSize; only this floor check is logical.
+// size (range-delete.md §Invariants): a within-page-compressed branch
+// layout (page-formats.md §Segregated Branch) shrinks a same-cluster
+// branch's bytes without reducing its fanout, so a logically-dense
+// branch must not read as underfull just because its shared prefix
+// compressed away. Under the plain layout the two notions coincide;
+// the rule is stated once and holds for both. Capacity ("does it fit
+// a page?") always uses the physical BranchEncodedSize.
 func branchUnderflow(cfg page.Config, cells []page.BranchCell, mergeThreshold uint8) bool {
 	size := page.BranchLogicalSize(cells)
 	return size*100 < int(mergeThreshold)*cfg.ContentEnd()
@@ -322,7 +323,7 @@ func branchUnderflow(cfg page.Config, cells []page.BranchCell, mergeThreshold ui
 // parentFitsSeparator reports whether a parent branch with the given
 // cells still encodes within one page when cells[sepIdx].Key is
 // replaced by newSep. Capacity is PHYSICAL (page.BranchEncodedSize —
-// the within-page prefix truncation applies), matching EncodeBranch's
+// any within-page branch compression applies), matching EncodeBranch's
 // own bound. The swap is transient; cells is restored before return.
 // This is the parentFits predicate handed to the merge/redistribute
 // helpers: a redistribute replaces exactly one parent cell key and
@@ -1686,11 +1687,10 @@ func mergeOrRedistributeBranches(pw PageWriter, cfg page.Config, mergeThreshold 
 	}
 	leftLeftmost, leftCells := page.DecodeBranch(leftSrc, cfg)
 	rightLeftmost, rightCells := page.DecodeBranch(rightSrc, cfg)
-	// Deep-clone Keys: leftCells / rightCells borrow from leftSrc /
-	// rightSrc; we'll FreePage both inputs after the new pages are
-	// encoded, and a sync.Pool-backed slab allocator could in
-	// principle hand the encoder a buffer aliased to one of the
-	// sources. Independent storage is the safe boundary.
+	// BranchCellAt already returns owned Key clones, so these deep
+	// clones are redundant today; they stay as the safety boundary
+	// against a future decoder handing out page-aliased slices —
+	// we FreePage both inputs after the new pages are encoded.
 	for i := range leftCells {
 		leftCells[i].Key = bytes.Clone(leftCells[i].Key)
 	}

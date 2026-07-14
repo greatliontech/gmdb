@@ -67,7 +67,7 @@ type bulkPageWriter interface {
 // branch routing contract — every separator S between adjacent children
 // satisfies max(left subtree) < S ≤ min(right subtree) — so btree.Get and
 // btree.Cursor over the result return each key's value. Leaf-level
-// separators are the prefix-truncated page.ShortestSeparator of (last key
+// separators are the cross-level-truncated page.ShortestSeparator of (last key
 // of the closed leaf, first key of the next leaf); branch-level
 // separators bubble up unchanged, because the separator of the first
 // child a new branch page receives is exactly the separator that page
@@ -278,12 +278,10 @@ func (b *bulkBuilder) addLink(level int, sep []byte, child uint64) error {
 		b.startBranch(bl, sep, child)
 		return nil
 	}
-	// Branch sizing is NON-additive (page-formats.md §Branch Page): the
-	// page-wide shared prefix is stored once, so adding sep — which can only
-	// shrink that prefix (cells arrive in ascending order, sep is the new
-	// largest, prefix = commonPrefix(cells[0], sep)) — lengthens every
-	// existing cell's stored suffix. Recompute the would-be size against the
-	// new prefix rather than accumulating a per-cell cost.
+	// Plain-branch sizing is additive (page-formats.md §Plain Branch):
+	// each cell costs its stored key bytes + directory entry + child
+	// pointer, so the running (count, keyLenSum, extRefs) tally sizes
+	// the would-be page exactly.
 	// Overflow separators (page-formats.md §Overflow-Key Cells): size
 	// with the RESIDENT first-T slice + the 12-byte extent reference;
 	// the extent is written only when the cell is actually appended,
@@ -295,15 +293,11 @@ func (b *bulkBuilder) addLink(level int, sep []byte, child uint64) error {
 	if sepOvk {
 		resident = sep[:t]
 	}
-	newPrefixLen := len(resident)
-	if len(bl.cells) > 0 {
-		newPrefixLen = commonPrefixLen(bl.cells[0].Key, resident)
-	}
 	extRefs := bl.extRefs
 	if sepOvk {
 		extRefs++
 	}
-	if page.BranchEncodedSizeOf(len(bl.cells)+1, bl.keyLenSum+len(resident), newPrefixLen, extRefs) <= b.cfg.ContentEnd() {
+	if page.BranchEncodedSizeOf(len(bl.cells)+1, bl.keyLenSum+len(resident), extRefs) <= b.cfg.ContentEnd() {
 		cell := page.BranchCell{Key: resident, Child: child}
 		if sepOvk {
 			ext, err := writeBulkOverflowChain(b.pw, b.cfg, sep[t:])
@@ -362,19 +356,6 @@ func (b *bulkBuilder) writeBranch(bl *bulkBranchLevel) (uint64, error) {
 	}
 	bl.have = false
 	return id, nil
-}
-
-// commonPrefixLen returns the length of the longest common byte prefix of a
-// and b. Used by the bulk-load branch builder to track the page-wide shared
-// separator prefix incrementally for non-additive branch sizing.
-func commonPrefixLen(a, b []byte) int {
-	n := min(len(a), len(b))
-	for i := range n {
-		if a[i] != b[i] {
-			return i
-		}
-	}
-	return n
 }
 
 // bulkOverflowWriter is the pager surface the streaming overflow-chain

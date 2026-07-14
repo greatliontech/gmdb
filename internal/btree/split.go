@@ -269,7 +269,7 @@ func largestInlineEntry(entries []page.LeafEntry) int {
 // cells are split across two pages — the byte-balanced analogue of
 // findLeafSplitIndex for branch (internal) nodes, per page-formats.md
 // §Leaf Split (the ~50%-of-content bias + lower-index tiebreak) and
-// §Prefix-Truncated Branch Keys (the boundary cell is lifted as the parent
+// §Separator Computation (the boundary cell is lifted as the parent
 // separator).
 //
 // Branch split/redistribute LIFT the boundary cell rather than copying it:
@@ -278,25 +278,24 @@ func largestInlineEntry(entries []page.LeafEntry) int {
 // to the parent as the separator (its Child becomes the right branch's
 // leftmost).
 //
-// TWO size metrics, deliberately distinct (page-formats.md §Branch Page +
-// range-delete.md §Invariants):
+// TWO size metrics, deliberately distinct (page-formats.md §Plain Branch /
+// §Segregated Branch + range-delete.md §Invariants):
 //
 //   - FIT (constraint): each half must encode within one physical page, so
-//     the constraint uses the PHYSICAL (compressed) page.BranchEncodedSize —
-//     this is what EncodeBranch will actually write, so the "halves fit"
-//     decision can't skew from the encoder. Within-page prefix truncation
-//     makes this non-additive (each half recomputes its own shared prefix),
-//     so it is measured per candidate rather than via a prefix sum.
+//     the constraint uses the PHYSICAL page.BranchEncodedSize — this is
+//     what EncodeBranch will actually write, so the "halves fit" decision
+//     can't skew from the encoder. Measured per candidate half rather than
+//     via a prefix sum so the check stays correct under any branch
+//     layout's sizing rules (the plain layout is additive; a
+//     within-page-compressed layout is not).
 //   - BALANCE (objective): among fitting boundaries, minimize the LOGICAL
 //     (uncompressed) imbalance via page.BranchLogicalSize. The fill-floor is
 //     a logical-content property, so balancing logical content is what keeps
 //     a redistribute's two halves both above the floor (range-delete.md
-//     §Invariants) where reachable; a compressed-balanced split could pile
-//     the cheap same-cluster cells on one side and leave the other logically
-//     underfull, spuriously tripping the decline. Balancing logical content
-//     is also exactly the original finding-19 byte-balance (pre-compression,
-//     encoded size == uncompressed == logical), so size-skewed Put splits
-//     still divide the real separator bytes evenly and never overflow a half.
+//     §Invariants) where reachable; under a compressed layout a
+//     physically-balanced split could pile the cheap same-cluster cells on
+//     one side and leave the other logically underfull, spuriously tripping
+//     the decline. Under the plain layout the two metrics coincide.
 //
 // Splitting by cell COUNT (len(cells)/2) is wrong for size-skewed branches:
 // a count midpoint can pile a page-worth of long separators on one half (a
@@ -317,12 +316,12 @@ func largestInlineEntry(entries []page.LeafEntry) int {
 // invariant): a pure function of (cfg, cells); ties in balance resolve to
 // the lower-index boundary (the strict-< update below).
 //
-// Cost is O(n²) — n lift positions, each sizing two halves in O(half) —
-// rather than the O(n) prefix-sum the old additive (uncompressed) model
-// allowed, because within-page truncation makes a half's compressed size
-// depend on its own shared prefix. n is a branch's cell count (tens at
-// typical key sizes) and this runs only on split/redistribute, off the read
-// hot path, so the quadratic scan is not optimized further.
+// Cost is O(n²) — n lift positions, each sizing two halves in O(half).
+// A prefix-sum would suffice for the additive plain layout, but the
+// per-candidate measurement stays correct under any layout's sizing
+// rules. n is a branch's cell count (tens at typical key sizes) and this
+// runs only on split/redistribute, off the read hot path, so the
+// quadratic scan is not optimized further.
 func findBranchSplitIndex(cfg page.Config, cells []page.BranchCell) (mid int, ok bool) {
 	n := len(cells)
 	if n < 2 {
