@@ -20,7 +20,7 @@ Scope:
 - Keyspace descriptor (40 bytes, stored on disk).
 - `Kind` enumeration.
 - Per-keyspace configuration (`RestartGroupTarget`,
-  `FixedValueSize`, `NextSeq`).
+  `NodeLayouts`, `FixedValueSize`, `NextSeq`).
 - Keyspace-name interning (`unique.Handle[string]`).
 - API-level type split (`Keyspace` for key→value, `SetKeyspace`
   for key→sorted-set).
@@ -47,7 +47,7 @@ Invariant: kind=clause-explicit;
     B+tree. The exact field order and sizes are:
     `Root(u64) Count(u64) Kind(u8) FixedValueSize(u16)
     NextSeq(u64) RestartGroupTarget(u16)
-    IndexRegistryRoot(u64) Reserved[3]byte`;
+    IndexRegistryRoot(u64) NodeLayouts(u8) Reserved[2]byte`;
   from=this spec §Keyspace Descriptor;
   violation=Mis-sized or reordered fields break every
     keyspace-table read on disk; an extra byte shifts every
@@ -169,13 +169,13 @@ spec-correct.)
 
 ```
 Keyspace Descriptor (40 bytes)
-+----------+----------+----------+----------------+----------+--------------+--------------------+----------+
-| Root     | Count    | Kind     | FixedValueSize | NextSeq  | RestartGroup | IndexRegistryRoot  | Reserved |
-| uint64   | uint64   | uint8    | uint16         | uint64   | uint16       | uint64             | [3]byte  |
-+----------+----------+----------+----------------+----------+--------------+--------------------+----------+
++----------+----------+----------+----------------+----------+--------------+--------------------+-------------+----------+
+| Root     | Count    | Kind     | FixedValueSize | NextSeq  | RestartGroup | IndexRegistryRoot  | NodeLayouts | Reserved |
+| uint64   | uint64   | uint8    | uint16         | uint64   | uint16       | uint64             | uint8       | [2]byte  |
++----------+----------+----------+----------------+----------+--------------+--------------------+-------------+----------+
 ```
 
-Total: `8 + 8 + 1 + 2 + 8 + 2 + 8 + 3 = 40` bytes.
+Total: `8 + 8 + 1 + 2 + 8 + 2 + 8 + 1 + 2 = 40` bytes.
 
 - **Root** (uint64): page ID of this keyspace's B+tree root.
   `0` ⇒ empty.
@@ -193,9 +193,11 @@ Total: `8 + 8 + 1 + 2 + 8 + 2 + 8 + 3 = 40` bytes.
   First call returns `1`.
 - **RestartGroupTarget** (uint16): per-keyspace target leaf
   restart-group size, bounded to `[0, 255]`. `0` ⇒ engine
-  default (16). `1` ⇒ uncompressed leaves
-  (`TypeLeafUncompressed`); `[2, 255]` ⇒ compressed leaves
-  (`TypeLeaf`) with variable-size groups capped at the target.
+  default (6). `1` ⇒ uncompressed leaves
+  (`TypeLeafUncompressed`); `[2, 255]` ⇒ compressed leaves in
+  the declared leaf layout (`NodeLayouts` below —
+  `TypeLeafSegregated` by default, `TypeLeaf` when interleaved
+  is declared) with variable-size groups capped at the target.
   Values `> 255` are rejected by `Tx.SetKeyspaceConfig()` with
   `ErrInvalidOptions` and by descriptor validation at open with
   `ErrCorrupted` — correctly different classes: the config API
@@ -214,7 +216,36 @@ Total: `8 + 8 + 1 + 2 + 8 + 2 + 8 + 3 = 40` bytes.
   per-keyspace index registry sub-tree (see `indexing.md
   §Storage Layout`). `0` ⇒ no indexes declared on this
   keyspace.
-- **Reserved** (3 bytes): must be zero. `Open()` rejects
+- **NodeLayouts** (uint8): the keyspace's declared node layout
+  variants (`page-formats.md`). Bits 0–1: leaf layout — `0` =
+  engine default, `1` = interleaved (`TypeLeaf`), `2` =
+  segregated (`TypeLeafSegregated`), `3` invalid. Bits 2–3:
+  branch layout — `0` = engine default, `1` = plain
+  (`TypeBranch`), `2` = segregated (`TypeBranchSegregated`), `3`
+  invalid. Bits 4–7: must be zero. `0` defers to the OPENING
+  process's engine default (`Options.LeafLayout` /
+  `Options.BranchLayout`, whose zero values are segregated for
+  both) — resolved at page-build time like `RestartGroupTarget
+  == 0`, never persisted; per-page type-byte dispatch makes a
+  cross-process default mismatch produce mixed-layout pages, not
+  misreads. Invalid field values and non-zero high
+  bits are rejected by `Tx.SetKeyspaceConfig()` /
+  `CreateKeyspace` options with `ErrInvalidOptions` and by
+  descriptor validation at open with `ErrCorrupted` (the same
+  two-class split as `RestartGroupTarget`). Mutable via
+  `Tx.SetKeyspaceConfig()` as a builder hint: pages written after
+  the change use the new layouts; existing pages keep theirs
+  (readers dispatch by page type byte, never by this field —
+  `page-formats.md §Invariants`) and migrate when next split,
+  merged, or rebuilt. A keyspace holds mixed-layout pages during
+  a transition. The uncompressed-leaf selection
+  (`RestartGroupTarget == 1`) overrides the leaf-layout bits.
+  Like `RestartGroupTarget`, the declaration governs the trees
+  built under the keyspace's builder configuration — the row tree
+  and nested set-value trees; the keyspace's index trees build
+  under the engine-wide defaults (their composite keys share no
+  shape with the row keys the per-keyspace tuning targets).
+- **Reserved** (2 bytes): must be zero. `Open()` rejects
   descriptors with non-zero reserved bytes.
 
 Depth (tree height) is not persisted — derived by reading the
@@ -232,15 +263,22 @@ user API returns `ErrKeyspaceReserved`.
 
 ## Per-Keyspace Configuration
 
-Two per-keyspace properties currently:
+Three per-keyspace properties currently:
 
 - `FixedValueSize` — SetKeyspace only, immutable after creation.
 - `RestartGroupTarget` — mutable via `Tx.SetKeyspaceConfig()`.
-  Defaults to engine-global 16. Tune higher (e.g. 32) for
+  Defaults to engine-global 6. Tune higher (e.g. 16) for
   keyspaces with very long shared prefixes (directory listings,
-  deeply nested composite keys); tune lower (e.g. 8) for
-  keyspaces with mostly distinct keys to reduce per-`Prev()`
-  group decode cost.
+  deeply nested composite keys) where density matters more than
+  within-group scan latency; `1` selects the uncompressed
+  variant for keyspaces with mostly distinct keys.
+- `NodeLayouts` — mutable via `Tx.SetKeyspaceConfig()`; leaf and
+  branch layout variants per the descriptor field above. Both
+  default to segregated. Declare the interleaved leaf for
+  write-heavy keyspaces (in-place value splices avoid the
+  segregated value-region shift); declare the plain branch for
+  small hot keyspaces whose separators share little prefix
+  (probe latency floor, no prefix gate).
 
 `SetKeyspaceConfig` works whether or not the keyspace is open in
 the transaction, and its effect is order-independent within the

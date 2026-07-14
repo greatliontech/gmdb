@@ -23,7 +23,7 @@ the triggering consumer — gitfs's cross-runtime change-propagation
 channel — carries a sub-millisecond wake contract that an adaptive
 poll's backoff ceiling cannot honor.
 
-Lands: 7 (`docs/plans/pre-consumer-engine-changes.md`). (weaver's
+Lands: 14 (`docs/plans/pre-consumer-engine-changes.md`). (weaver's
 substrate-watching surfaces — session pickers, unowned-state
 listings — remain follow-on consumers; live streams reach their
 serving process directly and never need this.)

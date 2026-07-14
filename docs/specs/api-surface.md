@@ -356,16 +356,19 @@ caller does not own them.
 txn modifications). Borrowed; valid until the **transaction
 closes** (`Commit()` or `Rollback()`).
 
-**Value slices for overflow entries** are heap-allocated and
-caller-owned. The overflow run's first page carries the page
-header at offset `[0, 8)` and (when `PageChecksum` is enabled)
-every page in the run carries an 8-byte footer at its tail, so
-the value bytes span non-contiguous regions of the mmap and a
-single contiguous borrowed slice cannot represent the assembled
-value. `Get` / `Cursor` assemble the chain into a freshly-
-allocated `[]byte` of length `TotalLen`; lifetime is caller-
-controlled (independent of the transaction). The borrowed-
-reference rule above does not apply to these slices.
+**Value slices for overflow entries** are borrowed references
+like inline values: an overflow run stores its extent bytes as
+ONE contiguous byte range (head-page metadata sits in front, run
+pages carry no footers — `page-formats.md §Overflow Page`), so
+`Get` / `Cursor` return a single borrowed slice of length
+`TotalLen` pointing into the mmap. Valid until the transaction
+closes, exactly as for inline values. (Overflow values written in
+the SAME write transaction live in per-page slab buffers, not the
+mmap — reading one back assembles a freshly-allocated copy whose
+lifetime is caller-controlled.) The normative caller rule is
+uniform regardless of which case produced the slice: treat every
+returned value as borrowed until the transaction closes, and copy
+to keep it longer.
 
 **Key slices** may point into the mmap (any key in an
 uncompressed leaf — `page-formats.md §Uncompressed Leaf` — or
@@ -495,9 +498,10 @@ type Options struct {
     // Must be a power of 2 in [4096, 65536]. Default: 4096.
     PageSize uint32
 
-    // DisablePageChecksum turns OFF the XXH3-64 footers that are
-    // otherwise written and verified on every data page. Stored as a
-    // flag in the meta page — immutable after creation. The zero value
+    // DisablePageChecksum turns OFF the XXH3-64 page footers and
+    // overflow whole-run digests that are otherwise written and
+    // verified on every data page / overflow run. Stored as a flag
+    // in the meta page — immutable after creation. The zero value
     // leaves checksums ENABLED (the spec default); opt out only on
     // media with its own end-to-end integrity. Only used when
     // creating; ignored when opening existing.
@@ -544,15 +548,30 @@ type Options struct {
     // restart-group target (the maximum entries per group on
     // compressed leaves). Per-keyspace overrides via
     // Tx.SetKeyspaceConfig(). Bounded to [0, 255]: 0 ⇒ engine
-    // default (16); 1 ⇒ uncompressed leaf variant
+    // default (6); 1 ⇒ uncompressed leaf variant
     // (page-formats.md §Leaf Page §Uncompressed Leaf), the
     // operational choice for keyspaces whose keys don't share
     // prefixes (random, hash, unique-id); [2, 255] ⇒ compressed
     // leaves with that target. Open() rejects values > 255 with
     // ErrInvalidOptions — the compressed-leaf restart-table
     // Count field is uint8, so 255 is the hard physical cap.
-    // Default: 16.
+    // Default: 6.
     RestartGroupTarget int
+
+    // LeafLayout and BranchLayout are the engine-wide default node
+    // layout variants for keyspaces whose descriptor declares the
+    // engine default (keyspaces.md §Keyspace Descriptor NodeLayouts;
+    // page-formats.md §Leaf Page / §Branch Page). Zero values take
+    // the engine defaults (segregated for both). Per-OPEN, not
+    // persisted (unlike DisablePageChecksum): the opening process's
+    // value resolves descriptor-0 keyspaces at page-build time, the
+    // same semantics as Options.RestartGroupTarget — per-page
+    // type-byte dispatch makes differing defaults across opens
+    // yield mixed-layout pages, never misreads. Per-keyspace
+    // overrides via CreateKeyspace options / Tx.SetKeyspaceConfig().
+    // Open() rejects unknown values with ErrInvalidOptions.
+    LeafLayout LeafLayout     // LeafLayoutDefault | LeafLayoutInterleaved | LeafLayoutSegregated
+    BranchLayout BranchLayout // BranchLayoutDefault | BranchLayoutPlain | BranchLayoutSegregated
 
     // MergeThreshold is the B+tree page fill percentage that doubles
     // as the post-deletion merge trigger AND the maintained non-root
@@ -995,21 +1014,26 @@ func (tx *Tx) DeleteKeyspace(name string) error
 // parent keyspace's index registry, not by name.
 func (tx *Tx) ListKeyspaces() ([]string, error)
 
-// SetKeyspaceConfig updates mutable per-keyspace settings.
-// Currently only RestartGroupTarget. Returns ErrInvalidOptions for
-// out-of-range values (RestartGroupTarget > 255 — the
-// compressed-leaf restart-table Count field is uint8, see
-// page-formats.md §Compressed Leaf). The KeyspaceConfig
-// RestartGroupTarget uses 0 as the "leave unchanged" sentinel
-// (distinct from the descriptor's 0 = engine-default semantic).
-// Returns ErrNotFound when name does not resolve to an existing
-// keyspace (matching Tx.DeleteKeyspace and the
+// SetKeyspaceConfig updates mutable per-keyspace settings:
+// RestartGroupTarget and the node layout declarations. Returns
+// ErrInvalidOptions for out-of-range values (RestartGroupTarget >
+// 255 — the compressed-leaf restart-table Count field is uint8,
+// see page-formats.md §Compressed Leaf — or an unknown layout
+// value). Every KeyspaceConfig field uses its zero value as the
+// "leave unchanged" sentinel (distinct from the descriptor's 0 =
+// engine-default semantic). Layout changes are builder hints:
+// existing pages keep their on-disk variant and migrate when next
+// split, merged, or rebuilt (keyspaces.md §Per-Keyspace
+// Configuration). Returns ErrNotFound when name does not resolve
+// to an existing keyspace (matching Tx.DeleteKeyspace and the
 // Delete-on-miss invariant family). Only valid on a write
 // transaction.
 func (tx *Tx) SetKeyspaceConfig(name string, cfg KeyspaceConfig) error
 
 type KeyspaceConfig struct {
-    RestartGroupTarget uint16 // 0 = leave unchanged; otherwise [1, 255]
+    RestartGroupTarget uint16       // 0 = leave unchanged; otherwise [1, 255]
+    LeafLayout         LeafLayout   // zero = leave unchanged
+    BranchLayout       BranchLayout // zero = leave unchanged
 }
 
 // TxIndexes is the index-administration surface of a write

@@ -3,7 +3,8 @@
 gmdb uses a single hash algorithm — **XXH3-64**
 (`github.com/zeebo/xxh3`, `xxh3.Hash`) — across every persisted
 digest in the file: meta-page checksum (mandatory), data-page
-footers (opt-out, on by default), and the index schema fingerprint
+footers (opt-out, on by default), the overflow-run whole-run
+digest (same flag), and the index schema fingerprint
 (`indexing.md §Drift Guard`). One hash family means one
 implementation, one performance profile, and no algorithm version
 flags.
@@ -12,6 +13,8 @@ Scope:
 - Meta-page checksum: always-on, atomic-commit anchor.
 - Data-page footer: enabled-at-creation flag, immutable for the
   life of the file.
+- Overflow-run digest: whole-run, head-resident — run pages carry
+  no per-page footers.
 - Storage layout, algorithm, verification, computation rules.
 - What checksums catch and what they do not.
 
@@ -64,13 +67,34 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=When checksums are enabled, the footer occupies the
-    last 8 bytes of every data page (Branch, Leaf, Overflow,
-    RPL segment). The footer covers bytes 0 through
-    `PageSize - 9` inclusive — including the page header;
+    last 8 bytes of every data page EXCEPT overflow-run pages
+    (Branch, Leaf, RPL segment). The footer covers bytes 0
+    through `PageSize - 9` inclusive — including the page header;
   from=this spec §Storage;
   violation=A footer that omits the header lets a corrupted
     header survive verification — wrong `Type` or `Count` is
     then accepted as authentic.
+
+Invariant: kind=clause-explicit;
+  property=When checksums are enabled, an overflow run's ONLY
+    integrity cover is the whole-run XXH3-64 digest at head-page
+    offset 8, computed over the run's FULL content range (head
+    content start through the last follower's end — the range
+    `AdditionalPages` determines, with slack past the extent
+    length zero on write), so the run verifies standalone from
+    its head; no page of the run — head or follower — carries a
+    per-page footer;
+  from=this spec §Overflow-Run Digest + `page-formats.md
+    §Overflow Page`;
+  violation=A per-page footer anywhere in the run punches a hole
+    in the extent byte range — a borrowed single-slice value
+    returns digest bytes as value data, and the capacity
+    arithmetic double-counts the footer bytes. A digest over only
+    the extent length is unverifiable from the head alone (the
+    length lives in the referencing leaf/branch cell, not the
+    run), so the proactive scrub either skips every run or hashes
+    the wrong byte count and reports healthy runs corrupt.
+    Lands: when the whole-run digest encoding is first written.
 
 Invariant: kind=clause-explicit;
   property=Bitmap pages do not carry checksums (no page header
@@ -119,9 +143,11 @@ Stored as the trailing `uint64` of the meta page payload (see
 
 ## Data Page Checksums (On by Default)
 
-Data pages (branch, leaf, overflow, RPL segment) carry an 8-byte
-XXH3-64 footer in the last 8 bytes of the page when checksums
-are enabled.
+Data pages (branch, leaf, RPL segment) carry an 8-byte XXH3-64
+footer in the last 8 bytes of the page when checksums are
+enabled. Overflow-run pages are the exception: the run is covered
+by one whole-run digest (§Overflow-Run Digest) and its pages
+carry no footers.
 
 Checksums are ON by default: a zero-value `Options` creates a
 checksummed database. Opt out with `Options.DisablePageChecksum =
@@ -163,6 +189,44 @@ guaranteed by the CoW model and the meta page checksum (the
 meta references the bitmap indirectly through `NumFreePages`
 and the page-allocation invariants that `Check()` verifies).
 
+## Overflow-Run Digest
+
+Overflow runs (`page-formats.md §Overflow Page`) are covered by
+ONE XXH3-64 digest per run, stored in the head page at offset 8
+(immediately after the 8-byte page header), computed over the
+run's FULL content range: head content start (offset 16) through
+the end of the last follower page — the range determined by the
+head's `AdditionalPages` alone. Slack bytes past the extent
+length are zero on write, so the digest domain is fully
+determined; covering the whole range rather than the extent
+length keeps the run verifiable STANDALONE from its head — the
+extent length lives only in the referencing leaf/branch cell
+(`TotalLen` for values, `KeyTotalLen - T` for key extents), which
+the proactive scrubber (`background-maintenance.md §Checksum
+Scrubbing`) does not have. No page of the run carries a per-page
+footer — the extent bytes are one uninterrupted range from head
+offset 16 through the follower pages, which is what makes an
+overflow value returnable as a single borrowed slice
+(`api-surface.md §Byte Slice Ownership`).
+
+The digest is verified on **first access to the run per
+transaction** — one hash pass over the run's content range,
+cached on the pager keyed by the run's head page ID exactly like
+per-page verification. A mismatch returns `ErrBadPageChecksum`
+with the head page ID. Value reads consume runs whole, so
+verification adds at most one page of extra hashing (the slack)
+over the retired per-page-footer form; a key-extent COMPARISON
+can early-out on the first divergent byte, so for key extents
+the first-access verification does hash bytes the comparison
+would skip — the price of catching bitrot in bytes that a later
+tie-through comparison would trust. The write path saves `N`
+footer computations per run; the read path drops the
+footer-skipping reassembly entirely.
+
+With checksums disabled the digest field is absent (extent bytes
+start at head offset 8), matching the footer rule for other data
+pages.
+
 ## Algorithm: XXH3-64
 
 `xxh3.Hash` from `github.com/zeebo/xxh3`. Pure Go with
@@ -197,6 +261,14 @@ within the same transaction. For a depth-4 lookup the cost is
 ~200–320 ns — negligible compared to traversal and potential
 page-fault costs. For full-database scans the cost is bounded
 by memory bandwidth.
+
+Overflow runs verify by the whole-run digest instead
+(§Overflow-Run Digest): on first access to the run in a
+transaction, one XXH3-64 pass over the run's content range
+(determined by the head's `AdditionalPages`) is compared against
+the head-resident digest, cached keyed by the head page ID;
+mismatch ⇒ `ErrBadPageChecksum` with the head page ID. Run pages
+never take the per-page footer path.
 
 RPL segment pages are read outside the verifying page accessor
 (the reclamation walk, the Open-time chain rebuild, and Check's
@@ -292,6 +364,13 @@ on-disk surface.
 When checksums are enabled, the XXH3-64 footer is computed on
 each dirty slab buffer at commit time, before the pwrite. The
 footer is written into the last 8 bytes of the buffer.
+
+An overflow run's whole-run digest is computed over the run's
+full content range — extent bytes plus zeroed slack — when the
+run is assembled (the extent is written once and never mutated in
+place — CoW carries runs by reference) and written into the head
+buffer at offset 8 before the head's pwrite; follower buffers are
+pure extent bytes.
 
 ## What Checksums Do and Do Not Catch
 

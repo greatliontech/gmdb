@@ -329,9 +329,12 @@ contract still holds.
 
 For each `(pageID, buf)` in `p.dirty` (now containing data pages, RPL
 segment pages, and modified bitmap pages): compute the XXH3-64
-footer (if `PageChecksum`), then `pwrite(fd, *buf, pageID *
-pageSize)`. Order within step 1 is unspecified; implementations may
-coalesce contiguous runs via `pwritev2` on Linux.
+footer (if `PageChecksum`; overflow-run buffers are exempt — the
+run's whole-run digest is written into the head buffer at run
+assembly, `checksums.md §Overflow-Run Digest`), then `pwrite(fd,
+*buf, pageID * pageSize)`. Order within step 1 is unspecified;
+implementations may coalesce contiguous runs via `pwritev2` on
+Linux.
 
 A partial-success pwrite (some pages reach the page cache, others
 fail mid-step) is crash-equivalent: meta is untouched, the previous

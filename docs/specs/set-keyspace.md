@@ -240,12 +240,15 @@ Two storage strategies based on value-set size:
 A subpage is stored in the leaf entry's value area.
 `CellFlags.MultiValue` is set and `CellFlags.NestedTree` is clear.
 The entry uses the standard restart/delta key encoding from
-`page-formats.md`; the subpage occupies the inline value half —
-the `ValueLen u32` prefix from `page-formats.md §Leaf Page` is
-present and equals `4 + DataSize` (the subpage header + entry
-bytes). The leaf layer carries the subpage bytes opaque-through;
-the subpage's internal structure (Count / DataSize / entries) is
-decoded by the SetKeyspace layer, not by the leaf.
+`page-formats.md`; the subpage occupies the value half — in the
+interleaved leaf the `ValueLen u32` prefix from `page-formats.md
+§Leaf Page` is present and equals `4 + DataSize` (the subpage
+header + entry bytes); in the segregated leaf the subpage bytes
+are the entry's value-region content and the length is derived by
+entry order (`page-formats.md §Segregated Leaf`). The leaf layer
+carries the subpage bytes opaque-through; the subpage's internal
+structure (Count / DataSize / entries) is decoded by the
+SetKeyspace layer, not by the leaf.
 
 ```
 SetKeyspace Subpage Entry (restart)        Subpage size = ValueLen = 4 + DataSize

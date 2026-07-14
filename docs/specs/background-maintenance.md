@@ -159,11 +159,22 @@ Invariant: kind=entailed;
 Invariant: kind=entailed;
   property=The scrubber footer-verifies only pages it can
     prove carry a footer: allocated pages (the snapshot
-    bitmap's bit is clear) in `[firstData, HighWaterMark)`.
-    The meta/bitmap region (`< firstData`) carries no
-    XXH3-64 footer (`checksums.md §Storage`), and a free or
-    never-written page holds no valid footer — neither is
-    verified;
+    bitmap's bit is clear) in `[firstData, HighWaterMark)`
+    that are not overflow-run pages. The meta/bitmap region
+    (`< firstData`) carries no XXH3-64 footer (`checksums.md
+    §Storage`), a free or never-written page holds no valid
+    footer, and overflow runs carry a whole-run digest instead
+    of footers (`checksums.md §Overflow-Run Digest`) — the
+    sequential scan verifies a run standalone by its head digest
+    when it reaches the head page (type byte `TypeOverflow`) and
+    advances past the `AdditionalPages` followers, which are
+    headerless and identifiable only from their head. Because
+    follower classification depends on having entered the run at
+    its head, a pass may only BEGIN at a position proven not to
+    be inside a run: the cursor's re-anchor rule (§Checksum
+    Scrubbing) — a pass whose anchor no longer validates restarts
+    from `firstData` instead of scanning from a position that
+    inter-pass reallocation may have absorbed into a run;
   from=entailed: §Checksum Scrubbing says "verify data pages
     sequentially" but does not state which pages carry a
     footer; the gate is the assumption that makes that
@@ -172,8 +183,15 @@ Invariant: kind=entailed;
     `[firstData, HighWaterMark)`, i.e. the common case — an
     ungated sequential verify emits a spurious
     `BadPageChecksum` `CheckWarning` for every free page,
-    flooding the log and burying real bitrot. The
-    proactive-detection intent inverts into noise.
+    flooding the log and burying real bitrot. Without the
+    re-anchor rule: pass k ends at a valid boundary; between
+    passes the surrounding pages are freed and reallocated into
+    one overflow run spanning that boundary; pass k+1 starts on
+    what is now a follower — arbitrary extent bytes — and either
+    reports a false `BadPageChecksum` on healthy data or reads a
+    garbage `AdditionalPages` and silently skips a window of real
+    node pages. The proactive-detection intent inverts into
+    noise.
 
 ## Coordination
 
@@ -305,21 +323,68 @@ performs a background read-only scan that verifies XXH3-64
 footers on data pages proactively — before they are accessed
 by a user transaction. Catches silent bitrot early.
 
-Each pass scans up to `ScrubBatchSize` page IDs (default 4096)
-in a read transaction, advancing through the data region
-sequentially across passes. A `ScrubCursor` on the DB tracks
+Each pass scans approximately `ScrubBatchSize` page IDs (default
+4096; a target, not a bound — see the run rule below) in a read
+transaction, advancing through the data region sequentially
+across passes. A `ScrubCursor` on the DB tracks
 the next page ID, wrapping at `HighWaterMark`. A full scrub
 cycle covers the data region over
 `ceil((HighWaterMark - firstData) / ScrubBatchSize)` passes.
 
 The scan footer-verifies only **allocated** pages (the
 snapshot bitmap's bit is clear) in `[firstData,
-HighWaterMark)` — data and RPL segment pages, both of which
-carry a footer (`pager-slab.md §Commit`). Free page IDs in
-that window are advanced over but not verified — a free page
-holds no valid footer. The meta/bitmap region (`< firstData`)
-is excluded entirely: those pages carry no XXH3-64 footer
-(`checksums.md §Storage`).
+HighWaterMark)` — node and RPL segment pages, which carry a
+footer (`pager-slab.md §Commit`). An allocated page whose
+type byte is `TypeOverflow` heads a run: the scrubber
+verifies the run's whole-run digest standalone (`checksums.md
+§Overflow-Run Digest` — the digest covers the
+`AdditionalPages`-determined content range, so no referencing
+cell is needed) and advances past the follower pages, which
+carry neither header nor footer and are identifiable only
+from their head. `ScrubBatchSize` is a target, not a bound: a
+pass never ends inside a run — it advances past the whole run
+before stopping. Free page IDs in the window are advanced
+over but not verified — a free page holds no valid footer.
+The meta/bitmap region (`< firstData`) is excluded entirely:
+those pages carry no XXH3-64 footer (`checksums.md
+§Storage`).
+
+**Cursor re-anchoring.** Follower pages are classifiable only
+by scanning forward from a position known not to be inside a
+run, and pages around a paused cursor can be freed and
+reallocated into a new run between passes. The `ScrubCursor` IS
+therefore an **anchor**, not a bare page ID: the ID and verified
+digest of the last allocated object the previous pass verified —
+a node/RPL page (footer digest) or a whole overflow run (head ID
++ whole-run digest). At pass start the anchor is revalidated
+against the new snapshot: still allocated, and its digest —
+recomputed over the footer page or over the run range the head's
+CURRENT `AdditionalPages` describes — unchanged. The pass then
+resumes at the anchor's end + 1: a valid anchor establishes that
+position is an object boundary, because a run absorbing it would
+have to overwrite the anchor's own bytes and thereby change the
+digest — up to CONTENT EQUALITY: extent bytes that happen to
+byte-replicate the old anchor image (user-stored page images, or
+an engineered XXH3-64 collision — the hash is non-cryptographic)
+revalidate a stale anchor. The residual is accepted: the scrubber
+is report-only, a misaligned pass emits bounded spurious warnings
+or skips a bounded window before realigning at the mimic run's
+end, and `Check()` remains the authoritative verifier. A new run
+may legitimately START at the resume position, in which case its
+`TypeOverflow` head is read normally. Free pages after the
+anchor are skipped by the new snapshot's bitmap, and pages the
+previous pass merely skipped as free are re-examined — redundant
+verification, never misclassification. An invalid anchor
+produces NO warning; the cursor resets to `firstData` and the
+cycle restarts — `firstData` is never a follower, since a
+follower always sits above its head and every head is
+`>= firstData`. Restart-on-invalidation makes full-cycle
+coverage CONDITIONAL on anchor stability: a workload that
+recycles the frontier pages between every pair of passes can
+starve the tail of the scan region indefinitely, and the
+cycle-length formula above is then an upper bound on luck, not a
+guarantee — accepted for a best-effort subsystem, stated so the
+coverage claim is not read as unconditional.
 
 The scrubber is **best-effort and report-only**, not a
 substitute for `Check`. The allocated/free gate uses a bitmap

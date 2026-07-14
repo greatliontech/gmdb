@@ -123,8 +123,11 @@ number of bitmap pages is determined by `MaxSize` at database
 creation time:
 
 ```
-BitmapPages = ceil((MaxSize / PageSize) / (PageSize * 8))
+BitmapPages = ceil(MaxSize / (PageSize * 8))
 ```
+
+(`MaxSize` is denominated in PAGES — §Meta Page — and each bitmap
+page carries `PageSize × 8` bits, one per page.)
 
 Data pages (B+tree nodes, overflow pages, RPL segment pages) begin
 immediately after the bitmap region. See `free-space.md` for the
@@ -144,10 +147,13 @@ Page Header (8 bytes)
 ```
 
 - **Type** (uint8): one of `Branch`, `Leaf`, `Overflow`,
-  `RPLSegment`, `LeafUncompressed`. `Leaf` is the
-  prefix-compressed leaf variant; `LeafUncompressed` is the
-  variant selected by `RestartGroupTarget == 1` (see
-  `page-formats.md §Leaf Page`). Meta pages and bitmap pages do
+  `RPLSegment`, `LeafUncompressed`, `LeafSegregated`,
+  `BranchSegregated`. `Branch` is the plain branch layout and
+  `BranchSegregated` the segregated one; `Leaf` is the
+  interleaved prefix-compressed leaf variant, `LeafSegregated`
+  the segregated one, and `LeafUncompressed` the variant
+  selected by `RestartGroupTarget == 1` (see `page-formats.md
+  §Leaf Page` / §Branch Page). Meta pages and bitmap pages do
   not carry the page header.
 - **Flags** (uint8): reserved for future per-page flags. Must be
   zero on write. Readers must reject pages with unknown flags set.
@@ -175,8 +181,9 @@ on-disk structures, with different read-time rules:
   each leaf page is self-describing and a mixed-version
   keyspace can hold pages from multiple encoder eras.
 - **Reserved bytes in fixed-format meta structures** (keyspace
-  descriptor `Reserved [3]byte` in `keyspaces.md §Keyspace
-  Descriptor`; future analogous slots in the meta page). *Strict-
+  descriptor `Reserved [2]byte` and the `NodeLayouts` high bits
+  in `keyspaces.md §Keyspace Descriptor`; future analogous slots
+  in the meta page). *Strict-
   reject* on read: the descriptor is part of the meta-page atomic
   unit and extending it requires a meta-page format version bump,
   not a silent per-record extension. Forward-compatibility for
@@ -208,8 +215,10 @@ verifies page type and structural validity at each offset; no stored
 PageID is needed.
 
 When `PageChecksum` is enabled (the default), every data page
-(branch, leaf, overflow, RPL segment) carries an 8-byte XXH3-64
-footer in the last 8 bytes of the page. See `checksums.md`.
+except overflow-run pages (branch, leaf, RPL segment) carries an
+8-byte XXH3-64 footer in the last 8 bytes of the page; overflow
+runs carry one head-resident whole-run digest instead. See
+`checksums.md`.
 
 ## Meta Page
 

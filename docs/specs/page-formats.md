@@ -1,23 +1,36 @@
 # Page Formats
 
 On-disk formats for the per-page structures stored in data pages:
-branch pages (internal B+tree nodes), leaf pages (two variants —
-prefix-compressed `TypeLeaf` and uncompressed `TypeLeafUncompressed`),
-and overflow pages (large value storage). Set-keyspace subpages and
-nested B+tree references are leaf-cell variants defined in
-`set-keyspace.md`. RPL segment pages live in `free-space.md`.
+branch pages (internal B+tree nodes — two layout variants, plain
+`TypeBranch` and segregated `TypeBranchSegregated`), leaf pages
+(three variants — interleaved prefix-compressed `TypeLeaf`,
+segregated prefix-compressed `TypeLeafSegregated`, and uncompressed
+`TypeLeafUncompressed`), and overflow pages (large value and key
+storage). Set-keyspace subpages and nested B+tree references are
+leaf-cell variants defined in `set-keyspace.md`. RPL segment pages
+live in `free-space.md`.
+
+Every page's first byte identifies its type AND layout variant;
+readers dispatch on it and reject unknown values. Layout variants
+are per-keyspace declared (`keyspaces.md §Per-Keyspace
+Configuration`) but per-page dispatched: a reader NEVER derives a
+page's layout from keyspace configuration — the keyspace can hold
+a mix of variants during a configuration transition, exactly as it
+can hold mixed compressed/uncompressed leaves.
 
 Scope:
-- Branch page layout, prefix-truncated separator computation.
-- Compressed leaf page layout with variable-size restart groups,
-  restart vs delta entries, overflow references.
+- Branch page layouts (plain, segregated), separator computation.
+- Interleaved and segregated compressed leaf layouts with
+  variable-size restart groups, restart vs delta entries, overflow
+  references.
 - Uncompressed leaf page layout (selected when `RestartGroupTarget
   == 1`).
 - Leaf lookup, insert/delete, split, and the `LeafIter`
   bidirectional iterator used by `btree.Cursor`.
 - Overflow-key cells: the inline threshold `T`, leaf and branch
   overflow-key forms, comparison and lifecycle rules.
-- Overflow page format and run construction.
+- Overflow page format, run construction, and the whole-run
+  digest.
 - NUL-escape encoding for composite index keys.
 
 Depends on / interacts with:
@@ -35,7 +48,7 @@ Invariant: kind=clause-explicit;
     child `R` satisfies `max(L) < S <= min(R)` — every key in the
     left subtree compares strictly less than `S`, every key in the
     right subtree compares greater than or equal to `S`;
-  from=this spec §Prefix-Truncated Branch Keys;
+  from=this spec §Separator Computation (Cross-Level Truncation);
   violation=A separator outside this range routes a search to the
     wrong subtree (key with `S <= k < min(R)` falls left and is not
     found; key with `max(L) < k < S` falls right and is not found),
@@ -43,15 +56,16 @@ Invariant: kind=clause-explicit;
     silent data loss to the caller.
 
 Invariant: kind=entailed;
-  property=A branch cell stores only the separator suffix after the
-    page-wide prefix `P` (`PrefixLen` bytes); the full separator is
-    `P || Suffix[i]`. A reader MUST account for `P` before comparing
-    suffixes — compare `target` against `P` first (descend leftmost
-    when `target < P`, rightmost when `target > P` without sharing all
-    of `P`) and binary-search suffixes only for a `target` that starts
-    with `P`. The encoding round-trips: `decode(encode(cells))`
-    reconstructs every cell's full key `P || Suffix[i]` and child
-    exactly;
+  property=A segregated-branch cell stores only the separator suffix
+    after the page-wide prefix `P` (`PrefixLen` bytes); the full
+    separator is `P || Suffix[i]`. A reader MUST account for `P`
+    before comparing suffixes — compare `target` against `P` first
+    (descend leftmost when `target < P`, rightmost when `target > P`
+    without sharing all of `P`) and binary-search suffixes only for a
+    `target` that starts with `P`. The encoding round-trips:
+    `decode(encode(cells))` reconstructs every cell's full key
+    `P || Suffix[i]` and child exactly. (The plain branch stores full
+    separators — no prefix accounting exists to get wrong.);
   from=entailed: the clause-explicit separator-routing invariant above
     fixes the separator VALUES but not how a within-page-compressed
     branch stores or searches them; no single clause states that the
@@ -64,6 +78,48 @@ Invariant: kind=entailed;
     `ErrNotFound` for a key that is present. Equivalently, a
     prefix/suffix split that drops or duplicates a boundary byte
     reconstructs a wrong full key on decode and on the split-time lift.
+
+Invariant: kind=entailed;
+  property=A reader dispatches a page's layout variant by the page's
+    type byte alone, never by the owning keyspace's declared layout
+    configuration;
+  from=entailed: layout declarations are mutable builder hints
+    (`keyspaces.md §Per-Keyspace Configuration`) and a keyspace holds
+    mixed-variant pages during a transition — the `RestartGroupTarget`
+    precedent; no clause states that the per-page type byte, not the
+    descriptor, is the decode authority;
+  violation=A layout config change mid-transition makes a
+    config-driven reader decode an old-variant page with the new
+    variant's offset arithmetic — fabricated entries or slice-bounds
+    panics on a page every write-path rule produced correctly.
+    Lands: when the second layout variant of either node kind is
+    first written.
+
+Invariant: kind=entailed;
+  property=Every supported BRANCH layout holds at least two
+    worst-case overflow-key cells (`PrefixLen == 0` where the layout
+    has a prefix) at every page size, and every supported LEAF
+    layout holds at least ONE maximal-form entry (overflow key +
+    overflow value) per page — the split-feasibility floor is
+    per-layout, preserved by construction under the shared inline
+    threshold `T`. The floors differ by node kind because splits
+    do: a branch split must leave two routable separators per half,
+    while a leaf split may legally produce single-entry leaves;
+  from=entailed: `limits.md §Maximum Key Size` derives `T` so a
+    branch can always split; making layouts per-keyspace silently
+    re-scopes that floor — the spec is incoherent if some declared
+    layout cannot hold two separators, or if a legal entry cannot
+    be encoded on an empty page of its own layout;
+  violation=A keyspace declared to a layout whose per-cell overhead
+    exceeds the derivation's budget reaches a branch page that must
+    split but cannot encode two overflow separators — the insert
+    wedges with no in-spec recovery path (every other clause holds:
+    the keys are legal, the cut is at `T`, the extents are valid).
+    Two maximal leaf entries per page is NOT required and does not
+    hold (two overflow-key + overflow-value entries exceed
+    `PageSize` at every size); requiring it would misderive `T`.
+    Lands: when the second layout variant of either node kind is
+    first written.
 
 Invariant: kind=clause-explicit;
   property=Within a leaf restart group, the entry at the group's
@@ -84,10 +140,13 @@ Invariant: kind=clause-explicit;
 
 Invariant: kind=clause-explicit;
   property=A leaf page's entry data is one contiguous stream
-    starting at the entry-data start (byte offset 12) and ending
-    exactly at `DataEnd`, entries in index order; every lookup-table
-    entry (compressed restart-table Offset, uncompressed
-    offset-table slot) equals its entry's position in that stream;
+    starting at the variant's entry-data start (byte offset 12;
+    segregated: 14) and ending exactly at `DataEnd`, entries in
+    index order; every lookup-table entry (compressed restart-table
+    Offset, uncompressed offset-table slot) equals its entry's
+    position in that stream. In the segregated variant the stream
+    holds entry headers and key bytes only — value bytes live in
+    the value region and are excluded from this clause;
   from=this spec §Cursor Iteration and §Leaf Page — the consumers
     that decode by CONTINUATION with the unchecked hot-path
     decoders: the compressed streaming iterator and first-key
@@ -144,15 +203,42 @@ Invariant: kind=clause-explicit;
     silently violates the binary-search contract.
 
 Invariant: kind=clause-explicit;
-  property=An overflow run of `1 + N` pages stores
-    `(PageSize - 8) + N * PageSize` bytes of value (subtract 8 per
-    page for the footer when `PageChecksum` is enabled). The first
-    page carries `AdditionalPages = N` in its header; follower pages
-    carry no header;
+  property=An overflow run of `1 + N` physically consecutive pages
+    stores `(PageSize - HeadMeta) + N * PageSize` extent bytes as ONE
+    contiguous byte range starting at the head page's content start
+    (`HeadMeta` = 16 with `PageChecksum`, 8 without). The head page
+    carries `AdditionalPages = N` in its header and, when
+    `PageChecksum` is enabled, an 8-byte XXH3-64 whole-run digest
+    immediately after the header, computed over the run's FULL
+    content range (content start through the last follower's end),
+    with slack bytes past the extent length zero on write; follower
+    pages carry no header, no footer, and no digest — nothing
+    interrupts the extent byte range;
   from=this spec §Overflow Page;
   violation=Reading a value with the wrong run-length truncates the
     value (short read) or runs past the run into another page
-    (returning interleaved bytes from an unrelated allocation).
+    (returning interleaved bytes from an unrelated allocation). Any
+    per-page metadata inside the run (the retired follower-footer
+    form) punches holes in the range — a borrowed single-slice value
+    would expose digest bytes as value data. A digest over only the
+    extent length is unverifiable from the head alone (the length
+    lives in the referencing cell), so the proactive scrub either
+    skips runs or false-positives on every run with slack.
+    Lands: when the whole-run digest encoding is first written.
+
+Invariant: kind=clause-explicit;
+  property=A segregated-leaf entry locates its value by an absolute
+    page offset (`VOff`); the value's LENGTH is derived by entry
+    order — the next entry's `VOff` in entry order, or `ValueEnd`
+    for the last entry — never by comparing value addresses;
+  from=this spec §Segregated Leaf;
+  violation=Zero-length values make adjacent entries share a
+    `VOff`; any maintenance rule keyed on value addresses ("shift
+    every value at-or-above X") misclassifies the boundary entry —
+    one splice later an entry's derived length swallows its
+    neighbour's value bytes while every offset individually stays
+    in range.
+    Lands: when the segregated leaf encoding is first written.
 
 Invariant: kind=clause-explicit;
   property=The NUL-escape encoding (every `0x00` inside a column →
@@ -268,119 +354,157 @@ Invariant: kind=entailed;
 ## Branch Page (Internal B+tree Node)
 
 Branch pages store separator keys and child page pointers. They do
-NOT store values. Separators are **prefix-truncated within the page**:
-the single common prefix `P` of all separators on the page is stored
-once, and each cell stores only the separator's suffix after `P` (see
-§Prefix-Truncated Branch Keys for why this is effective and how it
-composes with the cross-level truncation).
+NOT store values. Keys are stored in sorted order; for a branch
+with N cells (N keys) there are N+1 child pointers: `Ptr[0]`
+(leftmost, stored after the page header) plus one child pointer per
+cell. The descent contract is layout-independent: the descent index
+`i` is the number of separators `<= target` — `i == 0` → `Ptr[0]`;
+`0 < i <= N` → the child pointer of cell `i-1`. When `target`
+equals a separator, the search returns the index past it, so the
+target descends into that separator's right child (separators are
+right-child lower bounds; §Separator Computation).
+
+Two branch layout variants exist, declared per-keyspace
+(`keyspaces.md §Per-Keyspace Configuration`) and dispatched
+per-page by the type byte:
+
+- **Plain branch (`TypeBranch`).** Full separator bytes per cell.
+  Every binary-search probe compares directly against stored
+  separator bytes — no prefix gate, no reconstruction.
+- **Segregated branch (`TypeBranchSegregated`).** The separators'
+  single shared prefix stored once, suffix bytes packed in a heap
+  addressed by an offsets-only directory, child pointers in a
+  separate array.
+
+Both encodings are pure functions of `(cfg, leftmost, cells)` — a
+`Check()` re-encode is byte-identical to the original writer's
+output (the §Leaf Split deterministic-encoding invariant, for
+branch pages).
+
+### Plain Branch (`TypeBranch`)
 
 ```
-Branch Page
+Plain Branch Page
 +-----------------------+ offset 0
 | Page Header (8 bytes) | Type=TypeBranch, Count=N
++-----------------------+ offset 8
+| Ptr[0] (uint64)       |  leftmost child pointer (8 bytes)
++-----------------------+ offset 16
+| Cell Directory        |  Array of (Offset uint16, KeyLen uint16)
+| ...                   |  grows forward, 4 bytes per cell
++-----------------------+
+|       free space      |
++-----------------------+
+| ...                   |
+| Cell Data 1           |  each cell: KeyBytes || ChildPtr(uint64),
+| Cell Data 0           |  packed backward from ContentEnd
++-----------------------+ ContentEnd (PageSize - optional 8-byte footer)
+```
+
+Each cell stores the FULL separator bytes followed by its right
+child pointer; the directory's `Offset` points at the separator's
+first byte and `KeyLen` gives its length. Search is a binary
+search over the directory comparing `target` against the stored
+bytes directly.
+
+Bit 15 of the directory's `KeyLen` marks an **overflow branch
+cell** (§Overflow-Key Cells): a cell whose full separator exceeds
+`T` bytes. The low 15 bits give the inline length — always exactly
+`T`, which fits 15 bits at every page size — and the cell data is
+`Inline(T bytes) || KeyExtPage(uint64) || KeyTotalLen(uint32) ||
+ChildPtr(uint64)`. The inline bytes are `separator[0:T]` and the
+extent holds `separator[T:]`; comparison follows the
+§Overflow-Key Cells rule. Cells whose full separator is `<= T`
+are unchanged.
+
+### Segregated Branch (`TypeBranchSegregated`)
+
+```
+Segregated Branch Page
++-----------------------+ offset 0
+| Page Header (8 bytes) | Type=TypeBranchSegregated, Count=N
 +-----------------------+ offset 8
 | Ptr[0] (uint64)       |  leftmost child pointer (8 bytes)
 +-----------------------+ offset 16
 | PrefixLen (uint16)    |  length of the page-wide shared prefix P
 | Reserved  (uint16)    |  zero on write (keeps the directory at offset 20)
 +-----------------------+ offset 20
-| Cell Directory        |  Array of (Offset uint16, SuffixLen uint16)
-| ...                   |  grows forward, 4 bytes per cell
+| Offsets Directory     |  (N+1) × uint16, heap-relative, growing
+| ...                   |  forward; slot N is the heap-end sentinel
++-----------------------+ heap base = 20 + 2×(N+1)
+| Suffix Heap           |  suffix bytes packed forward in key order
 +-----------------------+
 |       free space      |
 +-----------------------+
-| ...                   |
-| Cell Data 1           |  each cell: SuffixBytes || ChildPtr(uint64),
-| Cell Data 0           |  packed below the prefix region, growing backward
-+-----------------------+ ContentEnd - PrefixLen
+| Child Pointer Array   |  N × uint64, packed ending at the prefix
++-----------------------+ ContentEnd - PrefixLen - 8×N
 | Prefix bytes P        |  the page-wide shared prefix, PrefixLen bytes
 +-----------------------+ ContentEnd (PageSize - optional 8-byte footer)
 ```
 
-Each cell in the data area stores the separator **suffix** (the bytes
-after the page-wide prefix `P`) followed by its right child pointer:
+Cell `i`'s suffix occupies heap span `[Off[i], Off[i+1])` — the
+directory stores offsets only; lengths derive from adjacent slots,
+with slot `N` as the sentinel naming the heap's end. Offsets are
+heap-relative, so growing the directory by one slot moves the heap
+base without rewriting any stored offset. The full separator of a
+(non-overflow) cell is `P || heap[Off[i]:Off[i+1]]`. Cell `i`'s
+child pointer sits at `ContentEnd - PrefixLen - 8×(N - i)`.
 
-```
-Branch Cell
-+--------------+----------+
-| Suffix bytes | ChildPtr |
-| key[len(P):] | uint64   |
-+--------------+----------+
-```
+`P` is the common prefix of the whole sorted separator set —
+`commonPrefix(first, last)` — **capped at `T` bytes**
+(`PrefixLen <= T`; the cap keeps `P` physically resident and part
+of the deterministic pure-function encoding when separators share
+a longer-than-`T` prefix; a shorter-than-true-common `P` is always
+correct, the residue simply stays in the suffixes). At
+`PrefixLen == 0` every cell stores its full key in the heap.
 
-The full separator key of cell `i` is `P || Suffix[i]`. Because cells
-are stored in sorted key order, `P = commonPrefix(cell[0], cell[N-1])`
-— the common prefix of the whole sorted set — **capped at `T`
-bytes** (`PrefixLen <= T`; the cap keeps `P` physically resident and
-part of the deterministic pure-function encoding when separators
-share a longer-than-`T` prefix; a shorter-than-true-common `P` is
-always correct, the residue simply stays in the suffixes). When the
-separators share no common prefix (e.g. a branch spanning a cluster
-boundary) `PrefixLen` is 0 and each cell stores its full key,
-identical to the uncompressed case with no size penalty beyond the
-fixed header fields.
-
-Keys are stored in sorted order. For a branch with N cells (N keys)
-there are N+1 child pointers: `Ptr[0]` (leftmost, stored after the
-page header) plus one `ChildPtr` per cell.
-
-**Search algorithm.** Let `m = PrefixLen` and `P` the prefix bytes. To
-find the child for `target`:
+**Search algorithm.** Let `m = PrefixLen` and `P` the prefix bytes:
 
 1. If `len(target) >= m` and `target[:m] == P`: binary-search
-   `target[m:]` against the cells' suffixes for the first suffix
-   strictly greater than `target[m:]`. That index `i` is the descent
-   index.
-2. Otherwise `target` does not start with `P`: if `target < P` every
-   separator exceeds it → descend leftmost (`i == 0`); if `target > P`
-   every separator is below it → descend rightmost (`i == N`).
+   `target[m:]` against the heap suffixes for the first suffix
+   strictly greater than `target[m:]`. That index `i` is the
+   descent index.
+2. Otherwise `target` does not start with `P`: if `target < P`
+   every separator exceeds it → descend leftmost (`i == 0`); if
+   `target > P` every separator is below it → descend rightmost
+   (`i == N`).
 
-The descent index `i` selects the child exactly as in the uncompressed
-case: `i == 0` → `Ptr[0]`; `0 < i <= N` → `ChildPtr` of cell `i-1`.
-When `target` equals a separator key, the suffix binary search returns
-the index past it, so the target descends into that separator's right
-child (separators are right-child lower bounds). Comparing `target`
-against `P` once per page — rather than against each full key at every
-binary-search probe — also makes the descent compare fewer bytes than
-an uncompressed branch would.
+Comparing `target` against `P` once per page — rather than against
+each full key at every binary-search probe — makes the descent
+compare fewer bytes than a plain branch when separators share a
+prefix.
 
-The cell directory stores `(Offset, SuffixLen)` per cell, enabling
-binary search over the variable-length suffixes without parsing the
-cell data area; `Offset` points at the suffix's first byte and the
-child pointer follows the suffix bytes (for an overflow branch
-cell, follows the inline bytes + 12-byte extent reference).
-
-Bit 15 of the directory's `SuffixLen` marks an **overflow branch
-cell** (§Overflow-Key Cells): a cell whose full separator exceeds
-`T` bytes. The low 15 bits give the inline length — always exactly
-`T - PrefixLen`, which fits 15 bits at every page size — and the
-cell data is `Inline(T - PrefixLen bytes) || KeyExtPage(uint64) ||
-KeyTotalLen(uint32) || ChildPtr(uint64)`. The inline bytes are
-`separator[PrefixLen : T]` and the extent holds
-`separator[T:]` — the extent cut is FIXED at byte `T` of the full
-separator, independent of any page's `P`, so a separator move
+An **overflow branch cell** is marked by bit 63 of its CHILD
+POINTER. Bit 63 of every stored page ID is RESERVED by this
+format: page IDs above `2^63 - 1` are structurally invalid
+everywhere (the read path's reachability bound
+`min(fileSize / PageSize, MaxSize)` — `checksums.md §Structural
+and Allocation Bounds` — rejects them long before they could be
+reached, and the `MaxSize`-sized mmap reservation keeps real IDs
+astronomically lower), so the bit is never ambiguous. The
+directory's offset field cannot carry the marker because heap-end
+sentinels need the full uint16 range at 64 KB pages. A marked cell's heap span is
+`Inline(T - PrefixLen bytes) || KeyExtPage(uint64) ||
+KeyTotalLen(uint32)` — span length exactly `(T - PrefixLen) + 12`
+— and the child pointer is the array word with bit 63 cleared.
+The inline bytes are `separator[PrefixLen : T]` and the extent
+holds `separator[T:]` — the extent cut is FIXED at byte `T` of the
+full separator, independent of any page's `P`, so a separator move
 between pages with different prefixes re-slices only the inline
-bytes (fully reconstructible as `P || Inline` without touching
-the extent) and carries the extent by reference unchanged. The
-suffix binary search compares the inline portion first and reads
-the extent only per the §Overflow-Key Cells comparison rule.
-Cells whose full separator is `<= T` are unchanged. A page whose
-separators share a `>= T` common prefix caps `P` at `T`
+bytes (fully reconstructible as `P || Inline` without touching the
+extent) and carries the extent by reference unchanged. The suffix
+binary search compares the inline portion first and reads the
+extent only per the §Overflow-Key Cells comparison rule. A page
+whose separators share a `>= T` common prefix caps `P` at `T`
 (§ above), so an overflow cell's inline length is `>= 0` and the
 `P || Inline` reconstruction always covers the first `T` bytes.
 
-The encoding is a pure function of `(cfg, leftmost, cells)` — `P`,
-the suffixes, the directory, and the cell packing order all follow
-deterministically — so a `Check()` re-encode is byte-identical to the
-original writer's output (the §Leaf Split deterministic-encoding
-invariant, for branch pages).
+### Separator Computation (Cross-Level Truncation)
 
-### Prefix-Truncated Branch Keys
-
-Branch pages store **prefix-truncated separator keys** — the shortest
-byte string that distinguishes the left subtree from the right —
-rather than full keys copied from leaf pages. A branch separator
-satisfies:
+Branch pages store **cross-level-truncated separator keys** — the
+shortest byte string that distinguishes the left subtree from the
+right — rather than full keys copied from leaf pages, in every
+branch layout. A branch separator satisfies:
 
 - Every key in the left child compares **strictly less than** the
   separator.
@@ -402,64 +526,76 @@ At merge time, the separator is removed from the parent. At
 redistribute time, the separator is recomputed from the new boundary
 keys and the parent updated.
 
-**Two complementary compressions on branch pages.** Branch separators
-are compressed *across* tree levels (the shortest distinguishing
-prefix, this section) **and** *within* a page (page-level prefix
-truncation, §Branch Page — the one common prefix of a page's
-separators stored once + per-cell suffixes). Leaf pages independently
-compress redundancy within a page via restart-group delta encoding
-(§Compressed Leaf). Cross-level and within-page truncation compose: a
-leaf-adjacent branch whose separators all share a long cluster prefix
-stores that prefix once, so its fan-out stays high even when each
-separator approaches the inline threshold `T` (§Overflow-Key Cells)
-— the case that, without within-page truncation, collapses fan-out
-toward 2 (a branch holding only ~2 near-`T` separators) and builds
-trees born below the `range-delete.md §Invariants` fill-floor.
+**Two complementary compressions.** Branch separators are compressed
+*across* tree levels (the shortest distinguishing prefix, this
+section) and — in the segregated branch layout — *within* a page
+(§Segregated Branch: the one common prefix of a page's separators
+stored once + per-cell suffixes). Leaf pages independently compress
+redundancy within a page via restart-group delta encoding
+(§Compressed Leaf). Cross-level and within-page truncation compose:
+a leaf-adjacent segregated branch whose separators all share a long
+cluster prefix stores that prefix once, so its fan-out stays high
+even when each separator approaches the inline threshold `T`
+(§Overflow-Key Cells) — the case that, in the plain layout,
+collapses fan-out toward 2 (a branch holding only ~2 near-`T`
+separators) and builds trees born below the `range-delete.md
+§Invariants` fill-floor. Keyspaces whose branch separators can
+approach `T` with shared prefixes should declare the segregated
+branch layout.
 
 **Interaction with key size**: separator truncation and within-page
 prefix truncation are density optimizations — they cannot bound key
 size, because the worst case is two separators sharing no prefix
 (`PrefixLen == 0`), each needing full residence in one branch page
 to split. That worst case is what bounds the INLINE threshold `T`
-(§Overflow-Key Cells): a branch page must hold two overflow-key
-cells at `PrefixLen == 0`, and keys or suffixes past `T` spill to
-key extents instead of constraining the format. Separators are
-always `<=` the full keys they distinguish, and are long only when
-the boundary keys share a long prefix — exactly the case within-page
-truncation then compresses.
-
-**Benefits**: high fan-out → shallow trees → fewer page accesses per
-lookup, *including* for keys that share deep prefixes (within-page
-truncation stores the shared bytes once instead of once per
-separator); less data read per branch traversal, and a single prefix
-comparison per page instead of a full-key comparison at every
-binary-search probe.
+(§Overflow-Key Cells): every branch layout must hold two
+overflow-key cells at zero shared prefix, and keys or suffixes past
+`T` spill to key extents instead of constraining the format.
+Separators are always `<=` the full keys they distinguish, and are
+long only when the boundary keys share a long prefix — exactly the
+case within-page truncation then compresses.
 
 ## Leaf Page
 
-gmdb supports two leaf page variants chosen per-page at build time
-by the keyspace's `RestartGroupTarget`:
+gmdb supports three leaf page variants chosen per-page at build
+time by the keyspace's `RestartGroupTarget` and declared leaf
+layout (`keyspaces.md §Per-Keyspace Configuration`):
 
-- **`TypeLeaf` (prefix-compressed, default).** Keys that share common
+- **Compressed, interleaved (`TypeLeaf`).** Keys that share common
   prefixes with their neighbours are stored as deltas grouped into
-  **variable-size restart groups**; two-phase lookup (binary search
-  over the restart table + linear scan within the matched group).
-  Selected when `RestartGroupTarget ≥ 2`. Group sizes are a TARGET,
-  not a bound: in-place inserts may grow a group up to
-  `min(2 × RestartGroupTarget, 255)` before the splice declines and
-  a rebuild rebalances it — persisted, observable on-disk state (a
-  reader must accept groups anywhere in `[1, 255]` regardless of
-  the keyspace's current target; 255 is the hard uint8 count cap).
-- **`TypeLeafUncompressed`.** Every key stored in full; lookup is a
-  single O(log N) binary search via an offset table. Selected when
-  `RestartGroupTarget == 1`.
+  **variable-size restart groups**; each entry's value bytes
+  follow its key bytes in one stream; two-phase lookup (binary
+  search over the restart table + linear scan within the matched
+  group). Selected when `RestartGroupTarget ≥ 2` and the keyspace
+  declares the interleaved leaf layout.
+- **Compressed, segregated (`TypeLeafSegregated`, default).** The
+  same restart-group key compression, but entry headers and key
+  bytes pack contiguously from the page front while value bytes
+  live in a separate region located by per-entry value offsets —
+  the search region is pure headers-and-keys. Selected when
+  `RestartGroupTarget ≥ 2` and the keyspace declares the
+  segregated leaf layout.
+- **Uncompressed (`TypeLeafUncompressed`).** Every key stored in
+  full, interleaved; lookup is a single O(log N) binary search via
+  an offset table. Selected when `RestartGroupTarget == 1`,
+  regardless of declared leaf layout.
 
-Both variants share the 8-byte common page header and the
-"entries-forward, lookup-table-backward" layout; only the per-entry
-encoding and lookup machinery differ. The two type bytes let
-`Check()` and the readers dispatch without probing further.
+Group-size semantics are shared by both compressed variants: group
+sizes are a TARGET, not a bound — in-place inserts may grow a
+group up to `min(2 × RestartGroupTarget, 255)` before the splice
+declines and a rebuild rebalances it — persisted, observable
+on-disk state (a reader must accept groups anywhere in `[1, 255]`
+regardless of the keyspace's current target; 255 is the hard uint8
+count cap).
 
-Each entry carries a `CellFlags` byte (same definitions across both
+All variants share the 8-byte common page header and the
+"entries-forward, lookup-table-backward" layout; only the
+per-entry encoding, value placement, and lookup machinery differ.
+The distinct type bytes let `Check()` and the readers dispatch
+without probing further — never from keyspace configuration
+(§Invariants).
+
+Each entry carries a `CellFlags` byte (same definitions across all
 variants):
 
 ```
@@ -479,11 +615,15 @@ Bits 5-7: Reserved (must be 0)
 `EmptyValue` is exclusive with the VALUE-form bits (0–2) — the
 trailer and subpage forms carry their own value halves — and
 composes freely with `OverflowKey`, which modifies only the key
-half of the entry (§Overflow-Key Cells). Encoders emit
-`EmptyValue` for every plain cell whose value is empty — nested
-B+tree members and the set-of-keys pattern — saving the 4-byte
-`ValueLen` per cell; decoders also accept the legacy
-`ValueLen == 0` inline form, so mixed-form pages are valid.
+half of the entry (§Overflow-Key Cells). In the INTERLEAVED and
+UNCOMPRESSED variants, encoders emit `EmptyValue` for every plain
+cell whose value is empty — nested B+tree members and the
+set-of-keys pattern — saving the 4-byte `ValueLen` per cell;
+decoders also accept the legacy `ValueLen == 0` inline form, so
+mixed-form pages are valid. In the SEGREGATED variant the bit is
+never set and is rejected at the read trust boundary — value
+lengths are derived there, so an empty value is simply a
+zero-length value-region span (§Segregated Leaf).
 
 `ValueLen` is `uint32` (max ~4 GB for inline values; bounded in
 practice by leaf-page free space). Values exceeding leaf-page
@@ -644,6 +784,99 @@ Delta Overflow Reference
 +-----------+-----------+-------------+---------------+----------+----------+
 ```
 
+### Segregated Leaf (`TypeLeafSegregated`)
+
+The segregated leaf keeps the compressed variant's restart-group
+key compression but splits each entry in two: the **entry stream**
+(headers + key bytes, packed contiguously from the page front —
+the region every search and iteration step touches) and the
+**value region** (value bytes, packed contiguously in entry
+order, ending at `ValueEnd`). Point lookups and key-only scans
+never stride over value bytes; a full-page decode reads two dense
+regions instead of one interleaved stream.
+
+```
+Segregated Leaf Page
++-----------------------+ offset 0
+| Page Header (8 bytes) | Type=TypeLeafSegregated, Count=N
++-----------------------+ offset 8
+| RestartCount uint16   |  number of restart groups
+| DataEnd      uint16   |  byte offset after the last entry's stream bytes
+| ValueEnd     uint16   |  byte offset after the last entry's value bytes
++-----------------------+ offset 14
+| Entry 0 (restart)     |  entry stream: headers + key bytes,
+| Entry 1 (delta)       |  forward order starting at offset 14
+| ...                   |
++-----------------------+ DataEnd
+|       free space      |
++-----------------------+ VOff of entry 0
+| Value Region          |  value content, packed in entry order,
+|                       |  ending exactly at ValueEnd
++-----------------------+ ValueEnd (<= restart table base)
+| Restart Table         |  RestartCount × 4 bytes, packed at content end
++-----------------------+ ContentEnd (PageSize - optional 8-byte footer)
+```
+
+Entry-stream forms (the restart table is the §Compressed Leaf
+4-byte form unchanged):
+
+```
+Restart entry
++-----------+--------+--------+-----------+
+| CellFlags | KeyLen | VOff   | Key bytes |
+| uint8     | uint16 | uint16 |           |
++-----------+--------+--------+-----------+
+
+Delta entry
++-----------+-----------+-------------+--------+--------------+
+| CellFlags | SharedLen | UnsharedLen | VOff   | UnsharedKey  |
+| uint8     | uint16    | uint16      | uint16 |              |
++-----------+-----------+-------------+--------+--------------+
+```
+
+`VOff` is the absolute page offset of the entry's value-region
+content. Value LENGTHS are stored nowhere: entry `i`'s content is
+`[VOff[i], VOff[i+1])` in ENTRY order, and `[VOff[N-1], ValueEnd)`
+for the last entry — so `VOff` is monotone non-decreasing in entry
+order with no gaps inside the region. The region is
+**END-ANCHORED**: `ValueEnd` is fixed across value splices, and
+growth claims free space at the region's LOW end (`VOff[0]` moves
+down). A splice that inserts, deletes, or resizes entry `i`'s
+value therefore shifts the value bytes and `VOff` fields of
+entries `0 .. i-1` (the entries BEFORE it in entry order, which
+occupy the low end) and leaves entries `i+1 ..` untouched — or
+declines into the rebuild path. The derivation is BY ENTRY ORDER,
+never by value address (§Invariants — zero-length values make
+adjacent entries share a `VOff`).
+
+Value-region content by `CellFlags`: inline value → the raw value
+bytes (length derived, so the interleaved `ValueLen` field does
+not exist); overflow value → `OvflPage(uint64) ||
+TotalLen(uint64)`; subpage / nested-tree → the `set-keyspace.md`
+value-half bytes unchanged; overflow key → the 12-byte key-extent
+reference prepended to the above (§Overflow-Key Cells). An empty
+value is a zero-length span — `CellFlags` bit 3 (`EmptyValue`) is
+never set by the segregated encoder (emptiness is derived, the
+flag would be redundant state) and is rejected by the segregated
+reader's trust boundary.
+
+`ValueEnd <= restart table base` is the validity rule; the
+canonical builder packs the value region flush against the restart
+table (`ValueEnd == ContentEnd - RestartCount × 4`, except the
+`Count == 0` form below, whose `ValueEnd` is the entry-data
+start). A splice that
+GROWS the restart table (a new group) moves the whole value region
+down by 4 bytes (every `VOff` and `ValueEnd` decrease by 4) or
+declines; one that shrinks it leaves a gap above `ValueEnd`, which
+persists until the page is next rebuilt — `ValueEnd` is the
+explicit source of truth for the last entry's length either way.
+The canonical empty page (`Count == 0`, never persisted by the
+delete path but valid transiently) has `RestartCount == 0` and
+`DataEnd == ValueEnd == 14`. Lookup, iteration, group-size
+semantics, the singleton overflow-key group rule, and the
+deterministic-encoding invariant are the §Compressed Leaf
+contracts unchanged; only the per-entry byte placement differs.
+
 ### Uncompressed Leaf (`TypeLeafUncompressed`)
 
 ```
@@ -697,8 +930,9 @@ bytes) equals the compressed delta-entry overhead at zero shared
 prefix (`CellFlags + SharedLen + UnsharedLen + ValueLen = 9` bytes,
 no per-entry offset). At `SharedLen == 0` the two formats consume
 identical per-entry bytes; the only delta is the compressed
-variant's 4-byte-per-group restart-table cost (~0.25 bytes/entry at
-`RestartGroupTarget = 16`), which is negligible.
+variant's 4-byte-per-group restart-table cost (`4 /
+RestartGroupTarget` bytes/entry — ~0.67 at the default target 6),
+which is negligible.
 
 The uncompressed variant is the right choice when:
 
@@ -781,14 +1015,16 @@ at 4 KB (`ContentEnd = 4088` with checksums):
 | Format | Bytes/entry (avg) | Entries/page | Improvement |
 |--------|-------------------|-------------|-------------|
 | Uncompressed (`TypeLeafUncompressed`) | ~259 | ~15 | baseline |
+| Compressed (`TypeLeaf`, default target K=6) | ~134 | ~30 | 1.9× |
 | Compressed (`TypeLeaf`, target K=16) | ~118 | ~34 | 2.2× |
 
 For keys with **no** shared prefix (50-byte random keys + 50-byte
-values), the two variants are essentially identical: compressed
-~109.25 bytes/entry (≈37 entries/page) vs uncompressed ~109
-bytes/entry (≈37 entries/page). The ~0.25 byte delta per entry is
-the compressed variant's per-group restart-table overhead
-(`4 / RestartGroupTarget` bytes amortized) — not material.
+values), the variants are essentially identical: compressed
+~109.7 bytes/entry (≈37 entries/page) at the default target vs
+uncompressed ~109 bytes/entry (≈37 entries/page). The sub-byte
+delta per entry is the compressed variant's per-group
+restart-table overhead (`4 / RestartGroupTarget` bytes amortized:
+~0.67 at target 6, ~0.25 at 16) — not material.
 
 So `RestartGroupTarget = 1` (uncompressed) is **not** chosen for
 density on random-key workloads — both formats are
@@ -855,7 +1091,7 @@ reconstructed from the source page (full decode for the boundary
 positions only — not the whole leaf; a boundary entry that is an
 overflow-key cell materializes inline + extent bytes). Separator
 computation for the parent branch uses these full keys (see
-§Prefix-Truncated Branch Keys).
+§Separator Computation (Cross-Level Truncation)).
 
 **Deterministic encoding invariant** (consequence of the tiebreak +
 the per-page group-target policy): the **same encoder version**
@@ -877,30 +1113,29 @@ same bytes the original writer would have written.
 Keys are not bounded by the page size. A key whose FULL length
 exceeds the **inline threshold `T`** is stored as an overflow-key
 cell with a fixed cut at byte `T`: the extent holds `key[T:]`, the
-resident inline bytes are `key[0:T]` in a leaf and
-`key[PrefixLen:T]` in a branch (§Branch form), and a 12-byte
-**key-extent reference** follows the inline bytes — `KeyExtPage
-(uint64)`, the first page of an §Overflow Page run holding
-`key[T:]`, and `KeyTotalLen (uint32)`, the FULL key length. The
-trigger is the full key length, never a page-relative portion — a
-suffix-relative trigger would flip a separator between inline and
-overflow form as the page prefix changes, re-creating the
-extent-rewrite-on-move problem the fixed cut removes. Keys `<= T`
-use the pre-existing inline encodings byte-for-byte.
+resident inline bytes are `key[0:T]` in a leaf and in a plain
+branch, `key[PrefixLen:T]` in a segregated branch (§Branch form),
+and a 12-byte **key-extent reference** — `KeyExtPage (uint64)`,
+the first page of an §Overflow Page run holding `key[T:]`, and
+`KeyTotalLen (uint32)`, the FULL key length — is carried per the
+holding layout's form (after the inline bytes in the interleaved
+leaf and both branch layouts; at the front of the entry's
+value-region content in the segregated leaf). The trigger is the
+full key length, never a page-relative portion — a suffix-relative
+trigger would flip a separator between inline and overflow form as
+the page prefix changes, re-creating the extent-rewrite-on-move
+problem the fixed cut removes. Keys `<= T` use the layout's inline
+encodings byte-for-byte.
 
 ### The inline threshold `T`
 
-`T` is a pure function of `(PageSize, PageChecksum)` — the largest
-inline length such that a branch page holds TWO overflow-key cells
-at `PrefixLen == 0` (the split-feasibility floor, inherited from
-the old maximum-key derivation in `limits.md`):
+`T` is a pure function of `(PageSize, PageChecksum)` — one shared
+constant across every layout variant, never per-layout (a
+per-layout `T` would move the extent cut when a key crosses layout
+boundaries, re-creating the extent-rewrite-on-move problem the
+fixed cut removes):
 
 ```
-content   = PageSize - 8 (header) - 8 (leftmost ptr)
-            - 4 (PrefixLen + Reserved)
-            - 8 (checksum footer, when PageChecksum)
-percell   = 4 (directory) + T (inline) + 12 (extent ref) + 8 (child)
-constraint: 2 × percell <= content
 T = (PageSize - 76) / 2        with PageChecksum
 T = (PageSize - 68) / 2        without
 ```
@@ -912,28 +1147,49 @@ T = (PageSize - 68) / 2        without
 | 16 KB | 8154 | 8158 |
 | 64 KB | 32730 | 32734 |
 
-`T` fits 15 bits at every page size (the branch directory's
-overflow marker occupies `SuffixLen` bit 15). The exact constants
-are pinned by test; the derivation above is the contract. The
-extent cut sits EXACTLY at byte `T` of the full key — the resident
-inline bytes are `key[0:T]` (leaf) or `key[PrefixLen:T]` (branch),
-never a different cut — so encoding stays a pure function of the
-input and the page's `PrefixLen` (the §Leaf Split
+The governing constraint is the **per-layout split-feasibility
+floor** (§Invariants): every supported BRANCH layout holds TWO
+worst-case overflow-key cells (zero shared prefix where the layout
+has one) within one page, and every supported LEAF layout holds
+ONE maximal-form entry (overflow key + overflow value), at every
+page size. The constants above satisfy both floors with slack —
+the worst branch budget is the segregated branch at
+`2T + 74 <= PageSize` with `PageChecksum` (header 8 + leftmost 8 +
+PrefixLen/Reserved 4 + directory 3×2 + 2 × (T inline + 12 extent
+ref) + child array 16 + footer 8); the plain branch needs
+`2T + 72`; the leaf floors need only `T + ~60`. (TWO maximal leaf
+entries per page do NOT fit — `2T + 86..96 > PageSize` — and are
+not required: leaf splits may produce single-entry leaves.) The
+exact constants and each layout's floor feasibility are pinned by
+test; the floors are the contract, the constants are the chosen
+fixed point. `T` fits 15
+bits at every page size (the plain-branch directory's overflow
+marker occupies `KeyLen` bit 15). The extent cut sits EXACTLY at
+byte `T` of the full key — the resident inline bytes are
+`key[0:T]` (leaf, plain branch) or `key[PrefixLen:T]` (segregated
+branch), never a different cut — so encoding stays a pure function
+of the input and the page's `PrefixLen` (the §Leaf Split
 deterministic-encoding invariant).
 
 ### Leaf forms
 
 `CellFlags` bit 4 (`OverflowKey`) modifies only the key half of an
-entry: `KeyLen` is repurposed as the inline length (always `T`),
-the inline key bytes are followed by the 12-byte key-extent
-reference, and the value half — inline, overflow, empty, subpage,
-or nested-tree per bits 0–3 — is unchanged in FORM, positioned
-after the key-extent reference (where the value half of an inline
-cell sits after the key bytes). The subpage and nested-tree-
-reference value halves (`set-keyspace.md §Subpage Format` /
-§Nested B+tree Reference Cell) compose the same way: their bytes
-are byte-identical to the inline-key case, shifted by the 12-byte
-reference. Diagrammed forms:
+entry: `KeyLen` is repurposed as the inline length (always `T`).
+In the **interleaved** leaf (and the uncompressed variant) the
+inline key bytes are followed by the 12-byte key-extent reference,
+and the value half — inline, overflow, empty, subpage, or
+nested-tree per bits 0–3 — is unchanged in FORM, positioned after
+the key-extent reference (where the value half of an inline cell
+sits after the key bytes). The subpage and nested-tree-reference
+value halves (`set-keyspace.md §Subpage Format` / §Nested B+tree
+Reference Cell) compose the same way: their bytes are
+byte-identical to the inline-key case, shifted by the 12-byte
+reference. In the **segregated** leaf the key stream stays pure
+key bytes — the 12-byte key-extent reference is instead PREPENDED
+to the entry's value-region content (read only when a comparison
+ties through all resident bytes), and the value half's bytes
+follow it in the value region unchanged in form. Diagrammed
+interleaved forms:
 
 ```
 Overflow-Key Restart Entry (inline value)
@@ -958,47 +1214,65 @@ Overflow-Key Restart Entry (empty value)
 Every fixed-length field stays in the header or at a
 header-computable offset, so the next-entry offset is computable
 without touching the variable bytes — the §Compressed Leaf
-field-ordering (decode-speed) property is preserved: the key half
-contributes a fixed `KeyLen + 12`.
+field-ordering (decode-speed) property is preserved: the
+interleaved key half contributes a fixed `KeyLen + 12`.
+
+Segregated overflow-key restart entry — the entry-stream half is
+the ordinary segregated restart form with `KeyLen == T`; the
+value region carries the reference plus the value content:
+
+```
+Segregated Overflow-Key Restart Entry
+entry stream:  | CellFlags | KeyLen | VOff   | Key bytes (=T) |
+               | uint8     | uint16 | uint16 |                |
+value region:  | KeyExtPage | KeyTotalLen | value content per bits 0-3 |
+               | uint64     | uint32      | (inline bytes / OvflPage+
+               |            |             |  TotalLen / subpage / ...) |
+```
 
 **Restart-group rule.** An overflow-key entry is always a restart
 entry and always a SINGLETON group (`Count == 1` in its
 restart-table entry); the following entry, if any, starts a fresh
 group with a full key. Delta entries never carry an overflow key
-and never share against one. In the uncompressed variant
-(`TypeLeafUncompressed`) the overflow-key entry form is the same
-minus group bookkeeping.
+and never share against one — in both compressed leaf layouts. In
+the uncompressed variant (`TypeLeafUncompressed`) the overflow-key
+entry form is the interleaved one minus group bookkeeping.
 
 **Derivable-length read policy.** The inline length is a constant
-of the page configuration — leaf `KeyLen == T`; branch low-15
-`SuffixLen == T - PrefixLen` — stored explicitly for decode
+of the page configuration — leaf `KeyLen == T`; plain-branch
+low-15 `KeyLen == T`; segregated-branch marked heap span
+`== (T - PrefixLen) + 12` — stored explicitly for decode
 uniformity. The read trust boundary verifies the equality
-(`LeafReader.Validate` and the branch decoder): a divergent value
+(`LeafReader.Validate` and the branch decoders): a divergent value
 is structural corruption, treated exactly like a restart-table
 `Count == 0` — never "trusted field", never silently recomputed.
 
 ### Branch form
 
-Defined in §Branch Page (directory `SuffixLen` bit 15). The extent
-cut is the SAME fixed cut as the leaf form — `separator[T:]` —
-independent of any page's prefix `P`; only the inline slice is
-page-relative (`separator[PrefixLen : T]`, reconstructible as
-`P || Inline`). Separator computation at split (§Prefix-Truncated
-Branch Keys) is unchanged — it operates on full keys,
+Defined per variant in §Plain Branch (directory `KeyLen` bit 15)
+and §Segregated Branch (child-pointer bit 63). The extent cut is
+the SAME fixed cut as the leaf form — `separator[T:]` —
+independent of any page's prefix `P`; only the segregated inline
+slice is page-relative (`separator[PrefixLen : T]`,
+reconstructible as `P || Inline`; the plain branch stores
+`separator[0:T]` whole). Separator computation at split
+(§Separator Computation) is unchanged — it operates on full keys,
 materializing boundary keys from their extents when the boundary
 entries are overflow-key cells. A separator move
 (split/merge/redistribute promoting or demoting a separator
-between pages, and any re-encode under a different `P`) re-slices
-the inline bytes from the reconstructed first-`T` prefix and
-carries the extent BY REFERENCE; the extent is written once when
-the over-`T` separator is first created and retired through the
-RPL when the separator is removed or replaced.
+between pages, any re-encode under a different `P`, and any move
+between layout variants) re-slices the inline bytes from the
+reconstructed first-`T` prefix and carries the extent BY
+REFERENCE; the extent is written once when the over-`T` separator
+is first created and retired through the RPL when the separator
+is removed or replaced.
 
 ### Comparison
 
 Stated over FULL keys. The stored key's first `T` bytes are always
-resident: `key[0:T]` directly in a leaf; `P || Inline` in a branch
-(no extent read to reconstruct). If the compared full key diverges
+resident: `key[0:T]` directly in a leaf or plain branch;
+`P || Inline` in a segregated branch (no extent read to
+reconstruct). If the compared full key diverges
 from `stored[0:T]` within its first `T` bytes, or has length
 `<= T` (a full match then makes it a strict prefix of the stored
 key — strictly less), the order is decided from resident bytes.
@@ -1022,20 +1296,36 @@ cursor op) is unchanged.
 
 ## Overflow Page
 
-Overflow pages are contiguous runs that store large values and
-the extent portion of overflow keys (§Overflow-Key Cells). The
-first page in the run carries the standard 8-byte page header with
-`AdditionalPages` set to the number of follower pages; the remaining
-bytes are value data. Follower pages carry no header — they are
-entirely value data (minus 8 bytes for the XXH3-64 footer when page
-checksums are enabled). Total value capacity for a run of `1 + N`
-pages: `(PageSize - 8) + N * PageSize` bytes (subtract 8 per page
-for the footer when enabled).
+Overflow pages are physically contiguous runs that store large
+values and the extent portion of overflow keys (§Overflow-Key
+Cells). The first (head) page carries the standard 8-byte page
+header with `AdditionalPages` set to the number of follower pages,
+followed — when `PageChecksum` is enabled — by an 8-byte XXH3-64
+**whole-run digest** (`checksums.md §Overflow-Run Digest`); the
+extent bytes start immediately after (head offset 16 with
+`PageChecksum`, 8 without) and continue through the follower
+pages, which carry no header, no footer, and no digest. Nothing
+interrupts the extent: the stored bytes are ONE contiguous byte
+range, so a reader returns them as a single borrowed slice from
+the mmap (`api-surface.md §Byte Slice Ownership`).
 
-When checksums are enabled, each page in the run carries its own
-independent XXH3-64 footer. The first page checksums header + data;
-each follower checksums its data. Per-page footers allow identifying
-which specific page is corrupted.
+Total extent capacity for a run of `1 + N` pages:
+`(PageSize - 16) + N × PageSize` bytes with `PageChecksum`,
+`(PageSize - 8) + N × PageSize` without. The extent LENGTH is
+supplied by the referencing cell — `TotalLen` for a value run,
+`KeyTotalLen - T` for a key-extent run — never stored in the run
+itself. Run pages carry NO per-page checksum footers — the
+whole-run digest is the run's entire integrity cover. It is
+computed over the run's FULL content range (head content start
+through the last follower's end — i.e. the capacity above), not
+over the extent length alone: that makes the run self-verifiable
+from its head plus `AdditionalPages`, with no dependence on the
+referencing cell (the proactive scrub in
+`background-maintenance.md` verifies runs standalone). Slack
+bytes past the extent length in the last page are ZERO ON WRITE —
+unconditionally, checksums on or off, so a run image is a pure
+function of its extent bytes; with checksums on, the whole-range
+digest is what enforces it.
 
 ## NUL-escape encoding (composite keys)
 

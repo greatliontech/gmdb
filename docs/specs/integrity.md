@@ -117,9 +117,11 @@ open the keyspace until `RebuildIndex` is called. See
 
 When `PageChecksum` is enabled (the default), every data page
 read is verified against its XXH3-64 footer on first access in a
-transaction (cached thereafter). Corruption is detected at read
-time with `ErrBadPageChecksum` identifying the affected page. See
-`checksums.md §Verification`.
+transaction (cached thereafter); overflow runs verify against
+their head-resident whole-run digest instead, once per run per
+transaction. Corruption is detected at read time with
+`ErrBadPageChecksum` identifying the affected page (the head
+page, for a run). See `checksums.md §Verification`.
 
 ## Forged / structural corruption tolerance
 

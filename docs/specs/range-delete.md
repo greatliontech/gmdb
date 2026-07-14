@@ -101,11 +101,14 @@ Invariant: kind=clause-explicit;
     redistribute balance measure page utilisation, and counting
     extent bytes would let one giant separator satisfy any floor
     while the page is physically near-empty.
-    Within-page branch prefix truncation (`page-formats.md` §Branch
-    Page) stores a page's shared separator prefix once, so a
-    maximally-dense same-cluster branch carries high fan-out yet few
-    physical bytes; measuring the floor on compressed bytes would
-    spuriously flag it as underfull. The physical (compressed) size is
+    Within-page branch prefix truncation (`page-formats.md`
+    §Segregated Branch) stores a page's shared separator prefix
+    once, so a maximally-dense same-cluster branch carries high
+    fan-out yet few physical bytes; measuring the floor on
+    compressed bytes would spuriously flag it as underfull. (In the
+    plain branch layout logical and physical content coincide up to
+    fixed per-cell overhead; the two-notion rule is stated once and
+    holds for both.) The physical (compressed) size is
     used only for **capacity** ("does a cell set fit one page?"); the
     floor, the underflow trigger, and the redistribute split-balance all
     use logical content. For a **leaf** page the floor is physical fill

@@ -36,8 +36,8 @@ Invariant: kind=clause-explicit;
   from=this spec §API;
   violation=Bulk-loading into a non-empty keyspace mixes
     bottom-up-constructed leaves with pre-existing top-down ones
-    — duplicate keys, broken prefix-truncated separators, and
-    incoherent count.
+    — duplicate keys, separators violating the
+    `max(left) < S <= min(right)` contract, and incoherent count.
 
 Invariant: kind=clause-explicit;
   property=`BulkLoad` input MUST be in strictly ascending lex
@@ -183,7 +183,9 @@ stores by overflow promotion is overflow-promoted by the bulk
 index build too — never rejected, never inlined oversize.
 Bulk-built index trees are encoded with the BASE page config,
 exactly as the per-Put maintenance path builds them (a keyspace's
-RestartGroupTarget applies to its ROW tree only). Internal
+`RestartGroupTarget` and `NodeLayouts` govern its row tree and
+nested set-value trees, never its index trees — `keyspaces.md
+§Keyspace Descriptor`). Internal
 builder sentinels never escape the BulkLoad boundary. (Pinned per
 path by TestErrKeyTooLargeSentinel; index-key gate, value
 promotion, and config parity by TestBulkLoadIndexKeyGateParity,
@@ -195,8 +197,9 @@ TestBulkLoadIndexTreeConfigParity.)
 Standard bottom-up B+tree construction:
 
 1. Allocate a fresh leaf page from `pageAlloc()`. Fill with input
-   entries — encoded per the keyspace's `RestartGroupTarget`
-   (prefix-compressed `TypeLeaf` for target `≥ 2`, uncompressed
+   entries — encoded per the keyspace's `RestartGroupTarget` and
+   declared node layouts (compressed `TypeLeafSegregated` /
+   `TypeLeaf` for target `≥ 2`, uncompressed
    `TypeLeafUncompressed` for target `= 1`; see `page-formats.md
    §Leaf Page`) — until the page is full or the input is
    exhausted.
