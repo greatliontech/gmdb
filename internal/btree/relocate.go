@@ -308,12 +308,15 @@ func relocateOverflowChain(pw PageWriter, cfg page.Config, oldFirst uint64, runL
 	if err != nil {
 		return 0, err
 	}
-	dst, err := pw.ZeroPageRun(newFirst, runLen)
-	if err != nil {
-		return 0, err
-	}
-	for i := range runLen {
-		copy(dst[i], src[int(i)*pageSize:])
+	// Byte-for-byte direct copy, head last: relocation must not
+	// publish a head whose followers haven't landed — a same-tx read
+	// of the new run (through the mmap; run pages are never
+	// slab-resident) resolves the extent from the head.
+	for i := runLen; i > 0; i-- {
+		idx := i - 1
+		if err := pw.WriteRunPage(newFirst+uint64(idx), src[int(idx)*pageSize:int(idx+1)*pageSize]); err != nil {
+			return 0, err
+		}
 	}
 	if err := pw.FreeRun(oldFirst, runLen); err != nil {
 		return 0, err

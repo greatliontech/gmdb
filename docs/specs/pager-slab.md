@@ -37,10 +37,15 @@ Invariant: kind=clause-explicit;
 Invariant: kind=clause-explicit;
   property=Every write-side page modification goes through the pager:
     fresh page ID + fresh slab buffer (or re-mutation of an existing
-    same-tx slab buffer). The writer never writes through the mmap;
-    on-disk state changes only via the commit-protocol pwrite path;
+    same-tx slab buffer), or a DIRECT pwrite to a page allocated in
+    this transaction and referenced by no active or recoverable meta
+    (overflow-run pages, the bulk-load builder — the `WriteDirect`
+    contract, `bulkload.md §Slab Bypass`). The writer never writes
+    through the mmap; pages reachable from any committed meta change
+    only via the commit-protocol pwrite path;
   from=this spec §CoW via the Slab + §Commit Write Ordering;
-  violation=A direct mmap mutation reaches the unified page cache out
+  violation=A direct mmap mutation — or a direct pwrite to a page an
+    active meta can reach — reaches the unified page cache out
     of order with the commit protocol, producing a meta that references
     a tree whose pages did not pass step 1/step 2 — readers can observe
     a partially-published commit (no atomic-swap guarantee).
@@ -62,12 +67,13 @@ Invariant: kind=clause-explicit;
     buffers held by the transaction: live (routed via `dirty[id]`),
     loose, and commit-step-0 RPL segment assembly buffers.
     `ErrTxTooLarge` fires on the first CoW or commit-step-0
-    allocation that would exceed the bound. Two commit-time writes
-    are deliberately OUTSIDE the budget because they are not
-    slab-allocated: modified bitmap pages pwrite directly from the
-    in-memory bitmap's own storage (bounded by `BitmapPages`, a
-    file-geometry constant), and the meta page is one page-sized
-    scratch allocation per commit;
+    allocation that would exceed the bound. Deliberately OUTSIDE the
+    budget because they are not slab-allocated: overflow-run pages
+    (pwritten directly as encoded, O(2 pages) working memory — see
+    §Slab Budget), modified bitmap pages (pwritten from the
+    in-memory bitmap's own storage, bounded by `BitmapPages`, a
+    file-geometry constant), and the meta page (one page-sized
+    scratch allocation per commit);
   from=this spec §Slab Budget and `ErrTxTooLarge`;
   violation=Unbounded slab growth (loose buffers excluded, or RPL
     assembly excluded) lets a transaction OOM the process despite
@@ -225,6 +231,20 @@ budget covers every page-sized buffer the transaction has allocated:
   step 1 pwrites them directly from the in-memory bitmap's own
   storage, outside the budget per the Invariants above.)
 
+**Overflow runs never enter the slab.** Every run page — online
+chain writes, key extents, run relocation, bulk load — is pwritten
+directly at its allocation-fresh id as the run is encoded
+(followers first, head last; `checksums.md §Overflow-Run Digest`),
+in O(2 × PageSize) working memory regardless of value size, and
+reads back through the mmap (unified page cache) same-tx included.
+Large values therefore do not charge `MaxTxBufferBytes` at all.
+Until the meta swap the run's pages are unreferenced by any
+recoverable meta — a crash or rollback leaves them as harmless
+free-page garbage (the in-memory bitmap snapshot restores; the
+on-disk bitmap was never pwritten pre-commit), exactly the
+`WriteDirect` bulk-load contract (`bulkload.md §Slab Bypass`),
+which this generalizes.
+
 `ErrTxTooLarge` fires on the first CoW (during the transaction body)
 or step-0 allocation (during commit) that would push `dirtyBytes`
 over the admission limit. The commit-time variant is detected before
@@ -329,12 +349,13 @@ contract still holds.
 
 For each `(pageID, buf)` in `p.dirty` (now containing data pages, RPL
 segment pages, and modified bitmap pages): compute the XXH3-64
-footer (if `PageChecksum`; overflow-run buffers are exempt — the
-run's whole-run digest is written into the head buffer at run
-assembly, `checksums.md §Overflow-Run Digest`), then `pwrite(fd,
-*buf, pageID * pageSize)`. Order within step 1 is unspecified;
-implementations may coalesce contiguous runs via `pwritev2` on
-Linux.
+footer (if `PageChecksum` — every slab page is a node/RPL page and
+takes a footer; overflow-run pages are never slab-resident, so the
+footer pass cannot reach one: they were pwritten directly at write
+time with the head-resident whole-run digest, `checksums.md
+§Overflow-Run Digest`), then `pwrite(fd, *buf, pageID * pageSize)`.
+Order within step 1 is unspecified; implementations may coalesce
+contiguous runs via `pwritev2` on Linux.
 
 A partial-success pwrite (some pages reach the page cache, others
 fail mid-step) is crash-equivalent: meta is untouched, the previous

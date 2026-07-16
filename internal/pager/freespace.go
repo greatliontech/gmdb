@@ -124,7 +124,7 @@ func (p *Pager) AllocPage() (uint64, error) {
 			//
 			// wasPreWindow per Savepoint: was dirty[id] in p.dirty at
 			// this savepoint's Begin time, or did the in-window add it
-			// (via CoW / AllocSlab / AllocSlabRun)? Scan sp's window
+			// (via CoW / AllocSlab)? Scan sp's window
 			// slice of savepointUndoLog for a prior (fieldDirty, id,
 			// false) entry — present iff dirty[id] was added inside
 			// this window. Critical for Restore correctness: an in-
@@ -346,9 +346,9 @@ func alignUp(n, step uint64) uint64 {
 //     at commit (bypassing the RPL because no other process holds a
 //     snapshot referencing a same-tx page).
 //   - In pendingAllocs but not yet in p.dirty (allocated this tx but
-//     never CoW'd / AllocSlab'd — the overflow rollback path
-//     reaches here when AllocContiguous succeeds but AllocSlabRun fails
-//     mid-run): bitmap bit is restored to free, pendingAllocs entry is
+//     never CoW'd / AllocSlab'd — direct-written overflow-run pages
+//     and their rollback paths land here): bitmap bit is restored to
+//     free, pendingAllocs entry is
 //     dropped. No retiredPages entry: no prior-tx reader holds a
 //     snapshot referencing this page.
 //   - Not in p.dirty and not in pendingAllocs (mmap-backed, from a
@@ -389,10 +389,21 @@ func (p *Pager) FreePage(id uint64) error {
 		// CoW'd / AllocSlab'd. Restore the bitmap bit (no slab buffer
 		// to retain) and drop the pendingAllocs entry — no prior-tx
 		// snapshot references this page, so it does not enter the
-		// RPL. Reachable today via AllocContiguous + AllocSlabRun
-		// rollback when AllocSlabRun fails on the budget check after
-		// AllocContiguous already cleared the bitmap bits.
-		p.bitmap.Set(id)
+		// RPL. Reached by every direct-written overflow-run page
+		// (never slab-resident) and by the run writers' mid-run
+		// failure rollback (FreeRun after a WriteRunPage error).
+		//
+		// Inside a savepoint window the bitmap.Set is DEFERRED to the
+		// last savepoint's release: setting it now would make the
+		// page re-allocatable — and direct-writable-over — while a
+		// RestoreSavepoint can still resurrect the tree's reference
+		// to its on-disk content (a freed value chain in a replace op
+		// whose later step fails; see deferredFrees).
+		if len(p.activeSavepoints) > 0 {
+			p.deferredFrees = append(p.deferredFrees, id)
+		} else {
+			p.bitmap.Set(id)
+		}
 		delete(p.pendingAllocs, id)
 		// justAllocated => wasPresent=true at delete time.
 		p.recordSavepointUndo(fieldPendingAllocs, id, true)
@@ -667,11 +678,13 @@ func (p *Pager) TailRefund() error {
 	return nil
 }
 
-// ResetFreespace clears the tx-scoped freespace bookkeeping (pendingAllocs,
-// pendingFrees, retiredPages, loosePages). Called by rollback and after
-// commit-step-0 finalisation; does not touch the bitmap or RPL chain (
-// those updates are applied at commit step 1 via pwrite + meta swap, and
-// rollback simply leaves the on-disk bitmap untouched).
+// ResetFreespace clears the tx-scoped freespace bookkeeping
+// (pendingAllocs, pendingFrees, retiredPages, loosePages,
+// deferredFrees) — the SINGLE tx-boundary reset, called by AbortTx
+// and by Commit's success cleanup so the two paths can never drift
+// on which sets they clear. Does not touch the bitmap or RPL chain
+// (those updates are applied at commit step 1 via pwrite + meta
+// swap, and rollback simply leaves the on-disk bitmap untouched).
 func (p *Pager) ResetFreespace() {
 	if p.readOnly {
 		return
@@ -680,6 +693,11 @@ func (p *Pager) ResetFreespace() {
 	clear(p.pendingFrees)
 	clear(p.loosePages)
 	p.retiredPages = p.retiredPages[:0]
+	// Deferred same-tx frees are dropped, not applied: on rollback the
+	// bitmap snapshot restore already reverted their allocations; at
+	// commit every savepoint resolved first (all-resolved-before-Commit),
+	// so the last ReleaseSavepoint applied them and the list is empty.
+	p.deferredFrees = p.deferredFrees[:0]
 }
 
 // buildLaggingReaderInfo constructs the info struct for the
@@ -982,10 +1000,10 @@ func (p *Pager) reserveBitmapRun(firstID uint64, n uint32) error {
 // rules: same-tx p.dirty page → loose; same-tx allocated-but-never-
 // written → bitmap-bit restored; prior-tx → retiredPages.
 //
-// The overflow rollback path calls FreeRun after AllocContiguous
-// succeeds but AllocSlabRun fails — every page in the run is in
-// pendingAllocs but not in p.dirty, so FreeRun restores all n bitmap
-// bits and drops the pendingAllocs entries. No retiredPages growth.
+// A same-tx direct-written run (never slab-resident) has every page
+// in pendingAllocs but not in p.dirty, so FreeRun restores all n
+// bitmap bits and drops the pendingAllocs entries. No retiredPages
+// growth.
 func (p *Pager) FreeRun(firstID uint64, n uint32) error {
 	if p.readOnly {
 		return ErrReadOnly

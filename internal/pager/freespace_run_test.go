@@ -9,20 +9,18 @@ import (
 	"github.com/greatliontech/gmdb/internal/page"
 )
 
-// These tests pin three invariants over AllocContiguous / AllocSlabRun /
-// FreeRun on a real *pager.Pager (fakeWriter's PageWriter contract translated
-// to the real implementation):
+// These tests pin two invariants over AllocContiguous / FreeRun on a
+// real *pager.Pager (fakeWriter's PageWriter contract translated to
+// the real implementation):
 //
 //   Inv-1 (atomicity): AllocContiguous(n) either reserves all n pages
 //          (bitmap bits cleared + pendingAllocs entries) or returns an
 //          error with no state change.
-//   Inv-2 (alloc+free round-trip): AllocContiguous(n) immediately followed
-//          by FreeRun(firstID, n) (without intervening AllocSlabRun) restores
-//          the bitmap bits and drops pendingAllocs without retiring same-tx
-//          pages to retiredPages.
-//   Inv-3 (PageWriter parity): the overflow-chain rollback shape —
-//          AllocContiguous then FreeRun on AllocSlabRun budget error —
-//          succeeds on *pager.Pager identically to fakeWriter.
+//   Inv-2 (alloc+free round-trip): AllocContiguous(n) followed by
+//          FreeRun(firstID, n) restores the bitmap bits and drops
+//          pendingAllocs without retiring same-tx pages to
+//          retiredPages — the run writers' mid-run failure rollback
+//          (runs are never slab-resident).
 
 func TestAllocContiguousBitmapHit(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
@@ -105,10 +103,9 @@ func TestAllocContiguousErrDBFull(t *testing.T) {
 }
 
 // TestAllocContiguousFreeRunRoundTrip promotes Inv-2: alloc + immediate
-// FreeRun (no AllocSlabRun) restores the bitmap + drops pendingAllocs and
-// does NOT retire same-tx pages. Demonstrated-fault anchor for the
-// FreePage extension that handles the
-// allocated-but-never-written case.
+// FreeRun restores the bitmap + drops pendingAllocs and does NOT
+// retire same-tx pages. Demonstrated-fault anchor for the FreePage
+// extension that handles the allocated-but-never-written case.
 func TestAllocContiguousFreeRunRoundTrip(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
 	defer p.Close()
@@ -303,84 +300,6 @@ func TestAllocContiguousSingleDelegatesToAllocPage(t *testing.T) {
 	}
 }
 
-func TestAllocSlabRunBudgetExceeded(t *testing.T) {
-	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
-	defer f.Close()
-
-	// Shrink the slab budget to a single page so any n>1 AllocSlabRun
-	// trips the budget check.
-	p.maxBytes = testPageSize
-
-	first := bm.FirstDataPage()
-	bm.Set(first + 0)
-	bm.Set(first + 1)
-	bm.Set(first + 2)
-
-	got, err := p.AllocContiguous(3)
-	if err != nil {
-		t.Fatalf("AllocContiguous: %v", err)
-	}
-	_, err = p.AllocSlabRun(got, 3)
-	if !errors.Is(err, ErrTxTooLarge) {
-		t.Errorf("AllocSlabRun(budget=1page, n=3): got %v, want ErrTxTooLarge", err)
-	}
-	// No slab buffers should have been installed.
-	if p.DirtyBytes() != 0 {
-		t.Errorf("dirtyBytes after failed AllocSlabRun = %d, want 0", p.DirtyBytes())
-	}
-	// Caller's responsibility is FreeRun to rollback the prior
-	// AllocContiguous.
-	if err := p.FreeRun(got, 3); err != nil {
-		t.Fatalf("FreeRun rollback: %v", err)
-	}
-}
-
-func TestAllocSlabRunIdempotent(t *testing.T) {
-	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
-	defer f.Close()
-
-	first := bm.FirstDataPage()
-	bm.Set(first + 0)
-	bm.Set(first + 1)
-	bm.Set(first + 2)
-
-	got, err := p.AllocContiguous(3)
-	if err != nil {
-		t.Fatalf("AllocContiguous: %v", err)
-	}
-	pages1, err := p.AllocSlabRun(got, 3)
-	if err != nil {
-		t.Fatalf("AllocSlabRun #1: %v", err)
-	}
-	dirtyAfter1 := p.DirtyBytes()
-
-	pages2, err := p.AllocSlabRun(got, 3)
-	if err != nil {
-		t.Fatalf("AllocSlabRun #2: %v", err)
-	}
-	if p.DirtyBytes() != dirtyAfter1 {
-		t.Errorf("idempotent AllocSlabRun re-billed budget: %d → %d",
-			dirtyAfter1, p.DirtyBytes())
-	}
-	// Identical backing buffers.
-	for i := range pages1 {
-		if &pages1[i][0] != &pages2[i][0] {
-			t.Errorf("idempotent AllocSlabRun returned new buffer at i=%d", i)
-		}
-	}
-}
-
-func TestAllocSlabRunZeroN(t *testing.T) {
-	p, _, f := setupWriter(t, 4)
-	defer p.Close()
-	defer f.Close()
-	if _, err := p.AllocSlabRun(3, 0); err == nil {
-		t.Error("AllocSlabRun(_, 0): want error, got nil")
-	}
-}
-
 func TestFreeRunSameTxAllocSlabBecomesLoose(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
 	defer p.Close()
@@ -394,18 +313,20 @@ func TestFreeRunSameTxAllocSlabBecomesLoose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllocContiguous: %v", err)
 	}
-	if _, err := p.AllocSlabRun(got, 2); err != nil {
-		t.Fatalf("AllocSlabRun: %v", err)
+	// Slab-resident pages (nodes) at the run's ids: FreeRun routes
+	// each through the same-tx loose path (buffer resurrectable).
+	for i := uint64(0); i < 2; i++ {
+		if _, err := p.AllocSlab(got + i); err != nil {
+			t.Fatalf("AllocSlab: %v", err)
+		}
 	}
 	if err := p.FreeRun(got, 2); err != nil {
 		t.Fatalf("FreeRun: %v", err)
 	}
-	// AllocSlabRun installed the buffers in p.dirty → FreeRun routes
-	// each through the same-tx loose path.
 	for i := uint64(0); i < 2; i++ {
 		id := got + i
 		if _, ok := p.loosePages[id]; !ok {
-			t.Errorf("page %d not in loosePages after FreeRun (alloc+slab path)", id)
+			t.Errorf("page %d not in loosePages after FreeRun (slab path)", id)
 		}
 		if _, ok := p.pendingAllocs[id]; ok {
 			t.Errorf("page %d still in pendingAllocs after FreeRun", id)
@@ -472,8 +393,8 @@ func TestFreeRunReadOnlyErrors(t *testing.T) {
 	if _, err := p.AllocContiguous(2); !errors.Is(err, ErrReadOnly) {
 		t.Errorf("AllocContiguous on read-only: got %v, want ErrReadOnly", err)
 	}
-	if _, err := p.AllocSlabRun(2, 2); !errors.Is(err, ErrReadOnly) {
-		t.Errorf("AllocSlabRun on read-only: got %v, want ErrReadOnly", err)
+	if err := p.WriteDirectRaw(2, make([]byte, testPageSize)); !errors.Is(err, ErrReadOnly) {
+		t.Errorf("WriteDirectRaw on read-only: got %v, want ErrReadOnly", err)
 	}
 }
 

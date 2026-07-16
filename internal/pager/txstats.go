@@ -36,7 +36,7 @@ type TxStatsSnapshot struct {
 func (p *Pager) resetTxCounters() { p.tc = TxStatsSnapshot{} }
 
 // bumpSlabPeak records a new slab-usage high-water mark. Called after
-// every dirtyBytes increase (CoW / AllocSlab / AllocSlabRun); a later
+// every dirtyBytes increase (CoW / AllocSlab); a later
 // Discard that lowers dirtyBytes never lowers the recorded peak.
 func (p *Pager) bumpSlabPeak() {
 	if int64(p.dirtyBytes) > p.tc.SlabPeakBytes {

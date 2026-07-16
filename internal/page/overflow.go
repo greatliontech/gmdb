@@ -105,57 +105,60 @@ func OverflowRunLength64(cfg Config, valLen uint64) uint64 {
 	return 1 + (remaining+follower-1)/follower
 }
 
-// EncodeOverflowRun writes value into a contiguous run of pages
-// starting at pages[0]: head header, whole-run digest (when
-// PageChecksum is enabled), and the extent bytes. pages MUST have
-// exactly OverflowRunLength entries, each a page-sized buffer. Every
-// page is cleared first, so slack past the extent is zero on write
-// regardless of checksum setting. No per-page footers are applied —
-// run pages are exempt from the commit footer pass.
+// WriteOverflowRun encodes value as an overflow run and hands each
+// completed page-sized buffer to write, one page at a time: followers
+// first (indices 1..AdditionalPages, ascending), then the head
+// (index 0) LAST — the head carries the whole-run XXH3-64 digest
+// (when PageChecksum is enabled), which is only complete after every
+// follower's bytes have been streamed through the hasher. write's
+// buf argument is reused between calls; implementations must consume
+// (write out / copy) it before returning. Trailing slack in the last
+// follower (and past the head's extent prefix) is zero-filled, so
+// the digest covers the full content range regardless of value
+// length (checksums.md §Overflow-Run Digest).
 //
-// Returns an error if pages's length doesn't match the computed run
-// length or if any page buffer is the wrong size — both are caller
-// bugs in the allocator.
-func EncodeOverflowRun(pages [][]byte, cfg Config, value []byte) error {
+// This is the ONE run-image ENCODER: online overflow-chain writes
+// and the bulk-load path both produce their committed run bytes
+// through it, so the digest and layout are computed in exactly one
+// place. (Run relocation copies an existing digest-verified image
+// byte-for-byte rather than re-encoding.) Memory is O(2 × PageSize)
+// regardless of value size — run pages are never slab-resident
+// (pager-slab.md §Slab Budget); the write callback pwrites each
+// page directly.
+//
+// The first write error aborts the run and is returned; pages
+// already written are the caller's to release (they are at fresh,
+// unreferenced ids — bounded leakage on abort).
+func WriteOverflowRun(cfg Config, value []byte, write func(idx uint32, buf []byte) error) error {
 	cfg.MustValidate()
-	want := int(OverflowRunLength(cfg, uint64(len(value))))
-	if len(pages) != want {
-		return fmt.Errorf("page: EncodeOverflowRun got %d pages, want %d for %d-byte value",
-			len(pages), want, len(value))
-	}
-	for i, p := range pages {
-		if len(p) != int(cfg.PageSize) {
-			return fmt.Errorf("page: EncodeOverflowRun page %d len %d != PageSize %d",
-				i, len(p), cfg.PageSize)
-		}
-		clear(p)
-	}
-	// Head page: header (+ digest slot) + extent prefix.
-	WriteHeader(pages[0], TypeOverflow, 0, uint32(want-1))
+	runLen := OverflowRunLength(cfg, uint64(len(value)))
+	// Head assembled in its own buffer and held back until the
+	// streamed digest is complete. Freshly zeroed, so the region past
+	// the copied prefix stays zero — slack is zero on write
+	// (page-formats.md §Overflow Page).
+	head := make([]byte, cfg.PageSize)
+	WriteHeader(head, TypeOverflow, 0, runLen-1)
 	start := OverflowHeadContentStart(cfg)
-	n := copy(pages[0][start:], value)
-	value = value[n:]
-	// Followers: pure extent bytes.
-	for i := 1; i < want; i++ {
-		m := copy(pages[i], value)
-		value = value[m:]
+	off := copy(head[start:], value)
+	h := xxh3.New()
+	_, _ = h.Write(head[start:])
+	// Followers: raw extent bytes, no header, no footer. clear(buf)
+	// each iteration drops the previous page's content and zero-fills
+	// the trailing slack of the final (partial) follower.
+	buf := make([]byte, cfg.PageSize)
+	followerCap := OverflowFollowerCapacity(cfg)
+	for i := uint32(1); i < runLen; i++ {
+		clear(buf)
+		off += copy(buf[:followerCap], value[off:])
+		_, _ = h.Write(buf)
+		if err := write(i, buf); err != nil {
+			return err
+		}
 	}
 	if cfg.PageChecksum {
-		// Whole-run digest over the FULL content range (checksums.md
-		// §Overflow-Run Digest): head content start through the last
-		// follower's end, slack included (zeroed above), so the run is
-		// verifiable standalone from AdditionalPages alone. Streamed
-		// because slab buffers are separate page-sized allocations;
-		// the streaming Hasher produces the identical value to the
-		// one-shot xxh3.Hash over the contiguous committed image.
-		h := xxh3.New()
-		_, _ = h.Write(pages[0][start:])
-		for i := 1; i < want; i++ {
-			_, _ = h.Write(pages[i])
-		}
-		le.PutUint64(pages[0][overflowDigestOff:], h.Sum64())
+		SetOverflowRunDigest(head, h.Sum64())
 	}
-	return nil
+	return write(0, head)
 }
 
 // DecodeOverflowFirstPage validates the head-page header and returns
@@ -183,10 +186,10 @@ func StoredOverflowRunDigest(head []byte) uint64 {
 }
 
 // SetOverflowRunDigest records the whole-run digest in a run's head
-// page — for writers that stream the digest across separately-written
-// pages (the bulk-load slab bypass) instead of encoding the run in
-// one EncodeOverflowRun call. Only valid when PageChecksum is enabled
-// (the field does not exist otherwise).
+// page. WriteOverflowRun calls it with the streamed digest once every
+// follower has passed through the hasher; exposed for tests and any
+// writer assembling a head out-of-band. Only valid when PageChecksum
+// is enabled (the field does not exist otherwise).
 func SetOverflowRunDigest(head []byte, digest uint64) {
 	le.PutUint64(head[overflowDigestOff:], digest)
 }

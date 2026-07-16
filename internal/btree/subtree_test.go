@@ -151,8 +151,12 @@ func TestFreeSubtreeWithOverflow(t *testing.T) {
 	for id := range reachable {
 		_, inRetired := retiredSet[id]
 		_, inLoose := loose[id]
-		if !inRetired && !inLoose {
-			t.Errorf("page %d not retired/loose post-FreeSubtree (overflow chain leaked?)", id)
+		// Direct-written same-tx overflow-run pages free straight back
+		// to the bitmap (never slab-resident, so FreePage's
+		// allocated-but-never-written branch applies).
+		bitmapFree := pw.Bitmap().IsSet(id)
+		if !inRetired && !inLoose && !bitmapFree {
+			t.Errorf("page %d not retired/loose/bitmap-free post-FreeSubtree (overflow chain leaked?)", id)
 		}
 	}
 }

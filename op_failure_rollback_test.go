@@ -63,10 +63,12 @@ func opFailureFixture(t *testing.T) (*DB, []string) {
 // Geometry: in a warm transaction the root is CoW'd by the first op,
 // so the only post-retire fallible step left is an ascend that must
 // CoW a mid-level branch not yet touched this tx — a one-page
-// allocation. The failing shape is a split-inducing insert under a
-// FRESH mid-branch: leaf CoW and split-right succeed, the old leaf is
-// retired, then the mid CoW trips ErrTxTooLarge with headroom exactly
-// two pages at the probe's start.
+// allocation. The failing shape is an overflow-value insert under a
+// FRESH mid-branch: the leaf CoW succeeds (consuming the last page of
+// headroom), the old leaf is retired, the overflow run itself writes
+// DIRECTLY (never slab-resident — no budget charge), and the mid CoW
+// then trips ErrTxTooLarge with headroom exactly one page at the
+// probe's start.
 //
 // Every btree mutation on this depth-3 tree costs one fresh buffer
 // per touched level (three pages for a leaf update — loose-page reuse
@@ -114,9 +116,9 @@ func probeOpsUntilBudgetFailures(t *testing.T, tx *Tx, ks *Keyspace, keys []stri
 		}
 	}
 
-	// Phase 2: exact one-page burns onto the two-page window.
+	// Phase 2: exact one-page burns onto the one-page window.
 	var burned []uint64
-	for headroomPages() > 2 {
+	for headroomPages() > 1 {
 		id, err := tx.pgr.AllocPage()
 		if err != nil {
 			t.Fatalf("burn AllocPage: %v", err)
@@ -126,8 +128,8 @@ func probeOpsUntilBudgetFailures(t *testing.T, tx *Tx, ks *Keyspace, keys []stri
 		}
 		burned = append(burned, id)
 	}
-	if hp := headroomPages(); hp != 2 {
-		t.Fatalf("fixture: landed at headroom %d pages, want 2", hp)
+	if hp := headroomPages(); hp != 1 {
+		t.Fatalf("fixture: landed at headroom %d pages, want 1", hp)
 	}
 
 	// Phase 3: probes — each must fail AFTER retiring the old leaf,
@@ -142,7 +144,7 @@ func probeOpsUntilBudgetFailures(t *testing.T, tx *Tx, ks *Keyspace, keys []stri
 		err := ks.Put([]byte(k), splitVal)
 		switch {
 		case err == nil:
-			t.Fatalf("fixture: probe Put(%q) succeeded at headroom 2 pages; window math off", k)
+			t.Fatalf("fixture: probe Put(%q) succeeded at headroom 1 page; window math off", k)
 		case errors.Is(err, ErrTxTooLarge) || errors.Is(err, ErrDBFull):
 			failures++
 			if after := tx.RetiredPagesLen(); after != before {

@@ -189,6 +189,20 @@ type Pager struct {
 	retiredPages  []uint64
 	loosePages    map[uint64]struct{}
 
+	// deferredFrees holds same-tx allocated-but-never-slab-written
+	// pages (direct-written overflow-run pages, mid-run alloc
+	// rollbacks) freed while a savepoint window was open. Their
+	// bitmap bits are set — making them re-allocatable — only when
+	// the LAST savepoint releases: an earlier re-allocation could
+	// direct-write over content a RestoreSavepoint resurrects the
+	// tree's reference to (the disk-resident analogue of the
+	// invariant loose-pop suspension and loosePopLog enforce for
+	// slab content). Truncated to the per-savepoint marker on
+	// Restore (those entries' allocations were undone; the pages
+	// revert to allocated). With no savepoint open, FreePage sets
+	// the bit immediately as before.
+	deferredFrees []uint64
+
 	// detachedBufs holds slab buffers that were severed from
 	// p.dirty when their page id was loose-popped by AllocPage.
 	// Required by the loose-page reuse contract:
@@ -272,19 +286,6 @@ type Pager struct {
 	// pager builds it fresh per ReadTx and discards it at close. Nil when
 	// PageChecksum is disabled or before the first verified read.
 	verified []uint64
-
-	// runPages tracks the page ids installed by AllocSlabRun in the
-	// current write tx — overflow-run pages, the only contiguous-run
-	// slab consumer (checksums.md §Overflow-Run Digest). commitStep1
-	// consults it to EXEMPT these pages from the per-page footer pass:
-	// run pages carry no footers (a stamp into a follower's last 8
-	// bytes would corrupt extent bytes; the head-resident whole-run
-	// digest is the run's integrity cover, written at encode time).
-	// Membership is provenance, not content: AllocSlab and CoW delete
-	// a reused id, so a run page freed and re-allocated as a node page
-	// within the same tx is stamped normally. Reset with the dirty map
-	// (ReleaseAll).
-	runPages map[uint64]struct{}
 
 	// txSnapshot captures the restorable core state (bitmap snapshot,
 	// HighWaterMark, RPL chain — snapshotCore) at the start of the
@@ -462,7 +463,6 @@ func NewWriter(file *os.File, cfg page.Config, reservationBytes int64, pool *Buf
 		return nil, err
 	}
 	p.dirty = make(map[uint64]*[]byte)
-	p.runPages = make(map[uint64]struct{})
 	p.maxBytes = maxBytes
 	p.bufPool = pool
 	p.readOnly = false
@@ -669,10 +669,7 @@ func (p *Pager) AbortTx() {
 	// reflect the (rolled-back) activity until the next BeginTx resets.
 	p.zeroSlabPeak()
 	p.ReleaseAll()
-	clear(p.pendingAllocs)
-	clear(p.pendingFrees)
-	clear(p.loosePages)
-	p.retiredPages = p.retiredPages[:0]
+	p.ResetFreespace()
 	// An armed RPL relocation request is owned by the arming
 	// transaction — consumed by ITS commit, executed or declined
 	// (free-space.md §RPL segment relocation). An abort discards it;
@@ -1173,16 +1170,18 @@ func (p *Pager) Page(id uint64) ([]byte, error) {
 //     must never satisfy a stray per-page Page call). A mismatch
 //     yields ErrBadPageChecksum with the head id.
 //
-// A run written in THIS write tx lives in per-page slab buffers, not
-// the mmap; PageRun assembles those into a freshly-allocated
-// contiguous image (api-surface.md §Byte Slice Ownership) — runs are
-// written whole via AllocSlabRun, so a dirty head implies every
-// follower is dirty too. Committed runs return a borrowed mmap slice
-// valid until the transaction closes.
+// Runs are NEVER slab-resident — every run page is written directly
+// (WriteDirectRaw) at allocation-fresh ids, and a run written in THIS
+// write tx reads back through the mmap like a committed one (the
+// unified page cache makes the pwritten bytes visible immediately).
+// The returned slice is a borrowed mmap view valid until the
+// transaction closes (api-surface.md §Byte Slice Ownership). A dirty
+// buffer at a run-head id therefore indicates a stale or forged
+// reference and yields ErrCorrupted.
 func (p *Pager) PageRun(headID uint64) ([]byte, error) {
 	if !p.readOnly {
 		if _, ok := p.dirty[headID]; ok {
-			return p.assembleDirtyRun(headID)
+			return nil, fmt.Errorf("%w: overflow-run head %d is slab-resident (runs are always written directly)", ErrCorrupted, headID)
 		}
 	}
 	run, err := p.pageRunMmap(headID)
@@ -1206,7 +1205,7 @@ func (p *Pager) PageRun(headID uint64) ([]byte, error) {
 func (p *Pager) PageRunRaw(headID uint64) ([]byte, error) {
 	if !p.readOnly {
 		if _, ok := p.dirty[headID]; ok {
-			return p.assembleDirtyRun(headID)
+			return nil, fmt.Errorf("%w: overflow-run head %d is slab-resident (runs are always written directly)", ErrCorrupted, headID)
 		}
 	}
 	return p.pageRunMmap(headID)
@@ -1249,33 +1248,6 @@ func (p *Pager) pageRunMmap(headID uint64) ([]byte, error) {
 		}
 	}
 	return p.mmap[off : off+total*uint64(p.cfg.PageSize)], nil
-}
-
-// assembleDirtyRun concatenates the per-page slab buffers of a run
-// written in this tx into a freshly-allocated contiguous image,
-// byte-identical to the committed mmap form. No digest verification:
-// this-tx slab content is trusted like every dirty read.
-func (p *Pager) assembleDirtyRun(headID uint64) ([]byte, error) {
-	head := *p.dirty[headID]
-	additional, err := page.DecodeOverflowFirstPage(head)
-	if err != nil {
-		return nil, fmt.Errorf("%w: dirty overflow-run head %d: %w", ErrCorrupted, headID, err)
-	}
-	total := 1 + uint64(additional)
-	out := make([]byte, 0, total*uint64(p.cfg.PageSize))
-	out = append(out, head...)
-	for i := uint64(1); i < total; i++ {
-		buf, ok := p.dirty[headID+i]
-		if !ok {
-			// Runs are written whole via AllocSlabRun; a dirty head
-			// with a non-dirty follower is an engine bug or a forged
-			// AdditionalPages on a this-tx buffer.
-			return nil, fmt.Errorf("%w: dirty overflow run at %d: follower %d not in slab",
-				ErrCorrupted, headID, headID+i)
-		}
-		out = append(out, *buf...)
-	}
-	return out, nil
 }
 
 // isVerified reports whether page id's footer has already been verified
@@ -1334,13 +1306,6 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 	if p.readOnly {
 		return nil, ErrReadOnly
 	}
-	// A CoW install supersedes any stale overflow-run provenance at
-	// dstID (run freed earlier in the tx, id re-allocated as a CoW
-	// destination) — see AllocSlab, including the undo-logging.
-	if _, wasRun := p.runPages[dstID]; wasRun {
-		p.recordSavepointUndo(fieldRunPages, dstID, true)
-		delete(p.runPages, dstID)
-	}
 	if existing, ok := p.dirty[dstID]; ok {
 		// Idempotent re-CoW: same destination already owned by this tx.
 		return *existing, nil
@@ -1374,16 +1339,6 @@ func (p *Pager) AllocSlab(id uint64) ([]byte, error) {
 	if p.readOnly {
 		return nil, ErrReadOnly
 	}
-	// A single-page (node) install supersedes any stale overflow-run
-	// provenance at this id (run freed earlier in the tx, id
-	// re-allocated as a node page) — the page must be footer-stamped
-	// at commit like any node page. Undo-logged so a savepoint restore
-	// that revives the run (via the loose-pop replay) revives its
-	// provenance with it.
-	if _, wasRun := p.runPages[id]; wasRun {
-		p.recordSavepointUndo(fieldRunPages, id, true)
-		delete(p.runPages, id)
-	}
 	if existing, ok := p.dirty[id]; ok {
 		return *existing, nil
 	}
@@ -1396,68 +1351,6 @@ func (p *Pager) AllocSlab(id uint64) ([]byte, error) {
 	p.bumpSlabPeak()
 	p.recordSavepointUndo(fieldDirty, id, false)
 	return *buf, nil
-}
-
-// AllocSlabRun installs n fresh zero-filled slab buffers covering the
-// contiguous run [firstID, firstID+n) previously reserved via
-// AllocContiguous. pages[i] is the buffer for firstID + uint64(i).
-// Implements the PageWriter contract used by the
-// overflow-chain Put path (internal/btree.overflow).
-//
-// Atomicity: the slab budget is checked once against the full n*PageSize
-// before any buffer is installed. On budget exceed (ErrTxTooLarge),
-// nothing is installed — the caller is expected to FreeRun(firstID, n)
-// to roll back the prior AllocContiguous.
-//
-// Idempotence: per-page, AllocSlab semantics are preserved — a buffer
-// already installed at any id in the run is returned unchanged and no
-// budget is charged for that id. The pre-flight budget check uses the
-// count of NOT-already-installed pages so an idempotent re-run of the
-// same firstID does not double-bill.
-func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
-	if p.readOnly {
-		return nil, ErrReadOnly
-	}
-	if n == 0 {
-		return nil, fmt.Errorf("pager: AllocSlabRun: n must be > 0")
-	}
-	end := firstID + uint64(n)
-	fresh := int64(0)
-	for id := firstID; id < end; id++ {
-		if _, ok := p.dirty[id]; !ok {
-			fresh++
-		}
-	}
-	// int64 arithmetic on the budget check so GOARCH=386/arm overflow
-	// isn't reachable for large n (uint32 max × 64 KB PageSize ≈ 2^48).
-	if int64(p.dirtyBytes)+fresh*int64(p.cfg.PageSize) > int64(p.admissionLimit()) {
-		return nil, ErrTxTooLarge
-	}
-	out := make([][]byte, n)
-	for i := uint32(0); i < n; i++ {
-		id := firstID + uint64(i)
-		// Overflow-run provenance: every page of the run is exempt
-		// from the commit footer pass (checksums.md §Overflow-Run
-		// Digest) — recorded here, the single install point for
-		// contiguous runs, whether the buffer is fresh or reused.
-		// Undo-logged (savepoint restore must strip the provenance
-		// when it strips the in-window run).
-		if _, wasRun := p.runPages[id]; !wasRun {
-			p.recordSavepointUndo(fieldRunPages, id, false)
-			p.runPages[id] = struct{}{}
-		}
-		if existing, ok := p.dirty[id]; ok {
-			out[i] = *existing
-			continue
-		}
-		buf := p.bufPool.Get()
-		p.dirty[id] = buf
-		p.dirtyBytes += int(p.cfg.PageSize)
-		p.recordSavepointUndo(fieldDirty, id, false)
-		out[i] = *buf
-	}
-	p.bumpSlabPeak()
-	return out, nil
 }
 
 // WriteDirect pwrites a fully-formed page buffer to disk at id's file
@@ -1607,10 +1500,6 @@ func (p *Pager) ReleaseAll() {
 	if p.readOnly {
 		return
 	}
-	// Run provenance is scoped to the tx exactly like the dirty map;
-	// cleared even on the fast path below (a savepoint rollback can
-	// empty the dirty map while stale run entries remain).
-	clear(p.runPages)
 	if len(p.dirty) == 0 && len(p.detachedBufs) == 0 {
 		return
 	}

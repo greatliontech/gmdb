@@ -8,7 +8,6 @@ import (
 
 	"github.com/greatliontech/gmdb/internal/btree"
 	"github.com/greatliontech/gmdb/internal/page"
-	"github.com/zeebo/xxh3"
 )
 
 // errBulkEntryTooLarge is an internal sentinel: a single leaf entry does
@@ -387,8 +386,8 @@ type bulkOverflowWriter interface {
 // bulkload.md §Slab Bypass). Returns the run's first page ID; the leaf
 // carries an overflow-reference entry to it.
 //
-// The on-disk layout is byte-identical to page.EncodeOverflowRun (head
-// page: TypeOverflow header with AdditionalPages = runLen-1, the
+// The on-disk layout is page.WriteOverflowRun's (head page:
+// TypeOverflow header with AdditionalPages = runLen-1, the
 // whole-run digest slot when checksums are enabled, then the value
 // prefix; followers: raw value bytes). The whole-run digest covers the
 // full content range — head content start through the last follower's
@@ -410,36 +409,14 @@ func writeBulkOverflowChain(pw bulkOverflowWriter, cfg page.Config, value []byte
 	if err != nil {
 		return 0, fmt.Errorf("gmdb: bulkload alloc overflow run (%d pages): %w", runLen, err)
 	}
-
-	// Head page assembled in its own buffer, held back until the
-	// streamed digest is complete. Freshly zeroed, so the region past
-	// the copied prefix (a value shorter than firstCap) stays zero —
-	// slack is zero on write (page-formats.md §Overflow Page).
-	head := make([]byte, cfg.PageSize)
-	page.WriteHeader(head, page.TypeOverflow, 0, runLen-1)
-	start := page.OverflowHeadContentStart(cfg)
-	off := copy(head[start:], value)
-	h := xxh3.New()
-	_, _ = h.Write(head[start:])
-
-	// Follower pages: raw value bytes, no header, no footer. clear(buf)
-	// each iteration drops the previous page's content and zero-fills
-	// the trailing slack of the final (partial) follower.
-	buf := make([]byte, cfg.PageSize)
-	followerCap := page.OverflowFollowerCapacity(cfg)
-	for i := uint32(1); i < runLen; i++ {
-		clear(buf)
-		off += copy(buf[:followerCap], value[off:])
-		_, _ = h.Write(buf)
-		if err := pw.WriteDirectRaw(firstID+uint64(i), buf); err != nil {
-			return 0, fmt.Errorf("gmdb: bulkload write overflow follower page %d: %w", i, err)
-		}
-	}
-	if cfg.PageChecksum {
-		page.SetOverflowRunDigest(head, h.Sum64())
-	}
-	if err := pw.WriteDirectRaw(firstID, head); err != nil {
-		return 0, fmt.Errorf("gmdb: bulkload write overflow head page: %w", err)
+	// page.WriteOverflowRun streams followers first and the head —
+	// carrying the completed whole-run digest — last, in O(2 pages)
+	// memory (the shared run-image writer; checksums.md
+	// §Overflow-Run Digest).
+	if err := page.WriteOverflowRun(cfg, value, func(idx uint32, buf []byte) error {
+		return pw.WriteDirectRaw(firstID+uint64(idx), buf)
+	}); err != nil {
+		return 0, fmt.Errorf("gmdb: bulkload write overflow run: %w", err)
 	}
 	return firstID, nil
 }

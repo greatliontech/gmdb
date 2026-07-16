@@ -116,21 +116,16 @@ func (f *fakeWriter) AllocContiguous(n uint32) (uint64, error) {
 	return first, nil
 }
 
-// ZeroPageRun returns fresh zero-filled slab buffers for each id
-// in [firstID, firstID+n). Mirrors ZeroPage semantics page-by-
-// page; the caller (writeOverflowChain) writes via
-// page.EncodeOverflowRun.
-func (f *fakeWriter) ZeroPageRun(firstID uint64, n uint32) ([][]byte, error) {
-	if n == 0 {
-		return nil, fmt.Errorf("fakeWriter.ZeroPageRun: n=0 invalid")
+// WriteRunPage stores a copy of one completed run page at id —
+// the fake's analogue of the pager's direct pwrite (the buffer is
+// reused by the caller, so a copy is mandatory, exactly like the
+// real write-out).
+func (f *fakeWriter) WriteRunPage(id uint64, buf []byte) error {
+	if len(buf) != int(f.pageSize) {
+		return fmt.Errorf("fakeWriter.WriteRunPage: buf len %d != pageSize %d", len(buf), f.pageSize)
 	}
-	pages := make([][]byte, n)
-	for i := range n {
-		buf := make([]byte, f.pageSize)
-		f.pages[firstID+uint64(i)] = buf
-		pages[i] = buf
-	}
-	return pages, nil
+	f.pages[id] = bytes.Clone(buf)
+	return nil
 }
 
 // FreeRun retires n consecutive pages starting at firstID. Each

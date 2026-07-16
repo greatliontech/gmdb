@@ -147,6 +147,30 @@ Invariant: kind=clause-explicit;
     same transaction's commit publishes — temporary allocation
     aliasing.
 
+Invariant: kind=entailed;
+  property=A page whose content a RESTORABLE state (an open
+    savepoint's capture) still references is never re-allocatable
+    while that state is restorable. For slab content this is the
+    loose-pop suspension under nested savepoints plus the shallow
+    loosePopLog buffer re-attach; for DISK content — same-tx
+    direct-written pages (overflow runs) freed inside a savepoint
+    window — the freed pages' bitmap bits are set only when the
+    LAST savepoint releases (deferred frees; a savepoint restore
+    drops its window's deferrals, since those frees were undone);
+  from=entailed: savepoint restore reverts the tree to a state
+    referencing the freed pages' content, and a direct write is
+    destructive on disk — nothing re-attaches disk bytes;
+  violation=Replace a large same-tx value inside one op: the old
+    run is freed (bitmap branch), a long split separator's key
+    extent direct-writes onto the freed ids (first-fit), the
+    ascend then fails and the op's shallow savepoint restores —
+    the tree references the old run whose bytes were destroyed:
+    ErrBadPageChecksum on a healthy tree (or silent wrong bytes
+    with checksums off). Enforced by
+    TestFreedDirectRunNotReallocatableInsideSavepointWindow,
+    TestDeferredSameTxFreesApplyAtWindowClose,
+    TestDeferredFreesDroppedOnRestore.
+
 Invariant: kind=clause-explicit;
   property=Tail-page refund (lowering `HighWaterMark` past tail
     pages with bits set in the bitmap) clears those bits *before*

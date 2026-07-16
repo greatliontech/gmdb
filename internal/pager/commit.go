@@ -214,10 +214,7 @@ func (p *Pager) Commit(cp CommitParams, prev Meta, prevActive int) (CommitResult
 	p.discardTxSnapshot()
 	p.ReleaseAll()
 	p.bitmap.ClearDirty()
-	clear(p.pendingAllocs)
-	clear(p.pendingFrees)
-	clear(p.loosePages)
-	p.retiredPages = p.retiredPages[:0]
+	p.ResetFreespace()
 	p.currentTxnID = 0
 
 	return CommitResult{Meta: newMeta, ActiveMetaIdx: newActive}, nil
@@ -396,12 +393,11 @@ func (p *Pager) commitStep1() (int, error) {
 	pageSize := int(p.cfg.PageSize)
 	written := 0
 	for id, buf := range p.dirty {
-		// Overflow-run pages are exempt from the footer pass: they
-		// carry the head-resident whole-run digest instead, written at
-		// encode time (checksums.md §Overflow-Run Digest). Stamping a
-		// footer into a follower's last 8 bytes would overwrite extent
-		// bytes.
-		if _, isRun := p.runPages[id]; p.cfg.PageChecksum && !isRun {
+		// Every slab page is a node page and gets a footer — overflow
+		// runs (footer-less, digest-covered) are never slab-resident;
+		// they are written directly at encode time (checksums.md
+		// §Overflow-Run Digest).
+		if p.cfg.PageChecksum {
 			page.WritePageFooter(*buf, p.cfg.PageSize)
 		}
 		off := int64(id) * int64(pageSize)

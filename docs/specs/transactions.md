@@ -504,7 +504,7 @@ what makes per-row `BeginShallowSavepoint` (one per
 total clone work across the tx is `O(N)`, not `O(N²)`.
 
 The slab's `dirty` map specifically is tracked via append-only
-log entries on `CoW`/`AllocSlab`/`AllocSlabRun` (the idempotent
+log entries on `CoW`/`AllocSlab` (the idempotent
 shortcut on `dirty[id]` already-present skips both the install
 and the log append). Loose-pop's `dirty[id]` detach is recorded
 in a separate per-Savepoint `loosePopLog` (with the original

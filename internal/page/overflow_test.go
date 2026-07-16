@@ -23,13 +23,16 @@ func encodeRun(t *testing.T, cfg Config, value []byte) [][]byte {
 	n := int(OverflowRunLength(cfg, uint64(len(value))))
 	pages := make([][]byte, n)
 	for i := range n {
-		// Pre-fill with garbage: production slab buffers are pool-
-		// recycled, so zero slack must come from the ENCODER (clear),
-		// never from a coincidentally-fresh buffer.
+		// Pre-fill with garbage: the writer reuses one scratch buffer
+		// across followers, so zero slack must come from the WRITER's
+		// clear, never from a coincidentally-fresh destination.
 		pages[i] = bytes.Repeat([]byte{0xFF}, int(cfg.PageSize))
 	}
-	if err := EncodeOverflowRun(pages, cfg, value); err != nil {
-		t.Fatalf("encode: %v", err)
+	if err := WriteOverflowRun(cfg, value, func(idx uint32, buf []byte) error {
+		copy(pages[idx], buf)
+		return nil
+	}); err != nil {
+		t.Fatalf("WriteOverflowRun: %v", err)
 	}
 	return pages
 }
@@ -200,10 +203,10 @@ func TestOverflowRunDigestAbsentWithoutChecksum(t *testing.T) {
 	}
 }
 
-// TestOverflowStreamedDigestMatchesOneShot: SetOverflowRunDigest with a
-// caller-streamed hash (the bulk-load slab-bypass writer) must be
-// byte-identical to EncodeOverflowRun's output — one on-disk form, no
-// writer drift.
+// TestOverflowStreamedDigestMatchesOneShot: the writer's streamed
+// digest (followers hashed one page at a time) must equal the
+// one-shot OverflowRunDigest over the contiguous committed image —
+// the verification side recomputes exactly that.
 func TestOverflowStreamedDigestMatchesOneShot(t *testing.T) {
 	cfg := Config{PageSize: 4096, PageChecksum: true}
 	valLen := OverflowFirstPageCapacity(cfg) + 2*OverflowFollowerCapacity(cfg) - 37
@@ -217,25 +220,55 @@ func TestOverflowStreamedDigestMatchesOneShot(t *testing.T) {
 	}
 }
 
-func TestOverflowEncodeRejectsWrongPageCount(t *testing.T) {
-	cfg := Config{PageSize: 4096}
-	value := bytes.Repeat([]byte("x"), 100) // 1-page run
-	pages := make([][]byte, 2)              // wrong: 2 supplied
-	for i := range pages {
-		pages[i] = make([]byte, cfg.PageSize)
+// TestOverflowWriteRunHeadLast pins the write ordering: followers
+// (ascending) strictly before the head. The head carries the
+// whole-run digest, so writing it first would publish a digest over
+// bytes not yet streamed — and a reader resolving the run through a
+// just-written head must find every follower already on disk.
+func TestOverflowWriteRunHeadLast(t *testing.T) {
+	cfg := Config{PageSize: 4096, PageChecksum: true}
+	value := bytes.Repeat([]byte("y"), int(OverflowFirstPageCapacity(cfg))+2*int(OverflowFollowerCapacity(cfg))-5)
+	var order []uint32
+	if err := WriteOverflowRun(cfg, value, func(idx uint32, _ []byte) error {
+		order = append(order, idx)
+		return nil
+	}); err != nil {
+		t.Fatalf("WriteOverflowRun: %v", err)
 	}
-	if err := EncodeOverflowRun(pages, cfg, value); err == nil {
-		t.Error("expected error on wrong page count")
+	want := []uint32{1, 2, 0}
+	if len(order) != len(want) {
+		t.Fatalf("write order %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("write order %v, want %v (head must be last)", order, want)
+		}
+	}
+}
+
+// TestOverflowWriteRunAbortsOnWriteError: the first callback error
+// aborts the run and surfaces unchanged.
+func TestOverflowWriteRunAbortsOnWriteError(t *testing.T) {
+	cfg := Config{PageSize: 4096}
+	value := bytes.Repeat([]byte("z"), int(OverflowFirstPageCapacity(cfg))+10) // 2-page run
+	boom := fmt.Errorf("boom")
+	calls := 0
+	err := WriteOverflowRun(cfg, value, func(uint32, []byte) error {
+		calls++
+		return boom
+	})
+	if err != boom {
+		t.Fatalf("err = %v, want the callback's error", err)
+	}
+	if calls != 1 {
+		t.Fatalf("writer continued after error: %d calls", calls)
 	}
 }
 
 func TestOverflowFirstPageTypeIsOverflow(t *testing.T) {
 	cfg := Config{PageSize: 4096}
 	value := []byte("small")
-	pages := [][]byte{make([]byte, cfg.PageSize)}
-	if err := EncodeOverflowRun(pages, cfg, value); err != nil {
-		t.Fatalf("encode: %v", err)
-	}
+	pages := encodeRun(t, cfg, value)
 	typ, _, _, _ := ReadHeader(pages[0])
 	if typ != TypeOverflow {
 		t.Errorf("type = %d, want %d (TypeOverflow)", typ, TypeOverflow)

@@ -400,15 +400,11 @@ func TestGetOverflowEntryAssemblesValueChain(t *testing.T) {
 	if runLen != 3 {
 		t.Fatalf("setup: runLen = %d; want 3 (10000B / 4 KB page with header gap)", runLen)
 	}
-	pages := make([][]byte, runLen)
-	for i := range runLen {
-		pages[i] = make([]byte, cfg.PageSize)
-	}
-	if err := page.EncodeOverflowRun(pages, cfg, value); err != nil {
-		t.Fatalf("setup: EncodeOverflowRun: %v", err)
-	}
-	for i := range runLen {
-		pr.put(42+uint64(i), pages[i])
+	if err := page.WriteOverflowRun(cfg, value, func(idx uint32, buf []byte) error {
+		pr.put(42+uint64(idx), append([]byte(nil), buf...))
+		return nil
+	}); err != nil {
+		t.Fatalf("setup: WriteOverflowRun: %v", err)
 	}
 
 	pr.put(1, makeLeaf(t, cfg, []page.LeafEntry{

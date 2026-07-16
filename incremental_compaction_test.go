@@ -462,13 +462,23 @@ func TestCompactionShrinksFileMonotonically(t *testing.T) {
 
 // --- 12.5b-3b: Inv-M4 (never surface ErrTxTooLarge) ---------------------
 
-// buildOversizeForest builds a forest whose full relocation exceeds maxBuf
-// (in slab pages), in per-tx batches small enough to commit under maxBuf.
+// buildOversizeForest builds a forest whose full relocation exceeds
+// maxBuf (in slab pages), in per-tx batches small enough to commit
+// under maxBuf. The forest is NODE-heavy (inline values): overflow
+// runs are never slab-resident, so only node-page relocations charge
+// the budget — an overrun fixture must overrun on leaves/branches.
+const (
+	oversizeForestBatches = 45
+	oversizeForestPerTx   = 35
+)
+
+func oversizeForestValue() []byte { return bytes.Repeat([]byte{0x5A}, 1200) }
+
 func buildOversizeForest(t *testing.T, db *DB) {
 	t.Helper()
 	ctx := context.Background()
-	big := bytes.Repeat([]byte{0x5A}, 6000) // overflow value (~2 follower pages)
-	for batch := range 12 {
+	val := oversizeForestValue()
+	for batch := range oversizeForestBatches {
 		tx, err := db.Begin(ctx)
 		if err != nil {
 			t.Fatalf("Begin batch %d: %v", batch, err)
@@ -480,8 +490,8 @@ func buildOversizeForest(t *testing.T, db *DB) {
 				t.Fatalf("Create/Open k: %v", err)
 			}
 		}
-		for i := range 25 {
-			if err := ks.Put(fmt.Appendf(nil, "ovf%03d-%03d", batch, i), big); err != nil {
+		for i := range oversizeForestPerTx {
+			if err := ks.Put(fmt.Appendf(nil, "ovf%03d-%03d", batch, i), val); err != nil {
 				t.Fatalf("Put ovf %d-%d: %v", batch, i, err)
 			}
 		}
@@ -506,17 +516,14 @@ func TestCompactionPassReturnsTxTooLargeAndRollsBack(t *testing.T) {
 	}
 	defer db.Close()
 	buildOversizeForest(t, db)
-	// LOW capacity: deleting the first eight batches (one tx each, to
-	// fit the reduced slab) releases their overflow chains and leaves
-	// inline (row deletes free chains immediately; a DeleteKeyspace
-	// defers the tree teardown to maintenance, which is disabled
-	// here) — enough below-floor holes that the surviving batches'
-	// relocation cascade overruns the slab before the capacity runs
-	// out.
-	for batch := range 8 {
+	// LOW capacity: deleting two thirds of the batches (one tx each,
+	// to fit the reduced slab) leaves enough below-floor holes that
+	// the surviving batches' node-relocation cascade overruns the
+	// slab before the capacity runs out.
+	for batch := range oversizeForestBatches * 2 / 3 {
 		txd, _ := db.Begin(ctx)
 		ksd, _ := txd.OpenKeyspace("k")
-		for i := range 30 {
+		for i := range oversizeForestPerTx {
 			_ = ksd.Delete(fmt.Appendf(nil, "ovf%03d-%03d", batch, i))
 		}
 		if err := txd.Commit(); err != nil {
@@ -532,9 +539,9 @@ func TestCompactionPassReturnsTxTooLargeAndRollsBack(t *testing.T) {
 
 	// Huge budget ⇒ the feasibility floor drops deep into the forest ⇒
 	// the relocation cascade overruns MaxTxBufferBytes.
-	_, err = db.compactionPass(ctx, 1<<20)
+	moved, err := db.compactionPass(ctx, 1<<20)
 	if !errors.Is(err, ErrTxTooLarge) {
-		t.Fatalf("compactionPass err = %v, want ErrTxTooLarge", err)
+		t.Fatalf("compactionPass err = %v (moved %d), want ErrTxTooLarge", err, moved)
 	}
 	assertCheckClean(t, db, "post-rolled-back-pass")
 }
@@ -562,11 +569,11 @@ func TestRunCompactionNeverSurfacesTxTooLarge(t *testing.T) {
 	// Every value still readable.
 	rtx, _ := db.Begin(ctx)
 	rks, _ := rtx.OpenKeyspace("k")
-	big := bytes.Repeat([]byte{0x5A}, 6000)
-	for batch := range 12 {
-		for i := range 25 {
+	val := oversizeForestValue()
+	for batch := range oversizeForestBatches {
+		for i := range oversizeForestPerTx {
 			got, err := rks.Get(fmt.Appendf(nil, "ovf%03d-%03d", batch, i))
-			if err != nil || !bytes.Equal(got, big) {
+			if err != nil || !bytes.Equal(got, val) {
 				t.Fatalf("ovf%03d-%03d after runCompaction: err=%v len=%d", batch, i, err, len(got))
 			}
 		}

@@ -7,10 +7,10 @@ import (
 
 // btreeWriter adapts *pager.Pager to btree.PageWriter. It is the one
 // place the two vocabularies meet: the pager owns the MVCC + slab
-// machinery and names it accordingly (CoW, AllocSlab, AllocSlabRun —
-// see docs/specs/pager-slab.md), while btree consumes an opaque
+// machinery and names it accordingly (CoW, AllocSlab, WriteDirectRaw
+// — see docs/specs/pager-slab.md), while btree consumes an opaque
 // page-buffer store and names it in storage-neutral terms (CopyPage,
-// ZeroPage, ZeroPageRun). Bridging here keeps pager internals out of
+// ZeroPage, WriteRunPage). Bridging here keeps pager internals out of
 // the btree package's surface — without this adapter the btree
 // interface would have to mirror the pager's method names verbatim.
 //
@@ -35,7 +35,9 @@ func (w btreeWriter) ZeroPage(id uint64) ([]byte, error) {
 	return w.Pager.AllocSlab(id)
 }
 
-// ZeroPageRun bridges the contiguous-run form to pager.AllocSlabRun.
-func (w btreeWriter) ZeroPageRun(firstID uint64, n uint32) ([][]byte, error) {
-	return w.Pager.AllocSlabRun(firstID, n)
+// WriteRunPage bridges btree's direct run-page write to
+// pager.WriteDirectRaw (run pages carry no per-page footer; the
+// head-resident whole-run digest is the run's integrity cover).
+func (w btreeWriter) WriteRunPage(id uint64, buf []byte) error {
+	return w.Pager.WriteDirectRaw(id, buf)
 }

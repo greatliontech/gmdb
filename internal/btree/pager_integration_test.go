@@ -196,7 +196,7 @@ func TestPagerOverflowReplaceFreesOldChain(t *testing.T) {
 // parity tests, mirroring the root package's gmdb.btreeWriter (which
 // is unreachable here: importing gmdb from internal/btree would
 // cycle). The pager keeps its MVCC/slab vocabulary (CoW/AllocSlab);
-// btree consumes the storage-neutral CopyPage/ZeroPage/ZeroPageRun.
+// btree consumes the storage-neutral CopyPage/ZeroPage/WriteRunPage.
 // Pager methods (Config, Close, PendingAllocs, ...) reach callers
 // through the embedded pointer.
 type pagerWriter struct{ *pager.Pager }
@@ -209,6 +209,6 @@ func (w pagerWriter) ZeroPage(id uint64) ([]byte, error) {
 	return w.Pager.AllocSlab(id)
 }
 
-func (w pagerWriter) ZeroPageRun(firstID uint64, n uint32) ([][]byte, error) {
-	return w.Pager.AllocSlabRun(firstID, n)
+func (w pagerWriter) WriteRunPage(id uint64, buf []byte) error {
+	return w.Pager.WriteDirectRaw(id, buf)
 }

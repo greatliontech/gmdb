@@ -50,10 +50,13 @@ type PageWriter interface {
 	// and must be addressable as firstID+1, ..., firstID+n-1).
 	AllocContiguous(n uint32) (uint64, error)
 
-	// ZeroPageRun returns fresh zero-filled writable buffers for the
-	// n pages of a run previously reserved via AllocContiguous.
-	// pages[i] is the buffer for firstID + uint64(i).
-	ZeroPageRun(firstID uint64, n uint32) (pages [][]byte, err error)
+	// WriteRunPage writes one completed overflow-run page DIRECTLY
+	// to storage at id — the page never becomes slab-resident and
+	// carries no per-page footer (run integrity is the head-resident
+	// whole-run digest; checksums.md §Overflow-Run Digest). id must
+	// belong to a run reserved via AllocContiguous in this
+	// transaction. buf may be reused by the caller after return.
+	WriteRunPage(id uint64, buf []byte) error
 
 	// FreeRun retires a contiguous run of n pages starting at
 	// firstID. Each id in [firstID, firstID+n) is retired exactly

@@ -227,6 +227,18 @@ tie-through comparison would trust. The write path saves `N`
 footer computations per run; the read path drops the
 footer-skipping reassembly entirely.
 
+Run pages are written DIRECTLY (they are never slab-resident —
+`pager-slab.md §Slab Budget`): followers first in ascending order,
+the head last, so a head page only becomes readable once the
+digest it carries is complete and every follower it references is
+on disk. The two ENCODING writers — online chain writes and bulk
+load — produce the run image through one shared streaming writer,
+so digest and layout are computed in exactly one place. Run
+relocation does not re-encode: it copies a digest-verified source
+image byte-for-byte to the new location (the digest covers content
+only, never page ids, so the copied head's stored digest remains
+valid), preserving the same head-last write order.
+
 With checksums disabled the digest field is absent (extent bytes
 start at head offset 8), matching the footer rule for other data
 pages.

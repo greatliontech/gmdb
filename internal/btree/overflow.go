@@ -164,14 +164,11 @@ func writeOverflowChain(pw PageWriter, cfg page.Config, key, value []byte) (page
 	if err != nil {
 		return page.LeafEntry{}, fmt.Errorf("btree: alloc overflow chain (run=%d): %w", runLen, err)
 	}
-	pages, err := pw.ZeroPageRun(firstID, runLen)
-	if err != nil {
+	if err := page.WriteOverflowRun(cfg, value, func(idx uint32, buf []byte) error {
+		return pw.WriteRunPage(firstID+uint64(idx), buf)
+	}); err != nil {
 		_ = pw.FreeRun(firstID, runLen)
-		return page.LeafEntry{}, fmt.Errorf("btree: alloc overflow slab run: %w", err)
-	}
-	if err := page.EncodeOverflowRun(pages, cfg, value); err != nil {
-		_ = pw.FreeRun(firstID, runLen)
-		return page.LeafEntry{}, fmt.Errorf("btree: encode overflow run: %w", err)
+		return page.LeafEntry{}, fmt.Errorf("btree: write overflow run: %w", err)
 	}
 	return page.LeafEntry{
 		Flags:        page.CellFlagOverflow,
@@ -277,14 +274,11 @@ func writeKeyExtent(pw PageWriter, cfg page.Config, key []byte) (uint64, error) 
 	if err != nil {
 		return 0, fmt.Errorf("btree: alloc key extent (run=%d): %w", runLen, err)
 	}
-	pages, err := pw.ZeroPageRun(firstID, runLen)
-	if err != nil {
+	if err := page.WriteOverflowRun(cfg, tail, func(idx uint32, buf []byte) error {
+		return pw.WriteRunPage(firstID+uint64(idx), buf)
+	}); err != nil {
 		_ = pw.FreeRun(firstID, runLen)
-		return 0, fmt.Errorf("btree: alloc key extent slab run: %w", err)
-	}
-	if err := page.EncodeOverflowRun(pages, cfg, tail); err != nil {
-		_ = pw.FreeRun(firstID, runLen)
-		return 0, fmt.Errorf("btree: encode key extent run: %w", err)
+		return 0, fmt.Errorf("btree: write key extent run: %w", err)
 	}
 	return firstID, nil
 }

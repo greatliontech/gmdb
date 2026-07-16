@@ -48,7 +48,7 @@ const (
 // wasPreWindow distinguishes whether the detached buf was already in
 // p.dirty at this Savepoint's Begin time (true → restore by re-
 // attaching buf to dirty[id]) or was added to p.dirty *during* the
-// window via CoW/AllocSlab/AllocSlabRun (false → the in-window
+// window via CoW/AllocSlab (false → the in-window
 // installer's `(fieldDirty, id, false)` undo entry already deleted
 // dirty[id] during the Restore step-3 replay, so the loose-pop replay
 // must drop buf back to the pool instead of installing it — installing
@@ -75,8 +75,8 @@ const (
 	fieldPendingAllocs savepointUndoField = iota
 	fieldPendingFrees
 	fieldLoosePages
-	// fieldDirty tracks additions to p.dirty (CoW / AllocSlab /
-	// AllocSlabRun). Pre-op state is always "absent" because the slab
+	// fieldDirty tracks additions to p.dirty (CoW / AllocSlab).
+	// Pre-op state is always "absent" because the slab
 	// installers return early when dirty[id] is already present
 	// (idempotent CoW), so the loggable case is uniformly wasPresent=
 	// false. RestoreSavepoint deletes dirty[id] and pool-Puts the buffer
@@ -85,15 +85,6 @@ const (
 	// detach needs the original buffer pointer for re-attach, which the
 	// uniform key/wasPresent shape here cannot carry).
 	fieldDirty
-	// fieldRunPages tracks mutations of p.runPages (overflow-run
-	// footer-exemption provenance): AllocSlabRun adds; AllocSlab / CoW
-	// delete on node-page reuse. Standard set semantics — wasPresent
-	// is the pre-op membership. Without this, a shallow savepoint's
-	// loose-pop replay re-attaches a buffer into p.dirty whose
-	// provenance the in-window ops changed, and commitStep1 then
-	// footer-stamps a live run page (extent corruption) or skips the
-	// footer on a live node page (false ErrBadPageChecksum).
-	fieldRunPages
 )
 
 // savepointUndoEntry records one observed mutation of a tx-scoped map
@@ -170,6 +161,12 @@ type Savepoint struct {
 	// length is therefore a complete restore.
 	retiredLen  int
 	detachedLen int
+	// deferredLen marks Pager.deferredFrees at Begin. Restore
+	// truncates back to it: the in-window deferred frees belong to
+	// allocations the restore undoes (the pages revert to allocated
+	// with their content referenced again), so their bitmap bits must
+	// never be set.
+	deferredLen int
 	dirtyBytes  int
 
 	// loosePopLog is the per-event record of loose-pops that AllocPage
@@ -243,6 +240,7 @@ func (p *Pager) captureSavepointState() *Savepoint {
 		undoLogPos:   len(p.savepointUndoLog),
 		retiredLen:   len(p.retiredPages),
 		detachedLen:  len(p.detachedBufs),
+		deferredLen:  len(p.deferredFrees),
 		dirtyBytes:   p.dirtyBytes,
 	}
 }
@@ -475,12 +473,6 @@ func (p *Pager) RestoreSavepoint(sp *Savepoint) {
 				p.bufPool.Put(buf)
 				delete(p.dirty, e.key)
 			}
-		case fieldRunPages:
-			if e.wasPresent {
-				p.runPages[e.key] = struct{}{}
-			} else {
-				delete(p.runPages, e.key)
-			}
 		}
 	}
 	p.savepointUndoLog = p.savepointUndoLog[:sp.undoLogPos]
@@ -507,7 +499,7 @@ func (p *Pager) RestoreSavepoint(sp *Savepoint) {
 	//     entry.buf at re-install time.
 	//
 	//   - wasPreWindow=false: dirty[entry.id] was added in-window
-	//     (CoW/AllocSlab/AllocSlabRun) and then loose-popped, also
+	//     (CoW/AllocSlab) and then loose-popped, also
 	//     in-window. The step-3 replay deleted the post-pop buffer (if
 	//     any) but cannot undo the original in-window add — that
 	//     buffer is held by entry.buf alone (detached by the loose-
@@ -555,6 +547,13 @@ func (p *Pager) RestoreSavepoint(sp *Savepoint) {
 	}
 	if len(p.detachedBufs) > sp.detachedLen {
 		p.detachedBufs = p.detachedBufs[:sp.detachedLen]
+	}
+	// In-window deferred frees are dropped: the frees' allocations
+	// were undone above (pendingAllocs / bitmap restore), so the
+	// pages are allocated again and their content is live — setting
+	// their bits later would double-free them.
+	if len(p.deferredFrees) > sp.deferredLen {
+		p.deferredFrees = p.deferredFrees[:sp.deferredLen]
 	}
 	p.dirtyBytes = sp.dirtyBytes
 
@@ -604,6 +603,15 @@ func (p *Pager) ReleaseSavepoint(sp *Savepoint) {
 	p.activeSavepoints = p.activeSavepoints[:n-1]
 	if len(p.activeSavepoints) == 0 {
 		p.savepointUndoLog = p.savepointUndoLog[:0]
+		// The last savepoint resolved: no restorable state can
+		// reference the deferred frees' content anymore — return
+		// them to the bitmap (see Pager.deferredFrees).
+		if len(p.deferredFrees) > 0 && p.bitmap != nil {
+			for _, id := range p.deferredFrees {
+				p.bitmap.Set(id)
+			}
+			p.deferredFrees = p.deferredFrees[:0]
+		}
 	}
 	if sp.bitmap != nil && p.bitmap != nil {
 		p.bitmap.Discard(sp.bitmap)
