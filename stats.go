@@ -237,6 +237,14 @@ type TxStats struct {
 	// immediately after Commit.
 	SlabPeakBytes int64
 
+	// SpilledPages counts slab pages written out to their file
+	// locations before commit because the transaction's working set
+	// exceeded MaxTxBufferBytes — the spill threshold (pager-slab.md
+	// §Slab Budget). Non-zero means the engine traded early pwrites
+	// for bounded memory; a persistently large value suggests raising
+	// MaxTxBufferBytes.
+	SpilledPages uint64
+
 	// B+tree operation counts.
 	Gets    uint64 // keyspace / set-keyspace Get calls
 	Puts    uint64 // keyspace / set-keyspace Put calls
@@ -273,6 +281,7 @@ func (tx *Tx) Stats() TxStats {
 		ReclaimedPages:       snap.ReclaimedPages,
 		WrittenPages:         snap.WrittenPages,
 		SlabPeakBytes:        snap.SlabPeakBytes,
+		SpilledPages:         snap.SpilledPages,
 		Gets:                 snap.Gets,
 		Puts:                 snap.Puts,
 		Deletes:              snap.Deletes,

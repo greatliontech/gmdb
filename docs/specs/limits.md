@@ -71,9 +71,10 @@ set members, and CopyTo's rebuild: one threshold, no drift — the
 same input is accepted or rejected identically on every path;
 pinned by TestErrKeyTooLargeSentinel and
 TestKeyTooLargeDeterministicAtBound).
-Practical bounds arrive earlier: a written key
-rides the transaction slab (`MaxTxBufferBytes`) and every deep
-comparison materializes shared-prefix bytes.
+Practical bounds arrive earlier: every deep
+comparison materializes shared-prefix bytes (`MaxTxBufferBytes`
+bounds steady-state slab memory, not written volume — excess spills
+at operation boundaries).
 
 Keys up to the **inline threshold `T`** are stored in the inline
 cell forms; longer keys take the overflow-key form —

@@ -1818,7 +1818,7 @@ func (tx *Tx) DeleteKeyspace(name string) (retErr error) {
 
 	// Steps 2 + 3: index retirement. Skip when no registry exists.
 	if desc.IndexRegistryRoot != 0 {
-		if err := tx.retireIndexRegistry(name, desc.IndexRegistryRoot); err != nil {
+		if err := tx.retireIndexRegistry(name, desc.IndexRegistryRoot, existingKS, existingSKS); err != nil {
 			return err
 		}
 	}

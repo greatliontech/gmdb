@@ -281,9 +281,10 @@ migration, RPL-segment slab allocation and file extension) does NOT
 poison: no pwrite has occurred, `AbortTx` fully restores the pre-tx
 in-memory state, and the handle stays usable. The only commit errors
 that can originate in assembly are `ErrTxTooLarge` (a defensive
-backstop — ops-phase admission reserves the commit sequence's exact
-slab cost, so the budget cannot be exceeded at `Commit` by in-spec
-use; see `pager-slab.md §Slab Budget` INV-COMMIT-HEADROOM) and
+backstop — the commit reserve is bounded at every obligation and
+retire event and a pre-commit spill frees everything else, so the
+budget cannot be exceeded at `Commit` by in-spec use; see
+`pager-slab.md §Slab Budget` INV-COMMIT-HEADROOM) and
 `ErrDBFull` (file extension hits `MaxSize`) — step 1+ performs no
 allocation — so `Commit` returning either leaves the handle
 recoverable and retryable (a fresh, smaller transaction), never
@@ -527,27 +528,27 @@ type Options struct {
     // runtime int→uint32 conversion needed).
     MaxReaders uint32
 
-    // MaxTxBufferBytes bounds the per-write-transaction slab (live +
-    // loose + commit-time assembly buffers). Operations fail with
-    // ErrTxTooLarge once the budget net of the commit reserve is
-    // exhausted; the reserve holds the exact slab cost of Commit's
-    // own work (RPL segment assembly + the descriptor flush), so a
+    // MaxTxBufferBytes is the per-write-transaction slab SPILL
+    // THRESHOLD, not a transaction-size cap: past it, modified pages
+    // are written out to their allocated file locations at operation
+    // boundaries and their buffers freed, so transactions of any
+    // size commit within bounded steady-state memory
+    // (pager-slab.md §Slab Budget; TxStats.SpilledPages counts the
+    // early write-outs for tuning). ErrTxTooLarge remains only for
+    // the commit RESERVE — the slab Commit itself must allocate,
+    // which cannot spill: a retired-page log (RPL) that alone
+    // outgrows the threshold (a huge DeleteRange or compaction
+    // pass), or a descriptor-flush obligation that cannot fit. A
     // transaction that saw ErrTxTooLarge from an operation can
-    // still Commit the work it applied
-    // (pager-slab.md §Slab Budget, INV-COMMIT-HEADROOM).
+    // still Commit the work it applied (INV-COMMIT-HEADROOM).
     //
-    // Sizing guide: each Put/Delete on an indexed keyspace with I
-    // indexes can CoW up to depth × (I + 1) pages in the worst case
-    // (row tree + each index tree, one CoW per level); the buffers
-    // of pages a later operation supersedes remain held until the
-    // transaction closes, so the budget sizes against the SUM of
-    // per-operation costs. At 4 KB pages, depth 5, and 3 indexes:
-    // ~80 KB per maximally-touching Put; the 256 MiB default
-    // accommodates ~3,000–3,200 such Puts before ErrTxTooLarge. For
-    // larger workloads, use BulkLoad (which bypasses the slab via
-    // streaming pwrite) or chunk the work across multiple write
-    // transactions. Default: 256 MiB.
-    MaxTxBufferBytes int64
+    // Sizing guide: the threshold trades memory for early pwrites —
+    // below it, a transaction's working set stays in memory and is
+    // written once at commit; past it, superseded and excess pages
+    // are written as they retire. Byte slices borrowed from the
+    // transaction (Get results, cursor reads) stay valid regardless.
+    // Default: 256 MiB.
+    MaxTxBufferBytes int
 
     // RestartGroupTarget is the engine-wide default for the leaf
     // restart-group target (the maximum entries per group on
@@ -1711,6 +1712,14 @@ type TxStats struct {
     LoosePages     uint64
     ReclaimedPages uint64
     WrittenPages   uint64 // data + bitmap + meta pages pwritten at commit
+
+    // SpilledPages counts slab pages written out to their file
+    // locations before commit because the working set exceeded the
+    // MaxTxBufferBytes spill threshold (pager-slab.md §Slab
+    // Budget). Non-zero means the engine traded early pwrites for
+    // bounded memory; a persistently large value suggests raising
+    // MaxTxBufferBytes.
+    SpilledPages uint64
 
     // SlabPeakBytes is the maximum slab usage observed during the
     // transaction's lifetime. Useful for tuning MaxTxBufferBytes.

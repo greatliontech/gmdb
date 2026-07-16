@@ -167,7 +167,6 @@ type Savepoint struct {
 	// with their content referenced again), so their bitmap bits must
 	// never be set.
 	deferredLen int
-	dirtyBytes  int
 
 	// loosePopLog is the per-event record of loose-pops that AllocPage
 	// performed during a SHALLOW savepoint window. Each entry is the
@@ -241,7 +240,6 @@ func (p *Pager) captureSavepointState() *Savepoint {
 		retiredLen:   len(p.retiredPages),
 		detachedLen:  len(p.detachedBufs),
 		deferredLen:  len(p.deferredFrees),
-		dirtyBytes:   p.dirtyBytes,
 	}
 }
 
@@ -555,7 +553,13 @@ func (p *Pager) RestoreSavepoint(sp *Savepoint) {
 	if len(p.deferredFrees) > sp.deferredLen {
 		p.deferredFrees = p.deferredFrees[:sp.deferredLen]
 	}
-	p.dirtyBytes = sp.dirtyBytes
+	// dirtyBytes is recomputed, not scalar-restored: it equals
+	// (live + detached buffers) × PageSize at every boundary, and a
+	// SpillExcess inside the window (a child transaction's operation
+	// boundaries) legitimately shrinks the buffer set below its
+	// Begin-time size — a Begin-time scalar would over-count the
+	// spilled (dropped) buffers forever after.
+	p.dirtyBytes = (len(p.dirty) + len(p.detachedBufs)) * int(p.cfg.PageSize)
 
 	// Step 6: Nested loose-pop re-enable.
 	if sp.kind == SavepointNested && p.savepointDepth > 0 {
@@ -619,6 +623,10 @@ func (p *Pager) ReleaseSavepoint(sp *Savepoint) {
 	if sp.kind == SavepointNested && p.savepointDepth > 0 {
 		p.savepointDepth--
 	}
+	// Operation boundary: the resolving savepoint leaves no SHALLOW
+	// window open (SpillExcess's own guard re-checks), so no writable
+	// borrow can be outstanding — the safe point for the spill pass.
+	p.SpillExcess()
 }
 
 // SavepointDepth reports the number of active (unresolved) NESTED

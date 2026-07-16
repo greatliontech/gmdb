@@ -262,20 +262,30 @@ func TestCommitOutcomeDurabilityUnknownOnMetaFsyncFailure(t *testing.T) {
 	}
 }
 
-// TestCommitOutcomeAssemblyFailuresNotVisibleUnpoisoned: assembly-phase
-// failures (here ErrTxTooLarge from the flush reserve) carry
-// ErrCommitNotVisible, do NOT poison, and the handle stays usable.
+// TestCommitOutcomeAssemblyFailuresNotVisibleUnpoisoned: assembly-class
+// ErrTxTooLarge — now reachable only through the RPL-reserve retire
+// guard (data pages spill instead of failing) — carries no poison,
+// and the handle stays usable after rollback.
 func TestCommitOutcomeAssemblyFailuresNotVisibleUnpoisoned(t *testing.T) {
 	ctx := context.Background()
+	// A tiny 4-page budget: the descriptor-flush reserve plus the
+	// growing RPL segment projection cannot fit, so a retire-heavy
+	// op trips the narrowed ErrTxTooLarge quickly.
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 1 << 16,
-		MaxTxBufferBytes: 64 * 1024, Maintenance: MaintenanceOptions{Disable: true}})
+		MaxTxBufferBytes: 4 * 4096, Maintenance: MaintenanceOptions{Disable: true}})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
 	tx0, _ := db.Begin(ctx)
-	if _, err := tx0.CreateKeyspace("k"); err != nil {
+	ks0, err := tx0.CreateKeyspace("k")
+	if err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
+	}
+	for i := range 16000 {
+		if err := ks0.Put(fmt.Appendf(nil, "k%06d", i), bytes.Repeat([]byte{'v'}, 256)); err != nil {
+			t.Fatalf("seed Put %d: %v", i, err)
+		}
 	}
 	if err := tx0.Commit(); err != nil {
 		t.Fatalf("create Commit: %v", err)
@@ -285,21 +295,12 @@ func TestCommitOutcomeAssemblyFailuresNotVisibleUnpoisoned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenKeyspace: %v", err)
 	}
-	// Overrun the slab budget mid-tx so an op (not Commit) fails, then
-	// drive a genuine assembly-phase Commit failure instead: keep
-	// writing until Put itself reports ErrTxTooLarge, roll back, and
-	// verify the handle is NOT poisoned. (A Commit-time assembly
-	// failure needs an RPL overrun, which the small-budget Put path
-	// hits first; the classification contract for assembly failures is
-	// pinned by the wrap in Commit's flush path below.)
-	var perr error
-	for i := range 10000 {
-		if perr = ks.Put(fmt.Appendf(nil, "k%06d", i), bytes.Repeat([]byte{'v'}, 512)); perr != nil {
-			break
-		}
-	}
+	// Retire the whole seeded subtree in one op: DeleteRange's
+	// un-indexed fast path retires every page of the range, growing
+	// the RPL segment projection past the tiny budget mid-walk.
+	_, perr := ks.DeleteRange(nil, nil)
 	if !errors.Is(perr, ErrTxTooLarge) {
-		t.Fatalf("budget overrun: %v, want ErrTxTooLarge", perr)
+		t.Fatalf("retire-guard overrun: %v, want ErrTxTooLarge", perr)
 	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatalf("Rollback: %v", err)

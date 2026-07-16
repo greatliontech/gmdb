@@ -220,11 +220,24 @@ func TestWriterMaxTxBufferBytes(t *testing.T) {
 	if _, err := p.CoW(1, 5); err != nil {
 		t.Fatalf("CoW 2: %v", err)
 	}
-	if _, err := p.CoW(2, 6); !errors.Is(err, ErrTxTooLarge) {
-		t.Errorf("CoW 3: got %v, want ErrTxTooLarge", err)
+	// MaxTxBufferBytes is a SPILL threshold, not an ops-phase ceiling
+	// (pager-slab.md §Slab Budget): the over-budget install succeeds.
+	if _, err := p.CoW(2, 6); err != nil {
+		t.Errorf("CoW 3 past the threshold: got %v, want success (spill-threshold semantics)", err)
 	}
-	if got := p.DirtyBytes(); got != 2*testPageSize {
-		t.Errorf("DirtyBytes after ErrTxTooLarge = %d, want %d", got, 2*testPageSize)
+	if got := p.DirtyBytes(); got != 3*testPageSize {
+		t.Errorf("DirtyBytes after over-threshold CoW = %d, want %d", got, 3*testPageSize)
+	}
+	// The commit phase keeps the raw cap: its allocations are the
+	// reserved pages, and exceeding maxBytes there is the narrowed
+	// ErrTxTooLarge surface.
+	p.SetCommitPhase(true)
+	defer p.SetCommitPhase(false)
+	if _, err := p.CoW(3, 7); !errors.Is(err, ErrTxTooLarge) {
+		t.Errorf("commit-phase CoW past raw cap: got %v, want ErrTxTooLarge", err)
+	}
+	if got := p.DirtyBytes(); got != 3*testPageSize {
+		t.Errorf("DirtyBytes after commit-phase ErrTxTooLarge = %d, want %d", got, 3*testPageSize)
 	}
 }
 
@@ -251,9 +264,10 @@ func TestWriterAllocSlabBudget(t *testing.T) {
 			t.Fatalf("AllocSlab buf[%d] = %d, want 0", i, b)
 		}
 	}
-	// Second alloc would exceed budget.
-	if _, err := p.AllocSlab(8); !errors.Is(err, ErrTxTooLarge) {
-		t.Errorf("second AllocSlab: got %v, want ErrTxTooLarge", err)
+	// A second alloc exceeds the threshold but still succeeds —
+	// MaxTxBufferBytes is a spill threshold, not an ops-phase ceiling.
+	if _, err := p.AllocSlab(8); err != nil {
+		t.Errorf("second AllocSlab past the threshold: got %v, want success", err)
 	}
 	// AllocSlab is idempotent on existing dirty IDs.
 	buf2, err := p.AllocSlab(7)

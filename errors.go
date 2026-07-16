@@ -49,8 +49,13 @@ var (
 	// transactions.md §Nested Transactions (LMDB-style parent-freeze).
 	ErrChildActive = errors.New("gmdb: transaction is frozen by an active child transaction")
 
-	// ErrTxTooLarge is returned when the per-tx slab budget is
-	// exceeded.
+	// ErrTxTooLarge is returned when the transaction's COMMIT
+	// RESERVE — the slab the commit itself must allocate, which
+	// cannot spill — outgrows MaxTxBufferBytes: a retired-page log
+	// past the threshold (a huge DeleteRange or compaction pass) or
+	// an unaffordable descriptor-flush obligation. Ordinary data
+	// writes never return it; past the threshold they spill
+	// (pager-slab.md §Slab Budget).
 	ErrTxTooLarge = errors.New("gmdb: transaction buffer budget exceeded")
 
 	// ErrDBFull is returned when no free space remains and the file

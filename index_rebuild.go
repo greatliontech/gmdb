@@ -553,7 +553,16 @@ func (tx *Tx) syncRebuildToCachedPinned(cachedKS *Keyspace, cachedSKS *SetKeyspa
 // flushKeyspaces Step 1, which runs at Commit). Tx
 // Rollback restores via AbortTx; Commit-after-error leaks (same
 // rest-of-tx-continues contract).
-func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) error {
+//
+// cachedKS/cachedSKS are the open handles when the keyspace is
+// cached (at most one non-nil): each entry's data root is resolved
+// through liveIndexRoot — same-tx index maintenance moves the pinned
+// root in memory and syncs the registry only at flush, so the
+// registry entry's Root can lag. Freeing the stale root double-frees
+// superseded pages and leaks every page the live tree gained this tx
+// (the same hazard dropIndex guards; reproduced for this walk by
+// TestDeleteKeyspaceRetiresLiveIndexRoots).
+func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64, cachedKS *Keyspace, cachedSKS *SetKeyspace) error {
 	cfg := tx.pgr.Config()
 	mergeThreshold := tx.db.opts.MergeThreshold
 	// Walk the registry sub-tree with a cursor; collect each
@@ -569,8 +578,8 @@ func (tx *Tx) retireIndexRegistry(keyspaceName string, registryRoot uint64) erro
 			return fmt.Errorf("%w: DeleteKeyspace %q: registry entry %q decode: %w",
 				ErrCorrupted, keyspaceName, string(k), err)
 		}
-		if entry.Root != 0 {
-			if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, entry.Root); err != nil {
+		if root := liveIndexRoot(cachedKS, cachedSKS, string(k), entry.Root); root != 0 {
+			if _, err := btree.FreeSubtree(btreeWriter{tx.pgr}, cfg, root); err != nil {
 				return fmt.Errorf("DeleteKeyspace %q: free index %q data subtree: %w",
 					keyspaceName, string(k), mapBtreeErr(err))
 			}

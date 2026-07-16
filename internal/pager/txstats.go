@@ -29,6 +29,11 @@ type TxStatsSnapshot struct {
 	IndexDeleted   uint64
 	IndexProbes    uint64
 	SlabPeakBytes  int64
+	// SpilledPages counts slab pages written out early by SpillExcess
+	// (pager-slab.md §Slab Budget, spill threshold). Non-zero means
+	// the transaction's working set exceeded MaxTxBufferBytes and the
+	// engine traded pwrites for memory.
+	SpilledPages uint64
 }
 
 // resetTxCounters zeroes the per-tx counters. Called from BeginTx so

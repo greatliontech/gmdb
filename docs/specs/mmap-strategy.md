@@ -112,9 +112,11 @@ The OS has global visibility into memory pressure across all
 processes and is better positioned to make eviction decisions.
 
 The writer additionally holds slab buffers (page-sized) for pages
-it has CoW'd in the current transaction. Slab usage is bounded by
-`Options.MaxTxBufferBytes`; exceeded ⇒ `ErrTxTooLarge` (see
-`pager-slab.md`).
+it has CoW'd in the current transaction. Steady-state slab usage is
+bounded by `Options.MaxTxBufferBytes` — the SPILL threshold: excess
+pages are written out to their allocated file locations at
+operation boundaries rather than capping transaction size (see
+`pager-slab.md §Slab Budget`).
 
 ## Write Path
 

@@ -468,7 +468,7 @@ func TestCompactionShrinksFileMonotonically(t *testing.T) {
 // runs are never slab-resident, so only node-page relocations charge
 // the budget — an overrun fixture must overrun on leaves/branches.
 const (
-	oversizeForestBatches = 45
+	oversizeForestBatches = 45 // see also TestCompactionPassReturnsTxTooLargeAndRollsBack's local scaling
 	oversizeForestPerTx   = 35
 )
 
@@ -501,29 +501,64 @@ func buildOversizeForest(t *testing.T, db *DB) {
 	}
 }
 
-// TestCompactionPassReturnsTxTooLargeAndRollsBack: a full-forest relocation
-// that overruns MaxTxBufferBytes surfaces ErrTxTooLarge to compactionPass and
-// rolls back cleanly (the foundation of runCompaction's halving — Inv-M4).
+// TestCompactionPassReturnsTxTooLargeAndRollsBack: a pass whose
+// relocations retire enough pages to overrun the RPL-reserve budget —
+// the narrowed ErrTxTooLarge; data pages spill instead of failing —
+// surfaces the error to compactionPass and rolls back cleanly (the
+// foundation of runCompaction's halving — Inv-M4). The budget is
+// sized so every fixture transaction stays inside ONE RPL segment's
+// reserve while the full-band relocation (one retire per relocated
+// page) crosses into a second segment and trips the retire guard.
 func TestCompactionPassReturnsTxTooLargeAndRollsBack(t *testing.T) {
 	ctx := context.Background()
+	// An RPL segment holds ~500 retire entries at 4 KB pages; the
+	// budget is sized so every fixture transaction's reserve stays in
+	// the first segment or two, while the full-band relocation (one
+	// retire per relocated page) walks the reserve through several
+	// segments and trips the retire guard with pages to spare in the
+	// budget window (no knife edge).
 	db, err := Open(ctx, tmpPath(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 1 << 20,
-		MaxTxBufferBytes: 480 << 10, // 120 pages of slab — fixture batches fit; a full-band relocation does not
+		MaxTxBufferBytes: 15 << 10, // between the fixture txs' ~3-page reserve and the pass's 4th RPL segment (16 KB)
 		Maintenance:      MaintenanceOptions{Disable: true},
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	buildOversizeForest(t, db)
-	// LOW capacity: deleting two thirds of the batches (one tx each,
-	// to fit the reduced slab) leaves enough below-floor holes that
-	// the surviving batches' node-relocation cascade overruns the
-	// slab before the capacity runs out.
-	for batch := range oversizeForestBatches * 2 / 3 {
+	// A LOCAL forest, larger than buildOversizeForest's: the band must
+	// hold thousands of relocatable pages so the pass's retires cross
+	// several segment boundaries.
+	const localBatches, localPerTx = 500, 35
+	val := oversizeForestValue()
+	for batch := range localBatches {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatalf("Begin batch %d: %v", batch, err)
+		}
+		ks, err := tx.OpenKeyspace("k")
+		if err != nil {
+			ks, err = tx.CreateKeyspace("k")
+			if err != nil {
+				t.Fatalf("Create/Open k: %v", err)
+			}
+		}
+		for i := range localPerTx {
+			if err := ks.Put(fmt.Appendf(nil, "ovf%03d-%03d", batch, i), val); err != nil {
+				t.Fatalf("Put ovf %d-%d: %v", batch, i, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit batch %d: %v", batch, err)
+		}
+	}
+	// LOW capacity: deleting most of the batches (one tx each) leaves
+	// enough below-floor holes that the surviving batches' relocation
+	// band spans thousands of pages.
+	for batch := range localBatches * 7 / 10 {
 		txd, _ := db.Begin(ctx)
 		ksd, _ := txd.OpenKeyspace("k")
-		for i := range oversizeForestPerTx {
+		for i := range localPerTx {
 			_ = ksd.Delete(fmt.Appendf(nil, "ovf%03d-%03d", batch, i))
 		}
 		if err := txd.Commit(); err != nil {

@@ -53,7 +53,7 @@ consistency in `indexing.md`.
 | Data structure | B+tree on fixed-size pages | Only viable option for multi-process mmap |
 | Concurrency | Single writer + N readers (MVCC/CoW) | Proven (LMDB); readers never block writer; cross-process per-keyspace concurrent writers (grove model) incompatible with single shared meta root |
 | Mmap mode | `MAP_SHARED \| PROT_READ` for every process (writer included), `mprotect(PROT_READ)` after Open | Read-only mmap eliminates stray-pointer corruption of the data file; one commit path across OSes; no macOS `msync(MS_SYNC)` special case |
-| Write path | Pager + slab: read through mmap, copy into slab buffer on first modify, pwrite at commit | Reuses existing Linux/macOS pwrite + fdatasync semantics uniformly; bounded per-txn memory via `MaxTxBufferBytes`; bulk operations bypass the slab via streaming pwrites |
+| Write path | Pager + slab: read through mmap, copy into slab buffer on first modify, pwrite at commit (excess spilled early at operation boundaries) | Reuses existing Linux/macOS pwrite + fdatasync semantics uniformly; bounded steady-state memory via the `MaxTxBufferBytes` spill threshold — transaction size is unbounded; bulk operations and overflow runs bypass the slab via streaming pwrites |
 | File layout | Fixed-size pages (4KB–64KB, configurable, immutable after creation) | Matches OS page size, mmap-friendly |
 | Page header | 8 bytes (Type uint8, Flags uint8, Count uint16, AdditionalPages uint32 — no PageID) | PageID is redundant (computable from file offset); Type/Flags split reserves 8 flag bits for future per-page metadata at zero cost |
 | Value storage | Inline + overflow pages | Simple single read path, overflow for large values |

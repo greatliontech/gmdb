@@ -83,7 +83,10 @@ func TestCommitSucceedsAfterTxTooLarge(t *testing.T) {
 				}
 			}
 
-			// Fill until the cap trips.
+			// Fill several multiples of the budget: every Put must
+			// succeed (MaxTxBufferBytes is a spill threshold, not an
+			// admission ceiling), with SpillExcess writing the excess
+			// out at operation boundaries.
 			tx, err := db.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
@@ -94,30 +97,19 @@ func TestCommitSucceedsAfterTxTooLarge(t *testing.T) {
 				t.Fatal(err)
 			}
 			big := make([]byte, 3000)
-			applied, tripped := 0, false
-			for i := 0; i < 10000; i++ {
+			for i := range 800 { // ~2.4 MB of values through a 256 KB budget
 				big[0] = byte('a' + i%20)
-				err := ks.Put(fmt.Appendf(nil, "k%05d", i%400), big)
-				if err == nil {
-					applied++
-					continue
+				if err := ks.Put(fmt.Appendf(nil, "k%05d", i%400), big); err != nil {
+					t.Fatalf("fill Put #%d: %v, want success (spill threshold)", i, err)
 				}
-				if !errors.Is(err, ErrTxTooLarge) {
-					t.Fatalf("fill Put #%d: %v, want ErrTxTooLarge", i, err)
-				}
-				tripped = true
-				break
 			}
-			if !tripped {
-				t.Fatalf("fixture: cap never tripped after %d puts", applied)
-			}
-			if applied == 0 {
-				t.Fatalf("fixture: first Put already tripped; nothing to commit")
+			if got := tx.DirtyBytes() + tx.CommitReserveBytes(); got > 256*1024 {
+				t.Fatalf("post-boundary slab %d > budget (spill did not run)", got)
 			}
 
-			// The reported defect: this Commit failed ErrTxTooLarge.
+			// The budget must never fail the commit.
 			if err := tx.Commit(); err != nil {
-				t.Fatalf("Commit after ErrTxTooLarge op: %v", err)
+				t.Fatalf("Commit of an over-budget transaction: %v", err)
 			}
 
 			// The applied prefix persisted, and the database is
@@ -540,38 +532,27 @@ func TestConfigStagingAfterCapFillCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	big := make([]byte, 3000)
-	tripped := false
-	for i := 0; i < 10000 && !tripped; i++ {
-		switch err := ks.Put(fmt.Appendf(nil, "k%05d", i%400), big); {
-		case err == nil:
-		case errors.Is(err, ErrTxTooLarge):
-			tripped = true
-		default:
+	for i := range 800 { // several budget multiples; spill absorbs
+		if err := ks.Put(fmt.Appendf(nil, "k%05d", i%400), big); err != nil {
 			t.Fatalf("fill Put: %v", err)
 		}
 	}
-	if !tripped {
-		t.Fatal("fixture: cap never tripped")
-	}
 	staged := 0
 	for i := range 8 {
-		err := tx.SetKeyspaceConfig(fmt.Sprintf("pad-%04d", i), KeyspaceConfig{RestartGroupTarget: 7})
-		switch {
-		case err == nil:
-			staged++
-		case errors.Is(err, ErrTxTooLarge):
-			// Rejected at the obligation edge — the staging must have
-			// been unwound (verified below: Commit succeeds and the
-			// name's config is unchanged).
-		default:
+		if err := tx.SetKeyspaceConfig(fmt.Sprintf("pad-%04d", i), KeyspaceConfig{RestartGroupTarget: 7}); err != nil {
 			t.Fatalf("SetKeyspaceConfig(pad-%04d): %v", i, err)
 		}
+		staged++
+		// Post-boundary invariant: at an operation boundary the slab
+		// plus the reserve (which each staged config grows) fits the
+		// budget — the commit's headroom regardless of fill volume.
+		tx.pgr.SpillExcess()
 		if got := tx.DirtyBytes() + tx.CommitReserveBytes(); got > budget {
 			t.Fatalf("invariant violated after staging %d: dirty+reserve = %d > %d", i, got, budget)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		t.Fatalf("Commit after cap fill + %d staged configs: %v", staged, err)
+		t.Fatalf("Commit after over-budget fill + %d staged configs: %v", staged, err)
 	}
 	for iss := range db.Check() {
 		t.Errorf("Check: %+v", iss)
@@ -704,8 +685,13 @@ func TestCommitReserveInvariantUnderRandomOps(t *testing.T) {
 				if !tolerated(opErr) {
 					t.Fatalf("step %d: unexpected op error: %v", step, opErr)
 				}
+				// Post-boundary invariant: production boundaries are
+				// ReleaseSavepoint and the pre-commit call; a FAILED op
+				// restores without spilling, so drive the boundary
+				// primitive explicitly before asserting.
+				tx.pgr.SpillExcess()
 				if got := tx.DirtyBytes() + tx.CommitReserveBytes(); got > budget {
-					t.Fatalf("step %d: dirty+reserve = %d > budget %d (INV-COMMIT-HEADROOM)", step, got, budget)
+					t.Fatalf("step %d: post-boundary dirty+reserve = %d > budget %d (INV-COMMIT-HEADROOM)", step, got, budget)
 				}
 			}
 			if err := tx.Commit(); err != nil {
@@ -889,6 +875,19 @@ func TestRebuildRejectionUnwindsObligation(t *testing.T) {
 		}
 	}
 
+	// The obligation edge is now RESERVE-ONLY (data pages spill; the
+	// reserve — flush + RPL segments — cannot). Fill the reserve by
+	// dirtying many sibling keyspaces (each adds its flush projection)
+	// until the next obligation cannot fit, then Rebuild — its
+	// pre-charge must reject and unwind.
+	for i := range 200 {
+		if err := db.Update(ctx, func(tx *Tx) error {
+			_, err := tx.CreateKeyspace(fmt.Sprintf("sib-%03d", i))
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -898,8 +897,77 @@ func TestRebuildRejectionUnwindsObligation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rejected := false
+	for i := range 200 {
+		sks, err := tx.OpenKeyspace(fmt.Sprintf("sib-%03d", i))
+		if err != nil {
+			t.Fatalf("open sib-%03d: %v", i, err)
+		}
+		if err := sks.Put([]byte("k"), []byte("v")); err != nil {
+			if errors.Is(err, ErrTxTooLarge) {
+				// The sibling's own obligation hit the edge first —
+				// close enough; proceed to the Rebuild attempt.
+				break
+			}
+			t.Fatalf("dirty sib-%03d: %v", i, err)
+		}
+		if tx.CommitReserveBytes() > budget-pageSz {
+			break
+		}
+	}
+	stateBefore := ks.state
+	reserveBefore := tx.CommitReserveBytes()
+	err = tx.Indexes().Rebuild("b", decl)
+	if errors.Is(err, ErrTxTooLarge) {
+		rejected = true
+	} else if err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	if !rejected {
+		t.Fatalf("fixture: Rebuild fit with reserve %d of budget %d; tighten the edge", reserveBefore, budget)
+	}
+	if ks.state != stateBefore {
+		t.Errorf("handle state after rejected Rebuild = %d, want %d (obligation persisted)", ks.state, stateBefore)
+	}
+	if got := tx.CommitReserveBytes(); got != reserveBefore {
+		t.Errorf("reserve after rejected Rebuild = %d, want %d (obligation not unwound)", got, reserveBefore)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit after rejected Rebuild: %v", err)
+	}
+	for iss := range db.Check() {
+		t.Errorf("Check: %+v", iss)
+	}
+}
+
+// TestObligationsIgnoreSpillableDirtyBytes: the obligation gate
+// bounds the RESERVE only — live dirtyBytes spills at operation
+// boundaries and must not block an obligation. Drive the slab far
+// past the threshold with raw burns (no savepoint, so no boundary
+// spill has run), then stage a config obligation: it must fit.
+func TestObligationsIgnoreSpillableDirtyBytes(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, tmpPath(t), Options{
+		PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		MaxTxBufferBytes: 64 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.Update(ctx, func(tx *Tx) error {
+		_, err := tx.CreateKeyspace("t")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
 	var burned []uint64
-	for budget-tx.CommitReserveBytes()-tx.DirtyBytes() > 2*pageSz {
+	for range 32 { // 128 KB of slab, 2× the threshold
 		id, err := tx.pgr.AllocPage()
 		if err != nil {
 			t.Fatalf("burn AllocPage: %v", err)
@@ -909,26 +977,18 @@ func TestRebuildRejectionUnwindsObligation(t *testing.T) {
 		}
 		burned = append(burned, id)
 	}
-	if err := tx.Indexes().Rebuild("b", decl); !errors.Is(err, ErrTxTooLarge) {
-		t.Fatalf("Rebuild at 2-page headroom: err = %v, want ErrTxTooLarge", err)
+	if tx.DirtyBytes() <= 64*1024 {
+		t.Fatal("fixture: dirty not past the threshold")
 	}
-	if ks.state != keyspaceStateClean {
-		t.Errorf("handle state after rejected Rebuild = %d, want Clean (obligation persisted)", ks.state)
+	if err := tx.SetKeyspaceConfig("t", KeyspaceConfig{RestartGroupTarget: 9}); err != nil {
+		t.Fatalf("obligation with spillable dirty past threshold: %v (dirtyBytes must not be charged)", err)
 	}
-	if got := tx.DirtyBytes() + tx.CommitReserveBytes(); got > budget {
-		t.Fatalf("dirty+reserve = %d > budget %d after rejected Rebuild", got, budget)
-	}
-	// Release the burns so the committed image carries no
-	// unreferenced pages (same-tx frees are discarded at commit).
 	for _, id := range burned {
 		if err := tx.pgr.FreePage(id); err != nil {
 			t.Fatalf("burn FreePage(%d): %v", id, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		t.Fatalf("Commit after rejected Rebuild: %v", err)
-	}
-	for iss := range db.Check() {
-		t.Errorf("Check: %+v", iss)
+		t.Fatalf("Commit: %v", err)
 	}
 }

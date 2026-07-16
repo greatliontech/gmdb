@@ -413,20 +413,22 @@ func (p *Pager) FreePage(id uint64) error {
 	// at savepoint Begin and truncated on Restore, so the append needs
 	// no per-entry undo log.
 	//
-	// Admission check mirroring CoW's: each retire grows the
-	// commit-time RPL segment projection (rplReserveBytes), and a
-	// retire-heavy operation (FreeSubtree) can grow it without any
-	// intervening CoW admission. Reject the retire that would make the
-	// transaction unable to afford its own commit — the caller rolls
-	// the operation back per the write-helper error contract. Skipped
-	// in the commit phase: the descriptor flush's own retires are
-	// covered by the external reserve's RPL slack
-	// (Tx.recalcFlushReserve).
+	// The one ops-phase ErrTxTooLarge left (pager-slab.md §Slab
+	// Budget): each retire grows the commit-time RPL segment
+	// projection (rplReserveBytes), whose pages MUST be slab-resident
+	// at commit step 0 — unlike data pages they cannot spill. Reject
+	// the retire whose segment projection (plus the descriptor
+	// flush's own reserved cost) cannot fit the budget. Live
+	// dirtyBytes is deliberately NOT charged: data pages spill at
+	// operation boundaries and freed pages' buffers are dropped at
+	// step 0, so they claim no step-0 slab. Skipped in the commit
+	// phase: the descriptor flush's own retires are covered by the
+	// external reserve's RPL slack (Tx.recalcFlushReserve).
 	capPerSeg := RPLEntriesPerSegment(p.cfg)
 	if !p.inCommit && capPerSeg > 0 && len(p.retiredPages)%capPerSeg == 0 {
 		// This retire opens a new segment: projected reserve grows by
 		// one page.
-		if p.dirtyBytes+p.rplReserveBytes()+p.externalReserve+int(p.cfg.PageSize) > p.maxBytes {
+		if p.rplReserveBytes()+p.externalReserve+int(p.cfg.PageSize) > p.maxBytes {
 			return ErrTxTooLarge
 		}
 	}

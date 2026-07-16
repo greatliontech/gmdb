@@ -584,10 +584,10 @@ caller decision, and `Tx.Rollback` is recovery-of-last-resort. After
 a helper returns an error the caller may legitimately `Commit` to
 publish the work done before the failure. That `Commit` is
 guaranteed to fit the slab budget even when the failed helper's
-error WAS `ErrTxTooLarge`: ops-phase admission continuously reserves
-the exact slab cost of the commit sequence (RPL segment assembly +
-the descriptor flush), so the engine's own commit work can never
-exceed the budget the operations were admitted under
+error WAS `ErrTxTooLarge`: the commit reserve (RPL segment assembly
++ the descriptor flush) is bounded by the budget at every
+obligation and retire event, and a pre-commit spill frees
+everything else, so the engine's own commit work always fits
 (`pager-slab.md §Slab Budget`, INV-COMMIT-HEADROOM).
 
 **Atomicity guarantee.** Every write-helper is **all-or-nothing in the

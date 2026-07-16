@@ -189,6 +189,13 @@ type Pager struct {
 	retiredPages  []uint64
 	loosePages    map[uint64]struct{}
 
+	// spillErr records the first spill-pass I/O failure of the
+	// transaction (SpillExcess is best-effort and cannot return an
+	// error to ReleaseSavepoint). A budget failure at commit that
+	// this degradation caused joins it for context (SpillError);
+	// cleared at BeginTx.
+	spillErr error
+
 	// deferredFrees holds same-tx allocated-but-never-slab-written
 	// pages (direct-written overflow-run pages, mid-run alloc
 	// rollbacks) freed while a savepoint window was open. Their
@@ -599,6 +606,7 @@ func (p *Pager) BeginTx(params TxParams) {
 	// Reset the per-tx commit reserve contributions.
 	p.externalReserve = 0
 	p.inCommit = false
+	p.spillErr = nil
 	if p.readOnly {
 		return
 	}
@@ -951,17 +959,152 @@ func (p *Pager) SetCommitPhase(on bool) { p.inCommit = on }
 // budget-edge tests to compute effective headroom.
 func (p *Pager) CommitReserveBytes() int { return p.rplReserveBytes() + p.externalReserve }
 
-// admissionLimit is the effective slab budget for ops-phase
-// allocations: maxBytes minus the commit-time reserve, so a
-// transaction the admission accepts can always afford its own commit
-// (pager-slab.md §Slab Budget). During the commit phase the reserve
-// is released — commit's allocations are the reserved pages.
+// admissionLimit is the SPILL threshold for the ops phase: maxBytes
+// minus the commit-time reserve. Ops-phase installs are never
+// rejected against it — SpillExcess brings dirtyBytes back under it
+// at operation boundaries, so the commit phase (whose allocations
+// are the reserved pages) always fits. It also anchors the
+// retire-time RPL-reserve check, the one ops-phase ErrTxTooLarge
+// left (pager-slab.md §Slab Budget). During the commit phase the
+// reserve is released — commit's allocations are the reserved pages.
 func (p *Pager) admissionLimit() int {
 	if p.inCommit {
 		return p.maxBytes
 	}
 	return p.maxBytes - p.rplReserveBytes() - p.externalReserve
 }
+
+// SpillExcess writes slab pages out to their allocated file pages and
+// drops their buffers when the slab exceeds the spill threshold
+// (admissionLimit): MaxTxBufferBytes bounds steady-state memory, not
+// transaction size (pager-slab.md §Slab Budget). Called at operation
+// boundaries — ReleaseSavepoint when the resolving savepoint leaves
+// no SHALLOW window open, and the transaction layer before commit —
+// where no writable page borrow can be outstanding.
+//
+// Eligibility: live pages (in pendingAllocs) AND loose pages — a
+// loose page's bitmap bit stays clear until commit, so its id is
+// stable and a savepoint restore that resurrects the free reads the
+// spilled content back through the mmap; under an open nested
+// window loose buffers have no other relief path (the drop below is
+// stack-empty-gated, loose-pop is suspended), so spilling them is
+// what keeps child-transaction churn bounded. Spilled bytes are
+// footer-stamped like commit's step 1 and land at
+// fresh, unreferenced ids — a crash leaves exactly the
+// died-holding-grant image, and rollback's bitmap restore makes them
+// free-page garbage. Reads of a spilled page fall through to the
+// mmap (unified page cache); a re-modification frees it and CoWs to
+// a fresh id like any committed page, and an in-window free is
+// quarantined by deferredFrees. Buffers are dropped to the garbage
+// collector, NOT pool-recycled: borrowed []byte slices alias them
+// and stay valid through tx close (byte-slice ownership), while
+// unborrowed buffers actually free.
+//
+// Best-effort: a pwrite error stops the pass and leaves the
+// remaining pages slab-resident — memory relief degrades, and the
+// I/O problem resurfaces loudly at commit.
+func (p *Pager) SpillExcess() {
+	if p.readOnly || p.inCommit || p.bitmap == nil {
+		return
+	}
+	if p.dirtyBytes <= p.admissionLimit() {
+		return
+	}
+	// Mid-operation guard: inside a SHALLOW window an operation may
+	// hold writable slices into these buffers; spilling would freeze
+	// its writes in a GC-orphaned buffer while the disk copy misses
+	// them. The trigger sites never call here in that state; the
+	// guard makes the primitive safe regardless of caller.
+	for _, sp := range p.activeSavepoints {
+		if sp.kind == SavepointShallow {
+			return
+		}
+	}
+	// With NO savepoint open, no restore can resurrect a freed page's
+	// pre-free state, so the buffers held for exactly that
+	// resurrection — loose pages' slab buffers and loose-pop detached
+	// buffers — are droppable outright, no pwrite needed (a loose
+	// page is FREE: nothing reads its content again; user-borrowed
+	// slices stay alive through the garbage collector). This is what
+	// lets a same-tx churn workload (write then delete more than the
+	// budget) commit: loose buffers cannot spill, but they can drop.
+	if len(p.activeSavepoints) == 0 {
+		for id := range p.loosePages {
+			if _, ok := p.dirty[id]; ok {
+				delete(p.dirty, id)
+				p.dirtyBytes -= int(p.cfg.PageSize)
+			}
+		}
+		if n := len(p.detachedBufs); n > 0 {
+			clear(p.detachedBufs) // release the pointers — [:0] alone pins them via the backing array
+			p.detachedBufs = p.detachedBufs[:0]
+			p.dirtyBytes -= n * int(p.cfg.PageSize)
+		}
+		if p.dirtyBytes <= p.admissionLimit() {
+			return
+		}
+	}
+	for id, buf := range p.dirty {
+		if p.spillErr != nil {
+			break
+		}
+		if _, owned := p.pendingAllocs[id]; !owned {
+			// Loose pages spill too — with a savepoint open they are
+			// the buffers nothing else can release (the drop above is
+			// gated on an empty stack, loose-pop is suspended under
+			// nested windows), and a child's churn would otherwise
+			// grow the slab without bound. The pwrite is safe and
+			// content-preserving: a loose page's bitmap bit stays
+			// clear until commit, so no allocation can claim the id,
+			// and a restore that resurrects the free reads the
+			// content back through the mmap. Anything else unowned
+			// is skipped.
+			if _, loose := p.loosePages[id]; !loose {
+				continue
+			}
+		}
+		if err := p.ensureFileCovers(id + 1); err != nil {
+			p.spillErr = fmt.Errorf("pager: spill ensure file covers page %d: %w", id, err)
+			break
+		}
+		if p.cfg.PageChecksum {
+			page.WritePageFooter(*buf, p.cfg.PageSize)
+		}
+		off := int64(id) * int64(p.cfg.PageSize)
+		if _, err := p.fops.WriteAt(*buf, off); err != nil {
+			p.spillErr = fmt.Errorf("pager: spill pwrite page %d: %w", id, err)
+			break
+		}
+		delete(p.dirty, id)
+		p.dirtyBytes -= int(p.cfg.PageSize)
+		p.tc.SpilledPages++
+	}
+}
+
+// admitInstall gates a one-page slab install. Ops-phase installs
+// pass unconditionally — the spill threshold, not admission, bounds
+// memory — with two exceptions that restore the hard bound:
+//   - the commit phase (raw maxBytes cap; its allocations are the
+//     reserved pages), and
+//   - degraded mode after a spill I/O failure (spillErr non-nil):
+//     with the relief path dead, unbounded installs would OOM, so
+//     the pre-spill admission ceiling returns, its error naming the
+//     underlying spill failure.
+func (p *Pager) admitInstall() error {
+	if p.inCommit && p.dirtyBytes+int(p.cfg.PageSize) > p.maxBytes {
+		return ErrTxTooLarge
+	}
+	if p.spillErr != nil && p.dirtyBytes+int(p.cfg.PageSize) > p.admissionLimit() {
+		return fmt.Errorf("%w (spill disabled by: %w)", ErrTxTooLarge, p.spillErr)
+	}
+	return nil
+}
+
+// SpillError returns the first spill-pass I/O failure recorded this
+// transaction (nil when spilling succeeded or never ran) — commit
+// error paths join it so a budget failure the degraded spill caused
+// names its real cause. Cleared at BeginTx.
+func (p *Pager) SpillError() error { return p.spillErr }
 
 // IsReadOnly reports whether mutating operations are rejected.
 func (p *Pager) IsReadOnly() bool { return p.readOnly }
@@ -1310,8 +1453,16 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 		// Idempotent re-CoW: same destination already owned by this tx.
 		return *existing, nil
 	}
-	if p.dirtyBytes+int(p.cfg.PageSize) > p.admissionLimit() {
-		return nil, ErrTxTooLarge
+	// Ops-phase installs are never budget-rejected: MaxTxBufferBytes
+	// is a SPILL threshold (SpillExcess writes excess pages out at
+	// operation boundaries), not a correctness ceiling. Only the
+	// commit phase — whose allocations are the reserved RPL segment
+	// pages — keeps a hard bound (pager-slab.md §Slab Budget).
+	// Degraded mode: a failed spill (spillErr) disables the relief
+	// path for the rest of the tx, so the old hard admission returns
+	// as the OOM backstop.
+	if err := p.admitInstall(); err != nil {
+		return nil, err
 	}
 	src := p.pageRaw(srcID)
 	buf := p.bufPool.Get()
@@ -1342,8 +1493,9 @@ func (p *Pager) AllocSlab(id uint64) ([]byte, error) {
 	if existing, ok := p.dirty[id]; ok {
 		return *existing, nil
 	}
-	if p.dirtyBytes+int(p.cfg.PageSize) > p.admissionLimit() {
-		return nil, ErrTxTooLarge
+	// Spill-threshold semantics — see the CoW admission comment.
+	if err := p.admitInstall(); err != nil {
+		return nil, err
 	}
 	buf := p.bufPool.Get()
 	p.dirty[id] = buf
@@ -1443,10 +1595,13 @@ func (p *Pager) writeDirect(id uint64, buf []byte, stampFooter bool) error {
 }
 
 // Mutate returns the writable slab buffer at id. Returns ErrPageNotDirty
-// if id has not been CoW'd or AllocSlab'd in this transaction (the
-// caller must CoW first); ErrReadOnly on a read-only pager. The returned
-// slice is the same backing memory CoW returned — mutations are visible
-// to subsequent Page(id) reads.
+// if id has no slab buffer in this transaction — never CoW'd /
+// AllocSlab'd, or CoW'd but since SPILLED out of the slab (a spilled
+// page is immutable at its id; re-modify by freeing it and CoWing to
+// a fresh id, like any committed page). ErrReadOnly on a read-only
+// pager. The returned slice is the same backing memory CoW returned —
+// mutations are visible to subsequent Page(id) reads. No production
+// caller today; the loud failure keeps a future caller honest.
 func (p *Pager) Mutate(id uint64) ([]byte, error) {
 	if p.readOnly {
 		return nil, ErrReadOnly
@@ -1526,3 +1681,8 @@ func (p *Pager) DirtyIDs() []uint64 {
 	}
 	return out
 }
+
+// HeldBufferCountForTest reports the number of page buffers the
+// transaction currently holds (live + detached) — the dirtyBytes
+// accounting invariant's ground truth, for tests.
+func (p *Pager) HeldBufferCountForTest() int { return len(p.dirty) + len(p.detachedBufs) }

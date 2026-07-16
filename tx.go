@@ -374,6 +374,13 @@ func (tx *Tx) Commit() error {
 	// reserve was maintained for (recalcFlushReserve), so they draw
 	// from the reserved space. pager.Commit manages the flag for its
 	// own steps; AbortTx/BeginTx reset it on the failure paths.
+	// Pre-commit spill (pager-slab.md §Slab Budget, spill threshold):
+	// bring the slab under the ops-phase limit before the commit
+	// phase, so the descriptor flush and step-0 RPL assembly have
+	// their reserved headroom regardless of how large the transaction
+	// grew. All savepoints are resolved here, so every non-loose
+	// dirty page is eligible.
+	tx.pgr.SpillExcess()
 	tx.pgr.SetCommitPhase(true)
 	// Capture the touched-keyspace notification slots BEFORE the
 	// descriptor flush marks the handles clean; published only after
@@ -385,7 +392,12 @@ func (tx *Tx) Commit() error {
 		// No on-disk pwrite has happened yet (pager.Commit's step-1
 		// runs later), so no DB-wide poisoning; trivially not-visible
 		// (durability.md §Commit Outcome Classification). The caller
-		// can retry in a fresh tx.
+		// can retry in a fresh tx. A failed best-effort spill can be
+		// the real cause of a budget failure here (the slab stayed
+		// over-threshold) — name it.
+		if serr := tx.pgr.SpillError(); serr != nil && errors.Is(err, pager.ErrTxTooLarge) {
+			err = fmt.Errorf("%w (after a degraded spill: %w)", err, serr)
+		}
 		tx.pgr.SetCommitPhase(false)
 		tx.pgr.AbortTx()
 		return fmt.Errorf("%w: %w", ErrCommitNotVisible, err)
@@ -493,6 +505,11 @@ func (tx *Tx) Commit() error {
 		}
 		if !classified {
 			return fmt.Errorf("gmdb: commit failed and the outcome could not be verified (do not retry; re-Open and probe): %w", mapPagerErr(err))
+		}
+		// Same degraded-spill context join as the flush path: a step-0
+		// budget failure after a failed spill names its real cause.
+		if serr := tx.pgr.SpillError(); serr != nil && errors.Is(err, pager.ErrTxTooLarge) {
+			return fmt.Errorf("%w: %w (after a degraded spill: %w)", class, mapPagerErr(err), serr)
 		}
 		return fmt.Errorf("%w: %w", class, mapPagerErr(err))
 	}
@@ -786,14 +803,16 @@ func (tx *Tx) measureRegPathLen(c *keyspaceCore) error {
 	return nil
 }
 
-// checkReserveAffordable is the admission gate for OBLIGATION events
-// (INV-COMMIT-HEADROOM's obligation edge — the pager's allocation
-// admission covers the other edge): after an event raises the commit
-// reserve, the raiser calls this and unwinds the event on
-// ErrTxTooLarge, so `dirtyBytes + commitReserve ≤ MaxTxBufferBytes`
-// holds at every point, not just at allocations.
+// checkReserveAffordable is the admission gate for OBLIGATION events:
+// after an event raises the commit reserve, the raiser calls this and
+// unwinds the event on ErrTxTooLarge, so the RESERVE — the slab the
+// commit phase itself must allocate (descriptor flush + RPL
+// segments), which cannot spill — always fits the budget. Live
+// dirtyBytes is deliberately not charged: data pages spill at
+// operation boundaries (pager-slab.md §Slab Budget, spill threshold),
+// so they claim no commit-phase headroom.
 func (tx *Tx) checkReserveAffordable() error {
-	if tx.pgr.DirtyBytes()+tx.pgr.CommitReserveBytes() > tx.pgr.MaxBytes() {
+	if tx.pgr.CommitReserveBytes() > tx.pgr.MaxBytes() {
 		return ErrTxTooLarge
 	}
 	return nil
@@ -989,7 +1008,10 @@ func mapPagerErr(err error) error {
 	case errors.Is(err, pager.ErrReadOnly):
 		return ErrReadOnly
 	case errors.Is(err, pager.ErrTxTooLarge):
-		return ErrTxTooLarge
+		// Wrapped, not replaced: the degraded-spill context (the
+		// admitInstall arm names the recorded spill failure) must
+		// survive to the public surface.
+		return fmt.Errorf("%w: %w", ErrTxTooLarge, err)
 	case errors.Is(err, pager.ErrDBFull):
 		return ErrDBFull
 	case errors.Is(err, pager.ErrBadPageChecksum):

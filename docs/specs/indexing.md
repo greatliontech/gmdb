@@ -1011,11 +1011,12 @@ index was rolled back to its prior state. The transaction is
 `tx.Rollback()` (the `defer` above) and start a fresh
 transaction. Specifically:
 
-- `ErrTxTooLarge` from `RebuildIndex` means the keyspace's row
-  corpus exceeds `MaxTxBufferBytes` for a single rebuild. Use
-  `BulkLoad` (which bypasses the slab) into a fresh keyspace,
-  or chunk the rebuild manually across multiple write
-  transactions using a shadow-index + cutover pattern.
+- `ErrTxTooLarge` from `RebuildIndex` means the rebuild's
+  RETIRED-page log alone outgrew `MaxTxBufferBytes` (the RPL
+  reserve — data pages spill past the threshold, so corpus size
+  itself no longer bounds a rebuild; `pager-slab.md §Slab
+  Budget`). Rare; if hit, raise the threshold or use `BulkLoad`
+  into a fresh keyspace.
 - `ErrIndexUniqueViolation` means the new extractor produced
   duplicate keys that the unique constraint rejected. The
   extractor logic is wrong (or the partial-index predicate is
@@ -1065,10 +1066,11 @@ root only on full success). Other transactions continue to see
 the pre-rebuild index until the commit publishes the registry
 write.
 
-For very large keyspaces this may exceed `MaxTxBufferBytes` —
-the rebuild fails with `ErrTxTooLarge` and the caller must use
-`BulkLoad` instead (see `bulkload.md §Interaction with
-Indexes`), or chunk the rebuild manually.
+Data pages spill past `MaxTxBufferBytes`, so a large corpus
+rebuilds within bounded memory; only a retired-page log that
+alone outgrows the threshold fails `ErrTxTooLarge`
+(`pager-slab.md §Slab Budget`) — then raise the threshold or
+use `BulkLoad` (see `bulkload.md §Interaction with Indexes`).
 
 ## Indexes on SetKeyspaces
 

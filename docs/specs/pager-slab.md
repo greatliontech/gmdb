@@ -39,8 +39,9 @@ Invariant: kind=clause-explicit;
     fresh page ID + fresh slab buffer (or re-mutation of an existing
     same-tx slab buffer), or a DIRECT pwrite to a page allocated in
     this transaction and referenced by no active or recoverable meta
-    (overflow-run pages, the bulk-load builder — the `WriteDirect`
-    contract, `bulkload.md §Slab Bypass`). The writer never writes
+    (overflow-run pages, the bulk-load builder, and the spill pass's
+    write-out of slab pages — the `WriteDirect` contract,
+    `bulkload.md §Slab Bypass`). The writer never writes
     through the mmap; pages reachable from any committed meta change
     only via the commit-protocol pwrite path;
   from=this spec §CoW via the Slab + §Commit Write Ordering;
@@ -51,64 +52,83 @@ Invariant: kind=clause-explicit;
     a partially-published commit (no atomic-swap guarantee).
 
 Invariant: kind=clause-explicit;
-  property=Within a write transaction, a slab buffer is not returned to
-    the buffer pool until `Commit()` or `Rollback()`. Buffers that
-    become loose mid-transaction stay alive until tx close, and the
-    `[]byte` borrowed from them remains valid for the full transaction;
+  property=Within a write transaction, a slab buffer is never
+    POOL-RECYCLED before `Commit()` or `Rollback()`: the pool's
+    clear-on-release and reuse would corrupt a borrowed `[]byte`. A
+    buffer may be DROPPED mid-transaction (the spill pass writes it
+    out first when its content is still referenced; loose and
+    detached buffers drop outright once no savepoint can resurrect
+    their content) — a dropped buffer survives through the garbage
+    collector for exactly as long as any borrowed `[]byte` aliases
+    it, so the API's "valid until tx close" contract holds either
+    way;
   from=this spec §Slab Budget and `ErrTxTooLarge`;
-  violation=A loose-page buffer recycled mid-tx leaves a dangling
-    `[]byte` in caller hands — the API's "valid until tx close"
-    contract breaks for own-write reads, and a subsequent read returns
-    zero-filled bytes (pool clear on release) or another page's content
-    (pool reuse).
+  violation=A loose-page buffer POOL-recycled mid-tx leaves a
+    dangling `[]byte` in caller hands — a subsequent read returns
+    zero-filled bytes (pool clear on release) or another page's
+    content (pool reuse).
 
 Invariant: kind=clause-explicit;
-  property=`MaxTxBufferBytes` bounds the sum of all page-sized SLAB
-    buffers held by the transaction: live (routed via `dirty[id]`),
-    loose, and commit-step-0 RPL segment assembly buffers.
-    `ErrTxTooLarge` fires on the first CoW or commit-step-0
-    allocation that would exceed the bound. Deliberately OUTSIDE the
-    budget because they are not slab-allocated: overflow-run pages
+  property=`MaxTxBufferBytes` is the SPILL THRESHOLD, not a
+    transaction-size cap: at every operation boundary the slab is
+    brought back under `MaxTxBufferBytes − commitReserve` — live
+    pages (in `pendingAllocs`) AND loose pages are pwritten to their
+    own file locations and their buffers dropped (a loose page's
+    bitmap bit stays clear until commit, so the id is stable and a
+    savepoint restore that resurrects the free reads the content
+    back through the mmap — which is what keeps child-transaction
+    churn bounded); with NO savepoint open, buffers held only for a
+    restorability nothing can still exercise (loose pages' buffers,
+    loose-pop detached buffers) are dropped outright without the
+    pwrite. Between boundaries the slab may exceed the threshold by
+    one operation's footprint. Deliberately OUTSIDE the accounting
+    because they are never slab-allocated: overflow-run pages
     (pwritten directly as encoded, O(2 pages) working memory — see
     §Slab Budget), modified bitmap pages (pwritten from the
     in-memory bitmap's own storage, bounded by `BitmapPages`, a
     file-geometry constant), and the meta page (one page-sized
-    scratch allocation per commit);
+    scratch allocation per commit). User-borrowed `[]byte` slices
+    alias dropped buffers and stay valid through tx close (garbage
+    collection — the byte-slice ownership invariant), so
+    steady-state memory is bounded by the threshold plus what the
+    caller itself retains;
   from=this spec §Slab Budget and `ErrTxTooLarge`;
-  violation=Unbounded slab growth (loose buffers excluded, or RPL
-    assembly excluded) lets a transaction OOM the process despite
-    nominal compliance with `MaxTxBufferBytes`, breaking the cost model
-    callers use to size the budget.
+  violation=A boundary that fails to spill (or an accounting drift
+    that hides held buffers) lets a long transaction OOM the process
+    despite nominal compliance with `MaxTxBufferBytes`, breaking the
+    cost model callers use to size the threshold — the failure mode
+    the old hard-admission budget prevented and the spill must too.
 
 Invariant: kind=clause-explicit;
-  property=Ops-phase slab admission maintains
-    `dirtyBytes + commitReserve ≤ MaxTxBufferBytes`, where
-    `commitReserve` is an exact projection of the commit sequence's
-    total slab allocation: the RPL segment pages for the pages
-    retired so far (`ceil(retired / entriesPerSegment)`,
-    pager-internal, recomputed live) plus the descriptor-flush cost
-    (one CoW page per tree-path level per pending flush write, with
-    slack for the flush's own retires — maintained by the
-    transaction layer at every flush-obligation event). Retiring a
-    page is itself admission-checked (a `FreeSubtree`-heavy
-    operation can grow the projection with no intervening CoW). The
-    commit phase draws from the reserved space, checked against the
-    raw bound as a backstop. Consequence: a transaction whose
-    operation failed with `ErrTxTooLarge` can always commit its
-    applied work — `Commit` never fails the budget for in-spec use.
+  property=`Commit` never fails the budget: the commit phase's own
+    slab allocations — the descriptor flush's CoW pages and step-0's
+    RPL segment pages, the pages that CANNOT spill — are covered by
+    `commitReserve`, an exact projection maintained live (RPL:
+    `ceil(retired / entriesPerSegment)`, pager-internal; flush: one
+    CoW page per tree-path level per pending flush write, with slack
+    for the flush's own retires — transaction layer). The reserve
+    alone is bounded by `MaxTxBufferBytes`: an OBLIGATION event
+    (dirtying a keyspace, a registry DDL) whose projection would
+    exceed the bound rejects with `ErrTxTooLarge` and unwinds, and a
+    retire that opens an RPL segment the reserve cannot afford
+    rejects the same way — the two remaining `ErrTxTooLarge`
+    surfaces (live dirtyBytes is charged by NEITHER: data pages
+    spill at boundaries, and freed pages' buffers drop at step 0). A
+    pre-commit spill brings the slab under the threshold before the
+    commit phase draws from the reserved space.
     INV-COMMIT-HEADROOM: enforced by
-    `TestCommitSucceedsAfterTxTooLarge`,
-    `TestCommitNeedsOnlyReservedHeadroom`, and
-    `TestRetireBudgetGuard`;
+    `TestCommitSucceedsAfterTxTooLarge` (over-threshold fill still
+    commits), `TestCommitNeedsOnlyReservedHeadroom`,
+    `TestRetireBudgetGuard`, and
+    `TestRebuildRejectionUnwindsObligation`;
   from=this spec §Slab Budget and `ErrTxTooLarge` +
     `transactions.md` write-helper error contract (the
     rest-of-tx-continues shape is incoherent if the engine's own
-    commit can exceed the budget ops were admitted under);
-  violation=Ops admitted up to the raw bound leave no headroom for
-    commit's own allocations: fill a transaction until a Put fails
-    `ErrTxTooLarge`, then `Commit` — the commit fails the same way
-    and the applied work is recoverable only by `Rollback`, i.e.
-    lost, while every other budget clause still holds.
+    commit can exceed what its reserve guarantees);
+  violation=A reserve that under-projects (or an obligation admitted
+    past the bound) makes `Commit` itself fail `ErrTxTooLarge` — the
+    applied work is recoverable only by `Rollback`, i.e. lost, while
+    every other budget clause still holds.
 
 Invariant: kind=entailed;
   property=Commit step 0 (pre-pwrite assembly) issues no syscall that
@@ -220,16 +240,51 @@ CoW'd-this-tx tracking is the discriminator.
 
 ## Slab Budget and `ErrTxTooLarge`
 
-`Options.MaxTxBufferBytes` (default 256 MiB) bounds the slab. The
-budget covers every page-sized buffer the transaction has allocated:
+`Options.MaxTxBufferBytes` (default 256 MiB) is the slab's SPILL
+THRESHOLD: transactions of any size commit; the threshold bounds
+steady-state memory. The accounting covers every page-sized buffer
+the transaction holds:
 
 - Live buffers (`dirty[id]` routes here).
-- Loose buffers (CoW'd then freed mid-tx; retained to honour the
-  byte-slice ownership invariant above).
+- Loose buffers (CoW'd then freed mid-tx; held for the
+  shallow-savepoint resurrection of the free and for byte-slice
+  ownership).
 - Commit-time assembly buffers — the RPL segment pages allocated in
   step 0 of commit. (Modified bitmap pages are NOT slab-allocated:
   step 1 pwrites them directly from the in-memory bitmap's own
   storage, outside the budget per the Invariants above.)
+
+**The spill pass.** At every operation boundary — a savepoint
+resolution that leaves no shallow window open, and once more before
+the commit phase — a slab over `MaxTxBufferBytes − commitReserve`
+is brought back under it:
+
+- Live pages (in `pendingAllocs`) and loose pages are pwritten to
+  their own file locations — footer-stamped exactly like commit's
+  step 1 — and their buffers dropped. Spilling loose pages is
+  load-bearing under an open nested window, where they can neither
+  drop (a restore could resurrect the free) nor loose-pop
+  (suspended): without it a child transaction's churn accumulates
+  unbounded loose buffers. The pages read back through the mmap
+  (unified page cache) and are unreferenced by any recoverable meta
+  until the meta swap, so a crash mid-transaction leaves the
+  died-holding-grant image (`free-space.md` grant-handoff tear
+  detection and leak reclamation cover it) and a rollback's bitmap
+  restore orphans them as free-page garbage. A later re-modification
+  frees the spilled page and CoWs to a fresh id like any committed
+  page; an in-window free of a spilled page rides the deferred-frees
+  quarantine (`free-space.md`, restorable-content invariant).
+- With no savepoint open, loose pages' buffers and loose-pop
+  detached buffers are dropped OUTRIGHT (no pwrite): they exist for
+  a savepoint resurrection that can no longer happen, and a loose
+  page's content is read by nothing else.
+- Between boundaries the slab may exceed the threshold by one
+  operation's footprint; an operation mid-flight is never spilled
+  (its writable buffers are in active use).
+
+The spill is best-effort on I/O error — the pass stops, memory
+relief degrades, and the error resurfaces loudly at commit.
+`TxStats.SpilledPages` counts spilled pages for threshold tuning.
 
 **Overflow runs never enter the slab.** Every run page — online
 chain writes, key extents, run relocation, bulk load — is pwritten
@@ -245,34 +300,43 @@ on-disk bitmap was never pwritten pre-commit), exactly the
 `WriteDirect` bulk-load contract (`bulkload.md §Slab Bypass`),
 which this generalizes.
 
-`ErrTxTooLarge` fires on the first CoW (during the transaction body)
-or step-0 allocation (during commit) that would push `dirtyBytes`
-over the admission limit. The commit-time variant is detected before
-any pwrite — rollback is clean (no on-disk side effects).
+**`ErrTxTooLarge` fires on exactly two surfaces** — both about the
+commit RESERVE, the slab the commit phase itself must allocate and
+therefore cannot spill:
 
-**Commit reserve.** The ops-phase admission limit is not the raw
-bound but `MaxTxBufferBytes − commitReserve`
-(INV-COMMIT-HEADROOM above): the pager continuously reserves the
-exact slab cost of the commit sequence — its own RPL segment
-projection plus the transaction layer's descriptor-flush projection
-— and the commit phase draws from that reserved space. Every flush
-write is a same-size upsert (descriptors are fixed-width; registry
-entries change only fixed-width fields after open; descriptor
-inserts and deletes happen eagerly inside `CreateKeyspace*` /
-`DeleteKeyspace`, under ops-phase admission), so it can neither
-split nor merge and costs exactly one CoW page per tree-path level —
-which is what makes the projection exact rather than an estimate.
-Operations therefore fail `ErrTxTooLarge` slightly earlier than the
-raw bound, and `Commit` never fails it.
+1. A retire that opens an RPL segment the reserve cannot afford
+   (`reserve + PageSize > MaxTxBufferBytes` at the segment
+   boundary) — a retire-heavy operation (a huge `DeleteRange`, a
+   giant compaction pass) whose retired-page log alone outgrows the
+   threshold.
+2. An obligation event — dirtying a keyspace, a registry DDL —
+   whose flush projection would push the reserve past the
+   threshold; the event unwinds (INV-COMMIT-HEADROOM above).
 
-Buffers are **not** returned to the pool when a page becomes loose
-within the transaction. They are returned only at `Commit()` or
-`Rollback()`. This preserves the byte-slice ownership contract: a
-`[]byte` returned by `Keyspace.Get` or a cursor read that points into
-a slab buffer remains valid for the full transaction even if the
-underlying page is CoW'd, rebalanced, or freed mid-transaction. The
-cost is bounded by `MaxTxBufferBytes` (loose buffers count against
-the same budget as live ones).
+Ordinary data writes NEVER fail the budget: past the threshold they
+spill. During the commit phase allocations are checked against the
+raw bound as a backstop.
+
+**Commit reserve.** The pager continuously reserves the exact slab
+cost of the commit sequence — its own RPL segment projection plus
+the transaction layer's descriptor-flush projection — and the
+commit phase draws from that reserved space (a pre-commit spill
+freed everything else). Every flush write is a same-size upsert
+(descriptors are fixed-width; registry entries change only
+fixed-width fields after open; descriptor inserts and deletes
+happen eagerly inside `CreateKeyspace*` / `DeleteKeyspace`), so it
+can neither split nor merge and costs exactly one CoW page per
+tree-path level — which is what makes the projection exact rather
+than an estimate.
+
+Buffers are **never pool-recycled** when a page becomes loose
+within the transaction — only at `Commit()` or `Rollback()` (or
+dropped to the garbage collector by the spill pass, which preserves
+borrowed slices — see the Invariants). This preserves the
+byte-slice ownership contract: a `[]byte` returned by
+`Keyspace.Get` or a cursor read that points into a slab buffer
+remains valid for the full transaction even if the underlying page
+is CoW'd, rebalanced, freed, spilled, or dropped mid-transaction.
 
 The buffer pool is shared process-wide. Returning a buffer clears
 it (zero-fill) and makes it available for reuse.
@@ -282,15 +346,14 @@ handle (each process holds its own pool).
 
 **Cost-model note.** Within one operation, re-modifying a page the
 operation already CoW'd pays nothing further (the re-modify
-invariant above). Across operations, however, each tree-level
-modification allocates a fresh destination page whose superseded
-same-tx predecessor's buffer remains held until transaction close
-(the byte-slice ownership invariant; loose-page reuse recycles page
-IDs, not buffers). The budget therefore sizes against the SUM of
-per-operation path costs — `operations × depth × (1 + indexes)`
-buffers in the worst case — not against the final tree's unique
-page count. Bulk operations have a dedicated escape hatch — see
-`bulkload.md`.
+invariant above). Across operations, each tree-level modification
+allocates a fresh destination page whose superseded same-tx
+predecessor goes loose; the spill pass drops loose buffers (and
+spills live ones) at boundaries, so steady-state memory tracks the
+THRESHOLD rather than the transaction's cumulative
+`operations × depth × (1 + indexes)` footprint — the transaction
+trades pwrite volume for memory past the threshold. Bulk operations
+still have their dedicated bottom-up path — see `bulkload.md`.
 
 ## Commit Write Ordering
 

@@ -150,8 +150,14 @@ type Options struct {
 	GrowStep        uint64
 	ShrinkThreshold uint64
 
-	// MaxTxBufferBytes bounds the per-transaction slab. Exceeding
-	// this returns ErrTxTooLarge. Default 256 MiB.
+	// MaxTxBufferBytes is the per-transaction slab SPILL threshold:
+	// past it, modified pages are written out early at operation
+	// boundaries instead of capping transaction size — steady-state
+	// memory is bounded, transaction size is not (pager-slab.md
+	// §Slab Budget; TxStats.SpilledPages). ErrTxTooLarge remains
+	// only for the commit reserve (the retired-page log and the
+	// descriptor-flush obligation, which cannot spill). Default
+	// 256 MiB.
 	MaxTxBufferBytes int
 
 	// ReadOnly opens the database read-only: the writer pager path is

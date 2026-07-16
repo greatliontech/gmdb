@@ -112,12 +112,12 @@ Invariant: kind=clause-explicit;
     altered file the operator can no longer triage.
 
 Invariant: kind=clause-explicit;
-  property=Incremental compaction's per-pass page-budget
-    (`CompactionBatchSize` × `(1 + depth)` × `PageSize` of
-    slab usage) is bounded by `MaxTxBufferBytes`. A pass
-    that would exceed the budget either reduces
-    `CompactionBatchSize` for that pass or aborts and
-    re-schedules — it never produces `ErrTxTooLarge` from
+  property=Incremental compaction never surfaces
+    `ErrTxTooLarge`: a pass whose RETIRED-page log outgrows
+    the `MaxTxBufferBytes` RPL reserve (relocated pages'
+    slab usage spills at boundaries and no longer bounds a
+    pass) reduces `CompactionBatchSize` for that pass or
+    aborts and re-schedules — it never produces `ErrTxTooLarge` from
     the maintenance code path;
   from=this spec §Incremental Compaction (Cost per pass);
   violation=A maintenance pass that returns `ErrTxTooLarge`
@@ -569,8 +569,9 @@ PageSize` plus `CompactionBatchSize × (1 + depth)` RPL entries
 for the retired originals. At 1024 pages, depth 5, 4 KB pages:
 ~24 MB of pwrite I/O per pass, ~6 K RPL entries (~12 segment
 pages at 508 entries/segment). Size `CompactionBatchSize`
-against `MaxTxBufferBytes` accordingly — the slab must hold the
-whole cascade plus assembly buffers in step 0 of the commit.
+against `MaxTxBufferBytes` accordingly — the RPL reserve for the
+pass's retires (plus step-0 assembly) must fit the threshold;
+relocated data pages spill at boundaries and do not count.
 Bounded by `CompactionBatchSize` and depth, independent of total
 database size.
 
