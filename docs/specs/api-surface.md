@@ -1262,6 +1262,15 @@ func (ks *Keyspace) Delete(key []byte) error
 //     only safe recovery is Tx.Rollback() (which restores via
 //     the pager bitmap snapshot).
 func (ks *Keyspace) DeleteRange(start, end []byte) (uint64, error)
+
+// DeletePrefix deletes every key beginning with prefix, returning the
+// count deleted. Pure composition over DeleteRange — the range is
+// [prefix, prefixSuccessor(prefix)), an all-0xFF prefix's successor
+// being the open upper bound — so semantics, atomicity, the indexed
+// fallback, and the error surface are DeleteRange's. A nil or empty
+// prefix deletes every key (the Prefix iterator's nil-yields-all
+// convention).
+func (ks *Keyspace) DeletePrefix(prefix []byte) (uint64, error)
 func (ks *Keyspace) NextSequence() (uint64, error)
 func (ks *Keyspace) Cursor() *Cursor
 
@@ -1375,6 +1384,13 @@ func (ks *SetKeyspace) CountValues(key []byte) (uint64, error)
 //     Tx.Rollback() (which restores via the pager bitmap
 //     snapshot).
 func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error)
+
+// DeletePrefix deletes every key (and all its members) beginning with
+// prefix, returning the total member-value count deleted — the same
+// composition over DeleteRange as the Kind=0 form, with SetKeyspace
+// DeleteRange's semantics (range-delete.md §Set Keyspace Range
+// Delete). A nil or empty prefix deletes every key.
+func (ks *SetKeyspace) DeletePrefix(prefix []byte) (uint64, error)
 func (ks *SetKeyspace) NextSequence() (uint64, error)
 func (ks *SetKeyspace) Cursor() *SetCursor
 func (ks *SetKeyspace) Index(name string) (*IndexHandle, error)

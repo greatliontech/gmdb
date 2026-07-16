@@ -3,8 +3,11 @@ package typed
 import (
 	"bytes"
 	"math"
+	"strings"
 	"testing"
 	"time"
+
+	"pgregory.net/rapid"
 )
 
 // assertRoundTrip encodes each value, decodes it, and asserts equality
@@ -224,5 +227,189 @@ func TestFuncEncoder(t *testing.T) {
 	assertLexOrder(t, enc, []uint16{0, 1, 258, math.MaxUint16})
 	if enc.ID() != "test/u16-be" {
 		t.Errorf("FuncEncoder ID = %q, want test/u16-be", enc.ID())
+	}
+}
+
+// JSONValue (typed-keyspaces.md §Engine-Provided Canonical Encoders,
+// value encoders): generic round-trip for JSON-representable types,
+// type-distinct stable IDs, loud failure on unrepresentable values.
+
+type jsonProbe struct {
+	Name    string
+	Age     int64
+	Scores  []float64
+	Tags    map[string]string
+	Blob    []byte
+	When    time.Time
+	Nested  *jsonProbe
+	private int // invisible to JSON by design — never set in tests
+}
+
+func TestJSONValueRoundTrip(t *testing.T) {
+	enc := JSONValue[jsonProbe]()
+	v := jsonProbe{
+		Name:   "α-probe",
+		Age:    -42,
+		Scores: []float64{0, 1.5, -2.25},
+		Tags:   map[string]string{"a": "1", "b": ""},
+		Blob:   []byte{0x00, 0xFF, 0x7F},
+		When:   time.Date(2026, 7, 17, 1, 2, 3, 456789000, time.UTC),
+		Nested: &jsonProbe{Name: "inner"},
+	}
+	b, err := enc.AppendEncode(nil, v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	got, err := enc.Decode(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Name != v.Name || got.Age != v.Age || !got.When.Equal(v.When) ||
+		len(got.Scores) != 3 || got.Scores[2] != -2.25 ||
+		got.Tags["a"] != "1" || string(got.Blob) != string(v.Blob) ||
+		got.Nested == nil || got.Nested.Name != "inner" {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+	// AppendEncode appends (the dst contract).
+	pre := []byte("prefix")
+	b2, err := enc.AppendEncode(pre, v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b2[:6]) != "prefix" {
+		t.Fatal("AppendEncode did not append to dst")
+	}
+}
+
+func TestJSONValueRoundTripProperty(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		enc := JSONValue[map[string][]int64]()
+		v := rapid.MapOf(
+			rapid.String(),
+			rapid.SliceOfN(rapid.Int64(), 0, 8),
+		).Draw(t, "v")
+		b, err := enc.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		got, err := enc.Decode(b)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(got) != len(v) {
+			t.Fatalf("size mismatch: %d != %d", len(got), len(v))
+		}
+		for k, xs := range v {
+			ys, ok := got[k]
+			if !ok || len(ys) != len(xs) {
+				t.Fatalf("key %q mismatch", k)
+			}
+			for i := range xs {
+				if xs[i] != ys[i] {
+					t.Fatalf("key %q[%d]: %d != %d", k, i, xs[i], ys[i])
+				}
+			}
+		}
+	})
+}
+
+func TestJSONValueIDsDistinctAndStable(t *testing.T) {
+	a := JSONValue[jsonProbe]().ID()
+	b := JSONValue[map[string]int]().ID()
+	c := JSONValue[jsonProbe]().ID()
+	if a == b {
+		t.Fatalf("distinct types share an ID: %q", a)
+	}
+	if a != c {
+		t.Fatalf("ID not stable: %q vs %q", a, c)
+	}
+	if a == "" || b == "" {
+		t.Fatal("empty ID")
+	}
+}
+
+// TestJSONValueIDsUseFullPackagePaths: wrapper shapes (*T, []T,
+// map[...]T) and anonymous structs must embed FULL package paths —
+// reflect's String() prints short names, so two same-basename
+// packages' types would otherwise share a schema fingerprint and a
+// value-type swap would evade ErrIndexFingerprintMismatch (silent
+// misdecode).
+func TestJSONValueIDsUseFullPackagePaths(t *testing.T) {
+	const full = "github.com/greatliontech/gmdb/typed.jsonProbe"
+	cases := map[string]string{
+		"ptr":   JSONValue[*jsonProbe]().ID(),
+		"slice": JSONValue[[]jsonProbe]().ID(),
+		"map":   JSONValue[map[string]jsonProbe]().ID(),
+		"anon": JSONValue[struct {
+			P jsonProbe
+			N int
+		}]().ID(),
+	}
+	for name, id := range cases {
+		if !strings.Contains(id, full) {
+			t.Errorf("%s ID lacks the full package path: %q", name, id)
+		}
+	}
+	// Wrapper distinctness across shapes.
+	if cases["ptr"] == cases["slice"] {
+		t.Error("*T and []T share an ID")
+	}
+	// Interface fields encode (dynamic value / null), so their
+	// method signatures carry full paths too.
+	ifaceID := JSONValue[struct {
+		F interface{ M() jsonProbe }
+	}]().ID()
+	if !strings.Contains(ifaceID, full) {
+		t.Errorf("interface-field ID lacks the full package path: %q", ifaceID)
+	}
+	// Anonymous structs with different field TAGS are different JSON
+	// schemas — distinct IDs.
+	tagA := JSONValue[struct {
+		X int `json:"x"`
+	}]().ID()
+	tagB := JSONValue[struct {
+		X int `json:"y"`
+	}]().ID()
+	if tagA == tagB {
+		t.Error("anonymous structs with different JSON tags share an ID")
+	}
+}
+
+func TestJSONValueRejectsUnrepresentable(t *testing.T) {
+	if _, err := JSONValue[float64]().AppendEncode(nil, math.NaN()); err == nil {
+		t.Fatal("NaN encoded without error")
+	}
+	if _, err := JSONValue[float64]().AppendEncode(nil, math.Inf(1)); err == nil {
+		t.Fatal("+Inf encoded without error")
+	}
+	if _, err := JSONValue[chan int]().AppendEncode(nil, make(chan int)); err == nil {
+		t.Fatal("chan encoded without error")
+	}
+	if _, err := JSONValue[int]().Decode([]byte("not-json")); err == nil {
+		t.Fatal("malformed input decoded without error")
+	}
+}
+
+// TestJSONValueInKeyspace: the encoder drives a real typed keyspace
+// end to end as the VALUE side, with a canonical key encoder.
+func TestJSONValueInKeyspace(t *testing.T) {
+	tx, cleanup := newTypedTx(t)
+	defer cleanup()
+
+	tks := NewKeyspace[string, jsonProbe]("j", StringEncoder{}, JSONValue[jsonProbe]())
+	ks, err := tks.Create(tx)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	want := jsonProbe{Name: "stored", Age: 7, Tags: map[string]string{"k": "v"}}
+	if err := ks.Put("row", want); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, err := ks.Get("row")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Name != "stored" || got.Age != 7 || got.Tags["k"] != "v" {
+		t.Fatalf("stored round-trip mismatch: %+v", got)
 	}
 }

@@ -2,7 +2,10 @@ package typed
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 )
 
@@ -266,3 +269,157 @@ var (
 	_ Encoder[[16]byte]  = UUIDv4Encoder{}
 	_ Encoder[[16]byte]  = UUIDv7Encoder{}
 )
+
+// JSONValue returns a generic VALUE encoder for T backed by
+// encoding/json: any JSON-representable Go type — structs, maps,
+// slices, pointers — round-trips without a hand-written encoder.
+//
+// VALUE-ONLY: the encoding is NOT order-preserving, so it must never
+// be used as a KEY (or index-column) encoder — lex order of JSON
+// bytes bears no relation to any value order, and range / prefix
+// queries over such keys would route arbitrarily. Keys keep the
+// canonical order-preserving encoders (typed-keyspaces.md
+// §Engine-Provided Canonical Encoders). As a SET-KEYSPACE member
+// (value) encoder it is safe — membership and dedup are byte
+// equality of the deterministic encoding — but member ITERATION
+// order is the encoded-byte order, arbitrary in the value domain;
+// note also that 0.0 and -0.0 encode distinctly ("0" vs "-0") and
+// so are distinct members.
+//
+// Round-trip caveats are encoding/json's: unexported fields are
+// invisible (silently absent from the round-trip — tag-check your
+// structs), NaN/±Inf floats and unsupported kinds (chan, func,
+// complex) FAIL at encode with an error rather than corrupting, and
+// []byte round-trips via base64. Decode into standard-library shapes
+// (pointers, maps, slices, []byte, json.RawMessage) allocates fresh
+// memory, satisfying the Encoder contract's no-retention rule — but
+// a T whose custom UnmarshalJSON RETAINS its argument would receive
+// subslices of the byte layer's borrowed buffer and violate that
+// rule through this encoder; such types need a copying UnmarshalJSON
+// or a hand-written encoder.
+//
+// ID is "gmdb/json/v1#<full type path>" — the type identity is part
+// of the ID so two JSONValue instantiations over different types
+// never share a schema fingerprint. Renaming or moving the Go type
+// changes the ID (a schema change); pin long-lived stored types
+// accordingly.
+func JSONValue[T any]() JSONValueEncoder[T] { return JSONValueEncoder[T]{} }
+
+// JSONValueEncoder is JSONValue's implementation type. Zero value is
+// ready to use.
+type JSONValueEncoder[T any] struct{}
+
+var _ Encoder[struct{ X int }] = JSONValueEncoder[struct{ X int }]{}
+
+func (JSONValueEncoder[T]) AppendEncode(dst []byte, v T) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("typed: JSONValue encode %T: %w", v, err)
+	}
+	return append(dst, b...), nil
+}
+
+func (JSONValueEncoder[T]) Decode(src []byte) (T, error) {
+	var v T
+	if err := json.Unmarshal(src, &v); err != nil {
+		return v, fmt.Errorf("typed: JSONValue decode into %T: %w", v, err)
+	}
+	return v, nil
+}
+
+func (JSONValueEncoder[T]) ID() string {
+	return "gmdb/json/v1#" + jsonTypeID(reflect.TypeFor[T]())
+}
+
+// jsonTypeID derives the type-identity segment of a JSONValue ID with
+// FULL package paths at every level. reflect's String() is not usable
+// here: it prints short package names, so *a/pkg.T and *b/pkg.T — two
+// distinct types — would render identically and share a schema
+// fingerprint, letting a value-type swap across same-basename
+// packages evade ErrIndexFingerprintMismatch and silently misdecode
+// (the Encoder contract's two-encoders-never-share-an-ID MUST).
+// Named types (generic instantiations included — Name() embeds full
+// paths in type arguments) short-circuit; wrapper and anonymous
+// shapes recurse; built-ins have no package and print unambiguously.
+func jsonTypeID(t reflect.Type) string {
+	if pp := t.PkgPath(); pp != "" {
+		return pp + "." + t.Name()
+	}
+	switch t.Kind() {
+	case reflect.Pointer:
+		return "*" + jsonTypeID(t.Elem())
+	case reflect.Slice:
+		return "[]" + jsonTypeID(t.Elem())
+	case reflect.Array:
+		return fmt.Sprintf("[%d]%s", t.Len(), jsonTypeID(t.Elem()))
+	case reflect.Map:
+		return "map[" + jsonTypeID(t.Key()) + "]" + jsonTypeID(t.Elem())
+	case reflect.Struct:
+		var b strings.Builder
+		b.WriteString("struct{")
+		for i := range t.NumField() {
+			f := t.Field(i)
+			if i > 0 {
+				b.WriteByte(';')
+			}
+			b.WriteString(f.Name)
+			b.WriteByte(' ')
+			b.WriteString(jsonTypeID(f.Type))
+			if f.Tag != "" {
+				fmt.Fprintf(&b, " %q", string(f.Tag))
+			}
+		}
+		b.WriteString("}")
+		return b.String()
+	case reflect.Interface:
+		// Interface FIELDS encode (the dynamic value; nil renders as
+		// JSON null), so their identity matters: method names and
+		// full-path signatures. interface{}/any yields "interface{}".
+		var b strings.Builder
+		b.WriteString("interface{")
+		for i := range t.NumMethod() {
+			m := t.Method(i)
+			if i > 0 {
+				b.WriteByte(';')
+			}
+			b.WriteString(m.Name)
+			b.WriteString(jsonTypeID(m.Type))
+		}
+		b.WriteString("}")
+		return b.String()
+	case reflect.Func:
+		// Reached only through interface method signatures (a func
+		// FIELD fails at encode) — still needs full paths, plus a
+		// variadic marker so func(...T) and func([]T) stay distinct.
+		var b strings.Builder
+		b.WriteString("func(")
+		for i := range t.NumIn() {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			if t.IsVariadic() && i == t.NumIn()-1 {
+				b.WriteString("...")
+			}
+			b.WriteString(jsonTypeID(t.In(i)))
+		}
+		b.WriteString(")(")
+		for i := range t.NumOut() {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(jsonTypeID(t.Out(i)))
+		}
+		b.WriteString(")")
+		return b.String()
+	case reflect.Chan:
+		return "chan[" + t.ChanDir().String() + "]" + jsonTypeID(t.Elem())
+	default:
+		// Built-ins (int, string, bool, float64, ...): no package,
+		// String() is unambiguous. Unexported struct fields reach
+		// here too via their types — they participate in the ID even
+		// though JSON ignores them: over-distinction, the safe
+		// direction (identical encodings may get distinct IDs, never
+		// the reverse).
+		return t.String()
+	}
+}

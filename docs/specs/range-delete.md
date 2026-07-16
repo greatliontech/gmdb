@@ -22,6 +22,12 @@ Depends on / interacts with:
   keyspaces.
 - `transactions.md` for cursor stability across CoW + rebalance.
 
+`DeletePrefix(prefix)` on both keyspace kinds is pure composition
+over this contract: the range is `[prefix, prefixSuccessor(prefix))`
+(an all-0xFF prefix's successor is the open upper bound; nil/empty
+prefix means the full range), so every clause below applies to it
+unchanged.
+
 ## Invariants
 
 Invariant: kind=clause-explicit;

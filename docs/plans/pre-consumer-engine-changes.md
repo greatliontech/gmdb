@@ -125,6 +125,6 @@ and 10 remove.
       existing grant-handoff tear detection and leak reclamation
       cover it); `ErrTxTooLarge` narrows to RPL-slab assembly;
       large-transaction and crash tests.
-- [ ] 16. Sugar pass: `DeletePrefix` on both keyspace kinds; a
+- [x] 16. Sugar pass: `DeletePrefix` on both keyspace kinds; a
       generic struct value-encoder helper in `typed` (values need
       round-trip only, not order preservation).

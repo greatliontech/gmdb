@@ -1309,6 +1309,21 @@ func (ks *SetKeyspace) DeleteRange(start, end []byte) (uint64, error) {
 	return ks.deleteRangeUnindexed(start, end, setKeyspaceCellFree, ks.markSetCursorsStale)
 }
 
+// DeletePrefix deletes every key (and all its members) that begins
+// with prefix, returning the total member-value count deleted. Pure
+// composition over DeleteRange: the range is
+// [prefix, prefixSuccessor(prefix)) — an all-0xFF prefix's successor
+// is the open upper bound. A nil or empty prefix deletes every key,
+// matching the Prefix iterator's nil-yields-all convention.
+// Semantics, atomicity, the indexed fallback, and the error surface
+// are DeleteRange's (range-delete.md §Set Keyspace Range Delete).
+func (ks *SetKeyspace) DeletePrefix(prefix []byte) (uint64, error) {
+	if len(prefix) == 0 {
+		return ks.DeleteRange(nil, nil)
+	}
+	return ks.DeleteRange(prefix, prefixSuccessor(prefix))
+}
+
 // deleteRangePerKey is the indexed-SetKeyspace path for DeleteRange.
 // Snapshots keys in [start, end) and calls ks.Delete(k) per row.
 // Per-row atomic via SetKeyspace.Delete's existing per-row index

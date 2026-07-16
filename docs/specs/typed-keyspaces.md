@@ -528,6 +528,32 @@ extends to application-defined encoders
 (`"<pkg>/<type>[/<version>]"` — bump the version segment when
 the encoding logic changes; see `Encoder.ID()` godoc).
 
+### Generic value encoder
+
+`typed.JSONValue[T]()` returns an `Encoder[T]` for any
+JSON-representable Go type — structs, maps, slices, pointers —
+backed by `encoding/json`. It is a VALUE encoder only: JSON bytes
+are not order-preserving, so it must never encode a KEY or an index
+column (range and prefix queries over such keys would route
+arbitrarily); the key side keeps the canonical order-preserving
+encoders above; as a set-keyspace MEMBER encoder it is safe
+(membership and dedup are byte equality of the deterministic
+encoding) but member iteration order is encoded-byte order,
+arbitrary in the value domain. Round-trip caveats are
+encoding/json's: unexported fields are invisible, NaN/±Inf floats
+and unsupported kinds fail at encode with an error rather than
+storing corrupt data, `[]byte` round-trips via base64, 0.0 and -0.0
+encode distinctly, and a custom `UnmarshalJSON` that retains its
+argument violates the Decode no-retention rule through this
+encoder. Its ID is `"gmdb/json/v1#<full type path>"`
+— the type identity is part of the ID, so instantiations over
+distinct types never share a schema fingerprint, and renaming or
+moving the Go type is a schema change. The key/value distinction is
+documentation-enforced: both sides of a typed keyspace accept any
+`Encoder[T]`, and nothing at runtime can detect a non-lex-preserving
+key encoder — splitting the interface into key- and value-specific
+forms is a possible future break.
+
 **Empty encoder IDs on typed.Keyspace without indexes.** The
 `Encoder.ID()` empty check fires only when an encoder is
 referenced by a typed index's schema hash (`IKEnc`, covering
