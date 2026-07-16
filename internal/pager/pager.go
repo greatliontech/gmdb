@@ -262,6 +262,19 @@ type Pager struct {
 	// PageChecksum is disabled or before the first verified read.
 	verified []uint64
 
+	// runPages tracks the page ids installed by AllocSlabRun in the
+	// current write tx — overflow-run pages, the only contiguous-run
+	// slab consumer (checksums.md §Overflow-Run Digest). commitStep1
+	// consults it to EXEMPT these pages from the per-page footer pass:
+	// run pages carry no footers (a stamp into a follower's last 8
+	// bytes would corrupt extent bytes; the head-resident whole-run
+	// digest is the run's integrity cover, written at encode time).
+	// Membership is provenance, not content: AllocSlab and CoW delete
+	// a reused id, so a run page freed and re-allocated as a node page
+	// within the same tx is stamped normally. Reset with the dirty map
+	// (ReleaseAll).
+	runPages map[uint64]struct{}
+
 	// txSnapshot captures the restorable core state (bitmap snapshot,
 	// HighWaterMark, RPL chain — snapshotCore) at the start of the
 	// in-progress write tx so AbortTx can restore it. Without it, file
@@ -438,6 +451,7 @@ func NewWriter(file *os.File, cfg page.Config, reservationBytes int64, pool *Buf
 		return nil, err
 	}
 	p.dirty = make(map[uint64]*[]byte)
+	p.runPages = make(map[uint64]struct{})
 	p.maxBytes = maxBytes
 	p.bufPool = pool
 	p.readOnly = false
@@ -1109,10 +1123,7 @@ func (p *Pager) Page(id uint64) ([]byte, error) {
 	// an externally-grown file can exceed the mmap reservation, and an
 	// id in that gap would slice past the mapping (the same canonical
 	// bound attachState and rebuildRPLChain use).
-	backedPages := uint64(p.fileSize) / uint64(p.cfg.PageSize)
-	if p.maxSizePages != 0 {
-		backedPages = min(backedPages, p.maxSizePages)
-	}
+	backedPages := p.backedPages()
 	if id >= backedPages {
 		return nil, fmt.Errorf("%w: page id %d beyond file-resident extent (%d pages)",
 			ErrCorrupted, id, backedPages)
@@ -1130,6 +1141,130 @@ func (p *Pager) Page(id uint64) ([]byte, error) {
 		p.markVerified(id, backedPages)
 	}
 	return buf, nil
+}
+
+// PageRun returns the CONTIGUOUS image of the overflow run headed at
+// headID — head page (header + optional whole-run digest) followed by
+// its AdditionalPages followers, (1+N)×PageSize bytes — verified and
+// bounded (checksums.md §Overflow-Run Digest):
+//
+//   - File-resident bound: headID and the WHOLE run (per the head's
+//     AdditionalPages) are bounded against the file-resident extent
+//     before any mmap access, so a forged head or forged
+//     AdditionalPages yields ErrCorrupted, never a SIGBUS.
+//   - Type gate: a head whose type byte is not TypeOverflow yields
+//     ErrCorrupted — run pages are reachable only through PageRun;
+//     the per-page Page accessor would misread a footer-less run page.
+//   - Digest verification: when checksums are enabled, the whole-run
+//     XXH3-64 digest is verified on the run's first access in the
+//     transaction — one hash pass over the full content range — and
+//     cached keyed by the HEAD id (only the head is marked: followers
+//     must never satisfy a stray per-page Page call). A mismatch
+//     yields ErrBadPageChecksum with the head id.
+//
+// A run written in THIS write tx lives in per-page slab buffers, not
+// the mmap; PageRun assembles those into a freshly-allocated
+// contiguous image (api-surface.md §Byte Slice Ownership) — runs are
+// written whole via AllocSlabRun, so a dirty head implies every
+// follower is dirty too. Committed runs return a borrowed mmap slice
+// valid until the transaction closes.
+func (p *Pager) PageRun(headID uint64) ([]byte, error) {
+	if !p.readOnly {
+		if _, ok := p.dirty[headID]; ok {
+			return p.assembleDirtyRun(headID)
+		}
+	}
+	run, err := p.pageRunMmap(headID)
+	if err != nil {
+		return nil, err
+	}
+	if p.cfg.PageChecksum && !p.isVerified(headID) {
+		if !page.VerifyOverflowRun(run, p.cfg) {
+			return nil, fmt.Errorf("%w: overflow run at %d", ErrBadPageChecksum, headID)
+		}
+		p.markVerified(headID, p.backedPages())
+	}
+	return run, nil
+}
+
+// PageRunRaw is PageRun without verification: bounded (never a
+// SIGBUS, ErrCorrupted on a forged head or run overrunning the
+// file-resident extent) but with no digest check — for Check's
+// report-don't-abort walk and the scrubber, which verify explicitly
+// and report mismatches as issues rather than aborting.
+func (p *Pager) PageRunRaw(headID uint64) ([]byte, error) {
+	if !p.readOnly {
+		if _, ok := p.dirty[headID]; ok {
+			return p.assembleDirtyRun(headID)
+		}
+	}
+	return p.pageRunMmap(headID)
+}
+
+// backedPages returns the file-resident page count clamped to MaxSize
+// — the canonical bound content-derived page ids are checked against
+// before any mmap access (checksums.md §Structural and Allocation
+// Bounds).
+func (p *Pager) backedPages() uint64 {
+	backed := uint64(p.fileSize) / uint64(p.cfg.PageSize)
+	if p.maxSizePages != 0 {
+		backed = min(backed, p.maxSizePages)
+	}
+	return backed
+}
+
+// pageRunMmap bounds and slices the contiguous committed run image at
+// headID out of the mmap. Shared by PageRun / PageRunRaw.
+func (p *Pager) pageRunMmap(headID uint64) ([]byte, error) {
+	backed := p.backedPages()
+	if headID >= backed {
+		return nil, fmt.Errorf("%w: overflow-run head %d beyond file-resident extent (%d pages)",
+			ErrCorrupted, headID, backed)
+	}
+	off := headID * uint64(p.cfg.PageSize)
+	head := p.mmap[off : off+uint64(p.cfg.PageSize)]
+	additional, err := page.DecodeOverflowFirstPage(head)
+	if err != nil {
+		return nil, fmt.Errorf("%w: overflow-run head %d: %w", ErrCorrupted, headID, err)
+	}
+	total := 1 + uint64(additional)
+	if headID+total > backed {
+		return nil, fmt.Errorf("%w: overflow run [%d,+%d) beyond file-resident extent (%d pages)",
+			ErrCorrupted, headID, total, backed)
+	}
+	if p.cold.enabled {
+		for i := range total {
+			p.cold.record(headID + i)
+		}
+	}
+	return p.mmap[off : off+total*uint64(p.cfg.PageSize)], nil
+}
+
+// assembleDirtyRun concatenates the per-page slab buffers of a run
+// written in this tx into a freshly-allocated contiguous image,
+// byte-identical to the committed mmap form. No digest verification:
+// this-tx slab content is trusted like every dirty read.
+func (p *Pager) assembleDirtyRun(headID uint64) ([]byte, error) {
+	head := *p.dirty[headID]
+	additional, err := page.DecodeOverflowFirstPage(head)
+	if err != nil {
+		return nil, fmt.Errorf("%w: dirty overflow-run head %d: %w", ErrCorrupted, headID, err)
+	}
+	total := 1 + uint64(additional)
+	out := make([]byte, 0, total*uint64(p.cfg.PageSize))
+	out = append(out, head...)
+	for i := uint64(1); i < total; i++ {
+		buf, ok := p.dirty[headID+i]
+		if !ok {
+			// Runs are written whole via AllocSlabRun; a dirty head
+			// with a non-dirty follower is an engine bug or a forged
+			// AdditionalPages on a this-tx buffer.
+			return nil, fmt.Errorf("%w: dirty overflow run at %d: follower %d not in slab",
+				ErrCorrupted, headID, headID+i)
+		}
+		out = append(out, *buf...)
+	}
+	return out, nil
 }
 
 // isVerified reports whether page id's footer has already been verified
@@ -1188,6 +1323,13 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 	if p.readOnly {
 		return nil, ErrReadOnly
 	}
+	// A CoW install supersedes any stale overflow-run provenance at
+	// dstID (run freed earlier in the tx, id re-allocated as a CoW
+	// destination) — see AllocSlab, including the undo-logging.
+	if _, wasRun := p.runPages[dstID]; wasRun {
+		p.recordSavepointUndo(fieldRunPages, dstID, true)
+		delete(p.runPages, dstID)
+	}
 	if existing, ok := p.dirty[dstID]; ok {
 		// Idempotent re-CoW: same destination already owned by this tx.
 		return *existing, nil
@@ -1220,6 +1362,16 @@ func (p *Pager) CoW(srcID, dstID uint64) ([]byte, error) {
 func (p *Pager) AllocSlab(id uint64) ([]byte, error) {
 	if p.readOnly {
 		return nil, ErrReadOnly
+	}
+	// A single-page (node) install supersedes any stale overflow-run
+	// provenance at this id (run freed earlier in the tx, id
+	// re-allocated as a node page) — the page must be footer-stamped
+	// at commit like any node page. Undo-logged so a savepoint restore
+	// that revives the run (via the loose-pop replay) revives its
+	// provenance with it.
+	if _, wasRun := p.runPages[id]; wasRun {
+		p.recordSavepointUndo(fieldRunPages, id, true)
+		delete(p.runPages, id)
 	}
 	if existing, ok := p.dirty[id]; ok {
 		return *existing, nil
@@ -1273,6 +1425,16 @@ func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
 	out := make([][]byte, n)
 	for i := uint32(0); i < n; i++ {
 		id := firstID + uint64(i)
+		// Overflow-run provenance: every page of the run is exempt
+		// from the commit footer pass (checksums.md §Overflow-Run
+		// Digest) — recorded here, the single install point for
+		// contiguous runs, whether the buffer is fresh or reused.
+		// Undo-logged (savepoint restore must strip the provenance
+		// when it strips the in-window run).
+		if _, wasRun := p.runPages[id]; !wasRun {
+			p.recordSavepointUndo(fieldRunPages, id, false)
+			p.runPages[id] = struct{}{}
+		}
 		if existing, ok := p.dirty[id]; ok {
 			out[i] = *existing
 			continue
@@ -1328,6 +1490,19 @@ func (p *Pager) AllocSlabRun(firstID uint64, n uint32) ([][]byte, error) {
 // length is not exactly PageSize, an id not in pendingAllocs, or an id
 // already in the slab.
 func (p *Pager) WriteDirect(id uint64, buf []byte) error {
+	return p.writeDirect(id, buf, true)
+}
+
+// WriteDirectRaw is WriteDirect without the footer stamp — for
+// overflow-run pages, which carry no per-page footers (the
+// head-resident whole-run digest, written by the caller's encode, is
+// the run's integrity cover — checksums.md §Overflow-Run Digest).
+// Every other part of the WriteDirect contract holds unchanged.
+func (p *Pager) WriteDirectRaw(id uint64, buf []byte) error {
+	return p.writeDirect(id, buf, false)
+}
+
+func (p *Pager) writeDirect(id uint64, buf []byte, stampFooter bool) error {
 	if p.readOnly {
 		return ErrReadOnly
 	}
@@ -1353,7 +1528,7 @@ func (p *Pager) WriteDirect(id uint64, buf []byte) error {
 	if err := p.ensureFileCovers(id + 1); err != nil {
 		return fmt.Errorf("pager: WriteDirect ensure file covers page %d: %w", id, err)
 	}
-	if p.cfg.PageChecksum {
+	if stampFooter && p.cfg.PageChecksum {
 		page.WritePageFooter(buf, p.cfg.PageSize)
 	}
 	off := int64(id) * int64(p.cfg.PageSize)
@@ -1421,6 +1596,10 @@ func (p *Pager) ReleaseAll() {
 	if p.readOnly {
 		return
 	}
+	// Run provenance is scoped to the tx exactly like the dirty map;
+	// cleared even on the fast path below (a savepoint rollback can
+	// empty the dirty map while stale run entries remain).
+	clear(p.runPages)
 	if len(p.dirty) == 0 && len(p.detachedBufs) == 0 {
 		return
 	}

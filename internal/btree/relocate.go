@@ -132,7 +132,7 @@ func relocateNode(pw PageWriter, cfg page.Config, id uint64, shouldRelocate func
 			continue
 		}
 		runLen := keyExtentRunLen(cfg, c.KeyTotalLen)
-		nf, err := relocateOverflowChain(pw, c.KeyExtPage, runLen)
+		nf, err := relocateOverflowChain(pw, cfg, c.KeyExtPage, runLen)
 		if err != nil {
 			return 0, false, err
 		}
@@ -202,7 +202,7 @@ func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldR
 		e := &entries[k]
 		if e.IsOverflowKey() && shouldRelocate(e.KeyExtPage) && *budget > 0 {
 			runLen := keyExtentRunLen(cfg, e.KeyTotalLen)
-			nf, err := relocateOverflowChain(pw, e.KeyExtPage, runLen)
+			nf, err := relocateOverflowChain(pw, cfg, e.KeyExtPage, runLen)
 			if err != nil {
 				return 0, false, err
 			}
@@ -217,7 +217,7 @@ func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldR
 				continue
 			}
 			runLen := page.OverflowRunLength(cfg, e.TotalLen)
-			nf, err := relocateOverflowChain(pw, e.OverflowPage, runLen)
+			nf, err := relocateOverflowChain(pw, cfg, e.OverflowPage, runLen)
 			if err != nil {
 				return 0, false, err
 			}
@@ -289,10 +289,21 @@ func relocateLeaf(pw PageWriter, cfg page.Config, id uint64, buf []byte, shouldR
 
 // relocateOverflowChain copies the runLen-page overflow chain at oldFirst to
 // a fresh contiguous run, retires the old run, and returns the new first id.
-// The copy is byte-for-byte (the stored footer comes along; commit
-// recomputes it). pw.Page verifies each source page's footer, so a bitrotted
-// chain page aborts relocation (rolled back) rather than propagating.
-func relocateOverflowChain(pw PageWriter, oldFirst uint64, runLen uint32) (uint64, error) {
+// The copy is byte-for-byte: the whole-run digest covers content only —
+// never page ids — so the head's stored digest stays valid at the new
+// location (checksums.md §Overflow-Run Digest). pw.PageRun verifies the
+// source run's digest, so a bitrotted chain aborts relocation (rolled
+// back) rather than propagating under a still-matching digest.
+func relocateOverflowChain(pw PageWriter, cfg page.Config, oldFirst uint64, runLen uint32) (uint64, error) {
+	src, err := pw.PageRun(oldFirst)
+	if err != nil {
+		return 0, err
+	}
+	pageSize := int(cfg.PageSize)
+	if len(src) != pageSize*int(runLen) {
+		return 0, fmt.Errorf("%w: overflow run at %d: image %d bytes disagrees with the reference-derived run %d",
+			ErrCorrupted, oldFirst, len(src), runLen)
+	}
 	newFirst, err := pw.AllocContiguous(runLen)
 	if err != nil {
 		return 0, err
@@ -302,11 +313,7 @@ func relocateOverflowChain(pw PageWriter, oldFirst uint64, runLen uint32) (uint6
 		return 0, err
 	}
 	for i := range runLen {
-		src, err := pw.Page(oldFirst + uint64(i))
-		if err != nil {
-			return 0, err
-		}
-		copy(dst[i], src)
+		copy(dst[i], src[int(i)*pageSize:])
 	}
 	if err := pw.FreeRun(oldFirst, runLen); err != nil {
 		return 0, err

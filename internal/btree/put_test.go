@@ -40,6 +40,30 @@ func (f *fakeWriter) Page(id uint64) ([]byte, error) {
 	panic(fmt.Sprintf("fakeWriter: page %d not allocated", id))
 }
 
+// PageRun assembles the contiguous run image headed at headID from the
+// per-id page map — the fake analog of the pager's PageRun (no digest
+// verification: fake pages are trusted like dirty slab buffers).
+func (f *fakeWriter) PageRun(headID uint64) ([]byte, error) {
+	head, ok := f.pages[headID]
+	if !ok {
+		panic(fmt.Sprintf("fakeWriter: run head %d not allocated", headID))
+	}
+	additional, err := page.DecodeOverflowFirstPage(head)
+	if err != nil {
+		return nil, err
+	}
+	run := make([]byte, 0, (1+uint64(additional))*uint64(f.pageSize))
+	run = append(run, head...)
+	for i := uint64(1); i <= uint64(additional); i++ {
+		buf, ok := f.pages[headID+i]
+		if !ok {
+			panic(fmt.Sprintf("fakeWriter: run follower %d not allocated", headID+i))
+		}
+		run = append(run, buf...)
+	}
+	return run, nil
+}
+
 func (f *fakeWriter) AllocPage() (uint64, error) {
 	id := f.nextID
 	f.nextID++

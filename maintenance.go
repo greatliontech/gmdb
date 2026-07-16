@@ -7,11 +7,13 @@ import (
 	"time"
 	"weak"
 
+	"github.com/greatliontech/gmdb/internal/bitmap"
 	"github.com/greatliontech/gmdb/internal/pager"
 	"github.com/greatliontech/gmdb/internal/verify"
 
 	"github.com/greatliontech/gmdb/internal/lock"
 	"github.com/greatliontech/gmdb/internal/page"
+	"github.com/zeebo/xxh3"
 )
 
 // maintDetectHookForTest fires inside maintReclaimLeaks's detection
@@ -36,10 +38,38 @@ type maintenance struct {
 	done    chan struct{}
 	started bool
 
-	// scrubCursor is the next page id the checksum scrubber verifies,
-	// wrapping at HighWaterMark (background-maintenance.md §Checksum
-	// Scrubbing). Touched only by the maintenance goroutine.
-	scrubCursor uint64
+	// scrubAnchor is the checksum scrubber's cursor ANCHOR — the id and
+	// content digest of the last allocated object the previous pass
+	// examined (background-maintenance.md §Checksum Scrubbing, Cursor
+	// re-anchoring). Follower pages of an overflow run are classifiable
+	// only by scanning forward from a position known not to be inside a
+	// run, so a bare next-page id is unsound across passes: the anchor
+	// is revalidated against the new snapshot at pass start and the
+	// scan resumes at its end + 1; an invalid anchor silently restarts
+	// the cycle from the first data page. Touched only by the
+	// maintenance goroutine.
+	scrubAnchor scrubAnchor
+}
+
+// scrubAnchor identifies the last object the scrubber examined —
+// verified or reported — as a node/RPL page (digest = XXH3-64 over the
+// full page bytes, footer included) or a whole overflow run (digest =
+// the recomputed whole-run digest, equal to the head-resident stored
+// value when the run verified). Recording the digest even on failure
+// lets the next pass resume PAST a persistently corrupt object (one
+// warning per cycle) instead of pinning the cycle on it. Zero value =
+// no anchor (cycle starts at firstData).
+type scrubAnchor struct {
+	valid bool
+	id    uint64
+	isRun bool
+	// digest pins the anchor's content: a later pass revalidates by
+	// recomputing over the page — or over the run range the head's
+	// CURRENT AdditionalPages describes — and comparing. A run
+	// absorbing the anchor position must overwrite the anchor's own
+	// bytes and thereby change this digest (up to content mimicry,
+	// the accepted residual).
+	digest uint64
 }
 
 // stopMaintenance cancels the maintenance goroutine and waits for it to
@@ -162,16 +192,36 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 // repair is the explicit CheckWithOptions(Repair) / CopyTo(compact=true)
 // path. Skipped entirely when PageChecksum is disabled.
 //
-// Footer-bearing gate: only pages the engine guarantees carry a footer are
-// verified — allocated pages (the snapshot bitmap's bit is clear) in
+// Footer-bearing gate: only pages the engine guarantees carry a checksum
+// are verified — allocated pages (the snapshot bitmap's bit is clear) in
 // [firstData, hwm). The meta/bitmap region (< firstData) carries no
 // XXH3-64 footer (checksums.md §Storage), and a free page holds no valid
 // footer; verifying either would emit a spurious BadPageChecksum per page
-// on any non-full database, flooding the log and burying real bitrot.
+// on any non-full database, flooding the log and burying real bitrot. An
+// allocated page whose type byte is TypeOverflow heads an overflow run:
+// the run is verified STANDALONE by its head-resident whole-run digest
+// over the AdditionalPages-determined content range (checksums.md
+// §Overflow-Run Digest — no referencing cell needed) and the scan
+// advances past the follower pages, which carry neither header nor
+// footer and are identifiable only from their head.
 //
-// The cursor scans the page-id space (free ids are advanced over, not
-// verified), wrapping at hwm; a full cycle covers the data region over
-// ceil((hwm-firstData)/ScrubBatchSize) passes.
+// Cursor re-anchoring (background-maintenance.md §Checksum Scrubbing):
+// because followers are classifiable only by scanning forward from a
+// position proven not to be inside a run, the persistent cursor is an
+// ANCHOR — id + digest of the last examined object — revalidated at pass
+// start; the pass resumes at the anchor's end + 1, and an invalid anchor
+// silently restarts the cycle from firstData (never a follower: a
+// follower always sits above its head). Content mimicry (extent bytes
+// byte-replicating the old anchor image) revalidating a stale anchor is
+// the accepted residual: report-only subsystem, bounded spurious
+// warnings, Check remains the authority.
+//
+// ScrubBatchSize is a verification target, not a bound: free ids are
+// advanced over without consuming budget (a free window larger than the
+// batch would otherwise pin the anchor and starve the region's tail —
+// the anchor only advances on examined objects), a pass never ends
+// inside a run, and total iteration is capped at one full cycle of the
+// data region.
 //
 // Best-effort: the allocated/free gate uses a bitmap snapshot copied once
 // at pass start (consistent for the whole pass), but page content is read
@@ -197,7 +247,8 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 		return // checksums disabled — no footers to verify
 	}
 	pageSize := meta.PageSize
-	c := &verify.Checker{Pgr: rtx.pgr, Cfg: page.Config{PageSize: pageSize, PageChecksum: true}, Meta: meta}
+	cfg := page.Config{PageSize: pageSize, PageChecksum: true}
+	c := &verify.Checker{Pgr: rtx.pgr, Cfg: cfg, Meta: meta}
 	bm, ok := c.SnapshotBitmap()
 	if !ok {
 		return // no bitmap pages — empty database
@@ -212,42 +263,167 @@ func (db *DB) maintScrubChecksums(ctx context.Context) {
 	if hwm <= firstData {
 		return // no data pages to scrub
 	}
-	// Clamp the persistent cursor into [firstData, hwm): the data region's
-	// bounds can move between passes (hwm grows, BitmapPages changes).
-	cursor := db.maint.scrubCursor
-	if cursor < firstData || cursor >= hwm {
-		cursor = firstData
+
+	// Revalidate the anchor against the new snapshot; resume at its
+	// end + 1, or restart the cycle at firstData (silently — an
+	// invalidated anchor is expected under churn, not a fault).
+	cursor := firstData
+	if a := db.maint.scrubAnchor; a.valid {
+		if end, ok := revalidateScrubAnchor(rtx.pgr, cfg, bm, a, firstData, hwm); ok {
+			cursor = end
+			if cursor >= hwm {
+				cursor = firstData
+			}
+		}
 	}
-	// Scan at most the whole data region once per pass — for a region
-	// smaller than the batch this avoids re-verifying the same pages
-	// repeatedly within one pass (one pass = one full cycle, per spec).
+
+	// nScan verified-object pages per pass (target); span caps total
+	// iteration at one full cycle of the data region.
 	span := hwm - firstData
 	nScan := min(uint64(db.opts.Maintenance.ScrubBatchSize), span)
-	for range nScan {
+	verified := uint64(0)
+	anchor := db.maint.scrubAnchor
+	for iter := uint64(0); iter < span && verified < nScan; iter++ {
 		if ctx.Err() != nil {
 			break // Close / cancel — persist progress and stop
 		}
 		id := cursor
-		cursor++
-		if cursor >= hwm {
-			cursor = firstData
-		}
 		if bm.IsSet(id) {
-			continue // free page (bit set) — no valid footer
+			// Free page (bit set) — no valid checksum; skipped without
+			// consuming verification budget.
+			cursor++
+			if cursor >= hwm {
+				cursor = firstData
+			}
+			continue
 		}
-		if !page.VerifyPageFooter(rtx.pgr.PageRaw(id), pageSize) {
-			// Re-verify once: a newer concurrent writer's in-flight pwrite of
-			// a page it allocated below the snapshot's hwm can be observed
-			// torn through the live mmap. A transient torn read clears on
-			// re-read; genuine bitrot (or an unwritten allocated page, which
-			// has no footer) persists.
-			if !page.VerifyPageFooter(rtx.pgr.PageRaw(id), pageSize) {
+		buf := rtx.pgr.PageRaw(id)
+		if buf[0] == page.TypeOverflow {
+			// Overflow-run head: verify the whole run standalone and
+			// advance past its followers ("a pass never ends inside a
+			// run" — the run is one indivisible scan quantum).
+			adv, v := db.scrubRun(rtx, cfg, id, hwm, &anchor)
+			verified += v
+			cursor += adv
+		} else {
+			if !scrubNodePage(rtx, pageSize, id) {
 				// Report-only and logged with page id (background-maintenance.md §Invariants).
 				db.logger.Warn("gmdb: scrub detected bad page checksum", "page", id)
 			}
+			// Anchor on the examined object regardless of outcome —
+			// the digest pins the CURRENT content, so a persistently
+			// corrupt page is resumed past (re-warned once per cycle,
+			// not once per pass) instead of pinning the cycle and
+			// starving everything behind it.
+			anchor = scrubAnchor{valid: true, id: id, digest: xxh3.Hash(buf)}
+			verified++
+			cursor++
+		}
+		if cursor >= hwm {
+			cursor = firstData
 		}
 	}
-	db.maint.scrubCursor = cursor
+	db.maint.scrubAnchor = anchor
+}
+
+// scrubNodePage footer-verifies one node/RPL page with the
+// re-verify-once discipline (a newer concurrent writer's in-flight
+// pwrite of a page it allocated below the snapshot's hwm can be
+// observed torn through the live mmap; a transient torn read clears on
+// re-read — genuine bitrot, or an unwritten allocated page, persists).
+func scrubNodePage(rtx *ReadTx, pageSize uint32, id uint64) bool {
+	if page.VerifyPageFooter(rtx.pgr.PageRaw(id), pageSize) {
+		return true
+	}
+	return page.VerifyPageFooter(rtx.pgr.PageRaw(id), pageSize)
+}
+
+// scrubRun digest-verifies the overflow run headed at id, anchoring on
+// the examined object whether or not it verified (a persistently
+// corrupt run must not pin the cycle — see the node branch). Returns
+// the pages to advance the cursor by and the count charged against the
+// verification budget. A run whose claimed extent overruns the
+// snapshot region is reported and advanced over as a single page — its
+// AdditionalPages is untrustworthy, so the followers cannot be
+// classified; the head anchors as a bare page (whole-page hash) and
+// the next objects re-align at the following pass (the accepted
+// best-effort residual).
+func (db *DB) scrubRun(rtx *ReadTx, cfg page.Config, id, hwm uint64, anchor *scrubAnchor) (advance, verified uint64) {
+	head := rtx.pgr.PageRaw(id)
+	_, _, _, additional := page.ReadHeader(head)
+	if id+1+uint64(additional) > hwm {
+		db.logger.Warn("gmdb: scrub detected overflow run overrunning the data region",
+			"page", id, "runPages", 1+uint64(additional))
+		*anchor = scrubAnchor{valid: true, id: id, digest: xxh3.Hash(head)}
+		return 1, 1
+	}
+	// Each attempt re-fetches the run so a torn first header read
+	// (in-flight pwrite of a page a newer writer allocated below the
+	// snapshot's hwm) re-reads AdditionalPages too, not just content —
+	// the same torn-read re-verify discipline as node pages.
+	var run []byte
+	attempt := func() bool {
+		r, err := rtx.pgr.PageRunRaw(id)
+		if err != nil {
+			return false
+		}
+		run = r
+		return page.VerifyOverflowRun(r, cfg)
+	}
+	if !(attempt() || attempt()) {
+		if run == nil {
+			db.logger.Warn("gmdb: scrub detected unreadable overflow run", "page", id)
+		} else {
+			db.logger.Warn("gmdb: scrub detected bad overflow-run digest", "page", id)
+		}
+	}
+	if run == nil {
+		// PageRunRaw itself failed (bounds/forgery) — anchor the head
+		// as a bare page and advance one; nothing more is classifiable.
+		*anchor = scrubAnchor{valid: true, id: id, digest: xxh3.Hash(head)}
+		return 1, 1
+	}
+	// Anchor with the recomputed (current-content) digest — equal to
+	// the stored digest when the run verified — and advance by the
+	// fetched image's true length (the freshest AdditionalPages view).
+	*anchor = scrubAnchor{valid: true, id: id, isRun: true,
+		digest: page.OverflowRunDigest(run, cfg)}
+	total := uint64(len(run)) / uint64(cfg.PageSize)
+	return total, total
+}
+
+// revalidateScrubAnchor checks a previous pass's anchor against the
+// current snapshot: still inside the data region, still allocated, and
+// its digest — recomputed over the page, or over the run range the
+// head's CURRENT AdditionalPages describes — unchanged. On success the
+// scan may resume at the returned end position (anchor end + 1): a run
+// absorbing that boundary would have had to overwrite the anchor's own
+// bytes and change the digest (background-maintenance.md §Checksum
+// Scrubbing, up to content mimicry).
+func revalidateScrubAnchor(pgr *pager.Pager, cfg page.Config, bm *bitmap.Bitmap, a scrubAnchor, firstData, hwm uint64) (end uint64, ok bool) {
+	if a.id < firstData || a.id >= hwm || bm.IsSet(a.id) {
+		return 0, false
+	}
+	head := pgr.PageRaw(a.id)
+	if a.isRun {
+		if head[0] != page.TypeOverflow {
+			return 0, false
+		}
+		_, _, _, additional := page.ReadHeader(head)
+		total := 1 + uint64(additional)
+		if a.id+total > hwm {
+			return 0, false
+		}
+		run, err := pgr.PageRunRaw(a.id)
+		if err != nil || page.OverflowRunDigest(run, cfg) != a.digest {
+			return 0, false
+		}
+		return a.id + total, true
+	}
+	if xxh3.Hash(head) != a.digest {
+		return 0, false
+	}
+	return a.id + 1, true
 }
 
 // maintReclaimLeaks reclaims bitmap-leaked pages — allocated in the bitmap

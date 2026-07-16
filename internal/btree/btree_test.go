@@ -30,6 +30,30 @@ func (f *fakeReader) Page(id uint64) ([]byte, error) {
 	panic(fmt.Sprintf("fakeReader: page %d not registered", id))
 }
 
+// PageRun assembles the contiguous run image headed at headID from
+// the per-id page map — the fake analog of the pager's PageRun (no
+// digest verification).
+func (f *fakeReader) PageRun(headID uint64) ([]byte, error) {
+	head, err := f.Page(headID)
+	if err != nil {
+		return nil, err
+	}
+	additional, err := page.DecodeOverflowFirstPage(head)
+	if err != nil {
+		return nil, err
+	}
+	run := make([]byte, 0, (1+uint64(additional))*uint64(f.pageSize))
+	run = append(run, head...)
+	for i := uint64(1); i <= uint64(additional); i++ {
+		buf, err := f.Page(headID + i)
+		if err != nil {
+			return nil, err
+		}
+		run = append(run, buf...)
+	}
+	return run, nil
+}
+
 func (f *fakeReader) put(id uint64, buf []byte) {
 	if uint32(len(buf)) != f.pageSize {
 		panic(fmt.Sprintf("fakeReader.put: buf len %d != PageSize %d", len(buf), f.pageSize))

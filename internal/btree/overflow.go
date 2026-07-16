@@ -180,63 +180,69 @@ func freeOverflowChainIfPresent(pw PageWriter, cfg page.Config, entry page.LeafE
 // comparisons over pr (page-formats.md §Overflow-Key Cells,
 // Comparison). Precondition per the type's contract: probe's first
 // T bytes equal the stored key's resident bytes and len(probe) > T.
-// The comparison streams the extent run one page at a time — never
-// materializing the stored tail — with the same forged-length
-// discipline as readOverflowValue.
+// The extent is one contiguous byte range in the run image
+// (page-formats.md §Overflow Page), so the comparison is a single
+// bytes.Compare over the borrowed slice — no materialization, no
+// per-page chunking.
 func keyTail(pr PageReader, cfg page.Config) page.TailCompare {
 	t := cfg.InlineThreshold()
-	firstCap := page.OverflowFirstPageCapacity(cfg)
-	followCap := page.OverflowFollowerCapacity(cfg)
 	return func(probe []byte, extPage uint64, totalLen uint32) (int, error) {
 		probeTail := probe[t:]
-		storedTail := int(totalLen) - t
-		if storedTail <= 0 {
+		storedLen := int(totalLen) - t
+		if storedLen <= 0 {
 			return 0, fmt.Errorf("%w: overflow-key extent at %d with KeyTotalLen %d <= inline threshold %d",
 				ErrCorrupted, extPage, totalLen, t)
 		}
-		remaining := storedTail
-		pi := uint64(0)
-		pos := 0 // consumed bytes of probeTail
-		for remaining > 0 {
-			buf, err := pr.Page(extPage + pi)
-			if err != nil {
-				return 0, err
-			}
-			chunk := followCap
-			start := 0
-			if pi == 0 {
-				chunk = firstCap
-				start = page.HeaderSize
-			}
-			if chunk > remaining {
-				chunk = remaining
-			}
-			stored := buf[start : start+chunk]
-			k := min(len(probeTail)-pos, chunk)
-			if c := bytes.Compare(probeTail[pos:pos+k], stored[:k]); c != 0 {
-				return c, nil
-			}
-			pos += k
-			if k < chunk {
-				// probe exhausted while stored bytes remain — probe is
-				// a strict prefix of the stored key.
-				return -1, nil
-			}
-			remaining -= chunk
-			if pos == len(probeTail) && remaining > 0 {
-				// Probe exhausted exactly at a page boundary with
-				// stored bytes remaining — strict prefix; skip the
-				// pointless zero-byte compare of the next page.
-				return -1, nil
-			}
-			pi++
+		stored, err := readRunExtent(pr, cfg, extPage, uint64(storedLen))
+		if err != nil {
+			return 0, err
 		}
-		// Stored tail exhausted with every byte tied.
-		if pos < len(probeTail) {
-			return 1, nil // probe longer — stored is a strict prefix
+		k := min(len(probeTail), storedLen)
+		if c := bytes.Compare(probeTail[:k], stored[:k]); c != 0 {
+			return c, nil
+		}
+		switch {
+		case len(probeTail) < storedLen:
+			return -1, nil // probe is a strict prefix of the stored key
+		case len(probeTail) > storedLen:
+			return 1, nil // stored is a strict prefix of the probe
 		}
 		return 0, nil
 	}
+}
+
+// readRunExtent fetches the run at headID and returns its first
+// extentLen extent bytes as a borrowed slice, after cross-checking
+// the head's AdditionalPages against the extentLen-derived run length
+// (checksums.md §Structural and Allocation Bounds): the run image is
+// bounded by the file-resident extent inside PageRun, so a forged
+// extent length that disagrees with the physical run is rejected here
+// with no extentLen-sized allocation anywhere on the path.
+func readRunExtent(pr PageReader, cfg page.Config, headID uint64, extentLen uint64) ([]byte, error) {
+	run, err := pr.PageRun(headID)
+	if err != nil {
+		return nil, err
+	}
+	additional, err := page.DecodeOverflowFirstPage(run)
+	if err != nil {
+		return nil, fmt.Errorf("%w: overflow run at %d: %w", ErrCorrupted, headID, err)
+	}
+	// Forged-length bound: uint64 run length — a forged extent length
+	// whose uint32 run truncates to a small value is caught by the
+	// uint64 comparison against the physical (file-bounded) run.
+	want := page.OverflowRunLength64(cfg, extentLen)
+	if uint64(additional)+1 != want {
+		return nil, fmt.Errorf("%w: overflow run at %d: header AdditionalPages %d+1 disagrees with the reference-derived run %d",
+			ErrCorrupted, headID, additional, want)
+	}
+	extent := page.OverflowRunExtent(run, cfg)
+	// Guaranteed by the run-length agreement above; kept as defense in
+	// depth at the slice boundary.
+	if extentLen > uint64(len(extent)) {
+		return nil, fmt.Errorf("%w: overflow run at %d: extent length %d exceeds run capacity %d",
+			ErrCorrupted, headID, extentLen, len(extent))
+	}
+	return extent[:extentLen], nil
 }
 
 // writeKeyExtent allocates and encodes the key extent holding
@@ -319,8 +325,9 @@ func freeBranchCellExtentIfPresent(pw PageWriter, cfg page.Config, c page.Branch
 	return nil
 }
 
-// readKeyExtentTail assembles key[T:] from a key extent. Shared by
-// leaf-entry and branch-cell key materialization.
+// readKeyExtentTail returns key[T:] from a key extent as a borrowed
+// slice of the run image. Shared by leaf-entry and branch-cell key
+// materialization.
 func readKeyExtentTail(pr PageReader, cfg page.Config, extPage uint64, keyTotalLen uint32) ([]byte, error) {
 	t := cfg.InlineThreshold()
 	tailLen := int(keyTotalLen) - t
@@ -328,12 +335,7 @@ func readKeyExtentTail(pr PageReader, cfg page.Config, extPage uint64, keyTotalL
 		return nil, fmt.Errorf("%w: key extent at %d with KeyTotalLen %d <= inline threshold %d",
 			ErrCorrupted, extPage, keyTotalLen, t)
 	}
-	fake := page.LeafEntry{
-		Flags:        page.CellFlagOverflow,
-		OverflowPage: extPage,
-		TotalLen:     uint64(tailLen),
-	}
-	return readOverflowValue(pr, cfg, fake)
+	return readRunExtent(pr, cfg, extPage, uint64(tailLen))
 }
 
 // materializeEntryKey returns the FULL key of a leaf entry — the
@@ -399,45 +401,19 @@ func makeSeparatorCell(pw PageWriter, cfg page.Config, sep []byte, child uint64)
 	}, nil
 }
 
-// readOverflowValue assembles the value bytes from the overflow
-// chain rooted at entry.OverflowPage. Returns a heap-allocated
-// slice of length entry.TotalLen — caller-owned, independent of
-// the pager's slab / mmap lifetimes. (See api-surface.md §Byte
-// Slice Ownership: overflow values diverge from the
-// borrowed-reference rule because the value spans non-contiguous
-// regions of the mmap (per-page headers / footers); a heap copy
-// is the simplest correct shape. Profile-revisit if allocation
-// pressure becomes material.)
+// readOverflowValue returns the value bytes of the overflow run
+// rooted at entry.OverflowPage as a single slice of length
+// entry.TotalLen. For a committed run this is a BORROWED view of the
+// contiguous mmap extent, valid until the transaction closes exactly
+// like an inline value; a run written in this same write tx comes
+// back as a freshly-allocated assembly of its slab buffers
+// (api-surface.md §Byte Slice Ownership). Forged TotalLen / forged
+// AdditionalPages are rejected inside readRunExtent with no
+// TotalLen-sized allocation on the path (checksums.md §Structural
+// and Allocation Bounds).
 func readOverflowValue(pr PageReader, cfg page.Config, entry page.LeafEntry) ([]byte, error) {
 	if !entry.IsOverflow() {
 		return nil, fmt.Errorf("btree: readOverflowValue called on non-overflow entry")
 	}
-	// Forged-length bound (checksums.md §Structural and Allocation Bounds): a forged on-disk TotalLen can imply a run of billions of
-	// pages (OverflowRunLength truncates to uint32, so a naive
-	// run-vs-extent guard would pass while make([]byte, TotalLen) is
-	// enormous). Compute the run length in uint64 and read pages ONE AT A
-	// TIME — pr.Page bounds each id against the file-resident extent
-	// (checksums.md §Structural and Allocation Bounds), so a run that walks past the file aborts here, before the
-	// TotalLen-sized allocation. Do not pre-size `pages` to run64 (itself
-	// possibly forged-huge); a run that stays in-bounds is ≤ the file's
-	// page count, which bounds TotalLen ≤ file size for the assembly.
-	run64 := page.OverflowRunLength64(cfg, entry.TotalLen)
-	pages := make([][]byte, 0, int(min(run64, 64)))
-	for i := range run64 {
-		buf, err := pr.Page(entry.OverflowPage + i)
-		if err != nil {
-			return nil, err
-		}
-		pages = append(pages, buf)
-	}
-	dst := make([]byte, entry.TotalLen)
-	n, err := page.AssembleOverflowValue(pages, cfg, dst)
-	if err != nil {
-		return nil, fmt.Errorf("%w: overflow chain at %d: %w", ErrCorrupted, entry.OverflowPage, err)
-	}
-	if uint64(n) != entry.TotalLen {
-		return nil, fmt.Errorf("%w: overflow chain at %d short-assembled %d of %d bytes",
-			ErrCorrupted, entry.OverflowPage, n, entry.TotalLen)
-	}
-	return dst, nil
+	return readRunExtent(pr, cfg, entry.OverflowPage, entry.TotalLen)
 }

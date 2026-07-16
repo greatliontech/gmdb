@@ -8,6 +8,7 @@ import (
 
 	"github.com/greatliontech/gmdb/internal/btree"
 	"github.com/greatliontech/gmdb/internal/page"
+	"github.com/zeebo/xxh3"
 )
 
 // errBulkEntryTooLarge is an internal sentinel: a single leaf entry does
@@ -54,6 +55,10 @@ type bulkPageWriter interface {
 	// live pager and CopyTo's fresh-file writer) provide it.
 	AllocContiguous(n uint32) (uint64, error)
 	WriteDirect(id uint64, buf []byte) error
+	// WriteDirectRaw is WriteDirect without the footer stamp — for
+	// overflow-run pages, which carry no per-page footers
+	// (checksums.md §Overflow-Run Digest).
+	WriteDirectRaw(id uint64, buf []byte) error
 }
 
 // bulkBuilder constructs a B+tree bottom-up from a strictly-ascending
@@ -367,29 +372,34 @@ func (b *bulkBuilder) writeBranch(bl *bulkBranchLevel) (uint64, error) {
 
 // bulkOverflowWriter is the pager surface the streaming overflow-chain
 // writer needs: reserve a contiguous run of fresh page IDs and pwrite each
-// directly (slab bypass). *pager.Pager satisfies it.
+// directly (slab bypass). Run pages carry no per-page footers — the
+// head-resident whole-run digest is the run's integrity cover
+// (checksums.md §Overflow-Run Digest) — so the writer uses the raw
+// (non-footer-stamping) direct write. *pager.Pager satisfies it.
 type bulkOverflowWriter interface {
 	AllocContiguous(n uint32) (uint64, error)
-	WriteDirect(id uint64, buf []byte) error
+	WriteDirectRaw(id uint64, buf []byte) error
 }
 
 // writeBulkOverflowChain streams value into a fresh contiguous overflow
-// run, pwriting each page directly via WriteDirect (slab bypass) using a
-// single reused page buffer — O(pageSize) memory, never materializing the
-// whole run (the BulkLoad memory contract, bulkload.md §Slab Bypass).
-// Returns the run's first page ID; the leaf carries an overflow-reference
-// entry to it.
+// run, pwriting each page directly (slab bypass) — O(pageSize) memory,
+// never materializing the whole run (the BulkLoad memory contract,
+// bulkload.md §Slab Bypass). Returns the run's first page ID; the leaf
+// carries an overflow-reference entry to it.
 //
-// The on-disk layout is byte-identical to page.EncodeOverflowRun (first
-// page: TypeOverflow header with AdditionalPages = runLen-1, then the
-// value prefix; followers: raw value bytes), so the engine's overflow
-// reader (page.AssembleOverflowValue) reassembles the value unchanged. The
-// per-page value capacities exclude the checksum footer (page.ContentEnd),
-// so WriteDirect's footer lands in the reserved tail without overwriting
-// value bytes.
+// The on-disk layout is byte-identical to page.EncodeOverflowRun (head
+// page: TypeOverflow header with AdditionalPages = runLen-1, the
+// whole-run digest slot when checksums are enabled, then the value
+// prefix; followers: raw value bytes). The whole-run digest covers the
+// full content range — head content start through the last follower's
+// end — so it is streamed across the follower writes and the HEAD page
+// is pwritten LAST, once the digest is complete; write order within
+// the run is free because nothing references the run until the leaf
+// entry lands (bulkload.md §Atomicity). Two page buffers (head +
+// working) keep memory O(pageSize).
 //
-// Atomicity: a mid-run WriteDirect failure leaves the already-pwritten
-// run pages as bounded leakage — they are at fresh IDs unreferenced by any
+// Atomicity: a mid-run write failure leaves the already-pwritten run
+// pages as bounded leakage — they are at fresh IDs unreferenced by any
 // recoverable meta and are reclaimed by tx rollback (AbortTx) or, on a
 // committed-after-error orphan, by background maintenance — identical to
 // every other bulk write (bulkload.md §Atomicity). No FreeRun is issued:
@@ -400,29 +410,36 @@ func writeBulkOverflowChain(pw bulkOverflowWriter, cfg page.Config, value []byte
 	if err != nil {
 		return 0, fmt.Errorf("gmdb: bulkload alloc overflow run (%d pages): %w", runLen, err)
 	}
+
+	// Head page assembled in its own buffer, held back until the
+	// streamed digest is complete. Freshly zeroed, so the region past
+	// the copied prefix (a value shorter than firstCap) stays zero —
+	// slack is zero on write (page-formats.md §Overflow Page).
+	head := make([]byte, cfg.PageSize)
+	page.WriteHeader(head, page.TypeOverflow, 0, runLen-1)
+	start := page.OverflowHeadContentStart(cfg)
+	off := copy(head[start:], value)
+	h := xxh3.New()
+	_, _ = h.Write(head[start:])
+
+	// Follower pages: raw value bytes, no header, no footer. clear(buf)
+	// each iteration drops the previous page's content and zero-fills
+	// the trailing slack of the final (partial) follower.
 	buf := make([]byte, cfg.PageSize)
-
-	// First page: header + value prefix. buf is freshly zeroed, so the
-	// region past the copied prefix (for a value shorter than firstCap)
-	// is already zero-filled.
-	page.WriteHeader(buf, page.TypeOverflow, 0, runLen-1)
-	firstCap := page.OverflowFirstPageCapacity(cfg)
-	off := copy(buf[page.HeaderSize:page.HeaderSize+firstCap], value)
-	if err := pw.WriteDirect(firstID, buf); err != nil {
-		return 0, fmt.Errorf("gmdb: bulkload write overflow first page: %w", err)
-	}
-
-	// Follower pages: raw value bytes, no header. clear(buf) each
-	// iteration drops the previous page's content (incl. the footer
-	// WriteDirect wrote) and zero-fills the trailing slack of the final
-	// (partial) follower.
 	followerCap := page.OverflowFollowerCapacity(cfg)
 	for i := uint32(1); i < runLen; i++ {
 		clear(buf)
 		off += copy(buf[:followerCap], value[off:])
-		if err := pw.WriteDirect(firstID+uint64(i), buf); err != nil {
+		_, _ = h.Write(buf)
+		if err := pw.WriteDirectRaw(firstID+uint64(i), buf); err != nil {
 			return 0, fmt.Errorf("gmdb: bulkload write overflow follower page %d: %w", i, err)
 		}
+	}
+	if cfg.PageChecksum {
+		page.SetOverflowRunDigest(head, h.Sum64())
+	}
+	if err := pw.WriteDirectRaw(firstID, head); err != nil {
+		return 0, fmt.Errorf("gmdb: bulkload write overflow head page: %w", err)
 	}
 	return firstID, nil
 }

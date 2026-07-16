@@ -227,7 +227,9 @@ Invariant: kind=clause-explicit;
     extent length is unverifiable from the head alone (the length
     lives in the referencing cell), so the proactive scrub either
     skips runs or false-positives on every run with slack.
-    Lands: when the whole-run digest encoding is first written.
+    Enforced by `TestOverflowRunLengthBoundaries` and
+    `TestOverflowRunDigestCoversFullContentRange` (`internal/page`)
+    and `TestOverflowRunPagesCarryNoFooters` (package `gmdb`).
 
 Invariant: kind=clause-explicit;
   property=A segregated-leaf entry locates its value by an absolute

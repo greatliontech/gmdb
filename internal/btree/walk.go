@@ -14,8 +14,16 @@ const (
 	PageKindBranch PageKind = iota
 	// PageKindLeaf is a B+tree leaf page.
 	PageKindLeaf
-	// PageKindOverflow is one page within a leaf entry's overflow run.
+	// PageKindOverflow is a FOLLOWER page within an overflow run —
+	// pure extent bytes, no header, no footer (page-formats.md
+	// §Overflow Page); its integrity is covered by the head's
+	// whole-run digest, so per-page verifiers must skip it.
 	PageKindOverflow
+	// PageKindOverflowHead is the head page of an overflow run — the
+	// page carrying the TypeOverflow header, AdditionalPages count,
+	// and (when checksums are enabled) the whole-run XXH3-64 digest
+	// covering the entire run (checksums.md §Overflow-Run Digest).
+	PageKindOverflowHead
 )
 
 // VisitFunc is invoked by Walk once per reachable page (branch, leaf,
@@ -226,11 +234,14 @@ func walkVisitKeyExtent(pr PageReader, cfg page.Config, ownerID uint64, extPage 
 		return fmt.Errorf("%w: key extent [%d,+%d) on page %d out of range (hwm=%d)",
 			ErrCorrupted, extPage, extRun, ownerID, hwm)
 	}
-	obuf, oerr := pr.Page(extPage)
+	// Runs are read whole (PageRun — a per-page Page read would
+	// footer-verify footer-less run pages); the header cross-check
+	// against the reference-derived length stays.
+	run, oerr := pr.PageRun(extPage)
 	if oerr != nil {
 		return oerr
 	}
-	additional, derr := page.DecodeOverflowFirstPage(obuf)
+	additional, derr := page.DecodeOverflowFirstPage(run)
 	if derr != nil {
 		return fmt.Errorf("%w: key extent at %d on page %d: %w", ErrCorrupted, extPage, ownerID, derr)
 	}
@@ -238,7 +249,10 @@ func walkVisitKeyExtent(pr PageReader, cfg page.Config, ownerID uint64, extPage 
 		return fmt.Errorf("%w: key extent at %d on page %d: header AdditionalPages %d+1 disagrees with the KeyTotalLen-derived run %d",
 			ErrCorrupted, extPage, ownerID, additional, extRun)
 	}
-	for j := range extRun {
+	if err := visit(extPage, PageKindOverflowHead, d+1); err != nil {
+		return err
+	}
+	for j := uint64(1); j < extRun; j++ {
 		if err := visit(extPage+j, PageKindOverflow, d+1); err != nil {
 			return err
 		}
@@ -296,18 +310,18 @@ func walkAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, visit
 						return fmt.Errorf("%w: overflow run [%d,+%d) on leaf %d out of range (hwm=%d)",
 							ErrCorrupted, e.OverflowPage, run64, leafID, hwm)
 					}
-					// Cross-check the run's first-page header against the
+					// Cross-check the run's head header against the
 					// leaf reference (checksums.md §Structural and
 					// Allocation Bounds): the read path rejects a wrong
-					// Type or AdditionalPages at assembly
-					// (DecodeOverflowFirstPage), so a walk that skipped
-					// the header would let Check pass a database clean
+					// Type or AdditionalPages at the same gate
+					// (readRunExtent), so a walk that skipped the
+					// header would let Check pass a database clean
 					// while every Get of the key fails ErrCorrupted.
-					obuf, oerr := pr.Page(e.OverflowPage)
+					run, oerr := pr.PageRun(e.OverflowPage)
 					if oerr != nil {
 						return oerr
 					}
-					additional, derr := page.DecodeOverflowFirstPage(obuf)
+					additional, derr := page.DecodeOverflowFirstPage(run)
 					if derr != nil {
 						return fmt.Errorf("%w: overflow run at %d on leaf %d: %w",
 							ErrCorrupted, e.OverflowPage, leafID, derr)
@@ -316,7 +330,10 @@ func walkAt(pr PageReader, cfg page.Config, pageID, hwm uint64, depth int, visit
 						return fmt.Errorf("%w: overflow run at %d on leaf %d: header AdditionalPages %d+1 disagrees with the TotalLen-derived run %d",
 							ErrCorrupted, e.OverflowPage, leafID, additional, run64)
 					}
-					for j := range run64 {
+					if err := visit(e.OverflowPage, PageKindOverflowHead, d+1); err != nil {
+						return err
+					}
+					for j := uint64(1); j < run64; j++ {
 						if err := visit(e.OverflowPage+j, PageKindOverflow, d+1); err != nil {
 							return err
 						}

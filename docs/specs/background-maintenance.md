@@ -192,6 +192,10 @@ Invariant: kind=entailed;
     garbage `AdditionalPages` and silently skips a window of real
     node pages. The proactive-detection intent inverts into
     noise.
+    Enforced by `TestMaintenanceScrubSkipsOverflowRunFooters`,
+    `TestMaintenanceScrubDetectsRunBitrot`, and
+    `TestMaintenanceScrubAnchorInvalidationRestartsSilently`
+    (package `gmdb`).
 
 ## Coordination
 
@@ -323,12 +327,19 @@ performs a background read-only scan that verifies XXH3-64
 footers on data pages proactively — before they are accessed
 by a user transaction. Catches silent bitrot early.
 
-Each pass scans approximately `ScrubBatchSize` page IDs (default
-4096; a target, not a bound — see the run rule below) in a read
-transaction, advancing through the data region sequentially
-across passes. A `ScrubCursor` on the DB tracks
-the next page ID, wrapping at `HighWaterMark`. A full scrub
-cycle covers the data region over
+Each pass examines approximately `ScrubBatchSize` pages of
+allocated objects (default 4096; a target, not a bound — see the
+run rule below) in a read transaction, advancing through the data
+region sequentially across passes; a `ScrubCursor` anchor on the
+DB (see Cursor re-anchoring below) marks the resume position,
+wrapping at `HighWaterMark`. The budget counts EXAMINED pages
+(verified or reported), not scanned ids: free ids are advanced
+over without consuming it — under the anchor model the cursor
+only advances on examined objects, so a free window larger than
+the batch would otherwise pin the anchor and starve everything
+past it. Total iteration
+per pass is capped at one full cycle of the data region, so a
+full scrub cycle covers the region in at most
 `ceil((HighWaterMark - firstData) / ScrubBatchSize)` passes.
 
 The scan footer-verifies only **allocated** pages (the
@@ -353,10 +364,16 @@ those pages carry no XXH3-64 footer (`checksums.md
 by scanning forward from a position known not to be inside a
 run, and pages around a paused cursor can be freed and
 reallocated into a new run between passes. The `ScrubCursor` IS
-therefore an **anchor**, not a bare page ID: the ID and verified
-digest of the last allocated object the previous pass verified —
-a node/RPL page (footer digest) or a whole overflow run (head ID
-+ whole-run digest). At pass start the anchor is revalidated
+therefore an **anchor**, not a bare page ID: the ID and content
+digest of the last allocated object the previous pass EXAMINED —
+a node/RPL page (whole-page digest) or a whole overflow run
+(head ID + whole-run digest). The digest is recorded whether or
+not the object verified: an object that failed verification is
+warned about and anchored with its current (corrupt) content's
+digest, so the next pass resumes PAST it — a persistently
+corrupt object is re-reported once per scrub cycle, never once
+per pass, and cannot pin the cycle and starve the region behind
+it (which would break the full-cycle coverage bound above). At pass start the anchor is revalidated
 against the new snapshot: still allocated, and its digest —
 recomputed over the footer page or over the run range the head's
 CURRENT `AdditionalPages` describes — unchanged. The pass then

@@ -13,9 +13,9 @@ the commit-outcome and change-notification semantics, and the API
 verbs to settle before external consumers exist (first consumer:
 the gitfs metadata store). Format and error-contract breaks are
 pre-v1 clean breaks (`development: true`, `.semrel.yaml`).
-Cross-level and within-page separator truncation already exist
-(`page-formats.md §Prefix-Truncated Branch Keys`); the key cap
-they cannot relax — two no-shared-prefix separators must fit one
+Cross-level separator truncation already exists
+(`page-formats.md §Separator Computation`); the key cap it
+cannot relax — two no-shared-prefix separators must fit one
 branch page (`limits.md §Maximum Key Size`) — is what chunks 1–2
 and 10 remove.
 
@@ -74,7 +74,7 @@ and 10 remove.
       relative offsets-only directory with sentinel, child-pointer
       array, child-pointer-bit-63 overflow marker; per-keyspace
       declaration; generator grammars extended.
-- [ ] 7. Whole-run overflow digest: head-resident XXH3-64 over
+- [x] 7. Whole-run overflow digest: head-resident XXH3-64 over
       extent bytes, follower pages lose per-page footers,
       verification once per run per transaction cached on the
       pager; contiguous extent assembly and the settled

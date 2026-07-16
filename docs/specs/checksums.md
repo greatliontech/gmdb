@@ -94,7 +94,11 @@ Invariant: kind=clause-explicit;
     length lives in the referencing leaf/branch cell, not the
     run), so the proactive scrub either skips every run or hashes
     the wrong byte count and reports healthy runs corrupt.
-    Lands: when the whole-run digest encoding is first written.
+    Enforced by `TestOverflowRunDigestCoversFullContentRange`
+    (`internal/page`, full-range coverage incl. slack) and
+    `TestOverflowRunPagesCarryNoFooters` /
+    `TestOverflowRunBitrotDetectedOnGet` (package `gmdb`,
+    end-to-end commit + read path).
 
 Invariant: kind=clause-explicit;
   property=Bitmap pages do not carry checksums (no page header

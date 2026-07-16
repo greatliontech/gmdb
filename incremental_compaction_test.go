@@ -577,8 +577,9 @@ func TestRunCompactionNeverSurfacesTxTooLarge(t *testing.T) {
 // --- 12.5b-3b: corrupt-follower checksum (deferred from 12.5b-2) ---------
 
 // TestCompactionOverflowFollowerChecksum: relocating an overflow chain whose
-// follower page is bitrotted aborts with ErrBadPageChecksum (the follower is
-// footer-verified by pw.Page), rather than silently propagating corruption.
+// follower page is bitrotted aborts with ErrBadPageChecksum (the run is
+// whole-run-digest-verified by pw.PageRun — checksums.md §Overflow-Run
+// Digest), rather than silently propagating corruption.
 func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)

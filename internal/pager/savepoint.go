@@ -85,6 +85,15 @@ const (
 	// detach needs the original buffer pointer for re-attach, which the
 	// uniform key/wasPresent shape here cannot carry).
 	fieldDirty
+	// fieldRunPages tracks mutations of p.runPages (overflow-run
+	// footer-exemption provenance): AllocSlabRun adds; AllocSlab / CoW
+	// delete on node-page reuse. Standard set semantics — wasPresent
+	// is the pre-op membership. Without this, a shallow savepoint's
+	// loose-pop replay re-attaches a buffer into p.dirty whose
+	// provenance the in-window ops changed, and commitStep1 then
+	// footer-stamps a live run page (extent corruption) or skips the
+	// footer on a live node page (false ErrBadPageChecksum).
+	fieldRunPages
 )
 
 // savepointUndoEntry records one observed mutation of a tx-scoped map
@@ -465,6 +474,12 @@ func (p *Pager) RestoreSavepoint(sp *Savepoint) {
 			if buf, ok := p.dirty[e.key]; ok {
 				p.bufPool.Put(buf)
 				delete(p.dirty, e.key)
+			}
+		case fieldRunPages:
+			if e.wasPresent {
+				p.runPages[e.key] = struct{}{}
+			} else {
+				delete(p.runPages, e.key)
 			}
 		}
 	}

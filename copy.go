@@ -366,6 +366,14 @@ func (w *freshFileWriter) WriteDirect(id uint64, buf []byte) error {
 	if w.checksum {
 		page.WritePageFooter(buf, uint32(w.pageSize))
 	}
+	return w.WriteDirectRaw(id, buf)
+}
+
+// WriteDirectRaw writes a fully-formed page with NO footer stamp — for
+// overflow-run pages, whose integrity cover is the head-resident
+// whole-run digest, not per-page footers (checksums.md §Overflow-Run
+// Digest; matching the pager's WriteDirectRaw).
+func (w *freshFileWriter) WriteDirectRaw(id uint64, buf []byte) error {
 	if _, err := w.f.WriteAt(buf, int64(id)*w.pageSize); err != nil {
 		return fmt.Errorf("gmdb: CopyTo write page %d: %w", id, err)
 	}

@@ -396,7 +396,12 @@ func (p *Pager) commitStep1() (int, error) {
 	pageSize := int(p.cfg.PageSize)
 	written := 0
 	for id, buf := range p.dirty {
-		if p.cfg.PageChecksum {
+		// Overflow-run pages are exempt from the footer pass: they
+		// carry the head-resident whole-run digest instead, written at
+		// encode time (checksums.md §Overflow-Run Digest). Stamping a
+		// footer into a follower's last 8 bytes would overwrite extent
+		// bytes.
+		if _, isRun := p.runPages[id]; p.cfg.PageChecksum && !isRun {
 			page.WritePageFooter(*buf, p.cfg.PageSize)
 		}
 		off := int64(id) * int64(pageSize)

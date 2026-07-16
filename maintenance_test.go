@@ -1,6 +1,7 @@
 package gmdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,8 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/greatliontech/gmdb/internal/btree"
 	"github.com/greatliontech/gmdb/internal/lock"
 	"github.com/greatliontech/gmdb/internal/page"
+	"github.com/greatliontech/gmdb/internal/verify"
+	"github.com/zeebo/xxh3"
 )
 
 // captureHandler is a minimal slog.Handler that records every Record so a
@@ -42,18 +46,28 @@ func newCaptureLogger() (*slog.Logger, *[]slog.Record, *sync.Mutex) {
 	return slog.New(captureHandler{mu: &mu, recs: recs}), recs, &mu
 }
 
-const scrubBadChecksumMsg = "gmdb: scrub detected bad page checksum"
+const (
+	scrubBadChecksumMsg  = "gmdb: scrub detected bad page checksum"
+	scrubBadRunDigestMsg = "gmdb: scrub detected bad overflow-run digest"
+)
 
 // scrubWarnedPages returns the page ids reported by scrub-detected
 // bad-checksum warnings among the captured records.
 func scrubWarnedPages(t *testing.T, recs *[]slog.Record, mu *sync.Mutex) []uint64 {
+	t.Helper()
+	return scrubWarnedPagesMsg(t, recs, mu, scrubBadChecksumMsg)
+}
+
+// scrubWarnedPagesMsg returns the page ids carried by captured records
+// with the given message.
+func scrubWarnedPagesMsg(t *testing.T, recs *[]slog.Record, mu *sync.Mutex, msg string) []uint64 {
 	t.Helper()
 	mu.Lock()
 	defer mu.Unlock()
 	var pages []uint64
 	for i := range *recs {
 		r := (*recs)[i]
-		if r.Message != scrubBadChecksumMsg {
+		if r.Message != msg {
 			continue
 		}
 		r.Attrs(func(a slog.Attr) bool {
@@ -465,9 +479,9 @@ func TestMaintenanceScrubCleanDBNoWarnings(t *testing.T) {
 	}
 }
 
-// TestMaintenanceScrubCursorAdvancesAndWraps: the persistent ScrubCursor
-// advances by the batch size each pass and wraps at HighWaterMark, so a
-// full cycle covers the data region (no stuck cursor, no skipped region).
+// TestMaintenanceScrubCursorAdvancesAndWraps: the persistent scrub
+// anchor advances each pass and wraps at HighWaterMark, so a full
+// cycle covers the data region (no stuck anchor, no skipped region).
 // A small ScrubBatchSize forces many passes over the region.
 func TestMaintenanceScrubCursorAdvancesAndWraps(t *testing.T) {
 	ctx := context.Background()
@@ -501,31 +515,32 @@ func TestMaintenanceScrubCursorAdvancesAndWraps(t *testing.T) {
 		t.Skipf("data region too small (span=%d) to exercise multi-pass cursor", span)
 	}
 
-	if db.maint.scrubCursor != 0 {
-		t.Fatalf("precondition: scrubCursor=%d, want 0", db.maint.scrubCursor)
+	if db.maint.scrubAnchor.valid {
+		t.Fatalf("precondition: scrubAnchor=%+v, want invalid (fresh handle)", db.maint.scrubAnchor)
 	}
 	db.maintScrubChecksums(ctx)
-	if db.maint.scrubCursor != firstData+2 { // start 0 → clamp firstData → +batch
-		t.Errorf("after pass 1: scrubCursor=%d, want %d (firstData=%d, hwm=%d)", db.maint.scrubCursor, firstData+2, firstData, hwm)
+	if a := db.maint.scrubAnchor; !a.valid || a.id < firstData || a.id >= hwm {
+		t.Errorf("after pass 1: anchor=%+v, want valid in [%d,%d)", a, firstData, hwm)
 	}
 
-	// Run a full region's worth of passes; the cursor must stay in range
-	// every pass and wrap at least once (decrease) — proving coverage.
-	prev := db.maint.scrubCursor
+	// Run a full region's worth of passes; the anchor must stay in range
+	// every pass and wrap at least once (its id decreases) — proving
+	// coverage of the whole region across the cycle.
+	prev := db.maint.scrubAnchor.id
 	wrapped := false
 	for pass := range int(span) {
 		db.maintScrubChecksums(ctx)
-		cur := db.maint.scrubCursor
-		if cur < firstData || cur >= hwm {
-			t.Fatalf("pass %d: cursor %d out of [%d,%d)", pass+2, cur, firstData, hwm)
+		a := db.maint.scrubAnchor
+		if !a.valid || a.id < firstData || a.id >= hwm {
+			t.Fatalf("pass %d: anchor %+v out of [%d,%d)", pass+2, a, firstData, hwm)
 		}
-		if cur < prev {
+		if a.id < prev {
 			wrapped = true
 		}
-		prev = cur
+		prev = a.id
 	}
 	if !wrapped {
-		t.Errorf("cursor never wrapped over %d passes (span=%d, hwm=%d)", span, span, hwm)
+		t.Errorf("anchor never wrapped over %d passes (span=%d, hwm=%d)", span, span, hwm)
 	}
 }
 
@@ -559,6 +574,174 @@ func TestMaintenanceScrubSkippedWithoutChecksum(t *testing.T) {
 	}
 }
 
+// scrubOverflowFixture commits keyspace "k" holding node pages plus
+// several multi-page overflow runs, returning one run's head id. The
+// shape exercises the scrubber's run classification: footer-less
+// followers interleaved with footer-bearing node pages in the scan
+// window.
+func scrubOverflowFixture(t *testing.T, ctx context.Context, db *DB) (root, head uint64) {
+	t.Helper()
+	tx, _ := db.Begin(ctx)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range 50 {
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	for i := range 4 {
+		if err := ks.Put(fmt.Appendf(nil, "big%02d", i), bytes.Repeat([]byte{byte('A' + i)}, 9000)); err != nil {
+			t.Fatalf("Put big: %v", err)
+		}
+	}
+	root = ks.desc.Root
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := btree.WalkLeafEntries(verify.RawPageReader{P: db.pgr}, db.pgr.Config(), root, db.pgr.HighWaterMark(), func(e page.LeafEntry) error {
+		if e.IsOverflow() && head == 0 {
+			head = e.OverflowPage
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkLeafEntries: %v", err)
+	}
+	if head == 0 {
+		t.Fatal("no overflow run found")
+	}
+	return root, head
+}
+
+// TestMaintenanceScrubSkipsOverflowRunFooters (the scrub run gate,
+// background-maintenance.md §Checksum Scrubbing): overflow-run pages
+// carry no footers — the scrubber must verify a run standalone by its
+// head digest and advance past the followers. Without the gate every
+// follower would emit a spurious BadPageChecksum warning on a healthy
+// database.
+func TestMaintenanceScrubSkipsOverflowRunFooters(t *testing.T) {
+	ctx := context.Background()
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	_, _ = scrubOverflowFixture(t, ctx, db)
+
+	// Full cycles: every allocated object gets verified at least once.
+	for range 4 {
+		db.maintScrubChecksums(ctx)
+	}
+	if pages := scrubWarnedPages(t, recs, mu); len(pages) != 0 {
+		t.Errorf("healthy db with overflow runs: scrub warned on pages %v (followers must be covered by the run digest, not footer-verified)", pages)
+	}
+	if pages := scrubWarnedPagesMsg(t, recs, mu, scrubBadRunDigestMsg); len(pages) != 0 {
+		t.Errorf("healthy db: scrub reported bad run digests on %v", pages)
+	}
+}
+
+// TestMaintenanceScrubDetectsRunBitrot: a flipped byte in a follower is
+// reported by the scrubber as a bad whole-run digest carrying the HEAD
+// page id (checksums.md §Overflow-Run Digest — the run is verified
+// standalone, no referencing cell needed).
+func TestMaintenanceScrubDetectsRunBitrot(t *testing.T) {
+	const pageSize = 4096
+	ctx := context.Background()
+	path := tmpPath(t)
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, path, Options{PageSize: pageSize, MinSize: 16, MaxSize: 4096,
+		Maintenance: MaintenanceOptions{Disable: true}, Logger: logger})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	_, head := scrubOverflowFixture(t, ctx, db)
+
+	// Corrupt a follower byte while the DB is open (the scrubber's read
+	// tx observes the external write through the shared page cache).
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	if _, err := f.WriteAt([]byte{0xEE}, int64(head+1)*pageSize+123); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+	f.Close()
+
+	for range 4 {
+		db.maintScrubChecksums(ctx)
+	}
+	if pages := scrubWarnedPagesMsg(t, recs, mu, scrubBadRunDigestMsg); !slices.Contains(pages, head) {
+		t.Errorf("scrub did not report the corrupted run's head %d; run-digest warnings = %v", head, pages)
+	}
+}
+
+// TestMaintenanceScrubAnchorInvalidationRestartsSilently
+// (background-maintenance.md §Checksum Scrubbing, Cursor re-anchoring):
+// an anchor whose digest no longer matches produces NO warning; the
+// cursor resets to the first data page and the cycle restarts — pinned
+// by comparing against the position an uninvalidated pass reaches.
+func TestMaintenanceScrubAnchorInvalidationRestartsSilently(t *testing.T) {
+	ctx := context.Background()
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		Maintenance: MaintenanceOptions{Disable: true, ScrubBatchSize: 4}, Logger: logger})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	root, head := scrubOverflowFixture(t, ctx, db)
+
+	db.maintScrubChecksums(ctx)
+	afterFirst := db.maint.scrubAnchor
+	if !afterFirst.valid {
+		t.Fatal("pass 1 left no anchor")
+	}
+	db.maintScrubChecksums(ctx)
+	afterSecond := db.maint.scrubAnchor
+	if afterSecond.id <= afterFirst.id {
+		t.Fatalf("pass 2 did not advance the anchor (%d -> %d)", afterFirst.id, afterSecond.id)
+	}
+
+	// Invalidate, per anchor KIND — the digest comparison exists once
+	// per branch of revalidateScrubAnchor (node page hash vs whole-run
+	// digest), so each must be pinned independently. root is a node
+	// page; head is a run head; both are allocated and in-region, so
+	// only the wrong digest can be what fails revalidation.
+	rtx, _ := db.BeginRead(ctx)
+	nodeDigest := xxh3.Hash(rtx.pgr.PageRaw(root))
+	runDigest := page.StoredOverflowRunDigest(rtx.pgr.PageRaw(head))
+	_ = rtx.Rollback()
+	for _, tc := range []struct {
+		name   string
+		anchor scrubAnchor
+	}{
+		{"node anchor", scrubAnchor{valid: true, id: root, digest: nodeDigest ^ 1}},
+		{"run anchor", scrubAnchor{valid: true, id: head, isRun: true, digest: runDigest ^ 1}},
+	} {
+		db.maint.scrubAnchor = tc.anchor
+		db.maintScrubChecksums(ctx)
+		afterRestart := db.maint.scrubAnchor
+		if !afterRestart.valid || afterRestart.id != afterFirst.id {
+			t.Errorf("%s invalidated: pass ended at %+v, want a restart from firstData reproducing pass 1's anchor %+v",
+				tc.name, afterRestart, afterFirst)
+		}
+	}
+	// And the converse: a CORRECT anchor resumes rather than restarts —
+	// re-installing pass 1's anchor must reproduce pass 2's.
+	db.maint.scrubAnchor = afterFirst
+	db.maintScrubChecksums(ctx)
+	if got := db.maint.scrubAnchor; got != afterSecond {
+		t.Errorf("valid anchor did not resume: got %+v, want pass 2's %+v", got, afterSecond)
+	}
+	if pages := scrubWarnedPages(t, recs, mu); len(pages) != 0 {
+		t.Errorf("anchor invalidation must be silent; warned on %v", pages)
+	}
+	if pages := scrubWarnedPagesMsg(t, recs, mu, scrubBadRunDigestMsg); len(pages) != 0 {
+		t.Errorf("anchor invalidation must be silent; run-digest warnings on %v", pages)
+	}
+}
+
 // TestMaintenanceDisabled: with Disable set, no goroutine is started and
 // Close is a clean no-op for maintenance.
 func TestMaintenanceDisabled(t *testing.T) {
@@ -573,5 +756,177 @@ func TestMaintenanceDisabled(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestMaintenanceScrubAdvancesPastPersistentCorruption
+// (background-maintenance.md §Checksum Scrubbing, Cursor re-anchoring):
+// a persistently corrupt object is anchored with its current content's
+// digest, so the NEXT pass resumes past it — one warning per scrub
+// cycle, never one per pass, and the region behind it keeps getting
+// covered. Without this the anchor pins at the last verified object
+// and every pass re-warns the same page forever.
+func TestMaintenanceScrubAdvancesPastPersistentCorruption(t *testing.T) {
+	ctx := context.Background()
+	path := tmpPath(t)
+	// 5000 rows: enough allocated objects that a batch-1 pass cannot
+	// wrap the whole cycle (the once-per-CYCLE re-warn is legitimate;
+	// the defect under test is a once-per-PASS re-warn). Batch 1 makes
+	// the corrupt page fill its whole window — the starvation shape:
+	// with no successfully-verifying object in the window, an anchor
+	// that only records successes never advances and every later pass
+	// re-warns the same page while the region behind it starves.
+	root, pageSize := writeKeyspaceForScrub(t, path, 5000)
+	corruptPageByte(t, path, root, pageSize)
+
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		Maintenance: MaintenanceOptions{Disable: true, ScrubBatchSize: 1}, Logger: logger})
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer db.Close()
+
+	// Drive passes until the corrupt page is reported (bounded by one
+	// full cycle at batch 1).
+	warned := false
+	for range 4096 {
+		db.maintScrubChecksums(ctx)
+		if slices.Contains(scrubWarnedPages(t, recs, mu), root) {
+			warned = true
+			break
+		}
+	}
+	if !warned {
+		t.Fatalf("scrub never reported the corrupt page %d", root)
+	}
+	before := len(scrubWarnedPages(t, recs, mu))
+
+	// The very next pass resumes PAST the corrupt page — no re-warn
+	// (a wrap back to it within one batch-1 pass is impossible for
+	// this region size).
+	db.maintScrubChecksums(ctx)
+	if after := len(scrubWarnedPages(t, recs, mu)); after != before {
+		t.Errorf("pass after the warning re-reported (warnings %d -> %d): the anchor pinned on the corrupt page instead of advancing past it", before, after)
+	}
+	if a := db.maint.scrubAnchor; !a.valid {
+		t.Errorf("no anchor after passes over a corrupt region")
+	}
+}
+
+// TestMaintenanceScrubRunCorruptionWarnsOncePerCycle: the run analog —
+// a persistently corrupt overflow run anchors (with its current
+// digest) and is resumed past, not re-warned by the next pass.
+func TestMaintenanceScrubRunCorruptionWarnsOncePerCycle(t *testing.T) {
+	const pageSize = 4096
+	ctx := context.Background()
+	path := tmpPath(t)
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, path, Options{PageSize: pageSize, MinSize: 16, MaxSize: 4096,
+		Maintenance: MaintenanceOptions{Disable: true, ScrubBatchSize: 2}, Logger: logger})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	_, head := scrubOverflowFixture(t, ctx, db)
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	if _, err := f.WriteAt([]byte{0xEE}, int64(head+1)*pageSize+77); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+	f.Close()
+
+	warned := false
+	for range 4096 {
+		db.maintScrubChecksums(ctx)
+		if slices.Contains(scrubWarnedPagesMsg(t, recs, mu, scrubBadRunDigestMsg), head) {
+			warned = true
+			break
+		}
+	}
+	if !warned {
+		t.Fatalf("scrub never reported the corrupt run head %d", head)
+	}
+	before := len(scrubWarnedPagesMsg(t, recs, mu, scrubBadRunDigestMsg))
+	db.maintScrubChecksums(ctx)
+	if after := len(scrubWarnedPagesMsg(t, recs, mu, scrubBadRunDigestMsg)); after != before {
+		t.Errorf("pass after the run warning re-reported (%d -> %d): the anchor did not advance past the corrupt run", before, after)
+	}
+}
+
+// TestMaintenanceScrubFreePagesDoNotConsumeBudget
+// (background-maintenance.md §Checksum Scrubbing, budget domain): the
+// per-pass batch counts VERIFIED pages — free ids are advanced over
+// without consuming it. With ScrubBatchSize=1, a pass whose resume
+// position lands on a free window must still verify one object (the
+// anchor advances every pass); if free ids consumed the budget, a
+// free window would leave the anchor unmoved and pin the cycle.
+func TestMaintenanceScrubFreePagesDoNotConsumeBudget(t *testing.T) {
+	ctx := context.Background()
+	logger, recs, mu := newCaptureLogger()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 4096,
+		Maintenance: MaintenanceOptions{Disable: true, ScrubBatchSize: 1}, Logger: logger})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Rows + a contiguous window of leaked pages; reclaiming the leaks
+	// leaves a multi-page FREE window inside [firstData, hwm).
+	tx, _ := db.Begin(ctx)
+	ks, _ := tx.CreateKeyspace("k")
+	for i := range 40 {
+		if err := ks.Put(fmt.Appendf(nil, "key%05d", i), fmt.Appendf(nil, "v%05d", i)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	for range 6 {
+		id, err := tx.AllocPage()
+		if err != nil {
+			t.Fatalf("AllocPage: %v", err)
+		}
+		if _, err := tx.AllocSlab(id); err != nil {
+			t.Fatalf("AllocSlab: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	db.maintReclaimLeaks(ctx)
+	if hasBitmapLeak(t, db) {
+		t.Fatal("fixture: leaks not reclaimed — no free window to exercise")
+	}
+
+	// Every pass must examine a NEW object — the anchor changes each
+	// pass even when the resume position crosses the free window —
+	// and the cycle wraps.
+	prev := uint64(0)
+	wrapped := false
+	db.maintScrubChecksums(ctx)
+	a := db.maint.scrubAnchor
+	if !a.valid {
+		t.Fatal("pass 1 left no anchor")
+	}
+	prev = a.id
+	for pass := range 512 {
+		db.maintScrubChecksums(ctx)
+		a := db.maint.scrubAnchor
+		if a.id == prev {
+			t.Fatalf("pass %d did not advance the anchor (stuck at %d) — a free window is consuming the verification budget", pass+2, a.id)
+		}
+		if a.id < prev {
+			wrapped = true
+			break
+		}
+		prev = a.id
+	}
+	if !wrapped {
+		t.Errorf("cycle never wrapped — coverage stalled")
+	}
+	if pages := scrubWarnedPages(t, recs, mu); len(pages) != 0 {
+		t.Errorf("healthy db: scrub warned on %v", pages)
 	}
 }

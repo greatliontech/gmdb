@@ -24,7 +24,28 @@ type PageReader interface {
 	// (mismatch yields ErrBadPageChecksum). The returned slice stays
 	// valid for the duration of the caller's enclosing transaction;
 	// btree reads it only within the call that obtained it.
+	//
+	// Page is for NODE pages only: overflow-run pages carry no
+	// per-page footers (page-formats.md §Overflow Page), so a
+	// conforming verifying Page fails on them — runs are reachable
+	// exclusively through PageRun.
 	Page(id uint64) ([]byte, error)
+
+	// PageRun returns the CONTIGUOUS image of the overflow run
+	// headed at headID — head page (header + optional whole-run
+	// digest) plus its AdditionalPages followers. A conforming
+	// reader bounds the head AND the whole run against the
+	// file-resident extent, rejects a head whose type byte is not
+	// TypeOverflow (ErrCorrupted), and, when checksums are enabled,
+	// verifies the head-resident whole-run XXH3-64 digest on the
+	// run's first access in the transaction (mismatch yields
+	// ErrBadPageChecksum with the head id — checksums.md
+	// §Overflow-Run Digest). The slice stays valid for the duration
+	// of the caller's enclosing transaction; for committed runs it
+	// is a borrowed mmap view, which is what lets an overflow value
+	// be returned to the API caller as a single borrowed slice
+	// (api-surface.md §Byte Slice Ownership).
+	PageRun(headID uint64) ([]byte, error)
 }
 
 // MaxTreeDepth caps the descent loop to catch malformed cyclic

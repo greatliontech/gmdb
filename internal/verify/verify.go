@@ -118,6 +118,11 @@ type RawPageReader struct{ P *pager.Pager }
 
 func (r RawPageReader) Page(id uint64) ([]byte, error) { return r.P.PageRaw(id), nil }
 
+// PageRun serves the run image bounded but UNVERIFIED (PageRunRaw):
+// Check verifies whole-run digests itself at the head visit and
+// reports a mismatch as an Issue instead of aborting the walk.
+func (r RawPageReader) PageRun(headID uint64) ([]byte, error) { return r.P.PageRunRaw(headID) }
+
 // VerifyingPageReader is the conforming btree.PageReader (footer-verified
 // on first access per the interface contract): a bad checksum yields
 // ErrBadPageChecksum and aborts the walk. Used where source bytes are
@@ -127,6 +132,11 @@ func (r RawPageReader) Page(id uint64) ([]byte, error) { return r.P.PageRaw(id),
 type VerifyingPageReader struct{ P *pager.Pager }
 
 func (r VerifyingPageReader) Page(id uint64) ([]byte, error) { return r.P.Page(id) }
+
+// PageRun serves the run image whole-run-digest-verified, so a
+// bitrotted overflow run aborts the rebuild instead of being
+// re-encoded under a fresh valid digest.
+func (r VerifyingPageReader) PageRun(headID uint64) ([]byte, error) { return r.P.PageRun(headID) }
 
 // errCheckStop is returned by a Checker's visit callback to abort an
 // in-progress btree.Walk when the caller stopped iterating.
@@ -563,10 +573,33 @@ func (c *Checker) walkTree(ks, idx string, root, firstData, hwm uint64) bool {
 		}
 		c.reachable.Set(id)
 		if c.Cfg.PageChecksum {
-			if !page.VerifyPageFooter(c.Pgr.PageRaw(id), c.Cfg.PageSize) {
-				if !c.Emit(Issue{Severity: Error, Code: CodeBadPageChecksum, PageID: id, Keyspace: ks, Index: idx,
-					Message: fmt.Sprintf("page %d checksum mismatch", id)}) {
-					return errCheckStop
+			switch kind {
+			case btree.PageKindOverflowHead:
+				// Overflow runs carry a head-resident whole-run digest
+				// instead of per-page footers (checksums.md
+				// §Overflow-Run Digest); verified standalone over the
+				// AdditionalPages-determined range, reported against
+				// the head id.
+				run, err := c.Pgr.PageRunRaw(id)
+				if err != nil || !page.VerifyOverflowRun(run, c.Cfg) {
+					msg := fmt.Sprintf("overflow run at %d whole-run digest mismatch", id)
+					if err != nil {
+						msg = fmt.Sprintf("overflow run at %d unreadable: %v", id, err)
+					}
+					if !c.Emit(Issue{Severity: Error, Code: CodeBadPageChecksum, PageID: id, Keyspace: ks, Index: idx,
+						Message: msg}) {
+						return errCheckStop
+					}
+				}
+			case btree.PageKindOverflow:
+				// Follower: no footer, no header — covered by its
+				// head's digest above.
+			default:
+				if !page.VerifyPageFooter(c.Pgr.PageRaw(id), c.Cfg.PageSize) {
+					if !c.Emit(Issue{Severity: Error, Code: CodeBadPageChecksum, PageID: id, Keyspace: ks, Index: idx,
+						Message: fmt.Sprintf("page %d checksum mismatch", id)}) {
+						return errCheckStop
+					}
 				}
 			}
 		}
@@ -1058,7 +1091,7 @@ func WalkTreePageStats(pr btree.PageReader, cfg page.Config, root, hwm uint64) (
 			if depth > maxLevel {
 				maxLevel = depth
 			}
-		case btree.PageKindOverflow:
+		case btree.PageKindOverflow, btree.PageKindOverflowHead:
 			s.OverflowPages++
 		}
 		return nil
