@@ -1526,7 +1526,7 @@ func mergeOrRedistributeLeaves(pw PageWriter, cfg page.Config, mergeThreshold ui
 	// alloc or free, so a decline changes nothing.
 	scratch := make([]byte, cfg.PageSize)
 	sb := page.NewLeafBuilder(scratch, cfg)
-	mid, ok := findLeafSplitIndex(sb, scratch, cfg, combined)
+	mid, ok := findLeafSplitIndex(sb, scratch, cfg, combined, false)
 	if !ok {
 		// No feasible two-page partition. NOT corruption: the combined
 		// set arrived from two valid sibling pages, but a canonical

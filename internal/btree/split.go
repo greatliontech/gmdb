@@ -25,10 +25,20 @@ import (
 // mutates it only after TryAppend commits) so a decline leaves leftBuf intact for
 // the decode-split fallback, which reads that same buffer.
 //
+// rightmost selects the append-aware LOPSIDED boundary (page-formats.md
+// §Leaf Split, append-aware policy): when the overflowing leaf is the
+// tree's RIGHTMOST, the boundary lands at the LAST group (entry)
+// boundary — the existing content packs the left half nearly full and
+// only the final group moves right with the new entry — instead of the
+// ~50% point, which on an ascending-key workload would strand every
+// left half at half fill forever (no future key ever lands in it). All
+// decline conditions are shared with the balanced case, so a variant
+// or config mismatch still cascades to the decode split.
+//
 // Precondition: e.Key sorts after every key in leftBuf (the append case), and
 // leftBuf is the freshly CoW'd, already-validated copy of the overflowing leaf
 // (its page ID — leftID at the call site — becomes the left half).
-func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.LeafEntry) (sep []byte, rightID uint64, ok bool, err error) {
+func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.LeafEntry, rightmost bool) (sep []byte, rightID uint64, ok bool, err error) {
 	r := page.NewLeafReader(leftBuf, cfg)
 	if r.Count() <= 1 {
 		return nil, 0, false, nil // nothing to split off
@@ -38,12 +48,17 @@ func trySplitLeafByGroup(pw PageWriter, cfg page.Config, leftBuf []byte, e page.
 		return nil, 0, false, nil // single group — decode split
 	}
 
-	// Boundary nearest 50% of data bytes (variant-specific).
+	// Boundary: last group/entry boundary on a rightmost append,
+	// otherwise nearest 50% of data bytes (variant-specific).
 	var boundary int
-	switch variant {
-	case page.TypeLeaf:
+	switch {
+	case rightmost && r.Compressed():
+		boundary = r.RestartCount() - 1
+	case rightmost:
+		boundary = r.Count() - 1
+	case variant == page.TypeLeaf:
 		boundary = page.FindSplitGroup(leftBuf, cfg)
-	case page.TypeLeafSegregated:
+	case variant == page.TypeLeafSegregated:
 		boundary = page.FindSegSplitGroup(leftBuf, cfg)
 	default:
 		boundary = page.FindUCSplitIndex(leftBuf, cfg)
@@ -164,19 +179,46 @@ func shortestSeparatorEntries(pr PageReader, cfg page.Config, left, right page.L
 // provably exists (the entries arrived from two valid sibling pages),
 // ErrCorrupted.
 //
+// appendRightmost selects the append-aware LOPSIDED boundary
+// (page-formats.md §Leaf Split, append-aware policy): the caller
+// asserts the last entry is a fresh append onto the tree's RIGHTMOST
+// leaf, so the boundary is the MAXIMAL fitting left prefix — the left
+// half packs as full as the encoder allows and only the tail spills
+// right — instead of the ~50% point, which on an ascending workload
+// strands every left half at half fill forever. Falls through to the
+// balanced scan when the maximal-left partition leaves an unfittable
+// right (a size-skewed tail the balanced machinery must judge).
+//
 // Determinism (page-formats.md §Leaf Split "deterministic encoding
-// invariant"): the choice is a pure function of (entries, cfg), so the
-// same inputs always yield the same split — required for Check() repair
-// and recovery to re-encode byte-identically.
+// invariant"): the choice is a pure function of (entries, cfg,
+// appendRightmost), so the same inputs always yield the same split —
+// required for Check() repair and recovery to re-encode
+// byte-identically.
 //
 // b is a scratch builder the function Resets onto scratch (a PageSize
 // buffer the caller owns and rebuilds afterwards); fill is measured
 // through the real LeafBuilder so prefix compression and
 // inline-vs-overflow entry sizes are exact.
-func findLeafSplitIndex(b *page.LeafBuilder, scratch []byte, cfg page.Config, entries []page.LeafEntry) (mid int, ok bool) {
+func findLeafSplitIndex(b *page.LeafBuilder, scratch []byte, cfg page.Config, entries []page.LeafEntry, appendRightmost bool) (mid int, ok bool) {
 	n := len(entries)
 	if n < 2 {
 		return 0, false
+	}
+	if appendRightmost {
+		b.Reset(scratch, cfg)
+		m := 0
+		for i, e := range entries {
+			if !b.AddEntry(e) {
+				break
+			}
+			m = i + 1
+		}
+		if m > n-1 {
+			m = n - 1 // reserve the appended entry for the right half
+		}
+		if m >= 1 && leafEntriesFit(b, scratch, cfg, entries[m:]) {
+			return m, true
+		}
 	}
 	target := cfg.UsableSpace() / 2
 

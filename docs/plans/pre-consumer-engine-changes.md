@@ -86,7 +86,7 @@ and 10 remove.
       live since chunk 4 — segregated branch, restart-group
       target 6), confirming or reverting each, and pin the chosen
       constants by test.
-- [ ] 9. Append-aware splits: lopsided right-edge split point +
+- [x] 9. Append-aware splits: lopsided right-edge split point +
       rightmost-leaf hint so ascending-key workloads stop
       stranding half-full left pages; sequential-insert corpus
       and bench coverage.

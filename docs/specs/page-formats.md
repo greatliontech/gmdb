@@ -1100,6 +1100,22 @@ boundaries are equidistant from the bias target, the lower-index
 boundary wins. Each half is then encoded independently with fresh
 group structure (compressed) or fresh offset table (uncompressed).
 
+**Append-aware policy.** When the split is triggered by an insert
+that appends past the last key of the tree's RIGHTMOST leaf (the
+descent took the last child pointer at every level), the boundary is
+LOPSIDED instead of balanced: the last group (entry) boundary on the
+in-place carve path, or the maximal fitting left prefix on the
+decode path — the existing content packs the left half nearly full
+and only the tail spills right. A balanced boundary would strand
+every left half of an ascending-key workload at ~50% fill forever
+(no future key ever lands in it); the rightmost gate keeps mid-tree
+appends balanced, since a lopsided split there strands a nearly-empty
+right page in a bounded key range. The same policy applies at branch
+levels on the ascend: a rightmost-append branch split lifts the last
+pre-insert cell and seeds the right branch with the new separator
+alone. The policy is a pure function of the tree shape and the
+insert, inside the deterministic-encoding invariant below.
+
 Boundary keys (last key of left leaf, first key of right leaf) are
 reconstructed from the source page (full decode for the boundary
 positions only — not the whole leaf; a boundary entry that is an

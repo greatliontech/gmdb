@@ -117,3 +117,54 @@ func BenchmarkPutSteadyState(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkPutSequentialFill measures the ascending-key insert workload
+// end-to-end AND reports its space efficiency: pages consumed per 1000
+// entries (from the HighWaterMark delta). The append-aware lopsided
+// split (page-formats.md §Leaf Split, append-aware policy) packs left
+// halves full, so the metric sits near the BulkLoad-packed floor;
+// before it, every leaf on the ascending path stranded at ~50% fill
+// and the metric ran ~2x higher. Run with a bounded -benchtime (the
+// keyspace grows without bound; see BenchmarkPutSteadyState).
+func BenchmarkPutSequentialFill(b *testing.B) {
+	db, _ := benchDB(b)
+	defer db.Close()
+	ctx := context.Background()
+	val := make([]byte, 100)
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		b.Fatalf("Begin: %v", err)
+	}
+	ks, err := tx.CreateKeyspace("k")
+	if err != nil {
+		b.Fatalf("CreateKeyspace: %v", err)
+	}
+	startPages := db.pgr.HighWaterMark()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if i > 0 && i%2000 == 0 {
+			b.StopTimer()
+			if err := tx.Commit(); err != nil {
+				b.Fatalf("Commit: %v", err)
+			}
+			tx, err = db.Begin(ctx)
+			if err != nil {
+				b.Fatalf("Begin: %v", err)
+			}
+			ks, err = tx.OpenKeyspace("k")
+			if err != nil {
+				b.Fatalf("OpenKeyspace: %v", err)
+			}
+			b.StartTimer()
+		}
+		if err := ks.Put(fmt.Appendf(nil, "k%015d", i), val); err != nil {
+			b.Fatalf("Put #%d: %v", i, err)
+		}
+	}
+	b.StopTimer()
+	_ = tx.Commit()
+	if b.N > 0 {
+		b.ReportMetric(float64(db.pgr.HighWaterMark()-startPages)/float64(b.N)*1000, "pages/1e3ops")
+	}
+}

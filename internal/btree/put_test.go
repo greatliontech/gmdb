@@ -522,11 +522,11 @@ func TestPutForcesMultiLevelTreeAndBranchSplit(t *testing.T) {
 	// values so each leaf holds few entries; the ~57-byte
 	// shared-prefix separators pack ~60 per plain branch page, so a
 	// multi-level (depth >= 2) branch structure needs many leaves —
-	// N=1500 (~375 leaves at the pinned group target) clears it.
-	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // depth calibration: N=1500 → ~375 leaves at target 16
+	// N=4000 (~570 full leaves at the pinned group target) clears it.
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // depth calibration: N=4000 → ~570 full leaves at target 16
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
-	const N = 1500
+	const N = 4000
 	keyPrefix := bytes.Repeat([]byte("k"), 50)
 	for i := range N {
 		key := fmt.Appendf(nil, "%s-%05d", keyPrefix, i)

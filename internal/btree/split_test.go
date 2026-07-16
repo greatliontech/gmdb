@@ -49,7 +49,7 @@ func TestFindLeafSplitIndexFeasibleWhenCountMidpointFails(t *testing.T) {
 		t.Fatalf("precondition: count-midpoint right half unexpectedly fits — reshape value sizes")
 	}
 
-	mid, ok := findLeafSplitIndex(b, scratch, cfg, entries)
+	mid, ok := findLeafSplitIndex(b, scratch, cfg, entries, false)
 	if !ok {
 		t.Fatalf("findLeafSplitIndex ok=false for a splittable size-skewed leaf")
 	}
@@ -77,7 +77,7 @@ func TestFindLeafSplitIndexRedistributeAlwaysFeasible(t *testing.T) {
 	for i, s := range sizes {
 		entries[i] = splitTestEntry(i, s)
 	}
-	mid, ok := findLeafSplitIndex(b, scratch, cfg, entries)
+	mid, ok := findLeafSplitIndex(b, scratch, cfg, entries, false)
 	if !ok {
 		t.Fatalf("findLeafSplitIndex ok=false for a two-page-feasible entry set")
 	}
@@ -97,10 +97,12 @@ func TestFindLeafSplitIndexDeterministic(t *testing.T) {
 		splitTestEntry(2, 1400),
 		splitTestEntry(3, 2800),
 	}
-	m1, ok1 := findLeafSplitIndex(b, scratch, cfg, entries)
-	m2, ok2 := findLeafSplitIndex(b, scratch, cfg, entries)
-	if m1 != m2 || ok1 != ok2 {
-		t.Errorf("non-deterministic split: (%d,%v) vs (%d,%v)", m1, ok1, m2, ok2)
+	for _, appendRightmost := range []bool{false, true} {
+		m1, ok1 := findLeafSplitIndex(b, scratch, cfg, entries, appendRightmost)
+		m2, ok2 := findLeafSplitIndex(b, scratch, cfg, entries, appendRightmost)
+		if m1 != m2 || ok1 != ok2 {
+			t.Errorf("non-deterministic split (appendRightmost=%v): (%d,%v) vs (%d,%v)", appendRightmost, m1, ok1, m2, ok2)
+		}
 	}
 }
 
@@ -115,7 +117,7 @@ func TestFindLeafSplitIndexNoFeasibleSplit(t *testing.T) {
 		splitTestEntry(1, 2450),
 		splitTestEntry(2, 2450),
 	}
-	if _, ok := findLeafSplitIndex(b, scratch, cfg, entries); ok {
+	if _, ok := findLeafSplitIndex(b, scratch, cfg, entries, false); ok {
 		t.Errorf("findLeafSplitIndex ok=true for an entry set with no feasible two-page split")
 	}
 }

@@ -134,9 +134,18 @@ Invariant: kind=clause-explicit;
     the plain layout because the neighbours are already byte-full): no
     merge (combined > one page) and no redistribute (every
     physically-fitting split leaves the seam half logically below MT)
-    can raise it. A page that no adjacent merge or
-    floor-clearing redistribute can heal is **accepted below-floor**, and
-    the rebalance MUST terminate rather than loop attempting to heal it.
+    can raise it. (c) The **rightmost append-split residue**
+    (`page-formats.md §Leaf Split`, append-aware policy): the tree's
+    rightmost leaf, and the rightmost-spine branches, may sit below
+    the floor between appends — they are the lopsided split's fresh
+    right halves, filled by subsequent ascending inserts. A delete
+    that does not touch the rightmost seam leaves them as they are
+    (the floor is a per-touched-page delete guarantee, not a
+    whole-tree sweep obligation); a delete that DOES touch them
+    merges or redistributes them like any other page. A page that no
+    adjacent merge or floor-clearing redistribute can heal is
+    **accepted below-floor**, and the rebalance MUST terminate rather
+    than loop attempting to heal it.
     Where reachable, the floor is maintained by the merge/redistribute
     contract: when a local merge produces a still-below-MT page,
     `rebalanceSurvivors` re-attempts merge with the next adjacent

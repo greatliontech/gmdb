@@ -149,7 +149,7 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 
 	// Phase 1: the shared descent (the pre-CoW leaf buffer is unused
 	// here — PutEntry decodes from its CoW copy).
-	path, leafID, _, err := descendToLeafForKey(pw, cfg, rootID, fullKey)
+	path, leafID, _, rightmost, err := descendToLeafForKey(pw, cfg, rootID, fullKey)
 	if err != nil {
 		rollbackKeyExt()
 		return 0, page.LeafEntry{}, err
@@ -183,6 +183,7 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 		_ = pw.FreePage(leftID)
 		return 0, page.LeafEntry{}, serr
 	}
+	appendRightmost := rightmost && !searchFound && searchIdx == len(entries)
 	entries, displaced, _ = insertOrReplaceLeafAt(entries, e, searchIdx, searchFound)
 
 	// Attempt single-page build.
@@ -211,9 +212,10 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 		return newID, displaced, nil
 	}
 
-	// Split required — byte-balanced boundary (page-formats.md §Leaf
-	// Split), not the entry-count midpoint. See findLeafSplitIndex.
-	mid, ok := findLeafSplitIndex(b, leftBuf, cfg, entries)
+	// Split required — append-aware (lopsided on a rightmost append) or
+	// byte-balanced boundary (page-formats.md §Leaf Split), never the
+	// entry-count midpoint. See findLeafSplitIndex.
+	mid, ok := findLeafSplitIndex(b, leftBuf, cfg, entries, appendRightmost)
 	if !ok {
 		_ = pw.FreePage(leftID)
 		return 0, page.LeafEntry{}, ErrKeyTooLarge
@@ -263,7 +265,7 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 	if err != nil {
 		return 0, page.LeafEntry{}, err
 	}
-	newID, err := ascendWithSplit(pw, cfg, path, leftID, sepCell)
+	newID, err := ascendWithSplit(pw, cfg, path, leftID, sepCell, appendRightmost)
 	if err != nil {
 		_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 		return 0, page.LeafEntry{}, err

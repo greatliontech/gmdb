@@ -228,15 +228,16 @@ func TestDeleteCascadesBranchMergeAndRootCollapse(t *testing.T) {
 	// merge from the leaf level up through one or more branch levels.
 	// Pin: (a) all leaves at the same depth post-delete; (b) every
 	// non-root page above threshold; (c) every key retrievable.
-	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // depth calibration: N=1500 → ~375 leaves at target 16
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // depth calibration: N=4000 → ~570 full leaves at target 16
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
 	// Long shared-prefix keys (~57B) and large values (512B) to force a
 	// depth-2+ tree (same shape as TestPutForcesMultiLevelTreeAndBranchSplit).
-	// N=1500: within-page branch prefix truncation packs ~260 shared-prefix
-	// separators per branch, so a multi-level branch structure needs ~375
-	// leaves' worth of keys (the prior 400 fit one compressed root branch).
-	const N = 1500
+	// N=4000: ascending inserts now pack leaves FULL (the append-aware
+	// lopsided split), so ~570 leaves need ~3 branches — a multi-level
+	// branch structure (the prior 1500 built only ~215 full leaves,
+	// which fit one shared-prefix branch).
+	const N = 4000
 	keyPrefix := bytes.Repeat([]byte("k"), 50)
 	keys := make([][]byte, N)
 	for i := range N {
@@ -300,12 +301,12 @@ func TestDeleteForcesBranchMergeAndRedistribute(t *testing.T) {
 	// (mergeOrRedistributeBranches). Build a depth-2+ tree, then
 	// delete enough that branches at depth 1 fall below threshold
 	// and merge with each other — invariants checked per delete.
-	// N=1500: with within-page branch prefix truncation, ~260 shared-prefix
-	// separators fit one branch, so a multi-level tree needs ~375 leaves.
-	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // depth calibration: N=1500 → ~375 leaves at target 16
+	// N=4000: ascending inserts pack leaves FULL (the append-aware
+	// lopsided split), so ~570 leaves' separators span multiple branches.
+	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16} // depth calibration: N=4000 → ~570 full leaves at target 16
 	pw := newFakeWriter(t, 4096)
 	root := uint64(0)
-	const N = 1500
+	const N = 4000
 	keyPrefix := bytes.Repeat([]byte("k"), 50)
 	keys := make([][]byte, N)
 	for i := range N {

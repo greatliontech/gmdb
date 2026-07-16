@@ -85,40 +85,47 @@ type pathFrame struct {
 // descendToLeafForKey performs the shared put-descent: walk from
 // rootID toward key, validating each branch and recording the path,
 // stopping at the first leaf-typed page. Returns the recorded path,
-// the leaf's page id, and the leaf's (pre-CoW) buffer. Both put
+// the leaf's page id, the leaf's (pre-CoW) buffer, and whether the
+// descent took the LAST child pointer at every level — i.e. the leaf
+// is the tree's rightmost, the trigger for the append-aware lopsided
+// split (page-formats.md §Leaf Split, append-aware policy). Both put
 // variants (putReportCore and PutEntry) start here; their leaf
 // mutation phases differ by contract (internal vs caller-managed
 // overflow-chain ownership) and deliberately stay separate.
-func descendToLeafForKey(pw PageWriter, cfg page.Config, rootID uint64, key []byte) (path []pathFrame, leafID uint64, leafBuf []byte, err error) {
+func descendToLeafForKey(pw PageWriter, cfg page.Config, rootID uint64, key []byte) (path []pathFrame, leafID uint64, leafBuf []byte, rightmost bool, err error) {
 	path = make([]pathFrame, 0, 8)
 	cur := rootID
+	rightmost = true
 	for depth := 0; depth <= MaxTreeDepth; depth++ {
 		buf, e := pw.Page(cur)
 		if e != nil {
-			return nil, 0, nil, e
+			return nil, 0, nil, false, e
 		}
 		typ, _, _, _ := page.ReadHeader(buf)
 		if page.IsLeafType(typ) {
-			return path, cur, buf, nil
+			return path, cur, buf, rightmost, nil
 		}
 		if !page.IsBranchType(typ) {
-			return nil, 0, nil, fmt.Errorf("%w: page %d has unexpected type %d during put descent", ErrCorrupted, cur, typ)
+			return nil, 0, nil, false, fmt.Errorf("%w: page %d has unexpected type %d during put descent", ErrCorrupted, cur, typ)
 		}
 		if e := validateBranchPage(buf, cfg, cur); e != nil {
-			return nil, 0, nil, e
+			return nil, 0, nil, false, e
 		}
 		i, serr := page.BranchSearch(buf, cfg, key, keyTail(pw, cfg))
 		if serr != nil {
-			return nil, 0, nil, serr
+			return nil, 0, nil, false, serr
+		}
+		if i != page.BranchCellCount(buf) {
+			rightmost = false
 		}
 		next := page.BranchChildAt(buf, cfg, i)
 		if next == 0 {
-			return nil, 0, nil, fmt.Errorf("%w: null child pointer in branch %d during put descent", ErrCorrupted, cur)
+			return nil, 0, nil, false, fmt.Errorf("%w: null child pointer in branch %d during put descent", ErrCorrupted, cur)
 		}
 		path = append(path, pathFrame{pageID: cur, childIdx: i})
 		cur = next
 	}
-	return nil, 0, nil, ErrTreeTooDeep
+	return nil, 0, nil, false, ErrTreeTooDeep
 }
 
 // Put inserts or updates key=value in the tree rooted at rootID.
@@ -195,7 +202,7 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 
 	// Phase 1: the shared descent. The leaf buffer is retained for the
 	// shared read (validate + search + last-key) below.
-	path, leafID, leafBuf, err := descendToLeafForKey(pw, cfg, rootID, key)
+	path, leafID, leafBuf, rightmost, err := descendToLeafForKey(pw, cfg, rootID, key)
 	if err != nil {
 		return 0, false, err
 	}
@@ -297,14 +304,19 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 	}
 
 	// Append-overflow group-split fast path: an append that overflowed a
-	// multi-group compressed leaf splits at a group boundary WITHOUT decoding —
-	// carve the page into two and append the new (largest) entry to the right
-	// (page-formats.md §Leaf Split). Declines (→ slow decode split) on a single
-	// group, an uncompressed/variant page, or when the right half can't absorb
-	// the new entry; the decode split then does the byte-balanced (entry-precise)
-	// split, promoting a near-page inline value to overflow if needed.
+	// multi-group compressed leaf splits at a group boundary WITHOUT
+	// decoding — carve the page into two and append the new (largest)
+	// entry to the right (page-formats.md §Leaf Split). On the tree's
+	// RIGHTMOST leaf the boundary is LOPSIDED (append-aware policy: only
+	// the last group moves right, packing the left nearly full — see
+	// trySplitLeafByGroup); elsewhere it is the ~50% byte point.
+	// Declines (→ slow decode split) on a single group, an
+	// uncompressed/variant mismatch, or when the right half can't absorb
+	// the new entry; the decode split then does the byte-balanced (or
+	// exactly-lopsided, on a rightmost append) entry-precise split,
+	// promoting a near-page inline value to overflow if needed.
 	if appendPos {
-		sep, rightID, ok, e := trySplitLeafByGroup(pw, cfg, leftBuf, newEntry)
+		sep, rightID, ok, e := trySplitLeafByGroup(pw, cfg, leftBuf, newEntry, rightmost)
 		if e != nil {
 			_ = pw.FreePage(leftID)
 			rollbackNewChain()
@@ -325,7 +337,7 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 				rollbackNewChain()
 				return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, e)
 			}
-			nr, e := ascendWithSplit(pw, cfg, path, leftID, sepCell)
+			nr, e := ascendWithSplit(pw, cfg, path, leftID, sepCell, rightmost)
 			if e != nil {
 				_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 				_ = pw.FreePage(leftID)
@@ -428,8 +440,8 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			return nr, existed, nil
 		}
 
-		// Too big for one leaf: byte-balanced split.
-		mid, ok := findLeafSplitIndex(b, leftBuf, cfg, entries)
+		// Too big for one leaf: append-aware or byte-balanced split.
+		mid, ok := findLeafSplitIndex(b, leftBuf, cfg, entries, rightmost && appendPos)
 		if !ok {
 			// No two-page partition fits (size-skewed leaf). Promote the
 			// largest inline value to overflow and retry — its leaf entry
@@ -538,7 +550,7 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			rollbackNewChain()
 			return 0, false, e
 		}
-		nr, e := ascendWithSplit(pw, cfg, path, leftID, sepCell)
+		nr, e := ascendWithSplit(pw, cfg, path, leftID, sepCell, rightmost && appendPos)
 		if e != nil {
 			_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 			_ = pw.FreePage(leftID)
@@ -770,7 +782,15 @@ func ascendNoSplit(pw PageWriter, cfg page.Config, path []pathFrame, newChildID 
 // If the path is empty (the root itself was a leaf that split), a
 // new root branch is allocated with two children: leftID and
 // rightID, separator sep.
-func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID uint64, sepCell page.BranchCell) (uint64, error) {
+// rightmostAppend marks the append-aware case: the split leaf was the
+// tree's rightmost and the insert appended past its last key, so the
+// propagated separator inserts at the END of every branch on the path
+// (each level's childIdx is its cell count). An overflowing branch then
+// splits LOPSIDED — the last pre-insert cell is lifted and the new
+// separator alone seeds the right branch — instead of byte-balanced,
+// so ascending-key workloads pack branch levels full too
+// (page-formats.md §Leaf Split, append-aware policy).
+func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID uint64, sepCell page.BranchCell, rightmostAppend bool) (uint64, error) {
 	// ascendWithSplit is reached only after a leaf split (its two call
 	// sites in putReportCore) — count that one leaf split here; each
 	// branch split inside the loop is counted at its completion below
@@ -829,15 +849,34 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 			return ascendNoSplit(pw, cfg, path[:i], newBranchID)
 		}
 
-		// Branch split required. Choose the boundary by BYTE size, not the
-		// cell-count midpoint: a branch mixing a few long (low-prefix-
-		// sharing) separators with short ones has count midpoints that put
-		// more than one page of cells on a side — a spurious failure on a
+		// Branch split required. Rightmost-append case: the separator was
+		// appended at this branch's end (childIdx == pre-insert cell
+		// count), so split LOPSIDED — lift the last pre-insert cell,
+		// keep everything before it left, seed the right branch with the
+		// new separator alone. The left half is a strict prefix of the
+		// already-fitting pre-insert cell set (fits under every layout's
+		// sizing — plain is additive; segregated size is strictly
+		// increasing in the cell count) and the 1-cell right fits by the
+		// branch split-feasibility floor, so the lopsided boundary never
+		// needs the balanced fallback beyond the n>=3 guard (a 2-cell
+		// overflow means giant separators — let the balanced scan judge
+		// feasibility).
+		//
+		// Otherwise choose the boundary by BYTE size, not the cell-count
+		// midpoint: a branch mixing a few long (low-prefix-sharing)
+		// separators with short ones has count midpoints that put more
+		// than one page of cells on a side — a spurious failure on a
 		// valid Put though a feasible byte-balanced boundary exists
-		// (page-formats.md §Leaf Split; see findBranchSplitIndex). The
-		// chosen halves are guaranteed to fit, so the EncodeBranch calls
-		// below cannot fail on size.
-		mid, ok := findBranchSplitIndex(cfg, newCells)
+		// (page-formats.md §Leaf Split; see findBranchSplitIndex). Either
+		// way the chosen halves are guaranteed to fit, so the
+		// EncodeBranch calls below cannot fail on size.
+		var mid int
+		var ok bool
+		if rightmostAppend && f.childIdx == uint16(len(cells)) && len(newCells) >= 3 {
+			mid, ok = len(newCells)-2, true
+		} else {
+			mid, ok = findBranchSplitIndex(cfg, newCells)
+		}
 		if !ok {
 			// No feasible two-page partition: a single separator exceeds
 			// page capacity. Unreachable under limits.md §Maximum Key Size
