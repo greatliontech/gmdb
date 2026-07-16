@@ -31,10 +31,10 @@ func TestFileSize(t *testing.T) {
 		maxReaders uint32
 		want       int64
 	}{
-		{1, int64(HeaderSize) + int64(SlotSize)},
-		{2, int64(HeaderSize) + 2*int64(SlotSize)},
-		{DefaultMaxReaders, int64(HeaderSize) + int64(SlotSize)*int64(DefaultMaxReaders)},
-		{MaxMaxReaders, int64(HeaderSize) + int64(SlotSize)*int64(MaxMaxReaders)},
+		{1, int64(HeaderSize) + int64(SlotSize) + NotifyRegionSize},
+		{2, int64(HeaderSize) + 2*int64(SlotSize) + NotifyRegionSize},
+		{DefaultMaxReaders, int64(HeaderSize) + int64(SlotSize)*int64(DefaultMaxReaders) + NotifyRegionSize},
+		{MaxMaxReaders, int64(HeaderSize) + int64(SlotSize)*int64(MaxMaxReaders) + NotifyRegionSize},
 	}
 	for _, c := range cases {
 		if got := FileSize(c.maxReaders); got != c.want {

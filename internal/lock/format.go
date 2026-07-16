@@ -153,10 +153,30 @@ var (
 	_ [SlotSize]byte   = [unsafe.Sizeof(ReaderSlot{})]byte{}
 )
 
+// Notification region (cross-process.md §Lock File Layout,
+// notification region): a fixed array of uint64 version words after
+// the reader table. Word 0 is the global commit-version word; words
+// 1..NotifyKeyspaceSlots are keyspace-scoped, addressed by name hash
+// (KeyspaceNotifySlot). All words are accessed with the Load64 /
+// Store64 / CAS64 helpers and futex-waited on their low 32-bit half.
+const (
+	// NotifyGlobalSlot is the index of the global version word:
+	// stamped by every commit.
+	NotifyGlobalSlot uint32 = 0
+	// NotifyKeyspaceSlots is the number of keyspace-hashed words.
+	// Collisions are benign — a collision wakes a waiter on an
+	// untouched keyspace, which the spurious-wakeup contract allows.
+	NotifyKeyspaceSlots uint32 = 64
+	// NotifySlotCount is the total word count of the region.
+	NotifySlotCount uint32 = 1 + NotifyKeyspaceSlots
+	// NotifyRegionSize is the region's byte length.
+	NotifyRegionSize = int64(NotifySlotCount) * 8
+)
+
 // FileSize returns the total mmap size for a lock file with
-// maxReaders slots: HeaderSize + SlotSize × maxReaders. The
-// cross-process.md mmap-size invariant requires every process to
-// mmap exactly this many bytes.
+// maxReaders slots: HeaderSize + SlotSize × maxReaders +
+// NotifyRegionSize. The cross-process.md mmap-size invariant requires
+// every process to mmap exactly this many bytes.
 func FileSize(maxReaders uint32) int64 {
-	return int64(HeaderSize) + int64(SlotSize)*int64(maxReaders)
+	return int64(HeaderSize) + int64(SlotSize)*int64(maxReaders) + NotifyRegionSize
 }

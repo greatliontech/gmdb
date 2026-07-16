@@ -924,6 +924,78 @@ func (tx *Tx) BeginChild() (*Tx, error)
 func (tx *Tx) SetFileFormat(f FileFormat) error
 ```
 
+## Change Notification
+
+Blocking change observation across processes, carried by the lock
+file's notification region (`cross-process.md §Lock File Layout,
+notification region`). Versions are opaque uint64 tokens: every
+committed-visible commit — from any process — produces a version
+greater than every version observed before it, and tokens from all
+three methods are mutually comparable across handles sharing a
+notification source (the lock file; or, for lock-free read-only
+fallback handles, the data file's committed state — the two sources
+can diverge after a Compact, so tokens must not be compared across
+the two handle modes). They are NOT transaction IDs and carry no
+meaning beyond ordering; persisting them across process restarts is
+meaningful only for ordering against other persisted tokens of the
+same database and source.
+
+```go
+// Version returns the database's current commit version. Use it as
+// the `from` argument of the waits below. Errors include ErrClosed
+// on a closed handle and ErrPoisoned on a poisoned one (same for the
+// waits); the lock-free fallback can additionally surface data-file
+// read errors (its version source is a meta pread).
+//
+// On the read-only lock-free fallback (no lock file; see
+// Options.ReadOnly) the version derives from the data file's
+// committed state.
+func (db *DB) Version() (uint64, error)
+
+// WaitVersion blocks until the database's commit version exceeds
+// from, and returns the observed version. Returns ctx.Err() on
+// context cancellation and ErrClosed if the handle is closed while
+// waiting (Close does not block on in-flight waits; it ends them).
+// A successful return always means version > from, and the commit
+// that produced the returned version is observed by any read
+// transaction opened afterwards — on any handle able to open one.
+// (The one handle that may not be: a commit that failed with a
+// classified visible/durability-unknown outcome wakes waiters, but
+// poisons its OWN handle — reads there fail loudly with ErrPoisoned
+// rather than observing anything; peers and a re-Open observe the
+// commit.)
+//
+// Wake latency: sub-millisecond on Linux (futex); single-digit
+// milliseconds elsewhere (adaptive poll). On the read-only
+// lock-free fallback the wait polls the data file's committed meta.
+func (db *DB) WaitVersion(ctx context.Context, from uint64) (uint64, error)
+
+// WaitKeyspaceVersion is WaitVersion scoped to commits that touched
+// the named keyspace: data writes, creation, configuration changes,
+// deletion. The keyspace need not exist — waiting for its creation
+// is valid. Scoping is by name hash over a fixed slot array, so an
+// unrelated keyspace's commit can end the wait spuriously (hash
+// collision); a successful return still guarantees version > from.
+// Callers re-check the data they care about — the wait is a wake
+// primitive, not a change description. A no-op commit against the
+// keyspace (a presence-gated verb that mutated nothing) does not
+// wake scoped waiters.
+//
+// On the read-only lock-free fallback, keyspace waits degrade to
+// global waits (every commit wakes them — spurious by contract).
+func (db *DB) WaitKeyspaceVersion(ctx context.Context, name string, from uint64) (uint64, error)
+```
+
+Version monotonicity survives a lock-file recreation on a database
+that has never been compacted (the region is re-seeded from the
+committed transaction ID). After a `Compact`, versions remain
+monotonic as long as the lock file — transient coordination state —
+survives; deleting it after a compaction may restart versions lower.
+Waits are delivery-guaranteed for commits that report success or a
+classified visible/durability-unknown outcome (`ErrCommitVisible`,
+`ErrCommitDurabilityUnknown`); an unclassified commit failure's
+changes wake waiters at the next successful commit.
+
 ## Keyspace API
 
 ```go

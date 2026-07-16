@@ -354,6 +354,10 @@ Lock File
 | | ...                                       | | up to MaxReaders slots
 | +-------+-----+-----+------+-------+-------+ |
 +----------------------------------------------+
+| Notification Region (520 bytes)              |
+| Global version word   | uint64               |  word 0: every commit
+| Keyspace version words| [64]uint64           |  words 1..64: by name hash
++----------------------------------------------+
 ```
 
 PST = Process Start Time. PIDN = PID Namespace. HB = Heartbeat.
@@ -371,8 +375,10 @@ writable handle caches the value its bitmap + RPL state was last
 rebuilt at and forces a full re-sync rebuild on mismatch
 (`free-space.md §Grant-handoff tear detection`). It
 occupies former header padding, so HeaderSize is unchanged —
-header GROWTH remains gated on shipping with a data-format break
-(see the stale-recreate arm's safety invariant).
+layout GROWTH (the header, or any region that changes the total
+file size, like the notification region) remains gated on shipping
+with a data-format break (see the stale-recreate arm's safety
+invariant).
 
 The lock-file structures use Go structs with `structs.HostLayout`
 (Go 1.24+), which guarantees the host platform's C ABI layout.
@@ -534,18 +540,76 @@ explicit encode/decode).
   writer-process turnover. Cleared back to 0 by slot release and
   by successful acquire's field-write phase.
 
-Total size: `136 + (56 × MaxReaders)`. Default 4096 readers:
-`136 + 229376 = 229512` bytes (~224 KB).
+Total size: `136 + (56 × MaxReaders) + 520`. Default 4096 readers:
+`136 + 229376 + 520 = 230032` bytes (~225 KB).
 
 `MaxReaders` is bounded `[1, 65536]`. The lower bound is one slot
 (degenerate but legal); the upper bound caps the mmap at
-`136 + 56 × 65536 ≈ 3.5 MiB`, so a corrupted or maliciously-crafted
-header value cannot demand a petabyte-scale mmap. A header
-`MaxReaders` value outside this range is treated as `ErrCorrupted`
-by `Open`.
+`136 + 56 × 65536 + 520 ≈ 3.5 MiB`, so a corrupted or
+maliciously-crafted header value cannot demand a petabyte-scale
+mmap. A header `MaxReaders` value outside this range is treated as
+`ErrCorrupted` by `Open`.
 
 The lock file is mmap'd `MAP_SHARED` by all processes for the
-reader table. The write lock is a separate concern via `flock()`.
+reader table and the notification region. The write lock is a
+separate concern via `flock()`.
+
+### Notification region
+
+A fixed array of 65 `uint64` version words after the reader table
+(8-byte aligned: both the header size and the slot size are
+multiples of 8). The words carry opaque, mutually comparable commit
+versions — the substrate of the public change-notification API
+(`api-surface.md §Change Notification`): a waiter remembers a
+version `from` and blocks until a word exceeds it.
+
+- **Word 0 — global version.** Incremented (atomic `+1`) by every
+  commit's notification publish. CAS-max seeded from the adopted
+  meta's `TxnID` by every `Open`, so versions continue ascending
+  across a lock-file recreation on a database that has never been
+  compacted. It is NOT the meta `TxnID`: `Compact` resets the
+  `TxnID`, and a version word must never regress within the file's
+  lifetime — waiters compare `value > from`, so a regression would
+  hide every later commit from an existing waiter (the monotonicity
+  invariant; the CAS-max seed and the grant-serialized publishes
+  together enforce it).
+- **Words 1..64 — keyspace versions.** A commit that touched a
+  keyspace — data writes, creation, configuration change, deletion
+  — stamps the keyspace's word, `1 + XXH3-64(name) mod 64`, with
+  the just-incremented GLOBAL version. Stamping the global value
+  (rather than counting per word) keeps every word comparable with
+  every observed version: `word > from` ⇔ a commit newer than
+  `from` touched a keyspace in that hash class. Name collisions
+  only widen a wake to unrelated waiters — spurious wakeups are
+  part of the wait contract.
+
+**Publish ordering.** The publish runs under the still-held write
+grant (serializing the stamps), strictly AFTER the commit's meta
+publication: a woken waiter immediately reads the database and must
+observe the commit — its wake is consumed either way. Commits whose
+error is classified visible or durability-unknown
+(`durability.md §Commit Outcome Classification`) publish too: peers
+can see them, so waiters must not sleep through them. Unclassified
+commit failures do not publish — delivery is best-effort there, and
+the next successful commit's stamp covers the gap.
+
+**Waiting.** On Linux, waiters block in a shared `futex(2)`
+(`FUTEX_WAIT` without `FUTEX_PRIVATE_FLAG`) on the low-order 32
+bits of the word — a publish moves the global word by exactly 1,
+and any same-low-half movement (an Open-time CAS-max seed jump, or
+a keyspace stamp landing ≥2^32 commits after the word's previous
+value) costs a waiter at most one sleep slice, never a lost wake —
+with a bounded sleep slice for liveness re-checks; publishes and
+context cancellation issue `FUTEX_WAKE`. Elsewhere, waiters poll the word with an adaptive
+backoff (sub-millisecond floor, single-digit-millisecond cap).
+Spurious wakeups (collisions, cancellation wakes on shared words)
+are absorbed by re-checking `value > from` before returning.
+
+**No notification region** exists on the read-only lock-free
+fallback (no lock file; see `mmap-strategy.md §Read-Only`): the
+waits degrade to polling the data file's committed meta `TxnID`,
+and keyspace-scoped waits degrade to global waits — conforming,
+since both only add spurious wakes.
 
 ## Lock File Lifecycle
 

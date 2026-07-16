@@ -657,8 +657,14 @@ func TestSetCursorNestedPositionIsStreamed(t *testing.T) {
 		}
 	})
 	// O(depth) work: a materializing cursor would allocate ~N copies
-	// (20k+); streaming stays in the dozens.
-	if allocs > 200 {
+	// (20k+); streaming stays in the dozens. Race instrumentation
+	// allocates shadow state on top — a laxer bound there, still two
+	// orders of magnitude under the regression scale.
+	bound := 200.0
+	if raceEnabled {
+		bound = 1000.0
+	}
+	if allocs > bound {
 		t.Errorf("Seek on a %d-member nested set allocated %.0f objects per run — O(set) materialization regressed", N, allocs)
 	}
 

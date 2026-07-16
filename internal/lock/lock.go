@@ -102,6 +102,10 @@ type File struct {
 	mmap   []byte
 	header *LockFileHeader
 	slots  []ReaderSlot
+	// notify overlays the notification region after the reader table:
+	// NotifySlotCount uint64 version words (format.go). Accessed only
+	// through the notify.go methods.
+	notify []uint64
 	// refs counts lifetime references on the mapping: 1 for the
 	// owning handle (seeded at Open, dropped by its Close), plus one
 	// per open read transaction (Ref at BeginRead, dropped when the
@@ -736,11 +740,17 @@ func mmapAndOverlay(f *os.File, maxReaders uint32, fileSize int64) (*File, error
 		(*ReaderSlot)(unsafe.Pointer(&mapping[HeaderSize])),
 		int(maxReaders),
 	)
+	notifyOff := HeaderSize + SlotSize*int(maxReaders)
+	notify := unsafe.Slice(
+		(*uint64)(unsafe.Pointer(&mapping[notifyOff])),
+		int(NotifySlotCount),
+	)
 	lf := &File{
 		f:      f,
 		mmap:   mapping,
 		header: header,
 		slots:  slots,
+		notify: notify,
 	}
 	lf.refs.Store(1)
 	return lf, nil
@@ -777,6 +787,7 @@ func (f *File) Close() error {
 		f.mmap = nil
 		f.header = nil
 		f.slots = nil
+		f.notify = nil
 	}
 	if f.f != nil {
 		if err := f.f.Close(); err != nil {

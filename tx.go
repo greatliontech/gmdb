@@ -375,6 +375,11 @@ func (tx *Tx) Commit() error {
 	// from the reserved space. pager.Commit manages the flag for its
 	// own steps; AbortTx/BeginTx reset it on the failure paths.
 	tx.pgr.SetCommitPhase(true)
+	// Capture the touched-keyspace notification slots BEFORE the
+	// descriptor flush marks the handles clean; published only after
+	// the commit's meta publication (cross-process.md §Lock File
+	// Layout, notification region: stamp happens-after visibility).
+	notifySlots := tx.touchedNotifySlots()
 	if err := tx.flushKeyspaces(); err != nil {
 		// Flush failed before pager.Commit ran — AbortTx is sufficient.
 		// No on-disk pwrite has happened yet (pager.Commit's step-1
@@ -480,6 +485,10 @@ func (tx *Tx) Commit() error {
 				} else {
 					class = ErrCommitVisible
 				}
+				// The commit IS visible to peers (verified readback);
+				// waiters must not sleep through it. Publish under the
+				// still-held grant, same as the success path.
+				tx.publishCommitNotify(notifySlots)
 			}
 		}
 		if !classified {
@@ -494,6 +503,12 @@ func (tx *Tx) Commit() error {
 	// from it.
 	tx.db.setMetaState(result.Meta, result.ActiveMetaIdx)
 	tx.db.mu.Unlock()
+	// Notification publish (cross-process.md §Lock File Layout,
+	// notification region): after the meta publication above (a woken
+	// waiter's next read must observe this commit), under the grant
+	// this tx still holds (releaseGrant is deferred) — grant
+	// serialization is what makes the plain version stamps monotonic.
+	tx.publishCommitNotify(notifySlots)
 	// The pager's commit-state seeding (HighWaterMark, MaxSize,
 	// reclamationBound) moved to the next write-tx Begin path
 	// so the reclamation bound reflects the reader-table
@@ -858,6 +873,80 @@ func (tx *Tx) hasDirtyOpenSetKeyspaces() bool {
 }
 
 // dirtyOpenNamesSorted returns the names of openKeyspaces entries
+// touchedNotifySlots collects the notification slots of every
+// keyspace this transaction touched — dirty/created open handles of
+// both kinds, unopened staged descriptor mutations, deletions, and
+// dead (deleted) handles — deduplicated (names may hash-collide) and
+// sorted. Must run BEFORE flushKeyspaces marks the handles clean.
+//
+// The dead-handle lists are load-bearing, not redundant with
+// pendingDeletes: a delete→recreate→delete of a pre-existing name
+// consumes the pendingDeletes marker on the recreate and the second
+// delete leaves only a dead created-state handle — yet the commit's
+// net peer-visible effect is that deletion. Scanning the dead lists
+// over-notifies a purely created-then-deleted name (never peer
+// visible); that is a spurious wake the wait contract allows,
+// whereas a missed deletion is a contract violation.
+func (tx *Tx) touchedNotifySlots() []uint32 {
+	seen := make(map[uint32]struct{})
+	add := func(name string) {
+		seen[lock.KeyspaceNotifySlot(name)] = struct{}{}
+	}
+	for _, ks := range tx.openKeyspaces {
+		if ks.state != keyspaceStateClean {
+			add(ks.name.Value())
+		}
+	}
+	for _, sks := range tx.openSetKeyspaces {
+		if sks.state != keyspaceStateClean {
+			add(sks.name.Value())
+		}
+	}
+	for name := range tx.dirtyDescriptors {
+		add(name)
+	}
+	for name := range tx.pendingDeletes {
+		add(name)
+	}
+	for _, ks := range tx.deadKeyspaces {
+		add(ks.name.Value())
+	}
+	for _, sks := range tx.deadSetKeyspaces {
+		add(sks.name.Value())
+	}
+	slots := make([]uint32, 0, len(seen))
+	for s := range seen {
+		slots = append(slots, s)
+	}
+	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
+	return slots
+}
+
+// publishCommitNotify stamps the notification region for a commit
+// that has become visible (success path, and the classified
+// visible/durability-unknown failure paths). Caller MUST still hold
+// the write grant — the grant both serializes the version stamps and
+// (by blocking DB.Close's shutdown-checkpoint acquisition) keeps the
+// lock-file mapping alive; the Ref bridges the poisoned-Close case,
+// where Close skips that acquisition. A nil lockFile (read-only
+// media, or a Close that already tore down state) skips the publish:
+// peers then have no notification region mapped either.
+func (tx *Tx) publishCommitNotify(slots []uint32) {
+	tx.db.mu.Lock()
+	lf := tx.db.lockFile
+	if lf != nil {
+		// Safe under db.mu: Close nils db.lockFile (under this mutex)
+		// strictly before dropping the owning reference.
+		lf.Ref()
+	}
+	tx.db.mu.Unlock()
+	if lf == nil {
+		return
+	}
+	lf.PublishCommit(slots)
+	_ = lf.Close() // drop the Ref
+}
+
 // whose state is Created or Dirty, sorted for deterministic flush
 // ordering.
 func dirtyOpenNamesSorted(m map[uniqueNameHandle]*Keyspace) []string {

@@ -4,7 +4,6 @@ Spec: `docs/specs/limits.md`, `docs/specs/page-formats.md`,
 `docs/specs/keyspaces.md`, `docs/specs/durability.md`,
 `docs/specs/cross-process.md`, `docs/specs/transactions.md`,
 `docs/specs/api-surface.md`.
-Riders: `change-notification-wait-primitive` (chunk 14).
 Scope: the format break (long keys plus the page-layout and
 overflow-digest backports from the sibling engine's measured
 layout work — pando `docs/specs/file-format.md`, evidence via
@@ -108,7 +107,7 @@ and 10 remove.
       stays the upsert.
 - [x] 13. `Cursor.SeekLE` / `SeekLT`, `SetCursor` key-level
       equivalents, `typed` cursor mirrors.
-- [ ] 14. `Version()` + `WaitVersion(ctx, from)` +
+- [x] 14. `Version()` + `WaitVersion(ctx, from)` +
       `WaitKeyspaceVersion(ctx, name, from)`: committed-visible
       root version; the notification region in the shared lock
       file is a fixed array of counter words — slot 0 bumps on

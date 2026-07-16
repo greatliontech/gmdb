@@ -476,6 +476,14 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	}
 	db.adoptOpened(opened)
 	db.takeoverSeqSeen = openTakeoverSeq
+	if lockFile != nil {
+		// Seed the notification region's global version word from the
+		// adopted meta (CAS-max: never lowers a peer-advanced value) so
+		// versions keep ascending across a lock-file recreation on an
+		// uncompacted database (cross-process.md §Lock File Layout,
+		// notification region).
+		lockFile.SeedNotifyVersion(opened.Meta.TxnID)
+	}
 	if coord != nil {
 		db.dataGeneration.Store(coord.DataGeneration())
 		// Inode verification AFTER the generation cache read: if a
