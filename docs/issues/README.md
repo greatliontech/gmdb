@@ -66,7 +66,6 @@ pre-existing at their change set's base.
 | Slug | Lands | Summary |
 |------|-------|---------|
 | iterator-error-swallowing | when the iterator surfaces gain a documented post-iteration error check | [M] `All`/`Range`/`Prefix` end silently on a mid-iteration cursor read error — a short clean-looking iteration is indistinguishable from a smaller keyspace |
-| chunk15-fable-review-owed | before plan chunk 15's close-out | chunk 15a's adversarial review ran on a substitute reviewer tier (strong tier unavailable); a strong-tier review of the full chunk-15 diff is owed before the chunk's close-out commit |
 
 ## Open — design gaps (2026-07-11 architecture audit)
 

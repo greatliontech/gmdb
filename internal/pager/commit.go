@@ -257,8 +257,10 @@ func (p *Pager) commitStep0() error {
 		_, freed := p.pendingFrees[id]
 		// id >= highWaterMark: the page was freed at the tail and (a)
 		// refunded it — it left the bitmap-tracked extent entirely
-		// (FreePage sets the free bit immediately, so TailRefund sees
-		// same-tx tail frees), and pwriting past the new HWM would
+		// (FreePage's free bit — set immediately outside savepoint
+		// windows, and by the last savepoint's release otherwise; all
+		// windows resolved before commit, so TailRefund always sees
+		// same-tx tail frees here), and pwriting past the new HWM would
 		// resurrect file bytes the commit just shrank away.
 		if freed || id >= p.highWaterMark {
 			p.Discard(id)

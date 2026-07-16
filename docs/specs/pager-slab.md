@@ -115,7 +115,13 @@ Invariant: kind=clause-explicit;
     surfaces (live dirtyBytes is charged by NEITHER: data pages
     spill at boundaries, and freed pages' buffers drop at step 0). A
     pre-commit spill brings the slab under the threshold before the
-    commit phase draws from the reserved space.
+    commit phase draws from the reserved space. DEGRADED-MODE
+    exception: after a recorded spill I/O failure the relief path is
+    dead, the pre-spill admission ceiling returns as the OOM
+    backstop, and a commit whose slab could not be spilled down can
+    itself fail `ErrTxTooLarge` — the error names the underlying
+    spill failure; the invariant as stated holds while the spill
+    path is healthy.
     INV-COMMIT-HEADROOM: enforced by
     `TestCommitSucceedsAfterTxTooLarge` (over-threshold fill still
     commits), `TestCommitNeedsOnlyReservedHeadroom`,
@@ -249,6 +255,9 @@ the transaction holds:
 - Loose buffers (CoW'd then freed mid-tx; held for the
   shallow-savepoint resurrection of the free and for byte-slice
   ownership).
+- Loose-pop detached buffers (severed from `dirty[id]` when a loose
+  page is re-allocated; held for byte-slice ownership and the
+  shallow loose-pop replay).
 - Commit-time assembly buffers — the RPL segment pages allocated in
   step 0 of commit. (Modified bitmap pages are NOT slab-allocated:
   step 1 pwrites them directly from the in-memory bitmap's own

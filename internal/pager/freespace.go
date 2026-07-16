@@ -346,11 +346,12 @@ func alignUp(n, step uint64) uint64 {
 //     at commit (bypassing the RPL because no other process holds a
 //     snapshot referencing a same-tx page).
 //   - In pendingAllocs but not yet in p.dirty (allocated this tx but
-//     never CoW'd / AllocSlab'd — direct-written overflow-run pages
-//     and their rollback paths land here): bitmap bit is restored to
-//     free, pendingAllocs entry is
-//     dropped. No retiredPages entry: no prior-tx reader holds a
-//     snapshot referencing this page.
+//     never CoW'd / AllocSlab'd — direct-written overflow-run pages,
+//     SPILLED pages, and their rollback paths land here): the bitmap
+//     bit is restored to free — deferred to the last savepoint's
+//     release while a window is open (see deferredFrees) — and the
+//     pendingAllocs entry is dropped. No retiredPages entry: no
+//     prior-tx reader holds a snapshot referencing this page.
 //   - Not in p.dirty and not in pendingAllocs (mmap-backed, from a
 //     prior tx): joins retiredPages. Appended to the RPL at commit so
 //     the page survives in MVCC until the reclamation bound advances

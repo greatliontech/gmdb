@@ -118,7 +118,7 @@ and 10 remove.
       fallback elsewhere; spurious wakeups allowed — hash
       collisions included — callers re-check; cross-process wake
       tests for both scopes; `cross-process.md` spec section.
-- [ ] 15. Transaction dirty-page spill: `MaxTxBufferBytes` becomes
+- [x] 15. Transaction dirty-page spill: `MaxTxBufferBytes` becomes
       the spill threshold, not a correctness ceiling; past it,
       CoW pages write out to their allocated file pages before
       commit (crash image identical to died-holding-grant; the
