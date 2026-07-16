@@ -309,3 +309,37 @@ func equalStr(a, b []string) bool {
 	}
 	return true
 }
+
+// TestTypedCursorSeekLE mirrors the byte layer's floor duals through
+// the typed cursor.
+func TestTypedCursorSeekLE(t *testing.T) {
+	tx, cleanup := newTypedTx(t)
+	defer cleanup()
+	tks := NewKeyspace[uint64, string]("le", Uint64Encoder{}, StringEncoder{})
+	ks, err := tks.Create(tx)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for _, n := range []uint64{10, 20, 30} {
+		if err := ks.Put(n, "v"); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	c := ks.Cursor()
+	defer c.Close()
+	if k, _, ok := c.SeekLE(25); !ok || k != 20 {
+		t.Errorf("SeekLE(25) = (%d, %v), want (20, true)", k, ok)
+	}
+	if k, _, ok := c.SeekLE(20); !ok || k != 20 {
+		t.Errorf("SeekLE(20) = (%d, %v), want (20, true)", k, ok)
+	}
+	if k, _, ok := c.SeekLT(20); !ok || k != 10 {
+		t.Errorf("SeekLT(20) = (%d, %v), want (10, true)", k, ok)
+	}
+	if _, _, ok := c.SeekLT(10); ok {
+		t.Error("SeekLT(10) = ok, want miss")
+	}
+	if err := c.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+}

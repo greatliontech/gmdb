@@ -106,7 +106,7 @@ and 10 remove.
 - [x] 12. `Insert` / `Replace` verbs (`ErrKeyExists` /
       `ErrNotFound`) on `Keyspace`, with `typed` mirrors; `Put`
       stays the upsert.
-- [ ] 13. `Cursor.SeekLE` / `SeekLT`, `SetCursor` key-level
+- [x] 13. `Cursor.SeekLE` / `SeekLT`, `SetCursor` key-level
       equivalents, `typed` cursor mirrors.
 - [ ] 14. `Version()` + `WaitVersion(ctx, from)` +
       `WaitKeyspaceVersion(ctx, name, from)`: committed-visible

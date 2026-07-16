@@ -472,6 +472,35 @@ func (c *Cursor[K, V]) SeekGE(target K) (K, V, bool) {
 	return c.decode(c.bc.SeekGE(tb))
 }
 
+// SeekLE positions at the largest key <= target (the typed mirror of
+// gmdb.Cursor.SeekLE); SeekLT at the largest key strictly < target.
+// An encode error on target is recorded (Err()) and returns ok=false.
+func (c *Cursor[K, V]) SeekLE(target K) (K, V, bool) {
+	tb, err := c.keyEnc.AppendEncode(nil, target)
+	if err != nil {
+		if c.err == nil {
+			c.err = err
+		}
+		var zk K
+		var zv V
+		return zk, zv, false
+	}
+	return c.decode(c.bc.SeekLE(tb))
+}
+
+func (c *Cursor[K, V]) SeekLT(target K) (K, V, bool) {
+	tb, err := c.keyEnc.AppendEncode(nil, target)
+	if err != nil {
+		if c.err == nil {
+			c.err = err
+		}
+		var zk K
+		var zv V
+		return zk, zv, false
+	}
+	return c.decode(c.bc.SeekLT(tb))
+}
+
 // Delete removes the current entry (same semantics as gmdb.Cursor.Delete).
 func (c *Cursor[K, V]) Delete() error { return c.bc.Delete() }
 

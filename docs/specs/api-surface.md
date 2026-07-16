@@ -1210,6 +1210,15 @@ func (c *Cursor) Next() (key, value []byte)
 func (c *Cursor) Prev() (key, value []byte)
 func (c *Cursor) Seek(target []byte) (key, value []byte)
 func (c *Cursor) SeekGE(target []byte) (key, value []byte)
+
+// SeekLE positions at the LARGEST key <= target (the floor);
+// SeekLT at the largest key strictly < target. Both return
+// (nil, nil) with Err() == nil when no qualifying key exists —
+// the backward duals of SeekGE, composed over the same descent
+// machinery (a miss lands on the successor and steps back; an
+// all-keys-smaller tree lands on Last).
+func (c *Cursor) SeekLE(target []byte) (key, value []byte)
+func (c *Cursor) SeekLT(target []byte) (key, value []byte)
 func (c *Cursor) Current() (key, value []byte)
 
 // Delete removes the current entry. Cursor must be Positioned;
@@ -1308,6 +1317,12 @@ func (c *SetCursor) Next() (key, value []byte)
 func (c *SetCursor) Prev() (key, value []byte)
 func (c *SetCursor) Seek(target []byte) (key, value []byte)
 func (c *SetCursor) SeekGE(target []byte) (key, value []byte)
+
+// Key-level floor duals: position at (largest-key-<=-target,
+// firstValueOf thatKey) / strictly-< variant. (nil, nil) when no
+// qualifying key exists.
+func (c *SetCursor) SeekLE(target []byte) (key, value []byte)
+func (c *SetCursor) SeekLT(target []byte) (key, value []byte)
 func (c *SetCursor) Current() (key, value []byte)
 func (c *SetCursor) Delete() error
 // Close — same semantics as Cursor.Close (explicit cursor release).

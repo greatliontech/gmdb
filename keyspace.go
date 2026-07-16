@@ -1443,6 +1443,24 @@ func (c *Cursor) SeekGE(target []byte) (key, value []byte) {
 	return c.inner.SeekGE(target)
 }
 
+// SeekLE positions at the LARGEST key <= target (the floor). Returns
+// (nil, nil) when no such key exists (api-surface.md §Cursor API).
+func (c *Cursor) SeekLE(target []byte) (key, value []byte) {
+	if !c.requireOpen(false) {
+		return nil, nil
+	}
+	return c.inner.SeekLE(target)
+}
+
+// SeekLT positions at the LARGEST key strictly < target. Returns
+// (nil, nil) when no such key exists (api-surface.md §Cursor API).
+func (c *Cursor) SeekLT(target []byte) (key, value []byte) {
+	if !c.requireOpen(false) {
+		return nil, nil
+	}
+	return c.inner.SeekLT(target)
+}
+
 // Current returns the current (key, value) without advancing.
 // (nil, nil) at End-of-iteration or Unpositioned.
 func (c *Cursor) Current() (key, value []byte) {

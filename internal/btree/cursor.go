@@ -287,6 +287,41 @@ func (c *Cursor) SeekGE(target []byte) (key, value []byte) {
 	return c.firstInLeaf()
 }
 
+// SeekLE positions the cursor at the LARGEST key ≤ target — the
+// floor. On a hit it is Seek; on a miss it is the predecessor of the
+// in-tree successor (composed from SeekGE + Prev, both of which own
+// their edge cases: an all-keys-smaller tree lands on Last, an
+// all-keys-greater tree steps before the first entry into
+// End-of-iteration). Returns (nil, nil) with Err == nil when no key
+// ≤ target exists.
+func (c *Cursor) SeekLE(target []byte) (key, value []byte) {
+	k, v := c.SeekGE(target)
+	if c.err != nil {
+		return nil, nil
+	}
+	if k == nil {
+		return c.Last() // every key < target (or empty tree)
+	}
+	if bytes.Equal(k, target) {
+		return k, v
+	}
+	return c.Prev() // successor found — its predecessor is the floor
+}
+
+// SeekLT positions the cursor at the LARGEST key strictly < target.
+// Identical to SeekLE except an exact hit also steps back. Returns
+// (nil, nil) with Err == nil when no key < target exists.
+func (c *Cursor) SeekLT(target []byte) (key, value []byte) {
+	k, _ := c.SeekGE(target)
+	if c.err != nil {
+		return nil, nil
+	}
+	if k == nil {
+		return c.Last() // every key < target (or empty tree)
+	}
+	return c.Prev() // ≥-successor found — predecessor is the strict floor
+}
+
 // Next advances the cursor by one entry. Behavior per state:
 //   - Unpositioned: behaves like First.
 //   - Positioned: advances to the next entry; transitions to

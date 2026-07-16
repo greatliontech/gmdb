@@ -360,6 +360,52 @@ func (c *SetCursor) SeekGE(target []byte) (key, value []byte) {
 	return c.currentKey, v
 }
 
+// SeekLE positions at the (largest-key-<=-target, firstValueOf
+// thatKey) pair — the key-level floor. Returns (nil, nil) when no
+// key <= target exists (api-surface.md §SetCursor API).
+func (c *SetCursor) SeekLE(target []byte) (key, value []byte) {
+	if !c.requireOpen(false) {
+		return nil, nil
+	}
+	c.clearPosition()
+	k, _ := c.outerCursor.SeekLE(target)
+	if k == nil {
+		return nil, nil
+	}
+	if err := c.materializeAtOuter(); err != nil {
+		c.closeErr = err
+		return nil, nil
+	}
+	v := c.valSetFirst()
+	if v == nil {
+		return nil, nil // nested descend failed — Err() carries the cause
+	}
+	return c.currentKey, v
+}
+
+// SeekLT positions at the (largest-key-strictly-<-target,
+// firstValueOf thatKey) pair. Returns (nil, nil) when no key < target
+// exists (api-surface.md §SetCursor API).
+func (c *SetCursor) SeekLT(target []byte) (key, value []byte) {
+	if !c.requireOpen(false) {
+		return nil, nil
+	}
+	c.clearPosition()
+	k, _ := c.outerCursor.SeekLT(target)
+	if k == nil {
+		return nil, nil
+	}
+	if err := c.materializeAtOuter(); err != nil {
+		c.closeErr = err
+		return nil, nil
+	}
+	v := c.valSetFirst()
+	if v == nil {
+		return nil, nil // nested descend failed — Err() carries the cause
+	}
+	return c.currentKey, v
+}
+
 // Current returns the current (key, value) without advancing.
 // (nil, nil) at Unpositioned or End-of-iteration; also (nil, nil)
 // at value-EOF or value-BOF (per E4, the cursor is conceptually
