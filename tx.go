@@ -18,6 +18,11 @@ import (
 	"github.com/greatliontech/gmdb/internal/pager"
 )
 
+// flushFailHookForTest fires at the top of flushKeyspaces — the seam
+// for driving the commit's assembly-phase (pre-pipeline) failure path,
+// which the flush reserve makes unreachable through ordinary fixtures.
+var flushFailHookForTest atomic.Pointer[func() error]
+
 // Tx is a write transaction. Its surface is keyspace and index
 // management (Open / Create / Delete keyspaces, Rebuild / Drop
 // indexes), nested transactions (BeginChild), and lifecycle (Commit,
@@ -373,11 +378,12 @@ func (tx *Tx) Commit() error {
 	if err := tx.flushKeyspaces(); err != nil {
 		// Flush failed before pager.Commit ran — AbortTx is sufficient.
 		// No on-disk pwrite has happened yet (pager.Commit's step-1
-		// runs later), so no DB-wide poisoning. The caller can retry
-		// in a fresh tx.
+		// runs later), so no DB-wide poisoning; trivially not-visible
+		// (durability.md §Commit Outcome Classification). The caller
+		// can retry in a fresh tx.
 		tx.pgr.SetCommitPhase(false)
 		tx.pgr.AbortTx()
-		return err
+		return fmt.Errorf("%w: %w", ErrCommitNotVisible, err)
 	}
 	// SyncMode → pager SyncPolicy. Flags carry only the immutable
 	// PageChecksum bit; the durable sub-record — the recovery contract
@@ -423,6 +429,17 @@ func (tx *Tx) Commit() error {
 		// step 1+ performs no allocation. Poisoning those would brick a
 		// recoverable handle (e.g. a single large delete whose RPL append
 		// overruns the budget, or background compaction's budget-halving retry (background-maintenance.md §Invariants)).
+		// Outcome classification (durability.md §Commit Outcome
+		// Classification): every Commit error wraps exactly one class
+		// sentinel. Assembly failures are trivially not-visible (no
+		// write was issued). Publication failures classify by META
+		// READBACK under the STILL-HELD grant (releaseGrant is
+		// deferred): if the latest valid on-disk meta is THIS tx's,
+		// the commit is visible despite the error — a retry would
+		// double-apply — and a step-4 fsync failure additionally
+		// leaves stable-storage durability unknown.
+		class := ErrCommitNotVisible
+		classified := true
 		if !errors.Is(err, pager.ErrTxTooLarge) && !errors.Is(err, pager.ErrDBFull) {
 			tx.db.poisoned.Store(true)
 			// The publication-phase pwrites that DID land are torn
@@ -438,8 +455,37 @@ func (tx *Tx) Commit() error {
 			if tx.db.coord != nil {
 				tx.db.coord.BumpTakeoverSeq()
 			}
+			m, rerr := tx.pgr.ReadBackLatestMeta()
+			switch {
+			case rerr != nil:
+				// The verification read itself failed (exotic — both
+				// slots are page-cache preads): certainty is
+				// unavailable, so NO class is attached rather than a
+				// false one. NotVisible would invite a double-applying
+				// retry; the class sentinels are certainty statements
+				// (durability.md §Commit outcome classification,
+				// unclassified failures). Callers must treat this as
+				// do-not-retry and probe after re-Open.
+				classified = false
+			case m.TxnID == tx.newTxnID:
+				// Published. Under SyncDurable the durability contract
+				// includes step 4's meta fsync, which either failed or
+				// never ran once anything after step 3 errored — the
+				// commit is visible but its promised durability is
+				// unestablished. The lazier modes never promised that
+				// fsync, so a published commit there is exactly what
+				// their contract delivers: Visible.
+				if syncPolicy == pager.SyncBoth {
+					class = ErrCommitDurabilityUnknown
+				} else {
+					class = ErrCommitVisible
+				}
+			}
 		}
-		return mapPagerErr(err)
+		if !classified {
+			return fmt.Errorf("gmdb: commit failed and the outcome could not be verified (do not retry; re-Open and probe): %w", mapPagerErr(err))
+		}
+		return fmt.Errorf("%w: %w", class, mapPagerErr(err))
 	}
 	tx.db.mu.Lock()
 	// The reclamation bound no longer rides the meta adoption: the
@@ -582,6 +628,16 @@ func (tx *Tx) releaseGrant() {
 // step-1 runs after this), so AbortTx is strictly sufficient to
 // restore pre-flush state.
 func (tx *Tx) flushKeyspaces() error {
+	// Test injection seam: the reserve machinery makes a real flush
+	// failure engineered-unreachable in ordinary fixtures, but the
+	// failure PATH (assembly-class commit error: AbortTx, no poison,
+	// ErrCommitNotVisible) is contract and needs pinning — same
+	// pattern as commitStep4HookForTest.
+	if hook := flushFailHookForTest.Load(); hook != nil {
+		if err := (*hook)(); err != nil {
+			return err
+		}
+	}
 	if len(tx.dirtyDescriptors) == 0 && !tx.hasDirtyOpenKeyspaces() && !tx.hasDirtyOpenSetKeyspaces() {
 		return nil
 	}

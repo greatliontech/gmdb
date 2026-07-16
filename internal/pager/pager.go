@@ -64,6 +64,17 @@ var (
 	// structural-layout violation. mapPagerErr translates this into
 	// gmdb.ErrBadPageChecksum, the public api-surface.md sentinel.
 	ErrBadPageChecksum = errors.New("pager: page checksum mismatch")
+
+	// ErrMetaFsyncFailed marks a commit whose final meta fdatasync
+	// (step 4, SyncBoth only) failed AFTER step 3 published the new
+	// meta: the commit is VISIBLE (this handle, peers, and any
+	// non-crash reopen adopt it via highest-valid-TxnID selection) but
+	// its stable-storage durability is UNKNOWN — the failed fsync may
+	// have flushed nothing, everything, or part, and the kernel error
+	// state is consumed (durability.md §Commit Outcome
+	// Classification). Wrapped around the step-4 error so the root
+	// commit path can classify the outcome.
+	ErrMetaFsyncFailed = errors.New("pager: commit step-4 meta fdatasync failed")
 )
 
 // Pager resolves page bytes for one transaction. Read transactions get a

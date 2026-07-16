@@ -382,6 +382,76 @@ on-disk state, so a poisoned handle converges instead of compounding.
 re-check and the no-poison clause pinned by
 `TestCheckpointPoisonEdges`.)
 
+### Commit outcome classification
+
+Every failure of the commit protocol itself — anything after
+`Tx.Commit` passes its usage checks — wraps exactly ONE of three
+public class sentinels, so a caller can act on the transaction's
+true fate with `errors.Is`:
+
+- **`ErrCommitNotVisible`** — the transaction did NOT become the
+  database state: the on-disk active meta is still the previous
+  one. Assembly-phase failures (`ErrTxTooLarge`, `ErrDBFull` from
+  step 0, and descriptor-flush failures before the pipeline) carry
+  it trivially — no write was issued and the handle stays usable.
+  Publication-phase failures carry it only after VERIFICATION:
+  the commit path, still holding the write grant, reads the meta
+  slots back and finds the previous meta active (a torn or
+  suppressed step-3 pwrite leaves the new slot checksum-invalid,
+  so highest-valid-TxnID selection keeps the old meta). Safe to
+  retry in a fresh transaction (after re-Open when poisoned).
+- **`ErrCommitVisible`** — the commit reported an error, but the
+  readback under the still-held grant shows THIS transaction's
+  meta is the active one: the transaction IS the database state —
+  this handle's subsequent readers, peer processes (whose grant
+  re-sync adopts the highest valid TxnID), and any reopen all
+  observe it. A retry would apply the changes twice. This class is
+  reachable only under `SyncLazy` / `SyncDataOnly`: those modes
+  never promise the final meta fsync, so a published commit is
+  exactly what their contract delivers.
+- **`ErrCommitDurabilityUnknown`** — the commit is VISIBLE (step 3
+  published, verified as above) but the `SyncDurable` contract's
+  final meta fdatasync did not complete — either it FAILED (the
+  failed fsync may have flushed anything from nothing to
+  everything, and it consumed the kernel's per-fd error state, so
+  no retry on this handle can re-establish the guarantee — the
+  §Checkpoint failure semantics trap) or it NEVER RAN because the
+  pipeline errored between step 3 and step 4. Under `SyncDurable`
+  every post-publication failure therefore carries this class, not
+  plain Visible: the mode's promised durability is unestablished
+  either way. After a power loss the transaction may or may not
+  survive; recovery's anchoring rules keep whatever survives
+  consistent. Re-Open and `Checkpoint` to re-assert durability.
+
+**Unclassified failures.** The class sentinels are CERTAINTY
+statements; if the verification read itself fails (exotic — both
+slots are page-cache preads), the error carries NO class rather
+than a false one, with an explicit do-not-retry message. Callers
+dispatching on the three classes fall through to their
+conservative branch: do not retry; re-Open and probe.
+
+The readback happens UNDER THE STILL-HELD GRANT — `Tx.Commit`
+releases the grant only after classification — so no peer commit
+can interleave between the failure and the verification; the
+readback observes exactly the failed commit's on-disk outcome.
+Publication-phase failures of every class also poison the handle
+(see `ErrPoisoned`); the class tells the caller what the database
+STATE is, the poison governs what this HANDLE may still do.
+
+**Committed-visible** is the canonical name for the state a
+successfully-published transaction is in (step 3 landed,
+regardless of step 4): it is the state this handle's readers and
+peers observe, and the state the root version — `Version()` and
+the change-notification surface — reports. Durability lags
+visibility by exactly the configured SyncMode's remaining steps.
+
+(Enforced in `Tx.Commit`; pinned per class, with fault injection
+and reopen verification, by TestCommitOutcomeNotVisibleOnDataWriteFailure,
+TestCommitOutcomeNotVisibleOnMetaWriteLost,
+TestCommitOutcomeVisibleOnMetaWriteLanded,
+TestCommitOutcomeDurabilityUnknownOnMetaFsyncFailure, and
+TestCommitOutcomeAssemblyFailuresNotVisibleUnpoisoned.)
+
 ### Directory-entry durability
 
 fdatasync on the database file makes its BYTES durable; POSIX makes

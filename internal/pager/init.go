@@ -731,6 +731,28 @@ func ReadLatestMeta(file *os.File, pageSize uint32) (Meta, error) {
 	return decodeActiveMeta(meta0, meta1, active)
 }
 
+// ReadBackLatestMeta is ReadLatestMeta through the pager's FileOps
+// seam — the commit-outcome classification's verification read
+// (durability.md §Commit outcome classification). Routing through
+// p.fops keeps the readback on the same fd abstraction the failed
+// commit wrote through (and lets the fault-injection harness cover
+// the verification-failure path).
+func (p *Pager) ReadBackLatestMeta() (Meta, error) {
+	meta0 := make([]byte, MetaPayloadSize)
+	if _, err := p.fops.ReadAt(meta0, 0); err != nil {
+		return Meta{}, fmt.Errorf("pager: read meta0: %w", err)
+	}
+	meta1 := make([]byte, MetaPayloadSize)
+	if _, err := p.fops.ReadAt(meta1, int64(p.cfg.PageSize)); err != nil {
+		return Meta{}, fmt.Errorf("pager: read meta1: %w", err)
+	}
+	active, ok := ActiveMeta(meta0, meta1)
+	if !ok {
+		return Meta{}, errBothMetasInvalid()
+	}
+	return decodeActiveMeta(meta0, meta1, active)
+}
+
 // DiscoverPageSize returns the page size of the gmdb file by reading
 // meta-0 and verifying its checksum + identity (Magic, Version). When
 // meta-0 fails any of those, it probes meta-1 at each supported page

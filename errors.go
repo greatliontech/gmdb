@@ -153,6 +153,50 @@ var (
 	// mapBtreeErr so callers' errors.Is(err, ErrKeyTooLarge) works.
 	ErrKeyTooLarge = errors.New("gmdb: key exceeds maximum size")
 
+	// Commit outcome classification (durability.md §Commit Outcome
+	// Classification): every failure of the commit protocol itself —
+	// anything after Tx.Commit passes its usage checks (open handle,
+	// top-level tx) — wraps exactly one of the three class sentinels
+	// below, so a caller can act on the transaction's true fate with
+	// errors.Is. Publication-phase failures also poison the handle
+	// (Close + re-Open recovers); assembly-phase failures
+	// (ErrTxTooLarge, ErrDBFull) do not. Exception: if the
+	// classification readback itself fails (exotic), the error
+	// carries NO class — the sentinels are certainty statements —
+	// and callers must treat it as do-not-retry (durability.md
+	// §Commit outcome classification, unclassified failures).
+
+	// ErrCommitNotVisible: the transaction did NOT become the
+	// database state — the on-disk active meta is still the previous
+	// one (verified by meta-slot readback under the still-held write
+	// grant for publication failures; trivially true for
+	// assembly-phase failures, which issue no writes). Safe to retry
+	// in a fresh transaction (after re-Open when the handle was
+	// poisoned).
+	ErrCommitNotVisible = errors.New("gmdb: commit failed before publication — the transaction is not the database state")
+
+	// ErrCommitVisible: the commit reported an error, but meta-slot
+	// readback under the still-held grant shows this transaction's
+	// meta IS the active one — the transaction is the database state
+	// (this handle's readers, peer processes, and any reopen adopt
+	// it). Do NOT retry: a retry would apply the changes twice. The
+	// handle is poisoned. Reachable only under SyncLazy /
+	// SyncDataOnly (whose contracts never promised the final meta
+	// fsync); under SyncDurable a visible-but-errored commit
+	// classifies ErrCommitDurabilityUnknown instead.
+	ErrCommitVisible = errors.New("gmdb: commit failed after publication — the transaction IS the database state; do not retry")
+
+	// ErrCommitDurabilityUnknown: the transaction is VISIBLE (its
+	// meta published) but SyncDurable's final meta fdatasync did not
+	// complete — it failed, or never ran because the pipeline errored
+	// after publication — so whether the commit reached STABLE
+	// STORAGE is unknown: after a power loss it may or may not
+	// survive, and a failed fsync consumes the kernel's error state,
+	// so no retry can re-establish the guarantee on this handle. Do
+	// not retry the transaction (it is visible); re-Open and
+	// Checkpoint to re-assert durability.
+	ErrCommitDurabilityUnknown = errors.New("gmdb: commit visible but the final meta fsync failed — stable-storage durability unknown")
+
 	// ErrKeyspaceKindMismatch is returned by Tx.OpenKeyspace when
 	// the stored descriptor's Kind does not match the API used (e.g.
 	// OpenKeyspace on a Kind=1 SetKeyspace, OpenSetKeyspace on a

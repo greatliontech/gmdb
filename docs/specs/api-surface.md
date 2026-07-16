@@ -178,6 +178,11 @@ var (
     ErrDatabaseReadOnly        = errors.New("gmdb: database opened read-only")
     ErrTxClosed                = errors.New("gmdb: transaction already committed or rolled back")
     ErrPoisoned                = errors.New("gmdb: database handle is poisoned; Close and re-Open to recover")
+    // Commit outcome classes (durability.md §Commit outcome
+    // classification): every commit-protocol failure wraps exactly one.
+    ErrCommitNotVisible        = errors.New("gmdb: commit failed before publication — the transaction is not the database state")
+    ErrCommitVisible           = errors.New("gmdb: commit failed after publication — the transaction IS the database state; do not retry")
+    ErrCommitDurabilityUnknown = errors.New("gmdb: commit visible but the final meta fsync failed — stable-storage durability unknown")
     ErrClosed                  = errors.New("gmdb: database is closed")
     ErrCursorUnpositioned      = errors.New("gmdb: cursor not positioned")
     ErrCursorClosed            = errors.New("gmdb: cursor closed")

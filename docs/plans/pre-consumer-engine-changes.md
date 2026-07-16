@@ -95,7 +95,7 @@ and 10 remove.
       keys, `BulkLoad`/extsort, `Check`/repair, incremental
       compaction relocation, `Compact`/`CopyTo`; fuzz and property
       generator grammars extended to long keys end to end.
-- [ ] 11. Commit-outcome classification: the engine's
+- [x] 11. Commit-outcome classification: the engine's
       publication-failure semantics (`durability.md §Checkpoint
       failure semantics`, pager commit contract) exposed to
       callers as distinct sentinels — definitely-not-visible vs

@@ -179,7 +179,7 @@ func (p *Pager) Commit(cp CommitParams, prev Meta, prevActive int) (CommitResult
 	if p.commitStep4HookForTest != nil {
 		if err := p.commitStep4HookForTest(); err != nil {
 			p.AbortTx()
-			return CommitResult{}, fmt.Errorf("pager: step 4 fdatasync meta (test-injected): %w", err)
+			return CommitResult{}, fmt.Errorf("%w (test-injected): %w", ErrMetaFsyncFailed, err)
 		}
 	}
 
@@ -192,7 +192,7 @@ func (p *Pager) Commit(cp CommitParams, prev Meta, prevActive int) (CommitResult
 	if cp.Sync == SyncBoth {
 		if err := p.fops.Fdatasync(); err != nil {
 			p.AbortTx()
-			return CommitResult{}, fmt.Errorf("pager: step 4 fdatasync meta: %w", err)
+			return CommitResult{}, fmt.Errorf("%w: %w", ErrMetaFsyncFailed, err)
 		}
 		// The completed step-4 fsync anchors this commit's own
 		// assertion; persisted by the NEXT meta write.
