@@ -8,15 +8,14 @@ entries whose `Lands:` resolved to the current chunk were folded,
 redeferred, or closed.
 
 The v0 chunk roadmap, the architecture-consolidation plan, the
-defect-audit remediation plan, and the query-builder plan
-(structure phase + typed columns + query builder) are complete;
-their plans were deleted at close-out
-(`git log --all -- docs/plans/<name>.md` recovers them). The active
-plan is `docs/plans/pre-consumer-engine-changes.md`; entries not
-riding one of its chunks are condition-triggered with a
-self-contained condition. Entries may also be pulled as a
-proactive burn-down — each resolved as its own change set:
-diagnose → fix → regression test → adversarial review →
+defect-audit remediation plan, the query-builder plan (structure
+phase + typed columns + query builder), and the pre-consumer
+engine-changes plan are complete; their plans were deleted at
+close-out (`git log --all -- docs/plans/<name>.md` recovers them).
+No plan is currently active; every remaining entry is
+condition-triggered with a self-contained condition. Entries may
+also be pulled as a proactive burn-down — each resolved as its own
+change set: diagnose → fix → regression test → adversarial review →
 promote-then-delete.
 
 When an issue is resolved, the load-bearing rationale moves inline
