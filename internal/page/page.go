@@ -163,7 +163,7 @@ const MaxRestartGroupTarget uint16 = 255
 // is encoded against that assumption.
 //
 // RestartGroupTarget bounds (per page-formats.md):
-//   - 0   ⇒ engine default (DefaultRestartGroupTarget = 16).
+//   - 0   ⇒ engine default (DefaultRestartGroupTarget).
 //   - 1   ⇒ uncompressed-leaf variant (TypeLeafUncompressed).
 //   - 2.. ⇒ compressed-leaf variant (TypeLeaf) with target as the maximum
 //     group entry count.

@@ -377,11 +377,17 @@ per-page by the type byte:
 
 - **Plain branch (`TypeBranch`).** Full separator bytes per cell.
   Every binary-search probe compares directly against stored
-  separator bytes — no prefix gate, no reconstruction.
-- **Segregated branch (`TypeBranchSegregated`).** The separators'
-  single shared prefix stored once, suffix bytes packed in a heap
-  addressed by an offsets-only directory, child pointers in a
-  separate array.
+  separator bytes — no prefix gate, no reconstruction. The
+  per-descend latency floor; a keyspace declares it when its
+  trees are small and hot enough that per-level CPU outweighs
+  density.
+- **Segregated branch (`TypeBranchSegregated`, default).** The
+  separators' single shared prefix stored once, suffix bytes
+  packed in a heap addressed by an offsets-only directory, child
+  pointers in a separate array. Denser wherever separator
+  prefixes survive minimization (measured up to +42% fanout on
+  MVCC-shaped keys) — the default favors fanout, which at scale
+  buys tree depth, working-set size, and write amplification.
 
 Both encodings are pure functions of `(cfg, leftmost, cells)` — a
 `Check()` re-encode is byte-identical to the original writer's

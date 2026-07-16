@@ -80,7 +80,7 @@ and 10 remove.
       pager; contiguous extent assembly and the settled
       overflow-value ownership contract; `Check` and relocation
       walkers updated.
-- [ ] 8. Layout benchmarks + defaults: spike-methodology corpus
+- [x] 8. Layout benchmarks + defaults: spike-methodology corpus
       benchmarks over gmdb's real encodings; validate the
       spec-recorded defaults already in effect (segregated leaf —
       live since chunk 4 — segregated branch, restart-group
