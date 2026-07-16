@@ -565,6 +565,10 @@ func (r LeafReader) segValidate() error {
 					if gc != 1 {
 						return fmt.Errorf("%w: %s overflow-key restart entry in group with Count=%d (must be a singleton group)", ErrCorrupted, ctx, gc)
 					}
+				} else if t := r.cfg.InlineThreshold(); keyLen > t {
+					// Over-threshold keys MUST take the overflow-key
+					// form (page-formats.md §Overflow-Key Cells).
+					return fmt.Errorf("%w: %s inline KeyLen %d exceeds inline threshold %d (over-threshold keys take the overflow-key form)", ErrCorrupted, ctx, keyLen, t)
 				}
 			} else {
 				if flags&CellFlagOverflowKey != 0 {
@@ -583,6 +587,12 @@ func (r LeafReader) segValidate() error {
 					return fmt.Errorf("%w: %s unshared bytes: %w", ErrCorrupted, ctx, err)
 				}
 				keyLen = sharedLen + unsharedLen
+				if t := r.cfg.InlineThreshold(); keyLen > t {
+					// Deltas never carry the overflow-key form, so the
+					// reconstructed full key must be within the inline
+					// threshold (page-formats.md §Overflow-Key Cells).
+					return fmt.Errorf("%w: %s delta full-key length %d exceeds inline threshold %d", ErrCorrupted, ctx, keyLen, t)
+				}
 				next = off + 7 + unsharedLen
 			}
 			// VOff monotonicity + previous entry's span resolution.

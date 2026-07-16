@@ -582,15 +582,18 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 		// declaration).
 		return false, fmt.Errorf("%w: value len %d, keyspace FixedValueSize %d", ErrValueSizeMismatch, len(value), fvs)
 	}
-	// Member bound (limits.md: set values are bounded by the maximum
-	// key size — a member becomes a nested-tree KEY on promotion).
-	// Gated at entry so a member is accepted or rejected identically
-	// whether the key's set is a genesis subpage or already promoted
-	// — without this, an over-bound member is stored fine at genesis
-	// and then fails the promotion insert when a SECOND value
-	// arrives (the tree-shape-dependent late failure the uniform
-	// gate exists to prevent).
-	if !setValueWithinInlineBound(ks.builderCfg(), len(value)) {
+	// Member bound (limits.md §Maximum Value Size (Set Keyspaces)):
+	// set values share the KEY bound — the uint32 encoding limit —
+	// because a member becomes a nested-tree KEY on promotion, where
+	// an over-threshold member takes the overflow-key form
+	// (page-formats.md §Overflow-Key Cells). Gated at entry so a
+	// member is accepted or rejected identically whether the key's
+	// set is a genesis subpage or already promoted — without this, an
+	// over-bound member is stored fine at genesis and then fails the
+	// promotion insert when a SECOND value arrives (the
+	// tree-shape-dependent late failure the uniform gate exists to
+	// prevent).
+	if !btree.KeyWithinBound(len(value)) {
 		return false, fmt.Errorf("gmdb: set value exceeds maximum size (%d bytes): %w: %v",
 			len(value), ErrKeyTooLarge, btree.ErrKeyTooLarge)
 	}
@@ -665,17 +668,14 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 	}()
 
 	if ks.desc.Root == 0 {
-		// Genesis: build a single-entry subpage + insert as the
-		// keyspace's root cell.
-		sp, err := page.EncodeSubpage([][]byte{value}, fvs)
+		// Genesis: build the key's first-value cell (subpage, or a
+		// single-member nested tree when the value alone exceeds the
+		// promotion budget) + insert as the keyspace's root cell.
+		cell, err := ks.newSetKeyCell(cfg, key, value)
 		if err != nil {
-			return false, fmt.Errorf("SetKeyspace.Put: encode genesis subpage: %w", err)
+			return false, err
 		}
-		newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, page.LeafEntry{
-			Flags: page.CellFlagMultiValue,
-			Key:   key,
-			Value: sp,
-		})
+		newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, cell)
 		if err != nil {
 			return false, mapBtreeErr(err)
 		}
@@ -691,16 +691,13 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 		return false, mapBtreeErr(err)
 	}
 	if !found {
-		// New key in a non-empty tree.
-		sp, err := page.EncodeSubpage([][]byte{value}, fvs)
+		// New key in a non-empty tree — same first-value cell shape as
+		// genesis.
+		cell, err := ks.newSetKeyCell(cfg, key, value)
 		if err != nil {
-			return false, fmt.Errorf("SetKeyspace.Put: encode new-key subpage: %w", err)
+			return false, err
 		}
-		newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, page.LeafEntry{
-			Flags: page.CellFlagMultiValue,
-			Key:   key,
-			Value: sp,
-		})
+		newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, cell)
 		if err != nil {
 			return false, mapBtreeErr(err)
 		}
@@ -728,19 +725,92 @@ func (ks *SetKeyspace) Put(key, value []byte) (added bool, err error) {
 // cell with the new subpage. If the result exceeds the promotion
 // threshold, calls PromoteSubpageToNestedTree and installs a
 // nested-tree-ref cell.
+// subpageEntrySize is one value's contribution to a subpage's
+// DataSize — [ValueLen u16][bytes] variable, the bare stride fixed.
+// Mirrors setBulk.entrySize; used to PRE-check sizes before any
+// subpage is encoded (the encoder's uint16 DataSize cap must never
+// decide storage routing — the budget does, and it is far below the
+// cap).
+func subpageEntrySize(fvs uint16, v []byte) int {
+	if fvs != 0 {
+		return int(fvs)
+	}
+	return 2 + len(v)
+}
+
+// subpageBudgetForKey is the byte budget a key's subpage may occupy
+// before the set promotes it to a nested tree: the global promotion
+// threshold (set-keyspace.md §Subpage Promotion Threshold) capped by
+// the per-key splittability bound (btree.MaxSetCellValueForKey — a
+// MultiValue cell over half a leaf's capacity can strand a leaf with
+// no feasible two-way split, and subpage bytes have no overflow form
+// to promote out of the way). One budget, applied at every
+// subpage-producing site: genesis, subpage growth, bulk accumulation,
+// and demotion.
+func subpageBudgetForKey(cfg page.Config, key []byte) int {
+	return min(page.SubpagePromotionThreshold(cfg), btree.MaxSetCellValueForKey(cfg, key))
+}
+
+// newSetKeyCell builds the storage cell for a key's FIRST value: a
+// subpage cell when the single-member subpage fits the promotion
+// threshold, else a fresh single-member nested tree. Over-threshold
+// members are legal set values (limits.md §Maximum Value Size (Set
+// Keyspaces)), but a subpage past the threshold would overflow the
+// parent leaf (set-keyspace.md §Subpage Promotion Threshold), so
+// genesis promotes immediately; the member takes the overflow-key
+// form inside the nested tree when over `T` (page-formats.md
+// §Overflow-Key Cells). Fixed-size keyspaces (fvs <= T at creation)
+// take the subpage branch under keys whose per-key budget covers one
+// stride; an over-T key's budget may not, and the nested branch is
+// then the correct routing (the splittability bound applies to the
+// whole cell, key included).
+func (ks *SetKeyspace) newSetKeyCell(cfg page.Config, key, value []byte) (page.LeafEntry, error) {
+	fvs := ks.desc.FixedValueSize
+	// SIZE-precheck before encoding: the budget decides routing; the
+	// subpage encoder's uint16 DataSize cap (far above the budget)
+	// must never be reachable, or a large member errors out of the
+	// encoder instead of routing to a nested tree.
+	if page.SubpageHeaderSize+subpageEntrySize(fvs, value) <= subpageBudgetForKey(cfg, key) {
+		sp, err := page.EncodeSubpage([][]byte{value}, fvs)
+		if err != nil {
+			return page.LeafEntry{}, fmt.Errorf("SetKeyspace.Put: encode first-value subpage: %w", err)
+		}
+		return page.LeafEntry{Flags: page.CellFlagMultiValue, Key: key, Value: sp}, nil
+	}
+	root, err := btree.Put(btreeWriter{ks.tx.pgr}, cfg, 0, value, nil)
+	if err != nil {
+		return page.LeafEntry{}, mapBtreeErr(err)
+	}
+	return page.LeafEntry{
+		Flags:       page.CellFlagMultiValue | page.CellFlagNestedTree,
+		Key:         key,
+		NestedRoot:  root,
+		NestedCount: 1,
+	}, nil
+}
+
 func (ks *SetKeyspace) putIntoSubpage(cfg page.Config, key, value []byte, e page.LeafEntry) (bool, error) {
 	fvs := ks.desc.FixedValueSize
 	sp := page.NewSubpageReader(e.Value, fvs)
-	newSubpage, added, err := sp.Insert(value)
-	if err != nil {
-		return false, fmt.Errorf("SetKeyspace.Put: subpage Insert: %w", err)
-	}
-	if !added {
-		// Duplicate value — no-op.
+	if _, found := sp.Search(value); found {
+		// Duplicate value — no-op (checked before any size routing so
+		// the promote path below never sees a duplicate —
+		// PromoteSubpageToNestedTree treats one as corruption).
 		return false, nil
 	}
-	threshold := page.SubpagePromotionThreshold(cfg)
-	if len(newSubpage) <= threshold {
+	// SIZE-precheck before Insert: the budget decides subpage-vs-
+	// promote; the encoder's uint16 DataSize cap (far above the
+	// budget) must never be reachable — see newSetKeyCell.
+	threshold := subpageBudgetForKey(cfg, key)
+	if len(e.Value)+subpageEntrySize(fvs, value) <= threshold {
+		newSubpage, added, err := sp.Insert(value)
+		if err != nil {
+			return false, fmt.Errorf("SetKeyspace.Put: subpage Insert: %w", err)
+		}
+		if !added {
+			// Unreachable after the Search above; defensive.
+			return false, nil
+		}
 		// Fits — update the subpage cell in place via PutEntry.
 		newRoot, _, err := btree.PutEntry(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, page.LeafEntry{
 			Flags: page.CellFlagMultiValue,
@@ -1355,7 +1425,7 @@ func (ks *SetKeyspace) deleteValueFromNestedTree(cfg page.Config, key, value []b
 		return nil
 	}
 	// Try to demote.
-	subpageBytes, demoted, err := btree.DemoteNestedTreeIfFits(btreeWriter{ks.tx.pgr}, cfg, fvs, newNestedRoot)
+	subpageBytes, demoted, err := btree.DemoteNestedTreeIfFits(btreeWriter{ks.tx.pgr}, cfg, fvs, newNestedRoot, subpageBudgetForKey(cfg, key))
 	if err != nil {
 		return mapBtreeErr(err)
 	}
@@ -1383,14 +1453,4 @@ func (ks *SetKeyspace) deleteValueFromNestedTree(cfg page.Config, key, value []b
 	ks.markDirty()
 	ks.markSetCursorsStale()
 	return nil
-}
-
-// setValueWithinInlineBound bounds set values at the inline threshold:
-// a set value becomes a nested-tree KEY on promotion, and the
-// set-keyspace surface has not yet adopted the overflow-key member
-// form — over-threshold values keep the clean ErrKeyTooLarge surface
-// until it does (limits.md §Maximum Value Size (Set Keyspaces) defines
-// the target state; fixed-stride sets stay bounded permanently).
-func setValueWithinInlineBound(cfg page.Config, n int) bool {
-	return n <= cfg.InlineThreshold()
 }

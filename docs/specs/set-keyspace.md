@@ -71,7 +71,10 @@ Invariant: kind=clause-explicit;
   property=Subpage promotion to a nested B+tree fires when inserting
     a new value would cause the subpage to exceed 50% of the leaf
     page's usable space (PageSize minus header, restart metadata,
-    restart table, and optional checksum footer);
+    restart table, and optional checksum footer), capped per key at
+    the splittability bound (§Subpage Promotion Threshold — the
+    parent-leaf cell must stay within half a leaf's single-entry
+    capacity);
   from=this spec §Subpage Promotion Threshold;
   violation=Crossing the threshold without promoting overflows the
     parent leaf and corrupts the surrounding restart-group encoding;
@@ -319,7 +322,20 @@ also small by definition (below the 50% promotion threshold).
 A subpage is promoted to a nested B+tree when inserting a new value
 would cause the subpage to exceed **50% of the leaf page's usable
 space** (PageSize minus header, restart metadata, restart table, and
-optional checksum footer).
+optional checksum footer) — capped per key at the SPLITTABILITY
+bound: the resulting parent-leaf CELL (entry header + the key's
+resident cost + the subpage bytes) must stay within half a leaf's
+single-entry capacity, because a mid-leaf cell past that can leave
+the leaf with no feasible two-way split and subpage bytes have no
+overflow form to promote out of the way (`page-formats.md §Leaf
+Split`, three-way fallback — which covers key cells, not subpage
+payloads). For a long (overflow-form) key the resident cost consumes
+most of the half-page budget, so such keys promote to a nested tree
+from their first value. The same per-key budget gates demotion, so a
+delete never re-creates an over-budget subpage cell. This rule also
+covers a key's FIRST value: one whose single-member subpage exceeds
+the budget goes straight to a single-member nested tree (its member
+in the overflow-key form when over `T`).
 
 Promotion:
 

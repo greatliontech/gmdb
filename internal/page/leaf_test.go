@@ -939,3 +939,81 @@ func buildLeafF(cfg Config, entries [][2]string) []byte {
 	b.Finish()
 	return buf
 }
+
+// TestValidateRejectsOverThresholdInlineKey (page-formats.md
+// §Overflow-Key Cells): keys over the inline threshold MUST take the
+// overflow-key form — a page carrying an over-T INLINE key
+// (restart/uncompressed) fails Validate on every variant. The
+// LeafBuilder itself is the forgery tool: it performs no over-T
+// conversion (that is the btree layer's job), so AddInline with an
+// over-T key lays down a structurally-consistent page that violates
+// ONLY this rule.
+func TestValidateRejectsOverThresholdInlineKey(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"seg", Config{PageSize: 4096}},
+		{"ivl", Config{PageSize: 4096, LeafLayout: LeafLayoutInterleaved}},
+		{"uc", Config{PageSize: 4096, RestartGroupTarget: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			tSz := cfg.InlineThreshold()
+			// Boundary control: exactly T validates; T+1 must not.
+			legal := make([]byte, cfg.PageSize)
+			lb := NewLeafBuilder(legal, cfg)
+			if !lb.AddInline(bytes.Repeat([]byte{'k'}, tSz), []byte("v")) {
+				t.Fatal("fixture: T-length key does not fit an empty leaf")
+			}
+			lb.Finish()
+			if err := NewLeafReader(legal, cfg).Validate(); err != nil {
+				t.Fatalf("legal T-length inline key rejected: %v", err)
+			}
+			buf := make([]byte, cfg.PageSize)
+			b := NewLeafBuilder(buf, cfg)
+			if !b.AddInline(bytes.Repeat([]byte{'k'}, tSz+1), []byte("v")) {
+				t.Fatal("fixture: T+1 key does not fit an empty leaf")
+			}
+			b.Finish()
+			if err := NewLeafReader(buf, cfg).Validate(); err == nil {
+				t.Fatal("over-T inline key passed Validate — the overflow-key form rule is unenforced")
+			}
+		})
+	}
+}
+
+// TestValidateRejectsOverThresholdDeltaKey: the delta arm of the same
+// rule — a reconstructed (shared+unshared) key over T fails Validate
+// on both compressed variants. Built through the ungated builder like
+// the inline arm; the restart anchor stays at T (legal) so only the
+// DELTA rule can reject.
+func TestValidateRejectsOverThresholdDeltaKey(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"seg", Config{PageSize: 4096}},
+		{"ivl", Config{PageSize: 4096, LeafLayout: LeafLayoutInterleaved}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			tSz := cfg.InlineThreshold()
+			buf := make([]byte, cfg.PageSize)
+			b := NewLeafBuilder(buf, cfg)
+			restart := bytes.Repeat([]byte{'k'}, tSz)
+			deltaKey := append(bytes.Clone(restart), 'z') // T+1, sharing all of T
+			if !b.AddInline(restart, []byte("v")) || !b.AddInline(deltaKey, []byte("w")) {
+				t.Fatal("fixture: entries do not fit")
+			}
+			b.Finish()
+			r := NewLeafReader(buf, cfg)
+			if r.GroupEntryCount(0) != 2 {
+				t.Fatalf("fixture: entries did not share a group (count=%d) — the delta arm is not exercised", r.GroupEntryCount(0))
+			}
+			if err := r.Validate(); err == nil {
+				t.Fatal("over-T delta full key passed Validate — the overflow-key form rule is unenforced for deltas")
+			}
+		})
+	}
+}

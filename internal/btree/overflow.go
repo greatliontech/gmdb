@@ -132,6 +132,27 @@ func OverflowRefFitsLeaf(cfg page.Config, key []byte) bool {
 	return overflowRefFitsLeaf(cfg, key)
 }
 
+// MaxSetCellValueForKey returns the byte budget for a MultiValue
+// cell's inline value (its subpage bytes) under `key`: half a
+// single-entry leaf's capacity, minus the entry header and the key's
+// resident cost. The half-capacity cap is what keeps every leaf
+// SPLITTABLE: a two-way split can isolate only an END cell, so a
+// mid-leaf cell larger than half a page can make every contiguous
+// two-partition overflow — and unlike plain inline values, subpage
+// bytes have no overflow form to promote out of the way (the escape
+// valve putReportCore's size-skew retry uses). With every cell at or
+// under half capacity, the greedy split boundary always leaves both
+// halves fitting (left fills past capacity-minus-half before
+// declining, so the remainder is at most half plus half). The set
+// surface promotes a subpage to a nested tree when it would exceed
+// min(page.SubpagePromotionThreshold, this) — the per-key term binds
+// for long (overflow-form) keys, whose resident cost consumes most of
+// the half-page budget.
+func MaxSetCellValueForKey(cfg page.Config, key []byte) int {
+	half := (cfg.ContentEnd() - singleEntryPageOverhead) / 2
+	return half - inlineEntryHeaderOverhead - residentKeyCost(cfg, key)
+}
+
 // writeOverflowChain allocates a contiguous run of pages, encodes
 // `value` across them, and returns the new LeafEntry with overflow
 // fields set. On error any partial allocation is rolled back via

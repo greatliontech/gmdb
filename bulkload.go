@@ -15,13 +15,13 @@ import (
 // not fit on an otherwise-empty leaf page. On the KEYSPACE path it is a
 // defensive guard against a caller/engine bug — the layer promotes
 // over-inline values to overflow-reference entries and pre-checks the
-// key (bulkLeafEntry → ErrKeyTooLarge). On the SET path it IS reachable
-// in-spec for variable-size sets: a key's FIRST value bypasses the
-// promotion threshold by design (matching Put's genesis shape, which
-// never threshold-checks a single value), so an oversize first value —
-// or an oversize member reaching a nested builder as its key — hits
-// this guard; bulkMapEntryTooLarge translates it to the public
-// ErrKeyTooLarge exactly as the same input surfaces through Put.
+// key (bulkLeafEntry → ErrKeyTooLarge). On the SET path the members'
+// nested-builder entries take the overflow-key form over the inline
+// threshold (bulkSetMemberEntry) and an over-budget first value goes
+// straight to a nested tree, so the guard is defensive there too;
+// bulkMapEntryTooLarge keeps the translation for any residual path so
+// a user-derived entry surfaces the public ErrKeyTooLarge exactly as
+// the same input would through Put.
 var errBulkEntryTooLarge = errors.New("gmdb: bulkload entry too large for an empty leaf page")
 
 // bulkMapEntryTooLarge translates the builder's empty-leaf guard
@@ -697,6 +697,7 @@ type setBulk struct {
 	cfg       page.Config
 	fvs       uint16
 	threshold int
+	keyBudget int // per-key subpage budget (see startKey)
 
 	haveKey   bool
 	curKey    []byte
@@ -714,10 +715,15 @@ type setBulk struct {
 	total  uint64       // total members across all keys
 }
 
-// startKey begins accumulating a fresh key's value set.
+// startKey begins accumulating a fresh key's value set. The per-key
+// subpage budget caps the global promotion threshold by the
+// splittability bound (btree.MaxSetCellValueForKey) — the same rule
+// the online subpageBudgetForKey applies, so bulk and incremental
+// loads produce the same subpage-vs-nested shape.
 func (sb *setBulk) startKey(key []byte) {
 	sb.curKeyBuf = append(sb.curKeyBuf[:0], key...)
 	sb.curKey = sb.curKeyBuf
+	sb.keyBudget = min(sb.threshold, btree.MaxSetCellValueForKey(sb.cfg, key))
 	sb.haveKey = true
 	sb.buffered = sb.buffered[:0]
 	sb.bufferedSize = page.SubpageHeaderSize
@@ -744,32 +750,37 @@ func (sb *setBulk) entrySize(v []byte) int {
 // order). Buffers it as a subpage entry, or — once the subpage would exceed
 // the promotion threshold — streams it into the nested builder.
 func (sb *setBulk) addValue(v []byte) error {
-	// Member bound (limits.md: set values are bounded by the maximum
-	// key size — a member becomes a nested-tree KEY on promotion):
-	// the same gate the online putIntoNestedTree applies via
-	// btree.Put, so bulk and incremental loads accept identical
-	// data. Checked before EITHER storage branch — the post-
-	// promotion nested path must not readmit what the subpage path
-	// rejects.
-	if !setValueWithinInlineBound(sb.cfg, len(v)) {
+	// Member bound (limits.md §Maximum Value Size (Set Keyspaces)):
+	// the uint32 KEY bound — the same gate the online SetKeyspace.Put
+	// applies, so bulk and incremental loads accept identical data.
+	// Checked before EITHER storage branch — the post-promotion
+	// nested path must not readmit what the subpage path rejects.
+	if !btree.KeyWithinBound(len(v)) {
 		return btree.ErrKeyTooLarge
 	}
 	sb.total++
 	if sb.nested != nil {
-		return sb.nested.add(page.LeafEntry{Key: v}, v)
+		e, err := bulkSetMemberEntry(sb.pw, sb.cfg, v)
+		if err != nil {
+			return err
+		}
+		return sb.nested.add(e, v)
 	}
 	newSize := sb.bufferedSize + sb.entrySize(v)
-	// Promote only when a SECOND-or-later value would push the subpage past
-	// the threshold. The first value of a key always stays a subpage —
-	// exactly as SetKeyspace.Put's genesis path, which never threshold-
-	// checks the first value (set_keyspace.go Put: a new key's single value
-	// is stored as a subpage regardless of size). This keeps the
-	// bulk-built storage shape identical to the per-Put shape.
-	if len(sb.buffered) > 0 && newSize > sb.threshold {
+	// Promote whenever the subpage would exceed the threshold —
+	// including on a key's FIRST value (an over-budget single value
+	// goes straight to a single-member nested tree), exactly as
+	// SetKeyspace.Put's genesis path. This keeps the bulk-built
+	// storage shape identical to the per-Put shape.
+	if newSize > sb.keyBudget {
 		if err := sb.promote(); err != nil {
 			return err
 		}
-		return sb.nested.add(page.LeafEntry{Key: v}, v)
+		e, err := bulkSetMemberEntry(sb.pw, sb.cfg, v)
+		if err != nil {
+			return err
+		}
+		return sb.nested.add(e, v)
 	}
 	sb.buffered = append(sb.buffered, bytes.Clone(v))
 	sb.bufferedSize = newSize
@@ -781,7 +792,11 @@ func (sb *setBulk) addValue(v []byte) error {
 func (sb *setBulk) promote() error {
 	sb.nested = newBulkBuilder(sb.pw, sb.cfg)
 	for _, v := range sb.buffered {
-		if err := sb.nested.add(page.LeafEntry{Key: v}, v); err != nil {
+		e, err := bulkSetMemberEntry(sb.pw, sb.cfg, v)
+		if err != nil {
+			return err
+		}
+		if err := sb.nested.add(e, v); err != nil {
 			return err
 		}
 	}
@@ -871,16 +886,43 @@ func bulkLeafEntry(pw bulkOverflowWriter, cfg page.Config, key, value []byte) (p
 	// Key half: an over-threshold key takes the overflow-key form
 	// (page-formats.md §Overflow-Key Cells) with its extent written
 	// through the same bulk writer as value overflow.
+	if err := applyBulkOverflowKey(pw, cfg, &e, key); err != nil {
+		return page.LeafEntry{}, err
+	}
+	return e, nil
+}
+
+// applyBulkOverflowKey converts e to the overflow-key form when its
+// full key exceeds the inline threshold: the extent holding key[T:]
+// is written through the bulk writer and e carries the resident
+// first-T slice + the extent reference (page-formats.md §Overflow-Key
+// Cells). No-op for keys within the threshold. Shared by the keyspace
+// entry builder (bulkLeafEntry) and the set nested-member builder
+// (bulkSetMemberEntry) — one conversion, no drift.
+func applyBulkOverflowKey(pw bulkOverflowWriter, cfg page.Config, e *page.LeafEntry, key []byte) error {
 	t := cfg.InlineThreshold()
-	if len(key) > t {
-		ext, err := writeBulkOverflowChain(pw, cfg, key[t:])
-		if err != nil {
-			return page.LeafEntry{}, err
-		}
-		e.Flags |= page.CellFlagOverflowKey
-		e.KeyTotalLen = uint32(len(key))
-		e.Key = key[:t]
-		e.KeyExtPage = ext
+	if len(key) <= t {
+		return nil
+	}
+	ext, err := writeBulkOverflowChain(pw, cfg, key[t:])
+	if err != nil {
+		return err
+	}
+	e.Flags |= page.CellFlagOverflowKey
+	e.KeyTotalLen = uint32(len(key))
+	e.Key = key[:t]
+	e.KeyExtPage = ext
+	return nil
+}
+
+// bulkSetMemberEntry builds one nested-tree member entry for the set
+// bulk path: the member is the nested tree's KEY with no value; an
+// over-threshold member takes the overflow-key form (limits.md
+// §Maximum Value Size (Set Keyspaces)).
+func bulkSetMemberEntry(pw bulkOverflowWriter, cfg page.Config, v []byte) (page.LeafEntry, error) {
+	e := page.LeafEntry{Key: v}
+	if err := applyBulkOverflowKey(pw, cfg, &e, v); err != nil {
+		return page.LeafEntry{}, err
 	}
 	return e, nil
 }

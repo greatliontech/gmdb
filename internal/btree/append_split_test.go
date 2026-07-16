@@ -369,3 +369,71 @@ func TestPutEntryAscendingPacksLeavesFull(t *testing.T) {
 		}
 	}
 }
+
+// TestPutThreeWaySplitBetweenJumboCells (page-formats.md §Leaf Split,
+// three-way fallback): an insert landing between cells that cannot
+// pair with any neighbor — overflow-key cells are singleton-restart
+// entries whose resident alone is ~half a page, and a near-T inline
+// key has the same shape — has NO feasible two-page partition and no
+// inline value to promote. The store loop isolates the inserted entry
+// on its own page (three-way split). Minimized from the long-key
+// property harness's first counterexample.
+func TestPutThreeWaySplitBetweenJumboCells(t *testing.T) {
+	cfg := page.Config{PageSize: 4096, PageChecksum: true}
+	pw := newFakeWriter(t, 4096)
+	root := uint64(0)
+	z := func(n int, last byte) []byte {
+		b := bytes.Repeat([]byte{0}, n)
+		b[n-1] = last
+		return b
+	}
+	puts := []struct {
+		klen, vlen int
+		last       byte
+	}{
+		{1, 1, 0},     // tiny anchor
+		{2013, 1, 1},  // overflow-key jumbo
+		{2008, 3, 0},  // near-T inline jumbo
+		{2013, 17, 0}, // overflow-key jumbo landing BETWEEN the other two
+	}
+	keys := make([][]byte, len(puts))
+	for i, p := range puts {
+		keys[i] = z(p.klen, p.last)
+		nr, err := Put(pw, cfg, root, keys[i], bytes.Repeat([]byte{0}, p.vlen))
+		if err != nil {
+			t.Fatalf("Put #%d (klen=%d): %v", i, p.klen, err)
+		}
+		root = nr
+	}
+	// Every key readable, order valid, and the same through PutEntry.
+	for i, p := range puts {
+		v, found, err := Get(pw, cfg, root, keys[i])
+		if err != nil || !found || len(v) != p.vlen {
+			t.Fatalf("Get #%d: found=%v len=%d err=%v", i, found, len(v), err)
+		}
+	}
+	if _, _, err := ValidateOrder(pw, cfg, root, ^uint64(0), 0,
+		func(kind OrderViolationKind, pageID uint64, msg string) bool {
+			t.Errorf("order violation %v at %d: %s", kind, pageID, msg)
+			return true
+		}); err != nil {
+		t.Fatalf("ValidateOrder: %v", err)
+	}
+
+	// PutEntry parity: the caller-managed path takes the same fallback.
+	pw2 := newFakeWriter(t, 4096)
+	root2 := uint64(0)
+	for i, p := range puts {
+		e := page.LeafEntry{Key: keys[i], Value: bytes.Repeat([]byte{0}, p.vlen)}
+		nr, _, err := PutEntry(pw2, cfg, root2, e)
+		if err != nil {
+			t.Fatalf("PutEntry #%d (klen=%d): %v", i, p.klen, err)
+		}
+		root2 = nr
+	}
+	for i := range puts {
+		if _, found, err := Get(pw2, cfg, root2, keys[i]); err != nil || !found {
+			t.Fatalf("PutEntry-built Get #%d: found=%v err=%v", i, found, err)
+		}
+	}
+}

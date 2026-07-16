@@ -812,6 +812,13 @@ func (r LeafReader) validateFullKeyEntry(off int) (next, keyLen int, flags uint8
 			return 0, 0, 0, fmt.Errorf("overflow-key resident length %d != inline threshold %d", keyLen, t)
 		}
 		keyTail = 12
+	} else if t := r.cfg.InlineThreshold(); keyLen > t {
+		// Keys over the inline threshold MUST take the overflow-key
+		// form (page-formats.md §Overflow-Key Cells) — an over-T
+		// inline KeyLen is a forged page or an encoder that bypassed
+		// the conversion (and past 65535 the u16 field would have
+		// wrapped, silently aliasing keys).
+		return 0, 0, 0, fmt.Errorf("inline KeyLen %d exceeds inline threshold %d (over-threshold keys take the overflow-key form)", keyLen, t)
 	}
 	if cellHasTrailerOnly(flags) {
 		// Overflow: [.. Key half ..][OvflPage u64][TotalLen u64].
@@ -907,6 +914,12 @@ func (r LeafReader) validateDeltaEntry(off, prevKeyLen int) (next, keyLen int, e
 		return 0, 0, fmt.Errorf("delta SharedLen %d exceeds previous full-key length %d", sharedLen, prevKeyLen)
 	}
 	keyLen = sharedLen + unsharedLen
+	if t := r.cfg.InlineThreshold(); keyLen > t {
+		// Delta entries never carry the overflow-key form (rejected
+		// above), so the reconstructed full key must be within the
+		// inline threshold (page-formats.md §Overflow-Key Cells).
+		return 0, 0, fmt.Errorf("delta full-key length %d exceeds inline threshold %d", keyLen, t)
+	}
 	if cellHasTrailerOnly(flags) {
 		// Overflow: [Flags][SharedLen][UnsharedLen][UnsharedKey][OvflPage][TotalLen].
 		// NestedTree: [Flags][SharedLen][UnsharedLen][UnsharedKey][Root][Count].

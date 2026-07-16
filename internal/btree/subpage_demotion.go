@@ -23,8 +23,9 @@ import (
 
 // DemoteNestedTreeIfFits inspects the nested tree rooted at rootID
 // and demotes it to a subpage if the tree is a single leaf whose
-// values fit as a subpage (encoded subpage size ≤
-// `page.SubpagePromotionThreshold(cfg)`). Returns:
+// values fit as a subpage (encoded subpage size ≤ maxSubpage — the
+// caller's per-key budget, normally min(promotion threshold,
+// MaxSetCellValueForKey)). Returns:
 //
 //   - (subpageBytes, true, nil) — demoted. The caller writes
 //     subpageBytes via `LeafBuilder.AddSubpage` in the parent leaf;
@@ -64,6 +65,7 @@ func DemoteNestedTreeIfFits(
 	cfg page.Config,
 	fixedValueSize uint16,
 	rootID uint64,
+	maxSubpage int,
 ) (subpageBytes []byte, demoted bool, err error) {
 	if rootID == 0 {
 		return nil, false, fmt.Errorf("%w: DemoteNestedTreeIfFits called with rootID=0", ErrCorrupted)
@@ -109,7 +111,38 @@ func DemoteNestedTreeIfFits(
 			ErrCorrupted, rootID)
 	}
 
+	// SIZE pre-pass: sum the candidate subpage's DataSize from the
+	// entries' stored lengths (KeyTotalLen for overflow-key members —
+	// no extent read needed) and DECLINE before materializing or
+	// encoding anything. The budget is far below the subpage
+	// encoder's uint16 DataSize cap, so gating here keeps the cap
+	// unreachable — an over-budget single leaf must stay a nested
+	// tree, never surface an encoder error from an in-spec delete.
+	{
+		sum := page.SubpageHeaderSize
+		pre := r.IterForReuse(nil, nil, nil)
+		for {
+			e, ok := pre.Next()
+			if !ok {
+				break
+			}
+			memberLen := len(e.Key)
+			if e.IsOverflowKey() {
+				memberLen = int(e.KeyTotalLen)
+			}
+			if fixedValueSize != 0 {
+				sum += int(fixedValueSize)
+			} else {
+				sum += 2 + memberLen
+			}
+		}
+		if sum > maxSubpage {
+			return nil, false, nil
+		}
+	}
+
 	values := make([][]byte, 0, r.Count())
+	var extentEntries []page.LeafEntry
 	it := r.IterForReuse(nil, nil, nil)
 	for {
 		e, ok := it.Next()
@@ -117,13 +150,27 @@ func DemoteNestedTreeIfFits(
 			break
 		}
 		// Defensive: nested-tree leaves hold members as plain inline
-		// or compact empty-value cells (§Nested B+tree Reference Cell
-		// + page-formats.md empty-value cell). A nested-tree leaf
-		// containing MultiValue or Overflow cells is structural
-		// corruption.
-		if e.Flags&^page.CellFlagEmptyValue != 0 {
-			return nil, false, fmt.Errorf("%w: nested-tree leaf %d entry has unexpected CellFlags 0x%x (expected a plain inline or empty-value cell)",
+		// or compact empty-value cells — over-threshold members in
+		// the overflow-key form (§Nested B+tree Reference Cell +
+		// page-formats.md §Overflow-Key Cells / empty-value cell). A
+		// nested-tree leaf containing MultiValue or value-Overflow
+		// cells is structural corruption.
+		if e.Flags&^(page.CellFlagEmptyValue|page.CellFlagOverflowKey) != 0 {
+			return nil, false, fmt.Errorf("%w: nested-tree leaf %d entry has unexpected CellFlags 0x%x (expected a plain inline, empty-value, or overflow-key cell)",
 				ErrCorrupted, rootID, e.Flags)
+		}
+		if e.IsOverflowKey() {
+			// The subpage stores the member's FULL bytes; materialize
+			// resident + extent, and record the extent for retirement
+			// on the demote path (the subpage carries the bytes, so a
+			// surviving extent would orphan its run).
+			full, kerr := materializeEntryKey(pw, cfg, e)
+			if kerr != nil {
+				return nil, false, kerr
+			}
+			values = append(values, full)
+			extentEntries = append(extentEntries, e)
+			continue
 		}
 		// Copy the key bytes — they're borrowed from the leaf's
 		// buf, which we're about to FreePage on the successful
@@ -149,14 +196,25 @@ func DemoteNestedTreeIfFits(
 		return nil, false, fmt.Errorf("%w: DemoteNestedTreeIfFits: EncodeSubpage for leaf %d (%d values): %w",
 			ErrCorrupted, rootID, len(values), err)
 	}
-	if len(candidate) > page.SubpagePromotionThreshold(cfg) {
-		// Single leaf but doesn't fit as subpage — keep as nested
-		// tree. No state change.
+	if len(candidate) > maxSubpage {
+		// Single leaf but doesn't fit the caller's subpage budget
+		// (the promotion threshold capped by the per-key
+		// splittability bound — see the set surface's
+		// subpageBudgetForKey) — keep as nested tree. No state
+		// change.
 		return nil, false, nil
 	}
 
-	// Demote: free the nested-root leaf, return the subpage bytes
-	// for the caller to install in the parent cell.
+	// Demote: retire the overflow-key members' extents FIRST (their
+	// bytes now live in the subpage; the leaf still references them,
+	// so a mid-retirement fault cannot observably orphan a run), then
+	// free the nested-root leaf, and return the subpage bytes for the
+	// caller to install in the parent cell.
+	for _, e := range extentEntries {
+		if err := freeKeyExtentIfPresent(pw, cfg, e); err != nil {
+			return nil, false, err
+		}
+	}
 	if err := pw.FreePage(rootID); err != nil {
 		return nil, false, fmt.Errorf("DemoteNestedTreeIfFits: free nested-root leaf %d: %w", rootID, err)
 	}

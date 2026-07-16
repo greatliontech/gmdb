@@ -337,7 +337,7 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 				rollbackNewChain()
 				return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, e)
 			}
-			nr, e := ascendWithSplit(pw, cfg, path, leftID, sepCell, rightmost)
+			nr, e := ascendWithSplit(pw, cfg, path, leftID, []page.BranchCell{sepCell}, rightmost)
 			if e != nil {
 				_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 				_ = pw.FreePage(leftID)
@@ -450,9 +450,47 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			// index on ties), so Check()/recovery re-encode preserves it.
 			pi := largestInlineEntry(entries)
 			if pi < 0 {
-				_ = pw.FreePage(leftID)
-				rollbackNewChain()
-				return 0, false, ErrKeyTooLarge
+				// Nothing left to promote: the multiset genuinely needs
+				// THREE pages — an insert between un-pairable jumbo
+				// cells (page-formats.md §Leaf Split, three-way
+				// fallback). Isolate the inserted entry at searchIdx.
+				seps, ok3, terr := splitLeafThreeWay(pw, cfg, leftBuf, entries, searchIdx)
+				if terr != nil {
+					_ = pw.FreePage(leftID)
+					rollbackNewChain()
+					return 0, false, terr
+				}
+				if !ok3 {
+					_ = pw.FreePage(leftID)
+					rollbackNewChain()
+					return 0, false, ErrKeyTooLarge
+				}
+				freeSepsAndPages := func() {
+					for _, sc := range seps {
+						_ = freeBranchCellExtentIfPresent(pw, cfg, sc)
+						_ = pw.FreePage(sc.Child)
+					}
+					_ = pw.FreePage(leftID)
+					rollbackNewChain()
+				}
+				if err := freeOverflowChainIfPresent(pw, cfg, displaced); err != nil {
+					freeSepsAndPages()
+					return 0, false, err
+				}
+				if err := freeKeyExtentIfPresent(pw, cfg, displaced); err != nil {
+					freeSepsAndPages()
+					return 0, false, err
+				}
+				if err := pw.FreePage(leafID); err != nil {
+					freeSepsAndPages()
+					return 0, false, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
+				}
+				nr, e := ascendWithSplit(pw, cfg, path, leftID, seps, false)
+				if e != nil {
+					freeSepsAndPages()
+					return 0, false, e
+				}
+				return nr, existed, nil
 			}
 			promoted, perr := writeOverflowChain(pw, cfg, entries[pi].Key, entries[pi].Value)
 			if perr != nil {
@@ -550,7 +588,7 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 			rollbackNewChain()
 			return 0, false, e
 		}
-		nr, e := ascendWithSplit(pw, cfg, path, leftID, sepCell, rightmost && appendPos)
+		nr, e := ascendWithSplit(pw, cfg, path, leftID, []page.BranchCell{sepCell}, rightmost && appendPos)
 		if e != nil {
 			_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 			_ = pw.FreePage(leftID)
@@ -790,7 +828,11 @@ func ascendNoSplit(pw PageWriter, cfg page.Config, path []pathFrame, newChildID 
 // separator alone seeds the right branch — instead of byte-balanced,
 // so ascending-key workloads pack branch levels full too
 // (page-formats.md §Leaf Split, append-aware policy).
-func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID uint64, sepCell page.BranchCell, rightmostAppend bool) (uint64, error) {
+// sepCells carries one separator per NEW right sibling, in key order —
+// one for the ordinary two-way split, two for the three-way fallback
+// that isolates an un-pairable jumbo entry (see splitLeafThreeWay).
+// Every cell inserts at the same childIdx position.
+func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID uint64, sepCells []page.BranchCell, rightmostAppend bool) (uint64, error) {
 	// ascendWithSplit is reached only after a leaf split (its two call
 	// sites in putReportCore) — count that one leaf split here; each
 	// branch split inside the loop is counted at its completion below
@@ -828,9 +870,9 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		// backing-array aliasing — a future refactor that copies
 		// cells field-by-field instead of via append won't
 		// silently drop the Child update.
-		newCells := make([]page.BranchCell, 0, len(cells)+1)
+		newCells := make([]page.BranchCell, 0, len(cells)+len(sepCells))
 		newCells = append(newCells, cells[:f.childIdx]...)
-		newCells = append(newCells, sepCell)
+		newCells = append(newCells, sepCells...)
 		newCells = append(newCells, cells[f.childIdx:]...)
 		if f.childIdx == 0 {
 			leftmost = leftID
@@ -929,7 +971,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		// freshly-allocated right branch.
 		leftID = newBranchID
 		nextSepCell.Child = newRightID
-		sepCell = nextSepCell
+		sepCells = []page.BranchCell{nextSepCell}
 	}
 
 	// Path exhausted. Root grew: allocate a new root branch with
@@ -943,8 +985,7 @@ func ascendWithSplit(pw PageWriter, cfg page.Config, path []pathFrame, leftID ui
 		_ = pw.FreePage(newRootID)
 		return 0, fmt.Errorf("btree: alloc new root slab: %w", err)
 	}
-	cells := []page.BranchCell{sepCell}
-	if err := page.EncodeBranch(newRootBuf, cfg, leftID, cells); err != nil {
+	if err := page.EncodeBranch(newRootBuf, cfg, leftID, sepCells); err != nil {
 		_ = pw.FreePage(newRootID)
 		return 0, fmt.Errorf("btree: encode new root branch: %w", err)
 	}

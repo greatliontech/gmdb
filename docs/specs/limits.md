@@ -111,8 +111,11 @@ subpage), so set values share the key bound above: nested-tree
 members over `T` are overflow-key cells. `T` binds a value only
 in its KEY role — a subpage stores value bytes with its own
 length bookkeeping, so an over-`T` value may legally reside in a
-subpage while the set stays below the promotion threshold (the
-window `(T, promotion threshold]` exists at every page size —
+subpage while the set stays below the promotion threshold (for
+keys of ordinary length the window `(T, per-key budget]` exists at
+every page size; the budget is the 50% threshold capped by the
+per-key splittability bound, so long — overflow-form — keys skip
+the subpage window and go straight to nested trees —
 `set-keyspace.md §Subpage Promotion Threshold`); promotion
 converts such values to overflow-key members. Exception:
 `FixedValueSize` set keyspaces require `FixedValueSize <= T`,

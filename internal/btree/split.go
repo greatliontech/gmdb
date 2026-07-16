@@ -394,3 +394,105 @@ func findBranchSplitIndex(cfg page.Config, cells []page.BranchCell) (mid int, ok
 	}
 	return best, true
 }
+
+// splitLeafThreeWay is the fallback for an entry multiset with NO
+// feasible two-page partition and no inline value left to promote: an
+// insert landed between jumbo cells that cannot pair with any
+// neighbor (overflow-key cells are singleton-restart entries whose
+// resident alone is ~half a page — two of them with any payload
+// exceed one leaf; near-`T` inline keys have the same shape). The
+// leaf floor guarantees only ONE maximal-form entry per page
+// (page-formats.md §The inline threshold T), so such states are
+// in-spec and need a THREE-page outcome: entries[:i] stay on the
+// (already CoW'd) left page, entries[i] — the just-inserted entry,
+// which fits alone by the entry gate — takes its own fresh page, and
+// entries[i+1:] take a second fresh page. Both outer parts are
+// contiguous subsets of a set that fit one page; the canonical
+// re-encode of a subset is not strictly monotone (a removed restart
+// anchor can turn deltas into restarts), so each part's fit is
+// verified and ok=false declines with nothing allocated — the caller
+// keeps its ErrKeyTooLarge path for that (theoretical) residual.
+//
+// Returns the two separator cells (in key order, each carrying its
+// right sibling's page id) for a single ascendWithSplit at the
+// leaf's parent position.
+func splitLeafThreeWay(pw PageWriter, cfg page.Config, leftBuf []byte, entries []page.LeafEntry, i int) (seps []page.BranchCell, ok bool, err error) {
+	if i <= 0 || i >= len(entries)-1 {
+		// An edge index has a trivial two-way partition; the caller's
+		// two-way machinery owns those.
+		return nil, false, nil
+	}
+	scratch := make([]byte, cfg.PageSize)
+	b := page.NewLeafBuilder(scratch, cfg)
+	if !leafEntriesFit(b, scratch, cfg, entries[:i]) ||
+		!leafEntriesFit(b, scratch, cfg, entries[i:i+1]) ||
+		!leafEntriesFit(b, scratch, cfg, entries[i+1:]) {
+		return nil, false, nil
+	}
+
+	midID, err := pw.AllocPage()
+	if err != nil {
+		return nil, false, fmt.Errorf("btree: alloc three-way mid leaf: %w", err)
+	}
+	midBuf, err := pw.ZeroPage(midID)
+	if err != nil {
+		_ = pw.FreePage(midID)
+		return nil, false, fmt.Errorf("btree: alloc three-way mid buf: %w", err)
+	}
+	rightID, err := pw.AllocPage()
+	if err != nil {
+		_ = pw.FreePage(midID)
+		return nil, false, fmt.Errorf("btree: alloc three-way right leaf: %w", err)
+	}
+	rightBuf, err := pw.ZeroPage(rightID)
+	if err != nil {
+		_ = pw.FreePage(midID)
+		_ = pw.FreePage(rightID)
+		return nil, false, fmt.Errorf("btree: alloc three-way right buf: %w", err)
+	}
+	free2 := func() { _ = pw.FreePage(midID); _ = pw.FreePage(rightID) }
+
+	emit := func(buf []byte, es []page.LeafEntry) bool {
+		eb := page.NewLeafBuilder(buf, cfg)
+		for _, e := range es {
+			if !eb.AddEntry(e) {
+				return false
+			}
+		}
+		eb.Finish()
+		return true
+	}
+	if !emit(midBuf, entries[i:i+1]) || !emit(rightBuf, entries[i+1:]) {
+		free2()
+		return nil, false, nil // defensive: the fit checks above hold
+	}
+	// Left LAST so a decline above leaves leftBuf intact for the
+	// caller's error path.
+	if !emit(leftBuf, entries[:i]) {
+		free2()
+		return nil, false, nil
+	}
+
+	sep1, err := shortestSeparatorEntries(pw, cfg, entries[i-1], entries[i])
+	if err != nil {
+		free2()
+		return nil, false, err
+	}
+	sep2, err := shortestSeparatorEntries(pw, cfg, entries[i], entries[i+1])
+	if err != nil {
+		free2()
+		return nil, false, err
+	}
+	cell1, err := makeSeparatorCell(pw, cfg, sep1, midID)
+	if err != nil {
+		free2()
+		return nil, false, err
+	}
+	cell2, err := makeSeparatorCell(pw, cfg, sep2, rightID)
+	if err != nil {
+		_ = freeBranchCellExtentIfPresent(pw, cfg, cell1)
+		free2()
+		return nil, false, err
+	}
+	return []page.BranchCell{cell1, cell2}, true, nil
+}

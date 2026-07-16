@@ -90,7 +90,7 @@ and 10 remove.
       rightmost-leaf hint so ascending-key workloads stop
       stranding half-full left pages; sequential-insert corpus
       and bench coverage.
-- [ ] 10. Long keys across the full surface: nested set-keyspace
+- [x] 10. Long keys across the full surface: nested set-keyspace
       value trees (lifts the set-value bound), composite index
       keys, `BulkLoad`/extsort, `Check`/repair, incremental
       compaction relocation, `Compact`/`CopyTo`; fuzz and property

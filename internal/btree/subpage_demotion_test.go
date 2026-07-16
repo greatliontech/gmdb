@@ -56,7 +56,7 @@ func TestDemoteNestedTreeSingleLeafFits(t *testing.T) {
 	newValue := []byte("charlie")
 	root := buildNestedTreeFromSubpage(t, pw, cfg, values, newValue)
 
-	subpage, demoted, err := DemoteNestedTreeIfFits(pw, cfg, 0, root)
+	subpage, demoted, err := DemoteNestedTreeIfFits(pw, cfg, 0, root, page.SubpagePromotionThreshold(cfg))
 	if err != nil {
 		t.Fatalf("Demote: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestDemoteNestedTreeFixedSize(t *testing.T) {
 		t.Fatalf("Promote: %v", err)
 	}
 
-	sp, demoted, err := DemoteNestedTreeIfFits(pw, cfg, fvs, root)
+	sp, demoted, err := DemoteNestedTreeIfFits(pw, cfg, fvs, root, page.SubpagePromotionThreshold(cfg))
 	if err != nil || !demoted {
 		t.Fatalf("Demote: demoted=%v err=%v", demoted, err)
 	}
@@ -128,7 +128,7 @@ func TestDemoteNestedTreeRootFreed(t *testing.T) {
 	}
 	freedBefore := len(fake.freed)
 
-	_, demoted, err := DemoteNestedTreeIfFits(fake, cfg, 0, root)
+	_, demoted, err := DemoteNestedTreeIfFits(fake, cfg, 0, root, page.SubpagePromotionThreshold(cfg))
 	if err != nil || !demoted {
 		t.Fatalf("Demote: demoted=%v err=%v", demoted, err)
 	}
@@ -176,7 +176,7 @@ func TestDemoteNestedTreeMultiLeafReturnsFalse(t *testing.T) {
 		t.Fatalf("root type=%d, want branch (test premise: multi-leaf tree)", typ)
 	}
 
-	sp, demoted, err := DemoteNestedTreeIfFits(pw, cfg, 0, root)
+	sp, demoted, err := DemoteNestedTreeIfFits(pw, cfg, 0, root, page.SubpagePromotionThreshold(cfg))
 	if err != nil {
 		t.Fatalf("Demote: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestDemoteNestedTreeSingleLeafTooLargeReturnsFalse(t *testing.T) {
 	}
 
 	freedBefore := len(fake.freed)
-	sp, demoted, err := DemoteNestedTreeIfFits(fake, cfg, 0, root)
+	sp, demoted, err := DemoteNestedTreeIfFits(fake, cfg, 0, root, page.SubpagePromotionThreshold(cfg))
 	if err != nil {
 		t.Fatalf("Demote: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestDemoteNestedTreeSingleLeafTooLargeReturnsFalse(t *testing.T) {
 func TestDemoteNestedTreeRejectsZeroRoot(t *testing.T) {
 	cfg := page.Config{PageSize: 4096, RestartGroupTarget: 16}
 	fake := newFakeWriter(t, cfg.PageSize)
-	_, _, err := DemoteNestedTreeIfFits(fake, cfg, 0, 0)
+	_, _, err := DemoteNestedTreeIfFits(fake, cfg, 0, 0, page.SubpagePromotionThreshold(cfg))
 	if err == nil {
 		t.Fatalf("Demote with rootID=0 did not error")
 	}

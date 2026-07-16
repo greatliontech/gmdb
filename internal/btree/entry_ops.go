@@ -217,8 +217,40 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 	// entry-count midpoint. See findLeafSplitIndex.
 	mid, ok := findLeafSplitIndex(b, leftBuf, cfg, entries, appendRightmost)
 	if !ok {
-		_ = pw.FreePage(leftID)
-		return 0, page.LeafEntry{}, ErrKeyTooLarge
+		// No two-page partition: the caller-supplied entry landed
+		// between un-pairable jumbo cells (page-formats.md §Leaf
+		// Split, three-way fallback — PutEntry has no inline value of
+		// its own to promote; the caller controls e's value form).
+		seps, ok3, terr := splitLeafThreeWay(pw, cfg, leftBuf, entries, searchIdx)
+		if terr != nil {
+			_ = pw.FreePage(leftID)
+			return 0, page.LeafEntry{}, terr
+		}
+		if !ok3 {
+			_ = pw.FreePage(leftID)
+			return 0, page.LeafEntry{}, ErrKeyTooLarge
+		}
+		freeSepsAndPages := func() {
+			for _, sc := range seps {
+				_ = freeBranchCellExtentIfPresent(pw, cfg, sc)
+				_ = pw.FreePage(sc.Child)
+			}
+			_ = pw.FreePage(leftID)
+		}
+		if err := pw.FreePage(leafID); err != nil {
+			freeSepsAndPages()
+			return 0, page.LeafEntry{}, fmt.Errorf("btree: free old leaf %d: %w", leafID, err)
+		}
+		newID, err := ascendWithSplit(pw, cfg, path, leftID, seps, false)
+		if err != nil {
+			freeSepsAndPages()
+			return 0, page.LeafEntry{}, err
+		}
+		if err := freeKeyExtentIfPresent(pw, cfg, displaced); err != nil {
+			return 0, page.LeafEntry{}, err
+		}
+		displaced = clearKeyExtent(displaced)
+		return newID, displaced, nil
 	}
 
 	b.Reset(leftBuf, cfg)
@@ -265,7 +297,7 @@ func PutEntry(pw PageWriter, cfg page.Config, rootID uint64, e page.LeafEntry) (
 	if err != nil {
 		return 0, page.LeafEntry{}, err
 	}
-	newID, err := ascendWithSplit(pw, cfg, path, leftID, sepCell, appendRightmost)
+	newID, err := ascendWithSplit(pw, cfg, path, leftID, []page.BranchCell{sepCell}, appendRightmost)
 	if err != nil {
 		_ = freeBranchCellExtentIfPresent(pw, cfg, sepCell)
 		return 0, page.LeafEntry{}, err

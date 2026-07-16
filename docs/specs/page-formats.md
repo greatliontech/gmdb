@@ -1100,6 +1100,24 @@ boundaries are equidistant from the bias target, the lower-index
 boundary wins. Each half is then encoded independently with fresh
 group structure (compressed) or fresh offset table (uncompressed).
 
+**Three-way fallback.** Overflow-key cells are singleton-restart
+entries whose resident alone occupies ~half a page (§Overflow-Key
+Cells), and a near-`T` inline key has the same shape — the leaf
+floor guarantees only ONE maximal-form entry per page (§The inline
+threshold `T`), so two such cells with any payload may not pair on
+one page. An insert landing BETWEEN un-pairable cells can therefore
+have no feasible two-page partition and (when no inline value
+remains to promote to overflow) requires a THREE-page outcome: the
+inserted entry — which fits alone by the entry gate — takes its own
+page between the untouched flanks, and the parent receives two
+separators at the same position. Both flanks are contiguous subsets
+of a set that fit one page; the rare canonical-re-encode inflation
+of a subset declines the fallback and surfaces `ErrKeyTooLarge`.
+The set-keyspace surface additionally caps its inline subpage cells
+at half a leaf's capacity per key (promoting to a nested tree
+beyond it), since subpage bytes have no overflow form to promote —
+see `set-keyspace.md §Subpage Promotion Threshold`.
+
 **Append-aware policy.** When the split is triggered by an insert
 that appends past the last key of the tree's RIGHTMOST leaf (the
 descent took the last child pointer at every level), the boundary is

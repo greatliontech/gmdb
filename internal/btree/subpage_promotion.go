@@ -104,6 +104,7 @@ func PromoteSubpageToNestedTree(
 		return 0, 0, fmt.Errorf("PromoteSubpageToNestedTree: alloc nested-root slab: %w", err)
 	}
 	b := page.NewLeafBuilder(leafBuf, cfg)
+	t := cfg.InlineThreshold()
 	var copied uint64
 	var spill [][]byte
 	sp.AllValues(func(v []byte) bool {
@@ -123,7 +124,14 @@ func PromoteSubpageToNestedTree(
 		// tree with proper splits — the promotion result is a
 		// multi-leaf nested tree whenever the members' leaf encoding
 		// requires one (set-keyspace.md §Subpage Promotion Threshold).
-		if len(spill) == 0 && b.AddInline(v, nil) {
+		//
+		// Over-threshold members (legal in a subpage — limits.md
+		// §Maximum Value Size (Set Keyspaces) — up to the promotion
+		// budget) MUST take the overflow-key form as nested-tree
+		// keys (page-formats.md §Overflow-Key Cells); AddInline
+		// would encode an invalid over-T inline key, so they spill
+		// to btree.Put, which writes the key extent.
+		if len(spill) == 0 && len(v) <= t && b.AddInline(v, nil) {
 			copied++
 			return true
 		}

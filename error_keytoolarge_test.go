@@ -104,11 +104,11 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		t.Errorf("indexed SetKeyspace.BulkLoad over-threshold set key: %v", e)
 	}
 
-	// Oversize FIRST value of a set key (variable-size sets): bypasses
-	// the promotion threshold by design (Put's genesis shape), reaches
-	// the builder as a subpage cell too large for an empty leaf, and
-	// must surface the public sentinel — the same input via Put maps
-	// to ErrKeyTooLarge. Both the plain and indexed set paths.
+	// Oversize FIRST value of a set key (variable-size sets): over the
+	// promotion budget it goes straight to a single-member nested tree
+	// with an overflow-key member (limits.md §Maximum Value Size (Set
+	// Keyspaces)) — stored and readable, never rejected. Both the
+	// plain and indexed set paths, matching Put.
 	bigVal := bytes.Repeat([]byte("v"), 8000)
 	oneBigVal := func(yield func([]byte, []byte) bool) { yield([]byte("k"), bigVal) }
 	if e := db.Update(ctx, func(tx *Tx) error {
@@ -116,10 +116,16 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		_, err = sks.BulkLoad(oneBigVal)
-		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("SetKeyspace.BulkLoad oversize first value: got %v, want ErrKeyTooLarge", e)
+		if _, err = sks.BulkLoad(oneBigVal); err != nil {
+			return err
+		}
+		has, err := sks.HasValue([]byte("k"), bigVal)
+		if err != nil || !has {
+			return fmt.Errorf("HasValue after oversize-first-value BulkLoad: has=%v err=%v", has, err)
+		}
+		return nil
+	}); e != nil {
+		t.Errorf("SetKeyspace.BulkLoad oversize first value: %v", e)
 	}
 	if e := db.Update(ctx, func(tx *Tx) error {
 		sks, err := tx.CreateSetKeyspace("idxsksv", nil,
@@ -129,8 +135,8 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 		}
 		_, err = sks.BulkLoad(oneBigVal)
 		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("indexed SetKeyspace.BulkLoad oversize first value: got %v, want ErrKeyTooLarge", e)
+	}); e != nil {
+		t.Errorf("indexed SetKeyspace.BulkLoad oversize first value: %v", e)
 	}
 
 	// Over-threshold INDEX keys produced by the extractor share the
@@ -183,16 +189,22 @@ func TestErrKeyTooLargeSentinel(t *testing.T) {
 	}
 
 	// Put parity for the oversize single value (the contract the bulk
-	// paths must match).
+	// paths must match): stored + readable.
 	if e := db.Update(ctx, func(tx *Tx) error {
 		sks, err := tx.CreateSetKeyspace("sksput", nil)
 		if err != nil {
 			return err
 		}
-		_, err = sks.Put([]byte("k"), bigVal)
-		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("SetKeyspace.Put oversize value: got %v, want ErrKeyTooLarge", e)
+		if _, err = sks.Put([]byte("k"), bigVal); err != nil {
+			return err
+		}
+		has, err := sks.HasValue([]byte("k"), bigVal)
+		if err != nil || !has {
+			return fmt.Errorf("HasValue after oversize Put: has=%v err=%v", has, err)
+		}
+		return nil
+	}); e != nil {
+		t.Errorf("SetKeyspace.Put oversize value: %v", e)
 	}
 }
 
@@ -254,28 +266,43 @@ func TestKeyTooLargeDeterministicAtBound(t *testing.T) {
 	}); e != nil {
 		t.Errorf("set gap-key Put: %v", e)
 	}
+	// A member in the (T, subpage-budget] window is a legal subpage
+	// resident (limits.md §Maximum Value Size (Set Keyspaces)) — both
+	// load paths accept and read it back.
 	gapMember := bytes.Repeat([]byte("m"), 3000)
 	if e := db.Update(ctx, func(tx *Tx) error {
 		sks, err := tx.CreateSetKeyspace("smem", nil)
 		if err != nil {
 			return err
 		}
-		_, err = sks.BulkLoad(func(yield func([]byte, []byte) bool) {
+		if _, err = sks.BulkLoad(func(yield func([]byte, []byte) bool) {
 			yield([]byte("k"), gapMember)
-		})
-		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("set gap-member BulkLoad: got %v, want ErrKeyTooLarge", e)
+		}); err != nil {
+			return err
+		}
+		has, err := sks.HasValue([]byte("k"), gapMember)
+		if err != nil || !has {
+			return fmt.Errorf("HasValue after gap-member BulkLoad: has=%v err=%v", has, err)
+		}
+		return nil
+	}); e != nil {
+		t.Errorf("set gap-member BulkLoad: %v", e)
 	}
 	if e := db.Update(ctx, func(tx *Tx) error {
 		sks, err := tx.CreateSetKeyspace("smem2", nil)
 		if err != nil {
 			return err
 		}
-		_, err = sks.Put([]byte("k"), gapMember)
-		return err
-	}); !errors.Is(e, ErrKeyTooLarge) {
-		t.Errorf("set gap-member Put: got %v, want ErrKeyTooLarge", e)
+		if _, err = sks.Put([]byte("k"), gapMember); err != nil {
+			return err
+		}
+		has, err := sks.HasValue([]byte("k"), gapMember)
+		if err != nil || !has {
+			return fmt.Errorf("HasValue after gap-member Put: has=%v err=%v", has, err)
+		}
+		return nil
+	}); e != nil {
+		t.Errorf("set gap-member Put: %v", e)
 	}
 
 	// A FixedValueSize above the member bound is rejected at
