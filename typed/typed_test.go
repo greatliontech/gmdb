@@ -264,3 +264,36 @@ func TestTypedKSOpenVariants(t *testing.T) {
 		t.Errorf("Get(42) via Open = %q, want answer", got)
 	}
 }
+
+// TestTypedKSInsertReplaceVerbs mirrors the byte layer's verb
+// semantics through the typed handle: Insert-only rejects a present
+// key with gmdb.ErrKeyExists, Replace-only rejects an absent one with
+// gmdb.ErrNotFound, and no-op verbs leave stored values unchanged.
+func TestTypedKSInsertReplaceVerbs(t *testing.T) {
+	tx, cleanup := newTypedTx(t)
+	defer cleanup()
+
+	tks := NewKeyspace[uint64, string]("verbs", Uint64Encoder{}, StringEncoder{})
+	ks, err := tks.Create(tx)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := ks.Replace(1, "x"); !errors.Is(err, gmdb.ErrNotFound) {
+		t.Fatalf("Replace absent = %v, want gmdb.ErrNotFound", err)
+	}
+	if err := ks.Insert(1, "one"); err != nil {
+		t.Fatalf("Insert absent: %v", err)
+	}
+	if err := ks.Insert(1, "uno"); !errors.Is(err, gmdb.ErrKeyExists) {
+		t.Fatalf("Insert present = %v, want gmdb.ErrKeyExists", err)
+	}
+	if got, _ := ks.Get(1); got != "one" {
+		t.Fatalf("value after no-op Insert = %q, want one", got)
+	}
+	if err := ks.Replace(1, "uno"); err != nil {
+		t.Fatalf("Replace present: %v", err)
+	}
+	if got, _ := ks.Get(1); got != "uno" {
+		t.Fatalf("value after Replace = %q, want uno", got)
+	}
+}

@@ -973,3 +973,43 @@ func TestPutAscendErrorRollsBackAllocations(t *testing.T) {
 		t.Errorf("ascend-error path leaked leftID=%d (not freed); freed=%v", leftID, fake.freed)
 	}
 }
+
+// TestReplaceIfPresentSemantics pins the update-only primitive's
+// contract: a miss — including on an EMPTY tree — is a true no-op
+// (original root back, replaced=false, nothing allocated); a hit
+// replaces the value without changing membership.
+func TestReplaceIfPresentSemantics(t *testing.T) {
+	cfg := page.Config{PageSize: 4096}
+	pw := newFakeWriter(t, 4096)
+
+	// Empty tree: no-op, no genesis leaf allocated.
+	nr, replaced, err := ReplaceIfPresent(pw, cfg, 0, []byte("k"), []byte("v"))
+	if err != nil || replaced || nr != 0 {
+		t.Fatalf("empty-tree Replace = (root=%d, replaced=%v, err=%v), want (0,false,nil)", nr, replaced, err)
+	}
+	if pw.nextID != 1 {
+		t.Fatalf("empty-tree Replace allocated %d page(s); must be a true no-op", pw.nextID-1)
+	}
+
+	root, err := Put(pw, cfg, 0, []byte("a"), []byte("v1"))
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	// Miss on a non-empty tree: no-op, root unchanged.
+	allocsBefore := pw.nextID
+	nr, replaced, err = ReplaceIfPresent(pw, cfg, root, []byte("b"), []byte("x"))
+	if err != nil || replaced || nr != root {
+		t.Fatalf("miss Replace = (root=%d, replaced=%v, err=%v), want (%d,false,nil)", nr, replaced, err, root)
+	}
+	if pw.nextID != allocsBefore {
+		t.Fatal("miss Replace allocated pages; must be a true no-op")
+	}
+	// Hit: replaced.
+	nr, replaced, err = ReplaceIfPresent(pw, cfg, root, []byte("a"), []byte("v2"))
+	if err != nil || !replaced {
+		t.Fatalf("hit Replace = (replaced=%v, err=%v)", replaced, err)
+	}
+	if v, found, _ := Get(pw, cfg, nr, []byte("a")); !found || string(v) != "v2" {
+		t.Fatalf("Get after Replace = (%q, %v)", v, found)
+	}
+}

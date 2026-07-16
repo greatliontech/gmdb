@@ -676,10 +676,46 @@ func (ks *Keyspace) Get(key []byte) ([]byte, error) {
 //     which stays Created — both will write at flush).
 //   - Every open Cursor on this keyspace is MarkStale'd.
 func (ks *Keyspace) Put(key, value []byte) error {
+	return ks.putVerb(key, value, verbUpsert)
+}
+
+// Insert stores (key, value) only when key is ABSENT; when the key
+// already exists it returns ErrKeyExists and mutates nothing — no
+// page is written, the descriptor and open cursors are untouched
+// (api-surface.md §Keyspace API). Put remains the upsert.
+func (ks *Keyspace) Insert(key, value []byte) error {
+	return ks.putVerb(key, value, verbInsert)
+}
+
+// Replace stores (key, value) only when key is PRESENT; when the key
+// does not exist it returns ErrNotFound and mutates nothing — the
+// update-only dual of Insert (api-surface.md §Keyspace API). Put
+// remains the upsert.
+func (ks *Keyspace) Replace(key, value []byte) error {
+	return ks.putVerb(key, value, verbReplace)
+}
+
+// putVerbKind selects putVerb's presence semantics.
+type putVerbKind uint8
+
+const (
+	verbUpsert  putVerbKind = iota // Put
+	verbInsert                     // ErrKeyExists on present, no mutation
+	verbReplace                    // ErrNotFound on absent, no mutation
+)
+
+// putVerb is the shared implementation behind Put / Insert / Replace.
+// The verb gates fire BEFORE any mutation (savepoint, index
+// maintenance, btree write): on the indexed path existence is known
+// from the old-value read; on the un-indexed path the single-descent
+// btree primitives (InsertIfAbsent / ReplaceIfPresent) are true
+// no-ops on their miss condition, and the verb maps the report to
+// its sentinel with the row savepoint released untouched.
+func (ks *Keyspace) putVerb(key, value []byte, verb putVerbKind) error {
 	if err := ks.checkWritable(key); err != nil {
 		return err
 	}
-	ks.tx.pgr.RecordPut() // TxStats.Puts
+	ks.tx.pgr.RecordPut() // TxStats.Puts (all three verbs are row writes)
 	cfg := ks.builderCfg()
 	if value == nil {
 		value = []byte{}
@@ -707,6 +743,21 @@ func (ks *Keyspace) Put(key, value []byte) error {
 			copy(oldValue, v)
 		}
 	}
+	// Early verb gates, wherever existence is already KNOWN: on the
+	// indexed path from the old-value read above, and on an empty tree
+	// trivially. A failing presence requirement returns its sentinel
+	// before the savepoint, the index maintenance, and the row write —
+	// the no-op paths mutate nothing.
+	existenceKnown := indexed || ks.desc.Root == 0
+	if existenceKnown {
+		if verb == verbInsert && existed {
+			return ErrKeyExists
+		}
+		if verb == verbReplace && !existed {
+			return ErrNotFound
+		}
+	}
+
 	// For an un-indexed keyspace `existed` is not known yet — the single
 	// btree.PutReportExisting descent below reports it, collapsing the
 	// redundant btree.Has probe + btree.Put into one descent.
@@ -756,9 +807,29 @@ func (ks *Keyspace) Put(key, value []byte) error {
 	}
 	var newRoot uint64
 	var err error
-	if indexed {
+	switch {
+	case indexed:
+		// Existence already gated above; the write is unconditional.
 		newRoot, err = btree.Put(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, key, value)
-	} else {
+	case verb == verbInsert:
+		var added bool
+		newRoot, added, err = btree.InsertIfAbsent(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, key, value)
+		if err == nil && !added {
+			// True no-op (no CoW, no alloc): nothing to roll back —
+			// release the empty savepoint and report the verb miss.
+			ks.tx.pgr.ReleaseSavepoint(sp)
+			return ErrKeyExists
+		}
+		existed = false
+	case verb == verbReplace:
+		var replaced bool
+		newRoot, replaced, err = btree.ReplaceIfPresent(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, key, value)
+		if err == nil && !replaced {
+			ks.tx.pgr.ReleaseSavepoint(sp)
+			return ErrNotFound
+		}
+		existed = true
+	default:
 		newRoot, existed, err = btree.PutReportExisting(btreeWriter{ks.tx.pgr}, cfg, ks.desc.Root, key, value)
 	}
 	if err != nil {

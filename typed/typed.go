@@ -225,6 +225,38 @@ func (t *KeyspaceHandle[K, V]) Put(key K, value V) error {
 	return t.ks.Put(kb, vb)
 }
 
+// Insert stores (key, value) only when key is ABSENT; when the key
+// already exists it returns gmdb.ErrKeyExists and mutates nothing —
+// the typed mirror of gmdb.Keyspace.Insert (api-surface.md §Keyspace
+// API). Put remains the upsert.
+func (t *KeyspaceHandle[K, V]) Insert(key K, value V) error {
+	kb, err := t.keyEnc.AppendEncode(nil, key)
+	if err != nil {
+		return err
+	}
+	vb, err := t.valEnc.AppendEncode(nil, value)
+	if err != nil {
+		return err
+	}
+	return t.ks.Insert(kb, vb)
+}
+
+// Replace stores (key, value) only when key is PRESENT; when the key
+// does not exist it returns gmdb.ErrNotFound and mutates nothing —
+// the typed mirror of gmdb.Keyspace.Replace (api-surface.md §Keyspace
+// API). Put remains the upsert.
+func (t *KeyspaceHandle[K, V]) Replace(key K, value V) error {
+	kb, err := t.keyEnc.AppendEncode(nil, key)
+	if err != nil {
+		return err
+	}
+	vb, err := t.valEnc.AppendEncode(nil, value)
+	if err != nil {
+		return err
+	}
+	return t.ks.Replace(kb, vb)
+}
+
 // Delete removes key, returning gmdb.ErrNotFound if it does not exist
 // (api-surface.md §Invariants — keyed-removal returns gmdb.ErrNotFound on
 // miss).

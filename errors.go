@@ -127,14 +127,17 @@ var (
 	// the addressed item is absent: Tx.OpenKeyspace on a missing
 	// keyspace name; Tx.DeleteKeyspace on a missing name;
 	// Keyspace.Delete / SetKeyspace.Delete / SetKeyspace.DeleteValue
-	// per the Delete-on-miss invariant
-	// (api-surface.md §Invariants).
+	// per the Delete-on-miss invariant (api-surface.md §Invariants);
+	// and Keyspace.Replace (with its typed mirror) on an absent key —
+	// the update-only verb's miss sentinel, mutating nothing.
 	ErrNotFound = errors.New("gmdb: key not found")
 
 	// ErrKeyExists is returned by Tx.CreateKeyspace and
 	// Tx.CreateSetKeyspace when a keyspace with the supplied name
-	// already exists. CreateKeyspaceIfNotExists silently opens the
-	// existing keyspace instead.
+	// already exists (CreateKeyspaceIfNotExists silently opens the
+	// existing keyspace instead), and by Keyspace.Insert (with its
+	// typed mirror) on a present key — the insert-only verb's miss
+	// sentinel, mutating nothing.
 	ErrKeyExists = errors.New("gmdb: key already exists")
 
 	// ErrKeyEmpty is returned by every operation taking a key when

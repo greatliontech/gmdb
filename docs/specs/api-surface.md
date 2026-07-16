@@ -1129,6 +1129,26 @@ type Keyspace struct { ... }
 func (ks *Keyspace) Get(key []byte) ([]byte, error)
 func (ks *Keyspace) Put(key, value []byte) error
 
+// Insert stores (key, value) only when key is ABSENT; on a present
+// key it returns ErrKeyExists and mutates NOTHING — no page write,
+// no descriptor change, no cursor invalidation, no index
+// maintenance (the presence gate fires before any of them). Put
+// remains the upsert. The un-indexed path is a single descent
+// (btree.InsertIfAbsent's no-op-on-present); the indexed path
+// gates on the old-value read it performs anyway.
+func (ks *Keyspace) Insert(key, value []byte) error
+
+// Replace stores (key, value) only when key is PRESENT; on an
+// absent key it returns ErrNotFound and mutates NOTHING — the
+// update-only dual of Insert, with the same no-op purity and the
+// same single-descent un-indexed path (btree.ReplaceIfPresent).
+//
+// SetKeyspace deliberately has neither verb: its Put already
+// reports `added` (insert semantics without a rejection), and a
+// member-level Replace has no meaning in a set (the member IS the
+// value).
+func (ks *Keyspace) Replace(key, value []byte) error
+
 // Delete returns ErrNotFound when the key does not exist (per
 // §Invariants — keyed-removal returns ErrNotFound on miss).
 func (ks *Keyspace) Delete(key []byte) error

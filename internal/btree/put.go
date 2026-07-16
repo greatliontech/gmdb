@@ -153,7 +153,7 @@ func descendToLeafForKey(pw PageWriter, cfg page.Config, rootID uint64, key []by
 // heuristics + table layout; btree treats leaves as opaque past
 // the LeafReader / LeafBuilder interface.
 func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint64, error) {
-	newRoot, _, err := putReportCore(pw, cfg, rootID, key, value, false)
+	newRoot, _, err := putReportCore(pw, cfg, rootID, key, value, putUpsert)
 	return newRoot, err
 }
 
@@ -164,7 +164,7 @@ func Put(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (uint
 // The value is always written (replacing any existing value), exactly
 // like Put.
 func PutReportExisting(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (newRoot uint64, existed bool, err error) {
-	return putReportCore(pw, cfg, rootID, key, value, false)
+	return putReportCore(pw, cfg, rootID, key, value, putUpsert)
 }
 
 // InsertIfAbsent inserts key=value only when key is absent and reports
@@ -176,17 +176,40 @@ func PutReportExisting(pw PageWriter, cfg page.Config, rootID uint64, key, value
 // write on present (which would also orphan the rewritten pages if the
 // caller discards the new root).
 func InsertIfAbsent(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (newRoot uint64, added bool, err error) {
-	newRoot, existed, err := putReportCore(pw, cfg, rootID, key, value, true)
+	newRoot, existed, err := putReportCore(pw, cfg, rootID, key, value, putInsertOnly)
 	return newRoot, !existed, err
 }
 
-// putReportCore is the shared single-descent implementation behind Put,
-// PutReportExisting, and InsertIfAbsent. It returns the new rootID and
-// whether key already existed. When insertOnly is true and key is
-// present it returns (rootID, true, nil) WITHOUT allocating or writing
-// any page (the InsertIfAbsent no-op-on-present contract); otherwise it
+// ReplaceIfPresent writes key=value only when key is already present
+// and reports whether the replace happened. When key is absent it is
+// a true no-op — no page allocated or written, the original rootID
+// returned with replaced=false — mirroring InsertIfAbsent's
+// no-op-on-miss discipline (single descent, no CoW churn, no orphaned
+// pages for a caller that treats the miss as an error). The
+// update-only primitive behind Keyspace.Replace (api-surface.md
+// §Keyspace API).
+func ReplaceIfPresent(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte) (newRoot uint64, replaced bool, err error) {
+	newRoot, existed, err := putReportCore(pw, cfg, rootID, key, value, putReplaceOnly)
+	return newRoot, existed, err
+}
+
+// putMode selects putReportCore's presence semantics.
+type putMode uint8
+
+const (
+	putUpsert      putMode = iota // write regardless (Put)
+	putInsertOnly                 // no-op when present (InsertIfAbsent)
+	putReplaceOnly                // no-op when absent (ReplaceIfPresent)
+)
+
+// putReportCore is the shared single-descent implementation behind
+// Put, PutReportExisting, InsertIfAbsent, and ReplaceIfPresent. It
+// returns the new rootID and whether key already existed. Mode
+// putInsertOnly returns (rootID, true, nil) on a present key WITHOUT
+// allocating or writing any page; putReplaceOnly returns
+// (rootID, false, nil) on an absent key the same way; putUpsert
 // performs the standard replace-or-insert.
-func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte, insertOnly bool) (newRoot uint64, existed bool, err error) {
+func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []byte, mode putMode) (newRoot uint64, existed bool, err error) {
 	// Storable-key bound (limits.md §Maximum Key Size): any key up to
 	// the uint32 encoding bound is accepted — over the inline
 	// threshold it takes the overflow-key form (page-formats.md
@@ -196,6 +219,9 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		return 0, false, ErrKeyTooLarge
 	}
 	if rootID == 0 {
+		if mode == putReplaceOnly {
+			return rootID, false, nil // nothing to replace in an empty tree
+		}
 		nr, e := putEmpty(pw, cfg, key, value)
 		return nr, false, e
 	}
@@ -222,10 +248,13 @@ func putReportCore(pw PageWriter, cfg page.Config, rootID uint64, key, value []b
 		return 0, false, serr
 	}
 
-	// InsertIfAbsent no-op-on-present: skip the write entirely (no CoW, no
-	// alloc) when the key already exists.
-	if insertOnly && searchFound {
+	// Mode no-ops: skip the write entirely (no CoW, no alloc) when the
+	// mode's presence requirement fails.
+	if mode == putInsertOnly && searchFound {
 		return rootID, true, nil
+	}
+	if mode == putReplaceOnly && !searchFound {
+		return rootID, false, nil
 	}
 
 	// Capture the last key before the CoW for the append fast path — the

@@ -103,7 +103,7 @@ and 10 remove.
       durability-indeterminate (failed final fsync); `durability.md`
       taxonomy pin, including "committed-visible" as the state the
       root version reports; crash-harness coverage for each class.
-- [ ] 12. `Insert` / `Replace` verbs (`ErrKeyExists` /
+- [x] 12. `Insert` / `Replace` verbs (`ErrKeyExists` /
       `ErrNotFound`) on `Keyspace`, with `typed` mirrors; `Put`
       stays the upsert.
 - [ ] 13. `Cursor.SeekLE` / `SeekLT`, `SetCursor` key-level
