@@ -611,8 +611,14 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64, force bool) (m Meta, ac
 // platter never received (a post-power-loss TreeCorrupted with a valid
 // meta). The gated recovery arm needs only the bitmap form: it adopts
 // the DURABLE projection, whose tree pages a completed barrier already
-// covered. Runs only on poison/death lineages (rare), so the O(extent)
-// rewrite is a recovery cost, never a steady-state one.
+// covered. The forced-resync caller reaches this only on poison/death
+// lineages (rare); the live-classified writable Open pays it on EVERY
+// writable Open of an in-use database — its lineage is unknowable with
+// current persisted state (a fresh Open has no takeover-seq baseline),
+// so correctness buys O(extent) Open I/O there (durability.md
+// §Anchoring). The meta slots are excluded: a clean-stale meta slot is
+// superseded by the next commit's alternate-slot pwrite, or a crash
+// falls back to the platter's older valid meta — both consistent.
 func (p *Pager) RedirtyAttachedExtent(m Meta) error {
 	if err := p.RedirtyBitmapRegion(m); err != nil {
 		return err
@@ -623,6 +629,11 @@ func (p *Pager) RedirtyAttachedExtent(m Meta) error {
 	for off := first * pageSize; off < int64(m.HighWaterMark)*pageSize; off += int64(len(buf)) {
 		want := min(int64(len(buf)), int64(m.HighWaterMark)*pageSize-off)
 		n, err := p.fops.ReadAt(buf[:want], off)
+		if int64(n) < want && err == nil {
+			// io.ReaderAt forbids a silent short read; advancing past
+			// one would skip the chunk tail's redirty.
+			return fmt.Errorf("pager: recovery extent read-back: short read %d of %d at %d", n, want, off)
+		}
 		if n > 0 {
 			if _, werr := p.fops.WriteAt(buf[:n], off); werr != nil {
 				return fmt.Errorf("pager: recovery extent redirty: %w", werr)
