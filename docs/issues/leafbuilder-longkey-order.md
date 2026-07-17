@@ -11,10 +11,11 @@ the ordering the builder receives violates its precondition, so
 the defect sits upstream in the long-key (overflow-key cell)
 compare/sort/insert path, not in the builder's check. Pre-existing:
 reproduces at 91e5c87 (before the current change sets) with the
-committed reproducer
-`testdata/rapid/TestPropertyLongKeysAcrossSurfaces/TestPropertyLongKeysAcrossSurfaces-20260717235502-2521415.fail`;
+committed reproducer `docs/issues/leafbuilder-longkey-order.fail`
+(stored here, NOT under testdata/rapid/, where rapid would
+auto-replay it and keep the whole suite red until the fix lands);
 two older fail files (2026-07-16) in the same directory are
 invalidated by generator drift but suggest the same class. Run:
 
     go test -run TestPropertyLongKeysAcrossSurfaces \
-      -rapid.failfile=testdata/rapid/TestPropertyLongKeysAcrossSurfaces/TestPropertyLongKeysAcrossSurfaces-20260717235502-2521415.fail .
+      -rapid.failfile=docs/issues/leafbuilder-longkey-order.fail .
