@@ -9,8 +9,9 @@ redeferred, or closed.
 
 The v0 chunk roadmap, the architecture-consolidation plan, the
 defect-audit remediation plan, the query-builder plan (structure
-phase + typed columns + query builder), and the pre-consumer
-engine-changes plan are complete; their plans were deleted at
+phase + typed columns + query builder), the pre-consumer
+engine-changes plan, and the DST-testing plan (toolchain wiring
+through the exploration tier) are complete; their plans were deleted at
 close-out (`git log --all -- docs/plans/<name>.md` recovers them).
 No plan is currently active; every remaining entry is
 condition-triggered with a self-contained condition. Entries may

@@ -175,10 +175,24 @@ across seeds.
     silently served.
   - *Wall-clock immunity*: step and drift faults never perturb
     the BOOTTIME-based heartbeat/stale-detection protocol.
-- **Exploration tier** — `Explore`/PCT over the hottest
-  interleaving surfaces (commit vs concurrent readers vs the
-  maintenance daemon vs notification waiters), with failures
-  replayed via `Replay`.
+- **Exploration tier** — systematic interleaving exploration over
+  the hottest surfaces: commit vs concurrent readers (snapshot
+  never torn), commit vs the notification waiter (WaitVersion bounded by a
+  VIRTUAL-time context so a lost wake surfaces as a deterministic,
+  replayable violation — an unbounded park would churn heartbeat
+  timers against the wedge detector instead of failing crisply,
+  and the bound costs nothing when the wake arrives), commit vs the maintenance daemon enabled at a short
+  interval (every schedule Check-clean), plus a PCT
+  (priority-inversion) sweep of the reader surface. The standard
+  (non-race) suite explores in EXHAUSTIVE mode under an explicit
+  per-seed schedule budget, reported never silently capped: the
+  fork's DPOR dependency relation requires the dst-race build
+  (`-tags dst -race`), and without it honestly reports
+  `Uninstrumented` instead of exploring — pinned in-suite, with
+  the race-build path replaying any failure via `Replay`. The
+  Explore → Failure → Replay workflow itself is proven end-to-end
+  on a known lost-update SUT before any real bug needs it. Every
+  failure report carries the seed and the replayable schedule.
 
 ## Seed policy
 
@@ -186,6 +200,14 @@ across seeds.
   in the test source — regressions reproduce identically
   everywhere) plus a sweep of `DST_SEEDS` additional seeds
   (environment variable; default small, cranked up for long
-  local runs).
+  local runs). `DST_SEEDS` accepts either `+N` — a COUNT appending N
+  consecutive seeds from a fixed base far above every anchor, so
+  extras are deterministic, reportable, and promotable — or a
+  comma-separated list of explicit seed values, including a single
+  one (re-running or bisecting a reported seed). The `+` prefix is
+  what disambiguates: a bare number is always a seed VALUE, never
+  a count, so a reported seed can be pasted verbatim. Anything
+  else fails loud. The extension is logged, so a sweep's coverage
+  is always stated (the `sweepSeeds` helper).
 - A failure report always includes the seed; fixing a
   seed-found bug adds that seed to the suite's anchors.
