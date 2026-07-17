@@ -16,7 +16,7 @@ plan in the fork repo.
       helpers + cross-process.md walk (grant handoff, stale-writer
       takeover, reader-slot reaping, snapshot pinning, notification
       over the real futex waiter).
-- [ ] 3. Crash suite: CrashHost/CrashTear seed sweeps over
+- [x] 3. Crash suite: CrashHost/CrashTear seed sweeps over
       durability.md (acked-durable recovery, in-flight-commit epoch
       preservation, SyncLazy/SyncDataOnly epochs, publish-path crash
       images).

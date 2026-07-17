@@ -583,16 +583,7 @@ func TestSimulationRecoveryGateDeadVsLiveAuthor(t *testing.T) {
 				}); err != nil {
 					t.Fatalf("View: %v", err)
 				}
-				// Rollback debris — the lazy commit's allocated-but-now-
-				// unreferenced pages and the matching free-count drift —
-				// is spec'd (background leak reclaim owns it). Allow-list
-				// exactly those codes; anything else, any severity, fails.
-				for issue := range db.Check() {
-					if issue.Code == "BitmapLeak" || issue.Code == "FreeCountMismatch" {
-						continue
-					}
-					t.Errorf("Check: %+v", issue)
-				}
+				checkAllowRecoveryDebris(t, db)
 			})
 
 			// Live-author leg: identical lazy commit, author stays alive

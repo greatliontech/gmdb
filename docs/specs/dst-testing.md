@@ -88,9 +88,8 @@ Known modeled-surface residuals:
   invalidation disabled, exactly the spec'd degradation for
   unreadable-/proc environments (cross-process.md boot-epoch
   clauses). Suites therefore cannot exercise the boot-epoch reset
-  path until the fork models per-boot host identity; that suite
-  lands under a `Lands:` condition (see the issue index), not
-  silently.
+  path until the fork models per-boot host identity — the suite's
+  landing condition, stated here in full, not silently skipped.
 
 ## Simulation topology conventions
 
