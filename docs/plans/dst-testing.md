@@ -26,7 +26,12 @@ plan in the fork repo.
       (pid-reuse) and cross-namespace heartbeat legs; spec residuals
       refreshed; CurrentBootID per-call read (the per-process cache's
       safety assumption fails when one OS process spans boots).
-- [ ] 5. Fault suite: fsyncgate, ENOSPC mid-commit, disk latency,
-      clock step/drift vs heartbeat and stale detection.
+- [x] 5. Fault suite: fsyncgate under both disk-failure shapes
+      (writeback classification walk + whole-stack unclassified
+      fallback; unlocked by the fork's FailWriteback fault built
+      for it), ENOSPC creation paths, disk latency vs stale
+      detection, bit rot at reboot, clock step/drift immunity;
+      production fix: recovery-gate bitmap redirty (dropped-
+      writeback cache/platter split found by the sweep).
 - [ ] 6. Exploration tier: Explore/PCT interleaving runs, Replay
       workflow, seed-policy plumbing (`DST_SEEDS`, anchor seeds).

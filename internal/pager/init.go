@@ -572,6 +572,32 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64, force bool) (m Meta, ac
 	return m, active, true, nil
 }
 
+// redirtyBitmapRegion rewrites the bitmap region byte-identically; the
+// caller's subsequent fdatasync covers it. Load-bearing, not redundant,
+// for exactly the reason the meta anchor rewrite is: the region may live
+// only in a surviving page cache carrying a crashed writer's pwrites
+// whose failed fdatasync DROPPED them from writeback (clean-stale —
+// Linux >= 4.13), and the drop is invisible here (the crashed writer
+// consumed the kernel's error). A bare fdatasync then succeeds without
+// those bytes ever reaching stable storage, and a power loss pairs the
+// platter's stale bitmap with meta state derived from the cache view.
+// Re-dirtying converges the platter to the adopted cache bytes; any
+// allocation a dead writer's failed commit left in them becomes ordinary
+// detectable residue (BitmapLeak / FreeCountMismatch, repaired offline)
+// instead of an undetectable cache/platter split. Caller has attachState'd
+// the meta, so BitmapPages is bounds-checked.
+func (p *Pager) redirtyBitmapRegion(m Meta) error {
+	pageSize := int64(p.cfg.PageSize)
+	buf := make([]byte, int64(m.BitmapPages)*pageSize)
+	if _, err := p.fops.ReadAt(buf, 2*pageSize); err != nil {
+		return fmt.Errorf("pager: recovery bitmap read-back: %w", err)
+	}
+	if _, err := p.fops.WriteAt(buf, 2*pageSize); err != nil {
+		return fmt.Errorf("pager: recovery bitmap redirty: %w", err)
+	}
+	return nil
+}
+
 // RecoverToDurable runs the gated writable-Open recovery path
 // (durability.md §Recovery steps 1–5) UNDER the caller's write grant:
 // it re-reads both meta slots (the pre-grant Open snapshot can be
@@ -655,6 +681,9 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 			if err := p.attachState(file, selected); err != nil {
 				return Meta{}, 0, false, err
 			}
+			if err := p.redirtyBitmapRegion(selected); err != nil {
+				return Meta{}, 0, false, err
+			}
 			if _, err := p.fops.WriteAt(buf, int64(selectedIdx)*int64(p.cfg.PageSize)); err != nil {
 				return Meta{}, 0, false, fmt.Errorf("pager: anchor rewrite meta %d: %w", selectedIdx, err)
 			}
@@ -687,9 +716,19 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 	if err := p.attachState(file, proj); err != nil {
 		return Meta{}, 0, false, err
 	}
+	if err := p.redirtyBitmapRegion(proj); err != nil {
+		return Meta{}, 0, false, err
+	}
 
-	// Publish the recovery commit at selected.TxnID+1.
+	// Publish the recovery commit at selected.TxnID+1. Its free-page count
+	// is derived from the bitmap actually attached (the adopted cache
+	// bytes the redirty just made durable-bound), not the sub-record's
+	// remembered count: a dead writer's failed commit may have left
+	// allocations in those bytes that the durable epoch never counted,
+	// and a count naming bytes the meta does not sit beside would be a
+	// durable FreeCountMismatch this commit can trivially avoid.
 	rm := proj
+	rm.NumFreePages = p.bitmap.NumFree()
 	rm.TxnID = selected.TxnID + 1
 	rm.Durable = rm.LiveSubRecord()
 	rm.Durable.AnchoredTxnID = d.TxnID

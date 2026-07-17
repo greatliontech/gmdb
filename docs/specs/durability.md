@@ -239,7 +239,25 @@ older-format writer left (decode ignores it, encode zeroes it, the
 checksum covers it) — is never rewritten; the open takes the
 recovery-commit publication instead (the next TxnID to the other
 slot), which is tear-safe by dual-slot and cannot create the
-equal-TxnID pair that undefines meta selection. The reclamation bound is
+equal-TxnID pair that undefines meta selection. The same
+consumed-error trap covers the BITMAP region: a dead writer's
+failed commit may have pwritten bitmap pages whose dropped
+writeback (Linux >= 4.13) left them clean-stale in the surviving
+page cache — invisible to any later opener, and unreachable by any
+bare fdatasync — so the gated Open also rewrites the bitmap region
+byte-identically from the adopted cache view before its fdatasync,
+on both arms. This converges the platter to the cache: the dead
+writer's allocations persist as DETECTABLE offline-repairable
+residue (`BitmapLeak`, and `FreeCountMismatch` against a
+byte-identical self-durable meta's unrewritable count), never an
+undetectable cache/platter split that a later successful
+Checkpoint would launder into a durable assertion over bitmap
+bytes stable storage never received. The recovery-commit arm
+additionally derives its published free-page count from the bitmap
+it attached, so the pair it writes cannot disagree. (Enforced by
+the DST fault suite's writeback fsyncgate sweep,
+`TestSimulationFsyncGateRecovery` — the seed-41/delay-0 anchor
+fails without the redirty.) The reclamation bound is
 `min(oldestActiveReaderTxnID, anchoredEpoch)` (`free-space.md §RPL
 Reclamation`); recovery adoption is unaffected (it reads
 `DurableTxnID` from disk, where anchoring is a tautology).

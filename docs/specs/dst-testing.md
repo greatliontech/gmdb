@@ -149,10 +149,32 @@ across seeds.
   and the CopyTo/Compact publish inside the crash image.
 - **Fault suite** — durability.md §Commit Outcome
   Classification + api-surface.md publish contracts under the
-  fork's disk faults: fsyncgate (an EIO'd barrier drops dirty
-  pages; the retried barrier must not be trusted), ENOSPC
-  mid-commit, disk latency; clock step/drift against heartbeat
-  and stale-detection logic.
+  fork's disk and clock faults, in five legs:
+  - *Fsyncgate sweep* under BOTH real disk-failure shapes: the
+    writeback fault (`FailWriteback` — cache-served buffered I/O,
+    EIO'd barriers drop dirty pages) walks the three-class
+    certainty statement end-to-end — every post-usage-check
+    commit failure must carry a class, since the verification
+    preads are cache-served — plus recovery and power-loss
+    verification per class; the whole-stack fault (`FailDisk`,
+    one anchor) pins the documented unclassified fallback (the
+    EIO'd verification read withholds the class; "do not retry;
+    re-Open and probe"). The recovery gate's bitmap redirty
+    (durability.md §Anchoring) is enforced here.
+  - *ENOSPC creation paths* (CopyTo / create-Open on a full
+    disk: clean classified failures, no wreckage; freeing space
+    restores). Mid-commit data ENOSPC is unconstructible
+    in-simulation for a truncate-growing store under the fork's
+    logical-bytes model (its recorded boundary): that
+    classification stays pinned by the untagged FileOps-seam
+    tier — stated, not silently capped.
+  - *Disk latency*: a commit stretched past StaleTimeout by a
+    slow disk must not be falsely reaped as stale.
+  - *Bit rot*: platter corruption surfacing at reboot is
+    detected (open error, Check issue, or read error) — never
+    silently served.
+  - *Wall-clock immunity*: step and drift faults never perturb
+    the BOOTTIME-based heartbeat/stale-detection protocol.
 - **Exploration tier** — `Explore`/PCT over the hottest
   interleaving surfaces (commit vs concurrent readers vs the
   maintenance daemon vs notification waiters), with failures
