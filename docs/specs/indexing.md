@@ -68,6 +68,32 @@ Invariant: kind=clause-explicit;
     `Check(CheckIndexes)` pass.
 
 Invariant: kind=clause-explicit;
+  property=Index entries are a pure function of the row: for every
+    index kind, `extract(key, value)` is determined by its two
+    arguments alone — no external state, no corpus statistics, no
+    data-dependent partitioning, no clock. This is the load-bearing
+    assumption of the synchronous-only maintenance model (§Write
+    Path: Synchronous-Only Model): nothing is ever owed after a
+    write operation returns, per-operation cursor invalidation is
+    complete, and `Check(CheckIndexes)` may verify an index by
+    re-running the extractor and comparing entry sets;
+  from=this spec §Write Path: Synchronous-Only Model (promoted from
+    the entailed assumption of §Write Path, §Handle Invalidation,
+    and Check's extractor-replay verification);
+  violation=An extractor whose entries depend on state outside the
+    row (a vector index's centroid assignment, a full-text kind's
+    corpus statistics, wall-clock time) breaks delete-side
+    maintenance SILENTLY: removing or replacing a row re-derives
+    the OLD entry set by re-running the extractor (§Write Path
+    steps 1–4), so a derivation that differs from what the insert
+    stored leaves orphaned index entries — phantom `Lookup` hits
+    and false `ErrIndexUniqueViolation` on unrelated Puts — with
+    the atomic-maintenance invariant intact at every step (the
+    deltas apply atomically; they are simply wrong) and no error
+    until, at best, a later `Check(CheckIndexes)` reports the
+    drift.
+
+Invariant: kind=clause-explicit;
   property=A `Put` that would introduce a duplicate key in any
     unique index aborts with `ErrIndexUniqueViolation` *before*
     writing the row or any index entries. The check happens
@@ -258,6 +284,15 @@ access. Every transaction that opens the same keyspace for write
 must supply matching `IndexDecl`s — same name set, same column
 specs, same `Unique`, same `Version`. Mismatch surfaces as
 `ErrIndexFingerprintMismatch` at open time.
+
+The user-supplied `Extract` closure must be a pure function of its
+`(key, value)` arguments (§Invariants: entries are a pure function
+of the row) — the same input always yields the same entry set, for
+the lifetime of the declared `Version`. Changing the logic means
+bumping `Version` and rebuilding (§Drift Guard). The engine cannot
+check purity; an impure extractor corrupts delete-side maintenance
+silently — orphaned index entries, phantom lookups (§Invariants) —
+and surfaces, at best, later as `Check(CheckIndexes)` drift.
 
 Duplicate `IndexDecl.Name` values in one `OpenKeyspace` call's
 variadic slice are rejected with `ErrIndexExists` naming the
@@ -896,6 +931,43 @@ resolved (the pager's all-resolved-before-Commit assumption).
 
 **Cursor.Delete():** same as `Delete` but uses the cursor's
 current key/value (already in hand).
+
+### Synchronous-Only Model
+
+All index MAINTENANCE — every change to an index's logical entry
+set — happens inside the synchronous operation that caused it: the
+write path above, plus `Rebuild`, `Drop`, indexed `BulkLoad`, the
+`DeleteRange` per-row fallback, and the SetKeyspace mutators
+(§Handle Invalidation enumerates the full surface). This is
+contract, not a gap:
+
+- **No deferred obligations.** There is no persisted "work owed"
+  state and no background hook on the index layer. When an
+  operation returns, every index it touches is fully maintained.
+  (Background incremental compaction DOES relocate index-tree
+  pages and rewrite registry roots — background-maintenance.md —
+  but that is physical page movement of an unchanged entry set,
+  committed through the same single-writer CoW pipeline as any
+  transaction; it never mutates a committed snapshot in place.)
+- **Per-operation invalidation is complete.** Handle invalidation
+  is per-operation `MarkStale` (§Handle Invalidation); because no
+  background pass changes a logical entry set, and physical
+  relocation is covered by snapshot isolation plus the RPL
+  reclamation bound, no epoch or generation channel is needed to
+  protect readers.
+- **Verification is extractor replay.** `Check(CheckIndexes)`
+  verifies an index by re-running the extractor and comparing
+  byte-equal entry sets — sound exactly because entries are a pure
+  function of the row (§Invariants).
+
+An index kind that cannot satisfy row-purity — asynchronous
+maintenance (a vector index's partition split/merge), corpus-level
+statistics (full-text scoring), or any entry derived from state
+outside the row — is outside this contract. Admitting one is a
+spec amendment that must design the seams this model deliberately
+omits: persisted deferred-obligation state, an index-layer
+background hook, an epoch/generation cursor-invalidation channel,
+and a kind-specific verifier to replace extractor replay.
 
 ## Bulk Operations on Indexed Keyspaces
 
