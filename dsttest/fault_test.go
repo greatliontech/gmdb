@@ -236,7 +236,7 @@ func TestSimulationFsyncGateRecovery(t *testing.T) {
 					}); err != nil {
 						t.Fatalf("%s: View: %v", tag, err)
 					}
-				if commitErr != nil && commitClassified(commitErr) {
+					if commitErr != nil && commitClassified(commitErr) {
 						classed++
 					}
 				})

@@ -64,6 +64,7 @@ pre-existing at their change set's base.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
+| [ungated-attach-dropped-bitmap](ungated-attach-dropped-bitmap.md) | extend bitmap redirty beyond the gated arm | Same-process re-Open / resync / live-join attach without bitmap redirty re-anchors over dropped writeback (adjacent, pre-existing) |
 | [recovery-arm2-freecount-unpinned](recovery-arm2-freecount-unpinned.md) | first test reaching the recovery-commit arm with a divergent bitmap | Mutation-surviving gap: recovery-commit arm's bitmap-derived free count has no pinning test |
 
 ## Open — design gaps (2026-07-11 architecture audit)
