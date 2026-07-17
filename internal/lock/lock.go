@@ -660,8 +660,13 @@ func bootEpochReset(p OpenParams, f *os.File, maxReaders uint32) error {
 	// TakeoverSeq is zeroed with the rest: like slot Gen words, its
 	// monotonicity is relied on only among live handles, and the
 	// reset's precondition (no process from the stamped boot exists)
-	// means no handle holds a cached value.
+	// means no handle holds a cached value. RedirtyCoveredSeq is
+	// zeroed WITH it so the covered mark never leads the sequence it
+	// gates on (a lead is only trailing-safe by the gated arm's
+	// overwrite; zeroing both keeps the invariant by construction),
+	// and a fresh boot has no page cache to cover anyway.
 	zeroed.TakeoverSeq = 0
+	zeroed.RedirtyCoveredSeq = 0
 	zeroed.BootID = cur
 	// Slots first, then the header with the new boot id LAST: a crash
 	// between the two leaves the old id and the next adopter repeats

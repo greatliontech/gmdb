@@ -31,6 +31,9 @@ func TestCoveredThroughGateLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("update: %v", err)
 	}
+	// Accessor reads here and below run without the write grant —
+	// benign in this single-process test (atomic loads, no concurrent
+	// bumper); the MUST-hold contract targets cross-process stability.
 	if c, s := db1.coord.RedirtyCoveredSeq(), db1.coord.TakeoverSeq(); c != s {
 		t.Fatalf("healthy open: covered %d != takeover %d (gate should be closed)", c, s)
 	}

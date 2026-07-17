@@ -489,7 +489,10 @@ explicit encode/decode).
   volatile coordination state under a non-blocking
   `flock(LOCK_EX)` conversion (contention ⇒ back off and re-adopt;
   the winner already stamped): the writer block,
-  `LastMaintenanceTime`, the LastWriter record, `ShrinkSeq`, and
+  `LastMaintenanceTime`, the LastWriter record, `ShrinkSeq`,
+  `TakeoverSeq` with its covered-through mark `RedirtyCoveredSeq`
+  (zeroed together so the mark never leads the sequence it gates
+  on), and
   every reader slot (including `Gen`) are zeroed — no process from
   the stamped boot can exist, so nothing live is evicted — then the
   current boot id is stamped LAST (a crash mid-reset repeats the
@@ -520,9 +523,11 @@ explicit encode/decode).
   this trails TakeoverSeq, then barriers and stores the value it
   read. Every poison/death bump reopens the gate; a healthy
   database keeps the two equal, so ordinary writable Opens pay a
-  header compare. Pre-field lock files carry 0 — at worst one
-  spurious covering rewrite, never a missed one, since TakeoverSeq
-  ≥ 0 keeps the gate open until first covered.
+  header compare. Zeroed by the boot-epoch reset together with
+  TakeoverSeq, so the mark never leads the sequence it gates on;
+  a differently-sized pre-field lock file never coexists — the
+  format-version gate partitions such binaries off the data file
+  before the size arm could stale-cycle a live peer's lock file.
 - **ShrinkSeq**: the file-shrink seqlock — see `file-format.md`
   §File Shrinkage for the protocol (writer brackets its
   scan→truncate span odd/even under the write grant; readers
@@ -576,7 +581,7 @@ Total size: `144 + (56 × MaxReaders) + 520`. Default 4096 readers:
 
 `MaxReaders` is bounded `[1, 65536]`. The lower bound is one slot
 (degenerate but legal); the upper bound caps the mmap at
-`136 + 56 × 65536 + 520 ≈ 3.5 MiB`, so a corrupted or
+`144 + 56 × 65536 + 520 ≈ 3.5 MiB`, so a corrupted or
 maliciously-crafted header value cannot demand a petabyte-scale
 mmap. A header `MaxReaders` value outside this range is treated as
 `ErrCorrupted` by `Open`.

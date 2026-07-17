@@ -68,7 +68,12 @@ const Magic uint32 = 0x62646D67
 // Version 3 = XXH3-64 persisted digests (page footers, meta checksum,
 // index schema fingerprint) + overflow-key cells (page-formats.md
 // §Overflow-Key Cells).
-const FormatVersion uint32 = 3
+// Version 4 = the RedirtyCoveredSeq lock-file layout (header 144
+// bytes; cross-process.md §Lock File Layout) — the first partition
+// cause again: a 136-header binary coexisting on the same data file
+// would stale-cycle the live 144-header lock file (or vice versa),
+// two writers, page aliasing.
+const FormatVersion uint32 = 4
 
 // Supported page-size range. PageSize is set at database creation, persisted
 // on the meta page, and immutable.
