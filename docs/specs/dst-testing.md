@@ -10,7 +10,7 @@ sweeping seeds explores interleavings and crash outcomes
 systematically.
 
 This spec pins the contract between gmdb and that toolchain: the
-build-tag discipline, the two syscall routing shims, the simulation
+build-tag discipline, the simulated syscall surface, the simulation
 topology conventions, what each suite enforces, and the seed
 policy. It does not restate the simulator's own contract — that is
 the fork's `docs/dst/design.md` and `docs/dst/faults.md`.
@@ -18,7 +18,8 @@ the fork's `docs/dst/design.md` and `docs/dst/faults.md`.
 ## Toolchain and invocation
 
 - DST tests build ONLY under the `dst` build tag against the fork
-  toolchain: `godst test -tags dst ./...` (the wrapper exports
+  toolchain, and live in the dedicated `dsttest` package:
+  `godst test -tags dst ./dsttest/` (the wrapper exports
   `GOTOOLCHAIN=local` and execs the fork's `go`).
   `simulation.Run` panics in a binary built without the tag.
 - Untagged builds (the normal `go` toolchain, normal `go test`)
@@ -74,14 +75,22 @@ fork per its own contract, `docs/dst/design.md` there):
   no-replace publish rung (api-surface.md §Check, CopyTo,
   Compact) runs its real Linux path in-simulation.
 
-Known modeled-surface residual: `/proc/sys/kernel/random/boot_id`
-is not modeled; the read fails and gmdb runs with the ZERO boot
-epoch — cross-boot invalidation disabled, exactly the spec'd
-degradation for unreadable-/proc environments (cross-process.md
-boot-epoch clauses). Suites therefore cannot exercise the
-boot-epoch reset path until the fork models per-boot host
-identity; that suite lands under a `Lands:` condition (see the
-issue index), not silently.
+Known modeled-surface residuals:
+
+- **`link(2)` is not modeled**: CopyTo's preferred hard-link
+  publish arm (and the NFS link-retransmission quirk detection)
+  is unreachable in-simulation — every simulated CopyTo publishes
+  through the renameat2 no-replace rung. The link arm and the
+  quirk are host-only paths; suites exercising the publish
+  exercise the rename rung.
+- **`/proc/sys/kernel/random/boot_id`** is not modeled; the read
+  fails and gmdb runs with the ZERO boot epoch — cross-boot
+  invalidation disabled, exactly the spec'd degradation for
+  unreadable-/proc environments (cross-process.md boot-epoch
+  clauses). Suites therefore cannot exercise the boot-epoch reset
+  path until the fork models per-boot host identity; that suite
+  lands under a `Lands:` condition (see the issue index), not
+  silently.
 
 ## Simulation topology conventions
 
@@ -114,7 +123,7 @@ across seeds.
   start-time, heartbeat legs); reader-slot acquisition, reaping
   of crashed readers, snapshot pinning across a writer's
   commits; change notification (`Version`/`WaitVersion`/
-  `WaitKeyspaceVersion`) over the poll waiter, including
+  `WaitKeyspaceVersion`) over the real futex waiter, including
   no-lost-wake across publish and cancellation.
 - **Crash suite** — durability.md: acked-durable commits always
   recover byte-exact after `CrashHost` at any point; an

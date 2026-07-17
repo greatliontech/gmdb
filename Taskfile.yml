@@ -6,6 +6,11 @@ tasks:
     cmds:
       - go test -race -count=1 ./...
 
+  test:dst:
+    desc: Deterministic-simulation suite (requires the godst fork toolchain; docs/specs/dst-testing.md)
+    cmds:
+      - godst test -tags dst -count=1 -timeout 600s ./dsttest/
+
   cover:
     desc: Run tests with coverage and open HTML report
     cmds:

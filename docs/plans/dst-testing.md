@@ -6,7 +6,7 @@ Fork prerequisites — landed (fork branch `dst`): renameat2
 dispatch and the shared-futex model, each with its own reviewed
 plan in the fork repo.
 
-- [ ] 1. Toolchain wiring + fence probe: Taskfile `test:dst` leg
+- [x] 1. Toolchain wiring + fence probe: Taskfile `test:dst` leg
       (godst, `-tags dst`); tagged smoke test — `simulation.Run` →
       Open → write → commit → reopen → `Check` — confirming gmdb's
       full production path (real futex waiter, real renameat2 rung)
