@@ -490,3 +490,185 @@ func TestCopyToDirSyncFailureUnpublishes(t *testing.T) {
 		t.Fatalf("retry CopyTo: %v", err)
 	}
 }
+
+// copyToSrcDB builds a one-key source DB for publish-path tests.
+func copyToSrcDB(t *testing.T, ctx context.Context) *DB {
+	t.Helper()
+	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.Update(ctx, func(tx *Tx) error {
+		ks, e := tx.CreateKeyspace("k")
+		if e != nil {
+			return e
+		}
+		return ks.Put([]byte("a"), []byte("b"))
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	return db
+}
+
+// verifyPublishedCopy opens dst and checks the copied row.
+func verifyPublishedCopy(t *testing.T, ctx context.Context, dst string) {
+	t.Helper()
+	cp, err := Open(ctx, dst, Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
+	if err != nil {
+		t.Fatalf("open copy: %v", err)
+	}
+	defer cp.Close()
+	rtx, _ := cp.BeginRead(ctx)
+	defer rtx.Rollback()
+	ks, err := rtx.OpenKeyspaceReadOnly("k")
+	if err != nil {
+		t.Fatalf("OpenKeyspaceReadOnly: %v", err)
+	}
+	v, err := ks.Get([]byte("a"))
+	if err != nil || !bytes.Equal(v, []byte("b")) {
+		t.Fatalf("copy Get = (%q, %v), want (b, nil)", v, err)
+	}
+}
+
+// A destination filesystem without hard-link support (link(2) →
+// ENOTSUP: vfat/exfat, many FUSE mounts) publishes via the
+// no-replace-rename fallback (api-surface.md §Check, CopyTo,
+// Compact per-filesystem contract).
+func TestCopyToPublishFallbackRenameWhenLinkUnsupported(t *testing.T) {
+	ctx := context.Background()
+	db := copyToSrcDB(t, ctx)
+	restore := SetCopyLinkForTest(func(_, newname string) error {
+		return &os.LinkError{Op: "link", Old: "", New: newname, Err: errors.ErrUnsupported}
+	})
+	defer restore()
+	dst := tmpPath(t)
+	if err := db.CopyTo(dst, false); err != nil {
+		t.Fatalf("CopyTo over linkless destination: %v", err)
+	}
+	verifyPublishedCopy(t, ctx, dst)
+	matches, err := filepath.Glob(dst + ".copytmp-*")
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("temp not cleaned after rename publish: %v %v", matches, err)
+	}
+}
+
+// The rename fallback preserves the no-clobber contract: a file
+// appearing at path mid-copy fails the publish (ErrExist-class) with
+// the pre-existing file untouched — never replaced.
+func TestCopyToPublishFallbackPreservesNoClobber(t *testing.T) {
+	ctx := context.Background()
+	db := copyToSrcDB(t, ctx)
+	dst := tmpPath(t)
+	sentinel := []byte("late arrival — must survive the fallback")
+	restoreHook := SetCopyPublishHookForTest(func(string) {
+		if err := os.WriteFile(dst, sentinel, 0o600); err != nil {
+			t.Fatalf("plant late file: %v", err)
+		}
+	})
+	defer restoreHook()
+	restoreLink := SetCopyLinkForTest(func(_, newname string) error {
+		return &os.LinkError{Op: "link", Old: "", New: newname, Err: errors.ErrUnsupported}
+	})
+	defer restoreLink()
+	if err := db.CopyTo(dst, false); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("fallback publish over late file = %v, want ErrExist-class", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil || !bytes.Equal(got, sentinel) {
+		t.Fatalf("late file clobbered by the fallback: (%q, %v)", got, err)
+	}
+	matches, err := filepath.Glob(dst + ".copytmp-*")
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("temp not cleaned after failed publish: %v %v", matches, err)
+	}
+}
+
+// NFS link retransmission: link(2) reports failure although the server
+// applied it — path already names the copied inode. That IS the
+// publish; CopyTo must succeed instead of removing the temp and
+// reporting an error with a complete copy present.
+func TestCopyToPublishNFSRetransmissionQuirk(t *testing.T) {
+	ctx := context.Background()
+	db := copyToSrcDB(t, ctx)
+	restore := SetCopyLinkForTest(func(oldname, newname string) error {
+		if err := os.Link(oldname, newname); err != nil {
+			return err
+		}
+		// The server applied the link; the client saw a lost reply.
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: errors.New("nfs: retransmission timeout")}
+	})
+	defer restore()
+	dst := tmpPath(t)
+	if err := db.CopyTo(dst, false); err != nil {
+		t.Fatalf("CopyTo with retransmission-quirk link: %v", err)
+	}
+	verifyPublishedCopy(t, ctx, dst)
+	matches, err := filepath.Glob(dst + ".copytmp-*")
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("temp not cleaned after quirk publish: %v %v", matches, err)
+	}
+}
+
+// renameNoReplaceBestEffort unit contract: refuses an existing path
+// (ErrExist-class, path untouched), renames into an absent one.
+func TestRenameNoReplaceBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, "tmp")
+	path := filepath.Join(dir, "dst")
+	if err := os.WriteFile(tmp, []byte("copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := renameNoReplaceBestEffort(tmp, path); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("best-effort over existing = %v, want ErrExist", err)
+	}
+	got, _ := os.ReadFile(path)
+	if !bytes.Equal(got, []byte("existing")) {
+		t.Fatal("existing path clobbered")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := renameNoReplaceBestEffort(tmp, path); err != nil {
+		t.Fatalf("best-effort into absent path = %v", err)
+	}
+	got, _ = os.ReadFile(path)
+	if !bytes.Equal(got, []byte("copy")) {
+		t.Fatal("rename did not publish the copy")
+	}
+}
+
+// The dir-fsync-failure unpublish holds over the RENAME publish too:
+// error ⇒ nothing at path, no temp residue (the temp name was
+// consumed by the rename; its removal is an ENOENT no-op), retry
+// succeeds.
+func TestCopyToDirSyncFailureUnpublishesRenamePublish(t *testing.T) {
+	ctx := context.Background()
+	db := copyToSrcDB(t, ctx)
+	restoreLink := SetCopyLinkForTest(func(_, newname string) error {
+		return &os.LinkError{Op: "link", Old: "", New: newname, Err: errors.ErrUnsupported}
+	})
+	defer restoreLink()
+	dst := tmpPath(t)
+	injected := errors.New("injected dir fsync failure")
+	restoreSync := SetSyncDirHookForTest(func(string) error { return injected })
+	err := db.CopyTo(dst, false)
+	restoreSync()
+	if !errors.Is(err, injected) {
+		t.Fatalf("CopyTo = %v, want the injected dir-fsync failure", err)
+	}
+	if _, serr := os.Lstat(dst); !errors.Is(serr, os.ErrNotExist) {
+		t.Fatalf("failed CopyTo left the rename-published copy at path: %v", serr)
+	}
+	matches, gerr := filepath.Glob(dst + ".copytmp-*")
+	if gerr != nil || len(matches) != 0 {
+		t.Fatalf("temp residue after failed CopyTo: %v %v", matches, gerr)
+	}
+	if err := db.CopyTo(dst, false); err != nil {
+		t.Fatalf("retry CopyTo (rename publish): %v", err)
+	}
+	verifyPublishedCopy(t, ctx, dst)
+}

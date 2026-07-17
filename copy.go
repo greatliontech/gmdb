@@ -36,8 +36,14 @@ type copyDest interface {
 var copyDestWrapForTest atomic.Pointer[func(copyDest) copyDest]
 
 // copyPublishHookForTest, when set, fires after the temp copy is
-// complete and fsynced, immediately before the hard-link publish.
+// complete and fsynced, immediately before the publish.
 var copyPublishHookForTest atomic.Pointer[func(tmpPath string)]
+
+// copyLinkForTest, when set, replaces os.Link in CopyTo's publish step
+// — the seam for exercising the non-hard-link destination fallback and
+// the NFS link-retransmission quirk without a special filesystem.
+// Global state — same non-parallel rule as the other copy seams.
+var copyLinkForTest atomic.Pointer[func(oldname, newname string) error]
 
 // wrapCopyDest applies the test seam (identity in production).
 func wrapCopyDest(f *os.File) copyDest {
@@ -81,12 +87,14 @@ func publicChecksumErr(err error) error {
 //
 // The destination is crash-consistent (api-surface.md §Check, CopyTo,
 // Compact): the copy is written to a temp file in path's directory,
-// fsynced, and only then published at path via an atomic hard link — a
-// crash mid-copy never leaves a partial file at path, only a
-// `<path>.copytmp-*` temp, which is inert and safe to delete once no
-// CopyTo is in flight. The link also enforces no-clobber atomically: a
-// file appearing at path mid-copy fails the publish instead of being
-// overwritten.
+// fsynced, and only then published at path — a crash mid-copy never
+// leaves a partial file at path, only a `<path>.copytmp-*` temp, which
+// is inert and safe to delete once no CopyTo is in flight. The publish
+// prefers an atomic hard link, which also enforces no-clobber
+// atomically (a file appearing at path mid-copy fails the publish
+// instead of being overwritten); destinations without hard-link
+// support fall back to a no-replace rename — see renameNoReplace for
+// the per-filesystem atomicity ladder.
 //
 // To change file format, re-open the copy and use SetFileFormat.
 func (db *DB) CopyTo(path string, compact bool) error {
@@ -100,8 +108,9 @@ func (db *DB) CopyTo(path string, compact bool) error {
 		return fmt.Errorf("gmdb: CopyTo generate UUID: %w", err)
 	}
 	// Fail fast when the destination already exists. Advisory only — the
-	// authoritative no-clobber guard is the atomic hard-link publish
-	// below (link fails EEXIST rather than overwriting).
+	// authoritative no-clobber guard is the publish ladder below (link /
+	// RENAME_NOREPLACE fail EEXIST rather than overwriting; best-effort
+	// on destinations with neither).
 	if _, serr := os.Lstat(path); serr == nil {
 		return fmt.Errorf("gmdb: CopyTo create %q: %w", path, os.ErrExist)
 	} else if !errors.Is(serr, os.ErrNotExist) {
@@ -125,12 +134,30 @@ func (db *DB) CopyTo(path string, compact bool) error {
 	// Publish: hard-link the complete, fsynced temp at path — atomic and
 	// no-clobber (EEXIST if path appeared meanwhile) — make the new
 	// dirent durable (durability.md §Directory-entry durability), then
-	// drop the temp name. A crash between link and the dir fsync can
+	// drop the temp name. A crash between publish and the dir fsync can
 	// lose the dirent but never expose partial bytes: path, when
 	// present, always names the fully-fsynced inode.
-	if lerr := os.Link(tmp, path); lerr != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("gmdb: CopyTo publish %q: %w", path, lerr)
+	osLink := os.Link
+	if h := copyLinkForTest.Load(); h != nil {
+		osLink = *h
+	}
+	if lerr := osLink(tmp, path); lerr != nil {
+		// A failed link may still have published: on NFS, link(2) can
+		// succeed on the server while the client sees an error (the
+		// reply is lost; the retransmission hits EEXIST). path already
+		// naming the SAME inode as tmp IS the successful publish —
+		// treating it as failure would remove the temp and report an
+		// error with a complete copy present at path. Anything else
+		// routes to the no-replace-rename fallback for destinations
+		// without hard-link support (vfat/exfat, many FUSE mounts);
+		// its failure — including a genuine EEXIST — leaves any
+		// pre-existing path untouched.
+		if !publishedByLinkQuirk(tmp, path) {
+			if rerr := renameNoReplace(tmp, path); rerr != nil {
+				_ = os.Remove(tmp)
+				return fmt.Errorf("gmdb: CopyTo publish %q: %w (hard link: %v)", path, rerr, lerr)
+			}
+		}
 	}
 	if serr := syncDirPath(filepath.Dir(path)); serr != nil {
 		// All-or-nothing: the publish's durability is unknowable after a
@@ -144,6 +171,39 @@ func (db *DB) CopyTo(path string, compact bool) error {
 	}
 	_ = os.Remove(tmp)
 	return nil
+}
+
+// publishedByLinkQuirk reports whether a failed link(2) nevertheless
+// published the copy: path already naming the same inode as tmp. The
+// reachable producer is NFS's link retransmission (the server applied
+// the first request, its reply was lost, and the retransmission
+// returned EEXIST) — the one shape where a link "failure" leaves the
+// publish semantically complete. Detection is best-effort: a
+// transient Lstat failure here (ESTALE on the same flaky mount)
+// misses the quirk and routes to the fallback, whose EEXIST error
+// then coexists with a complete copy at path — the residual corner
+// of an errno-based protocol, strictly narrower than the base
+// behavior (which mis-reported EVERY retransmission).
+func publishedByLinkQuirk(tmp, path string) bool {
+	ti, terr := os.Lstat(tmp)
+	pi, perr := os.Lstat(path)
+	return terr == nil && perr == nil && os.SameFile(ti, pi)
+}
+
+// renameNoReplaceBestEffort is the no-replace publish where no atomic
+// form is available: an existence probe, then a plain rename. The
+// probe-to-rename window is a genuine TOCTOU race — on these
+// destinations the no-clobber guarantee is best-effort, per the
+// per-filesystem contract in api-surface.md §Check, CopyTo, Compact.
+// The crash-consistency half of the contract is NOT weakened: the
+// renamed inode is already complete and fsynced.
+func renameNoReplaceBestEffort(tmp, path string) error {
+	if _, err := os.Lstat(path); err == nil {
+		return &os.LinkError{Op: "rename", Old: tmp, New: path, Err: os.ErrExist}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // copyVerbatim implements CopyTo(compact=false): walk the snapshot's
@@ -274,7 +334,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 	}
 
 	// Bytes-durable barrier. Dirent durability for the published name is
-	// the caller's publish step (CopyTo links then fsyncs the directory);
+	// the caller's publish step (CopyTo publishes then fsyncs the directory);
 	// this temp's own dirent needs no durability — a crash leaves only an
 	// inert temp file.
 	if err := dest.Sync(); err != nil {

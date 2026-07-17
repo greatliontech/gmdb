@@ -99,4 +99,6 @@ findings each shared-fix row covers.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| copyto-hardlink-destination-support | decided: supported — implement the no-replace-rename fallback | [L] publish fails on vfat/exfat/FUSE targets; [nit] NFS link() retransmission quirk |
+
+*None open — resolved issues live in git history
+(`git log --all -- docs/issues/<slug>.md`).*

@@ -310,3 +310,15 @@ func SetCopyPublishHookForTest(hook func(tmpPath string)) (restore func()) {
 	copyPublishHookForTest.Store(&hook)
 	return func() { copyPublishHookForTest.Store(nil) }
 }
+
+// SetCopyLinkForTest replaces os.Link in CopyTo's publish step —
+// exercises the non-hard-link fallback and the NFS retransmission
+// quirk on ordinary filesystems. Returns a restore func.
+func SetCopyLinkForTest(link func(oldname, newname string) error) (restore func()) {
+	if link == nil {
+		copyLinkForTest.Store(nil)
+		return func() {}
+	}
+	copyLinkForTest.Store(&link)
+	return func() { copyLinkForTest.Store(nil) }
+}

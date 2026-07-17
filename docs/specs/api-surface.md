@@ -135,23 +135,48 @@ Invariant: kind=entailed;
 Invariant: kind=clause-explicit;
   property=At no point — including after a crash at any moment
     during `CopyTo` — does the destination path name a file that
-    is not a complete, fsynced copy. The copy is written to a
-    `<path>.copytmp-*` temp file in the destination's directory,
-    fsynced, and only then published at path by an atomic hard
-    link (which also enforces the no-clobber contract: a file
-    appearing at path mid-copy fails the publish with the
-    pre-existing file untouched). A crash can leave only the
+    is not a complete, fsynced copy. On every supported
+    destination this holds for all non-crash paths; the sole
+    crash-window exception is the FAT-class dirent tear scoped in
+    the rename rung below. The copy is written to a `<path>.copytmp-*` temp
+    file in the destination's directory, fsynced, and only then
+    published at path down a per-filesystem atomicity ladder:
+    an atomic hard link (also atomic no-clobber: a file appearing
+    at path mid-copy fails the publish with the pre-existing file
+    untouched); on destinations without hard-link support
+    (vfat/exfat, many FUSE mounts), a no-replace rename —
+    `renameat2(RENAME_NOREPLACE)` on Linux (still atomic
+    no-clobber), degrading to a probe-then-rename where NOREPLACE
+    is unsupported and on non-Linux platforms, whose no-clobber is
+    BEST-EFFORT (a genuine probe-to-rename TOCTOU window). The
+    renamed inode is always complete and fsynced, but the rename
+    rung's CRASH-atomicity is the destination filesystem's own
+    rename crash-semantics: journaled filesystems keep the
+    invariant; FAT-class metadata (no journal) can tear the
+    directory entry on power loss during the rename, leaving path
+    naming a torn entry — the residual crash exposure on exactly
+    the destinations that forced the rename rung. A failed link
+    with path
+    already naming the copied inode (NFS's link retransmission)
+    IS a successful publish. A crash can leave only the
     inert temp, safe to delete once no `CopyTo` is in flight. A
-    directory-fsync failure after the link UNPUBLISHES (removes
+    directory-fsync failure after the publish UNPUBLISHES (removes
     path) before returning the error, so in the live namespace an
     error return means nothing was produced at path (best-effort:
-    a remove failure on top of the failed fsync, or a crash that
-    resurrects the un-fsynced unlink, can leave the file — always
-    a COMPLETE copy, never a partial one);
+    a remove failure on top of the failed fsync, a crash that
+    resurrects the un-fsynced unlink, or a missed
+    link-retransmission detection — the quirk probe's own Lstat
+    failing transiently on the same flaky mount — can leave the
+    file — always a COMPLETE copy, never a partial one);
   from=this spec §Check, CopyTo, Compact (CopyTo destination
     crash-consistency); enforced by `TestCopyToPublishAtomicity`,
     `TestCopyToPublishNeverClobbersLateFile`,
-    `TestCopyToDirSyncFailureUnpublishes`;
+    `TestCopyToDirSyncFailureUnpublishes`,
+    `TestCopyToPublishFallbackRenameWhenLinkUnsupported`,
+    `TestCopyToPublishFallbackPreservesNoClobber`,
+    `TestCopyToPublishNFSRetransmissionQuirk`,
+    `TestRenameNoReplaceBestEffort`,
+    `TestRenameNoReplaceErrnoRouting`;
   violation=Metas written directly at path can persist before
     the data pages under them (no write-order barrier below the
     final fsync) — a power loss then leaves a torn backup that
@@ -2017,11 +2042,21 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue]
 //
 // Destination crash-consistency: the copy is written to a
 // `<path>.copytmp-*` temp file in path's directory, fsynced, then
-// published at path via an atomic hard link — a crash mid-copy never
-// leaves a partial file at path, only the inert temp (safe to delete
-// once no CopyTo is in flight). The link publish is also the
-// authoritative no-clobber guard: a file appearing at path mid-copy
-// fails the publish (EEXIST) with the pre-existing file untouched.
+// published at path — a crash mid-copy never leaves a partial file at
+// path, only the inert temp (safe to delete once no CopyTo is in
+// flight). The publish walks a per-filesystem atomicity ladder: an
+// atomic hard link (the authoritative no-clobber guard — a file
+// appearing at path mid-copy fails the publish EEXIST with the
+// pre-existing file untouched); destinations without hard-link
+// support (vfat/exfat, many FUSE mounts) fall back to a no-replace
+// rename — renameat2(RENAME_NOREPLACE) on Linux, still atomic
+// no-clobber; probe-then-rename where NOREPLACE is unavailable and
+// off Linux, where no-clobber is best-effort (a real TOCTOU window).
+// The renamed inode is always complete and fsynced; the rename
+// rung's crash-atomicity is the destination filesystem's own (FAT-
+// class metadata can tear the dirent on power loss mid-rename). A
+// failed link with path already naming the copied inode — NFS's
+// link retransmission — counts as a successful publish.
 //
 // A verbatim (compact=false) copy of a source whose file no longer
 // covers its meta's HighWaterMark — a truncated transfer, a forged
