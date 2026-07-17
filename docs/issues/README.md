@@ -64,9 +64,7 @@ pre-existing at their change set's base.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-
-*None open — resolved issues live in git history
-(`git log --all -- docs/issues/<slug>.md`).*
+| dst-stale-writer-identity-legs | when the DST fork models pid reuse / namespace divergence | start-time and heartbeat stale-writer legs are structurally unconstructible in-simulation; DST suite pins the pid-liveness leg only |
 
 ## Open — design gaps (2026-07-11 architecture audit)
 

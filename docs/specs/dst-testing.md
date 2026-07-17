@@ -119,8 +119,13 @@ across seeds.
 
 - **Coordination suite** — cross-process.md: writer-grant
   mutual exclusion and handoff under contention; stale-writer
-  detection and takeover after `Crash("writer")` (pid-liveness,
-  start-time, heartbeat legs); reader-slot acquisition, reaping
+  takeover after `Crash("writer")` and the recovery-commit gate's
+  dead-vs-live author classification (the PID-LIVENESS leg; the
+  start-time and heartbeat legs need pid reuse and namespace
+  divergence, which the fork's identity model — monotonic
+  never-reused pids, a single namespace — cannot express: they
+  land under a `Lands:` condition, see the issue index); reader-slot
+  acquisition, reaping
   of crashed readers, snapshot pinning across a writer's
   commits; change notification (`Version`/`WaitVersion`/
   `WaitKeyspaceVersion`) over the real futex waiter, including

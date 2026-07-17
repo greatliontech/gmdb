@@ -12,7 +12,7 @@ plan in the fork repo.
       full production path (real futex waiter, real renameat2 rung)
       runs fence-free, and that identity/clock/boot-epoch surfaces
       behave as the spec's §Simulated syscall surface records.
-- [ ] 2. Coordination suite: multi-process Host/Process topology
+- [x] 2. Coordination suite: multi-process Host/Process topology
       helpers + cross-process.md walk (grant handoff, stale-writer
       takeover, reader-slot reaping, snapshot pinning, notification
       over the real futex waiter).
