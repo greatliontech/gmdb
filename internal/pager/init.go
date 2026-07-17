@@ -569,6 +569,21 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64, force bool) (m Meta, ac
 	if err := p.attachState(file, m); err != nil {
 		return Meta{}, 0, false, err
 	}
+	if force {
+		// A forced rebuild means the takeover sequence advanced: a peer
+		// died holding the grant or poisoned on a failed publication —
+		// exactly the lineages whose failed data fdatasync may have
+		// DROPPED pwrites from writeback (clean-stale, invisible here;
+		// see RedirtyAttachedExtent — the live projection adopted here
+		// may reference that lineage's data pages too). Redirty so this
+		// handle's next completed barrier genuinely covers every byte
+		// it will anchor over. Healthy resyncs (TxnID advance, no
+		// force) skip: their peer's commits completed their own
+		// barriers.
+		if err := p.RedirtyAttachedExtent(m); err != nil {
+			return Meta{}, 0, false, err
+		}
+	}
 	return m, active, true, nil
 }
 
@@ -586,7 +601,48 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64, force bool) (m Meta, ac
 // detectable residue (BitmapLeak / FreeCountMismatch, repaired offline)
 // instead of an undetectable cache/platter split. Caller has attachState'd
 // the meta, so BitmapPages is bounds-checked.
-func (p *Pager) redirtyBitmapRegion(m Meta) error {
+// RedirtyAttachedExtent rewrites the bitmap region AND every page of the
+// attached extent [firstDataPage, HighWaterMark) byte-identically. The
+// LIVE-projection attach arms (a forced grant re-sync, a live-classified
+// writable Open) need this stronger form: the adopted live tree may
+// reference a poisoned peer's DATA pages whose failed barrier dropped
+// them from writeback — a bitmap-only redirty would let this handle's
+// next completed barrier anchor a durable assertion over tree pages the
+// platter never received (a post-power-loss TreeCorrupted with a valid
+// meta). The gated recovery arm needs only the bitmap form: it adopts
+// the DURABLE projection, whose tree pages a completed barrier already
+// covered. Runs only on poison/death lineages (rare), so the O(extent)
+// rewrite is a recovery cost, never a steady-state one.
+func (p *Pager) RedirtyAttachedExtent(m Meta) error {
+	if err := p.RedirtyBitmapRegion(m); err != nil {
+		return err
+	}
+	pageSize := int64(p.cfg.PageSize)
+	first := int64(2) + int64(m.BitmapPages)
+	buf := make([]byte, 1<<20)
+	for off := first * pageSize; off < int64(m.HighWaterMark)*pageSize; off += int64(len(buf)) {
+		want := min(int64(len(buf)), int64(m.HighWaterMark)*pageSize-off)
+		n, err := p.fops.ReadAt(buf[:want], off)
+		if n > 0 {
+			if _, werr := p.fops.WriteAt(buf[:n], off); werr != nil {
+				return fmt.Errorf("pager: recovery extent redirty: %w", werr)
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			// The meta's HighWaterMark can exceed the backed extent (a
+			// truncated or forged image attachState already clamps and
+			// recovers); pages beyond EOF have no cache state to
+			// redirty. The backed prefix has been rewritten — done.
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("pager: recovery extent read-back: %w", err)
+		}
+	}
+	return nil
+}
+
+func (p *Pager) RedirtyBitmapRegion(m Meta) error {
 	pageSize := int64(p.cfg.PageSize)
 	buf := make([]byte, int64(m.BitmapPages)*pageSize)
 	if _, err := p.fops.ReadAt(buf, 2*pageSize); err != nil {
@@ -681,7 +737,7 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 			if err := p.attachState(file, selected); err != nil {
 				return Meta{}, 0, false, err
 			}
-			if err := p.redirtyBitmapRegion(selected); err != nil {
+			if err := p.RedirtyBitmapRegion(selected); err != nil {
 				return Meta{}, 0, false, err
 			}
 			if _, err := p.fops.WriteAt(buf, int64(selectedIdx)*int64(p.cfg.PageSize)); err != nil {
@@ -716,7 +772,7 @@ func (p *Pager) RecoverToDurable(file *os.File) (m Meta, active int, recovered b
 	if err := p.attachState(file, proj); err != nil {
 		return Meta{}, 0, false, err
 	}
-	if err := p.redirtyBitmapRegion(proj); err != nil {
+	if err := p.RedirtyBitmapRegion(proj); err != nil {
 		return Meta{}, 0, false, err
 	}
 

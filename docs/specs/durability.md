@@ -254,10 +254,34 @@ undetectable cache/platter split that a later successful
 Checkpoint would launder into a durable assertion over bitmap
 bytes stable storage never received. The recovery-commit arm
 additionally derives its published free-page count from the bitmap
-it attached, so the pair it writes cannot disagree. (Enforced by
-the DST fault suite's writeback fsyncgate sweep,
+it attached, so the pair it writes cannot disagree. The duty is
+NOT limited to the gated arm — a dropped-writeback lineage also
+reaches attaches that classify LIVE: a same-process re-Open after
+the documented DurabilityUnknown recovery (Close + re-Open while
+the writer record is still live), and a surviving peer's grant
+acquisition after the failed author released cleanly. Both
+redirty under the held grant: the live-classified writable Open
+always (its lineage is unknowable), and the grant re-sync exactly
+when the takeover sequence forced a rebuild — the level-triggered
+signal every publication-phase poison site bumps (the commit
+pipeline's and Checkpoint's alike), so a healthy resync pays
+nothing. The LIVE arms redirty the WHOLE attached extent (bitmap
+region + data pages to the HighWaterMark), not the bitmap alone:
+the adopted live projection may reference the poisoned lineage's
+dropped DATA pages — a SyncLazy tail whose checkpoint failed —
+and a bitmap-only redirty would let the next completed barrier
+stamp a durable meta over tree pages the platter never received
+(a post-power-loss TreeCorrupted behind a valid meta). The gated
+arm's durable projection needs only the bitmap form: its tree
+pages were covered by the completed barrier that defined the
+epoch. A Compact destination needs none: it is a fresh file
+whose entire history is this process's own completed barriers.
+(Enforced by the DST fault suite's writeback fsyncgate sweep,
 `TestSimulationFsyncGateRecovery` — the seed-41/delay-0 anchor
-fails without the redirty.) The reclamation bound is
+fails without the gated-arm redirty, the same-process
+re-Open and lazy-reopen legs pin the live-classified arm and its
+full-extent form, and the peer-takeover and checkpoint-poison
+legs pin the forced-resync arm and the poison-site bumps.) The reclamation bound is
 `min(oldestActiveReaderTxnID, anchoredEpoch)` (`free-space.md §RPL
 Reclamation`); recovery adoption is unaffected (it reads
 `DurableTxnID` from disk, where anchoring is a tautology).

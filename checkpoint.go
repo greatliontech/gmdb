@@ -112,6 +112,14 @@ func (db *DB) checkpointUnderGrant() error {
 	// failure semantics.)
 	failStep := func(step int, err error) error {
 		db.poisoned.Store(true)
+		if db.coord != nil {
+			// Level-triggered dropped-writeback signal, mirroring the
+			// commit pipeline's poison-site bump (tx.go): the failed
+			// barrier may have dropped bitmap pwrites from writeback,
+			// and the next acquirer's forced Resync must redirty them
+			// (durability.md §Anchoring). Bumped under the held grant.
+			db.coord.BumpTakeoverSeq()
+		}
 		db.logger.Error("gmdb: checkpoint publication failure; handle poisoned — Close and re-Open",
 			"step", step, "err", err)
 		return fmt.Errorf("gmdb: checkpoint step %d: %w (handle poisoned)", step, err)

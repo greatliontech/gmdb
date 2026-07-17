@@ -573,3 +573,457 @@ func TestSimulationWallClockFaultImmunity(t *testing.T) {
 		})
 	})
 }
+
+// TestSimulationFsyncGateSameProcessReopen pins the LIVE-classified arm of
+// the bitmap-redirty duty (durability.md §Anchoring): after a writeback-
+// shape publication failure, the same process follows the documented
+// recovery — Close + re-Open + Checkpoint — whose Open classifies live
+// (the writer record survives) and must redirty the bitmap region it
+// attached, or the dropped bitmap pwrites stay clean-stale and the
+// checkpoint anchors over bytes the platter never received.
+func TestSimulationFsyncGateSameProcessReopen(t *testing.T) {
+	simulation.Test(t, 53, func(t *testing.T) {
+		var commitErr error
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("app", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				if err := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.CreateKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k1"), []byte("v1"))
+				}); err != nil {
+					t.Fatalf("setup: %v", err)
+				}
+				simulation.FailWriteback("h")
+				commitErr = db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.OpenKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k2"), bytes.Repeat([]byte("y"), 32768))
+				})
+				simulation.HealWriteback("h")
+				if commitErr == nil || !commitClassified(commitErr) {
+					t.Fatalf("faulted commit = %v; want a classified failure", commitErr)
+				}
+				db.Close()
+				// The documented recovery, same process: re-Open (live-
+				// classified) + Checkpoint.
+				db2 := openDB(t, "/db")
+				defer db2.Close()
+				if err := db2.Checkpoint(ctx); err != nil {
+					t.Fatalf("Checkpoint: %v", err)
+				}
+				if err := db2.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.OpenKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k3"), []byte("v3"))
+				}); err != nil {
+					t.Fatalf("post-recovery Update: %v", err)
+				}
+			})
+		})
+		simulation.CrashHost("h")
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("verifier", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				defer db.Close()
+				residue := 0
+				for issue := range db.Check() {
+					if issue.Code == "BitmapLeak" || issue.Code == "FreeCountMismatch" {
+						residue++
+						continue
+					}
+					t.Errorf("Check: %+v", issue)
+				}
+				if residue > 0 {
+					for issue := range db.CheckWithOptions(&gmdb.CheckOptions{Repair: true}) {
+						if issue.Code != "BitmapLeak" && issue.Code != "FreeCountMismatch" {
+							t.Errorf("Repair: %+v", issue)
+						}
+					}
+					for issue := range db.Check() {
+						t.Errorf("post-repair Check: %+v", issue)
+					}
+				}
+				if err := db.View(ctx, func(rtx *gmdb.ReadTx) error {
+					ks, e := rtx.OpenKeyspaceReadOnly("k")
+					if e != nil {
+						return e
+					}
+					if v, e := ks.Get([]byte("k1")); e != nil || string(v) != "v1" {
+						t.Errorf("k1 = %q, %v; want v1", v, e)
+					}
+					if v, e := ks.Get([]byte("k3")); e != nil || string(v) != "v3" {
+						t.Errorf("k3 = %q, %v; want v3", v, e)
+					}
+					if v2, e2 := ks.Get([]byte("k2")); e2 == nil {
+						if !bytes.Equal(v2, bytes.Repeat([]byte("y"), 32768)) {
+							t.Errorf("surviving k2 corrupt")
+						}
+					} else if !errors.Is(e2, gmdb.ErrNotFound) {
+						t.Errorf("k2 = %v, want value or ErrNotFound", e2)
+					}
+					return nil
+				}); err != nil {
+					t.Fatalf("View: %v", err)
+				}
+			})
+		})
+	})
+}
+
+// TestSimulationFsyncGatePeerTakeoverResync pins the forced-resync leg of
+// the bitmap-redirty duty (durability.md §Anchoring): a writer poisons on a
+// writeback-shape publication failure (bumping the takeover sequence under
+// its grant) and SURVIVES; a peer's next grant acquisition sees the lag,
+// forces the rebuild, and must redirty the bitmap region it attached — its
+// own barrier then genuinely covers the dropped bitmap bytes.
+func TestSimulationFsyncGatePeerTakeoverResync(t *testing.T) {
+	simulation.Test(t, 54, func(t *testing.T) {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("setup", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				defer db.Close()
+				if err := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.CreateKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k1"), []byte("v1"))
+				}); err != nil {
+					t.Fatalf("setup: %v", err)
+				}
+			})
+			go simulation.Process("peer", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				if err := os.WriteFile("/peer-open", nil, 0o600); err != nil {
+					t.Errorf("signal: %v", err)
+					return
+				}
+				mustAwait(t, "/writer-poisoned")
+				// Grant acquisition sees the poison-site bump → forced
+				// resync → redirty; the commit's barrier covers it.
+				if err := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.OpenKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k3"), []byte("v3"))
+				}); err != nil {
+					t.Errorf("peer Update: %v", err)
+				}
+				if err := os.WriteFile("/peer-done", nil, 0o600); err != nil {
+					t.Errorf("signal: %v", err)
+				}
+				time.Sleep(time.Hour)
+			})
+			go simulation.Process("writer", func() {
+				ctx := context.Background()
+				mustAwait(t, "/peer-open")
+				db := openDB(t, "/db")
+				simulation.FailWriteback("h")
+				commitErr := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.OpenKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k2"), bytes.Repeat([]byte("z"), 32768))
+				})
+				simulation.HealWriteback("h")
+				if commitErr == nil || !commitClassified(commitErr) {
+					t.Errorf("faulted commit = %v; want a classified failure", commitErr)
+				}
+				if err := os.WriteFile("/writer-poisoned", nil, 0o600); err != nil {
+					t.Errorf("signal: %v", err)
+				}
+				// Stay alive: the writer record must classify LIVE so the
+				// peer takes the forced-resync path, never the gated arm.
+				time.Sleep(time.Hour)
+			})
+			simulation.Process("await", func() { mustAwait(t, "/peer-done") })
+		})
+		simulation.CrashHost("h")
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("verifier", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				defer db.Close()
+				residue := 0
+				for issue := range db.Check() {
+					if issue.Code == "BitmapLeak" || issue.Code == "FreeCountMismatch" {
+						residue++
+						continue
+					}
+					t.Errorf("Check: %+v", issue)
+				}
+				if residue > 0 {
+					for issue := range db.CheckWithOptions(&gmdb.CheckOptions{Repair: true}) {
+						if issue.Code != "BitmapLeak" && issue.Code != "FreeCountMismatch" {
+							t.Errorf("Repair: %+v", issue)
+						}
+					}
+					for issue := range db.Check() {
+						t.Errorf("post-repair Check: %+v", issue)
+					}
+				}
+				if err := db.View(ctx, func(rtx *gmdb.ReadTx) error {
+					ks, e := rtx.OpenKeyspaceReadOnly("k")
+					if e != nil {
+						return e
+					}
+					if v, e := ks.Get([]byte("k1")); e != nil || string(v) != "v1" {
+						t.Errorf("k1 = %q, %v; want v1", v, e)
+					}
+					if v, e := ks.Get([]byte("k3")); e != nil || string(v) != "v3" {
+						t.Errorf("k3 = %q, %v; want v3 (peer's post-takeover durable commit)", v, e)
+					}
+					return nil
+				}); err != nil {
+					t.Fatalf("View: %v", err)
+				}
+			})
+		})
+	})
+}
+
+// TestSimulationFsyncGateCheckpointPoisonResync is the Checkpoint-side
+// twin of the peer-takeover leg: a SyncLazy writer's CHECKPOINT fails
+// under the writeback shape (dropping the lazy tail's dirty pages),
+// poisons, and bumps the takeover sequence — Checkpoint's poison site
+// carries the same level-triggered duty as the commit pipeline's — so
+// the surviving peer's forced resync redirties what the failed barrier
+// dropped before anchoring over it.
+func TestSimulationFsyncGateCheckpointPoisonResync(t *testing.T) {
+	simulation.Test(t, 55, func(t *testing.T) {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("setup", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				defer db.Close()
+				if err := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.CreateKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k1"), []byte("v1"))
+				}); err != nil {
+					t.Fatalf("setup: %v", err)
+				}
+			})
+			go simulation.Process("peer", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				if err := os.WriteFile("/peer-open", nil, 0o600); err != nil {
+					t.Errorf("signal: %v", err)
+					return
+				}
+				mustAwait(t, "/writer-poisoned")
+				if err := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.OpenKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k3"), []byte("v3"))
+				}); err != nil {
+					t.Errorf("peer Update: %v", err)
+				}
+				if err := os.WriteFile("/peer-done", nil, 0o600); err != nil {
+					t.Errorf("signal: %v", err)
+				}
+				time.Sleep(time.Hour)
+			})
+			go simulation.Process("writer", func() {
+				ctx := context.Background()
+				mustAwait(t, "/peer-open")
+				lazyOpts := smallOpts
+				lazyOpts.SyncMode = gmdb.SyncLazy
+				db, err := gmdb.Open(ctx, "/db", lazyOpts)
+				if err != nil {
+					t.Errorf("lazy open: %v", err)
+					return
+				}
+				if err := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.OpenKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k2"), bytes.Repeat([]byte("w"), 32768))
+				}); err != nil {
+					t.Errorf("lazy Update: %v", err)
+					return
+				}
+				simulation.FailWriteback("h")
+				ckErr := db.Checkpoint(ctx)
+				simulation.HealWriteback("h")
+				if ckErr == nil {
+					t.Error("Checkpoint under FailWriteback succeeded; want a poisoning failure")
+				}
+				if err := os.WriteFile("/writer-poisoned", nil, 0o600); err != nil {
+					t.Errorf("signal: %v", err)
+				}
+				time.Sleep(time.Hour) // stay live: the peer must take the forced-resync path
+			})
+			simulation.Process("await", func() { mustAwait(t, "/peer-done") })
+		})
+		simulation.CrashHost("h")
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("verifier", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				defer db.Close()
+				residue := 0
+				for issue := range db.Check() {
+					if issue.Code == "BitmapLeak" || issue.Code == "FreeCountMismatch" {
+						residue++
+						continue
+					}
+					t.Errorf("Check: %+v", issue)
+				}
+				if residue > 0 {
+					for issue := range db.CheckWithOptions(&gmdb.CheckOptions{Repair: true}) {
+						if issue.Code != "BitmapLeak" && issue.Code != "FreeCountMismatch" {
+							t.Errorf("Repair: %+v", issue)
+						}
+					}
+					for issue := range db.Check() {
+						t.Errorf("post-repair Check: %+v", issue)
+					}
+				}
+				if err := db.View(ctx, func(rtx *gmdb.ReadTx) error {
+					ks, e := rtx.OpenKeyspaceReadOnly("k")
+					if e != nil {
+						return e
+					}
+					if v, e := ks.Get([]byte("k1")); e != nil || string(v) != "v1" {
+						t.Errorf("k1 = %q, %v; want v1", v, e)
+					}
+					if v, e := ks.Get([]byte("k3")); e != nil || string(v) != "v3" {
+						t.Errorf("k3 = %q, %v; want v3", v, e)
+					}
+					if v2, e2 := ks.Get([]byte("k2")); e2 == nil {
+						if !bytes.Equal(v2, bytes.Repeat([]byte("w"), 32768)) {
+							t.Errorf("surviving k2 corrupt")
+						}
+					} else if !errors.Is(e2, gmdb.ErrNotFound) {
+						t.Errorf("k2 = %v, want value or ErrNotFound", e2)
+					}
+					return nil
+				}); err != nil {
+					t.Fatalf("View: %v", err)
+				}
+			})
+		})
+	})
+}
+
+// TestSimulationFsyncGateLazyReopenExtent pins the full-extent form of the
+// live-classified Open's redirty: a SyncLazy tail is VISIBLE when its
+// checkpoint fails (dropping the tail's data pages), and the same
+// process's documented recovery — Close + re-Open + Checkpoint — must
+// make that tail genuinely durable, which requires redirtying the data
+// pages the failed barrier dropped, not the bitmap alone.
+func TestSimulationFsyncGateLazyReopenExtent(t *testing.T) {
+	simulation.Test(t, 56, func(t *testing.T) {
+		lazyOpts := smallOpts
+		lazyOpts.SyncMode = gmdb.SyncLazy
+		payload := bytes.Repeat([]byte("q"), 32768)
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("app", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				if err := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.CreateKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k1"), []byte("v1"))
+				}); err != nil {
+					t.Fatalf("setup: %v", err)
+				}
+				db.Close()
+				lazy, err := gmdb.Open(ctx, "/db", lazyOpts)
+				if err != nil {
+					t.Fatalf("lazy open: %v", err)
+				}
+				if err := lazy.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.OpenKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("k2"), payload)
+				}); err != nil {
+					t.Fatalf("lazy Update: %v", err)
+				}
+				simulation.FailWriteback("h")
+				if err := lazy.Checkpoint(ctx); err == nil {
+					t.Fatal("Checkpoint under FailWriteback succeeded; want a poisoning failure")
+				}
+				simulation.HealWriteback("h")
+				lazy.Close()
+				// Documented recovery: re-Open (live-classified — the k2
+				// tail is visible and must not roll back) + Checkpoint,
+				// which must make the whole visible state durable.
+				db2, err := gmdb.Open(ctx, "/db", lazyOpts)
+				if err != nil {
+					t.Fatalf("re-open: %v", err)
+				}
+				defer db2.Close()
+				if err := db2.Checkpoint(ctx); err != nil {
+					t.Fatalf("recovery Checkpoint: %v", err)
+				}
+			})
+		})
+		simulation.CrashHost("h")
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("verifier", func() {
+				ctx := context.Background()
+				db := openDB(t, "/db")
+				defer db.Close()
+				residue := 0
+				for issue := range db.Check() {
+					if issue.Code == "BitmapLeak" || issue.Code == "FreeCountMismatch" {
+						residue++
+						continue
+					}
+					t.Errorf("Check: %+v", issue)
+				}
+				if residue > 0 {
+					for issue := range db.CheckWithOptions(&gmdb.CheckOptions{Repair: true}) {
+						if issue.Code != "BitmapLeak" && issue.Code != "FreeCountMismatch" {
+							t.Errorf("Repair: %+v", issue)
+						}
+					}
+					for issue := range db.Check() {
+						t.Errorf("post-repair Check: %+v", issue)
+					}
+				}
+				if err := db.View(ctx, func(rtx *gmdb.ReadTx) error {
+					ks, e := rtx.OpenKeyspaceReadOnly("k")
+					if e != nil {
+						return e
+					}
+					if v, e := ks.Get([]byte("k1")); e != nil || string(v) != "v1" {
+						t.Errorf("k1 = %q, %v; want v1", v, e)
+					}
+					// The recovery Checkpoint SUCCEEDED: its durability
+					// promise covers the visible k2 tail unconditionally.
+					if v, e := ks.Get([]byte("k2")); e != nil || !bytes.Equal(v, payload) {
+						t.Errorf("k2 lost or wrong after a successful recovery Checkpoint (%v)", e)
+					}
+					return nil
+				}); err != nil {
+					t.Fatalf("View: %v", err)
+				}
+			})
+		})
+	})
+}

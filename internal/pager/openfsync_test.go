@@ -238,3 +238,89 @@ func TestAnchorDivergentMetaFallsToRecoveryCommit(t *testing.T) {
 		t.Fatalf("latest TxnID = %d, want 2", latest.TxnID)
 	}
 }
+
+// TestRecoveryCommitFreeCountDerivedFromBitmap pins the recovery-commit
+// arm's published free-page count (durability.md §Anchoring): it is
+// derived from the bitmap actually attached — the adopted cache view,
+// which a dead writer's unpublished allocations may have moved past the
+// sub-record's remembered count — never the sub-record's value, so the
+// published meta/bitmap pair cannot disagree. The lazy image's SyncNone
+// commits allocated pages the genesis sub-record never counted, making
+// the two counts observably different here.
+func TestRecoveryCommitFreeCountDerivedFromBitmap(t *testing.T) {
+	f, db, cleanup := initDB(t, false)
+	_ = f
+	defer cleanup()
+	p := db.Pager
+
+	// Build a DURABLE epoch holding one free page below its
+	// HighWaterMark, then an unpublished-durability SyncNone commit
+	// that re-allocates it: the sub-record remembers the page free
+	// while the on-disk bitmap region says allocated — the divergence
+	// the recovery-commit arm must resolve in the bitmap's favor.
+	prev, prevActive := db.Meta, db.ActiveMetaIdx
+	commit := func(txn uint64, sync SyncPolicy, body func()) {
+		t.Helper()
+		p.BeginTx(TxParams{
+			HighWaterMark: prev.HighWaterMark, MaxSize: prev.MaxSize,
+			GrowStep: prev.GrowStep, MinSize: prev.MinSize, TxnID: txn,
+			ReclamationBound: func() uint64 { return 0 },
+		})
+		body()
+		res, err := p.Commit(CommitParams{NewTxnID: txn, Flags: prev.Flags, Sync: sync}, prev, prevActive)
+		if err != nil {
+			t.Fatalf("Commit %d: %v", txn, err)
+		}
+		prev, prevActive = res.Meta, res.ActiveMetaIdx
+	}
+	var id1, id2 uint64
+	commit(1, SyncBoth, func() {
+		var err error
+		if id1, err = p.AllocPage(); err != nil {
+			t.Fatalf("AllocPage: %v", err)
+		}
+		if _, err = p.AllocSlab(id1); err != nil {
+			t.Fatalf("AllocSlab: %v", err)
+		}
+		if id2, err = p.AllocPage(); err != nil {
+			t.Fatalf("AllocPage: %v", err)
+		}
+		if _, err = p.AllocSlab(id2); err != nil {
+			t.Fatalf("AllocSlab: %v", err)
+		}
+	})
+	commit(2, SyncBoth, func() {
+		if err := p.FreeLeakedPage(id1); err != nil {
+			t.Fatalf("FreeLeakedPage: %v", err)
+		}
+	})
+	commit(3, SyncNone, func() {
+		id, err := p.AllocPage()
+		if err != nil {
+			t.Fatalf("AllocPage: %v", err)
+		}
+		if id != id1 {
+			t.Fatalf("reallocation = page %d, want the freed page %d", id, id1)
+		}
+		if _, err := p.AllocSlab(id); err != nil {
+			t.Fatalf("AllocSlab: %v", err)
+		}
+	})
+	db.Meta, db.ActiveMetaIdx = prev, prevActive
+
+	subRecordCount := db.Meta.Durable.NumFreePages
+	rm, _, recovered, err := p.RecoverToDurable(p.file)
+	if err != nil {
+		t.Fatalf("RecoverToDurable: %v", err)
+	}
+	if !recovered {
+		t.Fatal("expected the recovery-commit arm (non-self-durable image)")
+	}
+	bitmapCount := p.Bitmap().NumFree()
+	if subRecordCount == bitmapCount {
+		t.Fatalf("vacuous construction: sub-record and bitmap counts agree (%d); the image must diverge them", bitmapCount)
+	}
+	if rm.NumFreePages != bitmapCount {
+		t.Fatalf("recovery meta NumFreePages = %d, want the attached bitmap's count %d (sub-record remembered %d)", rm.NumFreePages, bitmapCount, subRecordCount)
+	}
+}

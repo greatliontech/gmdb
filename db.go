@@ -451,6 +451,20 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 				teardown()
 				return nil, mapPagerErr(lerr)
 			}
+			// This arm's lineage may include a poisoned handle whose
+			// failed data fdatasync dropped bitmap pwrites from
+			// writeback (a same-process re-Open after the documented
+			// DurabilityUnknown recovery classifies live and lands
+			// here). The LIVE projection may reference that lineage's
+			// dropped DATA pages too, so the whole attached extent is
+			// redirtied under the held grant — this handle's barriers
+			// then genuinely cover every byte it anchors over
+			// (durability.md §Anchoring).
+			if rerr := opened.Pager.RedirtyAttachedExtent(lm); rerr != nil {
+				grant.Release()
+				teardown()
+				return nil, mapPagerErr(rerr)
+			}
 			opened.Meta, opened.ActiveMetaIdx = lm, lidx
 		}
 		// Both attach arms rebuilt bitmap + RPL from the current
