@@ -547,7 +547,21 @@ func TestPatchKeyExtRefs(t *testing.T) {
 // the extents — while a duplicate inline key, and an inline key tying
 // an overflow predecessor whose full key exceeds it, still panic.
 func TestLeafBuilderResidentTieRules(t *testing.T) {
-	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	for _, variant := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"segregated", Config{PageSize: 4096, RestartGroupTarget: 16}},
+		{"interleaved", Config{PageSize: 4096, RestartGroupTarget: 16, LeafLayout: LeafLayoutInterleaved}},
+		{"uncompressed", Config{PageSize: 4096, RestartGroupTarget: 1}},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
+			testLeafBuilderResidentTieRules(t, variant.cfg)
+		})
+	}
+}
+
+func testLeafBuilderResidentTieRules(t *testing.T, cfg Config) {
 	tt := cfg.InlineThreshold()
 	res := bytes.Repeat([]byte{1}, tt)
 	full := bytes.Repeat([]byte{1}, tt+300)
