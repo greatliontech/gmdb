@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"testing/simulation"
 	"time"
@@ -27,8 +28,8 @@ import (
 // honestly (BudgetHit/Overflow/ForeignSched are stated, not hidden).
 func exploreReport(t *testing.T, tag string, seed uint64, res simulation.ExploreResult, sut func() bool) {
 	t.Helper()
-	t.Logf("%s: seed %d: %d schedules, exhausted=%v budgetHit=%v overflow=%v foreign=%v",
-		tag, seed, res.Schedules, res.Exhausted, res.BudgetHit, res.Overflow, res.ForeignSched)
+	t.Logf("%s: seed %d: mode=%v %d schedules, exhausted=%v budgetHit=%v overflow=%v foreign=%v uninstrumented=%v",
+		tag, seed, exploreMode(), res.Schedules, res.Exhausted, res.BudgetHit, res.Overflow, res.ForeignSched, res.Uninstrumented)
 	for _, f := range res.Failures {
 		failed, _ := simulation.Replay(seed, f, sut)
 		if !failed && f.ForeignSched {
@@ -50,32 +51,60 @@ func exploreReport(t *testing.T, tag string, seed uint64, res simulation.Explore
 // bug ever needs it: exploration finds the buggy interleaving, and
 // Replay deterministically reproduces exactly it.
 func TestSimulationExploreReplayWorkflow(t *testing.T) {
+	// The known bug is an ATOMIC lost update: TSan-clean (a plain-memory
+	// race would fail the -race test binary at the process level before
+	// the explorer could own it), yet a genuine atomicity violation both
+	// engines explore — non-race Exhaustive through the Gosched yield,
+	// dst-race DPOR through the instrumented atomic ops.
+	var x atomic.Int64
 	sut := func() bool {
-		x := 0
+		x.Store(0)
 		done := make(chan struct{}, 2)
 		for range 2 {
 			go func() {
-				v := x
+				v := x.Load()
 				runtime.Gosched() // the lost-update window
-				x = v + 1
+				x.Store(v + 1)
 				done <- struct{}{}
 			}()
 		}
 		<-done
 		<-done
-		return x != 2 // true = the bug manifested
+		return x.Load() != 2 // true = the bug manifested
 	}
-	res := simulation.Explore(1, simulation.Exhaustive, sut)
+	// Non-race: exhaustive over the yield-granularity tree, exhausted.
+	// dst-race: the same bug is ALSO a TSan race, access instrumentation
+	// multiplies the decision points, and DPOR prunes — bound the run
+	// and assert find+replay, not exhaustion.
+	opts := simulation.ExploreOptions{Mode: simulation.Exhaustive}
+	if raceEnabled {
+		opts = simulation.ExploreOptions{Mode: simulation.DPOR, MaxSchedules: 200}
+	}
+	res := simulation.ExploreWith(1, opts, sut)
 	if len(res.Failures) == 0 {
-		t.Fatalf("exhaustive exploration of a known lost-update bug found no failure in %d schedules", res.Schedules)
+		t.Fatalf("exploration of a known lost-update bug found no failure in %d schedules", res.Schedules)
 	}
+	asserted := 0
 	for _, f := range res.Failures {
-		failed, _ := simulation.Replay(1, f, sut)
+		failed, raced := simulation.Replay(1, f, sut)
+		if f.Race {
+			// TSan dedups race reports process-wide, so an in-process
+			// replay of a Race failure cannot re-report it (the fork's
+			// replay token targets fresh-process replay); exercising
+			// Replay without asserting reproduction is all this build
+			// can pin for the race-typed entries.
+			_ = raced
+			continue
+		}
+		asserted++
 		if !failed {
-			t.Fatalf("Replay(schedule %v) did not reproduce the recorded failure", f.Schedule)
+			t.Fatalf("Replay(schedule %v) did not reproduce the recorded assertion failure", f.Schedule)
 		}
 	}
-	if !res.Exhausted {
+	if asserted == 0 {
+		t.Fatalf("no assertion-typed failure to replay-verify among %d failures", len(res.Failures))
+	}
+	if !raceEnabled && !res.Exhausted {
 		t.Fatalf("tiny SUT not exhausted: %+v", res)
 	}
 }
@@ -92,7 +121,18 @@ func TestSimulationExploreReplayWorkflow(t *testing.T) {
 // capped schedule set per seed and REPORTS the cap (no silent
 // truncation). A dst-race build may flip this to DPOR for
 // dependency-pruned coverage.
-var exploreOpts = simulation.ExploreOptions{Mode: simulation.Exhaustive, MaxSchedules: 250}
+var exploreOpts = simulation.ExploreOptions{Mode: exploreMode(), MaxSchedules: 250}
+
+// exploreMode picks DPOR when this build carries the fork's dependency
+// instrumentation (-tags dst -race — the Taskfile's test:dst:race leg)
+// and budgeted Exhaustive otherwise; the choice is logged per leg via
+// exploreReport's coverage line.
+func exploreMode() simulation.ExploreMode {
+	if raceEnabled {
+		return simulation.DPOR
+	}
+	return simulation.Exhaustive
+}
 
 // TestSimulationExploreDPORRequiresRaceBuild pins the fork's honest
 // DPOR reporting for THIS suite's build mode: without -race, gmdb's

@@ -190,6 +190,15 @@ across seeds.
   (`-tags dst -race`), and without it honestly reports
   `Uninstrumented` instead of exploring — pinned in-suite, with
   the race-build path replaying any failure via `Replay`. The
+  dst-race leg (`test:dst:race`) selects DPOR automatically, with
+  a RECORDED scale boundary: a single full-database run carries
+  enough instrumented accesses to overflow the explorer's
+  per-bubble access budget, so the full-stack legs report
+  `Overflow` after one schedule — stated, never silently capped —
+  and dependency-pruned exploration genuinely bites at
+  component-scale SUTs (the workflow self-test explores and
+  prunes end-to-end under both builds); full-stack interleaving
+  coverage is the non-race Exhaustive+PCT legs' job. The
   Explore → Failure → Replay workflow itself is proven end-to-end
   on a known lost-update SUT before any real bug needs it. Every
   failure report carries the seed and the replayable schedule.

@@ -11,6 +11,11 @@ tasks:
     cmds:
       - godst test -tags dst -count=1 -timeout 600s ./dsttest/
 
+  test:dst:race:
+    desc: Exploration tier under the dst-race build — DPOR with the dependency instrumentation active (docs/specs/dst-testing.md §Exploration tier)
+    cmds:
+      - godst test -race -tags dst -count=1 -timeout 1800s -run 'TestSimulationExplore|TestSimulationPCT' ./dsttest/
+
   cover:
     desc: Run tests with coverage and open HTML report
     cmds:
