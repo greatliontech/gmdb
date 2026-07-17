@@ -121,6 +121,13 @@ type SetKeyspaceHandle[K, V any] struct {
 	sks    *gmdb.SetKeyspace
 	keyEnc Encoder[K]
 	valEnc Encoder[V]
+
+	// iterErr records the typed-layer error (a result decode, or a
+	// Range/Prefix bound encode) that ended the most recent All /
+	// Range / Prefix sequence; reset when a sequence's iteration
+	// starts. Byte-layer cursor errors live on the underlying handle
+	// — Err() layers the two.
+	iterErr error
 }
 
 // Has reports whether key has any members.
@@ -216,15 +223,22 @@ func (t *SetKeyspaceHandle[K, V]) Cursor() *SetCursor[K, V] {
 
 // All yields every (key, value) member in (key, value) lex order. Range
 // restricts to members whose key is in [*start, *end); Prefix to members
-// whose encoded key has the encoded prefix as a byte prefix. Best-effort
-// (a cursor / decode error ends the sequence — use Cursor()+Err() for
-// error visibility), matching KeyspaceHandle.
+// whose encoded key has the encoded prefix as a byte prefix. A cursor
+// read error or a decode error ENDS the sequence; check Err() post-loop
+// to distinguish that truncation from a clean end, matching
+// KeyspaceHandle. A Range/Prefix bound-encode failure yields an empty
+// sequence with the encode error on Err() once the sequence is ranged.
 func (t *SetKeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
 	seq := t.sks.All() // eager: the construction guard fires HERE, not at loop start
 	return func(yield func(K, V) bool) {
+		t.iterErr = nil // per-sequence reset: Err() reports the LAST sequence
 		for kb, vb := range seq {
-			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
-			if !ok || !yield(k, v) {
+			k, v, err := decodeKV(t.keyEnc, t.valEnc, kb, vb)
+			if err != nil {
+				t.iterErr = err
+				return
+			}
+			if !yield(k, v) {
 				return
 			}
 		}
@@ -233,18 +247,29 @@ func (t *SetKeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
 
 func (t *SetKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 	// Eager construction — uniform with the raw iterators and typed
-	// All; encode failure keeps its silent-empty contract.
+	// All; an encode failure yields an empty sequence recording the
+	// error on Err() when ranged (per-sequence, like every other
+	// iteration error).
 	sb, serr := encodeBound(t.keyEnc, start)
 	eb, eerr := encodeBound(t.keyEnc, end)
 	if serr != nil || eerr != nil {
 		t.sks.GuardIterConstruction()
-		return func(yield func(K, V) bool) {}
+		err := serr
+		if err == nil {
+			err = eerr
+		}
+		return func(yield func(K, V) bool) { t.iterErr = err }
 	}
 	seq := t.sks.Range(sb, eb)
 	return func(yield func(K, V) bool) {
+		t.iterErr = nil // per-sequence reset: Err() reports the LAST sequence
 		for kb, vb := range seq {
-			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
-			if !ok || !yield(k, v) {
+			k, v, err := decodeKV(t.keyEnc, t.valEnc, kb, vb)
+			if err != nil {
+				t.iterErr = err
+				return
+			}
+			if !yield(k, v) {
 				return
 			}
 		}
@@ -256,17 +281,36 @@ func (t *SetKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
 	pb, perr := t.keyEnc.AppendEncode(nil, prefix)
 	if perr != nil {
 		t.sks.GuardIterConstruction()
-		return func(yield func(K, V) bool) {}
+		return func(yield func(K, V) bool) { t.iterErr = perr }
 	}
 	seq := t.sks.Prefix(pb)
 	return func(yield func(K, V) bool) {
+		t.iterErr = nil // per-sequence reset: Err() reports the LAST sequence
 		for kb, vb := range seq {
-			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
-			if !ok || !yield(k, v) {
+			k, v, err := decodeKV(t.keyEnc, t.valEnc, kb, vb)
+			if err != nil {
+				t.iterErr = err
+				return
+			}
+			if !yield(k, v) {
 				return
 			}
 		}
 	}
+}
+
+// Err reports how the most recent All / Range / Prefix sequence on
+// this handle ended: a typed-layer error from the last sequence (a
+// result decode, or a Range/Prefix bound encode) takes precedence,
+// else the underlying byte handle's Err() — which carries the cursor
+// error that truncated the sequence and the broader handle truths
+// (dead keyspace, closed transaction). nil means the last sequence
+// ended cleanly. Mirrors Cursor[K, V].Err precedence.
+func (t *SetKeyspaceHandle[K, V]) Err() error {
+	if t.iterErr != nil {
+		return t.iterErr
+	}
+	return t.sks.Err()
 }
 
 // SetCursor is a member-level type-safe cursor over a SetKeyspaceHandle.

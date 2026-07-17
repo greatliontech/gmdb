@@ -191,6 +191,13 @@ type KeyspaceHandle[K, V any] struct {
 	// declarations this handle was opened with (nil for
 	// OpenReadOnly and decl-less opens).
 	idxInfo []qrep.IndexInfo
+
+	// iterErr records the typed-layer error (a result decode, or a
+	// Range/Prefix bound encode) that ended the most recent All /
+	// Range / Prefix sequence; reset when a sequence's iteration
+	// starts. Byte-layer cursor errors live on the underlying handle
+	// — Err() layers the two.
+	iterErr error
 }
 
 // Get returns the value for key, or the zero V and gmdb.ErrNotFound if the
@@ -324,17 +331,23 @@ func (t *KeyspaceHandle[K, V]) Cursor() *Cursor[K, V] {
 // match; for variable-width encoders (string/bytes) it is a true
 // prefix.
 //
-// These convenience iterators are best-effort: a cursor I/O error or a
-// decode error ENDS the sequence (it yields nothing further). Callers
-// that must observe such errors should iterate with Cursor() and check
-// Err(); the bare iter.Seq2 has no error channel by design (matching
-// the spec's typed-iterator surface).
+// A cursor read error or a decode error ENDS the sequence; check Err()
+// post-loop to distinguish that truncation from a clean end (the bare
+// iter.Seq2 has no error channel by design, matching the spec's
+// typed-iterator surface). A Range/Prefix bound-encode failure yields
+// an empty sequence with the encode error on Err() once the sequence
+// is ranged.
 func (t *KeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
 	seq := t.ks.All() // eager: the construction guard fires HERE, not at loop start
 	return func(yield func(K, V) bool) {
+		t.iterErr = nil // per-sequence reset: Err() reports the LAST sequence
 		for kb, vb := range seq {
-			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
-			if !ok || !yield(k, v) {
+			k, v, err := decodeKV(t.keyEnc, t.valEnc, kb, vb)
+			if err != nil {
+				t.iterErr = err
+				return
+			}
+			if !yield(k, v) {
 				return
 			}
 		}
@@ -344,20 +357,30 @@ func (t *KeyspaceHandle[K, V]) All() iter.Seq2[K, V] {
 func (t *KeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V] {
 	// Bounds encode and the raw seq construct EAGERLY, so the
 	// construction guard fires here and a post-construction state
-	// change ends the sequence silently — uniform with the raw
-	// iterators and typed All. An encode failure keeps its existing
-	// contract: a silently empty sequence.
+	// change ends the sequence — uniform with the raw iterators and
+	// typed All. An encode failure yields an empty sequence recording
+	// the error on Err() when ranged (per-sequence, like every other
+	// iteration error).
 	sb, serr := encodeBound(t.keyEnc, start)
 	eb, eerr := encodeBound(t.keyEnc, end)
 	if serr != nil || eerr != nil {
 		t.ks.GuardIterConstruction()
-		return func(yield func(K, V) bool) {}
+		err := serr
+		if err == nil {
+			err = eerr
+		}
+		return func(yield func(K, V) bool) { t.iterErr = err }
 	}
 	seq := t.ks.Range(sb, eb)
 	return func(yield func(K, V) bool) {
+		t.iterErr = nil // per-sequence reset: Err() reports the LAST sequence
 		for kb, vb := range seq {
-			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
-			if !ok || !yield(k, v) {
+			k, v, err := decodeKV(t.keyEnc, t.valEnc, kb, vb)
+			if err != nil {
+				t.iterErr = err
+				return
+			}
+			if !yield(k, v) {
 				return
 			}
 		}
@@ -369,35 +392,55 @@ func (t *KeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V] {
 	pb, perr := t.keyEnc.AppendEncode(nil, prefix)
 	if perr != nil {
 		t.ks.GuardIterConstruction()
-		return func(yield func(K, V) bool) {}
+		return func(yield func(K, V) bool) { t.iterErr = perr }
 	}
 	seq := t.ks.Prefix(pb)
 	return func(yield func(K, V) bool) {
+		t.iterErr = nil // per-sequence reset: Err() reports the LAST sequence
 		for kb, vb := range seq {
-			k, v, ok := decodeKV(t.keyEnc, t.valEnc, kb, vb)
-			if !ok || !yield(k, v) {
+			k, v, err := decodeKV(t.keyEnc, t.valEnc, kb, vb)
+			if err != nil {
+				t.iterErr = err
+				return
+			}
+			if !yield(k, v) {
 				return
 			}
 		}
 	}
 }
 
+// Err reports how the most recent All / Range / Prefix sequence on
+// this handle ended: a typed-layer error from the last sequence (a
+// result decode, or a Range/Prefix bound encode) takes precedence,
+// else the underlying byte handle's Err() — which carries the cursor
+// error that truncated the sequence and the broader handle truths
+// (dead keyspace, closed transaction). nil means the last sequence
+// ended cleanly. Mirrors Cursor[K, V].Err precedence.
+func (t *KeyspaceHandle[K, V]) Err() error {
+	if t.iterErr != nil {
+		return t.iterErr
+	}
+	return t.ks.Err()
+}
+
 // decodeKV decodes a borrowed (key, value) byte pair into owned (K, V).
-// ok is false if either decode fails (the convenience iterators end on
-// !ok). The Decode contract forbids retaining the borrowed src, so the
-// returned K / V are independent of kb / vb.
-func decodeKV[K, V any](keyEnc Encoder[K], valEnc Encoder[V], kb, vb []byte) (K, V, bool) {
+// The convenience iterators end their sequence on a non-nil error,
+// recording it for the handle's Err(). The Decode contract forbids
+// retaining the borrowed src, so the returned K / V are independent of
+// kb / vb.
+func decodeKV[K, V any](keyEnc Encoder[K], valEnc Encoder[V], kb, vb []byte) (K, V, error) {
 	var zk K
 	var zv V
 	k, err := keyEnc.Decode(kb)
 	if err != nil {
-		return zk, zv, false
+		return zk, zv, err
 	}
 	v, err := valEnc.Decode(vb)
 	if err != nil {
-		return zk, zv, false
+		return zk, zv, err
 	}
-	return k, v, true
+	return k, v, nil
 }
 
 // Cursor is a type-safe cursor over a KeyspaceHandle. Mirrors the byte

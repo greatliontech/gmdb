@@ -39,6 +39,15 @@ type keyspaceCore struct {
 	// DeleteKeyspace.
 	dead bool
 
+	// iterErr records how the most recent All / Range / Prefix
+	// sequence on this handle ended (api-surface.md §Range Iterators):
+	// reset when a sequence's iteration starts, set when it ends on a
+	// cursor error rather than clean exhaustion. Handle-level rather
+	// than per-cursor because the convenience iterators own their
+	// cursor internally — it is unreachable by the time the caller can
+	// ask. Surfaced by Keyspace.Err / SetKeyspace.Err.
+	iterErr error
+
 	// openIndexHandles tracks every *IndexHandle returned by Index(name) in
 	// this tx. Atomic Put / Delete / Cursor.Delete mutate index trees
 	// (applyIndexMaintenanceOn*); TxIndexes.Rebuild / TxIndexes.Drop replace

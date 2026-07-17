@@ -1441,7 +1441,58 @@ func (ks *Keyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte]
 func (ks *SetKeyspace) All() iter.Seq2[[]byte, []byte]
 func (ks *SetKeyspace) Range(start, end []byte) iter.Seq2[[]byte, []byte]
 func (ks *SetKeyspace) Prefix(prefix []byte) iter.Seq2[[]byte, []byte]
+
+// Err is the post-iteration error check: it reports how the most
+// recent All / Range / Prefix sequence on this handle ended.
+func (ks *Keyspace) Err() error
+func (ks *SetKeyspace) Err() error
 ```
+
+**Post-iteration error check.** The `Seq2` shape has no error
+channel, so a mid-iteration cursor error ENDS the sequence and the
+handle's `Err()` reports it after the loop — a truncated iteration
+is distinguishable from a smaller keyspace. The contract mirrors
+`IndexHandle.Err`:
+
+- `Err()` describes the LAST sequence's iteration: it resets when a
+  sequence's iteration starts (not at construction), and is nil
+  after every clean end — exhaustion, a `Range` end bound, a
+  `Prefix` mismatch, or a caller `break`. With nested or
+  `iter.Pull`-interleaved sequences on one handle, the slot holds
+  the outcome of the sequence that ENDED last.
+- An error-truncated sequence stops at the failing row without
+  yielding it: an overflow-value assembly failure (e.g.
+  `ErrBadPageChecksum`) must NOT surface as a phantom `(key, nil)`
+  yield. `Err()` carries the fault (the same wraps `Cursor.Err`
+  produces).
+- A loop-body mutation that ends the sequence via the stale
+  contract leaves `Err() == ErrCursorStale` — an intentional
+  mutate-and-restart caller sees the truncation signal and
+  re-iterates.
+- Broader handle truths win over the sticky per-sequence error, in
+  `IndexHandle.Err`'s order: a DEAD handle reports
+  `ErrKeyspaceClosed`, a closed transaction `ErrTxClosed`, a closed
+  DB `ErrClosed`, a parent frozen by an active child
+  `ErrChildActive`. The cascade's `ErrChildActive` leg is transient
+  — it clears when the child resolves — but a sequence that was
+  itself truncated by the freeze records `ErrChildActive` in the
+  per-sequence slot, reported until the next sequence resets it.
+- The handle serves one goroutine, like every handle surface;
+  concurrent iteration on one handle races on `Err`.
+
+The typed layer (`typed.KeyspaceHandle.Err` /
+`typed.SetKeyspaceHandle.Err`) layers its decode/encode errors on
+top of this check (typed-keyspaces.md). `gmdb/query` does not
+consume this surface: it drives cursors and index handles directly
+and performs its own equivalent post-iteration checks, folded into
+`Query.Err`.
+(Pinned by `TestIteratorErrNilOnCleanEnds`,
+`TestIteratorErrReportsLoopBodyMutationStale`,
+`TestIteratorErrReportsBadPageChecksum`,
+`TestSetIteratorErrReportsBadPageChecksum`,
+`TestIteratorErrNoPhantomPairOnCorruptOverflowValue`,
+`TestIteratorErrReportsChildFreezeTruncation`, and
+`TestIteratorErrHandleCascade`, with SetKeyspace and typed mirrors.)
 
 Constructing an iterator on a handle whose state forbids every
 operation — a parent frozen by an active child (`ErrChildActive`),
@@ -1453,7 +1504,8 @@ indistinguishable from no data (the Seq2 shape has no error
 channel). The typed layer's `All`/`Range`/`Prefix` run the same
 guard eagerly, so the panic fires at the typed call too, not at
 loop start. A state change AFTER construction (mid-loop close or
-freeze) still ends the sequence silently, like the stale contract.
+freeze) still ends the sequence, like the stale contract — the
+post-iteration `Err()` check (below) reports what ended it.
 (Pinned by `TestIteratorConstructionPanicsOnGuardErrors`,
 `TestIteratorConstructionPanicsOnClosedDB`, and
 `TestTypedIteratorConstructionPanicsEagerly`.)
@@ -1470,8 +1522,9 @@ func (ks *Keyspace) GuardIterConstruction()
 
 Mutation during iteration: a loop-body mutation on the same keyspace
 stales the iterator's cursor and ENDS the sequence early (the Seq2
-error model has no channel; the stale surfaces as end-of-sequence) —
-recovery is a fresh All/Range/Prefix. Iterator cursors are registered
+error model has no channel; the stale surfaces as end-of-sequence,
+with `Err() == ErrCursorStale` post-loop) — recovery is a fresh
+All/Range/Prefix. Iterator cursors are registered
 with the keyspace only while the loop is live and unregister at loop
 exit (completed or broken), unlike explicit Cursor() handles, which
 stay registered — and re-positionable — for the transaction lifetime.

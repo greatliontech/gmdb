@@ -64,7 +64,9 @@ pre-existing at their change set's base.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| iterator-error-swallowing | when the iterator surfaces gain a documented post-iteration error check | [M] `All`/`Range`/`Prefix` end silently on a mid-iteration cursor read error — a short clean-looking iteration is indistinguishable from a smaller keyspace |
+
+*None open — resolved issues live in git history
+(`git log --all -- docs/issues/<slug>.md`).*
 
 ## Open — design gaps (2026-07-11 architecture audit)
 

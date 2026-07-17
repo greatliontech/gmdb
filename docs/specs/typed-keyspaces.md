@@ -224,6 +224,17 @@ func (t *KeyspaceHandle[K, V]) Cursor() *Cursor[K, V]
 func (t *KeyspaceHandle[K, V]) All() iter.Seq2[K, V]
 func (t *KeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V]
 func (t *KeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V]
+
+// Err reports how the most recent All / Range / Prefix sequence on
+// this handle ended (the byte tier's post-iteration check,
+// api-surface.md §Range Iterators): a typed-layer error from the
+// last sequence — a result decode, or a Range/Prefix bound encode
+// (which yields an empty sequence recording the error once ranged)
+// — takes precedence, else the underlying byte handle's Err().
+// nil means the last sequence ended cleanly. SetKeyspaceHandle
+// carries the same method.
+func (t *KeyspaceHandle[K, V]) Err() error
+
 func (t *KeyspaceHandle[K, V]) Index(name string) (*IndexHandle, error)
 
 type Cursor[K, V any] struct { ... }
@@ -333,6 +344,10 @@ func (t *SetKeyspaceHandle[K, V]) Cursor() *SetCursor[K, V]
 func (t *SetKeyspaceHandle[K, V]) All() iter.Seq2[K, V]
 func (t *SetKeyspaceHandle[K, V]) Range(start, end *K) iter.Seq2[K, V]
 func (t *SetKeyspaceHandle[K, V]) Prefix(prefix K) iter.Seq2[K, V]
+
+// Err — the post-iteration error check; same contract as
+// KeyspaceHandle.Err.
+func (t *SetKeyspaceHandle[K, V]) Err() error
 ```
 
 `typed.KeyspaceHandle` has `Get`, `Put`, `Delete` — straightforward.
