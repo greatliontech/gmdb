@@ -44,8 +44,8 @@ func TestFileSize(t *testing.T) {
 }
 
 func TestStructSizes(t *testing.T) {
-	if HeaderSize != 136 {
-		t.Errorf("HeaderSize = %d, want 136", HeaderSize)
+	if HeaderSize != 144 {
+		t.Errorf("HeaderSize = %d, want 144", HeaderSize)
 	}
 	if SlotSize != 56 {
 		t.Errorf("SlotSize = %d, want 56", SlotSize)
@@ -874,7 +874,7 @@ func TestBootEpochResetContendedSkips(t *testing.T) {
 	}
 	defer f2raw.Close()
 	buf := make([]byte, 8)
-	if _, err := f2raw.ReadAt(buf, 136); err != nil { // slot 0 TxnID
+	if _, err := f2raw.ReadAt(buf, HeaderSize); err != nil { // slot 0 TxnID
 		t.Fatalf("read slot: %v", err)
 	}
 	if v := le64(buf); v != 33 {

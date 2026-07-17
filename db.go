@@ -422,7 +422,9 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 			return nil, mapLockErr(gerr)
 		}
 		_ = coord.OldestReaderTxnID() // reap stale slots in place
+		gatedArmRan := false
 		if !coord.PrevLastWriterLive() && coord.CountActiveReaders() == 0 {
+			gatedArmRan = true
 			rm, ridx, recovered, rerr := opened.Pager.RecoverToDurable(file)
 			if rerr != nil {
 				grant.Release()
@@ -452,15 +454,14 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 				return nil, mapPagerErr(lerr)
 			}
 			// This arm's lineage may include a poisoned handle whose
-			// failed data fdatasync dropped bitmap pwrites from
-			// writeback (a same-process re-Open after the documented
+			// failed data fdatasync dropped pwrites from writeback (a
+			// same-process re-Open after the documented
 			// DurabilityUnknown recovery classifies live and lands
-			// here). The LIVE projection may reference that lineage's
-			// dropped DATA pages too, so the whole attached extent is
-			// redirtied under the held grant — this handle's barriers
-			// then genuinely cover every byte it anchors over
-			// (durability.md §Anchoring).
-			if rerr := opened.Pager.RedirtyAttachedExtent(lm); rerr != nil {
+			// here), and the LIVE projection may reference that
+			// lineage's dropped DATA pages. The covered-through gate
+			// pays the extent rewrite only when the takeover sequence
+			// records an uncovered lineage (durability.md §Anchoring).
+			if rerr := coverDroppedWritebackLineage(coord, opened.Pager, lm); rerr != nil {
 				grant.Release()
 				teardown()
 				return nil, mapPagerErr(rerr)
@@ -472,6 +473,18 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		// grant (this acquisition's own dead-prev bump, if any, is
 		// already included — correct: our state postdates it).
 		openTakeoverSeq = coord.TakeoverSeq()
+		if gatedArmRan {
+			// The gated arm's completed barrier — the recovery
+			// commit's fdatasync, or the self-durable anchor
+			// rewrite's — neutralized every recorded lineage: the
+			// adopted durable projection references only
+			// barrier-covered pages, its bitmap region was redirtied
+			// and synced, and the lineage's orphaned data pages are
+			// rewritten before any reallocation can reference them.
+			// Close the covered-through gate here, where the coord
+			// handle lives (durability.md §Anchoring).
+			coord.SetRedirtyCoveredSeq(openTakeoverSeq)
+		}
 		grant.Release()
 	}
 
@@ -1101,6 +1114,16 @@ func (db *DB) resyncPagerLocked() (*pager.Pager, *os.File, error) {
 		return nil, nil, fmt.Errorf("gmdb: re-sync writer state on grant: %w", mapPagerErr(err))
 	}
 	if force {
+		// The bump that forced this rebuild may record a poison/death
+		// lineage whose failed barrier dropped pwrites from writeback;
+		// the covered-through gate redirties the attached extent and
+		// barriers over it exactly once across all handles
+		// (durability.md §Anchoring). Error posture mirrors Resync:
+		// surface without poisoning, the gate stays open, a retry
+		// re-runs it.
+		if cerr := coverDroppedWritebackLineage(db.coord, pgr, m); cerr != nil {
+			return nil, nil, fmt.Errorf("gmdb: re-sync writer state on grant: %w", mapPagerErr(cerr))
+		}
 		db.takeoverSeqSeen = seq
 	}
 	// Refresh the cached meta UNCONDITIONALLY, not only on a TxnID
@@ -1341,5 +1364,31 @@ func (db *DB) Update(ctx context.Context, fn func(tx *Tx) error) error {
 		return err
 	}
 	done = true
+	return nil
+}
+
+// coverDroppedWritebackLineage runs the dropped-writeback recovery
+// rewrite behind the covered-through gate (durability.md §Anchoring).
+// Under the held write grant — where the takeover sequence is stable —
+// a sequence past the covered-through mark records a poison/death
+// lineage nothing has covered: the whole attached extent is redirtied,
+// a barrier completes over it, and the gate closes at the sequence
+// read. A healthy lineage pays a single header compare. On any error
+// the gate stays open (conservative: the next attach retries).
+func coverDroppedWritebackLineage(coord *lock.Coord, pgr *pager.Pager, m pager.Meta) error {
+	if coord == nil {
+		return nil
+	}
+	seq := coord.TakeoverSeq()
+	if coord.RedirtyCoveredSeq() == seq {
+		return nil
+	}
+	if err := pgr.RedirtyAttachedExtent(m); err != nil {
+		return err
+	}
+	if err := pgr.SyncData(); err != nil {
+		return err
+	}
+	coord.SetRedirtyCoveredSeq(seq)
 	return nil
 }

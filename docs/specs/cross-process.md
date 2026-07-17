@@ -270,7 +270,7 @@ Invariant: kind=clause-explicit;
 Invariant: kind=clause-explicit;
   property=Every process that mmaps a lock file does so with
     size = HeaderSize + (SlotSize × LockFileHeader.MaxReaders)
-    (136 + 56 × MaxReaders at the current layout), where
+    (144 + 56 × MaxReaders at the current layout), where
     MaxReaders is the value of the lock file's MaxReaders field
     at the moment the mmap is established. The mmap size is
     established once at Open and is never resized; MaxReaders is
@@ -345,7 +345,7 @@ Invariant: kind=entailed;
 ```
 Lock File
 +----------------------------------------------+
-| Header (136 bytes)                           |
+| Header (144 bytes)                           |
 | Magic              | uint64                  |
 | MaxReaders         | uint32                  |
 | TakeoverSeq        | uint32                  |  dead-author takeover counter
@@ -362,6 +362,7 @@ Lock File
 | DataGeneration     | uint64                  |
 | BootID             | [16]byte                |  boot-epoch discriminator
 | ShrinkSeq          | uint64                  |  file-shrink seqlock
+| RedirtyCoveredSeq  | uint32 (+4 pad)         |  covered-through takeover sequence
 +----------------------------------------------+
 | Reader Table                                 |
 | +-------+-----+-----+------+-------+-------+ |
@@ -421,6 +422,8 @@ type LockFileHeader struct {
     DataGeneration      uint64
     BootID              [16]byte
     ShrinkSeq           uint64
+    RedirtyCoveredSeq   uint32
+    _                   [4]byte
 }
 
 type ReaderSlot struct {
@@ -451,7 +454,7 @@ different architecture requires deleting any stale lock file
 manually. The data file itself is fully portable (little-endian,
 explicit encode/decode).
 
-### Header fields (136 bytes)
+### Header fields (144 bytes)
 
 - **Magic**: identifies the file as a gmdb lock file.
 - **MaxReaders**: number of reader slots, set at lock-file creation
@@ -509,6 +512,17 @@ explicit encode/decode).
   for that file, across real reboots too, until it is
   stale-cycled (UUID or layout change). (Pinned by `TestAdoptForeignBootEpochResetsCoordinationState`
   and `TestAdoptSameBootPreservesCoordinationState`.)
+- **RedirtyCoveredSeq**: the TakeoverSeq value through which the
+  dropped-writeback recovery rewrite has run AND a covering
+  fdatasync has completed (durability.md §Anchoring). Read and
+  written only under the write grant, where TakeoverSeq is stable:
+  a recovery-lineage attach redirties the attached extent only when
+  this trails TakeoverSeq, then barriers and stores the value it
+  read. Every poison/death bump reopens the gate; a healthy
+  database keeps the two equal, so ordinary writable Opens pay a
+  header compare. Pre-field lock files carry 0 — at worst one
+  spurious covering rewrite, never a missed one, since TakeoverSeq
+  ≥ 0 keeps the gate open until first covered.
 - **ShrinkSeq**: the file-shrink seqlock — see `file-format.md`
   §File Shrinkage for the protocol (writer brackets its
   scan→truncate span odd/even under the write grant; readers
@@ -557,8 +571,8 @@ explicit encode/decode).
   writer-process turnover. Cleared back to 0 by slot release and
   by successful acquire's field-write phase.
 
-Total size: `136 + (56 × MaxReaders) + 520`. Default 4096 readers:
-`136 + 229376 + 520 = 230032` bytes (~225 KB).
+Total size: `144 + (56 × MaxReaders) + 520`. Default 4096 readers:
+`144 + 229376 + 520 = 230040` bytes (~225 KB).
 
 `MaxReaders` is bounded `[1, 65536]`. The lower bound is one slot
 (degenerate but legal); the upper bound caps the mmap at

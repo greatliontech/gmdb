@@ -11,7 +11,7 @@ const Magic uint64 = 0x6B636F6C62646D67
 
 // HeaderSize is the on-disk byte length of LockFileHeader. Frozen at
 // the value enforced by the compile-time size check in this file.
-const HeaderSize = 136
+const HeaderSize = 144
 
 // SlotSize is the on-disk byte length of one ReaderSlot, ditto.
 const SlotSize = 56
@@ -118,6 +118,18 @@ type LockFileHeader struct {
 	// which a freshly-published reader could retain a pre-shrink
 	// file-resident bound.
 	ShrinkSeq uint64
+	// RedirtyCoveredSeq is the TakeoverSeq value through which the
+	// dropped-writeback recovery rewrite has been performed AND covered
+	// by a completed fdatasync (durability.md §Anchoring): a recovery-
+	// lineage attach redirties the attached extent only when this
+	// trails TakeoverSeq, then barriers and stores the TakeoverSeq it
+	// read — all under the write grant, where TakeoverSeq is stable.
+	// Every poison/death bump reopens the gate; a healthy database
+	// keeps the two equal, so ordinary writable Opens pay nothing.
+	// Read and written ONLY under the write grant (no cross-grant
+	// atomicity needed; the atomic accessors are for mmap visibility).
+	RedirtyCoveredSeq uint32
+	_                 [4]byte // pad to 8-byte multiple (HeaderSize)
 }
 
 // ReaderSlot overlays one 56-byte slot in the reader table. All seven

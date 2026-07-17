@@ -1095,3 +1095,25 @@ func (f *File) SetLastWriterHeartbeat(v uint64) {
 	}
 	Store64(&f.header.LastWriterHeartbeat, v)
 }
+
+// RedirtyCoveredSeq reads the covered-through takeover sequence
+// (format.go field doc). Caller MUST hold the write grant — the field
+// is read and written only under it, where TakeoverSeq is stable.
+func (f *File) RedirtyCoveredSeq() uint32 {
+	if f.header == nil {
+		panic("lock: RedirtyCoveredSeq on closed *File")
+	}
+	return Load32(&f.header.RedirtyCoveredSeq)
+}
+
+// SetRedirtyCoveredSeq stores the covered-through takeover sequence:
+// the TakeoverSeq value read (under the same grant) before the
+// dropped-writeback rewrite whose covering fdatasync has COMPLETED.
+// Caller MUST hold the write grant and must not store a value newer
+// than the barrier actually covered.
+func (f *File) SetRedirtyCoveredSeq(v uint32) {
+	if f.header == nil {
+		panic("lock: SetRedirtyCoveredSeq on closed *File")
+	}
+	Store32(&f.header.RedirtyCoveredSeq, v)
+}

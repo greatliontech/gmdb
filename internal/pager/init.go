@@ -569,21 +569,9 @@ func (p *Pager) Resync(file *os.File, knownTxnID uint64, force bool) (m Meta, ac
 	if err := p.attachState(file, m); err != nil {
 		return Meta{}, 0, false, err
 	}
-	if force {
-		// A forced rebuild means the takeover sequence advanced: a peer
-		// died holding the grant or poisoned on a failed publication —
-		// exactly the lineages whose failed data fdatasync may have
-		// DROPPED pwrites from writeback (clean-stale, invisible here;
-		// see RedirtyAttachedExtent — the live projection adopted here
-		// may reference that lineage's data pages too). Redirty so this
-		// handle's next completed barrier genuinely covers every byte
-		// it will anchor over. Healthy resyncs (TxnID advance, no
-		// force) skip: their peer's commits completed their own
-		// barriers.
-		if err := p.RedirtyAttachedExtent(m); err != nil {
-			return Meta{}, 0, false, err
-		}
-	}
+	// A FORCED rebuild's lineage may carry dropped writeback; the ROOT
+	// caller runs the covered-through redirty gate after this returns
+	// (it owns the lock-header gate state the pager cannot see).
 	return m, active, true, nil
 }
 

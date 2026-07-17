@@ -891,3 +891,16 @@ func (c *Coord) PrevLastWriterLive() bool {
 	return identityLive(p.pid, p.startTime, p.pidNS, p.heartbeat,
 		c.pidNS, c.clock(), c.staleTimeoutNanos(), c.crossNSTimeoutNanos(), false)
 }
+
+// RedirtyCoveredSeq reads the covered-through takeover sequence. The
+// caller MUST hold the write grant (lock.File.RedirtyCoveredSeq).
+func (c *Coord) RedirtyCoveredSeq() uint32 {
+	return c.f.RedirtyCoveredSeq()
+}
+
+// SetRedirtyCoveredSeq stores the covered-through takeover sequence
+// after a completed covering barrier. The caller MUST hold the write
+// grant (lock.File.SetRedirtyCoveredSeq).
+func (c *Coord) SetRedirtyCoveredSeq(v uint32) {
+	c.f.SetRedirtyCoveredSeq(v)
+}

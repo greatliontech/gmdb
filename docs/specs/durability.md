@@ -260,12 +260,17 @@ reaches attaches that classify LIVE: a same-process re-Open after
 the documented DurabilityUnknown recovery (Close + re-Open while
 the writer record is still live), and a surviving peer's grant
 acquisition after the failed author released cleanly. Both
-redirty under the held grant: the live-classified writable Open
-always (its lineage is unknowable), and the grant re-sync exactly
-when the takeover sequence forced a rebuild — the level-triggered
-signal every publication-phase poison site bumps (the commit
-pipeline's and Checkpoint's alike), so a healthy resync pays
-nothing. The LIVE arms redirty the WHOLE attached extent (bitmap
+redirty under the held grant, behind the COVERED-THROUGH gate
+(`RedirtyCoveredSeq`, cross-process.md §Lock File Layout): the
+rewrite runs only while that field trails the takeover sequence —
+the level-triggered signal every publication-phase poison site
+bumps (the commit pipeline's and Checkpoint's alike) and every
+dead-writer takeover bumps — and on completion the coverer
+barriers and stores the sequence it read, closing the gate for
+every handle. A healthy database keeps the two equal, so an
+ordinary writable Open or resync pays a header compare. The gated
+recovery arm closes the gate too: its completed barrier plus the
+durable-projection rollback neutralizes the recorded lineages. The LIVE arms redirty the WHOLE attached extent (bitmap
 region + data pages to the HighWaterMark), not the bitmap alone:
 the adopted live projection may reference the poisoned lineage's
 dropped DATA pages — a SyncLazy tail whose checkpoint failed —
