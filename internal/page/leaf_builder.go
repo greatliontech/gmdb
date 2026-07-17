@@ -52,11 +52,8 @@ type LeafBuilder struct {
 	segRelBuf       [512]uint32
 
 	// Debug: previous key for sort-order assertion (shared across
-	// modes). Initialized lazily. lastWasOvk records whether the
-	// previous entry was overflow-key (resident-prefix equality is
-	// then legal between overflow-key neighbors).
+	// modes). Initialized lazily.
 	lastAddedKey []byte
-	lastWasOvk   bool
 
 	// forceRestart forces the next compressed entry to open a new
 	// restart group: set after writing an overflow-key entry so its
@@ -87,7 +84,6 @@ func (b *LeafBuilder) Reset(buf []byte, cfg Config) {
 	b.variant = cfg.EffectiveLeafType()
 	b.dataPos = leafEntryStart
 	b.lastAddedKey = nil
-	b.lastWasOvk = false
 	b.forceRestart = false
 	switch b.variant {
 	case TypeLeafUncompressed:
@@ -200,14 +196,18 @@ func (b *LeafBuilder) addEntry(key []byte, flags uint8, value []byte, ovflPage, 
 	ovk := flags&CellFlagOverflowKey != 0
 	if b.lastAddedKey != nil {
 		// Ordering assertion over the bytes the builder can see. For
-		// overflow-key entries `key` is the RESIDENT first-T prefix;
-		// two overflow-key entries may legitimately share it (their
-		// order lives in the extents, which the builder cannot read),
-		// so equality is tolerated exactly when both neighbors are
-		// overflow-key — every other equality or inversion is a
-		// caller bug.
+		// overflow-key entries `key` is the RESIDENT first-T prefix, so
+		// a resident tie is legal exactly when the INCOMING entry is
+		// overflow-key: its full key strictly exceeds the tied resident
+		// bytes, so it is strictly greater than a non-overflow
+		// predecessor equal to them (a key of exactly T bytes), and
+		// against an overflow predecessor the order lives in the
+		// extents, which the builder cannot read — the caller's
+		// contract. Every other equality (a duplicate, or a
+		// non-overflow entry tying an overflow predecessor whose full
+		// key exceeds it) or inversion is a caller bug.
 		c := bytes.Compare(b.lastAddedKey, key)
-		if c > 0 || (c == 0 && !(ovk && b.lastWasOvk)) {
+		if c > 0 || (c == 0 && !ovk) {
 			panic(fmt.Sprintf("page: LeafBuilder keys out of order — last %q, next %q", b.lastAddedKey, key))
 		}
 	}
@@ -225,7 +225,6 @@ func (b *LeafBuilder) addEntry(key []byte, flags uint8, value []byte, ovflPage, 
 		// Borrow the on-page bytes — they live for the builder's
 		// lifetime and don't get re-encoded later.
 		b.lastAddedKey = key
-		b.lastWasOvk = ovk
 	}
 	return ok
 }

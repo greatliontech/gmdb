@@ -538,3 +538,63 @@ func TestPatchKeyExtRefs(t *testing.T) {
 	}
 	_ = fmt.Sprint() // keep fmt import if unused paths change
 }
+
+// TestLeafBuilderResidentTieRules pins addEntry's ordering assertion at
+// the resident-byte tie (page-formats.md §Overflow-Key Cells): a tie is
+// legal exactly when the INCOMING entry is overflow-key — a key of
+// exactly T bytes followed by an overflow key sharing its first T bytes
+// (strict full-key order), or two overflow keys whose order lives in
+// the extents — while a duplicate inline key, and an inline key tying
+// an overflow predecessor whose full key exceeds it, still panic.
+func TestLeafBuilderResidentTieRules(t *testing.T) {
+	cfg := Config{PageSize: 4096, RestartGroupTarget: 16}
+	tt := cfg.InlineThreshold()
+	res := bytes.Repeat([]byte{1}, tt)
+	full := bytes.Repeat([]byte{1}, tt+300)
+
+	build := func(add func(b *LeafBuilder)) (pan any) {
+		defer func() { pan = recover() }()
+		buf := make([]byte, cfg.PageSize)
+		b := NewLeafBuilder(buf, cfg)
+		add(b)
+		b.Finish()
+		r := NewLeafReader(buf, cfg)
+		if err := r.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+		return nil
+	}
+
+	if pan := build(func(b *LeafBuilder) { // inline T-key then ovk with equal resident: legal
+		if !b.AddInline(res, []byte("s")) {
+			t.Fatal("AddInline")
+		}
+		if !b.AddEntry(ovkEntry(cfg, full, []byte("l"), 7)) {
+			t.Fatal("AddEntry ovk")
+		}
+	}); pan != nil {
+		t.Fatalf("legal inline-then-ovk tie panicked: %v", pan)
+	}
+	if pan := build(func(b *LeafBuilder) { // two ovk with equal residents: legal
+		if !b.AddEntry(ovkEntry(cfg, full, []byte("a"), 7)) {
+			t.Fatal("AddEntry ovk 1")
+		}
+		if !b.AddEntry(ovkEntry(cfg, bytes.Repeat([]byte{1}, tt+400), []byte("b"), 9)) {
+			t.Fatal("AddEntry ovk 2")
+		}
+	}); pan != nil {
+		t.Fatalf("legal ovk-ovk tie panicked: %v", pan)
+	}
+	if pan := build(func(b *LeafBuilder) { // duplicate inline key: caller bug, must panic
+		b.AddInline(res, []byte("x"))
+		b.AddInline(res, []byte("y"))
+	}); pan == nil {
+		t.Fatal("duplicate inline key did not panic")
+	}
+	if pan := build(func(b *LeafBuilder) { // ovk then equal inline: out of order, must panic
+		b.AddEntry(ovkEntry(cfg, full, []byte("l"), 7))
+		b.AddInline(res, []byte("s"))
+	}); pan == nil {
+		t.Fatal("inline key tying an overflow predecessor did not panic")
+	}
+}

@@ -64,7 +64,9 @@ pre-existing at their change set's base.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| [leafbuilder-longkey-order](leafbuilder-longkey-order.md) | long-key ordering fix change set | LeafBuilder keys-out-of-order panic on adjacent multi-KB keys (rapid-found, pre-existing; reproducer committed) |
+
+*None open — resolved issues live in git history
+(`git log --all -- docs/issues/<slug>.md`).*
 
 ## Open — design gaps (2026-07-11 architecture audit)
 
