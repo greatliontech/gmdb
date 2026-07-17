@@ -254,6 +254,9 @@ type CoordOptions struct {
 	// the per-platform default (CLOCK_BOOTTIME on Linux,
 	// CLOCK_MONOTONIC elsewhere). Tests inject deterministic clocks
 	// here to assert heartbeat values without flakiness.
+	// Injected clocks are PRE-floor: every read through the Coord is
+	// floored at 1 ns (the heartbeat-sentinel invariant, cross-process.md),
+	// so a Clock returning 0 stamps and scans as 1.
 	Clock func() uint64
 
 	// ReadOnly marks a Coord backing a read-only DB handle. The
@@ -285,10 +288,19 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 	if crossNSTimeout <= 0 {
 		crossNSTimeout = 6 * staleTimeout
 	}
-	clock := opts.Clock
-	if clock == nil {
-		clock = nowMonotonic
+	rawClock := opts.Clock
+	if rawClock == nil {
+		rawClock = nowMonotonic
 	}
+	// Floor the coordination clock at 1 ns: a heartbeat stamped with the
+	// literal value 0 IS the protocol's "unstamped" sentinel — permanently
+	// fresh to the reader-slot scan (zeroHeartbeatFresh) and instantly stale
+	// for the writer records — so a stamp must never be the sentinel by
+	// construction (cross-process.md, heartbeat sentinel clause). A real
+	// CLOCK_BOOTTIME never reads 0 while userspace runs; a virtualized boot
+	// clock (deterministic simulation) legitimately does at the boot instant,
+	// and this funnel feeds every stamp and scan.
+	clock := func() uint64 { return max(rawClock(), 1) }
 	c := &Coord{
 		f:                 f,
 		pid:               opts.PID,
@@ -742,7 +754,8 @@ func (c *Coord) ActiveReaderSlots() int {
 }
 
 // Clock returns the coord's monotonic clock value in nanoseconds (the
-// shared CLOCK_BOOTTIME on Linux, or the test-injected clock). The
+// shared CLOCK_BOOTTIME on Linux, or the test-injected clock), POST-floor:
+// never 0 (the heartbeat-sentinel invariant, cross-process.md). The
 // background-maintenance goroutine uses it both to compare against and to
 // stamp the lock file's LastMaintenanceTime, so the comparison and the
 // stamp share one clock source.

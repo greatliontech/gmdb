@@ -5,28 +5,26 @@ package lock
 import (
 	"encoding/hex"
 	"os"
-	"sync"
 )
 
 // CurrentBootID returns the running kernel's boot UUID
 // (/proc/sys/kernel/random/boot_id) as raw bytes — the boot-epoch
-// discriminator stamped into the lock-file header. Read once per
-// process (the value is constant for a boot, including across
-// suspend/resume). A read or parse failure yields the zero value;
-// callers treat a zero BootID as "epoch unknown": cross-boot
-// invalidation is DISABLED whenever either side is unknown (see
-// shouldResetBootEpoch) — resetting on an unknown epoch could evict
-// LIVE same-boot peers' coordination state, which is strictly worse
-// than the pre-boot-epoch hazard the reset exists to fix.
+// discriminator stamped into the lock-file header. Read on each call:
+// the value is constant for a boot (suspend/resume included) and the
+// callers are cold paths (Open, adoption), so a per-process cache buys
+// nothing — and its safety rests on "a process never outlives its
+// boot", which fails exactly where correctness matters most: under a
+// deterministic-simulation harness one OS process hosts many simulated
+// boots, and a cached id would serve a dead boot's epoch after a
+// reboot. A read or parse failure yields the zero value; callers treat
+// a zero BootID as "epoch unknown": cross-boot invalidation is
+// DISABLED whenever either side is unknown (see shouldResetBootEpoch)
+// — resetting on an unknown epoch could evict LIVE same-boot peers'
+// coordination state, which is strictly worse than the pre-boot-epoch
+// hazard the reset exists to fix.
 func CurrentBootID() [16]byte {
-	bootIDOnce.Do(func() { bootIDValue = readBootID() })
-	return bootIDValue
+	return readBootID()
 }
-
-var (
-	bootIDOnce  sync.Once
-	bootIDValue [16]byte
-)
 
 func readBootID() [16]byte {
 	var id [16]byte

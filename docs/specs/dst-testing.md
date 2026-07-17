@@ -63,33 +63,33 @@ Invariant: kind=clause-explicit;
 
 gmdb production code runs UNMODIFIED under simulation — no
 build-tag routing of production paths. The fork models gmdb's
-complete Linux host surface, including the two calls it did not
-model when this tier was first scoped (tracked and fixed in the
-fork per its own contract, `docs/dst/design.md` there):
+complete Linux host surface (each capability tracked and landed in
+the fork per its own contract, `docs/dst/design.md` there):
 
 - **`SYS_FUTEX`** (`FUTEX_WAIT` with timeout / `FUTEX_WAKE`, the
   shared non-PRIVATE form on `MAP_SHARED` file pages) — the
   notification waiter of cross-process.md §Notification region
   runs its real Linux path in-simulation.
-- **`SYS_RENAMEAT2`** (`RENAME_NOREPLACE`) — CopyTo's atomic
-  no-replace publish rung (api-surface.md §Check, CopyTo,
-  Compact) runs its real Linux path in-simulation.
-
-Known modeled-surface residuals:
-
-- **`link(2)` is not modeled**: CopyTo's preferred hard-link
-  publish arm (and the NFS link-retransmission quirk detection)
-  is unreachable in-simulation — every simulated CopyTo publishes
-  through the renameat2 no-replace rung. The link arm and the
-  quirk are host-only paths; suites exercising the publish
-  exercise the rename rung.
-- **`/proc/sys/kernel/random/boot_id`** is not modeled; the read
-  fails and gmdb runs with the ZERO boot epoch — cross-boot
-  invalidation disabled, exactly the spec'd degradation for
-  unreadable-/proc environments (cross-process.md boot-epoch
-  clauses). Suites therefore cannot exercise the boot-epoch reset
-  path until the fork models per-boot host identity — the suite's
-  landing condition, stated here in full, not silently skipped.
+- **`SYS_RENAMEAT2`** (`RENAME_NOREPLACE`) — dispatched by the
+  fork. Because the fork also models `link(2)`, CopyTo's publish
+  ladder takes its PREFERRED hard-link arm in-simulation and the
+  renameat2 rung is unreachable through CopyTo there (a modeled
+  filesystem supports hard links); the rung's coverage lives in
+  the untagged unit tier's publish-seam tests and the fork's own
+  raw-dispatch tests — stated, not silently capped.
+- **`link(2)`** — CopyTo's hard-link publish arm runs its real
+  Linux path in-simulation. The NFS link-retransmission quirk
+  remains a host-only shape (the modeled filesystem loses no
+  replies); the quirk detection stays unit-tier-covered.
+- **`/proc/sys/kernel/random/boot_id`** — the fork serves a
+  deterministic per-boot epoch (regenerated across
+  CrashHost + Host re-declaration), so cross-boot invalidation is
+  ACTIVE in-simulation and the boot-epoch suite exercises the
+  reset end-to-end.
+- **Process identity divergence** — pid reuse (the fork's
+  `Options.PidMax` pid_max model) and sibling pid namespaces
+  (`ProcessWith`) are constructible, so the stale-identity
+  start-time and cross-namespace heartbeat legs run end-to-end.
 
 ## Simulation topology conventions
 
@@ -119,16 +119,25 @@ across seeds.
 - **Coordination suite** — cross-process.md: writer-grant
   mutual exclusion and handoff under contention; stale-writer
   takeover after `Crash("writer")` and the recovery-commit gate's
-  dead-vs-live author classification (the PID-LIVENESS leg; the
-  start-time and heartbeat legs need pid reuse and namespace
-  divergence, which the fork's identity model — monotonic
-  never-reused pids, a single namespace — cannot express: they
-  land under a `Lands:` condition, see the issue index); reader-slot
+  dead-vs-live author classification; all THREE stale-identity
+  legs walked end-to-end on the READER-SLOT path — pid liveness,
+  start-time discrimination against a live pid-reuse impostor
+  (`Options.PidMax`), and the cross-namespace heartbeat window
+  against a sibling-namespace crash (`ProcessWith`); the
+  writer/last-writer record consumers reach the same
+  classification through the one shared classifier
+  (cross-process.md's stale-detection rules), pinned at the unit
+  tier; reader-slot
   acquisition, reaping
   of crashed readers, snapshot pinning across a writer's
   commits; change notification (`Version`/`WaitVersion`/
   `WaitKeyspaceVersion`) over the real futex waiter, including
   no-lost-wake across publish and cancellation.
+- **Boot-epoch suite** — cross-process.md §BootID: cross-boot
+  invalidation across `CrashHost` + `Host` re-declaration, with
+  the wedged resource constructed so the adoption reset is the
+  only possible recovery (a cross-namespace slot whose heartbeat
+  reads as the new boot's future).
 - **Crash suite** — durability.md: acked-durable commits always
   recover byte-exact after `CrashHost` at any point; an
   in-flight commit preserves the prior epoch under `CrashTear`

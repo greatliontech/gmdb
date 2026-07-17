@@ -18,15 +18,19 @@ import (
 // path — open (flock, mmap, madvise), write+commit (pwrite,
 // fdatasync, directory fsync), a genuinely BLOCKING change
 // notification wait (the real shared FUTEX_WAIT, woken by a
-// concurrent commit's FUTEX_WAKE), CopyTo publish (in-simulation the
-// link(2) arm is unmodeled, so this always exercises the real
-// renameat2 NOREPLACE rung — the spec's recorded residual), close,
-// reopen, Check, read-back — runs fence-free, identically across the
-// anchor seeds. Identity pins: the simulated /proc surface serves
-// the pid start-time and pid-namespace discriminators the stale
-// detection keys on (db.go tolerates their absence silently, so
-// without this pin a fork regression would degrade chunk-2 legs to
-// the wrong path).
+// concurrent commit's FUTEX_WAKE), CopyTo publish (the simulated
+// filesystem models link(2), so this exercises the preferred
+// hard-link arm; the renameat2 NOREPLACE rung is unreachable through
+// CopyTo in-simulation — a modeled FS supports hard links — and its
+// coverage lives in the untagged unit tier's publish-seam tests and
+// the fork's own raw-dispatch tests, per the spec's §Simulated
+// syscall surface), close, reopen, Check, read-back — runs
+// fence-free, identically across the anchor seeds. Identity pins:
+// the simulated /proc surface serves the pid start-time and
+// pid-namespace discriminators the stale detection keys on (db.go
+// tolerates their absence silently, so without this pin a fork
+// regression would degrade the coordination-suite legs to the wrong
+// path).
 func TestSimulationFullSurfaceFenceFree(t *testing.T) {
 	for _, seed := range []uint64{1, 2, 3} { // anchor seeds (spec §Seed policy)
 		simulation.Test(t, seed, func(t *testing.T) {
@@ -36,6 +40,22 @@ func TestSimulationFullSurfaceFenceFree(t *testing.T) {
 			}
 			if _, err := lock.PIDNamespace(); err != nil {
 				t.Fatalf("seed %d: PIDNamespace: %v", seed, err)
+			}
+			// link(2)-modeled tripwire: CopyTo's preferred hard-link arm is
+			// only exercised if the simulated filesystem models link — and
+			// CopyTo tolerates link absence silently (the rename fallback),
+			// so the spec's link-arm claim needs its own pin, exactly like
+			// the identity pins below.
+			if err := os.WriteFile("/link-probe", []byte("x"), 0o600); err != nil {
+				t.Fatalf("seed %d: link probe write: %v", seed, err)
+			}
+			if err := os.Link("/link-probe", "/link-probe2"); err != nil {
+				t.Fatalf("seed %d: os.Link under simulation = %v, want modeled (CopyTo's hard-link arm depends on it)", seed, err)
+			}
+			fi1, err1 := os.Stat("/link-probe")
+			fi2, err2 := os.Stat("/link-probe2")
+			if err1 != nil || err2 != nil || !os.SameFile(fi1, fi2) {
+				t.Fatalf("seed %d: linked names not one inode (%v/%v)", seed, err1, err2)
 			}
 			db, err := gmdb.Open(ctx, "/smoke.db", gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256})
 			if err != nil {
@@ -118,24 +138,27 @@ func TestSimulationFullSurfaceFenceFree(t *testing.T) {
 	}
 }
 
-// The recorded boot-epoch residual (spec §Simulated syscall surface):
-// /proc/sys/kernel/random/boot_id is unmodeled, the read fails, and
-// gmdb runs with the ZERO boot epoch — cross-boot invalidation
-// disabled, exactly its spec'd degradation for unreadable-/proc
-// environments. This pin turns the residual from an assumption into
-// an enforced fact; if the fork ever models boot_id, this test fails
-// and the boot-epoch suite's Lands: condition has fired.
-//
-// Order caveat: CurrentBootID caches per OS process (sync.Once). The
-// pin holds because every caller in this dst test binary runs inside
-// a simulation bubble (the simulated read fails → zero cached). A
-// future dst test touching gmdb or internal/lock OUTSIDE a bubble
-// before these tests would cache the HOST boot id and fail this test
-// for an unrelated reason — keep dsttest bubble-only.
-func TestSimulationBootEpochIsZero(t *testing.T) {
+// The boot-epoch surface (spec §Simulated syscall surface): the fork
+// models /proc/sys/kernel/random/boot_id, so gmdb reads a REAL
+// per-boot epoch in-simulation — nonzero, stable within a boot, and
+// distinct across seeds (each run is a different universe). Cross-boot
+// invalidation is therefore ACTIVE in-simulation; the reset behavior
+// itself is the boot-epoch suite's job (bootepoch_test.go). A
+// regression to the zero epoch would silently degrade that suite to
+// the invalidation-disabled path — this pin fails it loudly instead.
+func TestSimulationBootEpochModeled(t *testing.T) {
+	var id1, id1Again, id2 [16]byte
 	simulation.Test(t, 1, func(t *testing.T) {
-		if id := lock.CurrentBootID(); id != [16]byte{} {
-			t.Fatalf("boot id under simulation = %x, want zero (unmodeled /proc/sys)", id)
-		}
+		id1 = lock.CurrentBootID()
+		id1Again = lock.CurrentBootID()
 	})
+	simulation.Test(t, 2, func(t *testing.T) {
+		id2 = lock.CurrentBootID()
+	})
+	if id1 == ([16]byte{}) || id1 != id1Again {
+		t.Fatalf("boot id under simulation = %x then %x, want stable nonzero", id1, id1Again)
+	}
+	if id2 == id1 || id2 == ([16]byte{}) {
+		t.Fatalf("seed-2 boot id = %x, want nonzero and distinct from seed 1's %x", id2, id1)
+	}
 }

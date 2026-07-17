@@ -68,6 +68,23 @@ Invariant: kind=clause-explicit;
     fresh acquirer.
 
 Invariant: kind=clause-explicit;
+  property=A STAMPED heartbeat is never the literal value 0 — the
+    coordination clock is floored at 1 ns, so `Heartbeat == 0` (and
+    `WriterHeartbeat == 0`) always means "unstamped/cleared", never
+    "stamped at the boot instant". Enforced by the Coord clock
+    funnel; enforced by `TestCoordClockNeverStampsSentinel` and,
+    end-to-end at boot-instant time, by the DST coordination suite;
+  from=this spec (the sentinel readings of `Heartbeat == 0`
+    throughout §Reader Table and §Stale Writer Recovery);
+  violation=CLOCK_BOOTTIME legitimately reads 0 at the boot
+    instant — unreachable for userspace on real kernels but exact
+    under a virtualized boot clock. A reader slot stamped 0 reads
+    as mid-release (`zeroHeartbeatFresh`) and is PERMANENTLY fresh
+    to every scan — an unreclaimable slot wedging the table — while
+    a writer record stamped 0 reads instantly stale, evicting a
+    live writer.
+
+Invariant: kind=clause-explicit;
   property=Stale-reader detection that observes `TxnID != 0 AND
     PID == 0 AND Heartbeat == 0` (the "stuck mid-acquire" state)
     uses `HintEpoch` as the cross-process orphan anchor: the first

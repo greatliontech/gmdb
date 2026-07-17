@@ -7,20 +7,23 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"testing"
 	"testing/simulation"
 	"time"
 
 	"github.com/greatliontech/gmdb"
+	"github.com/greatliontech/gmdb/internal/lock"
 )
 
 // Coordination suite (docs/specs/dst-testing.md §Suites): the
 // cross-process.md walk over real multi-process topology — every gmdb
 // "process" is a simulation Process on one Host, sharing the data and
 // lock files through the simulated page cache exactly as co-located
-// OS processes would. Cross-node choreography uses the shared host
-// filesystem (the crash-sound discipline); harness-level result
-// channels only collect assertions.
+// OS processes would. Cross-node choreography between SUT processes
+// uses the shared host filesystem (the crash-sound discipline);
+// harness-level channels collect assertion inputs and sequence the
+// TEST DRIVER's own steps — never SUT-to-SUT communication.
 
 var smallOpts = gmdb.Options{PageSize: 4096, MinSize: 16, MaxSize: 256,
 	Maintenance: gmdb.MaintenanceOptions{Disable: true}}
@@ -250,7 +253,7 @@ func TestSimulationReaderCrashSlotReap(t *testing.T) {
 					t.Errorf("BeginRead: %v", err)
 					return
 				}
-				_ = rtx
+				defer runtime.KeepAlive(rtx) // held, not leaked (leak-detection would release it)
 				if err := os.WriteFile("/reader-pinned", nil, 0o600); err != nil {
 					t.Errorf("signal: %v", err)
 					return
@@ -638,6 +641,233 @@ func TestSimulationRecoveryGateDeadVsLiveAuthor(t *testing.T) {
 				}
 			})
 			<-liveDone
+		})
+	})
+}
+
+// Stale-identity classification, the start-time leg (cross-process.md
+// §Reader Table stale detection; the compound (PID, StartTime)
+// identity): a crashed reader's slot whose pid has been REUSED by a
+// live unrelated process must still be classified stale — the pid
+// probe alone reads ALIVE (the impostor answers it), and only the
+// /proc start-time mismatch tells the scanner the slot's owner is
+// gone. Constructible since the fork models pid_max wrap-and-reuse
+// (simulation Options.PidMax). The pid arrangement is pinned
+// explicitly: if the impostor missed the victim's pid the slot would
+// be reclaimed via plain ESRCH and the test would pass for the wrong
+// reason.
+func TestSimulationStaleReaderSlotPidReuse(t *testing.T) {
+	opts := smallOpts
+	opts.MaxReaders = 1
+	simulation.TestWith(t, 11, simulation.Options{PidMax: 8}, func(t *testing.T) {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			ids := make(chan [2]int, 2) // harness-level result collection only
+			simulation.Process("setup", func() {
+				ctx := context.Background()
+				db, err := gmdb.Open(ctx, "/db", opts)
+				if err != nil {
+					t.Fatalf("Open: %v", err)
+				}
+				defer db.Close()
+				if err := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.CreateKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("a"), []byte("v"))
+				}); err != nil {
+					t.Fatalf("Update: %v", err)
+				}
+			})
+			go simulation.Process("victim", func() {
+				ctx := context.Background()
+				db, err := gmdb.Open(ctx, "/db", opts)
+				if err != nil {
+					t.Errorf("victim Open: %v", err)
+					return
+				}
+				rtx, err := db.BeginRead(ctx)
+				if err != nil {
+					t.Errorf("victim BeginRead: %v", err)
+					return
+				}
+				defer runtime.KeepAlive(rtx) // held, not leaked (leak-detection would release it)
+				st, err := lock.ProcessStartTime(os.Getpid())
+				if err != nil {
+					t.Errorf("victim start time: %v", err)
+					return
+				}
+				ids <- [2]int{os.Getpid(), int(st)}
+				if err := os.WriteFile("/victim-pinned", nil, 0o600); err != nil {
+					t.Errorf("signal: %v", err)
+					return
+				}
+				time.Sleep(time.Hour)
+				t.Error("victim survived its crash")
+			})
+			simulation.Process("reaper", func() {
+				mustAwait(t, "/victim-pinned")
+				simulation.Crash("victim")
+			})
+			v := <-ids
+			victimPid, victimStart := v[0], v[1]
+			// The 20ms stagger puts every later start in a different USER_HZ
+			// tick than the victim's, so the start-time discriminator under
+			// test cannot collide.
+			time.Sleep(20 * time.Millisecond)
+			// Walk the bounded pid space until an allocation lands on the
+			// victim's freed pid; that candidate parks as the live impostor.
+			// Non-matching candidates exit and are awaited, so the space
+			// never fills to the fork's EAGAIN refusal.
+			impostorCand, impostorStart := -1, 0
+			for i := 0; impostorCand < 0; i++ {
+				if i > 16 {
+					t.Fatal("pid space walked twice without landing on the victim's pid")
+				}
+				got := make(chan int, 1)
+				exited := make(chan struct{}, 1)
+				go func() {
+					simulation.Process(fmt.Sprintf("cand-%d", i), func() {
+						p := os.Getpid()
+						got <- p
+						if p != victimPid {
+							return
+						}
+						st, err := lock.ProcessStartTime(p)
+						if err != nil {
+							t.Errorf("impostor start time: %v", err)
+							ids <- [2]int{p, -1} // unblock the harness; the Errorf fails the test
+							return
+						}
+						ids <- [2]int{p, int(st)}
+						time.Sleep(time.Hour) // alive throughout the survivor's scan
+					})
+					exited <- struct{}{}
+				}()
+				if p := <-got; p == victimPid {
+					imp := <-ids
+					impostorCand, impostorStart = i, imp[1]
+					break
+				}
+				<-exited
+			}
+			if victimStart == impostorStart {
+				t.Fatalf("start times both %d, want distinct (the discriminator)", victimStart)
+			}
+			simulation.Process("survivor", func() {
+				ctx := context.Background()
+				db, err := gmdb.Open(ctx, "/db", opts)
+				if err != nil {
+					t.Fatalf("survivor Open: %v", err)
+				}
+				defer db.Close()
+				// The single slot still records the victim's identity, and
+				// its pid answers kill(pid,0) — the impostor is alive on it.
+				// Acquisition succeeds only if the scanner discriminates by
+				// start time; a liveness-only classifier keeps the slot
+				// pinned forever.
+				rtx, err := db.BeginRead(ctx)
+				if err != nil {
+					t.Fatalf("BeginRead (needs the start-time discriminator): %v", err)
+				}
+				defer rtx.Rollback()
+			})
+			// The parked impostor must not outlive the run (the bubble
+			// refuses leaked blocked goroutines); its job is done. On the
+			// start-time-error path the candidate already exited — crashing
+			// a dead process would panic over the informative Errorf.
+			if impostorStart >= 0 {
+				simulation.Crash(fmt.Sprintf("cand-%d", impostorCand))
+			}
+		})
+	})
+}
+
+// Stale-identity classification, the cross-namespace heartbeat leg
+// (cross-process.md §Stale-reader detection, cross-namespace window):
+// a crashed reader in a SIBLING pid namespace leaves a slot no pid
+// probe can classify — kill answers ESRCH for live and dead alike
+// across namespaces — so the heartbeat window is the only signal.
+// Both halves are pinned: before the window elapses the slot must NOT
+// be reclaimed (an eager pid-based classifier would free it
+// instantly), and after it the reclaim must proceed.
+func TestSimulationStaleReaderCrossNamespaceHeartbeat(t *testing.T) {
+	opts := smallOpts
+	opts.MaxReaders = 1
+	opts.HeartbeatInterval = 50 * time.Millisecond
+	opts.StaleTimeout = 400 * time.Millisecond
+	opts.CrossNamespaceStaleTimeout = time.Second
+	simulation.Test(t, 12, func(t *testing.T) {
+		simulation.Host("h", simulation.HostConfig{}, func() {
+			simulation.Process("setup", func() {
+				ctx := context.Background()
+				db, err := gmdb.Open(ctx, "/db", opts)
+				if err != nil {
+					t.Fatalf("Open: %v", err)
+				}
+				defer db.Close()
+				if err := db.Update(ctx, func(tx *gmdb.Tx) error {
+					ks, e := tx.CreateKeyspace("k")
+					if e != nil {
+						return e
+					}
+					return ks.Put([]byte("a"), []byte("v"))
+				}); err != nil {
+					t.Fatalf("Update: %v", err)
+				}
+			})
+			go simulation.ProcessWith("container-reader", simulation.ProcessConfig{PIDNamespace: "pod-b"}, func() {
+				ctx := context.Background()
+				db, err := gmdb.Open(ctx, "/db", opts)
+				if err != nil {
+					t.Errorf("container Open: %v", err)
+					return
+				}
+				rtx, err := db.BeginRead(ctx)
+				if err != nil {
+					t.Errorf("container BeginRead: %v", err)
+					return
+				}
+				defer runtime.KeepAlive(rtx) // held, not leaked (leak-detection would release it)
+				if err := os.WriteFile("/container-pinned", nil, 0o600); err != nil {
+					t.Errorf("signal: %v", err)
+					return
+				}
+				time.Sleep(time.Hour)
+				t.Error("container reader survived its crash")
+			})
+			simulation.Process("survivor", func() {
+				ctx := context.Background()
+				mustAwait(t, "/container-pinned")
+				simulation.Crash("container-reader")
+				db, err := gmdb.Open(ctx, "/db", opts)
+				if err != nil {
+					t.Fatalf("survivor Open: %v", err)
+				}
+				defer db.Close()
+				// Within the cross-namespace window: the slot's heartbeat is
+				// fresh and the pid probe is meaningless (sibling namespace),
+				// so the slot must still be treated as LIVE.
+				if _, err := db.BeginRead(ctx); !errors.Is(err, gmdb.ErrReadersFull) {
+					t.Fatalf("BeginRead inside the cross-ns window = %v, want ErrReadersFull (the heartbeat is the only signal, and it is fresh)", err)
+				}
+				// Past the window the heartbeat has aged out. Reaping runs
+				// under LOCK_EX — Open's recovery gate reaps unconditionally,
+				// the writer's reclamation scan only under allocation
+				// pressure, and BeginRead never scans — so a fresh Open
+				// rides the production reap path, and the slot frees.
+				time.Sleep(1500 * time.Millisecond)
+				db2, err := gmdb.Open(ctx, "/db", opts)
+				if err != nil {
+					t.Fatalf("post-window Open: %v", err)
+				}
+				defer db2.Close()
+				rtx, err := db2.BeginRead(ctx)
+				if err != nil {
+					t.Fatalf("BeginRead past the cross-ns window (the reopen's recovery gate reaps): %v", err)
+				}
+				defer rtx.Rollback()
+			})
 		})
 	})
 }
