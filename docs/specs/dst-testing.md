@@ -183,22 +183,25 @@ across seeds.
   timers against the wedge detector instead of failing crisply,
   and the bound costs nothing when the wake arrives), commit vs the maintenance daemon enabled at a short
   interval (every schedule Check-clean), plus a PCT
-  (priority-inversion) sweep of the reader surface. The standard
-  (non-race) suite explores in EXHAUSTIVE mode under an explicit
-  per-seed schedule budget, reported never silently capped: the
-  fork's DPOR dependency relation requires the dst-race build
-  (`-tags dst -race`), and without it honestly reports
-  `Uninstrumented` instead of exploring — pinned in-suite, with
-  the race-build path replaying any failure via `Replay`. The
-  dst-race leg (`test:dst:race`) selects DPOR automatically, with
-  a RECORDED scale boundary: a single full-database run carries
-  enough instrumented accesses to overflow the explorer's
-  per-bubble access budget, so the full-stack legs report
-  `Overflow` after one schedule — stated, never silently capped —
-  and dependency-pruned exploration genuinely bites at
+  (priority-inversion) sweep of the reader surface. The suite
+  explores in DPOR mode in EVERY build under an explicit per-seed
+  schedule budget, reported never silently capped: the fork's
+  COARSE cross-process dependency model (its exploration.md —
+  file nodes, the host namespace, flock, the shared futex,
+  announced build-independently) makes non-race DPOR genuinely
+  explore and prune gmdb's multi-process conflicts at OS-object
+  granularity — pinned in-suite by the coarse-visibility test
+  (gmdb SUTs must never report `Uninstrumented`, and every found
+  failure must replay, with panic/deadlock-typed failures
+  reproducing by panic per the fork's Replay contract). The
+  dst-race leg (`test:dst:race`) adds memory-granularity
+  dependencies on top, with a RECORDED scale boundary: a single
+  full-database run carries enough instrumented accesses to
+  overflow the explorer's per-bubble access budget, so the
+  full-stack legs report `Overflow` after one schedule — stated,
+  never silently capped; memory-granular pruning bites at
   component-scale SUTs (the workflow self-test explores and
-  prunes end-to-end under both builds); full-stack interleaving
-  coverage is the non-race Exhaustive+PCT legs' job. The
+  prunes end-to-end under both builds). The
   Explore → Failure → Replay workflow itself is proven end-to-end
   on a known lost-update SUT before any real bug needs it. Every
   failure report carries the seed and the replayable schedule.

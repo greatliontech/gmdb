@@ -30,8 +30,18 @@ func exploreReport(t *testing.T, tag string, seed uint64, res simulation.Explore
 	t.Helper()
 	t.Logf("%s: seed %d: mode=%v %d schedules, exhausted=%v budgetHit=%v overflow=%v foreign=%v uninstrumented=%v",
 		tag, seed, exploreMode(), res.Schedules, res.Exhausted, res.BudgetHit, res.Overflow, res.ForeignSched, res.Uninstrumented)
+	replay := func(f simulation.Failure) (failed bool) {
+		if f.Panic != "" || f.Deadlock != "" {
+			// Replay reproduces panic/deadlock failures by PANICKING with
+			// the same marker (the fork's contract) — reproduction is the
+			// recovered panic, not the return value.
+			defer func() { failed = recover() != nil }()
+		}
+		failed, _ = simulation.Replay(seed, f, sut)
+		return failed
+	}
 	for _, f := range res.Failures {
-		failed, _ := simulation.Replay(seed, f, sut)
+		failed := replay(f)
 		if !failed && f.ForeignSched {
 			// A non-reproducing replay of a foreign-sched-tainted failure
 			// is the fork's documented best-effort bound, not a
@@ -123,25 +133,26 @@ func TestSimulationExploreReplayWorkflow(t *testing.T) {
 // dependency-pruned coverage.
 var exploreOpts = simulation.ExploreOptions{Mode: exploreMode(), MaxSchedules: 250}
 
-// exploreMode picks DPOR when this build carries the fork's dependency
-// instrumentation (-tags dst -race — the Taskfile's test:dst:race leg)
-// and budgeted Exhaustive otherwise; the choice is logged per leg via
-// exploreReport's coverage line.
+// exploreMode is DPOR in every build: the fork's coarse cross-process
+// dependency model (file nodes, the host namespace, flock, the shared
+// futex) is build-independent, so non-race DPOR genuinely explores and
+// prunes gmdb's multi-process conflicts at OS-object granularity; the
+// dst-race build (the Taskfile's test:dst:race leg) adds
+// memory-granularity dependencies on top, at full-stack budgets that
+// overflow after one schedule (the recorded scale boundary).
 func exploreMode() simulation.ExploreMode {
-	if raceEnabled {
-		return simulation.DPOR
-	}
-	return simulation.Exhaustive
+	return simulation.DPOR
 }
 
-// TestSimulationExploreDPORRequiresRaceBuild pins the fork's honest
-// DPOR reporting for THIS suite's build mode: without -race, gmdb's
-// cross-process conflicts are invisible to the dependency relation, and
-// a DPOR exploration must say so (Uninstrumented, no exhaustion claim)
-// rather than report one "exhausted" class — the false-completeness
-// trap that motivated the fork fix. Under a dst-race build the same
-// exploration is instrumented and the downgrade must not fire.
-func TestSimulationExploreDPORRequiresRaceBuild(t *testing.T) {
+// TestSimulationExploreDPORCoarseVisibility pins that gmdb's
+// cross-process conflicts are VISIBLE to non-race DPOR through the
+// fork's coarse dependency model (file nodes, namespace, flock, futex):
+// the exploration must never report Uninstrumented — gmdb SUTs fire
+// coarse events by construction — and any failure it finds must replay.
+// (Before the coarse model, non-race DPOR honestly reported
+// Uninstrumented here; that downgrade now belongs to SUTs with NO
+// OS-visible conflicts, pinned in the fork's own suite.)
+func TestSimulationExploreDPORCoarseVisibility(t *testing.T) {
 	sut := func() bool {
 		simulation.Host("h", simulation.HostConfig{}, func() {
 			simulation.Process("setup", func() {
@@ -159,7 +170,8 @@ func TestSimulationExploreDPORRequiresRaceBuild(t *testing.T) {
 				}
 			})
 			done := make(chan struct{}, 2)
-			go simulation.Process("w1", func() {
+			writer := func(v string) {
+				defer func() { done <- struct{}{} }() // after Close (LIFO): no closers parked at bubble exit
 				ctx := context.Background()
 				db := openDB(t, "/db")
 				defer db.Close()
@@ -168,23 +180,11 @@ func TestSimulationExploreDPORRequiresRaceBuild(t *testing.T) {
 					if e != nil {
 						return e
 					}
-					return ks.Put([]byte("a"), []byte("w1"))
+					return ks.Put([]byte("a"), []byte(v))
 				})
-				done <- struct{}{}
-			})
-			go simulation.Process("w2", func() {
-				ctx := context.Background()
-				db := openDB(t, "/db")
-				defer db.Close()
-				db.Update(ctx, func(tx *gmdb.Tx) error {
-					ks, e := tx.OpenKeyspace("k")
-					if e != nil {
-						return e
-					}
-					return ks.Put([]byte("a"), []byte("w2"))
-				})
-				done <- struct{}{}
-			})
+			}
+			go simulation.Process("w1", func() { writer("w1") })
+			go simulation.Process("w2", func() { writer("w2") })
 			<-done
 			<-done
 		})
@@ -193,13 +193,8 @@ func TestSimulationExploreDPORRequiresRaceBuild(t *testing.T) {
 	res := simulation.ExploreWith(60, simulation.ExploreOptions{Mode: simulation.DPOR, MaxSchedules: 50}, sut)
 	t.Logf("dpor: schedules=%d exhausted=%v uninstrumented=%v", res.Schedules, res.Exhausted, res.Uninstrumented)
 	if res.Uninstrumented {
-		// Non-race build: the honest report — and never a completeness claim.
-		if res.Exhausted {
-			t.Fatalf("Uninstrumented exploration claimed Exhausted: %+v", res)
-		}
-		return
+		t.Fatalf("gmdb SUT reported Uninstrumented — the coarse dependency model saw none of its OS conflicts: %+v", res)
 	}
-	// dst-race build: instrumented exploration; failures replay per policy.
 	for _, f := range res.Failures {
 		failed, _ := simulation.Replay(60, f, sut)
 		t.Errorf("dpor: failure schedule=%v — Replay reproduces: %v", f.Schedule, failed)
@@ -235,7 +230,9 @@ func TestSimulationExploreCommitVsReaders(t *testing.T) {
 				// reordering the (uninteresting) Open machinery — without
 				// the rendezvous, a budget-bounded sweep never reaches a
 				// post-commit read (mutation-verified).
+				writerDone := make(chan struct{})
 				go simulation.Process("writer", func() {
+					defer close(writerDone) // after Close: the join below must not leave closers parked at bubble exit
 					ctx := context.Background()
 					db := openDB(t, "/db")
 					defer db.Close()
@@ -277,6 +274,7 @@ func TestSimulationExploreCommitVsReaders(t *testing.T) {
 						violation = true
 					}
 				})
+				<-writerDone
 			})
 			return violation
 		}
@@ -448,7 +446,9 @@ func TestSimulationPCTCommitVsReaders(t *testing.T) {
 						t.Fatalf("setup: %v", err)
 					}
 				})
+				writerDone := make(chan struct{})
 				go simulation.Process("writer", func() {
+					defer close(writerDone) // after Close (LIFO)
 					ctx := context.Background()
 					db := openDB(t, "/db")
 					defer db.Close()
@@ -482,6 +482,7 @@ func TestSimulationPCTCommitVsReaders(t *testing.T) {
 						t.Errorf("seed %d: View: %v", seed, err)
 					}
 				})
+				<-writerDone
 			})
 		})
 	}
