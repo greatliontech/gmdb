@@ -58,6 +58,19 @@ first tagged release (`development: true`, `.semrel.yaml`). Resolved
 entries are removed from their table and preserved in git history
 (`git log --all -- docs/issues/<file>.md`).
 
+## Open — platform ports (2026-08-10)
+
+Filed from an ocifs-side survey (ocifs targets windows/darwin via
+ProjFS/FSKit backends and plans store bookkeeping on gmdb; gmdb today
+runs only on linux — darwin compiles but cannot open a database, and
+windows does not compile). Both condition-triggered; neither pulls
+work forward.
+
+| Slug | Lands | Summary |
+|------|-------|---------|
+| `port-darwin.md` | first darwin consumer scheduled (ocifs store bookkeeping on macOS is the known candidate) | Widen portable mmap shims to the unix family; decide `F_FULLFSYNC` durability policy; soak crash/DST/cross-process suites on a macOS runner. |
+| `port-windows.md` | first windows consumer scheduled (ocifs store bookkeeping on windows is the known candidate) | Move flock behind its seam + windows primitives (`LockFileEx`, `MapViewOfFile`, `QueryUnbiasedInterruptTime`, `GetProcessTimes`); audit rename/share-mode + dirent durability; soak on a windows runner. |
+
 ## Open — change-set review findings
 
 Adjacent findings surfaced by per-chunk adversarial reviews;
