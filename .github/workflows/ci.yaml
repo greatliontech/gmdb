@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Unit + race suite on every supported-and-runnable platform. The
+  # command mirrors the Taskfile `test` target. The DST tier is
+  # deliberately absent: it builds only under the `dst` tag against the
+  # godst fork toolchain and is local-only by contract
+  # (docs/specs/dst-testing.md §Toolchain and invocation).
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race -count=1 -timeout 25m ./...
+
+  # Platforms gmdb cross-compiles for but cannot run hosted tests on.
+  # amd64/arm64 only: the cross-process protocol requires single-copy
+  # atomicity of aligned 64-bit loads/stores (cross-process.md §Atomic
+  # Operations Convention), so 32-bit targets are out of spec.
+  crossbuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: GOOS=freebsd GOARCH=amd64 go build ./... && GOOS=freebsd GOARCH=amd64 go vet ./...
+      - run: GOOS=freebsd GOARCH=arm64 go build ./... && GOOS=freebsd GOARCH=arm64 go vet ./...
+      - run: GOOS=darwin GOARCH=amd64 go build ./... && GOOS=darwin GOARCH=amd64 go vet ./...
+
+  # Release gates on the full test surface: semrel must never publish
+  # a commit whose tests are red or still running.
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, crossbuild]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.GLT_RELEASER_APP_ID }}
+          private-key: ${{ secrets.GLT_RELEASER_APP_KEY }}
+
+      - uses: greatliontech/semrel@main
+        with:
+          release: true
+          releaseToken: ${{ steps.app-token.outputs.token }}

@@ -7,10 +7,11 @@
       option defaulting to full-flush; `durability.md` platform
       durability contract; correct the fdatasync fallback's
       "fsync is strictly stronger" claim.
-- [ ] 3. Darwin CI + soak: macOS test job (unit, `-race`, crash
-      harness, DST suite, cross-process tests); disposition the
-      optional niceties (sysctl start time, boot-session UUID,
-      madvise hints).
+- [ ] 3. Darwin CI + soak: macOS test job (unit + `-race`, which
+      carries the crash harness and cross-process tests; DST stays
+      local-only per dst-testing.md); disposition the optional
+      niceties (sysctl start time, boot-session UUID, madvise
+      hints).
 - [ ] 4. Windows flock: move `syscall.Flock` call sites behind a
       per-platform seam; `LockFileEx`/`UnlockFileEx` implementation;
       settle the windows platform rows in `cross-process.md` first.
