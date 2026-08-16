@@ -3,6 +3,7 @@ package gmdb
 import (
 	"context"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -89,6 +90,18 @@ func TestShrinkDefersWhileReaderLive(t *testing.T) {
 // then fails with ErrCorrupted instead of SIGBUSing on the unbacked
 // tail.
 func TestReaderBracketsShrinkSeqlock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The STALE-BOUND outcome this test pins is unreachable on
+		// windows: a reader's file-resident bound is taken after its
+		// mapping exists (NewReader stats post-mmap), and once the
+		// view exists SetEndOfFile is kernel-refused — mapping and
+		// bound can never straddle a truncate. The truncate CAN still
+		// race the mapping's establishment window; that arm resolves
+		// as a section-beyond-EOF map failure retried inside the
+		// windows mmapRO (mmap-strategy.md §Windows), not as a stale
+		// bound.
+		t.Skip("windows forecloses the stale-bound interleaving; establishment races retry inside mmapRO")
+	}
 	ctx := context.Background()
 	path := tmpPath(t)
 	const pageSize, initPages = 4096, 64

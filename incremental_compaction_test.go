@@ -632,6 +632,11 @@ func TestCompactionOverflowFollowerChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	// Deferred (post-assertions) close: the fixture must stay open
+	// MID-test — a clean Close's checkpoint would consume the free
+	// capacity it arranges — but the mapping must be released at test
+	// end (windows pins the temp dir otherwise).
+	defer db.Close()
 	// LOW capacity first: a twin chain + filler rows created BEFORE
 	// the target chain occupy low ids; deleting them afterwards leaves
 	// a contiguous below-bound run (overflow chains are contiguous by

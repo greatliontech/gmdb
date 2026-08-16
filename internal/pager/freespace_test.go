@@ -43,7 +43,11 @@ func setupWriter(t *testing.T, pages int) (*Pager, *bitmap.Bitmap, *os.File) {
 
 func TestAllocPageFromBitmap(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -76,7 +80,11 @@ func TestAllocPageFromBitmap(t *testing.T) {
 
 func TestAllocPageFromFileExtension(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -98,7 +106,11 @@ func TestAllocPageFromFileExtension(t *testing.T) {
 
 func TestAllocPageReturnsErrDBFull(t *testing.T) {
 	p, bm, f := setupWriter(t, 4)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	// firstDataPage = 3, maxSizePages = 4 → one page available.
@@ -113,7 +125,11 @@ func TestAllocPageReturnsErrDBFull(t *testing.T) {
 
 func TestAllocPageLooseFirst(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -136,7 +152,11 @@ func TestAllocPageLooseFirst(t *testing.T) {
 
 func TestFreePageSameTxBecomesLoose(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -164,7 +184,11 @@ func TestFreePageSameTxBecomesLoose(t *testing.T) {
 
 func TestFreePagePriorTxRetires(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 	_ = bm
 
@@ -182,7 +206,11 @@ func TestFreePagePriorTxRetires(t *testing.T) {
 
 func TestTailRefundFreeBitmap(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -207,7 +235,11 @@ func TestTailRefundFreeBitmap(t *testing.T) {
 
 func TestTailRefundLoosePages(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -228,7 +260,11 @@ func TestTailRefundLoosePages(t *testing.T) {
 
 func TestTailRefundStopsAtNonFree(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -246,7 +282,11 @@ func TestTailRefundStopsAtNonFree(t *testing.T) {
 
 func TestReclaimRPL(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	// Write an RPL segment to page 10 on disk, with TxnID=5 and PageID
@@ -302,7 +342,11 @@ func TestReclaimRPL(t *testing.T) {
 
 func TestReclaimRPLRespectsBound(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	cfg := page.Config{PageSize: testPageSize}
@@ -354,7 +398,11 @@ func TestReclaimRPLRespectsBound(t *testing.T) {
 // identity is the discriminator.
 func TestRPLChainOrientationMultiSegment(t *testing.T) {
 	p, _, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	cfg := page.Config{PageSize: testPageSize}
@@ -456,7 +504,11 @@ func TestRPLChainOrientationMultiSegment(t *testing.T) {
 
 func TestResetFreespace(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 	_ = bm
 
@@ -481,7 +533,11 @@ func TestAllocPageUnconfiguredErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 
 	if _, err := p.AllocPage(); !errors.Is(err, ErrFreespaceUnconfigured) {
 		t.Errorf("AllocPage without bitmap: got %v, want ErrFreespaceUnconfigured", err)
@@ -577,7 +633,11 @@ func TestAllocContiguousFragmentationStats(t *testing.T) {
 // tracked for DBStats, and the callback fires for the log.
 func TestReclaimRPLQuarantinesCorruptSegment(t *testing.T) {
 	p, _, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 	cfg := page.Config{PageSize: testPageSize}
 
@@ -694,7 +754,11 @@ func TestReclaimRPLQuarantinesChecksumMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-open: %v", err)
 	}
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	bm := bitmap.New(make([]byte, testPageSize), testPageSize, 1, 32)
 	p.AttachBitmap(bm)
 	p.SetRPLChain([]RPLSegmentRef{
@@ -810,7 +874,11 @@ func TestReclaimRPLQuarantinesOutOfRangeSegmentPage(t *testing.T) {
 // when the region has none.
 func TestAllocBelowFloor(t *testing.T) {
 	p, bm, f := setupWriter(t, 64)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 	first := bm.FirstDataPage()
 	p.SetCommitState(40, 64, 0) // HWM above the holes
@@ -851,7 +919,11 @@ func TestAllocBelowFloor(t *testing.T) {
 // covers the band twice over plus reserve.
 func TestEvacuationFloorExact(t *testing.T) {
 	p, bm, f := setupWriter(t, 64)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 	first := bm.FirstDataPage()
 	p.SetCommitState(40, 64, 0) // HWM 40

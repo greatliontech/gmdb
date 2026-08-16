@@ -207,20 +207,6 @@ func mmapRO(file uintptr, reservationBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	res := ceilG(reservationBytes)
-	fileLen, err := fileLength(file)
-	if err != nil {
-		return nil, err
-	}
-	if fileLen%allocGranularity != 0 {
-		// Foreign (unix-created) file: align once. A read-only handle
-		// cannot — the documented degradation — and a real I/O error
-		// surfaces as itself.
-		if terr := windows.Ftruncate(windows.Handle(file), ceilG(fileLen)); terr != nil {
-			return nil, fmt.Errorf("pager: windows mapping requires a %d-aligned file length; aligning %d → %d failed (read-only handle, or I/O error): %w",
-				allocGranularity, fileLen, ceilG(fileLen), terr)
-		}
-		fileLen = ceilG(fileLen)
-	}
 	r1, _, callErr := procVirtualAlloc2.Call(
 		uintptr(windows.CurrentProcess()),
 		0,
@@ -232,17 +218,46 @@ func mmapRO(file uintptr, reservationBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("pager: VirtualAlloc2 reserve %d: %w", res, callErr)
 	}
 	wm := &winMapping{base: r1, reservation: res}
-	if cover := min(fileLen, res); cover > 0 {
-		if err := wm.mapExtent(file, 0, cover); err != nil {
-			// The split may have succeeded before the failure —
-			// coalesce best-effort so the release covers the whole
-			// reservation (a failed coalesce here leaks address space
-			// on an already-failing Open; bounded by process life).
-			_ = windows.VirtualFree(r1, uintptr(res),
-				windows.MEM_RELEASE|memCoalescePlaceholder)
-			_ = windows.VirtualFree(r1, 0, windows.MEM_RELEASE)
-			return nil, err
+	// Establishment retry: a writer's shrink can land between our
+	// length stat and the section creation (the writer holds zero
+	// views during its truncate), failing the map with a
+	// section-beyond-EOF error. Re-stat and retry — once our section
+	// exists the file cannot shrink under us, so a success is
+	// consistent by construction.
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		var fileLen int64
+		fileLen, err = fileLength(file)
+		if err != nil {
+			break
 		}
+		if fileLen%allocGranularity != 0 {
+			// Foreign (unix-created) file: align once. A read-only
+			// handle cannot — the documented degradation — and a real
+			// I/O error surfaces as itself.
+			if terr := windows.Ftruncate(windows.Handle(file), ceilG(fileLen)); terr != nil {
+				err = fmt.Errorf("pager: windows mapping requires a %d-aligned file length; aligning %d → %d failed (read-only handle, or I/O error): %w",
+					allocGranularity, fileLen, ceilG(fileLen), terr)
+				break
+			}
+			fileLen = ceilG(fileLen)
+		}
+		cover := min(fileLen, res)
+		if cover == 0 {
+			err = nil
+			break
+		}
+		if err = wm.mapExtent(file, 0, cover); err == nil {
+			break
+		}
+	}
+	if err != nil {
+		// mapExtent re-coalesced on its failure exits; release the
+		// whole reservation (best-effort coalesce first for safety).
+		_ = windows.VirtualFree(r1, uintptr(res),
+			windows.MEM_RELEASE|memCoalescePlaceholder)
+		_ = windows.VirtualFree(r1, 0, windows.MEM_RELEASE)
+		return nil, err
 	}
 	winMapsMu.Lock()
 	winMaps[r1] = wm

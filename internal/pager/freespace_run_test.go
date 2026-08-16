@@ -24,7 +24,11 @@ import (
 
 func TestAllocContiguousBitmapHit(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -56,7 +60,11 @@ func TestAllocContiguousBitmapHit(t *testing.T) {
 
 func TestAllocContiguousHWMExtension(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -87,7 +95,11 @@ func TestAllocContiguousErrDBFull(t *testing.T) {
 	// HWM starts at firstDataPage=3, maxSizePages=4. A run of 2 would
 	// require HWM advance to 5 > maxSizePages.
 	p, _, f := setupWriter(t, 4)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	_, err := p.AllocContiguous(2)
@@ -108,7 +120,11 @@ func TestAllocContiguousErrDBFull(t *testing.T) {
 // extension that handles the allocated-but-never-written case.
 func TestAllocContiguousFreeRunRoundTrip(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -153,7 +169,11 @@ func TestAllocContiguousFreeRunRoundTrip(t *testing.T) {
 // free-space.md §Tail Page Refund handles file shrinkage).
 func TestAllocContiguousHWMExtensionThenFreeRun(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -197,7 +217,11 @@ func TestAllocContiguousHWMExtensionThenFreeRun(t *testing.T) {
 // contiguous run, reclaimRPL is invoked and the retry hits.
 func TestAllocContiguousAfterRPLReclamation(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	cfg := page.Config{PageSize: testPageSize}
@@ -248,7 +272,11 @@ func TestAllocContiguousHWMRollbackOnTruncateFailure(t *testing.T) {
 	//       Truncate (otherwise need <= fileSize short-circuits);
 	//   (b) closing the underlying file so Truncate's syscall errors.
 	p, _, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 
 	first := p.HighWaterMark()
 	p.fileSize = 0 // force ensureFileCovers to invoke Truncate
@@ -269,7 +297,11 @@ func TestAllocContiguousHWMRollbackOnTruncateFailure(t *testing.T) {
 
 func TestAllocContiguousZeroN(t *testing.T) {
 	p, _, f := setupWriter(t, 4)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 	if _, err := p.AllocContiguous(0); err == nil {
 		t.Error("AllocContiguous(0): want error, got nil")
@@ -281,7 +313,11 @@ func TestAllocContiguousSingleDelegatesToAllocPage(t *testing.T) {
 	// behaviour is preserved. The contract is observable: a loose
 	// page must be reused before falling through to the bitmap.
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -302,7 +338,11 @@ func TestAllocContiguousSingleDelegatesToAllocPage(t *testing.T) {
 
 func TestFreeRunSameTxAllocSlabBecomesLoose(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -343,7 +383,11 @@ func TestFreeRunPriorTxRetiresToRPL(t *testing.T) {
 	// (e.g. mmap-backed prior-tx pages opened via a fresh writer) must
 	// route to retiredPages for RPL retirement.
 	p, _, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	// Synthesize "prior-tx allocated pages": IDs that the bitmap shows
@@ -372,7 +416,11 @@ func TestFreeRunPriorTxRetiresToRPL(t *testing.T) {
 
 func TestFreeRunZeroN(t *testing.T) {
 	p, _, f := setupWriter(t, 4)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 	if err := p.FreeRun(3, 0); err == nil {
 		t.Error("FreeRun(_, 0): want error, got nil")
@@ -386,7 +434,11 @@ func TestFreeRunReadOnlyErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	if err := p.FreeRun(2, 2); !errors.Is(err, ErrReadOnly) {
 		t.Errorf("FreeRun on read-only: got %v, want ErrReadOnly", err)
 	}
@@ -411,7 +463,11 @@ func TestFreeRunReadOnlyErrors(t *testing.T) {
 // contain srcB's content, not srcA's.
 func TestLoosePoolPopDetachesStaleBuffer(t *testing.T) {
 	p, bm, f := setupWriter(t, 16)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
@@ -501,7 +557,11 @@ func TestLoosePoolPopDetachesStaleBufferCoW(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	bm := bitmap.New(make([]byte, testPageSize), testPageSize, 1, 16)
 	p.AttachBitmap(bm)
 	p.SetCommitState(bm.FirstDataPage(), 16, 0)
@@ -569,7 +629,11 @@ func TestLoosePoolPopDetachesStaleBufferCoW(t *testing.T) {
 // CoW / AllocSlab — observable here.
 func TestFreePageAllocatedButNeverWrittenRestoresBitmap(t *testing.T) {
 	p, bm, f := setupWriter(t, 32)
-	defer p.Close()
+	defer func() {
+		if p != nil {
+			_ = p.Close()
+		}
+	}()
 	defer f.Close()
 
 	first := bm.FirstDataPage()
