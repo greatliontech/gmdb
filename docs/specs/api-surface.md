@@ -2064,6 +2064,33 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue]
 // failed link with path already naming the copied inode — NFS's
 // link retransmission — counts as a successful publish.
 //
+// Windows share-mode and replace contract: the data and lock files
+// are opened via os.Root, whose windows opens request
+// FILE_SHARE_READ|WRITE|DELETE; the plain (share-delete-less) opens
+// are all off the publish/replace path — copy temps (CopyTo's and
+// Compact's, which no other handle opens before publish), bulk-load
+// spill scratch files, and transient directory handles. No gmdb
+// code path may
+// introduce a restrictive share mode on the publish/replace path.
+// CopyTo's publish (hard link or no-clobber rename of a FRESH name)
+// replaces nothing that is open and works unchanged; its no-clobber
+// rung is the same probe-then-rename best-effort as every non-Linux
+// platform.
+//
+// Compact's in-place replace does NOT work on windows: the kernel
+// refuses to replace or delete a file any process holds MAPPED
+// (ERROR_USER_MAPPED_FILE class), and every gmdb handle maps the
+// data file — including the compacting handle itself, whose old
+// mapping is still live at rename time. Windows Compact therefore
+// fails deterministically with a clean error at its publish rename:
+// the temp is removed, the database is untouched, the handle
+// remains usable. Lifting the limitation requires a dedicated
+// windows design meeting all of: the caller tears down its own
+// mapping before the rename, no peer process maps the file (a
+// sole-mapper precondition), and the rename uses os.Root's
+// POSIX-semantics form — recorded here so any future design starts
+// from the real precondition set.
+//
 // A verbatim (compact=false) copy of a source whose file no longer
 // covers its meta's HighWaterMark — a truncated transfer, a forged
 // meta — clamps its walk to the file-resident extent, exactly as

@@ -25,7 +25,7 @@
 - [x] 6. Windows mmap: placeholder-reservation model
       (`VirtualAlloc2`/`MapViewOfFile3`) for the pager RO mapping;
       fixed-size `CreateFileMapping` section for the lock RW mapping.
-- [ ] 7. Windows filesystem semantics: publish/replace-path
+- [x] 7. Windows filesystem semantics: publish/replace-path
       share-mode audit (`FILE_SHARE_DELETE` discipline); windows
       directory-durability ritual for the dirent guarantees.
 - [ ] 8. Windows CI + soak; plan close-out (promote issue rationale

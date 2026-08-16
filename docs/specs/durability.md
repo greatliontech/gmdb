@@ -152,7 +152,10 @@ durability (a created file's dirent lost to power loss loses the
 acknowledged commits inside it). Directory barriers use `fsync(2)` as
 the base call on every platform — the documented dirent ritual;
 `fdatasync`'s data-only contract is defined for file data — upgraded
-to `F_FULLFSYNC` on darwin under the same policy. The lock file is
+to `F_FULLFSYNC` on darwin under the same policy. On windows the
+ritual is `FlushFileBuffers` on a directory handle reopened with
+write access (by handle, preserving the caller's symlink-guard open
+— `FlushFileBuffers` refuses read-access handles). The lock file is
 exempt — transient coordination state with no durability contract
 (cross-process.md §Lock File Layout).
 

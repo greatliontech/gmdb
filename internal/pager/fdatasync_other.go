@@ -1,16 +1,15 @@
-//go:build !linux && !darwin
+//go:build !linux && !darwin && !windows
 
 package pager
 
 import "os"
 
 // fdatasync falls back to a full fsync on platforms where x/sys does
-// not expose fdatasync. On these platforms (freebsd, windows, …) the
-// claim "fsync is strictly stronger" holds — fsync(2) / FlushFileBuffers
-// reach stable storage — so the fallback only forgoes the
-// inode-time-flush optimization the Linux path gets. darwin is the
-// exception (fsync does not flush the drive cache there) and has its
-// own shim: fdatasync_darwin.go.
+// not expose fdatasync. On these platforms (freebsd, …) the claim
+// "fsync is strictly stronger" holds — fsync(2) reaches stable
+// storage — so the fallback only forgoes the inode-time-flush
+// optimization the Linux path gets. darwin (drive-cache exception)
+// and windows (directory-flush ritual) have their own shims.
 func fdatasync(f *os.File) error {
 	return f.Sync()
 }
