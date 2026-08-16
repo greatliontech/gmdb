@@ -120,6 +120,22 @@ type DB struct {
 	maint maintenance
 }
 
+// pagerOpenParamsFrom is the single Options → pager.OpenParams
+// derivation. Open and Compact's pager reopen must hand the pager
+// identical per-open configuration (builder defaults included); a
+// second hand-rolled construction is how those defaults were once
+// silently dropped across Compact.
+func pagerOpenParamsFrom(pool *pager.BufPool, opts Options) pager.OpenParams {
+	return pager.OpenParams{
+		Pool:               pool,
+		MaxTxBufferBytes:   opts.MaxTxBufferBytes,
+		RestartGroupTarget: opts.RestartGroupTarget,
+		LeafLayout:         page.LeafLayout(opts.LeafLayout),
+		BranchLayout:       page.BranchLayout(opts.BranchLayout),
+		NoFullFsync:        opts.NoFullFsync,
+	}
+}
+
 // Open opens the database at path. If the file does not exist, it is
 // created with opts; existing files use opts for runtime fields only
 // (PageSize, PageChecksum, file-size bounds are taken from the meta
@@ -279,14 +295,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	pool := pager.NewBufPool(int(persistedPageSize))
-	pop := pager.OpenParams{
-		Pool:               pool,
-		MaxTxBufferBytes:   opts.MaxTxBufferBytes,
-		RestartGroupTarget: opts.RestartGroupTarget,
-		LeafLayout:         page.LeafLayout(opts.LeafLayout),
-		BranchLayout:       page.BranchLayout(opts.BranchLayout),
-		NoFullFsync:        opts.NoFullFsync,
-	}
+	pop := pagerOpenParamsFrom(pool, opts)
 	var opened *pager.OpenedDB
 	if opts.ReadOnly {
 		// Read-only handle: build a reader pager (no writer slab / no

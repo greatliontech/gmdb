@@ -139,11 +139,11 @@ func (db *DB) reopenAfterCompact(base string) error {
 		db.poisoned.Store(true)
 		return fmt.Errorf("gmdb: Compact reopen file (handle poisoned — Close and re-Open): %w", err)
 	}
-	opened, err := pager.Open(newFile, pager.OpenParams{
-		Pool:             db.pool, // PageSize is preserved across compaction
-		MaxTxBufferBytes: db.opts.MaxTxBufferBytes,
-		NoFullFsync:      db.opts.NoFullFsync,
-	})
+	// The same per-open parameter set Open derives — via the single
+	// derivation point, so the reopened pager cannot silently diverge
+	// from the handle's configuration (db.pool's PageSize is preserved
+	// across compaction).
+	opened, err := pager.Open(newFile, pagerOpenParamsFrom(db.pool, db.opts))
 	if err != nil {
 		_ = newFile.Close()
 		db.poisoned.Store(true)

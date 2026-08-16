@@ -467,7 +467,15 @@ func (w *freshFileWriter) WriteDirectRaw(id uint64, buf []byte) error {
 // is a defragmented, minimally-sized copy with an all-allocated bitmap.
 func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	meta := rtx.meta
+	// The read pager's cfg is decode-only (PageSize, checksum) — decoding
+	// dispatches on the type byte and needs no builder defaults. The
+	// rebuild BUILDS pages, so graft the engine-wide builder defaults
+	// from Options onto it; descriptor.ApplyToConfig then applies the
+	// per-keyspace overrides below, exactly as the live write path does.
 	baseCfg := rtx.pgr.Config()
+	baseCfg.RestartGroupTarget = rtx.db.opts.RestartGroupTarget
+	baseCfg.LeafLayout = page.LeafLayout(rtx.db.opts.LeafLayout)
+	baseCfg.BranchLayout = page.BranchLayout(rtx.db.opts.BranchLayout)
 	hwm := meta.HighWaterMark
 	firstData := uint64(2) + uint64(meta.BitmapPages)
 	pageSize := int64(meta.PageSize)
