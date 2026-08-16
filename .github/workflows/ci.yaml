@@ -34,6 +34,23 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 -timeout 25m ./...
 
+  # Windows runs as its own job, deliberately OUTSIDE the release
+  # gate while the port soaks: the suite has never executed on
+  # windows, and known platform contracts (Compact's documented
+  # clean failure, multi-process shrink deferral — api-surface.md,
+  # mmap-strategy.md §Windows) need their tests platform-gated as
+  # the soak surfaces them. Fold into the release gate once green.
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race -count=1 -timeout 45m ./...
+
   # Platforms gmdb cross-compiles for but cannot run hosted tests on.
   # amd64/arm64 only: the cross-process protocol requires single-copy
   # atomicity of aligned 64-bit loads/stores (cross-process.md §Atomic
