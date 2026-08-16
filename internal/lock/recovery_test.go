@@ -571,9 +571,34 @@ func TestPrevLastWriterLiveClassification(t *testing.T) {
 		}
 	})
 	t.Run("same-ns dead pid is not live", func(t *testing.T) {
+		if ourNS == 0 {
+			// Platforms without a namespace id (non-linux) classify
+			// every identity as different-namespace — the kill(0) leg
+			// is unreachable by design (cross-process.md §PID
+			// Namespace Awareness); the ns-unknown subtests below pin
+			// that routing.
+			t.Skip("PID namespace unavailable: same-NS classification unreachable")
+		}
 		// A PID far above pid_max cannot be alive.
 		if mkCoord(1<<30, 12345, ourNS, now).PrevLastWriterLive() {
 			t.Error("dead pid classified live (kill(0) path)")
+		}
+	})
+	t.Run("ns-unknown fresh heartbeat is live", func(t *testing.T) {
+		// A record with no namespace id routes to the heartbeat leg on
+		// every platform (a zero on either side means the pids are not
+		// comparable — cross-process.md §PID Namespace Awareness), so
+		// even an impossible pid with a fresh heartbeat is live. This
+		// is the whole liveness story on platforms whose own namespace
+		// id is zero (heartbeat-only liveness, §Heartbeat Goroutine
+		// PLATFORM SUPPORT).
+		if !mkCoord(1<<30, 12345, 0, now).PrevLastWriterLive() {
+			t.Error("ns-unknown fresh heartbeat classified dead")
+		}
+	})
+	t.Run("ns-unknown stale heartbeat is not live", func(t *testing.T) {
+		if mkCoord(1<<30, 12345, 0, now-2*timeout).PrevLastWriterLive() {
+			t.Error("ns-unknown stale heartbeat classified live")
 		}
 	})
 	t.Run("same-ns live pid with matching start time is live", func(t *testing.T) {
