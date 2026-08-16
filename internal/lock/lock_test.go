@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"testing"
 )
 
@@ -635,7 +634,7 @@ func TestOpenStaleRemovalSkipsUnderLiveFlockHolder(t *testing.T) {
 		t.Fatalf("holder open: %v", err)
 	}
 	defer holder.Close()
-	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_SH); err != nil {
+	if err := flockShared(holder.Fd()); err != nil {
 		t.Fatalf("holder flock: %v", err)
 	}
 
@@ -856,7 +855,7 @@ func TestBootEpochResetContendedSkips(t *testing.T) {
 		t.Fatalf("holder: %v", err)
 	}
 	defer holder.Close()
-	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_SH); err != nil {
+	if err := flockShared(holder.Fd()); err != nil {
 		t.Fatalf("holder flock: %v", err)
 	}
 

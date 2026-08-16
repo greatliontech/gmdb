@@ -12,7 +12,7 @@
       local-only per dst-testing.md); disposition the optional
       niceties (sysctl start time, boot-session UUID, madvise
       hints).
-- [ ] 4. Windows flock: move `syscall.Flock` call sites behind a
+- [x] 4. Windows flock: move `syscall.Flock` call sites behind a
       per-platform seam; `LockFileEx`/`UnlockFileEx` implementation;
       settle the windows platform rows in `cross-process.md` first.
 - [ ] 5. Windows clock + process identity:

@@ -2,10 +2,8 @@ package lock
 
 import (
 	"context"
-	"errors"
 	"os"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -424,7 +422,7 @@ func TestClearBeforeUnlockOrdering(t *testing.T) {
 	// witnesses fire:
 	//   (a) read WriterPID via this Coord — must already be 0;
 	//   (b) issue flock(LOCK_EX|LOCK_NB) on a witness *File on the
-	//       same inode — must EWOULDBLOCK (we still hold LOCK_EX,
+	//       same inode — must observe contention (we still hold LOCK_EX,
 	//       even though we've cleared the fields).
 	// Together: cleared-and-still-locked == the invariant.
 	root, base, _ := tmpLock(t)
@@ -464,12 +462,12 @@ func TestClearBeforeUnlockOrdering(t *testing.T) {
 		pid := f.WriterPID()
 		start := f.WriterStartTime()
 		ns := f.WriterPIDNamespace()
-		// Cross-OFD probe: must EWOULDBLOCK — we still hold LOCK_EX.
-		ferr := syscall.Flock(int(witness.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		// Cross-OFD probe: must observe contention — we still hold LOCK_EX.
+		ferr := flockTryExclusive(witness.Fd())
 		if ferr == nil {
 			// Defensive: release if we somehow acquired (would
 			// indicate the test setup is wrong, not the invariant).
-			_ = syscall.Flock(int(witness.Fd()), syscall.LOCK_UN)
+			_ = flockUnlock(witness.Fd())
 		}
 		witnessCh <- witnessResult{pid, start, ns, ferr}
 	})
@@ -503,8 +501,8 @@ func TestClearBeforeUnlockOrdering(t *testing.T) {
 	if w.nsAtHook != 0 {
 		t.Errorf("WriterPIDNamespace at hook = %d, want 0", w.nsAtHook)
 	}
-	if !errors.Is(w.witnessFlockErr, syscall.EWOULDBLOCK) {
-		t.Errorf("witness flock during hook: got %v, want EWOULDBLOCK (LOCK_EX still held at clear-before-unlock point)", w.witnessFlockErr)
+	if !flockErrContended(w.witnessFlockErr) {
+		t.Errorf("witness flock during hook: got %v, want contention (LOCK_EX still held at clear-before-unlock point)", w.witnessFlockErr)
 	}
 }
 

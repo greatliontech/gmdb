@@ -6,7 +6,6 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unsafe"
 )
@@ -256,7 +255,7 @@ func Open(p OpenParams) (*File, error) {
 //
 // Partial-state handling. LOCK_SH does NOT serialise against the
 // pre-LOCK_EX window of a concurrent creator (between
-// O_CREATE|O_EXCL and the creator's first syscall.Flock). An
+// O_CREATE|O_EXCL and the creator's first flock acquisition). An
 // adopter that lands inside this window observes size==0 and/or
 // Magic==0; rather than returning terminal ErrCorrupted, it
 // surfaces errPartialInit so the lifecycle loop in Open retries
@@ -308,14 +307,14 @@ func tryAdoptExisting(p OpenParams) (*File, error) {
 	// If the creator is still in the open→flock window, our LOCK_SH
 	// succeeds immediately and we fall into the size==0 / Magic==0
 	// detection below.
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+	if err := flockShared(f.Fd()); err != nil {
 		return nil, fmt.Errorf("lock: flock(LOCK_SH) on %q: %w", p.Base, err)
 	}
 	// Drop LOCK_SH at function exit — we don't need it for steady-
 	// state use (the mmap is independent of flock). The writer's
 	// later LOCK_EX (taken by the flock goroutine in 2.4) doesn't
 	// conflict with our subsequent atomic mmap ops.
-	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	defer func() { _ = flockUnlock(f.Fd()) }()
 
 	st, err := f.Stat()
 	if err != nil {
@@ -483,13 +482,13 @@ func createAndInit(p OpenParams) (*File, error) {
 		(*hook)()
 	}
 
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := flockExclusive(f.Fd()); err != nil {
 		return nil, fmt.Errorf("lock: flock(LOCK_EX) on freshly-created %q: %w", p.Base, err)
 	}
 	// LOCK_EX is held across init; release after init regardless of
 	// outcome so adopters can take LOCK_SH and validate.
 	initErr := initLockFile(f, p.DataUUID, p.MaxReaders, FileSize(p.MaxReaders))
-	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = flockUnlock(f.Fd())
 	if initErr != nil {
 		return nil, initErr
 	}
@@ -584,7 +583,7 @@ func SetStaleRemoveHookForTest(hook func()) (restore func()) {
 // (the Open loop backs off first), and a real error for a stat or
 // removal failure.
 func removeStaleGuarded(p OpenParams, f *os.File) error {
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := flockTryConvertToExclusive(f.Fd()); err != nil {
 		return errStaleContended // another remover or a legacy holder
 	}
 	if hook := staleRemoveHookForTest.Load(); hook != nil {
@@ -635,7 +634,7 @@ var errBootEpochContended = errors.New("lock: boot-epoch reset contended")
 // cannot CAS a slot before mmapAndOverlay, which happens only after
 // this returns on every path).
 func bootEpochReset(p OpenParams, f *os.File, maxReaders uint32) error {
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := flockTryConvertToExclusive(f.Fd()); err != nil {
 		return errBootEpochContended
 	}
 	// Re-read the header under the lock: the winner of a concurrent

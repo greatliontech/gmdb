@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -483,11 +482,11 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 	// even under a hypothetical sustained EINTR stream — a fully-
 	// preempting kernel still cannot starve shutdown.
 	for {
-		err := syscall.Flock(int(c.f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := flockTryExclusive(c.f.Fd())
 		if err == nil {
 			break
 		}
-		if errors.Is(err, syscall.EINTR) {
+		if flockErrRetryable(err) {
 			select {
 			case <-c.stopCh:
 				return true
@@ -498,7 +497,7 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 				continue
 			}
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
+		if !flockErrContended(err) {
 			req.result <- err
 			return false
 		}
@@ -636,7 +635,7 @@ holdLoop:
 		(*hook)()
 	}
 
-	_ = syscall.Flock(int(c.f.Fd()), syscall.LOCK_UN)
+	_ = flockUnlock(c.f.Fd())
 	return stopped
 }
 

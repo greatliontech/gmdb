@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -669,10 +668,10 @@ func TestCoordOldestReaderTxnIDLiveWithFlock(t *testing.T) {
 	}
 	// Take LOCK_EX so OldestReaderTxnID is invoked in its
 	// production state.
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := flockExclusive(f.Fd()); err != nil {
 		t.Fatalf("flock: %v", err)
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	defer flockUnlock(f.Fd())
 	got := c.OldestReaderTxnID()
 	if got != 7 {
 		t.Errorf("OldestReaderTxnID = %d, want 7", got)
@@ -717,10 +716,10 @@ func TestCoordStaleTimeoutThreadsToOldestReaderTxnID(t *testing.T) {
 		// OldestReaderTxnID's documented precondition: caller holds
 		// LOCK_EX. The Coord's flock goroutine never flocks here (no
 		// writer request is issued), so taking it directly is safe.
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		if err := flockExclusive(f.Fd()); err != nil {
 			t.Fatalf("flock: %v", err)
 		}
-		defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+		defer func() { _ = flockUnlock(f.Fd()) }()
 		return c.OldestReaderTxnID()
 	}
 

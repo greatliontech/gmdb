@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -224,10 +223,10 @@ func TestCoordCloseWhileHolding(t *testing.T) {
 
 	// Pre-Close, the witness fd must NOT be able to acquire LOCK_EX —
 	// the Coord is holding flock on a different OFD for the same file.
-	if err := syscall.Flock(int(witness.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+	if err := flockTryExclusive(witness.Fd()); err == nil {
 		t.Fatalf("witness flock succeeded while Coord holds — Coord did not actually take LOCK_EX")
-	} else if !errors.Is(err, syscall.EWOULDBLOCK) {
-		t.Fatalf("witness flock pre-Close: got %v, want EWOULDBLOCK", err)
+	} else if !flockErrContended(err) {
+		t.Fatalf("witness flock pre-Close: got %v, want contention", err)
 	}
 
 	// Close while still holding. Coord must clear the header and
@@ -251,12 +250,12 @@ func TestCoordCloseWhileHolding(t *testing.T) {
 
 	// Post-Close, the witness fd MUST now be able to acquire LOCK_EX —
 	// proves the Coord released the kernel flock on its stopCh path.
-	if err := syscall.Flock(int(witness.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := flockTryExclusive(witness.Fd()); err != nil {
 		t.Errorf("witness flock post-Close: got %v, want success (Close-releases invariant)", err)
 	} else {
 		// Defer LOCK_UN immediately on success so a subsequent
 		// t.Fatal/t.FailNow cannot leak the flock past the test.
-		defer func() { _ = syscall.Flock(int(witness.Fd()), syscall.LOCK_UN) }()
+		defer func() { _ = flockUnlock(witness.Fd()) }()
 	}
 	_ = f.Close()
 }

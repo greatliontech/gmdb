@@ -1389,11 +1389,12 @@ stored value, the PID was recycled.
 | Linux | `/proc/[pid]/stat` field 22 | Clock ticks since boot (uint64) | No privileges. Pure Go: `os.ReadFile` + parse. |
 | macOS | `sysctl KERN_PROC_PID` → `kinfo_proc.kp_proc.p_starttime` | timeval packed as `sec*1e6+usec` | Same-user processes. PORT DESIGN — not shipped. |
 | FreeBSD | `sysctl KERN_PROC_PID` → `kinfo_proc.ki_start` | timeval packed | Same as macOS interface. PORT DESIGN — not shipped. |
+| Windows | `GetProcessTimes` creation time | FILETIME (100 ns units since 1601) | Same-user processes without SeDebugPrivilege need `PROCESS_QUERY_LIMITED_INFORMATION`. PORT DESIGN — not shipped. |
 
-Only the Linux row is implemented; the macOS/FreeBSD rows are the
-settled design for those platforms (see PLATFORM SUPPORT under
-§Heartbeat Goroutine — the non-Linux helpers ship as error stubs
-and liveness there is heartbeat-only).
+Only the Linux row is implemented; the macOS/FreeBSD/Windows rows
+are the settled design for those platforms (see PLATFORM SUPPORT
+under §Heartbeat Goroutine — the non-Linux helpers ship as error
+stubs and liveness there is heartbeat-only).
 
 If `processStartTime` fails, falls back to heartbeat (if
 available) or PID-only liveness.
@@ -1515,6 +1516,34 @@ forward by less than wall-time elapsed, so `StaleTimeout`'s
 10-second default is safe — false-stale detection requires a
 heartbeat older than 10 s of *monotonic* time, which a suspended
 process cannot accumulate.
+
+WINDOWS PORT DESIGN — the settled contract for a windows port; it
+describes no shipped behavior until that port lands:
+
+- **flock**: whole-file advisory semantics emulated with a one-byte
+  `LockFileEx`/`UnlockFileEx` range at offset 2^63−1 — beyond any
+  byte the lock file ever contains, because windows byte-range locks
+  are MANDATORY against `ReadFile`/`WriteFile` (mapped-view access
+  is not checked) and must never intersect the real read/write
+  paths. Shared/exclusive map to the `LOCKFILE_EXCLUSIVE_LOCK` flag;
+  non-blocking to `LOCKFILE_FAIL_IMMEDIATELY`. The shared→exclusive
+  CONVERSION is unlock-then-try-lock — exactly `flock(2)`'s
+  documented non-atomic conversion, which every conversion caller
+  already tolerates (contention ⇒ back off / retry; the §Lock File
+  Lifecycle validation re-runs under the new lock). Blocking
+  acquisitions poll the non-blocking variant (windows has no EINTR;
+  the blocking windows are brief creator-init races).
+- **monotonic clock**: `QueryUnbiasedInterruptTime` — kernel-wide,
+  boot-relative, excludes suspend; the `StaleTimeout` suspend
+  analysis above applies unchanged.
+- **process start time**: `GetProcessTimes` creation time
+  (§Process Start Time).
+- **boot id**: no clean source → zero; the zero-epoch residual
+  under §Lock File Layout BootID applies.
+- **futex**: the adaptive-poll fallback (`WaitOnAddress` is
+  within-process only, so polling is the correct degradation).
+- **fdatasync**: the full-strength fsync fallback
+  (`FlushFileBuffers`; durability.md §Platform sync primitives).
 
 `StaleTimeout` (default 10 s) controls how long a heartbeat
 must be stale before the slot is reclaimed. Must be
