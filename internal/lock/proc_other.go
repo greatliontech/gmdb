@@ -5,11 +5,11 @@ package lock
 import "errors"
 
 // errStartTimeUnsupported is returned by ProcessStartTime on platforms
-// where the per-platform implementation is not present in this build
-// (macOS / FreeBSD ship Linux-only stubs until the sysctl-based
-// helpers are implemented). On error, callers fall
-// back to the heartbeat-based liveness check per
-// cross-process.md §Process Start Time.
+// where the per-platform implementation is not present in this build —
+// macOS / FreeBSD (sysctl designs) and windows (GetProcessTimes
+// design) all ship this stub; the designs stay PORT DESIGN rows in
+// cross-process.md §Process Start Time. On error, callers fall back
+// to the heartbeat-based liveness check per that section.
 var errStartTimeUnsupported = errors.New("lock: ProcessStartTime not implemented on this platform")
 
 func ProcessStartTime(pid int) (uint64, error) {

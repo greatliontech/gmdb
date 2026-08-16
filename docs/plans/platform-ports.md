@@ -15,10 +15,13 @@
 - [x] 4. Windows flock: move `syscall.Flock` call sites behind a
       per-platform seam; `LockFileEx`/`UnlockFileEx` implementation;
       settle the windows platform rows in `cross-process.md` first.
-- [ ] 5. Windows clock + process identity:
-      `QueryUnbiasedInterruptTime` monotonic clock,
-      `GetProcessTimes` start time, boot id zero (designed
-      degradation); `GOOS=windows` build + vet green.
+- [x] 5. Windows clock + process identity:
+      `QueryUnbiasedInterruptTime` monotonic clock; process liveness
+      via `OpenProcess` for the IsAlive seam (classification stays
+      heartbeat-only per cross-process.md — `GetProcessTimes`
+      remains a PORT DESIGN row, matching the darwin sysctl
+      disposition); boot id zero (designed degradation);
+      `GOOS=windows` build + vet green.
 - [ ] 6. Windows mmap: `CreateFileMapping`/`MapViewOfFile` for the
       pager RO and lock RW mappings.
 - [ ] 7. Windows filesystem semantics: publish/replace-path
