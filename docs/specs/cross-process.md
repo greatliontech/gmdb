@@ -446,7 +446,9 @@ with explicit endian-aware encode/decode functions for portability.
 lock file is transient coordination state — it PERSISTS on disk
 (no code path deletes it in normal operation; persistence is
 harmless because cross-boot state is invalidated by the boot
-epoch below, and a recreated database stale-classifies it by
+epoch below — or, on zero-boot-id platforms, accepted as the
+zero-epoch residual documented under BootID — and a recreated
+database stale-classifies it by
 UUID) — and its layout deliberately follows the host platform's
 C ABI. A lock file written by a little-endian process is not
 readable by a big-endian process; mounting the database on a
@@ -1389,9 +1391,9 @@ stored value, the PID was recycled.
 | FreeBSD | `sysctl KERN_PROC_PID` → `kinfo_proc.ki_start` | timeval packed | Same as macOS interface. PORT DESIGN — not shipped. |
 
 Only the Linux row is implemented; the macOS/FreeBSD rows are the
-settled design for those ports (see PLATFORM SUPPORT under
-§Heartbeat Goroutine — the lock file itself is Linux-only today,
-so the non-Linux helpers ship as error stubs).
+settled design for those platforms (see PLATFORM SUPPORT under
+§Heartbeat Goroutine — the non-Linux helpers ship as error stubs
+and liveness there is heartbeat-only).
 
 If `processStartTime` fails, falls back to heartbeat (if
 available) or PID-only liveness.
@@ -1496,21 +1498,23 @@ from the same writer, even before the first refresh tick fires.
 suspend/resume, and is shared across all containers on the
 same host (kernel-wide, not per-PID-namespace).
 
-PLATFORM SUPPORT: the lock file — and with it all cross-process
-coordination this spec defines — is currently implemented on
-LINUX ONLY: the non-Linux lock mmap shim returns an
-unsupported-platform error, so a WRITABLE open fails outright on
-non-Linux, and a read-only open falls back to lock-free
-operation. The macOS/FreeBSD material in this spec is the DESIGN
-for those ports, kept so a port implements a settled contract; it
-describes no shipped behavior. For those future
-ports: `CLOCK_MONOTONIC` on macOS / FreeBSD is kernel-wide and
-boot-relative but does not survive suspend; on a laptop that
-resumes after a long sleep, the heartbeat clock jumps forward by
-less than wall-time elapsed, so `StaleTimeout`'s 10-second
-default is safe — false-stale detection requires a heartbeat
-older than 10 s of *monotonic* time, which a suspended process
-cannot accumulate.
+PLATFORM SUPPORT: the lock file — and with it the cross-process
+coordination this spec defines — is implemented on the unix
+family (Linux, macOS, FreeBSD). Outside that family (windows) the
+lock mmap shim returns an unsupported-platform error, so a
+WRITABLE open fails outright and a read-only open falls back to
+lock-free operation. The non-Linux family members run with the
+degradations this spec defines: adaptive-poll notification waits
+(no shared futex), zero boot id (cross-boot invalidation
+disabled), and heartbeat-only liveness (`ProcessStartTime` ships
+as an error stub until the sysctl-based designs in §Process Start
+Time are implemented). `CLOCK_MONOTONIC` on macOS / FreeBSD is
+kernel-wide and boot-relative but does not survive suspend; on a
+laptop that resumes after a long sleep, the heartbeat clock jumps
+forward by less than wall-time elapsed, so `StaleTimeout`'s
+10-second default is safe — false-stale detection requires a
+heartbeat older than 10 s of *monotonic* time, which a suspended
+process cannot accumulate.
 
 `StaleTimeout` (default 10 s) controls how long a heartbeat
 must be stale before the slot is reclaimed. Must be

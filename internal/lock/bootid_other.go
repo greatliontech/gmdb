@@ -4,8 +4,8 @@ package lock
 
 // CurrentBootID returns the zero boot id on platforms without a boot
 // discriminator source; shouldResetBootEpoch never fires on a zero,
-// so cross-boot invalidation is disabled (the lock file is Linux-only
-// in practice — see mmap_other.go).
+// so cross-boot invalidation is disabled — the designed degradation
+// for non-Linux platforms (cross-process.md §Lock File Layout).
 func CurrentBootID() [16]byte { return [16]byte{} }
 
 // shouldResetBootEpoch — see bootid_linux.go. Fires only when both

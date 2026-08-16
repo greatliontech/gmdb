@@ -1,13 +1,14 @@
-//go:build !linux
+//go:build !linux && !darwin && !freebsd
 
 package lock
 
 import "errors"
 
 // errUnsupportedPlatform mirrors internal/pager's same-name shim:
-// macOS and FreeBSD shims for the lock file are not yet implemented.
-// Until then this file keeps the package buildable on every supported
-// OS.
+// mmap_unix.go covers the unix family; platforms outside it (windows
+// is the notable absentee) have no lock-file mmap yet. Until then this
+// file keeps the mmap seam buildable outside the unix family (the
+// package as a whole has other unix-only dependencies).
 var errUnsupportedPlatform = errors.New("lock: mmap not implemented on this platform yet")
 
 func mmapRW(fd uintptr, size int64) ([]byte, error) {

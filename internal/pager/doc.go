@@ -14,6 +14,6 @@
 // subsystem; the btree operates on top of the pager.
 //
 // Platform mmap/madvise syscall shims live in build-tagged siblings:
-// mmap_linux.go, mmap_darwin.go, mmap_freebsd.go. No platform-conditional
-// code lives in the commit path itself.
+// mmap_unix.go (linux, darwin, freebsd) and mmap_other.go. No
+// platform-conditional code lives in the commit path itself.
 package pager
