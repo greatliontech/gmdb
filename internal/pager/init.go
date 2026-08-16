@@ -105,7 +105,7 @@ func Init(file *os.File, ip InitParams) error {
 	m.Durable.AnchoredTxnID = 0
 
 	pageSizeI := int64(ip.PageSize)
-	if err := file.Truncate(int64(filePages) * pageSizeI); err != nil {
+	if err := platformTruncate(file, int64(filePages)*pageSizeI); err != nil {
 		return fmt.Errorf("pager: truncate: %w", err)
 	}
 
@@ -421,6 +421,16 @@ func (p *Pager) attachState(file *os.File, m Meta) error {
 	}
 	newFileSize := st.Size()
 	pageSize := p.cfg.PageSize
+
+	// A peer may have grown the file since this pager's mapping was
+	// established; the bitmap copy and RPL walk below read pages up to
+	// the freshly-stat'd extent through the mapping, so its coverage
+	// must be current first — no-op on unix, view extension on windows
+	// (mmap-strategy.md §Windows). Still in the fallible zone: nothing
+	// is installed on the pager yet.
+	if err := mmapEnsureCoverage(p.mmap, file.Fd(), newFileSize); err != nil {
+		return fmt.Errorf("pager: extend mapping to %d: %w", newFileSize, err)
+	}
 
 	// Build the in-memory bitmap by reading the on-disk bitmap region from
 	// the mmap (MAP_SHARED — sees committed data through the unified page

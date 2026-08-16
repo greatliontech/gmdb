@@ -299,9 +299,12 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	var opened *pager.OpenedDB
 	if opts.ReadOnly {
 		// Read-only handle: build a reader pager (no writer slab / no
-		// in-memory bitmap / no RPL chain) — it owns the data mmap and
-		// backs handle-level raw reads (Check). Each read tx still spins
-		// up its own per-snapshot reader pager (BeginRead).
+		// in-memory bitmap / no RPL chain) — it owns the handle's data
+		// mmap. Raw reads (Check, CopyTo, maintenance) go through
+		// per-snapshot reader pagers (BeginRead), never this one: its
+		// mapping coverage is fixed at open time on windows
+		// (mmap-strategy.md §Windows), so a raw read routed here past
+		// a peer's growth would fault.
 		opened, err = pager.OpenReadOnly(file, pop)
 	} else {
 		opened, err = pager.Open(file, pop)

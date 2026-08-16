@@ -22,8 +22,9 @@
       remains a PORT DESIGN row, matching the darwin sysctl
       disposition); boot id zero (designed degradation);
       `GOOS=windows` build + vet green.
-- [ ] 6. Windows mmap: `CreateFileMapping`/`MapViewOfFile` for the
-      pager RO and lock RW mappings.
+- [x] 6. Windows mmap: placeholder-reservation model
+      (`VirtualAlloc2`/`MapViewOfFile3`) for the pager RO mapping;
+      fixed-size `CreateFileMapping` section for the lock RW mapping.
 - [ ] 7. Windows filesystem semantics: publish/replace-path
       share-mode audit (`FILE_SHARE_DELETE` discipline); windows
       directory-durability ritual for the dirent guarantees.

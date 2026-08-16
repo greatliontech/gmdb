@@ -149,6 +149,52 @@ store). But per-process `RLIMIT_AS` does apply to virtual-address-
 space reservations regardless of mapping type. Most defaults are
 unlimited; restricted environments may need a lower `MaxSize`.
 
+## Windows
+
+The fixed-reservation contract collapses onto windows' section
+semantics via a PLACEHOLDER reservation (`VirtualAlloc2` +
+`MapViewOfFile3`, Windows 10 1803+):
+
+- The reservation is a placeholder of `MaxSize` (rounded up to the
+  64 KiB allocation granularity). Its base address never moves —
+  borrowed page pointers stay valid for the mapping's lifetime,
+  exactly as on unix.
+- The file-backed extent is mapped into the placeholder as read-only
+  views. File GROWTH maps the newly backed extent as an additional
+  view; existing views are untouched. A peer process's growth is
+  covered where this process refreshes its file-size knowledge: at
+  meta adoption (attach) and at per-snapshot mapping creation.
+- File SHRINK unmaps the views intersecting the removed tail before
+  truncating (windows refuses `SetEndOfFile` under a mapped view)
+  and remaps a straddling view's surviving prefix afterwards. The
+  shrink gate's no-live-reader guarantee is what makes the unmap
+  window safe. Cross-process: `SetEndOfFile` also fails while ANY
+  peer process maps the file, so multi-process shrink is
+  structurally DEFERRED on windows — the failed truncation restores
+  the local coverage, the trailing slack persists, and a later
+  commit retries; the shrink lands when this process is the sole
+  mapper. Any post-unmap failure restores the coverage to the extent
+  the file actually has (the pre-shrink extent while the truncation
+  has not landed, the truncated extent after) — torn coverage would
+  turn the next mapped read into an access violation; an
+  unrestorable tear halts the process rather than fault
+  unpredictably later.
+- Windows data-file lengths are kept 64 KiB-aligned: every engine
+  truncation rounds up to the granularity, and a foreign
+  (unix-created) unaligned file is aligned once at writable open. A
+  read-only open of an unaligned file fails — the documented
+  degradation. The alignment slack sits above `HighWaterMark` and is
+  never referenced; page accounting keeps the un-rounded size.
+- Access beyond the mapped coverage raises an access violation — the
+  platform's analog of the SIGBUS-beyond-file model; the
+  `HighWaterMark` guard is the only protection, unchanged.
+- The `mprotect(PROT_READ)` belt-and-suspenders guard is structural:
+  every view is created `PAGE_READONLY`.
+- The entailed pwrite-visibility invariant (§Invariants) holds:
+  windows' cache manager keeps file views and the write path
+  coherent on local filesystems; network mounts are outside the
+  supported set.
+
 ## Prefaulting (Linux 5.14+)
 
 When `Options.PreloadPages` is true, the database calls

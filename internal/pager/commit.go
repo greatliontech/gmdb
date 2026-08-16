@@ -532,8 +532,48 @@ func (p *Pager) maybeShrink(shrinkThreshold uint64) error {
 	// re-read the file size. Consulted last — only when a truncation
 	// would actually happen — because the scan costs O(MaxReaders).
 	truncate := func() error {
+		// Windows refuses truncation under a mapped view: unmap the
+		// tail views first, truncate, then remap the surviving prefix
+		// of a straddling view. All three are no-ops on unix
+		// (mmap-strategy.md §Windows). The shrink gate guarantees no
+		// live reader observes the tail unmapped.
+		//
+		// Any failure after the unmap MUST restore the coverage it
+		// removed: shrink errors are non-fatal to the (already
+		// durable) commit, so returning with torn coverage would turn
+		// the next mmap read into a process-killing access violation.
+		// On windows the truncation itself fails whenever a peer
+		// process maps the file (mmap-strategy.md §Windows — shrink
+		// defers there); the restore makes that a clean deferral. An
+		// unrestorable tear is unrecoverable — panic loudly rather
+		// than fault unpredictably later.
+		// restoreTo remaps coverage to the extent the file actually has
+		// at each failure site — the pre-truncate extent before the
+		// truncation lands, the truncated extent after. An unrestorable
+		// tear panics: the commit is already durable, the mapping is
+		// unusable, and continuing guarantees an arbitrary later access
+		// violation.
+		restoreTo := func(cause error, size int64) error {
+			if rerr := mmapEnsureCoverage(p.mmap, p.file.Fd(), size); rerr != nil {
+				panic(fmt.Sprintf("pager: mapping coverage torn by failed shrink (cause: %v) and unrestorable at %d: %v", cause, size, rerr))
+			}
+			return cause
+		}
+		if err := mmapPrepareShrink(p.mmap, p.file.Fd(), target); err != nil {
+			// A partial unmap may have torn coverage; the file is
+			// untruncated, so restore to the pre-shrink extent.
+			return restoreTo(err, p.fileSize)
+		}
 		if err := p.fops.Truncate(target); err != nil {
-			return err
+			return restoreTo(err, p.fileSize)
+		}
+		if err := mmapEnsureCoverage(p.mmap, p.file.Fd(), target); err != nil {
+			// The file is already truncated — the only viable coverage
+			// is the truncated extent. One retry; if it heals, the
+			// shrink is in fact complete.
+			if rerr := mmapEnsureCoverage(p.mmap, p.file.Fd(), target); rerr != nil {
+				panic(fmt.Sprintf("pager: mapping coverage torn below truncated length (cause: %v) and unrestorable: %v", err, rerr))
+			}
 		}
 		p.fileSize = target
 		return nil

@@ -5,6 +5,7 @@ package pager
 import (
 	"fmt"
 	"math"
+	"os"
 
 	"golang.org/x/sys/unix"
 )
@@ -42,3 +43,15 @@ func mprotectRO(b []byte) error {
 func munmap(b []byte) error {
 	return unix.Munmap(b)
 }
+
+// mmapEnsureCoverage and mmapPrepareShrink are no-ops on unix: the
+// single MAP_SHARED VMA over the MaxSize reservation tracks file
+// growth and shrink automatically (mmap-strategy.md §mmap Resizing);
+// they exist for the windows placeholder model, whose views must be
+// extended on growth and unmapped ahead of truncation.
+func mmapEnsureCoverage(m []byte, file uintptr, size int64) error { return nil }
+func mmapPrepareShrink(m []byte, file uintptr, size int64) error  { return nil }
+
+// platformTruncate — plain ftruncate; the windows implementation
+// rounds up to the allocation granularity to keep view layout legal.
+func platformTruncate(f *os.File, size int64) error { return f.Truncate(size) }

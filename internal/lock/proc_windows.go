@@ -33,7 +33,7 @@ const stillActive = 259
 // Awareness) — but the symbol must exist and behave correctly for
 // the build and for any future same-host classification.
 func IsAlive(pid int) bool {
-	if pid <= 0 || pid > math.MaxUint32 {
+	if pid <= 0 || uint64(pid) > math.MaxUint32 {
 		// The upper guard restores unix parity for a corrupt record's
 		// impossible pid: kill() would ESRCH, but uint32 truncation
 		// could alias a live process into false-alive.

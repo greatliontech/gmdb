@@ -42,7 +42,7 @@ type osFileOps struct {
 
 func (o osFileOps) WriteAt(p []byte, off int64) (int, error) { return o.f.WriteAt(p, off) }
 func (o osFileOps) ReadAt(p []byte, off int64) (int, error)  { return o.f.ReadAt(p, off) }
-func (o osFileOps) Truncate(size int64) error                { return o.f.Truncate(size) }
+func (o osFileOps) Truncate(size int64) error                { return platformTruncate(o.f, size) }
 func (o osFileOps) Fdatasync() error                         { return syncBarrier(o.f, o.noFullFsync) }
 
 // SyncBarrier issues the platform durability barrier on a file outside

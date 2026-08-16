@@ -324,6 +324,12 @@ func (p *Pager) ensureFileCovers(pages uint64) error {
 	if err := p.fops.Truncate(target); err != nil {
 		return fmt.Errorf("pager: ftruncate to %d: %w", target, err)
 	}
+	// Extend the mapping's file-backed coverage over the new extent —
+	// no-op on unix (the reservation VMA covers it), view mapping on
+	// windows (mmap-strategy.md §Windows).
+	if err := mmapEnsureCoverage(p.mmap, p.file.Fd(), target); err != nil {
+		return fmt.Errorf("pager: extend mapping to %d: %w", target, err)
+	}
 	p.fileSize = target
 	return nil
 }
