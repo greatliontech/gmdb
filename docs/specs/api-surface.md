@@ -545,6 +545,12 @@ type Options struct {
     // SyncMode controls durability. Default: SyncDurable.
     SyncMode SyncMode
 
+    // NoFullFsync (darwin only) opts the durability barrier down from
+    // fcntl(F_FULLFSYNC) to plain fsync(2) — faster, but acknowledged
+    // commits can be lost on power loss (durability.md §Platform sync
+    // primitives). No effect elsewhere. Default: false.
+    NoFullFsync bool
+
     // MaxReaders is the maximum number of concurrent reader slots.
     // Default: 4096. Only used when creating a new lock file.
     // Type is `uint32` to match the lock-file header field

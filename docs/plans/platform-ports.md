@@ -3,7 +3,7 @@
 - [x] 1. Darwin mmap: widen the pager and lock mmap shims to the unix
       family (`linux || darwin || freebsd`); `GOOS=darwin` and
       `GOOS=freebsd` build + vet green.
-- [ ] 2. Darwin durability: `F_FULLFSYNC` on darwin behind a new
+- [x] 2. Darwin durability: `F_FULLFSYNC` on darwin behind a new
       option defaulting to full-flush; `durability.md` platform
       durability contract; correct the fdatasync fallback's
       "fsync is strictly stronger" claim.

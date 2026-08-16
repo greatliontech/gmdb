@@ -23,7 +23,8 @@ import (
 // FileOps: every write, truncate, and fsync on the temp copy routes
 // through it so a test can record the operation order and assert the
 // publish invariant (the copy's bytes are complete and fsynced before
-// the destination path exists). Production: the *os.File itself.
+// the destination path exists). Production: barrierDest — Sync is the
+// platform durability barrier, not a bare fsync.
 type copyDest interface {
 	io.WriterAt
 	Truncate(size int64) error
@@ -45,12 +46,29 @@ var copyPublishHookForTest atomic.Pointer[func(tmpPath string)]
 // Global state — same non-parallel rule as the other copy seams.
 var copyLinkForTest atomic.Pointer[func(oldname, newname string) error]
 
-// wrapCopyDest applies the test seam (identity in production).
-func wrapCopyDest(f *os.File) copyDest {
+// barrierDest is the production copyDest: a forward to *os.File whose
+// Sync is the platform durability barrier (durability.md §Platform
+// sync primitives) honoring Options.NoFullFsync — so the darwin
+// full-flush policy covers CopyTo artifact barriers, not only the
+// pager's.
+type barrierDest struct {
+	f           *os.File
+	noFullFsync bool
+}
+
+func (b barrierDest) WriteAt(p []byte, off int64) (int, error) { return b.f.WriteAt(p, off) }
+func (b barrierDest) Truncate(size int64) error                { return b.f.Truncate(size) }
+func (b barrierDest) Sync() error                              { return pager.SyncBarrier(b.f, b.noFullFsync) }
+
+// wrapCopyDest builds the production barrierDest and applies the test
+// seam around it (identity in production) — a test wrapper forwarding
+// Sync still lands on the barrier.
+func wrapCopyDest(f *os.File, noFullFsync bool) copyDest {
+	dest := copyDest(barrierDest{f: f, noFullFsync: noFullFsync})
 	if wrap := copyDestWrapForTest.Load(); wrap != nil {
-		return (*wrap)(f)
+		return (*wrap)(dest)
 	}
-	return f
+	return dest
 }
 
 // publicChecksumErr maps the internal pager checksum sentinel — surfaced by
@@ -159,7 +177,7 @@ func (db *DB) CopyTo(path string, compact bool) error {
 			}
 		}
 	}
-	if serr := syncDirPath(filepath.Dir(path)); serr != nil {
+	if serr := syncDirPath(filepath.Dir(path), db.opts.NoFullFsync); serr != nil {
 		// All-or-nothing: the publish's durability is unknowable after a
 		// failed directory fsync, and a caller treating the error as "no
 		// backup produced" would otherwise retry into ErrExist forever
@@ -255,7 +273,7 @@ func copyVerbatim(rtx *ReadTx, path string, uuid [16]byte) error {
 			_ = os.Remove(path)
 		}
 	}()
-	dest := wrapCopyDest(f)
+	dest := wrapCopyDest(f, rtx.db.opts.NoFullFsync)
 
 	filePages := max(hwm, meta.MinSize, firstData)
 	pageSize := int64(meta.PageSize)
@@ -477,7 +495,7 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	}()
 
 	w := &freshFileWriter{
-		f:        wrapCopyDest(f),
+		f:        wrapCopyDest(f, rtx.db.opts.NoFullFsync),
 		pageSize: pageSize,
 		checksum: meta.HasFlag(pager.MetaFlagPageChecksum),
 		next:     firstData,

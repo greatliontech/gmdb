@@ -454,7 +454,10 @@ func (p *Pager) WriteMetaPage(buf []byte, off int64) (int, error) {
 // additionally allocates the dirty-page slab. pool must be a process-wide
 // BufPool sized to cfg.PageSize. maxBytes is Options.MaxTxBufferBytes; CoW
 // and commit-step-0 buffer allocation respect this bound and return
-// ErrTxTooLarge when crossing it.
+// ErrTxTooLarge when crossing it. The FileOps seam defaults to
+// full-strength barriers; Open installs the Options.NoFullFsync policy
+// (the darwin barrier opt-down) — direct constructions keep the safe
+// default.
 func NewWriter(file *os.File, cfg page.Config, reservationBytes int64, pool *BufPool, maxBytes int) (*Pager, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("pager: pool must not be nil")

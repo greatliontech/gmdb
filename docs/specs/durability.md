@@ -112,6 +112,50 @@ structurally valid).
 | `SyncDataOnly` | `fdatasync()` | skip | The commits since the last durable-epoch advance may be lost (in pure `SyncDataOnly` use: at most the last one). DB is consistent — falls back to the surviving meta's sub-record. | ~2× faster |
 | `SyncLazy` | skip | skip | Rolls back to the **durable epoch** (the last fsync point). DB is always consistent — no corruption. | Much faster |
 
+## Platform sync primitives
+
+Every `fdatasync()` this spec names is a **durability barrier**: when
+it returns success, the covered writes are on stable storage — power
+loss cannot lose them — subject to the two exceptions defined below
+(the darwin `F_FULLFSYNC` rejection fallback and the `NoFullFsync`
+opt-down). The barrier call is per-platform:
+
+| Platform | Barrier | Notes |
+|----------|---------|-------|
+| Linux | `fdatasync(2)` | Flushes data + size metadata and the drive cache; skips the inode-time flush a full fsync pays. |
+| darwin | `fcntl(F_FULLFSYNC)` | `fsync(2)` on darwin flushes host buffers only, **not** the drive's cache, so it is not a barrier. Filesystems that reject `F_FULLFSYNC` (network mounts, some non-Apple filesystems) fall back to `fsync(2)` — the medium's strongest available flush. |
+| other (freebsd, windows, …) | `fsync(2)` / platform full sync | Strictly stronger than fdatasync; reaches stable storage. |
+
+`Options.NoFullFsync` (darwin only) opts the barrier down to plain
+`fsync(2)`: commits are faster, and every SyncMode row above retains
+its full guarantees against OS and application crashes (host buffers
+are flushed). Against **power loss**, the opt-down forfeits the
+guarantees of ALL rows, not only `SyncDurable`'s no-data-loss row:
+the drive may reorder cached writes across the meta/data barrier
+ordering, so even the "DB is consistent" claims — which rely on
+barrier-ordered writes — do not survive power loss under the
+opt-down. No effect on other platforms. Default: false.
+
+`NoFullFsync` is per-process and not persisted. In a cross-process
+composition the database's power-loss tier is the **weakest
+participant's**: one opted-down writer advances the durable
+sub-record with barriers that may not have reached stable storage,
+and every peer — full-strength included — trusts that sub-record
+(§Cross-process SyncMode interleaving). Opting down degrades the
+whole database's power-loss tier, not just the opting process's
+commits.
+
+The barrier policy covers **every** barrier the engine issues, not
+only the commit path: checkpoint, recovery, database creation, CopyTo
+artifact fsyncs, and the directory-entry fsyncs of §Directory-entry
+durability (a created file's dirent lost to power loss loses the
+acknowledged commits inside it). Directory barriers use `fsync(2)` as
+the base call on every platform — the documented dirent ritual;
+`fdatasync`'s data-only contract is defined for file data — upgraded
+to `F_FULLFSYNC` on darwin under the same policy. The lock file is
+exempt — transient coordination state with no durability contract
+(cross-process.md §Lock File Layout).
+
 ## Checkpoints and the durable sub-record
 
 In `SyncLazy` mode, commits pwrite bitmap, data, and meta but

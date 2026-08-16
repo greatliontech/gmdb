@@ -78,9 +78,7 @@ pre-existing at their change set's base.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-
-*None open — resolved issues live in git history
-(`git log --all -- docs/issues/<slug>.md`).*
+| `compact-reopen-drops-builder-defaults.md` | when the post-Compact write path next changes, or as a stand-alone burn-down item | `reopenAfterCompact` omits `RestartGroupTarget`/`LeafLayout`/`BranchLayout` from `OpenParams`; post-Compact page builds revert to engine defaults for the handle's lifetime. |
 
 ## Open — design gaps (2026-07-11 architecture audit)
 

@@ -218,6 +218,19 @@ type Options struct {
 	// meta's durable sub-record (durability.md).
 	SyncMode SyncMode
 
+	// NoFullFsync (darwin only) opts the durability barrier down from
+	// fcntl(F_FULLFSYNC) to plain fsync(2). On darwin, fsync flushes
+	// host buffers but not the drive's cache, so with NoFullFsync set a
+	// power loss can drop or reorder writes the engine has already
+	// acknowledged as durable — SyncDurable then only survives OS/app
+	// crashes, not power loss (durability.md §Platform sync
+	// primitives). Applies to every barrier the engine issues: commit,
+	// checkpoint, recovery, creation, CopyTo artifacts, and
+	// directory-entry fsyncs. No effect on other platforms, whose
+	// default barriers already reach stable storage. Default: false
+	// (full-strength barriers).
+	NoFullFsync bool
+
 	// RestartGroupTarget is the engine-wide default for the leaf
 	// restart-group target — the maximum entries per group on
 	// compressed leaves. Per-keyspace overrides via

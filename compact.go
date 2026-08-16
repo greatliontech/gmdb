@@ -112,7 +112,7 @@ func (db *DB) Compact() error {
 	// on failure the on-disk outcome is unknowable across a crash (the
 	// old inode may resurrect) — same failure class as the reopen path
 	// below: poison, Close + re-Open recovers.
-	if err := syncDir(db.root); err != nil {
+	if err := syncDir(db.root, db.opts.NoFullFsync); err != nil {
 		db.poisoned.Store(true)
 		return fmt.Errorf("gmdb: Compact dir fsync (handle poisoned — Close and re-Open): %w", err)
 	}
@@ -142,6 +142,7 @@ func (db *DB) reopenAfterCompact(base string) error {
 	opened, err := pager.Open(newFile, pager.OpenParams{
 		Pool:             db.pool, // PageSize is preserved across compaction
 		MaxTxBufferBytes: db.opts.MaxTxBufferBytes,
+		NoFullFsync:      db.opts.NoFullFsync,
 	})
 	if err != nil {
 		_ = newFile.Close()
@@ -212,13 +213,13 @@ func (db *DB) reopenAfterCompact(base string) error {
 // hits the SAME directory the data file was opened under even if a
 // path component was re-pointed since (the symlink-guard rationale on
 // DB.root).
-func syncDir(root *os.Root) error {
+func syncDir(root *os.Root, noFullFsync bool) error {
 	d, err := root.Open(".")
 	if err != nil {
 		return err
 	}
 	defer d.Close()
-	if err := d.Sync(); err != nil {
+	if err := pager.SyncDirBarrier(d, noFullFsync); err != nil {
 		return err
 	}
 	if hook := syncDirHookForTest.Load(); hook != nil {
@@ -229,13 +230,13 @@ func syncDir(root *os.Root) error {
 
 // syncDirPath is the path-addressed variant for targets with no
 // pinned root (CopyTo's freshly-created output file).
-func syncDirPath(dir string) error {
+func syncDirPath(dir string, noFullFsync bool) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
 	defer d.Close()
-	if err := d.Sync(); err != nil {
+	if err := pager.SyncDirBarrier(d, noFullFsync); err != nil {
 		return err
 	}
 	if hook := syncDirHookForTest.Load(); hook != nil {

@@ -22,6 +22,11 @@ type InitParams struct {
 	GrowStep        uint64 // file growth step in pages
 	ShrinkThreshold uint64 // shrink threshold in pages
 	UUID            [16]byte
+
+	// NoFullFsync is Options.NoFullFsync: the darwin barrier opt-down,
+	// honored by Init's genesis fsync (durability.md §Platform sync
+	// primitives). Ignored elsewhere.
+	NoFullFsync bool
 }
 
 // BitmapPages returns the number of bitmap pages required to cover
@@ -118,7 +123,7 @@ func Init(file *os.File, ip InitParams) error {
 
 	// Bitmap region is already zero from the truncate. Nothing to write.
 
-	if err := file.Sync(); err != nil {
+	if err := syncBarrier(file, ip.NoFullFsync); err != nil {
 		return fmt.Errorf("pager: fsync init: %w", err)
 	}
 	return nil
@@ -138,6 +143,11 @@ type OpenParams struct {
 	RestartGroupTarget uint16
 	LeafLayout         page.LeafLayout
 	BranchLayout       page.BranchLayout
+
+	// NoFullFsync is Options.NoFullFsync: the darwin barrier opt-down,
+	// installed into the writer pager's FileOps seam (durability.md
+	// §Platform sync primitives). Ignored elsewhere.
+	NoFullFsync bool
 }
 
 // OpenedDB bundles the products of Open: the UNATTACHED writer pager,
@@ -196,6 +206,11 @@ func Open(file *os.File, op OpenParams) (*OpenedDB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Install the barrier policy into the FileOps seam here — the single
+	// production wiring point — so every barrier this writer issues
+	// (commit, checkpoint, recovery) honors Options.NoFullFsync. Direct
+	// NewWriter constructions keep the full-strength default.
+	p.fops = osFileOps{f: file, noFullFsync: op.NoFullFsync}
 
 	// The writer pager is returned UNATTACHED: building the in-memory
 	// bitmap + RPL chain walks the selected meta's projection, and

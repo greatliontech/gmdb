@@ -231,6 +231,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 			GrowStep:        opts.GrowStep,
 			ShrinkThreshold: opts.ShrinkThreshold,
 			UUID:            opts.UUID,
+			NoFullFsync:     opts.NoFullFsync,
 		}
 		if err := pager.Init(file, ip); err != nil {
 			_ = file.Close()
@@ -253,7 +254,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	// read-only media would EROFS). The lock file's dirent needs no
 	// such guarantee — transient coordination state Open recreates.
 	if !opts.ReadOnly {
-		if err := syncDir(root); err != nil {
+		if err := syncDir(root, opts.NoFullFsync); err != nil {
 			_ = file.Close()
 			_ = root.Close()
 			return nil, fmt.Errorf("gmdb: open %q: parent directory fsync: %w", path, err)
@@ -284,6 +285,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 		RestartGroupTarget: opts.RestartGroupTarget,
 		LeafLayout:         page.LeafLayout(opts.LeafLayout),
 		BranchLayout:       page.BranchLayout(opts.BranchLayout),
+		NoFullFsync:        opts.NoFullFsync,
 	}
 	var opened *pager.OpenedDB
 	if opts.ReadOnly {
