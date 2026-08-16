@@ -78,6 +78,7 @@ func TestOpenVersionMismatchCrossDigestFamily(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	defer f.Close() // windows: an open handle blocks TempDir removal
 	ip := InitParams{
 		PageSize:        testPageSize,
 		MinSize:         16,

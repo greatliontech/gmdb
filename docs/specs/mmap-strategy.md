@@ -164,11 +164,14 @@ semantics via a PLACEHOLDER reservation (`VirtualAlloc2` +
   view; existing views are untouched. A peer process's growth is
   covered where this process refreshes its file-size knowledge: at
   meta adoption (attach) and at per-snapshot mapping creation.
-- File SHRINK unmaps the views intersecting the removed tail before
-  truncating (windows refuses `SetEndOfFile` under a mapped view)
-  and remaps a straddling view's surviving prefix afterwards. The
-  shrink gate's no-live-reader guarantee is what makes the unmap
-  window safe. Cross-process: `SetEndOfFile` also fails while ANY
+- File SHRINK unmaps the ENTIRE local mapping before truncating —
+  windows refuses `SetEndOfFile` while ANY view of the file exists,
+  not merely views past the new EOF (pinned empirically by the
+  mapping-lifecycle test's first soak run) — then remaps
+  `[0, target)` afterwards. The placeholder keeps the base address
+  stable, so borrowed page pointers are valid again after the
+  remap; the shrink gate's no-live-reader guarantee is what makes
+  the unmapped window safe. Cross-process: `SetEndOfFile` also fails while ANY
   peer process maps the file, so multi-process shrink is
   structurally DEFERRED on windows — the failed truncation restores
   the local coverage, the trailing slack persists, and a later

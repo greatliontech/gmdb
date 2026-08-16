@@ -306,12 +306,15 @@ func mmapEnsureCoverage(m []byte, file uintptr, size int64) error {
 	return wm.mapExtent(file, wm.coverage, target)
 }
 
-// mmapPrepareShrink unmaps every view intersecting [size, coverage)
-// so the caller's truncation is not refused under a mapped view. The
-// caller MUST call mmapEnsureCoverage after truncating to remap the
-// surviving prefix of any straddling view. Reader safety is the
-// caller's shrink gate: no live reader observes the tail being
-// unmapped.
+// mmapPrepareShrink unmaps the ENTIRE local mapping ahead of a
+// shrinking truncation: windows refuses SetEndOfFile while ANY view
+// of the file exists — not merely views past the new EOF (pinned
+// empirically by the first windows soak run of the lifecycle test).
+// The caller MUST call mmapEnsureCoverage after truncating to remap
+// [0, target); the placeholder keeps the base address stable, so
+// every borrowed page pointer is valid again after the remap. Reader
+// safety is the caller's shrink gate: no live reader observes the
+// unmapped window.
 func mmapPrepareShrink(m []byte, file uintptr, size int64) error {
 	if len(m) == 0 {
 		return nil
@@ -323,11 +326,10 @@ func mmapPrepareShrink(m []byte, file uintptr, size int64) error {
 	if wm == nil {
 		return fmt.Errorf("pager: shrink of unknown mapping %#x", base)
 	}
-	target := ceilG(size)
-	if target >= wm.coverage {
-		return nil
+	if ceilG(size) >= wm.coverage {
+		return nil // not a shrink of the mapped extent — nothing to unmap
 	}
-	return wm.unmapFrom(target)
+	return wm.unmapFrom(0)
 }
 
 // platformTruncate keeps windows data-file lengths G-aligned: every
