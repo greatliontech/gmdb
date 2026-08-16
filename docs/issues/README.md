@@ -10,9 +10,11 @@ redeferred, or closed.
 The v0 chunk roadmap, the architecture-consolidation plan, the
 defect-audit remediation plan, the query-builder plan (structure
 phase + typed columns + query builder), the pre-consumer
-engine-changes plan, and the DST-testing plan (toolchain wiring
-through the exploration tier) are complete; their plans were deleted at
-close-out (`git log --all -- docs/plans/<name>.md` recovers them).
+engine-changes plan, the DST-testing plan (toolchain wiring
+through the exploration tier), and the platform-ports plan (darwin +
+windows, with CI legs for both) are complete; their plans were
+deleted at close-out (`git log --all -- docs/plans/<name>.md`
+recovers them).
 No plan is currently active; every remaining entry is
 condition-triggered with a self-contained condition. Entries may
 also be pulled as a proactive burn-down — each resolved as its own
@@ -61,15 +63,20 @@ entries are removed from their table and preserved in git history
 ## Open — platform ports (2026-08-10)
 
 Filed from an ocifs-side survey (ocifs targets windows/darwin via
-ProjFS/FSKit backends and plans store bookkeeping on gmdb). The
-darwin port has landed (unix-family mmap, `F_FULLFSYNC` durability,
-macOS CI soak — `git log --all -- docs/issues/port-darwin.md`
-recovers the survey); windows does not compile and remains open,
-pulled into the active platform-ports plan.
+ProjFS/FSKit backends and plans store bookkeeping on gmdb). Both
+ports have landed — darwin (unix-family mmap, `F_FULLFSYNC`
+durability, macOS CI) and windows (flock/clock/mmap/dirent seams,
+placeholder-reservation data mapping, windows CI) — with their
+platform contracts recorded in `cross-process.md`, `durability.md`,
+`mmap-strategy.md` §Windows, and `api-surface.md`.
+`git log --all -- docs/issues/port-darwin.md` /
+`git log --all -- docs/issues/port-windows.md` recover the surveys.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-| `port-windows.md` | first windows consumer scheduled (ocifs store bookkeeping on windows is the known candidate) | Move flock behind its seam + windows primitives (`LockFileEx`, `MapViewOfFile`, `QueryUnbiasedInterruptTime`, `GetProcessTimes`); audit rename/share-mode + dirent durability; soak on a windows runner. |
+
+*None open — resolved issues live in git history
+(`git log --all -- docs/issues/<slug>.md`).*
 
 ## Open — change-set review findings
 
