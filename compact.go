@@ -30,11 +30,18 @@ const compactDrainPoll = 2 * time.Millisecond
 //  2. Wait up to Options.CompactDrainTimeout for active IN-PROCESS read
 //     transactions to finish. If any remain, abort with
 //     ErrCompactReadersActive — no temp file, no rename. (Cross-process
-//     readers are NOT drained; they keep working against the original
-//     inode, which stays alive until their mappings drop.)
+//     readers are NOT drained; on unix they keep working against the
+//     original inode, which stays alive until their mappings drop. On
+//     windows any peer mapping makes the rename below fail cleanly —
+//     the kernel-enforced sole-mapper gate, api-surface.md §Check,
+//     CopyTo, Compact.)
 //  3. Write the compacted copy to a temp file (UUID preserved) and fsync.
-//  4. Atomic rename over the original; fsync the directory; reopen the
-//     pager against the new inode; release the write lock.
+//  4. Teardown-before-rename: close this handle's own pager (releasing
+//     its mapping), atomically rename over the original via the
+//     confined os.Root form, fsync the directory, reopen the pager
+//     against the new inode, release the write lock. A refused rename
+//     (windows sole-mapper gate) restores the pager against the
+//     original file and returns a clean, retryable error.
 //
 // On ErrCompactReadersActive, fall back to CopyTo(path, compact=true) to
 // produce an offline compacted copy without draining in-process readers.
@@ -78,24 +85,60 @@ func (db *DB) Compact() error {
 	// 3. Write the compacted copy to a temp file beside the original,
 	// preserving the UUID (the renamed file IS this database).
 	base := filepath.Base(db.path)
-	tmpPath := db.path + ".compact"
-	_ = os.Remove(tmpPath) // clear any stale temp from a crashed Compact
+	tmpBase := base + ".compact"
+	// One namespace for the whole publish: the temp is created,
+	// removed, and renamed through db.root, so a re-pointed path
+	// component after Open cannot make the rename pick up a different
+	// file than the copy wrote (the same symlink-guard rationale as
+	// the data-file open).
+	_ = db.root.Remove(tmpBase) // clear any stale temp from a crashed Compact
 
 	rtx, err := db.BeginRead(context.Background())
 	if err != nil {
 		return err
 	}
 	srcUUID := rtx.meta.UUID
-	cerr := publicChecksumErr(copyCompact(rtx, tmpPath, srcUUID))
+	cerr := publicChecksumErr(copyCompact(rtx,
+		func() (*os.File, error) {
+			return db.root.OpenFile(tmpBase, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		},
+		func() { _ = db.root.Remove(tmpBase) },
+		srcUUID))
 	_ = rtx.Rollback()
 	if cerr != nil {
 		return fmt.Errorf("gmdb: Compact copy: %w", cerr)
 	}
 
-	// 4. Atomic rename over the original, then make the rename durable, then
-	// reopen the handle's pager against the new inode.
-	if err := os.Rename(tmpPath, db.path); err != nil {
-		_ = os.Remove(tmpPath)
+	// 4. Teardown-before-rename (api-surface.md §Check, CopyTo,
+	// Compact): close our own writer pager FIRST — its mapping is what
+	// makes the kernel refuse the replace-rename on windows, and under
+	// the grant with readers drained the teardown is equally sound
+	// everywhere. The nil-pager window is the same state DB.Close
+	// establishes; every db.pgr reader tolerates it. The data-file fd
+	// stays open — an unmapped open handle with share-delete (os.Root
+	// opens) does not block a POSIX-semantics rename.
+	db.mu.Lock()
+	oldPgr := db.pgr
+	db.pgr = nil
+	db.mu.Unlock()
+	_ = oldPgr.Close()
+
+	// Atomic rename over the original — os.Root's confined form
+	// (symlink guard; POSIX semantics on windows). On windows the
+	// kernel refuses while ANY other mapping of the file exists (a
+	// peer handle maps at Open; a read snapshot that began after the
+	// drain counts too) — the sole-mapper gate. The refusal is clean
+	// and retryable: restore the handle against the original file,
+	// which the failed rename left in place under its unchanged name.
+	renameFn := db.root.Rename
+	if hook := compactRenameHookForTest.Load(); hook != nil {
+		renameFn = *hook
+	}
+	if err := renameFn(tmpBase, base); err != nil {
+		_ = db.root.Remove(tmpBase)
+		if rerr := db.installCompactPager(db.file, "restore"); rerr != nil {
+			return fmt.Errorf("gmdb: Compact rename: %w (%v)", err, rerr)
+		}
 		return fmt.Errorf("gmdb: Compact rename: %w", err)
 	}
 	// Publish the replacement to every peer handle (cross-process.md
@@ -117,71 +160,101 @@ func (db *DB) Compact() error {
 		return fmt.Errorf("gmdb: Compact dir fsync (handle poisoned — Close and re-Open): %w", err)
 	}
 
-	if err := db.reopenAfterCompact(base); err != nil {
-		return err
-	}
-	return nil
-}
-
-// reopenAfterCompact swaps the handle's data-file fd + writer pager to the
-// post-rename inode, keeping the (unrenamed) lock file + Coord + write
-// grant alive. Called only under the write grant with readers drained.
-func (db *DB) reopenAfterCompact(base string) error {
-	// Open the new inode through the same os.Root as Open (symlink guard).
-	// A failure here is AFTER the rename: db.path is the new inode but this
-	// handle still maps the old (now-unlinked) one. Poison the handle so
-	// every subsequent op fails with ErrPoisoned rather than silently
-	// serving the stale inode while other processes see the new one (the
-	// split-brain the api-surface.md §Compact all-or-nothing invariant
-	// forbids). Close + re-Open recovers against the new inode.
+	// Reopen against the new inode through the same os.Root (symlink
+	// guard) and install it as the live pager.
 	newFile, err := db.root.OpenFile(base, os.O_RDWR, 0o600)
 	if err != nil {
 		db.poisoned.Store(true)
 		return fmt.Errorf("gmdb: Compact reopen file (handle poisoned — Close and re-Open): %w", err)
 	}
+	return db.installCompactPager(newFile, "reopen")
+}
+
+// compactRenameHookForTest, when set, replaces the publish rename —
+// the seam for exercising the rename-refusal restore path (the
+// windows sole-mapper gate) on any platform. Same non-parallel rule
+// as the other compact seams.
+var compactRenameHookForTest atomic.Pointer[func(oldname, newname string) error]
+
+// installCompactPager (re)builds the writer pager over file and
+// installs it as the handle's live pager — the shared tail of
+// Compact's publish reopen and its rename-refusal restore. file is
+// either a freshly opened fd for the renamed inode (reopen) or
+// db.file itself (restore: the original inode, still named by path —
+// no reopen needed or wanted). The previous pager is already closed
+// by the pre-rename teardown; the previous fd is closed iff replaced.
+// Called only under the write grant with readers drained.
+//
+// Any failure poisons the handle: a live handle without a pager
+// cannot serve the api-surface.md §Compact all-or-nothing contract
+// (on the reopen path it would otherwise serve the stale unlinked
+// inode while peers see the new one — split brain). Close + re-Open
+// recovers.
+func (db *DB) installCompactPager(file *os.File, op string) error {
 	// The same per-open parameter set Open derives — via the single
-	// derivation point, so the reopened pager cannot silently diverge
+	// derivation point, so the installed pager cannot silently diverge
 	// from the handle's configuration (db.pool's PageSize is preserved
 	// across compaction).
-	opened, err := pager.Open(newFile, pagerOpenParamsFrom(db.pool, db.opts))
+	opened, err := pager.Open(file, pagerOpenParamsFrom(db.pool, db.opts))
 	if err != nil {
-		_ = newFile.Close()
+		if file != db.file {
+			_ = file.Close()
+		}
 		db.poisoned.Store(true)
-		return fmt.Errorf("gmdb: Compact reopen pager (handle poisoned — Close and re-Open): %w", mapPagerErr(err))
+		return fmt.Errorf("gmdb: Compact %s pager (handle poisoned — Close and re-Open): %w", op, mapPagerErr(err))
 	}
-	// Attach under the grant Compact already holds. The compacted copy
-	// is self-durable at TxnID 0 (copy.go), so the live projection is
-	// the durable one; no gate applies (this handle IS the live
-	// author).
-	if m, idx, aerr := opened.Pager.AttachLatest(newFile); aerr != nil {
+	// Attach under the grant Compact already holds. Reopen: the
+	// compacted copy is self-durable at TxnID 0 (copy.go), so the live
+	// projection is the durable one and no recovery gate applies.
+	// Restore: the original image — whose latest meta may be a dead
+	// peer's uncovered lineage; the covered-through gate below handles
+	// exactly that.
+	if m, idx, aerr := opened.Pager.AttachLatest(file); aerr != nil {
 		_ = opened.Pager.Close()
-		_ = newFile.Close()
+		if file != db.file {
+			_ = file.Close()
+		}
 		db.poisoned.Store(true)
-		return fmt.Errorf("gmdb: Compact reopen attach (handle poisoned — Close and re-Open): %w", mapPagerErr(aerr))
+		return fmt.Errorf("gmdb: Compact %s attach (handle poisoned — Close and re-Open): %w", op, mapPagerErr(aerr))
 	} else {
 		opened.Meta, opened.ActiveMetaIdx = m, idx
+	}
+
+	// Restore attaches the ORIGINAL image, whose latest meta may
+	// reference a dead peer's uncovered writeback lineage (a failed
+	// barrier's dropped pwrites) — the state Open's live-join arm
+	// covers. Run the same gate here, BEFORE the takeover-sequence
+	// cache below arms itself past the bump this Compact's own
+	// acquisition made (durability.md §Anchoring). The reopen path
+	// must NOT: it attaches the freshly written, fully fsynced copy —
+	// barrier-covered by construction — and redirtying old-lineage
+	// page names against the new image would be wrong.
+	if file == db.file {
+		if rerr := coverDroppedWritebackLineage(db.coord, opened.Pager, opened.Meta); rerr != nil {
+			_ = opened.Pager.Close()
+			db.poisoned.Store(true)
+			return fmt.Errorf("gmdb: Compact %s lineage cover (handle poisoned — Close and re-Open): %w", op, mapPagerErr(rerr))
+		}
 	}
 
 	// Swap the live fields atomically vs. a concurrent Begin/BeginRead
 	// (which snapshot db.pgr/db.file/db.currentMeta under db.mu).
 	db.mu.Lock()
 	oldFile := db.file
-	oldPgr := db.pgr
-	db.file = newFile
+	db.file = file
 	db.pgr = opened.Pager
-	// Meta baseline mirrors Open (adoptOpened): a compacted file is
-	// fully durable and self-durable at TxnID 0 (copy.go).
+	// Meta baseline mirrors Open (adoptOpened).
 	db.adoptOpened(opened)
-	// The adopted state is a full rebuild from the (fresh) on-disk
-	// image; refresh the takeover-sequence cache like Open's attach
-	// arms do (Compact holds the grant, so the read is stable).
+	// The adopted state is a full rebuild from the on-disk image;
+	// refresh the takeover-sequence cache like Open's attach arms do
+	// (Compact holds the grant, so the read is stable).
 	if db.coord != nil {
 		db.takeoverSeqSeen = db.coord.TakeoverSeq()
 	}
 	db.mu.Unlock()
 
 	// Re-point the DB leak-detection cleanup at the new pager + file (the
-	// old cleanup info captured the now-closed ones). coord / lockFile /
+	// old cleanup info captured the closed ones). coord / lockFile /
 	// root / gate are unchanged.
 	db.cleanup.Stop()
 	db.cleanup = runtime.AddCleanup(db, dbCleanupFn, dbCleanupInfo{
@@ -189,17 +262,19 @@ func (db *DB) reopenAfterCompact(base string) error {
 		coord:     db.coord,
 		lockFile:  db.lockFile,
 		pgr:       opened.Pager,
-		file:      newFile,
+		file:      file,
 		root:      db.root,
 		logger:    db.logger,
 		originPCs: captureOriginPCs(),
 	})
 
-	// Release the old mapping + fd. The old inode (now unlinked by the
-	// rename) is freed once the last mapping drops — any cross-process
-	// reader still on it keeps it alive in their address space, never here.
-	_ = oldPgr.Close()
-	_ = oldFile.Close()
+	// Release the replaced fd (reopen path only). The old inode (now
+	// unlinked by the rename) is freed once the last mapping drops —
+	// any cross-process reader still on it keeps it alive in their
+	// address space, never here.
+	if oldFile != file {
+		_ = oldFile.Close()
+	}
 	return nil
 }
 

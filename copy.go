@@ -139,7 +139,12 @@ func (db *DB) CopyTo(path string, compact bool) error {
 	// makes the name unique against concurrent CopyTo calls).
 	tmp := fmt.Sprintf("%s.copytmp-%x", path, uuid[:8])
 	if compact {
-		err = publicChecksumErr(copyCompact(rtx, tmp, uuid))
+		err = publicChecksumErr(copyCompact(rtx,
+			func() (*os.File, error) {
+				return os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+			},
+			func() { _ = os.Remove(tmp) },
+			uuid))
 	} else {
 		err = copyVerbatim(rtx, tmp, uuid)
 	}
@@ -465,7 +470,14 @@ func (w *freshFileWriter) WriteDirectRaw(id uint64, buf []byte) error {
 // structurally, since the extractor closures are not on disk — and a new
 // keyspace-descriptor tree is built with the rewritten roots. The result
 // is a defragmented, minimally-sized copy with an all-allocated bitmap.
-func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
+// copyCompact's destination is caller-addressed: createDest must
+// create-exclusive the temp and removeDest must remove it, both in
+// the SAME namespace the caller later publishes from — Compact
+// creates, removes, and renames through db.root so one re-pointed
+// path component cannot make the publish pick up a different file
+// than the copy wrote; CopyTo addresses its user-supplied path
+// directly.
+func copyCompact(rtx *ReadTx, createDest func() (*os.File, error), removeDest func(), uuid [16]byte) error {
 	meta := rtx.meta
 	// The read pager's cfg is decode-only (PageSize, checksum) — decoding
 	// dispatches on the type byte and needs no builder defaults. The
@@ -490,15 +502,15 @@ func copyCompact(rtx *ReadTx, path string, uuid [16]byte) error {
 	// byte-for-byte, so corruption survives detectably without a re-encode.)
 	pr := verify.VerifyingPageReader{P: rtx.pgr}
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := createDest()
 	if err != nil {
-		return fmt.Errorf("gmdb: CopyTo create %q: %w", path, err)
+		return fmt.Errorf("gmdb: CopyTo create temp: %w", err)
 	}
 	committed := false
 	defer func() {
 		_ = f.Close()
 		if !committed {
-			_ = os.Remove(path)
+			removeDest()
 		}
 	}()
 

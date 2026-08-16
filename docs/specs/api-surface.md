@@ -2066,30 +2066,39 @@ func (db *DB) CheckWithOptions(opts *CheckOptions) iter.Seq[CheckIssue]
 //
 // Windows share-mode and replace contract: the data and lock files
 // are opened via os.Root, whose windows opens request
-// FILE_SHARE_READ|WRITE|DELETE; the plain (share-delete-less) opens
-// are all off the publish/replace path — copy temps (CopyTo's and
-// Compact's, which no other handle opens before publish), bulk-load
-// spill scratch files, and transient directory handles. No gmdb
-// code path may
+// FILE_SHARE_READ|WRITE|DELETE — Compact's temp included, since its
+// whole publish (create, remove, rename) runs through os.Root. The
+// plain (share-delete-less) opens are all off the publish/replace
+// path — the CopyTo temp (which no other handle opens before
+// publish), bulk-load spill scratch files, and transient directory
+// handles. No gmdb code path may
 // introduce a restrictive share mode on the publish/replace path.
 // CopyTo's publish (hard link or no-clobber rename of a FRESH name)
 // replaces nothing that is open and works unchanged; its no-clobber
 // rung is the same probe-then-rename best-effort as every non-Linux
 // platform.
 //
-// Compact's in-place replace does NOT work on windows: the kernel
-// refuses to replace or delete a file any process holds MAPPED
-// (ERROR_USER_MAPPED_FILE class), and every gmdb handle maps the
-// data file — including the compacting handle itself, whose old
-// mapping is still live at rename time. Windows Compact therefore
-// fails deterministically with a clean error at its publish rename:
-// the temp is removed, the database is untouched, the handle
-// remains usable. Lifting the limitation requires a dedicated
-// windows design meeting all of: the caller tears down its own
-// mapping before the rename, no peer process maps the file (a
-// sole-mapper precondition), and the rename uses os.Root's
-// POSIX-semantics form — recorded here so any future design starts
-// from the real precondition set.
+// Compact's publish is teardown-before-rename on EVERY platform:
+// the compacting handle closes its own writer pager — releasing its
+// mapping — before the rename, keeping the data-file fd open
+// (share-delete via os.Root), and the rename is os.Root's confined
+// form (POSIX semantics on windows). The pager-less window reuses
+// the same nil-pager state DB.Close establishes; every reader of
+// the handle's pager already tolerates it, and the write grant plus
+// the reader drain exclude everything else.
+//
+// The kernel refuses to replace a file any process holds MAPPED, so
+// on windows the rename itself is the sole-mapper gate: Compact
+// SUCCEEDS only when no other mapping of the data file exists at
+// rename time — a peer process merely holding the database open
+// maps it, and an in-process read snapshot beginning concurrently
+// counts too. A refused rename is a clean, retryable failure: the
+// temp is removed and the handle is RESTORED — the pager is rebuilt
+// on the same fd against the original file, which the rename left
+// in place — never poisoned; only a failed restore poisons (Close +
+// re-Open recovers). On unix nothing changes observably: the rename
+// always lands and cross-process readers keep the unlinked inode
+// alive until their mappings drop.
 //
 // A verbatim (compact=false) copy of a source whose file no longer
 // covers its meta's HighWaterMark — a truncated transfer, a forged

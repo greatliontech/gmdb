@@ -28,6 +28,10 @@
 - [x] 7. Windows filesystem semantics: publish/replace-path
       share-mode audit (`FILE_SHARE_DELETE` discipline); windows
       directory-durability ritual for the dirent guarantees.
-- [ ] 8. Windows CI + soak; plan close-out (promote issue rationale
-      into kept-current artifacts, delete both issue docs and their
-      README rows, retarget surviving `Lands:` references).
+- [x] 8. Windows Compact: unified teardown-before-rename publish,
+      `os.Root` POSIX-semantics rename, kernel-gated sole-mapper
+      with restore-on-refusal; rename fault seam + restore
+      regression test.
+- [ ] 9. Windows CI + soak; plan close-out (promote issue rationale
+      into kept-current artifacts, delete the issue doc and its
+      README row, retarget surviving `Lands:` references).
