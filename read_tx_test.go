@@ -453,7 +453,7 @@ func TestLeakedReadTxReleasesSlotViaCleanup(t *testing.T) {
 	// AFTER info.coord.ReleaseReader returns, so a hook-signalled
 	// BeginRead succeeds deterministically.
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{
+	db, err := Open(ctx, tmpPathLeakTolerant(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 64, MaxReaders: 1,
 	})
 	if err != nil {
@@ -618,7 +618,7 @@ func TestReadTxLeakAfterCloseNoCrash(t *testing.T) {
 	// return without touching the (already-unmapped) reader-table
 	// mmap.
 	ctx := context.Background()
-	db, err := Open(ctx, tmpPath(t), Options{
+	db, err := Open(ctx, tmpPathLeakTolerant(t), Options{
 		PageSize: 4096, MinSize: 16, MaxSize: 64, MaxReaders: 4,
 	})
 	if err != nil {
@@ -842,7 +842,7 @@ func TestCloseReleasesOpenReaderSlots(t *testing.T) {
 // forever.
 func TestLeakedReadTxReleasesSlotAfterDBClose(t *testing.T) {
 	ctx := context.Background()
-	path := tmpPath(t)
+	path := tmpPathLeakTolerant(t)
 	db, err := Open(ctx, path, Options{PageSize: 4096, MinSize: 16, MaxSize: 64})
 	if err != nil {
 		t.Fatalf("Open: %v", err)

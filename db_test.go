@@ -26,6 +26,22 @@ func tmpPath(t *testing.T) string {
 	return filepath.Join(dir, "db.gmdb")
 }
 
+// tmpPathLeakTolerant is tmpPath for tests that DELIBERATELY leave a
+// mapping alive at test end — the leak-detection tests' orphaned data
+// mmap, which leak-detection.md explicitly permits to outlive the
+// handle. On windows a live mapping pins the file name, so
+// t.TempDir's strict cleanup would fail the test for behavior the
+// spec sanctions; removal is best-effort instead.
+func tmpPathLeakTolerant(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "gmdb-leak-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "db.gmdb")
+}
+
 func TestOpenCreate(t *testing.T) {
 	ctx := context.Background()
 	path := tmpPath(t)

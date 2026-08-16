@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -696,7 +697,15 @@ func TestVerifyPathIdentity(t *testing.T) {
 	if err := verifyPathIdentity(p, f.f); err != nil {
 		t.Fatalf("same inode: %v", err)
 	}
-	if err := root.Remove(base); err != nil {
+	// Displace the name. Unix removes it; windows cannot remove a
+	// mapped file (the kernel gate — cross-process.md WINDOWS PORT
+	// DESIGN) but CAN rename it aside, which equally unbinds the name
+	// for the identity check.
+	if runtime.GOOS == "windows" {
+		if err := root.Rename(base, base+".aside"); err != nil {
+			t.Fatalf("rename aside: %v", err)
+		}
+	} else if err := root.Remove(base); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	if err := verifyPathIdentity(p, f.f); !errors.Is(err, errPathChanged) {

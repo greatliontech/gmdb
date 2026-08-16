@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -304,7 +305,10 @@ func TestCompactPreservesFileMode(t *testing.T) {
 	if after.Mode().Perm() != before.Mode().Perm() {
 		t.Errorf("Compact changed file mode: before=%o after=%o", before.Mode().Perm(), after.Mode().Perm())
 	}
-	if after.Mode().Perm() != 0o600 {
+	// The absolute-mode pin is unix-only: windows reports 0666 for any
+	// writable file; the preservation assertion above still pins
+	// Compact's behavior there.
+	if runtime.GOOS != "windows" && after.Mode().Perm() != 0o600 {
 		t.Errorf("compacted file mode = %o, want 0600", after.Mode().Perm())
 	}
 }

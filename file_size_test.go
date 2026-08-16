@@ -67,6 +67,15 @@ func TestGrowStepAlignedGrowth(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
+	// Compare against the OBSERVED post-Open size, not MinSize: windows
+	// keeps file lengths 64 KiB-aligned (mmap-strategy.md §Windows), so
+	// the initial file may already exceed MinSize without any growth
+	// having run. Batched growth is asserted from the first REAL grow.
+	fi0, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat initial: %v", err)
+	}
+	initPages := fi0.Size() / pageSize
 	grew := false
 	for round := range 30 {
 		if err := db.Update(ctx, func(tx *Tx) error {
@@ -88,7 +97,7 @@ func TestGrowStepAlignedGrowth(t *testing.T) {
 			t.Fatalf("stat: %v", err)
 		}
 		pages := fi.Size() / pageSize
-		if pages > minPages {
+		if pages > initPages {
 			grew = true
 			if pages%growStep != 0 {
 				t.Fatalf("round %d: file is %d pages, not GrowStep(%d)-aligned — growth not batched", round, pages, growStep)

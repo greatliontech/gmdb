@@ -1544,6 +1544,14 @@ describes no shipped behavior until that port lands:
   within-process only, so polling is the correct degradation).
 - **fdatasync**: the full-strength fsync fallback
   (`FlushFileBuffers`; durability.md §Platform sync primitives).
+- **stale lock-file removal**: kernel-gated like every windows
+  replace/delete of a mapped file — removal fails while any process
+  maps the stale file, surfacing as a clean, retryable Open error.
+  Sound: whatever still maps the stale file — a dead boot's
+  leftovers, a foreign/replaced database's peers, or an
+  older-layout process on this database — is coordination state
+  this Open must replace either way, and a later Open retries once
+  the mappers are gone.
 
 `StaleTimeout` (default 10 s) controls how long a heartbeat
 must be stale before the slot is reclaimed. Must be
