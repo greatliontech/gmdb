@@ -153,11 +153,15 @@ acknowledged commits inside it). Directory barriers use `fsync(2)` as
 the base call on every platform — the documented dirent ritual;
 `fdatasync`'s data-only contract is defined for file data — upgraded
 to `F_FULLFSYNC` on darwin under the same policy. On windows the
-ritual is `FlushFileBuffers` on a directory handle reopened with
-write access (by handle, preserving the caller's symlink-guard open
-— `FlushFileBuffers` refuses read-access handles). The lock file is
-exempt — transient coordination state with no durability contract
-(cross-process.md §Lock File Layout).
+directory ritual is unavailable — directory handles refuse the
+write access `FlushFileBuffers` requires — so the dirent barrier
+flushes the NAMED file itself after the name-space operation: NTFS
+journals create/rename records sequentially, and a file's metadata
+flush forces the log past that file's latest record, covering the
+very operation that published it. FAT-class destinations keep the
+publish ladder's documented weaker tier (api-surface.md). The lock
+file is exempt — transient coordination state with no durability
+contract (cross-process.md §Lock File Layout).
 
 ## Checkpoints and the durable sub-record
 

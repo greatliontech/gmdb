@@ -36,10 +36,10 @@ jobs:
 
   # Windows runs as its own job, deliberately OUTSIDE the release
   # gate while the port soaks: the suite has never executed on
-  # windows, and known platform contracts (Compact's documented
-  # clean failure, multi-process shrink deferral — api-surface.md,
-  # mmap-strategy.md §Windows) need their tests platform-gated as
-  # the soak surfaces them. Fold into the release gate once green.
+  # windows, and known platform contracts (the sole-mapper Compact
+  # gate, multi-process shrink deferral — api-surface.md,
+  # mmap-strategy.md §Windows) may need tests platform-gated as the
+  # soak surfaces them. Fold into the release gate once green.
   test-windows:
     runs-on: windows-latest
     timeout-minutes: 60

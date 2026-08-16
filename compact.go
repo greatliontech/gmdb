@@ -155,7 +155,7 @@ func (db *DB) Compact() error {
 	// on failure the on-disk outcome is unknowable across a crash (the
 	// old inode may resurrect) — same failure class as the reopen path
 	// below: poison, Close + re-Open recovers.
-	if err := syncDir(db.root, db.opts.NoFullFsync); err != nil {
+	if err := syncDir(db.root, base, db.opts.NoFullFsync); err != nil {
 		db.poisoned.Store(true)
 		return fmt.Errorf("gmdb: Compact dir fsync (handle poisoned — Close and re-Open): %w", err)
 	}
@@ -278,48 +278,13 @@ func (db *DB) installCompactPager(file *os.File, op string) error {
 	return nil
 }
 
-// syncDir fsyncs the directory so a created or renamed entry survives
-// a crash (POSIX: dirents are durable only after the parent directory
-// is fsynced — durability.md §Directory-entry durability). Callers
-// treat failure as fatal for their operation: an unsynced dirent means
-// a crash can lose the file (create) or resurrect the replaced inode
-// (Compact rename) despite acked SyncDurable commits.
-// syncDir fsyncs through the handle's pinned os.Root, so the fsync
-// hits the SAME directory the data file was opened under even if a
-// path component was re-pointed since (the symlink-guard rationale on
-// DB.root).
-func syncDir(root *os.Root, noFullFsync bool) error {
-	d, err := root.Open(".")
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	if err := pager.SyncDirBarrier(d, noFullFsync); err != nil {
-		return err
-	}
-	if hook := syncDirHookForTest.Load(); hook != nil {
-		return (*hook)(root.Name())
-	}
-	return nil
-}
+// syncDir / syncDirPath — the dirent-durability barrier, per-platform
+// in dirent_unix.go (parent-directory fsync) and dirent_windows.go
+// (named-file flush; directory handles refuse write access there).
+// An unsynced dirent means a crash can lose the file (create) or
+// resurrect the replaced inode (Compact rename) despite acked
+// SyncDurable commits — callers treat failure as fatal.
 
-// syncDirPath is the path-addressed variant for targets with no
-// pinned root (CopyTo's freshly-created output file).
-func syncDirPath(dir string, noFullFsync bool) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	if err := pager.SyncDirBarrier(d, noFullFsync); err != nil {
-		return err
-	}
-	if hook := syncDirHookForTest.Load(); hook != nil {
-		return (*hook)(dir)
-	}
-	return nil
-}
-
-// syncDirHookForTest observes/injects after syncDir's real fsync
+// syncDirHookForTest observes/injects after syncDir's real barrier
 // succeeded — the dirent-durability contract's test seam.
 var syncDirHookForTest atomic.Pointer[func(dir string) error]

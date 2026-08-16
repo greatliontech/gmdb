@@ -270,7 +270,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 	// read-only media would EROFS). The lock file's dirent needs no
 	// such guarantee — transient coordination state Open recreates.
 	if !opts.ReadOnly {
-		if err := syncDir(root, opts.NoFullFsync); err != nil {
+		if err := syncDir(root, base, opts.NoFullFsync); err != nil {
 			_ = file.Close()
 			_ = root.Close()
 			return nil, fmt.Errorf("gmdb: open %q: parent directory fsync: %w", path, err)

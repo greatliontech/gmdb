@@ -3,10 +3,8 @@
 package pager
 
 import (
-	"fmt"
+	"errors"
 	"os"
-
-	"golang.org/x/sys/windows"
 )
 
 // fdatasync falls back to a full fsync: FlushFileBuffers is
@@ -23,28 +21,13 @@ func syncBarrier(f *os.File, noFullFsync bool) error {
 	return fdatasync(f)
 }
 
-// procReOpenFile — not wrapped by x/sys/windows.
-var procReOpenFile = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
-
-// syncDirBarrier — the windows directory-entry ritual (durability.md
-// §Platform sync primitives): FlushFileBuffers demands WRITE access,
-// and Go's os.Open yields a read-access directory handle, so the
-// handle is reopened with GENERIC_WRITE via ReOpenFile — by HANDLE,
-// never by path, so the caller's os.Root symlink-guard open is not
-// re-resolved — and that handle is flushed.
+// syncDirBarrier is UNAVAILABLE on windows: directory handles refuse
+// the write access FlushFileBuffers requires (empirically
+// ACCESS_DENIED even on a fully-owned directory — the first windows
+// CI run). Dirent durability rides the named-file barrier instead
+// (the root package's windows syncDir flushes the published file;
+// durability.md §Platform sync primitives). Defensive error, never a
+// silent no-op.
 func syncDirBarrier(d *os.File, noFullFsync bool) error {
-	r1, _, callErr := procReOpenFile.Call(
-		d.Fd(),
-		uintptr(uint32(windows.GENERIC_WRITE)),
-		uintptr(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE),
-		uintptr(windows.FILE_FLAG_BACKUP_SEMANTICS))
-	h := windows.Handle(r1)
-	if h == windows.InvalidHandle || h == 0 {
-		return fmt.Errorf("pager: ReOpenFile(directory, GENERIC_WRITE): %w", callErr)
-	}
-	defer windows.CloseHandle(h)
-	if err := windows.FlushFileBuffers(h); err != nil {
-		return fmt.Errorf("pager: FlushFileBuffers(directory): %w", err)
-	}
-	return nil
+	return errors.New("pager: directory flush unavailable on windows; dirent durability uses the named-file barrier")
 }

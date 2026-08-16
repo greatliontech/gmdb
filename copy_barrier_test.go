@@ -3,6 +3,7 @@ package gmdb
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/greatliontech/gmdb/internal/pager"
@@ -30,8 +31,15 @@ func TestArtifactBarrierReachesFile(t *testing.T) {
 }
 
 // TestDirBarrierReachesFile — the same closed-fd probe for the
-// directory-entry barrier used by syncDir/syncDirPath.
+// directory-entry barrier used by syncDir/syncDirPath on unix. On
+// windows pager.SyncDirBarrier is a defensive always-error (the
+// dirent barrier flushes the named file instead — durability.md
+// §Platform sync primitives), which would satisfy this probe
+// vacuously — skip rather than pretend coverage.
 func TestDirBarrierReachesFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows dirent durability uses the named-file barrier; SyncDirBarrier is a defensive error there")
+	}
 	d, err := os.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

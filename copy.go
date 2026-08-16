@@ -182,7 +182,7 @@ func (db *DB) CopyTo(path string, compact bool) error {
 			}
 		}
 	}
-	if serr := syncDirPath(filepath.Dir(path), db.opts.NoFullFsync); serr != nil {
+	if serr := syncDirPath(filepath.Dir(path), filepath.Base(path), db.opts.NoFullFsync); serr != nil {
 		// All-or-nothing: the publish's durability is unknowable after a
 		// failed directory fsync, and a caller treating the error as "no
 		// backup produced" would otherwise retry into ErrExist forever
