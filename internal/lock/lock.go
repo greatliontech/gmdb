@@ -246,7 +246,7 @@ func openLifecycle(p OpenParams, allowTornRecovery bool) (*File, error) {
 			} else if partialInfo == nil {
 				partialInfo = info
 				partialSince = time.Now()
-			} else if !os.SameFile(partialInfo, info) {
+			} else if !sameStuckFile(partialInfo, info) {
 				partialStable = false
 			}
 			lastErr = err
@@ -324,6 +324,16 @@ func openLifecycle(p OpenParams, allowTornRecovery bool) (*File, error) {
 		maxAttempts, lastErr)
 }
 
+// sameStuckFile is the torn-init pin identity: dev+ino ALONE is
+// A-B-A-prone — ext4 hands a freed inode number straight back to the
+// next create, so os.SameFile matches a remove+recreate (demonstrated
+// by the first CI run of the churn test on every linux runner) —
+// while a never-progressing stuck file keeps its ModTime and Size
+// bit-identical. Any flap in either is progress and disarms.
+func sameStuckFile(a, b os.FileInfo) bool {
+	return os.SameFile(a, b) && a.ModTime().Equal(b.ModTime()) && a.Size() == b.Size()
+}
+
 // errTornProgress classifies a recoverTornInit abort meaning the file
 // made PROGRESS under someone else — a live holder's flock, a fresh
 // creator's replacement inode, a re-bound name, or a published
@@ -374,8 +384,8 @@ func recoverTornInit(p OpenParams, want os.FileInfo) error {
 	if err != nil {
 		return err
 	}
-	if !os.SameFile(fInfo, want) {
-		return fmt.Errorf("%w: inode replaced (a fresh creator owns the name)", errTornProgress)
+	if !sameStuckFile(fInfo, want) {
+		return fmt.Errorf("%w: file replaced (a fresh creator owns the name)", errTornProgress)
 	}
 	pInfo, err := p.Root.Stat(p.Base)
 	if err != nil {

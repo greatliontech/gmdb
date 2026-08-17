@@ -802,12 +802,16 @@ External tampering that zeroes a FINALISED file's Magic is
 treated as stale by the same recovery; live adopters of the
 pre-tamper file are then orphaned — the availability choice
 already made for UUID-zeroing tampering, under this spec's
-existing out-of-model caveat for tampering. Accepted residual:
-inode-number reuse could in principle re-pin a fresh creator's
-file inside its microseconds-wide open→flock window stacked on
-same-dev/ino recycling; the published-header and identity
-re-checks confine the damage to a retried open, never a split
-brain.
+existing out-of-model caveat for tampering. The pin identity is
+dev+inode+mtime+size — dev+inode alone is insufficient, since
+filesystems hand a freed inode number straight back to the next
+create (empirically the common case on ext4), while a
+never-progressing stuck file keeps mtime and size bit-identical.
+Accepted residual: a recreate forging an identical
+dev+inode+mtime+size tuple inside the creator's
+microseconds-wide open→flock window; the published-header and
+identity re-checks confine even that to a retried open, never a
+split brain.
 
 A failed creator whose failure path still runs (an
 `initLockFile` syscall error, any non-crash exit) unlinks the
