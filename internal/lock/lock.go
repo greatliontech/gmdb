@@ -138,10 +138,15 @@ type File struct {
 // A UUID mismatch — and a plausible header whose file size disagrees
 // with the current layout (an old-binary lock file; see the size-arm
 // comment) — classifies the file STALE: it is unlinked under the
-// identity guard (removeStaleGuarded) and the open retries. A Magic /
-// MaxReaders validation failure on a finalised file surfaces
-// ErrCorrupted without unlinking (the package does not auto-recover
-// externally-tampered or crashed-mid-init files).
+// identity guard (removeStaleGuarded) and the open retries. A file
+// that stays partially-initialised across the whole retry budget is
+// the crashed-creator staleness class (a power loss cannot run the
+// polite failed-creator unlink): it is recovered by
+// recoverTornInit — same-inode-across-the-budget + LOCK_EX + identity
+// + still-unpublished, all verified under the lock — and the
+// lifecycle re-runs once. A Magic / MaxReaders validation failure on
+// a finalised (non-zero-Magic) file surfaces ErrCorrupted without
+// unlinking.
 //
 // Retry budget. Three arms consume the 10-attempt budget: adopters
 // inside the creator's init window (errPartialInit), contended stale
@@ -164,11 +169,38 @@ func Open(p OpenParams) (*File, error) {
 		return nil, fmt.Errorf("lock: requested MaxReaders %d outside [%d, %d]: %w",
 			p.MaxReaders, MinMaxReaders, MaxMaxReaders, ErrInvalidMaxReaders)
 	}
+	return openLifecycle(p, true)
+}
 
+// openLifecycle runs the bounded adopt-or-create loop.
+// allowTornRecovery arms the one-shot crashed-creator recovery on
+// budget exhaustion; the recovered re-run passes false so a second
+// exhaustion cannot loop.
+func openLifecycle(p OpenParams, allowTornRecovery bool) (*File, error) {
 	const maxAttempts = 10
 	const maxBackoff = 256 * time.Millisecond
+	// tornInitMinWindow is the minimum wall-clock age of the partial
+	// pin before recovery may arm: the liveness judgment is "this
+	// inode stayed unpublished far longer than any legitimate init",
+	// and a pin established only by the budget's last attempt has
+	// observed nothing of the sort.
+	const tornInitMinWindow = 500 * time.Millisecond
 	backoff := time.Millisecond
 	var lastErr error
+	// partialInfo pins the inode observed partially-initialised; the
+	// torn-init recovery may only ever remove THAT inode, and only if
+	// (a) every partial observation was the same inode, (b) no other
+	// lifecycle arm ran after the pin (any other arm means the name
+	// made progress), and (c) the pin is at least tornInitMinWindow
+	// old. Churn or progress disarms recovery for this Open.
+	var partialInfo os.FileInfo
+	var partialSince time.Time
+	partialStable := true
+	disarmOnProgress := func() {
+		if partialInfo != nil {
+			partialStable = false
+		}
+	}
 	for range maxAttempts {
 		f, err := tryAdoptExisting(p)
 		if err == nil {
@@ -179,11 +211,13 @@ func Open(p OpenParams) (*File, error) {
 			// (identity-verified, under flock on the validated inode —
 			// see removeStaleGuarded); retry immediately against the
 			// post-removal state.
+			disarmOnProgress()
 			lastErr = err
 			continue
 		}
 		if errors.Is(err, errStaleContended) || errors.Is(err, errPathChanged) ||
 			errors.Is(err, errBootEpochContended) {
+			disarmOnProgress()
 			// Contended removal guard (another remover or a legacy
 			// coordinator holds the stale inode's flock), or the name
 			// was re-bound between our open/create and the final
@@ -207,6 +241,14 @@ func Open(p OpenParams) (*File, error) {
 			// retry adoption; do NOT fall through to createAndInit,
 			// because the file does exist on disk and a fresh
 			// O_CREATE|O_EXCL would just spin EEXIST.
+			if info, serr := p.Root.Stat(p.Base); serr != nil {
+				partialStable = false
+			} else if partialInfo == nil {
+				partialInfo = info
+				partialSince = time.Now()
+			} else if !os.SameFile(partialInfo, info) {
+				partialStable = false
+			}
 			lastErr = err
 			time.Sleep(backoff)
 			if backoff < maxBackoff {
@@ -225,26 +267,139 @@ func Open(p OpenParams) (*File, error) {
 		if err == nil {
 			return f, nil
 		}
+		if errors.Is(err, errPathChanged) {
+			// The name was re-bound between our create and the final
+			// identity verify — the same class as the adopt-side arm
+			// (a concurrent validator or recoverer replaced the file
+			// under us). Back off and retry rather than surfacing the
+			// internal sentinel terminally.
+			disarmOnProgress()
+			lastErr = err
+			time.Sleep(backoff)
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+			continue
+		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
 		}
 		// Lost the O_CREATE|O_EXCL race. Loop to adopt the winner.
+		disarmOnProgress()
 		lastErr = err
 	}
 	// Exhausted retries. If the terminal error was the partial-init
-	// signal, no live creator advanced the file across the ~800 ms
-	// budget — that's far longer than a legitimate
-	// Truncate+WriteAt+Sync on any supported filesystem, so the file
-	// is stuck (creator crashed between O_CREATE|O_EXCL and Flock,
-	// or external tampering left a zero-Magic file at this path).
-	// Surface as ErrCorrupted so callers can use the standard
-	// corruption-recovery surface.
+	// signal and the SAME inode stayed partially-initialised — pinned
+	// at least tornInitMinWindow ago, with no other lifecycle arm
+	// running since — no live creator exists: a legitimate
+	// Truncate+WriteAt+Sync is orders of magnitude faster on any
+	// supported filesystem, a live mid-init creator holds LOCK_EX,
+	// and a power-loss-crashed creator cannot run the polite
+	// failed-creator unlink. That is the crashed-creator staleness
+	// class — recover it once under the guard (LOCK_EX + identity +
+	// still-unpublished, on exactly the observed inode) and re-run
+	// the lifecycle. A recovery abort that indicates SOMEONE ELSE
+	// advanced the file (fresh creator, concurrent recoverer, a
+	// published header) also re-runs — the name is serviceable now
+	// and reporting corruption would be false. Only a second
+	// exhaustion, an unstable/young pin, or a recovery I/O error
+	// surfaces ErrCorrupted.
 	if errors.Is(lastErr, errPartialInit) {
+		if allowTornRecovery && partialStable && partialInfo != nil &&
+			time.Since(partialSince) >= tornInitMinWindow {
+			recErr := recoverTornInit(p, partialInfo)
+			if recErr == nil || errors.Is(recErr, errTornProgress) {
+				return openLifecycle(p, false)
+			}
+			return nil, fmt.Errorf("lock: file at %q remained partially-initialised after %d attempts (recovery: %v): %w",
+				p.Base, maxAttempts, recErr, ErrCorrupted)
+		}
 		return nil, fmt.Errorf("lock: file at %q remained partially-initialised after %d attempts: %w",
 			p.Base, maxAttempts, ErrCorrupted)
 	}
 	return nil, fmt.Errorf("lock: open lifecycle did not converge after %d attempts: %w",
 		maxAttempts, lastErr)
+}
+
+// errTornProgress classifies a recoverTornInit abort meaning the file
+// made PROGRESS under someone else — a live holder's flock, a fresh
+// creator's replacement inode, a re-bound name, or a published
+// header. The caller re-runs the lifecycle instead of reporting
+// corruption: the name is (or is becoming) serviceable.
+var errTornProgress = errors.New("lock: torn-init recovery yielded to a live peer")
+
+// recoverTornInit removes a crashed creator's never-finalised lock
+// file so the lifecycle can recreate it — the same transient-state
+// principle as every other staleness removal (cross-process.md §Lock
+// File Lifecycle). The guard is deliberately stricter than
+// removeStaleGuarded's, because a zero header is momentarily
+// indistinguishable from a LIVE creator's open→flock window:
+//
+//   - want must be the inode observed partially-initialised across
+//     the caller's ENTIRE exhausted budget — a fresh creator's
+//     just-created file is a different inode and aborts the
+//     recovery, so a live creator's window is never yanked.
+//   - flock(LOCK_EX|LOCK_NB) must succeed — a live mid-init creator
+//     holds LOCK_EX.
+//   - The name must still bind that inode, and the header must still
+//     be unpublished (size < HeaderSize, or Magic == 0), both
+//     re-checked UNDER the lock.
+//
+// Returns nil when the path no longer holds the stuck file (we
+// removed it, or it was already gone), or an errTornProgress-wrapped
+// error when a LIVE peer advanced the file (contended flock, replaced
+// inode, re-bound name, published header) — both mean the caller
+// should re-run the lifecycle. Any other error is a genuine I/O
+// failure; the file is left untouched in every non-nil case.
+func recoverTornInit(p OpenParams, want os.FileInfo) error {
+	f, err := p.Root.OpenFile(p.Base, os.O_RDWR, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // already recovered by a peer; retry will create
+		}
+		return err
+	}
+	// Defer-LIFO: unlock (registered second) runs before close, so
+	// the flock release lands on a live fd — same ordering rationale
+	// as tryAdoptExisting. The fd never escapes this function.
+	defer func() { _ = f.Close() }()
+	if err := flockTryExclusive(f.Fd()); err != nil {
+		return fmt.Errorf("%w: guard flock contended: %v", errTornProgress, err)
+	}
+	defer func() { _ = flockUnlock(f.Fd()) }()
+	fInfo, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(fInfo, want) {
+		return fmt.Errorf("%w: inode replaced (a fresh creator owns the name)", errTornProgress)
+	}
+	pInfo, err := p.Root.Stat(p.Base)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // name already gone
+		}
+		return err
+	}
+	if !os.SameFile(fInfo, pInfo) {
+		return fmt.Errorf("%w: name re-bound during recovery", errTornProgress)
+	}
+	if fInfo.Size() >= int64(HeaderSize) {
+		headerBytes := make([]byte, HeaderSize)
+		if _, err := f.ReadAt(headerBytes, 0); err != nil {
+			return err
+		}
+		if (*LockFileHeader)(unsafe.Pointer(&headerBytes[0])).Magic != 0 {
+			return fmt.Errorf("%w: header published during recovery", errTornProgress)
+		}
+	}
+	if err := p.Root.Remove(p.Base); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // tryAdoptExisting opens Base via Root and validates the header. The
@@ -692,9 +847,9 @@ func bootEpochReset(p OpenParams, f *os.File, maxReaders uint32) error {
 // blocked on LOCK_SH cannot observe the file's partial state. If
 // the process crashes mid-init (after Truncate but before Sync),
 // the kernel releases LOCK_EX on fd close; the next opener acquires
-// LOCK_SH, reads the half-init'd header (Magic == 0), and surfaces
-// ErrCorrupted. Manual cleanup is required — gmdb does not
-// auto-recover from crashed-mid-init files.
+// LOCK_SH, reads the half-init'd header (Magic == 0), retries
+// through the adoption budget, and then recovers the file as the
+// crashed-creator staleness class (recoverTornInit).
 func initLockFile(f *os.File, uuid [16]byte, maxReaders uint32, fileSize int64) error {
 	if err := f.Truncate(fileSize); err != nil {
 		return fmt.Errorf("lock: truncate: %w", err)

@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 // tmpLock returns an *os.Root over a fresh per-test temp directory
@@ -181,7 +182,13 @@ func TestOpenRejectsCorruptMagic(t *testing.T) {
 	root, base, fullPath := tmpLock(t)
 	uuid := [16]byte{0xAA}
 
-	if err := os.WriteFile(fullPath, make([]byte, FileSize(8)), 0o600); err != nil {
+	// A NON-ZERO wrong magic is a finalised-but-invalid header —
+	// terminal corruption, no recovery, no retry budget burned. (An
+	// all-zero file is the crashed-creator staleness class instead —
+	// TestOpenRecoversTornInit.)
+	bogus := make([]byte, FileSize(8))
+	copy(bogus, []byte{0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF})
+	if err := os.WriteFile(fullPath, bogus, 0o600); err != nil {
 		t.Fatalf("write bogus file: %v", err)
 	}
 
@@ -189,6 +196,215 @@ func TestOpenRejectsCorruptMagic(t *testing.T) {
 	if !errors.Is(err, ErrCorrupted) {
 		t.Errorf("got %v, want ErrCorrupted", err)
 	}
+}
+
+// TestOpenRecoversTornInit pins the crashed-creator staleness class
+// (cross-process.md §Lock File Lifecycle): a file left
+// partially-initialised by a creator that died without the polite
+// unlink — zero-length (crash in the open→flock window) or
+// full-size all-zero (crash after Truncate, before the header
+// write landed) — is recovered after the adoption budget proves no
+// live creator, and Open converges on a freshly-created lock file.
+func TestOpenRecoversTornInit(t *testing.T) {
+	cases := []struct {
+		name    string
+		content []byte
+	}{
+		{"zero-length (open→flock window)", nil},
+		{"full-size all-zero (post-truncate)", make([]byte, FileSize(8))},
+		// Undersized-with-content is tampering-shaped (no crash
+		// produces it), but it is equally unpublishable and
+		// unadoptable — the same availability choice as the
+		// UUID-zeroing tamper arm applies, and the guard (flock +
+		// same-inode-across-the-budget) protects any legitimate
+		// slow init strictly better than the former permanent
+		// ErrCorrupted did.
+		{"undersized non-zero (tampering-shaped)", []byte{0xFF}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root, base, fullPath := tmpLock(t)
+			if err := os.WriteFile(fullPath, tc.content, 0o600); err != nil {
+				t.Fatalf("write torn file: %v", err)
+			}
+			f, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xAA}, MaxReaders: 8})
+			if err != nil {
+				t.Fatalf("Open over torn init: %v", err)
+			}
+			defer f.Close()
+			if got := f.MaxReaders(); got != 8 {
+				t.Errorf("recovered MaxReaders = %d, want 8", got)
+			}
+			st, err := os.Stat(fullPath)
+			if err != nil {
+				t.Fatalf("stat: %v", err)
+			}
+			if st.Size() != FileSize(8) {
+				t.Errorf("recovered file size = %d, want %d", st.Size(), FileSize(8))
+			}
+		})
+	}
+}
+
+// TestTornInitRecoveryDisarmsOnChurn pins the end-to-end contract
+// under mid-budget inode churn (someone is making progress on the
+// name): ErrCorrupted with the replacement file left intact — never
+// a removal. The loop's stability guard is the first line of that
+// defense; recoverTornInit's pinned-inode check is the second (a
+// neutered stability guard still aborts there and converges to the
+// same outcome one budget later — the guard's untestable unique
+// value is the A-B-A inode-reuse pin).
+func TestTornInitRecoveryDisarmsOnChurn(t *testing.T) {
+	root, base, fullPath := tmpLock(t)
+	if err := os.WriteFile(fullPath, make([]byte, FileSize(8)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Replace the torn file with a DIFFERENT torn inode partway
+	// through Open's ~800 ms budget.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(200 * time.Millisecond)
+		_ = os.Remove(fullPath)
+		_ = os.WriteFile(fullPath, make([]byte, FileSize(8)), 0o600)
+	}()
+	_, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xAA}, MaxReaders: 8})
+	<-done
+	if !errors.Is(err, ErrCorrupted) {
+		t.Fatalf("Open under inode churn = %v, want ErrCorrupted (recovery must disarm)", err)
+	}
+	st, serr := os.Stat(fullPath)
+	if serr != nil {
+		t.Fatalf("replacement file removed despite churn disarm: %v", serr)
+	}
+	if st.Size() != FileSize(8) {
+		t.Errorf("replacement file altered: size %d", st.Size())
+	}
+}
+
+// TestOpenAdoptsAfterProgressAbort traverses the progress-abort
+// re-run end to end: Open exhausts its budget on a torn file, the
+// recovery finds the guard flock CONTENDED (a live peer appeared),
+// classifies it progress rather than corruption, re-runs the
+// lifecycle, blocks on LOCK_SH until the peer publishes a valid
+// header, and adopts it. A fold that treated the progress abort as
+// ErrCorrupted would fail here. Timing: the peer takes LOCK_EX at
+// ~650 ms — inside the budget's final 256 ms sleep (last adopt
+// attempt ≈ 511 ms, exhaustion ≈ 767 ms) — and publishes at ~1 s;
+// if scheduling drifts an adopt attempt into the hold, that attempt
+// blocks on LOCK_SH and adopts directly, which the assertions also
+// accept (the test is timing-stable; only the mutant kill is
+// timing-favored).
+func TestOpenAdoptsAfterProgressAbort(t *testing.T) {
+	root, base, fullPath := tmpLock(t)
+	uuid := [16]byte{0xAA}
+	if err := os.WriteFile(fullPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	peerDone := make(chan error, 1)
+	go func() {
+		time.Sleep(650 * time.Millisecond)
+		pf, err := os.OpenFile(fullPath, os.O_RDWR, 0)
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		defer pf.Close()
+		if err := flockExclusive(pf.Fd()); err != nil {
+			peerDone <- err
+			return
+		}
+		defer func() { _ = flockUnlock(pf.Fd()) }()
+		time.Sleep(350 * time.Millisecond)
+		peerDone <- initLockFile(pf, uuid, 8, FileSize(8))
+	}()
+
+	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open across a progress-aborted recovery = %v, want adoption of the peer's file", err)
+	}
+	defer f.Close()
+	if perr := <-peerDone; perr != nil {
+		t.Fatalf("peer publish: %v", perr)
+	}
+	if got := f.MaxReaders(); got != 8 {
+		t.Errorf("adopted MaxReaders = %d, want 8", got)
+	}
+	if got := f.UUID(); got != uuid {
+		t.Errorf("adopted UUID = %x, want %x", got, uuid)
+	}
+}
+
+// recoverTornInit guard pins: the recovery must refuse to touch a
+// file whose flock is held (a live mid-init creator), whose inode
+// was replaced since the stuck observation (a fresh creator's
+// open→flock window), or whose header got published meanwhile.
+func TestRecoverTornInitGuards(t *testing.T) {
+	t.Run("contended flock is a live holder", func(t *testing.T) {
+		root, base, fullPath := tmpLock(t)
+		if err := os.WriteFile(fullPath, make([]byte, FileSize(8)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		holder, err := os.OpenFile(fullPath, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Close()
+		if err := flockExclusive(holder.Fd()); err != nil {
+			t.Fatalf("witness flock: %v", err)
+		}
+		defer func() { _ = flockUnlock(holder.Fd()) }()
+		want, _ := os.Stat(fullPath)
+		if err := recoverTornInit(OpenParams{Root: root, Base: base}, want); err == nil {
+			t.Fatal("recovery removed a file whose flock is held")
+		} else if !errors.Is(err, errTornProgress) {
+			t.Fatalf("contended abort = %v, want errTornProgress (the lifecycle re-runs on it)", err)
+		}
+		if _, err := os.Stat(fullPath); err != nil {
+			t.Fatalf("file removed despite live holder: %v", err)
+		}
+	})
+	t.Run("replaced inode aborts", func(t *testing.T) {
+		root, base, fullPath := tmpLock(t)
+		if err := os.WriteFile(fullPath, make([]byte, FileSize(8)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		want, _ := os.Stat(fullPath)
+		// A fresh creator replaced the stuck file with its own
+		// (also momentarily zero) file.
+		if err := os.Remove(fullPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, make([]byte, FileSize(8)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := recoverTornInit(OpenParams{Root: root, Base: base}, want); err == nil {
+			t.Fatal("recovery removed a replaced (fresh creator's) inode")
+		} else if !errors.Is(err, errTornProgress) {
+			t.Fatalf("replaced-inode abort = %v, want errTornProgress", err)
+		}
+		if _, err := os.Stat(fullPath); err != nil {
+			t.Fatalf("fresh creator's file removed: %v", err)
+		}
+	})
+	t.Run("published header aborts", func(t *testing.T) {
+		root, base, fullPath := tmpLock(t)
+		f, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xAA}, MaxReaders: 8})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		want, _ := os.Stat(fullPath)
+		if err := recoverTornInit(OpenParams{Root: root, Base: base}, want); err == nil {
+			t.Fatal("recovery removed a finalised lock file")
+		} else if !errors.Is(err, errTornProgress) {
+			t.Fatalf("published-header abort = %v, want errTornProgress", err)
+		}
+		if got := f.MaxReaders(); got != 8 {
+			t.Errorf("finalised file damaged: MaxReaders = %d", got)
+		}
+	})
 }
 
 func TestOpenRejectsCorruptMaxReaders(t *testing.T) {
@@ -252,27 +468,6 @@ func TestOpenRecreatesOnSizeMismatch(t *testing.T) {
 	}
 	if st.Size() != FileSize(8) {
 		t.Errorf("recreated size = %d, want %d", st.Size(), FileSize(8))
-	}
-}
-
-func TestOpenRejectsUndersizedFile(t *testing.T) {
-	// With the flock-during-init lifecycle, a partially-
-	// initialised file can only come from external tampering or a
-	// crashed creator — never from a live concurrent creator. The
-	// lock surface treats both as ErrCorrupted (no auto-recover)
-	// rather than silently unlinking, since auto-unlink could
-	// destroy a legitimate user's mid-init progress in a future
-	// design where init takes longer.
-	root, base, fullPath := tmpLock(t)
-	uuid := [16]byte{0xAA}
-
-	if err := os.WriteFile(fullPath, []byte{0xFF}, 0o600); err != nil {
-		t.Fatalf("write tiny file: %v", err)
-	}
-
-	_, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 8})
-	if !errors.Is(err, ErrCorrupted) {
-		t.Errorf("got %v, want ErrCorrupted", err)
 	}
 }
 

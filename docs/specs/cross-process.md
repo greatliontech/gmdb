@@ -772,13 +772,48 @@ its first `flock(LOCK_EX)` and observe `size < HeaderSize` or
 post-truncate / pre-write header reads as all-zero); this is
 mid-init, not corruption. Adopters retry with bounded
 exponential backoff (10 attempts capped at 256 ms each,
-≈ 800 ms total); budget exhaustion surfaces `ErrCorrupted` (a
-creator that crashed inside the open→flock window or external
-tampering left a zero-Magic file at this path).
+≈ 800 ms total).
 
-A failed creator (crash mid-init, or `initLockFile` error from
-syscall) unlinks the in-progress file before exit so subsequent
-adopters do not waste the retry budget on a known-stuck file.
+Budget exhaustion on a partially-initialised file is the
+CRASHED-CREATOR staleness class — a power loss between the
+create and a completed init leaves exactly this state, and the
+crash forecloses the polite unlink below. It is recovered like
+every other staleness class (the lock file is transient
+coordination state), under a guard strictly stronger than the
+stale-removal guard, because a zero header is momentarily
+indistinguishable from a live creator's open→flock window:
+(a) the SAME inode must have been pinned partially-initialised
+for a minimum observation window (500 ms) with NO other
+lifecycle arm running since the pin — far longer than any
+legitimate init, and a fresh creator's file is a different
+inode; (b) `flock(LOCK_EX|LOCK_NB)` must succeed — a live
+mid-init creator holds `LOCK_EX`; (c) the name↔inode binding
+and (d) the still-unpublished header are re-verified UNDER the
+lock. The file is then removed and the lifecycle re-runs once.
+A recovery abort that indicates a LIVE peer advanced the file —
+contended guard, replaced inode, re-bound name, published
+header — ALSO re-runs the lifecycle (the name is serviceable;
+reporting corruption would be false); only a second exhaustion,
+an unstable or too-young pin, or a genuine recovery I/O error
+surfaces `ErrCorrupted`. For the crashed-creator class the
+removal cannot orphan a live coordinator — no peer can adopt a
+never-finalised file (adoption requires a published header).
+External tampering that zeroes a FINALISED file's Magic is
+treated as stale by the same recovery; live adopters of the
+pre-tamper file are then orphaned — the availability choice
+already made for UUID-zeroing tampering, under this spec's
+existing out-of-model caveat for tampering. Accepted residual:
+inode-number reuse could in principle re-pin a fresh creator's
+file inside its microseconds-wide open→flock window stacked on
+same-dev/ino recycling; the published-header and identity
+re-checks confine the damage to a retried open, never a split
+brain.
+
+A failed creator whose failure path still runs (an
+`initLockFile` syscall error, any non-crash exit) unlinks the
+in-progress file before returning, so subsequent adopters do
+not waste the retry budget on a known-stuck file; only a hard
+crash leaves the torn file for the recovery above.
 
 ## Write Lock
 
