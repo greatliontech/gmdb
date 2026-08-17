@@ -372,10 +372,19 @@ func TestRecoverTornInitGuards(t *testing.T) {
 		}
 		want, _ := os.Stat(fullPath)
 		// A fresh creator replaced the stuck file with its own
-		// (also momentarily zero) file.
+		// (also momentarily zero) file. The recreate crosses a
+		// timestamp tick (~15 ms update granularity on NTFS; ns on
+		// ext4) so the mtime leg of the pin identity distinguishes it
+		// on every platform — filesystems reuse inode/file-index
+		// numbers immediately, so dev+ino alone never could. A
+		// SUB-tick recreate can defeat the pin; the flock,
+		// published-header, and post-remove identity guards confine
+		// that residual to a retried open (cross-process.md §Lock
+		// File Lifecycle).
 		if err := os.Remove(fullPath); err != nil {
 			t.Fatal(err)
 		}
+		time.Sleep(30 * time.Millisecond)
 		if err := os.WriteFile(fullPath, make([]byte, FileSize(8)), 0o600); err != nil {
 			t.Fatal(err)
 		}

@@ -809,9 +809,11 @@ create (empirically the common case on ext4), while a
 never-progressing stuck file keeps mtime and size bit-identical.
 Accepted residual: a recreate forging an identical
 dev+inode+mtime+size tuple inside the creator's
-microseconds-wide open→flock window; the published-header and
-identity re-checks confine even that to a retried open, never a
-split brain.
+microseconds-wide open→flock window — realistic only within one
+filesystem timestamp tick (nanoseconds on ext4/XFS/APFS; the
+~15 ms update granularity on NTFS widens it); the flock,
+published-header, and identity re-checks confine even that to a
+retried open, never a split brain.
 
 A failed creator whose failure path still runs (an
 `initLockFile` syscall error, any non-crash exit) unlinks the
