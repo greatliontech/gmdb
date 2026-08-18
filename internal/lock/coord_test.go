@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/greatliontech/gmdb/internal/flock"
 )
 
 // newTestCoord opens a fresh *File via tmpLock and wraps it in a
@@ -223,9 +225,9 @@ func TestCoordCloseWhileHolding(t *testing.T) {
 
 	// Pre-Close, the witness fd must NOT be able to acquire LOCK_EX —
 	// the Coord is holding flock on a different OFD for the same file.
-	if err := flockTryExclusive(witness.Fd()); err == nil {
+	if err := flock.TryExclusive(witness.Fd()); err == nil {
 		t.Fatalf("witness flock succeeded while Coord holds — Coord did not actually take LOCK_EX")
-	} else if !flockErrContended(err) {
+	} else if !flock.ErrContended(err) {
 		t.Fatalf("witness flock pre-Close: got %v, want contention", err)
 	}
 
@@ -250,12 +252,12 @@ func TestCoordCloseWhileHolding(t *testing.T) {
 
 	// Post-Close, the witness fd MUST now be able to acquire LOCK_EX —
 	// proves the Coord released the kernel flock on its stopCh path.
-	if err := flockTryExclusive(witness.Fd()); err != nil {
+	if err := flock.TryExclusive(witness.Fd()); err != nil {
 		t.Errorf("witness flock post-Close: got %v, want success (Close-releases invariant)", err)
 	} else {
 		// Defer LOCK_UN immediately on success so a subsequent
 		// t.Fatal/t.FailNow cannot leak the flock past the test.
-		defer func() { _ = flockUnlock(witness.Fd()) }()
+		defer func() { _ = flock.Unlock(witness.Fd()) }()
 	}
 	_ = f.Close()
 }

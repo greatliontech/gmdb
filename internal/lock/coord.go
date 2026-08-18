@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/greatliontech/gmdb/internal/flock"
 )
 
 // ErrClosed is returned by AcquireWriter when the Coord is closed
@@ -482,11 +484,11 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 	// even under a hypothetical sustained EINTR stream — a fully-
 	// preempting kernel still cannot starve shutdown.
 	for {
-		err := flockTryExclusive(c.f.Fd())
+		err := flock.TryExclusive(c.f.Fd())
 		if err == nil {
 			break
 		}
-		if flockErrRetryable(err) {
+		if flock.ErrRetryable(err) {
 			select {
 			case <-c.stopCh:
 				return true
@@ -497,7 +499,7 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 				continue
 			}
 		}
-		if !flockErrContended(err) {
+		if !flock.ErrContended(err) {
 			req.result <- err
 			return false
 		}
@@ -635,7 +637,7 @@ holdLoop:
 		(*hook)()
 	}
 
-	_ = flockUnlock(c.f.Fd())
+	_ = flock.Unlock(c.f.Fd())
 	return stopped
 }
 

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/greatliontech/gmdb/internal/flock"
 )
 
 // tmpLock returns an *os.Root over a fresh per-test temp directory
@@ -311,11 +313,11 @@ func TestOpenAdoptsAfterProgressAbort(t *testing.T) {
 			return
 		}
 		defer pf.Close()
-		if err := flockExclusive(pf.Fd()); err != nil {
+		if err := flock.Exclusive(pf.Fd()); err != nil {
 			peerDone <- err
 			return
 		}
-		defer func() { _ = flockUnlock(pf.Fd()) }()
+		defer func() { _ = flock.Unlock(pf.Fd()) }()
 		time.Sleep(350 * time.Millisecond)
 		peerDone <- initLockFile(pf, uuid, 8, FileSize(8))
 	}()
@@ -351,10 +353,10 @@ func TestRecoverTornInitGuards(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer holder.Close()
-		if err := flockExclusive(holder.Fd()); err != nil {
+		if err := flock.Exclusive(holder.Fd()); err != nil {
 			t.Fatalf("witness flock: %v", err)
 		}
-		defer func() { _ = flockUnlock(holder.Fd()) }()
+		defer func() { _ = flock.Unlock(holder.Fd()) }()
 		want, _ := os.Stat(fullPath)
 		if err := recoverTornInit(OpenParams{Root: root, Base: base}, want); err == nil {
 			t.Fatal("recovery removed a file whose flock is held")
@@ -839,7 +841,7 @@ func TestOpenStaleRemovalSkipsUnderLiveFlockHolder(t *testing.T) {
 		t.Fatalf("holder open: %v", err)
 	}
 	defer holder.Close()
-	if err := flockShared(holder.Fd()); err != nil {
+	if err := flock.Shared(holder.Fd()); err != nil {
 		t.Fatalf("holder flock: %v", err)
 	}
 
@@ -1068,7 +1070,7 @@ func TestBootEpochResetContendedSkips(t *testing.T) {
 		t.Fatalf("holder: %v", err)
 	}
 	defer holder.Close()
-	if err := flockShared(holder.Fd()); err != nil {
+	if err := flock.Shared(holder.Fd()); err != nil {
 		t.Fatalf("holder flock: %v", err)
 	}
 

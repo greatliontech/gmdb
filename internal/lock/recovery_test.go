@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/greatliontech/gmdb/internal/flock"
 )
 
 // staleWriterFile seeds a fresh *File's writer-header with the given
@@ -463,11 +465,11 @@ func TestClearBeforeUnlockOrdering(t *testing.T) {
 		start := f.WriterStartTime()
 		ns := f.WriterPIDNamespace()
 		// Cross-OFD probe: must observe contention — we still hold LOCK_EX.
-		ferr := flockTryExclusive(witness.Fd())
+		ferr := flock.TryExclusive(witness.Fd())
 		if ferr == nil {
 			// Defensive: release if we somehow acquired (would
 			// indicate the test setup is wrong, not the invariant).
-			_ = flockUnlock(witness.Fd())
+			_ = flock.Unlock(witness.Fd())
 		}
 		witnessCh <- witnessResult{pid, start, ns, ferr}
 	})
@@ -501,7 +503,7 @@ func TestClearBeforeUnlockOrdering(t *testing.T) {
 	if w.nsAtHook != 0 {
 		t.Errorf("WriterPIDNamespace at hook = %d, want 0", w.nsAtHook)
 	}
-	if !flockErrContended(w.witnessFlockErr) {
+	if !flock.ErrContended(w.witnessFlockErr) {
 		t.Errorf("witness flock during hook: got %v, want contention (LOCK_EX still held at clear-before-unlock point)", w.witnessFlockErr)
 	}
 }

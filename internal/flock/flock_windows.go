@@ -1,6 +1,6 @@
 //go:build windows
 
-package lock
+package flock
 
 import (
 	"errors"
@@ -22,87 +22,87 @@ import (
 
 // flockRangeOffset is 2^63−1 split into the OVERLAPPED offset halves.
 const (
-	flockRangeOffsetLow  = 0xFFFFFFFF
-	flockRangeOffsetHigh = 0x7FFFFFFF
+	rangeOffsetLow  = 0xFFFFFFFF
+	rangeOffsetHigh = 0x7FFFFFFF
 )
 
-// flockPollInterval paces the blocking acquisitions' poll loop. The
+// pollInterval paces the blocking acquisitions' poll loop. The
 // contended windows are creator-init races measured in milliseconds;
 // 1 ms keeps the wait bounded without busy-spinning.
-const flockPollInterval = time.Millisecond
+const pollInterval = time.Millisecond
 
-func flockRange() *windows.Overlapped {
+func lockRange() *windows.Overlapped {
 	return &windows.Overlapped{
-		Offset:     flockRangeOffsetLow,
-		OffsetHigh: flockRangeOffsetHigh,
+		Offset:     rangeOffsetLow,
+		OffsetHigh: rangeOffsetHigh,
 	}
 }
 
-func flockTry(fd uintptr, exclusive bool) error {
+func tryRange(fd uintptr, exclusive bool) error {
 	flags := uint32(windows.LOCKFILE_FAIL_IMMEDIATELY)
 	if exclusive {
 		flags |= windows.LOCKFILE_EXCLUSIVE_LOCK
 	}
-	return windows.LockFileEx(windows.Handle(fd), flags, 0, 1, 0, flockRange())
+	return windows.LockFileEx(windows.Handle(fd), flags, 0, 1, 0, lockRange())
 }
 
-func flockBlocking(fd uintptr, exclusive bool) error {
+func blocking(fd uintptr, exclusive bool) error {
 	for {
-		err := flockTry(fd, exclusive)
+		err := tryRange(fd, exclusive)
 		if err == nil {
 			return nil
 		}
 		if err != windows.ERROR_LOCK_VIOLATION {
 			return err
 		}
-		time.Sleep(flockPollInterval)
+		time.Sleep(pollInterval)
 	}
 }
 
-// flockShared acquires the shared lock, blocking.
-func flockShared(fd uintptr) error {
-	return flockBlocking(fd, false)
+// Shared acquires the shared lock, blocking.
+func Shared(fd uintptr) error {
+	return blocking(fd, false)
 }
 
-// flockExclusive acquires the exclusive lock, blocking. Callers hold
+// Exclusive acquires the exclusive lock, blocking. Callers hold
 // no lock on fd when calling.
-func flockExclusive(fd uintptr) error {
-	return flockBlocking(fd, true)
+func Exclusive(fd uintptr) error {
+	return blocking(fd, true)
 }
 
-// flockTryExclusive attempts the exclusive lock without blocking.
+// TryExclusive attempts the exclusive lock without blocking.
 // Callers hold no lock on fd when calling.
-func flockTryExclusive(fd uintptr) error {
-	return flockTry(fd, true)
+func TryExclusive(fd uintptr) error {
+	return tryRange(fd, true)
 }
 
-// flockTryConvertToExclusive attempts the exclusive lock without
+// TryConvertToExclusive attempts the exclusive lock without
 // blocking while fd may hold the shared lock. LockFileEx cannot
 // convert — an exclusive request overlapping our own shared range
 // fails — so the seam releases first, matching flock(2)'s documented
 // non-atomic conversion, which every conversion caller tolerates
 // (abort and retry from scratch, re-validating under the new lock).
-func flockTryConvertToExclusive(fd uintptr) error {
-	_ = flockUnlock(fd)
-	return flockTry(fd, true)
+func TryConvertToExclusive(fd uintptr) error {
+	_ = Unlock(fd)
+	return tryRange(fd, true)
 }
 
-// flockUnlock releases whatever lock fd holds. ERROR_NOT_LOCKED on an
+// Unlock releases whatever lock fd holds. ERROR_NOT_LOCKED on an
 // unheld fd is reported but harmless — every caller ignores unlock
 // errors.
-func flockUnlock(fd uintptr) error {
-	return windows.UnlockFileEx(windows.Handle(fd), 0, 1, 0, flockRange())
+func Unlock(fd uintptr) error {
+	return windows.UnlockFileEx(windows.Handle(fd), 0, 1, 0, lockRange())
 }
 
-// flockErrContended reports whether err is the seam's contention
+// ErrContended reports whether err is the seam's contention
 // signal from a non-blocking acquisition — LockFileEx's
 // FAIL_IMMEDIATELY refusal.
-func flockErrContended(err error) bool {
+func ErrContended(err error) bool {
 	return errors.Is(err, windows.ERROR_LOCK_VIOLATION)
 }
 
-// flockErrRetryable — windows has no EINTR; nothing is
+// ErrRetryable — windows has no EINTR; nothing is
 // retry-without-tick.
-func flockErrRetryable(err error) bool {
+func ErrRetryable(err error) bool {
 	return false
 }

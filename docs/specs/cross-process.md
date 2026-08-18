@@ -160,10 +160,13 @@ Invariant: kind=clause-explicit;
     second trigger.
 
 Invariant: kind=clause-explicit;
-  property=Only the flock goroutine ever calls `flock()`; at most
-    one goroutine in the process is attempting `flock` at any
-    moment. Writers communicate with the flock goroutine via a
-    request channel and a per-request response channel;
+  property=Only the flock goroutine ever calls `flock()` on the
+    database's lock-file descriptor; at most one goroutine in the
+    process is attempting `flock` on that descriptor at any moment
+    (other packages' locks on other files — `oslock.md` — are
+    outside this clause). Writers communicate with the flock
+    goroutine via a request channel and a per-request response
+    channel;
   from=this spec §Write Lock (flock goroutine);
   violation=Multiple goroutines calling `flock(LOCK_EX)` block
     indefinitely in the kernel — `Close()` and `ctx` cancellation

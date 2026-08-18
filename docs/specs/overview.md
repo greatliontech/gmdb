@@ -26,10 +26,14 @@ live under `docs/issues/`.
 
 ## Package boundaries
 
-The root `gmdb` package is the public API surface and the
-integration layer; implementation lives in `internal/*` sub-packages
-that depend strictly downward — exactly `btree → page`,
-`pager → page`, and `pager → bitmap`; `internal/lock` stands alone.
+The root `gmdb` package is the database's public API surface and
+the integration layer; `oslock` is the one other public package —
+advisory-lock claims for external consumers (`oslock.md`), sharing
+nothing with the database but the platform seam. Implementation
+lives in `internal/*` sub-packages that depend strictly downward —
+exactly `btree → page`, `pager → page`, `pager → bitmap`,
+`lock → flock`, and `oslock → flock`; `internal/flock` (the
+platform advisory-lock seam) stands alone.
 `btree` never imports `pager`: it reaches storage only through its
 own `PageWriter` interface, satisfied by the pager. No upward or
 sibling imports. A change that appears to force an upward or sibling
