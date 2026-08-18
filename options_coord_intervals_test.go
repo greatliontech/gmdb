@@ -69,11 +69,11 @@ func TestOptionsCoordIntervalsDefault(t *testing.T) {
 }
 
 // TestOptionsCoordIntervalsValidation pins the data-integrity relation
-// StaleTimeout > HeartbeatInterval (cross-process.md §Heartbeat
-// Goroutine) and the non-negative bound. A window at or below the
-// heartbeat cadence lets a jitter-delayed tick misclassify a live
-// reader slot as stale, so Open must reject it rather than silently
-// configure use-after-reclaim.
+// StaleTimeout > HeartbeatInterval (cross-process.md §Writer
+// Heartbeat) and the non-negative bound. A window at or below the
+// heartbeat cadence lets a jitter-delayed tick misjudge a live
+// WRITER's record as stale, so Open must reject it rather than
+// silently configure a false recovery.
 func TestOptionsCoordIntervalsValidation(t *testing.T) {
 	ctx := context.Background()
 	base := func() Options {

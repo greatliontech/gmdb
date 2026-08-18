@@ -16,7 +16,7 @@ import (
 
 // nowMonotonic returns the current monotonic clock in nanoseconds.
 // On non-Linux Unix this is CLOCK_MONOTONIC, which does NOT survive
-// suspend/resume (cross-process.md §Heartbeat Goroutine accepts this
+// suspend/resume (cross-process.md §Writer Heartbeat accepts this
 // — a suspended process accumulates no monotonic time, so its
 // "stale" heartbeat remains exactly StaleTimeout seconds away from
 // triggering false-detection rather than aging past it).

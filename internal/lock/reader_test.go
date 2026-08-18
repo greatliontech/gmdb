@@ -3,11 +3,9 @@ package lock
 import (
 	"context"
 	"errors"
-	"math"
+	"fmt"
 	"os"
-	"runtime"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,71 +30,85 @@ func openTestFile(t *testing.T, maxReaders uint32) *File {
 	return f
 }
 
-// clockAt adapts a fixed timestamp to AcquireReaderSlot's store-time
-// clock parameter for fixtures that need a specific heartbeat value.
-func clockAt(v uint64) func() uint64 { return func() uint64 { return v } }
+// openPeerFile opens a SECOND *File over the same lock file — a
+// distinct handle whose hold/probe descriptions are distinct open
+// file descriptions, so its locks conflict with the first handle's
+// exactly as a separate process's would.
+func openPeerFile(t *testing.T, maxReaders uint32) (*File, *File) {
+	t.Helper()
+	root, base, _ := tmpLock(t)
+	params := OpenParams{
+		Root: root, Base: base, DataUUID: [16]byte{0xAB, 0xCD, 0xEF},
+		MaxReaders: maxReaders,
+	}
+	a, err := Open(params)
+	if err != nil {
+		t.Fatalf("Open a: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	b, err := Open(params)
+	if err != nil {
+		t.Fatalf("Open b: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	return a, b
+}
 
 func TestAcquireReaderSlotBasic(t *testing.T) {
-	// Sanity: acquire returns a valid index, slot fields hold the
-	// stamped identity, TxnID = txnID, PID = pid. End-to-end ordering
-	// invariant exercised more aggressively below.
-	f := openTestFile(t, 4)
-	idx, _, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, clockAt(100))
+	// Sanity: acquire returns a valid index, TxnID and the
+	// diagnostic PID are stored, the reserved fields are zeroed,
+	// and the slot's lock is HELD (a peer handle's probe fails).
+	a, b := openPeerFile(t, 4)
+	idx, err := a.AcquireReaderSlot(0, 42, 7777)
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot: %v", err)
 	}
 	if idx >= 4 {
 		t.Fatalf("slot index %d out of range", idx)
 	}
-	slot := f.Slot(idx)
+	slot := a.Slot(idx)
 	if got := Load64(&slot.TxnID); got != 42 {
 		t.Errorf("TxnID = %d, want 42", got)
 	}
 	if got := Load64(&slot.PID); got != 7777 {
 		t.Errorf("PID = %d, want 7777", got)
 	}
-	if got := Load64(&slot.ProcessStartTime); got != 12345 {
-		t.Errorf("PST = %d, want 12345", got)
+	for i, r := range []*uint64{&slot.Reserved1, &slot.Reserved2, &slot.Reserved3, &slot.Reserved4, &slot.Reserved5} {
+		if got := Load64(r); got != 0 {
+			t.Errorf("Reserved%d = %d, want 0", i+1, got)
+		}
 	}
-	if got := Load64(&slot.PIDNamespace); got != 99 {
-		t.Errorf("PIDNamespace = %d, want 99", got)
-	}
-	if got := Load64(&slot.Heartbeat); got != 100 {
-		t.Errorf("Heartbeat = %d, want 100", got)
-	}
-	if got := Load64(&slot.HintEpoch); got != 0 {
-		t.Errorf("HintEpoch = %d, want 0", got)
+	if _, err := b.locks.tryProbe(idx); !errors.Is(err, errSlotBusy) {
+		t.Fatalf("peer probe of a held slot: %v, want errSlotBusy", err)
 	}
 }
 
 func TestAcquireReaderSlotFull(t *testing.T) {
 	f := openTestFile(t, 2)
-	a, _, err := f.AcquireReaderSlot(0, 1, 1, 1, 1, clockAt(1))
+	a, err := f.AcquireReaderSlot(0, 1, 1)
 	if err != nil {
 		t.Fatalf("acquire 1: %v", err)
 	}
-	b, _, err := f.AcquireReaderSlot(0, 2, 1, 1, 1, clockAt(1))
+	b, err := f.AcquireReaderSlot(0, 2, 1)
 	if err != nil {
 		t.Fatalf("acquire 2: %v", err)
 	}
 	if a == b {
 		t.Errorf("acquire collided on idx %d", a)
 	}
-	_, _, err = f.AcquireReaderSlot(0, 3, 1, 1, 1, clockAt(1))
-	if !errors.Is(err, ErrReadersFull) {
+	if _, err := f.AcquireReaderSlot(0, 3, 1); !errors.Is(err, ErrReadersFull) {
 		t.Errorf("acquire 3: got %v, want ErrReadersFull", err)
 	}
 }
 
 func TestAcquireReaderSlotHintSeeds(t *testing.T) {
-	// hint=k seeds the scan to start at slot k. Pin the directional
-	// behavior (separate from the per-Coord hint *advancement*, which
-	// has its own test below).
-	f := openTestFile(t, 4)
-	// Occupy slot 0 via a raw store (skips the spec-ordered acquire
-	// path; this is a deliberate manufactured pre-state).
-	Store64(&f.Slot(0).TxnID, 99)
-	idx, _, err := f.AcquireReaderSlot(2, 1, 1, 1, 1, clockAt(1))
+	// hint=k seeds the scan to start at slot k (occupied slot 0 is
+	// genuinely HELD by a peer handle so pass 2 cannot reclaim it).
+	a, b := openPeerFile(t, 4)
+	if _, err := b.AcquireReaderSlot(0, 99, 1); err != nil {
+		t.Fatalf("peer occupy: %v", err)
+	}
+	idx, err := a.AcquireReaderSlot(2, 1, 1)
 	if err != nil {
 		t.Fatalf("AcquireReaderSlot hint=2: %v", err)
 	}
@@ -106,21 +118,18 @@ func TestAcquireReaderSlotHintSeeds(t *testing.T) {
 }
 
 func TestCoordAcquireReaderHintAdvances(t *testing.T) {
-	// Per cross-process.md §Reader Table: "Under steady-state load,
-	// the hint points to a recently-freed slot." Coord.AcquireReader
-	// stores the just-allocated slot index back into c.readerSlotHint
-	// so the next scan starts from a fresh-ish region. Pin that
-	// post-condition.
+	// Coord.AcquireReader stores the just-allocated slot index back
+	// into c.readerSlotHint so the next scan starts fresh-ish.
 	c, _ := newTestCoord(t, 10*time.Millisecond)
 	ctx := context.Background()
-	idx, idxGen, err := c.AcquireReader(ctx, 1)
+	idx, err := c.AcquireReader(ctx, 1)
 	if err != nil {
 		t.Fatalf("AcquireReader: %v", err)
 	}
 	if got := c.readerSlotHint.Load(); got != idx {
 		t.Errorf("post-Acquire hint = %d, want %d (idx)", got, idx)
 	}
-	c.ReleaseReader(idx, idxGen)
+	c.ReleaseReader(idx)
 }
 
 func TestAcquireReaderSlotTxnIDZeroPanics(t *testing.T) {
@@ -132,440 +141,195 @@ func TestAcquireReaderSlotTxnIDZeroPanics(t *testing.T) {
 			t.Error("expected panic on txnID=0")
 		}
 	}()
-	_, _, _ = f.AcquireReaderSlot(0, 0, 1, 1, 1, clockAt(1))
+	_, _ = f.AcquireReaderSlot(0, 0, 1)
 }
 
-func TestReleaseReaderSlotOrdering(t *testing.T) {
-	// Pin the release-ordered atomic stores: PID first, TxnID last.
-	// We can't directly observe ordering of completed stores, but we
-	// CAN observe the post-condition: TxnID transitions to 0 after
-	// every other field is already 0. We assert the final state and
-	// rely on the per-store atomicity for correctness.
-	//
-	// The TestStaleClearOrdering test below provides the
-	// race-against-acquire angle that actually exercises the
-	// ordering constraint (HintEpoch first prevents acquirer
-	// inheritance of stale epoch).
-	f := openTestFile(t, 1)
-	idx, gen, err := f.AcquireReaderSlot(0, 42, 7777, 12345, 99, clockAt(100))
+func TestReleaseFreesSlotForNextAcquirer(t *testing.T) {
+	// Release zeroes content BEFORE dropping the lock, and a peer
+	// handle can then acquire the same slot for real.
+	a, b := openPeerFile(t, 1)
+	idx, err := a.AcquireReaderSlot(0, 7, 1)
 	if err != nil {
-		t.Fatalf("AcquireReaderSlot: %v", err)
+		t.Fatalf("acquire: %v", err)
 	}
-	f.ReleaseReaderSlot(idx, gen)
-	slot := f.Slot(idx)
-	for name, p := range map[string]*uint64{
-		"TxnID": &slot.TxnID, "PID": &slot.PID,
-		"Heartbeat": &slot.Heartbeat, "HintEpoch": &slot.HintEpoch,
-	} {
-		if got := Load64(p); got != 0 {
-			t.Errorf("post-release %s = %d, want 0", name, got)
-		}
+	if _, err := b.AcquireReaderSlot(0, 8, 2); !errors.Is(err, ErrReadersFull) {
+		t.Fatalf("peer acquire of held single slot: %v, want ErrReadersFull", err)
+	}
+	a.ReleaseReaderSlot(idx)
+	if got := Load64(&a.Slot(idx).TxnID); got != 0 {
+		t.Fatalf("released TxnID = %d, want 0", got)
+	}
+	idx2, err := b.AcquireReaderSlot(0, 8, 2)
+	if err != nil {
+		t.Fatalf("peer acquire after release: %v", err)
+	}
+	if got := Load64(&b.Slot(idx2).TxnID); got != 8 {
+		t.Fatalf("peer TxnID = %d, want 8", got)
 	}
 }
 
-func TestClearStaleReaderSlotOrdering(t *testing.T) {
-	// Pin HintEpoch-first ordering: after ClearStaleReaderSlot the
-	// slot is free (TxnID == 0) AND any prior epoch is cleared
-	// (HintEpoch == 0). The reverse order would let a fresh acquirer
-	// CAS-win TxnID after the TxnID=0 store but before the
-	// HintEpoch=0 store and inherit a stale epoch — see the spec's
-	// per-occupant timer invariant.
+func TestStaleSlotReclaimedInlineOnFullTable(t *testing.T) {
+	// Pass 2 of the acquire scan try-locks every slot: a dead
+	// owner's residue (nonzero TxnID, unheld lock) is taken over in
+	// place — the inline form of stale reclamation.
 	f := openTestFile(t, 1)
-	// Manufacture a stuck mid-acquire state: TxnID != 0, PID == 0,
-	// Heartbeat == 0, HintEpoch = old-stale-value.
-	slot := f.Slot(0)
-	Store64(&slot.TxnID, 5)
-	Store64(&slot.HintEpoch, 12345)
-	f.ClearStaleReaderSlot(0)
-	if got := Load64(&slot.TxnID); got != 0 {
-		t.Errorf("post-clear TxnID = %d, want 0", got)
+	// Dead residue: raw store with no lock held anywhere.
+	Store64(&f.Slot(0).TxnID, 99)
+	idx, err := f.AcquireReaderSlot(0, 5, 1)
+	if err != nil {
+		t.Fatalf("acquire over dead residue: %v", err)
 	}
-	if got := Load64(&slot.HintEpoch); got != 0 {
-		t.Errorf("post-clear HintEpoch = %d, want 0", got)
+	if idx != 0 {
+		t.Fatalf("landed on %d, want 0", idx)
+	}
+	if got := Load64(&f.Slot(0).TxnID); got != 5 {
+		t.Fatalf("TxnID = %d, want 5 (residue overwritten)", got)
+	}
+}
+
+func TestOwnHeldSlotNeverReclaimed(t *testing.T) {
+	// Pass 2 must skip THIS handle's own held slots structurally: a
+	// try-lock through the same hold description would "succeed"
+	// against our own live reader (same-description caveat).
+	f := openTestFile(t, 1)
+	if _, err := f.AcquireReaderSlot(0, 7, 1); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, err := f.AcquireReaderSlot(0, 8, 1); !errors.Is(err, ErrReadersFull) {
+		t.Fatalf("second acquire stole own held slot: %v, want ErrReadersFull", err)
+	}
+	if got := Load64(&f.Slot(0).TxnID); got != 7 {
+		t.Fatalf("own slot TxnID = %d, want 7 (untouched)", got)
 	}
 }
 
 func TestOldestReaderTxnIDEmpty(t *testing.T) {
 	f := openTestFile(t, 4)
-	got := f.OldestReaderTxnID(99, 0, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
-	if got != math.MaxUint64 {
-		t.Errorf("empty table OldestReaderTxnID = %d, want MaxUint64", got)
+	if got := f.OldestReaderTxnID(); got != NoReaderTxnID {
+		t.Errorf("empty table oldest = %d, want NoReaderTxnID", got)
 	}
 }
 
 func TestOldestReaderTxnIDMinOfMany(t *testing.T) {
 	f := openTestFile(t, 4)
-	// All slots in this process's namespace, all alive.
-	myPID := uint64(os.Getpid())
-	myPST, _ := ProcessStartTime(os.Getpid())
-	myNS, _ := PIDNamespace()
-	// PIDNamespace may be 0 on non-Linux — that routes through the
-	// cross-namespace heartbeat path; we provide a recent heartbeat
-	// so the slots aren't classified stale.
-	now := uint64(time.Now().UnixNano())
-	for i, txn := range []uint64{50, 10, 30, 25} {
-		idx, _, err := f.AcquireReaderSlot(uint32(i), txn, myPID, myPST, myNS, clockAt(now))
-		if err != nil {
-			t.Fatalf("acquire %d: %v", i, err)
+	for _, txn := range []uint64{30, 10, 20} {
+		if _, err := f.AcquireReaderSlot(0, txn, 1); err != nil {
+			t.Fatalf("acquire %d: %v", txn, err)
 		}
-		_ = idx
 	}
-	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
-	if got != 10 {
-		t.Errorf("OldestReaderTxnID = %d, want 10", got)
+	if got := f.OldestReaderTxnID(); got != 10 {
+		t.Errorf("oldest = %d, want 10", got)
 	}
 }
 
-func TestOldestReaderTxnIDClearsStaleHeartbeat(t *testing.T) {
-	// Cross-namespace + aged heartbeat ⇒ stale ⇒ clear in-place.
-	// Slot's PID is a foreign value in a "different" namespace so
-	// the heartbeat path is taken.
+func TestOldestReaderTxnIDStalePinsUntilReap(t *testing.T) {
+	// The bound scan is a pure memory read: a dead owner's residue
+	// conservatively pins the bound; the probe-based reap clears it
+	// and the bound recovers.
+	f := openTestFile(t, 4)
+	if _, err := f.AcquireReaderSlot(0, 30, 1); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	Store64(&f.Slot(3).TxnID, 5) // dead residue, unheld
+	if got := f.OldestReaderTxnID(); got != 5 {
+		t.Fatalf("oldest with stale = %d, want 5 (conservative pin)", got)
+	}
+	if cleared, _ := f.ReapStaleReaderSlots(); cleared != 1 {
+		t.Fatalf("reap cleared %d, want 1", cleared)
+	}
+	if got := f.OldestReaderTxnID(); got != 30 {
+		t.Fatalf("oldest after reap = %d, want 30", got)
+	}
+}
+
+func TestReapNeverEvictsLiveReader(t *testing.T) {
+	// The verdict and the clear are one act under the slot's lock: a
+	// peer's reap probes the held lock, fails, and touches nothing —
+	// the heartbeat era's guarded-clear races are unrepresentable.
+	a, b := openPeerFile(t, 2)
+	idx, err := a.AcquireReaderSlot(0, 7, 1)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	Store64(&b.Slot(1).TxnID, 9) // dead residue beside the live slot
+	if cleared, _ := b.ReapStaleReaderSlots(); cleared != 1 {
+		t.Fatalf("peer reap cleared %d, want 1 (the residue only)", cleared)
+	}
+	if got := Load64(&a.Slot(idx).TxnID); got != 7 {
+		t.Fatalf("live slot TxnID = %d, want 7 (never evicted)", got)
+	}
+	a.ReleaseReaderSlot(idx)
+}
+
+func TestReapSkipsOwnHeldSlots(t *testing.T) {
 	f := openTestFile(t, 2)
-	now := uint64(time.Now().UnixNano())
-	stale := now - 2*uint64(DefaultStaleTimeout)
-	// Both slots use foreign namespace stamps (different from
-	// ourPIDNS=99 in the scan below). Stamping PIDNS=99 here would
-	// trigger the same-namespace IsAlive(pid) path against PIDs
-	// 9999/8888 which don't exist in this test process, classifying
-	// both as stale and defeating the heartbeat-path intent.
-	if _, _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(stale)); err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	// Live slot also cross-namespace, fresh heartbeat.
-	if _, _, err := f.AcquireReaderSlot(1, 11, 8888, 1, 77, clockAt(now)); err != nil {
-		t.Fatalf("acquire live: %v", err)
-	}
-	// First call should clear the stale slot (its TxnID=7) and
-	// leave the live one (TxnID=11). For the live slot to count as
-	// alive in our scan we need IsAlive(8888) to return false (no
-	// such PID) — and on the cross-namespace path that triggers
-	// the heartbeat fallback. Since slot 1 has a fresh heartbeat,
-	// it stays.
-	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
-	if got != 11 {
-		t.Errorf("after stale clear, OldestReaderTxnID = %d, want 11", got)
-	}
-	if Load64(&f.Slot(0).TxnID) != 0 {
-		t.Errorf("stale slot 0 not cleared; TxnID = %d", Load64(&f.Slot(0).TxnID))
-	}
-}
-
-func TestOldestReaderTxnIDCase0aFreshHBSkipsClear(t *testing.T) {
-	// Case 0a: TxnID != 0, PID == 0, Heartbeat != 0 and fresh.
-	// The acquirer made it past step 4a (Heartbeat store) but is
-	// still mid-publish (PID not yet stamped). Treat as live —
-	// TxnID enters min; slot is NOT cleared.
-	f := openTestFile(t, 1)
-	slot := f.Slot(0)
-	now := uint64(1_000_000_000)
-	stale := uint64(time.Second)
-	Store64(&slot.TxnID, 42)
-	Store64(&slot.Heartbeat, now-stale/2) // fresh
-	got := f.OldestReaderTxnID(99, now, stale, stale)
-	if got != 42 {
-		t.Errorf("case 0a: got %d, want 42 (live mid-publish)", got)
-	}
-	if Load64(&slot.TxnID) != 42 {
-		t.Errorf("case 0a: slot cleared spuriously")
-	}
-}
-
-func TestOldestReaderTxnIDCase0bStaleHBClears(t *testing.T) {
-	// Case 0b: TxnID != 0, PID == 0, Heartbeat != 0 but aged out.
-	// The acquirer crashed between step 4a (Heartbeat store) and
-	// step 4e (PID store); heartbeat is now older than StaleTimeout.
-	// Clear the slot.
-	f := openTestFile(t, 1)
-	slot := f.Slot(0)
-	// now must exceed 2*stale so the "aged out" heartbeat is a genuine PAST
-	// value. (The earlier now=1s, hb=now-2*stale underflowed to a ~2^64
-	// future stamp; the pre-future-guard code cleared it only via a second
-	// underflow in the comparison — a pass for the wrong reason. With the
-	// future-heartbeat guard a future stamp is correctly treated as fresh,
-	// so the stale case must be constructed as an actual past timestamp.)
-	stale := uint64(time.Second)
-	now := 10 * stale
-	Store64(&slot.TxnID, 42)
-	Store64(&slot.Heartbeat, now-2*stale) // aged out: now-hb = 2*stale > stale
-	got := f.OldestReaderTxnID(99, now, stale, stale)
-	if got != math.MaxUint64 {
-		t.Errorf("case 0b: got %d, want MaxUint64 (slot cleared)", got)
-	}
-	if Load64(&slot.TxnID) != 0 {
-		t.Errorf("case 0b: slot not cleared")
-	}
-}
-
-func TestOldestReaderTxnIDCase0aFutureHBSkipsClear(t *testing.T) {
-	// Regression (reader-stale-detection future-heartbeat underflow): a
-	// mid-publish reader (PID==0) whose Heartbeat is AHEAD of the scanner's
-	// nowNanos must be treated as live. Pre-fix nowNanos-hb underflowed
-	// (unsigned) to ~2^64, which is not <= staleTimeout, so the slot fell
-	// through to the 0b clear and a live reader was evicted — its pinned
-	// TxnID left the table and RPL reclamation could free pages it was about
-	// to read. The HB-first/PID-last acquire ordering exists precisely to
-	// keep this mid-publish window safe; the underflow defeated it.
-	f := openTestFile(t, 1)
-	slot := f.Slot(0)
-	now := uint64(1_000_000_000)
-	stale := uint64(time.Second)
-	Store64(&slot.TxnID, 42)
-	Store64(&slot.Heartbeat, now+stale) // FUTURE — reader's clock read raced ahead of the scan
-	got := f.OldestReaderTxnID(99, now, stale, stale)
-	if got != 42 {
-		t.Errorf("case 0a future HB: got %d, want 42 (live mid-publish, not evicted)", got)
-	}
-	if Load64(&slot.TxnID) != 42 {
-		t.Errorf("case 0a future HB: live slot cleared (underflow eviction)")
-	}
-}
-
-func TestOldestReaderTxnIDCase0cFutureEpochSkipsClear(t *testing.T) {
-	// Case 0c (PID==0, Heartbeat==0) with a HintEpoch orphan anchor in the
-	// future relative to this scanner (a peer writer stamped it on a clock
-	// ahead of ours). nowNanos-epoch must not underflow-clear a slot whose
-	// orphan timer has not actually elapsed.
-	f := openTestFile(t, 1)
-	slot := f.Slot(0)
-	now := uint64(1_000_000_000)
-	stale := uint64(time.Second)
-	Store64(&slot.TxnID, 9)
-	Store64(&slot.HintEpoch, now+stale) // FUTURE epoch
-	got := f.OldestReaderTxnID(99, now, stale, stale)
-	if got != 9 {
-		t.Errorf("case 0c future epoch: got %d, want 9 (orphan timer not elapsed)", got)
-	}
-	if Load64(&slot.TxnID) != 9 {
-		t.Errorf("case 0c future epoch: live slot cleared (underflow eviction)")
-	}
-}
-
-func TestOldestReaderTxnIDCase2FutureHBSkipsClear(t *testing.T) {
-	// Case 2 (cross-namespace, heartbeat-only liveness) with a future
-	// heartbeat — same underflow guard. On darwin/freebsd the codebase's own
-	// model has per-process CLOCK_MONOTONIC origins so a peer's stamp can
-	// routinely exceed our nowNanos, making this directly reachable.
-	f := openTestFile(t, 1)
-	now := uint64(time.Now().UnixNano())
-	future := now + uint64(DefaultStaleTimeout) // ahead of the scan clock
-	// Foreign namespace (≠ ourPIDNS=99 in the scan) so the heartbeat path is
-	// taken rather than same-namespace IsAlive against a nonexistent PID.
-	if _, _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(future)); err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
-	if got != 7 {
-		t.Errorf("case 2 future HB: got %d, want 7 (live, not evicted)", got)
-	}
-	if Load64(&f.Slot(0).TxnID) != 7 {
-		t.Errorf("case 2 future HB: live slot cleared (underflow eviction)")
-	}
-}
-
-func TestOldestReaderTxnIDHintEpochAnchor(t *testing.T) {
-	// Case 0c: PID==0 AND Heartbeat==0 — first observer CAS-stores
-	// HintEpoch=nowNanos; the slot is NOT cleared until
-	// (now - HintEpoch) > staleTimeout. Two scans separated in
-	// "wall time" pin the protocol.
-	f := openTestFile(t, 1)
-	slot := f.Slot(0)
-	// Manufacture the stuck-mid-acquire state directly.
-	Store64(&slot.TxnID, 9)
-	// First scan: anchors HintEpoch.
-	t0 := uint64(1_000_000_000)
-	staleNs := uint64(time.Second)
-	got := f.OldestReaderTxnID(99, t0, staleNs, staleNs)
-	// Skip — slot remains observably non-free, treated as live for
-	// reclamation safety (TxnID=9 enters min).
-	if got != 9 {
-		t.Errorf("first scan: got %d, want 9 (anchor-set, treat as live)", got)
-	}
-	if Load64(&slot.HintEpoch) != t0 {
-		t.Errorf("HintEpoch after first scan = %d, want %d", Load64(&slot.HintEpoch), t0)
-	}
-	if Load64(&slot.TxnID) != 9 {
-		t.Errorf("first scan must NOT clear slot; TxnID = %d", Load64(&slot.TxnID))
-	}
-	// Second scan within timeout: still skip.
-	got = f.OldestReaderTxnID(99, t0+staleNs/2, staleNs, staleNs)
-	if got != 9 {
-		t.Errorf("second scan (in-window): got %d, want 9", got)
-	}
-	if Load64(&slot.TxnID) != 9 {
-		t.Errorf("in-window scan cleared slot")
-	}
-	// Third scan past timeout: clear.
-	got = f.OldestReaderTxnID(99, t0+2*staleNs, staleNs, staleNs)
-	if Load64(&slot.TxnID) != 0 {
-		t.Errorf("post-timeout scan must clear; TxnID = %d", Load64(&slot.TxnID))
-	}
-	if got != math.MaxUint64 {
-		t.Errorf("post-clear with no other slots: got %d, want MaxUint64", got)
-	}
-	if Load64(&slot.HintEpoch) != 0 {
-		t.Errorf("HintEpoch not reset by ClearStaleReaderSlot")
-	}
-}
-
-func TestOldestReaderTxnIDSameNamespaceLiveSkipsClear(t *testing.T) {
-	// Same-namespace PID==!0 path: kill(pid, 0) on our own PID
-	// returns success — slot must NOT be cleared and TxnID must
-	// participate in min.
-	f := openTestFile(t, 1)
-	myPID := uint64(os.Getpid())
-	myPST, err := ProcessStartTime(os.Getpid())
+	idx, err := f.AcquireReaderSlot(0, 7, 1)
 	if err != nil {
-		t.Skipf("ProcessStartTime unavailable on this platform: %v", err)
-	}
-	myNS, _ := PIDNamespace()
-	if myNS == 0 {
-		// Cross-namespace path would be taken; skip the same-NS
-		// assertion. Heartbeat fallback covers it elsewhere.
-		t.Skip("PIDNamespace = 0 on this host; same-namespace path not exercised")
-	}
-	now := uint64(time.Now().UnixNano())
-	if _, _, err := f.AcquireReaderSlot(0, 77, myPID, myPST, myNS, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
-	if got != 77 {
-		t.Errorf("same-NS live slot dropped: got %d, want 77", got)
+	if cleared, _ := f.ReapStaleReaderSlots(); cleared != 0 {
+		t.Fatalf("reap cleared %d of its own handle's slots, want 0", cleared)
 	}
-	if Load64(&f.Slot(0).TxnID) != 77 {
-		t.Errorf("same-NS live slot cleared spuriously")
+	if got := Load64(&f.Slot(idx).TxnID); got != 7 {
+		t.Fatalf("own slot TxnID = %d, want 7", got)
 	}
 }
 
-func TestOldestReaderTxnIDSameNamespacePSTMismatchClears(t *testing.T) {
-	// Same-namespace path step (b): PID alive but ProcessStartTime
-	// mismatch ⇒ PID was recycled ⇒ stale, clear.
+func TestRaiseReaderSlotTxnID(t *testing.T) {
+	// The restabilization raise is an owner-only overwrite under the
+	// held lock.
 	f := openTestFile(t, 1)
-	myPID := uint64(os.Getpid())
-	myPST, err := ProcessStartTime(os.Getpid())
+	idx, err := f.AcquireReaderSlot(0, 7, 1)
 	if err != nil {
-		t.Skipf("ProcessStartTime unavailable: %v", err)
-	}
-	myNS, _ := PIDNamespace()
-	if myNS == 0 {
-		t.Skip("PIDNamespace = 0; same-namespace path not exercised")
-	}
-	now := uint64(time.Now().UnixNano())
-	// Acquire with a deliberately wrong PST so the rescan sees a
-	// mismatch and treats the slot as PID-recycled-since-acquire.
-	if _, _, err := f.AcquireReaderSlot(0, 33, myPID, myPST+1, myNS, clockAt(now)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
-	if Load64(&f.Slot(0).TxnID) != 0 {
-		t.Errorf("PST-mismatch slot not cleared")
-	}
-	if got != math.MaxUint64 {
-		t.Errorf("after sole stale clear: got %d, want MaxUint64", got)
+	f.RaiseReaderSlotTxnID(idx, 9)
+	if got := Load64(&f.Slot(idx).TxnID); got != 9 {
+		t.Fatalf("raised TxnID = %d, want 9", got)
 	}
 }
 
-func TestOldestReaderTxnIDSameNamespaceDeadPIDClears(t *testing.T) {
-	// Same-namespace path step (a): we need a PID that is
-	// definitively dead. Approach: spawn a child, capture its PID,
-	// wait for it to exit + reap it (so its PID is freed at the
-	// kernel level), then stamp the slot with the dead PID + a
-	// matching PST recorded BEFORE the wait.
-	//
-	// Race robustness: between Wait and the OldestReaderTxnID scan
-	// the kernel could recycle the freed PID to an unrelated
-	// process. If that happens, IsAlive(pid) returns true and the
-	// code falls through to the ProcessStartTime check — the
-	// recycled process's PST will not equal the recorded one, so
-	// the PST-mismatch branch (reader.go) clears the slot. The
-	// test is therefore deterministic against PID-recycle, not
-	// merely probabilistic.
-	myNS, _ := PIDNamespace()
-	if myNS == 0 {
-		t.Skip("PIDNamespace = 0; same-namespace path not exercised")
-	}
-	// /bin/true exits immediately. Wait reaps the zombie. PID is
-	// then a "dead PID" until the OS recycles it. With 4 M PIDs
-	// (Linux default), recycle in a 1-tick window is improbable.
-	cmd := exec("/bin/true")
-	if cmd == nil {
-		t.Skip("no /bin/true available")
-	}
-	pid := uint64(cmd.Process.Pid)
-	pst, _ := ProcessStartTime(int(pid))
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("wait: %v", err)
-	}
-	f := openTestFile(t, 1)
-	now := uint64(time.Now().UnixNano())
-	if _, _, err := f.AcquireReaderSlot(0, 55, pid, pst, myNS, clockAt(now)); err != nil {
+func TestSlotLockSurvivesOwnerHandleClose(t *testing.T) {
+	// A read transaction may outlive DB.Close: the slot's lock must
+	// stay held until the transaction's own release — the hold
+	// description rides the mapping's refcount
+	// (cross-process.md §Reader Table, descriptions outlive Close).
+	a, b := openPeerFile(t, 1)
+	idx, err := a.AcquireReaderSlot(0, 7, 1)
+	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
-	if Load64(&f.Slot(0).TxnID) != 0 {
-		t.Errorf("dead-PID slot not cleared")
+	a.Ref()       // the outstanding transaction's lifetime reference
+	_ = a.Close() // the owning handle's drop — NOT the last
+	if cleared, _ := b.ReapStaleReaderSlots(); cleared != 0 {
+		t.Fatalf("peer reaped %d slots under a post-Close live transaction, want 0", cleared)
 	}
-	if got != math.MaxUint64 {
-		t.Errorf("after dead-PID clear: got %d, want MaxUint64", got)
+	a.ReleaseReaderSlot(idx)
+	_ = a.Close() // the transaction's drop — final
+	if cleared, _ := b.ReapStaleReaderSlots(); cleared != 0 {
+		t.Fatalf("reap after clean release cleared %d, want 0 (slot was zeroed)", cleared)
 	}
 }
-
-// exec is a thin wrapper around os/exec.Cmd.Start with stdout/stderr
-// muted; keeps the dead-PID test compact. Returns nil on
-// non-existence of the binary so the caller can Skip.
-func exec(path string) *cmdProcess {
-	c := &cmdProcess{}
-	if _, err := osStatFile(path); err != nil {
-		return nil
-	}
-	if err := c.start(path); err != nil {
-		return nil
-	}
-	return c
-}
-
-// cmdProcess avoids importing os/exec at the package level for one
-// test — keeps imports minimal. We just need PID + Wait().
-type cmdProcess struct {
-	Process *os.Process
-}
-
-func (c *cmdProcess) start(path string) error {
-	attr := &os.ProcAttr{}
-	p, err := os.StartProcess(path, []string{path}, attr)
-	if err != nil {
-		return err
-	}
-	c.Process = p
-	return nil
-}
-
-func (c *cmdProcess) Wait() error {
-	_, err := c.Process.Wait()
-	return err
-}
-
-func osStatFile(path string) (os.FileInfo, error) { return os.Stat(path) }
 
 func TestCoordAcquireReleaseReader(t *testing.T) {
 	c, f := newTestCoord(t, 10*time.Millisecond)
 	ctx := context.Background()
-	idx, idxGen, err := c.AcquireReader(ctx, 5)
+	idx, err := c.AcquireReader(ctx, 42)
 	if err != nil {
 		t.Fatalf("AcquireReader: %v", err)
 	}
-	if idx == NoSlot {
-		t.Fatal("AcquireReader returned NoSlot")
+	if got := Load64(&f.Slot(idx).TxnID); got != 42 {
+		t.Errorf("TxnID = %d, want 42", got)
 	}
-	slot := f.Slot(idx)
-	if got := Load64(&slot.TxnID); got != 5 {
-		t.Errorf("slot TxnID = %d, want 5", got)
+	if got := c.ActiveReaderSlots(); got != 1 {
+		t.Errorf("ActiveReaderSlots = %d, want 1", got)
 	}
-	if got := Load64(&slot.PID); got != 4242 {
-		t.Errorf("slot PID = %d, want 4242", got)
+	c.ReleaseReader(idx)
+	if got := c.ActiveReaderSlots(); got != 0 {
+		t.Errorf("ActiveReaderSlots after release = %d, want 0", got)
 	}
-	c.ReleaseReader(idx, idxGen)
-	if got := Load64(&slot.TxnID); got != 0 {
-		t.Errorf("post-Release TxnID = %d, want 0", got)
+	if got := Load64(&f.Slot(idx).TxnID); got != 0 {
+		t.Errorf("TxnID after release = %d, want 0", got)
 	}
 }
 
@@ -573,649 +337,557 @@ func TestCoordAcquireReaderRespectsCtxCancel(t *testing.T) {
 	c, _ := newTestCoord(t, 10*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err := c.AcquireReader(ctx, 1)
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("AcquireReader on cancelled ctx: got %v, want context.Canceled", err)
+	if _, err := c.AcquireReader(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AcquireReader on cancelled ctx: %v", err)
 	}
 }
 
 func TestCoordAcquireReaderFullNoDeadline(t *testing.T) {
-	// Table size 1; one acquire fills it; second acquire surfaces
-	// ErrReadersFull immediately when ctx has no deadline.
-	root, base, _ := tmpLock(t)
-	f, err := Open(OpenParams{
-		Root: root, Base: base, DataUUID: [16]byte{0x1}, MaxReaders: 1,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
+	// A full table with an undeadlined ctx surfaces ErrReadersFull
+	// immediately (transactions.md §Read Transaction step 2).
+	c, f := newTestCoord(t, 10*time.Millisecond)
+	max := f.MaxReaders()
+	for i := uint32(0); i < max; i++ {
+		if _, err := c.AcquireReader(context.Background(), 1); err != nil {
+			t.Fatalf("fill %d: %v", i, err)
+		}
 	}
-	c := NewCoord(f, CoordOptions{PID: 1, RetryInterval: 10 * time.Millisecond})
-	t.Cleanup(func() {
-		_ = c.Close()
-		_ = f.Close()
-	})
-	if _, _, err := c.AcquireReader(context.Background(), 1); err != nil {
-		t.Fatalf("first acquire: %v", err)
-	}
-	_, _, err = c.AcquireReader(context.Background(), 2)
-	if !errors.Is(err, ErrReadersFull) {
-		t.Errorf("no-deadline second acquire: got %v, want ErrReadersFull", err)
+	if _, err := c.AcquireReader(context.Background(), 1); !errors.Is(err, ErrReadersFull) {
+		t.Fatalf("full, no deadline: %v, want ErrReadersFull", err)
 	}
 }
 
 func TestCoordAcquireReaderFullWithDeadline(t *testing.T) {
-	// With a deadline, AcquireReader retries until a slot frees or
-	// the deadline fires. Verify deadline-driven timeout.
-	root, base, _ := tmpLock(t)
-	f, err := Open(OpenParams{
-		Root: root, Base: base, DataUUID: [16]byte{0x2}, MaxReaders: 1,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	c := NewCoord(f, CoordOptions{PID: 1, RetryInterval: 10 * time.Millisecond})
-	t.Cleanup(func() {
-		_ = c.Close()
-		_ = f.Close()
-	})
-	if _, _, err := c.AcquireReader(context.Background(), 1); err != nil {
-		t.Fatalf("hold: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	_, _, err = c.AcquireReader(ctx, 2)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("deadlined second acquire: got %v, want DeadlineExceeded", err)
-	}
-}
-
-func TestCoordOldestReaderTxnIDLiveWithFlock(t *testing.T) {
-	// Caller-side LOCK_EX precondition test. We take LOCK_EX on
-	// the fd ourselves (mimicking the writer-path flock goroutine)
-	// before calling OldestReaderTxnID, then assert the value
-	// reflects the live readers.
-	//
-	// The Coord under test uses the real os.Getpid() / Process
-	// StartTime so the same-namespace IsAlive path classifies the
-	// slots as live. newTestCoord's fake PID=4242 would be killed
-	// by IsAlive (no such PID) — wrong harness for this test.
-	root, base, _ := tmpLock(t)
-	f, err := Open(OpenParams{
-		Root: root, Base: base, DataUUID: [16]byte{0xAB}, MaxReaders: 8,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	myPST, _ := ProcessStartTime(os.Getpid())
-	myNS, _ := PIDNamespace()
-	c := NewCoord(f, CoordOptions{
-		PID:              uint64(os.Getpid()),
-		ProcessStartTime: myPST,
-		PIDNamespace:     myNS,
-		RetryInterval:    10 * time.Millisecond,
-	})
-	t.Cleanup(func() {
-		_ = c.Close()
-		_ = f.Close()
-	})
-	ctx := context.Background()
-	// Two concurrent reader-tx Begins -> two slots.
-	idxA, idxAGen, err := c.AcquireReader(ctx, 10)
-	if err != nil {
-		t.Fatalf("acquire A: %v", err)
-	}
-	idxB, idxBGen, err := c.AcquireReader(ctx, 7)
-	if err != nil {
-		t.Fatalf("acquire B: %v", err)
-	}
-	// Take LOCK_EX so OldestReaderTxnID is invoked in its
-	// production state.
-	if err := flock.Exclusive(f.Fd()); err != nil {
-		t.Fatalf("flock: %v", err)
-	}
-	defer flock.Unlock(f.Fd())
-	got := c.OldestReaderTxnID()
-	if got != 7 {
-		t.Errorf("OldestReaderTxnID = %d, want 7", got)
-	}
-	c.ReleaseReader(idxA, idxAGen)
-	c.ReleaseReader(idxB, idxBGen)
-}
-
-func TestCoordStaleTimeoutThreadsToOldestReaderTxnID(t *testing.T) {
-	// The configured CoordOptions windows — not hard-coded defaults —
-	// govern reader-slot stale eviction in OldestReaderTxnID. A
-	// CROSS-namespace slot is governed by CrossNamespaceStaleTimeout
-	// (cross-process.md §Stale-reader detection, cross-namespace
-	// window); both are set to the straddling value so the test pins
-	// the threading. Manufacture one cross-namespace reader slot
-	// whose heartbeat lags the scan clock by `age`, then read it back
-	// under two coords whose StaleTimeouts straddle `age`: the short
-	// window evicts the slot (no live reader ⇒ MaxUint64 sentinel); the
-	// long window keeps it (returns its TxnID).
-	const now uint64 = 1_000_000_000_000 // 1000 s in ns
-	const age = 5 * time.Second
-	aged := now - uint64(age)
-
-	read := func(stale time.Duration) uint64 {
-		f := openTestFile(t, 4)
-		// Manufacture a slot whose namespace stays 0 so the scan (with
-		// ourPIDNS = 0) takes the cross-/unknown-namespace heartbeat
-		// path rather than the same-NS kill() path.
-		s := f.Slot(0)
-		Store64(&s.TxnID, 42)
-		Store64(&s.PID, 9999)
-		Store64(&s.Heartbeat, aged)
-		c := NewCoord(f, CoordOptions{
-			PID:                        1,
-			PIDNamespace:               0,
-			RetryInterval:              10 * time.Millisecond,
-			StaleTimeout:               stale,
-			CrossNamespaceStaleTimeout: stale,
-			Clock:                      func() uint64 { return now },
-		})
-		t.Cleanup(func() { _ = c.Close() })
-		// OldestReaderTxnID's documented precondition: caller holds
-		// LOCK_EX. The Coord's flock goroutine never flocks here (no
-		// writer request is issued), so taking it directly is safe.
-		if err := flock.Exclusive(f.Fd()); err != nil {
-			t.Fatalf("flock: %v", err)
+	// With a deadline, the acquirer retries until a slot frees.
+	c, f := newTestCoord(t, 10*time.Millisecond)
+	max := f.MaxReaders()
+	slots := make([]uint32, 0, max)
+	for i := uint32(0); i < max; i++ {
+		idx, err := c.AcquireReader(context.Background(), 1)
+		if err != nil {
+			t.Fatalf("fill %d: %v", i, err)
 		}
-		defer func() { _ = flock.Unlock(f.Fd()) }()
-		return c.OldestReaderTxnID()
+		slots = append(slots, idx)
 	}
-
-	if got := read(age - 2*time.Second); got != math.MaxUint64 {
-		t.Errorf("StaleTimeout (%v) < slot age (%v): got %d, want MaxUint64 (slot evicted)", age-2*time.Second, age, got)
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		c.ReleaseReader(slots[0])
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	idx, err := c.AcquireReader(ctx, 2)
+	if err != nil {
+		t.Fatalf("deadline acquire after free: %v", err)
 	}
-	if got := read(age + 2*time.Second); got != 42 {
-		t.Errorf("StaleTimeout (%v) > slot age (%v): got %d, want 42 (slot retained)", age+2*time.Second, age, got)
-	}
+	c.ReleaseReader(idx)
 }
 
-// TestAcquireReaderConcurrentNoSlotAliasing exercises the CAS-
-// serialisation: N goroutines acquire concurrently; assert no two
-// land on the same slot. Pinpoints invariant: the CAS on TxnID
-// gates ownership.
 func TestAcquireReaderConcurrentNoSlotAliasing(t *testing.T) {
-	const N = 64
-	f := openTestFile(t, N)
+	// N same-handle goroutines acquiring concurrently never alias a
+	// slot: the Coord's acquisition mutex serializes them (two
+	// try-locks through one hold description would not conflict).
+	c, f := newTestCoord(t, 10*time.Millisecond)
+	max := int(f.MaxReaders())
 	var wg sync.WaitGroup
-	slots := make([]uint32, N)
-	var errCount atomic.Int32
-	now := uint64(time.Now().UnixNano())
-	for i := range N {
+	got := make([]uint32, max)
+	for i := 0; i < max; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			idx, _, err := f.AcquireReaderSlot(0, uint64(i+1), uint64(i+1), 1, 99, clockAt(now))
+			idx, err := c.AcquireReader(context.Background(), uint64(i+1))
 			if err != nil {
-				errCount.Add(1)
+				t.Errorf("acquire %d: %v", i, err)
+				got[i] = NoSlot
 				return
 			}
-			slots[i] = idx
+			got[i] = idx
 		}(i)
 	}
 	wg.Wait()
-	if e := errCount.Load(); e != 0 {
-		t.Fatalf("%d acquire errors", e)
-	}
-	seen := make(map[uint32]int)
-	for i, s := range slots {
-		if prev, ok := seen[s]; ok {
-			t.Errorf("slot %d aliased: i=%d and i=%d", s, prev, i)
+	seen := map[uint32]bool{}
+	for i, idx := range got {
+		if idx == NoSlot {
+			continue
 		}
-		seen[s] = i
+		if seen[idx] {
+			t.Fatalf("slot %d aliased (goroutine %d)", idx, i)
+		}
+		seen[idx] = true
+	}
+	for idx := range seen {
+		c.ReleaseReader(idx)
 	}
 }
 
-// TestCoordReaderHeartbeatRegistration confirms AcquireReader
-// registers the slot with the heartbeat goroutine's active list,
-// ReleaseReader unregisters, and (the structural test) the
-// goroutine's tick refreshes the slot's Heartbeat field while
-// active.
-func TestCoordReaderHeartbeatRegistration(t *testing.T) {
-	clk := atomic.Uint64{}
-	clk.Store(1)
-	root, base, _ := tmpLock(t)
-	f, err := Open(OpenParams{
-		Root: root, Base: base, DataUUID: [16]byte{0x3}, MaxReaders: 2,
-	})
+// The per-slot lock-FILE backend is darwin/freebsd production and
+// the DST simulation tier, but newSlotLocks picks the range backend
+// on linux — so these tests construct fileLocks directly to keep the
+// portable backend covered on the real (linux) kernel.
+
+func newTestFileLocks(t *testing.T) *fileLocks {
+	t.Helper()
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	// Mirror the creator's eager population: the backend only opens.
+	if err := populateReadersDir(OpenParams{Root: root, Base: "x.lock"}, 0xA5A5, 8); err != nil {
+		t.Fatalf("populate: %v", err)
+	}
+	return &fileLocks{root: root, dir: readersDir("x.lock", 0xA5A5)}
+}
+
+func TestFileLocksHoldProbeConflict(t *testing.T) {
+	// Each acquisition opens its own descriptor, so a probe conflicts
+	// with a held lock even in-process — the property the range
+	// backend needs a second description for.
+	l := newTestFileLocks(t)
+	release, err := l.tryHold(0)
+	if err != nil {
+		t.Fatalf("tryHold: %v", err)
+	}
+	if _, err := l.tryProbe(0); !errors.Is(err, errSlotBusy) {
+		t.Fatalf("probe of held slot = %v, want errSlotBusy", err)
+	}
+	if _, err := l.tryHold(1); err != nil {
+		t.Fatalf("tryHold of a different slot: %v", err)
+	}
+	release()
+	rel2, err := l.tryProbe(0)
+	if err != nil {
+		t.Fatalf("probe after release = %v, want acquired", err)
+	}
+	rel2()
+}
+
+func TestPopulateSweepSkipsNonNonceEntries(t *testing.T) {
+	// The creation sweep unlinks by pattern — uniquely in the
+	// lifecycle — so the pattern is exact: directories with the
+	// 8-hex-digit nonce suffix only. A sibling database whose NAME
+	// happens to extend the prefix, or a stray file, is not ours.
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer root.Close()
+	decoyFile := "x.lock.readers-cafecafe" // right shape, wrong kind
+	if err := os.WriteFile(dir+"/"+decoyFile, []byte("peer"), 0o600); err != nil {
+		t.Fatalf("decoy file: %v", err)
+	}
+	decoyDir := "x.lock.readers-zzzz.lock" // dir, non-nonce suffix
+	if err := root.Mkdir(decoyDir, 0o755); err != nil {
+		t.Fatalf("decoy dir: %v", err)
+	}
+	orphan := readersDir("x.lock", 0xDEAD)
+	if err := root.Mkdir(orphan, 0o755); err != nil {
+		t.Fatalf("orphan: %v", err)
+	}
+	if err := populateReadersDir(OpenParams{Root: root, Base: "x.lock"}, 0xBEEF, 2); err != nil {
+		t.Fatalf("populate: %v", err)
+	}
+	if _, err := root.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("nonce-shaped orphan dir survived: %v", err)
+	}
+	if _, err := root.Stat(decoyFile); err != nil {
+		t.Fatalf("decoy FILE was swept: %v", err)
+	}
+	if _, err := root.Stat(decoyDir); err != nil {
+		t.Fatalf("non-nonce decoy dir was swept: %v", err)
+	}
+}
+
+func TestPopulateReadersDirSweepsOrphans(t *testing.T) {
+	// The creator's eager population first removes leftover readers
+	// directories — orphans from crashed inits and superseded
+	// incarnations a crashed removal missed. Anything present at
+	// CREATE time is provably not the live incarnation.
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer root.Close()
+	orphan := readersDir("x.lock", 0xDEAD)
+	if err := root.Mkdir(orphan, 0o755); err != nil {
+		t.Fatalf("mkdir orphan: %v", err)
+	}
+	if err := populateReadersDir(OpenParams{Root: root, Base: "x.lock"}, 0xBEEF, 4); err != nil {
+		t.Fatalf("populate: %v", err)
+	}
+	if _, err := root.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan dir survived creation sweep: %v", err)
+	}
+	for i := range uint32(4) {
+		if _, err := root.Stat(fmt.Sprintf("%s/%d", readersDir("x.lock", 0xBEEF), i)); err != nil {
+			t.Fatalf("slot file %d missing after populate: %v", i, err)
+		}
+	}
+}
+
+// failingSlotLocks errors every acquisition with a non-busy error.
+type failingSlotLocks struct{ err error }
+
+func (s *failingSlotLocks) tryHold(uint32) (func(), error)  { return nil, s.err }
+func (s *failingSlotLocks) tryProbe(uint32) (func(), error) { return nil, s.err }
+func (s *failingSlotLocks) close() error                    { return nil }
+
+func TestReapReportsUndecidedProbes(t *testing.T) {
+	// An occupied slot whose probe errors (not busy) can be neither
+	// judged nor cleared: the residue keeps pinning the reclamation
+	// bound, so the reap must SURFACE the count rather than swallow
+	// it — a persistent undecided is a silently halted reclamation
+	// (cross-process.md §Stale-slot reclamation).
+	f := openTestFile(t, 2)
+	Store64(&f.Slot(0).TxnID, 9)
+	f.locks = &failingSlotLocks{err: errors.New("injected probe failure")}
+	cleared, undecided := f.ReapStaleReaderSlots()
+	if cleared != 0 {
+		t.Fatalf("cleared %d under an undecided probe, want 0", cleared)
+	}
+	if undecided != 1 {
+		t.Fatalf("undecided = %d, want 1", undecided)
+	}
+	if got := Load64(&f.Slot(0).TxnID); got != 9 {
+		t.Fatalf("residue TxnID = %d, want 9 (never cleared on undecided)", got)
+	}
+}
+
+func TestAcquireReaderSlotUndecidedIsNotFull(t *testing.T) {
+	// A backend I/O failure is UNDECIDED — the scan must surface it,
+	// never dress it as ErrReadersFull (which asserts every slot has
+	// a live owner and steers callers into a hopeless retry loop).
+	f := openTestFile(t, 2)
+	ioErr := errors.New("injected backend failure")
+	f.locks = &failingSlotLocks{err: ioErr}
+	_, err := f.AcquireReaderSlot(0, 1, 42)
+	if errors.Is(err, ErrReadersFull) {
+		t.Fatalf("undecided scan reported ErrReadersFull")
+	}
+	if !errors.Is(err, ioErr) {
+		t.Fatalf("err = %v, want the injected backend failure wrapped", err)
+	}
+}
+
+// unlockOrderRecorder wraps a slotLocks backend and records the
+// slot's TxnID at the moment each hold release fires.
+type unlockOrderRecorder struct {
+	inner slotLocks
+	f     *File
+	seen  []uint64
+}
+
+func (r *unlockOrderRecorder) tryHold(idx uint32) (func(), error) {
+	rel, err := r.inner.tryHold(idx)
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		r.seen = append(r.seen, Load64(&r.f.Slot(idx).TxnID))
+		rel()
+	}, nil
+}
+func (r *unlockOrderRecorder) tryProbe(idx uint32) (func(), error) { return r.inner.tryProbe(idx) }
+func (r *unlockOrderRecorder) close() error                        { return r.inner.close() }
+
+func TestReleaseZeroesBeforeUnlock(t *testing.T) {
+	// cross-process.md §Slot release: zero-then-unlock. If the lock
+	// dropped first, a peer could take the slot and publish its own
+	// TxnID before this releaser's late zero landed — stomping the
+	// new owner's published TxnID and unpinning its snapshot from
+	// RPL reclamation (use-after-reclaim).
+	f := openTestFile(t, 2)
+	rec := &unlockOrderRecorder{inner: f.locks, f: f}
+	f.locks = rec
+	idx, err := f.AcquireReaderSlot(0, 7, 1)
+	if err != nil {
+		t.Fatalf("AcquireReaderSlot: %v", err)
+	}
+	f.ReleaseReaderSlot(idx)
+	if len(rec.seen) != 1 {
+		t.Fatalf("recorded %d hold releases, want 1", len(rec.seen))
+	}
+	if rec.seen[0] != 0 {
+		t.Fatalf("TxnID at unlock = %d, want 0 (zero-before-unlock)", rec.seen[0])
+	}
+}
+
+func TestRangeLocksHoldProbeConflict(t *testing.T) {
+	// The range backend's probe description must be DISTINCT from its
+	// hold description: OFD try-locks through one description never
+	// conflict with themselves, so a hold-description probe would
+	// judge this File's own live reader dead. The reap's own-held
+	// guard usually masks that — but not in the acquire window
+	// between a slot's tryHold and its holds registration, where a
+	// concurrent same-File reap probes a just-taken live slot.
+	f := openTestFile(t, 2)
+	if _, ok := f.locks.(*rangeLocks); !ok {
+		t.Skip("range backend not in use on this platform/build")
+	}
+	idx, err := f.AcquireReaderSlot(0, 7, 1)
+	if err != nil {
+		t.Fatalf("AcquireReaderSlot: %v", err)
+	}
+	if _, err := f.locks.tryProbe(idx); !errors.Is(err, errSlotBusy) {
+		t.Fatalf("same-File probe of own held slot = %v, want errSlotBusy (distinct descriptions)", err)
+	}
+}
+
+func TestReapSerializedPerFile(t *testing.T) {
+	// Same-File clearers share ONE probe description, which cannot
+	// conflict with itself — the kernel cannot serialize them, so
+	// ReapStaleReaderSlots must (cross-process.md §Stale-slot
+	// reclamation). Without that, reaper A's probe release strips
+	// reaper B's "held" probe mid-clear, and B's late zero-store can
+	// erase a slot a new reader has since taken. Pinned directly:
+	// while one reap is parked inside a clear, a second same-File
+	// reap must not complete.
+	f := openTestFile(t, 2)
+	Store64(&f.Slot(0).TxnID, 9) // dead residue
+
+	parked := make(chan struct{})
+	unpark := make(chan struct{})
+	var once sync.Once
+	hook := func(uint32) {
+		once.Do(func() {
+			close(parked)
+			<-unpark
+		})
+	}
+	staleClearHookForTest.Store(&hook)
+	t.Cleanup(func() { staleClearHookForTest.Store(nil) })
+
+	aDone := make(chan int, 1)
+	go func() { c, _ := f.ReapStaleReaderSlots(); aDone <- c }()
+	<-parked
+	bDone := make(chan int, 1)
+	go func() { c, _ := f.ReapStaleReaderSlots(); bDone <- c }()
+	select {
+	case <-bDone:
+		t.Fatal("second same-File reap completed while the first was mid-clear (clearers not serialized)")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(unpark)
+	if cleared := <-aDone; cleared != 1 {
+		t.Errorf("first reap cleared %d, want 1", cleared)
+	}
+	<-bDone
+}
+
+// passOneBusyOnce simulates a peer that holds slot 0 during the
+// acquire scan's first pass and releases before the second.
+type passOneBusyOnce struct {
+	inner slotLocks
+	fired bool
+}
+
+func (s *passOneBusyOnce) tryHold(idx uint32) (func(), error) {
+	if !s.fired && idx == 0 {
+		s.fired = true
+		return nil, errSlotBusy
+	}
+	return s.inner.tryHold(idx)
+}
+func (s *passOneBusyOnce) tryProbe(idx uint32) (func(), error) { return s.inner.tryProbe(idx) }
+func (s *passOneBusyOnce) close() error                        { return s.inner.close() }
+
+func TestAcquireRetriesFreedSlotInPassTwo(t *testing.T) {
+	// A peer holding the only slot during pass 1 and releasing before
+	// pass 2 must not surface ErrReadersFull: full means every slot's
+	// lock is HELD (cross-process.md §Slot acquire), never "the table
+	// churned mid-scan". Pass 2 therefore try-locks every slot, not
+	// only the nonzero ones — a zero slot pass 1 lost to a live
+	// holder is retried, not skipped.
+	f := openTestFile(t, 1)
+	f.locks = &passOneBusyOnce{inner: f.locks}
+	idx, err := f.AcquireReaderSlot(0, 7, 1)
+	if err != nil {
+		t.Fatalf("acquire across the pass boundary: %v (want slot 0)", err)
+	}
+	if idx != 0 {
+		t.Fatalf("landed on %d, want 0", idx)
+	}
+}
+
+func TestRaiseReaderSlotTxnIDUnownedPanics(t *testing.T) {
+	// Owner-only precondition, enforced: raising a slot this File
+	// does not hold would stomp another owner's pin.
+	f := openTestFile(t, 2)
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic raising an unowned slot")
+		}
+	}()
+	f.RaiseReaderSlotTxnID(0, 9)
+}
+
+func TestReadersDirScopedToIncarnation(t *testing.T) {
+	// The per-slot lock-file directory is named by the header's
+	// incarnation nonce, so a recreated lock file (UUID mismatch,
+	// stale format) derives a DIFFERENT directory — however the
+	// filesystem reuses inodes — and a prior incarnation's surviving
+	// holders cannot wedge the fresh table by holding locks on
+	// same-named slot files (cross-process.md §Reader Table). Two
+	// handles of ONE incarnation must agree on the name; two
+	// incarnations must not (nonce collision odds 2^-32 — a failure
+	// here is a real regression, not flake).
+	root, base, fullPath := tmpLock(t)
+	params := OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xD1}, MaxReaders: 2}
+	f1, err := Open(params)
+	if err != nil {
+		t.Fatalf("Open 1: %v", err)
+	}
+	nonce1 := f1.header.ReadersDirNonce
+	f2, err := Open(params)
+	if err != nil {
+		t.Fatalf("Open 2 (same incarnation): %v", err)
+	}
+	if got := f2.header.ReadersDirNonce; got != nonce1 {
+		t.Fatalf("same-incarnation adopter read nonce %08x, creator stamped %08x", got, nonce1)
+	}
+	f2.Close()
+	f1.Close()
+	if err := os.Remove(fullPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	f3, err := Open(params)
+	if err != nil {
+		t.Fatalf("Open 3 (new incarnation): %v", err)
+	}
+	defer f3.Close()
+	nonce3 := f3.header.ReadersDirNonce
+	if nonce3 == nonce1 {
+		t.Fatalf("recreated lock file stamped the same nonce %08x", nonce1)
+	}
+	if readersDir(base, nonce1) == readersDir(base, nonce3) {
+		t.Fatalf("distinct nonces derived the same readers dir")
+	}
+}
+
+func TestFileLocksDirRemovedFailsClosed(t *testing.T) {
+	// Externally removing a LIVE incarnation's readers dir is outside
+	// the protection boundary: recreating it would mint fresh
+	// slot-file inodes while a surviving holder's lock rides the
+	// unlinked one — a silent double-claim. The open path must fail
+	// CLOSED (undecided error), never silently recreate
+	// (cross-process.md §Reader Table, slot locks).
+	l := newTestFileLocks(t)
+	rel, err := l.tryHold(0)
+	if err != nil {
+		t.Fatalf("tryHold: %v", err)
+	}
+	defer rel() // held across the sweep — the dangerous interleaving
+	if err := os.RemoveAll(l.root.Name() + "/" + l.dir); err != nil {
+		t.Fatalf("remove dir: %v", err)
+	}
+	if _, err := l.tryHold(1); err == nil || errors.Is(err, errSlotBusy) {
+		t.Fatalf("tryHold after live-dir sweep = %v, want a fail-closed undecided error", err)
+	}
+	// And no silent double-claim of the HELD slot through a peer
+	// handle either: its acquisition must also fail closed.
+	peer := &fileLocks{root: l.root, dir: l.dir}
+	if _, err := peer.tryHold(0); err == nil || errors.Is(err, errSlotBusy) {
+		t.Fatalf("peer tryHold after live-dir sweep = %v, want a fail-closed undecided error", err)
+	}
+}
+
+func TestFileLocksSlotFileRemovedFailsClosed(t *testing.T) {
+	// The single-slot-file variant of the sweep hazard: with the
+	// directory intact, an O_CREATE in the open path would silently
+	// mint a fresh inode for a swept slot file while the surviving
+	// holder's lock rides the unlinked one — the peer would
+	// flock-acquire a slot that is still HELD. The open path must
+	// fail closed on the missing file too.
+	l := newTestFileLocks(t)
+	rel, err := l.tryHold(0)
+	if err != nil {
+		t.Fatalf("tryHold: %v", err)
+	}
+	defer rel()
+	if err := os.Remove(l.root.Name() + "/" + l.dir + "/0"); err != nil {
+		t.Fatalf("remove slot file: %v", err)
+	}
+	peer := &fileLocks{root: l.root, dir: l.dir}
+	if _, err := peer.tryHold(0); err == nil || errors.Is(err, errSlotBusy) {
+		t.Fatalf("peer tryHold of a swept-but-held slot file = %v, want a fail-closed undecided error", err)
+	}
+}
+
+func TestStaleRemovalSweepsReadersDir(t *testing.T) {
+	// The guarded stale removal deletes the outgoing incarnation's
+	// readers directory together with its lock file — the only
+	// sanctioned removal, run exactly when the incarnation is
+	// provably superseded, so litter never invites external sweeps
+	// (cross-process.md §Reader Table, slot locks).
+	root, base, fullPath := tmpLock(t)
+	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xA1}, MaxReaders: 2})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	c := NewCoord(f, CoordOptions{
-		PID:               4242,
-		RetryInterval:     10 * time.Millisecond,
-		HeartbeatInterval: 5 * time.Millisecond, // tight cadence for the test
-		Clock:             func() uint64 { return clk.Load() },
-	})
-	t.Cleanup(func() {
-		_ = c.Close()
-		_ = f.Close()
-	})
-	idx, idxGen, err := c.AcquireReader(context.Background(), 1)
+	dir := readersDir(base, f.header.ReadersDirNonce)
+	if err := root.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(fullPath+"-litter-probe", nil, 0o600); err != nil {
+		t.Fatalf("marker: %v", err)
+	}
+	if err := os.WriteFile(root.Name()+"/"+dir+"/0", nil, 0o600); err != nil {
+		t.Fatalf("slot file: %v", err)
+	}
+	f.Close()
+
+	// A different DataUUID classifies the file stale: the removal
+	// must take the directory with it.
+	f2, err := Open(OpenParams{Root: root, Base: base, DataUUID: [16]byte{0xB2}, MaxReaders: 2})
 	if err != nil {
-		t.Fatalf("AcquireReader: %v", err)
+		t.Fatalf("Open (new uuid): %v", err)
 	}
-	// Advance the test clock; wait for the heartbeat tick to fire
-	// and overwrite the slot's Heartbeat with the new value.
-	clk.Store(999)
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if Load64(&f.Slot(idx).Heartbeat) == 999 {
-			break
-		}
-		time.Sleep(time.Millisecond)
-		runtime.Gosched()
-	}
-	if got := Load64(&f.Slot(idx).Heartbeat); got != 999 {
-		t.Errorf("heartbeat goroutine did not refresh slot: got %d, want 999", got)
-	}
-	c.ReleaseReader(idx, idxGen)
-	// After ReleaseReader the slot must NOT be refreshed on the
-	// next tick. Bump the clock and verify the slot stays at 0.
-	clk.Store(7777)
-	time.Sleep(20 * time.Millisecond)
-	if got := Load64(&f.Slot(idx).Heartbeat); got != 0 {
-		t.Errorf("post-Release Heartbeat = %d, want 0 (active-list unregister failed)", got)
+	defer f2.Close()
+	if _, err := root.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outgoing readers dir still present after stale removal: %v", err)
 	}
 }
 
-// TestClearedSlotDoesNotEvictMidPublishAcquirer pins the stale-clear
-// identity rule (cross-process.md §Clearing a stale slot): after a
-// stale slot is cleared, a fresh acquirer that has CAS-won TxnID but
-// not yet published its heartbeat/identity must classify as case 0c
-// (epoch-anchored, StaleTimeout-bounded) — NOT inherit the dead
-// occupant's PID/heartbeat and be evicted immediately by the next
-// scan. Covers both misclassification shapes the leftover identity
-// caused: same-namespace IsAlive(deadPID) and the pid==0 stale-
-// heartbeat case 0b.
-func TestClearedSlotDoesNotEvictMidPublishAcquirer(t *testing.T) {
-	now := uint64(100 * uint64(time.Second))
-	staleTimeout := uint64(time.Second)
-	ourNS := uint64(99)
-
-	run := func(t *testing.T, stampDead func(s *ReaderSlot)) {
-		f := openTestFile(t, 1)
-		slot := f.Slot(0)
-		stampDead(slot)
-		f.ClearStaleReaderSlot(0)
-
-		// Fresh acquirer CAS-wins TxnID and is preempted before its
-		// heartbeat/identity stores (the AcquireReaderSlot publish
-		// sequence, frozen at its first step).
-		if !CAS64(&slot.TxnID, 0, 77) {
-			t.Fatalf("fixture: TxnID CAS failed; slot not cleared? TxnID=%d", Load64(&slot.TxnID))
-		}
-
-		// A concurrent writer scan must treat the slot as a live
-		// mid-publish acquirer: TxnID stays, enters the min, and the
-		// orphan epoch gets anchored — never an immediate clear.
-		got := f.OldestReaderTxnID(ourNS, now, staleTimeout, staleTimeout)
-		if got != 77 {
-			t.Errorf("OldestReaderTxnID = %d, want 77 (mid-publish acquirer must pin the bound)", got)
-		}
-		if txn := Load64(&slot.TxnID); txn != 77 {
-			t.Fatalf("mid-publish acquirer evicted: TxnID = %d, want 77", txn)
-		}
-		// The scan must have taken case 0c (epoch anchor), which is
-		// only reachable when the clear zeroed PID and Heartbeat —
-		// pin those directly so the assertion does not depend on the
-		// anchoring side effect alone.
-		if pid := Load64(&slot.PID); pid != 0 {
-			t.Fatalf("cleared slot retains dead PID %d", pid)
-		}
-		if hb := Load64(&slot.Heartbeat); hb != 0 {
-			t.Fatalf("cleared slot retains dead heartbeat %d", hb)
-		}
-		if epoch := Load64(&slot.HintEpoch); epoch != now {
-			t.Fatalf("HintEpoch = %d, want %d (case 0c first-observer anchor)", epoch, now)
-		}
+func TestSlotLocksRejectReboundName(t *testing.T) {
+	// The slot-lock descriptions are opened BY NAME after the
+	// lifecycle's identity verify; a name re-bound in that window
+	// (an unguarded remover racing the open) must be caught — a
+	// description on a different inode than the mmap would lock a
+	// file whose table this handle does not read (split brain).
+	// newSlotLocks verifies each description against the validated
+	// fd and reports errPathChanged so the lifecycle retries.
+	root, base, fullPath := tmpLock(t)
+	if err := os.WriteFile(fullPath, []byte("old"), 0o600); err != nil {
+		t.Fatalf("create: %v", err)
 	}
-
-	t.Run("dead-same-namespace-occupant", func(t *testing.T) {
-		run(t, func(s *ReaderSlot) {
-			// PID 4194305 exceeds the kernel hard cap PID_MAX_LIMIT
-			// (4194304 on 64-bit Linux; other supported platforms cap
-			// far lower), so it can never be allocated — reliably not
-			// alive regardless of the host's pid_max setting; same
-			// namespace as the scanner.
-			Store64(&s.TxnID, 42)
-			Store64(&s.PID, 4194305)
-			Store64(&s.PIDNamespace, 99)
-			Store64(&s.ProcessStartTime, 12345)
-			Store64(&s.Heartbeat, now-10*staleTimeout)
-		})
-	})
-	t.Run("stale-cross-namespace-occupant", func(t *testing.T) {
-		run(t, func(s *ReaderSlot) {
-			Store64(&s.TxnID, 42)
-			Store64(&s.PID, 4194305)
-			Store64(&s.PIDNamespace, 7) // != scanner's 99
-			Store64(&s.ProcessStartTime, 12345)
-			Store64(&s.Heartbeat, now-10*staleTimeout)
-		})
-	})
-}
-
-// TestRaiseReaderSlotTxnIDGuards pins the owner-only/monotonic
-// contract's four panic guards.
-func TestRaiseReaderSlotTxnIDGuards(t *testing.T) {
-	f := openTestFile(t, 2)
-	idx, gen, err := f.AcquireReaderSlot(0, 10, 1234, 1, 42, clockAt(100))
+	f, err := root.OpenFile(base, os.O_RDWR, 0)
 	if err != nil {
-		t.Fatalf("AcquireReaderSlot: %v", err)
+		t.Fatalf("open validated fd: %v", err)
 	}
-	mustPanic := func(name string, fn func()) {
-		t.Helper()
-		defer func() {
-			if recover() == nil {
-				t.Errorf("%s: no panic", name)
+	defer f.Close()
+	// Re-bind the name to a different inode behind the fd's back.
+	if err := os.Remove(fullPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.WriteFile(fullPath, []byte("new"), 0o600); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	locks, err := newSlotLocks(OpenParams{Root: root, Base: base}, f, 1)
+	if flock.RangeSupported {
+		if !errors.Is(err, errPathChanged) {
+			if locks != nil {
+				_ = locks.close()
 			}
-		}()
-		fn()
-	}
-	mustPanic("zero txnID", func() { f.RaiseReaderSlotTxnID(idx, gen, 0) })
-	mustPanic("lower raise", func() { f.RaiseReaderSlotTxnID(idx, gen, 9) })
-	mustPanic("index out of range", func() { f.RaiseReaderSlotTxnID(2, 0, 11) })
-	// Equal and higher raises succeed.
-	f.RaiseReaderSlotTxnID(idx, gen, 10)
-	f.RaiseReaderSlotTxnID(idx, gen, 12)
-	if got := Load64(&f.Slot(idx).TxnID); got != 12 {
-		t.Errorf("TxnID = %d, want 12", got)
-	}
-	closed := openTestFile(t, 1)
-	_ = closed.Close()
-	mustPanic("closed file", func() { closed.RaiseReaderSlotTxnID(0, 0, 1) })
-}
-
-// TestOldestReaderTxnIDReleaseInFlightNotCleared pins the
-// zeroHeartbeatFresh semantics of the shared identity classification
-// on the reader-scan path: a slot observed with pid != 0 but
-// Heartbeat == 0 is a release in flight (the owner zeroes PID first,
-// Heartbeat second; a scan can land between the loads), and clearing
-// it could stomp a third reader's fresh CAS — the phantom eviction
-// the §Reader Table clear ordering exists to prevent. The scan must
-// treat it live: keep the slot and count its TxnID.
-func TestOldestReaderTxnIDReleaseInFlightNotCleared(t *testing.T) {
-	f := openTestFile(t, 1)
-	now := uint64(time.Now().UnixNano())
-	// Foreign namespace so classification takes the heartbeat path
-	// (same-namespace would kill(0) the fake PID).
-	if _, _, err := f.AcquireReaderSlot(0, 7, 9999, 1, 42, clockAt(now)); err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	// Manufacture the mid-release observation: Heartbeat zeroed, PID
-	// still visible to the scan's load ordering.
-	Store64(&f.Slot(0).Heartbeat, 0)
-	got := f.OldestReaderTxnID(99, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
-	if got != 7 {
-		t.Errorf("release-in-flight slot: got %d, want 7 (live)", got)
-	}
-	if Load64(&f.Slot(0).TxnID) != 7 {
-		t.Error("release-in-flight slot was cleared (phantom-eviction hazard)")
-	}
-}
-
-// A stale-detection scan classifies an occupant, then runs syscalls
-// (kill(2), /proc reads) before clearing; in that window the occupant
-// can release and the slot be re-won by a LIVE reader. The clear must
-// re-validate the classified tuple and skip a changed slot — clearing
-// it unconditionally evicts the re-winner: its snapshot leaves the
-// table, the reclamation bound advances past it, and RPL reclamation
-// frees pages it is reading (use-after-reclaim).
-func TestStaleClearSkipsRewonSlot(t *testing.T) {
-	f := openTestFile(t, 2)
-	slot := f.Slot(0)
-	stale := uint64(time.Second)
-	now := 10 * stale
-	// Classified-stale occupant: crashed mid-acquire (case 0b — aged
-	// heartbeat, PID never stamped).
-	Store64(&slot.TxnID, 7)
-	Store64(&slot.Heartbeat, now-2*stale)
-
-	// The hook fires exactly at the classification→clear boundary:
-	// the occupant's slot is released and re-won by a live reader
-	// pinning TxnID 5, mid-publish with a fresh heartbeat.
-	hook := func(idx uint32) {
-		if idx != 0 {
-			return
+			t.Fatalf("newSlotLocks on a re-bound name = %v, want errPathChanged", err)
 		}
-		clearReaderSlot(slot)         // the release
-		Store64(&slot.TxnID, 5)       // the re-win (CAS equivalent)
-		Store64(&slot.Heartbeat, now) // fresh mid-publish heartbeat
+		return
 	}
-	staleClearHookForTest.Store(&hook)
-	defer staleClearHookForTest.Store(nil)
-
-	got := f.OldestReaderTxnID(99, now, stale, stale)
-	if tx := Load64(&slot.TxnID); tx != 5 {
-		t.Fatalf("re-won slot evicted: TxnID = %d, want 5 (the live reader's pin)", tx)
-	}
-	if got != 5 {
-		t.Errorf("OldestReaderTxnID = %d, want 5 (the re-winner's pin must floor the bound)", got)
-	}
-}
-
-// The identity-path variant: a dead same-namespace occupant is
-// classified via kill(2)/start-time, and the slot is re-won by THIS
-// live process before the clear. The guard must skip (PID and
-// start time differ from the observation).
-func TestStaleClearSkipsRewonSlotIdentityPath(t *testing.T) {
-	f := openTestFile(t, 1)
-	slot := f.Slot(0)
-	myPID := uint64(os.Getpid())
-	myPST, _ := ProcessStartTime(os.Getpid())
-	myNS, _ := PIDNamespace()
-	now := uint64(time.Now().UnixNano())
-	// Dead occupant: same-namespace PID that does not exist.
-	Store64(&slot.TxnID, 7)
-	Store64(&slot.Heartbeat, now)
-	Store64(&slot.PIDNamespace, myNS)
-	Store64(&slot.ProcessStartTime, 1)
-	Store64(&slot.PID, 400_000_000) // far beyond pid_max (2^22); kill(2) gives ESRCH
-	hook := func(idx uint32) {
-		// Release + re-win by this (live) process, same pinned TxnID
-		// — the guard must still catch it via PID/PST.
-		clearReaderSlot(slot)
-		Store64(&slot.TxnID, 7)
-		Store64(&slot.Heartbeat, now)
-		Store64(&slot.PIDNamespace, myNS)
-		Store64(&slot.ProcessStartTime, myPST)
-		Store64(&slot.PID, myPID)
-	}
-	staleClearHookForTest.Store(&hook)
-	defer staleClearHookForTest.Store(nil)
-
-	got := f.OldestReaderTxnID(myNS, now, uint64(DefaultStaleTimeout), uint64(DefaultStaleTimeout))
-	if tx := Load64(&slot.TxnID); tx != 7 {
-		t.Fatalf("re-won slot evicted: TxnID = %d, want 7", tx)
-	}
-	if got != 7 {
-		t.Errorf("OldestReaderTxnID = %d, want 7 (re-winner counted)", got)
-	}
-}
-
-// An acquirer frozen mid-publish past StaleTimeout can be aged out by
-// a scan and its slot re-won; on resume it must detect the loss at the
-// post-publish ownership verify and ABANDON the slot — returning it
-// would leave two owners (double release, cascading eviction), and
-// zeroing it would evict the re-winner.
-func TestAcquireAbandonsSlotClearedMidPublish(t *testing.T) {
-	f := openTestFile(t, 2)
-	fired := false
-	hook := func(idx uint32) {
-		if fired {
-			return
-		}
-		fired = true
-		// Simulate: a scan aged the mid-publish window out and
-		// cleared the slot; another reader re-won it pinning TxnID 9.
-		clearReaderSlot(f.Slot(idx))
-		Store64(&f.Slot(idx).TxnID, 9)
-	}
-	acquirePublishHookForTest.Store(&hook)
-	defer acquirePublishHookForTest.Store(nil)
-
-	idx, _, err := f.AcquireReaderSlot(0, 42, 1234, 1, 1, clockAt(100))
+	// File backend: identity is consumed as the dir name instead —
+	// the incarnation-scoping test covers it.
 	if err != nil {
-		t.Fatalf("AcquireReaderSlot: %v", err)
+		t.Fatalf("newSlotLocks (file backend): %v", err)
 	}
-	if idx == 0 {
-		t.Fatalf("acquire returned slot 0, which it lost mid-publish")
-	}
-	if tx := Load64(&f.Slot(0).TxnID); tx != 9 {
-		t.Errorf("re-winner's slot disturbed: TxnID = %d, want 9", tx)
-	}
-	if tx := Load64(&f.Slot(idx).TxnID); tx != 42 {
-		t.Errorf("acquired slot %d TxnID = %d, want 42", idx, tx)
-	}
-}
-
-// The 0c-aged clear is guarded like every other: a crashed-before-
-// heartbeat acquirer whose HintEpoch anchor aged out is about to be
-// cleared when its (actually frozen, now resumed) owner stores a
-// fresh heartbeat — the guard must skip, and the owner's pin must
-// floor the bound.
-func TestStaleClearSkips0cAgedWhenGhostResumes(t *testing.T) {
-	f := openTestFile(t, 1)
-	slot := f.Slot(0)
-	stale := uint64(time.Second)
-	now := 10 * stale
-	Store64(&slot.TxnID, 7)               // CAS'd, never heartbeat-stamped
-	Store64(&slot.HintEpoch, now-2*stale) // orphan anchor, aged out
-	hook := func(idx uint32) {
-		Store64(&slot.Heartbeat, now) // the frozen acquirer resumes: step 4a lands
-	}
-	staleClearHookForTest.Store(&hook)
-	defer staleClearHookForTest.Store(nil)
-
-	got := f.OldestReaderTxnID(99, now, stale, stale)
-	if tx := Load64(&slot.TxnID); tx != 7 {
-		t.Fatalf("resumed acquirer evicted: TxnID = %d, want 7", tx)
-	}
-	if got != 7 {
-		t.Errorf("OldestReaderTxnID = %d, want 7 (resumed acquirer's pin must floor the bound)", got)
-	}
-}
-
-// An acquirer that loses its slot mid-publish to an aging clear —
-// with the slot NOT re-won — must RE-CLAIM it rather than walk away:
-// abandoning strands its identity stores on a TxnID==0 slot forever
-// (nothing scrubs a free slot), and the junk breaks the free⇒PID==0
-// premise — the NEXT acquirer's CAS window would present its TxnID
-// under the ghost's dead PID and be evicted through the identity
-// path with no mid-publish aging grace.
-func TestAcquireReclaimsSlotClearedMidPublishNotRewon(t *testing.T) {
-	f := openTestFile(t, 2)
-	fired := false
-	hook := func(idx uint32) {
-		if fired {
-			return
-		}
-		fired = true
-		// A scan aged the mid-publish window out and cleared the
-		// slot; nobody re-wins it.
-		clearReaderSlot(f.Slot(idx))
-	}
-	acquirePublishHookForTest.Store(&hook)
-	defer acquirePublishHookForTest.Store(nil)
-
-	idx, _, err := f.AcquireReaderSlot(0, 42, 1234, 5, 6, clockAt(100))
-	if err != nil {
-		t.Fatalf("AcquireReaderSlot: %v", err)
-	}
-	if idx != 0 {
-		t.Fatalf("acquire moved to slot %d; must re-claim the cleared slot 0", idx)
-	}
-	s := f.Slot(0)
-	if tx, pid := Load64(&s.TxnID), Load64(&s.PID); tx != 42 || pid != 1234 {
-		t.Fatalf("re-claimed slot state (TxnID=%d, PID=%d), want (42, 1234)", tx, pid)
-	}
-	// No junk anywhere: slot 1 untouched and free.
-	if tx, pid := Load64(&f.Slot(1).TxnID), Load64(&f.Slot(1).PID); tx != 0 || pid != 0 {
-		t.Fatalf("slot 1 polluted: TxnID=%d PID=%d, want free and clean", tx, pid)
-	}
-}
-
-// The (TxnID, Gen) ownership token detects a re-win that pinned the
-// SAME TxnID — previously the recorded two-owners residual: both the
-// evicted ghost and the re-winner believed they owned the slot.
-func TestAcquireDetectsSameTxnIDRewin(t *testing.T) {
-	f := openTestFile(t, 2)
-	fired := false
-	hook := func(idx uint32) {
-		if fired {
-			return
-		}
-		fired = true
-		// Aging clear + re-win pinning the SAME TxnID (42) — the
-		// re-winner's CAS bumps Gen past the ghost's token.
-		clearReaderSlot(f.Slot(idx))
-		if !CAS64(&f.Slot(idx).TxnID, 0, 42) {
-			t.Error("fixture: re-win CAS failed")
-		}
-		Add64(&f.Slot(idx).Gen, 1)
-	}
-	acquirePublishHookForTest.Store(&hook)
-	defer acquirePublishHookForTest.Store(nil)
-
-	idx, _, err := f.AcquireReaderSlot(0, 42, 1234, 5, 6, clockAt(100))
-	if err != nil {
-		t.Fatalf("AcquireReaderSlot: %v", err)
-	}
-	if idx == 0 {
-		t.Fatalf("acquire kept slot 0 despite a same-TxnID re-win (two owners)")
-	}
-	if tx := Load64(&f.Slot(0).TxnID); tx != 42 {
-		t.Errorf("re-winner's slot disturbed: TxnID = %d, want 42", tx)
-	}
-}
-
-// A release presenting a stale generation token must NOT zero the
-// slot — it belongs to the re-winner (the cascading-eviction leg of
-// the frozen-ghost class).
-func TestReleaseSkipsRewonSlot(t *testing.T) {
-	f := openTestFile(t, 1)
-	idx, gen, err := f.AcquireReaderSlot(0, 10, 1, 2, 3, clockAt(100))
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	// Aging clear + re-win by another reader.
-	clearReaderSlot(f.Slot(idx))
-	if !CAS64(&f.Slot(idx).TxnID, 0, 99) {
-		t.Fatal("fixture: re-win CAS failed")
-	}
-	Add64(&f.Slot(idx).Gen, 1)
-	Store64(&f.Slot(idx).PID, 777)
-
-	f.ReleaseReaderSlot(idx, gen) // the ghost's release: stale token
-	if tx := Load64(&f.Slot(idx).TxnID); tx != 99 {
-		t.Fatalf("ghost release zeroed the re-winner's slot (TxnID = %d, want 99)", tx)
-	}
-	if pid := Load64(&f.Slot(idx).PID); pid != 777 {
-		t.Errorf("re-winner's PID disturbed: %d, want 777", pid)
-	}
-}
-
-// A restabilization raise presenting a stale token is refused.
-func TestRaiseRefusedAfterSlotLost(t *testing.T) {
-	f := openTestFile(t, 1)
-	idx, gen, err := f.AcquireReaderSlot(0, 10, 1, 2, 3, clockAt(100))
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	clearReaderSlot(f.Slot(idx))
-	if !CAS64(&f.Slot(idx).TxnID, 0, 5) {
-		t.Fatal("fixture: re-win CAS failed")
-	}
-	Add64(&f.Slot(idx).Gen, 1)
-
-	if f.RaiseReaderSlotTxnID(idx, gen, 12) {
-		t.Fatal("raise landed with a stale ownership token")
-	}
-	if tx := Load64(&f.Slot(idx).TxnID); tx != 5 {
-		t.Errorf("re-winner's pin stomped: TxnID = %d, want 5", tx)
-	}
+	_ = locks.close()
 }

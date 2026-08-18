@@ -2,9 +2,10 @@ package lock
 
 import "time"
 
-// DefaultStaleTimeout matches the cross-process.md §Heartbeat
-// Goroutine "StaleTimeout" default: a heartbeat must be at least
-// 10 s older than now before the writer/slot is reclaimed. Must
+// DefaultStaleTimeout matches the cross-process.md §Writer
+// Heartbeat "StaleTimeout" default: a writer-record heartbeat must
+// be at least 10 s older than now before its author is called dead
+// (reader slots consult no timeout — held slot lock). Must
 // be significantly larger than the heartbeat interval (1 s default)
 // for scheduling jitter. The value is exposed as a constant for
 // callers (the flock goroutine in coord.go and tests).
@@ -55,51 +56,46 @@ func IsStaleWriter(f *File, ourPIDNamespace uint64, nowNanos, staleTimeoutNanos,
 	// start-time fallback is conservative-safer: false-live means no
 	// recovery, just blocking on flock until a live writer releases.
 	return !identityLive(pid, f.WriterStartTime(), f.WriterPIDNamespace(),
-		f.WriterHeartbeat(), ourPIDNamespace, nowNanos, staleTimeoutNanos, crossNSTimeoutNanos, false)
+		f.WriterHeartbeat(), ourPIDNamespace, nowNanos, staleTimeoutNanos, crossNSTimeoutNanos)
 }
 
-// identityLive reports whether a persisted process identity —
+// identityLive reports whether a persisted WRITER-record identity —
 // pid/startTime/pidNS plus a heartbeat stamp — names a live process:
-// the ONE classification rule shared by the reader-slot scan,
-// stale-writer recovery, and the recovery-commit gate's last-writer
-// record (cross-process.md §Reader Table stale detection).
-// Same-namespace uses kill(0) + start-time PID-reuse detection,
-// falling back to the heartbeat when the start time is unreadable
-// (conservative toward LIVE — a false-live merely defers recovery);
-// cross-namespace or namespace-unknown uses heartbeat freshness alone
-// (heartbeatStale — future stamps are fresh, never underflow).
+// the ONE classification rule shared by stale-writer recovery and
+// the recovery-commit gate's last-writer record (cross-process.md
+// §Writer Heartbeat). Reader slots never come here — their liveness
+// is the held slot lock. Same-namespace uses kill(0) + start-time
+// PID-reuse detection, falling back to the heartbeat when the start
+// time is unreadable (conservative toward LIVE — a false-live merely
+// defers recovery); cross-namespace or namespace-unknown uses
+// heartbeat freshness alone (heartbeatStale — future stamps are
+// fresh, never underflow).
 //
 // pid == 0 classifies dead ("no identity recorded"); callers for whom
 // zero identity means something else (IsStaleWriter's "no writer to
-// recover", the reader scan's mid-acquire protocol) gate before
-// calling.
+// recover") gate before calling.
 //
 // timeoutNanos governs the same-namespace heartbeat FALLBACK (start
 // time unreadable on a kill(0)-alive process); crossNSTimeoutNanos —
 // validated >= timeoutNanos at the Options boundary — governs every
 // cross-namespace (or namespace-unknown) classification, where the
 // heartbeat is the ONLY signal and a paused/frozen container stops
-// heartbeating while its reads stay live (cross-process.md
-// §Stale-reader detection, cross-namespace window).
+// heartbeating while its work stays live (cross-process.md §Writer
+// Heartbeat).
 //
-// zeroHeartbeatFresh selects the heartbeat==0 semantics, a real
-// protocol distinction between the consumers: the reader scan passes
-// TRUE — a slot observed with pid != 0 but heartbeat == 0 is a
-// release in flight (PID zeroes first, Heartbeat second), and
-// clearing it could stomp a third reader's fresh CAS (the phantom
-// eviction §Reader Table's clear ordering exists to prevent); writer
-// and last-writer records pass FALSE — their four fields are
-// published atomically under LOCK_EX, so pid != 0 with heartbeat == 0
-// immediately stale — a torn cross-namespace header, or a crashed
-// peer, must never block recovery (both consumers evaluate under
-// LOCK_EX, so a live mid-publish writer is unobservable there).
-func identityLive(pid, startTime, pidNS, heartbeat, ourNS, nowNanos, timeoutNanos, crossNSTimeoutNanos uint64, zeroHeartbeatFresh bool) bool {
+// pid != 0 with heartbeat == 0 classifies immediately stale: writer
+// and last-writer records publish their four fields atomically under
+// LOCK_EX, so a half-written identity is a torn cross-namespace
+// header or a crashed peer — it must never block recovery (both
+// consumers evaluate under LOCK_EX, so a live mid-publish writer is
+// unobservable there).
+func identityLive(pid, startTime, pidNS, heartbeat, ourNS, nowNanos, timeoutNanos, crossNSTimeoutNanos uint64) bool {
 	if pid == 0 {
 		return false
 	}
 	hbLive := func(window uint64) bool {
 		if heartbeat == 0 {
-			return zeroHeartbeatFresh
+			return false
 		}
 		return !heartbeatStale(nowNanos, heartbeat, window)
 	}
@@ -119,20 +115,17 @@ func identityLive(pid, startTime, pidNS, heartbeat, ourNS, nowNanos, timeoutNano
 	return hbLive(crossNSTimeoutNanos)
 }
 
-// heartbeatStale reports whether a monotonic-clock stamp — a reader/writer
-// Heartbeat, or a reader slot's HintEpoch orphan anchor — is older than
+// heartbeatStale reports whether a monotonic-clock stamp — a WRITER-record
+// Heartbeat (reader slots carry none) — is older than
 // staleTimeoutNanos relative to nowNanos. A stamp in the FUTURE
 // (stamp > nowNanos) is treated as fresh, never stale: the unsigned
 // subtraction nowNanos-stamp would otherwise underflow to ~2^64 (> any
-// timeout) and evict a live owner. "Future" is reachable two ways —
-// (1) a mid-publish reader whose own monotonic read landed fractionally
-// after the scanner's (there is no happens-before between the two clock
-// reads, and the HB-first/PID-last acquire ordering of §Reader Table
-// relies on this stamp being honoured as live), and (2) backward clock
-// skew (NTP step-back, manual set, or cross-host on shared storage where
-// CLOCK_BOOTTIME origins differ per cross-process.md's own model). Every
-// reader-scan comparison and the writer-recovery check share this guard
-// (cross-process.md §Reader Table stale detection / §Stale Writer Recovery).
+// timeout) and misjudge a live author. "Future" is reachable through
+// backward clock skew (NTP step-back, manual set, or cross-host on
+// shared storage where CLOCK_BOOTTIME origins differ per
+// cross-process.md's own model). The writer-recovery check and the
+// recovery-commit gate's last-writer classification share this guard
+// (cross-process.md §Writer Heartbeat / §Stale writer recovery).
 func heartbeatStale(nowNanos, stamp, staleTimeoutNanos uint64) bool {
 	if stamp > nowNanos {
 		return false
@@ -155,48 +148,10 @@ func heartbeatStale(nowNanos, stamp, staleTimeoutNanos uint64) bool {
 // hold flock). The flock goroutine in coord.go uses this property
 // directly.
 func RecoverStaleWriter(f *File, ourPIDNamespace uint64) {
-	deadPID := f.WriterPID()
-	deadNS := f.WriterPIDNamespace()
-	deadStartTime := f.WriterStartTime()
-
-	// Reader-slot cleanup is only attempted for the same-namespace
-	// case — cross-namespace PIDs are not directly comparable, so
-	// reader-stale-detection's heartbeat path will clean those up
-	// asynchronously (cross-process.md §Reader Table stale
-	// detection case 2).
-	//
-	// Match condition is (PID, PIDNamespace, ProcessStartTime) —
-	// all three must agree (cross-process.md §Stale Writer Recovery
-	// step 2). Matching only on (PID, PIDNamespace) would wipe a
-	// live reader's slot if the OS recycled deadPID to another
-	// in-namespace process that subsequently opened a read tx:
-	// new reader's slot has the same PID + namespace but a
-	// different ProcessStartTime (its own spawn-tick), so the
-	// startTime check distinguishes them and skips the clear.
-	if deadPID != 0 && deadNS != 0 && ourPIDNamespace != 0 && deadNS == ourPIDNamespace {
-		max := f.MaxReaders()
-		for i := range max {
-			slot := f.Slot(i)
-			if Load64(&slot.PID) != deadPID {
-				continue
-			}
-			if Load64(&slot.PIDNamespace) != deadNS {
-				continue
-			}
-			if Load64(&slot.ProcessStartTime) != deadStartTime {
-				// Same (PID, namespace) but different start time
-				// — PID recycled; this slot belongs to a
-				// different (live) process. Skip.
-				continue
-			}
-			// Single home for the 4-store clear ordering (spec
-			// §Reader Table clear ordering): PID first so any
-			// concurrent other-process scan sees PID == 0 and
-			// falls through to the heartbeat path rather than
-			// running kill() against the dead (or recycled) PID.
-			f.ClearStaleReaderSlot(uint32(i))
-		}
-	}
+	// The dead writer's own reader slots need no identity-matched
+	// scan: the kernel released their slot locks with the process,
+	// so they are ordinary stale slots for the probe-based reap
+	// (cross-process.md §Stale Writer Recovery step 2).
 
 	// A writer that crashed between its shrink-seqlock bumps leaves
 	// the counter ODD — readers would burn their bracket retries on

@@ -12,8 +12,8 @@ import (
 // monotonic" clock in nanoseconds. On Linux this is CLOCK_BOOTTIME —
 // monotonic, survives suspend/resume, and is kernel-wide (not
 // per-PID-namespace), so containers sharing a database file via
-// volume mount see the same clock value (cross-process.md §Heartbeat
-// Goroutine).
+// volume mount see the same clock value (cross-process.md §Writer
+// Heartbeat).
 //
 // Linux guarantees CLOCK_BOOTTIME on every kernel ≥ 2.6.39. A
 // kernel-level failure here means the host environment is wildly

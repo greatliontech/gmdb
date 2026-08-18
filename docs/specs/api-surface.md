@@ -374,6 +374,22 @@ same file is unaffected by another process's poisoned handle.
 func Open(ctx context.Context, path string, opts Options) (*DB, error)
 ```
 
+**Mixed-version fleets.** All processes sharing one database file
+must run the same lock-file format generation. A binary from the
+heartbeat-era format (lock-file magic `MagicV1`) must not run
+concurrently with a current binary against the same file: the
+current binary treats the old lock file as stale-FORMAT
+(delete-and-recreate, cross-process.md §Lock File Lifecycle), and a
+live old-format peer — undetectable by construction when it holds
+no writer flock — would then coordinate on the removed file (split
+brain). Upgrades therefore drain all old-binary processes before
+the first new-binary `Open`. A LEFTOVER old-format lock file with
+no live peers is handled automatically. The reverse direction is
+loud, not silent: an OLD binary meeting a new-format lock file
+fails its magic validation and refuses to open (`ErrCorrupted`) —
+the signature of a botched rollback is old binaries erroring at
+`Open`, never quiet mixed-format coordination.
+
 ## Byte Slice Ownership
 
 All `[]byte` slices returned by gmdb (from `Get`, `Cursor.Next`,
@@ -639,16 +655,19 @@ type Options struct {
     // Default: 10ms.
     MaxBatchDelay time.Duration
 
-    // StaleTimeout for cross-PID-namespace stale detection via
-    // heartbeats. Default: 10s.
+    // StaleTimeout for heartbeat classification of the WRITER
+    // records (stale-writer recovery, the recovery-commit gate's
+    // last-writer classification). Reader slots consult no
+    // timeout: their liveness is the held slot lock. Default: 10s.
     StaleTimeout time.Duration
 
-    // HeartbeatInterval is the refresh cadence for both heartbeat
-    // fields: the flock goroutine refreshes `WriterHeartbeat` at this
-    // interval while it holds `LOCK_EX`, and the heartbeat goroutine
-    // refreshes the `Heartbeat` field of every active reader slot.
-    // Must be significantly less than `StaleTimeout` for scheduling
-    // jitter. Default: 1s. See cross-process.md §Heartbeat Goroutine.
+    // HeartbeatInterval is the refresh cadence for the writer
+    // heartbeats: the flock goroutine refreshes `WriterHeartbeat`
+    // at this interval while it holds `LOCK_EX`, and the
+    // last-writer refresher refreshes `LastWriterHeartbeat` while
+    // the record names this process. Must be significantly less
+    // than `StaleTimeout` for scheduling jitter. Default: 1s. See
+    // cross-process.md §Writer Heartbeat.
     HeartbeatInterval time.Duration
 
     // LockRetryInterval is the polling interval the flock goroutine

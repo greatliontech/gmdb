@@ -335,37 +335,41 @@ type Options struct {
 	// transactions.md §Write Batching.
 	MaxBatchDelay time.Duration
 
-	// StaleTimeout is how long a reader slot's (or a peer writer's)
-	// heartbeat may lag this process's monotonic clock before
-	// cross-process stale-detection reclaims it (cross-process.md
-	// §Heartbeat Goroutine). It is a *data-integrity* bound, not a
-	// performance knob: a window shorter than a live peer's effective
-	// heartbeat cadence lets a writer's RPL-reclamation scan evict that
-	// peer's still-live reader and reclaim pages it is still reading.
-	// Must be significantly larger than HeartbeatInterval to absorb
-	// scheduling jitter; Open rejects StaleTimeout <= HeartbeatInterval
-	// with ErrInvalidOptions. Zero ⇒ default. Default: 10s.
+	// StaleTimeout is how long a peer writer's record heartbeat may
+	// lag this process's monotonic clock before liveness
+	// classification calls its author dead (cross-process.md §Writer
+	// Heartbeat) — the recovery-commit gate is the consumer. Reader
+	// slots consult no timeout: their liveness is the held slot
+	// lock, so no window setting can evict a live reader. It is a
+	// *data-integrity* bound, not a performance knob: a window
+	// shorter than a live writer's effective heartbeat cadence lets
+	// recovery misjudge that writer dead. Must be significantly
+	// larger than HeartbeatInterval to absorb scheduling jitter;
+	// Open rejects StaleTimeout <= HeartbeatInterval with
+	// ErrInvalidOptions. Zero ⇒ default. Default: 10s.
 	StaleTimeout time.Duration
 
-	// CrossNamespaceStaleTimeout governs every CROSS-namespace (or
-	// namespace-unknown) liveness classification — container peers,
-	// where the heartbeat is the only signal and a paused or frozen
-	// container (docker pause, cgroup freeze, heavy swap) stops
-	// heartbeating while its reads stay live (cross-process.md
-	// §Stale-reader detection, cross-namespace window). Same-namespace
-	// peers are classified by kill(0) + process start time and are
-	// unaffected. Zero ⇒ 6 × the effective StaleTimeout (60 s at
-	// defaults). Must be >= StaleTimeout. The trade: a genuinely dead
-	// container pins RPL reclamation for this window instead of
+	// CrossNamespaceStaleTimeout governs the CROSS-namespace (or
+	// namespace-unknown) WRITER-record classification — container
+	// peers, where the heartbeat is the only signal and a paused or
+	// frozen container (docker pause, cgroup freeze, heavy swap)
+	// stops heartbeating while its work stays live
+	// (cross-process.md §Writer Heartbeat). Same-namespace peers are
+	// classified by kill(0) + process start time and are unaffected;
+	// reader slots consult no timeout in any namespace (held slot
+	// lock). Zero ⇒ 6 × the effective StaleTimeout (60 s at
+	// defaults). Must be >= StaleTimeout. The trade: a genuinely
+	// dead container defers recovery for this window instead of
 	// StaleTimeout.
 	CrossNamespaceStaleTimeout time.Duration
 
-	// HeartbeatInterval is how often the per-DB heartbeat goroutine
-	// refreshes WriterHeartbeat (while this process holds the write
-	// lock) and the Heartbeat field of every active reader slot
-	// (cross-process.md §Heartbeat Goroutine). Must be well under
-	// StaleTimeout so a few missed ticks don't trip false-stale
-	// detection. Zero ⇒ default. Default: 1s.
+	// HeartbeatInterval is the refresh cadence for the writer
+	// heartbeat fields: WriterHeartbeat while this process holds the
+	// write lock, and the last-writer record once it has ever held
+	// it (cross-process.md §Writer Heartbeat). Reader slots carry no
+	// heartbeat. Must be well under StaleTimeout so a few missed
+	// ticks don't trip false-stale detection. Zero ⇒ default.
+	// Default: 1s.
 	HeartbeatInterval time.Duration
 
 	// LockRetryInterval is the polling tick the flock goroutine uses
@@ -530,20 +534,22 @@ func (o Options) validate() error {
 		return errInvalidCoordInterval
 	}
 	// StaleTimeout > HeartbeatInterval is a data-integrity precondition,
-	// not a tuning preference (cross-process.md §Heartbeat Goroutine:
+	// not a tuning preference (cross-process.md §Writer Heartbeat:
 	// "Must be significantly larger than the heartbeat interval ... for
 	// scheduling jitter"). At or below the heartbeat cadence, a single
-	// jitter-delayed tick lets a writer's OldestReaderTxnID scan
-	// misclassify a live reader slot as stale and reclaim pages it is
-	// still reading (use-after-reclaim). Reject the always-unsafe region
-	// at Open; the godoc recommends a window several times larger.
+	// jitter-delayed tick lets liveness classification misjudge a LIVE
+	// WRITER's record as stale — the recovery-commit gate then treats a
+	// live author's unfsynced commits as a crash's (reader slots
+	// consult no timeout; their liveness is the held slot lock). Reject
+	// the always-unsafe region at Open; the godoc recommends a window
+	// several times larger.
 	if o.StaleTimeout <= o.HeartbeatInterval {
 		return errStaleTimeoutTooSmall
 	}
 	// The cross-namespace window can never be TIGHTER than the general
-	// one — it exists to widen the heartbeat-only classification for
-	// freezable container peers (cross-process.md §Stale-reader
-	// detection, cross-namespace window).
+	// one — it exists to widen the heartbeat-only writer-record
+	// classification for freezable container peers (cross-process.md
+	// §Writer Heartbeat).
 	if o.CrossNamespaceStaleTimeout < o.StaleTimeout {
 		return errCrossNSStaleTimeoutTooSmall
 	}

@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -319,7 +320,7 @@ func TestOpenAdoptsAfterProgressAbort(t *testing.T) {
 		}
 		defer func() { _ = flock.Unlock(pf.Fd()) }()
 		time.Sleep(350 * time.Millisecond)
-		peerDone <- initLockFile(pf, uuid, 8, FileSize(8))
+		peerDone <- initLockFile(OpenParams{Root: root, Base: base}, pf, uuid, 8, FileSize(8))
 	}()
 
 	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 8})
@@ -479,6 +480,58 @@ func TestOpenRecreatesOnSizeMismatch(t *testing.T) {
 	}
 	if st.Size() != FileSize(8) {
 		t.Errorf("recreated size = %d, want %d", st.Size(), FileSize(8))
+	}
+}
+
+func TestOpenRecreatesOnHeartbeatEraMagic(t *testing.T) {
+	// A header carrying the heartbeat-era magic (MagicV1) is a
+	// stale-FORMAT lock file: never adopted — a heartbeat-era peer
+	// sharing the table would evict lock-era readers — and never
+	// ErrCorrupted (that would brick every upgraded deployment whose
+	// old binary left its lock file behind). Open unlinks and
+	// recreates in the current format, exactly like a UUID mismatch
+	// (cross-process.md §Lock File Lifecycle, stale detection).
+	root, base, fullPath := tmpLock(t)
+	uuid := [16]byte{0xAA}
+
+	f, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// Occupy a reader slot so the recreate observably drops v1 state.
+	Store64(&f.Slot(3).TxnID, 42)
+	f.Close()
+
+	fd, err := os.OpenFile(fullPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open for tamper: %v", err)
+	}
+	v1 := make([]byte, 8)
+	binary.LittleEndian.PutUint64(v1, MagicV1)
+	if _, err := fd.WriteAt(v1, 0); err != nil {
+		t.Fatalf("tamper write: %v", err)
+	}
+	fd.Close()
+
+	f2, err := Open(OpenParams{Root: root, Base: base, DataUUID: uuid, MaxReaders: 8})
+	if err != nil {
+		t.Fatalf("reopen after MagicV1: %v (want stale-format recreate)", err)
+	}
+	defer f2.Close()
+	if got := Load64(&f2.Slot(3).TxnID); got != 0 {
+		t.Errorf("v1 reader-slot state survived recreate: TxnID = %d, want 0", got)
+	}
+	hdr := make([]byte, 8)
+	rf, err := os.Open(fullPath)
+	if err != nil {
+		t.Fatalf("reopen for verify: %v", err)
+	}
+	defer rf.Close()
+	if _, err := rf.ReadAt(hdr, 0); err != nil {
+		t.Fatalf("read recreated magic: %v", err)
+	}
+	if got := binary.LittleEndian.Uint64(hdr); got != Magic {
+		t.Errorf("recreated magic = 0x%016x, want lock.Magic 0x%016x", got, Magic)
 	}
 }
 
@@ -951,7 +1004,7 @@ func TestAdoptForeignBootEpochResetsCoordinationState(t *testing.T) {
 	f.SetLastWriterHeartbeat(999)
 	Store64(&f.Slot(1).TxnID, 33)
 	Store64(&f.Slot(1).PID, 4242)
-	Store64(&f.Slot(1).Heartbeat, 999)
+	Store64(&f.Slot(1).Reserved3, 999)
 	f.BumpDataGeneration()
 	f.BumpShrinkSeq() // leave it odd, like a writer crashed mid-bracket
 	gen := f.DataGeneration()
@@ -980,8 +1033,8 @@ func TestAdoptForeignBootEpochResetsCoordinationState(t *testing.T) {
 	if tx := Load64(&f2.Slot(1).TxnID); tx != 0 {
 		t.Errorf("slot 1 TxnID = %d, want 0 (cross-boot reader slots must reset)", tx)
 	}
-	if hb := Load64(&f2.Slot(1).Heartbeat); hb != 0 {
-		t.Errorf("slot 1 Heartbeat = %d, want 0", hb)
+	if hb := Load64(&f2.Slot(1).Reserved3); hb != 0 {
+		t.Errorf("slot 1 Reserved3 = %d, want 0 (reset zeroes retired fields)", hb)
 	}
 	if s := f2.ShrinkSeq(); s != 0 {
 		t.Errorf("ShrinkSeq = %d, want 0 (reset re-evens the seqlock)", s)

@@ -9,7 +9,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// The flock seam on windows (cross-process.md §Heartbeat Goroutine,
+// The flock seam on windows (cross-process.md §Writer Heartbeat,
 // WINDOWS PORT DESIGN): whole-file advisory semantics emulated with a
 // one-byte LockFileEx/UnlockFileEx range at offset 2^63−1. Windows
 // byte-range locks are MANDATORY against ReadFile/WriteFile (mapped

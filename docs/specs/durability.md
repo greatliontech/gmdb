@@ -612,9 +612,10 @@ On recovery (Open after crash):
    change the carrier's bytes and an equal-TxnID copy would
    undefine selection, so the divergent case republishes here).
    The no-live-author gate: the lock file was freshly created, or its persisted
-   last-writer record and every reader slot classify as dead/stale
+   last-writer record classifies as dead and every reader slot as
+   stale — a slot whose lock a probe takes
    (`cross-process.md §Lock File Layout`, LastWriter*; §Reader
-   Table). The last-writer record — written at grant acquisition,
+   Table, stale-slot reclamation). The last-writer record — written at grant acquisition,
    surviving grant release, heartbeated for the author handle's
    lifetime — is the load-bearing signal: only the last writer's
    process can own unfsynced live commits, and it may be IDLE

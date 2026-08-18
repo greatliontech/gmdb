@@ -33,8 +33,8 @@ var ErrReadOnlyCoord = errors.New("lock: AcquireWriter on a read-only coord")
 // for the LockRetryInterval default (cross-process.md §Write Lock).
 const DefaultRetryInterval = 50 * time.Millisecond
 
-// DefaultHeartbeatInterval matches the cross-process.md §Heartbeat
-// Goroutine default ("ticks every ~1 s"). Must remain well under
+// DefaultHeartbeatInterval matches the cross-process.md §Writer
+// Heartbeat default ("ticks every ~1 s"). Must remain well under
 // StaleTimeout (10 s) so a few missed ticks don't trip false-stale
 // detection. Exported so the gmdb Options layer shares a single
 // source of truth for the HeartbeatInterval default.
@@ -71,13 +71,13 @@ type Coord struct {
 
 	retryInterval time.Duration
 
-	// activeSlotsMu protects activeSlots. cross-process.md §Heartbeat
-	// Goroutine: RegisterReaderSlot / UnregisterReaderSlot mutate
-	// under the mutex; the heartbeat goroutine snapshots-and-releases
-	// before writing slot Heartbeats outside the lock to keep tick
-	// cost bounded.
+	// activeSlotsMu protects activeSlots — this handle's held reader
+	// slots, maintained by RegisterReaderSlot / UnregisterReaderSlot.
+	// Consumers: ActiveReaderSlots (Compact's in-process reader
+	// drain) and Close-time cleanup. Reader slots carry no heartbeat;
+	// no goroutine walks this list.
 	activeSlotsMu sync.Mutex
-	activeSlots   []slotRef
+	activeSlots   []uint32
 
 	heartbeatInterval time.Duration
 	staleTimeout      time.Duration
@@ -86,11 +86,11 @@ type Coord struct {
 	heartbeatDoneCh   chan struct{}
 
 	// readOnly marks a Coord that backs a read-only DB handle
-	// (CoordOptions.ReadOnly). The flock-grant goroutine (run) is not
-	// started — only the heartbeat goroutine runs, refreshing the
-	// reader slots this handle acquires so a concurrent cross-process
-	// writer cannot stale-evict them. AcquireWriter returns
-	// ErrReadOnlyCoord; Close waits only on the heartbeat goroutine.
+	// (CoordOptions.ReadOnly). Neither goroutine is started (see
+	// NewCoord): nothing to grant, and the last-writer refresh is
+	// unreachable without a grant. The handle's reader slots need no
+	// goroutine — their liveness is the held slot lock. AcquireWriter
+	// returns ErrReadOnlyCoord.
 	readOnly bool
 
 	// readerSlotHint is the process-local scan-start offset for
@@ -222,33 +222,37 @@ type CoordOptions struct {
 	// ctx-cancellation latency under sustained contention.
 	RetryInterval time.Duration
 
-	// HeartbeatInterval is the refresh cadence for both heartbeat
-	// fields: the flock goroutine refreshes WriterHeartbeat at this
-	// interval while it holds LOCK_EX (step-4 hold loop), and the
-	// heartbeat goroutine refreshes the Heartbeat field of every
-	// reader slot in the active list. Zero ⇒ DefaultHeartbeatInterval
-	// (1 s). Must remain well under StaleTimeout (10 s, per
-	// cross-process.md §Heartbeat Goroutine).
+	// HeartbeatInterval is the refresh cadence for the WRITER
+	// heartbeat fields: the flock goroutine refreshes
+	// WriterHeartbeat at this interval while it holds LOCK_EX
+	// (step-4 hold loop), and the heartbeat goroutine refreshes
+	// LastWriterHeartbeat (the recovery-commit gate's author-
+	// liveness signal). Reader slots carry no heartbeat — their
+	// liveness is the held slot lock. Zero ⇒
+	// DefaultHeartbeatInterval (1 s). Must remain well under
+	// StaleTimeout (10 s, per cross-process.md §Writer Heartbeat).
 	HeartbeatInterval time.Duration
 
-	// StaleTimeout is how long a reader-slot or writer Heartbeat must
-	// be older than the scan clock before stale-detection reclaims it
-	// (cross-process.md §Heartbeat Goroutine). Zero ⇒
-	// DefaultStaleTimeout (10 s). Consumed by OldestReaderTxnID (and
-	// thus ReapStaleReaderSlots); the writer-recovery path under
-	// LOCK_EX is timeout-independent (any non-zero WriterPID held while
-	// we own LOCK_EX is definitionally stale). Must be significantly
-	// larger than HeartbeatInterval for scheduling jitter — the caller
+	// StaleTimeout is how long a WRITER-record heartbeat must be
+	// older than the scan clock before liveness classification calls
+	// its author dead (cross-process.md §Writer Heartbeat) — the
+	// recovery-commit gate's LastWriter classification is the
+	// consumer. Zero ⇒ DefaultStaleTimeout (10 s). The
+	// writer-recovery path under LOCK_EX is timeout-independent (any
+	// non-zero WriterPID held while we own LOCK_EX is definitionally
+	// stale), and reader slots consult no timeout at all — their
+	// liveness is the held slot lock. Must be significantly larger
+	// than HeartbeatInterval for scheduling jitter — the caller
 	// (gmdb.Options.validate) enforces StaleTimeout > HeartbeatInterval.
 	StaleTimeout time.Duration
 
-	// CrossNamespaceStaleTimeout governs every cross-namespace (or
-	// namespace-unknown) heartbeat classification — where the
-	// heartbeat is the ONLY liveness signal and a paused/frozen
-	// container stops heartbeating while its reads stay live
-	// (cross-process.md §Stale-reader detection, cross-namespace
-	// window). Zero ⇒ 6 × the effective StaleTimeout. The caller
-	// (gmdb.Options.validate) enforces >= StaleTimeout.
+	// CrossNamespaceStaleTimeout governs the cross-namespace (or
+	// namespace-unknown) WRITER-record heartbeat classification —
+	// where the heartbeat is the only liveness signal and a
+	// paused/frozen container stops heartbeating while its work
+	// stays live (cross-process.md §Writer Heartbeat). Zero ⇒ 6 ×
+	// the effective StaleTimeout. The caller (gmdb.Options.validate)
+	// enforces >= StaleTimeout.
 	CrossNamespaceStaleTimeout time.Duration
 
 	// Clock returns the monotonic clock value in nanoseconds. Nil ⇒
@@ -294,10 +298,10 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 		rawClock = nowMonotonic
 	}
 	// Floor the coordination clock at 1 ns: a heartbeat stamped with the
-	// literal value 0 IS the protocol's "unstamped" sentinel — permanently
-	// fresh to the reader-slot scan (zeroHeartbeatFresh) and instantly stale
-	// for the writer records — so a stamp must never be the sentinel by
-	// construction (cross-process.md, heartbeat sentinel clause). A real
+	// literal value 0 IS the protocol's "unstamped" sentinel — instantly
+	// stale to the writer-record classifiers — so a stamp must never be
+	// the sentinel by construction (cross-process.md, heartbeat sentinel
+	// clause). A real
 	// CLOCK_BOOTTIME never reads 0 while userspace runs; a virtualized boot
 	// clock (deterministic simulation) legitimately does at the boot instant,
 	// and this funnel feeds every stamp and scan.
@@ -318,16 +322,20 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 		heartbeatDoneCh:   make(chan struct{}),
 		readOnly:          opts.ReadOnly,
 	}
-	// A read-only coord never takes LOCK_EX, so the flock-grant
-	// goroutine is not started. Close must not wait on doneCh in that
-	// case — nothing closes it. The heartbeat goroutine still runs to
-	// keep this handle's reader slots live.
+	// A read-only coord never takes LOCK_EX, so neither goroutine is
+	// started: the flock-grant goroutine has nothing to grant, and
+	// the heartbeat goroutine's one job — the last-writer refresh —
+	// is gated on everWriter, which a read-only handle can never
+	// latch (reader slots carry no heartbeat; their liveness is the
+	// held slot lock). Close must not wait on channels nothing
+	// closes, so both are pre-closed.
 	if !c.readOnly {
 		go c.run()
+		go c.heartbeat()
 	} else {
 		close(c.doneCh)
+		close(c.heartbeatDoneCh)
 	}
-	go c.heartbeat()
 	return c
 }
 
@@ -339,7 +347,7 @@ func NewCoord(f *File, opts CoordOptions) *Coord {
 // releases invariants).
 //
 // The heartbeat goroutine is also drained before Close returns
-// (cross-process.md §Heartbeat Goroutine shutdown coordination): a
+// (cross-process.md §Writer Heartbeat shutdown coordination): a
 // final tick must not race the *File's munmap. Callers must complete
 // Coord.Close before Closing the underlying *File.
 //
@@ -543,10 +551,10 @@ func (c *Coord) process(req writerRequest, tick <-chan time.Time) bool {
 
 	// Step 3: publish writer identity. Order among these three is NOT
 	// load-bearing — same-namespace stale-writer detection inspects
-	// all three jointly under cross-process.md §Stale Writer Recovery,
-	// unlike reader-slot acquire (cross-process.md §Reader Table)
-	// whose Heartbeat→HintEpoch→PIDNamespace→ProcessStartTime→PID
-	// ordering IS load-bearing. The flock-as-mutex is what makes the
+	// all three jointly under cross-process.md §Stale writer recovery,
+	// unlike reader-slot release (cross-process.md §Slot release)
+	// whose zero-then-unlock ordering IS load-bearing. The
+	// flock-as-mutex is what makes the
 	// asymmetry safe: no peer can observe these fields without first
 	// taking LOCK_SH or LOCK_EX, both of which we exclude via our held
 	// LOCK_EX. The publish-before-flock-release ordering is what's
@@ -659,18 +667,16 @@ func SetReleaseHookForTest(hook func()) {
 	releaseHookForTest.Store(&hook)
 }
 
-// heartbeat is the periodic-refresh goroutine started by NewCoord
-// and stopped by Close. Per cross-process.md §Heartbeat Goroutine it
-// refreshes every active reader slot's Heartbeat field once per
-// HeartbeatInterval. It does NOT touch WriterHeartbeat: that field is
-// refreshed exclusively by the flock goroutine inside its step-4 hold
-// loop (process) — the only context in which this process holds
+// heartbeat is the last-writer refresher goroutine started by
+// NewCoord and stopped by Close (cross-process.md §Writer
+// Heartbeat). Reader slots carry no heartbeat — their liveness is
+// the held slot lock — so this goroutine's ONE job is keeping the
+// last-writer record fresh, the recovery-commit gate's
+// author-liveness signal. It does NOT touch WriterHeartbeat: that
+// field is refreshed exclusively by the flock goroutine inside its
+// step-4 hold loop — the only context in which this process holds
 // LOCK_EX — so the "WriterHeartbeat written only under LOCK_EX"
-// invariant holds by construction rather than via a cross-goroutine
-// holding flag. The activeSlotsMu snapshot pattern keeps tick cost
-// bounded — the lock is held only long enough to copy the slot index
-// list; atomic stores happen outside the lock so a slow
-// Register/Unregister cannot stall the tick.
+// invariant holds by construction.
 func (c *Coord) heartbeat() {
 	defer close(c.heartbeatDoneCh)
 	ticker := time.NewTicker(c.heartbeatInterval)
@@ -680,25 +686,6 @@ func (c *Coord) heartbeat() {
 		case <-c.stopCh:
 			return
 		case <-ticker.C:
-			now := c.clock()
-			c.activeSlotsMu.Lock()
-			// Snapshot to a local. activeSlots is typically O(active
-			// readers) — small. The alloc is the only per-tick
-			// allocation; acceptable given a 1 s default cadence.
-			slots := append([]slotRef(nil), c.activeSlots...)
-			c.activeSlotsMu.Unlock()
-			for _, ref := range slots {
-				slot := c.f.Slot(ref.idx)
-				// Gen-guarded: never stamp a slot this handle no
-				// longer owns (aged out + possibly re-won). The
-				// check-then-store races a concurrent re-win by one
-				// tick; the stray stamp freshens the RE-WINNER's live
-				// slot — conservative, never an eviction.
-				if Load64(&slot.Gen) != ref.gen {
-					continue
-				}
-				Store64(&slot.Heartbeat, now)
-			}
 			// Keep the last-writer record fresh for this handle's
 			// LIFETIME once it has ever held the grant — but only
 			// while the record still names US (a later writer in
@@ -709,35 +696,24 @@ func (c *Coord) heartbeat() {
 			// conservative (recovery deferred ≤ one interval), never
 			// a false-stale.
 			if c.everWriter.Load() && c.f.LastWriterPID() == c.pid && c.f.LastWriterPIDNamespace() == c.pidNS {
-				c.f.SetLastWriterHeartbeat(now)
+				c.f.SetLastWriterHeartbeat(c.clock())
 			}
 		}
 	}
 }
 
-// RegisterReaderSlot adds slot index i to the heartbeat goroutine's
-// active list. Callers (the read-tx Begin path) invoke this AFTER
-// successful slot acquisition. The heartbeat goroutine refreshes
-// the slot's Heartbeat field on each subsequent tick until
-// UnregisterReaderSlot is called.
+// RegisterReaderSlot adds slot index i to the handle's active-slot
+// list. Callers (the read-tx Begin path) invoke this AFTER
+// successful slot acquisition; the list serves Close-time cleanup
+// and the in-process reader count (ActiveReaderSlots) — reader
+// slots carry no heartbeat.
 //
-// No deduplication: registering the same index twice will produce
-// two heartbeat writes per tick (harmless — both stores write the
-// same value) but UnregisterReaderSlot removes only the first match.
-// Internal callers are trusted not to double-register.
-func (c *Coord) RegisterReaderSlot(i uint32, gen uint64) {
+// No deduplication; internal callers are trusted not to
+// double-register.
+func (c *Coord) RegisterReaderSlot(i uint32) {
 	c.activeSlotsMu.Lock()
-	c.activeSlots = append(c.activeSlots, slotRef{idx: i, gen: gen})
+	c.activeSlots = append(c.activeSlots, i)
 	c.activeSlotsMu.Unlock()
-}
-
-// slotRef is a heartbeat-registry entry: the slot index plus the
-// acquisition generation, so a tick never stamps a slot this handle
-// lost to an aging clear (the stamp would ghost-freshen the
-// re-winner's heartbeat — or a free slot).
-type slotRef struct {
-	idx uint32
-	gen uint64
 }
 
 // ActiveReaderSlots reports how many reader slots this handle (this
@@ -772,11 +748,11 @@ func (c *Coord) BumpDataGeneration() uint64 { return c.f.BumpDataGeneration() }
 
 // StaleTimeout returns the effective per-process stale-detection
 // window — the configured CoordOptions.StaleTimeout, or
-// DefaultStaleTimeout (10 s) when unset. It governs how long a reader
-// slot's (or writer's) Heartbeat may lag the scan clock before
-// stale-detection reclaims it; OldestReaderTxnID uses it via
-// staleTimeoutNanos. Exposed for diagnostics and to let the gmdb
-// Options layer confirm the value it passed in took effect.
+// DefaultStaleTimeout (10 s) when unset. It governs how long a
+// WRITER-record heartbeat may lag the scan clock before liveness
+// classification calls its author dead (see the CoordOptions field
+// doc). Exposed for diagnostics and to let the gmdb Options layer
+// confirm the value it passed in took effect.
 func (c *Coord) StaleTimeout() time.Duration { return c.staleTimeout }
 
 // HeartbeatInterval returns the effective heartbeat-refresh cadence —
@@ -792,18 +768,17 @@ func (c *Coord) HeartbeatInterval() time.Duration { return c.heartbeatInterval }
 func (c *Coord) RetryInterval() time.Duration { return c.retryInterval }
 
 // UnregisterReaderSlot removes slot index i from the active list.
-// MUST be called BEFORE the reader-side clears the slot's
-// PID/Heartbeat/etc. on release (cross-process.md §Heartbeat
-// Goroutine "Race note"): otherwise the next heartbeat tick can
-// stomp a freshly-reacquired slot with our process's clock value.
+// No goroutine walks the list (reader slots carry no heartbeat), so
+// ordering against the slot's release stores is unconstrained; the
+// ReleaseReader path unregisters first purely so ActiveReaderSlots
+// never counts a slot whose lock is already dropped.
 //
 // Idempotent — removing an absent index is a no-op (no error).
 func (c *Coord) UnregisterReaderSlot(i uint32) {
 	c.activeSlotsMu.Lock()
 	for j, s := range c.activeSlots {
-		if s.idx == i {
-			// Swap-with-last + truncate. Order doesn't matter; the
-			// heartbeat snapshot walks the whole slice per tick.
+		if s == i {
+			// Swap-with-last + truncate; the list is unordered.
 			last := len(c.activeSlots) - 1
 			c.activeSlots[j] = c.activeSlots[last]
 			c.activeSlots = c.activeSlots[:last]
@@ -884,13 +859,26 @@ func (c *Coord) BumpTakeoverSeq() {
 // to the gate — the acquisition stamped this handle's own identity
 // into it.
 //
+// staleTimeoutNanos converts this Coord's effective StaleTimeout to
+// the uint64 nanoseconds the WRITER-record classifiers expect
+// (reader slots consult no timeout — held-lock liveness).
+func (c *Coord) staleTimeoutNanos() uint64 {
+	return uint64(c.staleTimeout / time.Nanosecond)
+}
+
+// crossNSTimeoutNanos is the cross-namespace classification window
+// for the writer records, in uint64 nanoseconds.
+func (c *Coord) crossNSTimeoutNanos() uint64 {
+	return uint64(c.crossNSTimeout / time.Nanosecond)
+}
+
 // A previous author that is THIS process (a same-process re-open after
 // Close) classifies live iff the process is, i.e. always — correct: an
 // in-process reopen is a live join, never crash recovery.
 func (c *Coord) PrevLastWriterLive() bool {
 	p := c.prevLastWriter
 	return identityLive(p.pid, p.startTime, p.pidNS, p.heartbeat,
-		c.pidNS, c.clock(), c.staleTimeoutNanos(), c.crossNSTimeoutNanos(), false)
+		c.pidNS, c.clock(), c.staleTimeoutNanos(), c.crossNSTimeoutNanos())
 }
 
 // RedirtyCoveredSeq reads the covered-through takeover sequence. The

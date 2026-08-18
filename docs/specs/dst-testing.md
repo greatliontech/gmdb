@@ -62,8 +62,9 @@ Invariant: kind=clause-explicit;
 ## Simulated syscall surface
 
 gmdb production code runs UNMODIFIED under simulation — no
-build-tag routing of production paths. The fork models gmdb's
-complete Linux host surface (each capability tracked and landed in
+build-tag routing of production paths, with one stated exception:
+the reader-slot lock backend (below). The fork models gmdb's
+Linux host surface (each capability tracked and landed in
 the fork per its own contract, `docs/dst/design.md` there):
 
 - **`SYS_FUTEX`** (`FUTEX_WAIT` with timeout / `FUTEX_WAKE`, the
@@ -88,8 +89,35 @@ the fork per its own contract, `docs/dst/design.md` there):
   reset end-to-end.
 - **Process identity divergence** — pid reuse (the fork's
   `Options.PidMax` pid_max model) and sibling pid namespaces
-  (`ProcessWith`) are constructible, so the stale-identity
-  start-time and cross-namespace heartbeat legs run end-to-end.
+  (`ProcessWith`) are constructible, so the WRITER records'
+  stale-identity start-time and cross-namespace heartbeat legs
+  run end-to-end (reader slots carry no identity legs — their
+  liveness is the held slot lock, exercised by the crash suite's
+  reader reaping).
+- **The mmap family** (`mmap`/`munmap`/`mprotect`) is modeled
+  ONLY behind the `syscall` package's named wrappers — the raw
+  trampolines `golang.org/x/sys/unix` uses for these calls are
+  refused at the raw boundary. Production mmap shims therefore
+  route through the `syscall` package on the DST platforms. This
+  contract is mmap-family-specific: other raw traps gmdb issues
+  (`SYS_FUTEX`, `SYS_RENAMEAT2`) are modeled at the raw boundary
+  per the bullets above.
+- **Reader-slot locks — the stated routing exception.** The fork
+  models `flock(2)` (crash-released) but not OFD byte-range locks
+  (`fcntl(F_OFD_SETLK)`), so under the `dst` tag
+  `flock.RangeSupported` is false and slot locks take the per-slot
+  lock-FILE backend — the same portable tier darwin/freebsd run in
+  production (cross-process.md §Reader Table, slot locks). The
+  slot protocol above the backend seam (acquire, release,
+  probe-and-clear reclamation, restabilization, crash reaping) is
+  backend-agnostic and fully explored in-simulation; what
+  simulation does NOT exercise is the Linux OFD backend itself,
+  whose kernel semantics are covered by the untagged unit tier on
+  the real kernel: two-handle tests for per-description conflict,
+  and a subprocess-kill test for crash release plus the survivor's
+  probe-and-clear. The exception retires if the fork ever models
+  OFD locks: delete the `dst` leg of the `flock` range build tags
+  and this bullet together.
 
 ## Simulation topology conventions
 
@@ -119,25 +147,24 @@ across seeds.
 - **Coordination suite** — cross-process.md: writer-grant
   mutual exclusion and handoff under contention; stale-writer
   takeover after `Crash("writer")` and the recovery-commit gate's
-  dead-vs-live author classification; all THREE stale-identity
-  legs walked end-to-end on the READER-SLOT path — pid liveness,
-  start-time discrimination against a live pid-reuse impostor
-  (`Options.PidMax`), and the cross-namespace heartbeat window
-  against a sibling-namespace crash (`ProcessWith`); the
-  writer/last-writer record consumers reach the same
-  classification through the one shared classifier
-  (cross-process.md's stale-detection rules), pinned at the unit
-  tier; reader-slot
+  dead-vs-live author classification — the stale-identity legs
+  (pid liveness, start-time discrimination against a live
+  pid-reuse impostor via `Options.PidMax`, the cross-namespace
+  heartbeat window via `ProcessWith`) walked on the
+  writer/last-writer RECORDS, their one remaining consumer;
+  reader-slot
   acquisition, reaping
-  of crashed readers, snapshot pinning across a writer's
+  of crashed readers (probe-and-clear: a crashed reader's slot
+  lock releases with its process), snapshot pinning across a
+  writer's
   commits; change notification (`Version`/`WaitVersion`/
   `WaitKeyspaceVersion`) over the real futex waiter, including
   no-lost-wake across publish and cancellation.
 - **Boot-epoch suite** — cross-process.md §BootID: cross-boot
   invalidation across `CrashHost` + `Host` re-declaration, with
   the wedged resource constructed so the adoption reset is the
-  only possible recovery (a cross-namespace slot whose heartbeat
-  reads as the new boot's future).
+  only possible recovery (a wedged coordination resource only
+  the adoption reset can clear).
 - **Crash suite** — durability.md: acked-durable commits always
   recover byte-exact after `CrashHost` at any point; an
   in-flight commit preserves the prior epoch under `CrashTear`

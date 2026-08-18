@@ -10,7 +10,7 @@ import (
 // TestCrossNamespaceStaleTimeoutValidation pins the cross-NS window's
 // Options contract: zero defaults to 6 × StaleTimeout; an explicit
 // value tighter than StaleTimeout is rejected (the window widens,
-// never tightens — cross-process.md §Stale-reader detection).
+// never tightens — cross-process.md §Writer Heartbeat).
 func TestCrossNamespaceStaleTimeoutValidation(t *testing.T) {
 	o := Options{}.applyDefaults()
 	if o.CrossNamespaceStaleTimeout != 6*o.StaleTimeout {

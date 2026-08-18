@@ -7,7 +7,15 @@ import (
 
 // Magic identifies a gmdb lock file. Encoded little-endian on disk so
 // a hex dump reads "gmdblock" left-to-right on x86/arm64.
-const Magic uint64 = 0x6B636F6C62646D67
+const Magic uint64 = 0x326B636F6C62646D
+
+// MagicV1 is the heartbeat-era format's magic. A file carrying it is
+// a stale-FORMAT lock file: deleted and recreated like a UUID
+// mismatch, never adopted — a heartbeat-era peer sharing the table
+// would evict lock-era readers (no heartbeats to observe), so
+// mixed-format peers must refuse to coordinate
+// (cross-process.md §Reader slot).
+const MagicV1 uint64 = 0x6B636F6C62646D67
 
 // HeaderSize is the on-disk byte length of LockFileHeader. Frozen at
 // the value enforced by the compile-time size check in this file.
@@ -129,29 +137,35 @@ type LockFileHeader struct {
 	// Read and written ONLY under the write grant (no cross-grant
 	// atomicity needed; the atomic accessors are for mmap visibility).
 	RedirtyCoveredSeq uint32
-	_                 [4]byte // pad to 8-byte multiple (HeaderSize)
+	// ReadersDirNonce names this lock-file INCARNATION: stamped
+	// random at creation (initLockFile, under the creator's
+	// LOCK_EX), immutable thereafter, and surviving the boot-epoch
+	// reset (incarnation identity, not boot-relative state). The
+	// per-slot lock-FILE backend derives its directory name from it
+	// (readersDir), so two incarnations of the lock file — however
+	// the filesystem reuses inodes — can never share slot files:
+	// cross-incarnation aliasing is unrepresentable
+	// (cross-process.md §Reader Table, slot locks). Occupies the
+	// former trailing pad; HeaderSize is unchanged.
+	ReadersDirNonce uint32
 }
 
-// ReaderSlot overlays one 56-byte slot in the reader table. All seven
-// fields are atomically accessed via the helpers in atomic.go;
-// cross-process visibility of these fields is the entire purpose of
-// the lock-file design.
+// ReaderSlot overlays one 56-byte slot in the reader table. TxnID
+// and the diagnostic PID are atomically accessed via the helpers in
+// atomic.go and mutated only under the slot's held kernel lock
+// (cross-process.md §Reader Table, slot locks) — the lock, not any
+// field, is the slot's liveness. The reserved fields are the
+// retired heartbeat-era layout, kept so the table geometry and size
+// formula are untouched; zeroed on acquire, never read.
 type ReaderSlot struct {
-	_                structs.HostLayout
-	TxnID            uint64
-	PID              uint64
-	ProcessStartTime uint64
-	PIDNamespace     uint64
-	Heartbeat        uint64
-	HintEpoch        uint64
-	// Gen is the slot's acquisition generation: monotonically bumped
-	// by every successful TxnID CAS, never zeroed by release or
-	// clear. An owner's ownership token is (TxnID, Gen-at-acquire):
-	// the post-publish verify, the release, and the restabilization
-	// raise all re-check it, so a slot lost to an aging clear and
-	// re-won — even at the SAME pinned TxnID — is never mistaken for
-	// still-owned (cross-process.md §Slot acquire).
-	Gen uint64
+	_         structs.HostLayout
+	TxnID     uint64
+	PID       uint64
+	Reserved1 uint64 // retired: ProcessStartTime
+	Reserved2 uint64 // retired: PIDNamespace
+	Reserved3 uint64 // retired: Heartbeat
+	Reserved4 uint64 // retired: HintEpoch
+	Reserved5 uint64 // retired: Gen
 }
 
 // Compile-time assertions that the structs' Go sizes match the spec's

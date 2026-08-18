@@ -152,21 +152,29 @@ func (db *DB) runMaintenancePass(ctx context.Context) {
 	db.maintReclaimLeaks(ctx)
 
 	// Task 2 — stale reader-slot cleanup (background-maintenance.md
-	// §Stale Reader Slot Cleanup). Acquire LOCK_EX (via the coord) and
-	// run the reader-table stale-clear scan. This is NOT lock-free: the
-	// clear races peer clearers (a writer's RPL-reclamation scan,
-	// stale-writer recovery) without LOCK_EX, which could evict a live
-	// reader's slot and let RPL reclamation free pages it is still
-	// reading. No write transaction is taken — clearing a slot is a
-	// lock-file mmap store, independent of the data file. Errors (ctx
-	// cancel on Close, coord closed) are benign: the next pass retries.
-	if err := coord.ReapStaleReaderSlots(ctx); err != nil &&
+	// §Stale Reader Slot Cleanup),
+	// probe-based: the slot lock itself serializes clearers, so no
+	// write grant is taken and no live reader can be evicted (a live
+	// owner holds the very lock the probe needs). No write
+	// transaction is taken — clearing a slot is a lock-file mmap
+	// store under the held probe. Errors (ctx cancel on Close) are
+	// benign: the next pass retries.
+	if _, undecided, err := coord.ReapStaleReaderSlots(ctx); err != nil &&
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
 		!errors.Is(err, lock.ErrClosed) {
 		// Closing / cancelled handles are expected and silent; anything
 		// else (e.g. a raw flock() syscall failure) is abnormal — log it,
 		// matching Task 1's discipline. The next pass retries regardless.
 		db.logger.Warn("gmdb: maintenance stale-reader cleanup skipped", "err", err)
+	} else if undecided > 0 {
+		// An occupied slot whose probe errors can be neither judged
+		// live nor cleared; its residue pins the RPL reclamation bound
+		// (conservative — never an eviction). Persistent counts here
+		// mean an unprobeable slot (e.g. an externally removed slot
+		// file under nonzero residue) is silently halting reclamation
+		// — surface it every pass rather than let the file grow
+		// without a trace.
+		db.logger.Warn("gmdb: reader-slot probes undecided; a stale slot may be pinning page reclamation", "slots", undecided)
 	}
 
 	// Task 3 — checksum scrubbing (background-maintenance.md §Checksum

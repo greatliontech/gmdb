@@ -73,7 +73,7 @@ func TestSimulationBootEpochResetUnwedgesReaders(t *testing.T) {
 				simulation.Process("writeback", func() {
 					mustAwait(t, "/pinned")
 					// The kernel's periodic writeback, modeled: the dirty
-					// lock-file pages (the pinned slot, its heartbeat, the
+					// lock-file pages (the pinned slot's TxnID residue, the
 					// boot-1 epoch stamp) reach the platter before power is
 					// lost, so the stale state survives into boot 2.
 					f, err := os.OpenFile("/db.lock", os.O_RDWR, 0)

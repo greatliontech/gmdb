@@ -3,19 +3,20 @@
 Processes sharing a gmdb file coordinate via a separate **lock
 file** (`<dbname>.lock`) mmap'd as shared memory. This spec defines
 the lock-file layout, the write-lock protocol (intra-process queue +
-cross-process flock), the reader table and its stale-detection
-rules, and the heartbeat goroutine that drives cross-PID-namespace
-liveness.
+cross-process flock), the reader table and its per-slot kernel
+locks (held-lock liveness: a reader is alive exactly while its
+slot lock is held), and the last-writer heartbeat that feeds the
+recovery-commit gate.
 
 Scope:
 - Lock file layout (header + reader slots) using `structs.HostLayout`.
 - Lock file lifecycle (creation, validation, deletion).
 - Write lock: flock goroutine, writer acquisition flow, stale
   writer recovery.
-- Reader table: scan + CAS acquisition, atomic-ordered release,
-  stale-reader detection with `HintEpoch` orphan anchor.
-- Process start time as PID-reuse discriminator.
-- PID namespace awareness.
+- Reader table: per-slot kernel locks, lock-then-store
+  acquisition, probe-and-clear stale reclamation.
+- Process start time as PID-reuse discriminator (writer records).
+- PID namespace awareness (writer records).
 - Heartbeat goroutine.
 - Atomic-operations convention for shared memory.
 - Writer's page reclamation entry point.
@@ -43,121 +44,83 @@ Invariant: kind=clause-explicit;
     writer-PID changes, and cross-database leakage.
 
 Invariant: kind=clause-explicit;
-  property=A reader slot is acquired by CAS on `TxnID` from `0` to
-    the current meta's TxnID; immediately after a successful CAS,
-    the acquirer writes `Heartbeat`, then `HintEpoch = 0`, then
-    `PIDNamespace`, then `ProcessStartTime`, then `PID` — in that
-    order. `PID = 0` is the discriminator for "mid-acquire" vs
-    "owned";
-  from=this spec §Reader Table (slot acquire);
-  violation=Out-of-order field stores let a stale-reader scan run
-    `kill(pid, 0)` against a PID the prior owner left behind,
-    misclassifying the new acquirer as stale and clearing its
-    slot mid-transaction (snapshot loss).
+  property=A reader slot's fields are mutated only while the
+    mutator holds the slot's lock (§Reader Table, slot locks):
+    acquisition takes the lock through the handle's hold
+    description before its first store, release zeroes `TxnID`
+    before dropping the lock, and a stale clear zeroes `TxnID`
+    only inside a successful probe acquisition. There is no other
+    writer of a slot;
+  from=this spec §Reader Table (slot locks);
+  violation=A store outside a held slot lock reintroduces the
+    verdict/act gap the lock exists to close: a clearer racing a
+    live acquirer evicts it mid-publish — its snapshot leaves the
+    table, the reclamation bound advances past it, and RPL
+    reclamation frees pages it is reading.
 
 Invariant: kind=clause-explicit;
-  property=A reader slot is released by atomic stores in the order:
-    `PID = 0`, `Heartbeat = 0`, `HintEpoch = 0`, `TxnID = 0`.
-    `TxnID = 0` is always the last store — the slot is observably
-    free only after every other field has been cleared;
-  from=this spec §Reader Table (slot release);
-  violation=Releasing `TxnID` before `PID` lets a writer scan
-    between the next acquirer's CAS and its `PID` store see the
-    *prior* owner's PID — running `kill()` against an exited
-    process, misclassifying the slot as stale, and clearing the
-    fresh acquirer.
+  property=In-process reader-slot acquisition is serialized by the
+    handle's acquisition mutex, because two try-locks through one
+    open file description do not conflict with each other; probes
+    (stale clears) always go through a description distinct from
+    every hold description;
+  from=this spec §Reader Table (slot locks, same-description
+    caveat);
+  violation=Two same-handle Begins racing the same free slot both
+    "acquire" it through the shared description and both publish —
+    two snapshots on one slot, the second silently overwriting the
+    first's pin; a probe through a hold description reads this
+    process's own live reader as dead and clears it.
 
 Invariant: kind=clause-explicit;
   property=A STAMPED heartbeat is never the literal value 0 — the
-    coordination clock is floored at 1 ns, so `Heartbeat == 0` (and
-    `WriterHeartbeat == 0`) always means "unstamped/cleared", never
+    coordination clock is floored at 1 ns, so
+    `WriterHeartbeat == 0` always means "unstamped/cleared", never
     "stamped at the boot instant". Enforced by the Coord clock
     funnel; enforced by `TestCoordClockNeverStampsSentinel` and,
-    end-to-end at boot-instant time, by the DST coordination suite;
-  from=this spec (the sentinel readings of `Heartbeat == 0`
-    throughout §Reader Table and §Stale Writer Recovery);
+    end-to-end at boot-instant time, by the DST coordination suite.
+    (Reader slots carry no heartbeat: their liveness is the held
+    slot lock);
+  from=this spec (the sentinel reading of `WriterHeartbeat == 0`
+    in the writer records and the recovery-commit gate);
   violation=CLOCK_BOOTTIME legitimately reads 0 at the boot
     instant — unreachable for userspace on real kernels but exact
-    under a virtualized boot clock. A reader slot stamped 0 reads
-    as mid-release (`zeroHeartbeatFresh`) and is PERMANENTLY fresh
-    to every scan — an unreclaimable slot wedging the table — while
-    a writer record stamped 0 reads instantly stale, evicting a
-    live writer.
+    under a virtualized boot clock. A writer record stamped 0
+    reads instantly stale, evicting a live writer.
 
 Invariant: kind=clause-explicit;
-  property=Stale-reader detection that observes `TxnID != 0 AND
-    PID == 0 AND Heartbeat == 0` (the "stuck mid-acquire" state)
-    uses `HintEpoch` as the cross-process orphan anchor: the first
-    observer CAS-stores its monotonic clock into `HintEpoch`;
-    subsequent observers in *any* process compare against the
-    stored epoch. The slot is cleared only once `now - HintEpoch >
-    StaleTimeout`;
-  from=this spec §Reader Table (stale detection, PID == 0 path);
-  violation=Without the shared epoch, short-lived writer processes
-    each observe the orphan once, record a local epoch, and exit
-    before `StaleTimeout` elapses — the slot is permanently
-    pinned, blocking all future reclamation.
+  property=A stale reader slot is cleared only by
+    probe-and-clear: the clearer try-locks the slot through a
+    probe description, and the verdict (acquired ⇒ the owner is
+    gone) and the clear (`TxnID = 0` under the held probe) are one
+    act. Held or undecided probes never clear;
+  from=this spec §Reader Table (stale-slot reclamation);
+  violation=A clear decided by anything but the held slot lock
+    (an age window, an identity read) can fire against a live
+    owner — a frozen reader's snapshot is evicted and RPL
+    reclamation frees pages it resumes into (wrong values or
+    ErrCorrupted on a healthy database), the exact failure class
+    the lock-based protocol exists to delete.
 
 Invariant: kind=clause-explicit;
-  property=When a writer clears a stale slot, it performs the SAME
-    four atomic stores in the SAME order as slot release:
-    `PID = 0`, `Heartbeat = 0`, `HintEpoch = 0`, `TxnID = 0` —
-    the dead occupant's identity never survives the clear, and the
-    slot is observably free only after every other field is clean;
-  from=this spec §Reader Table (stale detection — clear ordering);
-  violation=A clear that leaves the dead occupant's PID/Heartbeat
-    behind makes the next acquirer's CAS→publish window observably
-    `TxnID = fresh, PID = dead, Heartbeat = stale`; the scan
-    classifies by `PID != 0` (same-namespace `IsAlive` failure or
-    cross-namespace stale heartbeat) and immediately evicts the
-    LIVE acquirer — snapshot leaves the table, reclamation bound
-    advances past it (use-after-reclaim), and its own later
-    release zeroes a slot a third reader may have won. Reversing
-    only HintEpoch/TxnID instead leaves the narrower window where
-    a fresh acquirer inherits the prior epoch (already aged out)
-    and a genuinely-crashed acquirer is re-cleared faster than
-    `StaleTimeout`, violating the per-occupant timer invariant.
-    (Enforced by `ClearStaleReaderSlot`; pinned by
-    `TestClearedSlotDoesNotEvictMidPublishAcquirer` in
-    `internal/lock/reader_test.go`.)
-
-Invariant: kind=clause-explicit;
-  property=`HintEpoch` lives in the shared-memory lock file (not
-    process-local memory), so the orphan-detection timer survives
-    writer-process turnover;
-  from=this spec §Reader Table (why HintEpoch is shared);
-  violation=Process-local epoch + short-lived writers ⇒
-    permanently-pinned slot (Round-2 finding M1, see source
-    commit history). The shared-memory placement is the only
-    encoding that survives turnover.
-
-Invariant: kind=clause-explicit;
-  property=Every stale-detection age comparison (`now - Heartbeat`
-    and `now - HintEpoch`, in the reader-table scan, the
-    writer-recovery check, AND the recovery-commit gate's
+  property=Every remaining heartbeat age comparison
+    (`now - WriterHeartbeat` in the recovery-commit gate's
     last-writer classification) treats a stamp in the FUTURE
-    (`stamp > now`) as fresh/live, never stale — i.e. clears only
-    when `stamp <= now AND now - stamp > StaleTimeout`. The
-    monotonic-clock stamps are unsigned, so a naive `now - stamp >
-    StaleTimeout` underflows to ~2^64 (> any timeout) for a
-    future stamp and clears a live owner;
-  from=this spec §Reader Table (stale detection) and §Stale Writer
-    Recovery (shared future-stamp guard);
-  violation=A mid-publish reader stores `Heartbeat = nowMonotonic()`
-    (step 4a) before its `PID` (step 4e); a writer scanning with an
-    earlier `now` than that reader's clock read — reachable because
-    nothing orders the two clock reads (the writer may have sampled
-    `now` before the reader sampled its stamp; both clocks are
-    kernel-wide and boot-relative on every supported platform, so
-    the skew is bounded by scheduling, not clock domain) — sees
-    `Heartbeat > now`, underflows, and
-    clears the live acquirer mid-publish. Its snapshot `TxnID`
-    leaves the table, the reclamation bound advances past it, and
-    RPL reclamation frees pages the reader is about to read:
-    use-after-reclaim / torn snapshot. The HB-first/PID-last acquire
-    ordering exists precisely to make mid-publish safe; the underflow
-    defeats it. Backward clock skew (NTP step-back, manual set) is a
-    second trigger.
+    (`stamp > now`) as fresh/live, never stale — i.e. classifies
+    stale only when `stamp <= now AND now - stamp >
+    StaleTimeout`. The monotonic-clock stamps are unsigned, so a
+    naive `now - stamp > StaleTimeout` underflows to ~2^64 (> any
+    timeout) for a future stamp and evicts a live owner. (Reader
+    slots carry no age comparisons at all — their liveness is the
+    held slot lock);
+  from=this spec §Stale Writer Recovery and the recovery-commit
+    gate (durability.md);
+  violation=Nothing orders the stamper's clock read against the
+    classifier's (both kernel-wide and boot-relative; skew bounded
+    by scheduling, not clock domain): a record stamped after the
+    classifier sampled `now` reads as future, underflows, and a
+    live writer's record is classified dead. Backward clock skew
+    (NTP step-back, manual set) is a second trigger.
 
 Invariant: kind=clause-explicit;
   property=Only the flock goroutine ever calls `flock()` on the
@@ -225,7 +188,7 @@ Invariant: kind=clause-explicit;
     §Write Lock step 3). A peer that observes `WriterPID != 0`
     therefore always also sees a non-zero, recent `WriterHeartbeat`
     from the same writer;
-  from=this spec §Write Lock step 3 and §Heartbeat Goroutine
+  from=this spec §Write Lock step 3 and §Writer Heartbeat
     (initial-publish-on-grant);
   violation=Without the synchronous initial store, a different-
     namespace peer scanning between grant and the heartbeat
@@ -237,10 +200,10 @@ Invariant: kind=clause-explicit;
 Invariant: kind=clause-explicit;
   property=A process writes `WriterHeartbeat` only while it holds
     `LOCK_EX` on the lock file. Concurrent peers (in other
-    processes) and the same process's heartbeat goroutine when
+    processes) and the same process's last-writer refresher when
     `LOCK_EX` is not held by this process MUST NOT write
     `WriterHeartbeat`;
-  from=this spec §Heartbeat Goroutine (writer-only updates);
+  from=this spec §Writer Heartbeat (writer-only updates);
   violation=A non-holder "freshness-refresh" (e.g., a hypothetical
     maintenance pass that touches the writer header) corrupts the
     holder's own `WriterHeartbeat` cadence and confuses cross-
@@ -364,12 +327,13 @@ Lock File
 | LastWriterHeartbeat| uint64                  |
 | DataGeneration     | uint64                  |
 | BootID             | [16]byte                |  boot-epoch discriminator
+| ReadersDirNonce    | uint32 (trailing)       |  lock-file incarnation id
 | ShrinkSeq          | uint64                  |  file-shrink seqlock
 | RedirtyCoveredSeq  | uint32 (+4 pad)         |  covered-through takeover sequence
 +----------------------------------------------+
 | Reader Table                                 |
 | +-------+-----+-----+------+-------+-------+ |
-| | TxnID | PID | PST | PIDN | HB | HEpoch | Gen | Slot 0 (56 bytes)
+| | TxnID | PID | Reserved (5 x u64, retired fields) | Slot 0 (56 bytes)
 | | u64   | u64 | u64 | u64  | u64| u64    | u64 | |
 | +-------+-----+-----+------+-------+-------+ |
 | | ...                                       | | up to MaxReaders slots
@@ -381,9 +345,9 @@ Lock File
 +----------------------------------------------+
 ```
 
-PST = Process Start Time. PIDN = PID Namespace. HB = Heartbeat.
-HEpoch = HintEpoch (cross-process orphan-detection anchor for
-slots stuck mid-acquire; see Stale Reader Detection).
+PST = Process Start Time. PIDN = PID Namespace (writer records
+only). Reader-slot bytes past TxnID and the diagnostic PID are
+RESERVED — the retired heartbeat-era fields (see §Reader slot).
 
 TakeoverSeq counts torn-unpublished-write events: grant
 acquisitions that observed a non-zero WriterPID — a holder that
@@ -424,6 +388,7 @@ type LockFileHeader struct {
     LastWriterHeartbeat    uint64
     DataGeneration      uint64
     BootID              [16]byte
+    // … ShrinkSeq, RedirtyCoveredSeq, ReadersDirNonce (see format.go)
     ShrinkSeq           uint64
     RedirtyCoveredSeq   uint32
     _                   [4]byte
@@ -433,11 +398,11 @@ type ReaderSlot struct {
     _                structs.HostLayout
     TxnID            uint64
     PID              uint64
-    ProcessStartTime uint64
-    PIDNamespace     uint64
-    Heartbeat        uint64
-    HintEpoch        uint64 // monotonic clock; first observer of PID==0+Heartbeat==0 sets this
-    Gen              uint64 // acquisition generation; never zeroed
+    Reserved1 uint64 // retired: ProcessStartTime
+    Reserved2 uint64 // retired: PIDNamespace
+    Reserved3 uint64 // retired: Heartbeat
+    Reserved4 uint64 // retired: HintEpoch
+    Reserved5 uint64 // retired: Gen
 }
 ```
 
@@ -481,6 +446,11 @@ explicit encode/decode).
   completes (see `background-maintenance.md`).
 - **DataGeneration** (atomic): counts data-file replacements
   (Compact's rename-over). See §Data-file generation below.
+- **ReadersDirNonce**: the lock-file incarnation nonce — random,
+  stamped at creation, immutable, boot-epoch-reset-surviving. The
+  per-slot lock-FILE backend derives its directory name from it
+  (§Reader Table, slot locks), so two incarnations can never share
+  slot files.
 - **BootID**: the boot-epoch discriminator (Linux
   `/proc/sys/kernel/random/boot_id`), stamped at creation and by
   every cross-boot adoption reset. Heartbeats use a boot-relative
@@ -498,11 +468,12 @@ explicit encode/decode).
   `TakeoverSeq` with its covered-through mark `RedirtyCoveredSeq`
   (zeroed together so the mark never leads the sequence it gates
   on), and
-  every reader slot (including `Gen`) are zeroed — no process from
+  every reader slot (including the reserved fields) are zeroed — no process from
   the stamped boot can exist, so nothing live is evicted — then the
   current boot id is stamped LAST (a crash mid-reset repeats the
-  idempotent reset). `DataGeneration` SURVIVES (it counts inode
-  replacements, not boot-relative time). The reset fires ONLY when
+  idempotent reset). `DataGeneration` and `ReadersDirNonce` SURVIVE
+  (they identify inode replacements and the lock-file incarnation,
+  not boot-relative time). The reset fires ONLY when
   both the stamped and the current boot id are KNOWN (non-zero) and
   differ: a zero on either side (unreadable `/proc` in a chroot or
   mount namespace) DISABLES cross-boot invalidation — resetting on
@@ -542,9 +513,9 @@ explicit encode/decode).
   LastWriterHeartbeat** (atomic): the persisted identity of the most
   recent write-grant holder. Written at every grant acquisition
   under LOCK_EX and — unlike the Writer* block — NOT cleared at
-  release; the heartbeat goroutine of the author handle refreshes
-  `LastWriterHeartbeat` for the handle's LIFETIME while the record
-  still names its process. Only the last writer's process can hold
+  release; the author handle's last-writer refresher goroutine
+  (§Writer Heartbeat) refreshes `LastWriterHeartbeat` for the
+  handle's LIFETIME while the record still names its process. Only the last writer's process can hold
   unfsynced live commits in the shared page cache, so this record is
   the recovery-commit gate's author-liveness signal (`durability.md
   §Recovery` step 5): recovery must not roll the database back while
@@ -555,31 +526,21 @@ explicit encode/decode).
 ### Reader slot (56 bytes)
 
 - **TxnID** (atomic): snapshot TxnID held by this reader. `0` =
-  free.
-- **PID** (atomic): owning process. `uint64` for alignment +
-  forward safety.
-- **ProcessStartTime** (atomic): owning process's start time when
-  the slot was acquired.
-- **PIDNamespace** (atomic): PID namespace inode of owner.
-- **Heartbeat** (atomic): monotonic clock, updated periodically
-  (~1 s) by owning process's heartbeat goroutine.
-- **Gen** (atomic): the acquisition generation — bumped by every
-  successful `TxnID` CAS, never zeroed by release or clear (only
-  the cross-boot reset zeroes it). The `(TxnID, Gen)` pair is the
-  owner's TOKEN: the post-publish ownership verify, the release,
-  the restabilization raise, and the owner's heartbeat ticks all
-  re-check it, so a slot lost to an aging clear and re-won — even
-  at the SAME pinned TxnID — is never used, zeroed, raised, or
-  heartbeat-stamped by its former owner. The guarded clear's
-  observation tuple includes it.
-- **HintEpoch** (atomic): cross-process orphan-detection anchor.
-  Zero during normal operation. The first writer-scan that
-  observes the slot in the "stuck mid-acquire" state
-  (`TxnID != 0 AND PID == 0 AND Heartbeat == 0`) CAS-stores its
-  current monotonic clock here; subsequent scans by *any* process
-  compare against this stored epoch, so the orphan timer survives
-  writer-process turnover. Cleared back to 0 by slot release and
-  by successful acquire's field-write phase.
+  free. Mutated only under the held slot lock (§Reader Table,
+  slot locks) — the lock, not any field, is the slot's liveness.
+- **PID** (atomic): owning process — DIAGNOSTIC only, never
+  consulted for liveness. `uint64` for alignment + forward
+  safety.
+- **Reserved** (5 × uint64): the retired heartbeat-era fields
+  (start time, namespace, heartbeat, generation, orphan epoch).
+  Zeroed on acquire, never read. The 56-byte slot size is
+  retained so the table geometry and the size formula are
+  untouched by the liveness rework; `Magic` itself is bumped
+  regardless (the heartbeat-era value survives as `MagicV1`),
+  because a heartbeat-era peer sharing the file would evict
+  lock-era readers (no heartbeats to observe) — mixed-format
+  peers must not coordinate. A `MagicV1` file is handled by the
+  stale-FORMAT arm of §Lock File Lifecycle's stale detection.
 
 Total size: `144 + (56 × MaxReaders) + 520`. Default 4096 readers:
 `144 + 229376 + 520 = 230040` bytes (~225 KB).
@@ -664,19 +625,28 @@ deleted (e.g., after all processes exit), the next opener
 recreates it. `MaxReaders` is NOT in the data file — it is a
 runtime coordination property.
 
-**Stale detection and identity-guarded removal.** Two validated
+**Stale detection and identity-guarded removal.** Three validated
 states classify an existing lock file as STALE and route to
 delete-and-recreate: a `UUID` that does not match the data file's
-(a database recreated at the same path), and a plausible header
+(a database recreated at the same path); a plausible header
 (valid `Magic`, in-range `MaxReaders`) whose file size disagrees
 with the current layout — a lock file written by a binary with a
-different header layout. The size arm is sound only because a
+different header layout; and a header carrying the heartbeat-era
+magic (`MagicV1`) — a stale-FORMAT file, never adopted, because a
+heartbeat-era peer sharing the table would evict lock-era readers
+(they publish no heartbeats). The size arm is sound only because a
 layout change ships with a data-format-incompatible change: an
 old-binary peer can never be LIVE on the same data file (it cannot
 even open it). Growing the header WITHOUT a data-format break
 would make that arm reachable with a live old-binary peer — grow
 the header only alongside a data-format break, or replace the arm
-first.
+first. The `MagicV1` arm has no such structural guarantee (the
+data format did not break at the liveness rework): its soundness
+rests on not running mixed-format binaries against one data file
+concurrently. The identity guard below still refuses removal
+while a live heartbeat-era WRITER holds its flock; an idle or
+read-only heartbeat-era handle holds no kernel lock and is
+undetectable by construction.
 
 Every by-name unlink of the lock file is IDENTITY-GUARDED. The
 stale-removal path holds `flock(LOCK_EX)` on the fd it VALIDATED
@@ -1009,8 +979,9 @@ If a process crashes holding the write lock, `WriterPID` remains
 non-zero and the `flock()` is automatically released by the
 kernel (fd close on process exit). On `Open()` or write-lock
 acquisition with `WriterPID` non-zero, the process determines
-whether the writer is alive using the same namespace-aware logic
-as reader stale detection:
+whether the writer is alive using namespace-aware identity
+classification (readers need none — their liveness is the held
+slot lock):
 
 1. **Same PID namespace** (`WriterPIDNamespace` == checker's,
    both non-zero):
@@ -1027,18 +998,11 @@ If dead, recovery:
    valid checksum). The crashed writer's partial commit is
    invisible — CoW guarantees the previous meta points to a
    consistent tree.
-2. Scan the reader table for slots matching the dead writer by
-   `(PID, PIDNamespace, ProcessStartTime)` — all three must
-   agree with the corresponding header fields — and clear them.
-   Matching only on `(PID, PIDNamespace)` would wipe a live
-   reader's slot if the OS recycled the dead writer's PID to
-   another in-namespace process that subsequently opened a read
-   transaction (snapshot loss for that reader). The
-   ProcessStartTime term distinguishes PID lifetimes per the
-   same logic the reader-stale-detection same-namespace path
-   uses (§Reader Table case 1).
-3. Clear `WriterPID`, `WriterStartTime`, `WriterPIDNamespace`,
-   `WriterHeartbeat`.
+2. Clear `WriterPID`, `WriterStartTime`, `WriterPIDNamespace`,
+   `WriterHeartbeat`. (The dead writer's own reader slots need no
+   identity-matched scan: the kernel released their slot locks
+   with the process, so they are ordinary stale slots for the
+   probe-based reap — §Reader Table, stale-slot reclamation.)
 
 No special rollback logic for tree consistency — CoW guarantees
 the previous meta points to a fully consistent tree.
@@ -1053,10 +1017,17 @@ on-disk artifacts.
 
 ## Reader Table
 
-Slot allocation uses a simple scan with atomic CAS — no free
-stack or other auxiliary data structure. The reader table is a
-flat array of 56-byte slots in the lock file's shared mmap. All
-operations use atomic memory ops visible across processes.
+Slot allocation uses a simple scan guarded by per-slot kernel
+locks — no free stack or other auxiliary data structure. The
+reader table is a flat array of 56-byte slots in the lock file's
+shared mmap; slot CONTENT uses atomic memory ops visible across
+processes, and slot OWNERSHIP is a held advisory lock the kernel
+releases at process death (SIGKILL included). Liveness is never
+read from memory: a slot is alive exactly while its lock is held,
+judged by try-acquisition — the verdict and any consequent claim
+or clear are one act, so no verdict can go stale between judging
+and acting. No heartbeat, no identity, no timer ever decides a
+reader's death.
 
 **Snapshot selection.** A read transaction (`BeginRead`) snapshots
 the **latest committed** on-disk meta — both meta pages are re-read
@@ -1075,358 +1046,228 @@ This is what lets a reader in one process observe a commit that
 completed (happens-before its `BeginRead`) in another — see the
 Reader snapshot currency invariant.
 
+### Slot locks
+
+Each slot `i` has one kernel advisory lock — the slot's liveness
+authority:
+
+- **Linux**: an open-file-description (OFD) byte-range write lock
+  over the slot's own 56 bytes of the lock file
+  (`fcntl(F_OFD_SETLK)` on `[readerTableOffset + 56·i, 56)`).
+  Each handle keeps two descriptions of the lock file: the HOLD
+  description, on which its own readers' ranges are held, and a
+  PROBE description for judge-only try-locks. OFD range locks and
+  the writer's `flock` are independent lock systems on every
+  supported local filesystem, so they coexist on one file without
+  interaction; a network filesystem that emulates one over the
+  other could collide, and is already excluded by the shared
+  mmap the protocol requires.
+- **macOS / FreeBSD**: OFD range locks do not exist and POSIX
+  range locks are per-process (any close of any descriptor drops
+  them — unsound for multi-handle processes), so each slot's lock
+  is `flock` on a per-slot lock FILE
+  (`<lock>.readers-<nonce>/<i>`), opened per acquisition. The
+  directory and EVERY slot file are created eagerly by the
+  lock-file creator, under its `LOCK_EX`, before the header
+  publishes — the open path never creates, so a vanished entry
+  fails CLOSED for every handle (see the protection boundary
+  below). Creation cost: `MaxReaders` empty files plus two
+  directory fsyncs, once per incarnation — 4096 files at the
+  default, and as many persistent inodes per database for the
+  incarnation's lifetime (a sizing consideration on fixed-inode
+  filesystems hosting many small databases; dynamic-inode
+  filesystems like APFS/ZFS are unaffected). `<nonce>` is the
+  header's incarnation nonce
+  (`ReadersDirNonce`): stamped random at lock-file creation,
+  immutable, boot-epoch-reset-surviving, read by every adopter
+  from the mapped header. Scoping the directory to the lock-file
+  INCARNATION makes cross-incarnation aliasing unrepresentable —
+  a recreated lock file (UUID mismatch, stale format) stamps a
+  fresh nonce and derives a fresh directory, however the
+  filesystem reuses inodes — so a prior incarnation's surviving
+  holders cannot wedge the fresh reader table by holding locks
+  on same-named slot files. A superseded directory is removed by
+  the lifecycle itself: the guarded stale removal deletes the
+  outgoing incarnation's directory under the same `LOCK_EX` and
+  identity proof as the lock-file unlink, so litter never
+  accumulates. That is the ONLY sanctioned removal — externally
+  deleting a readers directory (or a slot file) while any process
+  has the database open is outside the protection boundary,
+  exactly as unlinking the live lock file is: a recreated
+  same-named entry is a fresh inode, surviving holders' locks
+  ride the unlinked one, and mutual exclusion silently splits.
+  The acquisition and probe paths therefore fail CLOSED on a
+  vanished directory or slot file (undecided error) rather than
+  recreating either — nothing ever recreates a slot file inside
+  a live incarnation. The bound consumer is the one path that
+  cannot fail closed: nonzero residue on an unprobeable slot
+  keeps pinning `OldestReaderTxnID` (conservative — never an
+  eviction), so the reap SURFACES its undecided-probe count and
+  background maintenance logs it every pass — a halted
+  reclamation bound is observable, never silent.
+  The creator's eager population also sweeps leftover readers
+  directories (orphans of crashed inits, whose unpublished nonce
+  nothing else can name, and residue of crashed removals):
+  anything present at CREATE time is provably not the live
+  incarnation. Descriptor
+  budget: one open descriptor per ACTIVE
+  read transaction — proportional to actual concurrency, never
+  to `MaxReaders` — documented as this tier's cost.
+- **Windows**: unchanged — the lock mmap shim is unsupported, so
+  a writable open fails and a read-only open falls back to
+  lock-free operation (see PLATFORM SUPPORT).
+
+**Descriptions outlive Close while slots are outstanding.** A
+read transaction may legally outlive `Close()` (leak-detection.md):
+its slot lock must stay HELD until that transaction releases, or
+peers would reclaim the slot under a live post-Close reader — so
+the hold description is refcounted by outstanding slots and closed
+only when the last releases (the per-slot-file tier gets this for
+free: each acquisition owns its descriptor). This is strictly
+stronger than the heartbeat era, which AGED OUT a post-Close
+reader's slot cross-namespace — a documented snapshot loss now
+unrepresentable.
+
+**Same-description caveat.** Two try-locks through one open file
+description do not conflict, on any platform. Consequences, both
+load-bearing: in-process acquisition is serialized by the
+handle's acquisition mutex (two same-handle Begins racing one
+free slot would otherwise both "acquire" it), and probes always
+run through a description distinct from every hold description
+(a probe through a hold description would read this process's
+own live reader as dead). The per-slot-file tier gets the second
+property for free (each acquisition opens its own description);
+the range tier keeps a dedicated probe description per handle.
+
 ### Slot acquire (`Begin` read transaction)
 
-The acquire sequence is structured so that a crash at *any* point
-after the CAS leaves the slot in a state the stale-detector can
-reclaim. Heartbeat is written first (so a crash mid-acquire still
-gives the slot a "recent liveness" anchor that will eventually go
-stale); PID is written last (so the detector's PID-based fast
-path is only used once the full identity has been populated).
+Under the handle's acquisition mutex:
 
-1. Start scanning from the **slot hint** (`coord.readerSlotHint`, an
-   `atomic.Uint32` on the Coord struct) rather than slot 0.
-2. Scan forward (with wraparound) for `TxnID == 0` (free).
-3. Atomically CAS the `TxnID` field from `0` to the current meta
-   page's TxnID. CAS failure ⇒ continue scanning. A successful CAS
-   immediately bumps `Gen`; the resulting `(TxnID, Gen)` pair is
-   the acquisition's OWNERSHIP TOKEN (see the `Gen` field doc).
-4. Immediately after the CAS + Gen bump, in this exact order:
-   a. Store `Heartbeat = nowMonotonic()` (atomic). The clock is
-      read AT STORE TIME, never earlier by the caller: a value read
-      before the CAS can be arbitrarily old by store time if the
-      acquirer was descheduled or frozen, and a stale-at-birth
-      heartbeat lets the next scan age the mid-publish window out
-      immediately.
-   b. Store `HintEpoch = 0` (atomic, clears any prior
-      orphan-anchor left over from a stale-cleared slot).
-   c. Store `PIDNamespace = db.pidNamespace` (atomic).
-   d. Store `ProcessStartTime = db.processStartTime` (atomic).
-   e. Store `PID = currentPID` (atomic).
-   f. **Ownership verify**: re-load the `(TxnID, Gen)` token. If
-      either differs from this acquisition's values, a
-      stale-detection scan aged the mid-publish window out
-      (reachable only when the acquirer was frozen past
-      `StaleTimeout` between the CAS and here) — the Gen check
-      catches even a re-win that pinned the SAME TxnID. Two
-      sub-cases:
-      - Slot still FREE (cleared, not re-won): the acquirer
-        RE-CLAIMS it (CAS from 0) and re-publishes from step 4a.
-        Walking away would strand its identity stores on a
-        `TxnID == 0` slot forever — nothing scrubs a free slot, and
-        the junk breaks the free⇒`PID == 0` premise the detector's
-        mid-publish grace period rests on (the next acquirer's CAS
-        window would present its `TxnID` under the ghost's dead
-        `PID` and be evicted through the identity path with no
-        aging grace). Each re-publish round requires another
-        `> StaleTimeout` freeze to fail again.
-      - Slot re-won: the acquirer ABANDONS it — zeroing it would
-        evict the re-winner, exactly the eviction the guarded clear
-        prevents — and continues scanning. The winner's own publish
-        stores overwrite the ghost's, so no junk survives the
-        abandon.
-
-      **Accepted residual** — each requiring the acquirer (or
-      scanner) frozen past a load-bearing window: (1) a resumed
-      ghost's stores b–e may TRANSIENTLY clobber a re-winner's
-      identity fields before the verify detects the loss (the
-      token makes the loss detectable, closing every durable
-      consequence — the ghost never uses, releases, raises, or
-      heartbeats the slot — but the store interleaving itself
-      needs per-field CAS to close); (2) a scanner descheduled
-      between its guard loads and its clear stores can zero a slot
-      whose frozen occupant resumed and re-published in between —
-      the resumed owner's verify may pass before the clear's final
-      `TxnID` store lands, leaving it on an unpinned snapshot. The
-      formerly-recorded same-TxnID two-owners residual is CLOSED
-      by the token (pinned by `TestAcquireDetectsSameTxnIDRewin`);
-      (3) a ghost frozen between its CAS and its Gen bump can, on
-      resume, leave a published slot NO one owns (both verifies
-      fail) — self-healing junk aged out within `StaleTimeout`,
-      never two owners;
-      the release/raise/heartbeat legs are pinned by
-      `TestReleaseSkipsRewonSlot`, `TestRaiseRefusedAfterSlotLost`,
-      and the gen-guarded tick.
-5. Register the slot index with the heartbeat goroutine's active
-   list.
-6. Update `coord.readerSlotHint`.
-7. If all slots occupied (full wraparound), return
-   `ErrReadersFull`.
-8. **Snapshot restabilization.** The meta whose TxnID seeded step 3
-   was read BEFORE the slot became visible, so a writer whose
-   bound-computation scan completed inside that window may already
-   have reclaimed that snapshot tree's pages. After the slot is
-   published: re-read the latest meta; if its TxnID differs from the
-   pinned one, raise the slot's `TxnID` to the new value (an owner-
-   only, monotonic overwrite — a concurrent scan reading the old
-   value computes a lower, strictly conservative, bound) and repeat
-   until one re-read returns the pinned TxnID unchanged. The
-   transaction proceeds on the stabilized meta.
+1. Scan from the **slot hint** (`coord.readerSlotHint`) with
+   wraparound for `TxnID == 0` (likely free).
+2. Try-lock the candidate slot's lock through the hold
+   description. Busy ⇒ another owner got there first (or a
+   concurrent prober is mid-clear) — continue scanning. Acquired
+   ⇒ the slot is OWNED: the held lock is the ownership token, and
+   there is no CAS, no generation, no publish ordering, and no
+   ownership verify — nothing else can write the slot while the
+   lock is held. Any other try-lock error is UNDECIDED — the
+   slot is skipped (never stolen on an error), and the outcome
+   class survives to step 5.
+3. Store `TxnID = ` the snapshot meta's TxnID (plain atomic
+   store — any residue belonged to a dead owner, whose lock the
+   kernel released; the held lock excludes every other writer of
+   the slot). Store `PID` (diagnostic). Zero the reserved fields.
+4. Register the slot in the handle's active list (Close-time
+   cleanup), update the hint.
+5. If a full wraparound finds no free slot, a SECOND wraparound
+   try-locks EVERY slot: an acquired nonzero one is a dead
+   owner's residue — take it (store TxnID over it), the inline
+   form of stale reclamation — and an acquired zero one closes
+   the pass-boundary race (a peer releasing between the passes
+   leaves a slot the first pass skipped as occupied and a
+   nonzero-only second pass would skip as free). `ErrReadersFull`
+   is returned only when every slot's lock is HELD; if any
+   try-lock was UNDECIDED and no slot was won, the acquisition
+   surfaces that error as a distinct failure — never
+   `ErrReadersFull`, which asserts a table full of live readers.
+6. **Snapshot restabilization** — unchanged from the heartbeat
+   era, because its proof never depended on how liveness is
+   judged: the meta whose TxnID seeded step 3 was read BEFORE the
+   slot became visible, so after publishing, re-read the latest
+   meta; if its TxnID differs, raise the slot's `TxnID` (an
+   owner-only overwrite, trivially exclusive under the held lock)
+   and repeat until one re-read returns the pinned TxnID
+   unchanged.
 
    Why a stable re-read is sufficient: pages of tree `T` are only
    reclaimed through RPL segments with `TxnID t > T`, and
    reclamation runs strictly after the meta carrying `t` was
    written. If the post-publish re-read still returns `T`, no such
    meta existed at re-read time — nothing of tree `T` had been
-   reclaimed — and from that instant every writer's bound scan sees
-   this slot, flooring the bound at `T`.
+   reclaimed — and from that instant every writer's bound scan
+   sees this slot, flooring the bound at `T`. The argument is
+   independent of how scanners treat unpublished slots, so the
+   window between taking the slot lock and the `TxnID` store
+   needs no scanner-side rule at all.
 
 The hint is process-local, updated with a relaxed atomic store —
-no cross-process coordination. Under steady-state load, the hint
-points to a recently-freed slot and the scan completes in 1–2
-iterations. Worst case wraps to O(MaxReaders).
-
-The CAS on `TxnID` is the serialization point. 56-byte slots ×
-4096 = 224 KB — fits in L2 cache, sequential scan with hardware
-prefetching.
+no cross-process coordination. Under steady-state load the scan
+completes in 1–2 iterations; worst case wraps to O(MaxReaders)
+with one try-lock syscall per candidate actually contended.
 
 ### Slot release (`Commit` / `Rollback` read transaction)
 
-In order:
+In order: store `TxnID = 0`, store `PID = 0`, then release the
+slot lock (unlock the range, or close the per-slot descriptor).
+Zero-before-release mirrors acquire's lock-before-store: the slot
+is observably free before it is claimable, so no prober ever
+holds a slot whose fields still claim a snapshot. Only the owner
+releases — enforced by possession of the held lock, not by
+discipline.
 
-1. `PID = 0` (atomic store). Prevents the next stale-reader scan
-   from inspecting this process's (about-to-be-stale) PID after
-   release.
-2. `Heartbeat = 0` (atomic store). Resets the heartbeat-based
-   liveness marker so a subsequent acquirer is in a clean state.
-   *Race note.* The heartbeat goroutine may concurrently store
-   a fresh value to `Heartbeat` for this slot if it has not yet
-   observed the corresponding `activeSlotsMu`-protected
-   Begin/Commit list update. The race is benign — both stores
-   are valid `uint64` values and step 4 (`TxnID = 0`) lands
-   shortly after, putting the slot in the unambiguously-free
-   state. The active-slot list removal happens *before* this
-   step 2 store, so the heartbeat goroutine's next tick will not
-   target this slot.
-3. `HintEpoch = 0` (atomic store). Clears any orphan-detection
-   anchor.
-4. `TxnID = 0` (atomic store). Final release — slot is now free.
+### Stale-slot reclamation
 
-No CAS — only the slot owner writes its own slot. Step 1 before
-step 4 closes the prior-owner-PID race: a writer scanning between
-the next acquirer's CAS and its PID store sees `PID == 0` and
-falls through to the heartbeat path rather than running `kill()`
-against the previous (now-exited) owner's PID.
+A slot is stale exactly when `TxnID != 0` and its lock is
+acquirable. The verdict and the clear are ONE act — probe-and-
+clear: try-lock the slot through a probe description; acquired ⇒
+the owner's process is gone (kernel-proven) ⇒ store `TxnID = 0`
+under the held probe ⇒ release. A held probe means a live owner;
+an undecided probe (open failure and the like) is never a stale
+verdict. There is no guarded-clear observation tuple, no
+namespace classification, no age window, and no orphan epoch:
+the eviction races those mechanisms managed are unrepresentable,
+because clearing requires holding the very lock a live owner
+holds. A frozen reader — the heartbeat era's documented residual
+gap — is simply live: it holds its lock, pins its snapshot, and
+resumes safely.
 
-### Stale-reader detection
+Where reclamation runs: the background maintenance pass
+(`ReapStaleReaderSlots`), the acquire path's second wraparound
+(inline, on table pressure), and a writer whose reclamation
+bound is pinned by a suspicious slot may run the reap before
+recomputing. The reap needs NO write grant: cross-handle clearers
+serialize on the slot lock itself, and same-handle clearers — who
+share ONE probe description, which cannot conflict with itself —
+serialize on a per-handle mutex. Read-only handles may reap too —
+the heartbeat era's "read-only fleets never reap" deployment
+bound is DELETED (a crashed reader's slot is reclaimable by any
+peer, writable or not).
 
-**Cross-namespace liveness uses a longer window.** Same-namespace
-classification rests on `kill(0)` + process-start-time — immune to
-scheduling. Cross-namespace (container) identities have ONLY the
-heartbeat, and a paused or frozen container (`docker pause`, cgroup
-freeze, heavy swap) stops heartbeating while its process — and its
-snapshot reads — stay live; evicting it on the same window tuned for
-same-host jitter reclaims pages under a reader that resumes. Every
-cross-namespace (or namespace-unknown) heartbeat classification —
-the reader-table scan, stale-writer recovery, and the recovery-commit
-gate's last-writer record — therefore uses
-`CrossNamespaceStaleTimeout` (default 6 × `StaleTimeout`, i.e. 60 s
-at defaults; independently tunable, validated `>= StaleTimeout`).
-The trade is explicit: a genuinely dead container pins RPL
-reclamation, and a dead container AUTHOR delays the recovery-commit
-gate, for the longer window instead of the shorter one.
-(Stale-WRITER recovery is unaffected: it is flock-gated and
-window-free — the kernel releases a dead holder's flock, a frozen
-holder still holds it and blocks acquisition at the flock itself,
-and any nonzero writer header observed under LOCK_EX is by the
-clear-before-unlock invariant definitionally stale.) The
-mid-acquire orphan timer (`HintEpoch`, case 0c) is NOT
-identity-based liveness and keeps `StaleTimeout` — it ages an
-anonymous stuck CAS, not a heartbeating peer. Per-process tuning
-cannot bound a PEER's freeze duration; the longer window is a
-documented bound, not a guarantee — the residual gap is inherent to
-heartbeat-based liveness.
-
-During the writer's reader-table scan (to find min active TxnID),
-if a slot has non-zero `TxnID`, classify it by inspecting `PID`
-and `Heartbeat`:
-
-**0. `PID == 0` path (slot is mid-acquire, mid-release, or
-orphaned):**
-
-a. **Fresh heartbeat** (`Heartbeat != 0 AND now - Heartbeat <=
-   StaleTimeout`): a live owner is mid-acquire/release. **Skip.**
-
-b. **Stale heartbeat** (`Heartbeat != 0 AND now - Heartbeat >
-   StaleTimeout`): the acquirer made it past step 4a (heartbeat
-   store) but crashed before step 4e (PID store), and the
-   heartbeat has now aged out. **Orphan: clear `TxnID = 0`.**
-
-c. **Zero heartbeat** (`Heartbeat == 0`): the acquirer crashed
-   *before* step 4a, leaving the slot with `TxnID != 0,
-   PID == 0, Heartbeat == 0`. There is no per-slot age signal
-   yet; use `HintEpoch` as the cross-process orphan anchor:
-
-   - If `HintEpoch == 0`: this is the first observation. CAS
-     `HintEpoch` from 0 to `now`. **Skip clearing this round AND
-     include `TxnID` in the oldest-min computation**: the acquirer
-     may be a live mid-publish reader about to stamp PID;
-     advancing the reclamation bound past its TxnID would let the
-     writer reclaim pages the reader will snapshot. The next scan
-     (from any process) compares against the stored epoch.
-   - If `HintEpoch != 0 AND now - HintEpoch > StaleTimeout`:
-     confirmed orphan. **Clear `TxnID = 0`** (and `HintEpoch`
-     via the post-clear cleanup below).
-   - Otherwise (`HintEpoch != 0`, epoch set but not yet aged out):
-     **skip clearing AND include `TxnID` in the oldest-min
-     computation** — same safety rationale as the first-observer
-     case.
-
-**1. `PID != 0`, same PID namespace** (slot's `PIDNamespace` ==
-checker's, both non-zero):
-
-a. `kill(pid, 0)` — `ESRCH` ⇒ stale.
-b. If alive, compare `ProcessStartTime` — different ⇒ PID
-   recycled, stale.
-c. Match ⇒ alive and holding the slot legitimately.
-
-**2. `PID != 0`, different PID namespace** (or either namespace
-inode is 0):
-
-a. `now - Heartbeat > StaleTimeout` ⇒ stale, clear `TxnID = 0`.
-b. Fresh ⇒ not stale.
-
-**3.** If neither PID nor heartbeat can determine liveness, fall
-back to PID-only liveness (legacy path).
-
-### Clearing a stale slot
-
-**The clear is guarded by the classified observation.** The scan
-loads the slot's full field tuple (`TxnID`, `PID`, `Heartbeat`,
-`HintEpoch`, `ProcessStartTime`, `PIDNamespace`), classifies from
-those values — running syscalls (`kill(2)`, `/proc` reads) in
-between — and immediately before the clear re-validates that every
-field still holds the observed value. A changed slot is SKIPPED and
-its current `TxnID` joins the oldest-min computation; the next scan
-re-classifies the new occupant from scratch. Rationale: between
-classification and clear the classified occupant can release and a
-LIVE reader re-win the slot (the slot hint makes the just-freed slot
-the likely target); an unguarded clear evicts the re-winner — its
-snapshot leaves the table, the reclamation bound advances past it,
-and RPL reclamation frees pages it is reading. The guard is sound
-because a stale-classified occupant is a dead process instance or an
-aged-out crashed acquirer — it cannot mutate its own slot — and no
-acquirer can CAS a slot whose `TxnID` is non-zero; release-then-re-win
-always changes at least one field of the tuple (a fresh heartbeat, a
-zeroed `HintEpoch`, a different `PID`/start time), so an unchanged
-tuple means the classified occupant still holds the slot. Residuals:
-a re-winner whose recycled PID collides on start time within the
-clock tick (the start-time-collision class), the cross-namespace
-frozen-but-alive occupant (the documented longer-window trade
-above), and the scanner-descheduled-mid-clear interleave recorded
-as residual (2) under §Slot acquire step f.
-
-When the writer clears a stale slot, it stores in the SAME exact
-order as slot release:
-
-1. `PID = 0` (atomic). The dead occupant's identity must not
-   survive the clear. If it did, the next acquirer's CAS→publish
-   window would be observably `TxnID = fresh, PID = dead
-   occupant, Heartbeat = stale` — and the stale-detection scan
-   classifies by `PID != 0`: same-namespace `IsAlive(deadPID)`
-   fails (or the cross-namespace heartbeat is stale), so the scan
-   immediately evicts the LIVE acquirer. Its snapshot leaves the
-   table, the reclamation bound advances past it (the
-   use-after-reclaim failure mode), and its own later release
-   zeroes a slot a third reader may since have won.
-2. `Heartbeat = 0` (atomic). Same hazard for the `PID == 0`
-   sub-cases: a leftover stale heartbeat puts the mid-publish
-   acquirer in case (b) — immediate clear — instead of case (c),
-   the epoch-anchored StaleTimeout-bounded path that mid-publish
-   protection relies on.
-3. `HintEpoch = 0` (atomic). Resets the orphan-detection anchor
-   *while the slot is still observably non-free*, so no acquirer
-   can race into the slot and inherit a stale epoch.
-4. `TxnID = 0` (atomic). Final release — slot is now free. Only
-   after this store can an acquirer CAS the slot, so acquirers
-   never observe a partial clear; concurrent scans are excluded
-   by flock(LOCK_EX).
-
-`PST`/`PIDN` are left as-is, exactly like the release path — the
-classification consults them only when `PID != 0`, which steps
-1–4 guarantee is false until the next acquirer publishes its own
-identity.
-
-The HintEpoch-before-TxnID ordering is load-bearing: reversed, a
-window exists between `TxnID = 0` and `HintEpoch = 0` during
-which a fresh acquirer can CAS-win `TxnID` and crash before step
-4a (heartbeat store). A subsequent stale-detection scan would
-then see `TxnID != 0, PID == 0, Heartbeat == 0,
-HintEpoch = <stale value from prior cycle>` and immediately
-re-clear the slot via case (c)'s timer (already aged out),
-evicting the (genuinely dead) new acquirer faster than
-StaleTimeout — benign for that slot but violating the
-per-occupant timer invariant. Zeroing HintEpoch first closes
-the window.
-
-### Read-only fleets never reap
-
-Every stale-slot clear path runs from a WRITER-side context (the
-stale scan is part of writer acquisition and maintenance, both of
-which hold `flock(LOCK_EX)`), and a read-only handle's coordinator
-refuses `AcquireWriter` while background maintenance is not started
-for read-only handles at all. Consequence — a documented deployment
-bound: in a fleet consisting EXCLUSIVELY of read-only handles, a
-crashed reader's slot is never reaped, and its stale `TxnID` pins
-the reclamation bound until any writable handle opens the database
-(its first grant acquisition scans and clears). Deployments that
-run long-lived read-only fleets over a database that also grows
-should include at least one writable opener (or periodic writable
-maintenance opens); pure-RO fleets over a static database are
-unaffected (nothing reclaims, so nothing is pinned). Granting
-read-only handles a narrow reap-only `LOCK_EX` path was considered
-and rejected: it would break the invariant that every bitmap/table
-mutation is writer-serialized, for a corner that a single writable
-open resolves.
-
-### Why HintEpoch lives in shared memory
-
-A process-local epoch would not survive writer-process turnover:
-short-lived writers (cron jobs, batch scripts) each observe the
-orphaned slot once, record their own local epoch, and exit
-before the StaleTimeout elapses, leaving the slot permanently
-pinned. The shared-memory `HintEpoch` accumulates observation
-time across all writer processes — the first observer sets it;
-any later writer in any process clears the slot once `now -
-HintEpoch > StaleTimeout`.
-
-The PID namespace check prevents cross-namespace failure modes
-(false dead when containers don't share PIDs; false alive when
-distinct processes happen to share a PID).
+**Bound scans stay pure memory reads.** `OldestReaderTxnID`
+computes the minimum over nonzero slots with atomic loads only —
+no per-slot syscalls on the write path. A stale slot
+conservatively pins the bound until a reap clears it; a
+mid-acquire slot needs no special floor (see the restabilization
+argument above).
 
 ### Go goroutine model
 
-Multiple slots may share the same PID (same process running
-multiple read transactions). This is correct:
-
-- **Slot allocation.** CAS on TxnID serializes claims across
-  goroutines and external processes.
-- **Stale detection.** `kill(pid, 0)` checks process liveness,
-  not thread liveness. If a process crashes, all its slots are
-  stale.
-- **Oldest-reader scan.** Writer finds min TxnID across all
-  occupied slots. Multiple slots from one process with different
-  TxnIDs are handled naturally.
-
-A single Go process running N concurrent read transactions
+Multiple slots may share the same PID (one process running
+multiple read transactions) — each read transaction owns one
+slot through the handle's hold description (Linux) or its own
+per-slot descriptor (macOS/FreeBSD). Slot allocation across
+goroutines of one handle is serialized by the acquisition mutex;
+across handles and processes, by the kernel's lock conflict. A
+single Go process running N concurrent read transactions
 consumes N reader slots. Set `MaxReaders` high enough for the
 expected total across all processes.
 
 ## Process Start Time
 
-Both reader slots and writer header store **start time** alongside
-PID. Monotonically-increasing value that changes when a PID is
+The WRITER header stores **start time** alongside PID (reader
+slots retired theirs — reader liveness is the held slot lock).
+Monotonically-increasing value that changes when a PID is
 recycled — unique `(PID, StartTime)` per process lifetime.
 
 At `Open()`, the process reads its own start time once and caches
 it on the DB struct (`db.processStartTime uint64`). Stored in
-reader slots on `Begin()` and in `WriterStartTime` on write-lock
-acquisition.
+`WriterStartTime` on write-lock acquisition.
 
-During stale detection, the writer reads the current start time
-for a given PID via `processStartTime(pid int) (uint64, error)`.
-If the PID is alive but the current start time differs from the
-stored value, the PID was recycled.
+During stale-writer classification, the checker reads the current
+start time for a given PID via `processStartTime(pid int)
+(uint64, error)`. If the PID is alive but the current start time
+differs from the stored value, the PID was recycled.
 
 | Platform | Source | Value | Notes |
 |----------|--------|-------|-------|
@@ -1437,7 +1278,7 @@ stored value, the PID was recycled.
 
 Only the Linux row is implemented; the macOS/FreeBSD/Windows rows
 are the settled design for those platforms (see PLATFORM SUPPORT
-under §Heartbeat Goroutine — the non-Linux helpers ship as error
+under §Writer Heartbeat — the non-Linux helpers ship as error
 stubs and liveness there is heartbeat-only).
 
 If `processStartTime` fails, falls back to heartbeat (if
@@ -1456,63 +1297,43 @@ correctness does **not** rely on uniqueness of
 (same-namespace PID liveness, start-time match, fresh
 heartbeat) and the heartbeat path being available as a fallback.
 A same-namespace `(PID, StartTime)` collision between distinct
-process lifetimes is benign because either (a) the prior holder
-is dead and the heartbeat is stale (caught by the heartbeat
-goroutine if the new holder rebooted heartbeat tracking, or by
-the zero-heartbeat orphan rule in stale detection) or (b) the
-prior holder is alive and legitimately holds the slot.
+process lifetimes is benign for the one remaining consumer (the
+writer-record classification): the flock gate, not the identity,
+is what admits a recoverer — the identity only labels the record.
 
 ## PID Namespace Awareness
 
-PID-based liveness operates within the caller's PID namespace.
-When multiple containers share a database file via volume mount,
-each container has its own PID namespace — a PID in one refers
-to a different (or nonexistent) process in another. Two failure
-modes:
+PID-based classification operates within the caller's PID
+namespace; a PID in one container refers to a different (or
+nonexistent) process in another. Reader slots retired their
+namespace field with the rest of identity-based liveness — a
+held lock conflicts across every namespace of a host, so
+cross-namespace readers need no classification at all. The one
+remaining consumer is the WRITER header: `WriterPIDNamespace` is
+read from `/proc/self/ns/pid` via `readlink` at Open (Linux;
+0 elsewhere or on failure, logged via `slog.Logger`) and lets
+the recovery-commit gate's last-writer classification route
+same-namespace records through the `(PID, StartTime)` fast path
+and everything else through the heartbeat window — conservative
+in both directions.
 
-- **False dead.** Container A holds slot at PID 42; container B
-  has no PID 42; `kill(42, 0)` from B returns `ESRCH` — B clears
-  the slot, removing snapshot protection for A's active reader.
-- **False alive.** Container A crashes with PID 42 in a slot;
-  container B also has a PID 42; `kill(42, 0)` from B succeeds —
-  slot never reclaimed.
+## Writer Heartbeat
 
-Each slot and the writer header store the process's **PID
-namespace inode** alongside the PID. On Linux, read from
-`/proc/self/ns/pid` via `readlink` at Open and cached on the DB
-struct. On non-Linux, 0. If the `readlink` fails (no `/proc`
-mounted, hardened sandbox), the DB caches 0 and logs the failure
-via `slog.Logger` — this forces every cross-process stale check
-involving this process to fall through to the heartbeat path,
-which is safe but slower than PID-based.
+There is no reader heartbeat: reader liveness is the held slot
+lock, released by the kernel at process death, and the per-slot
+refresh — one store per active slot per second, with the
+tick/active-list race notes that came with it — is deleted with
+it. The in-process **active-slot list** (`[]uint32` under
+`db.activeSlotsMu`) survives for one narrower job: Close-time
+cleanup of this handle's own slots.
 
-The writer compares its own PID namespace to the slot's. Match ⇒
-PID + StartTime fast path is safe. Differ ⇒ use heartbeat. A
-process with `PIDNamespace == 0` (Linux without `/proc`, or
-non-Linux) is treated as "different namespace" for the purposes
-of stale detection when the peer has a non-zero namespace inode
-— the asymmetry routes both directions through heartbeat, which
-is the correct conservative behavior.
-
-## Heartbeat Goroutine
-
-The DB struct maintains a **heartbeat goroutine** (started at
-Open, stopped at Close) that periodically refreshes the
-`Heartbeat` field on every reader slot this process holds.
-`WriterHeartbeat` is *not* refreshed here — it is refreshed by the
-flock goroutine inside its §Write Lock step-4 hold loop, the only
-context in which this process holds `LOCK_EX` (see **Writer-only
-updates** below).
-
-Ticks every ~1 s. Writes current monotonic clock
-(`CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on other
-platforms) to each active slot. The DB maintains an in-process
-**active-slot list** — a `[]uint32` of slot indices protected
-by `db.activeSlotsMu` (a `sync.Mutex`). `Begin()` appends under
-the mutex; `Commit()`/`Rollback()` removes under the mutex; the
-heartbeat goroutine takes a brief snapshot of the list under
-the mutex each tick and issues the atomic stores outside the
-lock to keep tick cost bounded.
+The heartbeat GOROUTINE survives, narrowed to one job: while the
+LastWriter record still names this process, it refreshes
+`LastWriterHeartbeat` each tick — the recovery-commit gate's
+author-liveness signal (durability.md §Recovery step 5), a
+bounded residual of clock-based judgment that the flock gate
+itself never depends on. A handle that never commits never
+refreshes anything.
 
 **Writer-only updates.** `WriterHeartbeat` is refreshed only by
 the flock goroutine, inside its §Write Lock step-4 hold loop, at
@@ -1523,9 +1344,9 @@ construction*: this goroutine is the sole writer of
 `WriterHeartbeat` and writes it only inside the hold window. There
 is no in-process "holding" flag a separate goroutine could read
 stale and so stomp the field after this process's `LOCK_UN`. The
-general heartbeat goroutine never writes `WriterHeartbeat` — it
-refreshes only reader-slot Heartbeats, every tick, regardless of
-write-lock state. Were a non-holder to write `WriterHeartbeat` it
+last-writer refresher never writes `WriterHeartbeat` — it
+refreshes only `LastWriterHeartbeat`, and only while the record
+names this process. Were a non-holder to write `WriterHeartbeat` it
 would stomp the value of whichever process actually holds the lock
 and corrupt cross-namespace stale-detection (§Stale Writer
 Recovery case 2); confining the write to the lock-holding
@@ -1551,9 +1372,12 @@ WRITABLE open fails outright and a read-only open falls back to
 lock-free operation. The non-Linux family members run with the
 degradations this spec defines: adaptive-poll notification waits
 (no shared futex), zero boot id (cross-boot invalidation
-disabled), and heartbeat-only liveness (`ProcessStartTime` ships
-as an error stub until the sysctl-based designs in §Process Start
-Time are implemented). `CLOCK_MONOTONIC` on macOS / FreeBSD is
+disabled), per-slot lock FILES instead of OFD ranges for reader
+liveness (§Reader Table, slot locks — same verdicts, a
+descriptor per active reader), and writer-record classification
+falling to the heartbeat window (`ProcessStartTime` ships as an
+error stub until the sysctl-based designs in §Process Start Time
+are implemented). `CLOCK_MONOTONIC` on macOS / FreeBSD is
 kernel-wide and boot-relative but does not survive suspend; on a
 laptop that resumes after a long sleep, the heartbeat clock jumps
 forward by less than wall-time elapsed, so `StaleTimeout`'s
@@ -1597,29 +1421,18 @@ describes no shipped behavior until that port lands:
   this Open must replace either way, and a later Open retries once
   the mappers are gone.
 
-`StaleTimeout` (default 10 s) controls how long a heartbeat
-must be stale before the slot is reclaimed. Must be
-significantly larger than the heartbeat interval (1 s) for
+`StaleTimeout` (default 10 s) survives only for the writer-record
+classifications above; no reader path consults it. Must remain
+significantly larger than the writer heartbeat interval (1 s) for
 scheduling jitter.
 
 **Shutdown coordination.** `Close()` stores the shared close
 gate's closed flag (atomic, see `leak-detection.md`), closes the
-heartbeat
-goroutine's stop channel, and **waits** for the goroutine to
-acknowledge via a done channel before unmapping the lock file.
-The heartbeat goroutine checks the stop channel before each
-tick and exits promptly. Without the wait, a final tick could
-race with the munmap and SIGSEGV. The wait is bounded by the
-tick interval (~1 s) since the goroutine sleeps in a `select`
-that includes the stop channel.
-
-Fixed-cost resource: one goroutine per DB handle, one atomic
-store per active slot per second, plus one `uint64` slice copy
-per tick — the snapshot-and-release pattern (`slots :=
-append(nil, activeSlots...)` under `activeSlotsMu`, atomic
-stores issued outside the lock) trades a small per-tick
-allocation for a bounded critical section that doesn't stall on
-slow atomic-store latency. No syscalls.
+last-writer refresher's stop channel and **waits** for it to
+acknowledge before releasing this handle's remaining reader-slot
+locks (the active-slot list) and unmapping the lock file —
+without the wait, a final refresh tick could race the munmap and
+SIGSEGV. The wait is bounded by the tick interval (~1 s).
 
 ## Atomic Operations Convention
 

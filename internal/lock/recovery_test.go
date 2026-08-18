@@ -150,140 +150,6 @@ func TestRecoverStaleWriterClearsHeader(t *testing.T) {
 	}
 }
 
-func TestRecoverStaleWriterClearsMatchingSlots(t *testing.T) {
-	// Seed three reader slots: one matches the dead writer's
-	// (PID, namespace, startTime), one matches PID + NS but not
-	// startTime (PID-reuse — see TestRecoverStaleWriterSkips-
-	// RecycledPIDSlots for the dedicated test), one matches PID
-	// but not namespace, one matches neither. Only the first
-	// should be cleared.
-	const deadPID, deadNS, deadStart = uint64(444), uint64(42), uint64(7)
-	f := staleWriterFile(t, deadPID, deadStart, deadNS, 100)
-
-	s0 := f.Slot(0)
-	Store64(&s0.TxnID, 0x111)
-	Store64(&s0.PID, deadPID)
-	Store64(&s0.PIDNamespace, deadNS)
-	Store64(&s0.ProcessStartTime, deadStart)
-	Store64(&s0.Heartbeat, 5_000)
-	Store64(&s0.HintEpoch, 0x222)
-
-	s1 := f.Slot(1)
-	Store64(&s1.TxnID, 0x333)
-	Store64(&s1.PID, deadPID)
-	Store64(&s1.PIDNamespace, deadNS+1) // different namespace
-	Store64(&s1.ProcessStartTime, deadStart)
-	Store64(&s1.Heartbeat, 6_000)
-
-	s2 := f.Slot(2)
-	Store64(&s2.TxnID, 0x555)
-	Store64(&s2.PID, 999) // different PID
-	Store64(&s2.PIDNamespace, deadNS)
-	Store64(&s2.ProcessStartTime, deadStart)
-
-	RecoverStaleWriter(f, deadNS)
-
-	// Slot 0: cleared.
-	if got := Load64(&s0.TxnID); got != 0 {
-		t.Errorf("slot 0 TxnID = %x, want 0 (matched dead writer)", got)
-	}
-	if got := Load64(&s0.PID); got != 0 {
-		t.Errorf("slot 0 PID = %d, want 0", got)
-	}
-	if got := Load64(&s0.Heartbeat); got != 0 {
-		t.Errorf("slot 0 Heartbeat = %d, want 0", got)
-	}
-	if got := Load64(&s0.HintEpoch); got != 0 {
-		t.Errorf("slot 0 HintEpoch = %x, want 0", got)
-	}
-
-	// Slot 1: untouched (different namespace).
-	if got := Load64(&s1.TxnID); got != 0x333 {
-		t.Errorf("slot 1 TxnID = %x, want 0x333 (different namespace)", got)
-	}
-	if got := Load64(&s1.PID); got != deadPID {
-		t.Errorf("slot 1 PID = %d, want %d", got, deadPID)
-	}
-
-	// Slot 2: untouched (different PID).
-	if got := Load64(&s2.TxnID); got != 0x555 {
-		t.Errorf("slot 2 TxnID = %x, want 0x555 (different PID)", got)
-	}
-}
-
-func TestRecoverStaleWriterSkipsRecycledPIDSlots(t *testing.T) {
-	// PID-reuse safety (cross-process.md §Stale Writer Recovery
-	// step 2): a slot matching (PID, PIDNamespace) but with a
-	// DIFFERENT ProcessStartTime belongs to a recycled-PID live
-	// reader, NOT the dead writer — recovery MUST NOT clear it.
-	// Without the ProcessStartTime term, recovery wipes the live
-	// reader's snapshot (snapshot loss).
-	const deadPID, deadNS, deadStart = uint64(444), uint64(42), uint64(0xAAAA)
-	const liveReaderStart = uint64(0xBBBB) // recycled PID, different start
-	f := staleWriterFile(t, deadPID, deadStart, deadNS, 100)
-
-	// Slot 0: belongs to the recycled-PID LIVE reader. Same PID
-	// and namespace as the dead writer, but different start time.
-	s0 := f.Slot(0)
-	Store64(&s0.TxnID, 0xCAFE)
-	Store64(&s0.PID, deadPID)
-	Store64(&s0.PIDNamespace, deadNS)
-	Store64(&s0.ProcessStartTime, liveReaderStart)
-	Store64(&s0.Heartbeat, 5_000)
-
-	// Slot 1: belongs to the actual dead writer's reader-tx (same
-	// PID, same namespace, same start time). MUST be cleared.
-	s1 := f.Slot(1)
-	Store64(&s1.TxnID, 0xDEAD)
-	Store64(&s1.PID, deadPID)
-	Store64(&s1.PIDNamespace, deadNS)
-	Store64(&s1.ProcessStartTime, deadStart)
-	Store64(&s1.Heartbeat, 6_000)
-
-	RecoverStaleWriter(f, deadNS)
-
-	// Slot 0: must NOT be touched (recycled-PID live reader).
-	if got := Load64(&s0.TxnID); got != 0xCAFE {
-		t.Errorf("slot 0 TxnID = %x, want 0xCAFE (recycled-PID live reader wiped — PID-reuse bug)", got)
-	}
-	if got := Load64(&s0.PID); got != deadPID {
-		t.Errorf("slot 0 PID = %d, want %d (live reader stomped)", got, deadPID)
-	}
-
-	// Slot 1: MUST have been cleared (dead writer's actual slot).
-	if got := Load64(&s1.TxnID); got != 0 {
-		t.Errorf("slot 1 TxnID = %x, want 0 (dead writer's slot not cleared)", got)
-	}
-	if got := Load64(&s1.PID); got != 0 {
-		t.Errorf("slot 1 PID = %d, want 0", got)
-	}
-}
-
-func TestRecoverStaleWriterSkipsCrossNSSlots(t *testing.T) {
-	// Cross-namespace recovery: writer header is in a different
-	// namespace than ours. Reader slots are NOT scanned — they're
-	// not directly comparable across namespaces.
-	const deadPID, deadNS = uint64(444), uint64(1)
-	f := staleWriterFile(t, deadPID, 7, deadNS, 100)
-
-	s0 := f.Slot(0)
-	Store64(&s0.TxnID, 0x111)
-	Store64(&s0.PID, deadPID)
-	Store64(&s0.PIDNamespace, deadNS)
-	Store64(&s0.Heartbeat, 5_000)
-
-	RecoverStaleWriter(f, 2 /*ourNS*/)
-
-	// Header cleared.
-	if got := f.WriterPID(); got != 0 {
-		t.Errorf("WriterPID = %d, want 0", got)
-	}
-	// Slot 0 untouched — cross-namespace skips the scan.
-	if got := Load64(&s0.TxnID); got != 0x111 {
-		t.Errorf("slot 0 TxnID = %x, want 0x111 (cross-NS recovery skips slot scan)", got)
-	}
-}
-
 func TestRecoverStaleWriterIdempotentOnCleanHeader(t *testing.T) {
 	// Recovery on an already-clean header: no-op.
 	root, base, _ := tmpLock(t)
@@ -355,58 +221,6 @@ func TestCoordRecoversStaleHeaderOnGrant(t *testing.T) {
 	if got := f.WriterHeartbeat(); got != clockValue {
 		t.Errorf("WriterHeartbeat = 0x%X, want 0x%X (stale 0xAAAA must have been cleared by recovery then republished via step-3)",
 			got, clockValue)
-	}
-}
-
-func TestCoordRecoversStaleReaderSlotsOnGrant(t *testing.T) {
-	// Stale writer state + reader slots owned by the dead writer.
-	// On grant, recovery clears both.
-	root, base, _ := tmpLock(t)
-	f, err := Open(OpenParams{
-		Root: root, Base: base, DataUUID: [16]byte{0xEE}, MaxReaders: 4,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer f.Close()
-
-	const deadPID, deadNS uint64 = 0x7FFFFFFF, 555
-	f.SetWriterPID(deadPID)
-	f.SetWriterPIDNamespace(deadNS)
-
-	s := f.Slot(2)
-	Store64(&s.TxnID, 0xABCD)
-	Store64(&s.PID, deadPID)
-	Store64(&s.PIDNamespace, deadNS)
-	Store64(&s.Heartbeat, 7777)
-	Store64(&s.HintEpoch, 0xDEAD)
-
-	c := NewCoord(f, CoordOptions{
-		PID:               1,
-		PIDNamespace:      deadNS, // same NS — slot cleanup eligible
-		RetryInterval:     time.Millisecond,
-		HeartbeatInterval: time.Hour,
-	})
-	defer c.Close()
-
-	grant, err := c.AcquireWriter(context.Background())
-	if err != nil {
-		t.Fatalf("AcquireWriter: %v", err)
-	}
-	defer grant.Release()
-
-	// Slot 2 should have been cleared by recovery.
-	if got := Load64(&s.TxnID); got != 0 {
-		t.Errorf("slot TxnID = %x, want 0", got)
-	}
-	if got := Load64(&s.PID); got != 0 {
-		t.Errorf("slot PID = %d, want 0", got)
-	}
-	if got := Load64(&s.Heartbeat); got != 0 {
-		t.Errorf("slot Heartbeat = %d, want 0", got)
-	}
-	if got := Load64(&s.HintEpoch); got != 0 {
-		t.Errorf("slot HintEpoch = %x, want 0", got)
 	}
 }
 
@@ -590,7 +404,7 @@ func TestPrevLastWriterLiveClassification(t *testing.T) {
 		// comparable — cross-process.md §PID Namespace Awareness), so
 		// even an impossible pid with a fresh heartbeat is live. This
 		// is the whole liveness story on platforms whose own namespace
-		// id is zero (heartbeat-only liveness, §Heartbeat Goroutine
+		// id is zero (heartbeat-only liveness, §Writer Heartbeat
 		// PLATFORM SUPPORT).
 		if !mkCoord(1<<30, 12345, 0, now).PrevLastWriterLive() {
 			t.Error("ns-unknown fresh heartbeat classified dead")
@@ -656,11 +470,11 @@ func TestPrevLastWriterLiveFutureHeartbeatIsLive(t *testing.T) {
 	}
 }
 
-// TestCrossNamespaceWindowSplit pins the two-window classification
-// (cross-process.md §Stale-reader detection, cross-namespace window):
-// a cross-namespace identity whose heartbeat has aged past
+// TestCrossNamespaceWindowSplit pins the two-window WRITER-record
+// classification (cross-process.md §Writer Heartbeat): a
+// cross-namespace identity whose heartbeat has aged past
 // StaleTimeout but not CrossNamespaceStaleTimeout is LIVE (a frozen
-// container's reads survive the same-host jitter window); past the
+// container's work survives the same-host jitter window); past the
 // cross-NS window it is dead. Same-namespace identities are governed
 // by kill(0) + start time and never consult the cross-NS window.
 func TestCrossNamespaceWindowSplit(t *testing.T) {
@@ -684,31 +498,6 @@ func TestCrossNamespaceWindowSplit(t *testing.T) {
 	}
 	if mk(long * 2).PrevLastWriterLive() {
 		t.Error("cross-NS identity aged past the cross-NS window classified live")
-	}
-}
-
-// TestCrossNamespaceWindowGovernsReaderSlots pins the reader-scan
-// side of the split window: a cross-NS slot older than StaleTimeout
-// but inside the cross-NS window is retained (its TxnID counts toward
-// the bound); past it, evicted.
-func TestCrossNamespaceWindowGovernsReaderSlots(t *testing.T) {
-	now := uint64(1_000_000_000_000)
-	short := uint64(10_000_000_000)
-	long := uint64(60_000_000_000)
-
-	read := func(hbAge uint64) uint64 {
-		f := openTestFile(t, 1)
-		s := f.Slot(0)
-		Store64(&s.TxnID, 42)
-		Store64(&s.PID, 9999)
-		Store64(&s.Heartbeat, now-hbAge)
-		return f.OldestReaderTxnID(99, now, short, long)
-	}
-	if got := read(short * 3); got != 42 {
-		t.Errorf("slot inside the cross-NS window: got %d, want 42 (retained)", got)
-	}
-	if got := read(long * 2); got == 42 {
-		t.Error("slot past the cross-NS window retained")
 	}
 }
 

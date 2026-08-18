@@ -377,12 +377,11 @@ BeginRead-captured Coord, not through the nil'd `*DB` pointers),
 and each slot is freed exactly once (the `held` CAS). The cost of
 the guarantee: a ReadTx held open indefinitely past `Close()`
 keeps the lock-file mapping and its snapshot's pages pinned —
-exactly as it would with the DB still open. Heartbeat residual:
-after `Close()` stops the heartbeat goroutine, a cross-namespace
-peer ages the slot out after its longer window
-(`cross-process.md` §Stale-reader detection); same-namespace
-peers classify by PID liveness and keep it pinned — unless the
-occupant's start time is unreadable to the scanner (restricted
-/proc), whose fallback is the same frozen heartbeat and the
-SHORT window.
+exactly as it would with the DB still open. Its slot LOCK stays
+held too (the hold description is refcounted by outstanding
+slots — `cross-process.md` §Reader Table, slot locks), so every
+peer classifies the slot live for exactly as long as the
+transaction exists: the heartbeat era's cross-namespace aging of
+a post-Close reader — a documented snapshot loss — is
+unrepresentable.
 (Pinned by `TestCloseReleasesOpenReaderSlots`.)

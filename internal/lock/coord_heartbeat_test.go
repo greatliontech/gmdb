@@ -198,35 +198,30 @@ func TestHeartbeatStopsAfterRelease(t *testing.T) {
 func TestHeartbeatWriterRefreshConfinedToLockHolder(t *testing.T) {
 	// The relocation guarantee (cross-process.md §Invariants):
 	// WriterHeartbeat is refreshed ONLY by the flock goroutine while
-	// it holds LOCK_EX (its step-4 hold loop), never by the general
-	// heartbeat goroutine. Prove the division of labor by contrast —
-	// after the writer releases, the heartbeat goroutine is
-	// demonstrably still alive and ticking (it keeps refreshing a
-	// registered reader slot), yet WriterHeartbeat is frozen because
-	// the only goroutine that ever wrote it (the flock goroutine) has
-	// left its hold window. A regression that re-adds a WriterHeartbeat
-	// write to the heartbeat goroutine fails the final assertion.
+	// it holds LOCK_EX (its step-4 hold loop), never by the
+	// last-writer refresher. Prove the division of labor by
+	// contrast — after the writer releases, the refresher goroutine
+	// is demonstrably still alive and ticking (it keeps refreshing
+	// the LastWriter record, which names this handle), yet
+	// WriterHeartbeat is frozen because the only goroutine that ever
+	// wrote it (the flock goroutine) has left its hold window. A
+	// regression that re-adds a WriterHeartbeat write to the
+	// refresher fails the final assertion.
 	clk := newFakeClock(1_000)
 	c, f := newHeartbeatCoord(t, 5*time.Millisecond, clk.now)
-
-	// A live reader slot witnesses that the heartbeat goroutine keeps
-	// ticking across the whole test.
-	c.RegisterReaderSlot(0, 0)
 
 	grant, err := c.AcquireWriter(context.Background())
 	if err != nil {
 		t.Fatalf("AcquireWriter: %v", err)
 	}
 
-	// While holding: advance the clock and wait for both the writer
-	// heartbeat (refreshed by the flock goroutine) and the reader slot
-	// (refreshed by the heartbeat goroutine) to reach the new value.
+	// While holding: advance the clock and wait for the writer
+	// heartbeat (refreshed by the flock goroutine) to reach it.
 	clk.set(2_000_000)
 	if !pollUntil(200*time.Millisecond, func() bool {
-		return f.WriterHeartbeat() == 2_000_000 && Load64(&f.Slot(0).Heartbeat) == 2_000_000
+		return f.WriterHeartbeat() == 2_000_000
 	}) {
-		t.Fatalf("while holding: writer=%d slot=%d, want both 2_000_000",
-			f.WriterHeartbeat(), Load64(&f.Slot(0).Heartbeat))
+		t.Fatalf("while holding: writer=%d, want 2_000_000", f.WriterHeartbeat())
 	}
 
 	grant.Release()
@@ -236,16 +231,16 @@ func TestHeartbeatWriterRefreshConfinedToLockHolder(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	frozenWriter := f.WriterHeartbeat()
 
-	// After release, advance the clock. The reader slot MUST keep
-	// advancing (heartbeat goroutine alive and ticking) — while
-	// WriterHeartbeat MUST stay frozen (no goroutine writes it once
-	// the hold window ends).
+	// After release, advance the clock. The LastWriter record MUST
+	// keep advancing (the refresher is alive, and the record names
+	// this handle) — while WriterHeartbeat MUST stay frozen (no
+	// goroutine writes it once the hold window ends).
 	clk.set(9_000_000)
 	if !pollUntil(200*time.Millisecond, func() bool {
-		return Load64(&f.Slot(0).Heartbeat) == 9_000_000
+		return f.LastWriterHeartbeat() == 9_000_000
 	}) {
-		t.Fatalf("reader slot did not advance after release: got %d, want 9_000_000 "+
-			"(heartbeat goroutine should still be ticking)", Load64(&f.Slot(0).Heartbeat))
+		t.Fatalf("LastWriterHeartbeat did not advance after release: got %d, want 9_000_000 "+
+			"(the refresher should still be ticking)", f.LastWriterHeartbeat())
 	}
 	if got := f.WriterHeartbeat(); got != frozenWriter {
 		t.Errorf("WriterHeartbeat advanced after release while not held: frozen=%d now=%d",
@@ -253,38 +248,21 @@ func TestHeartbeatWriterRefreshConfinedToLockHolder(t *testing.T) {
 	}
 }
 
-func TestHeartbeatActiveSlotsRefresh(t *testing.T) {
-	// Register two reader-slot indices; verify the heartbeat goroutine
-	// writes Heartbeat to both. Unregister one; verify it stops.
+func TestActiveSlotListBookkeeping(t *testing.T) {
+	// The active-slot list survives the heartbeat era for Close-time
+	// cleanup and the in-process reader count; reader slots carry no
+	// heartbeat to refresh.
 	clk := newFakeClock(0)
-	c, f := newHeartbeatCoord(t, 3*time.Millisecond, clk.now)
+	c, _ := newHeartbeatCoord(t, time.Hour, clk.now)
 
-	c.RegisterReaderSlot(0, 0)
-	c.RegisterReaderSlot(3, 0)
-
-	clk.set(5_000_000)
-	time.Sleep(20 * time.Millisecond)
-
-	if got := Load64(&f.Slot(0).Heartbeat); got != 5_000_000 {
-		t.Errorf("slot 0 Heartbeat = %d, want 5_000_000", got)
+	c.RegisterReaderSlot(0)
+	c.RegisterReaderSlot(3)
+	if got := c.ActiveReaderSlots(); got != 2 {
+		t.Fatalf("ActiveReaderSlots = %d, want 2", got)
 	}
-	if got := Load64(&f.Slot(3).Heartbeat); got != 5_000_000 {
-		t.Errorf("slot 3 Heartbeat = %d, want 5_000_000", got)
-	}
-	if got := Load64(&f.Slot(1).Heartbeat); got != 0 {
-		t.Errorf("slot 1 Heartbeat = %d, want 0 (not registered)", got)
-	}
-
-	// Unregister slot 0; advance clock; only slot 3 should advance.
 	c.UnregisterReaderSlot(0)
-	clk.set(9_000_000)
-	time.Sleep(20 * time.Millisecond)
-
-	if got := Load64(&f.Slot(0).Heartbeat); got != 5_000_000 {
-		t.Errorf("slot 0 Heartbeat after Unregister = %d, want frozen at 5_000_000", got)
-	}
-	if got := Load64(&f.Slot(3).Heartbeat); got != 9_000_000 {
-		t.Errorf("slot 3 Heartbeat = %d, want 9_000_000", got)
+	if got := c.ActiveReaderSlots(); got != 1 {
+		t.Fatalf("ActiveReaderSlots after unregister = %d, want 1", got)
 	}
 }
 
@@ -292,28 +270,20 @@ func TestHeartbeatUnregisterUnknownIsNoop(t *testing.T) {
 	// Idempotent unregister: removing an absent index must not panic
 	// and must not corrupt the active list.
 	clk := newFakeClock(0)
-	c, f := newHeartbeatCoord(t, time.Hour, clk.now)
+	c, _ := newHeartbeatCoord(t, time.Hour, clk.now)
 
-	c.RegisterReaderSlot(2, 0)
+	c.RegisterReaderSlot(2)
 	c.UnregisterReaderSlot(0) // not registered — no-op
 	c.UnregisterReaderSlot(2)
-
-	// After both unregisters, no slot should receive a heartbeat.
-	clk.set(1_000)
-	time.Sleep(5 * time.Millisecond)
-	for i := range uint32(8) {
-		if got := Load64(&f.Slot(i).Heartbeat); got != 0 {
-			t.Errorf("slot %d Heartbeat = %d, want 0 after all unregistered", i, got)
-		}
+	if got := c.ActiveReaderSlots(); got != 0 {
+		t.Fatalf("ActiveReaderSlots = %d, want 0 after all unregistered", got)
 	}
 }
 
 func TestHeartbeatCloseWaitsForGoroutine(t *testing.T) {
-	// Invariant 2: Close blocks until the heartbeat goroutine exits.
-	// We can't directly observe the goroutine count, but we can pin
-	// that Close serialises with a final write by counting writes:
-	// the slot's Heartbeat field must be stable across multiple
-	// Reads after Close returns.
+	// Close blocks until the last-writer refresher exits: after
+	// Close returns, advancing the clock must not move the
+	// LastWriter record — no goroutine is still ticking.
 	clk := newFakeClock(7)
 	root, base, _ := tmpLock(t)
 	f, err := Open(OpenParams{
@@ -329,20 +299,23 @@ func TestHeartbeatCloseWaitsForGoroutine(t *testing.T) {
 		Clock:             clk.now,
 	})
 
-	c.RegisterReaderSlot(0, 0)
+	// Become the last writer so the refresher has a live target.
+	grant, err := c.AcquireWriter(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireWriter: %v", err)
+	}
+	grant.Release()
 	time.Sleep(10 * time.Millisecond)
 
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// After Close, advancing the fake clock + waiting must NOT
-	// affect the slot — no goroutine is still ticking.
-	frozen := Load64(&f.Slot(0).Heartbeat)
+	frozen := f.LastWriterHeartbeat()
 	clk.set(999_999_999)
 	time.Sleep(20 * time.Millisecond)
-	if got := Load64(&f.Slot(0).Heartbeat); got != frozen {
-		t.Errorf("slot Heartbeat changed after Close: was %d, now %d", frozen, got)
+	if got := f.LastWriterHeartbeat(); got != frozen {
+		t.Errorf("LastWriterHeartbeat changed after Close: was %d, now %d", frozen, got)
 	}
 }
 
@@ -361,7 +334,7 @@ func TestHeartbeatConcurrentRegisterUnregister(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range Iter {
-				c.RegisterReaderSlot(i, 0)
+				c.RegisterReaderSlot(i)
 				c.UnregisterReaderSlot(i)
 			}
 		}()
@@ -399,9 +372,12 @@ func TestHeartbeatDefaultClock(t *testing.T) {
 		_ = f.Close()
 	})
 
-	c.RegisterReaderSlot(0, 0)
-	time.Sleep(20 * time.Millisecond)
-	if got := Load64(&f.Slot(0).Heartbeat); got == 0 {
+	grant, err := c.AcquireWriter(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireWriter: %v", err)
+	}
+	grant.Release()
+	if got := f.LastWriterHeartbeat(); got == 0 {
 		t.Errorf("default clock produced 0 heartbeat")
 	}
 }

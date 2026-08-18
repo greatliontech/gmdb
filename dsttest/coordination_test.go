@@ -215,10 +215,10 @@ func TestSimulationStaleWriterTakeover(t *testing.T) {
 	})
 }
 
-// Reader-slot reaping (cross-process.md §Reader Table, stale
-// detection): a crashed reader's slot — dead pid, frozen heartbeat —
-// must be reclaimable so later readers can acquire when the table is
-// full.
+// Reader-slot reaping (cross-process.md §Stale-slot reclamation): a
+// crashed reader's slot — its lock kernel-released at death, residue
+// left behind — must be reclaimable so later readers can acquire
+// when the table is full.
 func TestSimulationReaderCrashSlotReap(t *testing.T) {
 	opts := smallOpts
 	opts.MaxReaders = 2
@@ -783,20 +783,19 @@ func TestSimulationStaleReaderSlotPidReuse(t *testing.T) {
 	})
 }
 
-// Stale-identity classification, the cross-namespace heartbeat leg
-// (cross-process.md §Stale-reader detection, cross-namespace window):
-// a crashed reader in a SIBLING pid namespace leaves a slot no pid
-// probe can classify — kill answers ESRCH for live and dead alike
-// across namespaces — so the heartbeat window is the only signal.
-// Both halves are pinned: before the window elapses the slot must NOT
-// be reclaimed (an eager pid-based classifier would free it
-// instantly), and after it the reclaim must proceed.
-func TestSimulationStaleReaderCrossNamespaceHeartbeat(t *testing.T) {
+// Reader liveness across pid namespaces (cross-process.md §Reader
+// Table, slot locks): a reader in a SIBLING pid namespace is
+// invisible to every identity probe — kill answers ESRCH for live
+// and dead alike across namespaces — but its liveness is the held
+// slot lock, which no namespace boundary obscures. Both halves are
+// pinned: while the container reader is ALIVE its slot must not be
+// reclaimed (the held lock is the protection; no identity consult),
+// and the instant it crashes the kernel drops the lock and the next
+// acquisition reclaims the slot INLINE — no aging window, no reopen,
+// no recovery gate.
+func TestSimulationCrossNamespaceReaderCrashReclaim(t *testing.T) {
 	opts := smallOpts
 	opts.MaxReaders = 1
-	opts.HeartbeatInterval = 50 * time.Millisecond
-	opts.StaleTimeout = 400 * time.Millisecond
-	opts.CrossNamespaceStaleTimeout = time.Second
 	simulation.Test(t, 12, func(t *testing.T) {
 		simulation.Host("h", simulation.HostConfig{}, func() {
 			simulation.Process("setup", func() {
@@ -839,32 +838,24 @@ func TestSimulationStaleReaderCrossNamespaceHeartbeat(t *testing.T) {
 			simulation.Process("survivor", func() {
 				ctx := context.Background()
 				mustAwait(t, "/container-pinned")
-				simulation.Crash("container-reader")
 				db, err := gmdb.Open(ctx, "/db", opts)
 				if err != nil {
 					t.Fatalf("survivor Open: %v", err)
 				}
 				defer db.Close()
-				// Within the cross-namespace window: the slot's heartbeat is
-				// fresh and the pid probe is meaningless (sibling namespace),
-				// so the slot must still be treated as LIVE.
+				// Container reader alive: its slot lock is held, so the
+				// one-slot table is full — regardless of the namespace
+				// boundary that blinds every pid-based classifier.
 				if _, err := db.BeginRead(ctx); !errors.Is(err, gmdb.ErrReadersFull) {
-					t.Fatalf("BeginRead inside the cross-ns window = %v, want ErrReadersFull (the heartbeat is the only signal, and it is fresh)", err)
+					t.Fatalf("BeginRead with live cross-ns reader = %v, want ErrReadersFull (its held slot lock is the protection)", err)
 				}
-				// Past the window the heartbeat has aged out. Reaping runs
-				// under LOCK_EX — Open's recovery gate reaps unconditionally,
-				// the writer's reclamation scan only under allocation
-				// pressure, and BeginRead never scans — so a fresh Open
-				// rides the production reap path, and the slot frees.
-				time.Sleep(1500 * time.Millisecond)
-				db2, err := gmdb.Open(ctx, "/db", opts)
+				simulation.Crash("container-reader")
+				// Crash released the slot lock. The very next acquisition's
+				// second pass probes the occupied slot, wins the probe, and
+				// reclaims it inline — same handle, no reopen, no window.
+				rtx, err := db.BeginRead(ctx)
 				if err != nil {
-					t.Fatalf("post-window Open: %v", err)
-				}
-				defer db2.Close()
-				rtx, err := db2.BeginRead(ctx)
-				if err != nil {
-					t.Fatalf("BeginRead past the cross-ns window (the reopen's recovery gate reaps): %v", err)
+					t.Fatalf("BeginRead after cross-ns reader crash: %v (want inline reclaim of the freed slot)", err)
 				}
 				defer rtx.Rollback()
 			})

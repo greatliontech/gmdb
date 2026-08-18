@@ -3,8 +3,11 @@ package lock
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"math/rand/v2"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -97,7 +100,7 @@ type OpenParams struct {
 //     ensure no concurrent goroutine holds a slot pointer at Close
 //     time. The heartbeat goroutine's slot-pointer ownership is the
 //     concrete instance of (b) — see leak-detection.md §Close
-//     Ordering and cross-process.md §Heartbeat Goroutine.
+//     Ordering and cross-process.md §Writer Heartbeat.
 type File struct {
 	f      *os.File
 	mmap   []byte
@@ -107,6 +110,23 @@ type File struct {
 	// NotifySlotCount uint64 version words (format.go). Accessed only
 	// through the notify.go methods.
 	notify []uint64
+	// locks is the per-slot kernel-lock backend (reader.go); holds
+	// tracks this File's own held slots. Both live and die with the
+	// mapping's refs: the last drop closes the backend, so a read
+	// transaction outliving DB.Close keeps its slot lock held
+	// (cross-process.md §Reader Table, descriptions outlive Close).
+	locks slotLocks
+	holds holdSet
+	// reapMu serializes this File's stale-slot reapers — the range
+	// backend's one shared probe description cannot serialize
+	// same-File clearers itself (ReapStaleReaderSlots). acquireMu
+	// does the same for acquirers: two same-File try-locks through
+	// the one hold description never conflict, so without it two
+	// concurrent AcquireReaderSlot calls would both "win" one slot
+	// (cross-process.md §Reader Table, same-description caveat).
+	// Both live here, beside the descriptions they protect.
+	reapMu    sync.Mutex
+	acquireMu sync.Mutex
 	// refs counts lifetime references on the mapping: 1 for the
 	// owning handle (seeded at Open, dropped by its Close), plus one
 	// per open read transaction (Ref at BeginRead, dropped when the
@@ -507,6 +527,24 @@ func tryAdoptExisting(p OpenParams) (*File, error) {
 		// ErrCorrupted branch below.
 		return nil, errPartialInit
 	}
+	if hdr.Magic == MagicV1 {
+		// Heartbeat-era lock file: stale FORMAT. Adopting it would
+		// mix liveness protocols — a heartbeat-era peer sharing the
+		// table would evict lock-era readers (they publish no
+		// heartbeats) — so the file routes through identity-guarded
+		// removal exactly like a UUID mismatch and the lifecycle
+		// recreates it in the current format.
+		//
+		// Safety invariant: unlike the size-mismatch arm below, no
+		// data-format break makes a live heartbeat-era peer
+		// structurally impossible — soundness rests on not running
+		// mixed-format binaries against one data file concurrently
+		// (cross-process.md §Reader slot). The guard's SH→EX
+		// conversion still refuses while a live heartbeat-era WRITER
+		// holds its flock; an idle or read-only old handle holds no
+		// kernel lock and is undetectable by construction.
+		return nil, removeStaleGuarded(p, f)
+	}
 	if hdr.Magic != Magic {
 		return nil, fmt.Errorf("lock: %q magic 0x%016x != lock.Magic: %w",
 			p.Base, hdr.Magic, ErrCorrupted)
@@ -573,7 +611,7 @@ func tryAdoptExisting(p OpenParams) (*File, error) {
 	if err := verifyPathIdentity(p, f); err != nil {
 		return nil, err
 	}
-	out, err := mmapAndOverlay(f, hdr.MaxReaders, expectedSize)
+	out, err := mmapAndOverlay(p, f, hdr.MaxReaders, expectedSize)
 	if err != nil {
 		return nil, err
 	}
@@ -654,7 +692,7 @@ func createAndInit(p OpenParams) (*File, error) {
 	}
 	// LOCK_EX is held across init; release after init regardless of
 	// outcome so adopters can take LOCK_SH and validate.
-	initErr := initLockFile(f, p.DataUUID, p.MaxReaders, FileSize(p.MaxReaders))
+	initErr := initLockFile(p, f, p.DataUUID, p.MaxReaders, FileSize(p.MaxReaders))
 	_ = flock.Unlock(f.Fd())
 	if initErr != nil {
 		return nil, initErr
@@ -664,7 +702,7 @@ func createAndInit(p OpenParams) (*File, error) {
 	if err := verifyPathIdentity(p, f); err != nil {
 		return nil, err
 	}
-	out, err := mmapAndOverlay(f, p.MaxReaders, FileSize(p.MaxReaders))
+	out, err := mmapAndOverlay(p, f, p.MaxReaders, FileSize(p.MaxReaders))
 	if err != nil {
 		return nil, err
 	}
@@ -770,10 +808,36 @@ func removeStaleGuarded(p OpenParams, f *os.File) error {
 	if !os.SameFile(fInfo, pInfo) {
 		return errStaleUUID // name re-bound: a concurrent opener already replaced it
 	}
+	// The outgoing incarnation's readers directory goes with its lock
+	// file — under the same LOCK_EX and identity proof, BEFORE the
+	// unlink (a crash between the two leaves the still-stale file,
+	// and the next remover redoes the idempotent pair). This is the
+	// ONLY sanctioned removal of a readers directory: it runs exactly
+	// when the incarnation is provably superseded, so litter never
+	// accumulates and no external sweep is ever needed (an external
+	// sweep of a LIVE directory is outside the protection boundary —
+	// see fileLocks.open). Gated on the current Magic: heartbeat-era
+	// files had no readers directories, and a different-layout header
+	// has no trustworthy nonce field. Best-effort: a failed removal
+	// leaves inert litter, which the fail-closed open path tolerates
+	// safely.
+	if hdr, err := readHeaderAt(f); err == nil && hdr.Magic == Magic {
+		_ = p.Root.RemoveAll(readersDir(p.Base, hdr.ReadersDirNonce))
+	}
 	if rmErr := p.Root.Remove(p.Base); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 		return fmt.Errorf("lock: remove stale %q: %w", p.Base, rmErr)
 	}
 	return errStaleUUID
+}
+
+// readHeaderAt reads the lock-file header from the fd without the
+// mmap (the removal guard runs before any overlay exists).
+func readHeaderAt(f *os.File) (*LockFileHeader, error) {
+	b := make([]byte, HeaderSize)
+	if _, err := f.ReadAt(b, 0); err != nil {
+		return nil, err
+	}
+	return (*LockFileHeader)(unsafe.Pointer(&b[0])), nil
 }
 
 // errBootEpochContended signals a lost flock conversion during the
@@ -823,7 +887,7 @@ func bootEpochReset(p OpenParams, f *os.File, maxReaders uint32) error {
 	zeroed.LastMaintenanceTime = 0
 	zeroed.LastWriterPID, zeroed.LastWriterStartTime, zeroed.LastWriterPIDNamespace, zeroed.LastWriterHeartbeat = 0, 0, 0, 0
 	zeroed.ShrinkSeq = 0
-	// TakeoverSeq is zeroed with the rest: like slot Gen words, its
+	// TakeoverSeq is zeroed with the rest: its
 	// monotonicity is relied on only among live handles, and the
 	// reset's precondition (no process from the stamped boot exists)
 	// means no handle holds a cached value. RedirtyCoveredSeq is
@@ -862,7 +926,7 @@ func bootEpochReset(p OpenParams, f *os.File, maxReaders uint32) error {
 // LOCK_SH, reads the half-init'd header (Magic == 0), retries
 // through the adoption budget, and then recovers the file as the
 // crashed-creator staleness class (recoverTornInit).
-func initLockFile(f *os.File, uuid [16]byte, maxReaders uint32, fileSize int64) error {
+func initLockFile(p OpenParams, f *os.File, uuid [16]byte, maxReaders uint32, fileSize int64) error {
 	if err := f.Truncate(fileSize); err != nil {
 		return fmt.Errorf("lock: truncate: %w", err)
 	}
@@ -876,6 +940,21 @@ func initLockFile(f *os.File, uuid [16]byte, maxReaders uint32, fileSize int64) 
 		// The boot epoch is stamped so adopters in THIS boot trust the
 		// file's boot-relative stamps (heartbeats, start times).
 		BootID: CurrentBootID(),
+		// The incarnation nonce (format.go ReadersDirNonce). math/rand
+		// suffices: the property is accident-avoidance across a
+		// handful of incarnations at one path, not adversarial
+		// uniqueness — and it stays deterministic under the DST
+		// toolchain's seeded runtime.
+		ReadersDirNonce: rand.Uint32(),
+	}
+	// Eager slot-lock population for the per-slot lock-FILE backend,
+	// BEFORE the header publishes (adopters serialize on our LOCK_EX,
+	// so nobody opens slot files until the table is complete). Linux
+	// range locks need no files, so the dir is not created there.
+	if !flock.RangeSupported {
+		if err := populateReadersDir(p, hdr.ReadersDirNonce, maxReaders); err != nil {
+			return err
+		}
 	}
 	headerBytes := (*[HeaderSize]byte)(unsafe.Pointer(&hdr))[:]
 	if _, err := f.WriteAt(headerBytes, 0); err != nil {
@@ -894,7 +973,161 @@ func initLockFile(f *os.File, uuid [16]byte, maxReaders uint32, fileSize int64) 
 // On error, the caller retains ownership of f and must close it (the
 // closeOnExit defer pattern in tryAdoptExisting / createAndInit). On
 // success, ownership transfers to the returned *File.
-func mmapAndOverlay(f *os.File, maxReaders uint32, fileSize int64) (*File, error) {
+// newSlotLocks builds the per-slot kernel-lock backend
+// (cross-process.md §Reader Table, slot locks): OFD ranges over the
+// lock file on Linux (two dedicated descriptions — hold and probe —
+// opened through the same os.Root as the mmap descriptor and
+// identity-verified against it); per-slot lock files elsewhere, in
+// a directory scoped to this lock-file incarnation by the header's
+// nonce (readersDir).
+func newSlotLocks(p OpenParams, f *os.File, nonce uint32) (slotLocks, error) {
+	if !flock.RangeSupported {
+		return &fileLocks{root: p.Root, dir: readersDir(p.Base, nonce)}, nil
+	}
+	fInfo, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("lock: slot-lock identity fstat: %w", err)
+	}
+	open := func(role string) (*os.File, error) {
+		d, err := p.Root.OpenFile(p.Base, os.O_RDWR, 0)
+		if err != nil {
+			return nil, fmt.Errorf("lock: slot-lock %s description: %w", role, err)
+		}
+		// The descriptions are opened BY NAME after the lifecycle's
+		// verifyPathIdentity — an unguarded remover re-binding the
+		// name inside that window would put the mmap and the slot
+		// locks on different inodes: this handle's acquisitions
+		// would lock a file whose table it does not read (split
+		// brain). Verify each description against the validated fd
+		// and route a mismatch through the lifecycle's retry,
+		// exactly like verifyPathIdentity. (dup(2) is not an
+		// alternative: it shares the open file description, which
+		// would collapse hold, probe, and mmap fd into ONE
+		// description and void the same-description caveat.)
+		dInfo, err := d.Stat()
+		if err != nil {
+			d.Close()
+			return nil, fmt.Errorf("lock: slot-lock %s fstat: %w", role, err)
+		}
+		if !os.SameFile(fInfo, dInfo) {
+			d.Close()
+			return nil, errPathChanged
+		}
+		return d, nil
+	}
+	hold, err := open("hold")
+	if err != nil {
+		return nil, err
+	}
+	probe, err := open("probe")
+	if err != nil {
+		hold.Close()
+		return nil, err
+	}
+	return &rangeLocks{hold: hold, probe: probe}, nil
+}
+
+// populateReadersDir creates the incarnation's per-slot lock files
+// EAGERLY — the full table, under the creator's LOCK_EX, before the
+// header publishes. Eager-and-never-recreated is what lets every
+// later open fail CLOSED on a vanished entry (fileLocks.open): no
+// handle ever mkdirs or O_CREATEs a slot file, so an externally
+// swept directory or slot file cannot be silently replaced by a
+// fresh inode while a surviving holder's lock rides the unlinked
+// one. The sweep of leftover readers directories first removes
+// orphans from crashed inits (their nonce died unpublished, so no
+// other path can name them) and superseded incarnations a crashed
+// removal missed — anything present at CREATE time is provably not
+// the live incarnation (its lock file is gone, or we would be
+// adopting, not creating).
+func populateReadersDir(p OpenParams, nonce uint32, maxReaders uint32) error {
+	if entries, err := fs.ReadDir(p.Root.FS(), "."); err == nil {
+		prefix := p.Base + ".readers-"
+		for _, e := range entries {
+			// The sweep unlinks by PATTERN — uniquely in this file,
+			// where every other removal carries an fstat identity
+			// proof — so the pattern is kept exact: a directory whose
+			// suffix is precisely the 8-hex-digit nonce form
+			// readersDir emits. Anything else (a sibling database
+			// literally named "<base>.readers-x", a stray file) is
+			// not ours to remove.
+			rest, ok := strings.CutPrefix(e.Name(), prefix)
+			if !ok || !e.IsDir() || !isReadersNonce(rest) {
+				continue
+			}
+			_ = p.Root.RemoveAll(e.Name())
+		}
+	}
+	dir := readersDir(p.Base, nonce)
+	if err := p.Root.Mkdir(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("lock: create readers dir: %w", err)
+	}
+	for i := range maxReaders {
+		sf, err := p.Root.OpenFile(fmt.Sprintf("%s/%d", dir, i), os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			return fmt.Errorf("lock: create slot file %d: %w", i, err)
+		}
+		sf.Close()
+	}
+	// Make the table DURABLE before the header publishes: the caller
+	// fsyncs the header after this returns, and completed fsyncs
+	// order ahead of it — so a power loss can never resurrect a
+	// header whose table dirents were lost (the open path fails
+	// closed on missing entries and nothing recreates them; an
+	// undurable table under a durable header would wedge the
+	// incarnation for good). Slot-file dirents ride the directory
+	// fsync; the directory's own dirent rides the parent's.
+	if err := syncDir(p.Root, dir); err != nil {
+		return err
+	}
+	return syncDir(p.Root, ".")
+}
+
+// isReadersNonce reports whether s is exactly the 8-hex-digit
+// lowercase form readersDir emits — the creation sweep's pattern
+// guard.
+func isReadersNonce(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// syncDir fsyncs a directory within root, pinning its dirents.
+func syncDir(root *os.Root, name string) error {
+	d, err := root.Open(name)
+	if err != nil {
+		return fmt.Errorf("lock: open dir %q for fsync: %w", name, err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("lock: fsync dir %q: %w", name, err)
+	}
+	return nil
+}
+
+// readersDir names the per-slot lock-file directory for one
+// lock-file incarnation (cross-process.md §Reader Table, slot
+// locks). Scoping the name by the header's incarnation nonce makes
+// cross-incarnation aliasing unrepresentable: a recreated lock file
+// (UUID mismatch, stale format) stamps a fresh nonce and so derives
+// a fresh directory, however the filesystem reuses inodes — a prior
+// incarnation's surviving holders cannot wedge the fresh reader
+// table by holding locks on same-named slot files. A superseded
+// directory is inert litter — its locks die with their holders —
+// and deleting one is tolerated too (the open path recreates it;
+// fileLocks.open).
+func readersDir(base string, nonce uint32) string {
+	return fmt.Sprintf("%s.readers-%08x", base, nonce)
+}
+
+func mmapAndOverlay(p OpenParams, f *os.File, maxReaders uint32, fileSize int64) (*File, error) {
 	mapping, err := mmapRW(f.Fd(), fileSize)
 	if err != nil {
 		return nil, fmt.Errorf("lock: mmap: %w", err)
@@ -916,12 +1149,18 @@ func mmapAndOverlay(f *os.File, maxReaders uint32, fileSize int64) (*File, error
 		(*uint64)(unsafe.Pointer(&mapping[notifyOff])),
 		int(NotifySlotCount),
 	)
+	locks, err := newSlotLocks(p, f, header.ReadersDirNonce)
+	if err != nil {
+		_ = munmap(mapping)
+		return nil, err
+	}
 	lf := &File{
 		f:      f,
 		mmap:   mapping,
 		header: header,
 		slots:  slots,
 		notify: notify,
+		locks:  locks,
 	}
 	lf.refs.Store(1)
 	return lf, nil
@@ -959,6 +1198,12 @@ func (f *File) Close() error {
 		f.header = nil
 		f.slots = nil
 		f.notify = nil
+	}
+	if f.locks != nil {
+		if err := f.locks.close(); err != nil {
+			return fmt.Errorf("lock: slot locks close: %w", err)
+		}
+		f.locks = nil
 	}
 	if f.f != nil {
 		if err := f.f.Close(); err != nil {

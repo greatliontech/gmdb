@@ -111,7 +111,7 @@ var (
 	// Close has been called (or is concurrently in progress). Surfaces
 	// from Begin when the cross-process coordinator's goroutine has
 	// already shut down. The full close-gate semantics are specified
-	// by cross-process.md §Heartbeat Goroutine + leak-detection.md
+	// by cross-process.md §Writer Heartbeat + leak-detection.md
 	// §Close Ordering — this sentinel is the user-facing surface
 	// that contract requires.
 	ErrClosed = errors.New("gmdb: database is closed")
@@ -387,6 +387,6 @@ var (
 	errInvalidMaxBatchDelay        = errors.New("gmdb: MaxBatchDelay must be >= 0")
 	errInvalidMaintenance          = errors.New("gmdb: invalid MaintenanceOptions (Interval/ScrubBatchSize/CompactionBatchSize must be >= 0; CompactionThreshold in [0,1])")
 	errInvalidCoordInterval        = errors.New("gmdb: StaleTimeout/HeartbeatInterval/LockRetryInterval must be >= 0")
-	errStaleTimeoutTooSmall        = errors.New("gmdb: StaleTimeout must be > HeartbeatInterval (cross-process.md §Heartbeat Goroutine: significantly larger, for scheduling jitter)")
-	errCrossNSStaleTimeoutTooSmall = errors.New("gmdb: CrossNamespaceStaleTimeout must be >= StaleTimeout (cross-process.md §Stale-reader detection: the cross-namespace window widens, never tightens)")
+	errStaleTimeoutTooSmall        = errors.New("gmdb: StaleTimeout must be > HeartbeatInterval (cross-process.md §Writer Heartbeat: significantly larger, for scheduling jitter)")
+	errCrossNSStaleTimeoutTooSmall = errors.New("gmdb: CrossNamespaceStaleTimeout must be >= StaleTimeout (cross-process.md §Writer Heartbeat: the cross-namespace window widens, never tightens)")
 )

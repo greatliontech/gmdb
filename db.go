@@ -369,7 +369,7 @@ func openAttempt(ctx context.Context, path string, opts Options) (*DB, error) {
 			// The three cross-process coordination intervals come straight
 			// from Options (already resolved to their lock-package defaults
 			// by applyDefaults, and validated — StaleTimeout > Heartbeat-
-			// Interval). See cross-process.md §Heartbeat Goroutine / §Write
+			// Interval). See cross-process.md §Writer Heartbeat / §Write
 			// Lock and the Options godoc.
 			RetryInterval:              opts.LockRetryInterval,
 			HeartbeatInterval:          opts.HeartbeatInterval,

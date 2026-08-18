@@ -290,10 +290,11 @@ func TestMaintenanceSkipsReclamationUnderCorruption(t *testing.T) {
 
 // TestMaintenanceReapsStaleReaderSlot (Task 2 — background-maintenance.md
 // §Stale Reader Slot Cleanup): a full maintenance pass clears a reader
-// slot owned by a dead (cross-namespace) process and leaves a live one.
-// Driving runMaintenancePass exercises the Task-2 wiring end-to-end —
-// acquire LOCK_EX via the coord, scan, release — under a real flock, not
-// just the lock-package primitive.
+// slot whose owner no longer holds its slot lock (the image a crashed
+// peer leaves — kernel dropped the lock, slot bytes linger) and leaves
+// a live reader untouched. Driving runMaintenancePass exercises the
+// Task-2 wiring end-to-end: probe each occupied slot, clear under the
+// held probe where it acquires — no write grant involved.
 func TestMaintenanceReapsStaleReaderSlot(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, tmpPath(t), Options{PageSize: 4096, MinSize: 16, MaxSize: 256,
@@ -303,35 +304,36 @@ func TestMaintenanceReapsStaleReaderSlot(t *testing.T) {
 	}
 	defer db.Close()
 
-	now := db.coord.Clock()
-	// A cross-namespace (NS=0 ⇒ heartbeat-path) slot is governed by
-	// the CROSS-NAMESPACE window — 6 × StaleTimeout at defaults
-	// (cross-process.md §Stale-reader detection).
-	staleNanos := uint64(6 * lock.DefaultStaleTimeout)
-	if now <= 2*staleNanos {
-		t.Skip("machine uptime < 2×CrossNamespaceStaleTimeout; cannot forge an aged heartbeat deterministically")
+	// Live reader: a real read transaction — its slot lock is held, so
+	// the reap's probe cannot acquire it.
+	rtx, err := db.BeginRead(ctx)
+	if err != nil {
+		t.Fatalf("BeginRead: %v", err)
 	}
-	// Forge slot 0 stale: cross-namespace (NS=0 ⇒ heartbeat path),
-	// heartbeat aged well past the cross-NS window. Slot 1 live: cross-NS, fresh
-	// heartbeat. Raw stores — a deliberate manufactured pre-state. (The
-	// detection read-tx in Task 1 acquires a *different* free slot since
-	// these carry non-zero TxnIDs, so it does not disturb them.)
-	s0 := db.lockFile.Slot(0)
-	lock.Store64(&s0.TxnID, 7)
-	lock.Store64(&s0.PID, 9999)
-	lock.Store64(&s0.Heartbeat, now-2*staleNanos)
-	s1 := db.lockFile.Slot(1)
-	lock.Store64(&s1.TxnID, 11)
-	lock.Store64(&s1.PID, 8888)
-	lock.Store64(&s1.Heartbeat, now)
+	defer rtx.Rollback()
+	liveIdx := rtx.readerSlot
+	if liveIdx == lock.NoSlot {
+		t.Fatal("read transaction took no reader slot")
+	}
+	liveTxn := lock.Load64(&db.lockFile.Slot(liveIdx).TxnID)
+	if liveTxn == 0 {
+		t.Fatal("live slot carries TxnID 0")
+	}
+
+	// Stale slot: raw-store a non-zero TxnID into a slot nobody holds a
+	// lock on — a deliberate manufactured crashed-peer pre-state.
+	staleIdx := liveIdx + 1
+	s := db.lockFile.Slot(staleIdx)
+	lock.Store64(&s.TxnID, 7)
+	lock.Store64(&s.PID, 9999)
 
 	db.runMaintenancePass(ctx)
 
-	if got := lock.Load64(&s0.TxnID); got != 0 {
+	if got := lock.Load64(&db.lockFile.Slot(staleIdx).TxnID); got != 0 {
 		t.Errorf("stale reader slot not reaped: TxnID = %d, want 0", got)
 	}
-	if got := lock.Load64(&s1.TxnID); got != 11 {
-		t.Errorf("live reader slot reaped spuriously: TxnID = %d, want 11", got)
+	if got := lock.Load64(&db.lockFile.Slot(liveIdx).TxnID); got != liveTxn {
+		t.Errorf("live reader slot disturbed: TxnID = %d, want %d", got, liveTxn)
 	}
 }
 

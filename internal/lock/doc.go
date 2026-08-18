@@ -5,10 +5,10 @@
 //
 // This package exposes the lock-file lifecycle
 // (create-on-first-open, validate-or-recreate on UUID mismatch, mmap
-// MAP_SHARED) plus the typed shared-memory accessors for the
-// header and reader-slot fields. The flock goroutine, heartbeat
-// goroutine, stale-writer recovery, and reader-slot acquire/release
-// build on this surface.
+// MAP_SHARED) plus the typed shared-memory accessors for the header
+// and the reader slots' TxnID/PID fields. The flock goroutine, the
+// last-writer heartbeat refresher, stale-writer recovery, and the
+// slot-lock-based reader acquire/release/reap build on this surface.
 //
 // Atomic discipline. Every read/write of a shared-memory uint64 goes
 // through the function-based sync/atomic helpers in this package —

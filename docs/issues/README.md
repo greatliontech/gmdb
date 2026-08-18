@@ -85,9 +85,7 @@ pre-existing at their change set's base.
 
 | Slug | Lands | Summary |
 |------|-------|---------|
-
-*None open — resolved issues live in git history
-(`git log --all -- docs/issues/<slug>.md`).*
+| [dst-ofd-range-lock-model](dst-ofd-range-lock-model.md) | user decision | Model OFD byte-range locks in the godst fork so DST explores the Linux slot-lock backend directly; until then the `dst` tag routes slot locks to the portable lock-file backend (the sanctioned exception in `dst-testing.md` §Simulated syscall surface) |
 
 ## Open — design gaps (2026-07-11 architecture audit)
 
