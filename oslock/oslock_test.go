@@ -440,10 +440,20 @@ func TestAcquireSurfacesPersistentOpenFailure(t *testing.T) {
 // and a liveness authority must never read dead because a collector
 // ran. The claim persists until process death (leak reads live).
 func TestDroppedLockStaysHeldAcrossGC(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "gc.lock")
-	l, err := TryAcquire(path)
+	// Not t.TempDir: its mandatory RemoveAll fails on windows, where
+	// the deliberately-leaked lock holds gc.lock open and open files
+	// cannot be unlinked. The best-effort cleanup leaks one temp dir
+	// there — the cost of the property under test (the process holds
+	// the claim for its lifetime).
+	dir, err := os.MkdirTemp("", "oslock-gc-*")
 	if err != nil {
 		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "gc.lock")
+	l, lerr := TryAcquire(path)
+	if lerr != nil {
+		t.Fatal(lerr)
 	}
 	_ = l
 	l = nil //nolint:ineffassign // dropping the last reference is the point
