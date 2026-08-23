@@ -235,6 +235,16 @@ func TestCopyToPublishAtomicity(t *testing.T) {
 				// drop it so the no-residue assertion below sees only
 				// what CopyTo itself left behind.
 				defer os.Remove(tmp + ".lock")
+				// The verification open also mints the temp lock
+				// file's readers directory on the per-slot lock-FILE
+				// tier; both are this hook's residue, not CopyTo's.
+				defer func() {
+					if ms, _ := filepath.Glob(tmp + ".lock.readers-*"); ms != nil {
+						for _, m := range ms {
+							_ = os.RemoveAll(m)
+						}
+					}
+				}()
 				defer tdb.Close()
 				if err := tdb.View(ctx, func(rtx *ReadTx) error {
 					ks, e := rtx.OpenKeyspaceReadOnly("k")

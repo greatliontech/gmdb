@@ -900,11 +900,25 @@ func bootEpochReset(p OpenParams, f *os.File, maxReaders uint32) error {
 	zeroed.BootID = cur
 	// Slots first, then the header with the new boot id LAST: a crash
 	// between the two leaves the old id and the next adopter repeats
-	// the (idempotent) reset. Slot Gen words are reset with the rest —
-	// generation monotonicity is only relied on within a boot.
+	// the (idempotent) reset.
 	zeroSlab := make([]byte, int64(SlotSize)*int64(maxReaders))
 	if _, err := f.WriteAt(zeroSlab, int64(HeaderSize)); err != nil {
 		return fmt.Errorf("lock: zero reader table under boot-epoch reset: %w", err)
+	}
+	// Repopulate a missing or torn per-slot lock-FILE table
+	// (idempotent — existing entries are kept, missing ones created).
+	// The reset's precondition is the one moment repopulation is
+	// sound with no live-holder question: no process from the stamped
+	// boot exists, so no slot file can carry a live lock. This is the
+	// self-heal for table dirents lost to power loss — mandatory on
+	// windows, where directory fsync is unavailable and the eager
+	// table's durability rides NTFS metadata journaling (syncDir's
+	// windows arm), and a belt on unix against filesystems that lost
+	// metadata a completed fsync should have pinned.
+	if !flock.RangeSupported {
+		if err := populateReadersDir(p, zeroed.ReadersDirNonce, maxReaders); err != nil {
+			return fmt.Errorf("lock: repopulate reader table under boot-epoch reset: %w", err)
+		}
 	}
 	out := (*[HeaderSize]byte)(unsafe.Pointer(&zeroed))[:]
 	if _, err := f.WriteAt(out, 0); err != nil {
@@ -1097,19 +1111,6 @@ func isReadersNonce(s string) bool {
 		}
 	}
 	return true
-}
-
-// syncDir fsyncs a directory within root, pinning its dirents.
-func syncDir(root *os.Root, name string) error {
-	d, err := root.Open(name)
-	if err != nil {
-		return fmt.Errorf("lock: open dir %q for fsync: %w", name, err)
-	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
-		return fmt.Errorf("lock: fsync dir %q: %w", name, err)
-	}
-	return nil
 }
 
 // readersDir names the per-slot lock-file directory for one

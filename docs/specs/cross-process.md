@@ -1113,9 +1113,19 @@ authority:
   budget: one open descriptor per ACTIVE
   read transaction — proportional to actual concurrency, never
   to `MaxReaders` — documented as this tier's cost.
-- **Windows**: unchanged — the lock mmap shim is unsupported, so
-  a writable open fails and a read-only open falls back to
-  lock-free operation (see PLATFORM SUPPORT).
+- **Windows**: the per-slot lock-FILE tier, like macOS/FreeBSD —
+  `LockFileEx` through the flock seam on each slot file. One
+  windows-specific caveat: directory fsync is unavailable
+  (`FlushFileBuffers` on a directory handle is refused), so the
+  eager table's dirent durability rides NTFS metadata journaling
+  rather than the explicit fsync-before-header-publish ordering.
+  The power-loss residual — a durable header whose table dirents
+  were lost — self-heals at the next cross-boot adoption: the
+  boot-epoch reset repopulates a missing table under its
+  `LOCK_EX`, where no holder from the dead boot can exist. (The
+  repopulation runs on every lock-FILE-tier platform — on unix it
+  is a belt against metadata loss a completed fsync should have
+  excluded.)
 
 **Descriptions outlive Close while slots are outstanding.** A
 read transaction may legally outlive `Close()` (leak-detection.md):

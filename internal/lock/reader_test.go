@@ -369,7 +369,9 @@ func TestCoordAcquireReaderFullWithDeadline(t *testing.T) {
 		}
 		slots = append(slots, idx)
 	}
+	released := make(chan struct{})
 	go func() {
+		defer close(released)
 		time.Sleep(30 * time.Millisecond)
 		c.ReleaseReader(slots[0])
 	}()
@@ -379,6 +381,10 @@ func TestCoordAcquireReaderFullWithDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deadline acquire after free: %v", err)
 	}
+	// Join before the cleanup's File.Close: the acquire can win the
+	// slot the instant the flock drops, while the releaser goroutine
+	// is still returning through ReleaseReader.
+	<-released
 	c.ReleaseReader(idx)
 }
 
@@ -827,7 +833,10 @@ func TestStaleRemovalSweepsReadersDir(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	dir := readersDir(base, f.header.ReadersDirNonce)
-	if err := root.Mkdir(dir, 0o755); err != nil {
+	// On the file-backend tier the creator populated the dir eagerly;
+	// on the range tier it does not exist yet. Either is fine — the
+	// stale removal must take it out both ways.
+	if err := root.Mkdir(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	if err := os.WriteFile(fullPath+"-litter-probe", nil, 0o600); err != nil {
