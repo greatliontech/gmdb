@@ -68,6 +68,17 @@ release still happens) — the lock, not the file's absence, is the
 authority, and an unheld leftover file is an acquirable dead claim,
 not a hazard.
 
+A held Lock's lifetime is bounded by exactly three events: `Close`,
+`Retire`, or process death. Garbage collection is NOT one of them: a
+Lock whose last reference is dropped without disposal keeps its
+claim (and its descriptor) for the rest of the process — the
+implementation pins every held Lock against collection, because a
+runtime cleanup closing the descriptor would silently release the
+advisory lock and a liveness authority must never read dead because
+a collector ran. The leak bias is deliberate: a dropped claim reads
+LIVE until process exit, which merely defers reclamation; a silent
+release would invite reclamation under a live holder.
+
 Verdicts are sound only within one locking domain — the set of
 openers among whom the filesystem makes advisory locks conflict.
 One host's processes opening the same filesystem are one domain

@@ -48,6 +48,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -101,10 +102,40 @@ func setAfterLockHookForTest(h func(path string)) (restore func()) {
 // on the lock file, constructed only by a successful acquisition.
 // A Lock belongs to one owner; its methods are not safe for
 // concurrent use.
+//
+// A held Lock stays held until Close, Retire, or process death —
+// NEVER until the garbage collector notices it is unreachable. A
+// dropped-without-Close Lock therefore keeps its claim (and its
+// descriptor) for the rest of the process: the safe bias for a
+// liveness authority, where a leak reads live and a silent release
+// would read dead and invite reclamation under a live holder.
 type Lock struct {
 	f      *os.File
 	path   string
 	closed bool
+}
+
+// liveLocks pins every held Lock against garbage collection: an
+// os.File's cleanup closes its descriptor, and closing releases the
+// advisory lock, so an unreachable-but-unclosed Lock would silently
+// drop its claim at an arbitrary GC point. Registration at
+// acquisition and removal at Close/Retire make the held-until-
+// disposed lifetime structural.
+var (
+	liveLocksMu sync.Mutex
+	liveLocks   = map[*Lock]struct{}{}
+)
+
+func pinLive(l *Lock) {
+	liveLocksMu.Lock()
+	liveLocks[l] = struct{}{}
+	liveLocksMu.Unlock()
+}
+
+func unpinLive(l *Lock) {
+	liveLocksMu.Lock()
+	delete(liveLocks, l)
+	liveLocksMu.Unlock()
 }
 
 // open opens the lock file, creating it if absent. The descriptor is
@@ -160,7 +191,9 @@ func acquireVerified(path string, openErr func(error) error, lock func(fd uintpt
 			}
 			continue
 		}
-		return &Lock{f: f, path: path}, nil
+		l := &Lock{f: f, path: path}
+		pinLive(l)
+		return l, nil
 	}
 }
 
@@ -261,6 +294,7 @@ func (l *Lock) Retire() error {
 	unlinkErr := os.Remove(l.path)
 	closeErr := l.f.Close()
 	l.closed = true
+	unpinLive(l)
 	if unlinkErr != nil {
 		unlinkErr = fmt.Errorf("%w: %w", ErrUnlinkDeferred, unlinkErr)
 	}
@@ -276,5 +310,6 @@ func (l *Lock) Close() error {
 		return nil
 	}
 	l.closed = true
+	unpinLive(l)
 	return l.f.Close()
 }

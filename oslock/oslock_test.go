@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -429,5 +430,34 @@ func TestAcquireSurfacesPersistentOpenFailure(t *testing.T) {
 	}()
 	if _, err := Acquire(ctx2, p); !errors.Is(err, errMine) {
 		t.Fatalf("open-retry cancellation: %v, want the cancellation cause", err)
+	}
+}
+
+// TestDroppedLockStaysHeldAcrossGC pins the held-until-disposed
+// lifetime: a Lock whose last reference is dropped WITHOUT Close
+// keeps its claim across garbage collection — an os.File cleanup
+// closing the descriptor would silently release the advisory lock,
+// and a liveness authority must never read dead because a collector
+// ran. The claim persists until process death (leak reads live).
+func TestDroppedLockStaysHeldAcrossGC(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gc.lock")
+	l, err := TryAcquire(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l
+	l = nil //nolint:ineffassign // dropping the last reference is the point
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		second, err := TryAcquire(path)
+		if err == nil {
+			second.Close()
+			t.Fatal("dropped-but-unclosed lock was released by GC")
+		}
+		if !errors.Is(err, ErrHeld) {
+			t.Fatalf("probe: %v, want ErrHeld", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
