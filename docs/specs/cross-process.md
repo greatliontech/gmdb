@@ -1113,19 +1113,18 @@ authority:
   budget: one open descriptor per ACTIVE
   read transaction — proportional to actual concurrency, never
   to `MaxReaders` — documented as this tier's cost.
-- **Windows**: the per-slot lock-FILE tier, like macOS/FreeBSD —
-  `LockFileEx` through the flock seam on each slot file. One
-  windows-specific caveat: directory fsync is unavailable
-  (`FlushFileBuffers` on a directory handle is refused), so the
-  eager table's dirent durability rides NTFS metadata journaling
-  rather than the explicit fsync-before-header-publish ordering.
-  The power-loss residual — a durable header whose table dirents
-  were lost — self-heals at the next cross-boot adoption: the
-  boot-epoch reset repopulates a missing table under its
-  `LOCK_EX`, where no holder from the dead boot can exist. (The
-  repopulation runs on every lock-FILE-tier platform — on unix it
-  is a belt against metadata loss a completed fsync should have
-  excluded.)
+- **Windows**: the RANGE tier, like Linux — `LockFileEx` byte
+  ranges are HANDLE-scoped (two handles conflict; a lock survives
+  until unlock, handle close, or process termination), the same
+  shape as OFD descriptions, so windows takes the range backend
+  over the lock file itself and pays no per-slot file creation.
+  Windows range locks are MANDATORY against other handles'
+  ReadFile/WriteFile (mapped views are not policed); this is safe
+  by construction — steady-state slot access is mapping-only, and
+  the lock file's file-I/O paths either stay inside the header
+  (below every slot range) or run where no slot lock can exist
+  (creation under the creator's exclusivity; the boot-epoch reset
+  under its no-live-holders precondition).
 
 **Descriptions outlive Close while slots are outstanding.** A
 read transaction may legally outlive `Close()` (leak-detection.md):

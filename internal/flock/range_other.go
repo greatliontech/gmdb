@@ -1,13 +1,15 @@
-//go:build !linux || dst
+//go:build (!linux && !windows) || dst
 
 package flock
 
 import "errors"
 
-// OFD byte-range locks are Linux-only; POSIX range locks are
-// per-process (any close of any descriptor drops them), which is
-// unsound for multi-handle processes. This tier uses per-slot lock
-// FILES instead (cross-process.md §Reader Table, slot locks).
+// Description-scoped range locks exist on Linux (OFD) and windows
+// (LockFileEx); the remaining unix platforms have only POSIX range
+// locks, which are per-process (any close of any descriptor drops
+// them) — unsound for multi-handle processes. This tier uses
+// per-slot lock FILES instead (cross-process.md §Reader Table,
+// slot locks).
 //
 // The dst build also lands here: the DST toolchain's simulation
 // layer emulates flock(2) (with crash release) but not OFD range
